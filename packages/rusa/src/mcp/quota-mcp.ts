@@ -822,7 +822,9 @@ export class QuotaService {
     }
 
     const state = await inFlight;
-    this.cache.set(provider, { state, timestamp: Date.now() });
+    if (state.status !== "unknown" || !cached || cached.state.status === "unknown") {
+      this.cache.set(provider, { state, timestamp: Date.now() });
+    }
     return state;
   }
 
@@ -856,11 +858,15 @@ export class QuotaService {
     const isFresh = cached && Date.now() - cached.timestamp < this.getTtlMs(provider);
     if (!isFresh) {
       // Stale or cold → refresh in the background; do not await the probe.
-      // getQuota() dedupes concurrent probes via inFlightProbes and writes the
+      // Probe startup is deferred off the synchronous request call stack via
+      // queueMicrotask so the request path does zero synchronous I/O or PTY setup.
+      // getQuota() dedupes concurrent probes via inFlightProbes and writes any
       // fresh reading back into the same cache this read serves from.
-      void this.getQuota(provider).catch(() => {
-        // Background refresh; a failure just leaves the stale reading in place
-        // and surfaces on the next probe. Never rejects the request path.
+      queueMicrotask(() => {
+        void this.getQuota(provider).catch(() => {
+          // Background refresh; a failure just leaves the stale reading in place
+          // and surfaces on the next probe. Never rejects the request path.
+        });
       });
     }
     return (

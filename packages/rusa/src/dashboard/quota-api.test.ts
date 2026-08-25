@@ -1,12 +1,15 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { describe, expect, it } from "vitest";
-import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
+import { describe, expect, it, vi } from "vitest";
+import type { RusaConfig } from "../config/types.js";
+import { type ProviderQuotaSnapshot, QuotaService } from "../mcp/quota-mcp.js";
+import type { CodingProvider } from "../providers/types.js";
 import {
   buildQuotaHistory,
   buildQuotaSnapshot,
   handleQuotaApiRequest,
   type QuotaApiDeps,
   type QuotaHistorySource,
+  type QuotaSnapshotDto,
 } from "./quota-api.js";
 
 function historyPoint(
@@ -855,5 +858,146 @@ describe("GET /api/quota (ISSUE_NUM backend)", () => {
     expect(handled).toBe(true);
     expect(r.status()).toBe(500);
     expect(r.json()).toEqual({ error: "probe worktree busy" });
+  });
+
+  describe("non-blocking request path wiring with getQuotaCached (issue #10)", () => {
+    it("serves GET /api/quota immediately with cold DB fallback while underlying probe remains pending", async () => {
+      const now = Date.parse("2026-08-25T23:00:00.000Z");
+      // Probe promise that intentionally never resolves during the test
+      const pendingProbe = new Promise<{ success: boolean; output: string; exitCode: number }>(
+        () => {}
+      );
+      let probeStarted = false;
+
+      // Real QuotaService instance configured to return the unresolved probe on execution
+      const service = new QuotaService({
+        config: {
+          providers: {
+            claude: { cliCommand: "claude" },
+          },
+        } as unknown as RusaConfig,
+        workersDir: "/tmp/workers",
+        resolveProvider: () =>
+          ({
+            name: "claude",
+            providerName: "claude",
+            run: () => {
+              probeStarted = true;
+              return pendingProbe;
+            },
+          }) as unknown as CodingProvider,
+      });
+
+      // Wire exactly as start.ts:2545-2552 does in production
+      const deps: QuotaApiDeps = {
+        getQuota: async (provider) => service.getQuotaCached(provider),
+        providers: ["claude"],
+        now: () => now,
+        listHistory: (_provider, _sinceIso) => [
+          historyPoint({
+            observedAt: "2026-08-25T22:30:00.000Z", // 30 mins old, within 24h MAX_HOLD_MS
+            percentLeft: 85,
+          }),
+        ],
+      };
+
+      const r = fakeRes();
+      // handleQuotaApiRequest must complete and respond without awaiting the pending probe
+      const handled = await handleQuotaApiRequest(fakeReq("GET"), r.res, u("/api/quota"), deps);
+
+      expect(handled).toBe(true);
+      expect(r.status()).toBe(200);
+      const body = r.json() as QuotaSnapshotDto;
+      expect(body.providers).toHaveLength(1);
+      expect(body.providers[0]).toMatchObject({
+        provider: "claude",
+        status: "available",
+        scrapedAt: "2026-08-25T22:30:00.000Z",
+        usedPercent: 15,
+      });
+
+      // Background probe is kicked asynchronously without blocking the response
+      await vi.waitFor(() => {
+        expect(probeStarted).toBe(true);
+      });
+    });
+
+    it("serves unknown placeholder immediately on cold cache without DB history when probe remains pending", async () => {
+      const pendingProbe = new Promise<{ success: boolean; output: string; exitCode: number }>(
+        () => {}
+      );
+      const service = new QuotaService({
+        config: {
+          providers: {
+            claude: { cliCommand: "claude" },
+          },
+        } as unknown as RusaConfig,
+        workersDir: "/tmp/workers",
+        resolveProvider: () =>
+          ({
+            name: "claude",
+            providerName: "claude",
+            run: () => pendingProbe,
+          }) as unknown as CodingProvider,
+      });
+
+      const deps: QuotaApiDeps = {
+        getQuota: async (provider) => service.getQuotaCached(provider),
+        providers: ["claude"],
+        listHistory: () => [],
+      };
+
+      const r = fakeRes();
+      const handled = await handleQuotaApiRequest(fakeReq("GET"), r.res, u("/api/quota"), deps);
+
+      expect(handled).toBe(true);
+      expect(r.status()).toBe(200);
+      const body = r.json() as QuotaSnapshotDto;
+      expect(body.providers[0]).toMatchObject({
+        provider: "claude",
+        status: "unknown",
+      });
+    });
+
+    it("drops DB history older than 24h MAX_HOLD_MS and serves cold unknown placeholder", async () => {
+      const now = Date.parse("2026-08-25T23:00:00.000Z");
+      const service = new QuotaService({
+        config: {
+          providers: {
+            claude: { cliCommand: "claude" },
+          },
+        } as unknown as RusaConfig,
+        workersDir: "/tmp/workers",
+        resolveProvider: () =>
+          ({
+            name: "claude",
+            providerName: "claude",
+            run: () => new Promise<never>(() => {}),
+          }) as unknown as CodingProvider,
+      });
+
+      const deps: QuotaApiDeps = {
+        getQuota: async (provider) => service.getQuotaCached(provider),
+        providers: ["claude"],
+        now: () => now,
+        listHistory: () => [
+          historyPoint({
+            observedAt: "2026-08-24T22:00:00.000Z", // 25 hours old (> 24h MAX_HOLD_MS)
+            percentLeft: 70,
+          }),
+        ],
+      };
+
+      const r = fakeRes();
+      const handled = await handleQuotaApiRequest(fakeReq("GET"), r.res, u("/api/quota"), deps);
+
+      expect(handled).toBe(true);
+      expect(r.status()).toBe(200);
+      const body = r.json() as QuotaSnapshotDto;
+      expect(body.providers[0]).toMatchObject({
+        provider: "claude",
+        status: "unknown",
+      });
+    });
   });
 });

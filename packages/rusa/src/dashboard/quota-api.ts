@@ -12,9 +12,9 @@ import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
  * dashboard page load never triggers-and-awaits a live PTY probe in the request
  * path (issue #10). On a cold cache (e.g. just after a process restart) the
  * cache read returns an `unknown` state and `buildQuotaSnapshot` falls back to
- * the newest durable rows via `listHistory` (issue #9's observation-aged data),
- * so the header still shows the last real reading rather than dimming for the
- * full probe latency.
+ * the newest durable rows via `listHistory` (observations up to 24h old, see
+ * `MAX_HOLD_MS` in `latestStateFromHistory`), so the header still shows the last
+ * real reading rather than dimming for the full probe latency.
  *
  * kimi is now served via a host-side PTY scrape of the real CLI's `/usage`
  * display. The CLI owns its credentials; this endpoint only maps
