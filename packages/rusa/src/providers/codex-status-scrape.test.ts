@@ -63,17 +63,43 @@ describe("codex-status-scrape", () => {
       expect(script).toContain("show current session|/statusline|configure which items");
       expect(script).toContain("(›|>)[[:space:]]*/status");
 
-      // Verify panel readiness grep
-      expect(script).toContain("limit:|hit your usage limit|refresh requested|run /status again");
+      // A real limits table / exhaustion banner is detected separately from the
+      // "refresh requested" placeholder — the placeholder must NOT count as a
+      // successful reading (issue #8).
+      expect(script).toContain('grep -qE "limit:|hit your usage limit"');
+      expect(script).toContain('grep -qE "refresh requested|run /status again"');
 
-      // Verify error exit behavior: does not capture-pane unrendered popup on failure
-      const errorBlock = script.slice(script.indexOf('if [ "$rendered" -eq 0 ]; then'));
+      // Verify error exit behavior: only errors when NEITHER a real table nor a
+      // placeholder ever rendered, and does not capture-pane on that failure.
+      const errorBlock = script.slice(
+        script.indexOf('if [ "$rendered" -eq 0 ] && [ "$placeholder_seen" -eq 0 ]; then')
+      );
       const errorBranch = errorBlock.slice(0, errorBlock.indexOf("fi"));
       expect(errorBranch).toContain(
         'echo "ERROR: /status panel never rendered in Codex session" >&2'
       );
       expect(errorBranch).toContain("exit 1");
       expect(errorBranch).not.toContain("capture-pane");
+    });
+
+    it("retries /status within a bounded budget when only the refresh placeholder renders", () => {
+      const script = buildTmuxScript("codex", "/tmp/test.sock");
+
+      // A bounded whole-script budget bounds the retry loop (kept below the 90s
+      // Node wall-clock).
+      expect(script).toContain("BUDGET_S=80");
+
+      // The retry loop re-issues /status while the budget allows.
+      expect(script).toContain('while [ "$SECONDS" -lt "$BUDGET_S" ]; do');
+      expect(script).toContain("attempt_status");
+
+      // A real table stops the loop; a bare placeholder does not (it only records
+      // placeholder_seen and waits for codex's async refresh before re-issuing).
+      expect(script).toContain("rendered=1");
+      expect(script).toContain("placeholder_seen=1");
+
+      // AUTH-SAFETY: every retry is still /status, never /usage.
+      expect(script).not.toContain("/usage");
     });
   });
 

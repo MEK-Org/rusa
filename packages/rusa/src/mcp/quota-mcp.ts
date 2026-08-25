@@ -51,10 +51,6 @@ export interface QuotaInferenceExplanation {
   detail: string;
 }
 
-const CODEX_REFRESH_RETRY_DELAY_MS = 2_000;
-const CODEX_REFRESH_MAX_RETRIES = 2;
-const CODEX_REFRESH_REQUESTED_RE = /refresh requested;?\s*run \/status again shortly/i;
-
 /** One parsed usage-limit row from the healthy `/status` panel. */
 export interface QuotaLimit {
   /** The row label, e.g. "5h" or "Weekly". */
@@ -131,8 +127,6 @@ export interface QuotaMcpDeps {
    * real tmux-in-bwrap PTY harness. Returns the raw captured TUI text.
    */
   scrapeCodexStatus?: (opts: ScrapeCodexStatusOptions) => Promise<string>;
-  /** Injectable timer used only by the bounded Codex refresh-requested retry. */
-  sleep?: (delayMs: number) => Promise<void>;
   /**
    * Injectable agy interactive `/usage` scrape (test seam). Defaults to the real
    * host-side tmux PTY harness. Returns the raw captured "Models & Quota" text.
@@ -314,6 +308,34 @@ function resolveResetAtIso(
   return undefined;
 }
 
+/**
+ * The Codex-specific clause of the LLM quota parse prompt. Extracted (and named)
+ * so the placeholder contract from issue #8 is a testable, regression-locked unit
+ * rather than an anonymous slice of a ternary.
+ *
+ * The key property: codex's `/status` frequently renders
+ * `Limits: refresh requested; run /status again shortly.` — an async-refresh
+ * PLACEHOLDER, not a reading. The parser must classify it as a known pending /
+ * no-data state (emit `placeholder: true`, no number), NEVER as a real reading
+ * and NEVER as a parse error. The host-side probe now retries /status on this
+ * placeholder (see providers/codex-status-scrape.ts), so a real table usually
+ * reaches the parser; when only the placeholder ever renders, this contract keeps
+ * the parse honest instead of fabricating or failing.
+ */
+export const CODEX_QUOTA_PARSE_GUIDANCE =
+  "For Codex: a real reading contains limit rows (e.g. '5h limit:', 'Weekly limit:') " +
+  "or an explicit exhaustion message (\"You've hit your usage limit\" / 'hit your usage limit'). " +
+  `If it contains "You've hit your usage limit" or "hit your usage limit", ` +
+  "status is 'exhausted'; extract per-window (5h, Weekly) percentages and reset times (including from 'try again at <date/time>'). " +
+  'KNOWN PENDING STATE: codex\'s /status can render "Limits: refresh requested; run /status again shortly" ' +
+  '(or "run /status again") — this is codex\'s async-refresh PLACEHOLDER, NOT a reading and NOT a parse error. ' +
+  "Emit that window with placeholder: true and no usedPercent; do NOT guess a number and do NOT fail the parse. " +
+  "status is 'unknown' when every window is such a placeholder. " +
+  "If the output contains none of the above — no limit rows, no exhaustion message, no refresh placeholder — " +
+  "return status='unknown' and windows=[]. " +
+  "For standard 5h and Weekly limits, scope is 'provider'. " +
+  "For specific model limits (e.g. GPT-5.3-Codex-Spark limit), scope is 'model'.\n";
+
 async function parseQuotaWithLlm(
   output: string,
   apiKey: string,
@@ -354,13 +376,7 @@ async function parseQuotaWithLlm(
         "If any provider-wide window is 100% used or the output says 'rate limit exceeded' or 'limit exceeded', " +
         "status is 'exhausted'. Set scope to 'provider'.\n"
       : provider === "codex"
-        ? "For Codex: if the output does not contain limit rows (e.g. '5h limit:', 'Weekly limit:') or an explicit limit message ('hit your usage limit', 'refresh requested'), return status='unknown' and windows=[]. " +
-          `If it contains "You've hit your usage limit" or "hit your usage limit", ` +
-          "status is 'exhausted'; extract per-window (5h, Weekly) percentages and reset times (including from 'try again at <date/time>'). " +
-          'If the output instead says "refresh requested" or "run /status again shortly" with ' +
-          "no number, emit that window with placeholder: true and no usedPercent — do NOT " +
-          "guess a number, and do NOT treat this as a parse failure. For standard 5h and Weekly limits, scope is 'provider'. " +
-          "For specific model limits (e.g. GPT-5.3-Codex-Spark limit), scope is 'model'.\n"
+        ? CODEX_QUOTA_PARSE_GUIDANCE
         : provider === "agy"
           ? "For agy: locate the 'GEMINI MODELS' section, which has a Weekly Limit and a " +
             "Five Hour Limit window. " +
@@ -899,20 +915,15 @@ export class QuotaService {
    */
   private async probeCodexQuota(actorDir: string): Promise<ProviderQuotaSnapshot> {
     const scrape = this.deps.scrapeCodexStatus ?? scrapeCodexStatusImpl;
-    const sleep =
-      this.deps.sleep ??
-      ((delayMs: number) => new Promise((resolve) => setTimeout(resolve, delayMs)));
     let raw: string;
     try {
+      // A single scrape suffices: the tmux harness now retries `/status`
+      // IN-SESSION on codex's "refresh requested" async-refresh placeholder,
+      // within its own 90s budget (see providers/codex-status-scrape.ts, issue
+      // #8). The prior whole-scrape retry here spun up a FRESH cold codex session
+      // each time — which just re-renders the placeholder — so it never actually
+      // recovered a reading; re-sending `/status` in the same warm session does.
       raw = await scrape({ actorDir });
-      for (
-        let retry = 0;
-        retry < CODEX_REFRESH_MAX_RETRIES && CODEX_REFRESH_REQUESTED_RE.test(raw);
-        retry++
-      ) {
-        await sleep(CODEX_REFRESH_RETRY_DELAY_MS);
-        raw = await scrape({ actorDir });
-      }
     } catch (err) {
       return {
         provider: "codex",

@@ -29,6 +29,7 @@ import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers
 import { buildActorBwrapArgs } from "../providers/sandbox.js";
 import type { CodingProvider } from "../providers/types.js";
 import {
+  CODEX_QUOTA_PARSE_GUIDANCE,
   createQuotaMcpServer,
   inferQuotaState,
   type ProviderQuotaSnapshot,
@@ -68,6 +69,27 @@ describe("quota MCP server", () => {
       const parsed = await parseCodexQuota(output);
       expect(parsed.status).toBe("unknown");
       expect(parsed.message).toBe("no geminiApiKey configured for LLM quota parsing");
+    });
+  });
+
+  describe("CODEX_QUOTA_PARSE_GUIDANCE (issue #8 placeholder contract)", () => {
+    it("names the refresh-requested render as a known pending/no-data placeholder", () => {
+      // The classic codex /status placeholder text is called out verbatim.
+      expect(CODEX_QUOTA_PARSE_GUIDANCE).toContain("refresh requested");
+      expect(CODEX_QUOTA_PARSE_GUIDANCE).toContain("run /status again");
+      expect(CODEX_QUOTA_PARSE_GUIDANCE).toContain("placeholder: true");
+    });
+
+    it("forbids treating the placeholder as a real reading or a parse error", () => {
+      // Never fabricate a number ...
+      expect(CODEX_QUOTA_PARSE_GUIDANCE).toContain("do NOT guess a number");
+      // ... and never surface it as a parse failure.
+      expect(CODEX_QUOTA_PARSE_GUIDANCE).toContain("do NOT fail the parse");
+      expect(CODEX_QUOTA_PARSE_GUIDANCE).toContain("NOT a reading and NOT a parse error");
+    });
+
+    it("still returns unknown/[] when nothing recognizable rendered", () => {
+      expect(CODEX_QUOTA_PARSE_GUIDANCE).toContain("return status='unknown' and windows=[]");
     });
   });
 
@@ -1407,16 +1429,16 @@ describe("quota MCP server", () => {
         ]);
       });
 
-      it("retries a refresh-requested codex /status scrape, then parses the real reading", async () => {
+      it("parses the reading the in-session /status retry recovers, without re-running the whole scrape", async () => {
+        // The refresh-requested placeholder is now retried IN-SESSION inside the
+        // tmux harness (issue #8); by the time scrapeCodexStatus resolves it has
+        // already recovered the real table. The MCP layer must NOT re-run the
+        // whole scrape (a fresh cold session just re-renders the placeholder).
         const healthy = readFileSync(
           join(__dirname, "fixtures", "codex-status-healthy.txt"),
           "utf-8"
         );
-        const scrapeCodexStatus = vi
-          .fn()
-          .mockResolvedValueOnce("Limits: refresh requested; run /status again shortly.")
-          .mockResolvedValueOnce(healthy);
-        const sleep = vi.fn().mockResolvedValue(undefined);
+        const scrapeCodexStatus = vi.fn().mockResolvedValue(healthy);
         mockGenerateContent.mockResolvedValue({
           text: () =>
             JSON.stringify({
@@ -1437,7 +1459,6 @@ describe("quota MCP server", () => {
           config: { ...mockConfig, geminiApiKey: "test-gemini-key" },
           workersDir: "/tmp/workers",
           scrapeCodexStatus,
-          sleep,
         });
         const client = await connect(server);
         const result = (await client.callTool({
@@ -1445,9 +1466,7 @@ describe("quota MCP server", () => {
           arguments: { provider: "codex" },
         })) as CallToolResult;
 
-        expect(scrapeCodexStatus).toHaveBeenCalledTimes(2);
-        expect(sleep).toHaveBeenCalledOnce();
-        expect(sleep).toHaveBeenCalledWith(2_000);
+        expect(scrapeCodexStatus).toHaveBeenCalledOnce();
         const parsed = JSON.parse(textOf(result));
         expect(parsed.status).toBe("available");
         expect(parsed.limits).toHaveLength(2);
@@ -1460,15 +1479,16 @@ describe("quota MCP server", () => {
         });
       });
 
-      it("stops after the bounded codex refresh-requested retry count", async () => {
+      it("returns unknown for a persistent refresh placeholder without re-running the whole scrape", async () => {
+        // If the in-session harness still hands back the placeholder (its own
+        // budget exhausted), the MCP layer scrapes exactly once — never spinning
+        // up additional cold sessions — and reports an honest unknown.
         const placeholder = "Limits: refresh requested; run /status again shortly.";
         const scrapeCodexStatus = vi.fn().mockResolvedValue(placeholder);
-        const sleep = vi.fn().mockResolvedValue(undefined);
         const server = createQuotaMcpServer({
           config: mockConfig,
           workersDir: "/tmp/workers",
           scrapeCodexStatus,
-          sleep,
         });
         const client = await connect(server);
         const result = (await client.callTool({
@@ -1476,8 +1496,7 @@ describe("quota MCP server", () => {
           arguments: { provider: "codex" },
         })) as CallToolResult;
 
-        expect(scrapeCodexStatus).toHaveBeenCalledTimes(3);
-        expect(sleep).toHaveBeenCalledTimes(2);
+        expect(scrapeCodexStatus).toHaveBeenCalledOnce();
         const parsed = JSON.parse(textOf(result));
         expect(parsed.status).toBe("unknown");
       });
