@@ -4,8 +4,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
-import { canonicalQuotaBucketIdentity } from "./bucket-key.js";
-import { SharedQuotaStore } from "./shared-store.js";
+import { QUOTA_RAW_RETENTION_MS, SharedQuotaStore } from "./shared-store.js";
 
 const roots: string[] = [];
 
@@ -78,24 +77,68 @@ function recordObservation(
   store.recordParsed(id, state, state);
 }
 
-describe("canonicalQuotaBucketIdentity", () => {
-  it("does not let presentation label drift split a bucket", () => {
-    const a = canonicalQuotaBucketIdentity("shared", "agy", {
-      kind: "weekly",
-      scope: "provider",
-    });
-    const b = canonicalQuotaBucketIdentity("shared", "AGY", {
-      kind: "weekly",
-      scope: "provider",
-    });
-    expect(a.key).toBe(b.key);
-    expect(a.key).toBe("shared:agy:provider:weekly");
+describe("SharedQuotaStore canonical observations", () => {
+  it("uses the compact schema and prunes raw scrape payloads after 30 days", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-retention-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"), "test");
+    const now = Date.now();
+    try {
+      const expiredId = store.recordRaw({
+        provider: "claude",
+        scrapedAt: new Date(now - QUOTA_RAW_RETENTION_MS - 1).toISOString(),
+        rawOutput: "expired raw PTY output",
+      });
+      const expiredState: ProviderQuotaSnapshot = {
+        provider: "claude",
+        status: "available",
+        scrapedAt: new Date(now - QUOTA_RAW_RETENTION_MS - 1).toISOString(),
+        limits: [
+          {
+            label: "Weekly",
+            kind: "weekly",
+            scope: "provider",
+            percentLeft: 50,
+            resetAtIso: new Date(now + 24 * 60 * 60 * 1000).toISOString(),
+          },
+        ],
+      };
+      store.recordParsed(expiredId, expiredState, expiredState);
+      store.recordRaw({
+        provider: "claude",
+        scrapedAt: new Date(now).toISOString(),
+        rawOutput: "current raw PTY output",
+      });
+      expect(
+        (store.db.prepare("SELECT count(*) AS n FROM quota_scrapes").get() as { n: number }).n
+      ).toBe(1);
+      expect(store.listCanonicalSince("claude", "2000-01-01T00:00:00.000Z")).toHaveLength(1);
+      expect(
+        (store.db.prepare("PRAGMA table_info(quota_scrapes)").all() as Array<{ name: string }>).map(
+          (column) => column.name
+        )
+      ).not.toContain("inferred_parsed_state");
+      expect(
+        (
+          store.db
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .all() as Array<{ name: string }>
+        ).map((row) => row.name)
+      ).toEqual([
+        "quota_bucket_state",
+        "quota_observations",
+        "quota_provider_pacing",
+        "quota_scrapes",
+      ]);
+    } finally {
+      store.close();
+    }
   });
 
   it("repairs legacy missing scopes without splitting keys by model labels", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-legacy-scope-"));
     roots.push(root);
-    const store = new SharedQuotaStore(join(root, "shared.db"), "shared", "test");
+    const store = new SharedQuotaStore(join(root, "shared.db"), "test");
     const state: ProviderQuotaSnapshot = {
       provider: "claude",
       status: "available",
@@ -153,7 +196,7 @@ describe("SharedQuotaStore migration", () => {
         resetAtIso: "2026-08-29T12:00:00.000Z",
       },
     ]);
-    const store = new SharedQuotaStore(join(root, "shared.db"), "shared", "test");
+    const store = new SharedQuotaStore(join(root, "shared.db"), "test");
     try {
       store.importLegacyDatabase(weak, "staging");
       store.importLegacyDatabase(strong, "production");
@@ -162,30 +205,9 @@ describe("SharedQuotaStore migration", () => {
       expect(selected).toHaveLength(1);
       expect(selected[0]?.sourceInstance).toBe("production");
       expect(selected[0]?.resetAtIso).toBe("2026-08-29T12:00:00.000Z");
-    } finally {
-      store.close();
-    }
-  });
-
-  it("retains but rejects an isolated 0 to 100 to 0 percent-left spike", () => {
-    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-spike-"));
-    roots.push(root);
-    const sourceRoot = join(root, "source");
-    const source = legacyDb(sourceRoot, [
-      { id: "a", scrapedAt: "2026-08-25T12:00:00.000Z", sourceLabel: "Weekly", percentLeft: 0 },
-      { id: "b", scrapedAt: "2026-08-25T12:05:00.000Z", sourceLabel: "Weekly", percentLeft: 100 },
-      { id: "c", scrapedAt: "2026-08-25T12:10:00.000Z", sourceLabel: "Weekly", percentLeft: 0 },
-    ]);
-    const store = new SharedQuotaStore(join(root, "shared.db"), "shared", "test");
-    try {
-      const report = store.importLegacyDatabase(source, "production");
-      expect(report.rejectedAnomalies).toBe(1);
       expect(
-        store.listCanonicalSince("agy", "2026-08-25T00:00:00.000Z").map((x) => x.percentLeft)
-      ).toEqual([0, 0]);
-      expect(
-        (store.db.prepare("SELECT count(*) n FROM quota_observations").get() as { n: number }).n
-      ).toBe(3);
+        (store.db.prepare("SELECT count(*) AS n FROM quota_bucket_state").get() as { n: number }).n
+      ).toBe(0);
     } finally {
       store.close();
     }
@@ -196,7 +218,7 @@ describe("SharedQuotaStore persisted controller", () => {
   it("keeps exhaustion out of throttle decisions and resumes from the prior period", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-controller-"));
     roots.push(root);
-    const store = new SharedQuotaStore(join(root, "shared.db"), "shared", "test");
+    const store = new SharedQuotaStore(join(root, "shared.db"), "test");
     try {
       store.configureController({ maxIntervalSeconds: 3600 });
       recordObservation(
@@ -223,8 +245,11 @@ describe("SharedQuotaStore persisted controller", () => {
         "2030-01-08T00:00:00.000Z"
       );
       expect(
-        (store.db.prepare("SELECT count(*) n FROM quota_throttle_decisions").get() as { n: number })
-          .n
+        (
+          store.db
+            .prepare("SELECT count(*) n FROM quota_observations WHERE interval_seconds IS NOT NULL")
+            .get() as { n: number }
+        ).n
       ).toBe(2);
 
       recordObservation(
@@ -248,8 +273,8 @@ describe("SharedQuotaStore persisted controller", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-connections-"));
     roots.push(root);
     const path = join(root, "shared.db");
-    const first = new SharedQuotaStore(path, "shared", "production");
-    const second = new SharedQuotaStore(path, "shared", "staging");
+    const first = new SharedQuotaStore(path, "production");
+    const second = new SharedQuotaStore(path, "staging");
     try {
       first.configureController({ maxIntervalSeconds: 3600 });
       recordObservation(first, "agy", "2030-01-01T00:00:00.000Z", 50, "2030-01-08T00:00:00.000Z");
@@ -258,6 +283,11 @@ describe("SharedQuotaStore persisted controller", () => {
       const startedAt = Date.parse("2030-01-01T00:01:00.000Z");
       expect(first.claimNormalProviderStart("agy", startedAt)).toBeNull();
       expect(second.claimNormalProviderStart("agy", startedAt)).toBe(startedAt + intervalMs);
+      expect(second.claimNormalProviderStart("agy", startedAt + intervalMs)).toBeNull();
+      expect(
+        (first.db.prepare("SELECT count(*) AS n FROM quota_provider_pacing").get() as { n: number })
+          .n
+      ).toBe(1);
     } finally {
       second.close();
       first.close();

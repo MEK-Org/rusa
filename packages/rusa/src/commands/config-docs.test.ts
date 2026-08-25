@@ -26,7 +26,7 @@ describe("config docs", () => {
   it("documents shared quota persistence and pacing", () => {
     expect(CONFIG_DOCS).toContain("quota:");
     expect(CONFIG_DOCS).toContain("databasePath");
-    expect(CONFIG_DOCS).toContain("poolId");
+    expect(CONFIG_DOCS).not.toContain("poolId");
     expect(CONFIG_DOCS).toContain("quota.throttle:");
     expect(CONFIG_DOCS).not.toContain("mesh.quotaThrottle:");
   });

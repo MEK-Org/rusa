@@ -103,8 +103,6 @@ export interface DashboardQuotaProviderConfig {
 export interface QuotaThrottleConfig {
   /** Enable per-provider adaptive pacing from the cached quota windows. Default false. */
   enabled?: boolean;
-  /** Interval used while learning quota burn, in seconds. Default 0 (no delay). */
-  intervalSeconds?: number;
   /** Longest acceptable interval between normal starts. Default 3600 (one hour). */
   maxIntervalSeconds?: number;
   /** Quota sample/controller cadence in seconds. Default 300 (five minutes). */
@@ -119,8 +117,6 @@ export interface QuotaConfig {
    * Required when quota.throttle is enabled.
    */
   databasePath?: string;
-  /** Stable identity for the shared provider-auth context. Defaults to "default". */
-  poolId?: string;
   /** Closed-loop launch pacing configuration. */
   throttle?: QuotaThrottleConfig;
 }

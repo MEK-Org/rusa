@@ -65,18 +65,10 @@ function validateQuotaThrottle(quotaThrottle: QuotaThrottleConfig | undefined): 
     throw new Error("config.yaml: quota.throttle.enabled must be a boolean when set");
   }
   if (
-    quotaThrottle.intervalSeconds !== undefined &&
-    (!Number.isFinite(quotaThrottle.intervalSeconds) || quotaThrottle.intervalSeconds < 0)
-  ) {
-    throw new Error("config.yaml: quota.throttle.intervalSeconds must be non-negative");
-  }
-  if (
     quotaThrottle.maxIntervalSeconds !== undefined &&
-    (!Number.isFinite(quotaThrottle.maxIntervalSeconds) ||
-      quotaThrottle.maxIntervalSeconds <= 0 ||
-      quotaThrottle.maxIntervalSeconds < (quotaThrottle.intervalSeconds ?? 0))
+    (!Number.isFinite(quotaThrottle.maxIntervalSeconds) || quotaThrottle.maxIntervalSeconds <= 0)
   ) {
-    throw new Error("config.yaml: quota.throttle.maxIntervalSeconds must be >= intervalSeconds");
+    throw new Error("config.yaml: quota.throttle.maxIntervalSeconds must be positive");
   }
   if (
     quotaThrottle.tickSeconds !== undefined &&
@@ -200,7 +192,12 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     if (typeof quota !== "object" || quota === null || Array.isArray(quota)) {
       throw new Error("config.yaml: quota must be a mapping when set");
     }
-    for (const key of ["databasePath", "poolId"] as const) {
+    if ("poolId" in quota) {
+      throw new Error(
+        "config.yaml: quota.poolId has been removed; quota.databasePath is the sharing boundary"
+      );
+    }
+    for (const key of ["databasePath"] as const) {
       const value = quota[key];
       if (value !== undefined) {
         if (typeof value !== "string" || !value.trim()) {

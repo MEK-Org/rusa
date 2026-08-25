@@ -27,7 +27,6 @@ Minimal example:
   # Instances sharing provider credentials should use the same quota DB and pool id.
   quota:
     databasePath: /home/rusa/.rusa-shared/quota.db
-    poolId: shared-provider-auth
     throttle:
       enabled: true
       maxIntervalSeconds: 3600
@@ -133,13 +132,9 @@ quota:
                            quota.throttle.enabled is true. Instances sharing provider credentials should point at
                            the same file outside either RUSA_HOME.
                            Relative paths resolve against RUSA_HOME; ~/ and absolute paths are supported.
-  poolId                   Optional. Stable identity of the shared provider-auth account. Human quota labels are
-                           excluded from bucket keys; keys are poolId:provider:scope:window-kind.
-
 quota.throttle:
 
   enabled                  Optional boolean. Enables persisted closed-loop launch pacing.
-  intervalSeconds          Optional learning fallback used only before a reasoned decision exists.
   maxIntervalSeconds       Optional cap on normal launch spacing; defaults to 3600.
   tickSeconds              Optional positive integer quota refresh interval.
 

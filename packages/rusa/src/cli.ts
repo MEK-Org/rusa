@@ -136,34 +136,18 @@ quota
   .command("migrate")
   .description("Merge legacy instance quota histories into a shared quota database")
   .requiredOption("--database <path>", "Destination shared quota SQLite database")
-  .option("--pool-id <id>", "Shared provider-auth/quota pool identity", "default")
-  .option(
-    "--max-interval-seconds <seconds>",
-    "Maximum normal-launch interval used while seeding controller state",
-    (value: string) => Number.parseInt(value, 10),
-    3600
-  )
   .requiredOption(
     "--source <instance=path>",
     "Legacy instance database; repeat for each source",
     (value: string, previous: string[]) => [...previous, value],
     [] as string[]
   )
-  .action(
-    async (opts: {
-      database: string;
-      poolId: string;
-      source: string[];
-      maxIntervalSeconds: number;
-    }) => {
-      await runQuotaMigrate({
-        databasePath: opts.database,
-        poolId: opts.poolId,
-        sources: opts.source,
-        maxIntervalSeconds: opts.maxIntervalSeconds,
-      });
-    }
-  );
+  .action(async (opts: { database: string; source: string[] }) => {
+    await runQuotaMigrate({
+      databasePath: opts.database,
+      sources: opts.source,
+    });
+  });
 
 // NB: the IU distiller cursor ops (seed/gate/window/advance/mode) are actor-invoked, so
 // they live in the distiller MCP , NOT the CLI — per the convention that

@@ -421,10 +421,8 @@ describe("loadConfig quota throttle", () => {
       writeConfig({
         quota: {
           databasePath: "/srv/rusa/quota.db",
-          poolId: "shared-auth",
           throttle: {
             enabled: true,
-            intervalSeconds: 75,
             maxIntervalSeconds: 3600,
             tickSeconds: 300,
           },
@@ -434,7 +432,6 @@ describe("loadConfig quota throttle", () => {
 
     expect(config.quota?.throttle).toEqual({
       enabled: true,
-      intervalSeconds: 75,
       maxIntervalSeconds: 3600,
       tickSeconds: 300,
     });
@@ -442,8 +439,7 @@ describe("loadConfig quota throttle", () => {
 
   it.each([
     [{ enabled: "yes" }, /enabled must be a boolean/],
-    [{ intervalSeconds: -1 }, /intervalSeconds must be non-negative/],
-    [{ intervalSeconds: 75, maxIntervalSeconds: 60 }, /maxIntervalSeconds/],
+    [{ maxIntervalSeconds: 0 }, /maxIntervalSeconds/],
     [{ tickSeconds: 1.5 }, /tickSeconds must be a positive integer/],
   ])("rejects invalid quota throttle values %#", (quotaThrottle, message) => {
     expect(() => loadConfig(writeConfig({ quota: { throttle: quotaThrottle } }))).toThrow(message);
@@ -451,18 +447,21 @@ describe("loadConfig quota throttle", () => {
 });
 
 describe("loadConfig shared quota store", () => {
-  it("accepts and trims a shared database path and pool id", () => {
-    const config = loadConfig(
-      writeConfig({ quota: { databasePath: "  /srv/rusa/quota.db  ", poolId: " shared-auth " } })
-    );
-    expect(config.quota).toEqual({ databasePath: "/srv/rusa/quota.db", poolId: "shared-auth" });
+  it("accepts and trims a shared database path", () => {
+    const config = loadConfig(writeConfig({ quota: { databasePath: "  /srv/rusa/quota.db  " } }));
+    expect(config.quota).toEqual({ databasePath: "/srv/rusa/quota.db" });
   });
 
-  it.each([
-    [{ databasePath: "" }, /quota.databasePath/],
-    [{ poolId: "   " }, /quota.poolId/],
-  ])("rejects invalid shared quota config %#", (quota, message) => {
-    expect(() => loadConfig(writeConfig({ quota }))).toThrow(message);
+  it("rejects a blank shared database path", () => {
+    expect(() => loadConfig(writeConfig({ quota: { databasePath: "" } }))).toThrow(
+      /quota.databasePath/
+    );
+  });
+
+  it("rejects the removed pool namespace", () => {
+    expect(() =>
+      loadConfig(writeConfig({ quota: { databasePath: "/srv/rusa/quota.db", poolId: "shared" } }))
+    ).toThrow(/quota.poolId has been removed/);
   });
 });
 

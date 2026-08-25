@@ -13,7 +13,6 @@ function historyPoint(
   overrides: Partial<QuotaHistorySource> & Pick<QuotaHistorySource, "observedAt" | "percentLeft">
 ): QuotaHistorySource {
   return {
-    bucketKey: "shared:claude:provider:weekly",
     scope: "provider",
     kind: "weekly",
     label: "Weekly",
@@ -31,7 +30,6 @@ describe("buildQuotaHistory", () => {
         "claude",
         [
           {
-            bucketKey: "pool:claude:provider:weekly",
             scope: "provider",
             kind: "weekly",
             label: "Weekly",
@@ -42,7 +40,6 @@ describe("buildQuotaHistory", () => {
             intervalSeconds: 900,
           },
           {
-            bucketKey: "pool:claude:provider:weekly",
             scope: "provider",
             kind: "weekly",
             label: "Weekly",
@@ -268,13 +265,11 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
       now: () => now,
       listHistory: () => [
         historyPoint({
-          bucketKey: "shared:codex:provider:weekly",
           label: "Weekly limit",
           observedAt: "2026-07-26T19:00:00.000Z",
           percentLeft: 68,
         }),
         historyPoint({
-          bucketKey: "shared:codex:provider:five_hour",
           kind: "five_hour",
           label: "5h",
           observedAt: "2026-07-26T19:00:00.000Z",
@@ -332,20 +327,17 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
       now: () => now,
       listHistory: () => [
         historyPoint({
-          bucketKey: "shared:codex:model:weekly",
           scope: "model",
           label: "Weekly (model-specific)",
           observedAt: "2026-07-26T18:00:00.000Z",
           percentLeft: 20,
         }),
         historyPoint({
-          bucketKey: "shared:codex:provider:weekly",
           label: "Weekly (all models)",
           observedAt: "2026-07-26T18:00:00.000Z",
           percentLeft: 68,
         }),
         historyPoint({
-          bucketKey: "shared:codex:model:weekly",
           scope: "model",
           label: "Weekly (model-specific)",
           observedAt: "2026-07-26T19:00:00.000Z",
@@ -385,13 +377,11 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
       now: () => now,
       listHistory: () => [
         historyPoint({
-          bucketKey: "shared:codex:provider:weekly",
           label: "Weekly (all models)",
           observedAt: "2026-07-26T18:00:00.000Z",
           percentLeft: 72,
         }),
         historyPoint({
-          bucketKey: "shared:codex:provider:weekly",
           label: "Weekly (all models)",
           observedAt: "2026-07-26T19:00:00.000Z",
           percentLeft: 65,

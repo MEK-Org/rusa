@@ -78,7 +78,6 @@ export function createDashboardE2EQuotaApi(now = Date.now()): QuotaApiDeps {
         .map((weeklyRemaining, index) => {
           const observedAt = new Date(now - historyOffsetsMs[index]).toISOString();
           return {
-            bucketKey: `dashboard-demo:${provider}:provider:weekly`,
             scope: "provider" as const,
             kind: "weekly",
             label: "Weekly",

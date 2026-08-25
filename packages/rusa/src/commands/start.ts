@@ -856,7 +856,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const sharedQuotaStore = config.quota?.databasePath
     ? new SharedQuotaStore(
         resolveQuotaDatabasePath(config.quota.databasePath, mcHome),
-        config.quota.poolId ?? "default",
         config.rootActor?.handle ?? basename(mcHome)
       )
     : null;
@@ -1020,14 +1019,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // Quota pacing is backed exclusively by the configured shared quota store.
   const quotaThrottleConfig = config.quota?.throttle;
   const quotaThrottleEnabled = quotaThrottleConfig?.enabled === true;
-  const configuredIntervalSeconds = quotaThrottleConfig?.intervalSeconds ?? 0;
   const quotaProviders = configuredQuotaThrottleProviders(config);
   const providerPacers = new Map<string, ProviderPacer>();
   const pacerFor = (providerName: string): ProviderPacer => {
     let pacer = providerPacers.get(providerName);
     if (!pacer) {
-      const paced = quotaThrottleEnabled && isQuotaThrottleProvider(providerName);
-      pacer = new ProviderPacer(paced ? configuredIntervalSeconds * 1000 : 0);
+      pacer = new ProviderPacer(0);
       const sharedLastStart = sharedQuotaStore?.latestNormalStartMillis(providerName);
       if (sharedLastStart != null) pacer.hydrateLastStartedAt(sharedLastStart);
       providerPacers.set(providerName, pacer);
@@ -1046,7 +1043,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       const safeIntervalSeconds =
         Number.isFinite(tick.intervalSeconds) && tick.intervalSeconds >= 0
           ? tick.intervalSeconds
-          : configuredIntervalSeconds;
+          : 0;
       pacer.setInterval(safeIntervalSeconds * 1000);
       if (tick.expired) {
         const exhaustedUntilMs = exhaustedUntil ? Date.parse(exhaustedUntil) : Number.NaN;
@@ -1371,14 +1368,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           sharedQuotaStore && quotaThrottleEnabled
             ? () =>
                 sharedQuotaStore.claimNormalProviderStart(providerThrottleKey(providerName, config))
-            : undefined,
-        onStarted: () =>
-          request.responsive
-            ? sharedQuotaStore?.recordProviderStart(
-                providerThrottleKey(providerName, config),
-                new Date().toISOString(),
-                true
-              )
             : undefined,
       }),
     isHalted: isProviderHalted,

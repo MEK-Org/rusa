@@ -119,7 +119,6 @@ export interface QuotaSnapshotDto {
 }
 
 export interface QuotaHistorySource {
-  bucketKey: string;
   scope: "provider" | "model";
   kind: string;
   label: string;
