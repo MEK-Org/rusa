@@ -2264,6 +2264,87 @@ describe("ActorMesh", () => {
     expect(registry.get(child)?.model).toBe("claude-opus-4-8");
   });
 
+  it("setActorModel supports cross-provider moves for portable actors and rejects them for native actors", async () => {
+    const events: MeshEventInput[] = [];
+    const validations: Array<{ recordId: string; newModel: string; newProvider?: string }> = [];
+    const { mesh, registry } = setup({
+      events: (event) => events.push(event),
+      validateModel: (record, newModel, newProvider) => {
+        validations.push({ recordId: record.id, newModel, newProvider });
+        if (newProvider === "antigravity" && newModel === "invalid-model") {
+          throw new Error("invalid model for antigravity");
+        }
+      },
+    });
+
+    // 1. Portable ledger actor cross-provider move
+    const ledgerChild = mesh.spawn({
+      charter: "ledger child",
+      parentId: "root",
+      provider: "claude",
+      model: "claude-opus-4-8",
+      context: { type: "portable", mode: "ledger" },
+    });
+    mesh.setActorModel(ledgerChild, "gemini-3.7-flash-high", "root", "antigravity");
+    expect(registry.get(ledgerChild)?.provider).toBe("antigravity");
+    expect(registry.get(ledgerChild)?.model).toBe("gemini-3.7-flash-high");
+    expect(validations).toContainEqual({
+      recordId: ledgerChild,
+      newModel: "gemini-3.7-flash-high",
+      newProvider: "antigravity",
+    });
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "actor_model_set",
+        actorId: ledgerChild,
+        detail: "claude:claude-opus-4-8 -> antigravity:gemini-3.7-flash-high",
+      })
+    );
+
+    // 2. Portable tail actor cross-provider move
+    const tailChild = mesh.spawn({
+      charter: "tail child",
+      parentId: "root",
+      provider: "claude",
+      model: "claude-sonnet-5",
+      context: { type: "portable", mode: "tail" },
+    });
+    mesh.setActorModel(tailChild, "gpt-5.6-sol", "root", "codex");
+    expect(registry.get(tailChild)?.provider).toBe("codex");
+    expect(registry.get(tailChild)?.model).toBe("gpt-5.6-sol");
+
+    // 3. Validation failure aborts cross-provider move
+    expect(() => mesh.setActorModel(ledgerChild, "invalid-model", "root", "antigravity")).toThrow(
+      /invalid model for antigravity/
+    );
+    expect(registry.get(ledgerChild)?.model).toBe("gemini-3.7-flash-high");
+
+    // 4. Non-portable (native context) actor rejects provider move
+    const nativeChild = mesh.spawn({
+      charter: "native child",
+      parentId: "root",
+      provider: "claude",
+      model: "claude-sonnet-5",
+      context: { type: "native" },
+    });
+    expect(() =>
+      mesh.setActorModel(nativeChild, "gemini-3.7-flash-high", "root", "antigravity")
+    ).toThrow(/Cannot change provider on non-portable actor/);
+    expect(registry.get(nativeChild)?.provider).toBe("claude");
+    expect(registry.get(nativeChild)?.model).toBe("claude-sonnet-5");
+
+    // 5. Default context (implicit native) rejects provider move
+    const defaultContextChild = mesh.spawn({
+      charter: "default child",
+      parentId: "root",
+      provider: "claude",
+      model: "claude-sonnet-5",
+    });
+    expect(() =>
+      mesh.setActorModel(defaultContextChild, "gemini-3.7-flash-high", "root", "antigravity")
+    ).toThrow(/Cannot change provider on non-portable actor/);
+  });
+
   it("reparentThread moves the actor to a new parent and hands the new parent a handle", async () => {
     const { mesh, registry } = setup();
     const steward = mesh.spawn({ charter: "steward", parentId: "root" });

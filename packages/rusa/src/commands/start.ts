@@ -1336,9 +1336,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       if (!model) throw new Error("model is required");
       validateModelPin(provider, model);
     },
-    validateModel: (record, newModel) => {
+    validateModel: (record, newModel, newProvider) => {
       const effectiveProvider =
-        record.provider ?? config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER;
+        (newProvider?.trim() || record.provider) ??
+        config.rootActor?.provider ??
+        DEFAULT_ROOT_PROVIDER;
       validateModelPin(effectiveProvider, newModel);
     },
     events: meshEvents,

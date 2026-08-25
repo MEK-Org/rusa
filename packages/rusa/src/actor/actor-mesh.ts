@@ -221,7 +221,7 @@ export interface ActorMeshOptions {
   /** Synchronous gate run before a spawn id or durable record is created. */
   validateSpawn?: (req: SpawnRequest) => void;
   /** Synchronous validator before setting an actor's model in-place . */
-  validateModel?: (record: ThreadRecord, newModel: string) => void;
+  validateModel?: (record: ThreadRecord, newModel: string, newProvider?: string) => void;
   /** Cross-actor concurrency cap for non-responsive runs (default 4). */
   maxConcurrent?: number;
   /**
@@ -372,7 +372,11 @@ export class ActorMesh {
   readonly registry: ThreadRegistry;
   private readonly createActor: ActorFactory;
   private readonly validateSpawn?: (req: SpawnRequest) => void;
-  private readonly validateModel?: (record: ThreadRecord, newModel: string) => void;
+  private readonly validateModel?: (
+    record: ThreadRecord,
+    newModel: string,
+    newProvider?: string
+  ) => void;
   private readonly limiter: ConcurrencyLimiter;
   private readonly providerGate: NonNullable<ActorMeshOptions["providerGate"]>;
   private readonly isHalted: (provider?: string) => boolean;
@@ -2054,9 +2058,10 @@ export class ActorMesh {
    * Root or parent-gated: root may set the model for any thread in its subtree;
    * a non-root parent may only set the model for its own descendants (and never
    * raise its own tier).
+   * Optionally moves portable (ledger/tail) actors across providers.
    * Takes effect on the actor's NEXT run.
    */
-  setActorModel(id: string, model: string, requestedBy: string): void {
+  setActorModel(id: string, model: string, requestedBy: string, provider?: string): void {
     id = this.resolveThreadId(id);
     requestedBy = this.resolveThreadId(requestedBy);
     const record = this.registry.get(id);
@@ -2078,21 +2083,41 @@ export class ActorMesh {
     if (!trimmedModel) {
       throw new Error(`Cannot set an empty model on thread: ${id}`);
     }
+    const trimmedProvider = provider?.trim() || undefined;
+    if (trimmedProvider !== undefined) {
+      if (record.context?.type !== "portable") {
+        throw new Error(
+          `Cannot change provider on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail) actors can be moved across providers.`
+        );
+      }
+    }
     if (this.validateModel) {
-      this.validateModel(record, trimmedModel);
+      this.validateModel(record, trimmedModel, trimmedProvider);
     }
     const oldModel = record.model;
-    this.registry.patch(id, { model: trimmedModel });
+    const oldProvider = record.provider;
+    const patch: Partial<ThreadRecord> = { model: trimmedModel };
+    if (trimmedProvider !== undefined) {
+      patch.provider = trimmedProvider;
+    }
+    this.registry.patch(id, patch);
     const verified = this.registry.get(id);
-    if (verified?.model !== trimmedModel) {
+    if (
+      verified?.model !== trimmedModel ||
+      (trimmedProvider !== undefined && verified?.provider !== trimmedProvider)
+    ) {
       throw new Error(`Failed to verify model update for thread: ${id}`);
     }
     this.onModelSet?.(id, trimmedModel, verified);
+    const detail =
+      trimmedProvider && trimmedProvider !== oldProvider
+        ? `${oldProvider ?? "default"}:${oldModel ?? "default"} -> ${trimmedProvider}:${trimmedModel}`
+        : `${oldModel ?? "default"} -> ${trimmedModel}`;
     this.recordEvent({
       kind: "actor_model_set",
       actorId: id,
 
-      detail: `${oldModel ?? "default"} -> ${trimmedModel}`,
+      detail,
     });
   }
 

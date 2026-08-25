@@ -2494,6 +2494,29 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(activeMesh.registry.get("root")?.handles?.some((h) => h.id === validWorkerId)).toBe(
       true
     );
+
+    // 6. Cross-provider move validates against TARGET provider's catalog
+    const portableWorkerId = activeMesh.spawn({
+      charter: "portable worker",
+      parentId: "root",
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash (High)",
+      context: { type: "portable", mode: "ledger" },
+    });
+    // Valid target provider + model succeeds
+    activeMesh.setActorModel(portableWorkerId, "Gemini 3.7 Flash (High)", "root", "antigravity");
+    expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("antigravity");
+    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Gemini 3.7 Flash (High)");
+
+    // Invalid model for target provider fails validation
+    expect(() => {
+      activeMesh.setActorModel(
+        portableWorkerId,
+        "bad-model-for-antigravity",
+        "root",
+        "antigravity"
+      );
+    }).toThrow(/model pin validation failed/);
   });
 
   it("routes delegated chat spaces to the delegatee while others bubble to root", async () => {
