@@ -70,7 +70,7 @@ export const DEFAULT_COMMITMENT_THRESHOLDS: CommitmentThresholds = {
   // 10 minutes, against the wake → `run_queued` leg  — a measured gap of
   // 30 s healthy vs 10 h dropped, so the exact figure is not load-bearing. It was
   // load-bearing, and wrong, while this row keyed on `run_start`: that leg races
-  // `mesh.quotaThrottle.maxIntervalSeconds`, which a config edit can raise above
+  // `quota.throttle.maxIntervalSeconds`, which a config edit can raise above
   // any constant written here. If this row is ever re-keyed onto a dispatch leg,
   // derive the bound from that config instead of editing this number.
   missedWakeMs: 10 * 60 * 1000,

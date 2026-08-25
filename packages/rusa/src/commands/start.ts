@@ -866,7 +866,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       )
     : null;
   sharedQuotaStore?.configureController({
-    maxIntervalSeconds: config.mesh?.quotaThrottle?.maxIntervalSeconds ?? 3600,
+    maxIntervalSeconds: config.quota?.throttle?.maxIntervalSeconds ?? 3600,
   });
   const quotaScrapesStore = sharedQuotaStore ?? getRepositories().quotaScrapes;
   // Shared across the `get_quota` MCP tool and the dashboard's `/api/quota`
@@ -1022,7 +1022,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   } catch {
     /* the flap check must never wedge startup */
   }
-  const quotaThrottleConfig = config.mesh?.quotaThrottle;
+  // loadConfig canonicalizes the one-release mesh.quotaThrottle compatibility
+  // fallback into quota.throttle, so runtime wiring has a single source.
+  const quotaThrottleConfig = config.quota?.throttle;
   const quotaThrottleEnabled = quotaThrottleConfig?.enabled === true;
   const configuredIntervalSeconds = quotaThrottleConfig?.intervalSeconds ?? 0;
   const quotaProviders = configuredQuotaThrottleProviders(config);

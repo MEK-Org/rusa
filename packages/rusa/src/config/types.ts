@@ -99,7 +99,19 @@ export interface DashboardQuotaProviderConfig {
   primaryWindow: string;
 }
 
-/** Shared quota evidence and controller-state storage. */
+/** Adaptive provider launch pacing driven by quota observations. */
+export interface QuotaThrottleConfig {
+  /** Enable per-provider adaptive pacing from the cached quota windows. Default false. */
+  enabled?: boolean;
+  /** Interval used while learning quota burn, in seconds. Default 0 (no delay). */
+  intervalSeconds?: number;
+  /** Longest acceptable interval between normal starts. Default 3600 (one hour). */
+  maxIntervalSeconds?: number;
+  /** Quota sample/controller cadence in seconds. Default 300 (five minutes). */
+  tickSeconds?: number;
+}
+
+/** Shared quota evidence, controller state, and launch pacing. */
 export interface QuotaConfig {
   /**
    * SQLite database used for quota scrapes, canonical observations, and pacing state.
@@ -109,6 +121,8 @@ export interface QuotaConfig {
   databasePath?: string;
   /** Stable identity for the shared provider-auth context. Defaults to "default". */
   poolId?: string;
+  /** Closed-loop launch pacing configuration. */
+  throttle?: QuotaThrottleConfig;
 }
 
 export type DashboardQuotaProvidersConfig = Partial<
@@ -412,15 +426,6 @@ export interface RusaConfig {
 export interface MeshConfig {
   /** Cross-actor concurrency cap for non-responsive runs. Default 4. */
   maxConcurrent?: number;
-  /** Optional closed-loop provider start pacing. Disabled unless explicitly enabled. */
-  quotaThrottle?: {
-    /** Enable per-provider adaptive pacing from the cached quota windows. Default false. */
-    enabled?: boolean;
-    /** Interval used while learning quota burn, in seconds. Default 0 (no delay). */
-    intervalSeconds?: number;
-    /** Longest acceptable interval between normal starts. Default 3600 (one hour). */
-    maxIntervalSeconds?: number;
-    /** Quota sample/controller cadence in seconds. Default 300 (five minutes). */
-    tickSeconds?: number;
-  };
+  /** @deprecated Use quota.throttle. Read as a compatibility fallback for one release. */
+  quotaThrottle?: QuotaThrottleConfig;
 }

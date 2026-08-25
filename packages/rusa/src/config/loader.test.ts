@@ -388,8 +388,8 @@ describe("loadConfig dashboard quota providers", () => {
   });
 });
 
-describe("loadConfig mesh quota throttle", () => {
-  it("accepts an opt-in adaptive pacing configuration", () => {
+describe("loadConfig quota throttle", () => {
+  it("canonicalizes the legacy mesh location without a deployment gap", () => {
     const config = loadConfig(
       writeConfig({
         mesh: {
@@ -409,6 +409,67 @@ describe("loadConfig mesh quota throttle", () => {
       maxIntervalSeconds: 3600,
       tickSeconds: 300,
     });
+    expect(config.quota?.throttle).toEqual(config.mesh?.quotaThrottle);
+  });
+
+  it("accepts the canonical quota location", () => {
+    const config = loadConfig(
+      writeConfig({
+        quota: {
+          databasePath: "/srv/rusa/quota.db",
+          poolId: "shared-auth",
+          throttle: {
+            enabled: true,
+            intervalSeconds: 75,
+            maxIntervalSeconds: 3600,
+            tickSeconds: 300,
+          },
+        },
+      })
+    );
+
+    expect(config.quota?.throttle).toEqual({
+      enabled: true,
+      intervalSeconds: 75,
+      maxIntervalSeconds: 3600,
+      tickSeconds: 300,
+    });
+  });
+
+  it("lets canonical fields override and supplement the legacy fallback", () => {
+    const config = loadConfig(
+      writeConfig({
+        mesh: {
+          quotaThrottle: {
+            enabled: true,
+            intervalSeconds: 75,
+            maxIntervalSeconds: 3600,
+            tickSeconds: 300,
+          },
+        },
+        quota: {
+          throttle: { intervalSeconds: 120, tickSeconds: 600 },
+        },
+      })
+    );
+
+    expect(config.quota?.throttle).toEqual({
+      enabled: true,
+      intervalSeconds: 120,
+      maxIntervalSeconds: 3600,
+      tickSeconds: 600,
+    });
+  });
+
+  it("validates the effective merged throttle configuration", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          mesh: { quotaThrottle: { maxIntervalSeconds: 3600 } },
+          quota: { throttle: { intervalSeconds: 4000 } },
+        })
+      )
+    ).toThrow(/quota\.throttle\.maxIntervalSeconds/);
   });
 
   it.each([
@@ -418,6 +479,7 @@ describe("loadConfig mesh quota throttle", () => {
     [{ tickSeconds: 1.5 }, /tickSeconds must be a positive integer/],
   ])("rejects invalid quota throttle values %#", (quotaThrottle, message) => {
     expect(() => loadConfig(writeConfig({ mesh: { quotaThrottle } }))).toThrow(message);
+    expect(() => loadConfig(writeConfig({ quota: { throttle: quotaThrottle } }))).toThrow(message);
   });
 });
 

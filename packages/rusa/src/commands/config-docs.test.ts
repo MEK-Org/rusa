@@ -27,7 +27,9 @@ describe("config docs", () => {
     expect(CONFIG_DOCS).toContain("quota:");
     expect(CONFIG_DOCS).toContain("databasePath");
     expect(CONFIG_DOCS).toContain("poolId");
+    expect(CONFIG_DOCS).toContain("quota.throttle:");
     expect(CONFIG_DOCS).toContain("mesh.quotaThrottle:");
+    expect(CONFIG_DOCS).toContain("temporary legacy fallback");
   });
 
   it("documents disk-alert routing as implicit instead of a system eventSources knob", () => {
