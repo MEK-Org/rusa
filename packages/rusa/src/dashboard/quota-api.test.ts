@@ -2,11 +2,61 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { describe, expect, it } from "vitest";
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
 import {
+  buildPersistedQuotaHistory,
   buildQuotaHistory,
   buildQuotaSnapshot,
   handleQuotaApiRequest,
   type QuotaApiDeps,
 } from "./quota-api.js";
+
+describe("buildPersistedQuotaHistory", () => {
+  it("uses stored decisions and leaves exhausted evidence without a synthetic interval", () => {
+    expect(
+      buildPersistedQuotaHistory(
+        "claude",
+        [
+          {
+            bucketKey: "pool:claude:provider:weekly",
+            kind: "weekly",
+            label: "Weekly",
+            observedAt: "2030-01-01T00:00:00.000Z",
+            percentLeft: 50,
+            resetAtIso: "2030-01-08T00:00:00.000Z",
+            controllerError: 50,
+            intervalSeconds: 900,
+          },
+          {
+            bucketKey: "pool:claude:provider:weekly",
+            kind: "weekly",
+            label: "Weekly",
+            observedAt: "2030-01-07T23:00:00.000Z",
+            percentLeft: 0,
+            resetAtIso: "2030-01-08T00:00:00.000Z",
+            controllerError: null,
+            intervalSeconds: null,
+          },
+        ],
+        "2030-01-01T00:00:00.000Z",
+        "2030-01-08T00:00:00.000Z"
+      )[0]?.points
+    ).toEqual([
+      {
+        observedAt: "2030-01-01T00:00:00.000Z",
+        remainingPercent: 50,
+        error: -50,
+        resetAtIso: "2030-01-08T00:00:00.000Z",
+        intervalSeconds: 900,
+      },
+      {
+        observedAt: "2030-01-07T23:00:00.000Z",
+        remainingPercent: 0,
+        error: null,
+        resetAtIso: "2030-01-08T00:00:00.000Z",
+        intervalSeconds: null,
+      },
+    ]);
+  });
+});
 
 function fakeReq(method: string): IncomingMessage {
   return { method, headers: {} } as unknown as IncomingMessage;

@@ -9,7 +9,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Actor } from "../actor/actor.js";
 import {
@@ -174,7 +174,6 @@ import {
   validateModelPin,
 } from "../providers/model-catalog.js";
 import { refreshConfiguredProviderModelCatalogs } from "../providers/model-scrape.js";
-
 import {
   DEFAULT_ROOT_PROVIDER,
   normalizeFallbackModel,
@@ -183,6 +182,7 @@ import {
 } from "../providers/registry.js";
 import { assertBwrapAvailable, teardownFlutterOverlay } from "../providers/sandbox.js";
 import type { McpServerSpec } from "../providers/types.js";
+import { resolveQuotaDatabasePath, SharedQuotaStore } from "../quota/shared-store.js";
 import { createCommitmentPolarityEvaluator } from "../understanding/commitment-polarity.js";
 import {
   DistillerCursorStore,
@@ -858,12 +858,23 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const modelScrapesStore = getRepositories().modelScrapes;
   const workersDir = join(mcHome, "workers");
   mkdirSync(workersDir, { recursive: true });
+  const sharedQuotaStore = config.quota?.databasePath
+    ? new SharedQuotaStore(
+        resolveQuotaDatabasePath(config.quota.databasePath, mcHome),
+        config.quota.poolId ?? "default",
+        config.rootActor?.handle ?? basename(mcHome)
+      )
+    : null;
+  sharedQuotaStore?.configureController({
+    maxIntervalSeconds: config.mesh?.quotaThrottle?.maxIntervalSeconds ?? 3600,
+  });
+  const quotaScrapesStore = sharedQuotaStore ?? getRepositories().quotaScrapes;
   // Shared across the `get_quota` MCP tool and the dashboard's `/api/quota`
   // endpoint  — one TTL cache, so neither surface probes independently.
   const quotaService = createQuotaService({
     config,
     workersDir,
-    scrapeStore: getRepositories().quotaScrapes,
+    scrapeStore: quotaScrapesStore,
   });
   let webhookSilenceDetector: WebhookSilenceDetector | null = null;
   const servers: Record<string, () => McpServer> = {
@@ -1021,6 +1032,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     if (!pacer) {
       const paced = quotaThrottleEnabled && isQuotaThrottleProvider(providerName);
       pacer = new ProviderPacer(paced ? configuredIntervalSeconds * 1000 : 0);
+      const sharedLastStart = sharedQuotaStore?.latestNormalStartMillis(providerName);
+      if (sharedLastStart != null) pacer.hydrateLastStartedAt(sharedLastStart);
       providerPacers.set(providerName, pacer);
     }
     return pacer;
@@ -1040,7 +1053,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   };
   const recordQuotaThrottleTick = (
     providerName: QuotaThrottleProvider,
-    tick: QuotaThrottleTick
+    tick: QuotaThrottleTick,
+    persistedUpdatedAt?: string,
+    exhaustedUntil?: string | null
   ): void => {
     try {
       const pacer = pacerFor(providerName);
@@ -1049,13 +1064,20 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           ? tick.intervalSeconds
           : configuredIntervalSeconds;
       pacer.setInterval(safeIntervalSeconds * 1000);
-      if (tick.expired && safeIntervalSeconds > 0) {
-        pacer.deferUntil(Date.now() + safeIntervalSeconds * 1000);
+      if (tick.expired) {
+        const exhaustedUntilMs = exhaustedUntil ? Date.parse(exhaustedUntil) : Number.NaN;
+        if (Number.isFinite(exhaustedUntilMs)) {
+          pacer.deferUntil(exhaustedUntilMs);
+        } else if (safeIntervalSeconds > 0) {
+          // Legacy instance-local controller compatibility. Shared quota mode
+          // always supplies the reset instant derived from quota evidence.
+          pacer.deferUntil(Date.now() + safeIntervalSeconds * 1000);
+        }
       }
       quotaThrottleStatuses.set(providerName, {
         ...tick,
         intervalSeconds: safeIntervalSeconds,
-        updatedAt: new Date().toISOString(),
+        updatedAt: persistedUpdatedAt ?? new Date().toISOString(),
       });
       const errors = tick.buckets
         .map((bucket) => `${bucket.key}=${bucket.error.toFixed(1)}`)
@@ -1073,6 +1095,40 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       );
     }
   };
+  const applyPersistedQuotaThrottle = (providerName: QuotaThrottleProvider): boolean => {
+    if (!sharedQuotaStore) return false;
+    const persisted = sharedQuotaStore.getProviderThrottle(providerName);
+    if (!persisted) return false;
+    recordQuotaThrottleTick(
+      providerName,
+      {
+        intervalSeconds: persisted.intervalSeconds,
+        uncappedIntervalSeconds: persisted.uncappedIntervalSeconds,
+        held: persisted.held,
+        expired: persisted.expired,
+        capped: persisted.capped,
+        learning: persisted.held,
+        buckets: persisted.buckets.map((bucket) => ({
+          key: bucket.key,
+          percentLeft: bucket.percentLeft,
+          timeRemainingPct: bucket.timeRemainingPct,
+          error: bucket.error,
+          requiredIntervalSeconds: bucket.requiredIntervalSeconds,
+        })),
+      },
+      persisted.updatedAt,
+      persisted.exhaustedUntil
+    );
+    return true;
+  };
+  sharedQuotaStore?.setControllerUpdatedListener((providerName) => {
+    if (quotaThrottleEnabled && isQuotaThrottleProvider(providerName)) {
+      applyPersistedQuotaThrottle(providerName);
+    }
+  });
+  if (quotaThrottleEnabled && sharedQuotaStore) {
+    for (const providerName of quotaProviders) applyPersistedQuotaThrottle(providerName);
+  }
   const tickQuotaThrottle = async (): Promise<void> => {
     if (!quotaThrottleEnabled) return;
     try {
@@ -1080,9 +1136,17 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         quotaProviders.map(async (providerName) => {
           try {
             await quotaService.getQuota(providerName);
+            if (sharedQuotaStore) {
+              sharedQuotaStore.advancePendingController(
+                { maxIntervalSeconds: quotaThrottleConfig?.maxIntervalSeconds ?? 3600 },
+                providerName
+              );
+              applyPersistedQuotaThrottle(providerName);
+              return;
+            }
             const sinceIso = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-            const history = getRepositories()
-              .quotaScrapes.listSince(providerName, sinceIso)
+            const history = quotaScrapesStore
+              .listSince(providerName, sinceIso)
               .flatMap((scrape) =>
                 scrape.inferredParsedState ? quotaBucketsFromState(scrape.inferredParsedState) : []
               );
@@ -1095,8 +1159,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               const controller = quotaControllers.get(providerName);
               if (controller) {
                 const sinceIso = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-                const history = getRepositories()
-                  .quotaScrapes.listSince(providerName, sinceIso)
+                const history = quotaScrapesStore
+                  .listSince(providerName, sinceIso)
                   .flatMap((scrape) =>
                     scrape.inferredParsedState
                       ? quotaBucketsFromState(scrape.inferredParsedState)
@@ -1352,6 +1416,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         responsive: request.responsive,
         threadId: request.threadId,
         enqueueNormal: request.enqueueNormal,
+        claimStart:
+          sharedQuotaStore && quotaThrottleEnabled
+            ? () =>
+                sharedQuotaStore.claimNormalProviderStart(providerThrottleKey(providerName, config))
+            : undefined,
+        onStarted: () =>
+          request.responsive
+            ? sharedQuotaStore?.recordProviderStart(
+                providerThrottleKey(providerName, config),
+                new Date().toISOString(),
+                true
+              )
+            : undefined,
       }),
     isHalted: isProviderHalted,
     isShuttingDown: () => gracefulShutdown.isShuttingDown(),
@@ -2535,8 +2612,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           getQuota: (provider) => quotaService.getQuota(provider),
           providers: quotaProviders,
           getThrottle: (provider) => quotaThrottleStatuses.get(provider) ?? null,
-          listHistory: (provider, sinceIso) =>
-            getRepositories().quotaScrapes.listSince(provider, sinceIso),
+          listHistory: (provider, sinceIso) => quotaScrapesStore.listSince(provider, sinceIso),
+          listPersistedHistory: sharedQuotaStore
+            ? (provider, sinceIso) => sharedQuotaStore.listPersistedHistorySince(provider, sinceIso)
+            : undefined,
         },
         // IU reports reader (ISSUE_NUM/ISSUE_NUM): serves GET /api/understanding/reports
         // for the reports tab. The standalone `dashboard` command wires this
@@ -2786,6 +2865,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         /* already closed */
       }
     }
+    sharedQuotaStore?.close();
     closeDb();
     console.log("✓ Goodbye!");
     process.exit(getShutdownExitCode(reason));

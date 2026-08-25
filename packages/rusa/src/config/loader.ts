@@ -193,6 +193,21 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       throw new Error("config.yaml: mesh.quotaThrottle.tickSeconds must be a positive integer");
     }
   }
+  const quota = parsed.quota;
+  if (quota !== undefined) {
+    if (typeof quota !== "object" || quota === null || Array.isArray(quota)) {
+      throw new Error("config.yaml: quota must be a mapping when set");
+    }
+    for (const key of ["databasePath", "poolId"] as const) {
+      const value = quota[key];
+      if (value !== undefined) {
+        if (typeof value !== "string" || !value.trim()) {
+          throw new Error(`config.yaml: quota.${key} must be a non-empty string when set`);
+        }
+        quota[key] = value.trim();
+      }
+    }
+  }
   const dashboard = parsed.dashboard;
   if (dashboard) {
     if (dashboard.bindHost !== undefined) {

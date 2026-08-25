@@ -99,6 +99,18 @@ export interface DashboardQuotaProviderConfig {
   primaryWindow: string;
 }
 
+/** Shared quota evidence and controller-state storage. */
+export interface QuotaConfig {
+  /**
+   * SQLite database used for quota scrapes, canonical observations, and pacing state.
+   * Multiple rusa instances that share provider credentials should point at the same file.
+   * When omitted, quota evidence remains in the instance database for backwards compatibility.
+   */
+  databasePath?: string;
+  /** Stable identity for the shared provider-auth context. Defaults to "default". */
+  poolId?: string;
+}
+
 export type DashboardQuotaProvidersConfig = Partial<
   Record<"claude" | "codex" | "agy" | "kimi", DashboardQuotaProviderConfig>
 >;
@@ -369,6 +381,8 @@ export interface RusaConfig {
   /** Google Chat inbound/outbound integration (optional; disabled if absent). */
   chat?: ChatConfig;
   dashboard?: DashboardConfig;
+  /** Shared provider-quota storage and identity. */
+  quota?: QuotaConfig;
   /** Walkie-talkie voice tuning ; the feature is gated on geminiApiKey. */
   voice?: VoiceConfig;
   smokeTest?: SmokeTestConfig;

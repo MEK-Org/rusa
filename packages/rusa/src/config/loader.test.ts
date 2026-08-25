@@ -421,6 +421,22 @@ describe("loadConfig mesh quota throttle", () => {
   });
 });
 
+describe("loadConfig shared quota store", () => {
+  it("accepts and trims a shared database path and pool id", () => {
+    const config = loadConfig(
+      writeConfig({ quota: { databasePath: "  /srv/rusa/quota.db  ", poolId: " shared-auth " } })
+    );
+    expect(config.quota).toEqual({ databasePath: "/srv/rusa/quota.db", poolId: "shared-auth" });
+  });
+
+  it.each([
+    [{ databasePath: "" }, /quota.databasePath/],
+    [{ poolId: "   " }, /quota.poolId/],
+  ])("rejects invalid shared quota config %#", (quota, message) => {
+    expect(() => loadConfig(writeConfig({ quota }))).toThrow(message);
+  });
+});
+
 describe("loadConfig understanding root", () => {
   it("accepts and trims a provider-neutral root node id", () => {
     const config = loadConfig(writeConfig({ understanding: { rootNodeId: "  local-root  " } }));

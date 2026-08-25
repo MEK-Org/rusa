@@ -13,6 +13,7 @@ import { runInit } from "./commands/init.js";
 import { runInstallService } from "./commands/install-service.js";
 import { runLogs } from "./commands/logs.js";
 import { runQuickstart, runQuickstartConfigure } from "./commands/quickstart.js";
+import { runQuotaMigrate } from "./commands/quota.js";
 import { runReport } from "./commands/report.js";
 import { runServiceRestart, runServiceStatus, runServiceStop } from "./commands/service-control.js";
 import { runStart } from "./commands/start.js";
@@ -128,6 +129,41 @@ quickstart
   .action(async (opts: { home?: string }) => {
     await runQuickstartConfigure({ home: opts.home });
   });
+
+const quota = program.command("quota").description("Manage shared provider-quota state");
+
+quota
+  .command("migrate")
+  .description("Merge legacy instance quota histories into a shared quota database")
+  .requiredOption("--database <path>", "Destination shared quota SQLite database")
+  .option("--pool-id <id>", "Shared provider-auth/quota pool identity", "default")
+  .option(
+    "--max-interval-seconds <seconds>",
+    "Maximum normal-launch interval used while seeding controller state",
+    (value: string) => Number.parseInt(value, 10),
+    3600
+  )
+  .requiredOption(
+    "--source <instance=path>",
+    "Legacy instance database; repeat for each source",
+    (value: string, previous: string[]) => [...previous, value],
+    [] as string[]
+  )
+  .action(
+    async (opts: {
+      database: string;
+      poolId: string;
+      source: string[];
+      maxIntervalSeconds: number;
+    }) => {
+      await runQuotaMigrate({
+        databasePath: opts.database,
+        poolId: opts.poolId,
+        sources: opts.source,
+        maxIntervalSeconds: opts.maxIntervalSeconds,
+      });
+    }
+  );
 
 // NB: the IU distiller cursor ops (seed/gate/window/advance/mode) are actor-invoked, so
 // they live in the distiller MCP , NOT the CLI — per the convention that

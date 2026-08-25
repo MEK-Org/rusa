@@ -128,6 +128,17 @@ export interface QuotaHistorySource {
   inferredParsedState: ProviderQuotaSnapshot | null;
 }
 
+export interface PersistedQuotaHistorySource {
+  bucketKey: string;
+  kind: string;
+  label: string;
+  observedAt: string;
+  percentLeft: number;
+  resetAtIso: string | null;
+  controllerError: number | null;
+  intervalSeconds: number | null;
+}
+
 export interface QuotaHistoryWindowSelection {
   windowId: string;
   label: string;
@@ -148,6 +159,11 @@ export interface QuotaApiDeps {
   getThrottle?: (provider: SupportedProvider) => QuotaThrottleStatus | null;
   /** Durable quota scrape history. Absent in standalone/UI-only deployments. */
   listHistory?: (provider: SupportedProvider, sinceIso: string) => readonly QuotaHistorySource[];
+  /** Canonical quota evidence joined to the controller decisions actually persisted at scrape time. */
+  listPersistedHistory?: (
+    provider: SupportedProvider,
+    sinceIso: string
+  ) => readonly PersistedQuotaHistorySource[];
   /** Wall-clock timestamp source, injectable for tests. Defaults to `Date.now`. */
   now?: () => number;
 }
@@ -476,6 +492,44 @@ export function buildQuotaHistory(
   ];
 }
 
+/** Build dashboard history without replaying or re-implementing the controller. */
+export function buildPersistedQuotaHistory(
+  provider: SupportedProvider,
+  history: readonly PersistedQuotaHistorySource[],
+  sinceIso: string,
+  untilIso: string
+): QuotaHistorySeriesDto[] {
+  const sinceMs = Date.parse(sinceIso);
+  const untilMs = Date.parse(untilIso);
+  const weekly = history.filter((point) => {
+    const observedMs = Date.parse(point.observedAt);
+    return (
+      point.kind === "weekly" &&
+      Number.isFinite(observedMs) &&
+      observedMs >= sinceMs &&
+      observedMs <= untilMs
+    );
+  });
+  if (weekly.length === 0) return [];
+  const latest = weekly.at(-1);
+  return [
+    {
+      provider,
+      windowId: "weekly",
+      label: latest?.label ?? "Weekly",
+      points: weekly.map((point) => ({
+        observedAt: point.observedAt,
+        remainingPercent: point.percentLeft,
+        // The public chart convention is positive = quota surplus; persisted
+        // controller error is positive = consuming too fast.
+        error: point.controllerError === null ? null : -point.controllerError,
+        resetAtIso: point.resetAtIso,
+        intervalSeconds: point.intervalSeconds,
+      })),
+    },
+  ];
+}
+
 /** Build the current quota snapshot from the shared cache for configured providers. */
 export async function buildQuotaSnapshot(deps: QuotaApiDeps): Promise<QuotaSnapshotDto> {
   const now = deps.now ?? Date.now;
@@ -514,20 +568,29 @@ export async function buildQuotaSnapshot(deps: QuotaApiDeps): Promise<QuotaSnaps
     generatedAt,
     historySince,
     providers: providerDtos,
-    history: deps.listHistory
-      ? providers.flatMap((provider, i) => {
-          const historicalRows = deps.listHistory?.(provider, historySince) ?? [];
-          // Prefer the current ring's first weekly pool. If the current probe
-          // has no usable limits, freeze selection from the newest valid
-          // durable row so known history is not misreported as absent.
-          const weeklyPool =
-            selectWeeklyPool(provider, states[i]) ??
-            latestHistoricalWeeklyPool(provider, historicalRows, historySince, generatedAt);
-          return weeklyPool
-            ? buildQuotaHistory(provider, historicalRows, historySince, generatedAt, weeklyPool)
-            : [];
-        })
-      : [],
+    history: deps.listPersistedHistory
+      ? providers.flatMap((provider) =>
+          buildPersistedQuotaHistory(
+            provider,
+            deps.listPersistedHistory?.(provider, historySince) ?? [],
+            historySince,
+            generatedAt
+          )
+        )
+      : deps.listHistory
+        ? providers.flatMap((provider, i) => {
+            const historicalRows = deps.listHistory?.(provider, historySince) ?? [];
+            // Prefer the current ring's first weekly pool. If the current probe
+            // has no usable limits, freeze selection from the newest valid
+            // durable row so known history is not misreported as absent.
+            const weeklyPool =
+              selectWeeklyPool(provider, states[i]) ??
+              latestHistoricalWeeklyPool(provider, historicalRows, historySince, generatedAt);
+            return weeklyPool
+              ? buildQuotaHistory(provider, historicalRows, historySince, generatedAt, weeklyPool)
+              : [];
+          })
+        : [],
   };
 }
 

@@ -6,6 +6,11 @@ export interface ProviderPacerSubmitOptions {
   threadId?: string;
   /** Submit an eligible normal run to the mesh-wide concurrency queue. */
   enqueueNormal: <T>(fn: () => Promise<T>) => RunStartHandle<T>;
+  /**
+   * Atomically claim a shared-account start. Returns the next eligible instant
+   * when another process won the claim, or null when this request may start.
+   */
+  claimStart?: () => number | null;
   /** Fires at the actual provider start, never when either queue is entered. */
   onStarted?: () => void;
 }
@@ -72,6 +77,18 @@ export class ProviderPacer {
       this.nextAvailableAt = this.lastStartedAt + intervalMs;
     }
     this.schedule();
+  }
+
+  /** Restore the shared account's last actual normal start before admitting work. */
+  hydrateLastStartedAt(startedAtMs: number): void {
+    if (!Number.isFinite(startedAtMs) || startedAtMs < 0) {
+      throw new Error(`startedAtMs must be a non-negative finite number, got ${startedAtMs}`);
+    }
+    if (this.lastStartedAt === null || startedAtMs > this.lastStartedAt) {
+      this.lastStartedAt = startedAtMs;
+      this.nextAvailableAt = Math.max(this.nextAvailableAt, startedAtMs + this.intervalMs);
+      this.schedule();
+    }
   }
 
   /**
@@ -184,6 +201,16 @@ export class ProviderPacer {
         this.queue.unshift(request);
         this.schedule();
         return;
+      }
+      if (!request.responsive && request.opts.claimStart) {
+        const sharedAvailableAt = request.opts.claimStart();
+        if (sharedAvailableAt !== null && this.now() < sharedAvailableAt) {
+          this.deferUntil(sharedAvailableAt);
+          request.state = "provider-queued";
+          this.queue.unshift(request);
+          this.schedule();
+          return;
+        }
       }
       await this.start(request);
     });
