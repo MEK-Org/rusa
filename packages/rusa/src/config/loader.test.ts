@@ -446,7 +446,7 @@ describe("loadConfig providers.<name>.fallbackModel is rejected ", () => {
           },
         })
       )
-    ).toThrow(/providers\.claude\.fallbackModel is no longer supported.*ISSUE_NUM/s);
+    ).toThrow(/providers\.claude\.fallbackModel is no longer supported/);
   });
 
   it("still accepts rootActor.fallbackModel (root-only, unaffected)", () => {

@@ -584,7 +584,7 @@ describe("tracker hygiene runner", () => {
     expect(actions.map((action) => action.kind)).toEqual(["close_stale"]);
     expect(calls).toEqual([]);
     expect(logs).toEqual([
-      "would-have-closed #1 (an issue has no open PR and has been silent since 2026-07-03T00:00:00.000Z.) [+stale-close comment]",
+      "would-have-closed #1 (Issue #1 has no open PR and has been silent since 2026-07-03T00:00:00.000Z.) [+stale-close comment]",
     ]);
   });
 

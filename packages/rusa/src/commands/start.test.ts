@@ -180,7 +180,7 @@ describe("start command tests", () => {
         {
           id: "entry",
           actorId: "actor",
-          source: "github_issue:dummy-org/dummy-repoISSUE_NUM",
+          source: "github_issue:dummy-org/dummy-repo#123",
           deliveredAt: new Date("2026-07-26T00:00:00Z"),
           seenAt: new Date("2026-07-26T00:00:01Z"),
           handledAt: null,
@@ -936,7 +936,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(inbox.entries).toHaveLength(1);
     expect(inbox.entries[0]).toMatchObject({
       actorId: workerId,
-      source: "github_issue:dummy-org/dummy-repoISSUE_NUM",
+      source: "github_issue:dummy-org/dummy-repo#456",
       seenAt: null,
       handledAt: null,
       payload: {
@@ -1902,7 +1902,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // non-event doesn't warrant a mesh event) — assert the log line.
       expect(logSpy.mock.calls.map((c) => c.join(" "))).toContainEqual(
         expect.stringContaining(
-          "suppressed bot-sender event dropped: issues/labeled (sender=mock-bot repo=dummy-org/dummy-repoISSUE_NUM)"
+          "suppressed bot-sender event dropped: issues/labeled (sender=mock-bot repo=dummy-org/dummy-repo#456)"
         )
       );
 

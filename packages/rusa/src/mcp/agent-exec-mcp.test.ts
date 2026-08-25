@@ -951,7 +951,7 @@ describe("agent-execution MCP server", () => {
         },
       })) as CallToolResult;
       expect(delegateRes.isError).toBeFalsy();
-      expect(dataOf(delegateRes)).toContain("delegated github_pr:dummy-org/dummy-repoISSUE_NUM");
+      expect(dataOf(delegateRes)).toContain("delegated github_pr:dummy-org/dummy-repo#616");
 
       let listRes = (await rootClient.callTool({
         name: "list_subscriptions",
@@ -972,7 +972,7 @@ describe("agent-execution MCP server", () => {
         arguments: { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 616 },
       })) as CallToolResult;
       expect(reclaimRes.isError).toBeFalsy();
-      expect(dataOf(reclaimRes)).toContain("reclaimed github_pr:dummy-org/dummy-repoISSUE_NUM");
+      expect(dataOf(reclaimRes)).toContain("reclaimed github_pr:dummy-org/dummy-repo#616");
 
       listRes = (await rootClient.callTool({
         name: "list_subscriptions",

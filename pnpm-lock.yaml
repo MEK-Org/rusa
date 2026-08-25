@@ -33,11 +33,11 @@ importers:
         specifier: ^1.29.0
         version: 1.29.0(zod@4.4.3)
       '@thkp-eng/goals-core':
-        specifier: ^1.0.3
-        version: 1.0.4
+        specifier: workspace:*
+        version: link:../../third_party/glass_goals_devkit/packages/goals-core
       '@thkp-eng/goals-types':
-        specifier: ^1.0.1
-        version: 1.0.1
+        specifier: workspace:*
+        version: link:../../third_party/glass_goals_devkit/packages/goals-types
       better-sqlite3:
         specifier: ^12.6.2
         version: 12.6.2
@@ -1054,12 +1054,6 @@ packages:
 
   '@standard-schema/spec@1.1.0':
     resolution: {integrity: sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==}
-
-  '@thkp-eng/goals-core@1.0.4':
-    resolution: {integrity: sha512-jXZof+vxJxg/8jqjrG5tP+9g2TX8rpNN+T0YW2i45KrJF9vhqP16vUTd6Xab5P78XAG3dTFYUxmpTYwhu+eBxg==}
-
-  '@thkp-eng/goals-types@1.0.1':
-    resolution: {integrity: sha512-Hune3bjGsOW4kQoN2McH9TujPtMXIIPCJjQCdp0Ozvh1aluUXEitWTPY8e7BAKSJiJfNo+jTyPDAKu9Qld8CwQ==}
 
   '@tootallnate/once@2.0.0':
     resolution: {integrity: sha512-XCuKFP5PS55gnMVu3dty8KPatLqUoy/ZYzDzAGCQ8JNFCkLXzmI7vNHCR+XpbZaMWQK/vQubr7PkYq8g470J/A==}
@@ -3737,12 +3731,6 @@ snapshots:
     optional: true
 
   '@standard-schema/spec@1.1.0': {}
-
-  '@thkp-eng/goals-core@1.0.4':
-    dependencies:
-      '@thkp-eng/goals-types': 1.0.1
-
-  '@thkp-eng/goals-types@1.0.1': {}
 
   '@tootallnate/once@2.0.0':
     optional: true
