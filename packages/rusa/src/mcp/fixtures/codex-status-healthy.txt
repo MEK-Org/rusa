@@ -1,0 +1,40 @@
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary di
+r "/tmp" (codex_home: AbsolutePathBuf("/tmp"))
+╭──────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.142.5)                   │
+│                                              │
+│ model:     gpt-5.5 medium   /model to change │
+│ directory: /home/…/spike/scratch             │
+╰──────────────────────────────────────────────╯
+
+  Tip: New Use /fast to enable our fastest inference with increased plan usage.
+
+• You have 4 usage limit resets available. Run /usage to use one.
+
+/status
+
+╭─────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│  >_ OpenAI Codex (v0.142.5)                                                                             │
+│                                                                                                         │
+│ Visit https://chatgpt.com/codex/settings/usage for up-to-date                                           │
+│ information on rate limits and credits                                                                  │
+│                                                                                                         │
+│  Model:                       gpt-5.5 (reasoning medium, summaries auto)                                │
+│  Directory:                   /home/user/workspace/.rusa/workers/…/spike/scratch │
+│  Permissions:                 Workspace (Ask for approval)                                              │
+│  Agents.md:                   <none>                                                                    │
+│  Account:                     fake.email@example.com (Plus)                                        │
+│  Collaboration mode:          Default                                                                   │
+│  Session:                     019f3e18-c426-7323-a5c1-636e9ff6657a                                      │
+│                                                                                                         │
+│  5h limit:                    [████████████████████] 99% left (resets 23:32)                            │
+│  Weekly limit:                [███████████████████░] 93% left (resets 12:34 on 14 Jul)                  │
+│  GPT-5.3-Codex-Spark limit:                                                                             │
+│  5h limit:                    [████████████████████] 100% left (resets 00:40 on 8 Jul)                  │
+│  Weekly limit:                [████████████████████] 100% left (resets 19:40 on 14 Jul)                 │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+› Improve documentation in @filename
+
+  gpt-5.5 medium · /home/user/workspace/.rusa/workers/f25ecf43-ada0-43e3-931c-ff98fbb58ae9/spike…

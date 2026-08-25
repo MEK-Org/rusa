@@ -1,0 +1,34 @@
+
+node_modules/
+dist/
+*.db
+*.db-shm
+*.db-wal
+test-home/
+.rusa/
+.rusa-test/
+.metacoder/
+.metacoder-test/
+
+.pnpm-store/response.txt
+
+firebase_service_account_key.json
+
+.dart_tool/
+
+build/
+
+.idea/
+.flutter-plugins-dependencies
+meta_coder_dashboard.iml
+.antigravitycli/
+
+# Generated e2e run reports (pnpm e2e report) — local artifacts, never committed.
+e2e-reports/
+
+.env
+runs/
+# Quickstart artifacts
+quickstart-output*.txt
+quickstart-server*.log
+quickstart.pid

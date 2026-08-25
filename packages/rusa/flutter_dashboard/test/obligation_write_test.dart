@@ -1,0 +1,427 @@
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+
+import 'package:rusa_dashboard/api.dart';
+import 'package:rusa_dashboard/store.dart';
+import 'package:rusa_dashboard/widgets/inbox_tab.dart';
+import 'package:rusa_dashboard/widgets/work_tab.dart';
+
+import 'fakes.dart';
+
+void main() {
+  group('DashboardApi Obligation Write Methods', () {
+    test('createObligation sends POST with correct payload and returns ObligationDto', () async {
+      final mockClient = MockClient((req) async {
+        expect(req.url.path, '/api/mesh/obligations');
+        expect(req.method, 'POST');
+        final parsed = jsonDecode(req.body) as Map<String, dynamic>;
+        expect(parsed['ownerKind'], 'actor');
+        expect(parsed['ownerId'], 'cloudy-porpoise');
+        expect(parsed['intent'], 'Test create');
+        expect(parsed['priority'], 50.0);
+
+        return http.Response(
+          jsonEncode({
+            'obligation': {
+              'id': 'ob-new-1',
+              'parentId': null,
+              'owner': {'kind': 'actor', 'id': 'cloudy-porpoise'},
+              'intent': 'Test create',
+              'externalRef': null,
+              'status': 'ready',
+              'priority': 50.0,
+              'effectivePriority': 50.0,
+              'prioritySourceId': 'ob-new-1',
+            }
+          }),
+          201,
+        );
+      });
+
+      final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
+      final result = await api.createObligation(
+        ownerKind: 'actor',
+        ownerId: 'cloudy-porpoise',
+        intent: 'Test create',
+        priority: 50.0,
+      );
+
+      expect(result.id, 'ob-new-1');
+      expect(result.owner.id, 'cloudy-porpoise');
+      expect(result.effectivePriority, 50.0);
+    });
+
+    test('setObligationStatus sends POST and transitions status', () async {
+      final mockClient = MockClient((req) async {
+        expect(req.url.path, '/api/mesh/obligations/ob-123/status');
+        expect(req.method, 'POST');
+        final parsed = jsonDecode(req.body) as Map<String, dynamic>;
+        expect(parsed['status'], 'done');
+
+        return http.Response(
+          jsonEncode({
+            'ok': true,
+            'obligation': {
+              'id': 'ob-123',
+              'parentId': null,
+              'owner': {'kind': 'actor', 'id': 'root'},
+              'intent': 'Discharged task',
+              'externalRef': null,
+              'status': 'done',
+              'priority': 100.0,
+              'effectivePriority': 100.0,
+              'prioritySourceId': 'ob-123',
+            }
+          }),
+          200,
+        );
+      });
+
+      final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
+      final result = await api.setObligationStatus('ob-123', 'done');
+
+      expect(result.id, 'ob-123');
+      expect(result.status, 'done');
+      expect(result.isDone, true);
+    });
+
+    test('reorderObligation sends POST with previousId, nextId, and scope', () async {
+      final mockClient = MockClient((req) async {
+        expect(req.url.path, '/api/mesh/obligations/ob-target/reorder');
+        expect(req.method, 'POST');
+        final parsed = jsonDecode(req.body) as Map<String, dynamic>;
+        expect(parsed['previousId'], 'ob-prev');
+        expect(parsed['nextId'], 'ob-next');
+        expect(parsed['scope'], 'subtree');
+
+        return http.Response(
+          jsonEncode({
+            'ok': true,
+            'obligation': {
+              'id': 'ob-target',
+              'parentId': null,
+              'owner': {'kind': 'actor', 'id': 'root'},
+              'intent': 'Reordered',
+              'externalRef': null,
+              'status': 'ready',
+              'priority': 150.0,
+              'effectivePriority': 150.0,
+              'prioritySourceId': 'ob-target',
+            }
+          }),
+          200,
+        );
+      });
+
+      final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
+      final result = await api.reorderObligation(
+        'ob-target',
+        previousId: 'ob-prev',
+        nextId: 'ob-next',
+        scope: 'subtree',
+      );
+
+      expect(result.id, 'ob-target');
+      expect(result.effectivePriority, 150.0);
+    });
+
+    test('reparentObligation sends POST with parentId', () async {
+      final mockClient = MockClient((req) async {
+        expect(req.url.path, '/api/mesh/obligations/ob-child/reparent');
+        expect(req.method, 'POST');
+        final parsed = jsonDecode(req.body) as Map<String, dynamic>;
+        expect(parsed['parentId'], 'ob-new-parent');
+
+        return http.Response(
+          jsonEncode({
+            'ok': true,
+            'obligation': {
+              'id': 'ob-child',
+              'parentId': 'ob-new-parent',
+              'owner': {'kind': 'actor', 'id': 'root'},
+              'intent': 'Reparented child',
+              'externalRef': null,
+              'status': 'ready',
+              'priority': null,
+              'effectivePriority': 200.0,
+              'prioritySourceId': 'ob-new-parent',
+            }
+          }),
+          200,
+        );
+      });
+
+      final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
+      final result = await api.reparentObligation('ob-child', parentId: 'ob-new-parent');
+
+      expect(result.id, 'ob-child');
+      expect(result.parentId, 'ob-new-parent');
+    });
+
+    test('reassignObligation sends POST with the new owner', () async {
+      final mockClient = MockClient((req) async {
+        expect(req.url.path, '/api/mesh/obligations/ob-owner/reassign');
+        expect(req.method, 'POST');
+        expect(jsonDecode(req.body), {'ownerKind': 'human', 'ownerId': 'Operator'});
+        return http.Response(
+          jsonEncode({
+            'ok': true,
+            'obligation': {
+              'id': 'ob-owner',
+              'parentId': null,
+              'owner': {'kind': 'human', 'id': 'Operator'},
+              'intent': 'Reassigned task',
+              'externalRef': null,
+              'status': 'ready',
+              'priority': 100.0,
+              'effectivePriority': 100.0,
+              'prioritySourceId': 'ob-owner',
+            }
+          }),
+          200,
+        );
+      });
+      final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
+      final result = await api.reassignObligation(
+        'ob-owner',
+        ownerKind: 'human',
+        ownerId: 'Operator',
+      );
+      expect(result.owner.id, 'Operator');
+    });
+  });
+
+  group('WorkTab Interactive Write UI', () {
+    late FakeApi api;
+    late DashboardStore store;
+
+    setUp(() {
+      api = FakeApi();
+      final stream = FakeStream();
+      store = DashboardStore(
+        api: api,
+        stream: stream,
+        quotaCache: FakeQuotaCache(),
+        treePreferencesCache: FakeTreePreferencesCache(),
+      );
+    });
+
+    testWidgets('renders work tab with obligation tree and interactive action buttons', (tester) async {
+      tester.view.physicalSize = const Size(1280, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      final ob1 = makeObligation('ob-root-1', intent: 'Root Feature', status: 'ready');
+      final ob2 = makeObligation('ob-child-1', parentId: 'ob-root-1', intent: 'Child Task', status: 'ready');
+      api.obligationsResult = [ob1, ob2];
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: WorkTab(
+              store: store,
+              onSelectView: (_) {},
+            ),
+          ),
+        ),
+      );
+
+      await tester.pumpAndSettle();
+
+      expect(find.text('WORK QUEUE'), findsOneWidget);
+      expect(find.text('Root Feature'), findsOneWidget);
+      expect(find.byTooltip('New Root Obligation'), findsOneWidget);
+
+      // Tap on the root obligation in the tree
+      await tester.tap(find.text('Root Feature'));
+      await tester.pumpAndSettle();
+
+      // Check detail view sections
+      expect(find.text('OBLIGATION ACTIONS'), findsOneWidget);
+      expect(find.text('Mark Done'), findsOneWidget);
+      expect(find.text('Cancel Obligation'), findsOneWidget);
+      expect(find.text('Reassign...'), findsOneWidget);
+      expect(find.text('Reparent...'), findsOneWidget);
+      expect(find.text('Add Child...'), findsOneWidget);
+
+      // Tap Mark Done and confirm dialog
+      await tester.tap(find.text('Mark Done'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Mark Done Obligation?'), findsOneWidget);
+      // Confirm the action
+      await tester.tap(find.descendant(of: find.byType(AlertDialog), matching: find.widgetWithText(ElevatedButton, 'Mark Done')));
+      await tester.pumpAndSettle();
+
+      // Verify the status transition was recorded in the api
+      expect(api.statusCalls.length, 1);
+      expect(api.statusCalls.first.id, 'ob-root-1');
+      expect(api.statusCalls.first.status, 'done');
+    });
+
+    testWidgets('allows creating a new root obligation from sidebar', (tester) async {
+      tester.view.physicalSize = const Size(1280, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      api.obligationsResult = [];
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: WorkTab(
+              store: store,
+              onSelectView: (_) {},
+            ),
+          ),
+        ),
+      );
+
+      await tester.pumpAndSettle();
+
+      // Tap the + button in sidebar
+      await tester.tap(find.byTooltip('New Root Obligation'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Create Root Obligation'), findsOneWidget);
+
+      // Enter intent
+      await tester.enterText(
+        find.widgetWithText(TextFormField, '').first,
+        'Brand New Root Task',
+      );
+      await tester.pumpAndSettle();
+
+      // Enter owner
+      await tester.enterText(
+        find.byType(TextFormField).at(1),
+        'root',
+      );
+      await tester.pumpAndSettle();
+
+      // Tap Create
+      await tester.tap(find.widgetWithText(ElevatedButton, 'Create'));
+      await tester.pumpAndSettle();
+
+      expect(api.createObligationCalls.length, 1);
+      expect(api.createObligationCalls.first.intent, 'Brand New Root Task');
+      expect(api.createObligationCalls.first.parentId, null);
+    });
+
+    testWidgets('allows reparenting an obligation', (tester) async {
+      tester.view.physicalSize = const Size(1280, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      final ob1 = makeObligation('ob-1', intent: 'Task to Reparent', status: 'ready');
+      api.obligationsResult = [ob1];
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: WorkTab(
+              store: store,
+              onSelectView: (_) {},
+            ),
+          ),
+        ),
+      );
+
+      await tester.pumpAndSettle();
+
+      // Select obligation
+      await tester.tap(find.text('Task to Reparent'));
+      await tester.pumpAndSettle();
+
+      // Tap Reparent...
+      await tester.tap(find.text('Reparent...'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Reparent Obligation'), findsOneWidget);
+
+      // Tap Attach to Parent button
+      await tester.tap(find.text('Attach to Parent'));
+      await tester.pumpAndSettle();
+
+      // Enter new parent ID
+      await tester.enterText(
+        find.widgetWithText(TextFormField, '').first,
+        'ob-new-target-parent',
+      );
+      await tester.pumpAndSettle();
+
+      // Tap Reparent submit
+      await tester.tap(find.widgetWithText(ElevatedButton, 'Reparent'));
+      await tester.pumpAndSettle();
+
+      expect(api.reparentCalls.length, 1);
+      expect(api.reparentCalls.first.id, 'ob-1');
+      expect(api.reparentCalls.first.parentId, 'ob-new-target-parent');
+    });
+  });
+
+  group('InboxTab Interactive Write UI', () {
+    late FakeApi api;
+    late DashboardStore store;
+
+    setUp(() {
+      api = FakeApi();
+      final stream = FakeStream();
+      store = DashboardStore(
+        api: api,
+        stream: stream,
+        quotaCache: FakeQuotaCache(),
+        treePreferencesCache: FakeTreePreferencesCache(),
+      );
+    });
+
+    testWidgets('renders ready obligations with reorder controls and actions', (tester) async {
+      tester.view.physicalSize = const Size(1280, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      final ob1 = makeObligation('ob-1', ownerId: 'actor-a', intent: 'First Ready', effectivePriority: 10.0);
+      final ob2 = makeObligation('ob-2', ownerId: 'actor-a', intent: 'Second Ready', effectivePriority: 20.0);
+      api.obligationsResult = [ob1, ob2];
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: InboxTab(
+              actorId: 'actor-a',
+              store: store,
+              onSelectView: (_) {},
+            ),
+          ),
+        ),
+      );
+
+      await tester.pumpAndSettle();
+
+      expect(find.text('Ready Obligations'), findsOneWidget);
+      expect(find.text('First Ready'), findsOneWidget);
+      expect(find.text('Second Ready'), findsOneWidget);
+      expect(find.text('New Obligation'), findsOneWidget);
+
+      // Reorder: Move second item up
+      final moveUpButtons = find.byTooltip('Move Up in Priority');
+      expect(moveUpButtons, findsNWidgets(2));
+
+      // The second item's Move Up button is active
+      await tester.tap(moveUpButtons.last);
+      await tester.pumpAndSettle();
+
+      expect(api.reorderCalls.length, 1);
+      expect(api.reorderCalls.first.id, 'ob-2');
+      expect(api.reorderCalls.first.previousId, null);
+      expect(api.reorderCalls.first.nextId, 'ob-1');
+    });
+  });
+}

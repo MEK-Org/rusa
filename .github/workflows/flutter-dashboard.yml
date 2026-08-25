@@ -1,0 +1,45 @@
+name: Flutter Dashboard
+
+# Runs only when dashboard-relevant files change, so the slow Flutter
+# install/build/test doesn't gate PRs that don't touch the dashboard.
+on:
+  pull_request:
+    branches: [master, staging]
+    paths:
+      - 'packages/rusa/flutter_dashboard/**'
+      - 'packages/rusa/package.json'
+      - 'packages/rusa/scripts/build-dashboard-ui.mjs'
+      - '.github/workflows/flutter-dashboard.yml'
+
+jobs:
+  flutter-dashboard:
+    name: Flutter Dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.29.3
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - run: pnpm install --frozen-lockfile
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.41.5
+          channel: stable
+          cache: true
+
+      # Analyze before build/test so a static-analysis failure never pays for
+      # the expensive steps.
+      - run: pnpm --filter rusa run analyze:dashboard-ui
+
+      - run: pnpm --filter rusa run build
+
+      - run: pnpm --filter rusa run test:dashboard-ui

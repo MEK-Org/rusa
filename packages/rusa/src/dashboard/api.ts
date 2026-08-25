@@ -1,0 +1,1074 @@
+import { randomUUID } from "node:crypto";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import type { ActorMesh } from "../actor/actor-mesh.js";
+import { resolveContextSelection } from "../actor/context-selection.js";
+import { generateHandle } from "../actor/handle-generator.js";
+import type { InboxPage, InboxPayload, InboxStore } from "../actor/inbox-store.js";
+import type { RootControlService } from "../actor/root-control.js";
+import type { ThreadRegistry } from "../actor/thread-registry.js";
+import { summarizeCharter } from "../actor/worker-prompt.js";
+import {
+  generateAvatarForce,
+  isRootHandle,
+  type RootAvatarIdentity,
+  readAvatar,
+  uploadAvatar,
+} from "../avatar/avatars.js";
+import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
+import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
+import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import type { ObligationStatus } from "../obligations/obligation.js";
+import {
+  type CommitmentLedgerReport,
+  projectOpenCommitments,
+} from "../observability/commitment-ledger.js";
+import type { SseHub } from "./sse.js";
+
+/** Everything the mesh Data API needs, injected by the server wiring. */
+export interface DashboardDataDeps {
+  registry: ThreadRegistry;
+  meshEvents: MeshEventRepository;
+  meshChat: MeshChatRepository;
+  /** Durable obligation repository for task and dependency management. */
+  obligations?: ObligationRepository;
+  /** Durable actor inbox, intentionally exposed read-only to the dashboard. */
+  inbox?: InboxStore;
+  sseHub: SseHub;
+  /** The live ActorMesh instance. */
+  mesh?: ActorMesh;
+  /** Root-authorized commands exposed to trusted dashboard operators. */
+  rootControl?: RootControlService;
+  /**
+   * Read-only view of the mesh's emergency-brake state (the HALT sentinel),
+   * surfaced as the top-level `halted` flag on `/api/mesh/threads`. Optional:
+   * when absent (e.g. a UI-only server) the response reports `halted: false`.
+   */
+  isHalted?: () => boolean;
+  /**
+   * Read-only snapshot of the thread ids whose live actor is *genuinely
+   * executing a run right now* (between run_start and run_end — i.e. the
+   * TriggerRunner's running flag), used to derive each thread's `runState`.
+   * Returned as a Set so the threads handler can classify every thread against
+   * one synchronous, non-torn snapshot in a single pass. Optional: when absent
+   * (e.g. the standalone dashboard with no live mesh) every thread reads `idle`.
+   */
+  runningThreadIds?: () => Set<string>;
+  /** Read-only snapshot of actors waiting for their provider run to start. */
+  queuedThreadIds?: () => Set<string>;
+  /** Optional yield check for testing runState without full mesh instance. */
+  isYielded?: (actorId: string) => boolean;
+  /** The provider-paced FIFO heads with their exact next eligible start time. */
+  providerQueueHeads?: () => Array<{ threadId: string; availableAt: string }>;
+  /**
+   * This instance's configured root identity  — the resolved display
+   * handle and avatar override, if `rootActor.handle`/`rootActor.avatar` are
+   * set in config. Optional: absent (or fields unset) reproduces today's
+   * default (`root-actor`, the bundled image) everywhere it's read.
+   */
+  rootIdentity?: RootAvatarIdentity;
+  /**
+   * Gemini API key (`config.geminiApiKey`), threaded through so the dashboard's
+   * on-demand avatar-generate route can call the same Gemini image API the
+   * spawn-time avatar generation uses. Optional: absent → the generate route
+   * 400s with a message telling the operator to configure it.
+   */
+  geminiApiKey?: string;
+}
+
+/** Route prefix for the per-actor avatar endpoint . */
+const AVATAR_PREFIX = "/api/mesh/avatar/";
+
+/**
+ * Extract the avatar lookup key from `/api/mesh/avatar/<key>.(png|jpg)`: strip
+ * the prefix, decode, drop the extension, and reject anything with a path
+ * separator or `..` (the key is a flat handle or thread id, never a path).
+ */
+function avatarKeyFromPath(pathname: string): string | null {
+  let key: string;
+  try {
+    key = decodeURIComponent(pathname.slice(AVATAR_PREFIX.length));
+  } catch {
+    return null; // malformed percent-encoding
+  }
+  key = key.replace(/\.(png|jpg|jpeg)$/i, "");
+  if (!key || key.includes("/") || key.includes("\\") || key.includes("..")) return null;
+  return key;
+}
+
+/**
+ * Decode + validate the `<id>` path segment for the avatar POST routes
+ * (upload, generate). Same traversal guard as {@link avatarKeyFromPath}, minus
+ * the GET route's file-extension stripping — these routes address the id
+ * directly, with no `.png`/`.jpg` suffix in the URL.
+ */
+function parseAvatarId(raw: string): string | null {
+  let id: string;
+  try {
+    id = decodeURIComponent(raw);
+  } catch {
+    return null; // malformed percent-encoding
+  }
+  if (!id || id.includes("/") || id.includes("\\") || id.includes("..")) return null;
+  return id;
+}
+
+/** Upper bounds so a crafted query can't ask for an unbounded scan/result. */
+const MAX_LIMIT = 200;
+const MAX_ACTORS = 200;
+const DEFAULT_LIMIT = 50;
+/** Cap on a manually-uploaded avatar's decoded byte size (5 MB). */
+const MAX_AVATAR_UPLOAD_BYTES = 5 * 1024 * 1024;
+
+/** A thread as the dashboard tree consumes it: handle up front, UUID for detail. */
+interface ThreadDto {
+  id: string;
+  handle: string;
+  parentId: string | null;
+  status: string;
+  provider: string | null;
+  requestedModel: string | null;
+  model: string | null;
+  boundModel: string | null;
+  charter: string;
+  title: string;
+  createdAt: string;
+  /**
+   * Whether this thread's actor is executing a run at the moment the response is
+   * built. Server-side truth so the client can seed its dots correctly on a cold
+   * load (before any live `mesh_event` arrives), rather than guessing "active".
+   */
+  runState: "running" | "queued" | "winding_down" | "idle";
+  chatDisabled: boolean;
+  /** ISO-8601 timestamp of the actor's most recent mesh event, or null if none. */
+  lastActiveAt: string | null;
+  /** The most critical open commitment row kind for this thread, if any. */
+  commitmentKind?: string | null;
+  /** What this thread is blocked waiting on. */
+  waitingOn?: string | null;
+  /** Exact provider-pacer release time, populated only for a provider queue head. */
+  nextProviderAvailableAt?: string | null;
+  /** Whether the owner expects to retire this thread. */
+  ownerExpectsRetirement?: boolean | null;
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  res.end(payload);
+}
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+    req.on("error", reject);
+  });
+}
+
+/** Parse a comma-separated `actors` param into a de-duped, capped list. */
+function parseActors(url: URL): string[] {
+  const raw = url.searchParams.get("actors");
+  if (!raw) return [];
+  const seen = new Set<string>();
+  for (const part of raw.split(",")) {
+    const id = part.trim();
+    if (id) seen.add(id);
+    if (seen.size >= MAX_ACTORS) break;
+  }
+  return [...seen];
+}
+
+/** Parse a positive integer query param, or undefined if absent/invalid. */
+function parsePositiveInt(url: URL, name: string): number | undefined {
+  const raw = url.searchParams.get(name);
+  if (raw == null) return undefined;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
+function clampLimit(url: URL): number {
+  const requested = parsePositiveInt(url, "limit") ?? DEFAULT_LIMIT;
+  return Math.min(requested, MAX_LIMIT);
+}
+
+/**
+ * Inbox entries intentionally store lightweight pointers. The dashboard is the
+ * presentation boundary, so resolve a mesh-message pointer here and never leak
+ * its opaque id into the UI payload.
+ */
+function resolveInboxPage(page: InboxPage, meshChat: MeshChatRepository): InboxPage {
+  return {
+    ...page,
+    entries: page.entries.map((entry) => {
+      const { messageId, ...payload } = entry.payload as InboxPayload & {
+        messageId?: unknown;
+      };
+      if (typeof messageId !== "string") return entry;
+      const message = meshChat.getById(messageId);
+      return {
+        ...entry,
+        payload: message ? { ...payload, content: message.body } : payload,
+      };
+    }),
+  };
+}
+
+function parseKinds(url: URL): string[] | undefined {
+  const raw = url.searchParams.get("kinds");
+  if (!raw) return undefined;
+  const kinds = raw
+    .split(",")
+    .map((k) => k.trim())
+    .filter(Boolean);
+  return kinds.length > 0 ? kinds : undefined;
+}
+
+const commitmentLedgerCache = new WeakMap<
+  MeshEventRepository,
+  { maxRowid: number; ledger: CommitmentLedgerReport }
+>();
+
+/**
+ * Dispatch a `/api/mesh/*` request. Returns true if it owned the request
+ * (responded or took over the socket for SSE), false to let the caller fall
+ * through to static asset serving. When `deps` is null (e.g. the e2e UI-only
+ * server) every mesh route 503s — the static UI is unaffected.
+ */
+export function handleMeshApiRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  deps: DashboardDataDeps | null
+): boolean {
+  const { pathname } = url;
+  if (!pathname.startsWith("/api/mesh/")) return false;
+
+  if (req.method === "POST") {
+    if (pathname === "/api/mesh/actors") {
+      if (!deps?.rootControl) {
+        sendJson(res, 503, { error: "root control unavailable" });
+        return true;
+      }
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            sendJson(res, 400, { error: "Missing or invalid actor parameters" });
+            return;
+          }
+          const body = parsed as Record<string, unknown>;
+          try {
+            // Portable context  is opt-in per actor: absent means native, so
+            // an existing caller that never sends the field keeps the old record.
+            const context = resolveContextSelection(body.contextMode, {
+              compactionModel:
+                typeof body.compactionModel === "string" ? body.compactionModel : undefined,
+            });
+            const id = deps.rootControl?.spawnChild(
+              {
+                charter: typeof body.charter === "string" ? body.charter : "",
+                provider: typeof body.provider === "string" ? body.provider : "",
+                model: typeof body.model === "string" ? body.model : "",
+                maxRuns: typeof body.maxRuns === "number" ? body.maxRuns : undefined,
+                title: typeof body.title === "string" ? body.title : undefined,
+                context,
+              },
+              "human:operator"
+            );
+            sendJson(res, 201, { id });
+          } catch (err) {
+            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
+    const match = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/chat$/);
+    if (match) {
+      if (!deps) {
+        sendJson(res, 503, { error: "mesh data API unavailable (no live mesh bound)" });
+        return true;
+      }
+      const actorId = match[1];
+      const rec = deps.registry.get(actorId);
+      if (!rec) {
+        sendJson(res, 404, { error: "actor not found" });
+        return true;
+      }
+      if (rec.status === "retired") {
+        sendJson(res, 400, { error: "actor is retired", chatDisabled: true });
+        return true;
+      }
+
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null) {
+            sendJson(res, 400, { error: "Missing or invalid body parameter" });
+            return;
+          }
+          const bodyObj = parsed as Record<string, unknown>;
+          if (!bodyObj.body) {
+            sendJson(res, 400, { error: "Missing or invalid body parameter" });
+            return;
+          }
+          const body = String(bodyObj.body);
+          const sessionId = String(bodyObj.sessionId ?? bodyObj.session_id ?? randomUUID());
+
+          const voice = !!bodyObj.voice;
+
+          if (!deps.mesh) {
+            sendJson(res, 500, { error: "ActorMesh instance not bound to deps" });
+            return;
+          }
+
+          const result = deps.mesh.sendHumanMessage(actorId, body, sessionId, { voice });
+          if (result.delivered) {
+            sendJson(res, 200, { ok: true });
+          } else {
+            sendJson(res, 400, { error: "failed to deliver message", status: result.status });
+          }
+        })
+        .catch((err) => {
+          sendJson(res, 500, { error: String(err) });
+        });
+      return true;
+    }
+
+    const interruptMatch = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/interrupt$/);
+    if (interruptMatch) {
+      if (!deps) {
+        sendJson(res, 503, { error: "mesh data API unavailable (no live mesh bound)" });
+        return true;
+      }
+      const actorId = decodeURIComponent(interruptMatch[1]);
+      const rec = deps.registry.get(actorId);
+      if (!rec) {
+        sendJson(res, 404, { error: "actor not found" });
+        return true;
+      }
+      if (rec.status === "retired") {
+        sendJson(res, 400, { error: "actor is retired" });
+        return true;
+      }
+      const mesh = deps.mesh;
+      if (!mesh) {
+        sendJson(res, 500, { error: "ActorMesh instance not bound to deps" });
+        return true;
+      }
+      readBody(req)
+        .then((bodyStr) => {
+          let by = "human:operator";
+          if (bodyStr.trim()) {
+            try {
+              const parsed = JSON.parse(bodyStr);
+              if (parsed && typeof parsed.by === "string" && parsed.by.trim()) {
+                by = parsed.by.trim();
+              }
+            } catch {
+              // Ignore body parse errors, default to human:operator
+            }
+          }
+          try {
+            const result = mesh.interrupt(actorId, by);
+            sendJson(res, 200, {
+              ok: true,
+              interrupted: result.interrupted,
+              status: result.status,
+            });
+          } catch (err) {
+            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
+    const runNowMatch = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/run-now$/);
+    if (runNowMatch) {
+      if (!deps) {
+        sendJson(res, 503, { error: "mesh data API unavailable (no live mesh bound)" });
+        return true;
+      }
+      const actorId = decodeURIComponent(runNowMatch[1]);
+      const rec = deps.registry.get(actorId);
+      if (!rec) {
+        sendJson(res, 404, { error: "actor not found" });
+        return true;
+      }
+      if (rec.status === "retired") {
+        sendJson(res, 400, { error: "actor is retired" });
+        return true;
+      }
+      if (!deps.mesh) {
+        sendJson(res, 500, { error: "ActorMesh instance not bound to deps" });
+        return true;
+      }
+      try {
+        const result = deps.mesh.runNow(actorId, "human:operator");
+        sendJson(res, 200, { ok: true, queued: result.queued });
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return true;
+    }
+
+    // POST /api/mesh/avatar/<id>/generate — on-demand AI generation .
+    // Matched BEFORE the plain upload route below since it has an extra path
+    // segment the upload regex's `[^/]+$` anchor won't match anyway, but
+    // checking it first keeps the two routes visually paired.
+    const generateMatch = pathname.match(/^\/api\/mesh\/avatar\/([^/]+)\/generate$/);
+    if (generateMatch) {
+      if (!deps?.rootControl) {
+        sendJson(res, 503, { error: "root control unavailable" });
+        return true;
+      }
+      const id = parseAvatarId(generateMatch[1]);
+      if (!id) {
+        sendJson(res, 400, { error: "invalid avatar id" });
+        return true;
+      }
+      if (!deps.geminiApiKey) {
+        sendJson(res, 400, {
+          error: "Set geminiApiKey in config to enable avatar generation",
+        });
+        return true;
+      }
+      const targetId = isRootHandle(id, deps.rootIdentity?.handle)
+        ? (deps.rootIdentity?.id ?? "root")
+        : id;
+      generateAvatarForce(targetId, {
+        apiKey: deps.geminiApiKey,
+        rootHandle: deps.rootIdentity?.handle,
+        rootId: deps.rootIdentity?.id,
+      })
+        .then(() => sendJson(res, 200, { ok: true }))
+        .catch((err) => {
+          // Never relay raw error responses to the client. Since `callGeminiImage`
+          // handles error boundaries to ensure thrown errors are entirely body-free,
+          // we can safely log the stable, locally-authored error message server-side
+          // for debugging while returning a generic 502 status to the client.
+          console.error(
+            `avatar generate for ${targetId} failed: ${err instanceof Error ? err.message : "unknown error"}`
+          );
+          sendJson(res, 502, { error: "avatar generation failed" });
+        });
+      return true;
+    }
+
+    // POST /api/mesh/avatar/<id> — manual upload : { imageBase64, contentType }.
+    const uploadMatch = pathname.match(/^\/api\/mesh\/avatar\/([^/]+)$/);
+    if (uploadMatch) {
+      if (!deps?.rootControl) {
+        sendJson(res, 503, { error: "root control unavailable" });
+        return true;
+      }
+      const id = parseAvatarId(uploadMatch[1]);
+      if (!id) {
+        sendJson(res, 400, { error: "invalid avatar id" });
+        return true;
+      }
+      const targetId = isRootHandle(id, deps.rootIdentity?.handle)
+        ? (deps.rootIdentity?.id ?? "root")
+        : id;
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null) {
+            sendJson(res, 400, { error: "Missing or invalid body" });
+            return;
+          }
+          const body = parsed as Record<string, unknown>;
+          const contentType = body.contentType;
+          // The cache and serve paths (uploadAvatar / readAvatar) are PNG-only, so
+          // only image/png is accepted — a client-declared content-type is never
+          // trusted on its own; uploadAvatar re-verifies the PNG signature below.
+          if (contentType !== "image/png") {
+            sendJson(res, 400, {
+              error: 'contentType must be "image/png"',
+            });
+            return;
+          }
+          if (typeof body.imageBase64 !== "string" || body.imageBase64.length === 0) {
+            sendJson(res, 400, { error: "Missing or invalid imageBase64" });
+            return;
+          }
+          const bytes = Buffer.from(body.imageBase64, "base64");
+          if (bytes.length === 0) {
+            sendJson(res, 400, { error: "imageBase64 did not decode to any bytes" });
+            return;
+          }
+          if (bytes.length > MAX_AVATAR_UPLOAD_BYTES) {
+            sendJson(res, 400, {
+              error: `image exceeds the ${MAX_AVATAR_UPLOAD_BYTES / (1024 * 1024)}MB upload limit`,
+            });
+            return;
+          }
+          try {
+            uploadAvatar(targetId, bytes, deps.rootIdentity?.id);
+          } catch {
+            sendJson(res, 400, { error: "imageBase64 is not a valid PNG image" });
+            return;
+          }
+          sendJson(res, 200, { ok: true });
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
+    // POST /api/mesh/obligations — create obligation
+    if (pathname === "/api/mesh/obligations") {
+      const obligations = deps?.obligations;
+      if (!obligations) {
+        sendJson(res, 503, { error: "obligations data unavailable" });
+        return true;
+      }
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            sendJson(res, 400, { error: "Missing or invalid obligation parameters" });
+            return;
+          }
+          const body = parsed as Record<string, unknown>;
+          const ownerKind = (body.ownerKind ?? body.owner_kind) as string | undefined;
+          const ownerId = (body.ownerId ?? body.owner_id) as string | undefined;
+          if (ownerKind !== "actor" && ownerKind !== "human") {
+            sendJson(res, 400, { error: "ownerKind must be 'actor' or 'human'" });
+            return;
+          }
+          if (typeof ownerId !== "string" || !ownerId.trim()) {
+            sendJson(res, 400, { error: "ownerId is required" });
+            return;
+          }
+          const rawParentId = body.parentId ?? body.parent_id;
+          const parentId = typeof rawParentId === "string" ? rawParentId.trim() : null;
+          const intent = typeof body.intent === "string" ? body.intent : null;
+          const rawExternalRef = body.externalRef ?? body.external_ref;
+          const externalRef = typeof rawExternalRef === "string" ? rawExternalRef.trim() : null;
+          const rawPriority = body.priority;
+          const priority =
+            typeof rawPriority === "number" && Number.isFinite(rawPriority) ? rawPriority : null;
+
+          try {
+            const obligation = obligations.create({
+              owner: { kind: ownerKind, id: ownerId.trim() },
+              parentId,
+              intent,
+              externalRef,
+              priority,
+            });
+            sendJson(res, 201, { obligation });
+          } catch (err) {
+            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
+    // POST /api/mesh/obligations/:id/status — transition status to done or cancelled
+    const statusMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/status$/);
+    if (statusMatch) {
+      const obligations = deps?.obligations;
+      if (!obligations) {
+        sendJson(res, 503, { error: "obligations data unavailable" });
+        return true;
+      }
+      const id = decodeURIComponent(statusMatch[1]);
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            sendJson(res, 400, { error: "Missing or invalid body" });
+            return;
+          }
+          const body = parsed as Record<string, unknown>;
+          const status = body.status;
+          if (status !== "done" && status !== "cancelled") {
+            sendJson(res, 400, { error: "status must be 'done' or 'cancelled'" });
+            return;
+          }
+          const existing = obligations.get(id);
+          if (!existing) {
+            sendJson(res, 404, { error: "obligation not found" });
+            return;
+          }
+          try {
+            const obligation = obligations.setTerminalStatus(id, status);
+            sendJson(res, 200, { ok: true, obligation });
+          } catch (err) {
+            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
+    // POST /api/mesh/obligations/:id/reorder — reorder within queue
+    const reorderMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/reorder$/);
+    if (reorderMatch) {
+      const obligations = deps?.obligations;
+      if (!obligations) {
+        sendJson(res, 503, { error: "obligations data unavailable" });
+        return true;
+      }
+      const id = decodeURIComponent(reorderMatch[1]);
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            sendJson(res, 400, { error: "Missing or invalid body" });
+            return;
+          }
+          const body = parsed as Record<string, unknown>;
+          const rawPreviousId = body.previousId ?? body.previous_id;
+          const previousId = typeof rawPreviousId === "string" ? rawPreviousId.trim() : null;
+          const rawNextId = body.nextId ?? body.next_id;
+          const nextId = typeof rawNextId === "string" ? rawNextId.trim() : null;
+          const rawScope = body.scope;
+          const scope = rawScope === "self" ? "self" : "subtree";
+
+          const existing = obligations.get(id);
+          if (!existing) {
+            sendJson(res, 404, { error: "obligation not found" });
+            return;
+          }
+          try {
+            const obligation = obligations.movePriorityInternal(id, previousId, nextId, scope);
+            sendJson(res, 200, { ok: true, obligation });
+          } catch (err) {
+            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
+    // POST /api/mesh/obligations/:id/reparent — reparent obligation
+    const reparentMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/reparent$/);
+    if (reparentMatch) {
+      const obligations = deps?.obligations;
+      if (!obligations) {
+        sendJson(res, 503, { error: "obligations data unavailable" });
+        return true;
+      }
+      const id = decodeURIComponent(reparentMatch[1]);
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            sendJson(res, 400, { error: "Missing or invalid body" });
+            return;
+          }
+          const body = parsed as Record<string, unknown>;
+          const rawParentId = body.parentId ?? body.parent_id;
+          const parentId = typeof rawParentId === "string" ? rawParentId.trim() : null;
+
+          const existing = obligations.get(id);
+          if (!existing) {
+            sendJson(res, 404, { error: "obligation not found" });
+            return;
+          }
+          try {
+            const obligation = obligations.reparent(id, parentId);
+            sendJson(res, 200, { ok: true, obligation });
+          } catch (err) {
+            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
+    // POST /api/mesh/obligations/:id/reassign — trusted operator changes owner
+    const reassignMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/reassign$/);
+    if (reassignMatch) {
+      const obligations = deps?.obligations;
+      if (!obligations) {
+        sendJson(res, 503, { error: "obligations data unavailable" });
+        return true;
+      }
+      const id = decodeURIComponent(reassignMatch[1]);
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            sendJson(res, 400, { error: "Missing or invalid body" });
+            return;
+          }
+          const body = parsed as Record<string, unknown>;
+          const ownerKind = (body.ownerKind ?? body.owner_kind) as string | undefined;
+          const ownerId = (body.ownerId ?? body.owner_id) as string | undefined;
+          if (ownerKind !== "actor" && ownerKind !== "human") {
+            sendJson(res, 400, { error: "ownerKind must be 'actor' or 'human'" });
+            return;
+          }
+          if (typeof ownerId !== "string" || !ownerId.trim()) {
+            sendJson(res, 400, { error: "ownerId is required" });
+            return;
+          }
+          if (!obligations.get(id)) {
+            sendJson(res, 404, { error: "obligation not found" });
+            return;
+          }
+          try {
+            const obligation = obligations.reassign(id, {
+              kind: ownerKind,
+              id: ownerId.trim(),
+            });
+            sendJson(res, 200, { ok: true, obligation });
+          } catch (err) {
+            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+  }
+
+  if (req.method !== "GET") {
+    sendJson(res, 405, { error: "method not allowed" });
+    return true;
+  }
+
+  // GET /api/mesh/avatar/<id>.(png|jpg) — the per-actor avatar , keyed by
+  // the unique thread id (the root id serves the fixed bundled image).
+  // Filesystem-backed and independent of the live mesh, so it's served even when
+  // `deps` is null (a UI-only server). 404 when nothing is cached yet so the UI
+  // falls back to its placeholder.
+  if (pathname.startsWith(AVATAR_PREFIX)) {
+    const key = avatarKeyFromPath(pathname);
+    const avatar = key ? readAvatar(key, deps?.rootIdentity) : null;
+    if (!avatar) {
+      res.writeHead(404, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-store",
+      });
+      res.end("avatar not found");
+      return true;
+    }
+    res.writeHead(200, {
+      "Content-Type": avatar.contentType,
+      // Avatars can change from the bundled default to a generated/uploaded image,
+      // and the client resets its cache-busting epoch on every page load. Disable
+      // HTTP caching so a freshly generated avatar is never masked by a stale
+      // cached default after refresh.
+      "Cache-Control": "no-store",
+    });
+    res.end(avatar.body);
+    return true;
+  }
+
+  if (!deps) {
+    sendJson(res, 503, { error: "mesh data API unavailable (no live mesh bound)" });
+    return true;
+  }
+
+  const { registry, meshEvents, sseHub } = deps;
+
+  if (pathname === "/api/mesh/control/options") {
+    if (!deps.rootControl) {
+      sendJson(res, 503, { error: "root control unavailable" });
+      return true;
+    }
+    sendJson(res, 200, { providers: deps.rootControl.providers });
+    return true;
+  }
+
+  // GET /api/mesh/threads — every thread (active + retired), handle up front.
+  if (pathname === "/api/mesh/threads") {
+    // One synchronous snapshot of the running set, classified against every
+    // thread in a single pass — no await between reads, so the view can't tear.
+    const running = deps.runningThreadIds?.() ?? new Set<string>();
+    const queued = deps.queuedThreadIds?.() ?? new Set<string>();
+    const providerQueueHeads = new Map(
+      (deps.providerQueueHeads?.() ?? []).map((head) => [head.threadId, head.availableAt])
+    );
+    const rootHandle = deps.rootIdentity?.handle ?? generateHandle("root");
+    // Aggregate last activity once for all actors; the covering index on
+    // mesh_events(actor_id, ts) makes this cheap .
+    const lastActiveByActor = meshEvents.latestActivityByActor();
+
+    // Cached ledger projection to avoid unbounded mesh_events.list() scan on every poll
+    const currentMaxRowid = meshEvents.getMaxRowid();
+    let cached = commitmentLedgerCache.get(meshEvents);
+    if (!cached || cached.maxRowid !== currentMaxRowid) {
+      const ledger = projectOpenCommitments({
+        threads: registry.list(),
+        events: meshEvents.list(),
+        rootHandle,
+      });
+      cached = { maxRowid: currentMaxRowid, ledger };
+      commitmentLedgerCache.set(meshEvents, cached);
+    }
+    const ledger = cached.ledger;
+    const threadCommitments = new Map<
+      string,
+      { kind: string; waitingOn: string | null; ownerExpectsRetirement: boolean | null }
+    >();
+    for (const row of ledger.rows) {
+      if (row.subject_actor_id && !threadCommitments.has(row.subject_actor_id)) {
+        threadCommitments.set(row.subject_actor_id, {
+          kind: row.kind,
+          waitingOn: row.waiting_on,
+          ownerExpectsRetirement: row.owner_expects_retirement,
+        });
+      }
+    }
+
+    const threads: ThreadDto[] = registry.list().map((r) => {
+      const commitment = threadCommitments.get(r.id);
+      let runState: "running" | "queued" | "winding_down" | "idle" = "idle";
+      if (typeof deps.mesh?.activeRunState === "function") {
+        runState = deps.mesh.activeRunState(r.id)?.phase ?? "idle";
+      } else if (running.has(r.id)) {
+        runState = deps.isYielded?.(r.id) ? "winding_down" : "running";
+      } else if (queued.has(r.id)) {
+        runState = "queued";
+      }
+      return {
+        id: r.id,
+        handle: r.isRoot === true ? rootHandle : generateHandle(r.id),
+        parentId: r.parentId,
+        status: r.status,
+        provider: r.provider ?? null,
+        requestedModel: r.model ?? null,
+        model: r.boundModel ?? r.model ?? null,
+        boundModel: r.boundModel ?? null,
+        charter: r.charter,
+        title: r.title ?? summarizeCharter(r.charter),
+        createdAt: r.createdAt,
+        runState,
+        chatDisabled: r.status === "retired",
+        lastActiveAt: lastActiveByActor.get(r.id) ?? null,
+        commitmentKind: commitment?.kind ?? null,
+        waitingOn: commitment?.waitingOn ?? null,
+        nextProviderAvailableAt: providerQueueHeads.get(r.id) ?? null,
+        ownerExpectsRetirement: commitment?.ownerExpectsRetirement ?? null,
+      };
+    });
+    sendJson(res, 200, { halted: deps.isHalted?.() ?? false, threads });
+    return true;
+  }
+
+  // GET /api/mesh/events?actors=&limit=&before=&kinds=&conversation= — merged, newest-first.
+  // GET /api/mesh/events?since=<ISO>&until=<ISO>&limit= — ALL actors, oldest-first,
+  //   the half-open window [since, until) (until optional; the IU distiller's
+  //   mesh_events read, ISSUE_NUM 2a). Takes precedence over the actor/before path.
+  if (pathname === "/api/mesh/events") {
+    const since = url.searchParams.get("since");
+    if (since) {
+      const until = url.searchParams.get("until") ?? undefined;
+      const kinds = parseKinds(url);
+      const rawOrder = url.searchParams.get("order");
+      const order = rawOrder === "desc" ? "desc" : "asc";
+      sendJson(res, 200, meshEvents.listEventsSince(since, clampLimit(url), until, kinds, order));
+      return true;
+    }
+    const actors = parseActors(url);
+    const conversation = url.searchParams.get("conversation") === "true";
+    const page = meshEvents.listEventsByActors(actors, {
+      limit: clampLimit(url),
+      before: parsePositiveInt(url, "before") ?? null,
+      kinds: parseKinds(url),
+      conversation,
+    });
+    sendJson(res, 200, page);
+    return true;
+  }
+
+  // GET /api/mesh/chat?actors=&limit=&before= — direct chat history.
+  if (pathname === "/api/mesh/chat") {
+    const actors = parseActors(url);
+    const page = deps.meshChat.listChatByActors(actors, {
+      limit: clampLimit(url),
+      before: parsePositiveInt(url, "before") ?? null,
+    });
+    sendJson(res, 200, page);
+    return true;
+  }
+
+  // GET /api/mesh/inbox?actor=<id>&status=unhandled|handled|all
+  if (pathname === "/api/mesh/inbox") {
+    if (!deps.inbox) {
+      sendJson(res, 503, { error: "inbox data unavailable" });
+      return true;
+    }
+    const actorId = url.searchParams.get("actor");
+    if (!actorId) {
+      sendJson(res, 400, { error: "actor is required" });
+      return true;
+    }
+    const status = url.searchParams.get("status");
+    if (status && status !== "unhandled" && status !== "handled" && status !== "all") {
+      sendJson(res, 400, { error: "invalid status" });
+      return true;
+    }
+    sendJson(
+      res,
+      200,
+      resolveInboxPage(
+        deps.inbox.list(actorId, {
+          status: status as "unhandled" | "handled" | "all" | undefined,
+          limit: clampLimit(url),
+        }),
+        deps.meshChat
+      )
+    );
+    return true;
+  }
+
+  // GET /api/mesh/obligations — list obligations
+  if (pathname === "/api/mesh/obligations") {
+    if (!deps.obligations) {
+      sendJson(res, 503, { error: "obligations data unavailable" });
+      return true;
+    }
+    const ownerKind =
+      url.searchParams.get("ownerKind") ?? url.searchParams.get("owner_kind") ?? undefined;
+    const ownerId =
+      url.searchParams.get("ownerId") ?? url.searchParams.get("owner_id") ?? undefined;
+    const status = url.searchParams.get("status") ?? undefined;
+    const rawRootsOnly = url.searchParams.get("rootsOnly") ?? url.searchParams.get("roots_only");
+    const rootsOnly = rawRootsOnly === "true" || rawRootsOnly === "1";
+    const limit = clampLimit(url);
+    const offset = parsePositiveInt(url, "offset") ?? 0;
+
+    if (ownerKind && ownerKind !== "actor" && ownerKind !== "human") {
+      sendJson(res, 400, { error: "ownerKind must be 'actor' or 'human'" });
+      return true;
+    }
+    if (status && !["ready", "waiting", "done", "cancelled"].includes(status)) {
+      sendJson(res, 400, { error: "invalid status" });
+      return true;
+    }
+
+    const page = deps.obligations.listPage({
+      ownerKind: ownerKind as "actor" | "human" | undefined,
+      ownerId,
+      status: status as ObligationStatus | undefined,
+      rootsOnly,
+      limit,
+      offset,
+    });
+    sendJson(res, 200, page);
+    return true;
+  }
+
+  // GET /api/mesh/obligations/:id/tree — subtree hierarchy
+  const obligationTreeMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/tree$/);
+  if (obligationTreeMatch) {
+    if (!deps.obligations) {
+      sendJson(res, 503, { error: "obligations data unavailable" });
+      return true;
+    }
+    const id = decodeURIComponent(obligationTreeMatch[1]);
+    const obligation = deps.obligations.get(id);
+    if (!obligation) {
+      sendJson(res, 404, { error: "obligation not found" });
+      return true;
+    }
+    try {
+      const tree = deps.obligations.getTree(id);
+      sendJson(res, 200, tree);
+    } catch (err) {
+      sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+    }
+    return true;
+  }
+
+  // GET /api/mesh/obligations/:id — single obligation with parent + children + blockingChildren
+  const obligationMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)$/);
+  if (obligationMatch) {
+    if (!deps.obligations) {
+      sendJson(res, 503, { error: "obligations data unavailable" });
+      return true;
+    }
+    const id = decodeURIComponent(obligationMatch[1]);
+    const obligation = deps.obligations.get(id);
+    if (!obligation) {
+      sendJson(res, 404, { error: "obligation not found" });
+      return true;
+    }
+    const limit = clampLimit(url);
+    const offset = parsePositiveInt(url, "offset") ?? 0;
+    const children = deps.obligations.listChildrenPage(id, { limit, offset });
+    const blockingChildren = deps.obligations.listChildrenPage(id, {
+      limit,
+      offset: 0,
+      blockingOnly: true,
+    });
+    const parent = obligation.parentId ? deps.obligations.get(obligation.parentId) : null;
+    sendJson(res, 200, {
+      obligation,
+      parent,
+      children: children.obligations,
+      blockingChildren: blockingChildren.obligations,
+    });
+    return true;
+  }
+
+  // GET /api/mesh/stream?actors= — SSE: all mesh_event, live_output for `actors`.
+  if (pathname === "/api/mesh/stream") {
+    const actors = parseActors(url);
+    sseHub.addConnection(res, actors.length > 0 ? new Set(actors) : null);
+    return true;
+  }
+
+  sendJson(res, 404, { error: "unknown mesh endpoint" });
+  return true;
+}

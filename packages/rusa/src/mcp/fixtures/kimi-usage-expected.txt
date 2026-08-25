@@ -1,0 +1,6 @@
+Kimi Code Platform Usage
+
+5h limit       [██████████████░░░░░░] 72% left (resets 3h 10m)
+Weekly limit   [██████████░░░░░░░░░░] 50% left (resets 2 days, 22 hours)
+
+This display is separate from Open Platform API quotas.

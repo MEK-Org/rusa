@@ -1,0 +1,24 @@
+{
+  "private": true,
+  "name": "rusa-workspace",
+  "packageManager": "pnpm@10.29.3",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "start": "node packages/rusa/scripts/start.mjs quickstart",
+    "e2e": "pnpm --filter ./packages/rusa run e2e",
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "cli": "RUSA_TSUP_PRESERVE_DIST=1 pnpm --filter ./packages/rusa exec tsup --silent && RUSA_HOME=${RUSA_HOME:-$HOME/.rusa-test} node packages/rusa/dist/cli.js",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "typecheck": "pnpm -r typecheck",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.5",
+    "husky": "^9.1.7",
+    "typescript": "^5.9.3"
+  }
+}

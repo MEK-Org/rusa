@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Commitment Ledger Sample Report</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f7f8fa;
+        color: #1f2937;
+      }
+      body {
+        margin: 0;
+        padding: 32px;
+      }
+      main {
+        max-width: 1180px;
+        margin: 0 auto;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 28px;
+        font-weight: 700;
+      }
+      .meta {
+        margin: 0 0 24px;
+        color: #4b5563;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        background: #ffffff;
+        border: 1px solid #d1d5db;
+      }
+      th,
+      td {
+        padding: 10px 12px;
+        border-bottom: 1px solid #e5e7eb;
+        text-align: left;
+        vertical-align: top;
+      }
+      th {
+        background: #eef2f7;
+        color: #111827;
+        font-size: 12px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      tbody tr:last-child td {
+        border-bottom: 0;
+      }
+      .new-row td {
+        background: #fff7d6;
+      }
+      .empty-row td {
+        color: #4b5563;
+        font-style: italic;
+        text-align: center;
+      }
+      td:nth-child(5),
+      td:nth-child(8) {
+        white-space: nowrap;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Commitment Ledger Spike Report</h1>
+      <p class="meta">Generated 2026-06-30T12:00:00.000Z with minimum confidence 0.70.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Status</th>
+            <th>Kind</th>
+            <th>Owner</th>
+            <th>Subject</th>
+            <th>Source</th>
+            <th>Waiting on</th>
+            <th>Confidence</th>
+            <th>Owner expects retirement</th>
+            <th>Reason</th>
+            <th>Age</th>
+          </tr>
+        </thead>
+        <tbody>
+        <tr>
+          <td>open</td>
+          <td>request_commitment</td>
+          <td>cloudy-porpoise</td>
+          <td>Operator ask: turn observability into a drive-to-done report</td>
+          <td>message:mesh-message:operator-ask-dropped</td>
+          <td>observability lead follow-through</td>
+          <td>1.00</td>
+          <td></td>
+          <td>Request commitment is registered and still needs its owner to drive it to done.</td>
+          <td>4h</td>
+        </tr>
+        <tr>
+          <td>open</td>
+          <td>actor_completion</td>
+          <td>steward</td>
+          <td>done-worker</td>
+          <td>mesh_event:done-yield</td>
+          <td>steward retirement</td>
+          <td>0.95</td>
+          <td>yes</td>
+          <td>Actor yielded complete and remains active while its owner is expected to retire it.</td>
+          <td>12h</td>
+        </tr>
+        <tr>
+          <td>open</td>
+          <td>failed_run</td>
+          <td>steward</td>
+          <td>failed-worker</td>
+          <td>mesh_event:failed-end</td>
+          <td></td>
+          <td>0.90</td>
+          <td></td>
+          <td>Actor had a failed or capped run with no later run start.</td>
+          <td>30m</td>
+        </tr>
+        </tbody>
+      </table>
+    </main>
+  </body>
+</html>

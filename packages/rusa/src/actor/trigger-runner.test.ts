@@ -1,0 +1,71 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TriggerRunner } from "./trigger-runner.js";
+
+const flush = async () => {
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+};
+
+describe("TriggerRunner", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("coalesces pre-run nudges without retaining content", async () => {
+    const runs: unknown[] = [];
+    const runner = new TriggerRunner({
+      debounceMs: 10,
+      run: async (nudge) => void runs.push(nudge),
+    });
+    runner.requestRun();
+    runner.requestRun({ priority: "responsive" });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(runs).toEqual([{ priority: "responsive", mode: "ordinary" }]);
+  });
+
+  it("retains one dirty follow-up while a run is active", async () => {
+    let release!: () => void;
+    const runs: unknown[] = [];
+    const runner = new TriggerRunner({
+      debounceMs: 10,
+      run: async (nudge) => {
+        runs.push(nudge);
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      },
+    });
+    runner.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    runner.requestRun();
+    runner.requestRun();
+    release();
+    await flush();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(runs).toHaveLength(2);
+  });
+
+  it("quick-starts voice nudges", async () => {
+    const run = vi.fn(async () => {});
+    const runner = new TriggerRunner({ debounceMs: 30_000, run });
+    runner.requestRun({ priority: "responsive", voiceTimestamp: Date.now() });
+    await flush();
+    expect(run).toHaveBeenCalledOnce();
+  });
+
+  it("runs a content-free onIdle continuation", async () => {
+    const runs: unknown[] = [];
+    let continued = false;
+    const runner = new TriggerRunner({
+      debounceMs: 10,
+      run: async (nudge) => void runs.push(nudge),
+      onIdle: () => {
+        if (continued) return null;
+        continued = true;
+        return { mode: "yield-elicitation" };
+      },
+    });
+    runner.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    await flush();
+    expect(runs).toEqual([{}, { mode: "yield-elicitation" }]);
+  });
+});

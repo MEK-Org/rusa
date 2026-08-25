@@ -1,0 +1,18 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Flutter UI (Mock Data, Web Server)",
+      "type": "dart",
+      "request": "launch",
+      "cwd": "packages/rusa/flutter_dashboard",
+      "program": "lib/main.dart",
+      "deviceId": "web-server",
+      "toolArgs": ["--web-port", "8081"],
+      "args": [
+        "--dart-define=MC_USE_MOCK_DATA=true",
+        "--dart-define=MC_API_BASE_URL=http://localhost:9744"
+      ]
+    }
+  ]
+}

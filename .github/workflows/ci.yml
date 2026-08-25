@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master, staging]
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Checks
+    runs-on: ubuntu-latest
+    # Backstop so no single hung step can hold the required check (and every
+    # merge behind it) for GitHub's 6-hour default. A normal green run takes
+    # well under 15 minutes; anything past 30 is a hang, and failing fast makes
+    # it visible and re-runnable instead of silently blocking.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject NUL bytes in source files
+        run: |
+          files="$(
+            git ls-files -z -- \
+              '*.ts' '*.tsx' '*.js' '*.jsx' '*.json' '*.jsonc' '*.md' '*.css' '*.yml' '*.yaml' '*.dart' \
+              | perl -0ne '
+                chomp;
+                open my $fh, "<:raw", $_ or die "cannot read $_: $!";
+                local $/;
+                my $body = <$fh>;
+                print "$_\n" if index($body, "\0") >= 0;
+              '
+          )"
+          if [ -n "$files" ]; then
+            echo "NUL bytes found in tracked source files:"
+            echo "$files"
+            echo "Remove them with: tr -d '\\000' < file > file.tmp && mv file.tmp file"
+            exit 1
+          fi
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.29.3
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm lint
+
+      - run: pnpm typecheck
+
+      # Test-only host setup, deferred until after lint + typecheck pass so a
+      # fast-check failure never pays for the apt-get install or the suite.
+      # The runner's Azure Ubuntu mirror degrades two ways (both observed
+      # 2026-08-19): connections that never respond, and transfers at
+      # ~100 kB/s that can't finish an `apt-get update` inside a tight bound.
+      # So: first try installing straight from the image's existing package
+      # indexes (no index refresh needed when they're fresh enough), then
+      # fall back to bounded update+install attempts sized for the
+      # slow-but-alive mirror case.
+      # Acquire options make apt abandon a dead mirror connection after 30s
+      # and retry internally (observed 2026-08-19: even the 50 kB .deb fetch
+      # can stall on a dead connection after a successful update).
+      # DEBIAN_FRONTEND is belt-and-braces: nothing here prompts with -y, but
+      # it removes the interactive-prompt class entirely.
+      - name: Install bubblewrap
+        timeout-minutes: 17
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          if timeout 120 sudo -E apt-get $APT_OPTS install -y bubblewrap; then
+            exit 0
+          fi
+          for attempt in 1 2; do
+            if timeout 300 sudo -E apt-get $APT_OPTS update && timeout 120 sudo -E apt-get $APT_OPTS install -y bubblewrap; then
+              exit 0
+            fi
+            echo "apt attempt ${attempt} failed or timed out; retrying in 15s..."
+            sleep 15
+          done
+          echo "bubblewrap install failed after bounded attempts"
+          exit 1
+
+      - name: Enable unprivileged user namespaces (for real-bwrap tests)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - run: pnpm -r --if-present test

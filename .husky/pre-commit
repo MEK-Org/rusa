@@ -1,0 +1,53 @@
+# Pre-commit hook (see ISSUE_NUM). Design: the NUL-byte scan is env-independent and
+# cheap, so it is the ONE hard gate and runs unconditionally. Formatting and
+# typecheck require an installed tree (node_modules + a resolvable biome/pnpm)
+# and are re-run authoritatively by CI on every PR — so here they run only when
+# the toolchain is actually present and soft-skip with a warning otherwise.
+# Rationale: an env-only failure (uninstalled worker tree, PATH diff under git's
+# hook context) previously hard-failed the hook, training every actor to commit
+# `--no-verify` — a gate that teaches you to skip it is worse than no gate.
+
+# Format and re-stage only the files that are already staged, so the hook
+# honors the staged/unstaged boundary (not the whole tracked-modified tree).
+STAGED=$(git diff --cached --name-only --diff-filter=ACM -- \
+  '*.js' '*.jsx' '*.ts' '*.tsx' '*.json' '*.jsonc' '*.css' '*.md' '*.yml' '*.yaml' '*.dart')
+
+if [ -z "$STAGED" ]; then
+  exit 0
+fi
+
+# --- Hard gate: NUL-byte scan . Env-independent; always runs. ---
+# Uses `if perl …; then echo; fi` (not `perl … && echo`) so each loop iteration
+# — and thus the command substitution — exits 0 even when a file has no NUL.
+# The old `&&` form left the substitution's exit status non-zero on a clean
+# final file, which under husky's `set -e` aborted the hook before checks ran
+# (the "NUL-scan / set -e issue" in ISSUE_NUM).
+NUL_FILES=$(echo "$STAGED" | while IFS= read -r file; do
+  [ -f "$file" ] || continue
+  if perl -e 'local $/; open my $fh, "<:raw", $ARGV[0] or exit 1; exit(index(<$fh>, "\0") >= 0 ? 0 : 1)' "$file"; then
+    echo "$file"
+  fi
+done)
+if [ -n "$NUL_FILES" ]; then
+  echo "NUL bytes found in staged source files:"
+  echo "$NUL_FILES"
+  echo "Remove them with: tr -d '\\000' < file > file.tmp && mv file.tmp file"
+  exit 1
+fi
+
+# --- Soft gate: format only. Typecheck is intentionally NOT run here. ---
+# `tsc` requires a COMPLETE install. A present-but-incomplete node_modules
+# (common in worker sandboxes — e.g. a missing transitive dep like smol-toml)
+# makes typecheck fail for env reasons that are indistinguishable from a real
+# type error, so `[ -d node_modules ]` is not a reliable "can run it" probe.
+# That env-only failure is what trained the --no-verify habit . CI runs
+# `pnpm -r typecheck` authoritatively on every PR (master + staging), so that is
+# the real gate. Local biome format stays — it only needs the biome binary, not
+# a complete dependency graph — gated on biome being resolvable; a genuine lint
+# error still blocks (the gate working correctly), an absent binary soft-skips.
+if command -v biome >/dev/null 2>&1; then
+  echo "$STAGED" | xargs biome check --write --no-errors-on-unmatched
+  echo "$STAGED" | xargs git add
+else
+  echo "pre-commit: biome not resolvable (uninstalled tree / PATH) — skipping format; CI enforces it."
+fi

@@ -1,0 +1,18 @@
+[
+  {
+    "uncachedInput": 17,
+    "cacheRead": 23,
+    "output": 12,
+    "reasoning": 7,
+    "response": 5,
+    "model": "agy-fixture"
+  },
+  {
+    "uncachedInput": 19,
+    "cacheRead": 29,
+    "output": 15,
+    "reasoning": 6,
+    "response": 9,
+    "model": "agy-fixture"
+  }
+]

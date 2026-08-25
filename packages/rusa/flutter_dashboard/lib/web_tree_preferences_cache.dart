@@ -1,0 +1,64 @@
+import 'dart:convert';
+
+import 'package:web/web.dart' as web;
+
+import 'tree_preferences_cache.dart';
+
+/// Browser `localStorage` implementation of [TreePreferencesCache] .
+///
+/// Wraps all storage access so unreadable / disabled / corrupt storage
+/// degrades cleanly to defaults without crashing the dashboard.
+class WebTreePreferencesCache implements TreePreferencesCache {
+  static const String _collapsedKey = 'rusa.dashboard.tree.collapsed.v1';
+  static const String _showRetiredKey = 'rusa.dashboard.tree.show_retired.v1';
+
+  @override
+  Set<String>? loadCollapsed() {
+    try {
+      final raw = web.window.localStorage.getItem(_collapsedKey);
+      if (raw == null || raw.isEmpty) return null;
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return null;
+      return decoded.map((e) => e.toString()).toSet();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  void saveCollapsed(Set<String> collapsed) {
+    try {
+      web.window.localStorage.setItem(_collapsedKey, jsonEncode(collapsed.toList()));
+    } catch (_) {
+      // Best-effort: failed write is swallowed.
+    }
+  }
+
+  @override
+  bool? loadShowRetired() {
+    try {
+      final raw = web.window.localStorage.getItem(_showRetiredKey);
+      if (raw == null || raw.isEmpty) return null;
+      return raw == 'true';
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  void saveShowRetired(bool showRetired) {
+    try {
+      web.window.localStorage.setItem(_showRetiredKey, showRetired.toString());
+    } catch (_) {
+      // Best-effort.
+    }
+  }
+
+  @override
+  void clear() {
+    try {
+      web.window.localStorage.removeItem(_collapsedKey);
+      web.window.localStorage.removeItem(_showRetiredKey);
+    } catch (_) {}
+  }
+}

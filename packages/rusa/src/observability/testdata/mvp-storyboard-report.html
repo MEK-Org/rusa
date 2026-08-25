@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Commitment Ledger MVP Storyboard</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f7f8fa;
+        color: #1f2937;
+      }
+      body {
+        margin: 0;
+        padding: 32px;
+      }
+      main {
+        max-width: 1180px;
+        margin: 0 auto;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 28px;
+        font-weight: 700;
+      }
+      h2 {
+        margin: 32px 0 8px;
+        font-size: 20px;
+      }
+      p,
+      li {
+        line-height: 1.5;
+      }
+      .meta {
+        margin: 0 0 24px;
+        color: #4b5563;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        background: #ffffff;
+        border: 1px solid #d1d5db;
+      }
+      th,
+      td {
+        padding: 10px 12px;
+        border-bottom: 1px solid #e5e7eb;
+        text-align: left;
+        vertical-align: top;
+      }
+      th {
+        background: #eef2f7;
+        color: #111827;
+        font-size: 12px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      tbody tr:last-child td {
+        border-bottom: 0;
+      }
+      .new-row td {
+        background: #fff7d6;
+      }
+      .empty-row td {
+        color: #4b5563;
+        font-style: italic;
+        text-align: center;
+      }
+      td:nth-child(5),
+      td:nth-child(8) {
+        white-space: nowrap;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Commitment Ledger MVP Storyboard</h1>
+      <p class="meta">Generated 2026-07-01T23:30:00.000Z.</p>
+      <p>A deterministic vertical slice of the ledger as an observe-and-route surface: registered work appears, stale ownership becomes visible, and rows dissolve only after the owner acts.</p>
+      <section id="t0">
+        <h2>T0 healthy - 2026-06-30T18:00:00.000Z</h2>
+        <p>The standing root and cron actors are producing normal progress, and the ledger is empty. This is the false-positive guard made visible.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Status</th>
+            <th>Kind</th>
+            <th>Owner</th>
+            <th>Subject</th>
+            <th>Source</th>
+            <th>Waiting on</th>
+            <th>Confidence</th>
+            <th>Owner expects retirement</th>
+            <th>Reason</th>
+            <th>Age</th>
+          </tr>
+        </thead>
+        <tbody>
+        <tr class="empty-row">
+          <td colspan="10">No open commitment rows.</td>
+        </tr>
+        </tbody>
+      </table>
+      </section>
+      <section id="t1">
+        <h2>T1 registered - 2026-06-30T18:45:00.000Z</h2>
+        <p>Two Matt-asks have been acknowledged with Tracking lines, so the ledger can show owner, done-when, and age immediately instead of relying on Matt to remember.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Status</th>
+            <th>Kind</th>
+            <th>Owner</th>
+            <th>Subject</th>
+            <th>Source</th>
+            <th>Waiting on</th>
+            <th>Confidence</th>
+            <th>Owner expects retirement</th>
+            <th>Reason</th>
+            <th>Age</th>
+          </tr>
+        </thead>
+        <tbody>
+        <tr class="new-row">
+          <td>open</td>
+          <td>request_commitment</td>
+          <td>root-actor</td>
+          <td>Operator ask: close issue #530 after verifying it is complete</td>
+          <td>message:happy-tracking</td>
+          <td>root-actor -&gt; issue #530 closed</td>
+          <td>1.00</td>
+          <td></td>
+          <td>Request commitment is registered and still needs its owner to drive it to done.</td>
+          <td>25m</td>
+        </tr>
+        <tr class="new-row">
+          <td>open</td>
+          <td>request_commitment</td>
+          <td>root-actor</td>
+          <td>Operator ask: can we mark issue #531 complete?</td>
+          <td>message:issue-531-tracking</td>
+          <td>root-actor -&gt; issue #531 closed</td>
+          <td>1.00</td>
+          <td></td>
+          <td>Request commitment is registered and still needs its owner to drive it to done.</td>
+          <td>5m</td>
+        </tr>
+        </tbody>
+      </table>
+      </section>
+      <section id="t2">
+        <h2>T2 the slip - 2026-07-01T22:10:00.000Z</h2>
+        <p>Mocked time jumps forward: one ask dissolved because root drove it to done, while #531 is still open after 27h 30m. A single mechanical row is present but does not crowd the Matt-ask.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Status</th>
+            <th>Kind</th>
+            <th>Owner</th>
+            <th>Subject</th>
+            <th>Source</th>
+            <th>Waiting on</th>
+            <th>Confidence</th>
+            <th>Owner expects retirement</th>
+            <th>Reason</th>
+            <th>Age</th>
+          </tr>
+        </thead>
+        <tbody>
+        <tr>
+          <td>open</td>
+          <td>request_commitment</td>
+          <td>root-actor</td>
+          <td>Operator ask: can we mark issue #531 complete?</td>
+          <td>message:issue-531-tracking</td>
+          <td>root-actor -&gt; issue #531 closed</td>
+          <td>1.00</td>
+          <td></td>
+          <td>Request commitment is registered and still needs its owner to drive it to done.</td>
+          <td>1d 3h 30m</td>
+        </tr>
+        <tr class="new-row">
+          <td>open</td>
+          <td>actor_completion</td>
+          <td>root-actor</td>
+          <td>review-worker</td>
+          <td>mesh_event:review-worker-yield</td>
+          <td>root retire review-worker</td>
+          <td>0.95</td>
+          <td>yes</td>
+          <td>Actor yielded complete and remains active while its owner is expected to retire it.</td>
+          <td>7h</td>
+        </tr>
+        </tbody>
+      </table>
+      </section>
+      <section id="t3">
+        <h2>T3 driven to done - 2026-07-01T22:12:00.000Z</h2>
+        <p>Root acts on the routed attention and records the completion, then retires the finished worker. The report returns to empty because owners acted; the ledger only observed and routed.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Status</th>
+            <th>Kind</th>
+            <th>Owner</th>
+            <th>Subject</th>
+            <th>Source</th>
+            <th>Waiting on</th>
+            <th>Confidence</th>
+            <th>Owner expects retirement</th>
+            <th>Reason</th>
+            <th>Age</th>
+          </tr>
+        </thead>
+        <tbody>
+        <tr class="empty-row">
+          <td colspan="10">No open commitment rows.</td>
+        </tr>
+        </tbody>
+      </table>
+      </section>
+      <section id="known-gaps">
+        <h2>Known Gaps</h2>
+        <ul>
+          <li>The 2026-07-01 21:35Z mesh restart killed kickoff runs while the registry still showed actors active. The current four divergence classes would miss that for up to 24h because run_start is treated as progress; a future interrupted_run rule should flag run_start with no run_end or yield after roughly 30-60 minutes.</li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
