@@ -308,34 +308,6 @@ function resolveResetAtIso(
   return undefined;
 }
 
-/**
- * The Codex-specific clause of the LLM quota parse prompt. Extracted (and named)
- * so the placeholder contract from issue #8 is a testable, regression-locked unit
- * rather than an anonymous slice of a ternary.
- *
- * The key property: codex's `/status` frequently renders
- * `Limits: refresh requested; run /status again shortly.` — an async-refresh
- * PLACEHOLDER, not a reading. The parser must classify it as a known pending /
- * no-data state (emit `placeholder: true`, no number), NEVER as a real reading
- * and NEVER as a parse error. The host-side probe now retries /status on this
- * placeholder (see providers/codex-status-scrape.ts), so a real table usually
- * reaches the parser; when only the placeholder ever renders, this contract keeps
- * the parse honest instead of fabricating or failing.
- */
-export const CODEX_QUOTA_PARSE_GUIDANCE =
-  "For Codex: a real reading contains limit rows (e.g. '5h limit:', 'Weekly limit:') " +
-  "or an explicit exhaustion message (\"You've hit your usage limit\" / 'hit your usage limit'). " +
-  `If it contains "You've hit your usage limit" or "hit your usage limit", ` +
-  "status is 'exhausted'; extract per-window (5h, Weekly) percentages and reset times (including from 'try again at <date/time>'). " +
-  'KNOWN PENDING STATE: codex\'s /status can render "Limits: refresh requested; run /status again shortly" ' +
-  '(or "run /status again") — this is codex\'s async-refresh PLACEHOLDER, NOT a reading and NOT a parse error. ' +
-  "Emit that window with placeholder: true and no usedPercent; do NOT guess a number and do NOT fail the parse. " +
-  "status is 'unknown' when every window is such a placeholder. " +
-  "If the output contains none of the above — no limit rows, no exhaustion message, no refresh placeholder — " +
-  "return status='unknown' and windows=[]. " +
-  "For standard 5h and Weekly limits, scope is 'provider'. " +
-  "For specific model limits (e.g. GPT-5.3-Codex-Spark limit), scope is 'model'.\n";
-
 async function parseQuotaWithLlm(
   output: string,
   apiKey: string,
@@ -376,7 +348,25 @@ async function parseQuotaWithLlm(
         "If any provider-wide window is 100% used or the output says 'rate limit exceeded' or 'limit exceeded', " +
         "status is 'exhausted'. Set scope to 'provider'.\n"
       : provider === "codex"
-        ? CODEX_QUOTA_PARSE_GUIDANCE
+        ? // A real reading has limit rows or an exhaustion banner. codex's /status
+          // also frequently renders `Limits: refresh requested; run /status again
+          // shortly` — an async-refresh PLACEHOLDER, not a reading (issue #8). The
+          // host probe now retries /status in-session on it, so a real table usually
+          // reaches the parser; when only the placeholder renders, classify it as a
+          // known pending/no-data state — unknown with windows=[] — never a number,
+          // never a parse error, and never an invented window (the placeholder names
+          // no 5h/weekly window to label, and downstream drops placeholder windows
+          // anyway, so emitting one would only force the model to guess label/kind).
+          "For Codex: a real reading contains limit rows (e.g. '5h limit:', 'Weekly limit:') " +
+          "or an explicit exhaustion message (\"You've hit your usage limit\" / 'hit your usage limit'). " +
+          `If it contains "You've hit your usage limit" or "hit your usage limit", ` +
+          "status is 'exhausted'; extract per-window (5h, Weekly) percentages and reset times (including from 'try again at <date/time>'). " +
+          'KNOWN PENDING STATE: codex\'s /status can render "Limits: refresh requested; run /status again shortly" ' +
+          '(or "run /status again") — codex\'s async-refresh placeholder, NOT a reading and NOT a parse error. ' +
+          "When that placeholder is all that renders, return status='unknown' and windows=[] — do NOT guess a number, do NOT fail the parse, and do NOT emit an invented window for it. " +
+          "Likewise, if the output contains none of the above — no limit rows, no exhaustion message, no refresh placeholder — return status='unknown' and windows=[]. " +
+          "For standard 5h and Weekly limits, scope is 'provider'. " +
+          "For specific model limits (e.g. GPT-5.3-Codex-Spark limit), scope is 'model'.\n"
         : provider === "agy"
           ? "For agy: locate the 'GEMINI MODELS' section, which has a Weekly Limit and a " +
             "Five Hour Limit window. " +

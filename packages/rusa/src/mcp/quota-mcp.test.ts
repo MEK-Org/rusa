@@ -29,7 +29,6 @@ import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers
 import { buildActorBwrapArgs } from "../providers/sandbox.js";
 import type { CodingProvider } from "../providers/types.js";
 import {
-  CODEX_QUOTA_PARSE_GUIDANCE,
   createQuotaMcpServer,
   inferQuotaState,
   type ProviderQuotaSnapshot,
@@ -69,27 +68,6 @@ describe("quota MCP server", () => {
       const parsed = await parseCodexQuota(output);
       expect(parsed.status).toBe("unknown");
       expect(parsed.message).toBe("no geminiApiKey configured for LLM quota parsing");
-    });
-  });
-
-  describe("CODEX_QUOTA_PARSE_GUIDANCE (issue #8 placeholder contract)", () => {
-    it("names the refresh-requested render as a known pending/no-data placeholder", () => {
-      // The classic codex /status placeholder text is called out verbatim.
-      expect(CODEX_QUOTA_PARSE_GUIDANCE).toContain("refresh requested");
-      expect(CODEX_QUOTA_PARSE_GUIDANCE).toContain("run /status again");
-      expect(CODEX_QUOTA_PARSE_GUIDANCE).toContain("placeholder: true");
-    });
-
-    it("forbids treating the placeholder as a real reading or a parse error", () => {
-      // Never fabricate a number ...
-      expect(CODEX_QUOTA_PARSE_GUIDANCE).toContain("do NOT guess a number");
-      // ... and never surface it as a parse failure.
-      expect(CODEX_QUOTA_PARSE_GUIDANCE).toContain("do NOT fail the parse");
-      expect(CODEX_QUOTA_PARSE_GUIDANCE).toContain("NOT a reading and NOT a parse error");
-    });
-
-    it("still returns unknown/[] when nothing recognizable rendered", () => {
-      expect(CODEX_QUOTA_PARSE_GUIDANCE).toContain("return status='unknown' and windows=[]");
     });
   });
 
@@ -196,19 +174,30 @@ describe("quota MCP server", () => {
       });
     });
 
-    it("scopes the Codex LLM prompt to the Codex quota clause", async () => {
+    it("scopes the Codex LLM prompt to the Codex quota clause, incl. the issue #8 placeholder contract", async () => {
       mockGenerateContent.mockResolvedValue({
         text: () => JSON.stringify({ status: "unknown", windows: [] }),
       });
 
       await parseCodexQuota("Limits: refresh requested; run /status again shortly.", "test-key");
 
+      // The placeholder contract from issue #8 lives in the assembled prompt (there
+      // is no separate exported constant to assert against): the guidance is only
+      // meaningful if it is actually wired into the systemInstruction sent to Gemini.
       const systemInstruction = lastSystemInstruction();
       expect(systemInstruction).toContain("You are a precise quota parser");
       expect(systemInstruction).toContain("GROUNDING REQUIREMENT");
       expect(systemInstruction).toContain("For Codex:");
       expect(systemInstruction).toContain("refresh requested");
       expect(systemInstruction).toContain("run /status again shortly");
+      // Placeholder contract: named as a known pending state, classified as
+      // unknown/windows=[], and never fabricated, failed, or turned into an
+      // invented window.
+      expect(systemInstruction).toContain("NOT a reading and NOT a parse error");
+      expect(systemInstruction).toContain("return status='unknown' and windows=[]");
+      expect(systemInstruction).toContain("do NOT guess a number");
+      expect(systemInstruction).toContain("do NOT fail the parse");
+      expect(systemInstruction).toContain("do NOT emit an invented window");
       expect(systemInstruction).toContain("The current local time");
       expect(systemInstruction).not.toContain("For Claude:");
       expect(systemInstruction).not.toContain("For agy:");
