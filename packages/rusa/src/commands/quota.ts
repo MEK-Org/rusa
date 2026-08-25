@@ -35,7 +35,7 @@ export async function runQuotaMigrate(opts: RunQuotaMigrateOptions): Promise<voi
     }
     sourceNames.add(source.sourceInstance);
   }
-  const store = new SharedQuotaStore(destination, "quota-migration");
+  const store = new SharedQuotaStore(destination);
   try {
     for (const source of sources) {
       const report = store.importLegacyDatabase(source.databasePath, source.sourceInstance);

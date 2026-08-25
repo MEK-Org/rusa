@@ -9,7 +9,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Actor } from "../actor/actor.js";
 import {
@@ -854,10 +854,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const workersDir = join(mcHome, "workers");
   mkdirSync(workersDir, { recursive: true });
   const sharedQuotaStore = config.quota?.databasePath
-    ? new SharedQuotaStore(
-        resolveQuotaDatabasePath(config.quota.databasePath, mcHome),
-        config.rootActor?.handle ?? basename(mcHome)
-      )
+    ? new SharedQuotaStore(resolveQuotaDatabasePath(config.quota.databasePath, mcHome))
     : null;
   sharedQuotaStore?.configureController({
     maxIntervalSeconds: config.quota?.throttle?.maxIntervalSeconds ?? 3600,
@@ -1025,8 +1022,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     let pacer = providerPacers.get(providerName);
     if (!pacer) {
       pacer = new ProviderPacer(0);
-      const sharedLastStart = sharedQuotaStore?.latestNormalStartMillis(providerName);
-      if (sharedLastStart != null) pacer.hydrateLastStartedAt(sharedLastStart);
       providerPacers.set(providerName, pacer);
     }
     return pacer;
@@ -1364,11 +1359,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         responsive: request.responsive,
         threadId: request.threadId,
         enqueueNormal: request.enqueueNormal,
-        claimStart:
-          sharedQuotaStore && quotaThrottleEnabled
-            ? () =>
-                sharedQuotaStore.claimNormalProviderStart(providerThrottleKey(providerName, config))
-            : undefined,
       }),
     isHalted: isProviderHalted,
     isShuttingDown: () => gracefulShutdown.isShuttingDown(),

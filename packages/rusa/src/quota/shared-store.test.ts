@@ -81,7 +81,7 @@ describe("SharedQuotaStore canonical observations", () => {
   it("uses the compact schema and prunes raw scrape payloads after 30 days", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-retention-"));
     roots.push(root);
-    const store = new SharedQuotaStore(join(root, "shared.db"), "test");
+    const store = new SharedQuotaStore(join(root, "shared.db"));
     const now = Date.now();
     try {
       const expiredId = store.recordRaw({
@@ -119,17 +119,22 @@ describe("SharedQuotaStore canonical observations", () => {
         )
       ).not.toContain("inferred_parsed_state");
       expect(
+        (store.db.prepare("PRAGMA table_info(quota_scrapes)").all() as Array<{ name: string }>).map(
+          (column) => column.name
+        )
+      ).not.toContain("source_instance");
+      expect(
+        (
+          store.db.prepare("PRAGMA table_info(quota_observations)").all() as Array<{ name: string }>
+        ).map((column) => column.name)
+      ).not.toContain("source_instance");
+      expect(
         (
           store.db
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
             .all() as Array<{ name: string }>
         ).map((row) => row.name)
-      ).toEqual([
-        "quota_bucket_state",
-        "quota_observations",
-        "quota_provider_pacing",
-        "quota_scrapes",
-      ]);
+      ).toEqual(["quota_observations", "quota_scrapes"]);
     } finally {
       store.close();
     }
@@ -138,7 +143,7 @@ describe("SharedQuotaStore canonical observations", () => {
   it("repairs legacy missing scopes without splitting keys by model labels", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-legacy-scope-"));
     roots.push(root);
-    const store = new SharedQuotaStore(join(root, "shared.db"), "test");
+    const store = new SharedQuotaStore(join(root, "shared.db"));
     const state: ProviderQuotaSnapshot = {
       provider: "claude",
       status: "available",
@@ -196,18 +201,14 @@ describe("SharedQuotaStore migration", () => {
         resetAtIso: "2026-08-29T12:00:00.000Z",
       },
     ]);
-    const store = new SharedQuotaStore(join(root, "shared.db"), "test");
+    const store = new SharedQuotaStore(join(root, "shared.db"));
     try {
       store.importLegacyDatabase(weak, "staging");
       store.importLegacyDatabase(strong, "production");
       expect(store.importLegacyDatabase(strong, "production").insertedRows).toBe(0);
       const selected = store.listCanonicalSince("agy", "2026-08-25T00:00:00.000Z");
       expect(selected).toHaveLength(1);
-      expect(selected[0]?.sourceInstance).toBe("production");
       expect(selected[0]?.resetAtIso).toBe("2026-08-29T12:00:00.000Z");
-      expect(
-        (store.db.prepare("SELECT count(*) AS n FROM quota_bucket_state").get() as { n: number }).n
-      ).toBe(0);
     } finally {
       store.close();
     }
@@ -218,7 +219,7 @@ describe("SharedQuotaStore persisted controller", () => {
   it("keeps exhaustion out of throttle decisions and resumes from the prior period", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-controller-"));
     roots.push(root);
-    const store = new SharedQuotaStore(join(root, "shared.db"), "test");
+    const store = new SharedQuotaStore(join(root, "shared.db"));
     try {
       store.configureController({ maxIntervalSeconds: 3600 });
       recordObservation(
@@ -269,25 +270,23 @@ describe("SharedQuotaStore persisted controller", () => {
     }
   });
 
-  it("persists one shared controller and atomically spaces starts across connections", () => {
+  it("shares learned controller state across connections without storing launch timing", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-connections-"));
     roots.push(root);
     const path = join(root, "shared.db");
-    const first = new SharedQuotaStore(path, "production");
-    const second = new SharedQuotaStore(path, "staging");
+    const first = new SharedQuotaStore(path);
+    const second = new SharedQuotaStore(path);
     try {
       first.configureController({ maxIntervalSeconds: 3600 });
       recordObservation(first, "agy", "2030-01-01T00:00:00.000Z", 50, "2030-01-08T00:00:00.000Z");
-      const intervalMs = (second.getProviderThrottle("agy")?.intervalSeconds ?? 0) * 1000;
-      expect(intervalMs).toBeGreaterThan(0);
-      const startedAt = Date.parse("2030-01-01T00:01:00.000Z");
-      expect(first.claimNormalProviderStart("agy", startedAt)).toBeNull();
-      expect(second.claimNormalProviderStart("agy", startedAt)).toBe(startedAt + intervalMs);
-      expect(second.claimNormalProviderStart("agy", startedAt + intervalMs)).toBeNull();
+      expect(second.getProviderThrottle("agy")?.intervalSeconds).toBeGreaterThan(0);
       expect(
-        (first.db.prepare("SELECT count(*) AS n FROM quota_provider_pacing").get() as { n: number })
-          .n
-      ).toBe(1);
+        (
+          first.db
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .all() as Array<{ name: string }>
+        ).map((row) => row.name)
+      ).toEqual(["quota_observations", "quota_scrapes"]);
     } finally {
       second.close();
       first.close();
