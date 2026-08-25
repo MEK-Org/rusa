@@ -2,21 +2,37 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { describe, expect, it } from "vitest";
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
 import {
-  buildPersistedQuotaHistory,
   buildQuotaHistory,
   buildQuotaSnapshot,
   handleQuotaApiRequest,
   type QuotaApiDeps,
+  type QuotaHistorySource,
 } from "./quota-api.js";
 
-describe("buildPersistedQuotaHistory", () => {
+function historyPoint(
+  overrides: Partial<QuotaHistorySource> & Pick<QuotaHistorySource, "observedAt" | "percentLeft">
+): QuotaHistorySource {
+  return {
+    bucketKey: "shared:claude:provider:weekly",
+    scope: "provider",
+    kind: "weekly",
+    label: "Weekly",
+    resetAtIso: null,
+    controllerError: null,
+    intervalSeconds: null,
+    ...overrides,
+  };
+}
+
+describe("buildQuotaHistory", () => {
   it("uses stored decisions and leaves exhausted evidence without a synthetic interval", () => {
     expect(
-      buildPersistedQuotaHistory(
+      buildQuotaHistory(
         "claude",
         [
           {
             bucketKey: "pool:claude:provider:weekly",
+            scope: "provider",
             kind: "weekly",
             label: "Weekly",
             observedAt: "2030-01-01T00:00:00.000Z",
@@ -27,6 +43,7 @@ describe("buildPersistedQuotaHistory", () => {
           },
           {
             bucketKey: "pool:claude:provider:weekly",
+            scope: "provider",
             kind: "weekly",
             label: "Weekly",
             observedAt: "2030-01-07T23:00:00.000Z",
@@ -179,34 +196,14 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
       listHistory: (provider, sinceIso) => {
         calls.push({ provider, sinceIso });
         return [
-          {
-            scrapedAt: "2026-07-25T21:00:00.000Z",
-            inferredParsedState: {
-              ...claudeState,
-              scrapedAt: "2026-07-25T21:00:00.000Z",
-              limits: [
-                {
-                  label: "Weekly",
-                  kind: "weekly",
-                  percentLeft: 80,
-                },
-              ],
-            },
-          },
-          {
-            scrapedAt: "2026-07-26T19:00:00.000Z",
-            inferredParsedState: {
-              ...claudeState,
-              scrapedAt: "2026-07-26T19:00:00.000Z",
-              limits: [
-                {
-                  label: "Weekly",
-                  kind: "weekly",
-                  percentLeft: 62,
-                },
-              ],
-            },
-          },
+          historyPoint({
+            observedAt: "2026-07-25T21:00:00.000Z",
+            percentLeft: 80,
+          }),
+          historyPoint({
+            observedAt: "2026-07-26T19:00:00.000Z",
+            percentLeft: 62,
+          }),
         ];
       },
     });
@@ -270,29 +267,19 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
       providers: ["codex"],
       now: () => now,
       listHistory: () => [
-        {
-          scrapedAt: "2026-07-26T19:00:00.000Z",
-          inferredParsedState: {
-            ...current,
-            limits: [
-              {
-                label: "Weekly limit",
-                kind: "weekly",
-                percentLeft: 68,
-              },
-              {
-                label: "Weekly",
-                kind: "weekly",
-                percentLeft: 10,
-              },
-              {
-                label: "5h",
-                kind: "five_hour",
-                percentLeft: 25,
-              },
-            ],
-          },
-        },
+        historyPoint({
+          bucketKey: "shared:codex:provider:weekly",
+          label: "Weekly limit",
+          observedAt: "2026-07-26T19:00:00.000Z",
+          percentLeft: 68,
+        }),
+        historyPoint({
+          bucketKey: "shared:codex:provider:five_hour",
+          kind: "five_hour",
+          label: "5h",
+          observedAt: "2026-07-26T19:00:00.000Z",
+          percentLeft: 25,
+        }),
       ],
     });
 
@@ -344,40 +331,26 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
       providers: ["codex"],
       now: () => now,
       listHistory: () => [
-        {
-          scrapedAt: "2026-07-26T18:00:00.000Z",
-          inferredParsedState: {
-            ...current,
-            limits: [
-              {
-                label: "Weekly (model-specific)",
-                kind: "weekly",
-                scope: "model",
-                percentLeft: 20,
-              },
-              {
-                label: "Weekly (all models)",
-                kind: "weekly",
-                scope: "provider",
-                percentLeft: 68,
-              },
-            ],
-          },
-        },
-        {
-          scrapedAt: "2026-07-26T19:00:00.000Z",
-          inferredParsedState: {
-            ...current,
-            limits: [
-              {
-                label: "Weekly (model-specific)",
-                kind: "weekly",
-                scope: "model",
-                percentLeft: 10,
-              },
-            ],
-          },
-        },
+        historyPoint({
+          bucketKey: "shared:codex:model:weekly",
+          scope: "model",
+          label: "Weekly (model-specific)",
+          observedAt: "2026-07-26T18:00:00.000Z",
+          percentLeft: 20,
+        }),
+        historyPoint({
+          bucketKey: "shared:codex:provider:weekly",
+          label: "Weekly (all models)",
+          observedAt: "2026-07-26T18:00:00.000Z",
+          percentLeft: 68,
+        }),
+        historyPoint({
+          bucketKey: "shared:codex:model:weekly",
+          scope: "model",
+          label: "Weekly (model-specific)",
+          observedAt: "2026-07-26T19:00:00.000Z",
+          percentLeft: 10,
+        }),
       ],
     });
 
@@ -411,36 +384,18 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
       providers: ["codex"],
       now: () => now,
       listHistory: () => [
-        {
-          scrapedAt: "2026-07-26T18:00:00.000Z",
-          inferredParsedState: {
-            provider: "codex",
-            status: "available",
-            limits: [
-              {
-                label: "Weekly (all models)",
-                kind: "weekly",
-                scope: "provider",
-                percentLeft: 72,
-              },
-            ],
-          },
-        },
-        {
-          scrapedAt: "2026-07-26T19:00:00.000Z",
-          inferredParsedState: {
-            provider: "codex",
-            status: "available",
-            limits: [
-              {
-                label: "Weekly (all models)",
-                kind: "weekly",
-                scope: "provider",
-                percentLeft: 65,
-              },
-            ],
-          },
-        },
+        historyPoint({
+          bucketKey: "shared:codex:provider:weekly",
+          label: "Weekly (all models)",
+          observedAt: "2026-07-26T18:00:00.000Z",
+          percentLeft: 72,
+        }),
+        historyPoint({
+          bucketKey: "shared:codex:provider:weekly",
+          label: "Weekly (all models)",
+          observedAt: "2026-07-26T19:00:00.000Z",
+          percentLeft: 65,
+        }),
       ],
     });
 
@@ -775,170 +730,80 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
     expect(claude?.windows.every((w) => w.scrapedAt === null)).toBe(true);
   });
 
-  it("history ignores failed, out-of-window, and future scrape rows", () => {
+  it("history ignores non-provider buckets, short windows, and observations outside the range", () => {
     const series = buildQuotaHistory(
       "codex",
       [
-        {
-          scrapedAt: "2026-07-25T19:59:59.000Z",
-          inferredParsedState: codexState,
-        },
-        {
-          scrapedAt: "2026-07-25T21:00:00.000Z",
-          inferredParsedState: null,
-        },
-        {
-          scrapedAt: "2026-07-26T21:00:00.000Z",
-          inferredParsedState: codexState,
-        },
+        historyPoint({
+          observedAt: "2026-07-25T19:59:59.000Z",
+          percentLeft: 60,
+        }),
+        historyPoint({
+          scope: "model",
+          observedAt: "2026-07-25T21:00:00.000Z",
+          percentLeft: 55,
+        }),
+        historyPoint({
+          kind: "five_hour",
+          observedAt: "2026-07-25T22:00:00.000Z",
+          percentLeft: 50,
+        }),
+        historyPoint({
+          observedAt: "2026-07-26T21:00:00.000Z",
+          percentLeft: 45,
+        }),
       ],
       "2026-07-25T20:00:00.000Z",
-      "2026-07-26T20:00:00.000Z",
-      {
-        windowId: "weekly",
-        label: "Weekly limit",
-        poolKey: "weekly\u0000unspecified\u0000weekly limit",
-      }
+      "2026-07-26T20:00:00.000Z"
     );
 
     expect(series).toEqual([]);
   });
 
-  it("computes pace controller error = remainingPercent - timeRemainingPct when resetAtIso is present", () => {
-    // 7-day weekly window (604800000 ms)
+  it("uses the persisted controller error and interval instead of recomputing either", () => {
     const resetIso = "2026-07-30T00:00:00.000Z";
-    const resetMs = Date.parse(resetIso);
-    // Halfway through window: 3.5 days before reset -> timeRemainingPct = 50%
-    const observedMs = resetMs - 3.5 * 24 * 60 * 60 * 1000;
-    const observedIso = new Date(observedMs).toISOString();
-
-    // Fast burn: 30% quota remaining when 50% time remaining (underwater) -> error = -20%
-    const fastBurnState: ProviderQuotaSnapshot = {
-      provider: "claude",
-      status: "available",
-      limits: [
-        {
-          label: "Weekly",
-          kind: "weekly",
-          percentLeft: 30,
-          resetAtIso: resetIso,
-          scope: "provider",
-        },
-      ],
-    };
+    const observedIso = "2026-07-26T12:00:00.000Z";
 
     const series = buildQuotaHistory(
       "claude",
       [
-        {
-          scrapedAt: observedIso,
-          inferredParsedState: fastBurnState,
-        },
+        historyPoint({
+          observedAt: observedIso,
+          percentLeft: 30,
+          resetAtIso: resetIso,
+          controllerError: 20,
+          intervalSeconds: 1234,
+        }),
       ],
       "2026-07-20T00:00:00.000Z",
-      "2026-07-31T00:00:00.000Z",
-      {
-        windowId: "weekly",
-        label: "Weekly",
-        poolKey: "weekly\u0000provider\u0000weekly",
-      }
+      "2026-07-31T00:00:00.000Z"
     );
 
-    expect(series).toHaveLength(1);
-    expect(series[0].points).toHaveLength(1);
     expect(series[0].points[0]).toEqual({
       observedAt: observedIso,
       remainingPercent: 30,
       error: -20,
-      intervalSeconds: 0,
+      intervalSeconds: 1234,
       resetAtIso: resetIso,
     });
   });
 
-  it("computes positive pace controller error when burning slow (surplus quota)", () => {
-    // 7-day weekly window (604800000 ms)
-    const resetIso = "2026-07-30T00:00:00.000Z";
-    const resetMs = Date.parse(resetIso);
-    // Halfway through window: 3.5 days before reset -> timeRemainingPct = 50%
-    const observedMs = resetMs - 3.5 * 24 * 60 * 60 * 1000;
-    const observedIso = new Date(observedMs).toISOString();
-
-    // Slow burn: 70% quota remaining when 50% time remaining (surplus quota) -> error = +20%
-    const slowBurnState: ProviderQuotaSnapshot = {
-      provider: "claude",
-      status: "available",
-      limits: [
-        {
-          label: "Weekly",
-          kind: "weekly",
-          percentLeft: 70,
-          resetAtIso: resetIso,
-          scope: "provider",
-        },
-      ],
-    };
-
+  it("preserves null control values for evidence that produced no reasoned decision", () => {
     const series = buildQuotaHistory(
       "claude",
       [
-        {
-          scrapedAt: observedIso,
-          inferredParsedState: slowBurnState,
-        },
+        historyPoint({
+          observedAt: "2026-07-26T12:00:00.000Z",
+          percentLeft: 0,
+        }),
       ],
       "2026-07-20T00:00:00.000Z",
-      "2026-07-31T00:00:00.000Z",
-      {
-        windowId: "weekly",
-        label: "Weekly",
-        poolKey: "weekly\u0000provider\u0000weekly",
-      }
-    );
-
-    expect(series).toHaveLength(1);
-    expect(series[0].points[0]).toEqual({
-      observedAt: observedIso,
-      remainingPercent: 70,
-      error: 20,
-      intervalSeconds: 0,
-      resetAtIso: resetIso,
-    });
-  });
-
-  it("sets error to null when resetAtIso is not present", () => {
-    const noResetState: ProviderQuotaSnapshot = {
-      provider: "claude",
-      status: "available",
-      limits: [
-        {
-          label: "Weekly",
-          kind: "weekly",
-          percentLeft: 50,
-          scope: "provider",
-        },
-      ],
-    };
-
-    const series = buildQuotaHistory(
-      "claude",
-      [
-        {
-          scrapedAt: "2026-07-26T12:00:00.000Z",
-          inferredParsedState: noResetState,
-        },
-      ],
-      "2026-07-20T00:00:00.000Z",
-      "2026-07-31T00:00:00.000Z",
-      {
-        windowId: "weekly",
-        label: "Weekly",
-        poolKey: "weekly\u0000provider\u0000weekly",
-      }
+      "2026-07-31T00:00:00.000Z"
     );
 
     expect(series[0].points[0]).toEqual({
       observedAt: "2026-07-26T12:00:00.000Z",
-      remainingPercent: 50,
+      remainingPercent: 0,
       error: null,
       intervalSeconds: null,
       resetAtIso: null,

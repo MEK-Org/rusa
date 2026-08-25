@@ -76,18 +76,20 @@ export function createDashboardE2EQuotaApi(now = Date.now()): QuotaApiDeps {
     listHistory: (provider, sinceIso) =>
       demoHistory[provider]
         .map((weeklyRemaining, index) => {
-          const scrapedAt = now - historyOffsetsMs[index];
+          const observedAt = new Date(now - historyOffsetsMs[index]).toISOString();
           return {
-            id: `dashboard-demo-${provider}-${index}`,
-            provider,
-            scrapedAt: new Date(scrapedAt).toISOString(),
-            rawOutput: "Dashboard demo quota reading",
-            parsedState: null,
-            inferredParsedState: snapshot(provider, weeklyRemaining, scrapedAt),
-            parseError: null,
+            bucketKey: `dashboard-demo:${provider}:provider:weekly`,
+            scope: "provider" as const,
+            kind: "weekly",
+            label: "Weekly",
+            observedAt,
+            percentLeft: weeklyRemaining,
+            resetAtIso: null,
+            controllerError: null,
+            intervalSeconds: null,
           };
         })
-        .filter((reading) => reading.scrapedAt >= sinceIso),
+        .filter((reading) => reading.observedAt >= sinceIso),
   };
 }
 

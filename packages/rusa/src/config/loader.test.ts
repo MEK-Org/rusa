@@ -389,27 +389,31 @@ describe("loadConfig dashboard quota providers", () => {
 });
 
 describe("loadConfig quota throttle", () => {
-  it("canonicalizes the legacy mesh location without a deployment gap", () => {
-    const config = loadConfig(
-      writeConfig({
-        mesh: {
-          quotaThrottle: {
-            enabled: true,
-            intervalSeconds: 75,
-            maxIntervalSeconds: 3600,
-            tickSeconds: 300,
+  it("rejects the removed mesh location with the replacement path", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          mesh: {
+            quotaThrottle: {
+              enabled: true,
+              maxIntervalSeconds: 3600,
+            },
           },
-        },
-      })
-    );
+        })
+      )
+    ).toThrow(/mesh\.quotaThrottle has moved to quota\.throttle/);
+  });
 
-    expect(config.mesh?.quotaThrottle).toEqual({
-      enabled: true,
-      intervalSeconds: 75,
-      maxIntervalSeconds: 3600,
-      tickSeconds: 300,
-    });
-    expect(config.quota?.throttle).toEqual(config.mesh?.quotaThrottle);
+  it("requires shared persistence when adaptive pacing is enabled", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          quota: {
+            throttle: { enabled: true, maxIntervalSeconds: 3600 },
+          },
+        })
+      )
+    ).toThrow(/quota\.databasePath is required/);
   });
 
   it("accepts the canonical quota location", () => {
@@ -436,49 +440,12 @@ describe("loadConfig quota throttle", () => {
     });
   });
 
-  it("lets canonical fields override and supplement the legacy fallback", () => {
-    const config = loadConfig(
-      writeConfig({
-        mesh: {
-          quotaThrottle: {
-            enabled: true,
-            intervalSeconds: 75,
-            maxIntervalSeconds: 3600,
-            tickSeconds: 300,
-          },
-        },
-        quota: {
-          throttle: { intervalSeconds: 120, tickSeconds: 600 },
-        },
-      })
-    );
-
-    expect(config.quota?.throttle).toEqual({
-      enabled: true,
-      intervalSeconds: 120,
-      maxIntervalSeconds: 3600,
-      tickSeconds: 600,
-    });
-  });
-
-  it("validates the effective merged throttle configuration", () => {
-    expect(() =>
-      loadConfig(
-        writeConfig({
-          mesh: { quotaThrottle: { maxIntervalSeconds: 3600 } },
-          quota: { throttle: { intervalSeconds: 4000 } },
-        })
-      )
-    ).toThrow(/quota\.throttle\.maxIntervalSeconds/);
-  });
-
   it.each([
     [{ enabled: "yes" }, /enabled must be a boolean/],
     [{ intervalSeconds: -1 }, /intervalSeconds must be non-negative/],
     [{ intervalSeconds: 75, maxIntervalSeconds: 60 }, /maxIntervalSeconds/],
     [{ tickSeconds: 1.5 }, /tickSeconds must be a positive integer/],
   ])("rejects invalid quota throttle values %#", (quotaThrottle, message) => {
-    expect(() => loadConfig(writeConfig({ mesh: { quotaThrottle } }))).toThrow(message);
     expect(() => loadConfig(writeConfig({ quota: { throttle: quotaThrottle } }))).toThrow(message);
   });
 });

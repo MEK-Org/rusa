@@ -96,7 +96,7 @@ Top-level fields:
   github                   Required. GitHub polling and bot identity.
   providers                Required. Coding providers available to tasks.
   quota                    Optional. Shared quota evidence, persisted controller state, and launch coordination.
-  mesh                     Optional. Mesh concurrency settings. mesh.quotaThrottle is a temporary legacy fallback.
+  mesh                     Optional. Mesh concurrency settings.
   geminiApiKey             Optional. Enables Gemini features (quota-error classification, avatar generation, understanding retrieval/distill); each skips gracefully when absent.
   deployBranch             Optional. Branch the root self-update tool deploys from. Defaults to master.
   webhook                  Required. Local webhook listener settings.
@@ -129,8 +129,9 @@ providers:
 
 quota:
 
-  databasePath             Optional. Dedicated SQLite path for quota evidence and controller decisions. Instances
-                           sharing provider credentials should point at the same file outside either RUSA_HOME.
+  databasePath             Dedicated SQLite path for quota evidence and controller decisions; required when
+                           quota.throttle.enabled is true. Instances sharing provider credentials should point at
+                           the same file outside either RUSA_HOME.
                            Relative paths resolve against RUSA_HOME; ~/ and absolute paths are supported.
   poolId                   Optional. Stable identity of the shared provider-auth account. Human quota labels are
                            excluded from bucket keys; keys are poolId:provider:scope:window-kind.
@@ -141,11 +142,6 @@ quota.throttle:
   intervalSeconds          Optional learning fallback used only before a reasoned decision exists.
   maxIntervalSeconds       Optional cap on normal launch spacing; defaults to 3600.
   tickSeconds              Optional positive integer quota refresh interval.
-
-mesh.quotaThrottle:
-
-  Deprecated compatibility location for quota.throttle. It remains readable for one release so code can deploy
-  before production config moves. When both locations are present, quota.throttle fields take precedence.
 
 rootActor:
 

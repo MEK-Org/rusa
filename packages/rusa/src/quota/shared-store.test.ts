@@ -237,7 +237,7 @@ describe("SharedQuotaStore persisted controller", () => {
       const rolledOver = store.getProviderThrottle("claude");
       expect(rolledOver?.intervalSeconds).toBeGreaterThan(0);
       expect(rolledOver?.intervalSeconds).toBeLessThan(beforeExhaustion?.intervalSeconds ?? 0);
-      const decisions = store.listPersistedHistorySince("claude", "2030-01-01T00:00:00.000Z");
+      const decisions = store.listHistorySince("claude", "2030-01-01T00:00:00.000Z");
       expect(decisions.find((point) => point.percentLeft === 0)?.intervalSeconds).toBeNull();
     } finally {
       store.close();

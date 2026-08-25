@@ -56,22 +56,19 @@ const DEFAULT_DASHBOARD_QUOTA_PROVIDERS = {
   kimi: { primaryWindow: "weekly" },
 } as const;
 
-function validateQuotaThrottle(
-  quotaThrottle: QuotaThrottleConfig | undefined,
-  configPath: "quota.throttle" | "mesh.quotaThrottle"
-): void {
+function validateQuotaThrottle(quotaThrottle: QuotaThrottleConfig | undefined): void {
   if (quotaThrottle === undefined) return;
   if (typeof quotaThrottle !== "object" || quotaThrottle === null || Array.isArray(quotaThrottle)) {
-    throw new Error(`config.yaml: ${configPath} must be a mapping when set`);
+    throw new Error("config.yaml: quota.throttle must be a mapping when set");
   }
   if (quotaThrottle.enabled !== undefined && typeof quotaThrottle.enabled !== "boolean") {
-    throw new Error(`config.yaml: ${configPath}.enabled must be a boolean when set`);
+    throw new Error("config.yaml: quota.throttle.enabled must be a boolean when set");
   }
   if (
     quotaThrottle.intervalSeconds !== undefined &&
     (!Number.isFinite(quotaThrottle.intervalSeconds) || quotaThrottle.intervalSeconds < 0)
   ) {
-    throw new Error(`config.yaml: ${configPath}.intervalSeconds must be non-negative`);
+    throw new Error("config.yaml: quota.throttle.intervalSeconds must be non-negative");
   }
   if (
     quotaThrottle.maxIntervalSeconds !== undefined &&
@@ -79,7 +76,7 @@ function validateQuotaThrottle(
       quotaThrottle.maxIntervalSeconds <= 0 ||
       quotaThrottle.maxIntervalSeconds < (quotaThrottle.intervalSeconds ?? 0))
   ) {
-    throw new Error(`config.yaml: ${configPath}.maxIntervalSeconds must be >= intervalSeconds`);
+    throw new Error("config.yaml: quota.throttle.maxIntervalSeconds must be >= intervalSeconds");
   }
   if (
     quotaThrottle.tickSeconds !== undefined &&
@@ -87,7 +84,7 @@ function validateQuotaThrottle(
       !Number.isInteger(quotaThrottle.tickSeconds) ||
       quotaThrottle.tickSeconds <= 0)
   ) {
-    throw new Error(`config.yaml: ${configPath}.tickSeconds must be a positive integer`);
+    throw new Error("config.yaml: quota.throttle.tickSeconds must be a positive integer");
   }
 }
 
@@ -191,6 +188,13 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       );
     }
   }
+  if (
+    parsed.mesh &&
+    typeof parsed.mesh === "object" &&
+    "quotaThrottle" in (parsed.mesh as Record<string, unknown>)
+  ) {
+    throw new Error("config.yaml: mesh.quotaThrottle has moved to quota.throttle");
+  }
   const quota = parsed.quota;
   if (quota !== undefined) {
     if (typeof quota !== "object" || quota === null || Array.isArray(quota)) {
@@ -205,17 +209,12 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
         quota[key] = value.trim();
       }
     }
-    validateQuotaThrottle(quota.throttle, "quota.throttle");
-  }
-  const legacyQuotaThrottle = parsed.mesh?.quotaThrottle;
-  validateQuotaThrottle(legacyQuotaThrottle, "mesh.quotaThrottle");
-  if (legacyQuotaThrottle !== undefined) {
-    parsed.quota ??= {};
-    parsed.quota.throttle = {
-      ...legacyQuotaThrottle,
-      ...parsed.quota.throttle,
-    };
-    validateQuotaThrottle(parsed.quota.throttle, "quota.throttle");
+    validateQuotaThrottle(quota.throttle);
+    if (quota.throttle?.enabled === true && !quota.databasePath) {
+      throw new Error(
+        "config.yaml: quota.databasePath is required when quota.throttle.enabled is true"
+      );
+    }
   }
   const dashboard = parsed.dashboard;
   if (dashboard) {

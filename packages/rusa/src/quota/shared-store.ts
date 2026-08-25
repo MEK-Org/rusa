@@ -84,8 +84,9 @@ export interface PersistedQuotaProviderStatus {
   buckets: PersistedQuotaBucketStatus[];
 }
 
-export interface PersistedQuotaHistoryPoint {
+export interface QuotaHistoryRecord {
   bucketKey: string;
+  scope: "provider" | "model";
   kind: string;
   label: string;
   observedAt: string;
@@ -381,10 +382,10 @@ export class SharedQuotaStore {
       .all(provider, sinceIso) as CanonicalQuotaObservation[];
   }
 
-  listPersistedHistorySince(provider: string, sinceIso: string): PersistedQuotaHistoryPoint[] {
+  listHistorySince(provider: string, sinceIso: string): QuotaHistoryRecord[] {
     return this.db
       .prepare(
-        `SELECT o.bucket_key AS bucketKey, o.kind, o.label,
+        `SELECT o.bucket_key AS bucketKey, o.scope, o.kind, o.label,
                 o.observed_at AS observedAt, o.percent_left AS percentLeft,
                 o.reset_at_iso AS resetAtIso, d.error AS controllerError,
                 d.interval_seconds AS intervalSeconds
@@ -395,7 +396,7 @@ export class SharedQuotaStore {
            AND o.observed_at >= ?
          ORDER BY o.observed_at ASC, o.rowid ASC`
       )
-      .all(this.poolId, provider, sinceIso) as PersistedQuotaHistoryPoint[];
+      .all(this.poolId, provider, sinceIso) as QuotaHistoryRecord[];
   }
 
   /**

@@ -116,7 +116,7 @@ export interface QuotaConfig {
   /**
    * SQLite database used for quota scrapes, canonical observations, and pacing state.
    * Multiple rusa instances that share provider credentials should point at the same file.
-   * When omitted, quota evidence remains in the instance database for backwards compatibility.
+   * Required when quota.throttle is enabled.
    */
   databasePath?: string;
   /** Stable identity for the shared provider-auth context. Defaults to "default". */
@@ -426,6 +426,4 @@ export interface RusaConfig {
 export interface MeshConfig {
   /** Cross-actor concurrency cap for non-responsive runs. Default 4. */
   maxConcurrent?: number;
-  /** @deprecated Use quota.throttle. Read as a compatibility fallback for one release. */
-  quotaThrottle?: QuotaThrottleConfig;
 }
