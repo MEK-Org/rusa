@@ -1198,6 +1198,182 @@ describe("quota MCP server", () => {
       }
     });
 
+    describe("getQuotaCached (non-blocking request path, issue #10)", () => {
+      it("returns unsupported for an unconfigured provider without probing", () => {
+        const scrapeCodexStatus = vi.fn().mockResolvedValue("raw codex status");
+        const service = new QuotaService({
+          config: { ...mockConfig, providers: { claude: { cliCommand: "claude" } } },
+          workersDir: "/tmp/workers",
+          scrapeCodexStatus,
+        });
+
+        expect(service.getQuotaCached("codex")).toMatchObject({
+          provider: "codex",
+          status: "unsupported",
+        });
+        expect(scrapeCodexStatus).not.toHaveBeenCalled();
+      });
+
+      it("returns an 'unknown' placeholder immediately on a cold cache and defers background probe off synchronous stack", async () => {
+        const service = new QuotaService({
+          config: mockConfig,
+          workersDir: "/tmp/workers",
+          resolveProvider: mockResolveProvider,
+        });
+
+        // Synchronous return — a placeholder with no scrapedAt, no await on the
+        // probe. (Message distinguishes the cold placeholder from a probed
+        // unknown, which fail-closed parsing without a geminiApiKey also yields.)
+        const immediate = service.getQuotaCached("claude");
+        expect(immediate).toMatchObject({ provider: "claude", status: "unknown" });
+        expect(immediate.scrapedAt).toBeUndefined();
+        expect(immediate.message).toContain("refreshing in background");
+
+        // The probe startup is deferred to a microtask, so on the immediate
+        // synchronous tick of getQuotaCached(), run has not yet executed.
+        expect(mockClaudeProvider.run).toHaveBeenCalledTimes(0);
+
+        // Once microtasks flush and the probe settles, the cache holds a real
+        // probe (scrapedAt stamped), even though fail-closed parsing without a
+        // geminiApiKey keeps status 'unknown' — the point is the request path
+        // never blocked on it.
+        await vi.waitFor(() => {
+          expect(mockClaudeProvider.run).toHaveBeenCalledTimes(1);
+          expect(service.getQuotaCached("claude").scrapedAt).toBeDefined();
+        });
+      });
+
+      it("serves a stale cached reading immediately and refreshes in the background", async () => {
+        vi.useFakeTimers();
+        try {
+          vi.setSystemTime(new Date("2026-07-14T09:15:00.000Z"));
+          const service = new QuotaService({
+            config: mockConfig,
+            workersDir: "/tmp/workers",
+            resolveProvider: mockResolveProvider,
+          });
+
+          // Warm the cache with a real reading.
+          const warm = await service.getQuota("claude");
+          expect(warm.scrapedAt).toBe("2026-07-14T09:15:00.000Z");
+          expect(mockClaudeProvider.run).toHaveBeenCalledTimes(1);
+
+          // Advance past the 5-minute claude TTL so the entry is stale.
+          vi.setSystemTime(new Date("2026-07-14T09:25:00.000Z"));
+
+          // The stale reading is served immediately — same scrapedAt as the warm
+          // probe, NOT a fresh probe time — while a refresh is kicked behind it.
+          const stale = service.getQuotaCached("claude");
+          expect(stale.scrapedAt).toBe("2026-07-14T09:15:00.000Z");
+
+          // Drain the background probe and confirm the cache advanced.
+          await vi.runAllTimersAsync();
+          expect(mockClaudeProvider.run).toHaveBeenCalledTimes(2);
+          const refreshed = service.getQuotaCached("claude");
+          expect(refreshed.scrapedAt).toBe("2026-07-14T09:25:00.000Z");
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it("preserves stale valid reading when a background refresh fails (status: unknown)", async () => {
+        vi.useFakeTimers();
+        try {
+          vi.setSystemTime(new Date("2026-07-14T09:15:00.000Z"));
+          const service = new QuotaService({
+            config: mockConfig,
+            workersDir: "/tmp/workers",
+            resolveProvider: mockResolveProvider,
+          });
+
+          // Pre-populate cache directly with a valid known reading.
+          (service as unknown as { cache: Map<string, unknown> }).cache.set("claude", {
+            state: {
+              provider: "claude",
+              status: "available",
+              scrapedAt: "2026-07-14T09:15:00.000Z",
+              limits: [{ label: "Session", kind: "session", percentLeft: 90 }],
+            },
+            timestamp: Date.parse("2026-07-14T09:15:00.000Z"),
+          });
+
+          // Advance past the 5-minute claude TTL so the entry is stale.
+          vi.setSystemTime(new Date("2026-07-14T09:25:00.000Z"));
+
+          // Scraper/provider run fails closed (returns unknown status).
+          vi.mocked(mockClaudeProvider.run).mockResolvedValueOnce({
+            success: false,
+            output: "Scrape error or unavailable",
+            exitCode: 1,
+          });
+
+          // Stale reading served immediately.
+          const stale = service.getQuotaCached("claude");
+          expect(stale.status).toBe("available");
+          expect(stale.scrapedAt).toBe("2026-07-14T09:15:00.000Z");
+          expect(stale.limits?.[0].percentLeft).toBe(90);
+
+          // Drain background refresh probe.
+          await vi.runAllTimersAsync();
+          expect(mockClaudeProvider.run).toHaveBeenCalledTimes(1);
+
+          // The failed refresh does NOT overwrite the valid cached reading with
+          // unknown. Stale reading is preserved for subsequent reads.
+          const afterFailedRefresh = service.getQuotaCached("claude");
+          expect(afterFailedRefresh.status).toBe("available");
+          expect(afterFailedRefresh.scrapedAt).toBe("2026-07-14T09:15:00.000Z");
+          expect(afterFailedRefresh.limits?.[0].percentLeft).toBe(90);
+
+          // Because the entry was not updated with a fresh timestamp, subsequent
+          // reads still attempt background refresh until a successful probe lands.
+          await vi.runAllTimersAsync();
+          expect(mockClaudeProvider.run).toHaveBeenCalledTimes(2);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it("serves a fresh cached reading without probing", async () => {
+        vi.useFakeTimers();
+        try {
+          vi.setSystemTime(new Date("2026-07-14T09:15:00.000Z"));
+          const service = new QuotaService({
+            config: mockConfig,
+            workersDir: "/tmp/workers",
+            resolveProvider: mockResolveProvider,
+          });
+
+          await service.getQuota("claude");
+          expect(mockClaudeProvider.run).toHaveBeenCalledTimes(1);
+
+          // Still within the 5-minute TTL — no background probe.
+          vi.setSystemTime(new Date("2026-07-14T09:16:00.000Z"));
+          const fresh = service.getQuotaCached("claude");
+          expect(fresh.scrapedAt).toBe("2026-07-14T09:15:00.000Z");
+          expect(mockClaudeProvider.run).toHaveBeenCalledTimes(1);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it("dedupes concurrent background refreshes to a single probe", async () => {
+        const service = new QuotaService({
+          config: mockConfig,
+          workersDir: "/tmp/workers",
+          resolveProvider: mockResolveProvider,
+        });
+
+        // Three rapid cold reads should share one in-flight probe.
+        service.getQuotaCached("claude");
+        service.getQuotaCached("claude");
+        service.getQuotaCached("claude");
+
+        await vi.waitFor(() => {
+          expect(mockClaudeProvider.run).toHaveBeenCalledTimes(1);
+        });
+      });
+    });
+
     it("asserts context-safety: runs probe inside sandbox with correct worktreePath", async () => {
       const workersDir = "/tmp/workers";
       const server = createQuotaMcpServer({

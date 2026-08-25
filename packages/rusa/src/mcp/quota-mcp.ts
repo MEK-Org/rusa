@@ -822,8 +822,60 @@ export class QuotaService {
     }
 
     const state = await inFlight;
-    this.cache.set(provider, { state, timestamp: Date.now() });
+    if (state.status !== "unknown" || !cached || cached.state.status === "unknown") {
+      this.cache.set(provider, { state, timestamp: Date.now() });
+    }
     return state;
+  }
+
+  /**
+   * Non-blocking read for request paths — the dashboard's `GET /api/quota`
+   * (issue #10). Returns the latest in-memory reading immediately (fresh OR
+   * stale) and, when the entry is stale or absent, kicks a refresh through the
+   * same deduped probe path as {@link getQuota} **without awaiting it**, so a
+   * dashboard poll never blocks on a live PTY probe (up to ~90s cold) and never
+   * pins concurrent requests to that wait. Stale-while-revalidate: the caller
+   * shows the last real reading with its honest `scrapedAt` age (issue #9), and
+   * picks up the refreshed value on its next poll.
+   *
+   * A cold cache (e.g. right after a process restart) has no in-memory reading
+   * to serve, so this returns an `unknown` placeholder; the dashboard layer
+   * fills that from the durable quota DB via its `listHistory` fallback
+   * (`buildQuotaSnapshot` → `latestStateFromHistory`), which is the same
+   * newest-rows source issue #10 calls for. Callers that genuinely want an
+   * on-demand live probe (the throttle-controller tick, the `get_quota` MCP
+   * tool) keep using {@link getQuota}.
+   */
+  getQuotaCached(provider: "claude" | "codex" | "agy" | "kimi"): ProviderQuotaSnapshot {
+    if (!this.configuredProviders.has(provider)) {
+      return {
+        provider,
+        status: "unsupported",
+        message: `${provider} is not configured on this instance`,
+      };
+    }
+    const cached = this.cache.get(provider);
+    const isFresh = cached && Date.now() - cached.timestamp < this.getTtlMs(provider);
+    if (!isFresh) {
+      // Stale or cold → refresh in the background; do not await the probe.
+      // Probe startup is deferred off the synchronous request call stack via
+      // queueMicrotask so the request path does zero synchronous I/O or PTY setup.
+      // getQuota() dedupes concurrent probes via inFlightProbes and writes any
+      // fresh reading back into the same cache this read serves from.
+      queueMicrotask(() => {
+        void this.getQuota(provider).catch(() => {
+          // Background refresh; a failure just leaves the stale reading in place
+          // and surfaces on the next probe. Never rejects the request path.
+        });
+      });
+    }
+    return (
+      cached?.state ?? {
+        provider,
+        status: "unknown",
+        message: "no quota reading yet; refreshing in background",
+      }
+    );
   }
 
   private async executeProbe(

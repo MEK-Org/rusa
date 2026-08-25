@@ -2536,10 +2536,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           rootNodeId: resolveUnderstandingRootNodeId(config) ?? null,
         },
         // Cached per-provider quota snapshot : reads the same shared
-        // `QuotaService` TTL cache the `get_quota` MCP tool uses above, so the
-        // dashboard never triggers a live probe on page load.
+        // `QuotaService` TTL cache the `get_quota` MCP tool uses above, but via
+        // `getQuotaCached`, which never triggers-and-awaits a live PTY probe in
+        // the request path (issue #10). It serves the latest known reading
+        // immediately (stale-while-revalidate) and kicks any refresh in the
+        // background; a cold cache falls back to the durable quota DB below via
+        // `listHistory`.
         quotaApi: opts?.e2e?.quotaApi ?? {
-          getQuota: (provider) => quotaService.getQuota(provider),
+          getQuota: async (provider) => quotaService.getQuotaCached(provider),
           providers: quotaProviders,
           getThrottle: (provider) => quotaThrottleStatuses.get(provider) ?? null,
           listHistory: sharedQuotaStore
