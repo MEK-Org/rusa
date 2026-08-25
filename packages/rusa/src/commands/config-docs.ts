@@ -24,6 +24,14 @@ Minimal example:
     copilot:
       cliCommand: copilot
 
+  # Instances sharing provider credentials should use the same quota DB and pool id.
+  quota:
+    databasePath: /home/rusa/.rusa-shared/quota.db
+    throttle:
+      enabled: true
+      maxIntervalSeconds: 3600
+      tickSeconds: 300
+
   geminiApiKey: GEMINI_API_KEY_VALUE
 
   # Branch used by the root self-update tool (optional; defaults to master).
@@ -86,6 +94,8 @@ Top-level fields:
                            and GitHub poll ingestion unless explicitly overridden.
   github                   Required. GitHub polling and bot identity.
   providers                Required. Coding providers available to tasks.
+  quota                    Optional. Shared quota evidence, persisted controller state, and launch coordination.
+  mesh                     Optional. Mesh concurrency settings.
   geminiApiKey             Optional. Enables Gemini features (quota-error classification, avatar generation, understanding retrieval/distill); each skips gracefully when absent.
   deployBranch             Optional. Branch the root self-update tool deploys from. Defaults to master.
   webhook                  Required. Local webhook listener settings.
@@ -115,6 +125,18 @@ providers:
 
   cliCommand               Required. The CLI executable. Example: claude, codex, agy, kimi, copilot.
   dailyCap                 Optional string budget marker, for example "$50".
+
+quota:
+
+  databasePath             Dedicated SQLite path for quota evidence and controller decisions; required when
+                           quota.throttle.enabled is true. Instances sharing provider credentials should point at
+                           the same file outside either RUSA_HOME.
+                           Relative paths resolve against RUSA_HOME; ~/ and absolute paths are supported.
+quota.throttle:
+
+  enabled                  Optional boolean. Enables persisted closed-loop launch pacing.
+  maxIntervalSeconds       Optional cap on normal launch spacing; defaults to 3600.
+  tickSeconds              Optional positive integer quota refresh interval.
 
 rootActor:
 

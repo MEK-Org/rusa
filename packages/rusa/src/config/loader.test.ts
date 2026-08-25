@@ -388,14 +388,41 @@ describe("loadConfig dashboard quota providers", () => {
   });
 });
 
-describe("loadConfig mesh quota throttle", () => {
-  it("accepts an opt-in adaptive pacing configuration", () => {
+describe("loadConfig quota throttle", () => {
+  it("rejects the removed mesh location with the replacement path", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          mesh: {
+            quotaThrottle: {
+              enabled: true,
+              maxIntervalSeconds: 3600,
+            },
+          },
+        })
+      )
+    ).toThrow(/mesh\.quotaThrottle has moved to quota\.throttle/);
+  });
+
+  it("requires shared persistence when adaptive pacing is enabled", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          quota: {
+            throttle: { enabled: true, maxIntervalSeconds: 3600 },
+          },
+        })
+      )
+    ).toThrow(/quota\.databasePath is required/);
+  });
+
+  it("accepts the canonical quota location", () => {
     const config = loadConfig(
       writeConfig({
-        mesh: {
-          quotaThrottle: {
+        quota: {
+          databasePath: "/srv/rusa/quota.db",
+          throttle: {
             enabled: true,
-            intervalSeconds: 75,
             maxIntervalSeconds: 3600,
             tickSeconds: 300,
           },
@@ -403,9 +430,8 @@ describe("loadConfig mesh quota throttle", () => {
       })
     );
 
-    expect(config.mesh?.quotaThrottle).toEqual({
+    expect(config.quota?.throttle).toEqual({
       enabled: true,
-      intervalSeconds: 75,
       maxIntervalSeconds: 3600,
       tickSeconds: 300,
     });
@@ -413,11 +439,29 @@ describe("loadConfig mesh quota throttle", () => {
 
   it.each([
     [{ enabled: "yes" }, /enabled must be a boolean/],
-    [{ intervalSeconds: -1 }, /intervalSeconds must be non-negative/],
-    [{ intervalSeconds: 75, maxIntervalSeconds: 60 }, /maxIntervalSeconds/],
+    [{ maxIntervalSeconds: 0 }, /maxIntervalSeconds/],
     [{ tickSeconds: 1.5 }, /tickSeconds must be a positive integer/],
   ])("rejects invalid quota throttle values %#", (quotaThrottle, message) => {
-    expect(() => loadConfig(writeConfig({ mesh: { quotaThrottle } }))).toThrow(message);
+    expect(() => loadConfig(writeConfig({ quota: { throttle: quotaThrottle } }))).toThrow(message);
+  });
+});
+
+describe("loadConfig shared quota store", () => {
+  it("accepts and trims a shared database path", () => {
+    const config = loadConfig(writeConfig({ quota: { databasePath: "  /srv/rusa/quota.db  " } }));
+    expect(config.quota).toEqual({ databasePath: "/srv/rusa/quota.db" });
+  });
+
+  it("rejects a blank shared database path", () => {
+    expect(() => loadConfig(writeConfig({ quota: { databasePath: "" } }))).toThrow(
+      /quota.databasePath/
+    );
+  });
+
+  it("rejects the removed pool namespace", () => {
+    expect(() =>
+      loadConfig(writeConfig({ quota: { databasePath: "/srv/rusa/quota.db", poolId: "shared" } }))
+    ).toThrow(/quota.poolId has been removed/);
   });
 });
 
