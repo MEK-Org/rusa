@@ -13,6 +13,7 @@ import { runInit } from "./commands/init.js";
 import { runInstallService } from "./commands/install-service.js";
 import { runLogs } from "./commands/logs.js";
 import { runQuickstart, runQuickstartConfigure } from "./commands/quickstart.js";
+import { runQuotaMigrate } from "./commands/quota.js";
 import { runReport } from "./commands/report.js";
 import { runServiceRestart, runServiceStatus, runServiceStop } from "./commands/service-control.js";
 import { runStart } from "./commands/start.js";
@@ -127,6 +128,25 @@ quickstart
   .option("--home <path>", "Override RUSA_HOME for this setup")
   .action(async (opts: { home?: string }) => {
     await runQuickstartConfigure({ home: opts.home });
+  });
+
+const quota = program.command("quota").description("Manage shared provider-quota state");
+
+quota
+  .command("migrate")
+  .description("Merge legacy instance quota histories into a shared quota database")
+  .requiredOption("--database <path>", "Destination shared quota SQLite database")
+  .requiredOption(
+    "--source <instance=path>",
+    "Legacy instance database; repeat for each source",
+    (value: string, previous: string[]) => [...previous, value],
+    [] as string[]
+  )
+  .action(async (opts: { database: string; source: string[] }) => {
+    await runQuotaMigrate({
+      databasePath: opts.database,
+      sources: opts.source,
+    });
   });
 
 // NB: the IU distiller cursor ops (seed/gate/window/advance/mode) are actor-invoked, so

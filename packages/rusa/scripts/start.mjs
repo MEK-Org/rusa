@@ -16,8 +16,8 @@ const INSTALL_SOURCES = [
   "pnpm-lock.yaml",
   "pnpm-workspace.yaml",
   "packages/rusa/package.json",
-  "third_party/glass_goals/packages/goals-core/package.json",
-  "third_party/glass_goals/packages/goals-types/package.json",
+  "third_party/glass_goals_devkit/packages/goals-core/package.json",
+  "third_party/glass_goals_devkit/packages/goals-types/package.json",
 ];
 
 const SOURCE_ROOTS = [
@@ -159,7 +159,7 @@ export function readInstallStampContent(path = installStampPath) {
 
 export function currentSubmoduleSha(root = repoRoot) {
   try {
-    return execFileSync("git", ["-C", root, "rev-parse", ":third_party/glass_goals"], {
+    return execFileSync("git", ["-C", root, "rev-parse", ":third_party/glass_goals_devkit"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();

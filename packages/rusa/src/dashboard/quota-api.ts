@@ -1,11 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import {
-  KI_INTERVAL,
-  KP_INTERVAL,
-  MIN_DERIVATIVE_DT_SECONDS,
-  type QuotaThrottleStatus,
-} from "../actor/quota-throttle-controller.js";
-import type { ProviderQuotaSnapshot, QuotaLimit } from "../mcp/quota-mcp.js";
+import type { QuotaThrottleStatus } from "../actor/quota-throttle-status.js";
+import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
 
 /**
  * Server-side cached per-provider quota endpoint for the dashboard header (ISSUE_NUM,
@@ -124,15 +119,14 @@ export interface QuotaSnapshotDto {
 }
 
 export interface QuotaHistorySource {
-  scrapedAt: string;
-  inferredParsedState: ProviderQuotaSnapshot | null;
-}
-
-export interface QuotaHistoryWindowSelection {
-  windowId: string;
+  scope: "provider" | "model";
+  kind: string;
   label: string;
-  /** Stable identity for one logical pool across independently parsed scrapes. */
-  poolKey: string;
+  observedAt: string;
+  percentLeft: number;
+  resetAtIso: string | null;
+  controllerError: number | null;
+  intervalSeconds: number | null;
 }
 
 /** Injected by the wiring that owns the shared `QuotaService` cache. */
@@ -146,7 +140,7 @@ export interface QuotaApiDeps {
   providers?: readonly SupportedProvider[];
   /** Read-only latest controller decision from the runtime wiring. */
   getThrottle?: (provider: SupportedProvider) => QuotaThrottleStatus | null;
-  /** Durable quota scrape history. Absent in standalone/UI-only deployments. */
+  /** Canonical quota evidence joined to the controller decision persisted for that observation. */
   listHistory?: (provider: SupportedProvider, sinceIso: string) => readonly QuotaHistorySource[];
   /** Wall-clock timestamp source, injectable for tests. Defaults to `Date.now`. */
   now?: () => number;
@@ -296,184 +290,75 @@ function windowsForProvider(
         : agyWindows(state);
 }
 
-function normalizePoolLabel(label: string): string {
-  return label.normalize("NFKC").trim().toLocaleLowerCase("en-US").replace(/\s+/g, " ");
-}
-
-/**
- * Identity carried by the persisted parsed JSON already: normalized window
- * kind + scope + source label. Reset text and percentages deliberately do not
- * participate because they change within one pool.
- */
-function quotaPoolKey(limit: QuotaLimit): string {
-  return [
-    limit.kind ?? "other",
-    limit.scope ?? "unspecified",
-    normalizePoolLabel(limit.label),
-  ].join("\u0000");
-}
-
-function historyWindowsForProvider(
-  provider: SupportedProvider,
-  state: ProviderQuotaSnapshot
-): Array<{ window: QuotaWindowDto; poolKey: string }> {
-  const limits =
-    provider === "agy"
-      ? (state.limits ?? []).filter((limit) => limit.scope === "provider")
-      : (state.limits ?? []);
-  const windows = windowsForProvider(provider, state);
-  return windows.flatMap((window, index) => {
-    const limit = limits[index];
-    return limit ? [{ window, poolKey: quotaPoolKey(limit) }] : [];
-  });
-}
-
-function selectWeeklyPool(
-  provider: SupportedProvider,
-  state: ProviderQuotaSnapshot
-): QuotaHistoryWindowSelection | undefined {
-  const selected = historyWindowsForProvider(provider, state).find(
-    ({ window }) => window.id === "weekly"
-  );
-  return selected
-    ? {
-        windowId: selected.window.id,
-        label: selected.window.label,
-        poolKey: selected.poolKey,
-      }
-    : undefined;
-}
-
-function latestHistoricalWeeklyPool(
-  provider: SupportedProvider,
-  scrapes: readonly QuotaHistorySource[],
-  sinceIso: string,
-  untilIso: string
-): QuotaHistoryWindowSelection | undefined {
-  const sinceMs = Date.parse(sinceIso);
-  const untilMs = Date.parse(untilIso);
-  const newestFirst = [...scrapes].sort(
-    (a, b) => Date.parse(b.scrapedAt) - Date.parse(a.scrapedAt)
-  );
-  for (const scrape of newestFirst) {
-    const observedMs = Date.parse(scrape.scrapedAt);
-    if (
-      !scrape.inferredParsedState ||
-      !Number.isFinite(observedMs) ||
-      observedMs < sinceMs ||
-      observedMs > untilMs
-    ) {
-      continue;
-    }
-    const selection = selectWeeklyPool(provider, scrape.inferredParsedState);
-    if (selection) return selection;
-  }
-  return undefined;
-}
-
-/**
- * Convert durable parsed scrapes into one remaining-quota line for the selected
- * logical pool. The discriminator is derived from fields already persisted in
- * inferred_parsed_state, so changing parse order or temporarily omitting another weekly
- * pool cannot splice unrelated readings into this series.
- */
+/** Build dashboard history without replaying or re-implementing the controller. */
 export function buildQuotaHistory(
   provider: SupportedProvider,
-  scrapes: readonly QuotaHistorySource[],
+  history: readonly QuotaHistorySource[],
   sinceIso: string,
-  untilIso: string,
-  selection: QuotaHistoryWindowSelection
+  untilIso: string
 ): QuotaHistorySeriesDto[] {
   const sinceMs = Date.parse(sinceIso);
   const untilMs = Date.parse(untilIso);
-  const pointsByInstant = new Map<string, QuotaHistoryPointDto>();
-
-  const chronological = [...scrapes].sort(
-    (a, b) => Date.parse(a.scrapedAt) - Date.parse(b.scrapedAt)
-  );
-
-  let bucketInterval = 0;
-  let lastResetMs = -1;
-  let prevMs = -1;
-  let prevError = 0;
-
-  for (const scrape of chronological) {
-    const observedMs = Date.parse(scrape.scrapedAt);
-    if (
-      !scrape.inferredParsedState ||
-      !Number.isFinite(observedMs) ||
-      observedMs < sinceMs ||
-      observedMs > untilMs
-    ) {
-      continue;
-    }
-    const selected = historyWindowsForProvider(provider, scrape.inferredParsedState).find(
-      (candidate) =>
-        candidate.window.id === selection.windowId && candidate.poolKey === selection.poolKey
-    );
-    const window = selected?.window;
-    if (!window || window.usedPercent === null || !Number.isFinite(window.usedPercent)) continue;
-    const remainingPercent = Math.min(100, Math.max(0, 100 - window.usedPercent));
-    let error: number | null = null;
-    let intervalSeconds: number | null = null;
-    const resetAtIso = window.resetAtIso ?? null;
-    if (resetAtIso && window.windowMs > 0) {
-      const resetMs = Date.parse(resetAtIso);
-      if (Number.isFinite(resetMs)) {
-        const timeRemainingPct = Math.min(
-          100,
-          Math.max(0, ((resetMs - observedMs) / window.windowMs) * 100)
-        );
-        // Dashboard error: positive = surplus
-        error = remainingPercent - timeRemainingPct;
-
-        // Controller error: positive = hot
-        const controllerError = timeRemainingPct - remainingPercent;
-
-        if (Math.abs(resetMs - lastResetMs) > 60 * 60 * 1000) {
-          bucketInterval = 0;
-          prevMs = observedMs;
-          prevError = controllerError;
-          lastResetMs = resetMs;
-        }
-
-        const dtSeconds = (observedMs - prevMs) / 1000;
-        if (dtSeconds >= MIN_DERIVATIVE_DT_SECONDS) {
-          const deltaError = controllerError - prevError;
-          const pTerm = KP_INTERVAL * deltaError;
-          const iTerm = KI_INTERVAL * controllerError * Math.abs(controllerError) * dtSeconds;
-
-          bucketInterval = Math.max(0, bucketInterval + pTerm + iTerm);
-          prevMs = observedMs;
-          prevError = controllerError;
-        }
-        if (remainingPercent <= 0) {
-          intervalSeconds = null;
-        } else {
-          intervalSeconds = bucketInterval;
-        }
-      }
-    }
-    pointsByInstant.set(scrape.scrapedAt, {
-      observedAt: scrape.scrapedAt,
-      remainingPercent,
-      error,
-      resetAtIso,
-      intervalSeconds,
-    });
-  }
-
-  if (pointsByInstant.size === 0) return [];
+  const weekly = history
+    .filter((point) => {
+      const observedMs = Date.parse(point.observedAt);
+      return (
+        point.scope === "provider" &&
+        point.kind === "weekly" &&
+        Number.isFinite(observedMs) &&
+        observedMs >= sinceMs &&
+        observedMs <= untilMs
+      );
+    })
+    .sort((a, b) => Date.parse(a.observedAt) - Date.parse(b.observedAt));
+  if (weekly.length === 0) return [];
+  const latest = weekly.at(-1);
   return [
     {
       provider,
-      windowId: selection.windowId,
-      label: selection.label,
-      points: [...pointsByInstant.values()].sort(
-        (a, b) => Date.parse(a.observedAt) - Date.parse(b.observedAt)
-      ),
+      windowId: "weekly",
+      label: latest?.label ?? "Weekly",
+      points: weekly.map((point) => ({
+        observedAt: point.observedAt,
+        remainingPercent: point.percentLeft,
+        // The public chart convention is positive = quota surplus; persisted
+        // controller error is positive = consuming too fast.
+        error: point.controllerError === null ? null : -point.controllerError,
+        resetAtIso: point.resetAtIso,
+        intervalSeconds: point.intervalSeconds,
+      })),
     },
   ];
+}
+
+function latestStateFromHistory(
+  provider: SupportedProvider,
+  history: readonly QuotaHistorySource[],
+  nowMs: number
+): ProviderQuotaSnapshot | null {
+  const MAX_HOLD_MS = 24 * 60 * 60 * 1000;
+  const eligible = history.filter((point) => {
+    const observedMs = Date.parse(point.observedAt);
+    const ageMs = nowMs - observedMs;
+    return Number.isFinite(observedMs) && ageMs >= 0 && ageMs <= MAX_HOLD_MS;
+  });
+  const latestObservedAt = eligible
+    .map((point) => point.observedAt)
+    .sort((a, b) => Date.parse(b) - Date.parse(a))[0];
+  if (!latestObservedAt) return null;
+  const latest = eligible.filter((point) => point.observedAt === latestObservedAt);
+  return {
+    provider,
+    status: latest.some((point) => point.percentLeft <= 0) ? "exhausted" : "available",
+    scrapedAt: latestObservedAt,
+    limits: latest.map((point) => ({
+      label: point.label,
+      kind: point.kind as "session" | "five_hour" | "weekly" | "other",
+      scope: point.scope,
+      percentLeft: point.percentLeft,
+      resetAtIso: point.resetAtIso ?? undefined,
+    })),
+  };
 }
 
 /** Build the current quota snapshot from the shared cache for configured providers. */
@@ -484,29 +369,11 @@ export async function buildQuotaSnapshot(deps: QuotaApiDeps): Promise<QuotaSnaps
   const historySince = toIso(nowMs - HISTORY_WINDOW_MS);
   const providers = deps.providers ?? SUPPORTED_PROVIDERS;
   const states = await Promise.all(providers.map((provider) => deps.getQuota(provider)));
+  const histories = providers.map((provider) => deps.listHistory?.(provider, historySince) ?? []);
   const providerDtos = providers.map((provider, i) => {
     let state = states[i];
     if (state.status === "unknown" || !state.limits || state.limits.length === 0) {
-      if (deps.listHistory) {
-        const historicalRows = deps.listHistory(provider, historySince);
-        const newestFirst = [...historicalRows].sort(
-          (a, b) => Date.parse(b.scrapedAt) - Date.parse(a.scrapedAt)
-        );
-        const MAX_HOLD_MS = 24 * 60 * 60 * 1000;
-        for (const row of newestFirst) {
-          const ageMs = nowMs - Date.parse(row.scrapedAt);
-          if (ageMs > MAX_HOLD_MS) continue;
-          if (
-            row.inferredParsedState &&
-            row.inferredParsedState.status !== "unknown" &&
-            row.inferredParsedState.limits &&
-            row.inferredParsedState.limits.length > 0
-          ) {
-            state = { ...row.inferredParsedState, scrapedAt: row.scrapedAt };
-            break;
-          }
-        }
-      }
+      state = latestStateFromHistory(provider, histories[i] ?? [], nowMs) ?? state;
     }
     return toProviderDto(provider, state, deps.getThrottle?.(provider) ?? null);
   });
@@ -515,18 +382,9 @@ export async function buildQuotaSnapshot(deps: QuotaApiDeps): Promise<QuotaSnaps
     historySince,
     providers: providerDtos,
     history: deps.listHistory
-      ? providers.flatMap((provider, i) => {
-          const historicalRows = deps.listHistory?.(provider, historySince) ?? [];
-          // Prefer the current ring's first weekly pool. If the current probe
-          // has no usable limits, freeze selection from the newest valid
-          // durable row so known history is not misreported as absent.
-          const weeklyPool =
-            selectWeeklyPool(provider, states[i]) ??
-            latestHistoricalWeeklyPool(provider, historicalRows, historySince, generatedAt);
-          return weeklyPool
-            ? buildQuotaHistory(provider, historicalRows, historySince, generatedAt, weeklyPool)
-            : [];
-        })
+      ? providers.flatMap((provider, index) =>
+          buildQuotaHistory(provider, histories[index] ?? [], historySince, generatedAt)
+        )
       : [],
   };
 }

@@ -23,6 +23,14 @@ describe("config docs", () => {
     expect(CONFIG_DOCS).toContain("local git bridge delivery");
   });
 
+  it("documents shared quota persistence and pacing", () => {
+    expect(CONFIG_DOCS).toContain("quota:");
+    expect(CONFIG_DOCS).toContain("databasePath");
+    expect(CONFIG_DOCS).not.toContain("poolId");
+    expect(CONFIG_DOCS).toContain("quota.throttle:");
+    expect(CONFIG_DOCS).not.toContain("mesh.quotaThrottle:");
+  });
+
   it("documents disk-alert routing as implicit instead of a system eventSources knob", () => {
     expect(CONFIG_DOCS).toContain(
       "Configuring this section implicitly subscribes root to responsive system.disk events"

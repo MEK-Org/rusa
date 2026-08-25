@@ -184,7 +184,7 @@ export class GitRunner implements GitSeam {
     await this.git("git-reset", ["reset", "--hard", ref]);
   }
   async updateSubmodules(): Promise<void> {
-    // First init clones the submodule (e.g. private glass_goals) → allow a generous
+    // First init clones the submodule (e.g. glass_goals_devkit) → allow a generous
     // timeout for the clone; subsequent updates are fast no-ops when already in sync.
     await this.git("git-submodule", ["submodule", "update", "--init", "--recursive"], 300_000);
     assertSubmodulesMaterialized(this.repoRoot);

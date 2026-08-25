@@ -47,7 +47,7 @@ export interface GitSeam {
    * rebuild + restart even when already at the target sha): `resetHard` moves a
    * submodule's gitlink but not its working tree, and an already-current box may
    * never have inited the submodule, yet `flutter build web` needs the path-deps
-   * (repo-root third_party/glass_goals) on disk either way. Idempotent +
+   * (repo-root third_party/glass_goals_devkit) on disk either way. Idempotent +
    * a fast no-op when in sync.
    */
   updateSubmodules(): Promise<void>;
@@ -190,7 +190,7 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
     // (we rebuild + restart even when already-current), so its prerequisite must be
     // too. `resetHard` moves a submodule's gitlink but not its working tree, and an
     // already-current box may never have inited the submodule; either way
-    // `flutter build web` needs repo-root third_party/glass_goals on disk. Idempotent + a fast
+    // `flutter build web` needs repo-root third_party/glass_goals_devkit on disk. Idempotent + a fast
     // no-op when in sync.
     await deps.git.updateSubmodules();
     log(`[update] submodules updated (--init --recursive)`);

@@ -2787,7 +2787,7 @@ describe("ActorMesh", () => {
       expect(appended).toEqual([
         {
           actorId,
-          source: "github_issue:dummy-org/dummy-repoISSUE_NUM",
+          source: "github_issue:dummy-org/dummy-repo#903",
           payload: { type: "issue_comment.created", commentId: 4959289232 },
         },
       ]);

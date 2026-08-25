@@ -99,6 +99,28 @@ export interface DashboardQuotaProviderConfig {
   primaryWindow: string;
 }
 
+/** Adaptive provider launch pacing driven by quota observations. */
+export interface QuotaThrottleConfig {
+  /** Enable per-provider adaptive pacing from the cached quota windows. Default false. */
+  enabled?: boolean;
+  /** Longest acceptable interval between normal starts. Default 3600 (one hour). */
+  maxIntervalSeconds?: number;
+  /** Quota sample/controller cadence in seconds. Default 300 (five minutes). */
+  tickSeconds?: number;
+}
+
+/** Shared quota evidence, controller state, and launch pacing. */
+export interface QuotaConfig {
+  /**
+   * SQLite database used for quota scrapes, canonical observations, and pacing state.
+   * Multiple rusa instances that share provider credentials should point at the same file.
+   * Required when quota.throttle is enabled.
+   */
+  databasePath?: string;
+  /** Closed-loop launch pacing configuration. */
+  throttle?: QuotaThrottleConfig;
+}
+
 export type DashboardQuotaProvidersConfig = Partial<
   Record<"claude" | "codex" | "agy" | "kimi", DashboardQuotaProviderConfig>
 >;
@@ -369,6 +391,8 @@ export interface RusaConfig {
   /** Google Chat inbound/outbound integration (optional; disabled if absent). */
   chat?: ChatConfig;
   dashboard?: DashboardConfig;
+  /** Shared provider-quota storage and identity. */
+  quota?: QuotaConfig;
   /** Walkie-talkie voice tuning ; the feature is gated on geminiApiKey. */
   voice?: VoiceConfig;
   smokeTest?: SmokeTestConfig;
@@ -398,15 +422,4 @@ export interface RusaConfig {
 export interface MeshConfig {
   /** Cross-actor concurrency cap for non-responsive runs. Default 4. */
   maxConcurrent?: number;
-  /** Optional closed-loop provider start pacing. Disabled unless explicitly enabled. */
-  quotaThrottle?: {
-    /** Enable per-provider adaptive pacing from the cached quota windows. Default false. */
-    enabled?: boolean;
-    /** Interval used while learning quota burn, in seconds. Default 0 (no delay). */
-    intervalSeconds?: number;
-    /** Longest acceptable interval between normal starts. Default 3600 (one hour). */
-    maxIntervalSeconds?: number;
-    /** Quota sample/controller cadence in seconds. Default 300 (five minutes). */
-    tickSeconds?: number;
-  };
 }
