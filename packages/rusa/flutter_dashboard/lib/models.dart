@@ -443,6 +443,7 @@ class QuotaWindowDto {
     this.resetAtIso,
     this.windowMs = 0,
     this.scrapedAt,
+    this.carriedForward = false,
   });
 
   final String id;
@@ -466,7 +467,22 @@ class QuotaWindowDto {
   /// reached a probe.
   final String? scrapedAt;
 
+  /// True if this window's reading or reset instant was carried forward from a
+  /// previous assessment rather than directly observed in the latest probe.
+  final bool carriedForward;
+
   bool get isKnown => usedPercent != null && status != 'unknown';
+
+  /// Returns true if this window has an absolute reset instant that has already
+  /// passed relative to [now]. When true, the pre-reset reading does not
+  /// describe the current window and must not be presented as live quota.
+  bool isPastReset(DateTime now) {
+    final resetText = resetAtIso;
+    if (resetText == null) return false;
+    final reset = DateTime.tryParse(resetText);
+    if (reset == null) return false;
+    return now.isAfter(reset);
+  }
 
   factory QuotaWindowDto.fromJson(Map<String, dynamic> j) => QuotaWindowDto(
     id: j['id'] as String? ?? '',
@@ -477,6 +493,7 @@ class QuotaWindowDto {
     resetAtIso: j['resetAtIso'] as String?,
     windowMs: (j['windowMs'] as num?)?.toInt() ?? 0,
     scrapedAt: j['scrapedAt'] as String?,
+    carriedForward: j['carriedForward'] as bool? ?? false,
   );
 
   /// Inverse of [fromJson] — used to persist the last-known snapshot to
@@ -492,6 +509,7 @@ class QuotaWindowDto {
     'resetAtIso': resetAtIso,
     'windowMs': windowMs,
     'scrapedAt': scrapedAt,
+    'carriedForward': carriedForward,
   };
 }
 
@@ -579,6 +597,7 @@ class ProviderQuotaDto {
     required this.windows,
     this.scrapedAt,
     this.throttle,
+    this.carriedForward = false,
   });
 
   final String provider;
@@ -594,6 +613,10 @@ class ProviderQuotaDto {
 
   /// Current closed-loop launch throttle, null when the feature is disabled.
   final QuotaThrottleDto? throttle;
+
+  /// True if this provider reading was carried forward from a previous scrape
+  /// assessment or durable history fallback.
+  final bool carriedForward;
 
   QuotaWindowDto? get headlineWindow {
     for (final w in windows) {
@@ -615,6 +638,7 @@ class ProviderQuotaDto {
     throttle: j['throttle'] is Map<String, dynamic>
         ? QuotaThrottleDto.fromJson(j['throttle'] as Map<String, dynamic>)
         : null,
+    carriedForward: j['carriedForward'] as bool? ?? false,
   );
 
   Map<String, dynamic> toJson() => {
@@ -626,6 +650,7 @@ class ProviderQuotaDto {
     'windows': windows.map((w) => w.toJson()).toList(),
     'scrapedAt': scrapedAt,
     'throttle': throttle?.toJson(),
+    'carriedForward': carriedForward,
   };
 }
 

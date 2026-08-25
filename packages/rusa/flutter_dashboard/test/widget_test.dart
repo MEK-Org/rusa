@@ -782,6 +782,84 @@ void main() {
   );
 
   testWidgets(
+    'header renders empty inner ring and "window reset at" tooltip when window is past reset (issue #9)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final pastResetIso = DateTime.now()
+            .toUtc()
+            .subtract(const Duration(minutes: 32))
+            .toIso8601String();
+        final snapshot = QuotaSnapshotDto(
+          generatedAt: '2026-07-09T00:00:00.000Z',
+          providers: [
+            ProviderQuotaDto(
+              provider: 'codex',
+              status: 'available',
+              usedPercent: 47,
+              tier: null,
+              message: null,
+              windows: [
+                const QuotaWindowDto(
+                  id: 'weekly',
+                  label: 'Weekly',
+                  usedPercent: 10,
+                  status: 'available',
+                  headline: true,
+                  windowMs: 604800000,
+                ),
+                QuotaWindowDto(
+                  id: 'five_hour',
+                  label: '5h',
+                  usedPercent: 47,
+                  status: 'available',
+                  headline: false,
+                  resetAtIso: pastResetIso,
+                  windowMs: 18000000,
+                ),
+              ],
+            ),
+          ],
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root', created: 't0')]
+          ..quotaResult = snapshot;
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await store.refreshQuota();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: SizedBox(width: 1100, child: MeshHeader(store: store)),
+            ),
+          ),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+
+        final rings = tester
+            .widgetList<CircularProgressIndicator>(
+              find.byType(CircularProgressIndicator),
+            )
+            .toList();
+        expect(rings, hasLength(2));
+        expect(rings[0].value, 0.9); // weekly: 10% used => 90% remaining
+        expect(rings[1].value, 0.0); // 5h: past reset => 0.0 (empty ring)
+
+        final codexTooltip = tester.widget<Tooltip>(
+          find.byType(Tooltip).first,
+        );
+        expect(codexTooltip.message, contains('Weekly: 90% remaining'));
+        expect(codexTooltip.message, contains('5h: window reset at '));
+        expect(codexTooltip.message, contains('no fresh read since'));
+        expect(codexTooltip.message, isNot(contains('5h: 53% remaining')));
+        expect(codexTooltip.message, isNot(contains('5h: 47% quota remaining')));
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
     'quota provider config selects each provider primary window independently',
     (tester) async {
       await tester.runAsync(() async {
@@ -902,6 +980,7 @@ void main() {
       String status = 'available',
       String? resetAtIso,
       int windowMs = fiveHourMs,
+      bool carriedForward = false,
     }) => QuotaWindowDto(
       id: 'session',
       label: 'Session',
@@ -910,6 +989,7 @@ void main() {
       resetAtIso: resetAtIso,
       headline: false,
       windowMs: windowMs,
+      carriedForward: carriedForward,
     );
 
     test('unknown/null window reads grey (muted), never crashes', () {
@@ -921,6 +1001,16 @@ void main() {
         ),
         MeshColors.textMuted,
       );
+    });
+
+    test('window past its reset (resetAtIso < now) reads grey (muted)', () {
+      final w = window(
+        usedPercent: 53,
+        resetAtIso: now
+            .subtract(const Duration(minutes: 32))
+            .toIso8601String(),
+      );
+      expect(quotaScheduleColor(w, now: now), MeshColors.textMuted);
     });
 
     test('burning slow (delta >= 15) reads green', () {
@@ -1027,6 +1117,7 @@ void main() {
       String status = 'available',
       String? resetAtIso,
       int windowMs = fiveHourMs,
+      bool carriedForward = false,
     }) => QuotaWindowDto(
       id: 'session',
       label: 'Session',
@@ -1035,6 +1126,7 @@ void main() {
       resetAtIso: resetAtIso,
       headline: false,
       windowMs: windowMs,
+      carriedForward: carriedForward,
     );
 
     test('unknown/null window reads n/a, never crashes', () {
@@ -1049,6 +1141,55 @@ void main() {
           now: now,
         ),
         'Session: n/a',
+      );
+    });
+
+    test(
+      'honestly reports a window past its reset without showing stale percentage',
+      () {
+        final w = window(
+          usedPercent: 53,
+          resetAtIso: now
+              .subtract(const Duration(minutes: 32))
+              .toUtc()
+              .toIso8601String(),
+        );
+        expect(
+          quotaWindowTooltip(w, fallbackLabel: 'Session', now: now),
+          'Session: window reset at Wed 11:28 PM; no fresh read since',
+        );
+      },
+    );
+
+    test('distinguishes carried-forward values in tooltip', () {
+      final w = window(
+        usedPercent: 40,
+        carriedForward: true,
+        resetAtIso: now
+            .add(const Duration(hours: 2, minutes: 30))
+            .toUtc()
+            .toIso8601String(),
+      );
+      expect(
+        quotaWindowTooltip(w, fallbackLabel: 'Session', now: now),
+        'Session (carried forward): 60% quota remaining, 50% time remaining (on pace)\n'
+        'resets Thu 2:30 AM\n'
+        '~20% left at reset',
+      );
+    });
+
+    test('distinguishes carried-forward values past reset', () {
+      final w = window(
+        usedPercent: 53,
+        carriedForward: true,
+        resetAtIso: now
+            .subtract(const Duration(hours: 1))
+            .toUtc()
+            .toIso8601String(),
+      );
+      expect(
+        quotaWindowTooltip(w, fallbackLabel: 'Session', now: now),
+        'Session (carried forward): window reset at Wed 11:00 PM; no fresh read since',
       );
     });
 

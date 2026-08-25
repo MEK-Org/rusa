@@ -72,6 +72,11 @@ export interface QuotaWindowDto {
    * error/unsupported state) rather than a fetch/render time.
    */
   scrapedAt: string | null;
+  /**
+   * True if this window's assessment or reset was carried forward from a previous scrape
+   * rather than freshly observed in the latest probe.
+   */
+  carriedForward?: boolean;
 }
 
 export interface ProviderQuotaDto {
@@ -87,6 +92,8 @@ export interface ProviderQuotaDto {
   scrapedAt: string | null;
   /** Latest closed-loop throttle decision, or null when quota throttling is disabled/unavailable. */
   throttle: QuotaThrottleStatus | null;
+  /** True if this provider snapshot was carried forward from a previous scrape or historical reading. */
+  carriedForward?: boolean;
 }
 
 export interface QuotaHistoryPointDto {
@@ -185,6 +192,7 @@ function claudeWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
         headline: isWeekly,
         windowMs: windowMsFor(id),
         scrapedAt,
+        ...((limit.carriedForward ?? state.carriedForward) ? { carriedForward: true } : {}),
       };
     });
   }
@@ -209,6 +217,7 @@ function codexWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
         headline: isWeekly,
         windowMs: windowMsFor(id),
         scrapedAt,
+        ...((limit.carriedForward ?? state.carriedForward) ? { carriedForward: true } : {}),
       };
     });
   }
@@ -232,6 +241,7 @@ function agyWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
       headline: limit.kind === "weekly",
       windowMs: windowMsFor(limit.kind ?? "other"),
       scrapedAt,
+      ...((limit.carriedForward ?? state.carriedForward) ? { carriedForward: true } : {}),
     }));
 }
 
@@ -250,6 +260,7 @@ function kimiWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
         windowMs: windowMsFor(id),
         // kimi's pty probe never stamps scrapedAt → always null (ISSUE_NUM ask 5).
         scrapedAt: state.scrapedAt ?? null,
+        ...((limit.carriedForward ?? state.carriedForward) ? { carriedForward: true } : {}),
       };
     });
   }
@@ -271,6 +282,7 @@ function toProviderDto(
   // When there is no headline window (no structured limits), there is no
   // headline number — the snapshot no longer carries a top-level usedPercent.
   const usedPercent = headlineWindow ? headlineWindow.usedPercent : null;
+  const carriedForward = Boolean(state.carriedForward || windows.some((w) => w.carriedForward));
 
   return {
     provider,
@@ -283,6 +295,7 @@ function toProviderDto(
     windows,
     scrapedAt: state.scrapedAt ?? null,
     throttle,
+    ...(carriedForward ? { carriedForward: true } : {}),
   };
 }
 
@@ -362,12 +375,14 @@ function latestStateFromHistory(
     provider,
     status: latest.some((point) => point.percentLeft <= 0) ? "exhausted" : "available",
     scrapedAt: latestObservedAt,
+    carriedForward: true,
     limits: latest.map((point) => ({
       label: point.label,
       kind: point.kind as "session" | "five_hour" | "weekly" | "other",
       scope: point.scope,
       percentLeft: point.percentLeft,
       resetAtIso: point.resetAtIso ?? undefined,
+      carriedForward: true,
     })),
   };
 }

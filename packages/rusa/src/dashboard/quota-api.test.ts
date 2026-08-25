@@ -392,6 +392,7 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
       ],
     });
 
+    expect(snapshot.providers[0].carriedForward).toBe(true);
     expect(snapshot.providers[0].windows).toEqual([
       {
         id: "weekly",
@@ -402,6 +403,7 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
         headline: true,
         windowMs: 604800000,
         scrapedAt: "2026-07-26T19:00:00.000Z",
+        carriedForward: true,
       },
     ]);
     expect(snapshot.history).toEqual([
@@ -707,6 +709,44 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
     for (const w of agy?.windows ?? []) {
       expect(w.scrapedAt).toBe(scrapedAt);
     }
+  });
+
+  it("threads carriedForward through from limits and snapshot to QuotaWindowDto and ProviderQuotaDto", async () => {
+    const { deps } = fakeDeps({
+      claude: {
+        ...claudeState,
+        carriedForward: true,
+        limits: [
+          { label: "Session", kind: "session", percentLeft: 100, carriedForward: true },
+          { label: "Weekly", kind: "weekly", percentLeft: 97 },
+        ],
+      },
+      codex: {
+        ...codexState,
+        limits: [
+          { label: "5h", kind: "five_hour", percentLeft: 99, carriedForward: true },
+          { label: "Weekly", kind: "weekly", percentLeft: 93, carriedForward: false },
+        ],
+      },
+      agy: agyState,
+      kimi: kimiState,
+    });
+    const snapshot = await buildQuotaSnapshot(deps);
+
+    const claude = snapshot.providers.find((p) => p.provider === "claude");
+    expect(claude?.carriedForward).toBe(true);
+    expect(claude?.windows.find((w) => w.id === "session")?.carriedForward).toBe(true);
+    // Inherited from snapshot
+    expect(claude?.windows.find((w) => w.id === "weekly")?.carriedForward).toBe(true);
+
+    const codex = snapshot.providers.find((p) => p.provider === "codex");
+    expect(codex?.carriedForward).toBe(true);
+    expect(codex?.windows.find((w) => w.id === "five_hour")?.carriedForward).toBe(true);
+    expect(codex?.windows.find((w) => w.id === "weekly")?.carriedForward).toBeUndefined();
+
+    const agy = snapshot.providers.find((p) => p.provider === "agy");
+    expect(agy?.carriedForward).toBeUndefined();
+    expect(agy?.windows.every((w) => w.carriedForward === undefined)).toBe(true);
   });
 
   it("scrapedAt is null when the underlying state never reached a probe", async () => {
