@@ -42,22 +42,13 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
 
-  # glass_goals packages for the IU calibration view
+  # glass_goals_devkit packages for the IU calibration view
   goals_core:
-    git:
-      url: https://github.com/MEK-Org/glass_goals.git
-      ref: e6ba530bf87607e30f51be4b0e607642447cebdf
-      path: goals_core
+    path: ../../../third_party/glass_goals_devkit/packages/goals_core
   goals_ui_core:
-    git:
-      url: https://github.com/MEK-Org/glass_goals.git
-      ref: e6ba530bf87607e30f51be4b0e607642447cebdf
-      path: goals_ui_core
+    path: ../../../third_party/glass_goals_devkit/packages/goals_ui_core
   goals_widgets:
-    git:
-      url: https://github.com/MEK-Org/glass_goals.git
-      ref: e6ba530bf87607e30f51be4b0e607642447cebdf
-      path: goals_widgets
+    path: ../../../third_party/glass_goals_devkit/packages/goals_widgets
 
 # goals_widgets declares these overrides, but pub IGNORES a non-root package's
 # dependency_overrides — so the root (this app) must replicate them or resolution

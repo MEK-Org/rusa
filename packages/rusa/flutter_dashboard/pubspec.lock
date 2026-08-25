@@ -206,20 +206,16 @@ packages:
   goals_core:
     dependency: "direct main"
     description:
-      path: goals_core
-      ref: e6ba530bf87607e30f51be4b0e607642447cebdf
-      resolved-ref: e6ba530bf87607e30f51be4b0e607642447cebdf
-      url: "https://github.com/MEK-Org/glass_goals.git"
-    source: git
+      path: "../../../third_party/glass_goals_devkit/packages/goals_core"
+      relative: true
+    source: path
     version: "1.0.0"
   goals_types:
     dependency: transitive
     description:
-      path: goals_types
-      ref: e6ba530bf87607e30f51be4b0e607642447cebdf
-      resolved-ref: e6ba530bf87607e30f51be4b0e607642447cebdf
-      url: "https://github.com/MEK-Org/glass_goals.git"
-    source: git
+      path: "../../../third_party/glass_goals_devkit/packages/goals_types"
+      relative: true
+    source: path
     version: "6.0.0"
   goals_types_01:
     dependency: transitive
@@ -264,20 +260,16 @@ packages:
   goals_ui_core:
     dependency: "direct main"
     description:
-      path: goals_ui_core
-      ref: e6ba530bf87607e30f51be4b0e607642447cebdf
-      resolved-ref: e6ba530bf87607e30f51be4b0e607642447cebdf
-      url: "https://github.com/MEK-Org/glass_goals.git"
-    source: git
+      path: "../../../third_party/glass_goals_devkit/packages/goals_ui_core"
+      relative: true
+    source: path
     version: "1.0.0"
   goals_widgets:
     dependency: "direct main"
     description:
-      path: goals_widgets
-      ref: e6ba530bf87607e30f51be4b0e607642447cebdf
-      resolved-ref: e6ba530bf87607e30f51be4b0e607642447cebdf
-      url: "https://github.com/MEK-Org/glass_goals.git"
-    source: git
+      path: "../../../third_party/glass_goals_devkit/packages/goals_widgets"
+      relative: true
+    source: path
     version: "0.1.0+1"
   google_fonts:
     dependency: transitive

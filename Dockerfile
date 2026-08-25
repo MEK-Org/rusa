@@ -27,7 +27,7 @@ WORKDIR /app
 
 # Copy dashboard source and its submodule dependencies
 COPY packages/rusa/flutter_dashboard ./packages/rusa/flutter_dashboard
-COPY third_party/glass_goals ./third_party/glass_goals
+COPY third_party/glass_goals_devkit ./third_party/glass_goals_devkit
 
 WORKDIR /app/packages/rusa/flutter_dashboard
 RUN flutter pub get
@@ -74,6 +74,8 @@ USER node
 # Copy manifests to cache dependency resolution step
 COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY --chown=node:node packages/rusa/package.json ./packages/rusa/
+COPY --chown=node:node third_party/glass_goals_devkit/packages/goals-core/package.json ./third_party/glass_goals_devkit/packages/goals-core/
+COPY --chown=node:node third_party/glass_goals_devkit/packages/goals-types/package.json ./third_party/glass_goals_devkit/packages/goals-types/
 
 # Install deps fresh in the image to rebuild better-sqlite3 against Node 24 ABI
 RUN pnpm install --frozen-lockfile

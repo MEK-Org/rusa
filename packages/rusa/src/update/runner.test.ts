@@ -90,24 +90,24 @@ describe("GitRunner submodule materialization checks", () => {
     writeFileSync(
       join(repo, ".gitmodules"),
       [
-        '[submodule "third_party/glass_goals"]',
-        "\tpath = third_party/glass_goals",
-        "\turl = https://github.com/dummy-org/glass_goals.git",
+        '[submodule "third_party/glass_goals_devkit"]',
+        "\tpath = third_party/glass_goals_devkit",
+        "\turl = https://github.com/dummy-org/glass_goals_devkit.git",
         "",
       ].join("\n")
     );
 
     expect(submodulePathsFromGitmodules(join(repo, ".gitmodules"))).toEqual([
-      "third_party/glass_goals",
+      "third_party/glass_goals_devkit",
     ]);
   });
 
   it("fails loudly at pull when a registered submodule dir is empty after init", () => {
     const repo = mkdtempSync(join(tmpdir(), "repo-"));
-    const submodulePath = "third_party/glass_goals";
+    const submodulePath = "third_party/glass_goals_devkit";
     writeFileSync(
       join(repo, ".gitmodules"),
-      `[submodule "glass_goals"]\n\tpath = ${submodulePath}\n`
+      `[submodule "glass_goals_devkit"]\n\tpath = ${submodulePath}\n`
     );
     mkdirSync(join(repo, submodulePath), { recursive: true });
 
