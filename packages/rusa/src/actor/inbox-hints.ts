@@ -75,11 +75,23 @@ export function resolveInboxHint(entry: InboxEntry): string | undefined {
       spaceName ??
       (threadName?.includes("/threads/") ? threadName.split("/threads/")[0] : undefined);
 
+    // Issue #1493, #1595, #1719: Google Chat threading guidance
     const isThreadHead = isGchatThreadHead(messageName, threadName);
 
     if (threadName && !isThreadHead) {
-      return `This Google Chat message is in thread '${threadName}'. Reply inside this thread with the chat-write 'send_message' tool, passing spaceName '${effectiveSpace ?? "<the space from threadName>"}' and threadName '${threadName}' (threadName must belong to spaceName).`;
+      const confirmation = messageName
+        ? ` You can confirm this one from the payload alone — messageName is '${messageName}', whose message id differs from its thread id, making this a reply inside an existing thread.`
+        : "";
+      return `This Google Chat message is in thread '${threadName}'.${confirmation} Reply inside this thread with the chat-write 'send_message' tool, passing spaceName '${effectiveSpace ?? "<the space from threadName>"}' and threadName '${threadName}' (threadName must belong to spaceName).`;
     }
+
+    if (isThreadHead) {
+      if (effectiveSpace) {
+        return `This Google Chat message is at top-level in '${effectiveSpace}' (not in a thread) — in the UI it appears as a standalone message, and a thread only comes into being if someone replies to it. It still carries a threadName: in Google Chat every message has one, and on a top-level message that id is the handle you would use to start a thread here, not a sign that a thread already exists. You can confirm this one from the payload alone — messageName is '${messageName}', whose message id equals its thread id, the signature of a message heading its own as-yet-empty thread. Reply with the chat-write 'send_message' tool, passing spaceName '${effectiveSpace}' and omitting threadName, unless the message explicitly requests creating a new thread.`;
+      }
+      return `This Google Chat message is at top-level (not in a thread) — in the UI it appears as a standalone message, and a thread only comes into being if someone replies to it. It still carries a threadName: in Google Chat every message has one, and on a top-level message that id is the handle you would use to start a thread here, not a sign that a thread already exists. You can confirm this one from the payload alone — messageName is '${messageName}', whose message id equals its thread id, the signature of a message heading its own as-yet-empty thread. Reply with the chat-write 'send_message' tool, passing the message's spaceName and omitting threadName, unless the message explicitly requests creating a new thread.`;
+    }
+
     if (effectiveSpace) {
       return `This Google Chat message is at top-level in '${effectiveSpace}' (not in a thread). Reply with the chat-write 'send_message' tool, passing spaceName '${effectiveSpace}' and omitting threadName, unless the message explicitly requests creating a new thread.`;
     }
