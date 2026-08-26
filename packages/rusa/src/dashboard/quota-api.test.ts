@@ -244,10 +244,8 @@ describe("dashboard quota snapshot", () => {
         provider === "claude"
           ? {
               intervalSeconds: 73,
-              held: false,
               expired: false,
               capped: false,
-              learning: false,
               buckets: [],
               uncappedIntervalSeconds: 73,
               updatedAt: "2026-07-22T12:00:00.000Z",
@@ -255,9 +253,17 @@ describe("dashboard quota snapshot", () => {
           : null,
     });
 
-    expect(snapshot.providers.find((p) => p.provider === "claude")?.throttle).toMatchObject({
+    const throttle = snapshot.providers.find((p) => p.provider === "claude")?.throttle;
+    expect(throttle).toEqual({
       intervalSeconds: 73,
+      expired: false,
+      capped: false,
+      buckets: [],
+      uncappedIntervalSeconds: 73,
+      updatedAt: "2026-07-22T12:00:00.000Z",
     });
+    expect(throttle).not.toHaveProperty("held");
+    expect(throttle).not.toHaveProperty("learning");
   });
 
   it("kimi: carries the 5h and Weekly windows from the CLI /usage scrape", async () => {

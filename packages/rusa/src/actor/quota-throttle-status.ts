@@ -9,10 +9,8 @@ export interface QuotaBucketError {
 
 export interface QuotaThrottleTick {
   intervalSeconds: number;
-  held: boolean;
   expired: boolean;
   capped: boolean;
-  learning: boolean;
   buckets: QuotaBucketError[];
   uncappedIntervalSeconds: number;
 }
