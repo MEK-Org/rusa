@@ -1360,4 +1360,58 @@ void main() {
       expect(kimi.sessionWindow, kDefaultQuotaProviders['agy']!.sessionWindow);
     });
   });
+
+  testWidgets('ActorTree supports drag-to-reorder for sibling actors', (tester) async {
+    await tester.runAsync(() async {
+      final api = FakeApi()
+        ..threadsResult = [
+          makeThread('root', created: 't0'),
+          makeThread('child-1', parent: 'root', created: 't1'),
+          makeThread('child-2', parent: 'root', created: 't2'),
+        ];
+      final cache = FakeTreePreferencesCache();
+      final store = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        treePreferencesCache: cache,
+      );
+      await store.init();
+
+      await tester.pumpWidget(_harness(store));
+      await tester.pump(const Duration(milliseconds: 50));
+
+      // Verify Draggables and DragTargets exist for actors
+      expect(find.byType(Draggable<ThreadDto>), findsNWidgets(3));
+      expect(find.byType(DragTarget<ThreadDto>), findsNWidgets(3));
+
+      // Find Draggable for child-2
+      final child2Finder = find.widgetWithText(Draggable<ThreadDto>, 'child-2-handle');
+      expect(child2Finder, findsOneWidget);
+
+      // Find DragTarget for child-1
+      final child1Target = find.widgetWithText(DragTarget<ThreadDto>, 'child-1-handle');
+      expect(child1Target, findsOneWidget);
+
+      // Drag child-2 onto child-1 (upper half -> before child-1)
+      final firstLocation = tester.getCenter(child2Finder);
+      final targetTopLocation = tester.getTopLeft(child1Target) + const Offset(20, 5);
+
+      final gesture = await tester.startGesture(firstLocation);
+      await tester.pump(const Duration(milliseconds: 50));
+      await gesture.moveTo(targetTopLocation);
+      await tester.pump(const Duration(milliseconds: 50));
+      await gesture.up();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      // Verify child-2 is now before child-1
+      expect(store.flattenedVisible().map((t) => t.id), [
+        'root',
+        'child-2',
+        'child-1',
+      ]);
+      expect(cache.storedActorOrder?['root'], ['child-2', 'child-1']);
+
+      await store.dispose();
+    });
+  });
 }

@@ -608,12 +608,18 @@ class FakeQuotaCache implements QuotaCache {
 
 /// In-memory [TreePreferencesCache] for headless store tests.
 class FakeTreePreferencesCache implements TreePreferencesCache {
-  FakeTreePreferencesCache({this.storedCollapsed, this.storedShowRetired});
+  FakeTreePreferencesCache({
+    this.storedCollapsed,
+    this.storedShowRetired,
+    this.storedActorOrder,
+  });
 
   Set<String>? storedCollapsed;
   bool? storedShowRetired;
+  Map<String, List<String>>? storedActorOrder;
   int saveCollapsedCount = 0;
   int saveShowRetiredCount = 0;
+  int saveActorOrderCount = 0;
   int clearCount = 0;
 
   @override
@@ -635,9 +641,28 @@ class FakeTreePreferencesCache implements TreePreferencesCache {
   }
 
   @override
+  Map<String, List<String>>? loadActorOrder() =>
+      storedActorOrder == null
+          ? null
+          : {
+            for (final entry in storedActorOrder!.entries)
+              entry.key: List<String>.from(entry.value),
+          };
+
+  @override
+  void saveActorOrder(Map<String, List<String>> order) {
+    storedActorOrder = {
+      for (final entry in order.entries)
+        entry.key: List<String>.from(entry.value),
+    };
+    saveActorOrderCount++;
+  }
+
+  @override
   void clear() {
     storedCollapsed = null;
     storedShowRetired = null;
+    storedActorOrder = null;
     clearCount++;
   }
 }

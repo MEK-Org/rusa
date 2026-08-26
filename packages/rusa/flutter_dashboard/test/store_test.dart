@@ -211,6 +211,164 @@ void main() {
   );
 
   test(
+    'reorderActor reorders sibling actors under same parent and updates flattenedVisible',
+    () async {
+      final api = FakeApi()
+        ..threadsResult = [
+          makeThread('root', created: 't0'),
+          makeThread('child-1', parent: 'root', created: 't1'),
+          makeThread('child-2', parent: 'root', created: 't2'),
+          makeThread('child-3', parent: 'root', created: 't3'),
+        ];
+      final cache = FakeTreePreferencesCache();
+      final store = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        treePreferencesCache: cache,
+      );
+      await store.init();
+      await pumpEventQueue();
+
+      // Default order: root -> child-1 -> child-2 -> child-3
+      expect(store.flattenedVisible().map((t) => t.id), [
+        'root',
+        'child-1',
+        'child-2',
+        'child-3',
+      ]);
+
+      // Move child-3 before child-1
+      store.reorderActor('child-3', 'child-1', before: true);
+      expect(store.flattenedVisible().map((t) => t.id), [
+        'root',
+        'child-3',
+        'child-1',
+        'child-2',
+      ]);
+      expect(cache.storedActorOrder?['root'], ['child-3', 'child-1', 'child-2']);
+
+      // Move child-1 after child-2
+      store.reorderActor('child-1', 'child-2', before: false);
+      expect(store.flattenedVisible().map((t) => t.id), [
+        'root',
+        'child-3',
+        'child-2',
+        'child-1',
+      ]);
+      expect(cache.storedActorOrder?['root'], ['child-3', 'child-2', 'child-1']);
+
+      // Move child-3 after child-2
+      store.reorderActor('child-3', 'child-2', before: false);
+      expect(store.flattenedVisible().map((t) => t.id), [
+        'root',
+        'child-2',
+        'child-3',
+        'child-1',
+      ]);
+
+      await store.dispose();
+    },
+  );
+
+  test(
+    'reorderActor rejects cross-parent actor drags (v1 constraint)',
+    () async {
+      final api = FakeApi()
+        ..threadsResult = [
+          makeThread('root', created: 't0'),
+          makeThread('parent-a', parent: 'root', created: 't1'),
+          makeThread('child-a1', parent: 'parent-a', created: 't2'),
+          makeThread('parent-b', parent: 'root', created: 't3'),
+          makeThread('child-b1', parent: 'parent-b', created: 't4'),
+        ];
+      final cache = FakeTreePreferencesCache();
+      final store = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        treePreferencesCache: cache,
+      );
+      await store.init();
+      await pumpEventQueue();
+
+      final initialOrder = store.flattenedVisible().map((t) => t.id).toList();
+      expect(initialOrder, [
+        'root',
+        'parent-a',
+        'child-a1',
+        'parent-b',
+        'child-b1',
+      ]);
+
+      // Attempt to drag child-b1 onto child-a1 (different parents: parent-b vs parent-a)
+      store.reorderActor('child-b1', 'child-a1', before: true);
+      expect(store.flattenedVisible().map((t) => t.id), initialOrder);
+      expect(cache.saveActorOrderCount, 0);
+
+      // Attempt to drag child-a1 onto root (different parents: parent-a vs null)
+      store.reorderActor('child-a1', 'root', before: true);
+      expect(store.flattenedVisible().map((t) => t.id), initialOrder);
+      expect(cache.saveActorOrderCount, 0);
+
+      await store.dispose();
+    },
+  );
+
+  test(
+    'persists custom actor ordering across store reloads via TreePreferencesCache',
+    () async {
+      final cache = FakeTreePreferencesCache();
+      final api = FakeApi()
+        ..threadsResult = [
+          makeThread('root', created: 't0'),
+          makeThread('child-1', parent: 'root', created: 't1'),
+          makeThread('child-2', parent: 'root', created: 't2'),
+          makeThread('child-3', parent: 'root', created: 't3'),
+        ];
+
+      // Session 1: reorder child-3 before child-1
+      final store1 = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        treePreferencesCache: cache,
+      );
+      await store1.init();
+      await pumpEventQueue();
+
+      store1.reorderActor('child-3', 'child-1', before: true);
+      expect(store1.flattenedVisible().map((t) => t.id), [
+        'root',
+        'child-3',
+        'child-1',
+        'child-2',
+      ]);
+      await store1.dispose();
+
+      // Session 2: new store instance booted with the same cache
+      final store2 = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        treePreferencesCache: cache,
+      );
+      await store2.init();
+      await pumpEventQueue();
+
+      expect(store2.customActorOrder.value['root'], [
+        'child-3',
+        'child-1',
+        'child-2',
+      ]);
+      expect(store2.flattenedVisible().map((t) => t.id), [
+        'root',
+        'child-3',
+        'child-1',
+        'child-2',
+      ]);
+
+      await store2.dispose();
+    },
+  );
+
+  test(
     'click / ctrl-toggle / shift-range selection over the visible list',
     () async {
       final api = FakeApi()

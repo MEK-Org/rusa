@@ -138,6 +138,10 @@ class DashboardStore {
     if (savedShowRetired != null) {
       _showRetired.add(savedShowRetired);
     }
+    final savedActorOrder = _treePreferencesCache.loadActorOrder();
+    if (savedActorOrder != null) {
+      _customActorOrder.add(savedActorOrder);
+    }
   }
 
   final DashboardApi _api;
@@ -164,6 +168,8 @@ class DashboardStore {
   final _showRetired = BehaviorSubject<bool>.seeded(false);
   final _selection = BehaviorSubject<Set<String>>.seeded(const {});
   final _collapsed = BehaviorSubject<Set<String>>.seeded(const {});
+  final _customActorOrder =
+      BehaviorSubject<Map<String, List<String>>>.seeded(const {});
   final _primary = BehaviorSubject<String?>.seeded(null);
   final _kindFilter = BehaviorSubject<String?>.seeded(null);
   final _events = BehaviorSubject<EventsView>.seeded(const EventsView());
@@ -211,6 +217,8 @@ class DashboardStore {
   ValueStream<bool> get showRetired => _showRetired.stream;
   ValueStream<Set<String>> get selection => _selection.stream;
   ValueStream<Set<String>> get collapsed => _collapsed.stream;
+  ValueStream<Map<String, List<String>>> get customActorOrder =>
+      _customActorOrder.stream;
   ValueStream<String?> get primary => _primary.stream;
   ValueStream<String?> get kindFilter => _kindFilter.stream;
   ValueStream<EventsView> get events => _events.stream;
@@ -422,15 +430,33 @@ class DashboardStore {
     final all = _actorStates.value.orderedIds.map((id) => _actorStates.value.actors[id]!.thread).toList();
     final show = _showRetired.value;
     final collapsedSet = _collapsed.value;
+    final customOrder = _customActorOrder.value;
     final byParent = <String?, List<ThreadDto>>{};
     for (final t in all) {
       (byParent[t.parentId] ??= []).add(t);
     }
-    for (final list in byParent.values) {
-      list.sort((a, b) {
-        final c = a.createdAt.compareTo(b.createdAt);
-        return c != 0 ? c : a.id.compareTo(b.id);
-      });
+    for (final entry in byParent.entries) {
+      final parentKey = entry.key ?? '';
+      final ordering = customOrder[parentKey];
+      if (ordering != null && ordering.isNotEmpty) {
+        final indexMap = {for (var i = 0; i < ordering.length; i++) ordering[i]: i};
+        entry.value.sort((a, b) {
+          final aIdx = indexMap[a.id];
+          final bIdx = indexMap[b.id];
+          if (aIdx != null && bIdx != null) {
+            return aIdx.compareTo(bIdx);
+          }
+          if (aIdx != null) return -1;
+          if (bIdx != null) return 1;
+          final c = a.createdAt.compareTo(b.createdAt);
+          return c != 0 ? c : a.id.compareTo(b.id);
+        });
+      } else {
+        entry.value.sort((a, b) {
+          final c = a.createdAt.compareTo(b.createdAt);
+          return c != 0 ? c : a.id.compareTo(b.id);
+        });
+      }
     }
     final now = DateTime.timestamp();
     final out = <ThreadDto>[];
@@ -523,6 +549,59 @@ class DashboardStore {
         : (Set<String>.of(cur)..remove(id));
     _collapsed.add(updated);
     _treePreferencesCache.saveCollapsed(updated);
+  }
+
+  /// Reorders a child actor among its siblings under the same parent.
+  /// [draggedId] is moved relative to [targetId] (before it if [before] is true, else after).
+  /// Reordering is strictly scoped to siblings with the exact same [parentId] (v1 constraint).
+  void reorderActor(String draggedId, String targetId, {bool before = true}) {
+    if (draggedId == targetId) return;
+    final actors = _actorStates.value.actors;
+    final dragged = actors[draggedId]?.thread;
+    final target = actors[targetId]?.thread;
+    if (dragged == null || target == null) return;
+    if (dragged.parentId != target.parentId) {
+      // v1 constraint: only drag within the same parent
+      return;
+    }
+
+    final parentKey = dragged.parentId ?? '';
+    final siblings = _actorStates.value.orderedIds
+        .map((id) => _actorStates.value.actors[id]?.thread)
+        .whereType<ThreadDto>()
+        .where((t) => t.parentId == dragged.parentId)
+        .toList();
+
+    final currentCustom = _customActorOrder.value[parentKey];
+    if (currentCustom != null && currentCustom.isNotEmpty) {
+      final indexMap = {for (var i = 0; i < currentCustom.length; i++) currentCustom[i]: i};
+      siblings.sort((a, b) {
+        final aIdx = indexMap[a.id];
+        final bIdx = indexMap[b.id];
+        if (aIdx != null && bIdx != null) return aIdx.compareTo(bIdx);
+        if (aIdx != null) return -1;
+        if (bIdx != null) return 1;
+        final c = a.createdAt.compareTo(b.createdAt);
+        return c != 0 ? c : a.id.compareTo(b.id);
+      });
+    } else {
+      siblings.sort((a, b) {
+        final c = a.createdAt.compareTo(b.createdAt);
+        return c != 0 ? c : a.id.compareTo(b.id);
+      });
+    }
+
+    final ids = siblings.map((t) => t.id).toList();
+    ids.remove(draggedId);
+    final targetIdx = ids.indexOf(targetId);
+    if (targetIdx == -1) return;
+    final insertIdx = before ? targetIdx : targetIdx + 1;
+    ids.insert(insertIdx.clamp(0, ids.length), draggedId);
+
+    final nextMap = Map<String, List<String>>.from(_customActorOrder.value);
+    nextMap[parentKey] = ids;
+    _customActorOrder.add(nextMap);
+    _treePreferencesCache.saveActorOrder(nextMap);
   }
 
   /// Plain click: select only [id].
