@@ -355,16 +355,17 @@ export function buildQuotaHistory(
   ];
 }
 
+const MAX_FALLBACK_HOLD_MS = 24 * 60 * 60 * 1000;
+
 function latestStateFromHistory(
   provider: SupportedProvider,
   history: readonly QuotaHistorySource[],
   nowMs: number
 ): ProviderQuotaSnapshot | null {
-  const MAX_HOLD_MS = 24 * 60 * 60 * 1000;
   const eligible = history.filter((point) => {
     const observedMs = Date.parse(point.observedAt);
     const ageMs = nowMs - observedMs;
-    return Number.isFinite(observedMs) && ageMs >= 0 && ageMs <= MAX_HOLD_MS;
+    return Number.isFinite(observedMs) && ageMs >= 0 && ageMs <= MAX_FALLBACK_HOLD_MS;
   });
   const latestObservedAt = eligible
     .map((point) => point.observedAt)
@@ -384,8 +385,6 @@ function latestStateFromHistory(
     })),
   };
 }
-
-const MAX_FALLBACK_HOLD_MS = 24 * 60 * 60 * 1000;
 
 /** Build the current quota snapshot from the shared cache for configured providers. */
 export async function buildQuotaSnapshot(deps: QuotaApiDeps): Promise<QuotaSnapshotDto> {

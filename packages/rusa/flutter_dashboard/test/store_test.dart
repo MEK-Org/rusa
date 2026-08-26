@@ -940,6 +940,115 @@ void main() {
     });
   });
 
+  test('refreshQuotaHistory keeps last-known history and flips '
+      'quotaHistoryRefreshing while a background fetch is in flight', () async {
+    const firstHistory = QuotaHistoryDto(
+      generatedAt: 'first',
+      historySince: '2026-07-01T00:00:00.000Z',
+      history: [],
+    );
+    const secondHistory = QuotaHistoryDto(
+      generatedAt: 'second',
+      historySince: '2026-07-01T00:00:00.000Z',
+      history: [],
+    );
+    final api = FakeApi()
+      ..threadsResult = [makeThread('root', created: 't0')]
+      ..quotaHistoryResult = firstHistory;
+    final store = await _booted(api, FakeStream());
+
+    expect(store.quotaHistory.value?.generatedAt, 'first');
+    expect(store.quotaHistoryRefreshing.value, false);
+
+    final gate = Completer<QuotaHistoryDto>();
+    api.quotaHistoryGate = gate;
+    final refresh = store.refreshQuotaHistory();
+    await pumpEventQueue();
+
+    expect(store.quotaHistory.value?.generatedAt, 'first');
+    expect(store.quotaHistoryRefreshing.value, true);
+
+    gate.complete(secondHistory);
+    await refresh;
+
+    expect(store.quotaHistory.value?.generatedAt, 'second');
+    expect(store.quotaHistoryRefreshing.value, false);
+
+    await store.dispose();
+  });
+
+  test('a 503 on quota history reports null and does not mark stale', () async {
+    final api = FakeApi()
+      ..quotaHistoryError = DashboardApiException(
+        Uri.parse('/api/quota/history'),
+        503,
+        'unavailable',
+      );
+    final store = DashboardStore(api: api, stream: FakeStream());
+    await store.refreshQuotaHistory();
+
+    expect(store.quotaHistory.valueOrNull, isNull);
+    expect(store.quotaHistoryStale.value, false);
+
+    await store.dispose();
+  });
+
+  test('a failed history revalidation retains history and marks it stale without setting global error', () async {
+    final api = FakeApi()
+      ..quotaHistoryResult = const QuotaHistoryDto(
+        generatedAt: 'last-known',
+        historySince: '2026-07-01T00:00:00.000Z',
+        history: [],
+      );
+    final store = DashboardStore(api: api, stream: FakeStream());
+    await store.refreshQuotaHistory();
+    expect(store.quotaHistoryStale.value, false);
+
+    api.quotaHistoryError = DashboardApiException(
+      Uri.parse('/api/quota/history'),
+      500,
+      'fetch failed',
+    );
+    await store.refreshQuotaHistory();
+
+    expect(store.quotaHistory.value?.generatedAt, 'last-known');
+    expect(store.quotaHistoryStale.value, true);
+    expect(store.error.value, isNull);
+
+    api.quotaHistoryError = Exception('Connection timeout');
+    await store.refreshQuotaHistory();
+    expect(store.quotaHistoryStale.value, true);
+    expect(store.error.value, isNull);
+
+    await store.dispose();
+  });
+
+  test('background quota history polling refetches every 5 minutes', () {
+    fakeAsync((async) {
+      final api = FakeApi()
+        ..threadsResult = [makeThread('root', created: 't0')]
+        ..quotaHistoryResult = const QuotaHistoryDto(
+          generatedAt: 'hist',
+          historySince: '2026-07-01T00:00:00.000Z',
+          history: [],
+        );
+      final store = DashboardStore(api: api, stream: FakeStream());
+      unawaited(store.init());
+      async.flushMicrotasks();
+
+      expect(api.quotaHistoryCallCount, 1);
+
+      async.elapse(const Duration(minutes: 5));
+      expect(api.quotaHistoryCallCount, 2);
+
+      async.elapse(const Duration(minutes: 5));
+      expect(api.quotaHistoryCallCount, 3);
+
+      unawaited(store.dispose());
+      async.flushMicrotasks();
+    });
+  });
+
   test('conversation: live SSE dedupes message_sent + message_received for the '
       'same messageId — each message renders exactly once ', () async {
     final api = FakeApi()
