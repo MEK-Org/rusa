@@ -397,7 +397,7 @@ export function createTrackerMcpServer(
               side: z
                 .enum(["LEFT", "RIGHT"])
                 .optional()
-                .describe("Side of diff ('LEFT' or 'RIGHT')"),
+                .describe("Side of diff: 'LEFT' or 'RIGHT' (default: 'RIGHT')"),
               startLine: z
                 .number()
                 .int()
@@ -406,7 +406,7 @@ export function createTrackerMcpServer(
               startSide: z
                 .enum(["LEFT", "RIGHT"])
                 .optional()
-                .describe("Starting side for multi-line comments"),
+                .describe("Starting side for multi-line comments (defaults to side or 'RIGHT')"),
             })
           )
           .optional()
@@ -441,8 +441,13 @@ export function createTrackerMcpServer(
     {
       title: "Post an inline PR review comment",
       description:
-        "Post an inline review comment on a pull request diff line, or reply to an existing " +
-        "inline review comment thread. The comment body will be stamped with your authenticated identity.",
+        "Post an inline review comment on a pull request diff line, on a whole file, or reply to an existing " +
+        "inline review comment thread.\n\n" +
+        "Three modes are supported (provide fields for exactly one mode):\n" +
+        "1. Line/range comment: provide 'path', 'line', and optionally 'side' (defaults to 'RIGHT'), 'startLine', 'startSide'\n" +
+        "2. File comment: provide 'path' and 'subjectType: \"file\"'\n" +
+        "3. Reply: provide 'inReplyTo' (target comment ID; omit placement fields)\n\n" +
+        "The comment body will be stamped with your authenticated identity.",
       inputSchema: {
         repo: z.string().describe("Repository in owner/name format"),
         prNumber: z.number().int().describe("The pull request number"),
@@ -451,14 +456,14 @@ export function createTrackerMcpServer(
           .string()
           .optional()
           .describe(
-            "Relative file path in the repository (required when starting a new comment thread, omit if inReplyTo is set)"
+            "Relative file path in the repository (required for line and file comments, omit for replies)"
           ),
         line: z
           .number()
           .int()
           .optional()
           .describe(
-            "Line number in the file diff (required when starting a new line thread, omit if inReplyTo is set)"
+            "Line number in the file diff (required for line comments, omit for file comments and replies)"
           ),
         commitId: z
           .string()
@@ -478,12 +483,14 @@ export function createTrackerMcpServer(
         startSide: z
           .enum(["LEFT", "RIGHT"])
           .optional()
-          .describe("Starting side for multi-line comments"),
+          .describe("Starting side for multi-line comments (defaults to side or 'RIGHT')"),
         inReplyTo: z
           .number()
           .int()
           .optional()
-          .describe("Comment ID to reply to an existing review comment thread"),
+          .describe(
+            "Comment ID to reply to an existing review comment thread (omit placement fields)"
+          ),
         subjectType: z
           .enum(["line", "file"])
           .optional()

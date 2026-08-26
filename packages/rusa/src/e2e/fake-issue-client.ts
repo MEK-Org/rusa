@@ -328,10 +328,14 @@ export class FakeIssueClient implements IssueClient {
     reviewId?: number
   ): Promise<PrReviewComment[]> {
     return this.tracker.getReviewComments(prNumber, reviewId).map((c) => ({
+      id: c.id,
       path: c.path,
       line: c.line,
       body: c.body,
       diffHunk: c.diffHunk,
+      author: c.author,
+      createdAt: c.createdAt,
+      inReplyToId: c.inReplyToId ?? null,
     }));
   }
 

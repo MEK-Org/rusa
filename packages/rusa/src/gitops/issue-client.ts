@@ -674,19 +674,17 @@ export class GitHubIssueClient implements IssueClient {
       reviewId !== undefined
         ? `/repos/${repo}/pulls/${prNumber}/reviews/${reviewId}/comments`
         : `/repos/${repo}/pulls/${prNumber}/comments`;
-    const comments = await this.api<
-      Array<{
-        id: number;
-        path: string;
-        line: number | null;
-        original_line: number | null;
-        body: string;
-        diff_hunk: string;
-        user?: { login: string };
-        created_at?: string;
-        in_reply_to_id?: number | null;
-      }>
-    >("GET", path);
+    const comments = await this.apiPages<{
+      id: number;
+      path: string;
+      line: number | null;
+      original_line: number | null;
+      body: string;
+      diff_hunk: string;
+      user?: { login: string };
+      created_at?: string;
+      in_reply_to_id?: number | null;
+    }>(path, new URLSearchParams({ per_page: "100" }));
 
     return comments.map((c) => ({
       id: c.id,
@@ -869,9 +867,9 @@ export class GitHubIssueClient implements IssueClient {
         path: c.path,
         line: c.line,
         body: c.body,
-        side: c.side,
-        start_line: c.startLine,
-        start_side: c.startSide,
+        side: c.side ?? "RIGHT",
+        ...(c.startLine !== undefined ? { start_line: c.startLine } : {}),
+        ...(c.startLine !== undefined ? { start_side: c.startSide ?? c.side ?? "RIGHT" } : {}),
       }));
     }
     const review = await this.api<{ html_url?: string }>(
@@ -887,27 +885,55 @@ export class GitHubIssueClient implements IssueClient {
       body: opts.body,
     };
     if (opts.inReplyTo !== undefined) {
+      if (
+        opts.path !== undefined ||
+        opts.line !== undefined ||
+        opts.side !== undefined ||
+        opts.startLine !== undefined ||
+        opts.startSide !== undefined ||
+        opts.subjectType !== undefined
+      ) {
+        throw new Error(
+          "inReplyTo cannot be combined with path, line, side, startLine, startSide, or subjectType"
+        );
+      }
       payload.in_reply_to = opts.inReplyTo;
     } else {
       if (!opts.path) {
         throw new Error("path is required when creating a new review comment");
       }
       payload.path = opts.path;
-      if (opts.line !== undefined) {
+
+      if (opts.subjectType === "file") {
+        if (
+          opts.line !== undefined ||
+          opts.side !== undefined ||
+          opts.startLine !== undefined ||
+          opts.startSide !== undefined
+        ) {
+          throw new Error(
+            "line, side, startLine, and startSide cannot be provided when subjectType is 'file'"
+          );
+        }
+        payload.subject_type = "file";
+      } else {
+        if (opts.line === undefined) {
+          throw new Error("line is required for line-level review comments");
+        }
         payload.line = opts.line;
+        const side = opts.side ?? "RIGHT";
+        payload.side = side;
+        if (opts.startLine !== undefined) {
+          if (opts.startLine > opts.line) {
+            throw new Error(
+              `startLine (${opts.startLine}) cannot be greater than line (${opts.line})`
+            );
+          }
+          payload.start_line = opts.startLine;
+          payload.start_side = opts.startSide ?? side;
+        }
       }
-      if (opts.side) {
-        payload.side = opts.side;
-      }
-      if (opts.startLine !== undefined) {
-        payload.start_line = opts.startLine;
-      }
-      if (opts.startSide) {
-        payload.start_side = opts.startSide;
-      }
-      if (opts.subjectType) {
-        payload.subject_type = opts.subjectType;
-      }
+
       let commitId = opts.commitId;
       if (!commitId) {
         const prDetails = await this.getPullRequestDetails(opts.repo, opts.prNumber);

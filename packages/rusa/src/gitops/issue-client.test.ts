@@ -730,7 +730,7 @@ describe("GitHubIssueClient", () => {
     });
   });
 
-  it("creates an inline PR review comment resolving headSha when commitId is omitted", async () => {
+  it("creates an inline PR review comment resolving headSha and defaulting side to RIGHT", async () => {
     const requests = installFetch({
       [`GET /repos/${REPO}/pulls/12`]: {
         status: 200,
@@ -777,8 +777,126 @@ describe("GitHubIssueClient", () => {
       body: "Why this pattern?",
       path: "packages/app.ts",
       line: 15,
+      side: "RIGHT",
       commit_id: "pr-head-sha-456",
     });
+  });
+
+  it("creates a file-level PR review comment when subjectType is 'file'", async () => {
+    const requests = installFetch({
+      [`POST /repos/${REPO}/pulls/12/comments`]: {
+        status: 201,
+        json: {
+          id: 103,
+          html_url: `https://github.com/${REPO}/pull/12#discussion_r103`,
+          path: "packages/app.ts",
+          line: null,
+          body: "Overall file comments.",
+        },
+      },
+    });
+
+    const result = await new GitHubIssueClient().createPrReviewComment({
+      repo: REPO,
+      prNumber: 12,
+      path: "packages/app.ts",
+      subjectType: "file",
+      commitId: "custom-sha",
+      body: "Overall file comments.",
+    });
+
+    expect(result.id).toBe(103);
+    expect(requests[0].body).toEqual({
+      body: "Overall file comments.",
+      path: "packages/app.ts",
+      subject_type: "file",
+      commit_id: "custom-sha",
+    });
+  });
+
+  it("creates a multi-line PR review comment defaulting startSide to side", async () => {
+    const requests = installFetch({
+      [`POST /repos/${REPO}/pulls/12/comments`]: {
+        status: 201,
+        json: {
+          id: 104,
+          html_url: `https://github.com/${REPO}/pull/12#discussion_r104`,
+          path: "packages/app.ts",
+          line: 25,
+          body: "Multi line review.",
+        },
+      },
+    });
+
+    await new GitHubIssueClient().createPrReviewComment({
+      repo: REPO,
+      prNumber: 12,
+      path: "packages/app.ts",
+      startLine: 20,
+      line: 25,
+      commitId: "custom-sha",
+      body: "Multi line review.",
+    });
+
+    expect(requests[0].body).toEqual({
+      body: "Multi line review.",
+      path: "packages/app.ts",
+      line: 25,
+      side: "RIGHT",
+      start_line: 20,
+      start_side: "RIGHT",
+      commit_id: "custom-sha",
+    });
+  });
+
+  it("validates createPrReviewComment input constraints", async () => {
+    const client = new GitHubIssueClient();
+
+    // inReplyTo combined with path/line
+    await expect(
+      client.createPrReviewComment({
+        repo: REPO,
+        prNumber: 12,
+        inReplyTo: 101,
+        path: "packages/app.ts",
+        body: "bad",
+      })
+    ).rejects.toThrow("inReplyTo cannot be combined");
+
+    // subjectType: file with line
+    await expect(
+      client.createPrReviewComment({
+        repo: REPO,
+        prNumber: 12,
+        subjectType: "file",
+        path: "packages/app.ts",
+        line: 10,
+        body: "bad",
+      })
+    ).rejects.toThrow("line, side, startLine, and startSide cannot be provided");
+
+    // line missing for line-level comment
+    await expect(
+      client.createPrReviewComment({
+        repo: REPO,
+        prNumber: 12,
+        path: "packages/app.ts",
+        body: "bad",
+      })
+    ).rejects.toThrow("line is required");
+
+    // startLine > line
+    await expect(
+      client.createPrReviewComment({
+        repo: REPO,
+        prNumber: 12,
+        path: "packages/app.ts",
+        startLine: 30,
+        line: 20,
+        commitId: "sha",
+        body: "bad",
+      })
+    ).rejects.toThrow("startLine (30) cannot be greater than line (20)");
   });
 
   it("creates a PR review comment reply when inReplyTo is supplied", async () => {
@@ -1574,7 +1692,7 @@ describe("GitHubIssueClient", () => {
 
   it("maps review comments, falling back to original_line", async () => {
     installFetch({
-      [`GET /repos/${REPO}/pulls/5/reviews/77/comments`]: {
+      [`GET /repos/${REPO}/pulls/5/reviews/77/comments?per_page=100&page=1`]: {
         json: [
           { path: "a.ts", line: 10, original_line: 8, body: "fix", diff_hunk: "@@ -1 +1 @@" },
           { path: "b.ts", line: null, original_line: 4, body: "also", diff_hunk: "@@ -2 +2 @@" },
@@ -1607,38 +1725,63 @@ describe("GitHubIssueClient", () => {
     ]);
   });
 
-  it("fetches all PR review comments when reviewId is omitted", async () => {
+  it("fetches all PR review comments across pages when reviewId is omitted", async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({
+      id: i + 1,
+      path: `src/file_${i}.ts`,
+      line: i + 1,
+      original_line: i + 1,
+      body: `comment ${i + 1}`,
+      diff_hunk: "@@ -1 +1 @@",
+      user: { login: "reviewer-1" },
+      created_at: "2026-08-25T00:00:00Z",
+      in_reply_to_id: null,
+    }));
+    const page2 = [
+      {
+        id: 101,
+        path: "src/file_101.ts",
+        line: 101,
+        original_line: 101,
+        body: "comment 101",
+        diff_hunk: "@@ -1 +1 @@",
+        user: { login: "reviewer-2" },
+        created_at: "2026-08-25T01:00:00Z",
+        in_reply_to_id: 1,
+      },
+    ];
+
     installFetch({
-      [`GET /repos/${REPO}/pulls/5/comments`]: {
-        json: [
-          {
-            id: 201,
-            path: "src/a.ts",
-            line: 20,
-            original_line: 18,
-            body: "note",
-            diff_hunk: "@@ -1 +1 @@",
-            user: { login: "reviewer-1" },
-            created_at: "2026-08-25T00:00:00Z",
-            in_reply_to_id: null,
-          },
-        ],
+      [`GET /repos/${REPO}/pulls/5/comments?per_page=100&page=1`]: {
+        json: page1,
+      },
+      [`GET /repos/${REPO}/pulls/5/comments?per_page=100&page=2`]: {
+        json: page2,
       },
     });
 
     const comments = await new GitHubIssueClient().getPrReviewComments(REPO, 5);
-    expect(comments).toEqual([
-      {
-        id: 201,
-        path: "src/a.ts",
-        line: 20,
-        body: "note",
-        diffHunk: "@@ -1 +1 @@",
-        author: "reviewer-1",
-        createdAt: "2026-08-25T00:00:00Z",
-        inReplyToId: null,
-      },
-    ]);
+    expect(comments).toHaveLength(101);
+    expect(comments[0]).toEqual({
+      id: 1,
+      path: "src/file_0.ts",
+      line: 1,
+      body: "comment 1",
+      diffHunk: "@@ -1 +1 @@",
+      author: "reviewer-1",
+      createdAt: "2026-08-25T00:00:00Z",
+      inReplyToId: null,
+    });
+    expect(comments[100]).toEqual({
+      id: 101,
+      path: "src/file_101.ts",
+      line: 101,
+      body: "comment 101",
+      diffHunk: "@@ -1 +1 @@",
+      author: "reviewer-2",
+      createdAt: "2026-08-25T01:00:00Z",
+      inReplyToId: 1,
+    });
   });
 
   it("treats 404 as 'no parent' / 'no sub-issues' and propagates other errors", async () => {
