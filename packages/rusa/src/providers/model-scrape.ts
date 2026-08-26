@@ -35,11 +35,20 @@ export function buildCodexModelTmuxScript(
     'tmux -S "$SOCK" kill-server 2>/dev/null || true',
     `tmux -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 ${q(cliCommand)}${trustArg ? ` ${trustArg}` : ""}`,
     // Wait up to ~20s for the composer prompt to become ready (not just the banner).
+    "ready=0",
     "for i in $(seq 1 40); do",
     '  scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
-    '  printf "%s" "$scr" | grep -qiE "Ask Codex to do anything" && break',
+    '  if printf "%s" "$scr" | grep -qiE "Ask Codex to do anything"; then',
+    "    ready=1",
+    "    break",
+    "  fi",
     "  sleep 0.5",
     "done",
+    'if [ "$ready" -eq 0 ]; then',
+    '  echo "ERROR: composer never became ready in Codex session" >&2',
+    '  tmux -S "$SOCK" kill-server 2>/dev/null || true',
+    "  exit 1",
+    "fi",
     // Settle before sending keys so TUI is fully accepting input.
     "sleep 2",
     // Type the /model command with literal keys and submit after a short pause.
@@ -50,6 +59,7 @@ export function buildCodexModelTmuxScript(
     // On codex CLI, the first Enter may be consumed by the autocomplete popup.
     // Poll for confirmation: if the menu hasn't rendered yet and the popup or
     // prompt is still visible, re-send Enter to submit the command.
+    // Note: Keep regex in sync with extractModelCatalog pre-extraction guard in model-catalog.ts
     "rendered=0",
     "for i in $(seq 1 40); do",
     '  scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
@@ -244,7 +254,9 @@ function logFailedRefresh(provider: string, message: string, scrapeStore?: Model
   if (existing && existing.length > 0) {
     let ageNote = "";
     try {
-      const latest = scrapeStore?.getLatestForProvider?.(provider);
+      const latest =
+        scrapeStore?.getLatestParsedForProvider?.(provider) ??
+        scrapeStore?.getLatestForProvider?.(provider);
       if (latest?.scrapedAt) {
         ageNote = `, last scraped at ${latest.scrapedAt}`;
       }
@@ -378,20 +390,13 @@ export async function refreshConfiguredProviderModelCatalogs(deps: {
   await Promise.all(
     providersToProbe.map(async (provider) => {
       try {
-        const result = await refreshProviderModelCatalog({
+        await refreshProviderModelCatalog({
           provider,
           workersDir: deps.workersDir,
           scrapeStore: deps.scrapeStore,
           geminiApiKey: deps.config.geminiApiKey,
           probers: deps.probers,
         });
-        if (result.status === "unknown") {
-          logFailedRefresh(
-            provider,
-            `failed to refresh model catalog for ${provider}: ${result.message}`,
-            deps.scrapeStore
-          );
-        }
       } catch (err) {
         logFailedRefresh(
           provider,

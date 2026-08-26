@@ -93,7 +93,8 @@ export async function extractModelCatalog(
     };
   }
 
-  // Guard against panel-less captures that contain only the startup banner/status line
+  // Guard against panel-less captures that contain only the startup banner/status line.
+  // Note: Keep regex in sync with buildCodexModelTmuxScript panel detection markers in model-scrape.ts
   if (
     descriptor.provider === "codex" &&
     /(?:model\s*:\s*[^\n]+\/model to change|OpenAI Codex|Welcome to Codex)/i.test(rawOutput) &&
@@ -176,6 +177,9 @@ export interface ModelScrapeStore {
   recordParsed(id: string, models: readonly ModelEntry[]): void;
   recordParseError(id: string, error: unknown): void;
   getLatestForProvider?(
+    provider: string
+  ): { scrapedAt: string; parsedModels: readonly ModelEntry[] | null } | null;
+  getLatestParsedForProvider?(
     provider: string
   ): { scrapedAt: string; parsedModels: readonly ModelEntry[] | null } | null;
 }

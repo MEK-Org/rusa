@@ -131,4 +131,41 @@ describe("ModelScrapeRepository", () => {
 
     db.close();
   });
+
+  it("retrieves the latest successfully parsed scrape for a provider ignoring failed scrapes", () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const repo = new ModelScrapeRepository(db);
+
+    // Old successful scrape
+    const id1 = repo.recordRaw({
+      provider: "codex",
+      scrapedAt: "2026-08-18T08:00:00.000Z",
+      rawOutput: "good screen",
+    });
+    repo.recordParsed(id1, [
+      { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol", passable: true },
+    ]);
+
+    // Newer failed scrape (e.g. extraction error / raw capture only)
+    const id2 = repo.recordRaw({
+      provider: "codex",
+      scrapedAt: "2026-08-18T12:00:00.000Z",
+      rawOutput: "failed screen",
+    });
+    repo.recordParseError(id2, "failed extraction");
+
+    const latest = repo.getLatestForProvider("codex");
+    expect(latest?.scrapedAt).toBe("2026-08-18T12:00:00.000Z");
+    expect(latest?.parsedModels).toBeNull();
+
+    const latestParsed = repo.getLatestParsedForProvider("codex");
+    expect(latestParsed).not.toBeNull();
+    expect(latestParsed?.scrapedAt).toBe("2026-08-18T08:00:00.000Z");
+    expect(latestParsed?.parsedModels).toEqual([
+      { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol", passable: true },
+    ]);
+
+    db.close();
+  });
 });

@@ -163,6 +163,43 @@ gemini-3.1-pro-high       Gemini 3.1 Pro (High)
       { displayLabel: "claude-sonnet-5", identifier: "claude-sonnet-5", passable: true },
     ]);
   });
+
+  it("includes last scraped timestamp from getLatestParsedForProvider in warning log on probe failure", async () => {
+    setProviderModelCatalog("codex", [
+      { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol", passable: true },
+    ]);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const mockStore = {
+      recordRaw: vi.fn().mockReturnValue("scrape-fail-1"),
+      recordParsed: vi.fn(),
+      recordParseError: vi.fn(),
+      getLatestParsedForProvider: vi.fn().mockReturnValue({
+        scrapedAt: "2026-08-26T18:00:00.000Z",
+        parsedModels: [{ displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol", passable: true }],
+      }),
+    };
+
+    const mockScrapeCodex = vi.fn().mockRejectedValue(new Error("codex crashed"));
+
+    const res = await refreshProviderModelCatalog({
+      provider: "codex",
+      workersDir: "/tmp/test-workers",
+      scrapeStore: mockStore,
+      probers: {
+        scrapeCodex: mockScrapeCodex,
+      },
+    });
+
+    expect(res.status).toBe("unknown");
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "retaining last-known-good catalog (1 models, last scraped at 2026-08-26T18:00:00.000Z)"
+      )
+    );
+
+    warnSpy.mockRestore();
+  });
 });
 
 describe("refreshConfiguredProviderModelCatalogs", () => {
@@ -266,6 +303,7 @@ done
   it("generates tmux script with autocomplete confirmation and render error check ", () => {
     const script = buildCodexModelTmuxScript("codex", "/tmp/sock", '-c projects.trust="trusted"');
     expect(script).toContain("Ask Codex to do anything");
+    expect(script).toContain("ERROR: composer never became ready in Codex session");
     expect(script).toContain('tmux -S "$SOCK" send-keys -t "$S" -l "/model"');
     expect(script).toContain("Select Model");
     expect(script).toContain("ERROR: /model panel never rendered in Codex session");
