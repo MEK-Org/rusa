@@ -1431,6 +1431,20 @@ void main() {
       );
     });
 
+    test('renders only pacing line when not expired and no buckets driving pace', () {
+      final tooltip = quotaThrottleTooltip(
+        const QuotaThrottleDto(
+          intervalSeconds: 73,
+          expired: false,
+          updatedAt: '2026-07-22T12:00:00.000Z',
+          buckets: [],
+        ),
+      );
+      expect(tooltip, 'Normal launch pacing: one start every 1.2m');
+      expect(tooltip, isNot(contains('learning')));
+      expect(tooltip, isNot(contains('expired')));
+    });
+
     test('explains that previous quota window expired', () {
       expect(
         quotaThrottleTooltip(
