@@ -30,6 +30,34 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 /** A session/conversation UUID as it appears in codex rollout filenames + `session_meta.payload.id`. */
 const SESSION_UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
+/**
+ * Parse a Codex model string into its base model identifier and optional reasoning effort qualifier.
+ * Codex models are slugs like 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.5', 'gpt-5.4-mini'.
+ * Reasoning effort (e.g. 'low', 'medium', 'high', 'extra-high', 'none') is configured separately
+ * in Codex (via `model_reasoning_effort` in config.toml or `--config model_reasoning_effort=...`)
+ * and must not be passed inside `--model <slug>` (which causes 400 errors from ChatGPT-auth accounts).
+ */
+export function parseCodexModel(rawModel?: string): {
+  model?: string;
+  reasoningEffort?: string;
+} {
+  if (!rawModel) return {};
+  const trimmed = rawModel.trim();
+  if (!trimmed) return {};
+
+  const baseMatch = trimmed.match(/^([^\s(]+)/);
+  const baseModel = baseMatch ? baseMatch[1] : trimmed;
+
+  const effortRemainder = trimmed.slice(baseModel.length);
+  const effortMatch = effortRemainder.match(/\b(low|medium|high|extra-high|none)\b/i);
+  const reasoningEffort = effortMatch ? effortMatch[1].toLowerCase() : undefined;
+
+  return {
+    model: baseModel,
+    reasoningEffort,
+  };
+}
+
 export interface CodexArgsOptions {
   prompt: string;
   model?: string;
@@ -60,22 +88,28 @@ export function buildCodexArgs(o: CodexArgsOptions): string[] {
   // A model that was requested but is blank can't be passed through, and
   // dropping the flag would hand the run to the config-default model — a
   // silent substitution (ISSUE_NUM, same class as ISSUE_NUM). Hard stop instead.
-  const model = o.model?.trim();
-  if (o.model !== undefined && !model) {
+  const rawModel = o.model?.trim();
+  if (o.model !== undefined && !rawModel) {
     throw new Error(
       "codex: requested model slug is empty — refusing to fall through to the config-default model "
     );
   }
+  const { model, reasoningEffort } = parseCodexModel(rawModel);
+  const configOverrides = [...(o.configOverrides ?? [])];
+  if (reasoningEffort && !configOverrides.some((c) => c.startsWith("model_reasoning_effort="))) {
+    configOverrides.push(`model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
+  }
+
   if (o.resumeSessionId) {
     const args = ["exec", "resume", "--dangerously-bypass-approvals-and-sandbox"];
     if (model) args.push("--model", model);
-    for (const override of o.configOverrides ?? []) args.push("--config", override);
+    for (const override of configOverrides) args.push("--config", override);
     args.push(o.resumeSessionId, o.prompt);
     return args;
   }
   const args = ["exec", "--yolo", "--cd", o.cwd];
   if (model) args.push("--model", model);
-  for (const override of o.configOverrides ?? []) args.push("--config", override);
+  for (const override of configOverrides) args.push("--config", override);
   args.push(o.prompt);
   return args;
 }
@@ -261,16 +295,25 @@ export function stripMcpServersFromToml(toml: string): string {
  * Forcing the key makes the flag and the config agree, so a resolution hiccup
  * can never quietly downgrade the run to a different model.
  */
-export function overrideTomlModel(toml: string, model: string | undefined): string {
+export function overrideTomlModel(toml: string, rawModel: string | undefined): string {
+  if (!rawModel) return toml;
+  const { model, reasoningEffort } = parseCodexModel(rawModel);
   if (!model) return toml;
   try {
     const parsed = parse(toml) as Record<string, unknown>;
     parsed.model = model;
+    if (reasoningEffort) {
+      parsed.model_reasoning_effort = reasoningEffort;
+    }
     return stringify(parsed);
   } catch {
     // Unparseable base config: a config carrying only the requested model still
     // beats one carrying a wrong default.
-    return stringify({ model });
+    const fallback: Record<string, unknown> = { model };
+    if (reasoningEffort) {
+      fallback.model_reasoning_effort = reasoningEffort;
+    }
+    return stringify(fallback);
   }
 }
 
@@ -288,9 +331,11 @@ export function buildCodexMcpConfig(servers: McpServerSpec[]): string {
  * Root runs cannot consume the sandbox-only config.toml bind, so pass the same
  * model pin and MCP server map through Codex's repeatable `--config` option.
  */
-export function buildCodexConfigOverrides(servers: McpServerSpec[], model?: string): string[] {
+export function buildCodexConfigOverrides(servers: McpServerSpec[], rawModel?: string): string[] {
   const overrides: string[] = [];
+  const { model, reasoningEffort } = parseCodexModel(rawModel);
   if (model) overrides.push(`model=${JSON.stringify(model)}`);
+  if (reasoningEffort) overrides.push(`model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
   for (const server of servers) {
     overrides.push(`mcp_servers.${server.name}.url=${JSON.stringify(server.url)}`);
   }

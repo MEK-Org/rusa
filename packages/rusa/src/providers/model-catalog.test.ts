@@ -264,9 +264,21 @@ describe("validateModelPin", () => {
       { displayLabel: "gpt-5.6-terra", identifier: "gpt-5.6-terra" },
     ]);
     expect(validateModelPin("codex", "gpt-5.6-sol")).toEqual({ status: "accepted" });
+    expect(validateModelPin("codex", "gpt-5.6-sol medium")).toEqual({ status: "accepted" });
     expect(() => validateModelPin("codex", "bad-pin")).toThrow(
       'provider "codex": rejected "bad-pin"; acceptable values: "gpt-5.6-sol", "gpt-5.6-terra"'
     );
+  });
+
+  it("normalizes codex catalog entries with reasoning effort and accepts plain pins", () => {
+    setProviderModelCatalog("codex", [
+      { displayLabel: "gpt-5.6-sol medium", identifier: "gpt-5.6-sol medium" },
+    ]);
+    expect(getProviderModelCatalog("codex")).toEqual([
+      { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol" },
+    ]);
+    expect(validateModelPin("codex", "gpt-5.6-sol")).toEqual({ status: "accepted" });
+    expect(validateModelPin("codex", "gpt-5.6-sol medium")).toEqual({ status: "accepted" });
   });
 
   it("accepts both agy display labels and slug identifiers ", () => {
