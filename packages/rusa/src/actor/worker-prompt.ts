@@ -55,6 +55,19 @@ accepts only entries selected in this run. Leave deferred work unhandled. If
 unhandled work remains when you finish, the mesh will queue a follow-up run.`;
 
 /**
+ * Writing-for-agents discipline.
+ * Injected at prompt assembly into every worker prompt (and root prompt) so guidance
+ * on crafting effective prompts/charters is shared across all actors without needing
+ * to hand-edit individual charters.
+ */
+export const WRITING_FOR_AGENTS_DISCIPLINE = `## Writing for agents
+When drafting instructions, charters, or sub-task prompts for other agents:
+- **Anchor completion in verified evidence:** Define "done" as showing the concrete command or artifact already produced, together with its observed result — not a claimed condition.
+- **State desired behavior positively:** State what to do directly rather than forbidding unwanted actions.
+- **Prefer compact, connotation-rich phrasing:** Use tight idioms and direct imperatives over long procedural explanations (e.g. "keep the loop tight", "make it go red first").
+- **Rely on the single source of truth:** Point to the authoritative record instead of restating it; prune instructions that no longer change behavior.`;
+
+/**
  * Standing conduct norms for interacting with external systems .
  * Injected at prompt assembly into every actor prompt (root and workers alike).
  * Ratified by Operator (2026-08-19) following the OpenClaw incident: restricts identity/ownership
@@ -255,6 +268,8 @@ ${DELEGATION_DISCIPLINE}
 ${GROUNDING_DISCIPLINE}
 
 ${INBOX_DISCIPLINE}
+
+${WRITING_FOR_AGENTS_DISCIPLINE}
 
 ${EXTERNAL_CONDUCT_POLICY}
 
