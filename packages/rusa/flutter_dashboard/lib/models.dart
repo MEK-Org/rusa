@@ -671,14 +671,6 @@ class QuotaHistoryPointDto {
         resetAtIso: j['resetAtIso'] as String?,
         intervalSeconds: (j['intervalSeconds'] as num?)?.toDouble(),
       );
-
-  Map<String, dynamic> toJson() => {
-    'observedAt': observedAt,
-    'remainingPercent': remainingPercent,
-    'error': error,
-    'resetAtIso': resetAtIso,
-    'intervalSeconds': intervalSeconds,
-  };
 }
 
 /// The prior-3-day readings for one provider quota pool.
@@ -706,13 +698,6 @@ class QuotaHistorySeriesDto {
             )
             .toList(),
       );
-
-  Map<String, dynamic> toJson() => {
-    'provider': provider,
-    'windowId': windowId,
-    'label': label,
-    'points': points.map((point) => point.toJson()).toList(),
-  };
 }
 
 class QuotaSnapshotDto {
@@ -765,12 +750,6 @@ class QuotaHistoryDto {
         .map((e) => QuotaHistorySeriesDto.fromJson(e as Map<String, dynamic>))
         .toList(),
   );
-
-  Map<String, dynamic> toJson() => {
-    'generatedAt': generatedAt,
-    'historySince': historySince,
-    'history': history.map((series) => series.toJson()).toList(),
-  };
 }
 
 class QuotaProviderConfigDto {

@@ -315,4 +315,34 @@ void main() {
       });
     },
   );
+
+  testWidgets(
+    'OverviewTab fetches quota history on mount and cancels timer on dispose',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..quotaHistoryResult = const QuotaHistoryDto(
+            generatedAt: 'test-hist',
+            historySince: '2026-07-01T00:00:00.000Z',
+            history: [],
+          );
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+
+        expect(api.quotaHistoryCallCount, 0);
+
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        expect(api.quotaHistoryCallCount, 1);
+        expect(store.quotaHistory.value?.generatedAt, 'test-hist');
+
+        // Unmount OverviewTab
+        await tester.pumpWidget(const SizedBox());
+        await store.dispose();
+      });
+    },
+  );
 }

@@ -81,28 +81,6 @@ void main() {
     ],
   );
 
-  const history = QuotaHistoryDto(
-    generatedAt: '2026-07-14T09:20:00.000Z',
-    historySince: '2026-07-13T09:20:00.000Z',
-    history: [
-      QuotaHistorySeriesDto(
-        provider: 'claude',
-        windowId: 'weekly',
-        label: 'Weekly',
-        points: [
-          QuotaHistoryPointDto(
-            observedAt: '2026-07-14T08:15:00.000Z',
-            remainingPercent: 90,
-          ),
-          QuotaHistoryPointDto(
-            observedAt: '2026-07-14T09:15:00.000Z',
-            remainingPercent: 87.5,
-          ),
-        ],
-      ),
-    ],
-  );
-
   test('QuotaSnapshotDto survives a toJson → jsonEncode → fromJson round-trip '
       'with scrapedAt preserved verbatim', () {
     final restored = QuotaSnapshotDto.fromJson(
@@ -141,18 +119,6 @@ void main() {
 
     final agy = restored.provider('agy')!;
     expect(agy.windows.single.scrapedAt, '2026-07-14T09:10:00.000Z');
-  });
-
-  test('QuotaHistoryDto survives a toJson → jsonEncode → fromJson round-trip', () {
-    final restored = QuotaHistoryDto.fromJson(
-      jsonDecode(jsonEncode(history.toJson())) as Map<String, dynamic>,
-    );
-
-    expect(restored.generatedAt, history.generatedAt);
-    expect(restored.historySince, history.historySince);
-    expect(restored.history.single.provider, 'claude');
-    expect(restored.history.single.windowId, 'weekly');
-    expect(restored.history.single.points.last.remainingPercent, 87.5);
   });
 
   test('NoopQuotaCache never persists — every load is a cold start', () {

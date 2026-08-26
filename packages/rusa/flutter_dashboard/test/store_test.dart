@@ -940,8 +940,7 @@ void main() {
     });
   });
 
-  test('refreshQuotaHistory keeps last-known history and flips '
-      'quotaHistoryRefreshing while a background fetch is in flight', () async {
+  test('refreshQuotaHistory updates quota history and clears stale flag', () async {
     const firstHistory = QuotaHistoryDto(
       generatedAt: 'first',
       historySince: '2026-07-01T00:00:00.000Z',
@@ -955,24 +954,17 @@ void main() {
     final api = FakeApi()
       ..threadsResult = [makeThread('root', created: 't0')]
       ..quotaHistoryResult = firstHistory;
-    final store = await _booted(api, FakeStream());
+    final store = DashboardStore(api: api, stream: FakeStream());
+    await store.refreshQuotaHistory();
 
     expect(store.quotaHistory.value?.generatedAt, 'first');
-    expect(store.quotaHistoryRefreshing.value, false);
+    expect(store.quotaHistoryStale.value, false);
 
-    final gate = Completer<QuotaHistoryDto>();
-    api.quotaHistoryGate = gate;
-    final refresh = store.refreshQuotaHistory();
-    await pumpEventQueue();
-
-    expect(store.quotaHistory.value?.generatedAt, 'first');
-    expect(store.quotaHistoryRefreshing.value, true);
-
-    gate.complete(secondHistory);
-    await refresh;
+    api.quotaHistoryResult = secondHistory;
+    await store.refreshQuotaHistory();
 
     expect(store.quotaHistory.value?.generatedAt, 'second');
-    expect(store.quotaHistoryRefreshing.value, false);
+    expect(store.quotaHistoryStale.value, false);
 
     await store.dispose();
   });
@@ -1021,32 +1013,6 @@ void main() {
     expect(store.error.value, isNull);
 
     await store.dispose();
-  });
-
-  test('background quota history polling refetches every 5 minutes', () {
-    fakeAsync((async) {
-      final api = FakeApi()
-        ..threadsResult = [makeThread('root', created: 't0')]
-        ..quotaHistoryResult = const QuotaHistoryDto(
-          generatedAt: 'hist',
-          historySince: '2026-07-01T00:00:00.000Z',
-          history: [],
-        );
-      final store = DashboardStore(api: api, stream: FakeStream());
-      unawaited(store.init());
-      async.flushMicrotasks();
-
-      expect(api.quotaHistoryCallCount, 1);
-
-      async.elapse(const Duration(minutes: 5));
-      expect(api.quotaHistoryCallCount, 2);
-
-      async.elapse(const Duration(minutes: 5));
-      expect(api.quotaHistoryCallCount, 3);
-
-      unawaited(store.dispose());
-      async.flushMicrotasks();
-    });
   });
 
   test('conversation: live SSE dedupes message_sent + message_received for the '

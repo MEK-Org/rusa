@@ -100,7 +100,6 @@ const Duration _kRetiredInactivityThreshold = Duration(days: 7);
 /// (or a fresh `scrapedAt`) reaches the tooltip, not how often the
 /// underlying CLI is actually invoked.
 const Duration _kQuotaPollInterval = Duration(seconds: 60);
-const Duration _kQuotaHistoryPollInterval = Duration(minutes: 5);
 
 /// The dashboard's reactive brain. Holds all UI state as RxDart subjects and owns
 /// the selection state machine, the live/history seam de-dupe, pagination, and
@@ -180,7 +179,6 @@ class DashboardStore {
   /// persisted (no localStorage), so it always starts false on a fresh load.
   final _quotaRefreshing = BehaviorSubject<bool>.seeded(false);
   final _quotaStale = BehaviorSubject<bool>.seeded(false);
-  final _quotaHistoryRefreshing = BehaviorSubject<bool>.seeded(false);
   final _quotaHistoryStale = BehaviorSubject<bool>.seeded(false);
   final _dashboardConfig = BehaviorSubject<DashboardConfigDto?>.seeded(null);
   final _error = BehaviorSubject<String?>.seeded(null);
@@ -206,7 +204,6 @@ class DashboardStore {
 
   Timer? _topologyDebounce;
   Timer? _quotaPoll;
-  Timer? _quotaHistoryPoll;
 
   // ── Exposed streams ──
   ValueStream<ActorStateSnapshot> get actorStates => _actorStates.stream;
@@ -225,8 +222,6 @@ class DashboardStore {
   ValueStream<List<MeshEvent>> get yieldEvents => _yieldEvents.stream;
   ValueStream<bool> get quotaRefreshing => _quotaRefreshing.stream;
   ValueStream<bool> get quotaStale => _quotaStale.stream;
-  ValueStream<bool> get quotaHistoryRefreshing =>
-      _quotaHistoryRefreshing.stream;
   ValueStream<bool> get quotaHistoryStale => _quotaHistoryStale.stream;
   ValueStream<DashboardConfigDto?> get dashboardConfig =>
       _dashboardConfig.stream;
@@ -269,17 +264,12 @@ class DashboardStore {
     await refreshThreads();
     unawaited(refreshDashboardConfig());
     unawaited(refreshQuota());
-    unawaited(refreshQuotaHistory());
     // Background SWR revalidation (ISSUE_NUM ask 4) — the ring/tooltip keep
     // showing the last-known reading immediately; this just periodically
     // kicks off a fresh fetch behind it.
     _quotaPoll = Timer.periodic(
       _kQuotaPollInterval,
       (_) => unawaited(refreshQuota()),
-    );
-    _quotaHistoryPoll = Timer.periodic(
-      _kQuotaHistoryPollInterval,
-      (_) => unawaited(refreshQuotaHistory()),
     );
   }
 
@@ -380,7 +370,6 @@ class DashboardStore {
   }
 
   Future<void> refreshQuotaHistory() async {
-    _quotaHistoryRefreshing.add(true);
     try {
       final history = await _api.fetchQuotaHistory();
       _quotaHistory.add(history);
@@ -398,8 +387,6 @@ class DashboardStore {
       if (_quotaHistory.valueOrNull != null) {
         _quotaHistoryStale.add(true);
       }
-    } finally {
-      _quotaHistoryRefreshing.add(false);
     }
   }
 
@@ -1015,7 +1002,6 @@ class DashboardStore {
   Future<void> dispose() async {
     _topologyDebounce?.cancel();
     _quotaPoll?.cancel();
-    _quotaHistoryPoll?.cancel();
     for (final s in _subs) {
       await s.cancel();
     }
@@ -1037,7 +1023,6 @@ class DashboardStore {
       _yieldEvents.close(),
       _quotaRefreshing.close(),
       _quotaStale.close(),
-      _quotaHistoryRefreshing.close(),
       _quotaHistoryStale.close(),
       _avatarEpoch.close(),
       _dashboardConfig.close(),
