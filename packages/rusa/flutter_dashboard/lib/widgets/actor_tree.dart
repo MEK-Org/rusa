@@ -50,6 +50,7 @@ class ActorTree extends StatelessWidget {
                 store.actorStates,
                 store.primary,
                 store.collapsed,
+                store.customActorOrder,
               ]),
               builder: (_, _) {
                 final visible = store.flattenedVisible();
@@ -359,7 +360,7 @@ class _SpawnActorDialogState extends State<_SpawnActorDialog> {
   }
 }
 
-class _ActorRow extends StatelessWidget {
+class _ActorRow extends StatefulWidget {
   const _ActorRow({
     required this.thread,
     required this.depth,
@@ -386,18 +387,25 @@ class _ActorRow extends StatelessWidget {
   final VoidCallback onToggleCollapse;
   final DashboardStore store;
 
+  @override
+  State<_ActorRow> createState() => _ActorRowState();
+}
+
+class _ActorRowState extends State<_ActorRow> {
+  bool _dropBefore = true;
+
   Widget _buildChevron() {
-    if (!hasChildren) {
+    if (!widget.hasChildren) {
       return const SizedBox(width: 24);
     }
     return InkWell(
-      onTap: onToggleCollapse,
+      onTap: widget.onToggleCollapse,
       borderRadius: BorderRadius.circular(12),
       child: SizedBox(
         width: 24,
         height: 24,
         child: Icon(
-          isCollapsed ? Icons.arrow_right : Icons.arrow_drop_down,
+          widget.isCollapsed ? Icons.arrow_right : Icons.arrow_drop_down,
           size: 20,
           color: MeshColors.textSecondary,
         ),
@@ -405,165 +413,265 @@ class _ActorRow extends StatelessWidget {
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
+  Widget _buildContent(
+    BuildContext context, {
+    bool isHoveredTarget = false,
+  }) {
+    final thread = widget.thread;
+    final dot = widget.dot;
     final isRunning = !thread.isRetired && dot == DotState.active;
     final isQueued = !thread.isRetired && dot == DotState.queued;
 
-    return InkWell(
-      onTap: onSelect,
-      child: Container(
-        color: selected ? MeshColors.bgSelected : Colors.transparent,
-        padding: EdgeInsets.fromLTRB(
-          12.0 + depth * 16,
-          touchTargets ? 12 : 6,
-          12,
-          touchTargets ? 12 : 6,
+    return Container(
+      decoration: BoxDecoration(
+        color: isHoveredTarget
+            ? MeshColors.accent.withValues(alpha: 0.08)
+            : (widget.selected ? MeshColors.bgSelected : Colors.transparent),
+        border: Border(
+          top: isHoveredTarget && _dropBefore
+              ? const BorderSide(color: MeshColors.accent, width: 2)
+              : BorderSide.none,
+          bottom: isHoveredTarget && !_dropBefore
+              ? const BorderSide(color: MeshColors.accent, width: 2)
+              : BorderSide.none,
         ),
-        child: Row(
-          children: [
-            _buildChevron(),
-            const SizedBox(width: 4),
-            // Circular avatar with the live status dot as a corner badge, so
-            // run-state stays visible even before the image resolves .
-            SizedBox(
-              width: 52,
-              height: 52,
-              child: Stack(
-                clipBehavior: Clip.none,
-                children: [
-                  ActorAvatar(
-                    id: thread.id,
-                    size: 52,
-                    retired: thread.isRetired,
-                    store: store,
-                  ),
-                  Positioned(
-                    right: -1,
-                    bottom: -1,
-                    child: Container(
-                      padding: const EdgeInsets.all(1.5),
-                      decoration: const BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: MeshColors.bgSecondary,
-                      ),
-                      child: StatusDot(state: dot, size: 7),
+      ),
+      padding: EdgeInsets.fromLTRB(
+        12.0 + widget.depth * 16,
+        widget.touchTargets ? 12 : 6,
+        12,
+        widget.touchTargets ? 12 : 6,
+      ),
+      child: Row(
+        children: [
+          _buildChevron(),
+          const SizedBox(width: 4),
+          // Circular avatar with the live status dot as a corner badge, so
+          // run-state stays visible even before the image resolves .
+          SizedBox(
+            width: 52,
+            height: 52,
+            child: Stack(
+              clipBehavior: Clip.none,
+              children: [
+                ActorAvatar(
+                  id: thread.id,
+                  size: 52,
+                  retired: thread.isRetired,
+                  store: widget.store,
+                ),
+                Positioned(
+                  right: -1,
+                  bottom: -1,
+                  child: Container(
+                    padding: const EdgeInsets.all(1.5),
+                    decoration: const BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: MeshColors.bgSecondary,
                     ),
+                    child: StatusDot(state: dot, size: 7),
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    thread.handle,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: kMonoStyle.copyWith(
-                      fontSize: 16,
-                      color: thread.isRetired
-                          ? MeshColors.textMuted
-                          : MeshColors.textPrimary,
-                      fontWeight: selected
-                          ? FontWeight.w700
-                          : FontWeight.w500,
-                    ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  thread.handle,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: kMonoStyle.copyWith(
+                    fontSize: 16,
+                    color: thread.isRetired
+                        ? MeshColors.textMuted
+                        : MeshColors.textPrimary,
+                    fontWeight: widget.selected
+                        ? FontWeight.w700
+                        : FontWeight.w500,
                   ),
-                  const SizedBox(height: 2),
-                  Text(
-                    thread.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontSize: 12,
-                      color: MeshColors.textMuted,
-                    ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  thread.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: MeshColors.textMuted,
                   ),
-                  if (thread.model != null || thread.commitmentKind != null) ...[
-                    const SizedBox(height: 4),
-                    Row(
-                      children: [
-                        if (thread.model != null)
-                          Flexible(
-                            child: Text(
-                              thread.model!,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: kMonoStyle.copyWith(
-                                fontSize: 11,
-                                color: thread.modelDiverged
-                                    ? MeshColors.statusHalted
-                                    : MeshColors.textSecondary,
-                              ),
+                ),
+                if (thread.model != null || thread.commitmentKind != null) ...[
+                  const SizedBox(height: 4),
+                  Row(
+                    children: [
+                      if (thread.model != null)
+                        Flexible(
+                          child: Text(
+                            thread.model!,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: kMonoStyle.copyWith(
+                              fontSize: 11,
+                              color: thread.modelDiverged
+                                  ? MeshColors.statusHalted
+                                  : MeshColors.textSecondary,
                             ),
                           ),
-                        if (thread.modelDiverged) ...[
-                          if (thread.model != null) const SizedBox(width: 6),
-                          const _DivergenceBadge(compact: true),
-                        ],
-                        if (thread.commitmentKind != null) ...[
-                          if (thread.model != null || thread.modelDiverged)
-                            const SizedBox(width: 6),
-                          _WorkStateBadge(
-                            kind: thread.commitmentKind!,
-                            compact: true,
-                          ),
-                        ],
+                        ),
+                      if (thread.modelDiverged) ...[
+                        if (thread.model != null) const SizedBox(width: 6),
+                        const _DivergenceBadge(compact: true),
                       ],
-                    ),
-                  ],
+                      if (thread.commitmentKind != null) ...[
+                        if (thread.model != null || thread.modelDiverged)
+                          const SizedBox(width: 6),
+                        _WorkStateBadge(
+                          kind: thread.commitmentKind!,
+                          compact: true,
+                        ),
+                      ],
+                    ],
+                  ),
                 ],
+              ],
+            ),
+          ),
+          if (isQueued) ...[
+            IconButton(
+              icon: const Icon(Icons.fast_forward_rounded, size: 18),
+              color: MeshColors.textSecondary,
+              hoverColor: MeshColors.accent.withValues(alpha: 0.15),
+              splashRadius: 14,
+              tooltip: 'Run now',
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+              onPressed: () => widget.store.runNowActor(thread.id),
+            ),
+            const SizedBox(width: 2),
+            IconButton(
+              icon: const Icon(Icons.stop_rounded, size: 20),
+              color: MeshColors.textSecondary,
+              hoverColor: MeshColors.statusHalted.withValues(alpha: 0.15),
+              splashRadius: 14,
+              tooltip: 'Cancel queued run',
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+              onPressed: () => widget.store.interruptActor(thread.id),
+            ),
+          ] else if (isRunning)
+            IconButton(
+              icon: const Icon(Icons.stop_rounded, size: 20),
+              color: MeshColors.textSecondary,
+              hoverColor: MeshColors.statusHalted.withValues(alpha: 0.15),
+              splashRadius: 14,
+              tooltip: 'Interrupt',
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+              onPressed: () => widget.store.interruptActor(thread.id),
+            )
+          else if (widget.touchTargets)
+            const Padding(
+              padding: EdgeInsets.only(left: 6),
+              child: Icon(
+                Icons.chevron_right,
+                size: 18,
+                color: MeshColors.textMuted,
               ),
             ),
-            if (isQueued) ...[
-              IconButton(
-                icon: const Icon(Icons.fast_forward_rounded, size: 18),
-                color: MeshColors.textSecondary,
-                hoverColor: MeshColors.accent.withValues(alpha: 0.15),
-                splashRadius: 14,
-                tooltip: 'Run now',
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-                onPressed: () => store.runNowActor(thread.id),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFeedback(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      elevation: 6,
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        decoration: BoxDecoration(
+          color: MeshColors.bgSecondary,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: MeshColors.accent),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            StatusDot(state: widget.dot, size: 8),
+            const SizedBox(width: 8),
+            Text(
+              widget.thread.handle,
+              style: kMonoStyle.copyWith(
+                fontSize: 14,
+                color: MeshColors.textPrimary,
+                fontWeight: FontWeight.w600,
               ),
-              const SizedBox(width: 2),
-              IconButton(
-                icon: const Icon(Icons.stop_rounded, size: 20),
-                color: MeshColors.textSecondary,
-                hoverColor: MeshColors.statusHalted.withValues(alpha: 0.15),
-                splashRadius: 14,
-                tooltip: 'Cancel queued run',
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-                onPressed: () => store.interruptActor(thread.id),
-              ),
-            ] else if (isRunning)
-              IconButton(
-                icon: const Icon(Icons.stop_rounded, size: 20),
-                color: MeshColors.textSecondary,
-                hoverColor: MeshColors.statusHalted.withValues(alpha: 0.15),
-                splashRadius: 14,
-                tooltip: 'Interrupt',
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-                onPressed: () => store.interruptActor(thread.id),
-              )
-            else if (touchTargets)
-              const Padding(
-                padding: EdgeInsets.only(left: 6),
-                child: Icon(
-                  Icons.chevron_right,
-                  size: 18,
-                  color: MeshColors.textMuted,
-                ),
-              ),
+            ),
           ],
         ),
       ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return DragTarget<ThreadDto>(
+      onWillAcceptWithDetails: (details) {
+        return details.data.parentId == widget.thread.parentId &&
+            details.data.id != widget.thread.id;
+      },
+      onMove: (details) {
+        final renderBox = context.findRenderObject() as RenderBox?;
+        if (renderBox != null) {
+          final local = renderBox.globalToLocal(details.offset);
+          final dropBefore = local.dy < (renderBox.size.height / 2);
+          if (dropBefore != _dropBefore) {
+            setState(() => _dropBefore = dropBefore);
+          }
+        }
+      },
+      onAcceptWithDetails: (details) {
+        widget.store.reorderActor(
+          details.data.id,
+          widget.thread.id,
+          before: _dropBefore,
+        );
+      },
+      builder: (context, candidateData, rejectedData) {
+        final isHoveredTarget = candidateData.isNotEmpty;
+        final childWhenDragging = Opacity(
+          opacity: 0.35,
+          child: _buildContent(context),
+        );
+        final child = InkWell(
+          onTap: widget.onSelect,
+          child: _buildContent(context, isHoveredTarget: isHoveredTarget),
+        );
+
+        if (widget.touchTargets) {
+          return LongPressDraggable<ThreadDto>(
+            data: widget.thread,
+            hitTestBehavior: HitTestBehavior.opaque,
+            feedback: _buildFeedback(context),
+            childWhenDragging: childWhenDragging,
+            child: child,
+          );
+        }
+
+        return Draggable<ThreadDto>(
+          data: widget.thread,
+          hitTestBehavior: HitTestBehavior.opaque,
+          feedback: _buildFeedback(context),
+          childWhenDragging: childWhenDragging,
+          child: child,
+        );
+      },
     );
   }
 }

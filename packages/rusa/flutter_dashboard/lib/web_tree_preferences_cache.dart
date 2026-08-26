@@ -11,6 +11,7 @@ import 'tree_preferences_cache.dart';
 class WebTreePreferencesCache implements TreePreferencesCache {
   static const String _collapsedKey = 'rusa.dashboard.tree.collapsed.v1';
   static const String _showRetiredKey = 'rusa.dashboard.tree.show_retired.v1';
+  static const String _actorOrderKey = 'rusa.dashboard.tree.actor_order.v1';
 
   @override
   Set<String>? loadCollapsed() {
@@ -55,10 +56,40 @@ class WebTreePreferencesCache implements TreePreferencesCache {
   }
 
   @override
+  Map<String, List<String>>? loadActorOrder() {
+    try {
+      final raw = web.window.localStorage.getItem(_actorOrderKey);
+      if (raw == null || raw.isEmpty) return null;
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return null;
+      final result = <String, List<String>>{};
+      for (final entry in decoded.entries) {
+        if (entry.value is List) {
+          result[entry.key.toString()] =
+              (entry.value as List).map((e) => e.toString()).toList();
+        }
+      }
+      return result;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  void saveActorOrder(Map<String, List<String>> order) {
+    try {
+      web.window.localStorage.setItem(_actorOrderKey, jsonEncode(order));
+    } catch (_) {
+      // Best-effort.
+    }
+  }
+
+  @override
   void clear() {
     try {
       web.window.localStorage.removeItem(_collapsedKey);
       web.window.localStorage.removeItem(_showRetiredKey);
+      web.window.localStorage.removeItem(_actorOrderKey);
     } catch (_) {}
   }
 }

@@ -18,6 +18,12 @@ abstract interface class TreePreferencesCache {
   /// Persists [showRetired] preference.
   void saveShowRetired(bool showRetired);
 
+  /// The custom sibling ordering per parent ID persisted from prior sessions, or null.
+  Map<String, List<String>>? loadActorOrder();
+
+  /// Persists [order] as the custom sibling ordering map per parent ID.
+  void saveActorOrder(Map<String, List<String>> order);
+
   /// Drops any persisted tree preferences.
   void clear();
 }
@@ -38,6 +44,12 @@ class NoopTreePreferencesCache implements TreePreferencesCache {
 
   @override
   void saveShowRetired(bool showRetired) {}
+
+  @override
+  Map<String, List<String>>? loadActorOrder() => null;
+
+  @override
+  void saveActorOrder(Map<String, List<String>> order) {}
 
   @override
   void clear() {}
