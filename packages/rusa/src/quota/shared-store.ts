@@ -8,6 +8,17 @@ import type { ProviderQuotaSnapshot, QuotaWindowKind } from "../mcp/quota-mcp.js
 
 const SLOT_MS = 5 * 60 * 1000;
 export const QUOTA_RAW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Observation retention window (30 days).
+ *
+ * Chosen deliberately:
+ * 1. Overview tab history chart queries only 3 days (`HISTORY_WINDOW_MS`), and cold-start fallback
+ *    queries only 24h. 30 days provides a generous 10x safety buffer that covers full monthly provider
+ *    billing/quota reset cycles while strictly bounding table growth to ~50k-100k rows across all
+ *    providers and slot intervals.
+ * 2. Matches `QUOTA_RAW_RETENTION_MS` so raw telemetry and reasoned observation lifecycles stay in lockstep.
+ */
 export const QUOTA_OBSERVATION_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 // The product requirement is a PD controller. These are deliberately fixed
@@ -183,6 +194,8 @@ export class SharedQuotaStore {
       );
       CREATE INDEX IF NOT EXISTS idx_shared_quota_scrapes_provider_time
         ON quota_scrapes(provider, scraped_at);
+      CREATE INDEX IF NOT EXISTS idx_shared_quota_scrapes_time
+        ON quota_scrapes(scraped_at);
 
       CREATE TABLE IF NOT EXISTS quota_observations (
         provider TEXT NOT NULL,
@@ -202,6 +215,8 @@ export class SharedQuotaStore {
       );
       CREATE INDEX IF NOT EXISTS idx_quota_observations_provider_time
         ON quota_observations(provider, observed_at);
+      CREATE INDEX IF NOT EXISTS idx_quota_observations_observed_at
+        ON quota_observations(observed_at);
       CREATE INDEX IF NOT EXISTS idx_quota_observations_provider_kind_time
         ON quota_observations(provider, kind, observed_at DESC);
       CREATE INDEX IF NOT EXISTS idx_quota_observations_reasoned

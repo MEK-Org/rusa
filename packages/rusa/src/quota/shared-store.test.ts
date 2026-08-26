@@ -462,6 +462,8 @@ describe("SharedQuotaStore retention and indexing", () => {
 
       expect(indices).toContain("idx_quota_observations_provider_kind_time");
       expect(indices).toContain("idx_quota_observations_reasoned");
+      expect(indices).toContain("idx_quota_observations_observed_at");
+      expect(indices).toContain("idx_shared_quota_scrapes_time");
 
       store.configureController({ maxIntervalSeconds: 3600 });
       const now = Date.parse("2026-08-25T12:00:00.000Z");
@@ -474,6 +476,19 @@ describe("SharedQuotaStore retention and indexing", () => {
           new Date(now + 7 * 24 * 60 * 60 * 1000).toISOString()
         );
       }
+
+      // Query plan for observation prune deletion
+      const prunePlan = store.db
+        .prepare(
+          `EXPLAIN QUERY PLAN
+           DELETE FROM quota_observations
+           WHERE observed_at < ?`
+        )
+        .all("2026-07-25T00:00:00.000Z") as Array<{ detail: string }>;
+
+      expect(
+        prunePlan.some((step) => step.detail.includes("idx_quota_observations_observed_at"))
+      ).toBe(true);
 
       // Query plan for previous reasoned lookup
       const previousPlan = store.db
