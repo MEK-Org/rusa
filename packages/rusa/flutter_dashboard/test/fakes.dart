@@ -130,7 +130,6 @@ class FakeApi extends DashboardApi {
   /// [quotaResult] immediately — lets a test observe the SWR "refreshing"
   /// window (ISSUE_NUM ask 4) before letting the background revalidation resolve.
   Completer<QuotaSnapshotDto>? quotaGate;
-  Completer<QuotaHistoryDto>? quotaHistoryGate;
 
   /// When set, the NEXT fetchEvents awaits this instead of returning a canned
   /// page — lets a test inject a live SSE frame mid-fetch (the seam window).
@@ -183,11 +182,6 @@ class FakeApi extends DashboardApi {
   @override
   Future<QuotaHistoryDto> fetchQuotaHistory() async {
     quotaHistoryCallCount++;
-    final gate = quotaHistoryGate;
-    if (gate != null) {
-      quotaHistoryGate = null;
-      return gate.future;
-    }
     final err = quotaHistoryError;
     if (err != null) throw err;
     return quotaHistoryResult ??
