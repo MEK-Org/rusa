@@ -324,9 +324,6 @@ class _ProviderQuotaRing extends StatelessWidget {
     final asOf = _asOfLine(
       weeklyWindow?.scrapedAt ?? sessionWindow?.scrapedAt,
       now: now,
-      carriedForward: provider.carriedForward ||
-          (weeklyWindow?.carriedForward ?? false) ||
-          (sessionWindow?.carriedForward ?? false),
     );
     final tooltip = [
       _providerLabel(provider.provider),
@@ -489,7 +486,6 @@ String? _resetLine(QuotaWindowDto window) {
 String? _asOfLine(
   String? scrapedAtIso, {
   DateTime? now,
-  bool carriedForward = false,
 }) {
   if (scrapedAtIso == null) return null;
   final scraped = DateTime.tryParse(scrapedAtIso);
@@ -505,9 +501,6 @@ String? _asOfLine(
     } else if (age.inMinutes >= 2) {
       parts.add('(${age.inMinutes}m ago)');
     }
-  }
-  if (carriedForward) {
-    parts.add('(carried forward)');
   }
   return parts.join(' ');
 }

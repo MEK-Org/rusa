@@ -729,11 +729,17 @@ void main() {
 
   testWidgets(
     'provider tooltip shows the ground-truth scrape stamp as "as of HH:mm" '
-    '(ISSUE_NUM ask 5)',
+    'and formats relative age across minutes, hours, and days (issue #9)',
     (tester) async {
       await tester.runAsync(() async {
-        const snapshot = QuotaSnapshotDto(
-          generatedAt: '2026-07-09T00:00:00.000Z',
+        final now = DateTime.now().toUtc();
+        final recentIso = now.subtract(const Duration(seconds: 30)).toIso8601String();
+        final minutesAgoIso = now.subtract(const Duration(minutes: 5)).toIso8601String();
+        final hoursAgoIso = now.subtract(const Duration(hours: 2)).toIso8601String();
+        final daysAgoIso = now.subtract(const Duration(days: 2)).toIso8601String();
+
+        final snapshot = QuotaSnapshotDto(
+          generatedAt: now.toIso8601String(),
           providers: [
             ProviderQuotaDto(
               provider: 'claude',
@@ -749,7 +755,61 @@ void main() {
                   status: 'available',
                   headline: true,
                   windowMs: 604800000,
-                  scrapedAt: '2026-07-09T14:37:00.000Z',
+                  scrapedAt: recentIso,
+                ),
+              ],
+            ),
+            ProviderQuotaDto(
+              provider: 'codex',
+              status: 'available',
+              usedPercent: 10,
+              tier: null,
+              message: null,
+              windows: [
+                QuotaWindowDto(
+                  id: 'weekly',
+                  label: 'Weekly',
+                  usedPercent: 10,
+                  status: 'available',
+                  headline: true,
+                  windowMs: 604800000,
+                  scrapedAt: minutesAgoIso,
+                ),
+              ],
+            ),
+            ProviderQuotaDto(
+              provider: 'agy',
+              status: 'available',
+              usedPercent: 20,
+              tier: null,
+              message: null,
+              windows: [
+                QuotaWindowDto(
+                  id: 'weekly',
+                  label: 'Weekly',
+                  usedPercent: 20,
+                  status: 'available',
+                  headline: true,
+                  windowMs: 604800000,
+                  scrapedAt: hoursAgoIso,
+                ),
+              ],
+            ),
+            ProviderQuotaDto(
+              provider: 'kimi',
+              status: 'available',
+              usedPercent: 15,
+              tier: null,
+              message: null,
+              windows: [
+                QuotaWindowDto(
+                  id: 'weekly',
+                  label: 'Weekly',
+                  usedPercent: 15,
+                  status: 'available',
+                  headline: true,
+                  windowMs: 604800000,
+                  scrapedAt: daysAgoIso,
                 ),
               ],
             ),
@@ -771,10 +831,98 @@ void main() {
         );
         await tester.pump(const Duration(milliseconds: 50));
 
-        final claudeTooltip = tester.widget<Tooltip>(
+        final tooltips = tester.widgetList<Tooltip>(find.byType(Tooltip)).toList();
+        // 4 providers in order: Claude, Codex, Agy, Kimi
+        expect(tooltips, hasLength(4));
+
+        // Claude: < 2m ago -> just "as of HH:mm"
+        expect(tooltips[0].message, contains('as of '));
+        expect(tooltips[0].message, isNot(contains('ago)')));
+
+        // Codex: 5m ago -> "(5m ago)"
+        expect(tooltips[1].message, contains('(5m ago)'));
+
+        // Agy: 2h ago -> "(2h ago)"
+        expect(tooltips[2].message, contains('(2h ago)'));
+
+        // Kimi: 2d ago -> "(2d ago)"
+        expect(tooltips[3].message, contains('(2d ago)'));
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'mixed direct and carried-forward windows label each window precisely without tainting shared footer (issue #9)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final now = DateTime.now().toUtc();
+        final minutesAgoIso = now.subtract(const Duration(minutes: 5)).toIso8601String();
+
+        final snapshot = QuotaSnapshotDto(
+          generatedAt: now.toIso8601String(),
+          providers: [
+            ProviderQuotaDto(
+              provider: 'codex',
+              status: 'available',
+              usedPercent: 10,
+              tier: null,
+              message: null,
+              windows: [
+                QuotaWindowDto(
+                  id: 'weekly',
+                  label: 'Weekly',
+                  usedPercent: 10,
+                  status: 'available',
+                  headline: true,
+                  windowMs: 604800000,
+                  scrapedAt: minutesAgoIso,
+                  carriedForward: false,
+                ),
+                QuotaWindowDto(
+                  id: 'five_hour',
+                  label: '5h',
+                  usedPercent: 40,
+                  status: 'available',
+                  headline: false,
+                  windowMs: 18000000,
+                  scrapedAt: minutesAgoIso,
+                  carriedForward: true,
+                ),
+              ],
+            ),
+          ],
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root', created: 't0')]
+          ..quotaResult = snapshot;
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await store.refreshQuota();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: SizedBox(width: 1100, child: MeshHeader(store: store)),
+            ),
+          ),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+
+        final codexTooltip = tester.widget<Tooltip>(
           find.byType(Tooltip).first,
         );
-        expect(claudeTooltip.message, contains('as of 14:37'));
+        // Weekly is directly observed
+        expect(codexTooltip.message, contains('Weekly: 90% remaining'));
+        expect(codexTooltip.message, isNot(contains('Weekly (carried forward)')));
+
+        // 5h is carried forward
+        expect(codexTooltip.message, contains('5h (carried forward): 60% remaining'));
+
+        // Shared footer carries relative age but is NOT tainted with aggregate carried forward
+        expect(codexTooltip.message, contains('(5m ago)'));
+        expect(codexTooltip.message, isNot(contains('(5m ago) (carried forward)')));
 
         await store.dispose();
       });

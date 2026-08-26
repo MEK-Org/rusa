@@ -392,7 +392,6 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
       ],
     });
 
-    expect(snapshot.providers[0].carriedForward).toBe(true);
     expect(snapshot.providers[0].windows).toEqual([
       {
         id: "weekly",
@@ -403,7 +402,6 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
         headline: true,
         windowMs: 604800000,
         scrapedAt: "2026-07-26T19:00:00.000Z",
-        carriedForward: true,
       },
     ]);
     expect(snapshot.history).toEqual([
@@ -711,7 +709,7 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
     }
   });
 
-  it("threads carriedForward through from limits and snapshot to QuotaWindowDto and ProviderQuotaDto", async () => {
+  it("threads carriedForward through from limits and snapshot to QuotaWindowDto", async () => {
     const { deps } = fakeDeps({
       claude: {
         ...claudeState,
@@ -734,18 +732,15 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
     const snapshot = await buildQuotaSnapshot(deps);
 
     const claude = snapshot.providers.find((p) => p.provider === "claude");
-    expect(claude?.carriedForward).toBe(true);
     expect(claude?.windows.find((w) => w.id === "session")?.carriedForward).toBe(true);
     // Inherited from snapshot
     expect(claude?.windows.find((w) => w.id === "weekly")?.carriedForward).toBe(true);
 
     const codex = snapshot.providers.find((p) => p.provider === "codex");
-    expect(codex?.carriedForward).toBe(true);
     expect(codex?.windows.find((w) => w.id === "five_hour")?.carriedForward).toBe(true);
     expect(codex?.windows.find((w) => w.id === "weekly")?.carriedForward).toBeUndefined();
 
     const agy = snapshot.providers.find((p) => p.provider === "agy");
-    expect(agy?.carriedForward).toBeUndefined();
     expect(agy?.windows.every((w) => w.carriedForward === undefined)).toBe(true);
   });
 

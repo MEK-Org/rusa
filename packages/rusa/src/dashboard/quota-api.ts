@@ -92,8 +92,6 @@ export interface ProviderQuotaDto {
   scrapedAt: string | null;
   /** Latest closed-loop throttle decision, or null when quota throttling is disabled/unavailable. */
   throttle: QuotaThrottleStatus | null;
-  /** True if this provider snapshot was carried forward from a previous scrape or historical reading. */
-  carriedForward?: boolean;
 }
 
 export interface QuotaHistoryPointDto {
@@ -282,7 +280,6 @@ function toProviderDto(
   // When there is no headline window (no structured limits), there is no
   // headline number — the snapshot no longer carries a top-level usedPercent.
   const usedPercent = headlineWindow ? headlineWindow.usedPercent : null;
-  const carriedForward = Boolean(state.carriedForward || windows.some((w) => w.carriedForward));
 
   return {
     provider,
@@ -295,7 +292,6 @@ function toProviderDto(
     windows,
     scrapedAt: state.scrapedAt ?? null,
     throttle,
-    ...(carriedForward ? { carriedForward: true } : {}),
   };
 }
 
@@ -375,14 +371,12 @@ function latestStateFromHistory(
     provider,
     status: latest.some((point) => point.percentLeft <= 0) ? "exhausted" : "available",
     scrapedAt: latestObservedAt,
-    carriedForward: true,
     limits: latest.map((point) => ({
       label: point.label,
       kind: point.kind as "session" | "five_hour" | "weekly" | "other",
       scope: point.scope,
       percentLeft: point.percentLeft,
       resetAtIso: point.resetAtIso ?? undefined,
-      carriedForward: true,
     })),
   };
 }
