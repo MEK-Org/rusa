@@ -41,49 +41,128 @@ export interface ScrapeCodexStatusOptions {
   codexConfigDir?: string;
 }
 
+/**
+ * Timing bounds for the generated tmux script. Production uses the defaults; the
+ * only reason these are overridable is so the retry control-flow (issue #8) can be
+ * exercised end-to-end against a fake `tmux` in a test without waiting out the real
+ * multi-second budget/backoffs. Overriding them does not change production behavior.
+ */
+export interface TmuxScriptTiming {
+  /** Whole-script budget in seconds (banner wait + all /status retries share it). Default 80. */
+  budgetS?: number;
+  /** Max seconds to wait for a single /status to render before abandoning that attempt. Default 10. */
+  attemptSecs?: number;
+  /** Seconds to wait for codex's async refresh before re-issuing /status on a placeholder. Default 6. */
+  backoffSecs?: number;
+  /** Banner-wait poll iterations (each followed by ~0.5s). Default 40 (~20s). */
+  bannerTries?: number;
+}
+
 /** tmux orchestration: launch codex, send /status, capture the rendered panel. */
-export function buildTmuxScript(cliCommand: string, sockPath: string): string {
+export function buildTmuxScript(
+  cliCommand: string,
+  sockPath: string,
+  timing: TmuxScriptTiming = {}
+): string {
+  const budgetS = timing.budgetS ?? 80;
+  const attemptSecs = timing.attemptSecs ?? 10;
+  const backoffSecs = timing.backoffSecs ?? 6;
+  const bannerTries = timing.bannerTries ?? 40;
   // Poll (not fixed sleeps) for TUI-ready then for the status panel, so a fast
   // machine returns promptly and a slow one still succeeds. capture-pane -p emits
   // the clean rendered screen to stdout. The tmux server inherits CODEX_HOME/TERM
   // from this process's env, so the codex child it spawns sees them too.
+  //
+  // RETRY ON THE "refresh requested" PLACEHOLDER (issue #8): codex often answers
+  // the first /status with `Limits: refresh requested; run /status again shortly.`
+  // — it kicks off an async limits refresh and asks the caller to re-issue
+  // /status. That placeholder is NOT a reading (it parses to zero windows), so
+  // treating it as a successful render leaves the pipeline blind for hours. Here
+  // we distinguish a real limits table from the placeholder and, on a placeholder,
+  // wait a few seconds for the refresh to land and re-send /status IN THE SAME
+  // SESSION, looping while the wall-clock budget allows. AUTH-SAFETY is unchanged:
+  // every retry is still /status (read-only), NEVER /usage. If only placeholders
+  // ever render we still capture the last one so the parser gets the pending panel
+  // (which it classifies as no-data) rather than the scrape erroring.
   const q = JSON.stringify;
   return [
     "set -u",
     `SOCK=${q(sockPath)}`,
     "S=probe",
+    // Whole-script budget in seconds since shell start (banner wait + all /status
+    // retries share it). Kept below the caller's 90s Node wall-clock so we finish
+    // capturing + reaping tmux before Node's timer fires.
+    `BUDGET_S=${budgetS}`,
     'tmux -S "$SOCK" kill-server 2>/dev/null || true',
     `tmux -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 ${q(cliCommand)}`,
-    // Wait up to ~20s for the codex banner (TUI ready).
-    "for i in $(seq 1 40); do",
+    // Wait for the codex banner (TUI ready), polling ~0.5s per try.
+    `for i in $(seq 1 ${bannerTries}); do`,
     '  scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
     '  printf "%s" "$scr" | grep -q "OpenAI Codex" && break',
     "  sleep 0.5",
     "done",
-    // Type the read-only /status command and submit.
-    'tmux -S "$SOCK" send-keys -t "$S" "/status"',
-    "sleep 1",
-    'tmux -S "$SOCK" send-keys -t "$S" Enter',
-    // Wait up to ~20s for the status panel (limit rows) or an exhaustion banner.
-    // On codex CLI >=0.148.0 , the first Enter may be consumed by the
-    // slash-command autocomplete popup without submitting. Poll for confirmation:
-    // if the panel hasn't rendered yet and the popup or prompt is still visible,
-    // re-send Enter to submit the command.
+    // One /status attempt: type the read-only command and submit it, then poll the
+    // pane. On codex CLI >=0.148.0 the first Enter may be swallowed by the
+    // slash-command autocomplete popup without submitting, so if the panel hasn't
+    // rendered and the popup or prompt is still visible we re-send Enter.
+    // Sets `saw_real` (a real limits table / exhaustion banner rendered) or `saw_ph`
+    // (the refresh-requested placeholder rendered) and RETURNS as soon as the pane
+    // can be classified. We do NOT keep polling a placeholder: codex does not
+    // self-update the panel, so a real table only appears after /status is re-issued
+    // (the outer loop does that after a short backoff). Polling it here would just
+    // burn the attempt window without codex ever changing the pane.
+    "attempt_status() {",
+    "  saw_real=0",
+    "  saw_ph=0",
+    '  tmux -S "$SOCK" send-keys -t "$S" "/status"',
+    "  sleep 1",
+    '  tmux -S "$SOCK" send-keys -t "$S" Enter',
+    // Bounded wait to render something for THIS /status (defaults to ~10s, aligning
+    // with Matt's ~10s re-send bound in issue #8); the outer loop's backoff then
+    // re-issues on a placeholder.
+    `  local deadline=$((SECONDS + ${attemptSecs}))`,
+    '  while [ "$SECONDS" -lt "$deadline" ] && [ "$SECONDS" -lt "$BUDGET_S" ]; do',
+    '    scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
+    '    if printf "%s" "$scr" | grep -qE "limit:|hit your usage limit"; then',
+    "      saw_real=1",
+    "      return 0",
+    "    fi",
+    '    if printf "%s" "$scr" | grep -qE "refresh requested|run /status again"; then',
+    "      saw_ph=1",
+    "      return 0",
+    "    fi",
+    '    if printf "%s" "$scr" | grep -qiE "show current session|/statusline|configure which items"; then',
+    '      tmux -S "$SOCK" send-keys -t "$S" Enter',
+    '    elif printf "%s" "$scr" | grep -qE "(›|>)[[:space:]]*/status"; then',
+    '      tmux -S "$SOCK" send-keys -t "$S" Enter',
+    "    fi",
+    "    sleep 0.5",
+    "  done",
+    "  return 0",
+    "}",
+    // Retry /status ONLY while the refresh-requested placeholder keeps rendering —
+    // that is the single state codex asks us to re-issue for (issue #8). A real table
+    // stops the loop; any OTHER non-render (nothing recognizable on the pane) is a
+    // hard stop, NOT a retry: re-issuing wouldn't change it and hammering it for the
+    // whole budget isn't observation-motivated, so we break and let the never-rendered
+    // guard below error out. `placeholder_seen` lets an all-placeholder run still
+    // capture the pending panel instead of erroring.
     "rendered=0",
-    "for i in $(seq 1 40); do",
-    '  scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
-    '  if printf "%s" "$scr" | grep -qE "limit:|hit your usage limit|refresh requested|run /status again"; then',
+    "placeholder_seen=0",
+    'while [ "$SECONDS" -lt "$BUDGET_S" ]; do',
+    "  attempt_status",
+    '  if [ "$saw_real" -eq 1 ]; then',
     "    rendered=1",
     "    break",
     "  fi",
-    '  if printf "%s" "$scr" | grep -qiE "show current session|/statusline|configure which items"; then',
-    '    tmux -S "$SOCK" send-keys -t "$S" Enter',
-    '  elif printf "%s" "$scr" | grep -qE "(›|>)[[:space:]]*/status"; then',
-    '    tmux -S "$SOCK" send-keys -t "$S" Enter',
+    '  if [ "$saw_ph" -ne 1 ]; then',
+    "    break",
     "  fi",
-    "  sleep 0.5",
+    "  placeholder_seen=1",
+    // Give codex's async limits refresh a few seconds before re-issuing /status.
+    `  [ "$SECONDS" -lt "$BUDGET_S" ] && sleep ${backoffSecs}`,
     "done",
-    'if [ "$rendered" -eq 0 ]; then',
+    'if [ "$rendered" -eq 0 ] && [ "$placeholder_seen" -eq 0 ]; then',
     '  echo "ERROR: /status panel never rendered in Codex session" >&2',
     '  tmux -S "$SOCK" kill-server 2>/dev/null || true',
     "  exit 1",

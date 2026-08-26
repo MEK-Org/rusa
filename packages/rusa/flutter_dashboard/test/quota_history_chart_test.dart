@@ -5,10 +5,9 @@ import 'package:rusa_dashboard/theme.dart';
 import 'package:rusa_dashboard/widgets/quota_history_chart.dart';
 
 void main() {
-  const snapshot = QuotaSnapshotDto(
+  const history = QuotaHistoryDto(
     generatedAt: '2026-07-26T20:00:00.000Z',
     historySince: '2026-07-23T20:00:00.000Z',
-    providers: [],
     history: [
       QuotaHistorySeriesDto(
         provider: 'claude',
@@ -54,7 +53,7 @@ void main() {
             width: 900,
             child: Padding(
               padding: EdgeInsets.all(16),
-              child: QuotaHistoryChart(snapshot: snapshot),
+              child: QuotaHistoryChart(history: history),
             ),
           ),
         ),
@@ -107,7 +106,7 @@ void main() {
           home: const Scaffold(
             body: SizedBox(
               width: 900,
-              child: QuotaHistoryChart(snapshot: snapshot, isStale: true),
+              child: QuotaHistoryChart(history: history, isStale: true),
             ),
           ),
         ),
@@ -131,9 +130,10 @@ void main() {
         theme: buildMeshTheme(),
         home: const Scaffold(
           body: QuotaHistoryChart(
-            snapshot: QuotaSnapshotDto(
+            history: QuotaHistoryDto(
               generatedAt: '2026-07-26T20:00:00.000Z',
-              providers: [],
+              historySince: '2026-07-23T20:00:00.000Z',
+              history: [],
             ),
           ),
         ),
@@ -157,10 +157,9 @@ void main() {
       addTearDown(tester.view.resetDevicePixelRatio);
       const resetCycle1 = '2026-07-27T00:00:00.000Z';
       const resetCycle2 = '2026-08-03T00:00:00.000Z';
-      const multiWindowSnapshot = QuotaSnapshotDto(
+      const multiWindowHistory = QuotaHistoryDto(
         generatedAt: '2026-07-28T12:00:00.000Z',
         historySince: '2026-07-25T12:00:00.000Z',
-        providers: [],
         history: [
           QuotaHistorySeriesDto(
             provider: 'claude',
@@ -206,7 +205,7 @@ void main() {
               width: 900,
               child: Padding(
                 padding: EdgeInsets.all(16),
-                child: QuotaHistoryChart(snapshot: multiWindowSnapshot),
+                child: QuotaHistoryChart(history: multiWindowHistory),
               ),
             ),
           ),

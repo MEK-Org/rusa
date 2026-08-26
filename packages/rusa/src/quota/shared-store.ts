@@ -9,6 +9,18 @@ import type { ProviderQuotaSnapshot, QuotaWindowKind } from "../mcp/quota-mcp.js
 const SLOT_MS = 5 * 60 * 1000;
 export const QUOTA_RAW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
+/**
+ * Observation retention window (30 days).
+ *
+ * Chosen deliberately:
+ * 1. Overview tab history chart queries only 3 days (`HISTORY_WINDOW_MS`), and cold-start fallback
+ *    queries only 24h. 30 days provides a generous 10x safety buffer that covers full monthly provider
+ *    billing/quota reset cycles while strictly bounding table growth to ~50k-100k rows across all
+ *    providers and slot intervals.
+ * 2. Matches `QUOTA_RAW_RETENTION_MS` so raw telemetry and reasoned observation lifecycles stay in lockstep.
+ */
+export const QUOTA_OBSERVATION_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
 // The product requirement is a PD controller. These are deliberately fixed
 // implementation constants rather than configuration that no caller uses.
 export const QUOTA_KP_SECONDS_PER_POINT = 120;
@@ -59,15 +71,6 @@ export interface CanonicalQuotaObservation {
   windowMs: number;
 }
 
-export interface QuotaImportReport {
-  sourceInstance: string;
-  sourceRows: number;
-  insertedRows: number;
-  duplicateRows: number;
-  expiredRows: number;
-  canonicalObservations: number;
-}
-
 export interface QuotaControllerOptions {
   maxIntervalSeconds: number;
 }
@@ -89,7 +92,6 @@ export interface PersistedQuotaProviderStatus {
   uncappedIntervalSeconds: number;
   governingBucketKey: string | null;
   capped: boolean;
-  held: boolean;
   expired: boolean;
   /** Runtime gate derived from quota evidence; never stored as a throttle period. */
   exhaustedUntil: string | null;
@@ -128,13 +130,12 @@ interface ReasonedObservation {
   observedAt: string;
 }
 
-interface LegacyScrapeRow {
+interface StoredScrapeRow {
   id: string;
   provider: string;
   scraped_at: string;
   raw_output: string;
   parsed_state: string | null;
-  inferred_parsed_state: string | null;
   parse_error: string | null;
 }
 
@@ -182,6 +183,8 @@ export class SharedQuotaStore {
       );
       CREATE INDEX IF NOT EXISTS idx_shared_quota_scrapes_provider_time
         ON quota_scrapes(provider, scraped_at);
+      CREATE INDEX IF NOT EXISTS idx_shared_quota_scrapes_time
+        ON quota_scrapes(scraped_at);
 
       CREATE TABLE IF NOT EXISTS quota_observations (
         provider TEXT NOT NULL,
@@ -201,6 +204,13 @@ export class SharedQuotaStore {
       );
       CREATE INDEX IF NOT EXISTS idx_quota_observations_provider_time
         ON quota_observations(provider, observed_at);
+      CREATE INDEX IF NOT EXISTS idx_quota_observations_observed_at
+        ON quota_observations(observed_at);
+      CREATE INDEX IF NOT EXISTS idx_quota_observations_provider_kind_time
+        ON quota_observations(provider, kind, observed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_quota_observations_reasoned
+        ON quota_observations(provider, kind, observed_at DESC)
+        WHERE interval_seconds IS NOT NULL;
     `);
   }
 
@@ -210,10 +220,34 @@ export class SharedQuotaStore {
     return this.db.prepare("DELETE FROM quota_scrapes WHERE scraped_at < ?").run(cutoff).changes;
   }
 
+  pruneObservations(nowMs = Date.now()): number {
+    if (!Number.isFinite(nowMs)) throw new Error(`nowMs must be finite, got ${nowMs}`);
+    const cutoff = new Date(nowMs - QUOTA_OBSERVATION_RETENTION_MS).toISOString();
+    return this.db
+      .prepare(
+        `DELETE FROM quota_observations
+         WHERE observed_at < ?
+           AND rowid NOT IN (
+             SELECT o.rowid
+             FROM quota_observations o
+             WHERE o.interval_seconds IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM quota_observations newer
+                 WHERE newer.provider = o.provider AND newer.kind = o.kind
+                   AND newer.interval_seconds IS NOT NULL
+                   AND (newer.observed_at > o.observed_at OR
+                        (newer.observed_at = o.observed_at AND newer.rowid > o.rowid))
+               )
+           )`
+      )
+      .run(cutoff).changes;
+  }
+
   recordRaw(opts: { provider: string; scrapedAt: string; rawOutput: string }): string {
     const id = randomUUID();
     this.db.transaction(() => {
       this.pruneRawScrapes();
+      this.pruneObservations();
       this.db
         .prepare(
           `INSERT INTO quota_scrapes
@@ -259,7 +293,7 @@ export class SharedQuotaStore {
          FROM quota_scrapes WHERE provider = ? AND scraped_at >= ?
          ORDER BY scraped_at ASC, rowid ASC`
       )
-      .all(provider, sinceIso) as Array<Omit<LegacyScrapeRow, "inferred_parsed_state">>;
+      .all(provider, sinceIso) as StoredScrapeRow[];
     return rows.map((row) => {
       const state = parsedSnapshot(row.parsed_state);
       return {
@@ -500,7 +534,6 @@ export class SharedQuotaStore {
       governingBucketKey: governing ? `${provider}:${governing.kind}` : null,
       capped:
         governing !== undefined && governing.uncappedIntervalSeconds > governing.intervalSeconds,
-      held: false,
       expired: exhaustedUntil !== null,
       exhaustedUntil,
       updatedAt,
@@ -528,68 +561,6 @@ export class SharedQuotaStore {
         };
       }),
     };
-  }
-
-  importLegacyDatabase(sourcePath: string, sourceInstance: string): QuotaImportReport {
-    const source = new Database(sourcePath, { readonly: true, fileMustExist: true });
-    try {
-      const columns = new Set(
-        (source.prepare("PRAGMA table_info(quota_scrapes)").all() as Array<{ name: string }>).map(
-          (column) => column.name
-        )
-      );
-      const hasInferred = columns.has("inferred_parsed_state");
-      const total = (
-        source.prepare("SELECT count(*) AS n FROM quota_scrapes").get() as { n: number }
-      ).n;
-      const cutoff = new Date(Date.now() - QUOTA_RAW_RETENTION_MS).toISOString();
-      const rows = source
-        .prepare(
-          `SELECT id, provider, scraped_at, raw_output, parsed_state,
-                  ${hasInferred ? "inferred_parsed_state" : "NULL"} AS inferred_parsed_state,
-                  parse_error
-           FROM quota_scrapes WHERE scraped_at >= ?
-           ORDER BY scraped_at ASC, rowid ASC`
-        )
-        .all(cutoff) as LegacyScrapeRow[];
-      let insertedRows = 0;
-      const insert = this.db.prepare(
-        `INSERT OR IGNORE INTO quota_scrapes
-          (id, provider, scraped_at, raw_output, parsed_state, parse_error)
-         VALUES (?, ?, ?, ?, ?, ?)`
-      );
-      this.db.transaction(() => {
-        for (const row of rows) {
-          const stateJson = row.inferred_parsed_state ?? row.parsed_state;
-          const result = insert.run(
-            row.id,
-            row.provider,
-            row.scraped_at,
-            row.raw_output,
-            stateJson,
-            row.parse_error
-          );
-          insertedRows += result.changes;
-          const state = parsedSnapshot(stateJson);
-          if (state) {
-            this.insertObservations(state, row.scraped_at, row.provider);
-          }
-        }
-      })();
-      const canonicalObservations = (
-        this.db.prepare("SELECT count(*) AS n FROM quota_observations").get() as { n: number }
-      ).n;
-      return {
-        sourceInstance,
-        sourceRows: total,
-        insertedRows,
-        duplicateRows: rows.length - insertedRows,
-        expiredRows: total - rows.length,
-        canonicalObservations,
-      };
-    } finally {
-      source.close();
-    }
   }
 
   private insertObservations(

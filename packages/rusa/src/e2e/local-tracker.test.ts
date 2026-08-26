@@ -164,11 +164,52 @@ describe("LocalTracker", () => {
       state: "commented",
       comments: [{ path: "a.ts", line: null, body: "nit", diffHunk: "@@" }],
     });
-    expect(tracker.getReviewComments(1, review.id)).toEqual([
+    expect(tracker.getReviewComments(1, review.id)).toMatchObject([
       { path: "a.ts", line: null, body: "nit", diffHunk: "@@" },
     ]);
     expect(tracker.getReviewComments(1, 999)).toEqual([]);
     expect(tracker.listReviews(1)).toHaveLength(1);
+  });
+
+  it("records standalone PR review comments and replies to threads", async () => {
+    const tracker = makeTracker();
+    tracker.upsertPrByHead({
+      headRef: "mc/issue-1",
+      title: "PR",
+      body: "",
+      base: "main",
+      author: "rusa-e2e-bot",
+    });
+
+    const rootComment = tracker.recordPrReviewComment(1, {
+      path: "src/file.ts",
+      line: 42,
+      body: "Initial comment",
+      author: "reviewer",
+    });
+    expect(rootComment).toMatchObject({
+      id: expect.any(Number),
+      path: "src/file.ts",
+      line: 42,
+      body: "Initial comment",
+    });
+
+    const reply = tracker.recordPrReviewComment(1, {
+      inReplyTo: rootComment.id,
+      body: "Thread reply",
+      author: "author",
+    });
+    expect(reply).toMatchObject({
+      id: expect.any(Number),
+      path: "src/file.ts",
+      line: 42,
+      body: "Thread reply",
+    });
+
+    const comments = tracker.getReviewComments(1);
+    expect(comments).toHaveLength(2);
+    expect(comments[0].inReplyToId).toBeNull();
+    expect(comments[1].inReplyToId).toBe(rootComment.id);
   });
 
   it("computes a PR diff as a real git diff against the bare remote", async () => {

@@ -468,6 +468,17 @@ class QuotaWindowDto {
 
   bool get isKnown => usedPercent != null && status != 'unknown';
 
+  /// Returns true if this window has an absolute reset instant that has already
+  /// passed relative to [now]. When true, the pre-reset reading does not
+  /// describe the current window and must not be presented as live quota.
+  bool isPastReset(DateTime now) {
+    final resetText = resetAtIso;
+    if (resetText == null) return false;
+    final reset = DateTime.tryParse(resetText);
+    if (reset == null) return false;
+    return now.isAfter(reset);
+  }
+
   factory QuotaWindowDto.fromJson(Map<String, dynamic> j) => QuotaWindowDto(
     id: j['id'] as String? ?? '',
     label: j['label'] as String? ?? '',
@@ -529,28 +540,22 @@ class QuotaThrottleBucketDto {
 class QuotaThrottleDto {
   const QuotaThrottleDto({
     required this.intervalSeconds,
-    required this.held,
     required this.expired,
     this.capped = false,
-    this.learning = false,
     required this.buckets,
     required this.updatedAt,
   });
 
   final double intervalSeconds;
-  final bool held;
   final bool expired;
   final bool capped;
-  final bool learning;
   final List<QuotaThrottleBucketDto> buckets;
   final String updatedAt;
 
   factory QuotaThrottleDto.fromJson(Map<String, dynamic> j) => QuotaThrottleDto(
     intervalSeconds: (j['intervalSeconds'] as num?)?.toDouble() ?? 0,
-    held: j['held'] as bool? ?? false,
     expired: j['expired'] as bool? ?? false,
     capped: j['capped'] as bool? ?? false,
-    learning: j['learning'] as bool? ?? false,
     buckets: (j['buckets'] as List<dynamic>? ?? const [])
         .map((e) => QuotaThrottleBucketDto.fromJson(e as Map<String, dynamic>))
         .toList(),
@@ -559,10 +564,8 @@ class QuotaThrottleDto {
 
   Map<String, dynamic> toJson() => {
     'intervalSeconds': intervalSeconds,
-    'held': held,
     'expired': expired,
     'capped': capped,
-    'learning': learning,
     'buckets': buckets.map((bucket) => bucket.toJson()).toList(),
     'updatedAt': updatedAt,
   };
@@ -653,14 +656,6 @@ class QuotaHistoryPointDto {
         resetAtIso: j['resetAtIso'] as String?,
         intervalSeconds: (j['intervalSeconds'] as num?)?.toDouble(),
       );
-
-  Map<String, dynamic> toJson() => {
-    'observedAt': observedAt,
-    'remainingPercent': remainingPercent,
-    'error': error,
-    'resetAtIso': resetAtIso,
-    'intervalSeconds': intervalSeconds,
-  };
 }
 
 /// The prior-3-day readings for one provider quota pool.
@@ -688,27 +683,16 @@ class QuotaHistorySeriesDto {
             )
             .toList(),
       );
-
-  Map<String, dynamic> toJson() => {
-    'provider': provider,
-    'windowId': windowId,
-    'label': label,
-    'points': points.map((point) => point.toJson()).toList(),
-  };
 }
 
 class QuotaSnapshotDto {
   const QuotaSnapshotDto({
     required this.generatedAt,
     required this.providers,
-    this.historySince = '',
-    this.history = const [],
   });
 
   final String generatedAt;
   final List<ProviderQuotaDto> providers;
-  final String historySince;
-  final List<QuotaHistorySeriesDto> history;
 
   ProviderQuotaDto? provider(String id) {
     for (final p in providers) {
@@ -722,10 +706,6 @@ class QuotaSnapshotDto {
     providers: (j['providers'] as List<dynamic>? ?? const [])
         .map((e) => ProviderQuotaDto.fromJson(e as Map<String, dynamic>))
         .toList(),
-    historySince: j['historySince'] as String? ?? '',
-    history: (j['history'] as List<dynamic>? ?? const [])
-        .map((e) => QuotaHistorySeriesDto.fromJson(e as Map<String, dynamic>))
-        .toList(),
   );
 
   /// Serialize the whole snapshot for localStorage persistence (ISSUE_NUM ask 4).
@@ -734,9 +714,27 @@ class QuotaSnapshotDto {
   Map<String, dynamic> toJson() => {
     'generatedAt': generatedAt,
     'providers': providers.map((p) => p.toJson()).toList(),
-    'historySince': historySince,
-    'history': history.map((series) => series.toJson()).toList(),
   };
+}
+
+class QuotaHistoryDto {
+  const QuotaHistoryDto({
+    required this.generatedAt,
+    required this.historySince,
+    required this.history,
+  });
+
+  final String generatedAt;
+  final String historySince;
+  final List<QuotaHistorySeriesDto> history;
+
+  factory QuotaHistoryDto.fromJson(Map<String, dynamic> j) => QuotaHistoryDto(
+    generatedAt: j['generatedAt'] as String? ?? '',
+    historySince: j['historySince'] as String? ?? '',
+    history: (j['history'] as List<dynamic>? ?? const [])
+        .map((e) => QuotaHistorySeriesDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
+  );
 }
 
 class QuotaProviderConfigDto {

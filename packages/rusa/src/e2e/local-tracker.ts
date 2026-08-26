@@ -63,10 +63,14 @@ export type ReviewState = "approved" | "changes_requested" | "commented";
 
 /** An inline comment attached to a review, shaped like {@link PrReviewComment}. */
 export interface TrackerReviewComment {
+  id?: number;
   path: string;
   line: number | null;
   body: string;
   diffHunk: string;
+  author?: string;
+  createdAt?: string;
+  inReplyToId?: number | null;
 }
 
 export interface TrackerReview {
@@ -374,14 +378,26 @@ export class LocalTracker {
     opts: { state: ReviewState; body?: string; comments?: TrackerReviewComment[]; author?: string }
   ): Promise<TrackerReview> {
     const pr = this.requirePr(prNumber);
+    const reviewCreatedAt = new Date().toISOString();
+    const author = opts.author ?? this.defaultAuthor;
     const review: TrackerReview = {
       id: this.nextReviewId++,
       prNumber,
       state: opts.state,
       body: opts.body ?? "",
-      author: opts.author ?? this.defaultAuthor,
-      comments: opts.comments ?? [],
-      createdAt: new Date().toISOString(),
+      author,
+      comments:
+        opts.comments?.map((c) => ({
+          id: c.id ?? this.nextCommentId++,
+          path: c.path,
+          line: c.line,
+          body: c.body,
+          diffHunk: c.diffHunk,
+          author: c.author ?? author,
+          createdAt: c.createdAt ?? reviewCreatedAt,
+          inReplyToId: c.inReplyToId ?? null,
+        })) ?? [],
+      createdAt: reviewCreatedAt,
     };
     const list = this.reviews.get(prNumber) ?? [];
     list.push(review);
@@ -414,17 +430,41 @@ export class LocalTracker {
    */
   recordReview(
     prNumber: number,
-    opts: { state: ReviewState; body: string; author: string }
+    opts: {
+      state: ReviewState;
+      body: string;
+      author: string;
+      comments?: Array<{
+        path: string;
+        line: number;
+        body: string;
+        side?: "LEFT" | "RIGHT";
+        startLine?: number;
+        startSide?: "LEFT" | "RIGHT";
+      }>;
+    }
   ): TrackerReview {
     const pr = this.requirePr(prNumber);
+    const reviewId = this.nextReviewId++;
+    const reviewCreatedAt = new Date().toISOString();
     const review: TrackerReview = {
-      id: this.nextReviewId++,
+      id: reviewId,
       prNumber,
       state: opts.state,
       body: opts.body,
       author: opts.author,
-      comments: [],
-      createdAt: new Date().toISOString(),
+      comments:
+        opts.comments?.map((c) => ({
+          id: this.nextCommentId++,
+          path: c.path,
+          line: c.line,
+          body: c.body,
+          diffHunk: "",
+          author: opts.author,
+          createdAt: reviewCreatedAt,
+          inReplyToId: null,
+        })) ?? [],
+      createdAt: reviewCreatedAt,
     };
     const list = this.reviews.get(prNumber) ?? [];
     list.push(review);
@@ -433,9 +473,97 @@ export class LocalTracker {
     return review;
   }
 
-  /** Inline comments recorded for a specific review (backs getPrReviewComments). */
-  getReviewComments(prNumber: number, reviewId: number): TrackerReviewComment[] {
-    return this.reviews.get(prNumber)?.find((r) => r.id === reviewId)?.comments ?? [];
+  recordPrReviewComment(
+    prNumber: number,
+    opts: {
+      path?: string;
+      line?: number;
+      body: string;
+      author: string;
+      inReplyTo?: number;
+    }
+  ): { id: number; htmlUrl: string; path: string; line: number | null; body: string } {
+    const pr = this.requirePr(prNumber);
+    const id = this.nextCommentId++;
+    const now = new Date().toISOString();
+    let comment: TrackerReviewComment;
+
+    if (opts.inReplyTo !== undefined) {
+      const reviews = this.reviews.get(prNumber) ?? [];
+      let targetReview: TrackerReview | undefined;
+      let targetComment: TrackerReviewComment | undefined;
+
+      for (const r of reviews) {
+        const found = r.comments.find((c) => c.id === opts.inReplyTo);
+        if (found) {
+          targetReview = r;
+          targetComment = found;
+          break;
+        }
+      }
+
+      if (!targetReview || !targetComment) {
+        throw new Error(
+          `Cannot reply to comment #${opts.inReplyTo}: comment not found on PR #${prNumber}`
+        );
+      }
+
+      comment = {
+        id,
+        path: targetComment.path,
+        line: targetComment.line,
+        body: opts.body,
+        diffHunk: targetComment.diffHunk,
+        author: opts.author,
+        createdAt: now,
+        inReplyToId: opts.inReplyTo,
+      };
+      targetReview.comments.push(comment);
+    } else {
+      comment = {
+        id,
+        path: opts.path ?? "",
+        line: opts.line ?? null,
+        body: opts.body,
+        diffHunk: "",
+        author: opts.author,
+        createdAt: now,
+        inReplyToId: null,
+      };
+      const list = this.reviews.get(prNumber);
+      if (!list || list.length === 0) {
+        const review: TrackerReview = {
+          id: this.nextReviewId++,
+          prNumber,
+          state: "commented",
+          body: "",
+          author: opts.author,
+          comments: [comment],
+          createdAt: now,
+        };
+        this.reviews.set(prNumber, [review]);
+      } else {
+        list[list.length - 1].comments.push(comment);
+      }
+    }
+
+    pr.updatedAt = now;
+    return {
+      id,
+      htmlUrl: `${pr.htmlUrl}#discussion_r${id}`,
+      path: comment.path,
+      line: comment.line,
+      body: comment.body,
+    };
+  }
+
+  /** Inline comments recorded for a specific review or all reviews on the PR. */
+  getReviewComments(prNumber: number, reviewId?: number): TrackerReviewComment[] {
+    const reviews = this.reviews.get(prNumber) ?? [];
+    if (reviewId !== undefined) {
+      return reviews.find((r) => r.id === reviewId)?.comments ?? [];
+    }
+    return reviews.flatMap((r) => r.comments);
   }
 
   // ── Sub-issue hierarchy (plain parent pointer) ─────────────────────────────

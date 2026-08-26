@@ -44,10 +44,15 @@ describe("cron expression + actor-id validation", () => {
     expect(isValidCronExpr("0 3 * * * curl evil")).toBe(false); // trailing command
     expect(isValidCronExpr("0 3 * * *\ncurl evil")).toBe(false); // newline injection
   });
-  it("validates actor ids to safe characters", () => {
+  it("validates actor ids to safe characters, including suffixed wake slots", () => {
     expect(isValidActorId("73e0b00f-8810-4315")).toBe(true);
+    expect(isValidActorId("root:daily-bless-cut")).toBe(true);
+    expect(isValidActorId("actor-123:slot_a.1")).toBe(true);
     expect(isValidActorId("bad id")).toBe(false);
     expect(isValidActorId("a;rm -rf")).toBe(false);
+    expect(isValidActorId(":slot")).toBe(false);
+    expect(isValidActorId("root:")).toBe(false);
+    expect(isValidActorId("root::slot")).toBe(false);
   });
 });
 
@@ -100,13 +105,19 @@ describe("CrontabWakeCron schedule/cancel/list", () => {
     expect(entries).toEqual([{ actorId: "act1", cronExpr: "30 4 * * *", reason: "second" }]);
   });
 
-  it("manages multiple actors independently", async () => {
+  it("manages multiple actors and suffixed slots independently", async () => {
     const { cron } = make();
-    await cron.schedule("act1", "0 3 * * *", "one");
+    await cron.schedule("root", "0 3 * * *", "base root wake");
+    await cron.schedule("root:daily-bless-cut", "45 8 * * *", "daily bless cut", "responsive");
     await cron.schedule("act2", "0 4 * * *", "two");
-    expect((await cron.list()).map((e) => e.actorId).sort()).toEqual(["act1", "act2"]);
-    await cron.cancel("act1");
-    expect(await cron.list()).toEqual([{ actorId: "act2", cronExpr: "0 4 * * *", reason: "two" }]);
+
+    const entries = await cron.list();
+    expect(entries.map((e) => e.actorId).sort()).toEqual(["act2", "root", "root:daily-bless-cut"]);
+
+    await cron.cancel("root:daily-bless-cut");
+    const afterCancel = await cron.list();
+    expect(afterCancel.map((e) => e.actorId).sort()).toEqual(["act2", "root"]);
+    expect(afterCancel.find((e) => e.actorId === "root")?.reason).toBe("base root wake");
   });
 
   it("cancel preserves unrelated lines and no-ops when the actor is absent", async () => {

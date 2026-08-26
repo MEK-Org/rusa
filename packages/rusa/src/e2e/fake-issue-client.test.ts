@@ -132,10 +132,71 @@ describe("FakeIssueClient", () => {
       comments: [{ path: "src/x.ts", line: 4, body: "rename this", diffHunk: "@@ -1 +1 @@" }],
     });
     const comments = await client.getPrReviewComments(REPO, 1, review.id);
-    expect(comments).toEqual([
-      { path: "src/x.ts", line: 4, body: "rename this", diffHunk: "@@ -1 +1 @@" },
-    ]);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toMatchObject({
+      id: expect.any(Number),
+      path: "src/x.ts",
+      line: 4,
+      body: "rename this",
+      diffHunk: "@@ -1 +1 @@",
+      author: "e2e-user",
+      inReplyToId: null,
+    });
     expect(await client.getPrReviewComments(REPO, 1, 999)).toEqual([]);
+  });
+
+  it("creates standalone review comments and threads replies", async () => {
+    const { tracker, client } = setup();
+    tracker.upsertPrByHead({
+      headRef: "mc/issue-1",
+      title: "PR",
+      body: "",
+      base: "main",
+      author: BOT,
+    });
+
+    const rootComment = await client.createPrReviewComment({
+      repo: REPO,
+      prNumber: 1,
+      path: "src/main.ts",
+      line: 10,
+      body: "Initial question?",
+    });
+    expect(rootComment).toMatchObject({
+      id: expect.any(Number),
+      path: "src/main.ts",
+      line: 10,
+      body: "Initial question?",
+    });
+
+    const replyComment = await client.createPrReviewComment({
+      repo: REPO,
+      prNumber: 1,
+      inReplyTo: rootComment.id,
+      body: "Reply explanation.",
+    });
+    expect(replyComment).toMatchObject({
+      id: expect.any(Number),
+      path: "src/main.ts",
+      line: 10,
+      body: "Reply explanation.",
+    });
+
+    const allComments = await client.getPrReviewComments(REPO, 1);
+    expect(allComments).toHaveLength(2);
+    expect(allComments[0].id).toBe(rootComment.id);
+    expect(allComments[0].inReplyToId).toBeNull();
+    expect(allComments[1].id).toBe(replyComment.id);
+    expect(allComments[1].inReplyToId).toBe(rootComment.id);
+
+    await expect(
+      client.createPrReviewComment({
+        repo: REPO,
+        prNumber: 1,
+        inReplyTo: 99999,
+        body: "Orphaned reply",
+      })
+    ).rejects.toThrow(/Cannot reply to comment #99999/);
   });
 
   it("defaults the sub-issue hierarchy to the single-issue case", async () => {

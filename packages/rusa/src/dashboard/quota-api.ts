@@ -5,12 +5,16 @@ import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
 /**
  * Server-side cached per-provider quota endpoint for the dashboard header (ISSUE_NUM,
  * backend half). Wraps the existing `get_quota` probe family (claude ISSUE_NUM/ISSUE_NUM,
- * codex ISSUE_NUM/ISSUE_NUM, agy per-group ISSUE_NUM/ISSUE_NUM) — it never probes itself. Every
- * probe goes through `QuotaService.getQuota` (see `../mcp/quota-mcp.js`), which
- * already serves from a TTL cache and dedupes concurrent callers, so a
- * dashboard page load never triggers a live probe; it reads whatever the
- * shared cache last captured (probe interval governed by `QuotaMcpDeps.ttlMs`,
- * 30 minutes by default for claude/codex/agy).
+ * codex ISSUE_NUM/ISSUE_NUM, agy per-group ISSUE_NUM/ISSUE_NUM) — it never probes itself. The
+ * wiring binds `getQuota` to `QuotaService.getQuotaCached` (see
+ * `../mcp/quota-mcp.js`), which serves the latest known reading from the shared
+ * TTL cache immediately and kicks any needed refresh in the background — so a
+ * dashboard page load never triggers-and-awaits a live PTY probe in the request
+ * path (issue #10). On a cold cache (e.g. just after a process restart) the
+ * cache read returns an `unknown` state and `buildQuotaSnapshot` falls back to
+ * the newest durable rows via `listHistory` (observations up to 24h old, see
+ * `MAX_HOLD_MS` in `latestStateFromHistory`), so the header still shows the last
+ * real reading rather than dimming for the full probe latency.
  *
  * kimi is now served via a host-side PTY scrape of the real CLI's `/usage`
  * display. The CLI owns its credentials; this endpoint only maps
@@ -111,9 +115,13 @@ export interface QuotaHistorySeriesDto {
 
 export interface QuotaSnapshotDto {
   generatedAt: string;
+  providers: ProviderQuotaDto[];
+}
+
+export interface QuotaHistoryDto {
+  generatedAt: string;
   /** Inclusive lower bound for the quota history returned with this snapshot. */
   historySince: string;
-  providers: ProviderQuotaDto[];
   /** Durable real-scrape readings from the prior 3 days, grouped by quota pool. */
   history: QuotaHistorySeriesDto[];
 }
@@ -131,6 +139,13 @@ export interface QuotaHistorySource {
 
 /** Injected by the wiring that owns the shared `QuotaService` cache. */
 export interface QuotaApiDeps {
+  /**
+   * Returns the latest known quota reading immediately from the shared cache and
+   * kicks any refresh in the background — it must NOT trigger-and-await a live
+   * PTY probe in the request path (issue #10). Production binds this to
+   * `QuotaService.getQuotaCached`. The `Promise` return is a resolved-value
+   * convenience for `buildQuotaSnapshot`'s `Promise.all`, not an await on I/O.
+   */
   getQuota: (provider: SupportedProvider) => Promise<ProviderQuotaSnapshot>;
   /**
    * Providers configured for this instance, in display order. Omitting this is
@@ -331,16 +346,17 @@ export function buildQuotaHistory(
   ];
 }
 
+const MAX_FALLBACK_HOLD_MS = 24 * 60 * 60 * 1000;
+
 function latestStateFromHistory(
   provider: SupportedProvider,
   history: readonly QuotaHistorySource[],
   nowMs: number
 ): ProviderQuotaSnapshot | null {
-  const MAX_HOLD_MS = 24 * 60 * 60 * 1000;
   const eligible = history.filter((point) => {
     const observedMs = Date.parse(point.observedAt);
     const ageMs = nowMs - observedMs;
-    return Number.isFinite(observedMs) && ageMs >= 0 && ageMs <= MAX_HOLD_MS;
+    return Number.isFinite(observedMs) && ageMs >= 0 && ageMs <= MAX_FALLBACK_HOLD_MS;
   });
   const latestObservedAt = eligible
     .map((point) => point.observedAt)
@@ -366,30 +382,43 @@ export async function buildQuotaSnapshot(deps: QuotaApiDeps): Promise<QuotaSnaps
   const now = deps.now ?? Date.now;
   const nowMs = now();
   const generatedAt = toIso(nowMs);
-  const historySince = toIso(nowMs - HISTORY_WINDOW_MS);
   const providers = deps.providers ?? SUPPORTED_PROVIDERS;
   const states = await Promise.all(providers.map((provider) => deps.getQuota(provider)));
-  const histories = providers.map((provider) => deps.listHistory?.(provider, historySince) ?? []);
   const providerDtos = providers.map((provider, i) => {
     let state = states[i];
     if (state.status === "unknown" || !state.limits || state.limits.length === 0) {
-      state = latestStateFromHistory(provider, histories[i] ?? [], nowMs) ?? state;
+      const fallbackRows = deps.listHistory?.(provider, toIso(nowMs - MAX_FALLBACK_HOLD_MS)) ?? [];
+      state = latestStateFromHistory(provider, fallbackRows, nowMs) ?? state;
     }
     return toProviderDto(provider, state, deps.getThrottle?.(provider) ?? null);
   });
   return {
     generatedAt,
-    historySince,
     providers: providerDtos,
+  };
+}
+
+/** Build the durable quota history series for configured providers. */
+export function buildQuotaHistorySnapshot(deps: QuotaApiDeps): QuotaHistoryDto {
+  const now = deps.now ?? Date.now;
+  const nowMs = now();
+  const generatedAt = toIso(nowMs);
+  const historySince = toIso(nowMs - HISTORY_WINDOW_MS);
+  const providers = deps.providers ?? SUPPORTED_PROVIDERS;
+  return {
+    generatedAt,
+    historySince,
     history: deps.listHistory
-      ? providers.flatMap((provider, index) =>
-          buildQuotaHistory(provider, histories[index] ?? [], historySince, generatedAt)
-        )
+      ? providers.flatMap((provider) => {
+          const rows = deps.listHistory?.(provider, historySince) ?? [];
+          return buildQuotaHistory(provider, rows, historySince, generatedAt);
+        })
       : [],
   };
 }
 
-const PATH = "/api/quota";
+const SNAPSHOT_PATH = "/api/quota";
+const HISTORY_PATH = "/api/quota/history";
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, {
@@ -400,8 +429,8 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 }
 
 /**
- * Dispatch `GET /api/quota` — the dashboard's cached per-provider quota
- * snapshot. Returns true if it owned the request, false to fall through.
+ * Dispatch `GET /api/quota` (current snapshot) and `GET /api/quota/history` (durable history).
+ * Returns true if it owned the request, false to fall through.
  * `deps` absent (e.g. no live QuotaService bound) → 503, static UI unaffected.
  */
 export async function handleQuotaApiRequest(
@@ -410,7 +439,7 @@ export async function handleQuotaApiRequest(
   url: URL,
   deps: QuotaApiDeps | null
 ): Promise<boolean> {
-  if (url.pathname !== PATH) return false;
+  if (url.pathname !== SNAPSHOT_PATH && url.pathname !== HISTORY_PATH) return false;
   if (req.method !== "GET") {
     sendJson(res, 405, { error: "method not allowed" });
     return true;
@@ -422,8 +451,13 @@ export async function handleQuotaApiRequest(
     return true;
   }
   try {
-    const snapshot = await buildQuotaSnapshot(deps);
-    sendJson(res, 200, snapshot);
+    if (url.pathname === HISTORY_PATH) {
+      const historySnapshot = buildQuotaHistorySnapshot(deps);
+      sendJson(res, 200, historySnapshot);
+    } else {
+      const snapshot = await buildQuotaSnapshot(deps);
+      sendJson(res, 200, snapshot);
+    }
   } catch (err) {
     sendJson(res, 500, {
       error: err instanceof Error ? err.message : String(err),

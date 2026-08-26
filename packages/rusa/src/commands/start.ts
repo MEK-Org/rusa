@@ -1059,7 +1059,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         : "inf";
       const cappedStr = tick.capped ? ` capped(wanted=${wantedStr})` : "";
       console.log(
-        `[quota-throttle] provider=${providerName} interval=${safeIntervalSeconds.toFixed(1)}s${cappedStr} ${tick.held ? "held" : tick.expired ? "expired" : `error=[${errors}]`}`
+        `[quota-throttle] provider=${providerName} interval=${safeIntervalSeconds.toFixed(1)}s${cappedStr} ${tick.expired ? "expired" : `error=[${errors}]`}`
       );
     } catch (err) {
       console.warn(
@@ -1076,10 +1076,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       {
         intervalSeconds: persisted.intervalSeconds,
         uncappedIntervalSeconds: persisted.uncappedIntervalSeconds,
-        held: persisted.held,
         expired: persisted.expired,
         capped: persisted.capped,
-        learning: persisted.held,
         buckets: persisted.buckets.map((bucket) => ({
           key: bucket.key,
           percentLeft: bucket.percentLeft,
@@ -1336,10 +1334,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       if (!model) throw new Error("model is required");
       validateModelPin(provider, model);
     },
-    validateModel: (record, newModel) => {
+    validateModel: (record, newModel, newProvider) => {
       const effectiveProvider =
-        record.provider ?? config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER;
+        (newProvider?.trim() || record.provider) ??
+        config.rootActor?.provider ??
+        DEFAULT_ROOT_PROVIDER;
       validateModelPin(effectiveProvider, newModel);
+      resolveProvider(config, effectiveProvider, newModel);
     },
     events: meshEvents,
     recordChat: (opts) => getRepositories().meshChat.record(opts),
@@ -1615,7 +1616,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // its own auth dir rw (see providerWritableStateDirs).
         const sandbox = config.sandbox !== "container-boundary";
 
-        const actor = new Actor({
+        let actor: Actor;
+        actor = new Actor({
           id,
           cwd,
           provider: workerProvider,
@@ -1703,7 +1705,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                 : undefined,
               body: injectRecord ? JSON.stringify(injectRecord) : undefined,
               payload: JSON.stringify({
-                provider: providerThrottleKey(workerProvider.providerName, config),
+                provider: providerThrottleKey(actor.getProvider().providerName, config),
                 responsive,
               }),
             }),
@@ -1776,7 +1778,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                 failureSink,
                 id,
                 result,
-                formatProviderLabel(workerProvider, result.boundModel)
+                formatProviderLabel(actor.getProvider(), result.boundModel)
               );
             }
           },
@@ -2536,10 +2538,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           rootNodeId: resolveUnderstandingRootNodeId(config) ?? null,
         },
         // Cached per-provider quota snapshot : reads the same shared
-        // `QuotaService` TTL cache the `get_quota` MCP tool uses above, so the
-        // dashboard never triggers a live probe on page load.
+        // `QuotaService` TTL cache the `get_quota` MCP tool uses above, but via
+        // `getQuotaCached`, which never triggers-and-awaits a live PTY probe in
+        // the request path (issue #10). It serves the latest known reading
+        // immediately (stale-while-revalidate) and kicks any refresh in the
+        // background; a cold cache falls back to the durable quota DB below via
+        // `listHistory`.
         quotaApi: opts?.e2e?.quotaApi ?? {
-          getQuota: (provider) => quotaService.getQuota(provider),
+          getQuota: async (provider) => quotaService.getQuotaCached(provider),
           providers: quotaProviders,
           getThrottle: (provider) => quotaThrottleStatuses.get(provider) ?? null,
           listHistory: sharedQuotaStore

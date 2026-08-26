@@ -428,6 +428,7 @@ class RecordingBridgeDelegate implements IssueClient, GitHubPollingIssueClient {
   reopenIssue = notImplemented;
   mergePullRequest = notImplemented;
   createPullRequestReview = notImplemented;
+  createPrReviewComment = notImplemented;
   addReaction = notImplemented;
   addCommentReaction = notImplemented;
   getPrReviewComments = notImplemented;

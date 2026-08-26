@@ -14,24 +14,6 @@ void main() {
   // populated scrapedAt strings.
   const snapshot = QuotaSnapshotDto(
     generatedAt: '2026-07-14T09:20:00.000Z',
-    historySince: '2026-07-13T09:20:00.000Z',
-    history: [
-      QuotaHistorySeriesDto(
-        provider: 'claude',
-        windowId: 'weekly',
-        label: 'Weekly',
-        points: [
-          QuotaHistoryPointDto(
-            observedAt: '2026-07-14T08:15:00.000Z',
-            remainingPercent: 90,
-          ),
-          QuotaHistoryPointDto(
-            observedAt: '2026-07-14T09:15:00.000Z',
-            remainingPercent: 87.5,
-          ),
-        ],
-      ),
-    ],
     providers: [
       ProviderQuotaDto(
         provider: 'claude',
@@ -42,7 +24,6 @@ void main() {
         scrapedAt: '2026-07-14T09:15:00.000Z',
         throttle: QuotaThrottleDto(
           intervalSeconds: 73,
-          held: false,
           expired: false,
           updatedAt: '2026-07-14T09:15:00.000Z',
           buckets: [
@@ -104,10 +85,6 @@ void main() {
     );
 
     expect(restored.generatedAt, snapshot.generatedAt);
-    expect(restored.historySince, snapshot.historySince);
-    expect(restored.history.single.provider, 'claude');
-    expect(restored.history.single.windowId, 'weekly');
-    expect(restored.history.single.points.last.remainingPercent, 87.5);
     expect(restored.providers.length, 2);
 
     final claude = restored.provider('claude')!;
