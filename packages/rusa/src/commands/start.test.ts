@@ -1632,6 +1632,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       },
       providers: {
         antigravity: { cliCommand: "agy" },
+        claude: { cliCommand: "claude" },
       },
       rootActor: {
         provider: "antigravity",
@@ -2391,11 +2392,24 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
     // ISSUE_NUM: this test does real webhook event-emitter wiring; a loaded CI
     // runner occasionally exceeds the 5s default and reds the bless PR. Give it
-    // headroom — it's not a real-timer/backoff wait, just slow-under-load work.
   }, 15000);
 
   it("requires provider and model on spawn and refuses unresolvable configurations loudly (ISSUE_NUM, ISSUE_NUM)", async () => {
     let mesh: ActorMesh | undefined;
+    const config = {
+      github: {
+        account: "mock-bot",
+      },
+      providers: {
+        antigravity: { cliCommand: "agy" },
+        claude: { cliCommand: "claude" },
+      },
+      rootActor: {
+        provider: "antigravity",
+      },
+      geminiApiKey: "fake-gemini-key",
+    };
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
 
     const readyPromise = new Promise<void>((resolve) => {
       runStart({
@@ -2472,6 +2486,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
         passable: true,
       },
     ]);
+    setProviderModelCatalog("claude", [
+      {
+        identifier: "Claude 3.5 Sonnet",
+        displayLabel: "Claude 3.5 Sonnet",
+        passable: true,
+      },
+    ]);
     expect(() => {
       activeMesh.spawn({
         charter: "invalid model pin worker",
@@ -2494,6 +2515,45 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(activeMesh.registry.get("root")?.handles?.some((h) => h.id === validWorkerId)).toBe(
       true
     );
+
+    // 6. Cross-provider move validates against TARGET provider's catalog and resolves target provider
+    const portableWorkerId = activeMesh.spawn({
+      charter: "portable worker",
+      parentId: "root",
+      provider: "claude",
+      model: "Claude 3.5 Sonnet",
+      context: { type: "portable", mode: "ledger" },
+    });
+    expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("claude");
+    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
+
+    // Unconfigured target provider is rejected before state change, record untouched
+    expect(() => {
+      activeMesh.setActorModel(
+        portableWorkerId,
+        "Gemini 3.7 Flash (High)",
+        "root",
+        "unconfigured-provider"
+      );
+    }).toThrow(/unconfigured-provider/);
+    expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("claude");
+    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
+
+    // Valid target provider + model succeeds
+    activeMesh.setActorModel(portableWorkerId, "Gemini 3.7 Flash (High)", "root", "antigravity");
+    expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("antigravity");
+    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Gemini 3.7 Flash (High)");
+
+    // Invalid model for target provider fails validation
+    expect(() => {
+      activeMesh.setActorModel(
+        portableWorkerId,
+        "bad-model-for-antigravity",
+        "root",
+        "antigravity"
+      );
+    }).toThrow(/model pin validation failed/);
+    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Gemini 3.7 Flash (High)");
   });
 
   it("routes delegated chat spaces to the delegatee while others bubble to root", async () => {

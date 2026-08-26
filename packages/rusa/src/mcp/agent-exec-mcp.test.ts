@@ -1324,4 +1324,54 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     expect(res.isError).toBe(true);
     expect((res.content[0] as { text: string }).text).toMatch(/cannot set its own model/);
   });
+
+  it("set_actor_model moves portable actor across providers and refuses native actors", async () => {
+    const { mesh, registry } = setup();
+    const portableChild = mesh.spawn({
+      charter: "portable worker",
+      parentId: "root",
+      provider: "claude",
+      model: "claude-opus-4-8",
+      context: { type: "portable", mode: "ledger" },
+    });
+    const nativeChild = mesh.spawn({
+      charter: "native worker",
+      parentId: "root",
+      provider: "claude",
+      model: "claude-sonnet-5",
+    });
+
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+    // 1. Move portable actor to antigravity
+    const res1 = (await client.callTool({
+      name: "set_actor_model",
+      arguments: {
+        actor_id: portableChild,
+        model: "gemini-3.7-flash-high",
+        provider: "antigravity",
+      },
+    })) as CallToolResult;
+    expect(res1.isError).toBeFalsy();
+    expect((res1.content[0] as { text: string }).text).toContain(
+      `set model for ${portableChild} to gemini-3.7-flash-high (provider: antigravity)`
+    );
+    expect(registry.get(portableChild)?.provider).toBe("antigravity");
+    expect(registry.get(portableChild)?.model).toBe("gemini-3.7-flash-high");
+
+    // 2. Refuse move on native actor
+    const res2 = (await client.callTool({
+      name: "set_actor_model",
+      arguments: {
+        actor_id: nativeChild,
+        model: "gemini-3.7-flash-high",
+        provider: "antigravity",
+      },
+    })) as CallToolResult;
+    expect(res2.isError).toBe(true);
+    expect((res2.content[0] as { text: string }).text).toMatch(
+      /Cannot change provider on non-portable actor/
+    );
+    expect(registry.get(nativeChild)?.provider).toBe("claude");
+  });
 });

@@ -462,6 +462,10 @@ export class Actor {
     this.opts.provider = provider;
   }
 
+  getProvider(): CodingProvider {
+    return this.opts.provider;
+  }
+
   close(): void {
     this.closed = true;
     this.runner.close();

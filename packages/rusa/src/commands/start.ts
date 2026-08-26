@@ -1336,10 +1336,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       if (!model) throw new Error("model is required");
       validateModelPin(provider, model);
     },
-    validateModel: (record, newModel) => {
+    validateModel: (record, newModel, newProvider) => {
       const effectiveProvider =
-        record.provider ?? config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER;
+        (newProvider?.trim() || record.provider) ??
+        config.rootActor?.provider ??
+        DEFAULT_ROOT_PROVIDER;
       validateModelPin(effectiveProvider, newModel);
+      resolveProvider(config, effectiveProvider, newModel);
     },
     events: meshEvents,
     recordChat: (opts) => getRepositories().meshChat.record(opts),
@@ -1615,7 +1618,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // its own auth dir rw (see providerWritableStateDirs).
         const sandbox = config.sandbox !== "container-boundary";
 
-        const actor = new Actor({
+        let actor: Actor;
+        actor = new Actor({
           id,
           cwd,
           provider: workerProvider,
@@ -1703,7 +1707,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                 : undefined,
               body: injectRecord ? JSON.stringify(injectRecord) : undefined,
               payload: JSON.stringify({
-                provider: providerThrottleKey(workerProvider.providerName, config),
+                provider: providerThrottleKey(actor.getProvider().providerName, config),
                 responsive,
               }),
             }),
@@ -1776,7 +1780,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                 failureSink,
                 id,
                 result,
-                formatProviderLabel(workerProvider, result.boundModel)
+                formatProviderLabel(actor.getProvider(), result.boundModel)
               );
             }
           },

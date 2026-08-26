@@ -2264,6 +2264,157 @@ describe("ActorMesh", () => {
     expect(registry.get(child)?.model).toBe("claude-opus-4-8");
   });
 
+  it("setActorModel supports cross-provider moves for portable actors and rejects them for native actors", async () => {
+    const events: MeshEventInput[] = [];
+    const validations: Array<{ recordId: string; newModel: string; newProvider?: string }> = [];
+    const { mesh, registry } = setup({
+      events: (event) => events.push(event),
+      validateModel: (record, newModel, newProvider) => {
+        validations.push({ recordId: record.id, newModel, newProvider });
+        if (newProvider === "antigravity" && newModel === "invalid-model") {
+          throw new Error("invalid model for antigravity");
+        }
+      },
+    });
+
+    // 1. Portable ledger actor cross-provider move
+    const ledgerChild = mesh.spawn({
+      charter: "ledger child",
+      parentId: "root",
+      provider: "claude",
+      model: "claude-opus-4-8",
+      context: { type: "portable", mode: "ledger" },
+    });
+    mesh.setActorModel(ledgerChild, "gemini-3.7-flash-high", "root", "antigravity");
+    expect(registry.get(ledgerChild)?.provider).toBe("antigravity");
+    expect(registry.get(ledgerChild)?.model).toBe("gemini-3.7-flash-high");
+    expect(validations).toContainEqual({
+      recordId: ledgerChild,
+      newModel: "gemini-3.7-flash-high",
+      newProvider: "antigravity",
+    });
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "actor_model_set",
+        actorId: ledgerChild,
+        detail: "claude:claude-opus-4-8 -> antigravity:gemini-3.7-flash-high",
+      })
+    );
+
+    // 2. Portable tail actor cross-provider move
+    const tailChild = mesh.spawn({
+      charter: "tail child",
+      parentId: "root",
+      provider: "claude",
+      model: "claude-sonnet-5",
+      context: { type: "portable", mode: "tail" },
+    });
+    mesh.setActorModel(tailChild, "gpt-5.6-sol", "root", "codex");
+    expect(registry.get(tailChild)?.provider).toBe("codex");
+    expect(registry.get(tailChild)?.model).toBe("gpt-5.6-sol");
+
+    // 3. Validation failure aborts cross-provider move
+    expect(() => mesh.setActorModel(ledgerChild, "invalid-model", "root", "antigravity")).toThrow(
+      /invalid model for antigravity/
+    );
+    expect(registry.get(ledgerChild)?.model).toBe("gemini-3.7-flash-high");
+
+    // 4. Non-portable (native context) actor rejects provider move
+    const nativeChild = mesh.spawn({
+      charter: "native child",
+      parentId: "root",
+      provider: "claude",
+      model: "claude-sonnet-5",
+      context: { type: "native" },
+    });
+    expect(() =>
+      mesh.setActorModel(nativeChild, "gemini-3.7-flash-high", "root", "antigravity")
+    ).toThrow(/Cannot change provider on non-portable actor/);
+    expect(registry.get(nativeChild)?.provider).toBe("claude");
+    expect(registry.get(nativeChild)?.model).toBe("claude-sonnet-5");
+
+    // 5. Default context (implicit native) rejects provider move
+    const defaultContextChild = mesh.spawn({
+      charter: "default child",
+      parentId: "root",
+      provider: "claude",
+      model: "claude-sonnet-5",
+    });
+    expect(() =>
+      mesh.setActorModel(defaultContextChild, "gemini-3.7-flash-high", "root", "antigravity")
+    ).toThrow(/Cannot change provider on non-portable actor/);
+
+    // 6. Native actor accepts model update when explicit provider equals existing provider
+    mesh.setActorModel(nativeChild, "claude-opus-4-8", "root", "claude");
+    expect(registry.get(nativeChild)?.provider).toBe("claude");
+    expect(registry.get(nativeChild)?.model).toBe("claude-opus-4-8");
+
+    // 7. Refuses model/provider changes while actor is running or queued
+    const busyChild = mesh.spawn({
+      charter: "busy child",
+      parentId: "root",
+      provider: "claude",
+      model: "claude-opus-4-8",
+      context: { type: "portable", mode: "ledger" },
+    });
+    const liveBusyActor = mesh.get(busyChild);
+    if (liveBusyActor) {
+      Object.defineProperty(liveBusyActor, "isRunning", { value: true, configurable: true });
+    }
+    expect(() =>
+      mesh.setActorModel(busyChild, "gemini-3.7-flash-high", "root", "antigravity")
+    ).toThrow(/Cannot change model or provider while actor .* is running or queued/);
+
+    // 8. Dynamic provider halt check: moved actor obeys new provider's halt state on wake
+    let providerBExecuted = false;
+    let haltedProvider = "";
+    const mockProviderA: CodingProvider = {
+      name: "provider-a",
+      providerName: "provider-a",
+      run: async () => ({ success: true, exitCode: 0, output: "a" }),
+    };
+    const mockProviderB: CodingProvider = {
+      name: "provider-b",
+      providerName: "provider-b",
+      run: async () => {
+        providerBExecuted = true;
+        return { success: true, exitCode: 0, output: "b" };
+      },
+    };
+    const dynamicMeshSetup = setup({
+      sharedProvider: mockProviderA,
+      isHalted: (p) => p === haltedProvider,
+      onModelSet: (actorId, _newModel, record) => {
+        const live = dynamicMeshSetup.mesh.get(actorId);
+        if (live && record.provider === "provider-b") {
+          live.setProvider?.(mockProviderB);
+        }
+      },
+    });
+    const movingWorker = dynamicMeshSetup.mesh.spawn({
+      charter: "moving worker",
+      parentId: "root",
+      provider: "provider-a",
+      model: "model-a",
+      context: { type: "portable", mode: "ledger" },
+    });
+    // Move to provider-b
+    dynamicMeshSetup.mesh.setActorModel(movingWorker, "model-b", "root", "provider-b");
+    expect(dynamicMeshSetup.registry.get(movingWorker)?.provider).toBe("provider-b");
+
+    // When provider-b is halted, wake is skipped (provider-a halt does not block it)
+    haltedProvider = "provider-b";
+    dynamicMeshSetup.mesh.sendMessage(movingWorker, "do work", "root");
+    await dynamicMeshSetup.tick();
+    expect(providerBExecuted).toBe(false);
+
+    // When provider-b is unhalted, wake runs on mockProviderB
+    haltedProvider = "";
+    dynamicMeshSetup.mesh.sendMessage(movingWorker, "do work", "root");
+    await dynamicMeshSetup.tick();
+    expect(providerBExecuted).toBe(true);
+  });
+
   it("reparentThread moves the actor to a new parent and hands the new parent a handle", async () => {
     const { mesh, registry } = setup();
     const steward = mesh.spawn({ charter: "steward", parentId: "root" });
