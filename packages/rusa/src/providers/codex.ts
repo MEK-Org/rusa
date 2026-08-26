@@ -48,7 +48,8 @@ export function parseCodexModel(rawModel?: string): {
   const baseMatch = trimmed.match(/^([^\s(]+)/);
   const baseModel = baseMatch ? baseMatch[1] : trimmed;
 
-  const effortMatch = trimmed.match(/\b(low|medium|high|extra-high|none)\b/i);
+  const effortRemainder = trimmed.slice(baseModel.length);
+  const effortMatch = effortRemainder.match(/\b(low|medium|high|extra-high|none)\b/i);
   const reasoningEffort = effortMatch ? effortMatch[1].toLowerCase() : undefined;
 
   return {

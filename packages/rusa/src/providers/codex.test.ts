@@ -136,6 +136,14 @@ describe("CodexProvider", () => {
         model: "gpt-5.4-mini",
         reasoningEffort: undefined,
       });
+      expect(parseCodexModel("gpt-5.6-sol-high")).toEqual({
+        model: "gpt-5.6-sol-high",
+        reasoningEffort: undefined,
+      });
+      expect(parseCodexModel("o4-mini-high")).toEqual({
+        model: "o4-mini-high",
+        reasoningEffort: undefined,
+      });
     });
 
     it("parses model slug with whitespace-separated reasoning effort", () => {
