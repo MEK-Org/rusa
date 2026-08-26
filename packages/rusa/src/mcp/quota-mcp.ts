@@ -303,127 +303,32 @@ function validateParsedWindowsCompleteness(
   provider: "claude" | "codex" | "agy" | "kimi",
   realWindows: LlmQuotaWindow[]
 ): void {
-  // Helper to ensure we only match provider-scoped windows (or default scope)
-  // so model-scoped windows (e.g. Spark weekly) do not satisfy provider limit requirements.
-  const hasProviderWindow = (predicate: (w: LlmQuotaWindow) => boolean) =>
-    realWindows.some((w) => (w.scope === "provider" || w.scope === undefined) && predicate(w));
-
+  // Scoped to Codex for Issue #53 where LLM row omission was observed.
   if (provider === "codex") {
+    // Helper to ensure we only match provider-scoped windows (or default scope)
+    // so model-scoped windows (e.g. Spark weekly) do not satisfy provider limit requirements.
+    const hasProviderWindow = (predicate: (w: LlmQuotaWindow) => boolean) =>
+      realWindows.some((w) => (w.scope === "provider" || w.scope === undefined) && predicate(w));
+
     // Codex /status panel renders provider limit rows with colons ('5h limit:' and 'Weekly limit:').
     const has5hLimit = /(?:^|\n|\r|\s)5h\s+limit\s*:/i.test(output);
     const hasWeeklyLimit = /(?:^|\n|\r|\s)Weekly\s+limit\s*:/i.test(output);
 
     if (has5hLimit) {
-      const found = hasProviderWindow((w) => {
-        const k = normalizeQuotaWindowKind(w.kind);
-        return k === "five_hour" || k === "session" || /5h|five/i.test(w.label);
-      });
+      const found = hasProviderWindow((w) => normalizeQuotaWindowKind(w.kind) === "five_hour");
       if (!found) {
         throw new Error(
-          "Quota parse incomplete: raw output contains '5h limit:' but parsed windows omitted it (or emitted as unreadable placeholder)"
+          "Quota parse incomplete: raw output contains '5h limit:' but parsed windows omitted a provider-scoped five_hour window (or emitted as unreadable placeholder)"
         );
       }
     }
 
     if (hasWeeklyLimit) {
-      const found = hasProviderWindow((w) => {
-        const k = normalizeQuotaWindowKind(w.kind);
-        return k === "weekly" || /weekly/i.test(w.label);
-      });
+      const found = hasProviderWindow((w) => normalizeQuotaWindowKind(w.kind) === "weekly");
       if (!found) {
         throw new Error(
-          "Quota parse incomplete: raw output contains 'Weekly limit:' but parsed windows omitted it (or emitted as unreadable placeholder)"
+          "Quota parse incomplete: raw output contains 'Weekly limit:' but parsed windows omitted a provider-scoped weekly window (or emitted as unreadable placeholder)"
         );
-      }
-    }
-  } else if (provider === "claude") {
-    // Claude status panels render provider limit rows with colons ('Current session:' / 'Session limit:' and 'Current week:' / 'Weekly limit:').
-    const hasSession = /(?:^|\n|\r|\s)(?:Current\s+session|Session\s+limit)\s*:/i.test(output);
-    const hasWeekly = /(?:^|\n|\r|\s)(?:Current\s+week(?:\s+\([^)]+\))?|Weekly\s+limit)\s*:/i.test(
-      output
-    );
-
-    if (hasSession) {
-      const found = hasProviderWindow((w) => {
-        const k = normalizeQuotaWindowKind(w.kind);
-        return k === "session" || k === "five_hour" || /session/i.test(w.label);
-      });
-      if (!found) {
-        throw new Error(
-          "Quota parse incomplete: raw output contains session limit but parsed windows omitted it (or emitted as unreadable placeholder)"
-        );
-      }
-    }
-
-    if (hasWeekly) {
-      const found = hasProviderWindow((w) => {
-        const k = normalizeQuotaWindowKind(w.kind);
-        return k === "weekly" || /week/i.test(w.label);
-      });
-      if (!found) {
-        throw new Error(
-          "Quota parse incomplete: raw output contains weekly limit but parsed windows omitted it (or emitted as unreadable placeholder)"
-        );
-      }
-    }
-  } else if (provider === "kimi") {
-    // Kimi /usage panel renders limit rows without colons (e.g. '5h limit   [...]' or 'Weekly limit   [...]').
-    // We use \b after 'limit' to match the rendered label while tolerating varying spacing/bars.
-    const has5h = /(?:^|\n|\r|\s)5h\s+limit\b/i.test(output);
-    const hasWeekly = /(?:^|\n|\r|\s)Weekly\s+limit\b/i.test(output);
-
-    if (has5h) {
-      const found = hasProviderWindow((w) => {
-        const k = normalizeQuotaWindowKind(w.kind);
-        return k === "five_hour" || k === "session" || /5h|five/i.test(w.label);
-      });
-      if (!found) {
-        throw new Error(
-          "Quota parse incomplete: raw output contains '5h limit' but parsed windows omitted it (or emitted as unreadable placeholder)"
-        );
-      }
-    }
-
-    if (hasWeekly) {
-      const found = hasProviderWindow((w) => {
-        const k = normalizeQuotaWindowKind(w.kind);
-        return k === "weekly" || /weekly/i.test(w.label);
-      });
-      if (!found) {
-        throw new Error(
-          "Quota parse incomplete: raw output contains 'Weekly limit' but parsed windows omitted it (or emitted as unreadable placeholder)"
-        );
-      }
-    }
-  } else if (provider === "agy") {
-    // agy /usage panel renders 'GEMINI MODELS' section with 'Weekly Limit' and 'Five Hour Limit' / '5-Hour Limit' (no colons).
-    const hasGeminiModels = /GEMINI\s+MODELS/i.test(output);
-    if (hasGeminiModels) {
-      const has5h = /(?:^|\n|\r|\s)(?:Five\s+Hour|5-Hour|5h)\s+Limit\b/i.test(output);
-      const hasWeekly = /(?:^|\n|\r|\s)Weekly\s+Limit\b/i.test(output);
-
-      if (has5h) {
-        const found = hasProviderWindow((w) => {
-          const k = normalizeQuotaWindowKind(w.kind);
-          return k === "five_hour" || k === "session" || /5h|five/i.test(w.label);
-        });
-        if (!found) {
-          throw new Error(
-            "Quota parse incomplete: raw output contains GEMINI 5-hour limit but parsed windows omitted it (or emitted as unreadable placeholder)"
-          );
-        }
-      }
-
-      if (hasWeekly) {
-        const found = hasProviderWindow((w) => {
-          const k = normalizeQuotaWindowKind(w.kind);
-          return k === "weekly" || /weekly/i.test(w.label);
-        });
-        if (!found) {
-          throw new Error(
-            "Quota parse incomplete: raw output contains GEMINI weekly limit but parsed windows omitted it (or emitted as unreadable placeholder)"
-          );
-        }
       }
     }
   }
@@ -605,13 +510,17 @@ async function parseQuotaWithLlm(
     return await executeOnce("gemini-3.5-flash-lite");
   } catch (firstErr) {
     console.warn(
-      `[quota-mcp] LLM quota parse attempt 1 (gemini-3.5-flash-lite) failed: ${firstErr instanceof Error ? firstErr.message : String(firstErr)} — escalating attempt 2 to gemini-3.5-flash`
+      `[quota-mcp] [${provider}] LLM quota parse attempt 1 (gemini-3.5-flash-lite) failed: ${firstErr instanceof Error ? firstErr.message : String(firstErr)} — escalating attempt 2 to gemini-3.5-flash`
     );
     try {
-      return await executeOnce("gemini-3.5-flash");
+      const result = await executeOnce("gemini-3.5-flash");
+      console.info(
+        `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.5-flash) succeeded`
+      );
+      return result;
     } catch (secondErr) {
       console.error(
-        `[quota-mcp] LLM quota parse attempt 2 (gemini-3.5-flash) failed: ${secondErr instanceof Error ? secondErr.message : String(secondErr)}`
+        `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.5-flash) failed: ${secondErr instanceof Error ? secondErr.message : String(secondErr)}`
       );
       return {
         status: "unknown",
@@ -777,42 +686,6 @@ export function inferQuotaState(
           field: "resetAtIso",
           rule: "carried_forward_bad_read",
           detail: "carried forward previous unexpired window reset after missing reading",
-        });
-      }
-    }
-  }
-
-  // Step 3b: Bad read missing-window fallback (Rule: carried_forward_bad_read)
-  // The current parse extracted some windows, but completely omitted one or more window kinds
-  // present in the previous scrape whose reset has not yet expired.
-  if (limits && limits.length > 0 && prevState?.limits) {
-    for (const prevLimit of prevState.limits) {
-      if (!prevLimit.resetAtIso) continue;
-      const resetMs = Date.parse(prevLimit.resetAtIso);
-      if (!Number.isFinite(resetMs) || resetMs <= scrapedAtMs) continue;
-      if (isAssumedReset(prevState, prevLimit.label)) continue;
-
-      const alreadyPresent = limits.some(
-        (cur) =>
-          (cur.scope ?? "provider") === (prevLimit.scope ?? "provider") &&
-          ((prevLimit.kind !== undefined && cur.kind === prevLimit.kind) ||
-            cur.label === prevLimit.label)
-      );
-
-      if (!alreadyPresent) {
-        limits.push({ ...prevLimit });
-        if (
-          prevLimit.percentLeft === 0 &&
-          (prevLimit.scope ?? "provider") === "provider" &&
-          status === "available"
-        ) {
-          status = "exhausted";
-        }
-        explanations.push({
-          window: prevLimit.label,
-          field: "resetAtIso",
-          rule: "carried_forward_bad_read",
-          detail: "carried forward previous unexpired window assessment omitted from current parse",
         });
       }
     }
