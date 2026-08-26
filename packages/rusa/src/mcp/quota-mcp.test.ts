@@ -971,6 +971,74 @@ describe("quota MCP server", () => {
       expect(parsed.limits?.[1]).toMatchObject({ label: "Weekly limit", percentLeft: 52 });
     });
 
+    it("completeness gate: model-scope Spark weekly window does not satisfy provider-scope weekly limit check", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "5h limit",
+                kind: "five_hour",
+                usedPercent: 0,
+                scope: "provider",
+              },
+              {
+                label: "GPT-5.3-Codex-Spark Weekly limit",
+                kind: "weekly",
+                usedPercent: 20,
+                resetAtIso: "2026-07-14T12:34:00.000Z",
+                scope: "model",
+              },
+            ],
+          }),
+      });
+
+      const rawCodexOutput =
+        "5h limit: [████████████████████] 100% left (resets 23:32)\n" +
+        "Weekly limit: [███████████████████░] 93% left (resets 12:34 on 14 Jul)\n" +
+        "GPT-5.3-Codex-Spark Weekly limit: [████████████████░░░░] 80% left (resets 12:34 on 14 Jul)";
+
+      const parsed = await parseCodexQuota(rawCodexOutput, "test-key");
+      expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect(parsed.status).toBe("unknown");
+      expect(parsed.message).toContain(
+        "Quota parse incomplete: raw output contains 'Weekly limit:' but parsed windows omitted it"
+      );
+    });
+
+    it("completeness gate: agy fails loud when raw output contains GEMINI MODELS weekly limit but LLM omits it", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Five Hour Limit",
+                kind: "five_hour",
+                usedPercent: 0,
+                scope: "provider",
+              },
+            ],
+          }),
+      });
+
+      const rawAgyOutput =
+        "GEMINI MODELS\n" +
+        "  Weekly Limit\n" +
+        "    [░░░ …] 0.00%\n" +
+        "    Refreshes in 70h 13m\n" +
+        "  Five Hour Limit\n" +
+        "    [███ …] 100.00%";
+
+      const parsed = await parseAgyQuota(rawAgyOutput, "test-key");
+      expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect(parsed.status).toBe("unknown");
+      expect(parsed.message).toContain(
+        "Quota parse incomplete: raw output contains GEMINI weekly limit but parsed windows omitted it"
+      );
+    });
+
     it("threads an LLM-emitted resetAtIso through unchanged to the resulting limits ", async () => {
       mockGenerateContent.mockResolvedValue({
         text: () =>
@@ -1798,6 +1866,13 @@ describe("quota MCP server", () => {
                   resetAtIso: "2026-07-20T00:00:00.000Z",
                   scope: "provider",
                 },
+                {
+                  label: "Five Hour Limit",
+                  kind: "five_hour",
+                  usedPercent: 100,
+                  resetAtIso: "2026-07-22T22:00:00.000Z",
+                  scope: "provider",
+                },
               ],
             }),
         });
@@ -2489,6 +2564,136 @@ describe("quota MCP server", () => {
         // Expired weekly window is NOT carried forward
         expect(inferred.limits).toHaveLength(1);
         expect(inferred.limits?.[0].kind).toBe("five_hour");
+      });
+
+      it("carried_forward_bad_read: carries forward omitted unexpired window with undefined kind without colliding with unrelated undefined-kind window", () => {
+        const t0Iso = "2026-08-26T10:00:00.000Z";
+        const unexpiredResetIso = "2026-08-26T15:00:00.000Z";
+        const prevState: ProviderQuotaSnapshot = {
+          provider: "codex",
+          status: "available",
+          scrapedAt: t0Iso,
+          limits: [
+            {
+              label: "Custom Window A",
+              kind: undefined,
+              percentLeft: 50,
+              resetAtIso: unexpiredResetIso,
+              scope: "provider",
+            },
+          ],
+        };
+
+        const t1Iso = "2026-08-26T11:00:00.000Z";
+        const currentState: ProviderQuotaSnapshot = {
+          provider: "codex",
+          status: "available",
+          scrapedAt: t1Iso,
+          limits: [
+            {
+              label: "Custom Window B",
+              kind: undefined,
+              percentLeft: 100,
+              resetAtIso: "2026-08-26T18:00:00.000Z",
+              scope: "provider",
+            },
+          ],
+        };
+
+        const inferred = inferQuotaState(currentState, prevState, t1Iso);
+        // Custom Window A should be carried forward because its label does not match Custom Window B
+        expect(inferred.limits).toHaveLength(2);
+        expect(inferred.limits?.[0].label).toBe("Custom Window B");
+        expect(inferred.limits?.[1].label).toBe("Custom Window A");
+        expect(inferred.limits?.[1].percentLeft).toBe(50);
+      });
+
+      it("carried_forward_bad_read: updates status to exhausted if carried forward provider-scope window is at 0% left", () => {
+        const t0Iso = "2026-08-26T10:00:00.000Z";
+        const unexpiredResetIso = "2026-08-26T15:00:00.000Z";
+        const prevState: ProviderQuotaSnapshot = {
+          provider: "codex",
+          status: "exhausted",
+          scrapedAt: t0Iso,
+          limits: [
+            {
+              label: "Weekly limit",
+              kind: "weekly",
+              percentLeft: 0,
+              resetAtIso: unexpiredResetIso,
+              scope: "provider",
+            },
+          ],
+        };
+
+        const t1Iso = "2026-08-26T11:00:00.000Z";
+        // Raw state only extracted 5h limit with 100% left (status: available)
+        const currentState: ProviderQuotaSnapshot = {
+          provider: "codex",
+          status: "available",
+          scrapedAt: t1Iso,
+          limits: [
+            {
+              label: "5h limit",
+              kind: "five_hour",
+              percentLeft: 100,
+              resetAtIso: "2026-08-26T16:00:00.000Z",
+              scope: "provider",
+            },
+          ],
+        };
+
+        const inferred = inferQuotaState(currentState, prevState, t1Iso);
+        expect(inferred.status).toBe("exhausted");
+        expect(inferred.limits).toHaveLength(2);
+        expect(inferred.limits?.[1].label).toBe("Weekly limit");
+        expect(inferred.limits?.[1].percentLeft).toBe(0);
+      });
+
+      it("carried_forward_bad_read: Step 3 matches explicit scope 'provider' with undefined scope", () => {
+        const t0Iso = "2026-08-26T10:00:00.000Z";
+        const unexpiredResetIso = "2026-08-26T15:00:00.000Z";
+        const prevState: ProviderQuotaSnapshot = {
+          provider: "codex",
+          status: "available",
+          scrapedAt: t0Iso,
+          limits: [
+            {
+              label: "Weekly limit",
+              kind: "weekly",
+              percentLeft: 50,
+              resetAtIso: unexpiredResetIso,
+              scope: "provider",
+            },
+          ],
+        };
+
+        const t1Iso = "2026-08-26T11:00:00.000Z";
+        // Current state parsed Weekly limit without resetAtIso and scope undefined
+        const currentState: ProviderQuotaSnapshot = {
+          provider: "codex",
+          status: "available",
+          scrapedAt: t1Iso,
+          limits: [
+            {
+              label: "Weekly limit",
+              kind: "weekly",
+              percentLeft: 45,
+              scope: undefined,
+            },
+          ],
+        };
+
+        const inferred = inferQuotaState(currentState, prevState, t1Iso);
+        expect(inferred.limits?.[0].resetAtIso).toBe(unexpiredResetIso);
+        expect(inferred.explanations).toEqual([
+          {
+            window: "Weekly limit",
+            field: "resetAtIso",
+            rule: "carried_forward_bad_read",
+            detail: "carried forward previous unexpired window reset after missing reading",
+          },
+        ]);
       });
 
       it("invariant: empty explanations list => inferred_parsed_state equals parsed_state", () => {
