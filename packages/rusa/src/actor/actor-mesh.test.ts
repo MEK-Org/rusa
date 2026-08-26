@@ -2343,6 +2343,76 @@ describe("ActorMesh", () => {
     expect(() =>
       mesh.setActorModel(defaultContextChild, "gemini-3.7-flash-high", "root", "antigravity")
     ).toThrow(/Cannot change provider on non-portable actor/);
+
+    // 6. Native actor accepts model update when explicit provider equals existing provider
+    mesh.setActorModel(nativeChild, "claude-opus-4-8", "root", "claude");
+    expect(registry.get(nativeChild)?.provider).toBe("claude");
+    expect(registry.get(nativeChild)?.model).toBe("claude-opus-4-8");
+
+    // 7. Refuses model/provider changes while actor is running or queued
+    const busyChild = mesh.spawn({
+      charter: "busy child",
+      parentId: "root",
+      provider: "claude",
+      model: "claude-opus-4-8",
+      context: { type: "portable", mode: "ledger" },
+    });
+    const liveBusyActor = mesh.get(busyChild);
+    if (liveBusyActor) {
+      Object.defineProperty(liveBusyActor, "isRunning", { value: true, configurable: true });
+    }
+    expect(() =>
+      mesh.setActorModel(busyChild, "gemini-3.7-flash-high", "root", "antigravity")
+    ).toThrow(/Cannot change model or provider while actor .* is running or queued/);
+
+    // 8. Dynamic provider halt check: moved actor obeys new provider's halt state on wake
+    let providerBExecuted = false;
+    let haltedProvider = "";
+    const mockProviderA: CodingProvider = {
+      name: "provider-a",
+      providerName: "provider-a",
+      run: async () => ({ success: true, exitCode: 0, output: "a" }),
+    };
+    const mockProviderB: CodingProvider = {
+      name: "provider-b",
+      providerName: "provider-b",
+      run: async () => {
+        providerBExecuted = true;
+        return { success: true, exitCode: 0, output: "b" };
+      },
+    };
+    const dynamicMeshSetup = setup({
+      sharedProvider: mockProviderA,
+      isHalted: (p) => p === haltedProvider,
+      onModelSet: (actorId, _newModel, record) => {
+        const live = dynamicMeshSetup.mesh.get(actorId);
+        if (live && record.provider === "provider-b") {
+          live.setProvider?.(mockProviderB);
+        }
+      },
+    });
+    const movingWorker = dynamicMeshSetup.mesh.spawn({
+      charter: "moving worker",
+      parentId: "root",
+      provider: "provider-a",
+      model: "model-a",
+      context: { type: "portable", mode: "ledger" },
+    });
+    // Move to provider-b
+    dynamicMeshSetup.mesh.setActorModel(movingWorker, "model-b", "root", "provider-b");
+    expect(dynamicMeshSetup.registry.get(movingWorker)?.provider).toBe("provider-b");
+
+    // When provider-b is halted, wake is skipped (provider-a halt does not block it)
+    haltedProvider = "provider-b";
+    dynamicMeshSetup.mesh.sendMessage(movingWorker, "do work", "root");
+    await dynamicMeshSetup.tick();
+    expect(providerBExecuted).toBe(false);
+
+    // When provider-b is unhalted, wake runs on mockProviderB
+    haltedProvider = "";
+    dynamicMeshSetup.mesh.sendMessage(movingWorker, "do work", "root");
+    await dynamicMeshSetup.tick();
+    expect(providerBExecuted).toBe(true);
   });
 
   it("reparentThread moves the actor to a new parent and hands the new parent a handle", async () => {

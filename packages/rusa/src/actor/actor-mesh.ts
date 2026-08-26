@@ -59,6 +59,7 @@ export interface MeshActor {
   getInterruptedWatermark?(): Date | null;
   clearInterruptWatermark?(): void;
   setProvider?(provider: CodingProvider): void;
+  getProvider?(): CodingProvider;
 }
 
 export interface SpawnRequest {
@@ -2079,12 +2080,16 @@ export class ActorMesh {
         );
       }
     }
+    const liveActor = this.live.get(id);
+    if (liveActor && (liveActor.isRunning || liveActor.isQueued)) {
+      throw new Error(`Cannot change model or provider while actor ${id} is running or queued`);
+    }
     const trimmedModel = model.trim();
     if (!trimmedModel) {
       throw new Error(`Cannot set an empty model on thread: ${id}`);
     }
     const trimmedProvider = provider?.trim() || undefined;
-    if (trimmedProvider !== undefined) {
+    if (trimmedProvider !== undefined && trimmedProvider !== record.provider) {
       if (record.context?.type !== "portable") {
         throw new Error(
           `Cannot change provider on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail) actors can be moved across providers.`
@@ -2342,11 +2347,7 @@ export class ActorMesh {
         if (!rec || rec.status !== "active") {
           return false;
         }
-        if (
-          this.isHalted(record.provider) ||
-          this.isShuttingDown() ||
-          !this.checkLease(record.id)
-        ) {
+        if (this.isHalted(rec.provider) || this.isShuttingDown() || !this.checkLease(record.id)) {
           return false;
         }
         if (mode === "yield-elicitation") return true;
