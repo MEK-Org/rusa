@@ -427,6 +427,36 @@ describe("tracker MCP server", () => {
     expect(parseAuthor(opts.comments?.[0].body ?? "")).toBe("test-actor-skeptic");
   });
 
+  it("provides an actionable hint when APPROVE or REQUEST_CHANGES fails on own PR", async () => {
+    const failing: IssueClient = {
+      ...recordingIssueClient().client,
+      createPullRequestReview: async () => {
+        throw new Error("HTTP 422 Unprocessable Entity: Can not approve your own pull request");
+      },
+    };
+    const client = await connect(
+      createTrackerMcpServer("test-actor-skeptic", failing, { instanceId: "test-instance" })
+    );
+
+    const res = (await client.callTool({
+      name: "post_review",
+      arguments: {
+        repo: "owner/repo",
+        prNumber: 123,
+        event: "APPROVE",
+        body: "LGTM!",
+      },
+    })) as CallToolResult;
+
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain(
+      "HTTP 422 Unprocessable Entity: Can not approve your own pull request"
+    );
+    expect(textOf(res)).toContain(
+      "Hint: GitHub rejects APPROVE verdicts on PRs authored by the same account (including mesh-authored PRs). Submit with event: 'COMMENT' and express your verdict in the review body."
+    );
+  });
+
   it("posts an inline PR review comment with actor id stamp on create_pr_review_comment", async () => {
     const { client: backend, calls } = recordingIssueClient();
     const client = await connect(
