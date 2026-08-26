@@ -62,10 +62,10 @@ unhandled work remains when you finish, the mesh will queue a follow-up run.`;
  */
 export const WRITING_FOR_AGENTS_DISCIPLINE = `## Writing for agents
 When drafting instructions, charters, or sub-task prompts for other agents:
-- **Anchor completion in verified evidence:** Define "done" as naming the concrete command executed and its observed output or artifact, not a claimed condition.
+- **Anchor completion in verified evidence:** Define "done" as showing the concrete command or artifact already produced, together with its observed result — not a claimed condition.
 - **State desired behavior positively:** State what to do directly rather than forbidding unwanted actions.
 - **Prefer compact, connotation-rich phrasing:** Use tight idioms and direct imperatives over long procedural explanations.
-- **Rely on the single source of truth:** Point to existing repo files and environment state instead of re-summarizing them.`;
+- **Rely on the single source of truth:** Point to the authoritative record instead of restating it; prune instructions that no longer change behavior.`;
 
 /**
  * Standing conduct norms for interacting with external systems .

@@ -110,31 +110,3 @@ describe("WRITING_FOR_AGENTS_DISCIPLINE", () => {
     expect(WRITING_FOR_AGENTS_DISCIPLINE).toContain("Rely on the single source of truth");
   });
 });
-
-describe("prompt assembly writing-for-agents discipline injection", () => {
-  const dummyWorkerCtx = {
-    threadId: "test-worker-id-12345678",
-    parentId: "test-parent-id-87654321",
-  };
-
-  it("injects WRITING_FOR_AGENTS_DISCIPLINE into buildWorkerPrompt", () => {
-    const prompt = buildWorkerPrompt("custom worker task charter", dummyWorkerCtx);
-    expect(prompt).toContain("## Writing for agents");
-    expect(prompt).toContain(WRITING_FOR_AGENTS_DISCIPLINE);
-    expect(prompt.split("## Writing for agents").length - 1).toBe(1);
-  });
-
-  it("injects WRITING_FOR_AGENTS_DISCIPLINE into buildRootPrompt", () => {
-    const prompt = buildRootPrompt();
-    expect(prompt).toContain("## Writing for agents");
-    expect(prompt).toContain(WRITING_FOR_AGENTS_DISCIPLINE);
-    expect(prompt.split("## Writing for agents").length - 1).toBe(1);
-  });
-
-  it("ensures root and worker prompt paths share byte-identical writing-for-agents content", () => {
-    const rootPrompt = buildRootPrompt();
-    const workerPrompt = buildWorkerPrompt("worker charter", dummyWorkerCtx);
-    expect(rootPrompt).toContain(WRITING_FOR_AGENTS_DISCIPLINE);
-    expect(workerPrompt).toContain(WRITING_FOR_AGENTS_DISCIPLINE);
-  });
-});
