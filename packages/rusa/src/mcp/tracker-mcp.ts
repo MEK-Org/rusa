@@ -378,11 +378,17 @@ export function createTrackerMcpServer(
       title: "Review a pull request",
       description:
         "Submit a review on a pull request (approve, request changes, or comment), optionally with inline comments. " +
-        "The review body and inline comments will be stamped with your authenticated identity.",
+        "The review body and inline comments will be stamped with your authenticated identity.\n\n" +
+        "NOTE: GitHub rejects APPROVE and REQUEST_CHANGES verdicts on pull requests authored by the same GitHub account " +
+        "(which includes mesh-authored PRs). On such PRs, submit with event: 'COMMENT' and express your verdict in the body text.",
       inputSchema: {
         repo: z.string().describe("Repository in owner/name format"),
         prNumber: z.number().int().describe("The pull request number"),
-        event: z.enum(["APPROVE", "REQUEST_CHANGES", "COMMENT"]).describe("The review verdict"),
+        event: z
+          .enum(["APPROVE", "REQUEST_CHANGES", "COMMENT"])
+          .describe(
+            "The review verdict. Note: APPROVE and REQUEST_CHANGES fail on PRs authored by the same account (mesh-authored PRs); use COMMENT with verdict in body instead"
+          ),
         body: z.string().describe("The review body text"),
         commitId: z
           .string()
@@ -431,6 +437,17 @@ export function createTrackerMcpServer(
         options.onWrite?.();
         return toolOk(url ?? "reviewed");
       } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (
+          event !== "COMMENT" &&
+          (message.includes("own pull request") ||
+            message.includes("Unprocessable Entity") ||
+            message.includes("422"))
+        ) {
+          return toolError(
+            `${message}\n\nHint: GitHub rejects ${event} verdicts on PRs authored by the same account (including mesh-authored PRs). Submit with event: 'COMMENT' and express your verdict in the review body.`
+          );
+        }
         return toolError(err);
       }
     }
