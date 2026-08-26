@@ -709,6 +709,41 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
     }
   });
 
+  it("threads carriedForward through from limits to QuotaWindowDto without inheriting across siblings", async () => {
+    const { deps } = fakeDeps({
+      claude: {
+        ...claudeState,
+        carriedForward: true,
+        limits: [
+          { label: "Session", kind: "session", percentLeft: 100, carriedForward: true },
+          { label: "Weekly", kind: "weekly", percentLeft: 97 },
+        ],
+      },
+      codex: {
+        ...codexState,
+        limits: [
+          { label: "5h", kind: "five_hour", percentLeft: 99, carriedForward: true },
+          { label: "Weekly", kind: "weekly", percentLeft: 93, carriedForward: false },
+        ],
+      },
+      agy: agyState,
+      kimi: kimiState,
+    });
+    const snapshot = await buildQuotaSnapshot(deps);
+
+    const claude = snapshot.providers.find((p) => p.provider === "claude");
+    expect(claude?.windows.find((w) => w.id === "session")?.carriedForward).toBe(true);
+    // Directly observed sibling window is NOT marked carriedForward
+    expect(claude?.windows.find((w) => w.id === "weekly")?.carriedForward).toBeUndefined();
+
+    const codex = snapshot.providers.find((p) => p.provider === "codex");
+    expect(codex?.windows.find((w) => w.id === "five_hour")?.carriedForward).toBe(true);
+    expect(codex?.windows.find((w) => w.id === "weekly")?.carriedForward).toBeUndefined();
+
+    const agy = snapshot.providers.find((p) => p.provider === "agy");
+    expect(agy?.windows.every((w) => w.carriedForward === undefined)).toBe(true);
+  });
+
   it("scrapedAt is null when the underlying state never reached a probe", async () => {
     const { deps } = fakeDeps({
       claude: { provider: "claude", status: "unknown" },

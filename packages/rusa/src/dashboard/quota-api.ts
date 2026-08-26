@@ -72,6 +72,11 @@ export interface QuotaWindowDto {
    * error/unsupported state) rather than a fetch/render time.
    */
   scrapedAt: string | null;
+  /**
+   * True if this window's assessment or reset was carried forward from a previous scrape
+   * rather than freshly observed in the latest probe.
+   */
+  carriedForward?: boolean;
 }
 
 export interface ProviderQuotaDto {
@@ -185,6 +190,7 @@ function claudeWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
         headline: isWeekly,
         windowMs: windowMsFor(id),
         scrapedAt,
+        ...(limit.carriedForward ? { carriedForward: true } : {}),
       };
     });
   }
@@ -209,6 +215,7 @@ function codexWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
         headline: isWeekly,
         windowMs: windowMsFor(id),
         scrapedAt,
+        ...(limit.carriedForward ? { carriedForward: true } : {}),
       };
     });
   }
@@ -232,6 +239,7 @@ function agyWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
       headline: limit.kind === "weekly",
       windowMs: windowMsFor(limit.kind ?? "other"),
       scrapedAt,
+      ...(limit.carriedForward ? { carriedForward: true } : {}),
     }));
 }
 
@@ -250,6 +258,7 @@ function kimiWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
         windowMs: windowMsFor(id),
         // kimi's pty probe never stamps scrapedAt → always null (ISSUE_NUM ask 5).
         scrapedAt: state.scrapedAt ?? null,
+        ...(limit.carriedForward ? { carriedForward: true } : {}),
       };
     });
   }

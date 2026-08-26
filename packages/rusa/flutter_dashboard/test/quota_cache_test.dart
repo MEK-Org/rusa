@@ -64,6 +64,7 @@ void main() {
             resetAtIso: '2026-07-21T09:00:00.000Z',
             windowMs: 604800000,
             scrapedAt: '2026-07-14T09:15:00.000Z',
+            carriedForward: true,
           ),
           QuotaWindowDto(
             id: 'five_hour',
@@ -72,6 +73,7 @@ void main() {
             status: 'unknown',
             headline: false,
             scrapedAt: null,
+            carriedForward: false,
           ),
         ],
       ),
@@ -128,12 +130,14 @@ void main() {
     expect(weekly.headline, isTrue);
     // The verbatim honesty invariant (ISSUE_NUM ask 5).
     expect(weekly.scrapedAt, '2026-07-14T09:15:00.000Z');
+    expect(weekly.carriedForward, isTrue);
 
     final session = claude.windows[1];
     expect(session.id, 'five_hour');
     expect(session.usedPercent, isNull);
     expect(session.status, 'unknown');
     expect(session.scrapedAt, isNull);
+    expect(session.carriedForward, isFalse);
 
     final agy = restored.provider('agy')!;
     expect(agy.windows.single.scrapedAt, '2026-07-14T09:10:00.000Z');

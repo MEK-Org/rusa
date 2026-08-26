@@ -321,7 +321,10 @@ class _ProviderQuotaRing extends StatelessWidget {
     ];
     // Ground-truth "as of" scrape stamp (ISSUE_NUM ask 5) — the same instant rides
     // every window on this provider, so either one supplies it.
-    final asOf = _asOfLine(weeklyWindow?.scrapedAt ?? sessionWindow?.scrapedAt);
+    final asOf = _asOfLine(
+      weeklyWindow?.scrapedAt ?? sessionWindow?.scrapedAt,
+      now: now,
+    );
     final tooltip = [
       _providerLabel(provider.provider),
       tooltipParts.join('\n\n'),
@@ -346,7 +349,7 @@ class _ProviderQuotaRing extends StatelessWidget {
                     width: 20,
                     height: 20,
                     child: CircularProgressIndicator(
-                      value: _ringValue(weeklyWindow),
+                      value: _ringValue(weeklyWindow, now: now),
                       strokeWidth: 4,
                       strokeCap: StrokeCap.butt,
                       color: quotaScheduleColor(weeklyWindow, now: now),
@@ -358,7 +361,7 @@ class _ProviderQuotaRing extends StatelessWidget {
                       width: 11,
                       height: 11,
                       child: CircularProgressIndicator(
-                        value: _ringValue(sessionWindow),
+                        value: _ringValue(sessionWindow, now: now),
                         strokeWidth: 3,
                         strokeCap: StrokeCap.butt,
                         color: quotaScheduleColor(sessionWindow, now: now),
@@ -387,10 +390,11 @@ class _ProviderQuotaRing extends StatelessWidget {
 }
 
 /// The ring's fill fraction (quota remaining), or 0 (empty, grey) when the
-/// window is missing or its reading isn't known yet.
-double _ringValue(QuotaWindowDto? window) {
+/// window is missing, past its reset, or its reading isn't known yet.
+double _ringValue(QuotaWindowDto? window, {DateTime? now}) {
   final used = window?.usedPercent;
   if (window == null || used == null || !window.isKnown) return 0.0;
+  if (now != null && window.isPastReset(now)) return 0.0;
   return (100 - used.clamp(0, 100)) / 100;
 }
 
@@ -398,19 +402,45 @@ double _ringValue(QuotaWindowDto? window) {
 /// 3): quota remaining AND time remaining (both count down, battery
 /// metaphor — ask 2) with a pace verdict, then the window's own expiry
 /// ("resets ..."), then an unambiguous rate-based projection so the verdict
-/// is never a bare adjective. Falls back to a quota-only phrasing (plus the
-/// raw reset text, when there is one) when the window's schedule position
-/// can't be resolved to an absolute instant (see [_schedulePosition]) —
+/// is never a bare adjective. When a window is past its reset (resetAtIso < now),
+/// honestly reports that the window has reset without a fresh reading instead of
+/// showing the pre-reset percentage (issue #9). Distinguishes carried-forward
+/// values from directly observed ones (issue #9). Falls back to a quota-only
+/// phrasing (plus the raw reset text, when there is one) when the window's
+/// schedule position can't be resolved to an absolute instant (see [_schedulePosition]) —
 /// several provider CLIs report free-form reset text with no reliable epoch.
 String quotaWindowTooltip(
   QuotaWindowDto? window, {
   required String fallbackLabel,
   required DateTime now,
 }) {
-  final label = window?.label ?? fallbackLabel;
+  final baseLabel = (window?.label != null && window!.label.isNotEmpty)
+      ? window.label
+      : fallbackLabel;
+  final label = window?.carriedForward == true
+      ? '$baseLabel (carried forward)'
+      : baseLabel;
   if (window == null) return '$label: n/a';
+  if (window.isPastReset(now)) {
+    final reset = DateTime.tryParse(window.resetAtIso!);
+    final resetStr = reset != null
+        ? DateFormat('EEE h:mm a').format(reset.toLocal())
+        : window.resetAtIso!;
+    return '$label: window reset at $resetStr; no fresh read since';
+  }
   final pos = _schedulePosition(window, now);
-  if (pos == null) return '$label: n/a';
+  if (pos == null) {
+    // Belt-and-braces fallback: reachable if window has no known usedPercent
+    // or sits precisely at the millisecond tick where remainingMs <= 0.
+    // Windows with unparseable/missing reset text produce pos != null with
+    // timeRemainingPct == null, handled below.
+    if (!window.isKnown) return '$label: n/a';
+    final reset = _resetLine(window);
+    final remaining = (100 - (window.usedPercent ?? 0)).clamp(0, 100).round();
+    return reset == null
+        ? '$label: $remaining% remaining'
+        : '$label: $remaining% remaining\n$reset';
+  }
   final remaining = pos.quotaRemainingPct.round();
   final timeRemainingPct = pos.timeRemainingPct;
   if (timeRemainingPct == null) {
@@ -454,13 +484,30 @@ String? _resetLine(QuotaWindowDto window) {
 }
 
 /// "as of <HH:mm>" — the ground-truth scrape stamp (ISSUE_NUM ask 5), never a
-/// cache hit or client SWR fetch time. Null when the state behind this
-/// window never reached a probe, or the stamp can't be parsed.
-String? _asOfLine(String? scrapedAtIso) {
+/// cache hit or client SWR fetch time. Formatted in the viewer's local timezone
+/// to match reset timestamps. Carries relative age when [now] is provided so
+/// stale readings are visibly distinct. Null when the state behind this window
+/// never reached a probe, or the stamp can't be parsed.
+String? _asOfLine(
+  String? scrapedAtIso, {
+  DateTime? now,
+}) {
   if (scrapedAtIso == null) return null;
   final scraped = DateTime.tryParse(scrapedAtIso);
   if (scraped == null) return null;
-  return 'as of ${DateFormat('HH:mm').format(scraped)}';
+  final timeStr = DateFormat('HH:mm').format(scraped.toLocal());
+  final parts = <String>['as of $timeStr'];
+  if (now != null && now.isAfter(scraped)) {
+    final age = now.difference(scraped);
+    if (age.inHours >= 24) {
+      parts.add('(${age.inDays}d ago)');
+    } else if (age.inHours >= 1) {
+      parts.add('(${age.inHours}h ago)');
+    } else if (age.inMinutes >= 2) {
+      parts.add('(${age.inMinutes}m ago)');
+    }
+  }
+  return parts.join(' ');
 }
 
 /// Explain the control loop's current pacing decision in the same tooltip as
@@ -595,7 +642,9 @@ class _SchedulePosition {
 _SchedulePosition? _schedulePosition(QuotaWindowDto? window, DateTime now) {
   final used = window?.usedPercent;
   if (window == null || used == null || !window.isKnown) return null;
+  if (window.isPastReset(now)) return null;
   final remainingMs = _remainingMs(window, now);
+  if (remainingMs != null && remainingMs <= 0) return null;
   return _SchedulePosition(
     quotaRemainingPct: (100 - used).clamp(0, 100).toDouble(),
     timeRemainingPct: remainingMs == null
