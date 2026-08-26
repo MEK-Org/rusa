@@ -101,7 +101,6 @@ Top-level fields:
   webhook                  Required. Local webhook listener settings.
   rootActor                Optional. Provider/model the root actor runs on and its display identity. Provider
                            defaults to agy (antigravity); identity defaults to root-actor.
-  eventSources             Optional. Top-level external event-source families seeded to root at boot.
   chat                     Optional. Google Chat Workspace Events ingestion and REST write settings.
   dashboard                Optional. Dashboard listener and Tailscale settings.
   voice                    Optional. Walkie-talkie transcription/TTS model and voice overrides .
@@ -160,23 +159,6 @@ webhook:
   externalUrl              Optional. Public webhook URL, typically an ngrok or Tailscale URL.
   ignoreSelfEvents         Optional. Suppress events from this instance's own bot account (default true). Set false on a secondary instance that shares the account (e.g. staging) so cross-instance direction isn't filtered as self-activity .
 
-eventSources:
-
-  eventSources is a list of top-level external event-source families seeded to the root
-  actor at startup.
-
-  Supported kinds:
-    - kind: github_org
-      org: dummy-org
-    - kind: github_repo
-      repo: Rusa-Org/rusa
-    - kind: github_branch
-      repo: Rusa-Org/rusa
-      ref: refs/heads/staging
-    - kind: chat
-    - kind: chat_space
-      space: spaces/AAAA_STAGING
-
 chat:
 
   projectId                Required. GCP project that hosts the Pub/Sub topic + subscription.
@@ -230,8 +212,7 @@ observability.trackerHygiene:
 
 observability.diskAlert:
 
-  Configuring this section implicitly subscribes root to responsive system.disk events;
-  no separate eventSources entry is required.
+  Configuring this section implicitly subscribes root to responsive system.disk events.
   enabled                  Optional boolean. Disk headroom alert is enabled by default;
                            set enabled: false to deactivate.
   volume                   Optional string. The path to the relevant volume to check.
@@ -297,13 +278,10 @@ Multi-instance staging recipe:
   1. Dedicated Pub/Sub subscription on staging:
      Configure chat.subscription to a dedicated pull subscription (e.g. rusa-chat-staging)
      against the shared chat-events topic so staging and prod do not compete for messages.
-  2. Scoped event source on staging:
-     Configure eventSources: [{ kind: "chat_space", space: "spaces/AAAA_STAGING" }] on staging
-     so the staging root actor only receives messages from its dedicated test space.
-  3. Excluded spaces on prod:
+  2. Excluded spaces on prod:
      Configure chat.excludedSpaces: ["spaces/AAAA_STAGING"] on prod so messages sent in the staging
      test space are ignored by the production instance.
-  4. Outbound permission scoping:
+  3. Outbound permission scoping:
      Scope chat.gchat (e.g. ["spaces/AAAA_STAGING"] on staging) to restrict where each instance can post.
 `;
 

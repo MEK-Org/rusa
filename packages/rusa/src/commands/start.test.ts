@@ -1178,7 +1178,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           codex: { cliCommand: "codex" },
         },
         rootActor: { provider: "antigravity" },
-        eventSources: [{ kind: "chat" }],
         chat: {
           projectId: "test",
           subscription: "test",
@@ -1248,7 +1247,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         codex: { cliCommand: "codex" },
       },
       rootActor: { provider: "antigravity" },
-      eventSources: [{ kind: "chat" }],
       chat: {
         projectId: "test",
         subscription: "test",
@@ -1637,7 +1635,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
       rootActor: {
         provider: "antigravity",
       },
-      eventSources: [{ kind: "github_org", org: "dummy-org" }, { kind: "chat" }],
+      chat: {
+        projectId: "test",
+        subscription: "test",
+        pubsubKeyPath: "/dev/null",
+      },
       geminiApiKey: "fake-gemini-key",
     };
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
@@ -1703,7 +1705,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // Emit event with unsubscribed repo
     await emitGitHubEvent("issue_comment", {
       action: "created",
-      repository: { full_name: "dummy-org/some-other-repo" },
+      repository: { full_name: "uncovered-org/some-other-repo" },
       comment: { id: 123 },
       issue: { number: 456 },
       sender: { login: "someone-else" },
@@ -1752,7 +1754,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     await emitGitHubEvent("issue_comment", {
       action: "created",
-      repository: { full_name: "dummy-org/uncovered" },
+      repository: { full_name: "uncovered-org/uncovered" },
       comment: { id: 123, body: `ready\n<!-- mesh:deliver ${workerId} -->` },
       issue: { number: 456 },
       sender: { login: "mock-bot" },
@@ -1761,7 +1763,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(requestRunCalls).toEqual([{ actorId: workerId, reason: "{}" }]);
     mesh.actorQueued(workerId, { responsive: false, mode: "ordinary" });
     expect(issueClient.commentReactionsAdded).toEqual([
-      { repo: "dummy-org/uncovered", commentId: 123, reaction: "eyes", scope: "issue" },
+      { repo: "uncovered-org/uncovered", commentId: 123, reaction: "eyes", scope: "issue" },
     ]);
   });
 
@@ -2567,7 +2569,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           antigravity: { cliCommand: "agy" },
         },
         rootActor: { provider: "antigravity" },
-        eventSources: [{ kind: "chat" }],
         chat: {
           projectId: "test",
           subscription: "test",
@@ -2638,23 +2639,26 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(rootSpaceNames).not.toContain("spaces/delegated");
   });
 
-  it("seeds a configured chat_space eventSource and scopes routing to that single space ", async () => {
-    const chatClient = new FakeChatClient();
-    const chatSource = new FakeChatSource();
+  it("implies root event sources from github, targets, chat, and observability stanzas", async () => {
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
-        github: { account: "mock-bot" },
+        github: { account: "mock-bot", repo: "custom-org/custom-repo" },
+        targets: [{ repo: "target-org/target-repo", localPath: "/tmp/dummy" }],
         providers: {
           antigravity: { cliCommand: "agy" },
         },
         rootActor: { provider: "antigravity" },
-        eventSources: [{ kind: "chat_space", space: "spaces/AAAA_STAGING" }],
         chat: {
           projectId: "test",
           subscription: "test",
           pubsubKeyPath: "/dev/null",
           gchat: "all",
+        },
+        observability: {
+          diskAlert: {
+            enabled: true,
+          },
         },
         geminiApiKey: "fake-gemini-key",
       }),
@@ -2665,8 +2669,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const readyPromise = new Promise<void>((resolve) => {
       runStart({
         e2e: {
-          chatClient,
-          chatSource,
           onReady: (handles) => {
             mesh = handles.mesh;
             shutdownFn = handles.shutdown;
@@ -2684,40 +2686,25 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "chat_space", space: "spaces/AAAA_STAGING" },
+          resource: { kind: "github_org", org: "custom-org" },
+        }),
+        expect.objectContaining({
+          actorId: "root",
+          subscribedBy: "root",
+          resource: { kind: "github_org", org: "target-org" },
+        }),
+        expect.objectContaining({
+          actorId: "root",
+          subscribedBy: "root",
+          resource: { kind: "chat" },
+        }),
+        expect.objectContaining({
+          actorId: "root",
+          subscribedBy: "root",
+          resource: { kind: "system" },
         }),
       ])
     );
-
-    // Emit event in the configured staging space
-    await chatSource.emit({
-      name: "msg-staging",
-      spaceName: "spaces/AAAA_STAGING",
-      spaceType: "DIRECT_MESSAGE",
-      senderName: "users/operator",
-      senderDisplayName: "Operator",
-      text: "hello staging",
-      mentionsSelf: false,
-      isDirectMessage: true,
-    });
-
-    // Emit event in an unconfigured space
-    await chatSource.emit({
-      name: "msg-other",
-      spaceName: "spaces/OTHER_PROD",
-      spaceType: "DIRECT_MESSAGE",
-      senderName: "users/operator",
-      senderDisplayName: "Operator",
-      text: "hello other",
-      mentionsSelf: false,
-      isDirectMessage: true,
-    });
-
-    const rootEntries = getRepositories().inbox.list("root").entries;
-    const rootSpaceNames = rootEntries.map((e) => e.payload?.spaceName).filter(Boolean);
-
-    expect(rootSpaceNames).toContain("spaces/AAAA_STAGING");
-    expect(rootSpaceNames).not.toContain("spaces/OTHER_PROD");
   });
 
   it("drops inbound chat messages from spaces listed in chat.excludedSpaces ", async () => {
@@ -2731,7 +2718,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
           antigravity: { cliCommand: "agy" },
         },
         rootActor: { provider: "antigravity" },
-        eventSources: [{ kind: "chat" }],
         chat: {
           projectId: "test",
           subscription: "test",
@@ -2793,51 +2779,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(rootSpaceNames).not.toContain("spaces/AAAA_STAGING");
   });
 
-  it("rejects invalid eventSources chat_space config entries ", async () => {
-    const chatClient = new FakeChatClient();
-    const chatSource = new FakeChatSource();
-
-    // Missing / empty space
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: { account: "mock-bot" },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity" },
-        eventSources: [{ kind: "chat_space", space: "" }],
-        chat: { projectId: "test", subscription: "test", pubsubKeyPath: "/dev/null" },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    await expect(
-      runStart({
-        e2e: { chatClient, chatSource, onReady: () => {} },
-      })
-    ).rejects.toThrow(/eventSources\[0\]\.space is required for chat_space/);
-
-    // Malformed space
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: { account: "mock-bot" },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity" },
-        eventSources: [{ kind: "chat_space", space: "invalid-space-name" }],
-        chat: { projectId: "test", subscription: "test", pubsubKeyPath: "/dev/null" },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    await expect(
-      runStart({
-        e2e: { chatClient, chatSource, onReady: () => {} },
-      })
-    ).rejects.toThrow(/eventSources\[0\]\.space must be "spaces\/\.\.\." for chat_space/);
-  });
-
   it("routes two-person rooms and true DMs responsively while larger rooms remain mention-gated", async () => {
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();
@@ -2847,7 +2788,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
         rootActor: { provider: "antigravity" },
-        eventSources: [{ kind: "chat" }],
         chat: {
           projectId: "test",
           subscription: "test",
@@ -2917,7 +2857,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
         rootActor: { provider: "antigravity" },
-        eventSources: [{ kind: "chat" }],
         chat: { projectId: "test", subscription: "test", pubsubKeyPath: "/dev/null", gchat: "all" },
         geminiApiKey: "fake-gemini-key",
       }),
