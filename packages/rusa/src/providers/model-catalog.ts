@@ -46,7 +46,7 @@ export const PROVIDER_MODEL_DESCRIPTORS: Readonly<Record<string, ProviderModelDe
     provider: "codex",
     commandLineField: "identifier",
     extractionGuidance:
-      "Codex displays its passable model slug (e.g. 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.5'). Omit UI annotations such as '(current)' and reasoning effort qualifiers such as 'medium', 'low', 'high', 'extra-high'. Copy the plain model slug into both fields. Mark concrete models with passable: true.",
+      "Codex displays its passable model slug (e.g. 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.5') in the 'Select Model and Effort' menu panel. Do not extract model names from the banner status line or '/model to change' header line. Only extract models listed in the selectable menu panel. If no model selection menu is present, return an empty entries list. Omit UI annotations such as '(current)' and reasoning effort qualifiers such as 'medium', 'low', 'high', 'extra-high'. Copy the plain model slug into both fields. Mark concrete models with passable: true.",
   },
   // Source: Operator's investigation in ISSUE_NUM: Claude displays friendly aliases while
   // the corresponding passable values are claude-* identifiers.
@@ -90,6 +90,20 @@ export async function extractModelCatalog(
       status: "unknown",
       entries: [],
       message: "no geminiApiKey configured for LLM model catalog parsing",
+    };
+  }
+
+  // Guard against panel-less captures that contain only the startup banner/status line
+  if (
+    descriptor.provider === "codex" &&
+    /(?:model\s*:\s*[^\n]+\/model to change|OpenAI Codex|Welcome to Codex)/i.test(rawOutput) &&
+    !/(?:Select Model|Select a model|Select model and effort|[0-9]+\.\s*gpt-)/i.test(rawOutput)
+  ) {
+    return {
+      status: "unknown",
+      entries: [],
+      message:
+        "codex screen capture contains banner status line but no model selection panel rendered",
     };
   }
 
@@ -161,6 +175,9 @@ export interface ModelScrapeStore {
   recordRaw(opts: { provider: string; scrapedAt: string; rawOutput: string }): string;
   recordParsed(id: string, models: readonly ModelEntry[]): void;
   recordParseError(id: string, error: unknown): void;
+  getLatestForProvider?(
+    provider: string
+  ): { scrapedAt: string; parsedModels: readonly ModelEntry[] | null } | null;
 }
 
 /**
@@ -230,7 +247,6 @@ export async function recordAndExtractModelCatalog(opts: {
           /* best effort */
         }
       }
-      clearProviderModelCatalog(opts.provider);
       return {
         status: "unknown",
         entries: [],
@@ -238,7 +254,6 @@ export async function recordAndExtractModelCatalog(opts: {
       };
     }
   } catch (err) {
-    clearProviderModelCatalog(opts.provider);
     if (id && opts.scrapeStore) {
       try {
         opts.scrapeStore.recordParseError(id, err);

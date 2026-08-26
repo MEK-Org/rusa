@@ -98,7 +98,7 @@ gemini-3.1-pro-high       Gemini 3.1 Pro (High)
     });
   });
 
-  it("handles probe failure gracefully without throwing and clears stale catalog ", async () => {
+  it("handles probe failure gracefully without throwing and retains last-known-good catalog", async () => {
     setProviderModelCatalog("codex", [
       { displayLabel: "old-model", identifier: "old-model", passable: true },
     ]);
@@ -116,10 +116,12 @@ gemini-3.1-pro-high       Gemini 3.1 Pro (High)
     if (res.status === "unknown") {
       expect(res.message).toContain("tmux not available");
     }
-    expect(getProviderModelCatalog("codex")).toBeUndefined();
+    expect(getProviderModelCatalog("codex")).toEqual([
+      { displayLabel: "old-model", identifier: "old-model", passable: true },
+    ]);
   });
 
-  it("clears stale catalog and fails loud when agy output parses zero models ", async () => {
+  it("retains last-known-good catalog and records parse error when agy output parses zero models", async () => {
     setProviderModelCatalog("agy", [
       { displayLabel: "old-model", identifier: "old-model", passable: true },
     ]);
@@ -141,7 +143,25 @@ gemini-3.1-pro-high       Gemini 3.1 Pro (High)
 
     expect(res.status).toBe("unknown");
     expect(mockStore.recordParseError).toHaveBeenCalledWith("scrape-agy-empty", expect.any(Error));
-    expect(getProviderModelCatalog("agy")).toBeUndefined();
+    expect(getProviderModelCatalog("agy")).toEqual([
+      { displayLabel: "old-model", identifier: "old-model", passable: true },
+    ]);
+  });
+
+  it("retains last-known-good catalog when no probe is implemented (e.g. claude)", async () => {
+    setProviderModelCatalog("claude", [
+      { displayLabel: "claude-sonnet-5", identifier: "claude-sonnet-5", passable: true },
+    ]);
+
+    const res = await refreshProviderModelCatalog({
+      provider: "claude",
+      workersDir: "/tmp/test-workers",
+    });
+
+    expect(res.status).toBe("unknown");
+    expect(getProviderModelCatalog("claude")).toEqual([
+      { displayLabel: "claude-sonnet-5", identifier: "claude-sonnet-5", passable: true },
+    ]);
   });
 });
 
@@ -186,6 +206,7 @@ describe("scrapeCodexModelScreen", () => {
       mockBin,
       `#!/bin/bash
 echo "OpenAI Codex"
+echo "Ask Codex to do anything"
 while read -r line; do
   if [ "$line" = "/model" ]; then
     echo "Select Model and Effort"
@@ -221,6 +242,7 @@ sleep 1
       mockBin,
       `#!/bin/bash
 echo "OpenAI Codex"
+echo "Ask Codex to do anything"
 while true; do
   sleep 1
 done
@@ -243,7 +265,8 @@ done
 
   it("generates tmux script with autocomplete confirmation and render error check ", () => {
     const script = buildCodexModelTmuxScript("codex", "/tmp/sock", '-c projects.trust="trusted"');
-    expect(script).toContain('tmux -S "$SOCK" send-keys -t "$S" "/model"');
+    expect(script).toContain("Ask Codex to do anything");
+    expect(script).toContain('tmux -S "$SOCK" send-keys -t "$S" -l "/model"');
     expect(script).toContain("Select Model");
     expect(script).toContain("ERROR: /model panel never rendered in Codex session");
     expect(script).toContain("exit 1");
