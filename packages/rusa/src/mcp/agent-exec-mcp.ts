@@ -753,7 +753,11 @@ export function createAgentExecMcpServer(
           description:
             "Install (or replace) a cron schedule that mechanically wakes an actor — e.g. the nightly IU distill or standing ops (bless cut, digest). `cron_expr` is a standard 5-field cron expression (min hour dom mon dow); `reason` is delivered to the actor's inbox as its wake prompt; `priority` ('responsive' or true) marks the wake to ride the responsive lane and bypass provider pacing. Idempotent per actor. Root-only.",
           inputSchema: {
-            actor_id: z.string().describe("The actor's thread id to wake."),
+            actor_id: z
+              .string()
+              .describe(
+                "The actor's thread id (or suffixed wake slot, e.g. 'root:daily-bless-cut') to wake."
+              ),
             cron_expr: z
               .string()
               .describe("Standard 5-field cron expression, e.g. '0 3 * * *' for 03:00 daily."),
@@ -787,7 +791,13 @@ export function createAgentExecMcpServer(
         {
           title: "Cancel an actor's recurring wake (root-only)",
           description: "Remove an actor's cron wake schedule. No-op if none is set. Root-only.",
-          inputSchema: { actor_id: z.string().describe("The actor's thread id.") },
+          inputSchema: {
+            actor_id: z
+              .string()
+              .describe(
+                "The actor's thread id (or suffixed wake slot, e.g. 'root:daily-bless-cut')."
+              ),
+          },
         },
         async ({ actor_id }) => {
           const denied = assertRoot();

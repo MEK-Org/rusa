@@ -1074,6 +1074,45 @@ describe("ActorMesh", () => {
     });
   });
 
+  it("deliverWake with suffixed wake slot delivers to the base actor with slot metadata", async () => {
+    const events: MeshEventInput[] = [];
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (e) => events.push(e),
+    });
+    const rootId = mesh.registry.get("root")?.id ?? "root";
+    expect(mesh.deliverWake("root:daily-bless-cut", "cut morning bless", "responsive")).toBe(true);
+    await tick();
+
+    const inboxEntry = inboxStore.entries.find((e) => e.actorId === rootId);
+    expect(inboxEntry).toBeDefined();
+    expect(inboxEntry?.payload).toMatchObject({
+      type: "scheduled.wake",
+      slot: "root:daily-bless-cut",
+      priority: "responsive",
+    });
+
+    const wakeEvent = events.find((e) => e.kind === "scheduled_wake" && e.actorId === rootId);
+    expect(wakeEvent).toBeDefined();
+    expect(wakeEvent?.detail).toBeUndefined();
+    expect(JSON.parse(wakeEvent?.payload ?? "{}")).toMatchObject({
+      slot: "root:daily-bless-cut",
+      priority: "responsive",
+    });
+
+    // Dropped suffixed wake
+    expect(mesh.deliverWake("unknown-actor:nightly", "nightly run")).toBe(false);
+    const droppedEvent = events.find(
+      (e) => e.kind === "scheduled_wake" && e.actorId === "unknown-actor"
+    );
+    expect(droppedEvent).toBeDefined();
+    expect(droppedEvent?.detail).toBe("dropped — no live actor");
+    expect(JSON.parse(droppedEvent?.payload ?? "{}")).toMatchObject({
+      slot: "unknown-actor:nightly",
+    });
+  });
+
   it("lets a parent introduce peers — coder ↔ reviewer message directly", async () => {
     const { mesh, registry, fake, tick } = setup();
     // Root spawns a coder and a high-tier reviewer, owns both.
