@@ -42,7 +42,6 @@ void main() {
         scrapedAt: '2026-07-14T09:15:00.000Z',
         throttle: QuotaThrottleDto(
           intervalSeconds: 73,
-          held: false,
           expired: false,
           updatedAt: '2026-07-14T09:15:00.000Z',
           buckets: [

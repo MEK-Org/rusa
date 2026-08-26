@@ -1059,7 +1059,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         : "inf";
       const cappedStr = tick.capped ? ` capped(wanted=${wantedStr})` : "";
       console.log(
-        `[quota-throttle] provider=${providerName} interval=${safeIntervalSeconds.toFixed(1)}s${cappedStr} ${tick.held ? "held" : tick.expired ? "expired" : `error=[${errors}]`}`
+        `[quota-throttle] provider=${providerName} interval=${safeIntervalSeconds.toFixed(1)}s${cappedStr} ${tick.expired ? "expired" : `error=[${errors}]`}`
       );
     } catch (err) {
       console.warn(
@@ -1076,10 +1076,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       {
         intervalSeconds: persisted.intervalSeconds,
         uncappedIntervalSeconds: persisted.uncappedIntervalSeconds,
-        held: persisted.held,
         expired: persisted.expired,
         capped: persisted.capped,
-        learning: persisted.held,
         buckets: persisted.buckets.map((bucket) => ({
           key: bucket.key,
           percentLeft: bucket.percentLeft,

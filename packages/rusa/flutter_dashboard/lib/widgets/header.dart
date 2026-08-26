@@ -517,9 +517,7 @@ String quotaThrottleTooltip(QuotaThrottleDto throttle) {
     'Normal launch pacing: one start every '
         '${_formatInterval(throttle.intervalSeconds)}',
   ];
-  if (throttle.held) {
-    lines.add('learning burn per start from historical quota readings');
-  } else if (throttle.expired) {
+  if (throttle.expired) {
     lines.add(
       'previous quota window expired; returning to the configured interval',
     );

@@ -547,28 +547,22 @@ class QuotaThrottleBucketDto {
 class QuotaThrottleDto {
   const QuotaThrottleDto({
     required this.intervalSeconds,
-    required this.held,
     required this.expired,
     this.capped = false,
-    this.learning = false,
     required this.buckets,
     required this.updatedAt,
   });
 
   final double intervalSeconds;
-  final bool held;
   final bool expired;
   final bool capped;
-  final bool learning;
   final List<QuotaThrottleBucketDto> buckets;
   final String updatedAt;
 
   factory QuotaThrottleDto.fromJson(Map<String, dynamic> j) => QuotaThrottleDto(
     intervalSeconds: (j['intervalSeconds'] as num?)?.toDouble() ?? 0,
-    held: j['held'] as bool? ?? false,
     expired: j['expired'] as bool? ?? false,
     capped: j['capped'] as bool? ?? false,
-    learning: j['learning'] as bool? ?? false,
     buckets: (j['buckets'] as List<dynamic>? ?? const [])
         .map((e) => QuotaThrottleBucketDto.fromJson(e as Map<String, dynamic>))
         .toList(),
@@ -577,10 +571,8 @@ class QuotaThrottleDto {
 
   Map<String, dynamic> toJson() => {
     'intervalSeconds': intervalSeconds,
-    'held': held,
     'expired': expired,
     'capped': capped,
-    'learning': learning,
     'buckets': buckets.map((bucket) => bucket.toJson()).toList(),
     'updatedAt': updatedAt,
   };

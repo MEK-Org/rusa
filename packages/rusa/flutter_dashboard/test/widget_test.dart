@@ -1414,7 +1414,6 @@ void main() {
         quotaThrottleTooltip(
           const QuotaThrottleDto(
             intervalSeconds: 73,
-            held: false,
             expired: false,
             updatedAt: '2026-07-22T12:00:00.000Z',
             buckets: [
@@ -1432,18 +1431,17 @@ void main() {
       );
     });
 
-    test('explains that pacing is learning from quota history', () {
+    test('explains that previous quota window expired', () {
       expect(
         quotaThrottleTooltip(
           const QuotaThrottleDto(
             intervalSeconds: 73,
-            held: true,
-            expired: false,
+            expired: true,
             updatedAt: '2026-07-22T12:00:00.000Z',
             buckets: [],
           ),
         ),
-        contains('learning burn per start'),
+        contains('previous quota window expired'),
       );
     });
   });

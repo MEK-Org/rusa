@@ -89,7 +89,6 @@ export interface PersistedQuotaProviderStatus {
   uncappedIntervalSeconds: number;
   governingBucketKey: string | null;
   capped: boolean;
-  held: boolean;
   expired: boolean;
   /** Runtime gate derived from quota evidence; never stored as a throttle period. */
   exhaustedUntil: string | null;
@@ -500,7 +499,6 @@ export class SharedQuotaStore {
       governingBucketKey: governing ? `${provider}:${governing.kind}` : null,
       capped:
         governing !== undefined && governing.uncappedIntervalSeconds > governing.intervalSeconds,
-      held: false,
       expired: exhaustedUntil !== null,
       exhaustedUntil,
       updatedAt,

@@ -448,10 +448,8 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
         provider === "claude"
           ? {
               intervalSeconds: 73,
-              held: false,
               expired: false,
               capped: false,
-              learning: false,
               buckets: [],
               uncappedIntervalSeconds: 73,
               updatedAt: "2026-07-22T12:00:00.000Z",
