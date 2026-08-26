@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RusaConfig } from "../config/types.js";
 import {
-  clearProviderModelCatalog,
+  getProviderModelCatalog,
   ingestKimiHostModels,
   type ModelCatalogExtraction,
   type ModelScrapeStore,
@@ -34,20 +34,32 @@ export function buildCodexModelTmuxScript(
     "S=probe",
     'tmux -S "$SOCK" kill-server 2>/dev/null || true',
     `tmux -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 ${q(cliCommand)}${trustArg ? ` ${trustArg}` : ""}`,
-    // Wait up to ~20s for the codex banner (TUI ready).
+    // Wait up to ~20s for the composer prompt to become ready (not just the banner).
+    "ready=0",
     "for i in $(seq 1 40); do",
     '  scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
-    '  printf "%s" "$scr" | grep -qiE "OpenAI Codex|Welcome to Codex" && break',
+    '  if printf "%s" "$scr" | grep -qiE "Ask Codex to do anything"; then',
+    "    ready=1",
+    "    break",
+    "  fi",
     "  sleep 0.5",
     "done",
-    // Type the /model command and submit.
-    'tmux -S "$SOCK" send-keys -t "$S" "/model"',
-    "sleep 1",
+    'if [ "$ready" -eq 0 ]; then',
+    '  echo "ERROR: composer never became ready in Codex session" >&2',
+    '  tmux -S "$SOCK" kill-server 2>/dev/null || true',
+    "  exit 1",
+    "fi",
+    // Settle before sending keys so TUI is fully accepting input.
+    "sleep 2",
+    // Type the /model command with literal keys and submit after a short pause.
+    'tmux -S "$SOCK" send-keys -t "$S" -l "/model"',
+    "sleep 1.5",
     'tmux -S "$SOCK" send-keys -t "$S" Enter',
     // Wait up to ~20s for the model menu panel to render.
     // On codex CLI, the first Enter may be consumed by the autocomplete popup.
     // Poll for confirmation: if the menu hasn't rendered yet and the popup or
     // prompt is still visible, re-send Enter to submit the command.
+    // Note: Keep regex in sync with extractModelCatalog pre-extraction guard in model-catalog.ts
     "rendered=0",
     "for i in $(seq 1 40); do",
     '  scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
@@ -237,6 +249,28 @@ export async function scrapeCodexModelScreen(opts: ModelProbeOptions): Promise<s
   }
 }
 
+function logFailedRefresh(provider: string, message: string, scrapeStore?: ModelScrapeStore): void {
+  const existing = getProviderModelCatalog(provider);
+  if (existing && existing.length > 0) {
+    let ageNote = "";
+    try {
+      const latest =
+        scrapeStore?.getLatestParsedForProvider?.(provider) ??
+        scrapeStore?.getLatestForProvider?.(provider);
+      if (latest?.scrapedAt) {
+        ageNote = `, last scraped at ${latest.scrapedAt}`;
+      }
+    } catch {
+      /* best effort */
+    }
+    console.warn(
+      `[model-catalog] ${message}; retaining last-known-good catalog (${existing.length} models${ageNote})`
+    );
+  } else {
+    console.error(`[model-catalog] ${message}`);
+  }
+}
+
 /**
  * Probe a single provider's available models and persist the scrape.
  */
@@ -258,9 +292,8 @@ export async function refreshProviderModelCatalog(opts: {
     if (entries.length > 0) {
       return { status: "known", entries };
     }
-    clearProviderModelCatalog(provider);
     const message = "no models found in Kimi config";
-    console.error(`[model-catalog] ${message}`);
+    logFailedRefresh(provider, message, scrapeStore);
     return { status: "unknown", entries: [], message };
   }
 
@@ -289,14 +322,12 @@ export async function refreshProviderModelCatalog(opts: {
         setProviderModelCatalog(provider, entries);
         return { status: "known", entries };
       }
-      clearProviderModelCatalog(provider);
       const message = "no models found in agy models output";
-      console.error(`[model-catalog] ${message}`);
+      logFailedRefresh(provider, message, scrapeStore);
       return { status: "unknown", entries: [], message };
     } catch (err) {
-      clearProviderModelCatalog(provider);
       const message = `agy models probe failed: ${err instanceof Error ? err.message : String(err)}`;
-      console.error(`[model-catalog] ${message}`);
+      logFailedRefresh(provider, message, scrapeStore);
       return { status: "unknown", entries: [], message };
     }
   }
@@ -307,9 +338,8 @@ export async function refreshProviderModelCatalog(opts: {
       const probe = probers?.scrapeCodex ?? scrapeCodexModelScreen;
       rawOutput = await probe({ actorDir });
     } else {
-      clearProviderModelCatalog(provider);
       const message = `no probe implemented for provider "${provider}"`;
-      console.error(`[model-catalog] ${message}`);
+      logFailedRefresh(provider, message, scrapeStore);
       return {
         status: "unknown",
         entries: [],
@@ -317,9 +347,8 @@ export async function refreshProviderModelCatalog(opts: {
       };
     }
   } catch (err) {
-    clearProviderModelCatalog(provider);
     const message = `model probe failed for provider "${provider}": ${err instanceof Error ? err.message : String(err)}`;
-    console.error(`[model-catalog] ${message}`);
+    logFailedRefresh(provider, message, scrapeStore);
     return {
       status: "unknown",
       entries: [],
@@ -334,9 +363,10 @@ export async function refreshProviderModelCatalog(opts: {
     geminiApiKey,
   });
   if (res.status === "unknown") {
-    clearProviderModelCatalog(provider);
-    console.error(
-      `[model-catalog] model extraction failed for provider "${provider}": ${res.message}`
+    logFailedRefresh(
+      provider,
+      `model extraction failed for provider "${provider}": ${res.message}`,
+      scrapeStore
     );
   }
   return res;
@@ -360,22 +390,18 @@ export async function refreshConfiguredProviderModelCatalogs(deps: {
   await Promise.all(
     providersToProbe.map(async (provider) => {
       try {
-        const result = await refreshProviderModelCatalog({
+        await refreshProviderModelCatalog({
           provider,
           workersDir: deps.workersDir,
           scrapeStore: deps.scrapeStore,
           geminiApiKey: deps.config.geminiApiKey,
           probers: deps.probers,
         });
-        if (result.status === "unknown") {
-          console.error(
-            `[model-catalog] failed to refresh model catalog for ${provider}: ${result.message}`
-          );
-        }
       } catch (err) {
-        clearProviderModelCatalog(provider);
-        console.error(
-          `[model-catalog] failed to refresh model catalog for ${provider}: ${err instanceof Error ? err.message : String(err)}`
+        logFailedRefresh(
+          provider,
+          `failed to refresh model catalog for ${provider}: ${err instanceof Error ? err.message : String(err)}`,
+          deps.scrapeStore
         );
       }
     })
