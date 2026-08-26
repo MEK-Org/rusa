@@ -1509,32 +1509,40 @@ export class ActorMesh {
    * actor). At-least-once by nature → the nightly distill must be idempotent.
    */
   deliverWake(actorId: string, reason: string, priority?: "normal" | "responsive"): boolean {
-    actorId = this.resolveThreadId(actorId);
-    const rec = this.registry.get(actorId);
-    const isLive = Boolean(rec && rec.status === "active" && this.live.has(actorId));
-    const target = isLive ? this.live.get(actorId) : undefined;
+    const rawActorId = actorId;
+    const colonIdx = actorId.indexOf(":");
+    const baseActorId = colonIdx >= 0 ? actorId.slice(0, colonIdx) : actorId;
+    const resolvedId = this.resolveThreadId(baseActorId);
+    const rec = this.registry.get(resolvedId);
+    const isLive = Boolean(rec && rec.status === "active" && this.live.has(resolvedId));
+    const target = isLive ? this.live.get(resolvedId) : undefined;
     const isResponsive = priority === "responsive";
     const messageId = target
       ? this.recordMessageEmitted({
           fromId: SCHEDULER_SENDER_ID,
-          toId: actorId,
+          toId: resolvedId,
           body: reason,
           isDrop: false,
         })
       : undefined;
     this.recordEvent({
       kind: "scheduled_wake",
-      actorId,
-      detail: target ? undefined : DROPPED_MESSAGE_DETAIL,
+      actorId: resolvedId,
+      detail: target
+        ? rawActorId !== resolvedId
+          ? rawActorId
+          : undefined
+        : DROPPED_MESSAGE_DETAIL,
       payload: JSON.stringify({
         from: SCHEDULER_SENDER_ID,
+        ...(colonIdx >= 0 ? { slot: rawActorId } : {}),
         ...(messageId ? { messageId } : {}),
         ...(isResponsive ? { priority: "responsive" } : {}),
       }),
     });
     if (!target) {
       this.log(
-        `scheduled wake for ${actorId} dropped — ${rec?.status === "retired" ? "recipient retired" : "no live actor"}`
+        `scheduled wake for ${rawActorId} dropped — ${rec?.status === "retired" ? "recipient retired" : "no live actor"}`
       );
       return false;
     }
@@ -1543,22 +1551,23 @@ export class ActorMesh {
       return true;
     }
     if (!messageId) {
-      this.log(`scheduled wake for ${actorId} could not persist an inbox pointer`);
+      this.log(`scheduled wake for ${resolvedId} could not persist an inbox pointer`);
       return false;
     }
     this.inboxStore.append([
       {
-        actorId,
+        actorId: resolvedId,
         source: `mesh:${SCHEDULER_SENDER_ID}`,
         payload: {
           type: "scheduled.wake",
           messageId,
           fromId: SCHEDULER_SENDER_ID,
+          ...(colonIdx >= 0 ? { slot: rawActorId } : {}),
           ...(isResponsive ? { priority: "responsive" } : {}),
         },
       },
     ]);
-    this.notifyInboxChanged(actorId, isResponsive ? { priority: "responsive" } : {});
+    this.notifyInboxChanged(resolvedId, isResponsive ? { priority: "responsive" } : {});
     return true;
   }
 

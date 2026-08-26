@@ -1272,6 +1272,29 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
 
     await client.callTool({ name: "cancel_wake", arguments: { actor_id: "73e0b00f" } });
     expect(sched.entries).toEqual([]);
+
+    // Suffixed wake slot (e.g. root:daily-bless-cut)
+    const okSlot = (await client.callTool({
+      name: "schedule_wake",
+      arguments: {
+        actor_id: "root:daily-bless-cut",
+        cron_expr: "45 8 * * *",
+        reason: "morning bless cut",
+        priority: "responsive",
+      },
+    })) as CallToolResult;
+    expect(okSlot.isError).toBeFalsy();
+    expect(sched.entries).toEqual([
+      {
+        actorId: "root:daily-bless-cut",
+        cronExpr: "45 8 * * *",
+        reason: "morning bless cut",
+        priority: "responsive",
+      },
+    ]);
+
+    await client.callTool({ name: "cancel_wake", arguments: { actor_id: "root:daily-bless-cut" } });
+    expect(sched.entries).toEqual([]);
   });
 
   it("schedule_wake surfaces a validation error as an error result", async () => {

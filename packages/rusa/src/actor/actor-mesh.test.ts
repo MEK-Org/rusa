@@ -1074,6 +1074,36 @@ describe("ActorMesh", () => {
     });
   });
 
+  it("deliverWake with suffixed wake slot delivers to the base actor with slot metadata", async () => {
+    const events: MeshEventInput[] = [];
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, tick } = setup({
+      inboxStore,
+      events: (e) => events.push(e),
+    });
+    const rootId = mesh.registry.get("root")?.id ?? "root";
+    expect(mesh.deliverWake("root:daily-bless-cut", "cut morning bless", "responsive")).toBe(true);
+    await tick();
+
+    const inboxEntry = inboxStore.entries.find((e) => e.actorId === rootId);
+    expect(inboxEntry).toBeDefined();
+    expect(inboxEntry?.payload).toMatchObject({
+      type: "scheduled.wake",
+      slot: "root:daily-bless-cut",
+      priority: "responsive",
+    });
+
+    const wakeEvent = events.find(
+      (e) =>
+        e.kind === "scheduled_wake" && e.actorId === rootId && e.detail === "root:daily-bless-cut"
+    );
+    expect(wakeEvent).toBeDefined();
+    expect(JSON.parse(wakeEvent?.payload ?? "{}")).toMatchObject({
+      slot: "root:daily-bless-cut",
+      priority: "responsive",
+    });
+  });
+
   it("lets a parent introduce peers — coder ↔ reviewer message directly", async () => {
     const { mesh, registry, fake, tick } = setup();
     // Root spawns a coder and a high-tier reviewer, owns both.
