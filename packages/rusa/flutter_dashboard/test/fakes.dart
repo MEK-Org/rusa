@@ -98,7 +98,9 @@ class FakeApi extends DashboardApi {
   FakeApi() : super();
   List<ThreadDto> threadsResult = [];
   QuotaSnapshotDto? quotaResult;
+  QuotaHistoryDto? quotaHistoryResult;
   Object? quotaError;
+  Object? quotaHistoryError;
   DashboardConfigDto? dashboardConfigResult;
   bool halted = false;
   List<EventPage> eventPages = [];
@@ -106,6 +108,7 @@ class FakeApi extends DashboardApi {
   int chatCall = 0;
   int eventCall = 0;
   int quotaCallCount = 0;
+  int quotaHistoryCallCount = 0;
   final eventActorCalls = <List<String>>[];
   final chatActorCalls = <List<String>>[];
   final eventSinceCalls = <String?>[];
@@ -127,6 +130,7 @@ class FakeApi extends DashboardApi {
   /// [quotaResult] immediately — lets a test observe the SWR "refreshing"
   /// window (ISSUE_NUM ask 4) before letting the background revalidation resolve.
   Completer<QuotaSnapshotDto>? quotaGate;
+  Completer<QuotaHistoryDto>? quotaHistoryGate;
 
   /// When set, the NEXT fetchEvents awaits this instead of returning a canned
   /// page — lets a test inject a live SSE frame mid-fetch (the seam window).
@@ -174,6 +178,20 @@ class FakeApi extends DashboardApi {
     if (err != null) throw err;
     return quotaResult ??
         const QuotaSnapshotDto(generatedAt: '', providers: []);
+  }
+
+  @override
+  Future<QuotaHistoryDto> fetchQuotaHistory() async {
+    quotaHistoryCallCount++;
+    final gate = quotaHistoryGate;
+    if (gate != null) {
+      quotaHistoryGate = null;
+      return gate.future;
+    }
+    final err = quotaHistoryError;
+    if (err != null) throw err;
+    return quotaHistoryResult ??
+        const QuotaHistoryDto(generatedAt: '', historySince: '', history: []);
   }
 
   @override

@@ -26,22 +26,22 @@ String _providerTitle(String provider) => switch (provider) {
 class QuotaHistoryChart extends StatelessWidget {
   const QuotaHistoryChart({
     super.key,
-    required this.snapshot,
+    required this.history,
     this.isStale = false,
   });
 
-  final QuotaSnapshotDto snapshot;
+  final QuotaHistoryDto history;
   final bool isStale;
 
   @override
   Widget build(BuildContext context) {
     final end =
-        DateTime.tryParse(snapshot.generatedAt)?.toUtc() ??
+        DateTime.tryParse(history.generatedAt)?.toUtc() ??
         DateTime.now().toUtc();
     final start =
-        DateTime.tryParse(snapshot.historySince)?.toUtc() ??
+        DateTime.tryParse(history.historySince)?.toUtc() ??
         end.subtract(const Duration(days: 3));
-    final visible = snapshot.history
+    final visible = history.history
         .where(
           (series) =>
               series.windowId == 'weekly' &&
@@ -66,7 +66,7 @@ class QuotaHistoryChart extends StatelessWidget {
       children: [
         if (isStale) ...[
           Text(
-            'Cached snapshot as of ${snapshot.generatedAt}',
+            'Cached snapshot as of ${history.generatedAt}',
             style: kMonoStyle.copyWith(
               color: MeshColors.textMuted,
               fontSize: 11,
@@ -78,7 +78,7 @@ class QuotaHistoryChart extends StatelessWidget {
           label:
               'Weekly quota remaining over the prior 3 days. '
               'Vertical scale zero to one hundred percent.'
-              '${isStale ? ' Cached snapshot as of ${snapshot.generatedAt}.' : ''}',
+              '${isStale ? ' Cached snapshot as of ${history.generatedAt}.' : ''}',
           child: Container(
             height: 220,
             decoration: BoxDecoration(
@@ -138,7 +138,7 @@ class QuotaHistoryChart extends StatelessWidget {
           label:
               'Pace-controller error relative to target over the prior 3 days. '
               'Vertical scale minus fifty to plus fifty percent centered at zero.'
-              '${isStale ? ' Cached snapshot as of ${snapshot.generatedAt}.' : ''}',
+              '${isStale ? ' Cached snapshot as of ${history.generatedAt}.' : ''}',
           child: Container(
             height: 220,
             decoration: BoxDecoration(
@@ -197,7 +197,7 @@ class QuotaHistoryChart extends StatelessWidget {
         Semantics(
           label:
               'Pace-controller throttle interval over the prior 3 days.'
-              '${isStale ? ' Cached snapshot as of ${snapshot.generatedAt}.' : ''}',
+              '${isStale ? ' Cached snapshot as of ${history.generatedAt}.' : ''}',
           child: Container(
             height: 220,
             decoration: BoxDecoration(

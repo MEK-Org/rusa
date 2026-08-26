@@ -127,14 +127,14 @@ class _OverviewTabState extends State<OverviewTab> {
   /// Remaining quota over the prior 3 days, backed by durable provider scrapes.
   Widget _buildQuotaPoolsCard() {
     return StreamBuilder<List<Object?>>(
-      stream: Rx.combineLatest2<QuotaSnapshotDto?, bool, List<Object?>>(
-        widget.store.quota,
-        widget.store.quotaStale,
-        (quota, stale) => [quota, stale],
+      stream: Rx.combineLatest2<QuotaHistoryDto?, bool, List<Object?>>(
+        widget.store.quotaHistory,
+        widget.store.quotaHistoryStale,
+        (history, stale) => [history, stale],
       ),
       builder: (context, snap) {
-        final quota = widget.store.quota.valueOrNull;
-        final stale = widget.store.quotaStale.valueOrNull ?? false;
+        final history = widget.store.quotaHistory.valueOrNull;
+        final stale = widget.store.quotaHistoryStale.valueOrNull ?? false;
         return Container(
           padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(
@@ -159,13 +159,13 @@ class _OverviewTabState extends State<OverviewTab> {
                 ),
               ),
               const SizedBox(height: 14),
-              if (quota == null)
+              if (history == null)
                 const Text(
                   'Quota history unavailable.',
                   style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
                 )
               else
-                QuotaHistoryChart(snapshot: quota, isStale: stale),
+                QuotaHistoryChart(history: history, isStale: stale),
             ],
           ),
         );
