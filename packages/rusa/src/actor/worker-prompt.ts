@@ -64,7 +64,7 @@ export const WRITING_FOR_AGENTS_DISCIPLINE = `## Writing for agents
 When drafting instructions, charters, or sub-task prompts for other agents:
 - **Anchor completion in verified evidence:** Define "done" as showing the concrete command or artifact already produced, together with its observed result — not a claimed condition.
 - **State desired behavior positively:** State what to do directly rather than forbidding unwanted actions.
-- **Prefer compact, connotation-rich phrasing:** Use tight idioms and direct imperatives over long procedural explanations.
+- **Prefer compact, connotation-rich phrasing:** Use tight idioms and direct imperatives over long procedural explanations (e.g. "keep the loop tight", "make it go red first").
 - **Rely on the single source of truth:** Point to the authoritative record instead of restating it; prune instructions that no longer change behavior.`;
 
 /**
