@@ -430,6 +430,10 @@ String quotaWindowTooltip(
   }
   final pos = _schedulePosition(window, now);
   if (pos == null) {
+    // Belt-and-braces fallback: reachable if window has no known usedPercent
+    // or sits precisely at the millisecond tick where remainingMs <= 0.
+    // Windows with unparseable/missing reset text produce pos != null with
+    // timeRemainingPct == null, handled below.
     if (!window.isKnown) return '$label: n/a';
     final reset = _resetLine(window);
     final remaining = (100 - (window.usedPercent ?? 0)).clamp(0, 100).round();
@@ -480,9 +484,10 @@ String? _resetLine(QuotaWindowDto window) {
 }
 
 /// "as of <HH:mm>" — the ground-truth scrape stamp (ISSUE_NUM ask 5), never a
-/// cache hit or client SWR fetch time. Carries relative age when [now] is
-/// provided so stale readings are visibly distinct. Null when the state
-/// behind this window never reached a probe, or the stamp can't be parsed.
+/// cache hit or client SWR fetch time. Formatted in the viewer's local timezone
+/// to match reset timestamps. Carries relative age when [now] is provided so
+/// stale readings are visibly distinct. Null when the state behind this window
+/// never reached a probe, or the stamp can't be parsed.
 String? _asOfLine(
   String? scrapedAtIso, {
   DateTime? now,
@@ -490,7 +495,7 @@ String? _asOfLine(
   if (scrapedAtIso == null) return null;
   final scraped = DateTime.tryParse(scrapedAtIso);
   if (scraped == null) return null;
-  final timeStr = DateFormat('HH:mm').format(scraped);
+  final timeStr = DateFormat('HH:mm').format(scraped.toLocal());
   final parts = <String>['as of $timeStr'];
   if (now != null && now.isAfter(scraped)) {
     final age = now.difference(scraped);

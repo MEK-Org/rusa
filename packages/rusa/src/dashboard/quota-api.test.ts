@@ -709,7 +709,7 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
     }
   });
 
-  it("threads carriedForward through from limits and snapshot to QuotaWindowDto", async () => {
+  it("threads carriedForward through from limits to QuotaWindowDto without inheriting across siblings", async () => {
     const { deps } = fakeDeps({
       claude: {
         ...claudeState,
@@ -733,8 +733,8 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
 
     const claude = snapshot.providers.find((p) => p.provider === "claude");
     expect(claude?.windows.find((w) => w.id === "session")?.carriedForward).toBe(true);
-    // Inherited from snapshot
-    expect(claude?.windows.find((w) => w.id === "weekly")?.carriedForward).toBe(true);
+    // Directly observed sibling window is NOT marked carriedForward
+    expect(claude?.windows.find((w) => w.id === "weekly")?.carriedForward).toBeUndefined();
 
     const codex = snapshot.providers.find((p) => p.provider === "codex");
     expect(codex?.windows.find((w) => w.id === "five_hour")?.carriedForward).toBe(true);

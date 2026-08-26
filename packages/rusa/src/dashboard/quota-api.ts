@@ -190,7 +190,7 @@ function claudeWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
         headline: isWeekly,
         windowMs: windowMsFor(id),
         scrapedAt,
-        ...((limit.carriedForward ?? state.carriedForward) ? { carriedForward: true } : {}),
+        ...(limit.carriedForward ? { carriedForward: true } : {}),
       };
     });
   }
@@ -215,7 +215,7 @@ function codexWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
         headline: isWeekly,
         windowMs: windowMsFor(id),
         scrapedAt,
-        ...((limit.carriedForward ?? state.carriedForward) ? { carriedForward: true } : {}),
+        ...(limit.carriedForward ? { carriedForward: true } : {}),
       };
     });
   }
@@ -239,7 +239,7 @@ function agyWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
       headline: limit.kind === "weekly",
       windowMs: windowMsFor(limit.kind ?? "other"),
       scrapedAt,
-      ...((limit.carriedForward ?? state.carriedForward) ? { carriedForward: true } : {}),
+      ...(limit.carriedForward ? { carriedForward: true } : {}),
     }));
 }
 
@@ -258,7 +258,7 @@ function kimiWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
         windowMs: windowMsFor(id),
         // kimi's pty probe never stamps scrapedAt → always null (ISSUE_NUM ask 5).
         scrapedAt: state.scrapedAt ?? null,
-        ...((limit.carriedForward ?? state.carriedForward) ? { carriedForward: true } : {}),
+        ...(limit.carriedForward ? { carriedForward: true } : {}),
       };
     });
   }

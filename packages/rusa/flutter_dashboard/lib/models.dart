@@ -597,7 +597,6 @@ class ProviderQuotaDto {
     required this.windows,
     this.scrapedAt,
     this.throttle,
-    this.carriedForward = false,
   });
 
   final String provider;
@@ -613,10 +612,6 @@ class ProviderQuotaDto {
 
   /// Current closed-loop launch throttle, null when the feature is disabled.
   final QuotaThrottleDto? throttle;
-
-  /// True if this provider reading was carried forward from a previous scrape
-  /// assessment or durable history fallback.
-  final bool carriedForward;
 
   QuotaWindowDto? get headlineWindow {
     for (final w in windows) {
@@ -638,7 +633,6 @@ class ProviderQuotaDto {
     throttle: j['throttle'] is Map<String, dynamic>
         ? QuotaThrottleDto.fromJson(j['throttle'] as Map<String, dynamic>)
         : null,
-    carriedForward: j['carriedForward'] as bool? ?? false,
   );
 
   Map<String, dynamic> toJson() => {
@@ -650,7 +644,6 @@ class ProviderQuotaDto {
     'windows': windows.map((w) => w.toJson()).toList(),
     'scrapedAt': scrapedAt,
     'throttle': throttle?.toJson(),
-    'carriedForward': carriedForward,
   };
 }
 

@@ -40,7 +40,6 @@ void main() {
         tier: 'max',
         message: null,
         scrapedAt: '2026-07-14T09:15:00.000Z',
-        carriedForward: true,
         throttle: QuotaThrottleDto(
           intervalSeconds: 73,
           held: false,
@@ -119,7 +118,6 @@ void main() {
     expect(claude.tier, 'max');
     expect(claude.message, isNull);
     expect(claude.scrapedAt, '2026-07-14T09:15:00.000Z');
-    expect(claude.carriedForward, isTrue);
     expect(claude.throttle?.intervalSeconds, 73);
     expect(claude.throttle?.buckets.single.key, 'claude:weekly');
 
@@ -143,7 +141,6 @@ void main() {
 
     final agy = restored.provider('agy')!;
     expect(agy.windows.single.scrapedAt, '2026-07-14T09:10:00.000Z');
-    expect(agy.carriedForward, isFalse);
   });
 
   test('NoopQuotaCache never persists — every load is a cold start', () {
