@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import type {
   CreateIssueOptions,
   CreatePROptions,
+  CreatePrReviewCommentOptions,
   CreatePullRequestReviewOptions,
   IssueClient,
 } from "../gitops/issue-client.js";
@@ -24,6 +25,16 @@ function recordingIssueClient(): { client: IssueClient; calls: Call[] } {
     createPullRequest: async (opts: CreatePROptions) => {
       calls.push({ method: "createPullRequest", args: [opts] });
       return { number: 1, htmlUrl: "https://example.test/pr/1" };
+    },
+    createPrReviewComment: async (opts: CreatePrReviewCommentOptions) => {
+      calls.push({ method: "createPrReviewComment", args: [opts] });
+      return {
+        id: 99,
+        htmlUrl: "https://example.test/pr/1#discussion_r99",
+        path: opts.path ?? "a.ts",
+        line: opts.line ?? 1,
+        body: opts.body,
+      };
     },
     getOpenPullRequestsByAuthor: async (repo, author) => {
       calls.push({ method: "getOpenPullRequestsByAuthor", args: [repo, author] });
@@ -176,6 +187,7 @@ describe("tracker MCP server", () => {
         "add_sub_issue",
         "close_issue",
         "create_issue",
+        "create_pr_review_comment",
         "create_pull_request",
         "get_issue",
         "get_parent_issue",
@@ -376,6 +388,159 @@ describe("tracker MCP server", () => {
     expect(parseAuthor(body)).toBe("test-actor-review");
   });
 
+  it("submits a review with inline comments and stamps them on post_review", async () => {
+    const { client: backend, calls } = recordingIssueClient();
+    const client = await connect(
+      createTrackerMcpServer("test-actor-skeptic", backend, { instanceId: "test-instance" })
+    );
+
+    const res = (await client.callTool({
+      name: "post_review",
+      arguments: {
+        repo: "owner/repo",
+        prNumber: 123,
+        event: "REQUEST_CHANGES",
+        body: "Please address these points.",
+        comments: [
+          {
+            path: "src/worker.ts",
+            line: 42,
+            body: "Is this null check necessary?",
+            side: "RIGHT",
+          },
+        ],
+      },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].method).toBe("createPullRequestReview");
+
+    const opts = calls[0].args[0] as CreatePullRequestReviewOptions;
+    expect(opts.event).toBe("REQUEST_CHANGES");
+    expect(opts.body).toContain("Please address these points.");
+    expect(parseAuthor(opts.body)).toBe("test-actor-skeptic");
+    expect(opts.comments).toHaveLength(1);
+    expect(opts.comments?.[0].path).toBe("src/worker.ts");
+    expect(opts.comments?.[0].line).toBe(42);
+    expect(opts.comments?.[0].body).toContain("Is this null check necessary?");
+    expect(parseAuthor(opts.comments?.[0].body ?? "")).toBe("test-actor-skeptic");
+  });
+
+  it("posts an inline PR review comment with actor id stamp on create_pr_review_comment", async () => {
+    const { client: backend, calls } = recordingIssueClient();
+    const client = await connect(
+      createTrackerMcpServer("test-actor-reviewer", backend, { instanceId: "test-instance" })
+    );
+
+    const res = (await client.callTool({
+      name: "create_pr_review_comment",
+      arguments: {
+        repo: "owner/repo",
+        prNumber: 123,
+        path: "src/index.ts",
+        line: 55,
+        body: "Can this be simplified?",
+        side: "RIGHT",
+      },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toBe("https://example.test/pr/1#discussion_r99");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].method).toBe("createPrReviewComment");
+
+    const opts = calls[0].args[0] as CreatePrReviewCommentOptions;
+    expect(opts.repo).toBe("owner/repo");
+    expect(opts.prNumber).toBe(123);
+    expect(opts.path).toBe("src/index.ts");
+    expect(opts.line).toBe(55);
+    expect(opts.side).toBe("RIGHT");
+    expect(opts.body).toContain("Can this be simplified?");
+    expect(parseAuthor(opts.body)).toBe("test-actor-reviewer");
+  });
+
+  it("posts a file-level PR review comment on create_pr_review_comment", async () => {
+    const { client: backend, calls } = recordingIssueClient();
+    const client = await connect(
+      createTrackerMcpServer("test-actor-reviewer", backend, { instanceId: "test-instance" })
+    );
+
+    const res = (await client.callTool({
+      name: "create_pr_review_comment",
+      arguments: {
+        repo: "owner/repo",
+        prNumber: 123,
+        path: "README.md",
+        subjectType: "file",
+        body: "File-level feedback.",
+      },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].method).toBe("createPrReviewComment");
+
+    const opts = calls[0].args[0] as CreatePrReviewCommentOptions;
+    expect(opts.repo).toBe("owner/repo");
+    expect(opts.prNumber).toBe(123);
+    expect(opts.path).toBe("README.md");
+    expect(opts.subjectType).toBe("file");
+    expect(opts.line).toBeUndefined();
+    expect(opts.body).toContain("File-level feedback.");
+  });
+
+  it("posts a reply to an existing PR review comment on create_pr_review_comment", async () => {
+    const { client: backend, calls } = recordingIssueClient();
+    const client = await connect(
+      createTrackerMcpServer("test-actor-reviewer", backend, { instanceId: "test-instance" })
+    );
+
+    const res = (await client.callTool({
+      name: "create_pr_review_comment",
+      arguments: {
+        repo: "owner/repo",
+        prNumber: 123,
+        inReplyTo: 987,
+        body: "Replying to your comment.",
+      },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].method).toBe("createPrReviewComment");
+
+    const opts = calls[0].args[0] as CreatePrReviewCommentOptions;
+    expect(opts.repo).toBe("owner/repo");
+    expect(opts.prNumber).toBe(123);
+    expect(opts.inReplyTo).toBe(987);
+    expect(opts.path).toBeUndefined();
+    expect(opts.body).toContain("Replying to your comment.");
+  });
+
+  it("queries PR review comments via get_pr_review_comments tool", async () => {
+    const { client: backend, calls } = recordingIssueClient();
+    const client = await connect(createTrackerMcpServer("test-actor-1", backend));
+
+    await client.callTool({
+      name: "get_pr_review_comments",
+      arguments: { repo: "owner/repo", prNumber: 123 },
+    });
+    await client.callTool({
+      name: "get_pr_review_comments",
+      arguments: { repo: "owner/repo", prNumber: 123, reviewId: 456 },
+    });
+
+    expect(calls).toContainEqual({
+      method: "getPrReviewComments",
+      args: ["owner/repo", 123, undefined],
+    });
+    expect(calls).toContainEqual({
+      method: "getPrReviewComments",
+      args: ["owner/repo", 123, 456],
+    });
+  });
+
   it("restamps author on update_body", async () => {
     const { client: backend, calls } = recordingIssueClient();
     const client = await connect(
@@ -551,6 +716,10 @@ describe("tracker MCP server", () => {
       arguments: { repo: "o/r", prNumber: 1, event: "APPROVE", body: "ok" },
     });
     await client.callTool({
+      name: "create_pr_review_comment",
+      arguments: { repo: "o/r", prNumber: 1, body: "question", path: "a.ts", line: 1 },
+    });
+    await client.callTool({
       name: "add_reaction",
       arguments: { repo: "o/r", issueNumber: 1, content: "eyes" },
     });
@@ -571,7 +740,7 @@ describe("tracker MCP server", () => {
       arguments: { repo: "o/r", issueNumber: 10, subIssueNumber: 2 },
     });
 
-    expect(onWrite).toHaveBeenCalledTimes(13);
+    expect(onWrite).toHaveBeenCalledTimes(14);
   });
 
   it("does not notify when a write tool fails", async () => {
@@ -707,6 +876,31 @@ describe("tracker MCP server", () => {
     expect(calls).toContainEqual({
       method: "addSubIssue",
       args: ["o/r", 10, 507],
+    });
+  });
+
+  it("fetches PR review comments with or without reviewId", async () => {
+    const { client: backend, calls } = recordingIssueClient();
+    const client = await connect(createTrackerMcpServer("test-actor-1", backend));
+
+    const resAll = (await client.callTool({
+      name: "get_pr_review_comments",
+      arguments: { repo: "o/r", prNumber: 5 },
+    })) as CallToolResult;
+    expect(JSON.parse(textOf(resAll))).toMatchObject([{ path: "a.ts", line: 1, body: "c" }]);
+    expect(calls).toContainEqual({
+      method: "getPrReviewComments",
+      args: ["o/r", 5, undefined],
+    });
+
+    const resSpecific = (await client.callTool({
+      name: "get_pr_review_comments",
+      arguments: { repo: "o/r", prNumber: 5, reviewId: 42 },
+    })) as CallToolResult;
+    expect(JSON.parse(textOf(resSpecific))).toMatchObject([{ path: "a.ts", line: 1, body: "c" }]);
+    expect(calls).toContainEqual({
+      method: "getPrReviewComments",
+      args: ["o/r", 5, 42],
     });
   });
 
