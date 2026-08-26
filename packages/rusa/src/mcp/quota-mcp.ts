@@ -298,6 +298,99 @@ function resolveResetAtIso(
   return undefined;
 }
 
+function validateParsedWindowsCompleteness(
+  output: string,
+  provider: "claude" | "codex" | "agy" | "kimi",
+  realWindows: LlmQuotaWindow[]
+): void {
+  if (provider === "codex") {
+    // When output contains rendered limit rows (5h limit: or Weekly limit:),
+    // ensure realWindows does not drop them.
+    const has5hLimit = /(?:^|\n|\r|\s)5h\s+limit\s*:/i.test(output);
+    const hasWeeklyLimit = /(?:^|\n|\r|\s)Weekly\s+limit\s*:/i.test(output);
+
+    if (has5hLimit) {
+      const found = realWindows.some((w) => {
+        const k = normalizeQuotaWindowKind(w.kind);
+        return k === "five_hour" || k === "session" || /5h|five/i.test(w.label);
+      });
+      if (!found) {
+        throw new Error(
+          "Quota parse incomplete: raw output contains '5h limit:' but parsed windows omitted it"
+        );
+      }
+    }
+
+    if (hasWeeklyLimit) {
+      const found = realWindows.some((w) => {
+        const k = normalizeQuotaWindowKind(w.kind);
+        return k === "weekly" || /weekly/i.test(w.label);
+      });
+      if (!found) {
+        throw new Error(
+          "Quota parse incomplete: raw output contains 'Weekly limit:' but parsed windows omitted it"
+        );
+      }
+    }
+  } else if (provider === "claude") {
+    const hasSession = /(?:^|\n|\r|\s)(?:Current\s+session|Session\s+limit)\s*:/i.test(output);
+    const hasWeekly = /(?:^|\n|\r|\s)(?:Current\s+week(?:\s+\([^)]+\))?|Weekly\s+limit)\s*:/i.test(
+      output
+    );
+
+    if (hasSession) {
+      const found = realWindows.some((w) => {
+        const k = normalizeQuotaWindowKind(w.kind);
+        return k === "session" || k === "five_hour" || /session/i.test(w.label);
+      });
+      if (!found) {
+        throw new Error(
+          "Quota parse incomplete: raw output contains session limit but parsed windows omitted it"
+        );
+      }
+    }
+
+    if (hasWeekly) {
+      const found = realWindows.some((w) => {
+        const k = normalizeQuotaWindowKind(w.kind);
+        return k === "weekly" || /week/i.test(w.label);
+      });
+      if (!found) {
+        throw new Error(
+          "Quota parse incomplete: raw output contains weekly limit but parsed windows omitted it"
+        );
+      }
+    }
+  } else if (provider === "kimi") {
+    const has5h = /(?:^|\n|\r|\s)5h\s+limit\b/i.test(output);
+    const hasWeekly = /(?:^|\n|\r|\s)Weekly\s+limit\b/i.test(output);
+
+    if (has5h) {
+      const found = realWindows.some((w) => {
+        const k = normalizeQuotaWindowKind(w.kind);
+        return k === "five_hour" || k === "session" || /5h|five/i.test(w.label);
+      });
+      if (!found) {
+        throw new Error(
+          "Quota parse incomplete: raw output contains '5h limit' but parsed windows omitted it"
+        );
+      }
+    }
+
+    if (hasWeekly) {
+      const found = realWindows.some((w) => {
+        const k = normalizeQuotaWindowKind(w.kind);
+        return k === "weekly" || /weekly/i.test(w.label);
+      });
+      if (!found) {
+        throw new Error(
+          "Quota parse incomplete: raw output contains 'Weekly limit' but parsed windows omitted it"
+        );
+      }
+    }
+  }
+}
+
 async function parseQuotaWithLlm(
   output: string,
   apiKey: string,
@@ -418,47 +511,51 @@ async function parseQuotaWithLlm(
       status: parsed.status,
     };
 
-    if (Array.isArray(parsed.windows)) {
-      const realWindows = (parsed.windows as LlmQuotaWindow[]).filter(
-        (w) => !w.placeholder && typeof w.usedPercent === "number"
-      );
+    const realWindows = Array.isArray(parsed.windows)
+      ? (parsed.windows as LlmQuotaWindow[]).filter(
+          (w) => !w.placeholder && typeof w.usedPercent === "number"
+        )
+      : [];
 
-      const limits: QuotaLimit[] = [];
-      for (const w of realWindows) {
-        const percentLeft = 100 - (w.usedPercent as number);
-        const resetAtIso = resolveResetAtIso(w.resetAtIso, w.resetInIso, generatedAtMs);
+    validateParsedWindowsCompleteness(output, provider, realWindows);
 
-        // Fail-loud gate : Fail loud ONLY on windows with neither field AND percentLeft < 100.
-        // Model-scope windows missing a reset are permitted when a provider-scope sibling of the
-        // same kind in the same scrape provides a resolvable reset (copied downstream via sibling_window_copy).
-        if (percentLeft < 100 && !resetAtIso) {
-          const kind = normalizeQuotaWindowKind(w.kind);
-          const hasSiblingProviderReset =
-            w.scope === "model" &&
-            kind !== undefined &&
-            realWindows.some(
-              (other) =>
-                (other.scope === "provider" || other.scope === undefined) &&
-                normalizeQuotaWindowKind(other.kind) === kind &&
-                Boolean(resolveResetAtIso(other.resetAtIso, other.resetInIso, generatedAtMs))
-            );
+    const limits: QuotaLimit[] = [];
+    for (const w of realWindows) {
+      const percentLeft = 100 - (w.usedPercent as number);
+      const resetAtIso = resolveResetAtIso(w.resetAtIso, w.resetInIso, generatedAtMs);
 
-          if (!hasSiblingProviderReset) {
-            throw new Error(
-              `Quota parse failed: window '${w.label}' has percentLeft < 100 (${percentLeft}%) but no resolvable reset ISO`
-            );
-          }
+      // Fail-loud gate : Fail loud ONLY on windows with neither field AND percentLeft < 100.
+      // Model-scope windows missing a reset are permitted when a provider-scope sibling of the
+      // same kind in the same scrape provides a resolvable reset (copied downstream via sibling_window_copy).
+      if (percentLeft < 100 && !resetAtIso) {
+        const kind = normalizeQuotaWindowKind(w.kind);
+        const hasSiblingProviderReset =
+          w.scope === "model" &&
+          kind !== undefined &&
+          realWindows.some(
+            (other) =>
+              (other.scope === "provider" || other.scope === undefined) &&
+              normalizeQuotaWindowKind(other.kind) === kind &&
+              Boolean(resolveResetAtIso(other.resetAtIso, other.resetInIso, generatedAtMs))
+          );
+
+        if (!hasSiblingProviderReset) {
+          throw new Error(
+            `Quota parse failed: window '${w.label}' has percentLeft < 100 (${percentLeft}%) but no resolvable reset ISO`
+          );
         }
-
-        limits.push({
-          label: w.label,
-          kind: normalizeQuotaWindowKind(w.kind),
-          percentLeft,
-          resetAtIso,
-          scope: w.scope as "provider" | "model" | undefined,
-        });
       }
 
+      limits.push({
+        label: w.label,
+        kind: normalizeQuotaWindowKind(w.kind),
+        percentLeft,
+        resetAtIso,
+        scope: w.scope as "provider" | "model" | undefined,
+      });
+    }
+
+    if (Array.isArray(parsed.windows)) {
       result.limits = limits;
     }
 
@@ -623,7 +720,7 @@ export function inferQuotaState(
       if (limit.resetAtIso) continue;
       const prevMatch = prevState.limits.find(
         (p) =>
-          p.scope === limit.scope &&
+          (p.scope ?? "provider") === (limit.scope ?? "provider") &&
           (p.kind === limit.kind || p.label === limit.label) &&
           p.resetAtIso &&
           Date.parse(p.resetAtIso) > scrapedAtMs &&
@@ -636,6 +733,34 @@ export function inferQuotaState(
           field: "resetAtIso",
           rule: "carried_forward_bad_read",
           detail: "carried forward previous unexpired window reset after missing reading",
+        });
+      }
+    }
+  }
+
+  // Step 3b: Bad read missing-window fallback (Rule: carried_forward_bad_read)
+  // The current parse extracted some windows, but completely omitted one or more window kinds
+  // present in the previous scrape whose reset has not yet expired.
+  if (limits && limits.length > 0 && prevState?.limits) {
+    for (const prevLimit of prevState.limits) {
+      if (!prevLimit.resetAtIso) continue;
+      const resetMs = Date.parse(prevLimit.resetAtIso);
+      if (!Number.isFinite(resetMs) || resetMs <= scrapedAtMs) continue;
+      if (isAssumedReset(prevState, prevLimit.label)) continue;
+
+      const alreadyPresent = limits.some(
+        (cur) =>
+          (cur.scope ?? "provider") === (prevLimit.scope ?? "provider") &&
+          (cur.kind === prevLimit.kind || cur.label === prevLimit.label)
+      );
+
+      if (!alreadyPresent) {
+        limits.push({ ...prevLimit });
+        explanations.push({
+          window: prevLimit.label,
+          field: "resetAtIso",
+          rule: "carried_forward_bad_read",
+          detail: "carried forward previous unexpired window assessment omitted from current parse",
         });
       }
     }
