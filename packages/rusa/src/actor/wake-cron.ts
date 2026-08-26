@@ -71,7 +71,7 @@ export function isValidCronExpr(expr: string): boolean {
 
 /** Thread ids and suffixed wake slots only — keeps the tag/job lines free of whitespace or shell metachars. */
 export function isValidActorId(actorId: string): boolean {
-  return /^[A-Za-z0-9._:-]+$/.test(actorId);
+  return /^[A-Za-z0-9._-]+(:[A-Za-z0-9._-]+)*$/.test(actorId);
 }
 
 /** Single-quote a value for the cron job line, then escape `%` (a cron newline). */

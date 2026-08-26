@@ -50,6 +50,9 @@ describe("cron expression + actor-id validation", () => {
     expect(isValidActorId("actor-123:slot_a.1")).toBe(true);
     expect(isValidActorId("bad id")).toBe(false);
     expect(isValidActorId("a;rm -rf")).toBe(false);
+    expect(isValidActorId(":slot")).toBe(false);
+    expect(isValidActorId("root:")).toBe(false);
+    expect(isValidActorId("root::slot")).toBe(false);
   });
 });
 

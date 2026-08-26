@@ -1093,14 +1093,23 @@ describe("ActorMesh", () => {
       priority: "responsive",
     });
 
-    const wakeEvent = events.find(
-      (e) =>
-        e.kind === "scheduled_wake" && e.actorId === rootId && e.detail === "root:daily-bless-cut"
-    );
+    const wakeEvent = events.find((e) => e.kind === "scheduled_wake" && e.actorId === rootId);
     expect(wakeEvent).toBeDefined();
+    expect(wakeEvent?.detail).toBeUndefined();
     expect(JSON.parse(wakeEvent?.payload ?? "{}")).toMatchObject({
       slot: "root:daily-bless-cut",
       priority: "responsive",
+    });
+
+    // Dropped suffixed wake
+    expect(mesh.deliverWake("unknown-actor:nightly", "nightly run")).toBe(false);
+    const droppedEvent = events.find(
+      (e) => e.kind === "scheduled_wake" && e.actorId === "unknown-actor"
+    );
+    expect(droppedEvent).toBeDefined();
+    expect(droppedEvent?.detail).toBe("dropped — no live actor");
+    expect(JSON.parse(droppedEvent?.payload ?? "{}")).toMatchObject({
+      slot: "unknown-actor:nightly",
     });
   });
 

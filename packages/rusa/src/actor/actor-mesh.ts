@@ -1528,11 +1528,7 @@ export class ActorMesh {
     this.recordEvent({
       kind: "scheduled_wake",
       actorId: resolvedId,
-      detail: target
-        ? rawActorId !== resolvedId
-          ? rawActorId
-          : undefined
-        : DROPPED_MESSAGE_DETAIL,
+      detail: target ? undefined : DROPPED_MESSAGE_DETAIL,
       payload: JSON.stringify({
         from: SCHEDULER_SENDER_ID,
         ...(colonIdx >= 0 ? { slot: rawActorId } : {}),
