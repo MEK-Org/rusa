@@ -181,9 +181,7 @@ describe("CodexProvider", () => {
     });
 
     it("strips reasoning effort from --model and passes it via --config override", () => {
-      expect(
-        buildCodexArgs({ prompt: "do it", model: "gpt-5.6-sol medium", cwd: "/wt" })
-      ).toEqual([
+      expect(buildCodexArgs({ prompt: "do it", model: "gpt-5.6-sol medium", cwd: "/wt" })).toEqual([
         "exec",
         "--yolo",
         "--cd",
