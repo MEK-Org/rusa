@@ -853,81 +853,6 @@ void main() {
     },
   );
 
-  testWidgets(
-    'mixed direct and carried-forward windows label each window precisely without tainting shared footer (issue #9)',
-    (tester) async {
-      await tester.runAsync(() async {
-        final now = DateTime.now().toUtc();
-        final minutesAgoIso = now.subtract(const Duration(minutes: 5)).toIso8601String();
-
-        final snapshot = QuotaSnapshotDto(
-          generatedAt: now.toIso8601String(),
-          providers: [
-            ProviderQuotaDto(
-              provider: 'codex',
-              status: 'available',
-              usedPercent: 10,
-              tier: null,
-              message: null,
-              windows: [
-                QuotaWindowDto(
-                  id: 'weekly',
-                  label: 'Weekly',
-                  usedPercent: 10,
-                  status: 'available',
-                  headline: true,
-                  windowMs: 604800000,
-                  scrapedAt: minutesAgoIso,
-                  carriedForward: false,
-                ),
-                QuotaWindowDto(
-                  id: 'five_hour',
-                  label: '5h',
-                  usedPercent: 40,
-                  status: 'available',
-                  headline: false,
-                  windowMs: 18000000,
-                  scrapedAt: minutesAgoIso,
-                  carriedForward: true,
-                ),
-              ],
-            ),
-          ],
-        );
-        final api = FakeApi()
-          ..threadsResult = [makeThread('root', created: 't0')]
-          ..quotaResult = snapshot;
-        final store = DashboardStore(api: api, stream: FakeStream());
-        await store.init();
-        await store.refreshQuota();
-
-        await tester.pumpWidget(
-          MaterialApp(
-            home: Scaffold(
-              body: SizedBox(width: 1100, child: MeshHeader(store: store)),
-            ),
-          ),
-        );
-        await tester.pump(const Duration(milliseconds: 50));
-
-        final codexTooltip = tester.widget<Tooltip>(
-          find.byType(Tooltip).first,
-        );
-        // Weekly is directly observed
-        expect(codexTooltip.message, contains('Weekly: 90% remaining'));
-        expect(codexTooltip.message, isNot(contains('Weekly (carried forward)')));
-
-        // 5h is carried forward
-        expect(codexTooltip.message, contains('5h (carried forward): 60% remaining'));
-
-        // Shared footer carries relative age but is NOT tainted with aggregate carried forward
-        expect(codexTooltip.message, contains('(5m ago)'));
-        expect(codexTooltip.message, isNot(contains('(5m ago) (carried forward)')));
-
-        await store.dispose();
-      });
-    },
-  );
 
   testWidgets(
     'header renders empty inner ring and "window reset at" tooltip when window is past reset (issue #9)',
@@ -1128,7 +1053,6 @@ void main() {
       String status = 'available',
       String? resetAtIso,
       int windowMs = fiveHourMs,
-      bool carriedForward = false,
     }) => QuotaWindowDto(
       id: 'session',
       label: 'Session',
@@ -1137,7 +1061,6 @@ void main() {
       resetAtIso: resetAtIso,
       headline: false,
       windowMs: windowMs,
-      carriedForward: carriedForward,
     );
 
     test('unknown/null window reads grey (muted), never crashes', () {
@@ -1265,7 +1188,6 @@ void main() {
       String status = 'available',
       String? resetAtIso,
       int windowMs = fiveHourMs,
-      bool carriedForward = false,
     }) => QuotaWindowDto(
       id: 'session',
       label: 'Session',
@@ -1274,7 +1196,6 @@ void main() {
       resetAtIso: resetAtIso,
       headline: false,
       windowMs: windowMs,
-      carriedForward: carriedForward,
     );
 
     test('unknown/null window reads n/a, never crashes', () {
@@ -1308,38 +1229,6 @@ void main() {
         );
       },
     );
-
-    test('distinguishes carried-forward values in tooltip', () {
-      final w = window(
-        usedPercent: 40,
-        carriedForward: true,
-        resetAtIso: now
-            .add(const Duration(hours: 2, minutes: 30))
-            .toUtc()
-            .toIso8601String(),
-      );
-      expect(
-        quotaWindowTooltip(w, fallbackLabel: 'Session', now: now),
-        'Session (carried forward): 60% quota remaining, 50% time remaining (on pace)\n'
-        'resets Thu 2:30 AM\n'
-        '~20% left at reset',
-      );
-    });
-
-    test('distinguishes carried-forward values past reset', () {
-      final w = window(
-        usedPercent: 53,
-        carriedForward: true,
-        resetAtIso: now
-            .subtract(const Duration(hours: 1))
-            .toUtc()
-            .toIso8601String(),
-      );
-      expect(
-        quotaWindowTooltip(w, fallbackLabel: 'Session', now: now),
-        'Session (carried forward): window reset at Wed 11:00 PM; no fresh read since',
-      );
-    });
 
     test(
       'states quota remaining, time remaining, an on-pace verdict, the reset '
