@@ -965,6 +965,12 @@ describe("quota MCP server", () => {
 
       const parsed = await parseCodexQuota(rawCodexOutput, "test-key");
       expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect((mockGenerateContent.mock.calls[0][0] as { model: string }).model).toBe(
+        "gemini-3.5-flash-lite"
+      );
+      expect((mockGenerateContent.mock.calls[1][0] as { model: string }).model).toBe(
+        "gemini-3.5-flash"
+      );
       expect(parsed.status).toBe("available");
       expect(parsed.limits).toHaveLength(2);
       expect(parsed.limits?.[0]).toMatchObject({ label: "5h limit", percentLeft: 99 });

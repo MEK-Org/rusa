@@ -480,6 +480,7 @@ async function parseQuotaWithLlm(
           // anyway, so emitting one would only force the model to guess label/kind).
           "For Codex: a real reading contains limit rows (e.g. '5h limit:', 'Weekly limit:') " +
           "or an explicit exhaustion message (\"You've hit your usage limit\" / 'hit your usage limit'). " +
+          "Extract EVERY rendered limit row into `windows` — never drop or omit the Weekly row when 5h is present, and vice-versa. " +
           `If it contains "You've hit your usage limit" or "hit your usage limit", ` +
           "status is 'exhausted'; extract per-window (5h, Weekly) percentages and reset times (including from 'try again at <date/time>'). " +
           'KNOWN PENDING STATE: codex\'s /status can render "Limits: refresh requested; run /status again shortly" ' +
@@ -519,7 +520,7 @@ async function parseQuotaWithLlm(
     "The current local time — in the SAME timezone the TUI's clock is printed in (its " +
     `offset is included below) — is ${formatLocalIsoWithOffset(generatedAtMs)}. ` +
     "Use it to resolve wall-clock/calendar reset text (e.g. '23:32' means the next " +
-    "occurrence of that time at or after now; '12:34 on 14 Jul' means that specific date/time at or after now; 'Jul 7th, 2026 12:25 PM'; a date without a year means the next " +
+    "occurrence of that time at or after now; '12:34 on 14 Jul' or 'resets 02:10 on 27 Aug' or '15:11 on 1 Sep' means that specific date/time at or after now; 'Jul 7th, 2026 12:25 PM'; a date without a year means the next " +
     "such date at or after now) into resetAtIso, assuming the same UTC offset unless " +
     "the source states otherwise. If the timezone, date, or year is genuinely ambiguous, " +
     "leave resetAtIso empty rather than guess — a wrong instant is worse than a missing one. " +
@@ -527,9 +528,9 @@ async function parseQuotaWithLlm(
     "duration into resetInIso as a normalized ISO-8601 duration such as PT70H13M, " +
     "PT3H10M, PT4H12M, or P2DT22H.";
 
-  const executeOnce = async (): Promise<Partial<ProviderQuotaSnapshot>> => {
+  const executeOnce = async (modelName: string): Promise<Partial<ProviderQuotaSnapshot>> => {
     const response = await client.models.generateContent({
-      model: "gemini-3.5-flash-lite",
+      model: modelName,
       contents: `Parse the following CLI/TUI output of a quota check for the provider '${provider}':\n\n${output}`,
       config: {
         responseMimeType: "application/json",
@@ -601,12 +602,17 @@ async function parseQuotaWithLlm(
   };
 
   try {
-    return await executeOnce();
-  } catch {
+    return await executeOnce("gemini-3.5-flash-lite");
+  } catch (firstErr) {
+    console.warn(
+      `[quota-mcp] LLM quota parse attempt 1 (gemini-3.5-flash-lite) failed: ${firstErr instanceof Error ? firstErr.message : String(firstErr)} — escalating attempt 2 to gemini-3.5-flash`
+    );
     try {
-      return await executeOnce();
+      return await executeOnce("gemini-3.5-flash");
     } catch (secondErr) {
-      console.error(`[quota-mcp] LLM quota parse failed:`, secondErr);
+      console.error(
+        `[quota-mcp] LLM quota parse attempt 2 (gemini-3.5-flash) failed: ${secondErr instanceof Error ? secondErr.message : String(secondErr)}`
+      );
       return {
         status: "unknown",
         message: `LLM quota parsing failed: ${secondErr instanceof Error ? secondErr.message : String(secondErr)}`,
