@@ -5,6 +5,7 @@ import { type ProviderQuotaSnapshot, QuotaService } from "../mcp/quota-mcp.js";
 import type { CodingProvider } from "../providers/types.js";
 import {
   buildQuotaHistory,
+  buildQuotaHistorySnapshot,
   buildQuotaSnapshot,
   handleQuotaApiRequest,
   type QuotaApiDeps,
@@ -167,8 +168,8 @@ function fakeDeps(states: Partial<Record<string, ProviderQuotaSnapshot>>): {
   };
 }
 
-describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
-  it("builds one DTO per supported provider", async () => {
+describe("dashboard quota snapshot", () => {
+  it("builds one DTO per supported provider without history payload", async () => {
     const { deps, calls } = fakeDeps({
       claude: claudeState,
       codex: codexState,
@@ -179,195 +180,13 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
 
     expect(calls()).toEqual(["claude", "codex", "agy", "kimi"]);
     expect(snapshot.generatedAt).toBe(new Date(1000).toISOString());
-    expect(snapshot.historySince).toBe(new Date(1000 - 3 * 24 * 60 * 60 * 1000).toISOString());
-    expect(snapshot.history).toEqual([]);
+    expect(snapshot).not.toHaveProperty("historySince");
+    expect(snapshot).not.toHaveProperty("history");
     expect(snapshot.providers.map((p) => p.provider)).toEqual(["claude", "codex", "agy", "kimi"]);
     expect(snapshot.providers.every((p) => p.throttle === null)).toBe(true);
   });
 
-  it("returns prior-3-day durable readings as quota remaining, not quota used", async () => {
-    const now = Date.parse("2026-07-26T20:00:00.000Z");
-    const calls: Array<{ provider: string; sinceIso: string }> = [];
-    const { deps } = fakeDeps({ claude: claudeState });
-    const snapshot = await buildQuotaSnapshot({
-      ...deps,
-      providers: ["claude"],
-      now: () => now,
-      listHistory: (provider, sinceIso) => {
-        calls.push({ provider, sinceIso });
-        return [
-          historyPoint({
-            observedAt: "2026-07-25T21:00:00.000Z",
-            percentLeft: 80,
-          }),
-          historyPoint({
-            observedAt: "2026-07-26T19:00:00.000Z",
-            percentLeft: 62,
-          }),
-        ];
-      },
-    });
-
-    expect(calls).toEqual([
-      {
-        provider: "claude",
-        sinceIso: "2026-07-23T20:00:00.000Z",
-      },
-    ]);
-    expect(snapshot.history).toEqual([
-      {
-        provider: "claude",
-        windowId: "weekly",
-        label: "Weekly",
-        points: [
-          {
-            observedAt: "2026-07-25T21:00:00.000Z",
-            remainingPercent: 80,
-            error: null,
-            intervalSeconds: null,
-            resetAtIso: null,
-          },
-          {
-            observedAt: "2026-07-26T19:00:00.000Z",
-            remainingPercent: 62,
-            error: null,
-            intervalSeconds: null,
-            resetAtIso: null,
-          },
-        ],
-      },
-    ]);
-  });
-
-  it("uses the same first weekly limit as the header ring and excludes short windows", async () => {
-    const now = Date.parse("2026-07-26T20:00:00.000Z");
-    const current: ProviderQuotaSnapshot = {
-      provider: "codex",
-      status: "available",
-      limits: [
-        {
-          label: "Weekly limit",
-          kind: "weekly",
-          percentLeft: 70,
-        },
-        {
-          label: "Weekly",
-          kind: "weekly",
-          percentLeft: 40,
-        },
-        {
-          label: "5h",
-          kind: "five_hour",
-          percentLeft: 90,
-        },
-      ],
-    };
-    const snapshot = await buildQuotaSnapshot({
-      getQuota: async () => current,
-      providers: ["codex"],
-      now: () => now,
-      listHistory: () => [
-        historyPoint({
-          label: "Weekly limit",
-          observedAt: "2026-07-26T19:00:00.000Z",
-          percentLeft: 68,
-        }),
-        historyPoint({
-          kind: "five_hour",
-          label: "5h",
-          observedAt: "2026-07-26T19:00:00.000Z",
-          percentLeft: 25,
-        }),
-      ],
-    });
-
-    // The ring's `_findWindow` takes the first id=weekly DTO.
-    expect(snapshot.providers[0].windows.find((window) => window.id === "weekly")).toMatchObject({
-      label: "Weekly limit",
-      usedPercent: 30,
-    });
-    expect(snapshot.history).toEqual([
-      {
-        provider: "codex",
-        windowId: "weekly",
-        label: "Weekly limit",
-        points: [
-          {
-            observedAt: "2026-07-26T19:00:00.000Z",
-            remainingPercent: 68,
-            error: null,
-            intervalSeconds: null,
-            resetAtIso: null,
-          },
-        ],
-      },
-    ]);
-  });
-
-  it("keeps divergent weekly-window ordering and availability from splicing pools", async () => {
-    const now = Date.parse("2026-07-26T20:00:00.000Z");
-    const current: ProviderQuotaSnapshot = {
-      provider: "codex",
-      status: "available",
-      limits: [
-        {
-          label: "Weekly (all models)",
-          kind: "weekly",
-          scope: "provider",
-          percentLeft: 70,
-        },
-        {
-          label: "Weekly (model-specific)",
-          kind: "weekly",
-          scope: "model",
-          percentLeft: 40,
-        },
-      ],
-    };
-    const snapshot = await buildQuotaSnapshot({
-      getQuota: async () => current,
-      providers: ["codex"],
-      now: () => now,
-      listHistory: () => [
-        historyPoint({
-          scope: "model",
-          label: "Weekly (model-specific)",
-          observedAt: "2026-07-26T18:00:00.000Z",
-          percentLeft: 20,
-        }),
-        historyPoint({
-          label: "Weekly (all models)",
-          observedAt: "2026-07-26T18:00:00.000Z",
-          percentLeft: 68,
-        }),
-        historyPoint({
-          scope: "model",
-          label: "Weekly (model-specific)",
-          observedAt: "2026-07-26T19:00:00.000Z",
-          percentLeft: 10,
-        }),
-      ],
-    });
-
-    expect(snapshot.history).toEqual([
-      {
-        provider: "codex",
-        windowId: "weekly",
-        label: "Weekly (all models)",
-        points: [
-          {
-            observedAt: "2026-07-26T18:00:00.000Z",
-            remainingPercent: 68,
-            error: null,
-            intervalSeconds: null,
-            resetAtIso: null,
-          },
-        ],
-      },
-    ]);
-  });
-
-  it("retains valid durable history when the current probe has no limits", async () => {
+  it("retains valid durable fallback state when the current probe has no limits", async () => {
     const now = Date.parse("2026-07-26T20:00:00.000Z");
     const unavailable: ProviderQuotaSnapshot = {
       provider: "codex",
@@ -402,29 +221,6 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
         headline: true,
         windowMs: 604800000,
         scrapedAt: "2026-07-26T19:00:00.000Z",
-      },
-    ]);
-    expect(snapshot.history).toEqual([
-      {
-        provider: "codex",
-        windowId: "weekly",
-        label: "Weekly (all models)",
-        points: [
-          {
-            observedAt: "2026-07-26T18:00:00.000Z",
-            remainingPercent: 72,
-            error: null,
-            intervalSeconds: null,
-            resetAtIso: null,
-          },
-          {
-            observedAt: "2026-07-26T19:00:00.000Z",
-            remainingPercent: 65,
-            error: null,
-            intervalSeconds: null,
-            resetAtIso: null,
-          },
-        ],
       },
     ]);
   });
@@ -839,8 +635,149 @@ describe("dashboard quota snapshot (ISSUE_NUM backend)", () => {
   });
 });
 
-describe("GET /api/quota (ISSUE_NUM backend)", () => {
-  it("returns 200 with the snapshot on a matching GET", async () => {
+describe("dashboard quota history snapshot", () => {
+  it("returns prior-3-day durable readings as quota remaining, not quota used", () => {
+    const now = Date.parse("2026-07-26T20:00:00.000Z");
+    const calls: Array<{ provider: string; sinceIso: string }> = [];
+    const historySnapshot = buildQuotaHistorySnapshot({
+      getQuota: async () => claudeState,
+      providers: ["claude"],
+      now: () => now,
+      listHistory: (provider, sinceIso) => {
+        calls.push({ provider, sinceIso });
+        return [
+          historyPoint({
+            observedAt: "2026-07-25T21:00:00.000Z",
+            percentLeft: 80,
+          }),
+          historyPoint({
+            observedAt: "2026-07-26T19:00:00.000Z",
+            percentLeft: 62,
+          }),
+        ];
+      },
+    });
+
+    expect(calls).toEqual([
+      {
+        provider: "claude",
+        sinceIso: "2026-07-23T20:00:00.000Z",
+      },
+    ]);
+    expect(historySnapshot.generatedAt).toBe("2026-07-26T20:00:00.000Z");
+    expect(historySnapshot.historySince).toBe("2026-07-23T20:00:00.000Z");
+    expect(historySnapshot.history).toEqual([
+      {
+        provider: "claude",
+        windowId: "weekly",
+        label: "Weekly",
+        points: [
+          {
+            observedAt: "2026-07-25T21:00:00.000Z",
+            remainingPercent: 80,
+            error: null,
+            intervalSeconds: null,
+            resetAtIso: null,
+          },
+          {
+            observedAt: "2026-07-26T19:00:00.000Z",
+            remainingPercent: 62,
+            error: null,
+            intervalSeconds: null,
+            resetAtIso: null,
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("uses the same first weekly limit as the header ring and excludes short windows", () => {
+    const now = Date.parse("2026-07-26T20:00:00.000Z");
+    const historySnapshot = buildQuotaHistorySnapshot({
+      getQuota: async () => codexState,
+      providers: ["codex"],
+      now: () => now,
+      listHistory: () => [
+        historyPoint({
+          label: "Weekly limit",
+          observedAt: "2026-07-26T19:00:00.000Z",
+          percentLeft: 68,
+        }),
+        historyPoint({
+          kind: "five_hour",
+          label: "5h",
+          observedAt: "2026-07-26T19:00:00.000Z",
+          percentLeft: 25,
+        }),
+      ],
+    });
+
+    expect(historySnapshot.history).toEqual([
+      {
+        provider: "codex",
+        windowId: "weekly",
+        label: "Weekly limit",
+        points: [
+          {
+            observedAt: "2026-07-26T19:00:00.000Z",
+            remainingPercent: 68,
+            error: null,
+            intervalSeconds: null,
+            resetAtIso: null,
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("keeps divergent weekly-window ordering and availability from splicing pools", () => {
+    const now = Date.parse("2026-07-26T20:00:00.000Z");
+    const historySnapshot = buildQuotaHistorySnapshot({
+      getQuota: async () => codexState,
+      providers: ["codex"],
+      now: () => now,
+      listHistory: () => [
+        historyPoint({
+          scope: "model",
+          label: "Weekly (model-specific)",
+          observedAt: "2026-07-26T18:00:00.000Z",
+          percentLeft: 20,
+        }),
+        historyPoint({
+          label: "Weekly (all models)",
+          observedAt: "2026-07-26T18:00:00.000Z",
+          percentLeft: 68,
+        }),
+        historyPoint({
+          scope: "model",
+          label: "Weekly (model-specific)",
+          observedAt: "2026-07-26T19:00:00.000Z",
+          percentLeft: 10,
+        }),
+      ],
+    });
+
+    expect(historySnapshot.history).toEqual([
+      {
+        provider: "codex",
+        windowId: "weekly",
+        label: "Weekly (all models)",
+        points: [
+          {
+            observedAt: "2026-07-26T18:00:00.000Z",
+            remainingPercent: 68,
+            error: null,
+            intervalSeconds: null,
+            resetAtIso: null,
+          },
+        ],
+      },
+    ]);
+  });
+});
+
+describe("GET /api/quota and GET /api/quota/history", () => {
+  it("returns 200 with the current snapshot on GET /api/quota", async () => {
     const { deps } = fakeDeps({ claude: claudeState, codex: codexState, agy: agyState });
     const r = fakeRes();
     const handled = await handleQuotaApiRequest(fakeReq("GET"), r.res, u("/api/quota"), deps);
@@ -848,6 +785,21 @@ describe("GET /api/quota (ISSUE_NUM backend)", () => {
     expect(handled).toBe(true);
     expect(r.status()).toBe(200);
     expect(r.json()).toEqual(await buildQuotaSnapshot(deps));
+  });
+
+  it("returns 200 with the history series on GET /api/quota/history", async () => {
+    const { deps } = fakeDeps({ claude: claudeState, codex: codexState, agy: agyState });
+    const r = fakeRes();
+    const handled = await handleQuotaApiRequest(
+      fakeReq("GET"),
+      r.res,
+      u("/api/quota/history"),
+      deps
+    );
+
+    expect(handled).toBe(true);
+    expect(r.status()).toBe(200);
+    expect(r.json()).toEqual(buildQuotaHistorySnapshot(deps));
   });
 
   it("falls through (returns false) for a non-matching path", async () => {
@@ -864,21 +816,39 @@ describe("GET /api/quota (ISSUE_NUM backend)", () => {
     expect(r.status()).toBe(0);
   });
 
-  it("405s a non-GET method on a matching path", async () => {
+  it("405s a non-GET method on matching paths", async () => {
     const { deps } = fakeDeps({ claude: claudeState, codex: codexState, agy: agyState });
-    const r = fakeRes();
-    const handled = await handleQuotaApiRequest(fakeReq("POST"), r.res, u("/api/quota"), deps);
+    const r1 = fakeRes();
+    const handled1 = await handleQuotaApiRequest(fakeReq("POST"), r1.res, u("/api/quota"), deps);
+    expect(handled1).toBe(true);
+    expect(r1.status()).toBe(405);
 
-    expect(handled).toBe(true);
-    expect(r.status()).toBe(405);
+    const r2 = fakeRes();
+    const handled2 = await handleQuotaApiRequest(
+      fakeReq("POST"),
+      r2.res,
+      u("/api/quota/history"),
+      deps
+    );
+    expect(handled2).toBe(true);
+    expect(r2.status()).toBe(405);
   });
 
   it("503s when no QuotaService is bound (deps null)", async () => {
-    const r = fakeRes();
-    const handled = await handleQuotaApiRequest(fakeReq("GET"), r.res, u("/api/quota"), null);
+    const r1 = fakeRes();
+    const handled1 = await handleQuotaApiRequest(fakeReq("GET"), r1.res, u("/api/quota"), null);
+    expect(handled1).toBe(true);
+    expect(r1.status()).toBe(503);
 
-    expect(handled).toBe(true);
-    expect(r.status()).toBe(503);
+    const r2 = fakeRes();
+    const handled2 = await handleQuotaApiRequest(
+      fakeReq("GET"),
+      r2.res,
+      u("/api/quota/history"),
+      null
+    );
+    expect(handled2).toBe(true);
+    expect(r2.status()).toBe(503);
   });
 
   it("500s when the underlying getQuota rejects", async () => {

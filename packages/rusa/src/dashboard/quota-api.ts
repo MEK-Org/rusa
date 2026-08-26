@@ -120,9 +120,13 @@ export interface QuotaHistorySeriesDto {
 
 export interface QuotaSnapshotDto {
   generatedAt: string;
+  providers: ProviderQuotaDto[];
+}
+
+export interface QuotaHistoryDto {
+  generatedAt: string;
   /** Inclusive lower bound for the quota history returned with this snapshot. */
   historySince: string;
-  providers: ProviderQuotaDto[];
   /** Durable real-scrape readings from the prior 3 days, grouped by quota pool. */
   history: QuotaHistorySeriesDto[];
 }
@@ -351,16 +355,17 @@ export function buildQuotaHistory(
   ];
 }
 
+const MAX_FALLBACK_HOLD_MS = 24 * 60 * 60 * 1000;
+
 function latestStateFromHistory(
   provider: SupportedProvider,
   history: readonly QuotaHistorySource[],
   nowMs: number
 ): ProviderQuotaSnapshot | null {
-  const MAX_HOLD_MS = 24 * 60 * 60 * 1000;
   const eligible = history.filter((point) => {
     const observedMs = Date.parse(point.observedAt);
     const ageMs = nowMs - observedMs;
-    return Number.isFinite(observedMs) && ageMs >= 0 && ageMs <= MAX_HOLD_MS;
+    return Number.isFinite(observedMs) && ageMs >= 0 && ageMs <= MAX_FALLBACK_HOLD_MS;
   });
   const latestObservedAt = eligible
     .map((point) => point.observedAt)
@@ -386,30 +391,43 @@ export async function buildQuotaSnapshot(deps: QuotaApiDeps): Promise<QuotaSnaps
   const now = deps.now ?? Date.now;
   const nowMs = now();
   const generatedAt = toIso(nowMs);
-  const historySince = toIso(nowMs - HISTORY_WINDOW_MS);
   const providers = deps.providers ?? SUPPORTED_PROVIDERS;
   const states = await Promise.all(providers.map((provider) => deps.getQuota(provider)));
-  const histories = providers.map((provider) => deps.listHistory?.(provider, historySince) ?? []);
   const providerDtos = providers.map((provider, i) => {
     let state = states[i];
     if (state.status === "unknown" || !state.limits || state.limits.length === 0) {
-      state = latestStateFromHistory(provider, histories[i] ?? [], nowMs) ?? state;
+      const fallbackRows = deps.listHistory?.(provider, toIso(nowMs - MAX_FALLBACK_HOLD_MS)) ?? [];
+      state = latestStateFromHistory(provider, fallbackRows, nowMs) ?? state;
     }
     return toProviderDto(provider, state, deps.getThrottle?.(provider) ?? null);
   });
   return {
     generatedAt,
-    historySince,
     providers: providerDtos,
+  };
+}
+
+/** Build the durable quota history series for configured providers. */
+export function buildQuotaHistorySnapshot(deps: QuotaApiDeps): QuotaHistoryDto {
+  const now = deps.now ?? Date.now;
+  const nowMs = now();
+  const generatedAt = toIso(nowMs);
+  const historySince = toIso(nowMs - HISTORY_WINDOW_MS);
+  const providers = deps.providers ?? SUPPORTED_PROVIDERS;
+  return {
+    generatedAt,
+    historySince,
     history: deps.listHistory
-      ? providers.flatMap((provider, index) =>
-          buildQuotaHistory(provider, histories[index] ?? [], historySince, generatedAt)
-        )
+      ? providers.flatMap((provider) => {
+          const rows = deps.listHistory?.(provider, historySince) ?? [];
+          return buildQuotaHistory(provider, rows, historySince, generatedAt);
+        })
       : [],
   };
 }
 
-const PATH = "/api/quota";
+const SNAPSHOT_PATH = "/api/quota";
+const HISTORY_PATH = "/api/quota/history";
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, {
@@ -420,8 +438,8 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 }
 
 /**
- * Dispatch `GET /api/quota` — the dashboard's cached per-provider quota
- * snapshot. Returns true if it owned the request, false to fall through.
+ * Dispatch `GET /api/quota` (current snapshot) and `GET /api/quota/history` (durable history).
+ * Returns true if it owned the request, false to fall through.
  * `deps` absent (e.g. no live QuotaService bound) → 503, static UI unaffected.
  */
 export async function handleQuotaApiRequest(
@@ -430,7 +448,7 @@ export async function handleQuotaApiRequest(
   url: URL,
   deps: QuotaApiDeps | null
 ): Promise<boolean> {
-  if (url.pathname !== PATH) return false;
+  if (url.pathname !== SNAPSHOT_PATH && url.pathname !== HISTORY_PATH) return false;
   if (req.method !== "GET") {
     sendJson(res, 405, { error: "method not allowed" });
     return true;
@@ -442,8 +460,13 @@ export async function handleQuotaApiRequest(
     return true;
   }
   try {
-    const snapshot = await buildQuotaSnapshot(deps);
-    sendJson(res, 200, snapshot);
+    if (url.pathname === HISTORY_PATH) {
+      const historySnapshot = buildQuotaHistorySnapshot(deps);
+      sendJson(res, 200, historySnapshot);
+    } else {
+      const snapshot = await buildQuotaSnapshot(deps);
+      sendJson(res, 200, snapshot);
+    }
   } catch (err) {
     sendJson(res, 500, {
       error: err instanceof Error ? err.message : String(err),

@@ -171,6 +171,7 @@ class DashboardStore {
   final _operatorChat = BehaviorSubject<ChatView>.seeded(const ChatView());
   final _live = BehaviorSubject<List<LiveLine>>.seeded(const []);
   final _quota = BehaviorSubject<QuotaSnapshotDto?>.seeded(null);
+  final _quotaHistory = BehaviorSubject<QuotaHistoryDto?>.seeded(null);
   final _yieldEvents = BehaviorSubject<List<MeshEvent>>.seeded(const []);
 
   /// True while a background quota revalidation is in flight (ISSUE_NUM ask 4).
@@ -178,6 +179,7 @@ class DashboardStore {
   /// persisted (no localStorage), so it always starts false on a fresh load.
   final _quotaRefreshing = BehaviorSubject<bool>.seeded(false);
   final _quotaStale = BehaviorSubject<bool>.seeded(false);
+  final _quotaHistoryStale = BehaviorSubject<bool>.seeded(false);
   final _dashboardConfig = BehaviorSubject<DashboardConfigDto?>.seeded(null);
   final _error = BehaviorSubject<String?>.seeded(null);
   final _walkieActive = BehaviorSubject<bool>.seeded(false);
@@ -216,9 +218,11 @@ class DashboardStore {
   ValueStream<ChatView> get operatorChat => _operatorChat.stream;
   ValueStream<List<LiveLine>> get live => _live.stream;
   ValueStream<QuotaSnapshotDto?> get quota => _quota.stream;
+  ValueStream<QuotaHistoryDto?> get quotaHistory => _quotaHistory.stream;
   ValueStream<List<MeshEvent>> get yieldEvents => _yieldEvents.stream;
   ValueStream<bool> get quotaRefreshing => _quotaRefreshing.stream;
   ValueStream<bool> get quotaStale => _quotaStale.stream;
+  ValueStream<bool> get quotaHistoryStale => _quotaHistoryStale.stream;
   ValueStream<DashboardConfigDto?> get dashboardConfig =>
       _dashboardConfig.stream;
   ValueStream<String?> get error => _error.stream;
@@ -362,6 +366,27 @@ class DashboardStore {
       }
     } finally {
       _quotaRefreshing.add(false);
+    }
+  }
+
+  Future<void> refreshQuotaHistory() async {
+    try {
+      final history = await _api.fetchQuotaHistory();
+      _quotaHistory.add(history);
+      _quotaHistoryStale.add(false);
+    } on DashboardApiException catch (e) {
+      if (e.status == 503) {
+        _quotaHistory.add(null);
+        _quotaHistoryStale.add(false);
+        return;
+      }
+      if (_quotaHistory.valueOrNull != null) {
+        _quotaHistoryStale.add(true);
+      }
+    } catch (e) {
+      if (_quotaHistory.valueOrNull != null) {
+        _quotaHistoryStale.add(true);
+      }
     }
   }
 
@@ -994,9 +1019,11 @@ class DashboardStore {
       _operatorChat.close(),
       _live.close(),
       _quota.close(),
+      _quotaHistory.close(),
       _yieldEvents.close(),
       _quotaRefreshing.close(),
       _quotaStale.close(),
+      _quotaHistoryStale.close(),
       _avatarEpoch.close(),
       _dashboardConfig.close(),
       _error.close(),

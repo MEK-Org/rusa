@@ -73,6 +73,11 @@ class DashboardApi {
     return QuotaSnapshotDto.fromJson(await _getJson(_u('/api/quota')));
   }
 
+  /// `GET /api/quota/history` → durable quota history series payload.
+  Future<QuotaHistoryDto> fetchQuotaHistory() async {
+    return QuotaHistoryDto.fromJson(await _getJson(_u('/api/quota/history')));
+  }
+
   /// `GET /api/dashboard/config` → frontend-only dashboard config.
   Future<DashboardConfigDto> fetchDashboardConfig() async {
     return DashboardConfigDto.fromJson(

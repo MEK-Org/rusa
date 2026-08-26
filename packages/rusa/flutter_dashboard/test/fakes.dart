@@ -98,7 +98,9 @@ class FakeApi extends DashboardApi {
   FakeApi() : super();
   List<ThreadDto> threadsResult = [];
   QuotaSnapshotDto? quotaResult;
+  QuotaHistoryDto? quotaHistoryResult;
   Object? quotaError;
+  Object? quotaHistoryError;
   DashboardConfigDto? dashboardConfigResult;
   bool halted = false;
   List<EventPage> eventPages = [];
@@ -106,6 +108,7 @@ class FakeApi extends DashboardApi {
   int chatCall = 0;
   int eventCall = 0;
   int quotaCallCount = 0;
+  int quotaHistoryCallCount = 0;
   final eventActorCalls = <List<String>>[];
   final chatActorCalls = <List<String>>[];
   final eventSinceCalls = <String?>[];
@@ -174,6 +177,15 @@ class FakeApi extends DashboardApi {
     if (err != null) throw err;
     return quotaResult ??
         const QuotaSnapshotDto(generatedAt: '', providers: []);
+  }
+
+  @override
+  Future<QuotaHistoryDto> fetchQuotaHistory() async {
+    quotaHistoryCallCount++;
+    final err = quotaHistoryError;
+    if (err != null) throw err;
+    return quotaHistoryResult ??
+        const QuotaHistoryDto(generatedAt: '', historySince: '', history: []);
   }
 
   @override
