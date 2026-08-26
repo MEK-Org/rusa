@@ -437,26 +437,7 @@ class DashboardStore {
     }
     for (final entry in byParent.entries) {
       final parentKey = entry.key ?? '';
-      final ordering = customOrder[parentKey];
-      if (ordering != null && ordering.isNotEmpty) {
-        final indexMap = {for (var i = 0; i < ordering.length; i++) ordering[i]: i};
-        entry.value.sort((a, b) {
-          final aIdx = indexMap[a.id];
-          final bIdx = indexMap[b.id];
-          if (aIdx != null && bIdx != null) {
-            return aIdx.compareTo(bIdx);
-          }
-          if (aIdx != null) return -1;
-          if (bIdx != null) return 1;
-          final c = a.createdAt.compareTo(b.createdAt);
-          return c != 0 ? c : a.id.compareTo(b.id);
-        });
-      } else {
-        entry.value.sort((a, b) {
-          final c = a.createdAt.compareTo(b.createdAt);
-          return c != 0 ? c : a.id.compareTo(b.id);
-        });
-      }
+      _sortSiblings(entry.value, customOrder[parentKey]);
     }
     final now = DateTime.timestamp();
     final out = <ThreadDto>[];
@@ -572,9 +553,27 @@ class DashboardStore {
         .where((t) => t.parentId == dragged.parentId)
         .toList();
 
-    final currentCustom = _customActorOrder.value[parentKey];
-    if (currentCustom != null && currentCustom.isNotEmpty) {
-      final indexMap = {for (var i = 0; i < currentCustom.length; i++) currentCustom[i]: i};
+    _sortSiblings(siblings, _customActorOrder.value[parentKey]);
+
+    final ids = siblings.map((t) => t.id).toList();
+    ids.remove(draggedId);
+    final targetIdx = ids.indexOf(targetId);
+    if (targetIdx == -1) return;
+    final insertIdx = before ? targetIdx : targetIdx + 1;
+    ids.insert(insertIdx.clamp(0, ids.length), draggedId);
+
+    final nextMap = Map<String, List<String>>.from(_customActorOrder.value);
+    nextMap[parentKey] = ids;
+    _customActorOrder.add(nextMap);
+    _treePreferencesCache.saveActorOrder(nextMap);
+  }
+
+  /// Sorts siblings respecting an optional custom ordering. Actors present in
+  /// [customOrder] are sorted by their index; unindexed actors follow, sorted
+  /// by [ThreadDto.createdAt] ascending with [ThreadDto.id] tiebreak.
+  static void _sortSiblings(List<ThreadDto> siblings, List<String>? customOrder) {
+    if (customOrder != null && customOrder.isNotEmpty) {
+      final indexMap = {for (var i = 0; i < customOrder.length; i++) customOrder[i]: i};
       siblings.sort((a, b) {
         final aIdx = indexMap[a.id];
         final bIdx = indexMap[b.id];
@@ -590,18 +589,6 @@ class DashboardStore {
         return c != 0 ? c : a.id.compareTo(b.id);
       });
     }
-
-    final ids = siblings.map((t) => t.id).toList();
-    ids.remove(draggedId);
-    final targetIdx = ids.indexOf(targetId);
-    if (targetIdx == -1) return;
-    final insertIdx = before ? targetIdx : targetIdx + 1;
-    ids.insert(insertIdx.clamp(0, ids.length), draggedId);
-
-    final nextMap = Map<String, List<String>>.from(_customActorOrder.value);
-    nextMap[parentKey] = ids;
-    _customActorOrder.add(nextMap);
-    _treePreferencesCache.saveActorOrder(nextMap);
   }
 
   /// Plain click: select only [id].

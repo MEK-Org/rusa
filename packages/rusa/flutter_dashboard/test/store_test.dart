@@ -369,6 +369,57 @@ void main() {
   );
 
   test(
+    'newly created actors sort after custom-ordered siblings by createdAt',
+    () async {
+      final cache = FakeTreePreferencesCache();
+      final stream = FakeStream();
+      final api = FakeApi()
+        ..threadsResult = [
+          makeThread('root', created: 't0'),
+          makeThread('child-1', parent: 'root', created: 't1'),
+          makeThread('child-2', parent: 'root', created: 't2'),
+        ];
+      final store = DashboardStore(
+        api: api,
+        stream: stream,
+        treePreferencesCache: cache,
+      );
+      await store.init();
+      await pumpEventQueue();
+
+      // Custom reorder: child-2 before child-1
+      store.reorderActor('child-2', 'child-1', before: true);
+      expect(store.flattenedVisible().map((t) => t.id), [
+        'root',
+        'child-2',
+        'child-1',
+      ]);
+
+      // Simulate arrival of new threads child-3 (t3) and child-4 (t4) under root
+      api.threadsResult = [
+        makeThread('root', created: 't0'),
+        makeThread('child-1', parent: 'root', created: 't1'),
+        makeThread('child-2', parent: 'root', created: 't2'),
+        makeThread('child-4', parent: 'root', created: 't4'),
+        makeThread('child-3', parent: 'root', created: 't3'),
+      ];
+      await store.refreshThreads();
+      await pumpEventQueue();
+
+      // child-2 and child-1 (custom ordered) appear first, followed by child-3 and child-4 in createdAt order
+      expect(store.flattenedVisible().map((t) => t.id), [
+        'root',
+        'child-2',
+        'child-1',
+        'child-3',
+        'child-4',
+      ]);
+
+      await store.dispose();
+    },
+  );
+
+  test(
     'click / ctrl-toggle / shift-range selection over the visible list',
     () async {
       final api = FakeApi()

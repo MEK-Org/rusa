@@ -415,7 +415,6 @@ class _ActorRowState extends State<_ActorRow> {
 
   Widget _buildContent(
     BuildContext context, {
-    bool isDragging = false,
     bool isHoveredTarget = false,
   }) {
     final thread = widget.thread;
@@ -646,18 +645,31 @@ class _ActorRowState extends State<_ActorRow> {
       },
       builder: (context, candidateData, rejectedData) {
         final isHoveredTarget = candidateData.isNotEmpty;
+        final childWhenDragging = Opacity(
+          opacity: 0.35,
+          child: _buildContent(context),
+        );
+        final child = InkWell(
+          onTap: widget.onSelect,
+          child: _buildContent(context, isHoveredTarget: isHoveredTarget),
+        );
+
+        if (widget.touchTargets) {
+          return LongPressDraggable<ThreadDto>(
+            data: widget.thread,
+            hitTestBehavior: HitTestBehavior.opaque,
+            feedback: _buildFeedback(context),
+            childWhenDragging: childWhenDragging,
+            child: child,
+          );
+        }
+
         return Draggable<ThreadDto>(
           data: widget.thread,
           hitTestBehavior: HitTestBehavior.opaque,
           feedback: _buildFeedback(context),
-          childWhenDragging: Opacity(
-            opacity: 0.35,
-            child: _buildContent(context, isDragging: true),
-          ),
-          child: InkWell(
-            onTap: widget.onSelect,
-            child: _buildContent(context, isHoveredTarget: isHoveredTarget),
-          ),
+          childWhenDragging: childWhenDragging,
+          child: child,
         );
       },
     );

@@ -1414,4 +1414,35 @@ void main() {
       await store.dispose();
     });
   });
+
+  testWidgets('ActorTree uses LongPressDraggable when touchTargets is true', (tester) async {
+    await tester.runAsync(() async {
+      final api = FakeApi()
+        ..threadsResult = [
+          makeThread('root', created: 't0'),
+          makeThread('child-1', parent: 'root', created: 't1'),
+        ];
+      final cache = FakeTreePreferencesCache();
+      final store = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        treePreferencesCache: cache,
+      );
+      await store.init();
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: ActorTree(store: store, touchTargets: true),
+          ),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(find.byType(LongPressDraggable<ThreadDto>), findsNWidgets(2));
+      expect(find.byType(Draggable<ThreadDto>), findsNothing);
+
+      await store.dispose();
+    });
+  });
 }
