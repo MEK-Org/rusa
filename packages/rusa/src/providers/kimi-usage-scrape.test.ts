@@ -167,6 +167,51 @@ describe("scrapeKimiUsage semantic orchestration", () => {
     }
   });
 
+  it("navigates Up on trust prompt so 'Trust this folder' is selected instead of exiting on default 'Don't trust'", async () => {
+    const actorDir = mkdtempSync(join(tmpdir(), "rusa-kimi-trust-up-test-"));
+    const panel = fixture("kimi-usage-expected.txt");
+    // Simulates Kimi CLI trust prompt: default is "Don't trust" (exits 0 if bare Enter received).
+    // Only if Up arrow escape sequence (\u001b[A) is received does it accept trust and proceed.
+    const cliCode = [
+      "process.stdin.setRawMode(true);",
+      "process.stdout.write('Trust this folder?\\n  Trust this folder\\n❯ Don\\'t trust\\n  Exit Kimi Code.\\n');",
+      "let buf = '';",
+      "process.stdin.on('data', d => {",
+      "  buf += d.toString();",
+      "  if (buf.includes('\\u001b[A') && (buf.includes('\\r') || buf.includes('\\n'))) {",
+      "    process.stdout.write('> ');",
+      "  } else if (!buf.includes('\\u001b[A') && (buf.includes('\\r') || buf.includes('\\n'))) {",
+      "    process.exit(0);",
+      "  }",
+      "  if (buf.includes('/usage')) {",
+      `    process.stdout.write(${JSON.stringify(`${panel}\n`)});`,
+      "  }",
+      "});",
+      "setTimeout(() => {}, 10000);",
+    ].join(" ");
+    const cliCommand = `node -e ${JSON.stringify(cliCode)}`;
+    const states: KimiScreenState[] = ["trust_prompt", "ready", "usage_panel"];
+    const evaluateScreen = vi.fn(async () => ({
+      status: "known" as const,
+      state: states.shift() ?? "unknown",
+    }));
+
+    try {
+      const raw = await scrapeKimiUsage({
+        actorDir,
+        cliCommand,
+        timeoutMs: 5_000,
+        captureDelayMs: 100,
+        evaluateScreen,
+      });
+      expect(raw).toContain("Kimi Code Platform Usage");
+      expect(raw).toContain("72% left");
+      expect(evaluateScreen).toHaveBeenCalledTimes(3);
+    } finally {
+      rmSync(actorDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   it("fails closed instead of returning an ambiguous home screen", async () => {
     const actorDir = mkdtempSync(join(tmpdir(), "rusa-kimi-unknown-test-"));
     const cliCommand = `bash -lc ${JSON.stringify("printf '> '; sleep 10")}`;

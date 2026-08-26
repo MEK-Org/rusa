@@ -1048,7 +1048,11 @@ export class QuotaService {
     }
     let raw: string;
     try {
-      raw = await scrape({ actorDir, geminiApiKey: apiKey });
+      raw = await scrape({
+        actorDir,
+        geminiApiKey: apiKey,
+        cliCommand: this.deps.config.providers?.kimi?.cliCommand,
+      });
     } catch (err) {
       if (err instanceof KimiAuthRequiredError) {
         return {
