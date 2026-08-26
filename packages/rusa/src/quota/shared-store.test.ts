@@ -1,7 +1,6 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ProviderQuotaSnapshot, QuotaWindowKind } from "../mcp/quota-mcp.js";
 import {
@@ -15,46 +14,6 @@ const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
-
-function legacyDb(
-  root: string,
-  rows: Array<{
-    id: string;
-    scrapedAt: string;
-    sourceLabel: string;
-    percentLeft: number;
-    resetAtIso?: string;
-  }>
-): string {
-  mkdirSync(root, { recursive: true });
-  const path = join(root, "legacy.db");
-  const db = new Database(path);
-  db.exec(`CREATE TABLE quota_scrapes (
-    id TEXT PRIMARY KEY, provider TEXT NOT NULL, scraped_at TEXT NOT NULL,
-    raw_output TEXT NOT NULL, parsed_state TEXT, inferred_parsed_state TEXT,
-    parse_error TEXT
-  )`);
-  const insert = db.prepare(`INSERT INTO quota_scrapes VALUES (?, 'agy', ?, 'raw', ?, ?, NULL)`);
-  for (const row of rows) {
-    const state: ProviderQuotaSnapshot = {
-      provider: "agy",
-      status: "available",
-      scrapedAt: row.scrapedAt,
-      limits: [
-        {
-          label: row.sourceLabel,
-          kind: "weekly",
-          scope: "provider",
-          percentLeft: row.percentLeft,
-          resetAtIso: row.resetAtIso,
-        },
-      ],
-    };
-    insert.run(row.id, row.scrapedAt, JSON.stringify(state), JSON.stringify(state));
-  }
-  db.close();
-  return path;
-}
 
 function recordObservation(
   store: SharedQuotaStore,
@@ -195,43 +154,6 @@ describe("SharedQuotaStore canonical observations", () => {
       expect(store.listCanonicalSince("claude", "2029-01-01T00:00:00.000Z")).toMatchObject([
         { label: "Current week (all models)", percentLeft: 80 },
       ]);
-    } finally {
-      store.close();
-    }
-  });
-});
-
-describe("SharedQuotaStore migration", () => {
-  it("is idempotent and prefers the source with resolvable reset evidence", () => {
-    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-"));
-    roots.push(root);
-    const at = "2026-08-25T12:00:00.000Z";
-    const weak = legacyDb(join(root, "weak"), [
-      {
-        id: "weak-1",
-        scrapedAt: at,
-        sourceLabel: "Weekly Limit",
-        percentLeft: 50,
-      },
-    ]);
-    const strongRoot = join(root, "strong");
-    const strong = legacyDb(strongRoot, [
-      {
-        id: "strong-1",
-        scrapedAt: at,
-        sourceLabel: "Weekly Limit Remaining",
-        percentLeft: 50,
-        resetAtIso: "2026-08-29T12:00:00.000Z",
-      },
-    ]);
-    const store = new SharedQuotaStore(join(root, "shared.db"));
-    try {
-      store.importLegacyDatabase(weak, "staging");
-      store.importLegacyDatabase(strong, "production");
-      expect(store.importLegacyDatabase(strong, "production").insertedRows).toBe(0);
-      const selected = store.listCanonicalSince("agy", "2026-08-25T00:00:00.000Z");
-      expect(selected).toHaveLength(1);
-      expect(selected[0]?.resetAtIso).toBe("2026-08-29T12:00:00.000Z");
     } finally {
       store.close();
     }

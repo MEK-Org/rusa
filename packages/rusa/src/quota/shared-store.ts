@@ -71,15 +71,6 @@ export interface CanonicalQuotaObservation {
   windowMs: number;
 }
 
-export interface QuotaImportReport {
-  sourceInstance: string;
-  sourceRows: number;
-  insertedRows: number;
-  duplicateRows: number;
-  expiredRows: number;
-  canonicalObservations: number;
-}
-
 export interface QuotaControllerOptions {
   maxIntervalSeconds: number;
 }
@@ -139,13 +130,12 @@ interface ReasonedObservation {
   observedAt: string;
 }
 
-interface LegacyScrapeRow {
+interface StoredScrapeRow {
   id: string;
   provider: string;
   scraped_at: string;
   raw_output: string;
   parsed_state: string | null;
-  inferred_parsed_state: string | null;
   parse_error: string | null;
 }
 
@@ -303,7 +293,7 @@ export class SharedQuotaStore {
          FROM quota_scrapes WHERE provider = ? AND scraped_at >= ?
          ORDER BY scraped_at ASC, rowid ASC`
       )
-      .all(provider, sinceIso) as Array<Omit<LegacyScrapeRow, "inferred_parsed_state">>;
+      .all(provider, sinceIso) as StoredScrapeRow[];
     return rows.map((row) => {
       const state = parsedSnapshot(row.parsed_state);
       return {
@@ -571,68 +561,6 @@ export class SharedQuotaStore {
         };
       }),
     };
-  }
-
-  importLegacyDatabase(sourcePath: string, sourceInstance: string): QuotaImportReport {
-    const source = new Database(sourcePath, { readonly: true, fileMustExist: true });
-    try {
-      const columns = new Set(
-        (source.prepare("PRAGMA table_info(quota_scrapes)").all() as Array<{ name: string }>).map(
-          (column) => column.name
-        )
-      );
-      const hasInferred = columns.has("inferred_parsed_state");
-      const total = (
-        source.prepare("SELECT count(*) AS n FROM quota_scrapes").get() as { n: number }
-      ).n;
-      const cutoff = new Date(Date.now() - QUOTA_RAW_RETENTION_MS).toISOString();
-      const rows = source
-        .prepare(
-          `SELECT id, provider, scraped_at, raw_output, parsed_state,
-                  ${hasInferred ? "inferred_parsed_state" : "NULL"} AS inferred_parsed_state,
-                  parse_error
-           FROM quota_scrapes WHERE scraped_at >= ?
-           ORDER BY scraped_at ASC, rowid ASC`
-        )
-        .all(cutoff) as LegacyScrapeRow[];
-      let insertedRows = 0;
-      const insert = this.db.prepare(
-        `INSERT OR IGNORE INTO quota_scrapes
-          (id, provider, scraped_at, raw_output, parsed_state, parse_error)
-         VALUES (?, ?, ?, ?, ?, ?)`
-      );
-      this.db.transaction(() => {
-        for (const row of rows) {
-          const stateJson = row.inferred_parsed_state ?? row.parsed_state;
-          const result = insert.run(
-            row.id,
-            row.provider,
-            row.scraped_at,
-            row.raw_output,
-            stateJson,
-            row.parse_error
-          );
-          insertedRows += result.changes;
-          const state = parsedSnapshot(stateJson);
-          if (state) {
-            this.insertObservations(state, row.scraped_at, row.provider);
-          }
-        }
-      })();
-      const canonicalObservations = (
-        this.db.prepare("SELECT count(*) AS n FROM quota_observations").get() as { n: number }
-      ).n;
-      return {
-        sourceInstance,
-        sourceRows: total,
-        insertedRows,
-        duplicateRows: rows.length - insertedRows,
-        expiredRows: total - rows.length,
-        canonicalObservations,
-      };
-    } finally {
-      source.close();
-    }
   }
 
   private insertObservations(
