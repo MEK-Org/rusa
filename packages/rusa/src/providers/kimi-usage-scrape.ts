@@ -215,7 +215,7 @@ export async function scrapeKimiUsage(opts: ScrapeKimiUsageOptions): Promise<str
     });
   };
 
-  const capture = () => runTmux(["capture-pane", "-t", session, "-p"]);
+  const capture = () => runTmux(["capture-pane", "-t", session, "-p"], true);
   const classify = async (rawOutput: string): Promise<KimiScreenState> => {
     // An empty terminal carries no evidence, so no call can tell us anything about it.
     if (screenIsBlank(rawOutput)) return "unknown";
@@ -266,6 +266,9 @@ export async function scrapeKimiUsage(opts: ScrapeKimiUsageOptions): Promise<str
         case "auth_required":
           throw new KimiAuthRequiredError();
         case "trust_prompt":
+          // The trust prompt defaults to "Don't trust (Exit Kimi Code)".
+          // Send "Up" to navigate to "Trust this folder", then "Enter" to accept and persist trust.
+          runTmux(["send-keys", "-t", session, "Up"]);
           runTmux(["send-keys", "-t", session, "Enter"]);
           break;
         case "ready":
