@@ -32,7 +32,6 @@ class _OverviewTabState extends State<OverviewTab> {
   String _searchQuery = '';
   String? _statusFilter;
   late Future<Map<String, dynamic>> _humanQueueFuture;
-  Timer? _quotaHistoryPoll;
 
   Future<Map<String, dynamic>> _loadHumanQueue() async {
     final api = widget.store.api;
@@ -67,16 +66,11 @@ class _OverviewTabState extends State<OverviewTab> {
     super.initState();
     widget.store.refreshYieldEvents();
     widget.store.refreshQuotaHistory();
-    _quotaHistoryPoll = Timer.periodic(
-      const Duration(minutes: 5),
-      (_) => widget.store.refreshQuotaHistory(),
-    );
     _humanQueueFuture = _loadHumanQueue();
   }
 
   @override
   void dispose() {
-    _quotaHistoryPoll?.cancel();
     _searchController.dispose();
     super.dispose();
   }

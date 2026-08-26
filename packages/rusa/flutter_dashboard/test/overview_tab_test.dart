@@ -317,7 +317,7 @@ void main() {
   );
 
   testWidgets(
-    'OverviewTab fetches quota history on mount, polls every 5 minutes, and cancels timer on dispose',
+    'OverviewTab fetches quota history on mount and does not poll on an interval',
     (tester) async {
       final api = FakeApi()
         ..threadsResult = [makeThread('root')]
@@ -336,23 +336,15 @@ void main() {
       expect(api.quotaHistoryCallCount, 1);
       expect(store.quotaHistory.value?.generatedAt, 'test-hist');
 
-      // Advance 5 minutes while mounted: periodic timer fires
+      // Advance 5 minutes while mounted: no periodic timer fires
       await tester.pump(const Duration(minutes: 5));
-      expect(api.quotaHistoryCallCount, 2);
+      expect(api.quotaHistoryCallCount, 1);
 
-      // Advance another 5 minutes while mounted: periodic timer fires again
+      // Advance another 5 minutes while mounted: count remains 1
       await tester.pump(const Duration(minutes: 5));
-      expect(api.quotaHistoryCallCount, 3);
+      expect(api.quotaHistoryCallCount, 1);
 
-      // Unmount OverviewTab (cancelling the periodic timer in dispose())
-      await tester.pumpWidget(const SizedBox());
-      await tester.pump();
-
-      // Advance another 5 minutes: timer was cancelled on dispose, so count remains 3
-      await tester.pump(const Duration(minutes: 5));
-      expect(api.quotaHistoryCallCount, 3);
-
-      store.dispose();
+      await store.dispose();
     },
   );
 }
