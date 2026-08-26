@@ -443,7 +443,6 @@ class QuotaWindowDto {
     this.resetAtIso,
     this.windowMs = 0,
     this.scrapedAt,
-    this.carriedForward = false,
   });
 
   final String id;
@@ -467,10 +466,6 @@ class QuotaWindowDto {
   /// reached a probe.
   final String? scrapedAt;
 
-  /// True if this window's reading or reset instant was carried forward from a
-  /// previous assessment rather than directly observed in the latest probe.
-  final bool carriedForward;
-
   bool get isKnown => usedPercent != null && status != 'unknown';
 
   /// Returns true if this window has an absolute reset instant that has already
@@ -493,7 +488,6 @@ class QuotaWindowDto {
     resetAtIso: j['resetAtIso'] as String?,
     windowMs: (j['windowMs'] as num?)?.toInt() ?? 0,
     scrapedAt: j['scrapedAt'] as String?,
-    carriedForward: j['carriedForward'] as bool? ?? false,
   );
 
   /// Inverse of [fromJson] — used to persist the last-known snapshot to
@@ -509,7 +503,6 @@ class QuotaWindowDto {
     'resetAtIso': resetAtIso,
     'windowMs': windowMs,
     'scrapedAt': scrapedAt,
-    'carriedForward': carriedForward,
   };
 }
 

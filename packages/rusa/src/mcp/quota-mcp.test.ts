@@ -2169,10 +2169,8 @@ describe("quota MCP server", () => {
         expect(inferred.explanations).toHaveLength(1);
         expect(inferred.explanations?.[0].rule).toBe("carried_forward_bad_read");
         expect(inferred.status).toBe("exhausted");
-        expect(inferred.carriedForward).toBe(true);
         expect(inferred.limits?.[0].resetAtIso).toBe(resetIso);
         expect(inferred.limits?.[0].percentLeft).toBe(0);
-        expect(inferred.limits?.[0].carriedForward).toBe(true);
       });
 
       it("carried_forward_bad_read: carries forward unexpired resetAtIso when subsequent parse misses reset timestamp for an active window ", () => {
@@ -2211,10 +2209,8 @@ describe("quota MCP server", () => {
         const inferred = inferQuotaState(partialState, previousState, t1Iso);
         expect(inferred.explanations).toHaveLength(1);
         expect(inferred.explanations?.[0].rule).toBe("carried_forward_bad_read");
-        expect(inferred.carriedForward).toBe(true);
         expect(inferred.limits?.[0].percentLeft).toBe(50);
         expect(inferred.limits?.[0].resetAtIso).toBe(resetIso);
-        expect(inferred.limits?.[0].carriedForward).toBe(true);
       });
 
       it("REQUIRED HAZARD: inferred reset from assumed_window_starts_now is NEVER carried forward across bad reads", () => {

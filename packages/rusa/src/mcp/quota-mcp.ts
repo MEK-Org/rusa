@@ -74,11 +74,6 @@ export interface QuotaLimit {
    * Scope of the limit. "provider" for provider-wide limits, "model" for model-specific limits.
    */
   scope?: "provider" | "model";
-  /**
-   * True if this limit (or its resetAtIso) was carried forward from a previous scrape
-   * assessment rather than freshly parsed from this scrape .
-   */
-  carriedForward?: boolean;
 }
 
 export interface ProviderQuotaSnapshot {
@@ -110,11 +105,6 @@ export interface ProviderQuotaSnapshot {
    * snapshot is identical to the raw parser output.
    */
   explanations?: QuotaInferenceExplanation[];
-  /**
-   * True if this snapshot (or one of its limits) was carried forward from a previous scrape
-   * assessment .
-   */
-  carriedForward?: boolean;
 }
 
 export interface QuotaMcpDeps {
@@ -560,7 +550,6 @@ export function inferQuotaState(
   const effectiveScrapedAt = scrapedAt ?? rawState.scrapedAt ?? new Date().toISOString();
   const scrapedAtMs = Date.parse(effectiveScrapedAt);
   const explanations: QuotaInferenceExplanation[] = [];
-  let carriedForward: boolean | undefined;
 
   let status = rawState.status;
   let message = rawState.message;
@@ -588,8 +577,7 @@ export function inferQuotaState(
 
     if (activeUnexpiredLimits.length > 0) {
       status = prevState.status;
-      limits = activeUnexpiredLimits.map((l) => ({ ...l, carriedForward: true }));
-      carriedForward = true;
+      limits = activeUnexpiredLimits.map((l) => ({ ...l }));
       message = rawState.message ?? prevState.message;
       for (const limit of limits) {
         explanations.push({
@@ -643,8 +631,6 @@ export function inferQuotaState(
       );
       if (prevMatch?.resetAtIso) {
         limit.resetAtIso = prevMatch.resetAtIso;
-        limit.carriedForward = true;
-        carriedForward = true;
         explanations.push({
           window: limit.label,
           field: "resetAtIso",
@@ -689,7 +675,6 @@ export function inferQuotaState(
     limits,
     scrapedAt: effectiveScrapedAt,
     explanations,
-    ...(carriedForward ? { carriedForward: true } : {}),
   };
 }
 

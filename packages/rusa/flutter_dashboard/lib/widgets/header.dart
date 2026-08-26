@@ -404,8 +404,7 @@ double _ringValue(QuotaWindowDto? window, {DateTime? now}) {
 /// ("resets ..."), then an unambiguous rate-based projection so the verdict
 /// is never a bare adjective. When a window is past its reset (resetAtIso < now),
 /// honestly reports that the window has reset without a fresh reading instead of
-/// showing the pre-reset percentage (issue #9). Distinguishes carried-forward
-/// values from directly observed ones (issue #9). Falls back to a quota-only
+/// showing the pre-reset percentage (issue #9). Falls back to a quota-only
 /// phrasing (plus the raw reset text, when there is one) when the window's
 /// schedule position can't be resolved to an absolute instant (see [_schedulePosition]) —
 /// several provider CLIs report free-form reset text with no reliable epoch.
@@ -414,12 +413,9 @@ String quotaWindowTooltip(
   required String fallbackLabel,
   required DateTime now,
 }) {
-  final baseLabel = (window?.label != null && window!.label.isNotEmpty)
+  final label = (window?.label != null && window!.label.isNotEmpty)
       ? window.label
       : fallbackLabel;
-  final label = window?.carriedForward == true
-      ? '$baseLabel (carried forward)'
-      : baseLabel;
   if (window == null) return '$label: n/a';
   if (window.isPastReset(now)) {
     final reset = DateTime.tryParse(window.resetAtIso!);

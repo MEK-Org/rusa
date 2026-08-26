@@ -68,7 +68,7 @@ describe("QuotaScrapeRepository", () => {
     db.close();
   });
 
-  it("persists and retrieves carriedForward flag on snapshot and limits ", () => {
+  it("persists and retrieves explanations and limits on inferred snapshot", () => {
     const db = new Database(":memory:");
     runMigrations(db);
     const repo = new QuotaScrapeRepository(db);
@@ -98,24 +98,29 @@ describe("QuotaScrapeRepository", () => {
       provider: "codex",
       status: "available" as const,
       scrapedAt: "2026-08-22T10:00:00.000Z",
-      carriedForward: true,
       limits: [
         {
           label: "Weekly",
           kind: "weekly" as const,
           percentLeft: 93,
           resetAtIso: "2026-08-27T11:31:00.000Z",
-          carriedForward: true,
         },
       ],
-      explanations: [],
+      explanations: [
+        {
+          window: "Weekly",
+          field: "resetAtIso",
+          rule: "carried_forward_bad_read" as const,
+          detail: "carried forward previous unexpired window assessment after bad read",
+        },
+      ],
     };
 
     repo.recordParsed(id, rawParsed, inferredParsed);
 
     const [scrape] = repo.listSince("codex", "2026-08-22T00:00:00.000Z");
-    expect(scrape.inferredParsedState?.carriedForward).toBe(true);
-    expect(scrape.inferredParsedState?.limits?.[0].carriedForward).toBe(true);
+    expect(scrape.inferredParsedState?.explanations).toHaveLength(1);
+    expect(scrape.inferredParsedState?.explanations?.[0].rule).toBe("carried_forward_bad_read");
     expect(scrape.inferredParsedState?.limits?.[0].percentLeft).toBe(93);
     db.close();
   });
