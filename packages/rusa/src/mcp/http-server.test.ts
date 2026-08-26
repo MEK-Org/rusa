@@ -52,6 +52,13 @@ function fakeIssueClient(): { client: IssueClient; labels: string[] } {
     reopenIssue: async () => {},
     mergePullRequest: async () => "sha",
     createPullRequestReview: async () => undefined,
+    createPrReviewComment: async () => ({
+      id: 1,
+      htmlUrl: "https://example.test/pr/1#discussion_r1",
+      path: "a.ts",
+      line: 1,
+      body: "b",
+    }),
     addReaction: async () => {},
     addCommentReaction: async () => {},
     getPrReviewComments: async () => [],

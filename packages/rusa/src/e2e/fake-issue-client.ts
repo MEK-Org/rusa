@@ -1,9 +1,11 @@
 import {
   type CloseIssueReason,
   type CreatedIssue,
+  type CreatedPrReviewComment,
   type CreatedPullRequest,
   type CreateIssueOptions,
   type CreatePROptions,
+  type CreatePrReviewCommentOptions,
   type CreatePullRequestReviewOptions,
   type IssueClient,
   type IssueComment,
@@ -290,9 +292,20 @@ export class FakeIssueClient implements IssueClient {
       state: REVIEW_EVENT_TO_STATE[opts.event],
       body: opts.body,
       author: this.botAccount,
+      comments: opts.comments,
     });
     const pr = this.tracker.getPr(opts.prNumber);
     return pr ? `${pr.htmlUrl}#pullrequestreview-${review.id}` : undefined;
+  }
+
+  async createPrReviewComment(opts: CreatePrReviewCommentOptions): Promise<CreatedPrReviewComment> {
+    return this.tracker.recordPrReviewComment(opts.prNumber, {
+      path: opts.path,
+      line: opts.line,
+      body: opts.body,
+      author: this.botAccount,
+      inReplyTo: opts.inReplyTo,
+    });
   }
 
   async addReaction(_repo: string, _issueNumber: number, _content: ReactionContent): Promise<void> {
@@ -312,7 +325,7 @@ export class FakeIssueClient implements IssueClient {
   async getPrReviewComments(
     _repo: string,
     prNumber: number,
-    reviewId: number
+    reviewId?: number
   ): Promise<PrReviewComment[]> {
     return this.tracker.getReviewComments(prNumber, reviewId).map((c) => ({
       path: c.path,

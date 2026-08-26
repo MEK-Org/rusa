@@ -695,6 +695,120 @@ describe("GitHubIssueClient", () => {
     expect(url).toBeUndefined();
   });
 
+  it("submits a pull request review with commit_id and inline comments", async () => {
+    const requests = installFetch({
+      [`POST /repos/${REPO}/pulls/12/reviews`]: {
+        status: 200,
+        json: { html_url: `https://github.com/${REPO}/pull/12#pullrequestreview-2` },
+      },
+    });
+
+    const url = await new GitHubIssueClient().createPullRequestReview({
+      repo: REPO,
+      prNumber: 12,
+      event: "REQUEST_CHANGES",
+      body: "Needs changes.",
+      commitId: "commit-sha-123",
+      comments: [{ path: "src/index.ts", line: 42, body: "Consider refactoring", side: "RIGHT" }],
+    });
+
+    expect(url).toBe(`https://github.com/${REPO}/pull/12#pullrequestreview-2`);
+    expect(requests[0].body).toEqual({
+      body: "Needs changes.",
+      event: "REQUEST_CHANGES",
+      commit_id: "commit-sha-123",
+      comments: [
+        {
+          path: "src/index.ts",
+          line: 42,
+          body: "Consider refactoring",
+          side: "RIGHT",
+          start_line: undefined,
+          start_side: undefined,
+        },
+      ],
+    });
+  });
+
+  it("creates an inline PR review comment resolving headSha when commitId is omitted", async () => {
+    const requests = installFetch({
+      [`GET /repos/${REPO}/pulls/12`]: {
+        status: 200,
+        json: {
+          number: 12,
+          title: "PR 12",
+          body: "body",
+          html_url: `https://github.com/${REPO}/pull/12`,
+          head: { ref: "feature", sha: "pr-head-sha-456" },
+          state: "open",
+        },
+      },
+      [`POST /repos/${REPO}/pulls/12/comments`]: {
+        status: 201,
+        json: {
+          id: 101,
+          html_url: `https://github.com/${REPO}/pull/12#discussion_r101`,
+          path: "packages/app.ts",
+          line: 15,
+          body: "Why this pattern?",
+        },
+      },
+    });
+
+    const result = await new GitHubIssueClient().createPrReviewComment({
+      repo: REPO,
+      prNumber: 12,
+      path: "packages/app.ts",
+      line: 15,
+      body: "Why this pattern?",
+    });
+
+    expect(result).toEqual({
+      id: 101,
+      htmlUrl: `https://github.com/${REPO}/pull/12#discussion_r101`,
+      path: "packages/app.ts",
+      line: 15,
+      body: "Why this pattern?",
+    });
+    expect(
+      requests.find((r) => r.method === "POST" && r.path === `/repos/${REPO}/pulls/12/comments`)
+        ?.body
+    ).toEqual({
+      body: "Why this pattern?",
+      path: "packages/app.ts",
+      line: 15,
+      commit_id: "pr-head-sha-456",
+    });
+  });
+
+  it("creates a PR review comment reply when inReplyTo is supplied", async () => {
+    const requests = installFetch({
+      [`POST /repos/${REPO}/pulls/12/comments`]: {
+        status: 201,
+        json: {
+          id: 102,
+          html_url: `https://github.com/${REPO}/pull/12#discussion_r102`,
+          path: "packages/app.ts",
+          line: 15,
+          body: "Good point, updating.",
+        },
+      },
+    });
+
+    const result = await new GitHubIssueClient().createPrReviewComment({
+      repo: REPO,
+      prNumber: 12,
+      inReplyTo: 101,
+      body: "Good point, updating.",
+    });
+
+    expect(result.id).toBe(102);
+    expect(requests[0].body).toEqual({
+      body: "Good point, updating.",
+      in_reply_to: 101,
+    });
+  });
+
   it("maps PR details from the GitHub wire shape", async () => {
     installFetch({
       [`GET /repos/${REPO}/pulls/5`]: {
@@ -1470,8 +1584,60 @@ describe("GitHubIssueClient", () => {
 
     const comments = await new GitHubIssueClient().getPrReviewComments(REPO, 5, 77);
     expect(comments).toEqual([
-      { path: "a.ts", line: 10, body: "fix", diffHunk: "@@ -1 +1 @@" },
-      { path: "b.ts", line: 4, body: "also", diffHunk: "@@ -2 +2 @@" },
+      {
+        id: undefined,
+        path: "a.ts",
+        line: 10,
+        body: "fix",
+        diffHunk: "@@ -1 +1 @@",
+        author: undefined,
+        createdAt: undefined,
+        inReplyToId: null,
+      },
+      {
+        id: undefined,
+        path: "b.ts",
+        line: 4,
+        body: "also",
+        diffHunk: "@@ -2 +2 @@",
+        author: undefined,
+        createdAt: undefined,
+        inReplyToId: null,
+      },
+    ]);
+  });
+
+  it("fetches all PR review comments when reviewId is omitted", async () => {
+    installFetch({
+      [`GET /repos/${REPO}/pulls/5/comments`]: {
+        json: [
+          {
+            id: 201,
+            path: "src/a.ts",
+            line: 20,
+            original_line: 18,
+            body: "note",
+            diff_hunk: "@@ -1 +1 @@",
+            user: { login: "reviewer-1" },
+            created_at: "2026-08-25T00:00:00Z",
+            in_reply_to_id: null,
+          },
+        ],
+      },
+    });
+
+    const comments = await new GitHubIssueClient().getPrReviewComments(REPO, 5);
+    expect(comments).toEqual([
+      {
+        id: 201,
+        path: "src/a.ts",
+        line: 20,
+        body: "note",
+        diffHunk: "@@ -1 +1 @@",
+        author: "reviewer-1",
+        createdAt: "2026-08-25T00:00:00Z",
+        inReplyToId: null,
+      },
     ]);
   });
 

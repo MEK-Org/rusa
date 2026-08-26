@@ -414,7 +414,19 @@ export class LocalTracker {
    */
   recordReview(
     prNumber: number,
-    opts: { state: ReviewState; body: string; author: string }
+    opts: {
+      state: ReviewState;
+      body: string;
+      author: string;
+      comments?: Array<{
+        path: string;
+        line: number;
+        body: string;
+        side?: "LEFT" | "RIGHT";
+        startLine?: number;
+        startSide?: "LEFT" | "RIGHT";
+      }>;
+    }
   ): TrackerReview {
     const pr = this.requirePr(prNumber);
     const review: TrackerReview = {
@@ -423,7 +435,13 @@ export class LocalTracker {
       state: opts.state,
       body: opts.body,
       author: opts.author,
-      comments: [],
+      comments:
+        opts.comments?.map((c) => ({
+          path: c.path,
+          line: c.line,
+          body: c.body,
+          diffHunk: "",
+        })) ?? [],
       createdAt: new Date().toISOString(),
     };
     const list = this.reviews.get(prNumber) ?? [];
@@ -433,9 +451,56 @@ export class LocalTracker {
     return review;
   }
 
-  /** Inline comments recorded for a specific review (backs getPrReviewComments). */
-  getReviewComments(prNumber: number, reviewId: number): TrackerReviewComment[] {
-    return this.reviews.get(prNumber)?.find((r) => r.id === reviewId)?.comments ?? [];
+  recordPrReviewComment(
+    prNumber: number,
+    opts: {
+      path?: string;
+      line?: number;
+      body: string;
+      author: string;
+      inReplyTo?: number;
+    }
+  ): { id: number; htmlUrl: string; path: string; line: number | null; body: string } {
+    const pr = this.requirePr(prNumber);
+    const id = this.nextCommentId++;
+    const comment: TrackerReviewComment = {
+      path: opts.path ?? "",
+      line: opts.line ?? null,
+      body: opts.body,
+      diffHunk: "",
+    };
+    const list = this.reviews.get(prNumber);
+    if (!list || list.length === 0) {
+      const review: TrackerReview = {
+        id: this.nextReviewId++,
+        prNumber,
+        state: "commented",
+        body: "",
+        author: opts.author,
+        comments: [comment],
+        createdAt: new Date().toISOString(),
+      };
+      this.reviews.set(prNumber, [review]);
+    } else {
+      list[list.length - 1].comments.push(comment);
+    }
+    pr.updatedAt = new Date().toISOString();
+    return {
+      id,
+      htmlUrl: `${pr.htmlUrl}#discussion_r${id}`,
+      path: comment.path,
+      line: comment.line,
+      body: comment.body,
+    };
+  }
+
+  /** Inline comments recorded for a specific review or all reviews on the PR. */
+  getReviewComments(prNumber: number, reviewId?: number): TrackerReviewComment[] {
+    const reviews = this.reviews.get(prNumber) ?? [];
+    if (reviewId !== undefined) {
+      return reviews.find((r) => r.id === reviewId)?.comments ?? [];
+    }
+    return reviews.flatMap((r) => r.comments);
   }
 
   // ── Sub-issue hierarchy (plain parent pointer) ─────────────────────────────

@@ -377,26 +377,149 @@ export function createTrackerMcpServer(
     {
       title: "Review a pull request",
       description:
-        "Submit a review on a pull request (approve, request changes, or comment). " +
-        "The review body will be stamped with your authenticated identity.",
+        "Submit a review on a pull request (approve, request changes, or comment), optionally with inline comments. " +
+        "The review body and inline comments will be stamped with your authenticated identity.",
       inputSchema: {
         repo: z.string().describe("Repository in owner/name format"),
         prNumber: z.number().int().describe("The pull request number"),
         event: z.enum(["APPROVE", "REQUEST_CHANGES", "COMMENT"]).describe("The review verdict"),
         body: z.string().describe("The review body text"),
+        commitId: z
+          .string()
+          .optional()
+          .describe("Commit SHA the review applies to (optional, defaults to PR head SHA)"),
+        comments: z
+          .array(
+            z.object({
+              path: z.string().describe("Relative file path"),
+              line: z.number().int().describe("Line number in the diff"),
+              body: z.string().describe("Inline comment body text"),
+              side: z
+                .enum(["LEFT", "RIGHT"])
+                .optional()
+                .describe("Side of diff ('LEFT' or 'RIGHT')"),
+              startLine: z
+                .number()
+                .int()
+                .optional()
+                .describe("Starting line number for multi-line comments"),
+              startSide: z
+                .enum(["LEFT", "RIGHT"])
+                .optional()
+                .describe("Starting side for multi-line comments"),
+            })
+          )
+          .optional()
+          .describe("Optional batch of inline review comments attached to this review"),
       },
     },
-    async ({ repo, prNumber, event, body }) => {
+    async ({ repo, prNumber, event, body, commitId, comments }) => {
       try {
         const stampedBody = appendAuthorStamp(body, repo, prNumber);
+        const stampedComments = comments?.map((c) => ({
+          ...c,
+          body: appendAuthorStamp(c.body, repo, prNumber),
+        }));
         const url = await issueClient.createPullRequestReview({
           repo,
           prNumber,
           event,
           body: stampedBody,
+          commitId,
+          comments: stampedComments,
         });
         options.onWrite?.();
         return toolOk(url ?? "reviewed");
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "create_pr_review_comment",
+    {
+      title: "Post an inline PR review comment",
+      description:
+        "Post an inline review comment on a pull request diff line, or reply to an existing " +
+        "inline review comment thread. The comment body will be stamped with your authenticated identity.",
+      inputSchema: {
+        repo: z.string().describe("Repository in owner/name format"),
+        prNumber: z.number().int().describe("The pull request number"),
+        body: z.string().describe("The review comment body text"),
+        path: z
+          .string()
+          .optional()
+          .describe(
+            "Relative file path in the repository (required when starting a new comment thread, omit if inReplyTo is set)"
+          ),
+        line: z
+          .number()
+          .int()
+          .optional()
+          .describe(
+            "Line number in the file diff (required when starting a new line thread, omit if inReplyTo is set)"
+          ),
+        commitId: z
+          .string()
+          .optional()
+          .describe("Head commit SHA to attach comment to. Resolved automatically if omitted."),
+        side: z
+          .enum(["LEFT", "RIGHT"])
+          .optional()
+          .describe(
+            "Side of the diff: 'LEFT' for deleted lines, 'RIGHT' for added/modified lines (default: 'RIGHT')"
+          ),
+        startLine: z
+          .number()
+          .int()
+          .optional()
+          .describe("Starting line number for multi-line comments"),
+        startSide: z
+          .enum(["LEFT", "RIGHT"])
+          .optional()
+          .describe("Starting side for multi-line comments"),
+        inReplyTo: z
+          .number()
+          .int()
+          .optional()
+          .describe("Comment ID to reply to an existing review comment thread"),
+        subjectType: z
+          .enum(["line", "file"])
+          .optional()
+          .describe("The level at which the comment targets: 'line' (default) or 'file'"),
+      },
+    },
+    async ({
+      repo,
+      prNumber,
+      body,
+      path,
+      line,
+      commitId,
+      side,
+      startLine,
+      startSide,
+      inReplyTo,
+      subjectType,
+    }) => {
+      try {
+        const stampedBody = appendAuthorStamp(body, repo, prNumber);
+        const result = await issueClient.createPrReviewComment({
+          repo,
+          prNumber,
+          body: stampedBody,
+          path,
+          line,
+          commitId,
+          side,
+          startLine,
+          startSide,
+          inReplyTo,
+          subjectType,
+        });
+        options.onWrite?.();
+        return toolOk(result.htmlUrl ?? "commented");
       } catch (err) {
         return toolError(err);
       }
@@ -455,8 +578,17 @@ export function createTrackerMcpServer(
     "get_pr_review_comments",
     {
       title: "Get PR review comments",
-      description: "Fetch all inline comments for a specific pull request review.",
-      inputSchema: { repo: z.string(), prNumber: z.number().int(), reviewId: z.number().int() },
+      description:
+        "Fetch inline comments for a pull request, optionally filtered to a specific review ID.",
+      inputSchema: {
+        repo: z.string(),
+        prNumber: z.number().int(),
+        reviewId: z
+          .number()
+          .int()
+          .optional()
+          .describe("Optional review ID to filter comments to a specific review"),
+      },
     },
     async ({ repo, prNumber, reviewId }) => {
       try {

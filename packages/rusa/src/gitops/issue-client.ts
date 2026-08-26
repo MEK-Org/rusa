@@ -70,6 +70,21 @@ export interface MergePullRequestOptions {
   expectedHeadSha?: string;
 }
 
+export interface PrReviewCommentItem {
+  /** Relative path of the file to comment on */
+  path: string;
+  /** Line number in the diff to comment on */
+  line: number;
+  /** Inline comment body text */
+  body: string;
+  /** Side of the diff: "LEFT" (deleted) or "RIGHT" (added/modified) */
+  side?: "LEFT" | "RIGHT";
+  /** Starting line number for multi-line comments */
+  startLine?: number;
+  /** Starting side for multi-line comments */
+  startSide?: "LEFT" | "RIGHT";
+}
+
 export interface CreatePullRequestReviewOptions {
   /** Repository in owner/name format */
   repo: string;
@@ -79,13 +94,54 @@ export interface CreatePullRequestReviewOptions {
   event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
   /** Review body text */
   body: string;
+  /** Optional commit SHA the review applies to */
+  commitId?: string;
+  /** Optional batch of inline review comments attached to this review */
+  comments?: PrReviewCommentItem[];
+}
+
+export interface CreatePrReviewCommentOptions {
+  /** Repository in owner/name format */
+  repo: string;
+  /** Pull request number */
+  prNumber: number;
+  /** Review comment body text */
+  body: string;
+  /** Relative path of the file being commented on (required when starting a new thread, omit if inReplyTo is set) */
+  path?: string;
+  /** Line number in the diff (required when starting a new line thread, omit if inReplyTo is set) */
+  line?: number;
+  /** Commit SHA to attach comment to. If omitted, resolved from PR head SHA. */
+  commitId?: string;
+  /** Side of the diff: "LEFT" (deleted) or "RIGHT" (added/modified). Defaults to "RIGHT". */
+  side?: "LEFT" | "RIGHT";
+  /** Starting line number for multi-line comments */
+  startLine?: number;
+  /** Starting side for multi-line comments */
+  startSide?: "LEFT" | "RIGHT";
+  /** Comment ID to reply to (if replying to an existing review comment thread) */
+  inReplyTo?: number;
+  /** Subject type: "line" (default) or "file" */
+  subjectType?: "line" | "file";
+}
+
+export interface CreatedPrReviewComment {
+  id: number;
+  htmlUrl: string;
+  path: string;
+  line: number | null;
+  body: string;
 }
 
 export interface PrReviewComment {
+  id?: number;
   path: string;
   line: number | null;
   body: string;
   diffHunk: string;
+  author?: string;
+  createdAt?: string;
+  inReplyToId?: number | null;
 }
 
 export interface PullRequestDetails {
@@ -276,6 +332,11 @@ export interface IssueClient {
    * Returns the review URL if the API provides one.
    */
   createPullRequestReview(opts: CreatePullRequestReviewOptions): Promise<string | undefined>;
+  /**
+   * Post an inline review comment on a pull request diff or reply to an existing
+   * review comment thread. Returns the created comment details.
+   */
+  createPrReviewComment(opts: CreatePrReviewCommentOptions): Promise<CreatedPrReviewComment>;
   /** Add a reaction emoji to an issue or PR (e.g. `eyes` to acknowledge). */
   addReaction(repo: string, issueNumber: number, content: ReactionContent): Promise<void>;
   /**
@@ -289,8 +350,12 @@ export interface IssueClient {
     content: ReactionContent,
     scope: "issue" | "review"
   ): Promise<void>;
-  /** Fetch all inline comments for a specific PR review. */
-  getPrReviewComments(repo: string, prNumber: number, reviewId: number): Promise<PrReviewComment[]>;
+  /** Fetch inline comments for a pull request (optionally filtered to a specific review). */
+  getPrReviewComments(
+    repo: string,
+    prNumber: number,
+    reviewId?: number
+  ): Promise<PrReviewComment[]>;
   /**
    * Return the parent issue number if this issue is a sub-issue, or null if it
    * is a root issue (no parent).
@@ -603,23 +668,35 @@ export class GitHubIssueClient implements IssueClient {
   async getPrReviewComments(
     repo: string,
     prNumber: number,
-    reviewId: number
+    reviewId?: number
   ): Promise<PrReviewComment[]> {
+    const path =
+      reviewId !== undefined
+        ? `/repos/${repo}/pulls/${prNumber}/reviews/${reviewId}/comments`
+        : `/repos/${repo}/pulls/${prNumber}/comments`;
     const comments = await this.api<
       Array<{
+        id: number;
         path: string;
         line: number | null;
         original_line: number | null;
         body: string;
         diff_hunk: string;
+        user?: { login: string };
+        created_at?: string;
+        in_reply_to_id?: number | null;
       }>
-    >("GET", `/repos/${repo}/pulls/${prNumber}/reviews/${reviewId}/comments`);
+    >("GET", path);
 
     return comments.map((c) => ({
+      id: c.id,
       path: c.path,
       line: c.line ?? c.original_line ?? null,
       body: c.body,
       diffHunk: c.diff_hunk,
+      author: c.user?.login,
+      createdAt: c.created_at,
+      inReplyToId: c.in_reply_to_id ?? null,
     }));
   }
 
@@ -780,12 +857,80 @@ export class GitHubIssueClient implements IssueClient {
   }
 
   async createPullRequestReview(opts: CreatePullRequestReviewOptions): Promise<string | undefined> {
+    const payload: Record<string, unknown> = {
+      body: opts.body,
+      event: opts.event,
+    };
+    if (opts.commitId) {
+      payload.commit_id = opts.commitId;
+    }
+    if (opts.comments && opts.comments.length > 0) {
+      payload.comments = opts.comments.map((c) => ({
+        path: c.path,
+        line: c.line,
+        body: c.body,
+        side: c.side,
+        start_line: c.startLine,
+        start_side: c.startSide,
+      }));
+    }
     const review = await this.api<{ html_url?: string }>(
       "POST",
       `/repos/${opts.repo}/pulls/${opts.prNumber}/reviews`,
-      { body: opts.body, event: opts.event }
+      payload
     );
     return review?.html_url;
+  }
+
+  async createPrReviewComment(opts: CreatePrReviewCommentOptions): Promise<CreatedPrReviewComment> {
+    const payload: Record<string, unknown> = {
+      body: opts.body,
+    };
+    if (opts.inReplyTo !== undefined) {
+      payload.in_reply_to = opts.inReplyTo;
+    } else {
+      if (!opts.path) {
+        throw new Error("path is required when creating a new review comment");
+      }
+      payload.path = opts.path;
+      if (opts.line !== undefined) {
+        payload.line = opts.line;
+      }
+      if (opts.side) {
+        payload.side = opts.side;
+      }
+      if (opts.startLine !== undefined) {
+        payload.start_line = opts.startLine;
+      }
+      if (opts.startSide) {
+        payload.start_side = opts.startSide;
+      }
+      if (opts.subjectType) {
+        payload.subject_type = opts.subjectType;
+      }
+      let commitId = opts.commitId;
+      if (!commitId) {
+        const prDetails = await this.getPullRequestDetails(opts.repo, opts.prNumber);
+        commitId = prDetails.headSha;
+      }
+      payload.commit_id = commitId;
+    }
+
+    const comment = await this.api<{
+      id: number;
+      html_url: string;
+      path: string;
+      line: number | null;
+      body: string;
+    }>("POST", `/repos/${opts.repo}/pulls/${opts.prNumber}/comments`, payload);
+
+    return {
+      id: comment.id,
+      htmlUrl: comment.html_url,
+      path: comment.path,
+      line: comment.line,
+      body: comment.body,
+    };
   }
 
   async addReaction(repo: string, issueNumber: number, content: ReactionContent): Promise<void> {
@@ -1201,6 +1346,10 @@ export class GitBridgeIssueClient implements IssueClient, GitHubPollingIssueClie
     return this.delegate.createPullRequestReview(opts);
   }
 
+  createPrReviewComment(opts: CreatePrReviewCommentOptions): Promise<CreatedPrReviewComment> {
+    return this.delegate.createPrReviewComment(opts);
+  }
+
   addReaction(repo: string, issueNumber: number, content: ReactionContent): Promise<void> {
     return this.delegate.addReaction(repo, issueNumber, content);
   }
@@ -1217,7 +1366,7 @@ export class GitBridgeIssueClient implements IssueClient, GitHubPollingIssueClie
   getPrReviewComments(
     repo: string,
     prNumber: number,
-    reviewId: number
+    reviewId?: number
   ): Promise<PrReviewComment[]> {
     return this.delegate.getPrReviewComments(repo, prNumber, reviewId);
   }
