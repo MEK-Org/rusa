@@ -8,6 +8,7 @@ import type { ProviderQuotaSnapshot, QuotaWindowKind } from "../mcp/quota-mcp.js
 
 const SLOT_MS = 5 * 60 * 1000;
 export const QUOTA_RAW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+export const QUOTA_OBSERVATION_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 // The product requirement is a PD controller. These are deliberately fixed
 // implementation constants rather than configuration that no caller uses.
@@ -201,6 +202,11 @@ export class SharedQuotaStore {
       );
       CREATE INDEX IF NOT EXISTS idx_quota_observations_provider_time
         ON quota_observations(provider, observed_at);
+      CREATE INDEX IF NOT EXISTS idx_quota_observations_provider_kind_time
+        ON quota_observations(provider, kind, observed_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_quota_observations_reasoned
+        ON quota_observations(provider, kind, observed_at DESC)
+        WHERE interval_seconds IS NOT NULL;
     `);
   }
 
@@ -210,10 +216,34 @@ export class SharedQuotaStore {
     return this.db.prepare("DELETE FROM quota_scrapes WHERE scraped_at < ?").run(cutoff).changes;
   }
 
+  pruneObservations(nowMs = Date.now()): number {
+    if (!Number.isFinite(nowMs)) throw new Error(`nowMs must be finite, got ${nowMs}`);
+    const cutoff = new Date(nowMs - QUOTA_OBSERVATION_RETENTION_MS).toISOString();
+    return this.db
+      .prepare(
+        `DELETE FROM quota_observations
+         WHERE observed_at < ?
+           AND rowid NOT IN (
+             SELECT o.rowid
+             FROM quota_observations o
+             WHERE o.interval_seconds IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM quota_observations newer
+                 WHERE newer.provider = o.provider AND newer.kind = o.kind
+                   AND newer.interval_seconds IS NOT NULL
+                   AND (newer.observed_at > o.observed_at OR
+                        (newer.observed_at = o.observed_at AND newer.rowid > o.rowid))
+               )
+           )`
+      )
+      .run(cutoff).changes;
+  }
+
   recordRaw(opts: { provider: string; scrapedAt: string; rawOutput: string }): string {
     const id = randomUUID();
     this.db.transaction(() => {
       this.pruneRawScrapes();
+      this.pruneObservations();
       this.db
         .prepare(
           `INSERT INTO quota_scrapes
