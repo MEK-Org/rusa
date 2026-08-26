@@ -14,6 +14,7 @@ import {
   extractCodexBoundModel,
   extractNewestCodexSessionId,
   overrideTomlModel,
+  parseCodexModel,
   stripMcpServersFromToml,
 } from "./codex.js";
 
@@ -125,6 +126,47 @@ describe("CodexProvider", () => {
     );
   });
 
+  describe("parseCodexModel", () => {
+    it("parses plain model slugs without reasoning effort", () => {
+      expect(parseCodexModel("gpt-5.6-sol")).toEqual({
+        model: "gpt-5.6-sol",
+        reasoningEffort: undefined,
+      });
+      expect(parseCodexModel("gpt-5.4-mini")).toEqual({
+        model: "gpt-5.4-mini",
+        reasoningEffort: undefined,
+      });
+    });
+
+    it("parses model slug with whitespace-separated reasoning effort", () => {
+      expect(parseCodexModel("gpt-5.6-sol medium")).toEqual({
+        model: "gpt-5.6-sol",
+        reasoningEffort: "medium",
+      });
+      expect(parseCodexModel("gpt-5.5 high")).toEqual({
+        model: "gpt-5.5",
+        reasoningEffort: "high",
+      });
+    });
+
+    it("parses model slug with parenthesized reasoning effort", () => {
+      expect(parseCodexModel("gpt-5.6-sol (medium)")).toEqual({
+        model: "gpt-5.6-sol",
+        reasoningEffort: "medium",
+      });
+      expect(parseCodexModel("gpt-5.6-sol (reasoning medium, summaries auto)")).toEqual({
+        model: "gpt-5.6-sol",
+        reasoningEffort: "medium",
+      });
+    });
+
+    it("returns empty object for empty or undefined input", () => {
+      expect(parseCodexModel(undefined)).toEqual({});
+      expect(parseCodexModel("")).toEqual({});
+      expect(parseCodexModel("   ")).toEqual({});
+    });
+  });
+
   describe("buildCodexArgs", () => {
     it("builds a fresh exec with --yolo --cd and the model", () => {
       expect(buildCodexArgs({ prompt: "do it", model: "gpt-5-codex", cwd: "/wt" })).toEqual([
@@ -134,6 +176,22 @@ describe("CodexProvider", () => {
         "/wt",
         "--model",
         "gpt-5-codex",
+        "do it",
+      ]);
+    });
+
+    it("strips reasoning effort from --model and passes it via --config override", () => {
+      expect(
+        buildCodexArgs({ prompt: "do it", model: "gpt-5.6-sol medium", cwd: "/wt" })
+      ).toEqual([
+        "exec",
+        "--yolo",
+        "--cd",
+        "/wt",
+        "--model",
+        "gpt-5.6-sol",
+        "--config",
+        'model_reasoning_effort="medium"',
         "do it",
       ]);
     });
@@ -226,6 +284,19 @@ describe("CodexProvider", () => {
         'mcp_servers.inbox.url="http://127.0.0.1:5555/mcp/inbox-token"',
       ]);
     });
+
+    it("separates model and reasoning effort into distinct overrides", () => {
+      expect(
+        buildCodexConfigOverrides(
+          [{ name: "tracker", url: "http://127.0.0.1:5555/mcp/tracker-token" }],
+          "gpt-5.6-sol medium"
+        )
+      ).toEqual([
+        'model="gpt-5.6-sol"',
+        'model_reasoning_effort="medium"',
+        'mcp_servers.tracker.url="http://127.0.0.1:5555/mcp/tracker-token"',
+      ]);
+    });
   });
 
   describe("overrideTomlModel ", () => {
@@ -242,6 +313,14 @@ trust_level = "trusted"
       expect(out).toContain('model = "gpt-5.6-sol"');
       expect(out).not.toContain('"gpt-5.5"');
       expect(out).toContain('model_reasoning_effort = "medium"');
+      expect(out).toContain("trust_level");
+    });
+
+    it("overwrites reasoning effort if supplied in requested model string", () => {
+      const out = overrideTomlModel(base, "gpt-5.6-sol high");
+      expect(out).toContain('model = "gpt-5.6-sol"');
+      expect(out).not.toContain('"gpt-5.5"');
+      expect(out).toContain('model_reasoning_effort = "high"');
       expect(out).toContain("trust_level");
     });
 
