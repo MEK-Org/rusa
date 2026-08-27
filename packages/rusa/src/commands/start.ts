@@ -352,26 +352,13 @@ function configuredRootEventSources(config: RusaConfig, repoName: string | null)
   const orgs = new Set<string>();
 
   if (repoName) {
-    const org = repoName.split("/")[0]?.trim();
+    const org = repoName.split("/")[0];
     if (org) orgs.add(org);
   }
 
-  if (config.github?.org) {
-    const org = config.github.org.trim();
-    if (org) orgs.add(org);
-  }
-
-  if (config.github?.orgs) {
+  if (config.github.orgs) {
     for (const org of config.github.orgs) {
-      const trimmed = org?.trim();
-      if (trimmed) orgs.add(trimmed);
-    }
-  }
-
-  if (config.github?.repos) {
-    for (const repo of config.github.repos) {
-      const org = repo?.split("/")[0]?.trim();
-      if (org) orgs.add(org);
+      orgs.add(org);
     }
   }
 

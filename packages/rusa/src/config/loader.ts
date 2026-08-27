@@ -155,16 +155,6 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     }
     parsed.github.repo = parsed.github.repo.trim();
   }
-  if (parsed.github.org !== undefined) {
-    if (typeof parsed.github.org !== "string" || !parsed.github.org.trim()) {
-      throw new Error("config.yaml: github.org must be a non-empty string when set");
-    }
-    const match = parsed.github.org.trim().match(/^[^/\s]+$/);
-    if (!match) {
-      throw new Error("config.yaml: github.org must be a valid organization name without slashes");
-    }
-    parsed.github.org = parsed.github.org.trim();
-  }
   if (parsed.github.orgs !== undefined) {
     if (
       !Array.isArray(parsed.github.orgs) ||
@@ -177,20 +167,6 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       );
     }
     parsed.github.orgs = parsed.github.orgs.map((org) => org.trim());
-  }
-  if (parsed.github.repos !== undefined) {
-    if (
-      !Array.isArray(parsed.github.repos) ||
-      parsed.github.repos.some(
-        (repo) =>
-          typeof repo !== "string" || !repo.trim() || !/^[^/\s]+\/[^/\s]+$/.test(repo.trim())
-      )
-    ) {
-      throw new Error(
-        'config.yaml: github.repos must be an array of "owner/name" strings when set'
-      );
-    }
-    parsed.github.repos = parsed.github.repos.map((repo) => repo.trim());
   }
   if (!parsed.providers || Object.keys(parsed.providers).length === 0) {
     throw new Error("config.yaml: at least one provider is required");

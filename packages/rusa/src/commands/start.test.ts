@@ -2741,8 +2741,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         github: {
           account: "mock-bot",
           repo: "custom-org/custom-repo",
-          orgs: ["target-org"],
-          repos: ["extra-org/extra-repo"],
+          orgs: ["target-org", "extra-org"],
         },
         providers: {
           antigravity: { cliCommand: "agy" },

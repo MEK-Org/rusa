@@ -55,20 +55,10 @@ export interface GitHubConfig {
    */
   repo?: string;
   /**
-   * Optional additional GitHub repositories in "owner/name" format.
-   * When set, each repository's organization is included in root's implied github_org event source subscriptions.
-   */
-  repos?: string[];
-  /**
    * Optional list of GitHub organizations to subscribe root to for mesh event ingestion.
    * When unset, the org is implied from `github.repo` (or derived repo root).
    */
   orgs?: string[];
-  /**
-   * Optional single GitHub organization to subscribe root to for mesh event ingestion.
-   * Alternative to `orgs` when only one organization is needed.
-   */
-  org?: string;
   /**
    * Path to a read-mostly fine-grained GitHub PAT file (Contents R/W for git
    * push; Issues/PRs/Actions/Checks read-only) that sandboxed mesh workers see
@@ -380,7 +370,7 @@ export interface RusaConfig {
   providers: Record<string, ProviderConfig>;
   /**
    * @deprecated Top-level `targets` is deprecated and will be completely removed in due time.
-   * Configure GitHub repositories and organizations under `github` (`github.org`, `github.orgs`, `github.repos`, or `github.repo`) instead.
+   * Configure GitHub organizations under `github.orgs` (or `github.repo`) instead.
    */
   targets?: Target[];
   /** Branch the root self-update tool deploys from. Defaults to "master". */

@@ -228,28 +228,10 @@ describe("loadConfig github.repo (ISSUE_NUM single-repo identity)", () => {
   });
 });
 
-describe("loadConfig github.org and github.orgs (event source organization derivation)", () => {
+describe("loadConfig github.orgs (event source organization derivation)", () => {
   it("defaults to undefined when omitted", () => {
     const config = loadConfig(writeConfig({ github: { account: "CodeChopsBot" } }));
-    expect(config.github.org).toBeUndefined();
     expect(config.github.orgs).toBeUndefined();
-  });
-
-  it("trims and keeps a valid github.org", () => {
-    const config = loadConfig(
-      writeConfig({ github: { account: "CodeChopsBot", org: "  my-org  " } })
-    );
-    expect(config.github.org).toBe("my-org");
-  });
-
-  it("rejects invalid github.org values", () => {
-    expect(() =>
-      loadConfig(writeConfig({ github: { account: "CodeChopsBot", org: "   " } }))
-    ).toThrow(/github\.org must be a non-empty string when set/);
-
-    expect(() =>
-      loadConfig(writeConfig({ github: { account: "CodeChopsBot", org: "org/with/slashes" } }))
-    ).toThrow(/github\.org must be a valid organization name without slashes/);
   });
 
   it("trims and keeps valid github.orgs array", () => {
@@ -277,45 +259,6 @@ describe("loadConfig github.org and github.orgs (event source organization deriv
         writeConfig({ github: { account: "CodeChopsBot", orgs: ["valid", "invalid/org"] } })
       )
     ).toThrow(/github\.orgs must be an array/);
-  });
-});
-
-describe("loadConfig github.repos (additional repositories configuration)", () => {
-  it("defaults to undefined when omitted", () => {
-    const config = loadConfig(writeConfig({ github: { account: "CodeChopsBot" } }));
-    expect(config.github.repos).toBeUndefined();
-  });
-
-  it("trims and keeps valid github.repos array", () => {
-    const config = loadConfig(
-      writeConfig({
-        github: {
-          account: "CodeChopsBot",
-          repos: ["  owner-1/repo-1  ", "owner-2/repo-2"],
-        },
-      })
-    );
-    expect(config.github.repos).toEqual(["owner-1/repo-1", "owner-2/repo-2"]);
-  });
-
-  it("rejects invalid github.repos values", () => {
-    expect(() =>
-      loadConfig(
-        writeConfig({
-          github: { account: "CodeChopsBot", repos: "not-an-array" as unknown as string[] },
-        })
-      )
-    ).toThrow(/github\.repos must be an array of "owner\/name" strings/);
-
-    expect(() =>
-      loadConfig(
-        writeConfig({ github: { account: "CodeChopsBot", repos: ["owner/repo", "invalid-repo"] } })
-      )
-    ).toThrow(/github\.repos must be an array of "owner\/name" strings/);
-
-    expect(() =>
-      loadConfig(writeConfig({ github: { account: "CodeChopsBot", repos: ["owner/repo", ""] } }))
-    ).toThrow(/github\.repos must be an array of "owner\/name" strings/);
   });
 });
 
