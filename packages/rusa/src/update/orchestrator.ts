@@ -131,6 +131,31 @@ function updateStatusText(sha: string, subject: string): string {
   return `🔄 Updating → ${shortSha(sha)} (${subject}) — draining + restarting`;
 }
 
+export interface FormatFailureParams {
+  failedStep: string;
+  timedOut: boolean;
+  error: string;
+  movedToNew: boolean;
+  rollbackFailed: boolean;
+  oldSha?: string;
+  newSha?: string;
+}
+
+export function formatFailureOutcome(params: FormatFailureParams): string {
+  const { failedStep, timedOut, error, movedToNew, rollbackFailed, oldSha, newSha } = params;
+  let locationSummary: string;
+  if (movedToNew) {
+    if (rollbackFailed) {
+      locationSummary = `rollback FAILED, checkout not restored (at ${newSha ? shortSha(newSha) : "unknown"}), staying on UNSAFE`;
+    } else {
+      locationSummary = `rolled back, staying on ${oldSha ? shortSha(oldSha) : "unknown"}`;
+    }
+  } else {
+    locationSummary = `no rollback needed, staying on ${oldSha ? shortSha(oldSha) : "unknown"}`;
+  }
+  return `update failed at ${failedStep}${timedOut ? " (timeout)" : ""}: ${error} [${locationSummary}]`;
+}
+
 let isUpdating = false;
 
 /**
@@ -140,11 +165,21 @@ let isUpdating = false;
  */
 export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise<UpdateResult> {
   if (isUpdating) {
+    const head = await deps.git.headSha();
+    const refusalMsg = `update refused: already in progress (current SHA: ${shortSha(head)})`;
+    try {
+      deps.recordAction?.(refusalMsg);
+    } catch (recErr) {
+      const log = deps.log ?? (() => {});
+      log(
+        `[update] recordAction failed: ${recErr instanceof Error ? recErr.message : String(recErr)}`
+      );
+    }
     return {
       ok: false,
       failedStep: "pull",
       error: "Refused: update already in progress.",
-      oldSha: await deps.git.headSha(),
+      oldSha: head,
       restarting: false,
     };
   }
@@ -152,6 +187,7 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
   const log = deps.log ?? (() => {});
   let step: UpdateStep = "pull";
   let oldSha = "";
+  let newSha = "";
   let movedToNew = false;
   let rollbackFailed = false;
 
@@ -161,10 +197,18 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
     oldSha = await deps.git.headSha();
     log(`[update] current sha ${shortSha(oldSha)} — fetching origin ${plan.branch}`);
     await deps.git.fetch(plan.branch);
-    const newSha = await deps.git.remoteSha(plan.branch);
+    newSha = await deps.git.remoteSha(plan.branch);
     const alreadyCurrent = newSha === oldSha;
     if (alreadyCurrent) {
       log(`[update] already at origin/${plan.branch} @ ${shortSha(newSha)}`);
+      const refusalMsg = `update refused: already deployed (origin/${plan.branch} tip ${shortSha(newSha)} matches deployed SHA ${shortSha(oldSha)})`;
+      try {
+        deps.recordAction?.(refusalMsg);
+      } catch (recErr) {
+        log(
+          `[update] recordAction failed: ${recErr instanceof Error ? recErr.message : String(recErr)}`
+        );
+      }
       return {
         ok: false,
         failedStep: "pull",
@@ -175,7 +219,13 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
       };
     } else {
       const recordMsg = `update authorized/attempted by root (trigger: MCP tool, target SHA: ${newSha})`;
-      deps.recordAction?.(recordMsg);
+      try {
+        deps.recordAction?.(recordMsg);
+      } catch (recErr) {
+        log(
+          `[update] recordAction failed: ${recErr instanceof Error ? recErr.message : String(recErr)}`
+        );
+      }
       log(`[update] resetting checkout to ${shortSha(newSha)}`);
       await deps.git.resetHard(newSha);
       movedToNew = true;
@@ -276,21 +326,23 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
         }
       }
     }
-    const rollbackSummary = movedToNew
-      ? rollbackFailed
-        ? "rollback FAILED"
-        : "rolled back"
-      : "no rollback needed";
+    const failureSummary = formatFailureOutcome({
+      failedStep,
+      timedOut,
+      error,
+      movedToNew,
+      rollbackFailed,
+      oldSha,
+      newSha,
+    });
     try {
-      deps.recordAction?.(
-        `update failed at ${failedStep}${timedOut ? " (timeout)" : ""}: ${error} [${rollbackSummary}, staying on ${oldSha ? shortSha(oldSha) : "unknown"}]`
-      );
+      deps.recordAction?.(failureSummary);
     } catch (recErr) {
       log(
         `[update] recordAction failed: ${recErr instanceof Error ? recErr.message : String(recErr)}`
       );
     }
-    const msg = `❌ update failed at ${failedStep}${timedOut ? " (timed out)" : ""}: ${error} — staying on ${shortSha(oldSha)}`;
+    const msg = `❌ ${failureSummary}`;
     if (deps.notify) {
       try {
         await deps.notify.notify(msg);

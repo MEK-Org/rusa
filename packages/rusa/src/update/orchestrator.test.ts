@@ -159,7 +159,7 @@ describe("executeUpdate — happy path (green build → drain → exit)", () => 
   });
 
   it("REFUSES (fail-loud no-op) if already at origin tip, leaving mesh completely untouched ", async () => {
-    const { deps, git, build, drain, exits } = makeDeps();
+    const { deps, git, build, drain, exits, actions } = makeDeps();
     git.remote = git.head; // tip matches deployed
     const order: string[] = [];
     git.resetHard = async () => void order.push("reset");
@@ -174,24 +174,24 @@ describe("executeUpdate — happy path (green build → drain → exit)", () => 
     expect(order).toEqual([]); // no reset, no submodules, NO BUILD
     expect(drain.engaged).toBe(false);
     expect(exits).toEqual([]);
+    expect(actions).toEqual([
+      "update refused: already deployed (origin/master tip 0000000 matches deployed SHA 0000000)",
+    ]);
   });
 
-  it("aborts safely if the audit write (recordAction) throws, leaving git un-reset ", async () => {
-    const { deps, git, drain, exits } = makeDeps();
+  it("proceeds with update even if recordAction on attempt throws", async () => {
+    const { deps, exits } = makeDeps();
     deps.recordAction = () => {
       throw new Error("ENOSPC / unwritable audit log");
     };
     const res = await executeUpdate(plan(), deps);
-    expect(res.ok).toBe(false);
-    expect(res.failedStep).toBe("pull");
-    expect(res.error).toContain("ENOSPC / unwritable audit log");
-    expect(git.resets).toEqual([]); // Did NOT reset to new SHA
-    expect(drain.engaged).toBe(false);
-    expect(exits).toEqual([]);
+    expect(res.ok).toBe(true);
+    expect(res.restarting).toBe(true);
+    expect(exits).toEqual([0]);
   });
 
   it("REFUSES concurrent calls via concurrency guard ", async () => {
-    const { deps, git } = makeDeps();
+    const { deps, git, actions } = makeDeps();
     let releaseFetch: () => void = () => {};
     git.fetch = () =>
       new Promise((resolve) => {
@@ -202,6 +202,7 @@ describe("executeUpdate — happy path (green build → drain → exit)", () => 
     const res2 = await executeUpdate(plan(), deps);
     expect(res2.ok).toBe(false);
     expect(res2.error?.includes("update already in progress")).toBe(true);
+    expect(actions).toEqual(["update refused: already in progress (current SHA: 0000000)"]);
 
     releaseFetch?.();
     await p1;
@@ -221,11 +222,16 @@ describe("executeUpdate — happy path (green build → drain → exit)", () => 
   });
 
   it("still exits even if the drain times out (don't wedge on a stuck actor)", async () => {
-    const { deps, drain, exits } = makeDeps();
+    const { deps, drain, exits, actions } = makeDeps();
     drain.quiesced = false; // bounded wait expired
+    drain.waitedMs = 1234;
     const res = await executeUpdate(plan(), deps);
     expect(res.restarting).toBe(true);
     expect(exits).toEqual([0]);
+    expect(actions).toEqual([
+      "update authorized/attempted by root (trigger: MCP tool, target SHA: 1111111111111111111111111111111111111111)",
+      "update committed: 0000000 → 1111111 (feat: new thing) [drain: timeout after 1234ms] — restarting",
+    ]);
   });
 });
 
@@ -249,8 +255,10 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
       "update authorized/attempted by root (trigger: MCP tool, target SHA: 1111111111111111111111111111111111111111)",
       "update failed at build: tsc: type error [rolled back, staying on 0000000]",
     ]);
-    expect(notify.messages.some((m) => m.includes("❌ update failed at build"))).toBe(true);
-    expect(notify.messages.some((m) => m.includes("staying on 0000000"))).toBe(true);
+    expect(notify.messages).toEqual([
+      "🚀 update authorized/attempted by root (trigger: MCP tool, target SHA: 1111111111111111111111111111111111111111)",
+      "❌ update failed at build: tsc: type error [rolled back, staying on 0000000]",
+    ]);
   });
 
   it("a FAILED rollback fires the LOUD chat-independent alert (last silent-failure path)", async () => {
@@ -273,16 +281,24 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     expect(git.resets).toEqual([NEW, OLD]); // tried to roll back; it threw
     expect(actions).toEqual([
       "update authorized/attempted by root (trigger: MCP tool, target SHA: 1111111111111111111111111111111111111111)",
-      "update failed at build: tsc broke [rollback FAILED, staying on 0000000]",
+      "update failed at build: tsc broke [rollback FAILED, checkout not restored (at 1111111), staying on UNSAFE]",
     ]);
+    expect(actions[1]).not.toContain("staying on 0000000");
     // LOUD: journal ERROR (console.error) + durable marker + best-effort chat — all fired.
     expect(errs.some((e) => e.includes("rollback FAILED"))).toBe(true);
     expect(markers.some((m) => m.includes("restart-fragile"))).toBe(true);
     expect(notify.messages.some((m) => m.includes("rollback FAILED"))).toBe(true);
+    expect(
+      notify.messages.some((m) =>
+        m.includes(
+          "❌ update failed at build: tsc broke [rollback FAILED, checkout not restored (at 1111111), staying on UNSAFE]"
+        )
+      )
+    ).toBe(true);
   });
 
   it("a HUNG build (timeout) aborts the same way, flagged timedOut (elder #2)", async () => {
-    const { deps, drain, exits, actions } = makeDeps();
+    const { deps, drain, exits, actions, notify } = makeDeps();
     deps.build = {
       async build() {
         throw new StepError("install", "install timed out after 600000ms", true);
@@ -298,10 +314,14 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
       "update authorized/attempted by root (trigger: MCP tool, target SHA: 1111111111111111111111111111111111111111)",
       "update failed at install (timeout): install timed out after 600000ms [rolled back, staying on 0000000]",
     ]);
+    expect(notify.messages).toEqual([
+      "🚀 update authorized/attempted by root (trigger: MCP tool, target SHA: 1111111111111111111111111111111111111111)",
+      "❌ update failed at install (timeout): install timed out after 600000ms [rolled back, staying on 0000000]",
+    ]);
   });
 
   it("a pull failure aborts before build, drain and exit (no rollback — never moved)", async () => {
-    const { deps, git, drain, build, exits, actions } = makeDeps();
+    const { deps, git, drain, build, exits, actions, notify } = makeDeps();
     git.failFetch = new Error("network down");
     const res = await executeUpdate(plan(), deps);
     expect(res.ok).toBe(false);
@@ -312,6 +332,9 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     expect(git.resets).toEqual([]); // pull failed before we moved
     expect(actions).toEqual([
       "update failed at pull: network down [no rollback needed, staying on 0000000]",
+    ]);
+    expect(notify.messages).toEqual([
+      "❌ update failed at pull: network down [no rollback needed, staying on 0000000]",
     ]);
   });
 
