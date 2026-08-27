@@ -3011,13 +3011,29 @@ describe("runStart webhook event routing (Phase 4)", () => {
       opts: { mcpServers: Array<{ name: string; url: string }> };
     };
     expect(actor).toBeDefined();
-    const serverNames = actor.opts.mcpServers.map((s) => s.name);
-    expect(serverNames).toContain("chat-read");
+    const chatReadSpecs = actor.opts.mcpServers.filter((s) => s.name === "chat-read");
+    expect(chatReadSpecs).toHaveLength(1);
+    const initialChatReadUrl = chatReadSpecs[0].url;
 
-    // Grant a write capability and verify chat-read is retained alongside the new grant
+    // Grant a write capability and verify chat-read is retained without duplication
     mesh.grantCapability(workerId, "chat-write:spaces/AAAA", "root");
-    const updatedServerNames = actor.opts.mcpServers.map((s: { name: string }) => s.name);
-    expect(updatedServerNames).toContain("chat-read");
+    const updatedChatReadSpecs = actor.opts.mcpServers.filter((s) => s.name === "chat-read");
+    expect(updatedChatReadSpecs).toHaveLength(1);
+    expect(updatedChatReadSpecs[0].url).toBe(initialChatReadUrl);
+
+    const updatedServerNames = actor.opts.mcpServers.map((s) => s.name);
     expect(updatedServerNames).toContain("chat-write");
+
+    // Scoped chat-read is no longer a grantable capability (all actors have implicit unscoped read)
+    const liveMesh = mesh;
+    expect(() => liveMesh.grantCapability(workerId, "chat-read:spaces/BBBB", "root")).toThrow(
+      "not a grantable capability: chat-read:spaces/BBBB"
+    );
+
+    // Revoking write capability preserves the default chat-read server intact
+    mesh.revokeCapability(workerId, "chat-write:spaces/AAAA", "root");
+    const afterRevokeSpecs = actor.opts.mcpServers.filter((s) => s.name === "chat-read");
+    expect(afterRevokeSpecs).toHaveLength(1);
+    expect(afterRevokeSpecs[0].url).toBe(initialChatReadUrl);
   });
 });

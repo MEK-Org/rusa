@@ -1270,9 +1270,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     );
     for (let index = workerMcp.length - 1; index >= 0; index -= 1) {
       const spec = workerMcp[index];
-      if (spec && spec.name !== CHAT_READ_MCP_NAME && grantableServers.has(spec.name)) {
-        workerMcp.splice(index, 1);
-      }
+      if (spec && grantableServers.has(spec.name)) workerMcp.splice(index, 1);
     }
     workerMcp.push(...mounted);
   };
