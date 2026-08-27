@@ -189,21 +189,62 @@ describe("loadConfig GitHub ingestion mode", () => {
   });
 });
 
-describe("loadConfig github.repo (ISSUE_NUM single-repo identity)", () => {
-  const withRepo = (repo: string) =>
-    writeConfig({ github: { account: "CodeChopsBot", pollIntervalSeconds: 300, repo } });
+describe("loadConfig github.repo (obsolete field rejection)", () => {
+  it("rejects github.repo with clear migration instruction", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          github: { account: "CodeChopsBot", repo: "dummy-org/dummy-repo" },
+        })
+      )
+    ).toThrow(/github\.repo is no longer supported; use github\.repos: \["owner\/name"\] instead/);
+  });
+});
 
-  it("defaults to undefined when omitted (identity falls back to git-remote derivation)", () => {
+describe("loadConfig github.repos (multi-repo identity and subscriptions)", () => {
+  it("defaults to undefined when omitted", () => {
     const config = loadConfig(
       writeConfig({ github: { account: "CodeChopsBot", pollIntervalSeconds: 300 } })
     );
-    expect(config.github.repo).toBeUndefined();
+    expect(config.github.repos).toBeUndefined();
   });
 
-  it("trims and keeps a well-formed owner/name", () => {
-    expect(loadConfig(withRepo("  dummy-org/dummy-repo  ")).github.repo).toBe(
-      "dummy-org/dummy-repo"
+  it("trims and keeps a well-formed owner/name list", () => {
+    const config = loadConfig(
+      writeConfig({
+        github: {
+          account: "CodeChopsBot",
+          repos: ["  dummy-org/dummy-repo  ", "other-org/other-repo"],
+        },
+      })
     );
+    expect(config.github.repos).toEqual(["dummy-org/dummy-repo", "other-org/other-repo"]);
+  });
+
+  it("loads successfully with bare repos and no orgs", () => {
+    const config = loadConfig(
+      writeConfig({
+        github: {
+          account: "CodeChopsBot",
+          repos: ["MEK-Org/meta-coder"],
+        },
+      })
+    );
+    expect(config.github.repos).toEqual(["MEK-Org/meta-coder"]);
+    expect(config.github.orgs).toBeUndefined();
+  });
+
+  it("rejects non-array repos value", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          github: {
+            account: "CodeChopsBot",
+            repos: "MEK-Org/meta-coder" as unknown as string[],
+          },
+        })
+      )
+    ).toThrow(/github\.repos must be an array of repository names in owner\/name format/);
   });
 
   it.each([
@@ -211,20 +252,18 @@ describe("loadConfig github.repo (ISSUE_NUM single-repo identity)", () => {
     ["too many segments", "dummy-org/dummy-repo/extra"],
     ["whitespace in the owner", "MEK Org/rusa"],
     ["whitespace in the name", "dummy-org/meta coder"],
-  ])("rejects %s", (_label, repo) => {
-    // The whitespace cases are the reason this validator must stay in lockstep
-    // with the quickstart prompt's: a hand-edited config never passes through
-    // that prompt, so the loader is the only gate on this path. A slug like
-    // "MEK Org/rusa" is not null and not a wrong-but-valid repo — it
-    // reaches the poller and tracker hygiene and fails as malformed API paths,
-    // far from the config that caused it.
-    expect(() => loadConfig(withRepo(repo))).toThrow(/github\.repo must be in owner\/name format/);
-  });
-
-  it("rejects a blank repo before the format check", () => {
-    expect(() => loadConfig(withRepo("   "))).toThrow(
-      /github\.repo must be a non-empty string when set/
-    );
+    ["blank string", "   "],
+  ])("rejects invalid repo %s", (_label, repo) => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          github: {
+            account: "CodeChopsBot",
+            repos: [repo],
+          },
+        })
+      )
+    ).toThrow(/github\.repos must be an array of repository names in owner\/name format/);
   });
 });
 
@@ -234,11 +273,60 @@ describe("loadConfig github.orgs (event source organization derivation)", () => 
     expect(config.github.orgs).toBeUndefined();
   });
 
-  it("trims and keeps valid github.orgs array", () => {
+  it("trims and keeps valid string array", () => {
     const config = loadConfig(
       writeConfig({ github: { account: "CodeChopsBot", orgs: ["  org-1  ", "org-2"] } })
     );
     expect(config.github.orgs).toEqual(["org-1", "org-2"]);
+  });
+
+  it("parses and normalizes object entries with org and excludedRepos", () => {
+    const config = loadConfig(
+      writeConfig({
+        github: {
+          account: "CodeChopsBot",
+          orgs: [
+            "plain-org",
+            { org: "  MEK-Org  ", excludedRepos: ["  MEK-Org/meta-coder-test-bed  "] },
+            { name: "Named-Org" },
+            { "Mapped-Org": { excludedRepos: ["Mapped-Org/secret"] } },
+          ],
+        },
+      })
+    );
+    expect(config.github.orgs).toEqual([
+      "plain-org",
+      { org: "MEK-Org", excludedRepos: ["MEK-Org/meta-coder-test-bed"] },
+      { org: "Named-Org" },
+      { org: "Mapped-Org", excludedRepos: ["Mapped-Org/secret"] },
+    ]);
+  });
+
+  it("loads successfully with bare orgs and no repos", () => {
+    const config = loadConfig(
+      writeConfig({
+        github: {
+          account: "CodeChopsBot",
+          orgs: ["MEK-Org"],
+        },
+      })
+    );
+    expect(config.github.orgs).toEqual(["MEK-Org"]);
+    expect(config.github.repos).toBeUndefined();
+  });
+
+  it("loads successfully with both repos and orgs configured", () => {
+    const config = loadConfig(
+      writeConfig({
+        github: {
+          account: "CodeChopsBot",
+          repos: ["special-org/special-repo"],
+          orgs: [{ org: "MEK-Org", excludedRepos: ["MEK-Org/test-bed"] }],
+        },
+      })
+    );
+    expect(config.github.repos).toEqual(["special-org/special-repo"]);
+    expect(config.github.orgs).toEqual([{ org: "MEK-Org", excludedRepos: ["MEK-Org/test-bed"] }]);
   });
 
   it("rejects invalid github.orgs values", () => {
@@ -252,13 +340,26 @@ describe("loadConfig github.orgs (event source organization derivation)", () => 
 
     expect(() =>
       loadConfig(writeConfig({ github: { account: "CodeChopsBot", orgs: ["valid", ""] } }))
-    ).toThrow(/github\.orgs must be an array/);
+    ).toThrow(/github\.orgs entries must be valid organization names/);
 
     expect(() =>
       loadConfig(
         writeConfig({ github: { account: "CodeChopsBot", orgs: ["valid", "invalid/org"] } })
       )
-    ).toThrow(/github\.orgs must be an array/);
+    ).toThrow(/github\.orgs entries must be valid organization names/);
+
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          github: {
+            account: "CodeChopsBot",
+            orgs: [{ org: "valid-org", excludedRepos: ["invalid-repo-without-slash"] }],
+          },
+        })
+      )
+    ).toThrow(
+      /github\.orgs excludedRepos must be an array of repository names in owner\/name format/
+    );
   });
 });
 

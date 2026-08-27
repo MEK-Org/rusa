@@ -37,6 +37,20 @@ export interface ProviderConfig {
   dailyCap?: string;
 }
 
+export interface GitHubOrgConfig {
+  /** The GitHub organization name */
+  org?: string;
+  /** Alternative field name for organization */
+  name?: string;
+  /**
+   * Optional list of repository full names ("owner/name") to exclude from this organization's
+   * events/subscriptions.
+   */
+  excludedRepos?: string[];
+}
+
+export type GitHubOrgEntry = string | GitHubOrgConfig;
+
 export interface GitHubConfig {
   account?: string;
   /**
@@ -48,17 +62,19 @@ export interface GitHubConfig {
   /** GitHub event ingestion edge. Defaults to "webhook" for existing installs. */
   ingestionMode?: "webhook" | "poll";
   /**
-   * Optional explicit repository identity in "owner/name" format.
-   * If set, this repository identity is used directly for GitHub polling and
-   * tracker hygiene. Otherwise, the repository identity is derived from the git remote
-   * of the repository root.
+   * Optional list of GitHub repositories in "owner/name" format.
+   * Root actor's implied github_org event source subscriptions include each repository's organization.
+   * When git remote cannot be determined from the repository root, the first entry in `repos`
+   * is used as the primary repository identity for GitHub polling and tracker hygiene.
+   * Repositories listed here are additive with `orgs` and the git-remote derived repo identity.
    */
-  repo?: string;
+  repos?: string[];
   /**
    * Optional list of GitHub organizations to subscribe root to for mesh event ingestion.
-   * When unset, the org is implied from `github.repo` (or derived repo root).
+   * Entries may be organization name strings or objects specifying `org` (or `name`) and optional `excludedRepos`.
+   * Organization subscriptions are additive with `repos` and the repository identity derived from the git remote.
    */
-  orgs?: string[];
+  orgs?: GitHubOrgEntry[];
   /**
    * Path to a read-mostly fine-grained GitHub PAT file (Contents R/W for git
    * push; Issues/PRs/Actions/Checks read-only) that sandboxed mesh workers see
@@ -369,8 +385,9 @@ export interface RusaConfig {
   github: GitHubConfig;
   providers: Record<string, ProviderConfig>;
   /**
-   * @deprecated Top-level `targets` is deprecated and will be completely removed in due time.
-   * Configure GitHub organizations under `github.orgs` (or `github.repo`) instead.
+   * @deprecated Top-level `targets` is deprecated and slated for complete removal in due time.
+   * For GitHub event subscriptions, configure `github.orgs` or `github.repos` instead.
+   * Remaining local-worktree and git-bridge consumers under `targets` do not yet have a replacement.
    */
   targets?: Target[];
   /** Branch the root self-update tool deploys from. Defaults to "master". */

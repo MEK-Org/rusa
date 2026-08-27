@@ -10,7 +10,12 @@ import {
   SECRETS_DIRNAME,
   WEBHOOK_SECRET_FILENAME,
 } from "./secrets.js";
-import { DEFAULT_DEPLOY_BRANCH, type QuotaThrottleConfig, type RusaConfig } from "./types.js";
+import {
+  DEFAULT_DEPLOY_BRANCH,
+  type GitHubOrgEntry,
+  type QuotaThrottleConfig,
+  type RusaConfig,
+} from "./types.js";
 
 export { resolveHome } from "./secrets.js";
 
@@ -140,33 +145,99 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     }
     parsed.github.workerTokenPath = parsed.github.workerTokenPath.trim();
   }
-  if (parsed.github.repo !== undefined) {
-    if (typeof parsed.github.repo !== "string" || !parsed.github.repo.trim()) {
-      throw new Error("config.yaml: github.repo must be a non-empty string when set");
-    }
-    // Reject INTERNAL whitespace too, not just the outer trim: `owner name/repo`
-    // is not a GitHub slug. This must stay identical to the quickstart prompt's
-    // validator (`quickstart.ts`) — one value with two validators means the
-    // LOOSER one governs, and this is the looser one, because it guards the
-    // hand-edited config path that never goes through the prompt at all.
-    const match = parsed.github.repo.trim().match(/^[^/\s]+\/[^/\s]+$/);
-    if (!match) {
-      throw new Error("config.yaml: github.repo must be in owner/name format");
-    }
-    parsed.github.repo = parsed.github.repo.trim();
+  if ("repo" in (parsed.github as Record<string, unknown>)) {
+    throw new Error(
+      'config.yaml: github.repo is no longer supported; use github.repos: ["owner/name"] instead'
+    );
   }
-  if (parsed.github.orgs !== undefined) {
+  if (parsed.github.repos !== undefined) {
     if (
-      !Array.isArray(parsed.github.orgs) ||
-      parsed.github.orgs.some(
-        (org) => typeof org !== "string" || !org.trim() || !/^[^/\s]+$/.test(org.trim())
+      !Array.isArray(parsed.github.repos) ||
+      parsed.github.repos.some(
+        (repo) =>
+          typeof repo !== "string" || !repo.trim() || !/^[^/\s]+\/[^/\s]+$/.test(repo.trim())
       )
     ) {
       throw new Error(
-        "config.yaml: github.orgs must be an array of non-empty organization names without slashes when set"
+        "config.yaml: github.repos must be an array of repository names in owner/name format when set"
       );
     }
-    parsed.github.orgs = parsed.github.orgs.map((org) => org.trim());
+    parsed.github.repos = parsed.github.repos.map((repo) => repo.trim());
+  }
+  if (parsed.github.orgs !== undefined) {
+    if (!Array.isArray(parsed.github.orgs)) {
+      throw new Error(
+        "config.yaml: github.orgs must be an array of organization names or org objects when set"
+      );
+    }
+    const validatedOrgs: GitHubOrgEntry[] = [];
+    for (const item of parsed.github.orgs) {
+      if (typeof item === "string") {
+        const trimmed = item.trim();
+        if (!trimmed || !/^[^/\s]+$/.test(trimmed)) {
+          throw new Error(
+            "config.yaml: github.orgs entries must be valid organization names without slashes or org objects"
+          );
+        }
+        validatedOrgs.push(trimmed);
+      } else if (typeof item === "object" && item !== null && !Array.isArray(item)) {
+        const record = item as Record<string, unknown>;
+        let orgName: string | undefined;
+        let excludedReposRaw: unknown;
+
+        if (typeof record.org === "string") {
+          orgName = record.org;
+          excludedReposRaw = record.excludedRepos;
+        } else if (typeof record.name === "string") {
+          orgName = record.name;
+          excludedReposRaw = record.excludedRepos;
+        } else {
+          const keys = Object.keys(record);
+          if (keys.length === 1 && typeof record[keys[0]] === "object") {
+            orgName = keys[0];
+            const sub = record[keys[0]] as Record<string, unknown> | null;
+            excludedReposRaw = sub?.excludedRepos;
+          }
+        }
+
+        if (
+          !orgName ||
+          typeof orgName !== "string" ||
+          !orgName.trim() ||
+          !/^[^/\s]+$/.test(orgName.trim())
+        ) {
+          throw new Error(
+            "config.yaml: github.orgs org object must specify a valid organization name without slashes"
+          );
+        }
+
+        let excludedRepos: string[] | undefined;
+        if (excludedReposRaw !== undefined) {
+          if (
+            !Array.isArray(excludedReposRaw) ||
+            excludedReposRaw.some(
+              (repo) =>
+                typeof repo !== "string" || !repo.trim() || !/^[^/\s]+\/[^/\s]+$/.test(repo.trim())
+            )
+          ) {
+            throw new Error(
+              "config.yaml: github.orgs excludedRepos must be an array of repository names in owner/name format when set"
+            );
+          }
+          excludedRepos = excludedReposRaw.map((repo) => (repo as string).trim());
+        }
+
+        validatedOrgs.push({
+          org: orgName.trim(),
+          ...(excludedRepos ? { excludedRepos } : {}),
+        });
+      } else {
+        throw new Error(
+          "config.yaml: github.orgs entries must be valid organization names without slashes or org objects"
+        );
+      }
+    }
+    parsed.github.orgs = validatedOrgs;
   }
   if (!parsed.providers || Object.keys(parsed.providers).length === 0) {
     throw new Error("config.yaml: at least one provider is required");
