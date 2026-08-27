@@ -365,7 +365,7 @@ function configuredRootEventSources(config: RusaConfig, repoName: string | null)
 
   if (config.github.orgs) {
     for (const entry of config.github.orgs) {
-      const org = typeof entry === "string" ? entry : (entry.org ?? entry.name);
+      const org = typeof entry === "string" ? entry : entry.org;
       if (org) orgs.add(org);
     }
   }
@@ -644,17 +644,18 @@ export async function compactPortableContext(input: {
 }
 
 function getServiceRepoName(config: RusaConfig, repoRoot: string | null): string | null {
+  if (repoRoot) {
+    const remoteUrl = getRemoteUrl(repoRoot);
+    if (remoteUrl) {
+      const cleanUrl = remoteUrl.trim().replace(/\.git$/, "");
+      const match = cleanUrl.match(/github\.com[:/]([^/]+)\/([^/]+)$/);
+      if (match) {
+        return `${match[1]}/${match[2]}`;
+      }
+    }
+  }
   if (config.github.repos && config.github.repos.length > 0) {
     return config.github.repos[0];
-  }
-  if (!repoRoot) return null;
-  const remoteUrl = getRemoteUrl(repoRoot);
-  if (remoteUrl) {
-    const cleanUrl = remoteUrl.trim().replace(/\.git$/, "");
-    const match = cleanUrl.match(/github\.com[:/]([^/]+)\/([^/]+)$/);
-    if (match) {
-      return `${match[1]}/${match[2]}`;
-    }
   }
   return null;
 }

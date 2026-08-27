@@ -39,9 +39,7 @@ export interface ProviderConfig {
 
 export interface GitHubOrgConfig {
   /** The GitHub organization name */
-  org?: string;
-  /** Alternative field name for organization */
-  name?: string;
+  org: string;
   /**
    * Optional list of repository full names ("owner/name") to exclude from this organization's
    * events/subscriptions.
@@ -71,7 +69,7 @@ export interface GitHubConfig {
   repos?: string[];
   /**
    * Optional list of GitHub organizations to subscribe root to for mesh event ingestion.
-   * Entries may be organization name strings or objects specifying `org` (or `name`) and optional `excludedRepos`.
+   * Entries may be organization name strings or objects specifying `org` and optional `excludedRepos`.
    * Organization subscriptions are additive with `repos` and the repository identity derived from the git remote.
    */
   orgs?: GitHubOrgEntry[];
