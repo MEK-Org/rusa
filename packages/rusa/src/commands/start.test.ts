@@ -428,6 +428,101 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
   });
 
+  it("warns at boot when the self-update tool mounts without errorChat configured", async () => {
+    const warns: string[] = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation((...args) => {
+      warns.push(args.join(" "));
+    });
+
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    await readyPromise;
+    warnSpy.mockRestore();
+
+    expect(warns).toContain("[update] no errorChat configured — lifecycle pings disabled");
+  });
+
+  it("warns at boot when the self-update tool mounts with errorChat configured but no chat client", async () => {
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity" },
+        geminiApiKey: "fake-gemini-key",
+        chat: { errorChat: "spaces/operator-dm" },
+      }),
+      "utf8"
+    );
+
+    const warns: string[] = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation((...args) => {
+      warns.push(args.join(" "));
+    });
+
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    await readyPromise;
+    warnSpy.mockRestore();
+
+    expect(warns).toContain("[update] chat client unavailable — lifecycle pings disabled");
+    expect(warns).not.toContain("[update] no errorChat configured — lifecycle pings disabled");
+  });
+
+  it("does not warn at boot when self-update tool mounts with both errorChat and chat client present", async () => {
+    const chatClient = new FakeChatClient();
+    const chatSource = new FakeChatSource();
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity" },
+        geminiApiKey: "fake-gemini-key",
+        chat: { errorChat: "spaces/operator-dm" },
+      }),
+      "utf8"
+    );
+
+    const warns: string[] = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation((...args) => {
+      warns.push(args.join(" "));
+    });
+
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          chatClient,
+          chatSource,
+          onReady: (handles) => {
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    await readyPromise;
+    warnSpy.mockRestore();
+
+    expect(warns.some((w) => w.startsWith("[update]"))).toBe(false);
+  });
+
   it("adds a live capability grant to the cached provider config for the next run", async () => {
     writeFileSync(
       join(homeDir, "threads.json"),

@@ -873,7 +873,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   };
   let chatClient: ChatClient | null = opts?.e2e?.chatClient ?? null;
   let gchat: GchatClient | null = null;
-  if (!chatClient && config.chat) {
+  if (!chatClient && config.chat && !opts?.e2e) {
     gchat = new GchatClient(config.chat.gchatConfigDir);
     chatClient = gchat;
   }
@@ -1990,6 +1990,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     const packageDir = join(repoRoot, "packages", "rusa");
     const errorChatSpace = config.chat?.errorChat;
     const deployBranch = config.deployBranch ?? DEFAULT_DEPLOY_BRANCH;
+    if (!errorChatSpace) {
+      console.warn("[update] no errorChat configured — lifecycle pings disabled");
+    } else if (!chatClient) {
+      console.warn("[update] chat client unavailable — lifecycle pings disabled");
+    }
     const updateToolDeps: UpdateToolDeps = {
       plan: { branch: deployBranch, drainTimeoutMs: UPDATE_DRAIN_TIMEOUT_MS },
       rootId: rootId,

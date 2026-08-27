@@ -43,8 +43,7 @@ export interface GitSeam {
   resetHard(ref: string): Promise<void>;
   /**
    * Materialize git submodules to the checked-out commit (`git submodule update
-   * --init --recursive`). Runs before EVERY build (the build is unconditional — we
-   * rebuild + restart even when already at the target sha): `resetHard` moves a
+   * --init --recursive`). Runs before EVERY build: `resetHard` moves a
    * submodule's gitlink but not its working tree, and an already-current box may
    * never have inited the submodule, yet `flutter build web` needs the path-deps
    * (repo-root third_party/glass_goals_devkit) on disk either way. Idempotent +
@@ -132,6 +131,31 @@ function updateStatusText(sha: string, subject: string): string {
   return `🔄 Updating → ${shortSha(sha)} (${subject}) — draining + restarting`;
 }
 
+export interface FormatFailureParams {
+  failedStep: string;
+  timedOut: boolean;
+  error: string;
+  movedToNew: boolean;
+  rollbackFailed: boolean;
+  oldSha?: string;
+  newSha?: string;
+}
+
+export function formatFailureOutcome(params: FormatFailureParams): string {
+  const { failedStep, timedOut, error, movedToNew, rollbackFailed, oldSha, newSha } = params;
+  let locationSummary: string;
+  if (movedToNew) {
+    if (rollbackFailed) {
+      locationSummary = `rollback FAILED, checkout state UNKNOWN/UNSAFE (update target ${newSha ? shortSha(newSha) : "unknown"}; attempted rollback to ${oldSha ? shortSha(oldSha) : "unknown"})`;
+    } else {
+      locationSummary = `rolled back, staying on ${oldSha ? shortSha(oldSha) : "unknown"}`;
+    }
+  } else {
+    locationSummary = `no rollback needed, staying on ${oldSha ? shortSha(oldSha) : "unknown"}`;
+  }
+  return `update failed at ${failedStep}${timedOut ? " (timeout)" : ""}: ${error} [${locationSummary}]`;
+}
+
 let isUpdating = false;
 
 /**
@@ -141,11 +165,21 @@ let isUpdating = false;
  */
 export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise<UpdateResult> {
   if (isUpdating) {
+    const head = await deps.git.headSha();
+    const refusalMsg = `update refused: already in progress (current SHA: ${shortSha(head)})`;
+    try {
+      deps.recordAction?.(refusalMsg);
+    } catch (recErr) {
+      const log = deps.log ?? (() => {});
+      log(
+        `[update] recordAction failed: ${recErr instanceof Error ? recErr.message : String(recErr)}`
+      );
+    }
     return {
       ok: false,
       failedStep: "pull",
       error: "Refused: update already in progress.",
-      oldSha: await deps.git.headSha(),
+      oldSha: head,
       restarting: false,
     };
   }
@@ -153,6 +187,7 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
   const log = deps.log ?? (() => {});
   let step: UpdateStep = "pull";
   let oldSha = "";
+  let newSha = "";
   let movedToNew = false;
   let rollbackFailed = false;
 
@@ -162,21 +197,35 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
     oldSha = await deps.git.headSha();
     log(`[update] current sha ${shortSha(oldSha)} — fetching origin ${plan.branch}`);
     await deps.git.fetch(plan.branch);
-    const newSha = await deps.git.remoteSha(plan.branch);
+    newSha = await deps.git.remoteSha(plan.branch);
     const alreadyCurrent = newSha === oldSha;
     if (alreadyCurrent) {
       log(`[update] already at origin/${plan.branch} @ ${shortSha(newSha)}`);
+      const refusalMsg = `update refused: already deployed (origin/${plan.branch} tip ${shortSha(newSha)} matches deployed SHA ${shortSha(oldSha)})`;
+      try {
+        deps.recordAction?.(refusalMsg);
+      } catch (recErr) {
+        log(
+          `[update] recordAction failed: ${recErr instanceof Error ? recErr.message : String(recErr)}`
+        );
+      }
       return {
         ok: false,
         failedStep: "pull",
-        error: `Refused: already deployed (origin/${plan.branch} tip ${newSha} matches deployed SHA ${oldSha})`,
+        error: `Refused: already deployed (origin/${plan.branch} tip ${newSha} matches deployed SHA ${oldSha}; note: a green update restarts the daemon, causing an expected MCP transport disconnect)`,
         oldSha,
         alreadyCurrent: true,
         restarting: false,
       };
     } else {
       const recordMsg = `update authorized/attempted by root (trigger: MCP tool, target SHA: ${newSha})`;
-      deps.recordAction?.(recordMsg);
+      try {
+        deps.recordAction?.(recordMsg);
+      } catch (recErr) {
+        log(
+          `[update] recordAction failed: ${recErr instanceof Error ? recErr.message : String(recErr)}`
+        );
+      }
       log(`[update] resetting checkout to ${shortSha(newSha)}`);
       await deps.git.resetHard(newSha);
       movedToNew = true;
@@ -186,9 +235,8 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
         } catch {}
       }
     }
-    // Materialize submodules before EVERY build — the build below is unconditional
-    // (we rebuild + restart even when already-current), so its prerequisite must be
-    // too. `resetHard` moves a submodule's gitlink but not its working tree, and an
+    // Materialize submodules before EVERY build: `resetHard` moves a
+    // submodule's gitlink but not its working tree, and an
     // already-current box may never have inited the submodule; either way
     // `flutter build web` needs repo-root third_party/glass_goals_devkit on disk. Idempotent + a fast
     // no-op when in sync.
@@ -220,6 +268,16 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
     );
 
     // ── 4. EXIT — systemd restarts onto the fresh build. ─────────────────
+    const drainSummary = drain.quiesced ? "quiesced" : `timeout after ${drain.waitedMs}ms`;
+    try {
+      deps.recordAction?.(
+        `update committed: ${shortSha(oldSha)} → ${shortSha(newSha)} (${subject}) [drain: ${drainSummary}] — restarting`
+      );
+    } catch (recErr) {
+      log(
+        `[update] recordAction failed: ${recErr instanceof Error ? recErr.message : String(recErr)}`
+      );
+    }
     log(`[update] exit(0) → systemd restart onto ${shortSha(newSha)} (${subject})`);
     deps.exit(0);
     return {
@@ -257,7 +315,7 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
         try {
           deps.alertMarker?.(alert); // durable marker file
         } catch {
-          /* best-effort */
+          /* best-effort marker */
         }
         if (deps.notify) {
           try {
@@ -268,7 +326,23 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
         }
       }
     }
-    const msg = `❌ update failed at ${failedStep}${timedOut ? " (timed out)" : ""}: ${error} — staying on ${shortSha(oldSha)}`;
+    const failureSummary = formatFailureOutcome({
+      failedStep,
+      timedOut,
+      error,
+      movedToNew,
+      rollbackFailed,
+      oldSha,
+      newSha,
+    });
+    try {
+      deps.recordAction?.(failureSummary);
+    } catch (recErr) {
+      log(
+        `[update] recordAction failed: ${recErr instanceof Error ? recErr.message : String(recErr)}`
+      );
+    }
+    const msg = `❌ ${failureSummary}`;
     if (deps.notify) {
       try {
         await deps.notify.notify(msg);
