@@ -356,9 +356,17 @@ function configuredRootEventSources(config: RusaConfig, repoName: string | null)
     if (org) orgs.add(org);
   }
 
+  if (config.github.repos) {
+    for (const repo of config.github.repos) {
+      const org = repo.split("/")[0];
+      if (org) orgs.add(org);
+    }
+  }
+
   if (config.github.orgs) {
-    for (const org of config.github.orgs) {
-      orgs.add(org);
+    for (const entry of config.github.orgs) {
+      const org = typeof entry === "string" ? entry : (entry.org ?? entry.name);
+      if (org) orgs.add(org);
     }
   }
 
@@ -636,8 +644,8 @@ export async function compactPortableContext(input: {
 }
 
 function getServiceRepoName(config: RusaConfig, repoRoot: string | null): string | null {
-  if (config.github.repo) {
-    return config.github.repo;
+  if (config.github.repos && config.github.repos.length > 0) {
+    return config.github.repos[0];
   }
   if (!repoRoot) return null;
   const remoteUrl = getRemoteUrl(repoRoot);
@@ -915,7 +923,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // (ingestionMode, trackerHygiene.enabled); the honest report is that neither
     // can run without a repository identity.
     console.error(
-      `[start] Could not determine the repository name (github.repo is not configured and could not derive from git remote at ${repoRoot ?? "unknown"}). GitHub polling and tracker hygiene are DISABLED for this run.`
+      `[start] Could not determine the repository name (github.repos is not configured and could not derive from git remote at ${repoRoot ?? "unknown"}). GitHub polling and tracker hygiene are DISABLED for this run.`
     );
   }
   // Append-only observability log: every message, wake, spawn, and retire lands

@@ -1609,7 +1609,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }
   });
 
-  it("uses github.repo if configured, starting the poller even if resolveRepoRoot throws", async () => {
+  it("uses github.repos if configured, starting the poller even if resolveRepoRoot throws", async () => {
     let sigintListener: NodeJS.SignalsListener | undefined;
     const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
       if (event === "SIGINT") {
@@ -1635,7 +1635,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           account: "mock-bot",
           ingestionMode: "poll",
           pollIntervalSeconds: 300,
-          repo: "custom-owner/custom-repo",
+          repos: ["custom-owner/custom-repo"],
         },
         providers: { antigravity: { cliCommand: "agy" } },
         rootActor: { provider: "antigravity" },
@@ -2740,9 +2740,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: {
           account: "mock-bot",
-          repo: "custom-org/custom-repo",
-          orgs: ["target-org", "extra-org"],
+          repos: ["custom-org/custom-repo"],
+          orgs: ["target-org", { org: "extra-org", excludedRepos: ["extra-org/secret"] }],
         },
+        targets: [{ repo: "legacy-org/legacy-repo", localPath: "/tmp/dummy" }],
         providers: {
           antigravity: { cliCommand: "agy" },
         },
@@ -2779,7 +2780,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await readyPromise;
     if (!mesh) throw new Error("mesh not ready");
 
-    expect(mesh.listSubscriptions()).toEqual(
+    const subscriptions = mesh.listSubscriptions();
+    expect(subscriptions).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           actorId: "root",
@@ -2808,6 +2810,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
         }),
       ])
     );
+
+    // Negative requirement: targets is no longer consumed to derive github_org subscriptions
+    expect(
+      subscriptions.some((s) => s.resource.kind === "github_org" && s.resource.org === "legacy-org")
+    ).toBe(false);
   });
 
   it("drops inbound chat messages from spaces listed in chat.excludedSpaces ", async () => {
