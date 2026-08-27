@@ -745,6 +745,16 @@ describe("loadConfig understanding and glassGoals ", () => {
     );
   });
 
+  it("rejects understanding.mount.enabled under container-boundary sandbox", () => {
+    const home = writeConfig({
+      sandbox: "container-boundary",
+      understanding: { mount: { enabled: true } },
+    });
+    expect(() => loadConfig(home)).toThrow(
+      /understanding\.mount\.enabled requires sandbox: "bwrap"/
+    );
+  });
+
   it("rejects blank glassGoals username", () => {
     const homeNested = writeConfig({ understanding: { glassGoals: { username: "   " } } });
     expect(() => loadConfig(homeNested)).toThrow(

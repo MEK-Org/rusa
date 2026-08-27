@@ -2,9 +2,15 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Goal, SyncClient } from "@thkp-eng/goals-core";
-import type { GoalLogEntry, StatusLogEntry } from "@thkp-eng/goals-types";
+import type {
+  ArchiveStatusLogEntry,
+  ClearStatusLogEntry,
+  GoalLogEntry,
+  StatusLogEntry,
+} from "@thkp-eng/goals-types";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  getEffectiveGoalStatus,
   getNodeContents,
   isArchivedGoal,
   isVisibleNode,
@@ -262,6 +268,96 @@ describe("snapshot renderer", () => {
       const children = listChildren(sync, parentId, rootId);
       expect(children).not.toBeNull();
       expect(children?.map((c) => c.id)).toEqual([child1Id]);
+    });
+
+    it("respects clearStatus, archiveStatus tombstones, and time windows in effective status", () => {
+      const now = 100000;
+
+      // Case 1: Newer clearStatus overrides older status: "ar"
+      const goalWithClear = makeGoal("clearedGoal", "Goal with clearStatus");
+      goalWithClear.log.push({
+        id: "status-1",
+        creationTime: 10,
+        type: "status",
+        status: "ar",
+      } as StatusLogEntry);
+      goalWithClear.log.unshift({
+        id: "clear-1",
+        creationTime: 20,
+        type: "clearStatus",
+      } as ClearStatusLogEntry);
+      expect(getEffectiveGoalStatus(goalWithClear, now)).toBeNull();
+      expect(isArchivedGoal(goalWithClear, now)).toBe(false);
+
+      // Case 2: archiveStatus tombstones an entry
+      const goalWithTombstone = makeGoal("tombstoneGoal", "Goal with tombstoned status");
+      goalWithTombstone.log.push({
+        id: "status-tombstoned",
+        creationTime: 10,
+        type: "status",
+        status: "ar",
+      } as StatusLogEntry);
+      goalWithTombstone.log.unshift({
+        id: "status-tombstoned",
+        creationTime: 20,
+        type: "archiveStatus",
+      } as ArchiveStatusLogEntry);
+      expect(getEffectiveGoalStatus(goalWithTombstone, now)).toBeNull();
+      expect(isArchivedGoal(goalWithTombstone, now)).toBe(false);
+
+      // Case 3: Future startTime is not active yet
+      const futureGoal = makeGoal("futureGoal", "Goal with future archive status");
+      futureGoal.log.push({
+        id: "status-future",
+        creationTime: 10,
+        type: "status",
+        status: "ar",
+        startTime: now + 50000,
+      } as StatusLogEntry);
+      expect(isArchivedGoal(futureGoal, now)).toBe(false);
+
+      // Case 4: Past endTime is expired
+      const expiredGoal = makeGoal("expiredGoal", "Goal with expired archive status");
+      expiredGoal.log.push({
+        id: "status-expired",
+        creationTime: 10,
+        type: "status",
+        status: "ar",
+        endTime: now - 5000,
+      } as StatusLogEntry);
+      expect(isArchivedGoal(expiredGoal, now)).toBe(false);
+    });
+
+    it("fails closed when a configured rootNodeId is missing or stale", async () => {
+      const staleRootId = "staleRootNodeDoesNotExist";
+      const goal1 = makeGoal("node1", "Node 1", { contents: "Contents 1" });
+      const goal2 = makeGoal("node2", "Node 2", { contents: "Contents 2" });
+
+      const { sync } = fake([goal1, goal2]);
+
+      // viewNode on any node with a stale root returns null (fails closed)
+      expect(viewNode(sync, "node1", staleRootId)).toBeNull();
+      expect(viewNode(sync, "node2", staleRootId)).toBeNull();
+
+      // listChildren with undefined parentId falls back to top-level roots
+      expect(
+        listChildren(sync, undefined, staleRootId)
+          ?.map((c) => c.id)
+          .sort()
+      ).toEqual(["node1", "node2"]);
+      // listChildren with specific parentId fails closed (returns null)
+      expect(listChildren(sync, "node1", staleRootId)).toBeNull();
+
+      // renderUnderstandingSnapshot with stale root renders 0 files
+      const snapshotDir = mkdtempSync(join(tmpdir(), "rusa-stale-root-test-"));
+      try {
+        const result = await renderUnderstandingSnapshot(sync, snapshotDir, staleRootId);
+        expect(result.fileCount).toBe(0);
+        expect(result.nodeIds).toEqual([]);
+        expect(readdirSync(snapshotDir)).toEqual([]);
+      } finally {
+        rmSync(snapshotDir, { recursive: true, force: true });
+      }
     });
   });
 });

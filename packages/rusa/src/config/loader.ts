@@ -433,6 +433,12 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     parsed.sandbox = "bwrap";
   }
 
+  if (parsed.understanding?.mount?.enabled === true && parsed.sandbox === "container-boundary") {
+    throw new Error(
+      'config.yaml: understanding.mount.enabled requires sandbox: "bwrap" (found "container-boundary")'
+    );
+  }
+
   if (parsed.gitBridgePort !== undefined) {
     if (
       typeof parsed.gitBridgePort !== "number" ||

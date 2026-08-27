@@ -91,8 +91,7 @@ export async function renderUnderstandingSnapshot(
   }
 
   const goals = syncClient.getGoals();
-  const reachable =
-    rootNodeId && goals.has(rootNodeId) ? getReachableNodeIds(goals, rootNodeId) : null;
+  const reachable = rootNodeId ? getReachableNodeIds(goals, rootNodeId) : null;
 
   // Identify visible nodes using the unified predicate
   const visibleGoals: Goal[] = [];
