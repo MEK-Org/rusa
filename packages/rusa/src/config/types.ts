@@ -60,17 +60,15 @@ export interface GitHubConfig {
   /** GitHub event ingestion edge. Defaults to "webhook" for existing installs. */
   ingestionMode?: "webhook" | "poll";
   /**
-   * Optional list of GitHub repositories in "owner/name" format.
-   * Root actor's implied github_org event source subscriptions include each repository's organization.
+   * Optional list of GitHub repositories in "owner/name" format representing
+   * repositories in the service's operating scope.
    * When git remote cannot be determined from the repository root, the first entry in `repos`
-   * is used as the primary repository identity for GitHub polling and tracker hygiene.
-   * Repositories listed here are additive with `orgs` and the git-remote derived repo identity.
+   * is used as the primary repository identity fallback for GitHub polling and tracker hygiene.
    */
   repos?: string[];
   /**
-   * Optional list of GitHub organizations to subscribe root to for mesh event ingestion.
+   * Optional list of GitHub organizations representing organizations in the service's operating scope.
    * Entries may be organization name strings or objects specifying `org` and optional `excludedRepos`.
-   * Organization subscriptions are additive with `repos` and the repository identity derived from the git remote.
    */
   orgs?: GitHubOrgEntry[];
   /**
@@ -384,7 +382,8 @@ export interface RusaConfig {
   providers: Record<string, ProviderConfig>;
   /**
    * @deprecated Top-level `targets` is deprecated and slated for complete removal in due time.
-   * For GitHub event subscriptions, configure `github.orgs` or `github.repos` instead.
+   * For GitHub operating scope, configure `github.repos` or `github.orgs` instead.
+   * GitHub event source subscriptions are configured explicitly via `eventSources`.
    * Remaining local-worktree and git-bridge consumers under `targets` do not yet have a replacement.
    */
   targets?: Target[];

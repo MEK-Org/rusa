@@ -1807,15 +1807,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "github_org", org: "dummy-org" },
-        }),
-        expect.objectContaining({
-          actorId: "root",
-          subscribedBy: "root",
           resource: { kind: "chat" },
         }),
       ])
     );
+    expect(mesh.listSubscriptions().some((s) => s.resource.kind === "github_org")).toBe(false);
   });
 
   it("drops the event with no receipt when no subscription covers the repo ", async () => {
@@ -2780,7 +2776,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(rootSpaceNames).not.toContain("spaces/delegated");
   });
 
-  it("implies root event sources from github, chat, and observability stanzas", async () => {
+  it("implies root event sources from chat and observability stanzas without synthesizing github_org", async () => {
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
@@ -2832,21 +2828,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "github_org", org: "custom-org" },
-        }),
-        expect.objectContaining({
-          actorId: "root",
-          subscribedBy: "root",
-          resource: { kind: "github_org", org: "target-org" },
-        }),
-        expect.objectContaining({
-          actorId: "root",
-          subscribedBy: "root",
-          resource: { kind: "github_org", org: "extra-org" },
-        }),
-        expect.objectContaining({
-          actorId: "root",
-          subscribedBy: "root",
           resource: { kind: "chat" },
         }),
         expect.objectContaining({
@@ -2857,10 +2838,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       ])
     );
 
-    // Negative requirement: targets is no longer consumed to derive github_org subscriptions
-    expect(
-      subscriptions.some((s) => s.resource.kind === "github_org" && s.resource.org === "legacy-org")
-    ).toBe(false);
+    // Negative requirement: github_org is no longer implicitly synthesized from repoName, github.repos, github.orgs, or targets
+    expect(subscriptions.some((s) => s.resource.kind === "github_org")).toBe(false);
   });
 
   it("drops inbound chat messages from spaces listed in chat.excludedSpaces ", async () => {

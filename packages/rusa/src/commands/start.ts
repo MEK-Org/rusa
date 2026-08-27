@@ -347,32 +347,8 @@ function configuredQuotaThrottleProviders(config: RusaConfig): QuotaThrottleProv
   return [...providers];
 }
 
-function configuredRootEventSources(config: RusaConfig, repoName: string | null): EventResource[] {
+function configuredRootEventSources(config: RusaConfig): EventResource[] {
   const configured: EventResource[] = [];
-  const orgs = new Set<string>();
-
-  if (repoName) {
-    const org = repoName.split("/")[0];
-    if (org) orgs.add(org);
-  }
-
-  if (config.github.repos) {
-    for (const repo of config.github.repos) {
-      const org = repo.split("/")[0];
-      if (org) orgs.add(org);
-    }
-  }
-
-  if (config.github.orgs) {
-    for (const entry of config.github.orgs) {
-      const org = typeof entry === "string" ? entry : entry.org;
-      if (org) orgs.add(org);
-    }
-  }
-
-  for (const org of orgs) {
-    configured.push({ kind: "github_org", org });
-  }
 
   if (config.chat) {
     configured.push({ kind: "chat" });
@@ -1137,7 +1113,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   });
   const rootSourceSync = syncRootEventSources(
     eventSubscriptions,
-    configuredRootEventSources(config, repoName),
+    configuredRootEventSources(config),
     rootId,
     () => new Date().toISOString()
   );

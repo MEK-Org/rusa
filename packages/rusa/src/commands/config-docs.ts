@@ -116,8 +116,8 @@ github:
   account                  GitHub username used by this Rusa instance, for example CodeChopsBot.
   pollIntervalSeconds      Optional. GitHub poll interval in seconds when ingestionMode is poll; defaults to 300. Must be a positive number when set.
   ingestionMode            Optional. "webhook" (default) binds the webhook listener; "poll" fetches GitHub updates without binding it.
-  repos                    Optional list. GitHub repositories in owner/name format to subscribe root to and derive event sources from.
-  orgs                     Optional list. GitHub organization names (or objects with org and optional excludedRepos) to subscribe root to for mesh event ingestion.
+  repos                    Optional list. GitHub repositories in owner/name format defining operating scope.
+  orgs                     Optional list. GitHub organization names (or objects with org and optional excludedRepos) defining operating scope.
   workerTokenPath          Optional. Path to read-mostly fine-grained GitHub PAT file visible to sandboxed workers.
 
 providers:
