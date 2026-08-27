@@ -12,7 +12,12 @@ import {
   createCalendarReadMcpServer,
   createCalendarWriteMcpServer,
 } from "./calendar-mcp.js";
-import { CHAT_WRITE_MCP_NAME, createChatWriteMcpServer } from "./chat-mcp.js";
+import {
+  CHAT_READ_MCP_NAME,
+  CHAT_WRITE_MCP_NAME,
+  createChatReadMcpServer,
+  createChatWriteMcpServer,
+} from "./chat-mcp.js";
 import {
   createDistillerServer,
   DISTILLER_MCP_NAME,
@@ -158,6 +163,14 @@ export function buildGrantableServers(
     ],
   ]);
   if (deps.chatClient) {
+    map.set(CHAT_READ_MCP_NAME, (_selfId, params, options) => {
+      const allowedSpaces = params.map((p) => (p.startsWith("spaces/") ? p : `spaces/${p}`));
+      if (!deps.chatClient) throw new Error("chatClient is required for chat-read capability");
+      return createChatReadMcpServer(deps.chatClient, {
+        allowedSpaces,
+        isFenced: options?.isFenced,
+      });
+    });
     map.set(CHAT_WRITE_MCP_NAME, (selfId, params, options) => {
       // params are e.g. ["spaces/AAAA", "spaces/BBBB"] from "chat-write:spaces/AAAA" etc.
       // Or if they were granted "*", we can support that, though typically spaces are passed.
@@ -238,6 +251,8 @@ export async function handleCapabilityRevoked(
     let baseCapability = capability;
     if (capability.startsWith("chat-write:")) {
       baseCapability = "chat-write";
+    } else if (capability.startsWith("chat-read:")) {
+      baseCapability = "chat-read";
     } else if (capability.startsWith("calendar-read:")) {
       baseCapability = "calendar-read";
     } else if (capability.startsWith("calendar-write:")) {
@@ -250,6 +265,7 @@ export async function handleCapabilityRevoked(
 
     if (
       baseCapability === "chat-write" ||
+      baseCapability === "chat-read" ||
       baseCapability === "calendar-read" ||
       baseCapability === "calendar-write" ||
       baseCapability === "email-send" ||

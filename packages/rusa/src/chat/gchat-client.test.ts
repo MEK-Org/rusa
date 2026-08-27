@@ -225,8 +225,86 @@ describe("GchatClient reads", () => {
 
     expect(downloaded).toEqual(fileBytes);
     expect(fetchMock.mock.calls[1]?.[0]).toBe(
-      "https://chat.googleapis.com/v1/media/spaces/A/attachments/ATT1?alt=media"
+      "https://chat.googleapis.com/v1/media/spaces%2FA%2Fattachments%2FATT1?alt=media"
     );
+  });
+
+  it("resolves human-readable message attachment name via getAttachment before downloading", async () => {
+    const fileBytes = Buffer.from("resolved binary content");
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), {
+          status: 200,
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            name: "spaces/A/messages/M1/attachments/ATT1",
+            attachmentDataRef: { resourceName: "spaces/A/attachments/DATAREF_99" },
+            source: "UPLOADED_CONTENT",
+          }),
+          { status: 200 }
+        )
+      )
+      .mockResolvedValueOnce(new Response(fileBytes, { status: 200 }));
+
+    const downloaded = await new GchatClient(credentialsDir()).downloadAttachment(
+      "spaces/A/messages/M1/attachments/ATT1"
+    );
+
+    expect(downloaded).toEqual(fileBytes);
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      "https://chat.googleapis.com/v1/spaces/A/messages/M1/attachments/ATT1"
+    );
+    expect(fetchMock.mock.calls[2]?.[0]).toBe(
+      "https://chat.googleapis.com/v1/media/spaces%2FA%2Fattachments%2FDATAREF_99?alt=media"
+    );
+  });
+
+  it("rejects downloadAttachment if attachment is a Drive file", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), {
+          status: 200,
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            name: "spaces/A/messages/M1/attachments/ATT1",
+            source: "DRIVE_FILE",
+          }),
+          { status: 200 }
+        )
+      );
+
+    await expect(
+      new GchatClient(credentialsDir()).downloadAttachment("spaces/A/messages/M1/attachments/ATT1")
+    ).rejects.toThrow("is a Drive file");
+  });
+
+  it("rejects downloadAttachment if message attachment lacks attachmentDataRef", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), {
+          status: 200,
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            name: "spaces/A/messages/M1/attachments/ATT1",
+            source: "UPLOADED_CONTENT",
+          }),
+          { status: 200 }
+        )
+      );
+
+    await expect(
+      new GchatClient(credentialsDir()).downloadAttachment("spaces/A/messages/M1/attachments/ATT1")
+    ).rejects.toThrow("does not contain an attachmentDataRef");
   });
 
   it("uploads an attachment via multipart request and returns attachmentDataRef", async () => {

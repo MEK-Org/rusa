@@ -11,21 +11,33 @@ export const CHAT_WRITE_MCP_NAME = "chat-write";
 export const CHAT_READ_MCP_NAME = "chat-read";
 
 export const ATTACHMENT_RESOURCE_NAME_RE =
-  /^spaces\/[^/]+(?:\/messages\/[^/]+)?\/attachments\/[^/]+$/;
+  /^(?:spaces\/[^/]+(?:\/messages\/[^/]+)?\/attachments\/[^/]+|media\/.+)$/;
 
 export function inferChatMimeType(filename: string): string {
   return mime.getType(filename) ?? "application/octet-stream";
 }
 
-/** Read-only Google Chat tools, mounted for every actor when Chat is configured. */
+export interface ChatReadMcpOptions {
+  allowedSpaces?: string[];
+  isFenced?: () => boolean;
+  maxAttachmentBytes?: number;
+}
+
+/** Read-only Google Chat tools, mounted for root or granted to space-scoped actors. */
 export function createChatReadMcpServer(
   chatClient: ChatClient,
-  options?: { isFenced?: () => boolean; maxAttachmentBytes?: number }
+  options?: ChatReadMcpOptions
 ): McpServer {
   const server = createMcpServer(
     { name: CHAT_READ_MCP_NAME, version: "0.1.0" },
     { isFenced: options?.isFenced }
   );
+
+  const isAllowed = (spaceName: string) => {
+    if (!options?.allowedSpaces || options.allowedSpaces.length === 0) return true;
+    if (options.allowedSpaces.includes("*")) return true;
+    return options.allowedSpaces.includes(spaceName);
+  };
 
   server.registerTool(
     "get_message",
@@ -40,6 +52,11 @@ export function createChatReadMcpServer(
       try {
         if (!/^spaces\/[^/]+\/messages\/[^/]+$/.test(messageName)) {
           throw new Error("messageName must be in format spaces/SPACE/messages/MESSAGE");
+        }
+        const spaceMatch = /^spaces\/([^/]+)/.exec(messageName);
+        const spaceName = spaceMatch ? `spaces/${spaceMatch[1]}` : "";
+        if (!isAllowed(spaceName)) {
+          throw new Error(`access denied: space ${spaceName} is not in allowed spaces`);
         }
         return toolOk(await chatClient.getMessage(messageName));
       } catch (err) {
@@ -68,6 +85,11 @@ export function createChatReadMcpServer(
             "attachmentName must be in format spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT or spaces/SPACE/attachments/ATTACHMENT"
           );
         }
+        const spaceMatch = /^spaces\/([^/]+)/.exec(attachmentName);
+        const spaceName = spaceMatch ? `spaces/${spaceMatch[1]}` : "";
+        if (spaceName && !isAllowed(spaceName)) {
+          throw new Error(`access denied: space ${spaceName} is not in allowed spaces`);
+        }
         return toolOk(await chatClient.getAttachment(attachmentName));
       } catch (err) {
         return toolError(err);
@@ -94,6 +116,11 @@ export function createChatReadMcpServer(
           throw new Error(
             "resourceName must be in format spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT or spaces/SPACE/attachments/ATTACHMENT"
           );
+        }
+        const spaceMatch = /^spaces\/([^/]+)/.exec(resourceName);
+        const spaceName = spaceMatch ? `spaces/${spaceMatch[1]}` : "";
+        if (spaceName && !isAllowed(spaceName)) {
+          throw new Error(`access denied: space ${spaceName} is not in allowed spaces`);
         }
         const result = await chatClient.downloadAttachment(resourceName);
         const maxBytes = options?.maxAttachmentBytes ?? MAX_CHAT_ATTACHMENT_BYTES;
@@ -122,12 +149,21 @@ export function createChatReadMcpServer(
     },
     async ({ pageSize, pageToken }) => {
       try {
-        return toolOk(
-          await chatClient.listSpaces({
-            ...(pageSize !== undefined ? { pageSize } : {}),
-            ...(pageToken ? { pageToken } : {}),
-          })
-        );
+        const result = await chatClient.listSpaces({
+          ...(pageSize !== undefined ? { pageSize } : {}),
+          ...(pageToken ? { pageToken } : {}),
+        });
+        if (
+          options?.allowedSpaces &&
+          options.allowedSpaces.length > 0 &&
+          !options.allowedSpaces.includes("*")
+        ) {
+          return toolOk({
+            ...result,
+            spaces: (result.spaces ?? []).filter((s) => isAllowed(s.name)),
+          });
+        }
+        return toolOk(result);
       } catch (err) {
         return toolError(err);
       }
@@ -170,6 +206,9 @@ export function createChatReadMcpServer(
       try {
         if (!/^spaces\/[^/]+$/.test(spaceName)) {
           throw new Error("spaceName must be in format spaces/SPACE");
+        }
+        if (!isAllowed(spaceName)) {
+          throw new Error(`access denied: space ${spaceName} is not in allowed spaces`);
         }
         if (threadName && !/^spaces\/[^/]+\/threads\/[^/]+$/.test(threadName)) {
           throw new Error("threadName must be in format spaces/SPACE/threads/THREAD");

@@ -142,19 +142,30 @@ export class FakeChatClient implements ChatClient {
   }
 
   async downloadAttachment(resourceName: string): Promise<Buffer> {
+    let targetRef = resourceName;
+    if (resourceName.includes("/messages/")) {
+      const metadata = await this.getAttachment(resourceName);
+      if (metadata.source === "DRIVE_FILE") {
+        throw new Error(
+          `attachment ${resourceName} is a Drive file; access it using the Drive API instead of downloadAttachment`
+        );
+      }
+      targetRef = metadata.attachmentDataRef?.resourceName ?? metadata.name ?? resourceName;
+    }
+
     let data: Buffer | undefined;
-    const entry = this.attachments.get(resourceName);
+    const entry = this.attachments.get(targetRef);
     if (entry) {
       data = entry.data;
     } else {
-      const uploaded = this.uploadedAttachments.find((u) => u.resourceName === resourceName);
+      const uploaded = this.uploadedAttachments.find((u) => u.resourceName === targetRef);
       if (uploaded) {
         data = uploaded.content;
       } else {
         for (const [, v] of this.attachments.entries()) {
           if (
-            v.metadata.attachmentDataRef?.resourceName === resourceName ||
-            v.metadata.name === resourceName
+            v.metadata.attachmentDataRef?.resourceName === targetRef ||
+            v.metadata.name === targetRef
           ) {
             data = v.data;
             break;

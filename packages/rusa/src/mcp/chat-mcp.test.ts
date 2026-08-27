@@ -832,4 +832,129 @@ describe("chat MCP server", () => {
     expect(fake.sent.length).toBe(0);
     expect(fake.reactions.length).toBe(0);
   });
+
+  it("restricts chat-read MCP tools to allowedSpaces when specified", async () => {
+    const fake = new FakeChatClient();
+    fake.spaces.push(
+      { name: "spaces/A", spaceType: "SPACE", displayName: "Allowed Space" },
+      { name: "spaces/B", spaceType: "SPACE", displayName: "Forbidden Space" }
+    );
+    fake.messages.push(
+      {
+        name: "spaces/A/messages/M1",
+        text: "in allowed space",
+        createTime: "2026-08-26T10:00:00Z",
+      },
+      {
+        name: "spaces/B/messages/M2",
+        text: "in forbidden space",
+        createTime: "2026-08-26T10:00:00Z",
+      }
+    );
+    const sampleBytes = Buffer.from("attachment bytes");
+    fake.attachments.set("spaces/A/attachments/ATT1", {
+      metadata: {
+        name: "spaces/A/attachments/ATT1",
+        contentName: "allowed.txt",
+        contentType: "text/plain",
+      },
+      data: sampleBytes,
+    });
+    fake.attachments.set("spaces/B/attachments/ATT2", {
+      metadata: {
+        name: "spaces/B/attachments/ATT2",
+        contentName: "forbidden.txt",
+        contentType: "text/plain",
+      },
+      data: sampleBytes,
+    });
+
+    const client = await connect(createChatReadMcpServer(fake, { allowedSpaces: ["spaces/A"] }));
+
+    // list_spaces only returns allowed spaces
+    const listSpacesRes = (await client.callTool({
+      name: "list_spaces",
+      arguments: {},
+    })) as CallToolResult;
+    expect(listSpacesRes.isError).toBeFalsy();
+    const listedSpaces = JSON.parse(textOf(listSpacesRes)) as { spaces: { name: string }[] };
+    expect(listedSpaces.spaces.map((s) => s.name)).toEqual(["spaces/A"]);
+
+    // get_message in allowed space vs forbidden space
+    const getMsgAllowed = (await client.callTool({
+      name: "get_message",
+      arguments: { messageName: "spaces/A/messages/M1" },
+    })) as CallToolResult;
+    expect(getMsgAllowed.isError).toBeFalsy();
+
+    const getMsgForbidden = (await client.callTool({
+      name: "get_message",
+      arguments: { messageName: "spaces/B/messages/M2" },
+    })) as CallToolResult;
+    expect(getMsgForbidden.isError).toBeTruthy();
+    expect(textOf(getMsgForbidden)).toContain("access denied");
+
+    // get_attachment in allowed space vs forbidden space
+    const getAttAllowed = (await client.callTool({
+      name: "get_attachment",
+      arguments: { attachmentName: "spaces/A/attachments/ATT1" },
+    })) as CallToolResult;
+    expect(getAttAllowed.isError).toBeFalsy();
+
+    const getAttForbidden = (await client.callTool({
+      name: "get_attachment",
+      arguments: { attachmentName: "spaces/B/attachments/ATT2" },
+    })) as CallToolResult;
+    expect(getAttForbidden.isError).toBeTruthy();
+    expect(textOf(getAttForbidden)).toContain("access denied");
+
+    // download_attachment in allowed space vs forbidden space
+    const dlAttAllowed = (await client.callTool({
+      name: "download_attachment",
+      arguments: { resourceName: "spaces/A/attachments/ATT1" },
+    })) as CallToolResult;
+    expect(dlAttAllowed.isError).toBeFalsy();
+    expect(textOf(dlAttAllowed)).toBe(sampleBytes.toString("base64"));
+
+    const dlAttForbidden = (await client.callTool({
+      name: "download_attachment",
+      arguments: { resourceName: "spaces/B/attachments/ATT2" },
+    })) as CallToolResult;
+    expect(dlAttForbidden.isError).toBeTruthy();
+    expect(textOf(dlAttForbidden)).toContain("access denied");
+
+    // list_messages in allowed space vs forbidden space
+    const listMsgAllowed = (await client.callTool({
+      name: "list_messages",
+      arguments: { spaceName: "spaces/A" },
+    })) as CallToolResult;
+    expect(listMsgAllowed.isError).toBeFalsy();
+
+    const listMsgForbidden = (await client.callTool({
+      name: "list_messages",
+      arguments: { spaceName: "spaces/B" },
+    })) as CallToolResult;
+    expect(listMsgForbidden.isError).toBeTruthy();
+    expect(textOf(listMsgForbidden)).toContain("access denied");
+  });
+
+  it("downloads attachment using raw dataRef token or media format", async () => {
+    const fake = new FakeChatClient();
+    const sampleBytes = Buffer.from("opaque token bytes");
+    fake.attachments.set("spaces/A/attachments/OPAQUE_TOKEN_123", {
+      metadata: {
+        name: "spaces/A/attachments/OPAQUE_TOKEN_123",
+        attachmentDataRef: { resourceName: "spaces/A/attachments/OPAQUE_TOKEN_123" },
+      },
+      data: sampleBytes,
+    });
+    const client = await connect(createChatReadMcpServer(fake));
+
+    const res = (await client.callTool({
+      name: "download_attachment",
+      arguments: { resourceName: "spaces/A/attachments/OPAQUE_TOKEN_123" },
+    })) as CallToolResult;
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toBe(sampleBytes.toString("base64"));
+  });
 });
