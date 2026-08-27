@@ -31,7 +31,7 @@ describe("config docs", () => {
     expect(CONFIG_DOCS).not.toContain("mesh.quotaThrottle:");
   });
 
-  it("documents disk-alert routing as implicit instead of a separate config knob", () => {
+  it("documents disk-alert routing as implicit instead of a system eventSources knob", () => {
     expect(CONFIG_DOCS).toContain(
       "Configuring this section implicitly subscribes root to responsive system.disk events"
     );
@@ -44,9 +44,10 @@ describe("config docs", () => {
     expect(CONFIG_DOCS).toContain("Legacy top-level Integrated Understanding storage section");
   });
 
-  it("documents chat and multi-instance staging recipe", () => {
+  it("documents chat, eventSources, and multi-instance staging recipe ", () => {
     expect(CONFIG_DOCS).toContain("chat:");
-    expect(CONFIG_DOCS).not.toContain("eventSources:");
+    expect(CONFIG_DOCS).toContain("eventSources:");
+    expect(CONFIG_DOCS).toContain("chat_space");
     expect(CONFIG_DOCS).toContain("excludedSpaces");
     expect(CONFIG_DOCS).toContain("Multi-instance staging recipe:");
     expect(CONFIG_DOCS).toContain("spaces/AAAA_STAGING");

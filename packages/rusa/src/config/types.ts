@@ -185,6 +185,26 @@ export interface ChatConfig {
   excludedSpaces?: string[];
 }
 
+export type EventSourceConfig =
+  | { kind: "github_org"; org: string }
+  /**
+   * Subscribe root to a single repo ("owner/name") instead of a whole org —
+   * e.g. a secondary instance (staging) that should only hear its test-bed, not
+   * the org-wide firehose . Seeded like any root source; note it is not
+   * config-reconciled on removal (its kind can't be told apart from a reclaimed
+   * repo slice — see CONFIG_ROOT_KINDS in event-subscriptions).
+   */
+  | { kind: "github_repo"; repo: string }
+  | { kind: "github_branch"; repo: string; ref: string }
+  | { kind: "chat" }
+  /**
+   * Subscribe root to a single Google Chat space ("spaces/...") instead of the
+   * all-spaces chat firehose — e.g. a secondary instance (staging) that should
+   * only receive messages from its dedicated test space . Reconciled on
+   * removal just like top-level chat and github_org.
+   */
+  | { kind: "chat_space"; space: string };
+
 export interface DashboardConfig {
   /** Port to serve the dashboard on (default: 8080) */
   port: number;
@@ -399,6 +419,8 @@ export interface RusaConfig {
   /** Mistral API key. Optional; grantable to sandboxed actors as MISTRAL_API_KEY. */
   mistralApiKey?: string;
   webhook: WebhookConfig;
+  /** Top-level event sources held by root and sub-delegated through the mesh. */
+  eventSources?: EventSourceConfig[];
   /** Which provider/model the root actor runs on (optional; defaults to agy). */
   rootActor?: RootActorConfig;
   /** Google Chat inbound/outbound integration (optional; disabled if absent). */

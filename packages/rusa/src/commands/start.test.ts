@@ -1273,6 +1273,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           codex: { cliCommand: "codex" },
         },
         rootActor: { provider: "antigravity" },
+        eventSources: [{ kind: "chat" }],
         chat: {
           projectId: "test",
           subscription: "test",
@@ -1776,11 +1777,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       rootActor: {
         provider: "antigravity",
       },
-      chat: {
-        projectId: "test",
-        subscription: "test",
-        pubsubKeyPath: "/dev/null",
-      },
+      eventSources: [{ kind: "github_org", org: "dummy-org" }, { kind: "chat" }],
       geminiApiKey: "fake-gemini-key",
     };
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
@@ -1807,11 +1804,15 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
+          resource: { kind: "github_org", org: "dummy-org" },
+        }),
+        expect.objectContaining({
+          actorId: "root",
+          subscribedBy: "root",
           resource: { kind: "chat" },
         }),
       ])
     );
-    expect(mesh.listSubscriptions().some((s) => s.resource.kind === "github_org")).toBe(false);
   });
 
   it("drops the event with no receipt when no subscription covers the repo ", async () => {
@@ -2706,6 +2707,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           antigravity: { cliCommand: "agy" },
         },
         rootActor: { provider: "antigravity" },
+        eventSources: [{ kind: "chat" }],
         chat: {
           projectId: "test",
           subscription: "test",
@@ -2776,7 +2778,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(rootSpaceNames).not.toContain("spaces/delegated");
   });
 
-  it("implies root event sources from chat and observability stanzas without synthesizing github_org", async () => {
+  it("decouples github.repos/orgs/targets and chat config from root event subscription; only diskAlert seeds system", async () => {
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
@@ -2823,13 +2825,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
     if (!mesh) throw new Error("mesh not ready");
 
     const subscriptions = mesh.listSubscriptions();
+    // diskAlert is the sole implicit root source (host-owned producer == subscription).
     expect(subscriptions).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({
-          actorId: "root",
-          subscribedBy: "root",
-          resource: { kind: "chat" },
-        }),
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
@@ -2838,8 +2836,138 @@ describe("runStart webhook event routing (Phase 4)", () => {
       ])
     );
 
-    // Negative requirement: github_org is no longer implicitly synthesized from repoName, github.repos, github.orgs, or targets
+    // No eventSources declared, so nothing external is synthesized: github_org is
+    // never derived from repoName/github.repos/github.orgs/targets, and chat is
+    // explicit-only (config.chat alone does not subscribe root to chat).
     expect(subscriptions.some((s) => s.resource.kind === "github_org")).toBe(false);
+    expect(subscriptions.some((s) => s.resource.kind === "chat")).toBe(false);
+  });
+
+  it("seeds a configured chat_space eventSource and scopes routing to that single space ", async () => {
+    const chatClient = new FakeChatClient();
+    const chatSource = new FakeChatSource();
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: {
+          antigravity: { cliCommand: "agy" },
+        },
+        rootActor: { provider: "antigravity" },
+        eventSources: [{ kind: "chat_space", space: "spaces/AAAA_STAGING" }],
+        chat: {
+          projectId: "test",
+          subscription: "test",
+          pubsubKeyPath: "/dev/null",
+          gchat: "all",
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    let mesh: ActorMesh | undefined;
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          chatClient,
+          chatSource,
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    await readyPromise;
+    if (!mesh) throw new Error("mesh not ready");
+
+    expect(mesh.listSubscriptions()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          actorId: "root",
+          subscribedBy: "root",
+          resource: { kind: "chat_space", space: "spaces/AAAA_STAGING" },
+        }),
+      ])
+    );
+
+    // Emit event in the configured staging space
+    await chatSource.emit({
+      name: "msg-staging",
+      spaceName: "spaces/AAAA_STAGING",
+      spaceType: "DIRECT_MESSAGE",
+      senderName: "users/operator",
+      senderDisplayName: "Operator",
+      text: "hello staging",
+      mentionsSelf: false,
+      isDirectMessage: true,
+    });
+
+    // Emit event in an unconfigured space
+    await chatSource.emit({
+      name: "msg-other",
+      spaceName: "spaces/OTHER_PROD",
+      spaceType: "DIRECT_MESSAGE",
+      senderName: "users/operator",
+      senderDisplayName: "Operator",
+      text: "hello other",
+      mentionsSelf: false,
+      isDirectMessage: true,
+    });
+
+    const rootEntries = getRepositories().inbox.list("root").entries;
+    const rootSpaceNames = rootEntries.map((e) => e.payload?.spaceName).filter(Boolean);
+
+    expect(rootSpaceNames).toContain("spaces/AAAA_STAGING");
+    expect(rootSpaceNames).not.toContain("spaces/OTHER_PROD");
+  });
+
+  it("rejects invalid eventSources chat_space config entries ", async () => {
+    const chatClient = new FakeChatClient();
+    const chatSource = new FakeChatSource();
+
+    // Missing / empty space
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity" },
+        eventSources: [{ kind: "chat_space", space: "" }],
+        chat: { projectId: "test", subscription: "test", pubsubKeyPath: "/dev/null" },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    await expect(
+      runStart({
+        e2e: { chatClient, chatSource, onReady: () => {} },
+      })
+    ).rejects.toThrow(/eventSources\[0\]\.space is required for chat_space/);
+
+    // Malformed space
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity" },
+        eventSources: [{ kind: "chat_space", space: "invalid-space-name" }],
+        chat: { projectId: "test", subscription: "test", pubsubKeyPath: "/dev/null" },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    await expect(
+      runStart({
+        e2e: { chatClient, chatSource, onReady: () => {} },
+      })
+    ).rejects.toThrow(/eventSources\[0\]\.space must be "spaces\/\.\.\." for chat_space/);
   });
 
   it("drops inbound chat messages from spaces listed in chat.excludedSpaces ", async () => {
@@ -2853,6 +2981,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           antigravity: { cliCommand: "agy" },
         },
         rootActor: { provider: "antigravity" },
+        eventSources: [{ kind: "chat" }],
         chat: {
           projectId: "test",
           subscription: "test",
@@ -2923,6 +3052,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
         rootActor: { provider: "antigravity" },
+        eventSources: [{ kind: "chat" }],
         chat: {
           projectId: "test",
           subscription: "test",

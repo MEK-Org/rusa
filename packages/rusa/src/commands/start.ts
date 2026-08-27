@@ -348,11 +348,50 @@ function configuredQuotaThrottleProviders(config: RusaConfig): QuotaThrottleProv
 }
 
 function configuredRootEventSources(config: RusaConfig): EventResource[] {
-  const configured: EventResource[] = [];
-
-  if (config.chat) {
-    configured.push({ kind: "chat" });
-  }
+  const configured: EventResource[] = (config.eventSources ?? []).map((source, index) => {
+    if (source.kind === "github_org") {
+      if (!source.org?.trim()) {
+        throw new Error(`config.yaml: eventSources[${index}].org is required for github_org`);
+      }
+      return { kind: "github_org", org: source.org };
+    }
+    if (source.kind === "github_repo") {
+      if (!source.repo?.includes("/")) {
+        throw new Error(
+          `config.yaml: eventSources[${index}].repo must be "owner/name" for github_repo`
+        );
+      }
+      return { kind: "github_repo", repo: source.repo };
+    }
+    if (source.kind === "github_branch") {
+      if (!source.repo?.includes("/")) {
+        throw new Error(
+          `config.yaml: eventSources[${index}].repo must be "owner/name" for github_branch`
+        );
+      }
+      if (!source.ref?.trim()) {
+        throw new Error(`config.yaml: eventSources[${index}].ref is required for github_branch`);
+      }
+      return { kind: "github_branch", repo: source.repo, ref: source.ref };
+    }
+    if (source.kind === "chat") {
+      return { kind: "chat" };
+    }
+    if (source.kind === "chat_space") {
+      if (!source.space?.trim()) {
+        throw new Error(`config.yaml: eventSources[${index}].space is required for chat_space`);
+      }
+      const trimmed = source.space.trim();
+      const parts = trimmed.split("/");
+      if (!trimmed.startsWith("spaces/") || parts.length !== 2 || !parts[1]) {
+        throw new Error(
+          `config.yaml: eventSources[${index}].space must be "spaces/..." for chat_space`
+        );
+      }
+      return { kind: "chat_space", space: trimmed };
+    }
+    throw new Error(`config.yaml: unsupported eventSources[${index}].kind`);
+  });
 
   // Disk alerts are a host-owned event source, so configuring the producer is
   // also the subscription declaration. Keeping that derivation here avoids a
