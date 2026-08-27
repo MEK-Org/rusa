@@ -205,6 +205,15 @@ export interface GlassGoalsConfig {
   rootNodeId?: string;
 }
 
+export interface UnderstandingMountConfig {
+  /**
+   * Whether to mount the Integrated Understanding as a read-only filesystem
+   * inside sandboxed worker containers at /tmp/understanding.
+   * Default: false.
+   */
+  enabled?: boolean;
+}
+
 export interface UnderstandingConfig {
   /**
    * Provider-neutral root node used to scope IU reads and dashboard rendering.
@@ -216,6 +225,10 @@ export interface UnderstandingConfig {
    * Remote Glass Goals persistence settings for Integrated Understanding.
    */
   glassGoals?: GlassGoalsConfig;
+  /**
+   * Read-only filesystem mount prototype settings.
+   */
+  mount?: UnderstandingMountConfig;
   // The nightly distiller's chat read set is NOT configured here. It is every
   // space the Chat identity is a member of, enumerated per run via `list_spaces`
   // (see chat/spaces.ts). The former `chatSpaces` allowlist carved personal

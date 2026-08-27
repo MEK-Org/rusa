@@ -513,6 +513,74 @@ describe("sandbox bwrap args", () => {
     }
   });
 
+  describe("understanding read-only mount (/tmp/understanding)", () => {
+    it("emits --dir /tmp/understanding and --ro-bind <host_dir> /tmp/understanding after --tmpfs /tmp when understandingMount is provided", async () => {
+      const home = mkdtempSync(join(tmpdir(), "mc-home-"));
+      tempDirs.push(home);
+      const actorDir = join(home, ".rusa", "workers", "abc123");
+      mkdirSync(actorDir, { recursive: true });
+      process.env.HOME = home;
+
+      execSyncMock.mockImplementation((command: string) => {
+        if (command === "pnpm store path") return "/tmp/pnpm-store\n";
+        const fallback = defaultExecSyncResponse(command);
+        if (fallback) return fallback;
+        throw new Error(`Unexpected command: ${command}`);
+      });
+
+      const hostSnapshotDir = "/tmp/host-understanding-snapshot-123";
+      const { buildActorBwrapArgs } = await import("./sandbox.js");
+      const { args } = buildActorBwrapArgs(
+        actorDir,
+        "antigravity",
+        undefined,
+        false,
+        hostSnapshotDir
+      );
+
+      const tmpfsIdx = args.indexOf("/tmp");
+      expect(tmpfsIdx).toBeGreaterThan(-1);
+      expect(args[tmpfsIdx - 1]).toBe("--tmpfs");
+
+      const dirIdx = args.indexOf("/tmp/understanding");
+      expect(dirIdx).toBeGreaterThan(tmpfsIdx);
+      expect(args[dirIdx - 1]).toBe("--dir");
+
+      const roBindIndices: number[] = [];
+      for (let i = 0; i < args.length; i++) {
+        if (
+          args[i] === "--ro-bind" &&
+          args[i + 1] === hostSnapshotDir &&
+          args[i + 2] === "/tmp/understanding"
+        ) {
+          roBindIndices.push(i);
+        }
+      }
+      expect(roBindIndices.length).toBe(1);
+      expect(roBindIndices[0]).toBeGreaterThan(tmpfsIdx);
+    });
+
+    it("omits /tmp/understanding when understandingMount is not provided", async () => {
+      const home = mkdtempSync(join(tmpdir(), "mc-home-"));
+      tempDirs.push(home);
+      const actorDir = join(home, ".rusa", "workers", "abc123");
+      mkdirSync(actorDir, { recursive: true });
+      process.env.HOME = home;
+
+      execSyncMock.mockImplementation((command: string) => {
+        if (command === "pnpm store path") return "/tmp/pnpm-store\n";
+        const fallback = defaultExecSyncResponse(command);
+        if (fallback) return fallback;
+        throw new Error(`Unexpected command: ${command}`);
+      });
+
+      const { buildActorBwrapArgs } = await import("./sandbox.js");
+      const { args } = buildActorBwrapArgs(actorDir, "antigravity");
+
+      expect(args).not.toContain("/tmp/understanding");
+    });
+  });
+
   describe("worker GitHub credential split (github.workerTokenPath, ISSUE_NUM/ISSUE_NUM-adjacent)", () => {
     it("is inert (workers keep the host gh config) and logs once when github.workerTokenPath is unset", async () => {
       const home = mkdtempSync(join(tmpdir(), "mc-home-"));

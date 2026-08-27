@@ -344,6 +344,21 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       }
       understanding.rootNodeId = understanding.rootNodeId.trim();
     }
+    if (understanding.mount !== undefined) {
+      if (
+        typeof understanding.mount !== "object" ||
+        understanding.mount === null ||
+        Array.isArray(understanding.mount)
+      ) {
+        throw new Error("config.yaml: understanding.mount must be a mapping when set");
+      }
+      if (
+        understanding.mount.enabled !== undefined &&
+        typeof understanding.mount.enabled !== "boolean"
+      ) {
+        throw new Error("config.yaml: understanding.mount.enabled must be a boolean when set");
+      }
+    }
   }
 
   const nestedGg = parsed.understanding?.glassGoals;
@@ -416,6 +431,12 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     }
   } else {
     parsed.sandbox = "bwrap";
+  }
+
+  if (parsed.understanding?.mount?.enabled === true && parsed.sandbox === "container-boundary") {
+    throw new Error(
+      'config.yaml: understanding.mount.enabled requires sandbox: "bwrap" (found "container-boundary")'
+    );
   }
 
   if (parsed.gitBridgePort !== undefined) {

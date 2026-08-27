@@ -719,6 +719,42 @@ describe("loadConfig understanding and glassGoals ", () => {
     );
   });
 
+  it("loads understanding.mount configuration", () => {
+    const home = writeConfig({
+      understanding: {
+        mount: {
+          enabled: true,
+        },
+      },
+    });
+    const config = loadConfig(home);
+    expect(config.understanding?.mount).toEqual({
+      enabled: true,
+    });
+  });
+
+  it("rejects non-mapping understanding.mount", () => {
+    const home = writeConfig({ understanding: { mount: "true" } });
+    expect(() => loadConfig(home)).toThrow(/understanding\.mount must be a mapping when set/);
+  });
+
+  it("rejects non-boolean understanding.mount.enabled", () => {
+    const home = writeConfig({ understanding: { mount: { enabled: "yes" } } });
+    expect(() => loadConfig(home)).toThrow(
+      /understanding\.mount\.enabled must be a boolean when set/
+    );
+  });
+
+  it("rejects understanding.mount.enabled under container-boundary sandbox", () => {
+    const home = writeConfig({
+      sandbox: "container-boundary",
+      understanding: { mount: { enabled: true } },
+    });
+    expect(() => loadConfig(home)).toThrow(
+      /understanding\.mount\.enabled requires sandbox: "bwrap"/
+    );
+  });
+
   it("rejects blank glassGoals username", () => {
     const homeNested = writeConfig({ understanding: { glassGoals: { username: "   " } } });
     expect(() => loadConfig(homeNested)).toThrow(

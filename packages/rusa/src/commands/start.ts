@@ -2,6 +2,7 @@ import {
   appendFileSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -9,6 +10,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Actor } from "../actor/actor.js";
@@ -196,6 +198,7 @@ import {
   resolveGlassGoalsConfig,
   resolveUnderstandingRootNodeId,
 } from "../understanding/root-scope.js";
+import { renderUnderstandingSnapshot } from "../understanding/snapshot.js";
 import { readBuildSentinel } from "../update/build-sentinel.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
@@ -1593,6 +1596,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // The Actor derives the sandbox (rooted at cwd, git+gh); each provider mounts
         // its own auth dir rw (see providerWritableStateDirs).
         const sandbox = config.sandbox !== "container-boundary";
+        const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
         let actor: Actor;
         actor = new Actor({
@@ -1602,6 +1606,26 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           mcpServers: workerMcp,
           addDirs: [],
           sandbox,
+          prepareUnderstandingMount: understandingMountEnabled
+            ? async () => {
+                const client = await localWriteDeps.getClient();
+                if (!client) {
+                  throw new Error("Understanding mount enabled but syncClient is not available");
+                }
+                const snapshotDir = mkdtempSync(join(tmpdir(), "rusa-iu-snapshot-"));
+                try {
+                  await renderUnderstandingSnapshot(
+                    client,
+                    snapshotDir,
+                    resolveUnderstandingRootNodeId(config)
+                  );
+                  return snapshotDir;
+                } catch (err) {
+                  rmSync(snapshotDir, { recursive: true, force: true });
+                  throw err;
+                }
+              }
+            : undefined,
           // Portable-context actors (design ISSUE_NUM) are called STATELESS — never resume a
           // provider session — so the mesh, not the provider, owns their memory.
           loadSessionId: () =>
@@ -1637,6 +1661,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                   threadId: id,
                   parentId: r.parentId ?? rootId,
                   handles,
+                  understandingMountEnabled,
                 },
                 injection?.priorContext
               ),
