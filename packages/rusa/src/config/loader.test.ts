@@ -226,11 +226,11 @@ describe("loadConfig github.repos (multi-repo identity and subscriptions)", () =
       writeConfig({
         github: {
           account: "CodeChopsBot",
-          repos: ["MEK-Org/meta-coder"],
+          repos: ["example-org/example-repo"],
         },
       })
     );
-    expect(config.github.repos).toEqual(["MEK-Org/meta-coder"]);
+    expect(config.github.repos).toEqual(["example-org/example-repo"]);
     expect(config.github.orgs).toBeUndefined();
   });
 
@@ -240,7 +240,7 @@ describe("loadConfig github.repos (multi-repo identity and subscriptions)", () =
         writeConfig({
           github: {
             account: "CodeChopsBot",
-            repos: "MEK-Org/meta-coder" as unknown as string[],
+            repos: "example-org/example-repo" as unknown as string[],
           },
         })
       )
@@ -250,8 +250,8 @@ describe("loadConfig github.repos (multi-repo identity and subscriptions)", () =
   it.each([
     ["no slash", "rusa"],
     ["too many segments", "dummy-org/dummy-repo/extra"],
-    ["whitespace in the owner", "MEK Org/rusa"],
-    ["whitespace in the name", "dummy-org/meta coder"],
+    ["whitespace in the owner", "dummy org/rusa"],
+    ["whitespace in the name", "dummy-org/sample repo"],
     ["blank string", "   "],
   ])("rejects invalid repo %s", (_label, repo) => {
     expect(() =>
@@ -287,18 +287,14 @@ describe("loadConfig github.orgs (event source organization derivation)", () => 
           account: "CodeChopsBot",
           orgs: [
             "plain-org",
-            { org: "  MEK-Org  ", excludedRepos: ["  MEK-Org/meta-coder-test-bed  "] },
-            { name: "Named-Org" },
-            { "Mapped-Org": { excludedRepos: ["Mapped-Org/secret"] } },
+            { org: "  example-org  ", excludedRepos: ["  example-org/sample-repo  "] },
           ],
         },
       })
     );
     expect(config.github.orgs).toEqual([
       "plain-org",
-      { org: "MEK-Org", excludedRepos: ["MEK-Org/meta-coder-test-bed"] },
-      { org: "Named-Org" },
-      { org: "Mapped-Org", excludedRepos: ["Mapped-Org/secret"] },
+      { org: "example-org", excludedRepos: ["example-org/sample-repo"] },
     ]);
   });
 
@@ -307,11 +303,11 @@ describe("loadConfig github.orgs (event source organization derivation)", () => 
       writeConfig({
         github: {
           account: "CodeChopsBot",
-          orgs: ["MEK-Org"],
+          orgs: ["example-org"],
         },
       })
     );
-    expect(config.github.orgs).toEqual(["MEK-Org"]);
+    expect(config.github.orgs).toEqual(["example-org"]);
     expect(config.github.repos).toBeUndefined();
   });
 
@@ -321,12 +317,14 @@ describe("loadConfig github.orgs (event source organization derivation)", () => 
         github: {
           account: "CodeChopsBot",
           repos: ["special-org/special-repo"],
-          orgs: [{ org: "MEK-Org", excludedRepos: ["MEK-Org/test-bed"] }],
+          orgs: [{ org: "example-org", excludedRepos: ["example-org/sample-repo"] }],
         },
       })
     );
     expect(config.github.repos).toEqual(["special-org/special-repo"]);
-    expect(config.github.orgs).toEqual([{ org: "MEK-Org", excludedRepos: ["MEK-Org/test-bed"] }]);
+    expect(config.github.orgs).toEqual([
+      { org: "example-org", excludedRepos: ["example-org/sample-repo"] },
+    ]);
   });
 
   it("rejects invalid github.orgs values", () => {
@@ -347,6 +345,17 @@ describe("loadConfig github.orgs (event source organization derivation)", () => 
         writeConfig({ github: { account: "CodeChopsBot", orgs: ["valid", "invalid/org"] } })
       )
     ).toThrow(/github\.orgs entries must be valid organization names/);
+
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          github: {
+            account: "CodeChopsBot",
+            orgs: [{ name: "unsupported-alias" } as unknown as { org: string }],
+          },
+        })
+      )
+    ).toThrow(/github\.orgs org object must specify a valid organization name/);
 
     expect(() =>
       loadConfig(

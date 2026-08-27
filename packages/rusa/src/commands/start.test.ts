@@ -1668,6 +1668,52 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }
   });
 
+  it("prefers git remote as primary repository identity when available while github.repos is additive", async () => {
+    let sigintListener: NodeJS.SignalsListener | undefined;
+    const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
+      if (event === "SIGINT") {
+        sigintListener = listener as NodeJS.SignalsListener;
+      }
+      return process;
+    });
+
+    worktreeMock.getRemoteUrl.mockReturnValue("https://github.com/primary-org/primary-repo.git");
+
+    const issueClient = new MockIssueClient();
+    setIssueClient(issueClient as unknown as IssueClient);
+
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: {
+          account: "mock-bot",
+          ingestionMode: "poll",
+          pollIntervalSeconds: 300,
+          repos: ["extra-org/extra-repo"],
+        },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity" },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    try {
+      void runStart({ noDashboardServer: true });
+      await waitUntil(() => sigintListener !== undefined, "start did not install shutdown handler");
+
+      // Verify that startGitHubEventPoller was started with primary repo derived from remote
+      expect(pollerMock.startGitHubEventPoller).toHaveBeenCalledWith(
+        expect.objectContaining({ repos: ["primary-org/primary-repo"] })
+      );
+
+      sigintListener?.("SIGINT");
+    } finally {
+      processOnSpy.mockRestore();
+      worktreeMock.getRemoteUrl.mockReturnValue("https://github.com/dummy-org/dummy-repo.git");
+    }
+  });
+
   it("does not start poller if ingestionMode is poll and repo cannot be resolved", async () => {
     let sigintListener: NodeJS.SignalsListener | undefined;
     const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {

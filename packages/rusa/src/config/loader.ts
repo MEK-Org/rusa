@@ -181,41 +181,20 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
         }
         validatedOrgs.push(trimmed);
       } else if (typeof item === "object" && item !== null && !Array.isArray(item)) {
-        const record = item as Record<string, unknown>;
-        let orgName: string | undefined;
-        let excludedReposRaw: unknown;
+        const record = item as unknown as Record<string, unknown>;
+        const orgName = record.org;
 
-        if (typeof record.org === "string") {
-          orgName = record.org;
-          excludedReposRaw = record.excludedRepos;
-        } else if (typeof record.name === "string") {
-          orgName = record.name;
-          excludedReposRaw = record.excludedRepos;
-        } else {
-          const keys = Object.keys(record);
-          if (keys.length === 1 && typeof record[keys[0]] === "object") {
-            orgName = keys[0];
-            const sub = record[keys[0]] as Record<string, unknown> | null;
-            excludedReposRaw = sub?.excludedRepos;
-          }
-        }
-
-        if (
-          !orgName ||
-          typeof orgName !== "string" ||
-          !orgName.trim() ||
-          !/^[^/\s]+$/.test(orgName.trim())
-        ) {
+        if (typeof orgName !== "string" || !orgName.trim() || !/^[^/\s]+$/.test(orgName.trim())) {
           throw new Error(
             "config.yaml: github.orgs org object must specify a valid organization name without slashes"
           );
         }
 
         let excludedRepos: string[] | undefined;
-        if (excludedReposRaw !== undefined) {
+        if (record.excludedRepos !== undefined) {
           if (
-            !Array.isArray(excludedReposRaw) ||
-            excludedReposRaw.some(
+            !Array.isArray(record.excludedRepos) ||
+            record.excludedRepos.some(
               (repo) =>
                 typeof repo !== "string" || !repo.trim() || !/^[^/\s]+\/[^/\s]+$/.test(repo.trim())
             )
@@ -224,7 +203,7 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
               "config.yaml: github.orgs excludedRepos must be an array of repository names in owner/name format when set"
             );
           }
-          excludedRepos = excludedReposRaw.map((repo) => (repo as string).trim());
+          excludedRepos = record.excludedRepos.map((repo) => (repo as string).trim());
         }
 
         validatedOrgs.push({
