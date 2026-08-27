@@ -164,7 +164,9 @@ export function buildGrantableServers(
   ]);
   if (deps.chatClient) {
     map.set(CHAT_READ_MCP_NAME, (_selfId, params, options) => {
-      const allowedSpaces = params.map((p) => (p.startsWith("spaces/") ? p : `spaces/${p}`));
+      const allowedSpaces = params.map((p) =>
+        p === "*" ? "*" : p.startsWith("spaces/") ? p : `spaces/${p}`
+      );
       if (!deps.chatClient) throw new Error("chatClient is required for chat-read capability");
       return createChatReadMcpServer(deps.chatClient, {
         allowedSpaces,
@@ -174,7 +176,9 @@ export function buildGrantableServers(
     map.set(CHAT_WRITE_MCP_NAME, (selfId, params, options) => {
       // params are e.g. ["spaces/AAAA", "spaces/BBBB"] from "chat-write:spaces/AAAA" etc.
       // Or if they were granted "*", we can support that, though typically spaces are passed.
-      const allowedSpaces = params.map((p) => (p.startsWith("spaces/") ? p : `spaces/${p}`));
+      const allowedSpaces = params.map((p) =>
+        p === "*" ? "*" : p.startsWith("spaces/") ? p : `spaces/${p}`
+      );
       if (!deps.chatClient) throw new Error("chatClient is required for chat-write capability");
       const workDir = deps.actorRootFor?.(selfId);
       return createChatWriteMcpServer(selfId, deps.chatClient, {

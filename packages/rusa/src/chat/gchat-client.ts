@@ -229,8 +229,8 @@ export class GchatClient implements ChatClient {
   }
 
   async downloadAttachment(resourceName: string): Promise<Buffer> {
-    let dataRef = resourceName;
-    if (resourceName.includes("/messages/")) {
+    let dataRef: string;
+    if (resourceName.startsWith("spaces/")) {
       const attachment = await this.getAttachment(resourceName);
       if (attachment.source === "DRIVE_FILE") {
         throw new Error(
@@ -242,6 +242,12 @@ export class GchatClient implements ChatClient {
         throw new Error(`attachment ${resourceName} does not contain an attachmentDataRef`);
       }
       dataRef = ref;
+    } else if (resourceName.startsWith("media/")) {
+      dataRef = resourceName;
+    } else {
+      throw new Error(
+        `invalid attachment resource name: expected spaces/... or media/... (got ${resourceName})`
+      );
     }
 
     const token = await this.token();

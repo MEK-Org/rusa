@@ -208,7 +208,7 @@ describe("GchatClient reads", () => {
     );
   });
 
-  it("downloads binary attachment contents via the media endpoint", async () => {
+  it("downloads binary attachment contents via direct media token", async () => {
     const fileBytes = Buffer.from("fake binary content");
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
@@ -220,13 +220,19 @@ describe("GchatClient reads", () => {
       .mockResolvedValueOnce(new Response(fileBytes, { status: 200 }));
 
     const downloaded = await new GchatClient(credentialsDir()).downloadAttachment(
-      "spaces/A/attachments/ATT1"
+      "media/spaces/A/attachments/DATAREF_123"
     );
 
     expect(downloaded).toEqual(fileBytes);
     expect(fetchMock.mock.calls[1]?.[0]).toBe(
-      "https://chat.googleapis.com/v1/media/spaces%2FA%2Fattachments%2FATT1?alt=media"
+      "https://chat.googleapis.com/v1/media/spaces%2FA%2Fattachments%2FDATAREF_123?alt=media"
     );
+  });
+
+  it("rejects downloadAttachment if resource name is neither spaces/... nor media/...", async () => {
+    await expect(
+      new GchatClient(credentialsDir()).downloadAttachment("invalid-resource-name")
+    ).rejects.toThrow("invalid attachment resource name");
   });
 
   it("resolves human-readable message attachment name via getAttachment before downloading", async () => {
@@ -358,7 +364,7 @@ describe("GchatClient reads", () => {
       );
 
     await expect(
-      new GchatClient(credentialsDir(), 500).downloadAttachment("spaces/A/attachments/ATT1")
+      new GchatClient(credentialsDir(), 500).downloadAttachment("media/spaces/A/attachments/ATT1")
     ).rejects.toThrow("attachment size limit exceeded");
   });
 
@@ -380,7 +386,7 @@ describe("GchatClient reads", () => {
       .mockResolvedValueOnce(new Response(stream, { status: 200 }));
 
     await expect(
-      new GchatClient(credentialsDir(), 80).downloadAttachment("spaces/A/attachments/ATT1")
+      new GchatClient(credentialsDir(), 80).downloadAttachment("media/spaces/A/attachments/ATT1")
     ).rejects.toThrow("attachment size limit exceeded");
   });
 

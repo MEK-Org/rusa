@@ -142,8 +142,8 @@ export class FakeChatClient implements ChatClient {
   }
 
   async downloadAttachment(resourceName: string): Promise<Buffer> {
-    let targetRef = resourceName;
-    if (resourceName.includes("/messages/")) {
+    let targetRef: string;
+    if (resourceName.startsWith("spaces/")) {
       const metadata = await this.getAttachment(resourceName);
       if (metadata.source === "DRIVE_FILE") {
         throw new Error(
@@ -151,6 +151,12 @@ export class FakeChatClient implements ChatClient {
         );
       }
       targetRef = metadata.attachmentDataRef?.resourceName ?? metadata.name ?? resourceName;
+    } else if (resourceName.startsWith("media/")) {
+      targetRef = resourceName;
+    } else {
+      throw new Error(
+        `invalid attachment resource name: expected spaces/... or media/... (got ${resourceName})`
+      );
     }
 
     let data: Buffer | undefined;

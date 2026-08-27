@@ -334,9 +334,9 @@ describe("chat MCP server", () => {
   it("rejects oversized downloads in download_attachment", async () => {
     const fake = new FakeChatClient();
     const largeBytes = Buffer.alloc(100, "a");
-    fake.attachments.set("spaces/A/attachments/ATT1", {
+    fake.attachments.set("spaces/A/messages/M1/attachments/ATT1", {
       metadata: {
-        name: "spaces/A/attachments/ATT1",
+        name: "spaces/A/messages/M1/attachments/ATT1",
         contentName: "large.bin",
         contentType: "application/octet-stream",
       },
@@ -346,7 +346,7 @@ describe("chat MCP server", () => {
 
     const res = (await client.callTool({
       name: "download_attachment",
-      arguments: { resourceName: "spaces/A/attachments/ATT1" },
+      arguments: { resourceName: "spaces/A/messages/M1/attachments/ATT1" },
     })) as CallToolResult;
     expect(res.isError).toBe(true);
     expect(textOf(res)).toContain("attachment size limit exceeded");
@@ -860,11 +860,23 @@ describe("chat MCP server", () => {
       },
       data: sampleBytes,
     });
-    fake.attachments.set("spaces/B/attachments/ATT2", {
+    fake.attachments.set("spaces/A/messages/M1/attachments/ATT1", {
       metadata: {
-        name: "spaces/B/attachments/ATT2",
+        name: "spaces/A/messages/M1/attachments/ATT1",
+        contentName: "allowed.txt",
+        contentType: "text/plain",
+        source: "UPLOADED_CONTENT",
+        attachmentDataRef: { resourceName: "media/TOKEN_A" },
+      },
+      data: sampleBytes,
+    });
+    fake.attachments.set("spaces/B/messages/M2/attachments/ATT2", {
+      metadata: {
+        name: "spaces/B/messages/M2/attachments/ATT2",
         contentName: "forbidden.txt",
         contentType: "text/plain",
+        source: "UPLOADED_CONTENT",
+        attachmentDataRef: { resourceName: "media/TOKEN_B" },
       },
       data: sampleBytes,
     });
@@ -897,13 +909,13 @@ describe("chat MCP server", () => {
     // get_attachment in allowed space vs forbidden space
     const getAttAllowed = (await client.callTool({
       name: "get_attachment",
-      arguments: { attachmentName: "spaces/A/attachments/ATT1" },
+      arguments: { attachmentName: "spaces/A/messages/M1/attachments/ATT1" },
     })) as CallToolResult;
     expect(getAttAllowed.isError).toBeFalsy();
 
     const getAttForbidden = (await client.callTool({
       name: "get_attachment",
-      arguments: { attachmentName: "spaces/B/attachments/ATT2" },
+      arguments: { attachmentName: "spaces/B/messages/M2/attachments/ATT2" },
     })) as CallToolResult;
     expect(getAttForbidden.isError).toBeTruthy();
     expect(textOf(getAttForbidden)).toContain("access denied");
@@ -911,17 +923,25 @@ describe("chat MCP server", () => {
     // download_attachment in allowed space vs forbidden space
     const dlAttAllowed = (await client.callTool({
       name: "download_attachment",
-      arguments: { resourceName: "spaces/A/attachments/ATT1" },
+      arguments: { resourceName: "spaces/A/messages/M1/attachments/ATT1" },
     })) as CallToolResult;
     expect(dlAttAllowed.isError).toBeFalsy();
     expect(textOf(dlAttAllowed)).toBe(sampleBytes.toString("base64"));
 
     const dlAttForbidden = (await client.callTool({
       name: "download_attachment",
-      arguments: { resourceName: "spaces/B/attachments/ATT2" },
+      arguments: { resourceName: "spaces/B/messages/M2/attachments/ATT2" },
     })) as CallToolResult;
     expect(dlAttForbidden.isError).toBeTruthy();
     expect(textOf(dlAttForbidden)).toContain("access denied");
+
+    // raw media tokens are rejected on scoped servers
+    const dlMediaTokenForbidden = (await client.callTool({
+      name: "download_attachment",
+      arguments: { resourceName: "media/TOKEN_A" },
+    })) as CallToolResult;
+    expect(dlMediaTokenForbidden.isError).toBeTruthy();
+    expect(textOf(dlMediaTokenForbidden)).toContain("raw media/ tokens are not permitted");
 
     // list_messages in allowed space vs forbidden space
     const listMsgAllowed = (await client.callTool({
@@ -938,13 +958,13 @@ describe("chat MCP server", () => {
     expect(textOf(listMsgForbidden)).toContain("access denied");
   });
 
-  it("downloads attachment using raw dataRef token or media format", async () => {
+  it("downloads attachment using raw dataRef token or media format on unscoped server", async () => {
     const fake = new FakeChatClient();
     const sampleBytes = Buffer.from("opaque token bytes");
-    fake.attachments.set("spaces/A/attachments/OPAQUE_TOKEN_123", {
+    fake.attachments.set("media/OPAQUE_TOKEN_123", {
       metadata: {
-        name: "spaces/A/attachments/OPAQUE_TOKEN_123",
-        attachmentDataRef: { resourceName: "spaces/A/attachments/OPAQUE_TOKEN_123" },
+        name: "spaces/A/messages/M1/attachments/ATT1",
+        attachmentDataRef: { resourceName: "media/OPAQUE_TOKEN_123" },
       },
       data: sampleBytes,
     });
@@ -952,9 +972,32 @@ describe("chat MCP server", () => {
 
     const res = (await client.callTool({
       name: "download_attachment",
-      arguments: { resourceName: "spaces/A/attachments/OPAQUE_TOKEN_123" },
+      arguments: { resourceName: "media/OPAQUE_TOKEN_123" },
     })) as CallToolResult;
     expect(res.isError).toBeFalsy();
     expect(textOf(res)).toBe(sampleBytes.toString("base64"));
+  });
+
+  it("auto-paginates list_spaces for scoped actors to locate allowed spaces across pages", async () => {
+    const fake = new FakeChatClient();
+    fake.spaces.push(
+      { name: "spaces/OTHER_1", displayName: "Other 1", spaceType: "SPACE" },
+      { name: "spaces/OTHER_2", displayName: "Other 2", spaceType: "SPACE" },
+      { name: "spaces/TARGET", displayName: "Target Space", spaceType: "SPACE" }
+    );
+    // listSpaces with pageSize=1 would normally require paging; scoped list_spaces finds it
+    const client = await connect(
+      createChatReadMcpServer(fake, { allowedSpaces: ["spaces/TARGET"] })
+    );
+
+    const res = (await client.callTool({
+      name: "list_spaces",
+      arguments: { pageSize: 1 },
+    })) as CallToolResult;
+    expect(res.isError).toBeFalsy();
+    const parsed = JSON.parse(textOf(res)) as { spaces: { name: string }[] };
+    expect(parsed.spaces).toEqual([
+      { name: "spaces/TARGET", displayName: "Target Space", spaceType: "SPACE" },
+    ]);
   });
 });
