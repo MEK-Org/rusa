@@ -1945,9 +1945,9 @@ describe("ActorMesh", () => {
     ]);
   });
 
-  it("requires a space name for chat-read and chat-write grants", () => {
+  it("requires a space name for chat-write grants", () => {
     const { mesh, registry } = setup({
-      grantableCapabilities: new Set(["chat-read", "chat-write"]),
+      grantableCapabilities: new Set(["chat-write"]),
     });
     registry.upsert({
       id: "worker-thread",
@@ -1957,12 +1957,6 @@ describe("ActorMesh", () => {
       createdAt: "2026-01-01T00:00:00Z",
     });
 
-    expect(() => mesh.grantCapability("worker-thread", "chat-read", "root")).toThrow(
-      "bare chat-read grant is not allowed"
-    );
-    expect(() => mesh.grantCapability("worker-thread", "chat-read:", "root")).toThrow(
-      "bare chat-read grant is not allowed"
-    );
     expect(() => mesh.grantCapability("worker-thread", "chat-write", "root")).toThrow(
       "bare chat-write grant is not allowed"
     );
@@ -1970,12 +1964,8 @@ describe("ActorMesh", () => {
       "bare chat-write grant is not allowed"
     );
 
-    mesh.grantCapability("worker-thread", "chat-read:spaces/AAQA29JwOwg", "root");
     mesh.grantCapability("worker-thread", "chat-write:spaces/AAQA29JwOwg", "root");
-    expect(mesh.activeCapabilitiesFor("worker-thread")).toEqual([
-      "chat-read:spaces/AAQA29JwOwg",
-      "chat-write:spaces/AAQA29JwOwg",
-    ]);
+    expect(mesh.activeCapabilitiesFor("worker-thread")).toEqual(["chat-write:spaces/AAQA29JwOwg"]);
   });
 
   it("a parent grants an allow-listed secret to its DIRECT child, audited with peerId = grantor", async () => {

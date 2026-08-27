@@ -1547,6 +1547,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           { name: STUCK_LOOP_DETECTOR_MCP_NAME, url: stuckLoopUrl },
           { name: QUOTA_MCP_NAME, url: quotaUrl },
         ];
+        if (chatClient) {
+          const chatReadUrl = mcpHttp.addServer(`${id}:${CHAT_READ_MCP_NAME}`, () =>
+            createChatReadMcpServer(chatClient, { isFenced })
+          );
+          perActorShared.push({ name: CHAT_READ_MCP_NAME, url: chatReadUrl });
+        }
 
         // Workers get their per-actor shared tools, agent execution, and durable messaging.
         const workerMcp: McpServerSpec[] = [

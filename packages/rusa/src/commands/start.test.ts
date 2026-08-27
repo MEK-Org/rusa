@@ -3056,4 +3056,79 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(t2Record).toBeDefined();
     expect(t2Record?.status).toBe("active");
   });
+
+  it("provides unscoped chat-read MCP server to all spawned workers when chatClient is configured (#59)", async () => {
+    const chatClient = new FakeChatClient();
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: {
+          antigravity: { cliCommand: "agy" },
+        },
+        rootActor: { provider: "antigravity" },
+        chat: {
+          projectId: "test",
+          subscription: "test",
+          pubsubKeyPath: "/dev/null",
+          gchat: "all",
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    let mesh: ActorMesh | undefined;
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          chatClient,
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    await readyPromise;
+    if (!mesh) throw new Error("mesh not ready");
+
+    const workerId = mesh.spawn({
+      charter: "chat-reader worker",
+      parentId: "root",
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash (High)",
+    });
+
+    const actor = mesh.get(workerId) as unknown as {
+      opts: { mcpServers: Array<{ name: string; url: string }> };
+    };
+    expect(actor).toBeDefined();
+    const chatReadSpecs = actor.opts.mcpServers.filter((s) => s.name === "chat-read");
+    expect(chatReadSpecs).toHaveLength(1);
+    const initialChatReadUrl = chatReadSpecs[0].url;
+
+    // Grant a write capability and verify chat-read is retained without duplication
+    mesh.grantCapability(workerId, "chat-write:spaces/AAAA", "root");
+    const updatedChatReadSpecs = actor.opts.mcpServers.filter((s) => s.name === "chat-read");
+    expect(updatedChatReadSpecs).toHaveLength(1);
+    expect(updatedChatReadSpecs[0].url).toBe(initialChatReadUrl);
+
+    const updatedServerNames = actor.opts.mcpServers.map((s) => s.name);
+    expect(updatedServerNames).toContain("chat-write");
+
+    // Scoped chat-read is no longer a grantable capability (all actors have implicit unscoped read)
+    const liveMesh = mesh;
+    expect(() => liveMesh.grantCapability(workerId, "chat-read:spaces/BBBB", "root")).toThrow(
+      "not a grantable capability: chat-read:spaces/BBBB"
+    );
+
+    // Revoking write capability preserves the default chat-read server intact
+    mesh.revokeCapability(workerId, "chat-write:spaces/AAAA", "root");
+    const afterRevokeSpecs = actor.opts.mcpServers.filter((s) => s.name === "chat-read");
+    expect(afterRevokeSpecs).toHaveLength(1);
+    expect(afterRevokeSpecs[0].url).toBe(initialChatReadUrl);
+  });
 });
