@@ -198,6 +198,11 @@ describe("quota MCP server", () => {
       expect(systemInstruction).toContain("do NOT guess a number");
       expect(systemInstruction).toContain("do NOT fail the parse");
       expect(systemInstruction).toContain("do NOT emit an invented window");
+      expect(systemInstruction).toContain(
+        "Extract EVERY rendered limit row into `windows` — never drop or omit the Weekly row when 5h is present, and vice-versa."
+      );
+      expect(systemInstruction).toContain("resets 02:10 on 27 Aug");
+      expect(systemInstruction).toContain("15:11 on 1 Sep");
       expect(systemInstruction).toContain("The current local time");
       expect(systemInstruction).not.toContain("For Claude:");
       expect(systemInstruction).not.toContain("For agy:");
@@ -868,6 +873,285 @@ describe("quota MCP server", () => {
       ]);
     });
 
+    it("completeness gate: fails loud with unknown status and error message when Codex raw output contains 'Weekly limit:' but LLM omits it", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "5h limit",
+                kind: "five_hour",
+                usedPercent: 0,
+              },
+            ],
+          }),
+      });
+
+      const rawCodexOutput =
+        "5h limit: [████████████████████] 100% left (resets 23:32)\n" +
+        "Weekly limit: [███████████████████░] 93% left (resets 12:34 on 14 Jul)";
+
+      const parsed = await parseCodexQuota(rawCodexOutput, "test-key");
+      expect(mockGenerateContent).toHaveBeenCalledTimes(2); // failed on attempt 1, retried, failed on attempt 2
+      expect(parsed.status).toBe("unknown");
+      expect(parsed.message).toContain("Quota parse incomplete");
+      expect(parsed.message).toContain("Weekly limit:");
+    });
+
+    it("completeness gate: fails loud with unknown status when Codex raw output contains '5h limit:' but LLM omits it", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Weekly limit",
+                kind: "weekly",
+                usedPercent: 7,
+                resetAtIso: "2026-07-14T12:34:00.000Z",
+              },
+            ],
+          }),
+      });
+
+      const rawCodexOutput =
+        "5h limit: [████████████████████] 100% left (resets 23:32)\n" +
+        "Weekly limit: [███████████████████░] 93% left (resets 12:34 on 14 Jul)";
+
+      const parsed = await parseCodexQuota(rawCodexOutput, "test-key");
+      expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect(parsed.status).toBe("unknown");
+      expect(parsed.message).toContain("Quota parse incomplete");
+      expect(parsed.message).toContain("5h limit:");
+    });
+
+    it("completeness gate: retries and succeeds when LLM retry recovers omitted limit rows", async () => {
+      // Attempt 1 omits weekly; Attempt 2 includes both 5h and weekly
+      mockGenerateContent
+        .mockResolvedValueOnce({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [
+                {
+                  label: "5h limit",
+                  kind: "five_hour",
+                  usedPercent: 1,
+                  resetAtIso: "2026-07-14T23:32:00.000Z",
+                },
+              ],
+            }),
+        })
+        .mockResolvedValueOnce({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [
+                {
+                  label: "5h limit",
+                  kind: "five_hour",
+                  usedPercent: 1,
+                  resetAtIso: "2026-07-14T23:32:00.000Z",
+                },
+                {
+                  label: "Weekly limit",
+                  kind: "weekly",
+                  usedPercent: 48,
+                  resetAtIso: "2026-07-14T12:34:00.000Z",
+                },
+              ],
+            }),
+        });
+
+      const rawCodexOutput =
+        "5h limit: [████████████████████] 99% left (resets 23:32)\n" +
+        "Weekly limit: [███████████████████░] 52% left (resets 12:34 on 14 Jul)";
+
+      const parsed = await parseCodexQuota(rawCodexOutput, "test-key");
+      expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect((mockGenerateContent.mock.calls[0][0] as { model: string }).model).toBe(
+        "gemini-3.5-flash-lite"
+      );
+      expect((mockGenerateContent.mock.calls[1][0] as { model: string }).model).toBe(
+        "gemini-3.5-flash"
+      );
+      expect(parsed.status).toBe("available");
+      expect(parsed.limits).toHaveLength(2);
+      expect(parsed.limits?.[0]).toMatchObject({ label: "5h limit", percentLeft: 99 });
+      expect(parsed.limits?.[1]).toMatchObject({ label: "Weekly limit", percentLeft: 52 });
+    });
+
+    it("completeness gate: model-scope Spark weekly window does not satisfy provider-scope weekly limit check", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "5h limit",
+                kind: "five_hour",
+                usedPercent: 0,
+                scope: "provider",
+              },
+              {
+                label: "GPT-5.3-Codex-Spark Weekly limit",
+                kind: "weekly",
+                usedPercent: 20,
+                resetAtIso: "2026-07-14T12:34:00.000Z",
+                scope: "model",
+              },
+            ],
+          }),
+      });
+
+      const rawCodexOutput =
+        "5h limit: [████████████████████] 100% left (resets 23:32)\n" +
+        "Weekly limit: [███████████████████░] 93% left (resets 12:34 on 14 Jul)\n" +
+        "GPT-5.3-Codex-Spark Weekly limit: [████████████████░░░░] 80% left (resets 12:34 on 14 Jul)";
+
+      const parsed = await parseCodexQuota(rawCodexOutput, "test-key");
+      expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect(parsed.status).toBe("unknown");
+      expect(parsed.message).toContain(
+        "Quota parse incomplete: raw output contains 'Weekly limit:' but parsed windows omitted a provider-scoped weekly window"
+      );
+    });
+
+    it("completeness gate: matching label with wrong or non-normalized kind (e.g. other) fails loud", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "5h limit",
+                kind: "five_hour",
+                usedPercent: 0,
+                scope: "provider",
+              },
+              {
+                label: "Weekly limit",
+                kind: "other",
+                usedPercent: 7,
+                resetAtIso: "2026-07-14T12:34:00.000Z",
+                scope: "provider",
+              },
+            ],
+          }),
+      });
+
+      const rawCodexOutput =
+        "5h limit: [████████████████████] 100% left (resets 23:32)\n" +
+        "Weekly limit: [███████████████████░] 93% left (resets 12:34 on 14 Jul)";
+
+      const parsed = await parseCodexQuota(rawCodexOutput, "test-key");
+      expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect(parsed.status).toBe("unknown");
+      expect(parsed.message).toContain(
+        "Quota parse incomplete: raw output contains 'Weekly limit:' but parsed windows omitted a provider-scoped weekly window"
+      );
+    });
+
+    it("attempt-level logging: logs warn on attempt 1 failure with provider tag and info on attempt 2 success", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+
+      mockGenerateContent
+        .mockResolvedValueOnce({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [
+                {
+                  label: "5h limit",
+                  kind: "five_hour",
+                  usedPercent: 1,
+                  resetAtIso: "2026-07-14T23:32:00.000Z",
+                },
+              ],
+            }),
+        })
+        .mockResolvedValueOnce({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [
+                {
+                  label: "5h limit",
+                  kind: "five_hour",
+                  usedPercent: 1,
+                  resetAtIso: "2026-07-14T23:32:00.000Z",
+                },
+                {
+                  label: "Weekly limit",
+                  kind: "weekly",
+                  usedPercent: 48,
+                  resetAtIso: "2026-07-14T12:34:00.000Z",
+                },
+              ],
+            }),
+        });
+
+      const rawCodexOutput =
+        "5h limit: [████████████████████] 99% left (resets 23:32)\n" +
+        "Weekly limit: [███████████████████░] 52% left (resets 12:34 on 14 Jul)";
+
+      const parsed = await parseCodexQuota(rawCodexOutput, "test-key");
+      expect(parsed.status).toBe("available");
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "[quota-mcp] [codex] LLM quota parse attempt 1 (gemini-3.5-flash-lite) failed: Quota parse incomplete: raw output contains 'Weekly limit:' but parsed windows omitted a provider-scoped weekly window"
+        )
+      );
+      expect(infoSpy).toHaveBeenCalledWith(
+        "[quota-mcp] [codex] LLM quota parse attempt 2 (gemini-3.5-flash) succeeded"
+      );
+
+      warnSpy.mockRestore();
+      infoSpy.mockRestore();
+    });
+
+    it("attempt-level logging: logs warn on attempt 1 failure and error on attempt 2 failure with provider tag", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "5h limit",
+                kind: "five_hour",
+                usedPercent: 1,
+                resetAtIso: "2026-07-14T23:32:00.000Z",
+              },
+            ],
+          }),
+      });
+
+      const rawCodexOutput =
+        "5h limit: [████████████████████] 99% left (resets 23:32)\n" +
+        "Weekly limit: [███████████████████░] 52% left (resets 12:34 on 14 Jul)";
+
+      const parsed = await parseCodexQuota(rawCodexOutput, "test-key");
+      expect(parsed.status).toBe("unknown");
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "[quota-mcp] [codex] LLM quota parse attempt 1 (gemini-3.5-flash-lite) failed: Quota parse incomplete: raw output contains 'Weekly limit:' but parsed windows omitted a provider-scoped weekly window"
+        )
+      );
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "[quota-mcp] [codex] LLM quota parse attempt 2 (gemini-3.5-flash) failed: Quota parse incomplete: raw output contains 'Weekly limit:' but parsed windows omitted a provider-scoped weekly window"
+        )
+      );
+
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
     it("threads an LLM-emitted resetAtIso through unchanged to the resulting limits ", async () => {
       mockGenerateContent.mockResolvedValue({
         text: () =>
@@ -1434,8 +1718,8 @@ describe("quota MCP server", () => {
               status: "available",
               windows: [
                 {
-                  label: "Weekly",
-                  kind: "weekly",
+                  label: "Current session",
+                  kind: "session",
                   usedPercent: 77,
                   resetAtIso: "2026-07-13T02:59:00.000Z",
                 },
@@ -1461,8 +1745,8 @@ describe("quota MCP server", () => {
         expect(parsed.status).toBe("available");
         expect(parsed.limits).toEqual([
           {
-            label: "Weekly",
-            kind: "weekly",
+            label: "Current session",
+            kind: "session",
             percentLeft: 23,
             resetAtIso: "2026-07-13T02:59:00.000Z",
           },
@@ -1557,7 +1841,13 @@ describe("quota MCP server", () => {
               status: "available",
               windows: [
                 {
-                  label: "Weekly",
+                  label: "5h limit",
+                  kind: "five_hour",
+                  usedPercent: 1,
+                  resetAtIso: "2026-07-14T23:32:00.000Z",
+                },
+                {
+                  label: "Weekly limit",
                   kind: "weekly",
                   usedPercent: 42,
                   resetAtIso: "2026-07-14T12:34:00.000Z",
@@ -1586,7 +1876,13 @@ describe("quota MCP server", () => {
         expect(parsed.status).toBe("available");
         expect(parsed.limits).toEqual([
           {
-            label: "Weekly",
+            label: "5h limit",
+            kind: "five_hour",
+            percentLeft: 99,
+            resetAtIso: "2026-07-14T23:32:00.000Z",
+          },
+          {
+            label: "Weekly limit",
             kind: "weekly",
             percentLeft: 58,
             resetAtIso: "2026-07-14T12:34:00.000Z",
@@ -1681,6 +1977,13 @@ describe("quota MCP server", () => {
                   kind: "weekly",
                   usedPercent: 100,
                   resetAtIso: "2026-07-20T00:00:00.000Z",
+                  scope: "provider",
+                },
+                {
+                  label: "Five Hour Limit",
+                  kind: "five_hour",
+                  usedPercent: 100,
+                  resetAtIso: "2026-07-22T22:00:00.000Z",
                   scope: "provider",
                 },
               ],
@@ -2263,6 +2566,52 @@ describe("quota MCP server", () => {
         };
         const inferredT1Fresh = inferQuotaState(stateT1Fresh, inferredT0);
         expect(inferredT1Fresh.limits?.[0].resetAtIso).toBe("2026-08-20T17:00:00.000Z");
+      });
+
+      it("carried_forward_bad_read: Step 3 matches explicit scope 'provider' with undefined scope", () => {
+        const t0Iso = "2026-08-26T10:00:00.000Z";
+        const unexpiredResetIso = "2026-08-26T15:00:00.000Z";
+        const prevState: ProviderQuotaSnapshot = {
+          provider: "codex",
+          status: "available",
+          scrapedAt: t0Iso,
+          limits: [
+            {
+              label: "Weekly limit",
+              kind: "weekly",
+              percentLeft: 50,
+              resetAtIso: unexpiredResetIso,
+              scope: "provider",
+            },
+          ],
+        };
+
+        const t1Iso = "2026-08-26T11:00:00.000Z";
+        // Current state parsed Weekly limit without resetAtIso and scope undefined
+        const currentState: ProviderQuotaSnapshot = {
+          provider: "codex",
+          status: "available",
+          scrapedAt: t1Iso,
+          limits: [
+            {
+              label: "Weekly limit",
+              kind: "weekly",
+              percentLeft: 45,
+              scope: undefined,
+            },
+          ],
+        };
+
+        const inferred = inferQuotaState(currentState, prevState, t1Iso);
+        expect(inferred.limits?.[0].resetAtIso).toBe(unexpiredResetIso);
+        expect(inferred.explanations).toEqual([
+          {
+            window: "Weekly limit",
+            field: "resetAtIso",
+            rule: "carried_forward_bad_read",
+            detail: "carried forward previous unexpired window reset after missing reading",
+          },
+        ]);
       });
 
       it("invariant: empty explanations list => inferred_parsed_state equals parsed_state", () => {
