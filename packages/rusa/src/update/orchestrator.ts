@@ -43,8 +43,7 @@ export interface GitSeam {
   resetHard(ref: string): Promise<void>;
   /**
    * Materialize git submodules to the checked-out commit (`git submodule update
-   * --init --recursive`). Runs before EVERY build (the build is unconditional — we
-   * rebuild + restart even when already at the target sha): `resetHard` moves a
+   * --init --recursive`). Runs before EVERY build: `resetHard` moves a
    * submodule's gitlink but not its working tree, and an already-current box may
    * never have inited the submodule, yet `flutter build web` needs the path-deps
    * (repo-root third_party/glass_goals_devkit) on disk either way. Idempotent +
@@ -169,7 +168,7 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
       return {
         ok: false,
         failedStep: "pull",
-        error: `Refused: already deployed (origin/${plan.branch} tip ${newSha} matches deployed SHA ${oldSha})`,
+        error: `Refused: already deployed (origin/${plan.branch} tip ${newSha} matches deployed SHA ${oldSha}; note: a green update restarts the daemon, causing an expected MCP transport disconnect)`,
         oldSha,
         alreadyCurrent: true,
         restarting: false,
@@ -186,9 +185,8 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
         } catch {}
       }
     }
-    // Materialize submodules before EVERY build — the build below is unconditional
-    // (we rebuild + restart even when already-current), so its prerequisite must be
-    // too. `resetHard` moves a submodule's gitlink but not its working tree, and an
+    // Materialize submodules before EVERY build: `resetHard` moves a
+    // submodule's gitlink but not its working tree, and an
     // already-current box may never have inited the submodule; either way
     // `flutter build web` needs repo-root third_party/glass_goals_devkit on disk. Idempotent + a fast
     // no-op when in sync.
@@ -220,6 +218,16 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
     );
 
     // ── 4. EXIT — systemd restarts onto the fresh build. ─────────────────
+    const drainSummary = drain.quiesced ? "quiesced" : `timeout after ${drain.waitedMs}ms`;
+    try {
+      deps.recordAction?.(
+        `update committed: ${shortSha(oldSha)} → ${shortSha(newSha)} (${subject}) [drain: ${drainSummary}] — restarting`
+      );
+    } catch (recErr) {
+      log(
+        `[update] recordAction failed: ${recErr instanceof Error ? recErr.message : String(recErr)}`
+      );
+    }
     log(`[update] exit(0) → systemd restart onto ${shortSha(newSha)} (${subject})`);
     deps.exit(0);
     return {
@@ -257,7 +265,7 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
         try {
           deps.alertMarker?.(alert); // durable marker file
         } catch {
-          /* best-effort */
+          /* best-effort marker */
         }
         if (deps.notify) {
           try {
@@ -267,6 +275,20 @@ export async function executeUpdate(plan: UpdatePlan, deps: UpdateDeps): Promise
           }
         }
       }
+    }
+    const rollbackSummary = movedToNew
+      ? rollbackFailed
+        ? "rollback FAILED"
+        : "rolled back"
+      : "no rollback needed";
+    try {
+      deps.recordAction?.(
+        `update failed at ${failedStep}${timedOut ? " (timeout)" : ""}: ${error} [${rollbackSummary}, staying on ${oldSha ? shortSha(oldSha) : "unknown"}]`
+      );
+    } catch (recErr) {
+      log(
+        `[update] recordAction failed: ${recErr instanceof Error ? recErr.message : String(recErr)}`
+      );
     }
     const msg = `❌ update failed at ${failedStep}${timedOut ? " (timed out)" : ""}: ${error} — staying on ${shortSha(oldSha)}`;
     if (deps.notify) {

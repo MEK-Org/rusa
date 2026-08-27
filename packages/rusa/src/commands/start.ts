@@ -1990,6 +1990,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     const packageDir = join(repoRoot, "packages", "rusa");
     const errorChatSpace = config.chat?.errorChat;
     const deployBranch = config.deployBranch ?? DEFAULT_DEPLOY_BRANCH;
+    if (!chatClient || !errorChatSpace) {
+      console.warn("[update] no errorChat configured — lifecycle pings disabled");
+    }
     const updateToolDeps: UpdateToolDeps = {
       plan: { branch: deployBranch, drainTimeoutMs: UPDATE_DRAIN_TIMEOUT_MS },
       rootId: rootId,

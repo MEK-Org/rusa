@@ -428,6 +428,28 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
   });
 
+  it("warns at boot when the self-update tool mounts without errorChat configured", async () => {
+    const warns: string[] = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation((...args) => {
+      warns.push(args.join(" "));
+    });
+
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    await readyPromise;
+    warnSpy.mockRestore();
+
+    expect(warns).toContain("[update] no errorChat configured — lifecycle pings disabled");
+  });
+
   it("adds a live capability grant to the cached provider config for the next run", async () => {
     writeFileSync(
       join(homeDir, "threads.json"),

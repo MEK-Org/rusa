@@ -86,16 +86,18 @@ function makeDeps(over: Partial<UpdateDeps> = {}) {
     },
   };
   const markers: string[] = [];
+  const actions: string[] = [];
   const deps: UpdateDeps = {
     git,
     build,
     drain,
     notify,
     alertMarker: (text) => markers.push(text),
+    recordAction: (text) => actions.push(text),
     exit: (c) => exits.push(c),
     ...over,
   };
-  return { deps, git, drain, build, notify, exits, markers };
+  return { deps, git, drain, build, notify, exits, markers, actions };
 }
 
 const plan = (over: Partial<UpdatePlan> = {}): UpdatePlan => ({
@@ -106,7 +108,7 @@ const plan = (over: Partial<UpdatePlan> = {}): UpdatePlan => ({
 
 describe("executeUpdate — happy path (green build → drain → exit)", () => {
   it("pulls, builds the new sha, engages drain, then exit(0)", async () => {
-    const { deps, git, drain, build, exits, notify } = makeDeps();
+    const { deps, git, drain, build, exits, notify, actions } = makeDeps();
     const res = await executeUpdate(plan(), deps);
 
     expect(res.ok).toBe(true);
@@ -116,6 +118,10 @@ describe("executeUpdate — happy path (green build → drain → exit)", () => 
     expect(build.builtSha).toBe(NEW); // built BEFORE touching run-state
     expect(drain.engaged).toBe(true);
     expect(exits).toEqual([0]); // systemd will restart onto the fresh build
+    expect(actions).toEqual([
+      "update authorized/attempted by root (trigger: MCP tool, target SHA: 1111111111111111111111111111111111111111)",
+      "update committed: 0000000 → 1111111 (feat: new thing) [drain: quiesced] — restarting",
+    ]);
     expect(notify.messages).toEqual([
       "🚀 update authorized/attempted by root (trigger: MCP tool, target SHA: 1111111111111111111111111111111111111111)",
       "🔄 Updating → 1111111 (feat: new thing) — draining + restarting",
@@ -225,7 +231,7 @@ describe("executeUpdate — happy path (green build → drain → exit)", () => 
 
 describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
   it("a RED build aborts: rolls back, NEVER drains, NEVER exits, reports ❌", async () => {
-    const { deps, git, drain, exits, notify } = makeDeps();
+    const { deps, git, drain, exits, notify, actions } = makeDeps();
     deps.build = {
       async build() {
         throw new StepError("build", "tsc: type error", false);
@@ -239,12 +245,16 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     expect(drain.engaged).toBe(false); // run-state untouched
     expect(exits).toEqual([]); // NEVER restart onto a broken build
     expect(git.resets).toEqual([NEW, OLD]); // rolled back to old code
+    expect(actions).toEqual([
+      "update authorized/attempted by root (trigger: MCP tool, target SHA: 1111111111111111111111111111111111111111)",
+      "update failed at build: tsc: type error [rolled back, staying on 0000000]",
+    ]);
     expect(notify.messages.some((m) => m.includes("❌ update failed at build"))).toBe(true);
     expect(notify.messages.some((m) => m.includes("staying on 0000000"))).toBe(true);
   });
 
   it("a FAILED rollback fires the LOUD chat-independent alert (last silent-failure path)", async () => {
-    const { deps, git, markers, notify } = makeDeps();
+    const { deps, git, markers, notify, actions } = makeDeps();
     deps.build = {
       async build() {
         throw new StepError("build", "tsc broke", false);
@@ -261,6 +271,10 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     expect(res.ok).toBe(false);
     expect(res.rollbackFailed).toBe(true); // surfaced in the result
     expect(git.resets).toEqual([NEW, OLD]); // tried to roll back; it threw
+    expect(actions).toEqual([
+      "update authorized/attempted by root (trigger: MCP tool, target SHA: 1111111111111111111111111111111111111111)",
+      "update failed at build: tsc broke [rollback FAILED, staying on 0000000]",
+    ]);
     // LOUD: journal ERROR (console.error) + durable marker + best-effort chat — all fired.
     expect(errs.some((e) => e.includes("rollback FAILED"))).toBe(true);
     expect(markers.some((m) => m.includes("restart-fragile"))).toBe(true);
@@ -268,7 +282,7 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
   });
 
   it("a HUNG build (timeout) aborts the same way, flagged timedOut (elder #2)", async () => {
-    const { deps, drain, exits } = makeDeps();
+    const { deps, drain, exits, actions } = makeDeps();
     deps.build = {
       async build() {
         throw new StepError("install", "install timed out after 600000ms", true);
@@ -280,10 +294,14 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     expect(res.timedOut).toBe(true);
     expect(drain.engaged).toBe(false);
     expect(exits).toEqual([]); // a hung build never wedges into a restart
+    expect(actions).toEqual([
+      "update authorized/attempted by root (trigger: MCP tool, target SHA: 1111111111111111111111111111111111111111)",
+      "update failed at install (timeout): install timed out after 600000ms [rolled back, staying on 0000000]",
+    ]);
   });
 
   it("a pull failure aborts before build, drain and exit (no rollback — never moved)", async () => {
-    const { deps, git, drain, build, exits } = makeDeps();
+    const { deps, git, drain, build, exits, actions } = makeDeps();
     git.failFetch = new Error("network down");
     const res = await executeUpdate(plan(), deps);
     expect(res.ok).toBe(false);
@@ -292,6 +310,9 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     expect(drain.engaged).toBe(false);
     expect(exits).toEqual([]);
     expect(git.resets).toEqual([]); // pull failed before we moved
+    expect(actions).toEqual([
+      "update failed at pull: network down [no rollback needed, staying on 0000000]",
+    ]);
   });
 
   it("a failed notify never sinks the result", async () => {
@@ -304,5 +325,20 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     };
     const res = await executeUpdate(plan(), deps);
     expect(res.ok).toBe(false); // still returns cleanly
+  });
+
+  it("does not abort or throw if recordAction on terminal outcome throws", async () => {
+    const { deps, exits } = makeDeps();
+    let callCount = 0;
+    deps.recordAction = (_msg) => {
+      callCount++;
+      if (callCount > 1) {
+        throw new Error("disk error on second recordAction");
+      }
+    };
+    const res = await executeUpdate(plan(), deps);
+    expect(res.ok).toBe(true);
+    expect(res.restarting).toBe(true);
+    expect(exits).toEqual([0]);
   });
 });
