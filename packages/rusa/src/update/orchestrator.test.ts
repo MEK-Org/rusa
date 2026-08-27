@@ -281,9 +281,10 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     expect(git.resets).toEqual([NEW, OLD]); // tried to roll back; it threw
     expect(actions).toEqual([
       "update authorized/attempted by root (trigger: MCP tool, target SHA: 1111111111111111111111111111111111111111)",
-      "update failed at build: tsc broke [rollback FAILED, checkout not restored (at 1111111), staying on UNSAFE]",
+      "update failed at build: tsc broke [rollback FAILED, checkout state UNKNOWN/UNSAFE (update target 1111111; attempted rollback to 0000000)]",
     ]);
     expect(actions[1]).not.toContain("staying on 0000000");
+    expect(actions[1]).not.toContain("at 1111111");
     // LOUD: journal ERROR (console.error) + durable marker + best-effort chat — all fired.
     expect(errs.some((e) => e.includes("rollback FAILED"))).toBe(true);
     expect(markers.some((m) => m.includes("restart-fragile"))).toBe(true);
@@ -291,7 +292,7 @@ describe("executeUpdate — the GATE (mesh untouched on a bad build)", () => {
     expect(
       notify.messages.some((m) =>
         m.includes(
-          "❌ update failed at build: tsc broke [rollback FAILED, checkout not restored (at 1111111), staying on UNSAFE]"
+          "❌ update failed at build: tsc broke [rollback FAILED, checkout state UNKNOWN/UNSAFE (update target 1111111; attempted rollback to 0000000)]"
         )
       )
     ).toBe(true);

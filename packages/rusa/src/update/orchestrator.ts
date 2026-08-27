@@ -146,7 +146,7 @@ export function formatFailureOutcome(params: FormatFailureParams): string {
   let locationSummary: string;
   if (movedToNew) {
     if (rollbackFailed) {
-      locationSummary = `rollback FAILED, checkout not restored (at ${newSha ? shortSha(newSha) : "unknown"}), staying on UNSAFE`;
+      locationSummary = `rollback FAILED, checkout state UNKNOWN/UNSAFE (update target ${newSha ? shortSha(newSha) : "unknown"}; attempted rollback to ${oldSha ? shortSha(oldSha) : "unknown"})`;
     } else {
       locationSummary = `rolled back, staying on ${oldSha ? shortSha(oldSha) : "unknown"}`;
     }
