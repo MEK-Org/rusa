@@ -255,4 +255,83 @@ describe("grantable capabilities allow-list ", () => {
     expect(mounted).toEqual(["actor-1:drive-read"]);
     expect(mountedParams).toEqual([["kept-folder"]]);
   });
+
+  it("registers chat-read and chat-write when chatClient is present and remounts chat-read on revocation", async () => {
+    const fakeChatClient = {
+      listSpaces: async () => ({ spaces: [] }),
+      listMessages: async () => ({ messages: [] }),
+      getMessage: async () => ({ name: "spaces/A/messages/M1" }),
+      getAttachment: async () => ({ name: "spaces/A/attachments/ATT1" }),
+      downloadAttachment: async () => Buffer.alloc(0),
+      uploadAttachment: async () => ({ attachmentDataRef: { resourceName: "ref" } }),
+      send: async () => ({ name: "spaces/A/messages/M1" }),
+      react: async () => {},
+      getSpaceType: async () => "SPACE",
+      listSpaceMembers: async () => ({ members: [] }),
+    };
+    const serversWithChat = buildGrantableServers({
+      ...STUB_DEPS,
+      chatClient: fakeChatClient,
+    });
+    expect([...serversWithChat.keys()]).toContain("chat-read");
+    expect([...serversWithChat.keys()]).toContain("chat-write");
+
+    const removed: string[] = [];
+    const mounted: string[] = [];
+    const chatReadFactory = serversWithChat.get("chat-read");
+    if (!chatReadFactory) throw new Error("chat-read factory missing");
+    serversWithChat.set("chat-read", (selfId, params) => {
+      return chatReadFactory(selfId, params);
+    });
+
+    await handleCapabilityRevoked(
+      "actor-1",
+      "chat-read:spaces/B",
+      () => ["chat-read:spaces/A"],
+      serversWithChat,
+      {
+        removeServer: async (name) => {
+          removed.push(name);
+        },
+        addServer: (name, factory) => {
+          factory();
+          mounted.push(name);
+          return "http://example.invalid/mcp/token";
+        },
+      }
+    );
+
+    expect(removed).toEqual(["actor-1:chat-read"]);
+    expect(mounted).toEqual(["actor-1:chat-read"]);
+  });
+
+  it("preserves wildcard * for chat-read and chat-write capability grants", () => {
+    const fakeChatClient = {
+      listSpaces: async () => ({ spaces: [] }),
+      listMessages: async () => ({ messages: [] }),
+      getMessage: async () => ({ name: "spaces/A/messages/M1" }),
+      getAttachment: async () => ({ name: "spaces/A/attachments/ATT1" }),
+      downloadAttachment: async () => Buffer.alloc(0),
+      uploadAttachment: async () => ({ attachmentDataRef: { resourceName: "ref" } }),
+      send: async () => ({ name: "spaces/A/messages/M1" }),
+      react: async () => {},
+      getSpaceType: async () => "SPACE",
+      listSpaceMembers: async () => ({ members: [] }),
+    };
+    const serversWithChat = buildGrantableServers({
+      ...STUB_DEPS,
+      chatClient: fakeChatClient,
+    });
+    const chatReadFactory = serversWithChat.get("chat-read");
+    const chatWriteFactory = serversWithChat.get("chat-write");
+    if (!chatReadFactory || !chatWriteFactory) {
+      throw new Error("expected chat-read and chat-write factories");
+    }
+
+    // Calling factory with ["*"] should not throw and configure wildcard access
+    const readServer = chatReadFactory("actor-1", ["*"]);
+    const writeServer = chatWriteFactory("actor-1", ["*"]);
+    expect(readServer).toBeDefined();
+    expect(writeServer).toBeDefined();
+  });
 });

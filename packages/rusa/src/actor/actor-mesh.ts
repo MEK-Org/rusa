@@ -870,6 +870,8 @@ export class ActorMesh {
     let baseCapability = capability;
     if (capability.startsWith("chat-write:")) {
       baseCapability = "chat-write";
+    } else if (capability.startsWith("chat-read:")) {
+      baseCapability = "chat-read";
     } else if (capability.startsWith("calendar-read:")) {
       baseCapability = "calendar-read";
     } else if (capability.startsWith("calendar-write:")) {
@@ -910,6 +912,8 @@ export class ActorMesh {
     let baseCapability = capability;
     if (capability.startsWith("chat-write:")) {
       baseCapability = "chat-write";
+    } else if (capability.startsWith("chat-read:")) {
+      baseCapability = "chat-read";
     } else if (capability.startsWith("calendar-read:")) {
       baseCapability = "calendar-read";
     } else if (capability.startsWith("calendar-write:")) {
@@ -919,9 +923,14 @@ export class ActorMesh {
     } else if (capability.startsWith("drive-read:")) {
       baseCapability = "drive-read";
     }
-    if (capability === "chat-write") {
+    if (capability === "chat-write" || capability === "chat-write:") {
       throw new Error(
         `bare chat-write grant is not allowed; must specify a space (e.g. chat-write:spaces/AAAA)`
+      );
+    }
+    if (capability === "chat-read" || capability === "chat-read:") {
+      throw new Error(
+        `bare chat-read grant is not allowed; must specify a space (e.g. chat-read:spaces/AAAA)`
       );
     }
     if (capability === "calendar-read" || capability === "calendar-read:") {
