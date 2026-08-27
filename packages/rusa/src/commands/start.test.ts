@@ -2734,12 +2734,16 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(rootSpaceNames).not.toContain("spaces/delegated");
   });
 
-  it("implies root event sources from github, targets, chat, and observability stanzas", async () => {
+  it("implies root event sources from github, chat, and observability stanzas", async () => {
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
-        github: { account: "mock-bot", repo: "custom-org/custom-repo" },
-        targets: [{ repo: "target-org/target-repo", localPath: "/tmp/dummy" }],
+        github: {
+          account: "mock-bot",
+          repo: "custom-org/custom-repo",
+          orgs: ["target-org"],
+          repos: ["extra-org/extra-repo"],
+        },
         providers: {
           antigravity: { cliCommand: "agy" },
         },
@@ -2787,6 +2791,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
           actorId: "root",
           subscribedBy: "root",
           resource: { kind: "github_org", org: "target-org" },
+        }),
+        expect.objectContaining({
+          actorId: "root",
+          subscribedBy: "root",
+          resource: { kind: "github_org", org: "extra-org" },
         }),
         expect.objectContaining({
           actorId: "root",
