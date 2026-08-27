@@ -216,6 +216,10 @@ export function getEffectiveGoalStatus(
     if (entry.type !== "status" && entry.type !== "archiveStatus" && entry.type !== "clearStatus") {
       continue;
     }
+    // Canonical pathless status read ignores instance-specific (path-scoped) entries
+    if (entry.path && entry.path.length > 0) {
+      continue;
+    }
     if (entry.type === "clearStatus") {
       return null;
     }

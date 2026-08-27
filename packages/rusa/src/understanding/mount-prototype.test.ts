@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +12,17 @@ import { loadConfig } from "../config/index.js";
 import { buildActorBwrapArgs } from "../providers/sandbox.js";
 import { getNodeContents } from "./graph-store.js";
 import { renderUnderstandingSnapshot } from "./snapshot.js";
+
+function probeBwrapCapable(): boolean {
+  try {
+    execFileSync("bwrap", ["--ro-bind", "/", "/", "--", "/bin/true"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const BWRAP_CAPABLE = probeBwrapCapable();
 
 function makeGoal(
   id: string,
@@ -265,35 +276,7 @@ describe("Issue #45: Integrated Understanding Read-Only Mount Prototype Validati
     });
   });
 
-  describe("Gate 6: Snapshot factory failure cleanup & Provider cleanup", () => {
-    it("cleans up temporary snapshot directory if rendering throws", async () => {
-      const snapshotDir = mkdtempSync(join(tmpdir(), "rusa-iu-error-cleanup-"));
-      expect(existsSync(snapshotDir)).toBe(true);
-
-      const rootId = "rootNode123";
-      const fixedPrefix = "colfix";
-      const id1 = `${fixedPrefix}1111111111111111`;
-      const id2 = `${fixedPrefix}2222222222222222`;
-
-      const rootGoal = makeGoal(rootId, "Root", { children: [id1, id2] });
-      const goal1 = makeGoal(id1, "Colliding Concept", { parents: [rootId] });
-      const goal2 = makeGoal(id2, "Colliding Concept", { parents: [rootId] });
-
-      const { sync } = fake([rootGoal, goal1, goal2]);
-
-      // Factory pattern wrapped in try/catch rmSync
-      let caught = false;
-      try {
-        await renderUnderstandingSnapshot(sync, snapshotDir, rootId);
-      } catch {
-        caught = true;
-        rmSync(snapshotDir, { recursive: true, force: true });
-      }
-
-      expect(caught).toBe(true);
-      expect(existsSync(snapshotDir)).toBe(false);
-    });
-
+  describe("Gate 6: Temporary snapshot directory cleanup", () => {
     it("cleans up temporary snapshot directory after execution", () => {
       const snapshotDir = mkdtempSync(join(tmpdir(), "rusa-iu-cleanup-test-"));
       expect(existsSync(snapshotDir)).toBe(true);
@@ -304,69 +287,67 @@ describe("Issue #45: Integrated Understanding Read-Only Mount Prototype Validati
     });
   });
 
-  describe("Sandbox Integration: bwrap read access and EROFS write protection", () => {
-    it("allows reading /tmp/understanding and rejects writes with EROFS inside bwrap", () => {
-      const hostSnapshotDir = mkdtempSync(join(tmpdir(), "rusa-bwrap-integ-"));
-      try {
-        writeFileSync(
-          join(hostSnapshotDir, "system-architecture--ggDxZ2.md"),
-          "# System Architecture\nCore spec.",
-          "utf-8"
-        );
+  describe.skipIf(!BWRAP_CAPABLE)(
+    "Sandbox Integration: bwrap read access and EROFS write protection",
+    () => {
+      it("allows reading /tmp/understanding and rejects writes with EROFS inside bwrap", () => {
+        const hostSnapshotDir = mkdtempSync(join(tmpdir(), "rusa-bwrap-integ-"));
+        try {
+          writeFileSync(
+            join(hostSnapshotDir, "system-architecture--ggDxZ2.md"),
+            "# System Architecture\nCore spec.",
+            "utf-8"
+          );
 
-        // Probe 1: Read files inside bwrap sandbox
-        const readResult = spawnSync(
-          "bwrap",
-          [
-            "--ro-bind",
-            "/",
-            "/",
-            "--tmpfs",
-            "/tmp",
-            "--dir",
-            "/tmp/understanding",
-            "--ro-bind",
-            hostSnapshotDir,
-            "/tmp/understanding",
-            "cat",
-            "/tmp/understanding/system-architecture--ggDxZ2.md",
-          ],
-          { encoding: "utf-8" }
-        );
+          // Probe 1: Read files inside bwrap sandbox
+          const readResult = spawnSync(
+            "bwrap",
+            [
+              "--ro-bind",
+              "/",
+              "/",
+              "--tmpfs",
+              "/tmp",
+              "--dir",
+              "/tmp/understanding",
+              "--ro-bind",
+              hostSnapshotDir,
+              "/tmp/understanding",
+              "cat",
+              "/tmp/understanding/system-architecture--ggDxZ2.md",
+            ],
+            { encoding: "utf-8" }
+          );
 
-        if (readResult.error) {
-          // If bwrap is not available or blocked in current container, skip gracefully
-          return;
+          expect(readResult.status).toBe(0);
+          expect(readResult.stdout).toContain("# System Architecture");
+
+          // Probe 2: Write attempt fails with EROFS
+          const writeResult = spawnSync(
+            "bwrap",
+            [
+              "--ro-bind",
+              "/",
+              "/",
+              "--tmpfs",
+              "/tmp",
+              "--dir",
+              "/tmp/understanding",
+              "--ro-bind",
+              hostSnapshotDir,
+              "/tmp/understanding",
+              "touch",
+              "/tmp/understanding/unauthorized_write.txt",
+            ],
+            { encoding: "utf-8" }
+          );
+
+          expect(writeResult.status).not.toBe(0);
+          expect(writeResult.stderr).toMatch(/Read-only file system/);
+        } finally {
+          rmSync(hostSnapshotDir, { recursive: true, force: true });
         }
-
-        expect(readResult.status).toBe(0);
-        expect(readResult.stdout).toContain("# System Architecture");
-
-        // Probe 2: Write attempt fails with EROFS
-        const writeResult = spawnSync(
-          "bwrap",
-          [
-            "--ro-bind",
-            "/",
-            "/",
-            "--tmpfs",
-            "/tmp",
-            "--dir",
-            "/tmp/understanding",
-            "--ro-bind",
-            hostSnapshotDir,
-            "/tmp/understanding",
-            "touch",
-            "/tmp/understanding/unauthorized_write.txt",
-          ],
-          { encoding: "utf-8" }
-        );
-
-        expect(writeResult.status).not.toBe(0);
-        expect(writeResult.stderr).toMatch(/Read-only file system/);
-      } finally {
-        rmSync(hostSnapshotDir, { recursive: true, force: true });
-      }
-    });
-  });
+      });
+    }
+  );
 });

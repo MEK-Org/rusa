@@ -326,6 +326,38 @@ describe("snapshot renderer", () => {
         endTime: now - 5000,
       } as StatusLogEntry);
       expect(isArchivedGoal(expiredGoal, now)).toBe(false);
+
+      // Case 5: Path-scoped (instance-specific) status does not archive canonical goal
+      const pathScopedGoal = makeGoal("pathScopedGoal", "Goal with instance-specific status");
+      pathScopedGoal.log.push({
+        id: "status-path-scoped",
+        creationTime: 10,
+        type: "status",
+        status: "ar",
+        path: ["parentInstance", "childInstance"],
+      } as StatusLogEntry);
+      expect(getEffectiveGoalStatus(pathScopedGoal, now)).toBeNull();
+      expect(isArchivedGoal(pathScopedGoal, now)).toBe(false);
+
+      // Case 6: Path-scoped clearStatus does not clear canonical archive status
+      const canonicalArchiveGoal = makeGoal(
+        "canonicalArchiveGoal",
+        "Archived goal with instance clear"
+      );
+      canonicalArchiveGoal.log.push({
+        id: "status-canonical",
+        creationTime: 10,
+        type: "status",
+        status: "ar",
+      } as StatusLogEntry);
+      canonicalArchiveGoal.log.unshift({
+        id: "clear-path-scoped",
+        creationTime: 20,
+        type: "clearStatus",
+        path: ["parentInstance", "childInstance"],
+      } as ClearStatusLogEntry);
+      expect(getEffectiveGoalStatus(canonicalArchiveGoal, now)?.status).toBe("ar");
+      expect(isArchivedGoal(canonicalArchiveGoal, now)).toBe(true);
     });
 
     it("fails closed when a configured rootNodeId is missing or stale", async () => {
