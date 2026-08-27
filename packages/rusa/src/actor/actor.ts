@@ -60,6 +60,12 @@ export interface ActorOptions {
    * the directory basename.
    */
   isE2eRoot?: boolean;
+  /**
+   * Optional factory to prepare and return a host directory containing the
+   * Integrated Understanding snapshot to mount into the sandbox at /tmp/understanding.
+   * Called per launch when sandboxed.
+   */
+  prepareUnderstandingMount?: () => Promise<string | undefined> | string | undefined;
   /** Extra repos granted via `--add-dir`. */
   addDirs?: string[];
   /** Load this actor's persisted working-memory session id (undefined on first run). */
@@ -558,10 +564,15 @@ export class Actor {
     // The provider treats the actor's cwd as its private directory and shadows
     // everything beside it (see buildActorBwrapArgs). This object is just the
     // opt-in signal.
+    let understandingMount: string | undefined;
+    if (this.opts.sandbox && this.opts.prepareUnderstandingMount) {
+      understandingMount = await this.opts.prepareUnderstandingMount();
+    }
     const sandbox: SandboxOptions | undefined = this.opts.sandbox
       ? {
           worktreePath: this.opts.cwd,
           isE2eRoot: this.opts.isE2eRoot,
+          understandingMount,
         }
       : undefined;
 

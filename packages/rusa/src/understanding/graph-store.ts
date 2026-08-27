@@ -202,6 +202,10 @@ export interface NodeView {
  * answered "not found"). Exported because the distiller and LLM-retrieval tool
  * loops are readers too, and each had its own inline copy of the rule .
  */
+export function isArchivedGoal(goal: Goal): boolean {
+  return goal.log.find((e): e is StatusLogEntry => e.type === "status")?.status === "ar";
+}
+
 export function isVisibleNode(
   goals: Map<string, Goal>,
   id: string,
@@ -210,12 +214,16 @@ export function isVisibleNode(
 ): boolean {
   if (rootNodeId && id === rootNodeId) return false;
   if (reachable && !reachable.has(id)) return false;
-  return goals.has(id);
+  const goal = goals.get(id);
+  if (!goal) return false;
+  if (isArchivedGoal(goal)) return false;
+  return true;
 }
 
 export function viewNode(syncClient: SyncClient, id: string, rootNodeId?: string): NodeView | null {
   const goals = syncClient.getGoals();
-  const reachable = rootNodeId ? getReachableNodeIds(goals, rootNodeId) : null;
+  const reachable =
+    rootNodeId && goals.has(rootNodeId) ? getReachableNodeIds(goals, rootNodeId) : null;
   if (!isVisibleNode(goals, id, reachable, rootNodeId)) return null;
 
   const goal = goals.get(id);
@@ -225,10 +233,10 @@ export function viewNode(syncClient: SyncClient, id: string, rootNodeId?: string
     title: goal.text,
     contents: getNodeContents(goal),
     parents: Array.from(goal.superGoalIds)
-      .filter((pid) => (rootNodeId ? pid !== rootNodeId && reachable?.has(pid) : goals.has(pid)))
+      .filter((pid) => isVisibleNode(goals, pid, reachable, rootNodeId))
       .map((pid) => ({ id: pid, title: goals.get(pid)?.text })),
     children: Array.from(goal.subGoalIds)
-      .filter((cid) => (reachable ? reachable.has(cid) : goals.has(cid)))
+      .filter((cid) => isVisibleNode(goals, cid, reachable, rootNodeId))
       .map((cid) => ({ id: cid, title: goals.get(cid)?.text })),
   };
 }
@@ -249,7 +257,8 @@ export function listChildren(
   rootNodeId?: string
 ): { id: string; title: string; childCount: number }[] | null {
   const goals = syncClient.getGoals();
-  const reachable = rootNodeId ? getReachableNodeIds(goals, rootNodeId) : null;
+  const reachable =
+    rootNodeId && goals.has(rootNodeId) ? getReachableNodeIds(goals, rootNodeId) : null;
   if (parentId !== undefined && !isVisibleNode(goals, parentId, reachable, rootNodeId)) return null;
 
   const effectiveParentId =
@@ -258,12 +267,13 @@ export function listChildren(
   let ids: string[];
   if (effectiveParentId) {
     ids = Array.from(goals.get(effectiveParentId)?.subGoalIds ?? []).filter((cid) =>
-      reachable ? reachable.has(cid) : goals.has(cid)
+      isVisibleNode(goals, cid, reachable, rootNodeId)
     );
   } else {
     ids = Array.from(goals.values())
       .filter((g) => Array.from(g.superGoalIds).every((pid) => !goals.has(pid)))
-      .map((g) => g.id);
+      .map((g) => g.id)
+      .filter((id) => isVisibleNode(goals, id, reachable, rootNodeId));
   }
 
   return ids
@@ -271,7 +281,7 @@ export function listChildren(
       const g = goals.get(id);
       if (!g) return null;
       const childCount = Array.from(g.subGoalIds).filter((cid) =>
-        reachable ? reachable.has(cid) : goals.has(cid)
+        isVisibleNode(goals, cid, reachable, rootNodeId)
       ).length;
       return {
         id,

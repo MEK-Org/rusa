@@ -204,9 +204,13 @@ export class KimiProvider implements CodingProvider {
           opts.sandbox.worktreePath,
           "kimi",
           mcpConfigSource,
-          opts.sandbox.isE2eRoot
+          opts.sandbox.isE2eRoot,
+          opts.sandbox.understandingMount
         );
         tempPaths.push(...bwrapResult.tempPaths);
+        if (opts.sandbox.understandingMount) {
+          tempPaths.push(opts.sandbox.understandingMount);
+        }
         spawnArgs = buildActorBwrapCommand(bwrapResult, resolvedCommand, args);
         spawnCommand = "bwrap";
       }

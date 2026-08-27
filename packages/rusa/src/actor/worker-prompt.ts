@@ -123,6 +123,8 @@ export interface WorkerPromptContext {
   parentId: string;
   /** Extra actors this worker may message, already resolved to display labels. */
   handles?: ResolvedHandle[];
+  /** Whether the Integrated Understanding read-only filesystem mount is enabled. */
+  understandingMountEnabled?: boolean;
 }
 
 /** A short, one-line label for an actor, derived from its charter. */
@@ -243,6 +245,9 @@ export function buildWorkerPrompt(
   priorContext?: string
 ): string {
   const shortId = ctx.threadId.slice(0, 8);
+  const mountNotice = ctx.understandingMountEnabled
+    ? "\n\nA read-only snapshot of the integrated understanding is mounted at /tmp/understanding; grep and read it directly."
+    : "";
   const workingDir = `
 
 ---
@@ -258,7 +263,7 @@ When you change code: work on a branch namespaced to you (e.g.
 \`rusa/${shortId}/<short-topic>\`) so you never collide, commit, push, and open a PR
 with your tools. Your charter defines the scope — it may span several repos or
 several PRs. Don't touch the user's live working trees or anything outside your
-directory.`;
+directory.${mountNotice}`;
   return `${buildWorkerScaffold(ctx)}
 
 ${FORWARD_PROGRESS_DISCIPLINE}

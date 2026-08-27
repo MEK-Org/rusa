@@ -6,6 +6,7 @@ import {
   readFileSync,
   readSync,
   realpathSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -428,9 +429,13 @@ export class AntigravityProvider implements CodingProvider {
         opts.cwd,
         "antigravity",
         tempMcpConfigPath,
-        opts.sandbox.isE2eRoot
+        opts.sandbox.isE2eRoot,
+        opts.sandbox.understandingMount
       );
       tempPaths.push(...bwrapResult.tempPaths);
+      if (opts.sandbox.understandingMount) {
+        tempPaths.push(opts.sandbox.understandingMount);
+      }
       spawnArgs = buildActorBwrapCommand(bwrapResult, command, args);
       spawnCommand = "bwrap";
     }
@@ -438,7 +443,7 @@ export class AntigravityProvider implements CodingProvider {
     const cleanup = () => {
       if (tempMcpConfigPath) {
         try {
-          unlinkSync(tempMcpConfigPath);
+          rmSync(tempMcpConfigPath, { recursive: true, force: true });
         } catch {
           /* best effort */
         }
@@ -446,7 +451,7 @@ export class AntigravityProvider implements CodingProvider {
       }
       for (const p of tempPaths) {
         try {
-          unlinkSync(p);
+          rmSync(p, { recursive: true, force: true });
         } catch {
           /* best effort */
         }

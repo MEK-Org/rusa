@@ -1,12 +1,5 @@
 import { randomUUID } from "node:crypto";
-import {
-  existsSync,
-  readdirSync,
-  readFileSync,
-  statSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { parse, stringify } from "smol-toml";
 import type { ProviderConfig } from "../config/types.js";
@@ -367,14 +360,14 @@ export class CodexProvider implements CodingProvider {
     const cleanupMcpConfig = () => {
       if (mcpConfigSource) {
         try {
-          unlinkSync(mcpConfigSource);
+          rmSync(mcpConfigSource, { recursive: true, force: true });
         } catch {
           /* best effort */
         }
       }
       for (const p of tempPaths) {
         try {
-          unlinkSync(p);
+          rmSync(p, { recursive: true, force: true });
         } catch {
           /* best effort */
         }
@@ -543,11 +536,15 @@ export class CodexProvider implements CodingProvider {
           opts.sandbox.worktreePath,
           "codex",
           mcpConfigSource,
-          opts.sandbox.isE2eRoot
+          opts.sandbox.isE2eRoot,
+          opts.sandbox.understandingMount
         );
         bwrapResult = bResult;
         spawnCommand = "bwrap";
         tempPaths.push(...bResult.tempPaths);
+        if (opts.sandbox.understandingMount) {
+          tempPaths.push(opts.sandbox.understandingMount);
+        }
       }
 
       // Attempt resume when the pre-check cleared it. Fall back to a fresh run on

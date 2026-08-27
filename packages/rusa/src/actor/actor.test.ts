@@ -70,6 +70,31 @@ describe("Actor", () => {
     });
   });
 
+  it("invokes prepareUnderstandingMount and passes host mount directory to sandbox options", async () => {
+    let actor!: Actor;
+    const provider = new FakeProvider(() => {
+      actor.declareYield();
+      return {};
+    });
+    const prepareMountMock = vi.fn().mockResolvedValue("/tmp/test-snapshot-mount");
+    actor = makeActor(
+      {
+        sandbox: true,
+        prepareUnderstandingMount: prepareMountMock,
+      },
+      provider
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(prepareMountMock).toHaveBeenCalledTimes(1);
+    expect(provider.calls[0]?.sandbox).toEqual({
+      worktreePath: "/tmp/a1",
+      understandingMount: "/tmp/test-snapshot-mount",
+    });
+  });
+
   it("skips provider sandbox options when disabled", async () => {
     const provider = new FakeProvider();
     const actor = makeActor({ sandbox: false }, provider);

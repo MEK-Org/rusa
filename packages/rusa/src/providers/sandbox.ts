@@ -718,6 +718,7 @@ function buildMeshActorBwrapArgs(o: {
   authMode?: SandboxAuthMode;
   mcpConfigPath?: string;
   isE2eRoot?: boolean;
+  understandingMount?: string;
 }): ActorBwrapResult {
   const pnpmStore = realpathIfExists(resolvePnpmStorePath());
   mkdirSync(pnpmStore, { recursive: true });
@@ -746,6 +747,11 @@ function buildMeshActorBwrapArgs(o: {
     "--dir",
     "/tmp/cache",
   ];
+
+  if (o.understandingMount) {
+    args.push("--dir", "/tmp/understanding");
+    args.push("--ro-bind", o.understandingMount, "/tmp/understanding");
+  }
 
   // Bind the toolchain directory onto /usr/local/bin and the sibling lib directory onto
   // /usr/local/lib to survive `bash -lc` login shells.
@@ -1041,9 +1047,16 @@ export function buildActorBwrapArgs(
   actorDir: string,
   authMode?: SandboxAuthMode,
   mcpConfigPath?: string,
-  isE2eRoot?: boolean
+  isE2eRoot?: boolean,
+  understandingMount?: string
 ): ActorBwrapResult {
-  return buildMeshActorBwrapArgs({ actorDir, authMode, mcpConfigPath, isE2eRoot });
+  return buildMeshActorBwrapArgs({
+    actorDir,
+    authMode,
+    mcpConfigPath,
+    isE2eRoot,
+    understandingMount,
+  });
 }
 
 let _hostFlutterRoot: string | null | undefined;
