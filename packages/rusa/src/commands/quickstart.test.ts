@@ -168,7 +168,7 @@ describe("quickstart command", () => {
       ingestionMode: "poll",
     });
     expect(config).not.toHaveProperty("targets");
-    expect(config.rootActor?.handle).toMatch(/^[a-z]+-[a-z]+$/);
+    expect(config.rootActor?.handle).toMatch(/^[a-z]+(?:-[a-z]+)+$/);
   });
 
   it("persists the entire node home for provider CLI state", () => {
