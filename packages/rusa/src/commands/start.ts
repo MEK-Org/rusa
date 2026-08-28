@@ -357,6 +357,14 @@ function configuredRootEventSources(config: RusaConfig): EventResource[] {
     configured.push({ kind: "github_repo", repo });
   }
 
+  if (config.deployRepo) {
+    configured.push({
+      kind: "github_branch",
+      repo: config.deployRepo,
+      ref: `refs/heads/${config.deployBranch ?? DEFAULT_DEPLOY_BRANCH}`,
+    });
+  }
+
   if (config.chat) {
     configured.push({ kind: "chat" });
   }
@@ -2382,10 +2390,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const githubPoller =
     !e2eMode &&
     ingestionMode === "poll" &&
-    ((config.github.repos?.length ?? 0) > 0 || (config.github.orgs?.length ?? 0) > 0)
+    ((config.github.repos?.length ?? 0) > 0 ||
+      (config.github.orgs?.length ?? 0) > 0 ||
+      config.deployRepo !== undefined)
       ? startGitHubEventPoller({
           repos: config.github.repos ?? [],
           orgs: config.github.orgs ?? [],
+          ...(config.deployRepo ? { deployRepo: config.deployRepo } : {}),
           deployBranch: config.deployBranch ?? DEFAULT_DEPLOY_BRANCH,
           intervalSeconds: config.github.pollIntervalSeconds,
           home: mcHome,

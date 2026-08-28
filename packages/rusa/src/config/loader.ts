@@ -473,6 +473,17 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   }
   // geminiApiKey and mistralApiKey are optional at config-validation time;
   // individual consumers gate the features that require them.
+  if (parsed.deployRepo !== undefined) {
+    if (
+      typeof parsed.deployRepo !== "string" ||
+      !/^[^/\s]+\/[^/\s]+$/.test(parsed.deployRepo.trim())
+    ) {
+      throw new Error(
+        "config.yaml: deployRepo must be a repository name in owner/name format when set"
+      );
+    }
+    parsed.deployRepo = parsed.deployRepo.trim();
+  }
   if (parsed.deployBranch !== undefined) {
     if (typeof parsed.deployBranch !== "string" || !parsed.deployBranch.trim()) {
       throw new Error("config.yaml: deployBranch must be a non-empty string when set");

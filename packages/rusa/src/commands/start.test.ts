@@ -2850,6 +2850,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
         providers: {
           antigravity: { cliCommand: "agy" },
         },
+        deployRepo: "deploy-org/deploy-repo",
+        deployBranch: "staging",
         rootActor: { provider: "antigravity" },
         chat: {
           projectId: "test",
@@ -2904,6 +2906,15 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
+          resource: {
+            kind: "github_branch",
+            repo: "deploy-org/deploy-repo",
+            ref: "refs/heads/staging",
+          },
+        }),
+        expect.objectContaining({
+          actorId: "root",
+          subscribedBy: "root",
           resource: { kind: "chat" },
         }),
         expect.objectContaining({
@@ -2912,6 +2923,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
           resource: { kind: "system" },
         }),
       ])
+    );
+    expect(subscriptions).not.toContainEqual(
+      expect.objectContaining({
+        resource: { kind: "github_repo", repo: "deploy-org/deploy-repo" },
+      })
     );
   });
 
