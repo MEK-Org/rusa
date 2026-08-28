@@ -33,7 +33,7 @@ export interface GitHubConfig {
   ingestionMode?: "webhook" | "poll";
   /**
    * GitHub repositories in "owner/name" format that this instance subscribes to
-   * and polls. The first entry is the primary repository for tracker hygiene.
+   * and polls. Tracker hygiene scans every configured repository.
    */
   repos?: string[];
   /**

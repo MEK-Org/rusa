@@ -626,10 +626,6 @@ export async function compactPortableContext(input: {
     : null;
 }
 
-function getServiceRepoName(config: RusaConfig): string | null {
-  return config.github.repos?.[0] ?? null;
-}
-
 /**
  * Start rusa as the single **root actor** over an {@link ActorMesh}.
  *
@@ -880,11 +876,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     }
   })();
   const addDirs: string[] = repoRoot ? [repoRoot] : [];
-  const repoName = getServiceRepoName(config);
-  if (!repoName && config.observability?.trackerHygiene?.enabled === true) {
-    console.error(
-      "[start] Could not determine the primary repository (github.repos is empty). Tracker hygiene is DISABLED for this run."
-    );
+  const trackerHygieneRepos = config.github.repos ?? [];
+  if (trackerHygieneRepos.length === 0 && config.observability?.trackerHygiene?.enabled === true) {
+    console.error("[start] github.repos is empty. Tracker hygiene is DISABLED for this run.");
   }
   // Append-only observability log: every message, wake, spawn, and retire lands
   // in `mesh_events` so a run can be replayed as a timeline by `rusa report`.
@@ -2401,7 +2395,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       : null;
   let trackerHygieneTimer: ReturnType<typeof setInterval> | null = null;
   const trackerHygieneConfig = config.observability?.trackerHygiene;
-  if (!e2eMode && trackerHygieneConfig?.enabled === true && repoName) {
+  if (!e2eMode && trackerHygieneConfig?.enabled === true && trackerHygieneRepos.length > 0) {
     const intervalSeconds = trackerHygieneConfig?.intervalSeconds ?? 6 * 60 * 60;
     const areaStewardHandle = trackerHygieneConfig?.areaStewardHandle ?? rootHandle;
     const thresholds = {
@@ -2416,34 +2410,36 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         console.log("[tracker-hygiene] HALT active — scan skipped");
         return;
       }
-      const actions = await runTrackerHygiene(
-        issueClient,
-        {
-          resolveHandle: (handle) =>
-            registry.resolveHandle(handle, (id) =>
-              id === rootId ? rootHandle : generateHandle(id)
-            ),
-          sendMessage: (toId, body) => mesh.sendMessage(toId, body, SCHEDULER_SENDER_ID),
-        },
-        {
-          repo: repoName,
-          areaStewardHandle,
-          automationAuthor: botLogin,
-          closeAction: trackerHygieneConfig?.closeAction ?? "log",
-          thresholds,
-          log: (message) => console.warn(message),
-          // Same instance id `mesh.deliverEvent` is called with for this
-          // instance's own writes — lets the system:* suppression rule
-          // recognize the stamp as this instance's (ISSUE_NUM leg 1).
-          instanceId: rootHandle,
-        }
-      );
-      if (actions.length > 0) {
-        console.log(
-          `[tracker-hygiene] ${repoName}: ${actions
-            .map((action) => `${action.kind}#${action.number}`)
-            .join(", ")}`
+      for (const repo of trackerHygieneRepos) {
+        const actions = await runTrackerHygiene(
+          issueClient,
+          {
+            resolveHandle: (handle) =>
+              registry.resolveHandle(handle, (id) =>
+                id === rootId ? rootHandle : generateHandle(id)
+              ),
+            sendMessage: (toId, body) => mesh.sendMessage(toId, body, SCHEDULER_SENDER_ID),
+          },
+          {
+            repo,
+            areaStewardHandle,
+            automationAuthor: botLogin,
+            closeAction: trackerHygieneConfig?.closeAction ?? "log",
+            thresholds,
+            log: (message) => console.warn(message),
+            // Same instance id `mesh.deliverEvent` is called with for this
+            // instance's own writes — lets the system:* suppression rule
+            // recognize the stamp as this instance's (ISSUE_NUM leg 1).
+            instanceId: rootHandle,
+          }
         );
+        if (actions.length > 0) {
+          console.log(
+            `[tracker-hygiene] ${repo}: ${actions
+              .map((action) => `${action.kind}#${action.number}`)
+              .join(", ")}`
+          );
+        }
       }
     };
     void runTrackerHygieneOnce().catch((err) => {

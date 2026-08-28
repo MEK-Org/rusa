@@ -1482,7 +1482,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }
   });
 
-  it("runs tracker hygiene when explicitly enabled", async () => {
+  it("runs tracker hygiene for every explicit github.repos entry when enabled", async () => {
     let sigintListener: NodeJS.SignalsListener | undefined;
     const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
       if (event === "SIGINT") {
@@ -1499,7 +1499,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           account: "mock-bot",
           ingestionMode: "poll",
           pollIntervalSeconds: 300,
-          repos: ["dummy-org/dummy-repo"],
+          repos: ["dummy-org/dummy-repo", "other-org/other-repo"],
         },
         providers: { antigravity: { cliCommand: "agy" } },
         rootActor: { provider: "antigravity" },
@@ -1512,11 +1512,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
     try {
       void runStart({ noDashboardServer: true });
       await waitUntil(
-        () => trackerHygieneMock.runTrackerHygiene.mock.calls.length === 1,
+        () => trackerHygieneMock.runTrackerHygiene.mock.calls.length === 2,
         "tracker hygiene did not run"
       );
 
-      expect(trackerHygieneMock.runTrackerHygiene).toHaveBeenCalledWith(
+      expect(trackerHygieneMock.runTrackerHygiene).toHaveBeenNthCalledWith(
+        1,
         issueClient,
         expect.objectContaining({
           resolveHandle: expect.any(Function),
@@ -1527,8 +1528,22 @@ describe("runStart webhook event routing (Phase 4)", () => {
           closeAction: "log",
         })
       );
+      expect(trackerHygieneMock.runTrackerHygiene).toHaveBeenNthCalledWith(
+        2,
+        issueClient,
+        expect.objectContaining({
+          resolveHandle: expect.any(Function),
+          sendMessage: expect.any(Function),
+        }),
+        expect.objectContaining({
+          repo: "other-org/other-repo",
+          closeAction: "log",
+        })
+      );
       expect(pollerMock.startGitHubEventPoller).toHaveBeenCalledWith(
-        expect.objectContaining({ repos: ["dummy-org/dummy-repo"] })
+        expect.objectContaining({
+          repos: ["dummy-org/dummy-repo", "other-org/other-repo"],
+        })
       );
       sigintListener?.("SIGINT");
     } finally {
