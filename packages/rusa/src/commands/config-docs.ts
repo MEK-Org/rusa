@@ -39,9 +39,7 @@ Minimal example:
 
   geminiApiKey: GEMINI_API_KEY_VALUE
 
-  # Repository and branch used by the root self-update tool. Setting deployRepo
-  # also subscribes the root to that exact branch for webhook deploy triggers.
-  deployRepo: example-org/rusa
+  # Branch used by the root self-update tool (optional; defaults to master).
   deployBranch: master
 
   # Which provider/model the root actor runs on (optional; defaults to agy).
@@ -104,7 +102,6 @@ Top-level fields:
   quota                    Optional. Shared quota evidence, persisted controller state, and launch coordination.
   mesh                     Optional. Mesh concurrency settings.
   geminiApiKey             Optional. Enables Gemini features (quota-error classification, avatar generation, understanding retrieval/distill); each skips gracefully when absent.
-  deployRepo               Optional. Repository the root self-update tool deploys from, in owner/name format. Enables its exact webhook branch subscription.
   deployBranch             Optional. Branch the root self-update tool deploys from. Defaults to master.
   webhook                  Required. Local webhook listener settings.
   rootActor                Optional. Provider/model the root actor runs on and its display identity. Provider
@@ -124,7 +121,7 @@ github:
   account                  GitHub username used by this Rusa instance, for example CodeChopsBot.
   pollIntervalSeconds      Optional. GitHub poll interval in seconds when ingestionMode is poll; defaults to 300. Must be a positive number when set.
   ingestionMode            Optional. "webhook" (default) binds the webhook listener; "poll" fetches GitHub updates without binding it.
-  repos                    Optional list. GitHub repositories in owner/name format to subscribe to and poll. Independent of deployRepo.
+  repos                    Optional list. GitHub repositories in owner/name format to subscribe to and poll. The poller also watches deployBranch head changes for these explicit repositories.
   orgs                     Optional list of objects. Each requires org and may include excludedRepos. Organization repositories are subscribed to and polled; exclusions are suppressed at webhook and poll ingestion.
   workerTokenPath          Optional. Path to read-mostly fine-grained GitHub PAT file visible to sandboxed workers.
 

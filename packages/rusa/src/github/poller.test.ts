@@ -85,7 +85,7 @@ describe("GitHubEventPoller", () => {
     ]);
   });
 
-  it("emits an exact branch push for a deploy repository outside the tracker feeds", async () => {
+  it("emits a repo-scoped push when an explicit repository deploy branch advances", async () => {
     home = mkdtempSync(join(tmpdir(), "rusa-github-poller-"));
     const client = new MockPollIssueClient();
     const branchKey = "example-org/service-repo@master";
@@ -96,8 +96,7 @@ describe("GitHubEventPoller", () => {
       deliveryId?: string;
     }> = [];
     const poller = new GitHubEventPoller({
-      repos: ["example-org/tracker-repo"],
-      deployRepo: "example-org/service-repo",
+      repos: ["example-org/service-repo"],
       deployBranch: "master",
       home,
       issueClient: client as GitHubPollingIssueClient,
@@ -116,7 +115,6 @@ describe("GitHubEventPoller", () => {
         payload: {
           before: "sha-before",
           after: "sha-after",
-          ref: "refs/heads/master",
           repository: {
             full_name: "example-org/service-repo",
             name: "service-repo",
@@ -126,11 +124,10 @@ describe("GitHubEventPoller", () => {
         deliveryId: "poll:example-org/service-repo:push:master:sha-after",
       },
     ]);
-    expect(client.polledRepos).toEqual(["example-org/tracker-repo", "example-org/tracker-repo"]);
+    expect(events[0].payload).not.toHaveProperty("ref");
     expect(deriveGitHubInboxNotification("push", events[0].payload)?.resource).toEqual({
-      kind: "github_branch",
+      kind: "github_repo",
       repo: "example-org/service-repo",
-      ref: "refs/heads/master",
     });
   });
 
@@ -441,7 +438,6 @@ describe("GitHubEventPoller", () => {
 
     await new GitHubEventPoller({
       repos: ["dummy-org/dummy-repo"],
-      deployRepo: "dummy-org/dummy-repo",
       intervalSeconds: 300,
       home,
       issueClient: bridgeClient,

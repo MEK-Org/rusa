@@ -350,8 +350,6 @@ export interface RusaConfig {
   profile?: string;
   github: GitHubConfig;
   providers: Record<string, ProviderConfig>;
-  /** Repository the root self-update tool deploys from, in "owner/name" format. */
-  deployRepo?: string;
   /** Branch the root self-update tool deploys from. Defaults to "master". */
   deployBranch?: string;
   /**

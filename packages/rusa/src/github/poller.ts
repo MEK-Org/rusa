@@ -16,9 +16,7 @@ type EmitGitHubEvent = (
 export interface GitHubPollerOptions {
   repos: string[];
   orgs?: GitHubOrgConfig[];
-  /** Repository whose deploy branch head is watched independently of tracker repositories. */
-  deployRepo?: string;
-  /** Branch whose head changes synthesize deploy push notifications. */
+  /** Branch whose head changes synthesize repo-scoped deploy push notifications. */
   deployBranch?: string;
   /**
    * Optional because raw `config.yaml` does not guarantee it — see
@@ -90,10 +88,13 @@ export class GitHubEventPoller {
     try {
       const state = this.loadState();
       const repos = await this.resolveConfiguredRepos();
+      const explicitRepos = new Set(this.options.repos.map((repo) => repo.toLowerCase()));
       for (const repo of repos) {
         await this.pollRepo(repo, state);
+        if (explicitRepos.has(repo.toLowerCase())) {
+          await this.pollDeployBranch(repo, state);
+        }
       }
-      if (this.options.deployRepo) await this.pollDeployBranch(this.options.deployRepo, state);
       this.saveState(state);
     } finally {
       this.polling = false;
@@ -134,14 +135,17 @@ export class GitHubEventPoller {
     repoState.branchHeads = { ...repoState.branchHeads, [branch]: head.sha };
     if (previous === undefined || previous === head.sha) return;
 
-    // Match webhook push routing: the fully qualified ref makes this an exact
-    // github_branch notification for the dedicated deploy subscription.
+    // Deliberately omit `ref`: a webhook push with a ref is an exact
+    // github_branch resource and cannot bubble. Polling is enabled only for
+    // explicitly configured github.repos, so this synthetic notification is
+    // repo-scoped and reaches that exact configured subscription. This replaces
+    // the removed explicit deploy-branch eventSource without turning github.orgs
+    // into a branch-push firehose.
     await this.options.onEvent(
       "push",
       {
         before: previous,
         after: head.sha,
-        ref: `refs/heads/${branch}`,
         repository: repositoryPayload(repo),
       },
       eventDeliveryId(repo, `push:${branch}:${head.sha}`)

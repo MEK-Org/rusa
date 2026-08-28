@@ -40,30 +40,6 @@ describe("loadConfig deployBranch", () => {
   });
 });
 
-describe("loadConfig deployRepo", () => {
-  it("defaults to undefined when omitted", () => {
-    expect(loadConfig(writeConfig()).deployRepo).toBeUndefined();
-  });
-
-  it("trims a repository in owner/name format", () => {
-    expect(loadConfig(writeConfig({ deployRepo: "  example-org/rusa  " })).deployRepo).toBe(
-      "example-org/rusa"
-    );
-  });
-
-  it.each([
-    "rusa",
-    "example-org/rusa/extra",
-    "example org/rusa",
-    "example-org/rusa repo",
-    "",
-  ])("rejects invalid repository %j", (deployRepo) => {
-    expect(() => loadConfig(writeConfig({ deployRepo }))).toThrow(
-      /deployRepo must be a repository name in owner\/name format/
-    );
-  });
-});
-
 describe("loadConfig geminiApiKey (optional)", () => {
   it("loads a config that omits geminiApiKey", () => {
     // writeConfig always injects the key, so build one without it directly.
