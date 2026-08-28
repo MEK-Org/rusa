@@ -193,6 +193,14 @@ export class FakeIssueClient implements IssueClient {
     ].filter((record) => record.updatedAt > since);
   }
 
+  async listPollOrganizationRepositories(_org: string): Promise<string[]> {
+    return [];
+  }
+
+  async getPollBranchHead(_repo: string, _branch: string): Promise<null> {
+    return null;
+  }
+
   async listUpdatedIssueComments(_repo: string, since: string): Promise<PollIssueComment[]> {
     return this.tracker
       .listIssues()

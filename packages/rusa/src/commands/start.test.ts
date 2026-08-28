@@ -1072,6 +1072,47 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(issueClient.commentReactionsAdded).toHaveLength(1);
   });
 
+  it("suppresses webhook events from github.orgs excludedRepos before inbox delivery", async () => {
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: {
+          account: "mock-bot",
+          orgs: [{ org: "dummy-org", excludedRepos: ["dummy-org/private-repo"] }],
+        },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity" },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+    let emitGitHubEvent:
+      | ((event: string, payload: Record<string, unknown>) => Promise<void>)
+      | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            emitGitHubEvent = handles.emitGitHubEvent;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!emitGitHubEvent) throw new Error("emitGitHubEvent not ready");
+
+    await emitGitHubEvent("issues", {
+      action: "opened",
+      repository: { full_name: "dummy-org/private-repo" },
+      issue: { number: 1 },
+      sender: { login: "operator" },
+    });
+
+    expect(getRepositories().inbox.list("root").entries).toHaveLength(0);
+    expect(requestRunCalls).toHaveLength(0);
+  });
+
   it("routes the production low-water check to root as responsive system.disk work without DMing the error chat", async () => {
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();
@@ -1413,7 +1454,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
-        github: { account: "mock-bot", ingestionMode: "poll", pollIntervalSeconds: 300 },
+        github: {
+          account: "mock-bot",
+          ingestionMode: "poll",
+          pollIntervalSeconds: 300,
+          repos: ["dummy-org/dummy-repo"],
+        },
         providers: { antigravity: { cliCommand: "agy" } },
         rootActor: { provider: "antigravity" },
         geminiApiKey: "fake-gemini-key",
@@ -1449,7 +1495,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
-        github: { account: "mock-bot", ingestionMode: "poll", pollIntervalSeconds: 300 },
+        github: {
+          account: "mock-bot",
+          ingestionMode: "poll",
+          pollIntervalSeconds: 300,
+          repos: ["dummy-org/dummy-repo"],
+        },
         providers: { antigravity: { cliCommand: "agy" } },
         rootActor: { provider: "antigravity" },
         observability: { trackerHygiene: { enabled: true } },
@@ -1497,7 +1548,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
-        github: { account: "mock-bot", ingestionMode: "poll", pollIntervalSeconds: 300 },
+        github: {
+          account: "mock-bot",
+          ingestionMode: "poll",
+          pollIntervalSeconds: 300,
+          repos: ["dummy-org/dummy-repo"],
+        },
         providers: { antigravity: { cliCommand: "agy" } },
         rootActor: { provider: "antigravity" },
         observability: { trackerHygiene: { enabled: true } },
@@ -1551,7 +1607,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     ]);
   });
 
-  it("fails closed when getRemoteUrl returns null, disabling polling and tracker hygiene", async () => {
+  it("does not infer polling scope from git remote when github config has no scope", async () => {
     let sigintListener: NodeJS.SignalsListener | undefined;
     const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
       if (event === "SIGINT") {
@@ -1559,9 +1615,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
       }
       return process;
     });
-
-    // Mock getRemoteUrl to return null
-    worktreeMock.getRemoteUrl.mockReturnValue(null);
 
     const issueClient = new MockIssueClient();
     setIssueClient(issueClient as unknown as IssueClient);
@@ -1588,14 +1641,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // Verify tracker hygiene was NOT called
       expect(trackerHygieneMock.runTrackerHygiene).not.toHaveBeenCalled();
 
-      // Verify the console.error named BOTH disabled consumers. This config has
-      // ingestionMode "poll" AND trackerHygiene enabled, so a missing repoName
-      // silences both — a log that names only one reports a partial outage as a
-      // total picture. Asserting the full sentence is what makes this test able
-      // to catch a regression back to an ingestionMode-conditional message.
-      expect(errorSpy).toHaveBeenCalledWith(
-        expect.stringContaining("GitHub polling and tracker hygiene are DISABLED for this run.")
-      );
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("github.repos is empty"));
 
       // Verify poller was NOT started
       expect(pollerMock.startGitHubEventPoller).not.toHaveBeenCalled();
@@ -1604,8 +1650,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     } finally {
       processOnSpy.mockRestore();
       errorSpy.mockRestore();
-      // Restore default mock value for subsequent tests
-      worktreeMock.getRemoteUrl.mockReturnValue("https://github.com/dummy-org/dummy-repo.git");
     }
   });
 
@@ -1668,7 +1712,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }
   });
 
-  it("prefers git remote as primary repository identity when available while github.repos is additive", async () => {
+  it("ignores git remote identity and polls only explicitly configured github.repos", async () => {
     let sigintListener: NodeJS.SignalsListener | undefined;
     const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
       if (event === "SIGINT") {
@@ -1702,9 +1746,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       void runStart({ noDashboardServer: true });
       await waitUntil(() => sigintListener !== undefined, "start did not install shutdown handler");
 
-      // Verify that startGitHubEventPoller was started with primary repo derived from remote
       expect(pollerMock.startGitHubEventPoller).toHaveBeenCalledWith(
-        expect.objectContaining({ repos: ["primary-org/primary-repo"] })
+        expect.objectContaining({ repos: ["extra-org/extra-repo"] })
       );
 
       sigintListener?.("SIGINT");
@@ -1714,7 +1757,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }
   });
 
-  it("does not start poller if ingestionMode is poll and repo cannot be resolved", async () => {
+  it("does not start poller when poll mode has neither github.repos nor github.orgs", async () => {
     let sigintListener: NodeJS.SignalsListener | undefined;
     const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
       if (event === "SIGINT") {
@@ -1751,9 +1794,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // Verify that startGitHubEventPoller was NOT called
       expect(pollerMock.startGitHubEventPoller).not.toHaveBeenCalled();
 
-      // Verify that we logged the error about missing repository name
-      expect(errorSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Could not determine the repository name")
+      expect(errorSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining("Could not determine the primary repository")
       );
 
       sigintListener?.("SIGINT");
@@ -1768,6 +1810,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const config = {
       github: {
         account: "mock-bot",
+        repos: ["dummy-org/dummy-repo"],
       },
       providers: {
         antigravity: { cliCommand: "agy" },
@@ -1807,7 +1850,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "github_org", org: "dummy-org" },
+          resource: { kind: "github_repo", repo: "dummy-org/dummy-repo" },
         }),
         expect.objectContaining({
           actorId: "root",
@@ -2787,9 +2830,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
         github: {
           account: "mock-bot",
           repos: ["custom-org/custom-repo"],
-          orgs: ["target-org", { org: "extra-org", excludedRepos: ["extra-org/secret"] }],
+          orgs: [{ org: "target-org" }, { org: "extra-org", excludedRepos: ["extra-org/secret"] }],
         },
-        targets: [{ repo: "legacy-org/legacy-repo", localPath: "/tmp/dummy" }],
         providers: {
           antigravity: { cliCommand: "agy" },
         },
@@ -2832,7 +2874,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "github_org", org: "custom-org" },
+          resource: { kind: "github_repo", repo: "custom-org/custom-repo" },
         }),
         expect.objectContaining({
           actorId: "root",
@@ -2856,11 +2898,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
         }),
       ])
     );
-
-    // Negative requirement: targets is no longer consumed to derive github_org subscriptions
-    expect(
-      subscriptions.some((s) => s.resource.kind === "github_org" && s.resource.org === "legacy-org")
-    ).toBe(false);
   });
 
   it("drops inbound chat messages from spaces listed in chat.excludedSpaces ", async () => {

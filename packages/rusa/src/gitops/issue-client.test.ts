@@ -74,6 +74,32 @@ describe("GitHubIssueClient", () => {
     expect(requests[0].body).toEqual({ body: "hello" });
   });
 
+  it("lists organization repositories for poll scope expansion", async () => {
+    const requests = installFetch({
+      "GET /orgs/test-org/repos?type=all&per_page=100&page=1": {
+        json: [{ full_name: "test-org/one" }, { full_name: "test-org/two" }],
+      },
+    });
+
+    await expect(
+      new GitHubIssueClient().listPollOrganizationRepositories("test-org")
+    ).resolves.toEqual(["test-org/one", "test-org/two"]);
+    expect(requests[0].path).toBe("/orgs/test-org/repos?type=all&per_page=100&page=1");
+  });
+
+  it("reads a deploy branch head and treats an absent branch as no head", async () => {
+    installFetch({
+      [`GET /repos/${REPO}/branches/release%2Fprod`]: { json: { commit: { sha: "abc123" } } },
+      [`GET /repos/${REPO}/branches/missing`]: { status: 404, json: { message: "Not Found" } },
+    });
+    const client = new GitHubIssueClient();
+
+    await expect(client.getPollBranchHead(REPO, "release/prod")).resolves.toEqual({
+      sha: "abc123",
+    });
+    await expect(client.getPollBranchHead(REPO, "missing")).resolves.toBeNull();
+  });
+
   it("can read a PAT from RUSA_HOME/github-token without GH_TOKEN", async () => {
     vi.unstubAllEnvs();
     const home = mkdtempSync(join(tmpdir(), "rusa-gh-token-"));

@@ -8,7 +8,6 @@ import { buildActorBwrapArgs, buildActorBwrapCommand, teardownFlutterOverlay } f
 vi.mock("../config/loader.js", () => ({
   loadConfig: () => ({
     github: { account: "test" },
-    targets: [],
     providers: {},
     webhook: { port: 9742, secret: "secret" },
     gitBridge: false,

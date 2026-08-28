@@ -238,7 +238,15 @@ export interface PollIssueComment {
   updatedAt: string;
 }
 
+export interface PollBranchHead {
+  sha: string;
+}
+
 export interface GitHubPollingIssueClient {
+  /** List repositories currently visible in an organization. */
+  listPollOrganizationRepositories(org: string): Promise<string[]>;
+  /** Read one branch head for deploy-push polling; null means the branch is absent. */
+  getPollBranchHead(repo: string, branch: string): Promise<PollBranchHead | null>;
   /** Fetch issues and PR-backed issues updated after a watermark for event polling. */
   listUpdatedIssuesAndPullRequests(repo: string, since: string): Promise<PollIssueOrPullRequest[]>;
   /** Fetch issue/PR conversation comments updated after a watermark for event polling. */
@@ -745,6 +753,27 @@ export class GitHubIssueClient implements IssueClient {
     });
     const issues = await this.apiPages<PollIssueResponse>(`/repos/${repo}/issues`, params);
     return issues.map(mapPollIssue);
+  }
+
+  async listPollOrganizationRepositories(org: string): Promise<string[]> {
+    const repos = await this.apiPages<{ full_name: string }>(
+      `/orgs/${org}/repos`,
+      new URLSearchParams({ type: "all", per_page: "100" })
+    );
+    return repos.map((repo) => repo.full_name);
+  }
+
+  async getPollBranchHead(repo: string, branch: string): Promise<PollBranchHead | null> {
+    try {
+      const response = await this.api<{ commit: { sha: string } }>(
+        "GET",
+        `/repos/${repo}/branches/${encodeURIComponent(branch)}`
+      );
+      return { sha: response.commit.sha };
+    } catch (err) {
+      if (err instanceof GitHubApiError && err.status === 404) return null;
+      throw err;
+    }
   }
 
   async listUpdatedIssueComments(repo: string, since: string): Promise<PollIssueComment[]> {
@@ -1419,6 +1448,14 @@ export class GitBridgeIssueClient implements IssueClient, GitHubPollingIssueClie
 
   listUpdatedIssuesAndPullRequests(repo: string, since: string): Promise<PollIssueOrPullRequest[]> {
     return this.delegate.listUpdatedIssuesAndPullRequests(repo, since);
+  }
+
+  listPollOrganizationRepositories(org: string): Promise<string[]> {
+    return this.delegate.listPollOrganizationRepositories(org);
+  }
+
+  getPollBranchHead(repo: string, branch: string): Promise<PollBranchHead | null> {
+    return this.delegate.getPollBranchHead(repo, branch);
   }
 
   listUpdatedIssueComments(repo: string, since: string): Promise<PollIssueComment[]> {

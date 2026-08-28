@@ -5,32 +5,6 @@
 export const DEFAULT_DEPLOY_BRANCH = "master";
 export type SandboxMode = "container-boundary" | "bwrap";
 
-export interface Target {
-  /** GitHub repo in owner/name format */
-  repo: string;
-  /** Optional path within the repo to scope work to */
-  path?: string;
-  /** Local filesystem path to the repo clone */
-  localPath: string;
-  /** Default branch name (defaults to "main") */
-  defaultBranch?: string;
-  /** If true, this target is the test bed repo */
-  testBed?: boolean;
-  /**
-   * Maximum concurrent worktrees for parallel task execution (default: 2).
-   * Set to 1 to disable parallel execution within a single repository.
-   * Higher values allow more tasks to run concurrently on the same repo.
-   */
-  maxConcurrentWorktrees?: number;
-  /**
-   * When true, markdown files in this target's localPath are not automatically
-   * ingested as raw inputs for knowledge distillation.
-   * Useful for repos whose .md files are test fixtures or generated content
-   * rather than human-authored documentation.
-   */
-  disableMarkdownSync?: boolean;
-}
-
 export interface ProviderConfig {
   /** CLI command name, e.g. "claude", "codex", "agy" */
   cliCommand?: string;
@@ -47,8 +21,6 @@ export interface GitHubOrgConfig {
   excludedRepos?: string[];
 }
 
-export type GitHubOrgEntry = string | GitHubOrgConfig;
-
 export interface GitHubConfig {
   account?: string;
   /**
@@ -60,19 +32,15 @@ export interface GitHubConfig {
   /** GitHub event ingestion edge. Defaults to "webhook" for existing installs. */
   ingestionMode?: "webhook" | "poll";
   /**
-   * Optional list of GitHub repositories in "owner/name" format.
-   * Root actor's implied github_org event source subscriptions include each repository's organization.
-   * When git remote cannot be determined from the repository root, the first entry in `repos`
-   * is used as the primary repository identity for GitHub polling and tracker hygiene.
-   * Repositories listed here are additive with `orgs` and the git-remote derived repo identity.
+   * GitHub repositories in "owner/name" format that this instance subscribes to
+   * and polls. The first entry is the primary repository for tracker hygiene.
    */
   repos?: string[];
   /**
-   * Optional list of GitHub organizations to subscribe root to for mesh event ingestion.
-   * Entries may be organization name strings or objects specifying `org` and optional `excludedRepos`.
-   * Organization subscriptions are additive with `repos` and the repository identity derived from the git remote.
+   * GitHub organizations that this instance subscribes to and polls. Repositories
+   * listed in `excludedRepos` are suppressed at both webhook and poll ingestion.
    */
-  orgs?: GitHubOrgEntry[];
+  orgs?: GitHubOrgConfig[];
   /**
    * Path to a read-mostly fine-grained GitHub PAT file (Contents R/W for git
    * push; Issues/PRs/Actions/Checks read-only) that sandboxed mesh workers see
@@ -382,12 +350,6 @@ export interface RusaConfig {
   profile?: string;
   github: GitHubConfig;
   providers: Record<string, ProviderConfig>;
-  /**
-   * @deprecated Top-level `targets` is deprecated and slated for complete removal in due time.
-   * For GitHub event subscriptions, configure `github.orgs` or `github.repos` instead.
-   * Remaining local-worktree and git-bridge consumers under `targets` do not yet have a replacement.
-   */
-  targets?: Target[];
   /** Branch the root self-update tool deploys from. Defaults to "master". */
   deployBranch?: string;
   /**

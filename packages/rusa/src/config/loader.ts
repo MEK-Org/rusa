@@ -12,7 +12,7 @@ import {
 } from "./secrets.js";
 import {
   DEFAULT_DEPLOY_BRANCH,
-  type GitHubOrgEntry,
+  type GitHubOrgConfig,
   type QuotaThrottleConfig,
   type RusaConfig,
 } from "./types.js";
@@ -106,6 +106,16 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
 
   const raw = readFileSync(configPath, "utf-8");
   const rawParsed = parseYaml(raw) as RusaConfig;
+  if ("targets" in (rawParsed as unknown as Record<string, unknown>)) {
+    throw new Error(
+      "config.yaml: top-level targets is no longer supported; use github.repos and github.orgs"
+    );
+  }
+  if ("eventSources" in (rawParsed as unknown as Record<string, unknown>)) {
+    throw new Error(
+      "config.yaml: top-level eventSources is no longer supported; use github.repos and github.orgs"
+    );
+  }
   if (options?.profile !== undefined) {
     rawParsed.profile = options.profile;
   }
@@ -166,21 +176,11 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   }
   if (parsed.github.orgs !== undefined) {
     if (!Array.isArray(parsed.github.orgs)) {
-      throw new Error(
-        "config.yaml: github.orgs must be an array of organization names or org objects when set"
-      );
+      throw new Error("config.yaml: github.orgs must be an array of org objects when set");
     }
-    const validatedOrgs: GitHubOrgEntry[] = [];
+    const validatedOrgs: GitHubOrgConfig[] = [];
     for (const item of parsed.github.orgs) {
-      if (typeof item === "string") {
-        const trimmed = item.trim();
-        if (!trimmed || !/^[^/\s]+$/.test(trimmed)) {
-          throw new Error(
-            "config.yaml: github.orgs entries must be valid organization names without slashes or org objects"
-          );
-        }
-        validatedOrgs.push(trimmed);
-      } else if (typeof item === "object" && item !== null && !Array.isArray(item)) {
+      if (typeof item === "object" && item !== null && !Array.isArray(item)) {
         const record = item as unknown as Record<string, unknown>;
         const orgName = record.org;
 
@@ -204,6 +204,15 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
             );
           }
           excludedRepos = record.excludedRepos.map((repo) => (repo as string).trim());
+          if (
+            excludedRepos.some(
+              (repo) => repo.split("/")[0]?.toLowerCase() !== orgName.trim().toLowerCase()
+            )
+          ) {
+            throw new Error(
+              "config.yaml: github.orgs excludedRepos entries must belong to their configured organization"
+            );
+          }
         }
 
         validatedOrgs.push({
@@ -211,9 +220,7 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
           ...(excludedRepos ? { excludedRepos } : {}),
         });
       } else {
-        throw new Error(
-          "config.yaml: github.orgs entries must be valid organization names without slashes or org objects"
-        );
+        throw new Error("config.yaml: github.orgs entries must be org objects");
       }
     }
     parsed.github.orgs = validatedOrgs;

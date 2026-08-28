@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import type { GitHubOrgConfig } from "../config/types.js";
 import type {
   GitHubPollingIssueClient,
   PollIssueComment,
@@ -14,6 +15,9 @@ type EmitGitHubEvent = (
 
 export interface GitHubPollerOptions {
   repos: string[];
+  orgs?: GitHubOrgConfig[];
+  /** Branch whose head changes synthesize repo-scoped deploy push notifications. */
+  deployBranch?: string;
   /**
    * Optional because raw `config.yaml` does not guarantee it — see
    * {@link DEFAULT_POLL_INTERVAL_SECONDS}. Declaring it required made the type
@@ -32,6 +36,7 @@ interface RepoPollState {
   /** @deprecated kept only to migrate pre-stream-cursor state files. */
   watermark?: string;
   seen: string[];
+  branchHeads?: Record<string, string>;
 }
 
 interface PollerState {
@@ -82,13 +87,69 @@ export class GitHubEventPoller {
     this.polling = true;
     try {
       const state = this.loadState();
-      for (const repo of this.options.repos) {
+      const repos = await this.resolveConfiguredRepos();
+      const explicitRepos = new Set(this.options.repos.map((repo) => repo.toLowerCase()));
+      for (const repo of repos) {
         await this.pollRepo(repo, state);
+        if (explicitRepos.has(repo.toLowerCase())) {
+          await this.pollDeployBranch(repo, state);
+        }
       }
       this.saveState(state);
     } finally {
       this.polling = false;
     }
+  }
+
+  private async resolveConfiguredRepos(): Promise<string[]> {
+    const excluded = new Set(
+      (this.options.orgs ?? [])
+        .flatMap((entry) => entry.excludedRepos ?? [])
+        .map((repo) => repo.toLowerCase())
+    );
+    const repos = new Map<string, string>();
+    const add = (repo: string): void => {
+      const key = repo.toLowerCase();
+      if (!excluded.has(key)) repos.set(key, repo);
+    };
+
+    for (const repo of this.options.repos) add(repo);
+    for (const entry of this.options.orgs ?? []) {
+      for (const repo of await this.options.issueClient.listPollOrganizationRepositories(
+        entry.org
+      )) {
+        add(repo);
+      }
+    }
+    return [...repos.values()];
+  }
+
+  private async pollDeployBranch(repo: string, state: PollerState): Promise<void> {
+    const branch = this.options.deployBranch ?? "master";
+    const head = await this.options.issueClient.getPollBranchHead(repo, branch);
+    if (!head) return;
+
+    const repoState = state.repos[repo] ?? { seen: [] };
+    state.repos[repo] = repoState;
+    const previous = repoState.branchHeads?.[branch];
+    repoState.branchHeads = { ...repoState.branchHeads, [branch]: head.sha };
+    if (previous === undefined || previous === head.sha) return;
+
+    // Deliberately omit `ref`: a webhook push with a ref is an exact
+    // github_branch resource and cannot bubble. Polling is enabled only for
+    // explicitly configured github.repos, so this synthetic notification is
+    // repo-scoped and reaches that exact configured subscription. This replaces
+    // the removed explicit deploy-branch eventSource without turning github.orgs
+    // into a branch-push firehose.
+    await this.options.onEvent(
+      "push",
+      {
+        before: previous,
+        after: head.sha,
+        repository: repositoryPayload(repo),
+      },
+      eventDeliveryId(repo, `push:${branch}:${head.sha}`)
+    );
   }
 
   private async pollRepo(repo: string, state: PollerState): Promise<void> {

@@ -273,11 +273,13 @@ describe("loadConfig github.orgs (event source organization derivation)", () => 
     expect(config.github.orgs).toBeUndefined();
   });
 
-  it("trims and keeps valid string array", () => {
+  it("trims and keeps valid org objects", () => {
     const config = loadConfig(
-      writeConfig({ github: { account: "CodeChopsBot", orgs: ["  org-1  ", "org-2"] } })
+      writeConfig({
+        github: { account: "CodeChopsBot", orgs: [{ org: "  org-1  " }, { org: "org-2" }] },
+      })
     );
-    expect(config.github.orgs).toEqual(["org-1", "org-2"]);
+    expect(config.github.orgs).toEqual([{ org: "org-1" }, { org: "org-2" }]);
   });
 
   it("parses and normalizes object entries with org and excludedRepos", () => {
@@ -285,15 +287,11 @@ describe("loadConfig github.orgs (event source organization derivation)", () => 
       writeConfig({
         github: {
           account: "CodeChopsBot",
-          orgs: [
-            "plain-org",
-            { org: "  example-org  ", excludedRepos: ["  example-org/sample-repo  "] },
-          ],
+          orgs: [{ org: "  example-org  ", excludedRepos: ["  example-org/sample-repo  "] }],
         },
       })
     );
     expect(config.github.orgs).toEqual([
-      "plain-org",
       { org: "example-org", excludedRepos: ["example-org/sample-repo"] },
     ]);
   });
@@ -303,11 +301,11 @@ describe("loadConfig github.orgs (event source organization derivation)", () => 
       writeConfig({
         github: {
           account: "CodeChopsBot",
-          orgs: ["example-org"],
+          orgs: [{ org: "example-org" }],
         },
       })
     );
-    expect(config.github.orgs).toEqual(["example-org"]);
+    expect(config.github.orgs).toEqual([{ org: "example-org" }]);
     expect(config.github.repos).toBeUndefined();
   });
 
@@ -337,14 +335,14 @@ describe("loadConfig github.orgs (event source organization derivation)", () => 
     ).toThrow(/github\.orgs must be an array/);
 
     expect(() =>
-      loadConfig(writeConfig({ github: { account: "CodeChopsBot", orgs: ["valid", ""] } }))
-    ).toThrow(/github\.orgs entries must be valid organization names/);
+      loadConfig(writeConfig({ github: { account: "CodeChopsBot", orgs: ["valid"] } }))
+    ).toThrow(/github\.orgs entries must be org objects/);
 
     expect(() =>
       loadConfig(
-        writeConfig({ github: { account: "CodeChopsBot", orgs: ["valid", "invalid/org"] } })
+        writeConfig({ github: { account: "CodeChopsBot", orgs: [{ org: "invalid/org" }] } })
       )
-    ).toThrow(/github\.orgs entries must be valid organization names/);
+    ).toThrow(/github\.orgs org object must specify a valid organization name/);
 
     expect(() =>
       loadConfig(
@@ -369,6 +367,41 @@ describe("loadConfig github.orgs (event source organization derivation)", () => 
     ).toThrow(
       /github\.orgs excludedRepos must be an array of repository names in owner\/name format/
     );
+
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          github: {
+            account: "CodeChopsBot",
+            orgs: [{ org: "valid-org", excludedRepos: ["other-org/repo"] }],
+          },
+        })
+      )
+    ).toThrow(/github\.orgs excludedRepos entries must belong to their configured organization/);
+  });
+});
+
+describe("loadConfig removed targets field", () => {
+  it("rejects top-level targets with migration guidance", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          targets: [{ repo: "dummy-org/repo", localPath: "/tmp/repo" }],
+        })
+      )
+    ).toThrow(/top-level targets is no longer supported; use github\.repos and github\.orgs/);
+  });
+});
+
+describe("loadConfig removed eventSources field", () => {
+  it("rejects explicit root eventSources with migration guidance", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          eventSources: [{ kind: "github_repo", repo: "dummy-org/repo" }],
+        })
+      )
+    ).toThrow(/top-level eventSources is no longer supported; use github\.repos and github\.orgs/);
   });
 });
 
