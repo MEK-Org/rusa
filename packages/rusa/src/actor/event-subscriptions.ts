@@ -91,9 +91,6 @@ export const resourceKey = (resource: EventResource): string => {
   }
 };
 
-const key = (resource: EventResource, actorId: string): string =>
-  `${resourceKey(resource)}:${actorId}`;
-
 export const sameResource = (a: EventResource, b: EventResource): boolean => {
   if (a.kind !== b.kind) return false;
   switch (a.kind) {
@@ -136,60 +133,52 @@ export function parentOf(resource: EventResource): EventResource | undefined {
 }
 
 export interface EventSourceBootSyncResult {
-  seeded: EventSubscription[];
-  deactivated: EventSubscription[];
+  store: EventSubscriptionStore;
+  droppedDelegations: EventSubscription[];
 }
 
-const CONFIG_ROOT_KINDS = new Set<EventSourceKind>([
-  "github_org",
-  "github_repo",
-  "github_branch",
-  "chat",
-  "chat_space",
-  "system",
-]);
-
-export function syncRootEventSources(
-  store: EventSubscriptionStore,
+export function reconcileEventSources(
+  persistentStore: EventSubscriptionStore,
   configured: EventResource[],
   rootId: string,
   now: () => string
 ): EventSourceBootSyncResult {
-  const seeded: EventSubscription[] = [];
-  const deactivated: EventSubscription[] = [];
-  const configuredKeys = new Set(configured.map(resourceKey));
+  const impliedStore = new InMemoryEventSubscriptionStore();
+  const droppedDelegations: EventSubscription[] = [];
 
   for (const resource of configured) {
-    const active = store.activeForResource(resource)[0];
-    if (active) {
-      continue;
-    }
-    const subscription: EventSubscription = {
+    // One active subscriber per resource. We seed implied subscriptions for the root,
+    // but the UnionEventSubscriptionStore means persistent explicit overrides (if any)
+    // will take precedence if the root later delegates it or drops it.
+    impliedStore.subscribe({
       resource,
       actorId: rootId,
       subscribedBy: rootId,
       subscribedAt: now(),
-    };
-    store.subscribe(subscription);
-    seeded.push(subscription);
+    });
   }
 
-  for (const subscription of store.list()) {
-    if (
-      subscription.unsubscribedAt ||
-      subscription.actorId !== rootId ||
-      subscription.subscribedBy !== rootId ||
-      !CONFIG_ROOT_KINDS.has(subscription.resource.kind) ||
-      configuredKeys.has(resourceKey(subscription.resource))
-    ) {
-      continue;
+  for (const sub of persistentStore.list()) {
+    if (sub.unsubscribedAt) continue;
+
+    let isAnchored = false;
+    for (const configResource of configured) {
+      if (isSubResourceOf(sub.resource, configResource)) {
+        isAnchored = true;
+        break;
+      }
     }
-    const at = now();
-    store.unsubscribe(subscription.resource, rootId, at);
-    deactivated.push({ ...subscription, unsubscribedAt: at });
+
+    if (!isAnchored) {
+      persistentStore.unsubscribe(sub.resource, sub.actorId, now());
+      droppedDelegations.push({ ...sub, unsubscribedAt: now() });
+    }
   }
 
-  return { seeded, deactivated };
+  return {
+    store: new UnionEventSubscriptionStore(impliedStore, persistentStore),
+    droppedDelegations,
+  };
 }
 
 /**
@@ -226,17 +215,65 @@ export class InMemoryEventSubscriptionStore implements EventSubscriptionStore {
       );
     }
     // Re-subscribing reactivates: drop any prior unsubscription, refresh metadata.
-    this.subs.set(key(resource, actorId), { ...subscription, unsubscribedAt: undefined });
+    this.subs.set(`${resourceKey(resource)}:${actorId}`, {
+      ...subscription,
+      unsubscribedAt: undefined,
+    });
   }
 
   unsubscribe(resource: EventSubscription["resource"], actorId: string, at: string): void {
-    const existing = this.subs.get(key(resource, actorId));
+    const existing = this.subs.get(`${resourceKey(resource)}:${actorId}`);
     if (!existing || existing.unsubscribedAt) return;
-    this.subs.set(key(resource, actorId), { ...existing, unsubscribedAt: at });
+    this.subs.set(`${resourceKey(resource)}:${actorId}`, { ...existing, unsubscribedAt: at });
   }
 
   list(): EventSubscription[] {
     return [...this.subs.values()].map((s) => ({ ...s, resource: { ...s.resource } }));
+  }
+
+  activeForResource(resource: EventSubscription["resource"]): EventSubscription[] {
+    return this.list().filter((s) => sameResource(s.resource, resource) && !s.unsubscribedAt);
+  }
+}
+
+export class UnionEventSubscriptionStore implements EventSubscriptionStore {
+  constructor(
+    private readonly baseStore: EventSubscriptionStore,
+    private readonly mutatingStore: EventSubscriptionStore
+  ) {}
+
+  subscribe(subscription: EventSubscription): void {
+    this.mutatingStore.subscribe(subscription);
+  }
+
+  unsubscribe(resource: EventSubscription["resource"], actorId: string, at: string): void {
+    const active = this.activeForResource(resource).find((s) => s.actorId === actorId);
+    if (active) {
+      // Ensure the row exists in the mutating store so that the unsubscription
+      // leaves a permanent tombstone, overriding the base store.
+      this.mutatingStore.subscribe(active);
+    }
+    this.mutatingStore.unsubscribe(resource, actorId, at);
+  }
+
+  list(): EventSubscription[] {
+    const base = this.baseStore.list();
+    const mutating = this.mutatingStore.list();
+    const activeMutatingResources = new Set(
+      mutating.filter((s) => !s.unsubscribedAt).map((s) => resourceKey(s.resource))
+    );
+
+    const merged = new Map<string, EventSubscription>();
+    for (const s of base) {
+      if (activeMutatingResources.has(resourceKey(s.resource))) {
+        continue;
+      }
+      merged.set(`${resourceKey(s.resource)}:${s.actorId}`, s);
+    }
+    for (const s of mutating) {
+      merged.set(`${resourceKey(s.resource)}:${s.actorId}`, s);
+    }
+    return [...merged.values()];
   }
 
   activeForResource(resource: EventSubscription["resource"]): EventSubscription[] {
@@ -253,23 +290,40 @@ export class InMemoryEventSubscriptionStore implements EventSubscriptionStore {
 export class FileEventSubscriptionStore implements EventSubscriptionStore {
   private readonly mem = new InMemoryEventSubscriptionStore();
 
-  constructor(private readonly file: string) {
+  constructor(
+    private readonly file: string,
+    rootId: string
+  ) {
+    let isUnversioned = false;
+    let didLoadSubscriptions = false;
     try {
       const parsed = JSON.parse(readFileSync(file, "utf-8")) as {
+        version?: number;
         subscriptions?: EventSubscription[];
       };
+      isUnversioned = !parsed.version;
       for (const s of parsed.subscriptions ?? []) {
-        this.mem.subscribe(s); // subscribe() clears unsubscribedAt on insert…
-        if (s.unsubscribedAt) this.mem.unsubscribe(s.resource, s.actorId, s.unsubscribedAt); // …re-apply it.
+        didLoadSubscriptions = true;
+        if (isUnversioned && s.actorId === rootId && s.subscribedBy === rootId) {
+          continue;
+        }
+        this.mem.subscribe(s);
+        if (s.unsubscribedAt) this.mem.unsubscribe(s.resource, s.actorId, s.unsubscribedAt);
       }
     } catch {
       /* missing / empty / invalid → start empty */
+    }
+    if (isUnversioned && didLoadSubscriptions) {
+      this.flush();
     }
   }
 
   private flush(): void {
     try {
-      writeFileSync(this.file, JSON.stringify({ subscriptions: this.mem.list() }, null, 2));
+      writeFileSync(
+        this.file,
+        JSON.stringify({ version: 2, subscriptions: this.mem.list() }, null, 2)
+      );
     } catch {
       /* best effort — in-memory copy remains authoritative for this process */
     }

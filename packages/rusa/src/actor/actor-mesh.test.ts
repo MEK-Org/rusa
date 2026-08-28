@@ -2872,6 +2872,85 @@ describe("ActorMesh", () => {
       expect(() => mesh.reclaimEventSource(pr, sibling)).toThrow(/effective owner after reclaim/);
     });
 
+    it("an actor may self-delegate a strict descendant of a parent it effectively owns", () => {
+      const { mesh } = setup();
+      const actor = mesh.spawn({ charter: "repo steward", parentId: "root" });
+
+      mesh.subscribeEventSource(
+        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+        actor,
+        "root"
+      );
+
+      // Actor owns the repo. It can self-delegate a branch.
+      expect(() =>
+        mesh.delegateEventSource(
+          { kind: "github_branch", repo: "dummy-org/dummy-repo", ref: "staging" },
+          actor,
+          actor
+        )
+      ).not.toThrow();
+    });
+
+    it("an actor may not self-delegate an unrelated resource", () => {
+      const { mesh } = setup();
+      const actor = mesh.spawn({ charter: "steward", parentId: "root" });
+
+      mesh.subscribeEventSource(
+        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+        actor,
+        "root"
+      );
+
+      // Cannot self-delegate an unrelated branch
+      expect(() =>
+        mesh.delegateEventSource(
+          { kind: "github_branch", repo: "dummy-org/other-repo", ref: "staging" },
+          actor,
+          actor
+        )
+      ).toThrow(/strict descendant of an already-owned parent/);
+    });
+
+    it("holding only the exact resource is not sufficient", () => {
+      const { mesh } = setup();
+      const actor = mesh.spawn({ charter: "steward", parentId: "root" });
+      const branch = {
+        kind: "github_branch" as const,
+        repo: "dummy-org/dummy-repo",
+        ref: "staging",
+      };
+
+      // actor gets the branch exactly (not the parent repo)
+      mesh.subscribeEventSource(branch, actor, "root");
+
+      // Cannot self-delegate the exact resource they hold unless they own a parent
+      expect(() => mesh.delegateEventSource(branch, actor, actor)).toThrow(
+        /strict descendant of an already-owned parent/
+      );
+    });
+
+    it("an existing exact row is ignored only while checking ancestor ownership", () => {
+      const { mesh } = setup();
+      const actor = mesh.spawn({ charter: "steward", parentId: "root" });
+      const branch = {
+        kind: "github_branch" as const,
+        repo: "dummy-org/dummy-repo",
+        ref: "staging",
+      };
+
+      // actor holds the repo (parent) AND holds the branch (exact)
+      mesh.subscribeEventSource(
+        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+        actor,
+        "root"
+      );
+      mesh.subscribeEventSource(branch, actor, "root");
+
+      // Can self-delegate the exact resource because they ALSO own the parent
+      expect(() => mesh.delegateEventSource(branch, actor, actor)).not.toThrow();
+    });
+
     it("routes repo events to the subscriber when live", async () => {
       const { mesh, tick, fake } = setup();
       const actorId = mesh.spawn({ charter: "worker", parentId: "root" });

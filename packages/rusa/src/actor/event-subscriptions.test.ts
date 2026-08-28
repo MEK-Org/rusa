@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -10,9 +10,9 @@ import {
   isStrictSubResourceOf,
   isSubResourceOf,
   parentOf,
+  reconcileEventSources,
   resourceKey,
   sameResource,
-  syncRootEventSources,
 } from "./event-subscriptions.js";
 
 const REPO = { kind: "github_repo", repo: "dummy-org/dummy-repo" } as const;
@@ -125,6 +125,8 @@ describe("InMemoryEventSubscriptionStore", () => {
 describe("FileEventSubscriptionStore", () => {
   let dir: string;
   let file: string;
+  const rootId = "root";
+
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "eventsubs-"));
     file = join(dir, "event-subscriptions.json");
@@ -134,19 +136,19 @@ describe("FileEventSubscriptionStore", () => {
   });
 
   it("persists subscriptions across instances (reload round-trips)", () => {
-    const a = new FileEventSubscriptionStore(file);
+    const a = new FileEventSubscriptionStore(file, rootId);
     a.subscribe(sub());
-    const b = new FileEventSubscriptionStore(file);
+    const b = new FileEventSubscriptionStore(file, rootId);
     expect(b.activeForResource(REPO).map((s) => s.actorId)).toEqual([ACTOR_A]);
   });
 
   it("persists unsubscriptions across instances (active + inactive survives reload)", () => {
-    const a = new FileEventSubscriptionStore(file);
+    const a = new FileEventSubscriptionStore(file, rootId);
     a.subscribe(sub({ resource: REPO, actorId: ACTOR_A }));
     a.subscribe(sub({ resource: OTHER, actorId: ACTOR_B }));
     a.unsubscribe(OTHER, ACTOR_B, "2026-06-28T00:00:00Z");
 
-    const b = new FileEventSubscriptionStore(file);
+    const b = new FileEventSubscriptionStore(file, rootId);
     expect(b.activeForResource(REPO).map((s) => s.actorId)).toEqual([ACTOR_A]);
     expect(b.activeForResource(OTHER)).toEqual([]);
     expect(b.list()).toHaveLength(2);
@@ -156,22 +158,22 @@ describe("FileEventSubscriptionStore", () => {
   });
 
   it("preserves the one-active-subscriber invariant across reload", () => {
-    const a = new FileEventSubscriptionStore(file);
+    const a = new FileEventSubscriptionStore(file, rootId);
     a.subscribe(sub({ actorId: ACTOR_A }));
-    const b = new FileEventSubscriptionStore(file);
+    const b = new FileEventSubscriptionStore(file, rootId);
     expect(() => b.subscribe(sub({ actorId: ACTOR_B }))).toThrow(
       /already has an active subscriber/
     );
   });
 
   it("starts empty when the file is missing", () => {
-    const store = new FileEventSubscriptionStore(join(dir, "does-not-exist.json"));
+    const store = new FileEventSubscriptionStore(join(dir, "does-not-exist.json"), rootId);
     expect(store.list()).toEqual([]);
   });
 
   it("starts empty (no crash) when the file is corrupt JSON", () => {
     writeFileSync(file, "{ this is not valid json ]");
-    const store = new FileEventSubscriptionStore(file);
+    const store = new FileEventSubscriptionStore(file, rootId);
     expect(store.list()).toEqual([]);
     // …and remains usable.
     store.subscribe(sub());
@@ -183,44 +185,45 @@ describe("FileEventSubscriptionStore", () => {
     // every writeFileSync throws (ENOTDIR) — the flush is swallowed best-effort.
     const blocker = join(dir, "blocker");
     writeFileSync(blocker, "x");
-    const store = new FileEventSubscriptionStore(join(blocker, "event-subscriptions.json"));
+    const store = new FileEventSubscriptionStore(join(blocker, "event-subscriptions.json"), rootId);
     expect(() => store.subscribe(sub())).not.toThrow();
     // In-memory copy is authoritative for the process despite the failed write.
     expect(store.activeForResource(REPO).map((s) => s.actorId)).toEqual([ACTOR_A]);
   });
 
   it("the conflict guard throws before mutating (File store)", () => {
-    const store = new FileEventSubscriptionStore(file);
+    const store = new FileEventSubscriptionStore(file, rootId);
     store.subscribe(sub({ actorId: ACTOR_A }));
     expect(() => store.subscribe(sub({ actorId: ACTOR_B }))).toThrow();
     expect(store.list()).toHaveLength(1);
     // A reload sees only the first subscriber.
-    const reloaded = new FileEventSubscriptionStore(file);
+    const reloaded = new FileEventSubscriptionStore(file, rootId);
     expect(reloaded.activeForResource(REPO).map((s) => s.actorId)).toEqual([ACTOR_A]);
   });
 });
 
-describe("syncRootEventSources", () => {
+describe("reconcileEventSources", () => {
   const rootOrg = { kind: "github_org", org: "dummy-org" } as const;
   const chat = { kind: "chat" } as const;
   const system = { kind: "system" } as const;
   const removedOrg = { kind: "github_org", org: "Old-Org" } as const;
+  const rootId = "root";
 
   it("seeds configured root sources and is idempotent across reboots", () => {
     const store = new InMemoryEventSubscriptionStore();
     const now = () => "2026-07-02T00:00:00Z";
 
-    const first = syncRootEventSources(store, [rootOrg, chat], "root", now);
-    const second = syncRootEventSources(store, [rootOrg, chat], "root", now);
+    const first = reconcileEventSources(store, [rootOrg, chat], rootId, now);
+    const second = reconcileEventSources(store, [rootOrg, chat], rootId, now);
 
-    expect(first.seeded.map((s) => s.resource)).toEqual([rootOrg, chat]);
-    expect(second.seeded).toEqual([]);
-    expect(store.list()).toHaveLength(2);
-    expect(store.activeForResource(rootOrg)[0]).toMatchObject({
+    expect(first.droppedDelegations).toEqual([]);
+    expect(second.droppedDelegations).toEqual([]);
+    expect(first.store.list()).toHaveLength(2);
+    expect(first.store.activeForResource(rootOrg)[0]).toMatchObject({
       actorId: "root",
       subscribedBy: "root",
     });
-    expect(store.activeForResource(chat)[0]).toMatchObject({
+    expect(first.store.activeForResource(chat)[0]).toMatchObject({
       actorId: "root",
       subscribedBy: "root",
     });
@@ -230,20 +233,20 @@ describe("syncRootEventSources", () => {
     const store = new InMemoryEventSubscriptionStore();
     const now = () => "2026-07-02T00:00:00Z";
 
-    expect(syncRootEventSources(store, [system], "root", now).seeded[0]?.resource).toEqual(system);
-    expect(store.activeForResource(system)[0]?.actorId).toBe("root");
+    const first = reconcileEventSources(store, [system], rootId, now);
+    expect(first.store.activeForResource(system)[0]?.actorId).toBe("root");
 
-    expect(syncRootEventSources(store, [], "root", now).deactivated[0]?.resource).toEqual(system);
-    expect(store.activeForResource(system)).toEqual([]);
+    const second = reconcileEventSources(store, [], rootId, now);
+    expect(second.droppedDelegations).toEqual([]);
+    expect(second.store.activeForResource(system)).toEqual([]);
   });
 
-  it("deactivates removed config roots without touching delegated or reclaimed slices", () => {
+  it("drops orphaned delegations in the persistent store", () => {
     const store = new InMemoryEventSubscriptionStore();
-    store.subscribe(sub({ resource: rootOrg, actorId: "root", subscribedBy: "root" }));
-    store.subscribe(sub({ resource: removedOrg, actorId: "root", subscribedBy: "root" }));
+    store.subscribe(sub({ resource: removedOrg, actorId: "child", subscribedBy: "root" }));
     store.subscribe(
       sub({
-        resource: { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+        resource: { kind: "github_repo", repo: "Old-Org/dummy-repo" },
         actorId: "child",
         subscribedBy: "root",
       })
@@ -256,23 +259,25 @@ describe("syncRootEventSources", () => {
       })
     );
 
-    const result = syncRootEventSources(store, [rootOrg], "root", () => "2026-07-02T00:00:00Z");
+    const result = reconcileEventSources(store, [rootOrg], rootId, () => "2026-07-02T00:00:00Z");
 
-    expect(result.deactivated.map((s) => s.resource)).toEqual([removedOrg]);
-    expect(store.activeForResource(removedOrg)).toEqual([]);
-    expect(store.activeForResource(rootOrg)).toHaveLength(1);
+    expect(result.droppedDelegations.map((s) => s.resource)).toEqual([
+      removedOrg,
+      { kind: "github_repo", repo: "Old-Org/dummy-repo" },
+    ]);
+    expect(result.store.activeForResource(removedOrg)).toEqual([]);
+    expect(result.store.activeForResource(rootOrg)).toHaveLength(1);
     expect(
-      store.activeForResource({ kind: "github_repo", repo: "dummy-org/dummy-repo" })
-    ).toHaveLength(1);
-    expect(
-      store.activeForResource({ kind: "github_pr", repo: "dummy-org/dummy-repo", number: 616 })
+      result.store.activeForResource({
+        kind: "github_pr",
+        repo: "dummy-org/dummy-repo",
+        number: 616,
+      })
     ).toHaveLength(1);
   });
 
-  it("seeds a configured github_repo source and drops removed root-owned GitHub config sources", () => {
+  it("seeds a configured github_repo source and drops orphaned delegations", () => {
     const store = new InMemoryEventSubscriptionStore();
-    // Old org-wide firehose + a repo slice root reclaimed from a child.
-    store.subscribe(sub({ resource: rootOrg, actorId: "root", subscribedBy: "root" }));
     const reclaimed = { kind: "github_repo", repo: "dummy-org/reclaimed" } as const;
     store.subscribe(sub({ resource: reclaimed, actorId: "root", subscribedBy: "root" }));
     const legacyBranch = {
@@ -284,37 +289,128 @@ describe("syncRootEventSources", () => {
 
     // New config: subscribe root to the test-bed repo only, dropping the org.
     const testBed = { kind: "github_repo", repo: "dummy-org/dummy-repo-test-bed" } as const;
-    const result = syncRootEventSources(store, [testBed], "root", () => "2026-07-02T00:00:00Z");
+    const result = reconcileEventSources(store, [testBed], rootId, () => "2026-07-02T00:00:00Z");
 
-    // Both old root sources are config-reconciled now that explicit root
-    // eventSources are gone.
-    expect(result.deactivated.map((s) => s.resource)).toEqual([rootOrg, reclaimed, legacyBranch]);
-    expect(store.activeForResource(rootOrg)).toEqual([]);
+    expect(result.droppedDelegations.map((s) => s.resource)).toEqual([reclaimed, legacyBranch]);
+    expect(result.store.activeForResource(rootOrg)).toEqual([]);
     // The configured repo is seeded.
-    expect(store.activeForResource(testBed)).toHaveLength(1);
-    expect(store.activeForResource(reclaimed)).toEqual([]);
-    expect(store.activeForResource(legacyBranch)).toEqual([]);
+    expect(result.store.activeForResource(testBed)).toHaveLength(1);
+    expect(result.store.activeForResource(reclaimed)).toEqual([]);
+    expect(result.store.activeForResource(legacyBranch)).toEqual([]);
   });
 
-  it("deactivates removed chat_space config root subscriptions while preserving active and child subscriptions ", () => {
+  it("drops removed chat_space active delegations", () => {
     const store = new InMemoryEventSubscriptionStore();
     const keptSpace = { kind: "chat_space", space: "spaces/KEPT" } as const;
     const removedSpace = { kind: "chat_space", space: "spaces/REMOVED" } as const;
     const childSpace = { kind: "chat_space", space: "spaces/CHILD" } as const;
 
-    store.subscribe(sub({ resource: keptSpace, actorId: "root", subscribedBy: "root" }));
-    store.subscribe(sub({ resource: removedSpace, actorId: "root", subscribedBy: "root" }));
+    store.subscribe(sub({ resource: removedSpace, actorId: "child", subscribedBy: "root" }));
     store.subscribe(sub({ resource: childSpace, actorId: "child-1", subscribedBy: "root" }));
 
-    const result = syncRootEventSources(store, [keptSpace], "root", () => "2026-07-02T00:00:00Z");
+    const result = reconcileEventSources(
+      store,
+      [keptSpace, childSpace],
+      rootId,
+      () => "2026-07-02T00:00:00Z"
+    );
 
-    // chat_space is in CONFIG_ROOT_KINDS → removedSpace is deactivated for root
-    expect(result.deactivated.map((s) => s.resource)).toEqual([removedSpace]);
-    expect(store.activeForResource(removedSpace)).toEqual([]);
+    expect(result.droppedDelegations.map((s) => s.resource)).toEqual([removedSpace]);
+    expect(result.store.activeForResource(removedSpace)).toEqual([]);
     // keptSpace is present in configured → remains active
-    expect(store.activeForResource(keptSpace)).toHaveLength(1);
-    // childSpace is subscribed by child-1 → untouched
-    expect(store.activeForResource(childSpace)).toHaveLength(1);
+    expect(result.store.activeForResource(keptSpace)).toHaveLength(1);
+    // childSpace is explicitly in configured and subscribed by child-1 → untouched
+    expect(result.store.activeForResource(childSpace)).toHaveLength(1);
+  });
+});
+
+describe("UnionEventSubscriptionStore and implied persistence", () => {
+  it("shows an implied-only row disappears immediately and stays suppressed after reloading the v2 file", () => {
+    const file = join(tmpdir(), `event-subs-test-legacy-${Date.now()}.json`);
+    const rootOrg = { kind: "github_org" as const, org: "dummy-org" };
+    const rootId = "root";
+
+    // Legacy file with no version and an implied-only row
+    writeFileSync(
+      file,
+      JSON.stringify({
+        subscriptions: [
+          {
+            resource: rootOrg,
+            actorId: rootId,
+            subscribedBy: rootId,
+            subscribedAt: "2025-01-01T00:00:00Z",
+          },
+        ],
+      })
+    );
+
+    // Boot 1: The file is unversioned, so it should run the migration, drop the row, and immediately flush version: 2
+    let sync = reconcileEventSources(
+      new FileEventSubscriptionStore(file, rootId),
+      [rootOrg],
+      rootId,
+      () => "2026-01-01T00:00:00Z"
+    );
+
+    // It is active because it's implied by config
+    expect(sync.store.activeForResource(rootOrg)).toHaveLength(1);
+
+    // But it has disappeared immediately from the persistent file
+    let saved = JSON.parse(readFileSync(file, "utf8"));
+    expect(saved.version).toBe(2);
+    expect(saved.subscriptions).toEqual([]);
+
+    // Boot 2: Reloading the v2 file. The implied row stays suppressed from disk.
+    sync = reconcileEventSources(
+      new FileEventSubscriptionStore(file, rootId),
+      [rootOrg],
+      rootId,
+      () => "2026-02-01T00:00:00Z"
+    );
+
+    expect(sync.store.activeForResource(rootOrg)).toHaveLength(1);
+    saved = JSON.parse(readFileSync(file, "utf8"));
+    expect(saved.subscriptions).toEqual([]);
+  });
+
+  it("locks the existing same-key inactive-collision behavior", () => {
+    const file = join(tmpdir(), `event-subs-test-tombstone-${Date.now()}.json`);
+    writeFileSync(file, JSON.stringify({ version: 2, subscriptions: [] }));
+    const rootOrg = { kind: "github_org" as const, org: "dummy-org" };
+    const rootId = "root";
+
+    let sync = reconcileEventSources(
+      new FileEventSubscriptionStore(file, rootId),
+      [rootOrg],
+      rootId,
+      () => "2026-01-01T00:00:00Z"
+    );
+
+    // Active via baseStore
+    expect(sync.store.activeForResource(rootOrg)).toHaveLength(1);
+
+    // Explicitly unsubscribe. This should write a tombstone to the file.
+    sync.store.unsubscribe(rootOrg, rootId, "2026-02-01T00:00:00Z");
+
+    // The union store correctly hides the base active row
+    expect(sync.store.activeForResource(rootOrg)).toEqual([]);
+
+    // The tombstone is saved to disk
+    const saved = JSON.parse(readFileSync(file, "utf8"));
+    expect(saved.subscriptions).toHaveLength(1);
+    expect(saved.subscriptions[0].unsubscribedAt).toBe("2026-02-01T00:00:00Z");
+
+    // Boot 2: Reloading the v2 file
+    sync = reconcileEventSources(
+      new FileEventSubscriptionStore(file, rootId),
+      [rootOrg],
+      rootId,
+      () => "2026-03-01T00:00:00Z"
+    );
+
+    // The tombstone continues to suppress the implied config row
+    expect(sync.store.activeForResource(rootOrg)).toEqual([]);
   });
 });
 
