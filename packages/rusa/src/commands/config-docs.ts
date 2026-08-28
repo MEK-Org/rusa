@@ -17,6 +17,11 @@ Minimal example:
     account: CodeChopsBot
     pollIntervalSeconds: 300
     # ingestionMode: poll  # webhook (default) or poll
+    repos:
+      - example-org/example-repo
+    # orgs:
+    #   - org: example-org
+    #     excludedRepos: [example-org/ignored-repo]
 
   providers:
     claude:
@@ -116,6 +121,9 @@ github:
   account                  GitHub username used by this Rusa instance, for example CodeChopsBot.
   pollIntervalSeconds      Optional. GitHub poll interval in seconds when ingestionMode is poll; defaults to 300. Must be a positive number when set.
   ingestionMode            Optional. "webhook" (default) binds the webhook listener; "poll" fetches GitHub updates without binding it.
+  repos                    Optional list. GitHub repositories in owner/name format to subscribe to and poll. The poller also watches deployBranch head changes for these explicit repositories.
+  orgs                     Optional list of objects. Each requires org and may include excludedRepos. Organization repositories are subscribed to and polled; exclusions are suppressed at webhook and poll ingestion.
+  workerTokenPath          Optional. Path to read-mostly fine-grained GitHub PAT file visible to sandboxed workers.
 
 providers:
 

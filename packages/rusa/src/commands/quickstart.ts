@@ -1,21 +1,13 @@
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import {
-  appendFileSync,
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { appendFileSync, chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import { input, password } from "@inquirer/prompts";
-import { parse as parseYaml, stringify as toYaml } from "yaml";
+import { stringify as toYaml } from "yaml";
 import { generateRandomRootHandle } from "../actor/handle-generator.js";
 import { GEMINI_API_KEY_SECRET_FILENAME, writeHostSecret } from "../config/secrets.js";
 import type { RusaConfig } from "../config/types.js";
-import { generateRepoKey, getBareClonePath } from "../gitops/worktree.js";
 import { formatDoctorResults, runQuickstartDoctor } from "./quickstart-doctor.js";
 
 export const QUICKSTART_DASHBOARD_PORT = 8080;
@@ -187,7 +179,7 @@ export async function runQuickstart(opts: QuickstartOptions = {}): Promise<void>
   if (hasExistingConfig && !opts.reconfigure) {
     console.log("\n[quickstart] Existing configuration found in container volume.");
     console.log(
-      "[quickstart] Skipping interactive configuration wizard. (Pass --reconfigure to update logins/targets).\n"
+      "[quickstart] Skipping interactive configuration wizard. (Pass --reconfigure to update settings).\n"
     );
   } else {
     const ttyFlags = process.stdin.isTTY ? ["-it"] : ["-i"];
@@ -207,102 +199,11 @@ export async function runQuickstart(opts: QuickstartOptions = {}): Promise<void>
     }
   }
 
-  console.log("[quickstart] Seeding target local git repositories into container volume...");
-  seedContainerFromHostLocalTargets({ container: setupContainer });
-
   console.log("\n[quickstart] Replacing setup container with the app container...");
   runDocker(["rm", "-f", setupContainer], { allowFailure: true });
   runDocker(buildAppDockerRunArgs({ image, container, volume }));
 
   console.log(`\nDashboard: http://localhost:${QUICKSTART_DASHBOARD_PORT}\n`);
-}
-
-export function seedContainerFromHostLocalTargets(opts: { container: string }): void {
-  let configRaw = "";
-  try {
-    const res = spawnSync(
-      "docker",
-      ["exec", opts.container, "cat", "/home/node/.rusa/config.yaml"],
-      {
-        encoding: "utf8",
-      }
-    );
-    if (res.status === 0 && res.stdout) {
-      configRaw = res.stdout;
-    }
-  } catch {
-    return;
-  }
-
-  if (!configRaw) return;
-
-  let config: RusaConfig | undefined;
-  try {
-    config = parseYaml(configRaw) as RusaConfig;
-  } catch {
-    return;
-  }
-
-  if (!config?.targets || config.targets.length === 0) return;
-
-  for (const target of config.targets) {
-    if (!target.localPath || !target.repo) continue;
-    const resolvedPath = resolve(target.localPath);
-    if (!existsSync(resolvedPath)) continue;
-
-    console.log(
-      `[quickstart] Seeding repository code from host path ${resolvedPath} into container...`
-    );
-
-    const tempBundle = join(tmpdir(), `rusa-seed-${randomBytes(6).toString("hex")}.bundle`);
-    try {
-      const bundleRes = spawnSync(
-        "git",
-        ["-C", resolvedPath, "bundle", "create", tempBundle, "--all"],
-        {
-          encoding: "utf8",
-        }
-      );
-      if (bundleRes.status !== 0) {
-        spawnSync("git", ["-C", resolvedPath, "bundle", "create", tempBundle, "HEAD"], {
-          encoding: "utf8",
-        });
-      }
-
-      if (!existsSync(tempBundle)) {
-        console.warn(`[quickstart] Could not create git bundle for ${resolvedPath}`);
-        continue;
-      }
-
-      const targetContainerPath = "/tmp/seed.bundle";
-      runDocker(["cp", tempBundle, `${opts.container}:${targetContainerPath}`]);
-
-      const repoKey = generateRepoKey(target.repo);
-      const barePathInContainer = getBareClonePath("/home/node/.rusa", repoKey);
-      const script = [
-        `mkdir -p "${dirname(barePathInContainer)}"`,
-        `rm -rf "${barePathInContainer}"`,
-        `git clone --bare "${targetContainerPath}" "${barePathInContainer}"`,
-        `git -C "${barePathInContainer}" config daemon.uploadpack true`,
-        `git -C "${barePathInContainer}" config http.receivepack true`,
-        `git -C "${barePathInContainer}" config receive.denyCurrentBranch ignore`,
-        `rm -f "${targetContainerPath}"`,
-      ].join(" && ");
-
-      runDocker(["exec", opts.container, "bash", "-c", script]);
-      console.log(`[quickstart] Successfully seeded ${target.repo} into container volume.`);
-    } catch (err) {
-      console.warn(
-        `[quickstart] Failed to seed repository ${target.repo}: ${err instanceof Error ? err.message : String(err)}`
-      );
-    } finally {
-      try {
-        unlinkSync(tempBundle);
-      } catch {
-        /* best effort */
-      }
-    }
-  }
 }
 
 function resolveHomeOverride(home?: string): string {
@@ -438,14 +339,15 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
 
   const localRepoPathAnswer = await input({
     message:
-      "Target local git repository path (optional — leave blank to skip; set later via config.yaml or re-run configure):",
+      "Target local git repository path (optional — leave blank to skip; re-run configure later to select one):",
   });
-
-  const trimmedLocalPath = localRepoPathAnswer.trim();
-  const resolvedLocalPath = trimmedLocalPath ? resolve(trimmedLocalPath) : "";
-  const localTargetRepo = resolvedLocalPath
-    ? `local/${basename(resolvedLocalPath) || "local-repo"}`
-    : "";
+  const localRepoPath = localRepoPathAnswer.trim();
+  if (localRepoPath) {
+    // TODO(#69): copy the selected host repository into the container volume and expose it through
+    // the local Git bridge. The configure command runs inside the setup container, so it cannot
+    // complete that host-to-container handoff by itself.
+    console.log(`[quickstart] Local repository selected: ${resolve(localRepoPath)}`);
+  }
 
   const suggestedRootHandle = generateRandomRootHandle();
   const rootHandleAnswer = await input({
@@ -460,16 +362,6 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
       pollIntervalSeconds: 30,
       ingestionMode: "poll",
     },
-    ...(resolvedLocalPath
-      ? {
-          targets: [
-            {
-              repo: localTargetRepo,
-              localPath: resolvedLocalPath,
-            },
-          ],
-        }
-      : {}),
     providers: Object.fromEntries(
       providers.map((provider) => [provider, { cliCommand: PROVIDER_CLI_COMMANDS[provider] }])
     ),
@@ -490,13 +382,5 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
   console.log(`\nConfig written to ${configPath}`);
   console.log("Provider login state is stored in the quickstart volume for the app container.");
   console.log(`\nDashboard: http://localhost:${QUICKSTART_DASHBOARD_PORT}`);
-  if (localTargetRepo) {
-    const gitBridgeUrl = `http://localhost:${QUICKSTART_GIT_BRIDGE_PORT}/${localTargetRepo}.git`;
-    console.log(`Git bridge: ${gitBridgeUrl}`);
-    console.log("\nFrom your local repo, add the bridge remote and push your code when ready:");
-    console.log(`  git remote add rusa ${gitBridgeUrl}`);
-    console.log("  git push rusa main    # Push initial code to Rusa");
-    console.log("  git fetch rusa        # Fetch agent branches/edits");
-  }
   console.log();
 }

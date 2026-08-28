@@ -1,6 +1,5 @@
 import {
   appendFileSync,
-  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -119,7 +118,7 @@ import {
   getIssueClient,
   type IssueClient,
 } from "../gitops/issue-client.js";
-import { getRemoteUrl, initEmptyBareRepo, seedBareRepoFromLocalPath } from "../gitops/worktree.js";
+import { initEmptyBareRepo } from "../gitops/worktree.js";
 import { AGENT_EXEC_MCP_NAME, createAgentExecMcpServer } from "../mcp/agent-exec-mcp.js";
 import {
   CHAT_READ_MCP_NAME,
@@ -347,24 +346,15 @@ function configuredQuotaThrottleProviders(config: RusaConfig): QuotaThrottleProv
   return [...providers];
 }
 
-function configuredRootEventSources(config: RusaConfig, repoName: string | null): EventResource[] {
+function configuredRootEventSources(config: RusaConfig): EventResource[] {
   const configured: EventResource[] = [];
-  const orgs = new Set<string>();
 
-  if (repoName) {
-    const org = repoName.split("/")[0];
-    if (org) orgs.add(org);
+  for (const entry of config.github.orgs ?? []) {
+    configured.push({ kind: "github_org", org: entry.org });
   }
 
-  if (config.targets) {
-    for (const target of config.targets) {
-      const org = target.repo.split("/")[0];
-      if (org) orgs.add(org);
-    }
-  }
-
-  for (const org of orgs) {
-    configured.push({ kind: "github_org", org });
+  for (const repo of config.github.repos ?? []) {
+    configured.push({ kind: "github_repo", repo });
   }
 
   if (config.chat) {
@@ -636,22 +626,6 @@ export async function compactPortableContext(input: {
     : null;
 }
 
-function getServiceRepoName(config: RusaConfig, repoRoot: string | null): string | null {
-  if (config.github.repo) {
-    return config.github.repo;
-  }
-  if (!repoRoot) return null;
-  const remoteUrl = getRemoteUrl(repoRoot);
-  if (remoteUrl) {
-    const cleanUrl = remoteUrl.trim().replace(/\.git$/, "");
-    const match = cleanUrl.match(/github\.com[:/]([^/]+)\/([^/]+)$/);
-    if (match) {
-      return `${match[1]}/${match[2]}`;
-    }
-  }
-  return null;
-}
-
 /**
  * Start rusa as the single **root actor** over an {@link ActorMesh}.
  *
@@ -766,19 +740,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const baseIssueClient = getIssueClient();
   const gitBridgePort = config.gitBridgePort ?? 8085;
   const gitBridgeBindHost = config.gitBridgeBindHost ?? "127.0.0.1";
-  if (config.gitBridge && config.targets) {
-    for (const target of config.targets) {
+  if (config.gitBridge) {
+    for (const repo of config.github.repos ?? []) {
       try {
-        if (target.localPath && existsSync(target.localPath)) {
-          seedBareRepoFromLocalPath({ mcHome, repoId: target.repo, localPath: target.localPath });
-          console.log(`[git-bridge] seeded bare repo for ${target.repo} from ${target.localPath}`);
-        } else {
-          initEmptyBareRepo(mcHome, target.repo);
-          console.log(`[git-bridge] initialized bare repo for ${target.repo}`);
-        }
+        initEmptyBareRepo(mcHome, repo);
+        console.log(`[git-bridge] initialized bare repo for ${repo}`);
       } catch (err) {
         console.warn(
-          `[git-bridge] failed to initialize bare repo for ${target.repo}: ${err instanceof Error ? err.message : String(err)}`
+          `[git-bridge] failed to initialize bare repo for ${repo}: ${err instanceof Error ? err.message : String(err)}`
         );
       }
     }
@@ -907,17 +876,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     }
   })();
   const addDirs: string[] = repoRoot ? [repoRoot] : [];
-  const repoName = getServiceRepoName(config, repoRoot);
-  if (!repoName) {
-    // Name BOTH consequences unconditionally. `repoName` gates the GitHub poller
-    // AND tracker hygiene, so an if/else on ingestionMode would silently disable
-    // one of them while the log named only the other — one value answering two
-    // questions. Which of the two is actually armed depends on further config
-    // (ingestionMode, trackerHygiene.enabled); the honest report is that neither
-    // can run without a repository identity.
-    console.error(
-      `[start] Could not determine the repository name (github.repo is not configured and could not derive from git remote at ${repoRoot ?? "unknown"}). GitHub polling and tracker hygiene are DISABLED for this run.`
-    );
+  const trackerHygieneRepos = config.github.repos ?? [];
+  if (trackerHygieneRepos.length === 0 && config.observability?.trackerHygiene?.enabled === true) {
+    console.error("[start] github.repos is empty. Tracker hygiene is DISABLED for this run.");
   }
   // Append-only observability log: every message, wake, spawn, and retire lands
   // in `mesh_events` so a run can be replayed as a timeline by `rusa report`.
@@ -1129,7 +1090,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   });
   const rootSourceSync = syncRootEventSources(
     eventSubscriptions,
-    configuredRootEventSources(config, repoName),
+    configuredRootEventSources(config),
     rootId,
     () => new Date().toISOString()
   );
@@ -2272,6 +2233,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const dashboardPort = config.dashboard?.port ?? 8080;
   const dashboardBindHost = config.dashboard?.bindHost ?? "127.0.0.1";
   const botLogin = config.github.account?.toLowerCase();
+  const excludedGitHubRepos = new Set(
+    (config.github.orgs ?? [])
+      .flatMap((entry) => entry.excludedRepos ?? [])
+      .map((repo) => repo.toLowerCase())
+  );
 
   const onEvent = async (
     event: string,
@@ -2286,6 +2252,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     const action = (payload.action as string | undefined) ?? "-";
     const repoFullName = (payload.repository as { full_name?: string } | undefined)?.full_name;
     const repo = repoFullName ?? "?";
+    if (repoFullName && excludedGitHubRepos.has(repoFullName.toLowerCase())) {
+      console.log(
+        `[github] configured excluded repository event dropped: ${event} on ${repoFullName}`
+      );
+      return;
+    }
     // Directive-only: this walks a parent fallback chain and must never feed authorship.
     // See authorStampBodyForWebhookPayload.
     const directiveBody = directiveBodyForWebhookPayload(payload);
@@ -2408,9 +2380,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       })
     : null;
   const githubPoller =
-    !e2eMode && ingestionMode === "poll" && repoName
+    !e2eMode &&
+    ingestionMode === "poll" &&
+    ((config.github.repos?.length ?? 0) > 0 || (config.github.orgs?.length ?? 0) > 0)
       ? startGitHubEventPoller({
-          repos: [repoName],
+          repos: config.github.repos ?? [],
+          orgs: config.github.orgs ?? [],
+          deployBranch: config.deployBranch ?? DEFAULT_DEPLOY_BRANCH,
           intervalSeconds: config.github.pollIntervalSeconds,
           home: mcHome,
           issueClient,
@@ -2419,7 +2395,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       : null;
   let trackerHygieneTimer: ReturnType<typeof setInterval> | null = null;
   const trackerHygieneConfig = config.observability?.trackerHygiene;
-  if (!e2eMode && trackerHygieneConfig?.enabled === true && repoName) {
+  if (!e2eMode && trackerHygieneConfig?.enabled === true && trackerHygieneRepos.length > 0) {
     const intervalSeconds = trackerHygieneConfig?.intervalSeconds ?? 6 * 60 * 60;
     const areaStewardHandle = trackerHygieneConfig?.areaStewardHandle ?? rootHandle;
     const thresholds = {
@@ -2434,34 +2410,36 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         console.log("[tracker-hygiene] HALT active — scan skipped");
         return;
       }
-      const actions = await runTrackerHygiene(
-        issueClient,
-        {
-          resolveHandle: (handle) =>
-            registry.resolveHandle(handle, (id) =>
-              id === rootId ? rootHandle : generateHandle(id)
-            ),
-          sendMessage: (toId, body) => mesh.sendMessage(toId, body, SCHEDULER_SENDER_ID),
-        },
-        {
-          repo: repoName,
-          areaStewardHandle,
-          automationAuthor: botLogin,
-          closeAction: trackerHygieneConfig?.closeAction ?? "log",
-          thresholds,
-          log: (message) => console.warn(message),
-          // Same instance id `mesh.deliverEvent` is called with for this
-          // instance's own writes — lets the system:* suppression rule
-          // recognize the stamp as this instance's (ISSUE_NUM leg 1).
-          instanceId: rootHandle,
-        }
-      );
-      if (actions.length > 0) {
-        console.log(
-          `[tracker-hygiene] ${repoName}: ${actions
-            .map((action) => `${action.kind}#${action.number}`)
-            .join(", ")}`
+      for (const repo of trackerHygieneRepos) {
+        const actions = await runTrackerHygiene(
+          issueClient,
+          {
+            resolveHandle: (handle) =>
+              registry.resolveHandle(handle, (id) =>
+                id === rootId ? rootHandle : generateHandle(id)
+              ),
+            sendMessage: (toId, body) => mesh.sendMessage(toId, body, SCHEDULER_SENDER_ID),
+          },
+          {
+            repo,
+            areaStewardHandle,
+            automationAuthor: botLogin,
+            closeAction: trackerHygieneConfig?.closeAction ?? "log",
+            thresholds,
+            log: (message) => console.warn(message),
+            // Same instance id `mesh.deliverEvent` is called with for this
+            // instance's own writes — lets the system:* suppression rule
+            // recognize the stamp as this instance's (ISSUE_NUM leg 1).
+            instanceId: rootHandle,
+          }
         );
+        if (actions.length > 0) {
+          console.log(
+            `[tracker-hygiene] ${repo}: ${actions
+              .map((action) => `${action.kind}#${action.number}`)
+              .join(", ")}`
+          );
+        }
       }
     };
     void runTrackerHygieneOnce().catch((err) => {

@@ -31,7 +31,6 @@ function defaultExecSyncResponse(command: string): string | null {
 
 const mockLoadConfig = vi.fn().mockReturnValue({
   github: { account: "test" },
-  targets: [],
   providers: {},
   webhook: { port: 9742, secret: "secret" },
   gitBridge: false,
@@ -640,7 +639,6 @@ describe("sandbox bwrap args", () => {
 
       mockLoadConfig.mockReturnValue({
         github: { account: "test", workerTokenPath: tokenPath },
-        targets: [],
         providers: {},
         webhook: { port: 9742, secret: "secret" },
         gitBridge: false,
@@ -731,7 +729,6 @@ describe("sandbox bwrap args", () => {
 
       mockLoadConfig.mockReturnValue({
         github: { account: "test", workerTokenPath: join(home, "does-not-exist-pat") },
-        targets: [],
         providers: {},
         webhook: { port: 9742, secret: "secret" },
         gitBridge: false,
@@ -765,7 +762,6 @@ describe("sandbox bwrap args", () => {
 
       mockLoadConfig.mockReturnValue({
         github: { account: "test", workerTokenPath: tokenPath },
-        targets: [],
         providers: {},
         webhook: { port: 9742, secret: "secret" },
         gitBridge: false,
@@ -822,7 +818,6 @@ describe("sandbox bwrap args", () => {
       // Keep the gh-credential split inert for these tests.
       mockLoadConfig.mockReturnValue({
         github: { account: "test" },
-        targets: [],
         providers: {},
         webhook: { port: 9742, secret: "secret" },
         gitBridge: false,
@@ -879,7 +874,6 @@ describe("sandbox bwrap args", () => {
 
       mockLoadConfig.mockReturnValue({
         github: { account: "test" },
-        targets: [],
         providers: {},
         webhook: { port: 9742, secret: "secret" },
         gitBridge: false,
@@ -928,7 +922,6 @@ describe("sandbox bwrap args", () => {
       // — these tests exercise ONLY the secrets masking.
       mockLoadConfig.mockReturnValue({
         github: { account: "test" },
-        targets: [],
         providers: {},
         webhook: { port: 9742, secret: "secret" },
         gitBridge: false,
@@ -1138,7 +1131,6 @@ describe("sandbox bwrap args", () => {
 
       mockLoadConfig.mockReturnValue({
         github: { account: "test" },
-        targets: [],
         providers: {},
         webhook: { port: 9742, secret: "secret" },
         gitBridge: false,
@@ -1359,7 +1351,6 @@ describe("sandbox bwrap args", () => {
     it("injects GIT_CONFIG_PARAMETERS when gitBridge is enabled", async () => {
       mockLoadConfig.mockReturnValue({
         github: { account: "test" },
-        targets: [],
         providers: {},
         webhook: { port: 9742, secret: "secret" },
         gitBridge: true,

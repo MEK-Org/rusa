@@ -5,36 +5,20 @@
 export const DEFAULT_DEPLOY_BRANCH = "master";
 export type SandboxMode = "container-boundary" | "bwrap";
 
-export interface Target {
-  /** GitHub repo in owner/name format */
-  repo: string;
-  /** Optional path within the repo to scope work to */
-  path?: string;
-  /** Local filesystem path to the repo clone */
-  localPath: string;
-  /** Default branch name (defaults to "main") */
-  defaultBranch?: string;
-  /** If true, this target is the test bed repo */
-  testBed?: boolean;
-  /**
-   * Maximum concurrent worktrees for parallel task execution (default: 2).
-   * Set to 1 to disable parallel execution within a single repository.
-   * Higher values allow more tasks to run concurrently on the same repo.
-   */
-  maxConcurrentWorktrees?: number;
-  /**
-   * When true, markdown files in this target's localPath are not automatically
-   * ingested as raw inputs for knowledge distillation.
-   * Useful for repos whose .md files are test fixtures or generated content
-   * rather than human-authored documentation.
-   */
-  disableMarkdownSync?: boolean;
-}
-
 export interface ProviderConfig {
   /** CLI command name, e.g. "claude", "codex", "agy" */
   cliCommand?: string;
   dailyCap?: string;
+}
+
+export interface GitHubOrgConfig {
+  /** The GitHub organization name */
+  org: string;
+  /**
+   * Optional list of repository full names ("owner/name") to exclude from this organization's
+   * events/subscriptions.
+   */
+  excludedRepos?: string[];
 }
 
 export interface GitHubConfig {
@@ -48,12 +32,15 @@ export interface GitHubConfig {
   /** GitHub event ingestion edge. Defaults to "webhook" for existing installs. */
   ingestionMode?: "webhook" | "poll";
   /**
-   * Optional explicit repository identity in "owner/name" format.
-   * If set, this repository identity is used directly for GitHub polling and
-   * tracker hygiene. Otherwise, the repository identity is derived from the git remote
-   * of the repository root.
+   * GitHub repositories in "owner/name" format that this instance subscribes to
+   * and polls. Tracker hygiene scans every configured repository.
    */
-  repo?: string;
+  repos?: string[];
+  /**
+   * GitHub organizations that this instance subscribes to and polls. Repositories
+   * listed in `excludedRepos` are suppressed at both webhook and poll ingestion.
+   */
+  orgs?: GitHubOrgConfig[];
   /**
    * Path to a read-mostly fine-grained GitHub PAT file (Contents R/W for git
    * push; Issues/PRs/Actions/Checks read-only) that sandboxed mesh workers see
@@ -363,8 +350,6 @@ export interface RusaConfig {
   profile?: string;
   github: GitHubConfig;
   providers: Record<string, ProviderConfig>;
-  /** Optional target repositories for local worktrees or work execution */
-  targets?: Target[];
   /** Branch the root self-update tool deploys from. Defaults to "master". */
   deployBranch?: string;
   /**

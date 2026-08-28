@@ -10,6 +10,7 @@ import type {
 } from "../gitops/issue-client.js";
 import { GitBridgeIssueClient } from "../gitops/issue-client.js";
 import { parseDirectedDeliveryDirective } from "../webhook/directed-delivery.js";
+import { deriveGitHubInboxNotification } from "./inbox-notification.js";
 import { GitHubEventPoller } from "./poller.js";
 
 class MockPollIssueClient implements Partial<GitHubPollingIssueClient> {
@@ -18,11 +19,24 @@ class MockPollIssueClient implements Partial<GitHubPollingIssueClient> {
   pollIssues = new Map<number, PollIssueOrPullRequest>();
   issueSinceCalls: string[] = [];
   commentSinceCalls: string[] = [];
+  polledRepos: string[] = [];
+  orgRepos = new Map<string, string[]>();
+  branchHeads = new Map<string, string>();
+
+  async listPollOrganizationRepositories(org: string): Promise<string[]> {
+    return this.orgRepos.get(org) ?? [];
+  }
+
+  async getPollBranchHead(repo: string, branch: string): Promise<{ sha: string } | null> {
+    const sha = this.branchHeads.get(`${repo}@${branch}`);
+    return sha ? { sha } : null;
+  }
 
   async listUpdatedIssuesAndPullRequests(
     _repo: string,
     since: string
   ): Promise<PollIssueOrPullRequest[]> {
+    this.polledRepos.push(_repo);
     this.issueSinceCalls.push(since);
     return this.issues.filter((issue) => issue.updatedAt > since);
   }
@@ -45,6 +59,76 @@ describe("GitHubEventPoller", () => {
   afterEach(() => {
     vi.useRealTimers();
     if (home) rmSync(home, { recursive: true, force: true });
+  });
+
+  it("polls explicit repositories plus organization repositories and suppresses exclusions", async () => {
+    home = mkdtempSync(join(tmpdir(), "rusa-github-poller-"));
+    const client = new MockPollIssueClient();
+    client.orgRepos.set("dummy-org", [
+      "dummy-org/included",
+      "dummy-org/excluded",
+      "dummy-org/duplicate",
+    ]);
+
+    await new GitHubEventPoller({
+      repos: ["dummy-org/duplicate", "other-org/explicit"],
+      orgs: [{ org: "dummy-org", excludedRepos: ["dummy-org/excluded"] }],
+      home,
+      issueClient: client as GitHubPollingIssueClient,
+      onEvent: async () => undefined,
+    }).pollOnce();
+
+    expect(client.polledRepos).toEqual([
+      "dummy-org/duplicate",
+      "other-org/explicit",
+      "dummy-org/included",
+    ]);
+  });
+
+  it("emits a repo-scoped push when an explicit repository deploy branch advances", async () => {
+    home = mkdtempSync(join(tmpdir(), "rusa-github-poller-"));
+    const client = new MockPollIssueClient();
+    const branchKey = "example-org/service-repo@master";
+    client.branchHeads.set(branchKey, "sha-before");
+    const events: Array<{
+      event: string;
+      payload: Record<string, unknown>;
+      deliveryId?: string;
+    }> = [];
+    const poller = new GitHubEventPoller({
+      repos: ["example-org/service-repo"],
+      deployBranch: "master",
+      home,
+      issueClient: client as GitHubPollingIssueClient,
+      onEvent: async (event, payload, deliveryId) => {
+        events.push({ event, payload, deliveryId });
+      },
+    });
+
+    await poller.pollOnce();
+    client.branchHeads.set(branchKey, "sha-after");
+    await poller.pollOnce();
+
+    expect(events).toEqual([
+      {
+        event: "push",
+        payload: {
+          before: "sha-before",
+          after: "sha-after",
+          repository: {
+            full_name: "example-org/service-repo",
+            name: "service-repo",
+            owner: { login: "example-org" },
+          },
+        },
+        deliveryId: "poll:example-org/service-repo:push:master:sha-after",
+      },
+    ]);
+    expect(events[0].payload).not.toHaveProperty("ref");
+    expect(deriveGitHubInboxNotification("push", events[0].payload)?.resource).toEqual({
+      kind: "github_repo",
+      repo: "example-org/service-repo",
+    });
   });
 
   it("maps a polled mesh:deliver issue comment to webhook-shaped payload", async () => {
@@ -374,6 +458,7 @@ describe("GitHubEventPoller", () => {
         since: "1970-01-01T00:00:00.000Z",
       },
       { method: "getPollIssue", repo: "dummy-org/dummy-repo", issueNumber: 1218 },
+      { method: "getPollBranchHead", repo: "dummy-org/dummy-repo", branch: "master" },
     ]);
     expect(events).toHaveLength(1);
     expect(events[0][0]).toBe("issue_comment");
@@ -382,12 +467,24 @@ describe("GitHubEventPoller", () => {
 
 class RecordingBridgeDelegate implements IssueClient, GitHubPollingIssueClient {
   calls: Array<
+    | { method: "listPollOrganizationRepositories"; org: string }
+    | { method: "getPollBranchHead"; repo: string; branch: string }
     | { method: "listUpdatedIssuesAndPullRequests"; repo: string; since: string }
     | { method: "listUpdatedIssueComments"; repo: string; since: string }
     | { method: "getPollIssue"; repo: string; issueNumber: number }
   > = [];
   comments: PollIssueComment[] = [];
   pollIssues = new Map<number, PollIssueOrPullRequest>();
+
+  async listPollOrganizationRepositories(org: string): Promise<string[]> {
+    this.calls.push({ method: "listPollOrganizationRepositories", org });
+    return [];
+  }
+
+  async getPollBranchHead(repo: string, branch: string): Promise<null> {
+    this.calls.push({ method: "getPollBranchHead", repo, branch });
+    return null;
+  }
 
   async listUpdatedIssuesAndPullRequests(
     repo: string,

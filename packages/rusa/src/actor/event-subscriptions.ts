@@ -140,7 +140,14 @@ export interface EventSourceBootSyncResult {
   deactivated: EventSubscription[];
 }
 
-const CONFIG_ROOT_KINDS = new Set<EventSourceKind>(["github_org", "chat", "chat_space", "system"]);
+const CONFIG_ROOT_KINDS = new Set<EventSourceKind>([
+  "github_org",
+  "github_repo",
+  "github_branch",
+  "chat",
+  "chat_space",
+  "system",
+]);
 
 export function syncRootEventSources(
   store: EventSubscriptionStore,

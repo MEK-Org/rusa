@@ -269,25 +269,31 @@ describe("syncRootEventSources", () => {
     ).toHaveLength(1);
   });
 
-  it("seeds a configured github_repo source and drops a removed github_org, without touching a reclaimed repo slice ", () => {
+  it("seeds a configured github_repo source and drops removed root-owned GitHub config sources", () => {
     const store = new InMemoryEventSubscriptionStore();
     // Old org-wide firehose + a repo slice root reclaimed from a child.
     store.subscribe(sub({ resource: rootOrg, actorId: "root", subscribedBy: "root" }));
     const reclaimed = { kind: "github_repo", repo: "dummy-org/reclaimed" } as const;
     store.subscribe(sub({ resource: reclaimed, actorId: "root", subscribedBy: "root" }));
+    const legacyBranch = {
+      kind: "github_branch",
+      repo: "dummy-org/deploy",
+      ref: "refs/heads/master",
+    } as const;
+    store.subscribe(sub({ resource: legacyBranch, actorId: "root", subscribedBy: "root" }));
 
     // New config: subscribe root to the test-bed repo only, dropping the org.
     const testBed = { kind: "github_repo", repo: "dummy-org/dummy-repo-test-bed" } as const;
     const result = syncRootEventSources(store, [testBed], "root", () => "2026-07-02T00:00:00Z");
 
-    // github_org IS config-reconciled → the removed org firehose is deactivated.
-    expect(result.deactivated.map((s) => s.resource)).toEqual([rootOrg]);
+    // Both old root sources are config-reconciled now that explicit root
+    // eventSources are gone.
+    expect(result.deactivated.map((s) => s.resource)).toEqual([rootOrg, reclaimed, legacyBranch]);
     expect(store.activeForResource(rootOrg)).toEqual([]);
     // The configured repo is seeded.
     expect(store.activeForResource(testBed)).toHaveLength(1);
-    // github_repo is NOT config-reconciled → the reclaimed repo slice survives
-    // (kind alone can't distinguish a config source from a reclaimed slice).
-    expect(store.activeForResource(reclaimed)).toHaveLength(1);
+    expect(store.activeForResource(reclaimed)).toEqual([]);
+    expect(store.activeForResource(legacyBranch)).toEqual([]);
   });
 
   it("deactivates removed chat_space config root subscriptions while preserving active and child subscriptions ", () => {
