@@ -189,18 +189,6 @@ describe("loadConfig GitHub ingestion mode", () => {
   });
 });
 
-describe("loadConfig github.repo (obsolete field rejection)", () => {
-  it("rejects github.repo with clear migration instruction", () => {
-    expect(() =>
-      loadConfig(
-        writeConfig({
-          github: { account: "CodeChopsBot", repo: "dummy-org/dummy-repo" },
-        })
-      )
-    ).toThrow(/github\.repo is no longer supported; use github\.repos: \["owner\/name"\] instead/);
-  });
-});
-
 describe("loadConfig github.repos (multi-repo identity and subscriptions)", () => {
   it("defaults to undefined when omitted", () => {
     const config = loadConfig(

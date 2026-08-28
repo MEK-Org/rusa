@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { appendFileSync, chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { input, password } from "@inquirer/prompts";
 import { stringify as toYaml } from "yaml";
 import { generateRandomRootHandle } from "../actor/handle-generator.js";
@@ -337,27 +337,17 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
 
   writeHostSecret(GEMINI_API_KEY_SECRET_FILENAME, geminiApiKey.trim(), mcHome);
 
-  const githubReposAnswer = await input({
+  const localRepoPathAnswer = await input({
     message:
-      "GitHub repositories to subscribe to and poll (comma-separated owner/name values; optional):",
-    validate: (value) => {
-      const repos = value
-        .split(",")
-        .map((repo) => repo.trim())
-        .filter(Boolean);
-      return repos.every((repo) => /^[^/\s]+\/[^/\s]+$/.test(repo))
-        ? true
-        : "Each repository must use owner/name format";
-    },
+      "Target local git repository path (optional — leave blank to skip; re-run configure later to select one):",
   });
-  const githubRepos = [
-    ...new Set(
-      githubReposAnswer
-        .split(",")
-        .map((repo) => repo.trim())
-        .filter(Boolean)
-    ),
-  ];
+  const localRepoPath = localRepoPathAnswer.trim();
+  if (localRepoPath) {
+    // TODO(#69): copy the selected host repository into the container volume and expose it through
+    // the local Git bridge. The configure command runs inside the setup container, so it cannot
+    // complete that host-to-container handoff by itself.
+    console.log(`[quickstart] Local repository selected: ${resolve(localRepoPath)}`);
+  }
 
   const suggestedRootHandle = generateRandomRootHandle();
   const rootHandleAnswer = await input({
@@ -371,7 +361,6 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
     github: {
       pollIntervalSeconds: 30,
       ingestionMode: "poll",
-      ...(githubRepos.length > 0 ? { repos: githubRepos } : {}),
     },
     providers: Object.fromEntries(
       providers.map((provider) => [provider, { cliCommand: PROVIDER_CLI_COMMANDS[provider] }])
@@ -393,8 +382,5 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
   console.log(`\nConfig written to ${configPath}`);
   console.log("Provider login state is stored in the quickstart volume for the app container.");
   console.log(`\nDashboard: http://localhost:${QUICKSTART_DASHBOARD_PORT}`);
-  for (const repo of githubRepos) {
-    console.log(`Git bridge: http://localhost:${QUICKSTART_GIT_BRIDGE_PORT}/${repo}.git`);
-  }
   console.log();
 }

@@ -34,7 +34,7 @@ The root `quickstart` command accepts the following options:
    docker exec -it rusa-quickstart-setup rusa quickstart configure
    ```
    The interactive wizard collects configuration details and writes them directly inside the volume:
-   * **GitHub repositories**: Optional comma-separated `owner/name` entries. These are written directly to `github.repos`; quickstart never infers repository identity from the local checkout.
+   * **Local repository**: An optional local Git repository path. The wizard records the selection in its output but does not yet copy it into the container or configure a GitHub subscription; completing that host-to-container bridge is tracked in [#69](https://github.com/MEK-Org/rusa/issues/69).
    * **Coding LLM providers**: Choose one or more of `codex`, `claude`, `antigravity`, or `kimi` (defaults to `codex`).
    * **Provider sign-in**: For `codex`, `claude`, and `antigravity`, quickstart hands the real terminal to that vendor's CLI login, then verifies the login before continuing (for `antigravity`, exit the CLI session via `Ctrl+D Ctrl+D` or `/exit` after logging in to proceed). No API key is pasted into Rusa. Quickstart login for `kimi` is not supported yet (tracked in ISSUE_NUM); complete authentication with the vendor's own CLI.
    * **Verification record**: Quickstart writes each supported provider's pass/fail verification result and exit code to `$RUSA_HOME/logs/quickstart-provider-login.jsonl`; it never captures vendor login output.
@@ -45,7 +45,7 @@ The root `quickstart` command accepts the following options:
    Once configuration is complete, the quickstart CLI automatically tears down the temporary setup container and boots the main app container (`rusa-quickstart`). This container mounts the volume and starts the orchestrator service.
 
 ### Local Git Bridge
-Once the orchestrator is running, each repository explicitly listed in `github.repos` has a Git HTTP bridge endpoint. You can connect a matching local workspace repository to it using:
+Once the orchestrator is running, each repository explicitly listed in `github.repos` has a Git HTTP bridge endpoint. The quickstart wizard does not add this configuration automatically; add the repository's `owner/name` to `github.repos` in the volume's `config.yaml` first. You can then connect a matching local workspace repository to it using:
 
 Add the bridge remote to your local repository:
 ```bash

@@ -155,11 +155,6 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     }
     parsed.github.workerTokenPath = parsed.github.workerTokenPath.trim();
   }
-  if ("repo" in (parsed.github as Record<string, unknown>)) {
-    throw new Error(
-      'config.yaml: github.repo is no longer supported; use github.repos: ["owner/name"] instead'
-    );
-  }
   if (parsed.github.repos !== undefined) {
     if (
       !Array.isArray(parsed.github.repos) ||

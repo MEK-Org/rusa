@@ -130,7 +130,7 @@ describe("quickstart command", () => {
   });
 
   it("writes quickstart config without the removed targets field", async () => {
-    promptMocks.state.inputs = ["codex", "example-org/example-repo", "my-root-entity"];
+    promptMocks.state.inputs = ["codex", "/work/example-repo", "my-root-entity"];
     promptMocks.state.passwords = ["test-gemini-key"];
     await runQuickstartConfigure({
       home,
@@ -145,7 +145,6 @@ describe("quickstart command", () => {
     expect(config.github).toEqual({
       pollIntervalSeconds: 30,
       ingestionMode: "poll",
-      repos: ["example-org/example-repo"],
     });
     expect(config).not.toHaveProperty("targets");
     expect(config.rootActor?.provider).toBe("codex");
