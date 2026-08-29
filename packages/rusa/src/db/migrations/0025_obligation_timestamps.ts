@@ -102,6 +102,12 @@ export const obligationTimestamps: Migration = {
     // receipt is written in the same operation that mints its obligation, so its
     // created_at is that obligation's creation time.
     //
+    // Today this recovers nothing: 0020 creates `obligation_capture_receipts`
+    // but no code writes it — there is no capture gateway yet — so in practice
+    // every pre-existing row takes the NULL path below. The join is kept rather
+    // than deferred because it is the correct source the moment receipts start
+    // being written, and reconstructing it after the fact would be guesswork.
+    //
     // Every other pre-existing row stays NULL. Stamping them with the migration
     // time would assert that 100+ historical obligations were all created the
     // moment this shipped — a fabricated provenance, and precisely the kind of

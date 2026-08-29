@@ -75,6 +75,14 @@ export interface OwnedObligationPageOptions extends ObligationPageOptions {
 export interface ReadyHeadChange {
   ownerId: EntityId;
   head: Obligation;
+  /**
+   * The head this one displaced, or `null` when the owner had no ready head.
+   *
+   * Carried because `head` alone cannot tell "this obligation reached the head
+   * for the first time" from "it reached the head again after being displaced",
+   * and a consumer that deduplicates on head identity needs to.
+   */
+  previousHeadId: string | null;
 }
 
 export interface ObligationPage {
@@ -206,7 +214,7 @@ export class ObligationRepository {
   }
 
   /**
-   * Current ready head per owner, keyed `kind\0id`.
+   * Current ready head per owner, keyed by owner id.
    *
    * "Head" is the first row of the owner's ready queue, which must stay
    * byte-identical to `listOwned`'s ordering (effective priority, then id) or
@@ -254,12 +262,27 @@ export class ObligationRepository {
     const result = run();
     const after = this.readyHeads();
     for (const [ownerId, headId] of after) {
-      if (before.get(ownerId) === headId) continue;
+      const previousHeadId = before.get(ownerId) ?? null;
+      if (previousHeadId === headId) continue;
       // #1645: head attention for the operator belongs in the dashboard/digest,
       // and a system component has no inbox — only actors are woken.
       if (!isActorEntityId(ownerId)) continue;
       const head = this.get(headId);
-      if (head) listener({ ownerId, head });
+      if (!head) continue;
+      // The mutation is already committed; attention is a downstream effect of
+      // it, not part of it. Letting an inbox write failure propagate would
+      // report failure for durable work — and the caller's natural retry of
+      // `create_obligation` then trips the external-ref uniqueness guard,
+      // stranding an actor on work it believes it never created.
+      try {
+        listener({ ownerId, head, previousHeadId });
+      } catch (err) {
+        console.warn(
+          `[obligations] ready-head listener failed for ${ownerId}: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
     }
     return result;
   }

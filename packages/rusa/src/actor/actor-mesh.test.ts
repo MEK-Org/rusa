@@ -742,30 +742,73 @@ describe("ActorMesh", () => {
     expect(calls[0]?.prompt).toContain("Work from your inbox");
   });
 
-  it("delivers ready-head attention exactly once per head, across repeats and restarts", async () => {
+  it("delivers ready-head attention exactly once per transition, across repeats and restarts", async () => {
     const inboxStore = createMemoryInboxStore();
     const { mesh, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
 
-    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" })).toBe(true);
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null)).toBe(
+      true
+    );
     await tick();
 
-    const first = inboxStore.entries.filter((entry) => entry.actorId === "root");
+    const first = rootEntries();
     expect(first).toHaveLength(1);
     expect(first[0].source).toBe("obligation:ob-1");
     expect(first[0].payload).toMatchObject({ type: "obligation.ready_head", obligationId: "ob-1" });
 
-    // Replay of the same transition — and, since the id is derived from the head
-    // identity rather than a run, this is also what a restart looks like.
-    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" })).toBe(false);
-    expect(inboxStore.entries.filter((entry) => entry.actorId === "root")).toHaveLength(1);
+    // Replay of the same transition — and, since the id is derived from the
+    // transition rather than a run, this is also what a restart looks like.
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null)).toBe(
+      false
+    );
+    expect(rootEntries()).toHaveLength(1);
 
     // A genuinely different head is genuinely new attention.
-    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-2", intent: "next" })).toBe(true);
-    expect(inboxStore.entries.filter((entry) => entry.actorId === "root")).toHaveLength(2);
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-2", intent: "next" }, "ob-1")).toBe(
+      true
+    );
+    expect(rootEntries()).toHaveLength(2);
 
-    // Churning back to a head already announced must stay silent.
-    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" })).toBe(false);
-    expect(inboxStore.entries.filter((entry) => entry.actorId === "root")).toHaveLength(2);
+    // ob-1 becoming the head again after ob-2 displaced it is a NEW transition,
+    // not a repeat of the first one. Keying on the head alone made this silent,
+    // which left an actor that had already handled the ob-1 entry sitting on
+    // live work with nothing to wake it.
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, "ob-2")).toBe(
+      true
+    );
+    expect(rootEntries()).toHaveLength(3);
+  });
+
+  it("nudges rather than going silent when a handled transition recurs", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, fake, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null)).toBe(
+      true
+    );
+    await tick();
+    expect(rootEntries()).toHaveLength(1);
+
+    // Still unhandled: the wake is outstanding, so a repeat is pure noise.
+    const beforeUnhandledRepeat = fake("root").calls.length;
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null)).toBe(
+      false
+    );
+    await tick();
+    expect(fake("root").calls.length).toBe(beforeUnhandledRepeat);
+
+    // Once handled, the same transition recurring means the head came back the
+    // way it came the first time. The entry id cannot express that, so the
+    // durable entry is not duplicated — but the actor is still woken.
+    inboxStore.markHandled("root", [rootEntries()[0].id]);
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null)).toBe(
+      false
+    );
+    await tick();
+    expect(rootEntries()).toHaveLength(1);
+    expect(fake("root").calls.length).toBeGreaterThan(beforeUnhandledRepeat);
   });
 
   it("does not deliver ready-head attention to a retired actor", async () => {

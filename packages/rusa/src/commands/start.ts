@@ -1794,6 +1794,18 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }
     },
   });
+  // Route head changes as soon as the mesh exists — ahead of rehydration, which
+  // is what registers the per-actor obligations MCP servers, and well ahead of
+  // the dashboard binding its port. A head change cannot commit into a sink
+  // that is still undefined.
+  //
+  // Boot is not covered: nothing re-derives heads at startup, so a head that
+  // moved while the process was down is never announced. Closing that needs a
+  // boot sweep over `readyHeads()`, which this branch does not implement.
+  readyHeadSink = ({ ownerId, head, previousHeadId }) => {
+    mesh.deliverReadyHeadAttention(ownerId, { id: head.id, intent: head.intent }, previousHeadId);
+  };
+
   const rootControl = new RootControlService({
     mesh,
     rootId: rootId,
@@ -2266,13 +2278,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // rehydration, replaying any `send_message` trigger claimed by a run that
   // never completed (drain or hard kill). Cron wakes and GitHub events remain
   // outside this path by design.
-  // Route head changes now that the mesh exists. Set before reconcile so a head
-  // that moved while the process was down takes the same exact-once path rather
-  // than needing a special boot case.
-  readyHeadSink = ({ ownerId, head }) => {
-    mesh.deliverReadyHeadAttention(ownerId, { id: head.id, intent: head.intent });
-  };
-
   mesh.rehydrateAll();
   mesh.reconcilePendingDeliveries();
   mesh.reconcileInbox();
@@ -2872,10 +2877,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }
     }
     sharedQuotaStore?.close();
-    // The repository container outlives a single runStart (process-global), so
-    // clearing the sink stops a dead mesh being reachable from the next
-    // instance in this process. Clearing the sink rather than the listener
-    // avoids touching the database on a shutdown path that is about to close it.
+    // `closeDb()` below drops the repository container, but the listener it
+    // holds is a closure over this `runStart`'s `readyHeadSink`. Clearing the
+    // sink first stops a dead mesh being reachable through that closure, and
+    // clearing the sink rather than the listener avoids touching the database
+    // on a shutdown path that is about to close it.
     readyHeadSink = undefined;
     closeDb();
     console.log("✓ Goodbye!");

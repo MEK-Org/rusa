@@ -260,6 +260,45 @@ void main() {
       expect(api.statusCalls.first.status, 'done');
     });
 
+    testWidgets('owner panel labels the category instead of repeating the id', (tester) async {
+      tester.view.physicalSize = const Size(1280, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      // Neither owner is a live actor this dashboard knows, so the panel's
+      // primary line falls back to the raw id. Printing the id again beneath it
+      // says nothing and drops the cue the old `Kind: ACTOR` line carried.
+      final operatorOwned =
+          makeObligation('ob-op', ownerId: 'human:operator', intent: 'Operator Work');
+      final ghostOwned =
+          makeObligation('ob-ghost', ownerId: 'actor-ghost', intent: 'Ghost Work');
+      api.obligationsResult = [operatorOwned, ghostOwned];
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: WorkTab(
+              store: store,
+              onSelectView: (_) {},
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Operator Work'));
+      await tester.pumpAndSettle();
+      expect(find.text('OWNER'), findsOneWidget);
+      expect(find.text('human:operator'), findsOneWidget);
+      expect(find.text('Operator'), findsOneWidget);
+
+      await tester.tap(find.text('Ghost Work'));
+      await tester.pumpAndSettle();
+      expect(find.text('actor-ghost'), findsOneWidget);
+      expect(find.text('Actor — not in this mesh view'), findsOneWidget);
+    });
+
     testWidgets('allows creating a new root obligation from sidebar', (tester) async {
       tester.view.physicalSize = const Size(1280, 900);
       tester.view.devicePixelRatio = 1.0;

@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Obligation } from "../../obligations/obligation.js";
 import { obligations } from "../migrations/0016_obligations.js";
 import { obligationPriority } from "../migrations/0017_obligation_priority.js";
@@ -63,6 +63,48 @@ describe("ObligationRepository", () => {
       heads = [];
       repository.create({ id: "second", ownerId: "actor-a", priority: 20 });
       expect(heads).toEqual([]);
+    });
+
+    it("carries the head it displaced, so a restored head is not a repeat", () => {
+      const transitions: Array<{ from: string | null; to: string }> = [];
+      repository.setReadyHeadListener(({ head, previousHeadId }) =>
+        transitions.push({ from: previousHeadId, to: head.id })
+      );
+
+      repository.create({ id: "first", ownerId: "actor-a", priority: 10 });
+      repository.create({ id: "urgent", ownerId: "actor-a", priority: 1 });
+      repository.setTerminalStatus("urgent", "done");
+
+      // "first" is the head twice, and only `previousHeadId` separates the two.
+      // Without it a consumer deduplicating on head identity cannot tell the
+      // restored head from a replay, and goes silent on live work.
+      expect(transitions).toEqual([
+        { from: null, to: "first" },
+        { from: "first", to: "urgent" },
+        { from: "urgent", to: "first" },
+      ]);
+    });
+
+    it("keeps a committed mutation successful when the listener throws", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      repository.setReadyHeadListener(() => {
+        throw new Error("inbox is unavailable");
+      });
+
+      // Attention is a downstream effect of a committed write, not part of it.
+      // Propagating would report failure for durable work — and the caller's
+      // retry of create would then trip the external-ref uniqueness guard,
+      // stranding an actor on work it believes it never created.
+      expect(() =>
+        repository.create({
+          id: "committed",
+          ownerId: "actor-a",
+          externalRef: "github_issue:o/r#1",
+        })
+      ).not.toThrow();
+      expect(repository.get("committed")?.ownerId).toBe("actor-a");
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("ready-head listener failed"));
+      warn.mockRestore();
     });
 
     it("announces the displacing obligation when new work takes the head", () => {

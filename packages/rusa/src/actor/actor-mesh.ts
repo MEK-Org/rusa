@@ -711,19 +711,39 @@ export class ActorMesh {
    * Durable attention for an actor that gained a new ready head (#1645).
    *
    * The obligation store stays the work-state authority; this is only the wake
-   * surface. Exact-once comes from the entry id, which is derived from the
-   * resulting head identity — `append` is `ON CONFLICT(id) DO NOTHING`, so a
-   * restart, a replayed transition, or a head that churns away and back can
-   * never manufacture a second notification for the same head.
+   * surface. `append` is `ON CONFLICT(id) DO NOTHING`, so exact-once comes from
+   * the entry id — but the id is derived from the *transition* (which head this
+   * one displaced), not from the resulting head alone.
+   *
+   * Keying on the head alone made the id permanent per (actor, obligation),
+   * which is exactly-once but not live. An actor notified about head H that
+   * marked the entry handled while deferring H, then worked a higher-priority
+   * H0, got nothing at all when H became its head again: no entry, no nudge,
+   * and `reconcileInbox` could not rescue it because the only entry for H was
+   * already handled. Keying on `previousHeadId -> head.id` makes that a
+   * distinct transition, so the actor is woken again.
+   *
+   * A restart or a replay of the same committed transition is still silent.
+   * The residual case — the identical transition recurring after the actor
+   * handled it — cannot be expressed in the id, and falls back to a live nudge:
+   * it wakes a running mesh but is not durable across a restart.
    */
-  deliverReadyHeadAttention(actorId: string, head: { id: string; intent: string | null }): boolean {
+  deliverReadyHeadAttention(
+    actorId: string,
+    head: { id: string; intent: string | null },
+    previousHeadId: string | null = null
+  ): boolean {
     actorId = this.resolveThreadId(actorId);
     if (!this.inboxStore) return false;
     const record = this.registry.get(actorId);
     if (!record || record.status !== "active") return false;
+    const entryId = deduplicatedInboxEntryId(
+      `obligation-head:${actorId}:${previousHeadId ?? "none"}->${head.id}`,
+      actorId
+    );
     const entries = this.inboxStore.append([
       {
-        id: deduplicatedInboxEntryId(`obligation-head:${actorId}:${head.id}`, actorId),
+        id: entryId,
         actorId,
         source: `obligation:${head.id}`,
         payload: {
@@ -733,8 +753,14 @@ export class ActorMesh {
         } as unknown as InboxPayload,
       },
     ]);
-    // A suppressed duplicate returns no row: nothing new to wake for.
-    if (entries.length === 0) return false;
+    if (entries.length === 0) {
+      // Already delivered for this exact transition. While it is still
+      // unhandled the wake is outstanding and a second entry is only noise;
+      // once handled, the head has come back the same way it came the first
+      // time, so nudge rather than going silent.
+      if (this.inboxStore.read(actorId, entryId)?.handledAt) this.notifyInboxChanged(actorId);
+      return false;
+    }
     this.notifyInboxChanged(actorId);
     return true;
   }

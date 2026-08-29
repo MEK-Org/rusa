@@ -1442,16 +1442,49 @@ describe("handleMeshApiRequest", () => {
 
     describe("POST /api/mesh/obligations", () => {
       it("creates obligation and returns 201", async () => {
+        registry.upsert(rec(UUID_A, "root", "active"));
         const body = JSON.stringify({
-          ownerId: "actor-1",
+          ownerId: UUID_A,
           intent: "build feature",
         });
         const { res } = call(deps, "POST", "/api/mesh/obligations", body);
         await new Promise((resolve) => process.nextTick(resolve));
         expect(res.statusCode).toBe(201);
         const data = JSON.parse(res.body);
-        expect(data.obligation.ownerId).toBe("actor-1");
+        expect(data.obligation.ownerId).toBe(UUID_A);
         expect(data.obligation.intent).toBe("build feature");
+        // The dashboard binds the creator from the server's own identity; a
+        // null here would be an unrecoverable loss of attribution (#1671).
+        expect(data.obligation.creatorId).toBe(HUMAN_OPERATOR);
+      });
+
+      it("binds the operator as creator without accepting one from the body", async () => {
+        const { res } = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations",
+          JSON.stringify({ ownerId: HUMAN_OPERATOR, creatorId: "actor-impostor" })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(res.statusCode).toBe(201);
+        expect(JSON.parse(res.body).obligation.creatorId).toBe(HUMAN_OPERATOR);
+      });
+
+      it("rejects an owner that is neither a live actor nor the operator", async () => {
+        registry.upsert(rec(UUID_RETIRED, "root", "retired"));
+        for (const ownerId of ["actor-1", UUID_RETIRED, "system:mesh"]) {
+          const { res } = call(
+            deps,
+            "POST",
+            "/api/mesh/obligations",
+            JSON.stringify({ ownerId, intent: "typo" })
+          );
+          await new Promise((resolve) => process.nextTick(resolve));
+          // A typed handle that resolves to nothing must not become live work
+          // owned by an id that appears in no queue and wakes nobody.
+          expect(res.statusCode).toBe(400);
+        }
+        expect(obligations.listOwned("actor-1")).toHaveLength(0);
       });
 
       it("400s on invalid payload", async () => {
@@ -1584,6 +1617,16 @@ describe("handleMeshApiRequest", () => {
         );
         await new Promise((resolve) => process.nextTick(resolve));
         expect(missing.res.statusCode).toBe(404);
+
+        const unknownOwner = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/task-owner/reassign",
+          JSON.stringify({ ownerId: "actor-typo" })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(unknownOwner.res.statusCode).toBe(400);
+        expect(obligations.get("task-owner")?.ownerId).toBe("actor-1");
       });
     });
   });

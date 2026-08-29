@@ -18,6 +18,7 @@ import {
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { ObligationStatus } from "../obligations/obligation.js";
 import {
   COMMITMENT_LEDGER_BODY_KINDS,
@@ -26,6 +27,35 @@ import {
   projectOpenCommitments,
 } from "../observability/commitment-ledger.js";
 import type { SseHub } from "./sse.js";
+
+/**
+ * Resolve an owner id supplied by the dashboard to one the mesh can route to.
+ *
+ * The dashboard is the operator's console, so its owner ids come from typed
+ * input — and the Flutter owner dialog falls back to the raw text when no
+ * handle matches. With `owner_kind` gone there is no second field to disagree
+ * with, and production wires `ObligationRepository` without an `actorExists`
+ * probe, so an unvalidated id here creates live work owned by something that
+ * appears in no queue and wakes nobody: exactly the owner drift `0025` exists
+ * to clean up, re-entering through the write boundary.
+ *
+ * Accepted: a live actor id, or the single operator id. `system:*` owners are
+ * refused because nothing mints them today; that is a deliberate narrowing of
+ * `EntityId` at this surface, not a claim about the id space.
+ */
+function resolveObligationOwner(
+  registry: ThreadRegistry,
+  rawOwnerId: string
+): { ok: true; ownerId: string } | { ok: false; error: string } {
+  const ownerId = rawOwnerId.trim();
+  if (ownerId === HUMAN_OPERATOR) return { ok: true, ownerId };
+  const record = registry.get(ownerId);
+  if (!record) return { ok: false, error: `unknown obligation owner: ${ownerId}` };
+  if (record.status !== "active") {
+    return { ok: false, error: `obligation owner is not active: ${ownerId}` };
+  }
+  return { ok: true, ownerId };
+}
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
 export interface DashboardDataDeps {
@@ -692,13 +722,25 @@ export function handleMeshApiRequest(
           const priority =
             typeof rawPriority === "number" && Number.isFinite(rawPriority) ? rawPriority : null;
 
+          const owner = resolveObligationOwner(deps.registry, ownerId);
+          if (!owner.ok) {
+            sendJson(res, 400, { error: owner.error });
+            return;
+          }
+
           try {
             const obligation = obligations.create({
-              ownerId: ownerId.trim(),
+              ownerId: owner.ownerId,
               parentId,
               intent,
               externalRef,
               priority,
+              // The dashboard IS the operator, so the creator is bound here from
+              // the server's own identity — the same binding the actor MCP does
+              // with its actor id and the e2e control server does with this one.
+              // Missing it made every dashboard-created obligation
+              // creator-unknown, and #1671 forbids recovering that by inference.
+              creatorId: HUMAN_OPERATOR,
             });
             sendJson(res, 201, { obligation });
           } catch (err) {
@@ -873,8 +915,13 @@ export function handleMeshApiRequest(
             sendJson(res, 404, { error: "obligation not found" });
             return;
           }
+          const owner = resolveObligationOwner(deps.registry, ownerId);
+          if (!owner.ok) {
+            sendJson(res, 400, { error: owner.error });
+            return;
+          }
           try {
-            const obligation = obligations.reassign(id, ownerId.trim());
+            const obligation = obligations.reassign(id, owner.ownerId);
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });

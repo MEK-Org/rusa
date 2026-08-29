@@ -493,6 +493,18 @@ class _DetailView extends StatelessWidget {
     final isSystem = ownerId.startsWith('system:');
     final isActor = !isHuman && !isSystem;
     final displayId = store.actor(ownerId)?.handle ?? ownerId;
+    // The second line exists to disambiguate the first. When the first line
+    // already IS the raw id — the operator, a system component, or an actor
+    // this dashboard has no record of — repeating it says nothing, so fall back
+    // to the category the prefix encodes. That is the cue the old `Kind: ACTOR`
+    // line carried before owner_kind was dropped.
+    final ownerSubtitle = displayId != ownerId
+        ? ownerId
+        : isHuman
+            ? 'Operator'
+            : isSystem
+                ? 'System component'
+                : 'Actor — not in this mesh view';
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -526,7 +538,7 @@ class _DetailView extends StatelessWidget {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  ownerId,
+                  ownerSubtitle,
                   style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),
                 ),
               ],
