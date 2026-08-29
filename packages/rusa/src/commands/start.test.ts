@@ -132,6 +132,7 @@ vi.mock("../providers/sandbox.js", async (importOriginal) => ({
 import {
   getShutdownExitCode,
   isLegacyWorktreeKey,
+  mechanicallySubscribeCreatedResource,
   reactToQueuedInboxEntries,
   runStart,
   shouldBindDashboardServer,
@@ -214,6 +215,46 @@ describe("start command tests", () => {
     expect(isLegacyWorktreeKey("wt-003")).toBe(true);
     expect(isLegacyWorktreeKey("deploy")).toBe(false);
     expect(isLegacyWorktreeKey("issue-42")).toBe(false);
+  });
+
+  it("mechanically subscribes only created resources anchored in root config", () => {
+    const subscribeEventSource = vi.fn();
+    const log = vi.fn();
+    const mesh = { subscribeEventSource };
+    const configuredRoots = [{ kind: "github_org" as const, org: "configured-org" }];
+
+    for (const actorId of ["root", "worker"]) {
+      mechanicallySubscribeCreatedResource(
+        mesh,
+        configuredRoots,
+        { kind: "github_issue", repo: "configured-org/repo", number: 72 },
+        actorId,
+        log
+      );
+      mechanicallySubscribeCreatedResource(
+        mesh,
+        configuredRoots,
+        { kind: "github_issue", repo: "other-org/repo", number: 72 },
+        actorId,
+        log
+      );
+    }
+
+    expect(subscribeEventSource.mock.calls).toEqual([
+      [{ kind: "github_issue", repo: "configured-org/repo", number: 72 }, "root", "root"],
+      [{ kind: "github_issue", repo: "configured-org/repo", number: 72 }, "worker", "worker"],
+    ]);
+    expect(log).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "github_issue:other-org/repo#72 to root skipped: not anchored in config"
+      )
+    );
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "github_issue:other-org/repo#72 to worker skipped: not anchored in config"
+      )
+    );
   });
 
   it("binds the webhook server only in webhook ingestion mode outside e2e", () => {

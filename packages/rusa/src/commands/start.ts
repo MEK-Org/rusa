@@ -488,6 +488,28 @@ export function isLegacyWorktreeKey(key: string): boolean {
   return /^wt-\d+$/.test(key);
 }
 
+export function mechanicallySubscribeCreatedResource(
+  mesh: Pick<ActorMesh, "subscribeEventSource">,
+  configuredRoots: readonly EventResource[],
+  resource: EventResource,
+  actorId: string,
+  log: (message: string) => void = console.log
+): void {
+  try {
+    if (!configuredRoots.some((configured) => isSubResourceOf(resource, configured))) {
+      log(
+        `[mesh] mechanical subscribe of ${resourceKey(resource)} to ${actorId} skipped: not anchored in config`
+      );
+      return;
+    }
+    mesh.subscribeEventSource(resource, actorId, actorId);
+  } catch (err) {
+    log(
+      `[mesh] mechanical subscribe of ${resourceKey(resource)} to ${actorId} skipped: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+
 function loadRootSessionId(file: string): string | undefined {
   try {
     return (JSON.parse(readFileSync(file, "utf-8")) as { sessionId?: string }).sessionId;
@@ -1473,19 +1495,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             // audit marker. Best-effort: another actor may already hold the exact
             // resource (update-existing-PR path) — log and continue.
             onResourceCreated: (resource) => {
-              try {
-                if (!configuredRoots.some((c) => isSubResourceOf(resource, c))) {
-                  console.log(
-                    `[mesh] mechanical subscribe of ${resourceKey(resource)} to ${id} skipped: not anchored in config`
-                  );
-                  return;
-                }
-                mesh.subscribeEventSource(resource, id, id);
-              } catch (err) {
-                console.log(
-                  `[mesh] mechanical subscribe of ${resourceKey(resource)} to ${id} skipped: ${err instanceof Error ? err.message : String(err)}`
-                );
-              }
+              mechanicallySubscribeCreatedResource(mesh, configuredRoots, resource, id);
             },
           })
         );
@@ -1901,19 +1911,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // Uniform rule : the root gets mechanical subscriptions for what
       // it creates too, and can delegate them onward.
       onResourceCreated: (resource) => {
-        try {
-          if (!configuredRoots.some((c) => isSubResourceOf(resource, c))) {
-            console.log(
-              `[mesh] mechanical subscribe of ${resourceKey(resource)} to ${rootId} skipped: not anchored in config`
-            );
-            return;
-          }
-          mesh.subscribeEventSource(resource, rootId, rootId);
-        } catch (err) {
-          console.log(
-            `[mesh] mechanical subscribe of ${resourceKey(resource)} to ${rootId} skipped: ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
+        mechanicallySubscribeCreatedResource(mesh, configuredRoots, resource, rootId);
       },
     })
   );
