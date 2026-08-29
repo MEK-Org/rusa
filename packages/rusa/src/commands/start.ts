@@ -30,8 +30,9 @@ import { E2EInstanceManager } from "../actor/e2e-instance-manager.js";
 import {
   type EventResource,
   FileEventSubscriptionStore,
+  isSubResourceOf,
+  reconcileEventSources,
   resourceKey,
-  syncRootEventSources,
 } from "../actor/event-subscriptions.js";
 import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import {
@@ -485,6 +486,28 @@ export function shouldBindDashboardServer(params: {
 
 export function isLegacyWorktreeKey(key: string): boolean {
   return /^wt-\d+$/.test(key);
+}
+
+export function mechanicallySubscribeCreatedResource(
+  mesh: Pick<ActorMesh, "subscribeEventSource">,
+  configuredRoots: readonly EventResource[],
+  resource: EventResource,
+  actorId: string,
+  log: (message: string) => void = console.log
+): void {
+  try {
+    if (!configuredRoots.some((configured) => isSubResourceOf(resource, configured))) {
+      log(
+        `[mesh] mechanical subscribe of ${resourceKey(resource)} to ${actorId} skipped: not anchored in config`
+      );
+      return;
+    }
+    mesh.subscribeEventSource(resource, actorId, actorId);
+  } catch (err) {
+    log(
+      `[mesh] mechanical subscribe of ${resourceKey(resource)} to ${actorId} skipped: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
 }
 
 function loadRootSessionId(file: string): string | undefined {
@@ -1077,8 +1100,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // registers the glass-goals `understanding-write` server (claude FS isolation
   // ISSUE_NUM having landed); grantable-servers.test.ts locks the contents.
   const capabilityGrants = new FileCapabilityGrantStore(join(mcHome, CAPABILITY_GRANTS_FILENAME));
-  const eventSubscriptions = new FileEventSubscriptionStore(
-    join(mcHome, "event-subscriptions.json")
+  const persistentEventSubscriptions = new FileEventSubscriptionStore(
+    join(mcHome, "event-subscriptions.json"),
+    rootId
   );
   // Host-plane host-jobs capability : durable per-actor job records, keyed
   // the same way capabilityGrants/eventSubscriptions are.
@@ -1088,15 +1112,17 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     workersDir,
     handleForId: (id) => (id === rootId ? rootHandle : generateHandle(id)),
   });
-  const rootSourceSync = syncRootEventSources(
-    eventSubscriptions,
-    configuredRootEventSources(config),
+  const configuredRoots = configuredRootEventSources(config);
+  const rootSourceSync = reconcileEventSources(
+    persistentEventSubscriptions,
+    configuredRoots,
     rootId,
     () => new Date().toISOString()
   );
-  if (rootSourceSync.seeded.length > 0 || rootSourceSync.deactivated.length > 0) {
+  const eventSubscriptions = rootSourceSync.store;
+  if (rootSourceSync.droppedDelegations.length > 0) {
     console.log(
-      `[mesh] synced root event sources: seeded=${rootSourceSync.seeded.length} deactivated=${rootSourceSync.deactivated.length}`
+      `[mesh] reconciled root event sources: dropped ${rootSourceSync.droppedDelegations.length} orphaned delegations`
     );
   }
   // `const` so the closure below keeps the non-null narrowing (`chatClient` is a
@@ -1469,13 +1495,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             // audit marker. Best-effort: another actor may already hold the exact
             // resource (update-existing-PR path) — log and continue.
             onResourceCreated: (resource) => {
-              try {
-                mesh.subscribeEventSource(resource, id, id);
-              } catch (err) {
-                console.log(
-                  `[mesh] mechanical subscribe of ${resourceKey(resource)} to ${id} skipped: ${err instanceof Error ? err.message : String(err)}`
-                );
-              }
+              mechanicallySubscribeCreatedResource(mesh, configuredRoots, resource, id);
             },
           })
         );
@@ -1891,13 +1911,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // Uniform rule : the root gets mechanical subscriptions for what
       // it creates too, and can delegate them onward.
       onResourceCreated: (resource) => {
-        try {
-          mesh.subscribeEventSource(resource, rootId, rootId);
-        } catch (err) {
-          console.log(
-            `[mesh] mechanical subscribe of ${resourceKey(resource)} to ${rootId} skipped: ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
+        mechanicallySubscribeCreatedResource(mesh, configuredRoots, resource, rootId);
       },
     })
   );
