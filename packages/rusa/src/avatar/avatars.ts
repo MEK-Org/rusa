@@ -1,5 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateHandle } from "../actor/handle-generator.js";
@@ -81,16 +91,29 @@ export function avatarCachePath(id: string): string {
 }
 
 /**
+ * Absolute path to the configured root avatar override (`rootActor.avatar`) when
+ * it resolves to a file that exists, else null. Split out of {@link
+ * rootAvatarPath} because dashboard branding (#48) has to tell an image this
+ * instance's operator actually chose apart from the bundled default that every
+ * install shares — the latter is generic rusa artwork, not this root's face.
+ */
+export function configuredRootAvatarPath(configuredPath?: string): string | null {
+  if (!configuredPath) return null;
+  const resolved = resolve(configuredPath);
+  return existsSync(resolved) ? resolved : null;
+}
+
+/**
  * Absolute path to the root avatar image: the configured override
  * (`rootActor.avatar`) if it resolves to a file that exists, else the bundled
  * System Root image, or null if neither can be found.
  */
 export function rootAvatarPath(configuredPath?: string): string | null {
-  if (configuredPath) {
-    const resolved = resolve(configuredPath);
-    if (existsSync(resolved)) return resolved;
-  }
-  return ROOT_AVATAR_CANDIDATES.find((p) => existsSync(p)) ?? null;
+  return (
+    configuredRootAvatarPath(configuredPath) ??
+    ROOT_AVATAR_CANDIDATES.find((p) => existsSync(p)) ??
+    null
+  );
 }
 
 /**
@@ -338,4 +361,63 @@ export function readAvatar(id: string, rootIdentity?: RootAvatarIdentity): Serve
     };
   }
   return null;
+}
+
+/**
+ * Sniff an image file's content type from its first bytes, without loading the
+ * whole file. Only PNG and JPEG are ever cached (see {@link
+ * isValidImageSignature}), so anything not JPEG-signed is reported as PNG — the
+ * same rule {@link readAvatar} applies to bytes it has already read.
+ */
+function sniffImageContentType(path: string): string {
+  const fd = openSync(path, "r");
+  try {
+    const head = Buffer.alloc(8);
+    const read = readSync(fd, head, 0, head.length, 0);
+    return isJpegSignature(head.subarray(0, read)) ? "image/jpeg" : "image/png";
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** A root image this instance's operator chose, ready to brand the dashboard with. */
+export interface RootBrandingImage {
+  /** Absolute path of the image on disk. */
+  path: string;
+  /** `image/png` or `image/jpeg`, sniffed from the file's signature. */
+  contentType: string;
+  /** Cache-busting stamp; changes whenever the file is replaced. */
+  version: string;
+}
+
+/**
+ * The root actor's *own* image, or null when this instance is still showing the
+ * bundled default.
+ *
+ * Deliberately narrower than {@link readAvatar}: that one always resolves to
+ * something for the root (falling back to the bundled robot) because the
+ * dashboard needs an avatar to draw. Branding is the opposite — the bundled
+ * robot is generic rusa artwork shared by every install, so falling back to it
+ * would replace the crafted actor-mesh favicon with an equally generic but worse
+ * one. Only an uploaded/generated root image, or a configured `rootActor.avatar`,
+ * counts. Never throws: a missing or racing file just means "no branding image".
+ */
+export function rootBrandingImage(rootIdentity?: RootAvatarIdentity): RootBrandingImage | null {
+  try {
+    // Root images always cache under the literal `root` key — `uploadAvatar` and
+    // `generateAvatarForce` both canonicalize the durable root id to it.
+    const uploaded = avatarCachePath("root");
+    const path = existsSync(uploaded)
+      ? uploaded
+      : configuredRootAvatarPath(rootIdentity?.avatarPath);
+    if (!path) return null;
+    const stats = statSync(path);
+    return {
+      path,
+      contentType: sniffImageContentType(path),
+      version: `${Math.trunc(stats.mtimeMs)}-${stats.size}`,
+    };
+  } catch {
+    return null;
+  }
 }

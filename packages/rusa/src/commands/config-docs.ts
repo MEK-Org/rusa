@@ -164,8 +164,11 @@ rootActor:
   handle                   Optional. Overrides the root actor's display handle (default: derived, "root-actor").
                            Lets a secondary instance sharing the bot account (e.g. staging) present under its own
                            identity in GitHub signing bylines, the dashboard, and its avatar .
+                           Also titles the dashboard page and names the installed PWA ("Ember Familiar").
   avatar                   Optional. Path to a root avatar image, overriding the bundled default. Falls back to
                            the bundled image when unset or the path doesn't resolve to an existing file.
+                           A root image — this or one uploaded from the dashboard — also becomes the dashboard's
+                           favicon and app icon (#48).
 
 webhook:
 
