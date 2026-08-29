@@ -45,16 +45,23 @@ function createMemoryInboxStore(): InboxStore & { entries: InboxEntry[] } {
   return {
     entries,
     append: (inputs) => {
-      const inserted = inputs.map((input, index) => ({
-        id: input.id ?? `entry-${entries.length + index + 1}`,
-        actorId: input.actorId,
-        source: input.source,
-        deliveredAt: input.deliveredAt ?? new Date("2026-01-01T00:00:00Z"),
-        seenAt: null,
-        handledAt: null,
-        handledNote: null,
-        payload: input.payload,
-      }));
+      // Mirrors InboxRepository: the insert is `ON CONFLICT(id) DO NOTHING` and
+      // the return is filtered to rows actually inserted, so a caller-supplied
+      // duplicate id is suppressed and reported as "nothing new". Without this
+      // the fake silently grants at-least-once where the real store gives
+      // exactly-once, and dedupe-dependent behaviour cannot be tested here.
+      const inserted = inputs
+        .map((input, index) => ({
+          id: input.id ?? `entry-${entries.length + index + 1}`,
+          actorId: input.actorId,
+          source: input.source,
+          deliveredAt: input.deliveredAt ?? new Date("2026-01-01T00:00:00Z"),
+          seenAt: null,
+          handledAt: null,
+          handledNote: null,
+          payload: input.payload,
+        }))
+        .filter((row) => !entries.some((existing) => existing.id === row.id));
       entries.push(...inserted);
       return inserted;
     },
@@ -733,6 +740,82 @@ describe("ActorMesh", () => {
     const calls = fake("t1").calls;
     expect(calls).toHaveLength(1);
     expect(calls[0]?.prompt).toContain("Work from your inbox");
+  });
+
+  it("delivers ready-head attention exactly once per head, across repeats and restarts", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, tick } = setup({ inboxStore });
+
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" })).toBe(true);
+    await tick();
+
+    const first = inboxStore.entries.filter((entry) => entry.actorId === "root");
+    expect(first).toHaveLength(1);
+    expect(first[0].source).toBe("obligation:ob-1");
+    expect(first[0].payload).toMatchObject({ type: "obligation.ready_head", obligationId: "ob-1" });
+
+    // Replay of the same transition — and, since the id is derived from the head
+    // identity rather than a run, this is also what a restart looks like.
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" })).toBe(false);
+    expect(inboxStore.entries.filter((entry) => entry.actorId === "root")).toHaveLength(1);
+
+    // A genuinely different head is genuinely new attention.
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-2", intent: "next" })).toBe(true);
+    expect(inboxStore.entries.filter((entry) => entry.actorId === "root")).toHaveLength(2);
+
+    // Churning back to a head already announced must stay silent.
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" })).toBe(false);
+    expect(inboxStore.entries.filter((entry) => entry.actorId === "root")).toHaveLength(2);
+  });
+
+  it("does not deliver ready-head attention to a retired actor", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, registry } = setup({ inboxStore });
+    const id = mesh.spawn({ charter: "worker", parentId: "root" });
+    registry.patch(id, { status: "retired" });
+
+    expect(mesh.deliverReadyHeadAttention(id, { id: "ob-1", intent: null })).toBe(false);
+    expect(inboxStore.entries.filter((entry) => entry.actorId === id)).toHaveLength(0);
+  });
+
+  it("re-queues an actor that leaves inbox work unhandled, and stops once the inbox drains", async () => {
+    const inboxStore = createMemoryInboxStore();
+    // Handle exactly one entry per run so the actor deliberately under-drains,
+    // which is the deferral pattern the inbox contract is meant to support.
+    const { mesh, fake, tick } = setup({
+      inboxStore,
+      createActor: undefined,
+    });
+    inboxStore.append([
+      { actorId: "root", source: "mesh:a", payload: payload("mesh.message") },
+      { actorId: "root", source: "mesh:b", payload: payload("mesh.message") },
+      { actorId: "root", source: "mesh:c", payload: payload("mesh.message") },
+    ]);
+
+    const handleOne = () => {
+      const next = inboxStore.list("root").entries[0];
+      if (!next) return 0;
+      mesh.selectInboxEntries("root", [next.id]);
+      inboxStore.markHandled("root", [next.id]);
+      mesh.inboxHandled("root");
+      return inboxStore.countUnhandled("root");
+    };
+
+    expect(handleOne()).toBe(2);
+    await tick();
+    expect(fake("root").calls.length).toBeGreaterThan(0);
+
+    const afterFirst = fake("root").calls.length;
+    expect(handleOne()).toBe(1);
+    await tick();
+    expect(fake("root").calls.length).toBeGreaterThan(afterFirst);
+
+    // Draining the last entry must NOT schedule another run: an empty inbox is
+    // the termination condition, otherwise the actor spins forever.
+    const afterSecond = fake("root").calls.length;
+    expect(handleOne()).toBe(0);
+    await tick();
+    expect(fake("root").calls).toHaveLength(afterSecond);
   });
 
   it("delivers a system.disk event to the system subscriber as responsive inbox work", async () => {

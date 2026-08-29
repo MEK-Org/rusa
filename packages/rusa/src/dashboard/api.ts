@@ -678,12 +678,7 @@ export function handleMeshApiRequest(
             return;
           }
           const body = parsed as Record<string, unknown>;
-          const ownerKind = (body.ownerKind ?? body.owner_kind) as string | undefined;
           const ownerId = (body.ownerId ?? body.owner_id) as string | undefined;
-          if (ownerKind !== "actor" && ownerKind !== "human") {
-            sendJson(res, 400, { error: "ownerKind must be 'actor' or 'human'" });
-            return;
-          }
           if (typeof ownerId !== "string" || !ownerId.trim()) {
             sendJson(res, 400, { error: "ownerId is required" });
             return;
@@ -699,7 +694,7 @@ export function handleMeshApiRequest(
 
           try {
             const obligation = obligations.create({
-              owner: { kind: ownerKind, id: ownerId.trim() },
+              ownerId: ownerId.trim(),
               parentId,
               intent,
               externalRef,
@@ -869,12 +864,7 @@ export function handleMeshApiRequest(
             return;
           }
           const body = parsed as Record<string, unknown>;
-          const ownerKind = (body.ownerKind ?? body.owner_kind) as string | undefined;
           const ownerId = (body.ownerId ?? body.owner_id) as string | undefined;
-          if (ownerKind !== "actor" && ownerKind !== "human") {
-            sendJson(res, 400, { error: "ownerKind must be 'actor' or 'human'" });
-            return;
-          }
           if (typeof ownerId !== "string" || !ownerId.trim()) {
             sendJson(res, 400, { error: "ownerId is required" });
             return;
@@ -884,10 +874,7 @@ export function handleMeshApiRequest(
             return;
           }
           try {
-            const obligation = obligations.reassign(id, {
-              kind: ownerKind,
-              id: ownerId.trim(),
-            });
+            const obligation = obligations.reassign(id, ownerId.trim());
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1099,8 +1086,6 @@ export function handleMeshApiRequest(
       sendJson(res, 503, { error: "obligations data unavailable" });
       return true;
     }
-    const ownerKind =
-      url.searchParams.get("ownerKind") ?? url.searchParams.get("owner_kind") ?? undefined;
     const ownerId =
       url.searchParams.get("ownerId") ?? url.searchParams.get("owner_id") ?? undefined;
     const status = url.searchParams.get("status") ?? undefined;
@@ -1109,17 +1094,12 @@ export function handleMeshApiRequest(
     const limit = clampLimit(url);
     const offset = parsePositiveInt(url, "offset") ?? 0;
 
-    if (ownerKind && ownerKind !== "actor" && ownerKind !== "human") {
-      sendJson(res, 400, { error: "ownerKind must be 'actor' or 'human'" });
-      return true;
-    }
     if (status && !["ready", "waiting", "done", "cancelled"].includes(status)) {
       sendJson(res, 400, { error: "invalid status" });
       return true;
     }
 
     const page = deps.obligations.listPage({
-      ownerKind: ownerKind as "actor" | "human" | undefined,
       ownerId,
       status: status as ObligationStatus | undefined,
       rootsOnly,

@@ -432,13 +432,16 @@ describe("obligation projection (ISSUE_NUM, ratified in ISSUE_NUM comment 536984
   ): Obligation => ({
     id,
     parentId: null,
-    owner: { kind: "actor", id: "actor-a" },
+    ownerId: "actor-a",
     intent,
     externalRef,
     status,
     priority,
     effectivePriority: priority,
     prioritySourceId: id,
+    createdAt: "2026-08-29T00:00:00.000Z",
+    updatedAt: "2026-08-29T00:00:00.000Z",
+    creatorId: "actor-a",
   });
 
   const OBLIGATIONS_HEADING = "### Your obligations (system of record)";

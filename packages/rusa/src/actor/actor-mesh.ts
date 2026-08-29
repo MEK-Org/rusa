@@ -707,6 +707,38 @@ export class ActorMesh {
     this.selectedInboxEntryIds.delete(actorId);
   }
 
+  /**
+   * Durable attention for an actor that gained a new ready head (#1645).
+   *
+   * The obligation store stays the work-state authority; this is only the wake
+   * surface. Exact-once comes from the entry id, which is derived from the
+   * resulting head identity — `append` is `ON CONFLICT(id) DO NOTHING`, so a
+   * restart, a replayed transition, or a head that churns away and back can
+   * never manufacture a second notification for the same head.
+   */
+  deliverReadyHeadAttention(actorId: string, head: { id: string; intent: string | null }): boolean {
+    actorId = this.resolveThreadId(actorId);
+    if (!this.inboxStore) return false;
+    const record = this.registry.get(actorId);
+    if (!record || record.status !== "active") return false;
+    const entries = this.inboxStore.append([
+      {
+        id: deduplicatedInboxEntryId(`obligation-head:${actorId}:${head.id}`, actorId),
+        actorId,
+        source: `obligation:${head.id}`,
+        payload: {
+          type: "obligation.ready_head",
+          obligationId: head.id,
+          intent: head.intent ?? undefined,
+        } as unknown as InboxPayload,
+      },
+    ]);
+    // A suppressed duplicate returns no row: nothing new to wake for.
+    if (entries.length === 0) return false;
+    this.notifyInboxChanged(actorId);
+    return true;
+  }
+
   inboxHandled(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
     if (this.inboxStore && this.inboxStore.countUnhandled(actorId) > 0) {

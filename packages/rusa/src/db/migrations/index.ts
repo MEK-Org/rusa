@@ -20,6 +20,7 @@ import { obligationCaptureReceipts } from "./0020_obligation_capture_receipts.js
 import { inferredParsedState } from "./0022_inferred_parsed_state.js";
 import { dropMeshEventsPeerId } from "./0023_drop_mesh_events_peer_id.js";
 import { renameThreadEvents } from "./0024_rename_thread_events.js";
+import { obligationTimestamps } from "./0025_obligation_timestamps.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -52,4 +53,5 @@ export const migrations: Migration[] = [
   inferredParsedState,
   dropMeshEventsPeerId,
   renameThreadEvents,
+  obligationTimestamps,
 ];

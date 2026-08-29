@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
-import type { ObligationOwner, ObligationStatus } from "../obligations/obligation.js";
+import type { ObligationStatus } from "../obligations/obligation.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 
@@ -112,7 +112,7 @@ export function createObligationsMcpServer(
     { name: OBLIGATIONS_MCP_NAME, version: "0.1.0" },
     { isFenced: options?.isFenced }
   );
-  const owner: ObligationOwner = { kind: "actor", id: actorId };
+  const ownerId = actorId;
 
   server.registerTool(
     "get_obligation",
@@ -190,9 +190,9 @@ export function createObligationsMcpServer(
     async ({ status, limit, cursor }) => {
       try {
         const offset = ownedOffset(cursor, actorId, status);
-        const page = repository.listOwnedPage(owner, { status, limit, offset });
+        const page = repository.listOwnedPage(ownerId, { status, limit, offset });
         return toolOk({
-          owner,
+          ownerId,
           obligations: page.obligations,
           total: page.total,
           truncated: offset > 0 || page.hasMore,
@@ -219,7 +219,6 @@ export function createObligationsMcpServer(
       description:
         "Create a new obligation. If parent_id is specified, the parent obligation transitions to waiting if it was ready.",
       inputSchema: {
-        owner_kind: z.enum(["actor", "human"]),
         owner_id: z.string().trim().min(1),
         parent_id: z.string().trim().min(1).nullable().optional(),
         intent: z.string().nullable().optional(),
@@ -227,14 +226,20 @@ export function createObligationsMcpServer(
         priority: z.number().finite().nullable().optional(),
       },
     },
-    async ({ owner_kind, owner_id, parent_id, intent, external_ref, priority }) => {
+    async ({ owner_id, parent_id, intent, external_ref, priority }) => {
       try {
         const obligation = repository.create({
-          owner: { kind: owner_kind, id: owner_id },
+          ownerId: owner_id,
           parentId: parent_id ?? null,
           intent: intent ?? null,
           externalRef: external_ref ?? null,
           priority: priority ?? null,
+          // Bound by the server from this server's actor identity, exactly like
+          // `owner` on list_owned. There is deliberately no `created_by` field
+          // in inputSchema: #1671's trust boundary requires that attribution is
+          // never accepted as model-supplied payload, so an actor cannot claim
+          // to be anyone else — including when it creates work owned by another.
+          creatorId: actorId,
         });
         return toolOk({ obligation });
       } catch (err) {
@@ -300,20 +305,19 @@ export function createObligationsMcpServer(
         "Change a ready or waiting obligation's owner while preserving its identity, tree position, priority, external reference, and state.",
       inputSchema: {
         id: z.string().trim().min(1),
-        owner_kind: z.enum(["actor", "human"]),
         owner_id: z.string().trim().min(1),
       },
     },
-    async ({ id, owner_kind, owner_id }) => {
+    async ({ id, owner_id }) => {
       try {
         const current = repository.get(id);
         if (!current) throw new Error("obligation not found");
         const authorized = options?.canReassign
           ? options.canReassign(actorId, current)
-          : current.owner.kind === "actor" && current.owner.id === actorId;
+          : current.ownerId === actorId;
         if (!authorized) throw new Error("not authorized to reassign this obligation");
-        const obligation = repository.reassign(id, { kind: owner_kind, id: owner_id });
-        return toolOk({ obligation, previousOwner: current.owner });
+        const obligation = repository.reassign(id, owner_id);
+        return toolOk({ obligation, previousOwnerId: current.ownerId });
       } catch (err) {
         return toolError(err);
       }

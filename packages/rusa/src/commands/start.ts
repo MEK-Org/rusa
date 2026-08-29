@@ -112,6 +112,7 @@ import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import type { QuotaApiDeps } from "../dashboard/quota-api.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { isSelfAuthoredLedgerSource } from "../db/repositories/mesh-event-repository.js";
+import type { ReadyHeadChange } from "../db/repositories/obligation-repository.js";
 import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
 import {
@@ -573,7 +574,7 @@ function assemblePortableInjection(
           runs,
           // Read-through only. The prompt shows work state; it never authors it
           // — the obligation store stays the sole lifecycle authority .
-          obligations: getRepositories().obligations.listOwned({ kind: "actor", id }),
+          obligations: getRepositories().obligations.listOwned(id),
         })
       : assemblePortableContext(runs);
   return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
@@ -730,6 +731,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   console.log("Initializing database...");
   initDb(mcHome);
   console.log("✓ Database ready");
+
+  // #1645 ready-head attention. Attached here, immediately after initDb, rather
+  // than beside the mesh: `getRepositories()` throws once the database is
+  // closed, and in a process that runs more than one instance (the tests, the
+  // e2e manager) a prior shutdown can land mid-startup. The sink is filled in
+  // once the mesh exists; until then a head change is simply not routed.
+  let readyHeadSink: ((change: ReadyHeadChange) => void) | undefined;
+  getRepositories().obligations.setReadyHeadListener((change) => readyHeadSink?.(change));
 
   try {
     populateModelCatalogsFromDb(getRepositories().modelScrapes);
@@ -1503,8 +1512,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const obligationsUrl = mcpHttp.addServer(`${id}:${OBLIGATIONS_MCP_NAME}`, () =>
           createObligationsMcpServer(getRepositories().obligations, id, {
             isFenced,
-            canReassign: (callerId, obligation) =>
-              obligation.owner.kind === "actor" && mesh.isAncestorOf(callerId, obligation.owner.id),
+            canReassign: (callerId, obligation) => mesh.isAncestorOf(callerId, obligation.ownerId),
           })
         );
         const meshChatUrl = mcpHttp.addServer(`${id}:${MESH_CHAT_MCP_NAME}`, () =>
@@ -2258,6 +2266,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // rehydration, replaying any `send_message` trigger claimed by a run that
   // never completed (drain or hard kill). Cron wakes and GitHub events remain
   // outside this path by design.
+  // Route head changes now that the mesh exists. Set before reconcile so a head
+  // that moved while the process was down takes the same exact-once path rather
+  // than needing a special boot case.
+  readyHeadSink = ({ ownerId, head }) => {
+    mesh.deliverReadyHeadAttention(ownerId, { id: head.id, intent: head.intent });
+  };
+
   mesh.rehydrateAll();
   mesh.reconcilePendingDeliveries();
   mesh.reconcileInbox();
@@ -2857,6 +2872,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }
     }
     sharedQuotaStore?.close();
+    // The repository container outlives a single runStart (process-global), so
+    // clearing the sink stops a dead mesh being reachable from the next
+    // instance in this process. Clearing the sink rather than the listener
+    // avoids touching the database on a shutdown path that is about to close it.
+    readyHeadSink = undefined;
     closeDb();
     console.log("✓ Goodbye!");
     process.exit(getShutdownExitCode(reason));
