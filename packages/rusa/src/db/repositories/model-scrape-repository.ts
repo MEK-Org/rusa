@@ -68,6 +68,37 @@ export class ModelScrapeRepository {
     };
   }
 
+  getLatestParsedForProvider(provider: string): ModelScrape | null {
+    const row = this.db
+      .prepare(
+        `SELECT id, provider, scraped_at, raw_output, parsed_models, parse_error
+         FROM model_scrapes
+         WHERE provider = ? AND parsed_models IS NOT NULL
+         ORDER BY scraped_at DESC, rowid DESC
+         LIMIT 1`
+      )
+      .get(provider) as
+      | {
+          id: string;
+          provider: string;
+          scraped_at: string;
+          raw_output: string;
+          parsed_models: string | null;
+          parse_error: string | null;
+        }
+      | undefined;
+
+    if (!row) return null;
+    return {
+      id: row.id,
+      provider: row.provider,
+      scrapedAt: row.scraped_at,
+      rawOutput: row.raw_output,
+      parsedModels: row.parsed_models ? (JSON.parse(row.parsed_models) as ModelEntry[]) : null,
+      parseError: row.parse_error,
+    };
+  }
+
   listLatestForEachProvider(): Map<string, ModelEntry[]> {
     const rows = this.db
       .prepare(

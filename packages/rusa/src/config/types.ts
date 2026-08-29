@@ -5,36 +5,20 @@
 export const DEFAULT_DEPLOY_BRANCH = "master";
 export type SandboxMode = "container-boundary" | "bwrap";
 
-export interface Target {
-  /** GitHub repo in owner/name format */
-  repo: string;
-  /** Optional path within the repo to scope work to */
-  path?: string;
-  /** Local filesystem path to the repo clone */
-  localPath: string;
-  /** Default branch name (defaults to "main") */
-  defaultBranch?: string;
-  /** If true, this target is the test bed repo */
-  testBed?: boolean;
-  /**
-   * Maximum concurrent worktrees for parallel task execution (default: 2).
-   * Set to 1 to disable parallel execution within a single repository.
-   * Higher values allow more tasks to run concurrently on the same repo.
-   */
-  maxConcurrentWorktrees?: number;
-  /**
-   * When true, markdown files in this target's localPath are not automatically
-   * ingested as raw inputs for knowledge distillation.
-   * Useful for repos whose .md files are test fixtures or generated content
-   * rather than human-authored documentation.
-   */
-  disableMarkdownSync?: boolean;
-}
-
 export interface ProviderConfig {
   /** CLI command name, e.g. "claude", "codex", "agy" */
   cliCommand?: string;
   dailyCap?: string;
+}
+
+export interface GitHubOrgConfig {
+  /** The GitHub organization name */
+  org: string;
+  /**
+   * Optional list of repository full names ("owner/name") to exclude from this organization's
+   * events/subscriptions.
+   */
+  excludedRepos?: string[];
 }
 
 export interface GitHubConfig {
@@ -48,12 +32,15 @@ export interface GitHubConfig {
   /** GitHub event ingestion edge. Defaults to "webhook" for existing installs. */
   ingestionMode?: "webhook" | "poll";
   /**
-   * Optional explicit repository identity in "owner/name" format.
-   * If set, this repository identity is used directly for GitHub polling and
-   * tracker hygiene. Otherwise, the repository identity is derived from the git remote
-   * of the repository root.
+   * GitHub repositories in "owner/name" format that this instance subscribes to
+   * and polls. Tracker hygiene scans every configured repository.
    */
-  repo?: string;
+  repos?: string[];
+  /**
+   * GitHub organizations that this instance subscribes to and polls. Repositories
+   * listed in `excludedRepos` are suppressed at both webhook and poll ingestion.
+   */
+  orgs?: GitHubOrgConfig[];
   /**
    * Path to a read-mostly fine-grained GitHub PAT file (Contents R/W for git
    * push; Issues/PRs/Actions/Checks read-only) that sandboxed mesh workers see
@@ -168,26 +155,6 @@ export interface ChatConfig {
   excludedSpaces?: string[];
 }
 
-export type EventSourceConfig =
-  | { kind: "github_org"; org: string }
-  /**
-   * Subscribe root to a single repo ("owner/name") instead of a whole org —
-   * e.g. a secondary instance (staging) that should only hear its test-bed, not
-   * the org-wide firehose . Seeded like any root source; note it is not
-   * config-reconciled on removal (its kind can't be told apart from a reclaimed
-   * repo slice — see CONFIG_ROOT_KINDS in event-subscriptions).
-   */
-  | { kind: "github_repo"; repo: string }
-  | { kind: "github_branch"; repo: string; ref: string }
-  | { kind: "chat" }
-  /**
-   * Subscribe root to a single Google Chat space ("spaces/...") instead of the
-   * all-spaces chat firehose — e.g. a secondary instance (staging) that should
-   * only receive messages from its dedicated test space . Reconciled on
-   * removal just like top-level chat and github_org.
-   */
-  | { kind: "chat_space"; space: string };
-
 export interface DashboardConfig {
   /** Port to serve the dashboard on (default: 8080) */
   port: number;
@@ -225,6 +192,15 @@ export interface GlassGoalsConfig {
   rootNodeId?: string;
 }
 
+export interface UnderstandingMountConfig {
+  /**
+   * Whether to mount the Integrated Understanding as a read-only filesystem
+   * inside sandboxed worker containers at /tmp/understanding.
+   * Default: false.
+   */
+  enabled?: boolean;
+}
+
 export interface UnderstandingConfig {
   /**
    * Provider-neutral root node used to scope IU reads and dashboard rendering.
@@ -236,6 +212,10 @@ export interface UnderstandingConfig {
    * Remote Glass Goals persistence settings for Integrated Understanding.
    */
   glassGoals?: GlassGoalsConfig;
+  /**
+   * Read-only filesystem mount prototype settings.
+   */
+  mount?: UnderstandingMountConfig;
   // The nightly distiller's chat read set is NOT configured here. It is every
   // space the Chat identity is a member of, enumerated per run via `list_spaces`
   // (see chat/spaces.ts). The former `chatSpaces` allowlist carved personal
@@ -370,8 +350,6 @@ export interface RusaConfig {
   profile?: string;
   github: GitHubConfig;
   providers: Record<string, ProviderConfig>;
-  /** Optional target repositories for local worktrees or work execution */
-  targets?: Target[];
   /** Branch the root self-update tool deploys from. Defaults to "master". */
   deployBranch?: string;
   /**
@@ -384,8 +362,6 @@ export interface RusaConfig {
   /** Mistral API key. Optional; grantable to sandboxed actors as MISTRAL_API_KEY. */
   mistralApiKey?: string;
   webhook: WebhookConfig;
-  /** Top-level event sources held by root and sub-delegated through the mesh. */
-  eventSources?: EventSourceConfig[];
   /** Which provider/model the root actor runs on (optional; defaults to agy). */
   rootActor?: RootActorConfig;
   /** Google Chat inbound/outbound integration (optional; disabled if absent). */

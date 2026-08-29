@@ -919,7 +919,7 @@ export class ActorMesh {
     } else if (capability.startsWith("drive-read:")) {
       baseCapability = "drive-read";
     }
-    if (capability === "chat-write") {
+    if (capability === "chat-write" || capability === "chat-write:") {
       throw new Error(
         `bare chat-write grant is not allowed; must specify a space (e.g. chat-write:spaces/AAAA)`
       );
@@ -1100,9 +1100,15 @@ export class ActorMesh {
         `cannot delegate to non-active thread: ${childThreadId} (status: ${child.status})`
       );
     }
+
     if (childThreadId === delegatedBy) {
-      throw new Error("event sources may only be delegated to another actor");
+      if (this.effectiveOwnerOf(resource, { ignoreExactResource: resource }) !== delegatedBy) {
+        throw new Error(
+          "cannot self-delegate a resource unless it is a strict descendant of an already-owned parent"
+        );
+      }
     }
+
     if (this.effectiveOwnerOf(resource) !== delegatedBy) {
       throw new Error(
         `cannot delegate ${resourceKey(resource)}: caller is not the current effective owner`

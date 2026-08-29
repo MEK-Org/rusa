@@ -1,4 +1,4 @@
-import { unlinkSync } from "node:fs";
+import { rmSync } from "node:fs";
 import type { ProviderConfig } from "../config/types.js";
 import { buildActorBwrapArgs, buildActorBwrapCommand, teardownFlutterOverlay } from "./sandbox.js";
 import { runSubprocess } from "./subprocess-execution.js";
@@ -40,9 +40,13 @@ export class CopilotProvider implements CodingProvider {
         opts.sandbox.worktreePath,
         "copilot",
         undefined,
-        opts.sandbox.isE2eRoot
+        opts.sandbox.isE2eRoot,
+        opts.sandbox.understandingMount
       );
       tempPaths.push(...bwrapResult.tempPaths);
+      if (opts.sandbox.understandingMount) {
+        tempPaths.push(opts.sandbox.understandingMount);
+      }
       spawnArgs = buildActorBwrapCommand(bwrapResult, command, args);
       spawnCommand = "bwrap";
     }
@@ -50,7 +54,7 @@ export class CopilotProvider implements CodingProvider {
     const cleanupTempPaths = () => {
       for (const p of tempPaths) {
         try {
-          unlinkSync(p);
+          rmSync(p, { recursive: true, force: true });
         } catch {
           /* best effort */
         }

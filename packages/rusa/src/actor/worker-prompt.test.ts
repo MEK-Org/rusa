@@ -98,4 +98,30 @@ describe("prompt assembly conduct policy injection ", () => {
     expect(rootPrompt).toContain(EXTERNAL_CONDUCT_POLICY);
     expect(workerPrompt).toContain(EXTERNAL_CONDUCT_POLICY);
   });
+
+  it("injects understanding mount notice into worker prompt when understandingMountEnabled is true", () => {
+    const prompt = buildWorkerPrompt("worker charter", {
+      ...dummyWorkerCtx,
+      understandingMountEnabled: true,
+    });
+    expect(prompt).toContain(
+      "A read-only snapshot of the integrated understanding is mounted at /tmp/understanding; grep and read it directly."
+    );
+  });
+
+  it("omits understanding mount notice from worker prompt when understandingMountEnabled is false or undefined", () => {
+    const prompt1 = buildWorkerPrompt("worker charter", {
+      ...dummyWorkerCtx,
+      understandingMountEnabled: false,
+    });
+    expect(prompt1).not.toContain("/tmp/understanding");
+
+    const prompt2 = buildWorkerPrompt("worker charter", dummyWorkerCtx);
+    expect(prompt2).not.toContain("/tmp/understanding");
+  });
+
+  it("never includes understanding mount notice in root prompt", () => {
+    const prompt = buildRootPrompt();
+    expect(prompt).not.toContain("/tmp/understanding");
+  });
 });

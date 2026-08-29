@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { Type } from "@google/genai";
 import { parse as parseToml } from "smol-toml";
 import { extractGeminiText, getGeminiClient } from "../understanding/gemini-utils.js";
+import { parseCodexModel } from "./codex.js";
 
 /**
  * One model as presented by a provider and as identified underneath that
@@ -45,7 +46,7 @@ export const PROVIDER_MODEL_DESCRIPTORS: Readonly<Record<string, ProviderModelDe
     provider: "codex",
     commandLineField: "identifier",
     extractionGuidance:
-      "Codex displays its passable model slug. Copy that slug into both fields and omit UI annotations such as '(current)'. Mark concrete models with passable: true.",
+      "Codex displays its passable model slug (e.g. 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.5') in the 'Select Model and Effort' menu panel. Do not extract model names from the banner status line or '/model to change' header line. Only extract models listed in the selectable menu panel. If no model selection menu is present, return an empty entries list. Omit UI annotations such as '(current)' and reasoning effort qualifiers such as 'medium', 'low', 'high', 'extra-high'. Copy the plain model slug into both fields. Mark concrete models with passable: true.",
   },
   // Source: Operator's investigation in ISSUE_NUM: Claude displays friendly aliases while
   // the corresponding passable values are claude-* identifiers.
@@ -89,6 +90,21 @@ export async function extractModelCatalog(
       status: "unknown",
       entries: [],
       message: "no geminiApiKey configured for LLM model catalog parsing",
+    };
+  }
+
+  // Guard against panel-less captures that contain only the startup banner/status line.
+  // Note: Keep regex in sync with buildCodexModelTmuxScript panel detection markers in model-scrape.ts
+  if (
+    descriptor.provider === "codex" &&
+    /(?:model\s*:\s*[^\n]+\/model to change|OpenAI Codex|Welcome to Codex)/i.test(rawOutput) &&
+    !/(?:Select Model|Select a model|Select model and effort|[0-9]+\.\s*gpt-)/i.test(rawOutput)
+  ) {
+    return {
+      status: "unknown",
+      entries: [],
+      message:
+        "codex screen capture contains banner status line but no model selection panel rendered",
     };
   }
 
@@ -160,6 +176,12 @@ export interface ModelScrapeStore {
   recordRaw(opts: { provider: string; scrapedAt: string; rawOutput: string }): string;
   recordParsed(id: string, models: readonly ModelEntry[]): void;
   recordParseError(id: string, error: unknown): void;
+  getLatestForProvider?(
+    provider: string
+  ): { scrapedAt: string; parsedModels: readonly ModelEntry[] | null } | null;
+  getLatestParsedForProvider?(
+    provider: string
+  ): { scrapedAt: string; parsedModels: readonly ModelEntry[] | null } | null;
 }
 
 /**
@@ -229,7 +251,6 @@ export async function recordAndExtractModelCatalog(opts: {
           /* best effort */
         }
       }
-      clearProviderModelCatalog(opts.provider);
       return {
         status: "unknown",
         entries: [],
@@ -237,7 +258,6 @@ export async function recordAndExtractModelCatalog(opts: {
       };
     }
   } catch (err) {
-    clearProviderModelCatalog(opts.provider);
     if (id && opts.scrapeStore) {
       try {
         opts.scrapeStore.recordParseError(id, err);
@@ -251,9 +271,38 @@ export async function recordAndExtractModelCatalog(opts: {
 
 const catalogs = new Map<string, readonly ModelEntry[]>();
 
+/**
+ * Normalizes model entries for a provider if necessary.
+ * For Codex, entries that include reasoning effort suffixes (e.g. 'gpt-5.6-sol medium')
+ * are normalized to their base model identifier and display label ('gpt-5.6-sol').
+ */
+export function normalizeModelEntries(
+  provider: string,
+  entries: readonly ModelEntry[]
+): ModelEntry[] {
+  if (provider === "codex") {
+    const seen = new Set<string>();
+    const normalized: ModelEntry[] = [];
+    for (const entry of entries) {
+      const { model } = parseCodexModel(entry.identifier);
+      const slug = model || entry.identifier;
+      if (!seen.has(slug)) {
+        seen.add(slug);
+        normalized.push({
+          identifier: slug,
+          displayLabel: slug,
+          ...(entry.passable !== undefined ? { passable: entry.passable } : {}),
+        });
+      }
+    }
+    return normalized;
+  }
+  return [...entries];
+}
+
 /** Host-enumeration seam for a later slice. An absent provider is unknown. */
 export function setProviderModelCatalog(provider: string, entries: readonly ModelEntry[]): void {
-  catalogs.set(provider, [...entries]);
+  catalogs.set(provider, normalizeModelEntries(provider, entries));
 }
 
 export function clearProviderModelCatalog(provider?: string): void {
@@ -312,9 +361,21 @@ export function validateModelPin(provider: string, pin: string): ModelPinValidat
   }
 
   const passableEntries = entries.filter((entry) => entry.passable !== false);
-  const isMatch = passableEntries.some(
+  let isMatch = passableEntries.some(
     (entry) => entry.identifier === pin || entry.displayLabel === pin
   );
+  if (!isMatch && provider === "codex") {
+    const { model: pinModel } = parseCodexModel(pin);
+    if (pinModel) {
+      isMatch = passableEntries.some(
+        (entry) =>
+          entry.identifier === pinModel ||
+          entry.displayLabel === pinModel ||
+          parseCodexModel(entry.identifier).model === pinModel ||
+          parseCodexModel(entry.displayLabel).model === pinModel
+      );
+    }
+  }
   if (!isMatch) {
     const acceptable = Array.from(
       new Set(

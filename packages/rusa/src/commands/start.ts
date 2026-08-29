@@ -1,7 +1,7 @@
 import {
   appendFileSync,
-  existsSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -9,6 +9,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Actor } from "../actor/actor.js";
@@ -29,8 +30,9 @@ import { E2EInstanceManager } from "../actor/e2e-instance-manager.js";
 import {
   type EventResource,
   FileEventSubscriptionStore,
+  isSubResourceOf,
+  reconcileEventSources,
   resourceKey,
-  syncRootEventSources,
 } from "../actor/event-subscriptions.js";
 import { ExternalRootDriver } from "../actor/external-root-driver.js";
 import {
@@ -117,7 +119,7 @@ import {
   getIssueClient,
   type IssueClient,
 } from "../gitops/issue-client.js";
-import { getRemoteUrl, initEmptyBareRepo, seedBareRepoFromLocalPath } from "../gitops/worktree.js";
+import { initEmptyBareRepo } from "../gitops/worktree.js";
 import { AGENT_EXEC_MCP_NAME, createAgentExecMcpServer } from "../mcp/agent-exec-mcp.js";
 import {
   CHAT_READ_MCP_NAME,
@@ -196,6 +198,7 @@ import {
   resolveGlassGoalsConfig,
   resolveUnderstandingRootNodeId,
 } from "../understanding/root-scope.js";
+import { renderUnderstandingSnapshot } from "../understanding/snapshot.js";
 import { readBuildSentinel } from "../update/build-sentinel.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
@@ -345,50 +348,19 @@ function configuredQuotaThrottleProviders(config: RusaConfig): QuotaThrottleProv
 }
 
 function configuredRootEventSources(config: RusaConfig): EventResource[] {
-  const configured: EventResource[] = (config.eventSources ?? []).map((source, index) => {
-    if (source.kind === "github_org") {
-      if (!source.org?.trim()) {
-        throw new Error(`config.yaml: eventSources[${index}].org is required for github_org`);
-      }
-      return { kind: "github_org", org: source.org };
-    }
-    if (source.kind === "github_repo") {
-      if (!source.repo?.includes("/")) {
-        throw new Error(
-          `config.yaml: eventSources[${index}].repo must be "owner/name" for github_repo`
-        );
-      }
-      return { kind: "github_repo", repo: source.repo };
-    }
-    if (source.kind === "github_branch") {
-      if (!source.repo?.includes("/")) {
-        throw new Error(
-          `config.yaml: eventSources[${index}].repo must be "owner/name" for github_branch`
-        );
-      }
-      if (!source.ref?.trim()) {
-        throw new Error(`config.yaml: eventSources[${index}].ref is required for github_branch`);
-      }
-      return { kind: "github_branch", repo: source.repo, ref: source.ref };
-    }
-    if (source.kind === "chat") {
-      return { kind: "chat" };
-    }
-    if (source.kind === "chat_space") {
-      if (!source.space?.trim()) {
-        throw new Error(`config.yaml: eventSources[${index}].space is required for chat_space`);
-      }
-      const trimmed = source.space.trim();
-      const parts = trimmed.split("/");
-      if (!trimmed.startsWith("spaces/") || parts.length !== 2 || !parts[1]) {
-        throw new Error(
-          `config.yaml: eventSources[${index}].space must be "spaces/..." for chat_space`
-        );
-      }
-      return { kind: "chat_space", space: trimmed };
-    }
-    throw new Error(`config.yaml: unsupported eventSources[${index}].kind`);
-  });
+  const configured: EventResource[] = [];
+
+  for (const entry of config.github.orgs ?? []) {
+    configured.push({ kind: "github_org", org: entry.org });
+  }
+
+  for (const repo of config.github.repos ?? []) {
+    configured.push({ kind: "github_repo", repo });
+  }
+
+  if (config.chat) {
+    configured.push({ kind: "chat" });
+  }
 
   // Disk alerts are a host-owned event source, so configuring the producer is
   // also the subscription declaration. Keeping that derivation here avoids a
@@ -514,6 +486,28 @@ export function shouldBindDashboardServer(params: {
 
 export function isLegacyWorktreeKey(key: string): boolean {
   return /^wt-\d+$/.test(key);
+}
+
+export function mechanicallySubscribeCreatedResource(
+  mesh: Pick<ActorMesh, "subscribeEventSource">,
+  configuredRoots: readonly EventResource[],
+  resource: EventResource,
+  actorId: string,
+  log: (message: string) => void = console.log
+): void {
+  try {
+    if (!configuredRoots.some((configured) => isSubResourceOf(resource, configured))) {
+      log(
+        `[mesh] mechanical subscribe of ${resourceKey(resource)} to ${actorId} skipped: not anchored in config`
+      );
+      return;
+    }
+    mesh.subscribeEventSource(resource, actorId, actorId);
+  } catch (err) {
+    log(
+      `[mesh] mechanical subscribe of ${resourceKey(resource)} to ${actorId} skipped: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
 }
 
 function loadRootSessionId(file: string): string | undefined {
@@ -655,22 +649,6 @@ export async function compactPortableContext(input: {
     : null;
 }
 
-function getServiceRepoName(config: RusaConfig, repoRoot: string | null): string | null {
-  if (config.github.repo) {
-    return config.github.repo;
-  }
-  if (!repoRoot) return null;
-  const remoteUrl = getRemoteUrl(repoRoot);
-  if (remoteUrl) {
-    const cleanUrl = remoteUrl.trim().replace(/\.git$/, "");
-    const match = cleanUrl.match(/github\.com[:/]([^/]+)\/([^/]+)$/);
-    if (match) {
-      return `${match[1]}/${match[2]}`;
-    }
-  }
-  return null;
-}
-
 /**
  * Start rusa as the single **root actor** over an {@link ActorMesh}.
  *
@@ -785,19 +763,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const baseIssueClient = getIssueClient();
   const gitBridgePort = config.gitBridgePort ?? 8085;
   const gitBridgeBindHost = config.gitBridgeBindHost ?? "127.0.0.1";
-  if (config.gitBridge && config.targets) {
-    for (const target of config.targets) {
+  if (config.gitBridge) {
+    for (const repo of config.github.repos ?? []) {
       try {
-        if (target.localPath && existsSync(target.localPath)) {
-          seedBareRepoFromLocalPath({ mcHome, repoId: target.repo, localPath: target.localPath });
-          console.log(`[git-bridge] seeded bare repo for ${target.repo} from ${target.localPath}`);
-        } else {
-          initEmptyBareRepo(mcHome, target.repo);
-          console.log(`[git-bridge] initialized bare repo for ${target.repo}`);
-        }
+        initEmptyBareRepo(mcHome, repo);
+        console.log(`[git-bridge] initialized bare repo for ${repo}`);
       } catch (err) {
         console.warn(
-          `[git-bridge] failed to initialize bare repo for ${target.repo}: ${err instanceof Error ? err.message : String(err)}`
+          `[git-bridge] failed to initialize bare repo for ${repo}: ${err instanceof Error ? err.message : String(err)}`
         );
       }
     }
@@ -892,7 +865,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   };
   let chatClient: ChatClient | null = opts?.e2e?.chatClient ?? null;
   let gchat: GchatClient | null = null;
-  if (!chatClient && config.chat) {
+  if (!chatClient && config.chat && !opts?.e2e) {
     gchat = new GchatClient(config.chat.gchatConfigDir);
     chatClient = gchat;
   }
@@ -926,17 +899,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     }
   })();
   const addDirs: string[] = repoRoot ? [repoRoot] : [];
-  const repoName = getServiceRepoName(config, repoRoot);
-  if (!repoName) {
-    // Name BOTH consequences unconditionally. `repoName` gates the GitHub poller
-    // AND tracker hygiene, so an if/else on ingestionMode would silently disable
-    // one of them while the log named only the other — one value answering two
-    // questions. Which of the two is actually armed depends on further config
-    // (ingestionMode, trackerHygiene.enabled); the honest report is that neither
-    // can run without a repository identity.
-    console.error(
-      `[start] Could not determine the repository name (github.repo is not configured and could not derive from git remote at ${repoRoot ?? "unknown"}). GitHub polling and tracker hygiene are DISABLED for this run.`
-    );
+  const trackerHygieneRepos = config.github.repos ?? [];
+  if (trackerHygieneRepos.length === 0 && config.observability?.trackerHygiene?.enabled === true) {
+    console.error("[start] github.repos is empty. Tracker hygiene is DISABLED for this run.");
   }
   // Append-only observability log: every message, wake, spawn, and retire lands
   // in `mesh_events` so a run can be replayed as a timeline by `rusa report`.
@@ -1135,8 +1100,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // registers the glass-goals `understanding-write` server (claude FS isolation
   // ISSUE_NUM having landed); grantable-servers.test.ts locks the contents.
   const capabilityGrants = new FileCapabilityGrantStore(join(mcHome, CAPABILITY_GRANTS_FILENAME));
-  const eventSubscriptions = new FileEventSubscriptionStore(
-    join(mcHome, "event-subscriptions.json")
+  const persistentEventSubscriptions = new FileEventSubscriptionStore(
+    join(mcHome, "event-subscriptions.json"),
+    rootId
   );
   // Host-plane host-jobs capability : durable per-actor job records, keyed
   // the same way capabilityGrants/eventSubscriptions are.
@@ -1146,15 +1112,17 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     workersDir,
     handleForId: (id) => (id === rootId ? rootHandle : generateHandle(id)),
   });
-  const rootSourceSync = syncRootEventSources(
-    eventSubscriptions,
-    configuredRootEventSources(config),
+  const configuredRoots = configuredRootEventSources(config);
+  const rootSourceSync = reconcileEventSources(
+    persistentEventSubscriptions,
+    configuredRoots,
     rootId,
     () => new Date().toISOString()
   );
-  if (rootSourceSync.seeded.length > 0 || rootSourceSync.deactivated.length > 0) {
+  const eventSubscriptions = rootSourceSync.store;
+  if (rootSourceSync.droppedDelegations.length > 0) {
     console.log(
-      `[mesh] synced root event sources: seeded=${rootSourceSync.seeded.length} deactivated=${rootSourceSync.deactivated.length}`
+      `[mesh] reconciled root event sources: dropped ${rootSourceSync.droppedDelegations.length} orphaned delegations`
     );
   }
   // `const` so the closure below keeps the non-null narrowing (`chatClient` is a
@@ -1527,13 +1495,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             // audit marker. Best-effort: another actor may already hold the exact
             // resource (update-existing-PR path) — log and continue.
             onResourceCreated: (resource) => {
-              try {
-                mesh.subscribeEventSource(resource, id, id);
-              } catch (err) {
-                console.log(
-                  `[mesh] mechanical subscribe of ${resourceKey(resource)} to ${id} skipped: ${err instanceof Error ? err.message : String(err)}`
-                );
-              }
+              mechanicallySubscribeCreatedResource(mesh, configuredRoots, resource, id);
             },
           })
         );
@@ -1615,6 +1577,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // The Actor derives the sandbox (rooted at cwd, git+gh); each provider mounts
         // its own auth dir rw (see providerWritableStateDirs).
         const sandbox = config.sandbox !== "container-boundary";
+        const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
         let actor: Actor;
         actor = new Actor({
@@ -1624,6 +1587,26 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           mcpServers: workerMcp,
           addDirs: [],
           sandbox,
+          prepareUnderstandingMount: understandingMountEnabled
+            ? async () => {
+                const client = await localWriteDeps.getClient();
+                if (!client) {
+                  throw new Error("Understanding mount enabled but syncClient is not available");
+                }
+                const snapshotDir = mkdtempSync(join(tmpdir(), "rusa-iu-snapshot-"));
+                try {
+                  await renderUnderstandingSnapshot(
+                    client,
+                    snapshotDir,
+                    resolveUnderstandingRootNodeId(config)
+                  );
+                  return snapshotDir;
+                } catch (err) {
+                  rmSync(snapshotDir, { recursive: true, force: true });
+                  throw err;
+                }
+              }
+            : undefined,
           // Portable-context actors (design ISSUE_NUM) are called STATELESS — never resume a
           // provider session — so the mesh, not the provider, owns their memory.
           loadSessionId: () =>
@@ -1659,6 +1642,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                   threadId: id,
                   parentId: r.parentId ?? rootId,
                   handles,
+                  understandingMountEnabled,
                 },
                 injection?.priorContext
               ),
@@ -1927,13 +1911,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // Uniform rule : the root gets mechanical subscriptions for what
       // it creates too, and can delegate them onward.
       onResourceCreated: (resource) => {
-        try {
-          mesh.subscribeEventSource(resource, rootId, rootId);
-        } catch (err) {
-          console.log(
-            `[mesh] mechanical subscribe of ${resourceKey(resource)} to ${rootId} skipped: ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
+        mechanicallySubscribeCreatedResource(mesh, configuredRoots, resource, rootId);
       },
     })
   );
@@ -1993,6 +1971,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     const packageDir = join(repoRoot, "packages", "rusa");
     const errorChatSpace = config.chat?.errorChat;
     const deployBranch = config.deployBranch ?? DEFAULT_DEPLOY_BRANCH;
+    if (!errorChatSpace) {
+      console.warn("[update] no errorChat configured — lifecycle pings disabled");
+    } else if (!chatClient) {
+      console.warn("[update] chat client unavailable — lifecycle pings disabled");
+    }
     const updateToolDeps: UpdateToolDeps = {
       plan: { branch: deployBranch, drainTimeoutMs: UPDATE_DRAIN_TIMEOUT_MS },
       rootId: rootId,
@@ -2264,6 +2247,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const dashboardPort = config.dashboard?.port ?? 8080;
   const dashboardBindHost = config.dashboard?.bindHost ?? "127.0.0.1";
   const botLogin = config.github.account?.toLowerCase();
+  const excludedGitHubRepos = new Set(
+    (config.github.orgs ?? [])
+      .flatMap((entry) => entry.excludedRepos ?? [])
+      .map((repo) => repo.toLowerCase())
+  );
 
   const onEvent = async (
     event: string,
@@ -2278,6 +2266,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     const action = (payload.action as string | undefined) ?? "-";
     const repoFullName = (payload.repository as { full_name?: string } | undefined)?.full_name;
     const repo = repoFullName ?? "?";
+    if (repoFullName && excludedGitHubRepos.has(repoFullName.toLowerCase())) {
+      console.log(
+        `[github] configured excluded repository event dropped: ${event} on ${repoFullName}`
+      );
+      return;
+    }
     // Directive-only: this walks a parent fallback chain and must never feed authorship.
     // See authorStampBodyForWebhookPayload.
     const directiveBody = directiveBodyForWebhookPayload(payload);
@@ -2400,9 +2394,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       })
     : null;
   const githubPoller =
-    !e2eMode && ingestionMode === "poll" && repoName
+    !e2eMode &&
+    ingestionMode === "poll" &&
+    ((config.github.repos?.length ?? 0) > 0 || (config.github.orgs?.length ?? 0) > 0)
       ? startGitHubEventPoller({
-          repos: [repoName],
+          repos: config.github.repos ?? [],
+          orgs: config.github.orgs ?? [],
+          deployBranch: config.deployBranch ?? DEFAULT_DEPLOY_BRANCH,
           intervalSeconds: config.github.pollIntervalSeconds,
           home: mcHome,
           issueClient,
@@ -2411,7 +2409,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       : null;
   let trackerHygieneTimer: ReturnType<typeof setInterval> | null = null;
   const trackerHygieneConfig = config.observability?.trackerHygiene;
-  if (!e2eMode && trackerHygieneConfig?.enabled === true && repoName) {
+  if (!e2eMode && trackerHygieneConfig?.enabled === true && trackerHygieneRepos.length > 0) {
     const intervalSeconds = trackerHygieneConfig?.intervalSeconds ?? 6 * 60 * 60;
     const areaStewardHandle = trackerHygieneConfig?.areaStewardHandle ?? rootHandle;
     const thresholds = {
@@ -2426,34 +2424,36 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         console.log("[tracker-hygiene] HALT active — scan skipped");
         return;
       }
-      const actions = await runTrackerHygiene(
-        issueClient,
-        {
-          resolveHandle: (handle) =>
-            registry.resolveHandle(handle, (id) =>
-              id === rootId ? rootHandle : generateHandle(id)
-            ),
-          sendMessage: (toId, body) => mesh.sendMessage(toId, body, SCHEDULER_SENDER_ID),
-        },
-        {
-          repo: repoName,
-          areaStewardHandle,
-          automationAuthor: botLogin,
-          closeAction: trackerHygieneConfig?.closeAction ?? "log",
-          thresholds,
-          log: (message) => console.warn(message),
-          // Same instance id `mesh.deliverEvent` is called with for this
-          // instance's own writes — lets the system:* suppression rule
-          // recognize the stamp as this instance's (ISSUE_NUM leg 1).
-          instanceId: rootHandle,
-        }
-      );
-      if (actions.length > 0) {
-        console.log(
-          `[tracker-hygiene] ${repoName}: ${actions
-            .map((action) => `${action.kind}#${action.number}`)
-            .join(", ")}`
+      for (const repo of trackerHygieneRepos) {
+        const actions = await runTrackerHygiene(
+          issueClient,
+          {
+            resolveHandle: (handle) =>
+              registry.resolveHandle(handle, (id) =>
+                id === rootId ? rootHandle : generateHandle(id)
+              ),
+            sendMessage: (toId, body) => mesh.sendMessage(toId, body, SCHEDULER_SENDER_ID),
+          },
+          {
+            repo,
+            areaStewardHandle,
+            automationAuthor: botLogin,
+            closeAction: trackerHygieneConfig?.closeAction ?? "log",
+            thresholds,
+            log: (message) => console.warn(message),
+            // Same instance id `mesh.deliverEvent` is called with for this
+            // instance's own writes — lets the system:* suppression rule
+            // recognize the stamp as this instance's (ISSUE_NUM leg 1).
+            instanceId: rootHandle,
+          }
         );
+        if (actions.length > 0) {
+          console.log(
+            `[tracker-hygiene] ${repo}: ${actions
+              .map((action) => `${action.kind}#${action.number}`)
+              .join(", ")}`
+          );
+        }
       }
     };
     void runTrackerHygieneOnce().catch((err) => {

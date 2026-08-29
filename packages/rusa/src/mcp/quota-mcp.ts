@@ -298,6 +298,42 @@ function resolveResetAtIso(
   return undefined;
 }
 
+function validateParsedWindowsCompleteness(
+  output: string,
+  provider: "claude" | "codex" | "agy" | "kimi",
+  realWindows: LlmQuotaWindow[]
+): void {
+  // Scoped to Codex for Issue #53 where LLM row omission was observed.
+  if (provider === "codex") {
+    // Helper to ensure we only match provider-scoped windows (or default scope)
+    // so model-scoped windows (e.g. Spark weekly) do not satisfy provider limit requirements.
+    const hasProviderWindow = (predicate: (w: LlmQuotaWindow) => boolean) =>
+      realWindows.some((w) => (w.scope === "provider" || w.scope === undefined) && predicate(w));
+
+    // Codex /status panel renders provider limit rows with colons ('5h limit:' and 'Weekly limit:').
+    const has5hLimit = /(?:^|\n|\r|\s)5h\s+limit\s*:/i.test(output);
+    const hasWeeklyLimit = /(?:^|\n|\r|\s)Weekly\s+limit\s*:/i.test(output);
+
+    if (has5hLimit) {
+      const found = hasProviderWindow((w) => normalizeQuotaWindowKind(w.kind) === "five_hour");
+      if (!found) {
+        throw new Error(
+          "Quota parse incomplete: raw output contains '5h limit:' but parsed windows omitted a provider-scoped five_hour window (or emitted as unreadable placeholder)"
+        );
+      }
+    }
+
+    if (hasWeeklyLimit) {
+      const found = hasProviderWindow((w) => normalizeQuotaWindowKind(w.kind) === "weekly");
+      if (!found) {
+        throw new Error(
+          "Quota parse incomplete: raw output contains 'Weekly limit:' but parsed windows omitted a provider-scoped weekly window (or emitted as unreadable placeholder)"
+        );
+      }
+    }
+  }
+}
+
 async function parseQuotaWithLlm(
   output: string,
   apiKey: string,
@@ -349,6 +385,7 @@ async function parseQuotaWithLlm(
           // anyway, so emitting one would only force the model to guess label/kind).
           "For Codex: a real reading contains limit rows (e.g. '5h limit:', 'Weekly limit:') " +
           "or an explicit exhaustion message (\"You've hit your usage limit\" / 'hit your usage limit'). " +
+          "Extract EVERY rendered limit row into `windows` — never drop or omit the Weekly row when 5h is present, and vice-versa. " +
           `If it contains "You've hit your usage limit" or "hit your usage limit", ` +
           "status is 'exhausted'; extract per-window (5h, Weekly) percentages and reset times (including from 'try again at <date/time>'). " +
           'KNOWN PENDING STATE: codex\'s /status can render "Limits: refresh requested; run /status again shortly" ' +
@@ -388,7 +425,7 @@ async function parseQuotaWithLlm(
     "The current local time — in the SAME timezone the TUI's clock is printed in (its " +
     `offset is included below) — is ${formatLocalIsoWithOffset(generatedAtMs)}. ` +
     "Use it to resolve wall-clock/calendar reset text (e.g. '23:32' means the next " +
-    "occurrence of that time at or after now; '12:34 on 14 Jul' means that specific date/time at or after now; 'Jul 7th, 2026 12:25 PM'; a date without a year means the next " +
+    "occurrence of that time at or after now; '12:34 on 14 Jul' or 'resets 02:10 on 27 Aug' or '15:11 on 1 Sep' means that specific date/time at or after now; 'Jul 7th, 2026 12:25 PM'; a date without a year means the next " +
     "such date at or after now) into resetAtIso, assuming the same UTC offset unless " +
     "the source states otherwise. If the timezone, date, or year is genuinely ambiguous, " +
     "leave resetAtIso empty rather than guess — a wrong instant is worse than a missing one. " +
@@ -396,9 +433,9 @@ async function parseQuotaWithLlm(
     "duration into resetInIso as a normalized ISO-8601 duration such as PT70H13M, " +
     "PT3H10M, PT4H12M, or P2DT22H.";
 
-  const executeOnce = async (): Promise<Partial<ProviderQuotaSnapshot>> => {
+  const executeOnce = async (modelName: string): Promise<Partial<ProviderQuotaSnapshot>> => {
     const response = await client.models.generateContent({
-      model: "gemini-3.5-flash-lite",
+      model: modelName,
       contents: `Parse the following CLI/TUI output of a quota check for the provider '${provider}':\n\n${output}`,
       config: {
         responseMimeType: "application/json",
@@ -418,47 +455,51 @@ async function parseQuotaWithLlm(
       status: parsed.status,
     };
 
-    if (Array.isArray(parsed.windows)) {
-      const realWindows = (parsed.windows as LlmQuotaWindow[]).filter(
-        (w) => !w.placeholder && typeof w.usedPercent === "number"
-      );
+    const realWindows = Array.isArray(parsed.windows)
+      ? (parsed.windows as LlmQuotaWindow[]).filter(
+          (w) => !w.placeholder && typeof w.usedPercent === "number"
+        )
+      : [];
 
-      const limits: QuotaLimit[] = [];
-      for (const w of realWindows) {
-        const percentLeft = 100 - (w.usedPercent as number);
-        const resetAtIso = resolveResetAtIso(w.resetAtIso, w.resetInIso, generatedAtMs);
+    validateParsedWindowsCompleteness(output, provider, realWindows);
 
-        // Fail-loud gate : Fail loud ONLY on windows with neither field AND percentLeft < 100.
-        // Model-scope windows missing a reset are permitted when a provider-scope sibling of the
-        // same kind in the same scrape provides a resolvable reset (copied downstream via sibling_window_copy).
-        if (percentLeft < 100 && !resetAtIso) {
-          const kind = normalizeQuotaWindowKind(w.kind);
-          const hasSiblingProviderReset =
-            w.scope === "model" &&
-            kind !== undefined &&
-            realWindows.some(
-              (other) =>
-                (other.scope === "provider" || other.scope === undefined) &&
-                normalizeQuotaWindowKind(other.kind) === kind &&
-                Boolean(resolveResetAtIso(other.resetAtIso, other.resetInIso, generatedAtMs))
-            );
+    const limits: QuotaLimit[] = [];
+    for (const w of realWindows) {
+      const percentLeft = 100 - (w.usedPercent as number);
+      const resetAtIso = resolveResetAtIso(w.resetAtIso, w.resetInIso, generatedAtMs);
 
-          if (!hasSiblingProviderReset) {
-            throw new Error(
-              `Quota parse failed: window '${w.label}' has percentLeft < 100 (${percentLeft}%) but no resolvable reset ISO`
-            );
-          }
+      // Fail-loud gate : Fail loud ONLY on windows with neither field AND percentLeft < 100.
+      // Model-scope windows missing a reset are permitted when a provider-scope sibling of the
+      // same kind in the same scrape provides a resolvable reset (copied downstream via sibling_window_copy).
+      if (percentLeft < 100 && !resetAtIso) {
+        const kind = normalizeQuotaWindowKind(w.kind);
+        const hasSiblingProviderReset =
+          w.scope === "model" &&
+          kind !== undefined &&
+          realWindows.some(
+            (other) =>
+              (other.scope === "provider" || other.scope === undefined) &&
+              normalizeQuotaWindowKind(other.kind) === kind &&
+              Boolean(resolveResetAtIso(other.resetAtIso, other.resetInIso, generatedAtMs))
+          );
+
+        if (!hasSiblingProviderReset) {
+          throw new Error(
+            `Quota parse failed: window '${w.label}' has percentLeft < 100 (${percentLeft}%) but no resolvable reset ISO`
+          );
         }
-
-        limits.push({
-          label: w.label,
-          kind: normalizeQuotaWindowKind(w.kind),
-          percentLeft,
-          resetAtIso,
-          scope: w.scope as "provider" | "model" | undefined,
-        });
       }
 
+      limits.push({
+        label: w.label,
+        kind: normalizeQuotaWindowKind(w.kind),
+        percentLeft,
+        resetAtIso,
+        scope: w.scope as "provider" | "model" | undefined,
+      });
+    }
+
+    if (Array.isArray(parsed.windows)) {
       result.limits = limits;
     }
 
@@ -466,12 +507,21 @@ async function parseQuotaWithLlm(
   };
 
   try {
-    return await executeOnce();
-  } catch {
+    return await executeOnce("gemini-3.5-flash-lite");
+  } catch (firstErr) {
+    console.warn(
+      `[quota-mcp] [${provider}] LLM quota parse attempt 1 (gemini-3.5-flash-lite) failed: ${firstErr instanceof Error ? firstErr.message : String(firstErr)} — escalating attempt 2 to gemini-3.5-flash`
+    );
     try {
-      return await executeOnce();
+      const result = await executeOnce("gemini-3.5-flash");
+      console.info(
+        `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.5-flash) succeeded`
+      );
+      return result;
     } catch (secondErr) {
-      console.error(`[quota-mcp] LLM quota parse failed:`, secondErr);
+      console.error(
+        `[quota-mcp] [${provider}] LLM quota parse attempt 2 (gemini-3.5-flash) failed: ${secondErr instanceof Error ? secondErr.message : String(secondErr)}`
+      );
       return {
         status: "unknown",
         message: `LLM quota parsing failed: ${secondErr instanceof Error ? secondErr.message : String(secondErr)}`,
@@ -623,8 +673,8 @@ export function inferQuotaState(
       if (limit.resetAtIso) continue;
       const prevMatch = prevState.limits.find(
         (p) =>
-          p.scope === limit.scope &&
-          (p.kind === limit.kind || p.label === limit.label) &&
+          (p.scope ?? "provider") === (limit.scope ?? "provider") &&
+          ((limit.kind !== undefined && p.kind === limit.kind) || p.label === limit.label) &&
           p.resetAtIso &&
           Date.parse(p.resetAtIso) > scrapedAtMs &&
           !isAssumedReset(prevState, p.label)
@@ -1048,7 +1098,11 @@ export class QuotaService {
     }
     let raw: string;
     try {
-      raw = await scrape({ actorDir, geminiApiKey: apiKey });
+      raw = await scrape({
+        actorDir,
+        geminiApiKey: apiKey,
+        cliCommand: this.deps.config.providers?.kimi?.cliCommand,
+      });
     } catch (err) {
       if (err instanceof KimiAuthRequiredError) {
         return {

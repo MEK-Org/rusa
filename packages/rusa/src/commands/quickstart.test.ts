@@ -28,7 +28,6 @@ import {
   runProviderLogins,
   runQuickstart,
   runQuickstartConfigure,
-  seedContainerFromHostLocalTargets,
 } from "./quickstart.js";
 
 const promptMocks = vi.hoisted(() => {
@@ -130,8 +129,8 @@ describe("quickstart command", () => {
     expect(process.exitCode).toBe(1);
   });
 
-  it("configures target local repo path when provided and omits GitHub identity prompts", async () => {
-    promptMocks.state.inputs = ["codex", "/my/local/repo", "my-root-entity"];
+  it("writes quickstart config without the removed targets field", async () => {
+    promptMocks.state.inputs = ["codex", "/work/example-repo", "my-root-entity"];
     promptMocks.state.passwords = ["test-gemini-key"];
     await runQuickstartConfigure({
       home,
@@ -147,20 +146,15 @@ describe("quickstart command", () => {
       pollIntervalSeconds: 30,
       ingestionMode: "poll",
     });
-    expect(config.targets).toEqual([
-      {
-        repo: "local/repo",
-        localPath: "/my/local/repo",
-      },
-    ]);
+    expect(config).not.toHaveProperty("targets");
     expect(config.rootActor?.provider).toBe("codex");
     expect(config.rootActor?.handle).toBe("my-root-entity");
     expect(config.dashboard?.port).toBe(8080);
     expect(config.providers).toEqual({ codex: { cliCommand: "codex" } });
   });
 
-  it("omits targets when the local repo path prompt is left blank", async () => {
-    promptMocks.state.inputs = ["codex", "", "my-root-entity"];
+  it("keeps the generated root handle when the handle prompt is blank", async () => {
+    promptMocks.state.inputs = ["codex", "", ""];
     promptMocks.state.passwords = ["test-gemini-key"];
 
     await runQuickstartConfigure({ home, executeProviderCommand: () => 0 });
@@ -173,8 +167,8 @@ describe("quickstart command", () => {
       pollIntervalSeconds: 30,
       ingestionMode: "poll",
     });
-    expect(config.targets).toBeUndefined();
-    expect(config.rootActor?.handle).toBe("my-root-entity");
+    expect(config).not.toHaveProperty("targets");
+    expect(config.rootActor?.handle).toMatch(/^[a-z]+(?:-[a-z]+)+$/);
   });
 
   it("persists the entire node home for provider CLI state", () => {
@@ -240,22 +234,6 @@ describe("quickstart command", () => {
       )
     );
     log.mockRestore();
-  });
-
-  it("seeds container volume when target localPath exists on host", () => {
-    spawnSyncMock.mockImplementation((cmd: string, args: string[]) => {
-      if (cmd === "docker" && args.includes("cat")) {
-        return {
-          status: 0,
-          stdout: `profile: quickstart\ntargets:\n  - repo: local/my-repo\n    localPath: ${home}\n`,
-          stderr: "",
-        };
-      }
-      return { status: 0, stdout: "", stderr: "" };
-    });
-
-    expect(() => seedContainerFromHostLocalTargets({ container: "test-setup" })).not.toThrow();
-    expect(spawnSyncMock).toHaveBeenCalled();
   });
 
   it("skips interactive configuration when config.yaml already exists in volume", async () => {

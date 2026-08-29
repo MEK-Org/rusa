@@ -229,9 +229,31 @@ export class GchatClient implements ChatClient {
   }
 
   async downloadAttachment(resourceName: string): Promise<Buffer> {
+    let dataRef: string;
+    if (resourceName.startsWith("spaces/")) {
+      const attachment = await this.getAttachment(resourceName);
+      if (attachment.source === "DRIVE_FILE") {
+        throw new Error(
+          `attachment ${resourceName} is a Drive file; access it using the Drive API instead of downloadAttachment`
+        );
+      }
+      const ref = attachment.attachmentDataRef?.resourceName;
+      if (!ref) {
+        throw new Error(`attachment ${resourceName} does not contain an attachmentDataRef`);
+      }
+      dataRef = ref;
+    } else if (resourceName.startsWith("media/")) {
+      dataRef = resourceName;
+    } else {
+      throw new Error(
+        `invalid attachment resource name: expected spaces/... or media/... (got ${resourceName})`
+      );
+    }
+
     const token = await this.token();
-    const path = resourceName.startsWith("media/") ? resourceName : `media/${resourceName}`;
-    const resp = await fetch(`${CHAT_API}/${path}?alt=media`, {
+    const dataRefPath = dataRef.startsWith("media/") ? dataRef.slice("media/".length) : dataRef;
+    const encoded = encodeURIComponent(dataRefPath);
+    const resp = await fetch(`${CHAT_API}/media/${encoded}?alt=media`, {
       headers: { authorization: `Bearer ${token}` },
     });
     if (!resp.ok) {

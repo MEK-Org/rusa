@@ -85,6 +85,24 @@ describe("extractModelCatalog", () => {
       ],
     });
   });
+
+  it("guards against panel-less codex captures containing only banner status line", async () => {
+    const bannerOnlyScreen = `
+OpenAI Codex
+model: gpt-5.6-sol medium  /model to change
+`;
+    const res = await extractModelCatalog(
+      bannerOnlyScreen,
+      PROVIDER_MODEL_DESCRIPTORS.codex,
+      "test-key"
+    );
+    expect(res).toEqual({
+      status: "unknown",
+      entries: [],
+      message:
+        "codex screen capture contains banner status line but no model selection panel rendered",
+    });
+  });
 });
 
 describe("recordAndExtractModelCatalog", () => {
@@ -173,9 +191,9 @@ describe("recordAndExtractModelCatalog", () => {
     expect(recordedErrors[0].id).toBe("scrape-456");
   });
 
-  it("clears stale in-memory catalog when extraction fails ", async () => {
+  it("retains last-known-good in-memory catalog when extraction fails", async () => {
     setProviderModelCatalog("codex", [
-      { displayLabel: "stale-model", identifier: "stale-model", passable: true },
+      { displayLabel: "good-model", identifier: "good-model", passable: true },
     ]);
     expect(getProviderModelCatalog("codex")).toBeDefined();
 
@@ -192,9 +210,10 @@ describe("recordAndExtractModelCatalog", () => {
     });
 
     expect(res.status).toBe("unknown");
-    expect(getProviderModelCatalog("codex")).toBeUndefined();
-    // Subsequent validation falls back to unknown-permissive rather than rejecting against stale catalog
-    expect(validateModelPin("codex", "any-model").status).toBe("unknown");
+    expect(getProviderModelCatalog("codex")).toEqual([
+      { displayLabel: "good-model", identifier: "good-model", passable: true },
+    ]);
+    expect(validateModelPin("codex", "good-model")).toEqual({ status: "accepted" });
   });
 });
 
@@ -264,9 +283,21 @@ describe("validateModelPin", () => {
       { displayLabel: "gpt-5.6-terra", identifier: "gpt-5.6-terra" },
     ]);
     expect(validateModelPin("codex", "gpt-5.6-sol")).toEqual({ status: "accepted" });
+    expect(validateModelPin("codex", "gpt-5.6-sol medium")).toEqual({ status: "accepted" });
     expect(() => validateModelPin("codex", "bad-pin")).toThrow(
       'provider "codex": rejected "bad-pin"; acceptable values: "gpt-5.6-sol", "gpt-5.6-terra"'
     );
+  });
+
+  it("normalizes codex catalog entries with reasoning effort and accepts plain pins", () => {
+    setProviderModelCatalog("codex", [
+      { displayLabel: "gpt-5.6-sol medium", identifier: "gpt-5.6-sol medium" },
+    ]);
+    expect(getProviderModelCatalog("codex")).toEqual([
+      { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol" },
+    ]);
+    expect(validateModelPin("codex", "gpt-5.6-sol")).toEqual({ status: "accepted" });
+    expect(validateModelPin("codex", "gpt-5.6-sol medium")).toEqual({ status: "accepted" });
   });
 
   it("accepts both agy display labels and slug identifiers ", () => {

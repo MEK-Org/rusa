@@ -189,42 +189,207 @@ describe("loadConfig GitHub ingestion mode", () => {
   });
 });
 
-describe("loadConfig github.repo (ISSUE_NUM single-repo identity)", () => {
-  const withRepo = (repo: string) =>
-    writeConfig({ github: { account: "CodeChopsBot", pollIntervalSeconds: 300, repo } });
-
-  it("defaults to undefined when omitted (identity falls back to git-remote derivation)", () => {
+describe("loadConfig github.repos (multi-repo identity and subscriptions)", () => {
+  it("defaults to undefined when omitted", () => {
     const config = loadConfig(
       writeConfig({ github: { account: "CodeChopsBot", pollIntervalSeconds: 300 } })
     );
-    expect(config.github.repo).toBeUndefined();
+    expect(config.github.repos).toBeUndefined();
   });
 
-  it("trims and keeps a well-formed owner/name", () => {
-    expect(loadConfig(withRepo("  dummy-org/dummy-repo  ")).github.repo).toBe(
-      "dummy-org/dummy-repo"
+  it("trims and keeps a well-formed owner/name list", () => {
+    const config = loadConfig(
+      writeConfig({
+        github: {
+          account: "CodeChopsBot",
+          repos: ["  dummy-org/dummy-repo  ", "other-org/other-repo"],
+        },
+      })
     );
+    expect(config.github.repos).toEqual(["dummy-org/dummy-repo", "other-org/other-repo"]);
+  });
+
+  it("loads successfully with bare repos and no orgs", () => {
+    const config = loadConfig(
+      writeConfig({
+        github: {
+          account: "CodeChopsBot",
+          repos: ["example-org/example-repo"],
+        },
+      })
+    );
+    expect(config.github.repos).toEqual(["example-org/example-repo"]);
+    expect(config.github.orgs).toBeUndefined();
+  });
+
+  it("rejects non-array repos value", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          github: {
+            account: "CodeChopsBot",
+            repos: "example-org/example-repo" as unknown as string[],
+          },
+        })
+      )
+    ).toThrow(/github\.repos must be an array of repository names in owner\/name format/);
   });
 
   it.each([
     ["no slash", "rusa"],
     ["too many segments", "dummy-org/dummy-repo/extra"],
-    ["whitespace in the owner", "MEK Org/rusa"],
-    ["whitespace in the name", "dummy-org/meta coder"],
-  ])("rejects %s", (_label, repo) => {
-    // The whitespace cases are the reason this validator must stay in lockstep
-    // with the quickstart prompt's: a hand-edited config never passes through
-    // that prompt, so the loader is the only gate on this path. A slug like
-    // "MEK Org/rusa" is not null and not a wrong-but-valid repo — it
-    // reaches the poller and tracker hygiene and fails as malformed API paths,
-    // far from the config that caused it.
-    expect(() => loadConfig(withRepo(repo))).toThrow(/github\.repo must be in owner\/name format/);
+    ["whitespace in the owner", "dummy org/rusa"],
+    ["whitespace in the name", "dummy-org/sample repo"],
+    ["blank string", "   "],
+  ])("rejects invalid repo %s", (_label, repo) => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          github: {
+            account: "CodeChopsBot",
+            repos: [repo],
+          },
+        })
+      )
+    ).toThrow(/github\.repos must be an array of repository names in owner\/name format/);
+  });
+});
+
+describe("loadConfig github.orgs (event source organization derivation)", () => {
+  it("defaults to undefined when omitted", () => {
+    const config = loadConfig(writeConfig({ github: { account: "CodeChopsBot" } }));
+    expect(config.github.orgs).toBeUndefined();
   });
 
-  it("rejects a blank repo before the format check", () => {
-    expect(() => loadConfig(withRepo("   "))).toThrow(
-      /github\.repo must be a non-empty string when set/
+  it("trims and keeps valid org objects", () => {
+    const config = loadConfig(
+      writeConfig({
+        github: { account: "CodeChopsBot", orgs: [{ org: "  org-1  " }, { org: "org-2" }] },
+      })
     );
+    expect(config.github.orgs).toEqual([{ org: "org-1" }, { org: "org-2" }]);
+  });
+
+  it("parses and normalizes object entries with org and excludedRepos", () => {
+    const config = loadConfig(
+      writeConfig({
+        github: {
+          account: "CodeChopsBot",
+          orgs: [{ org: "  example-org  ", excludedRepos: ["  example-org/sample-repo  "] }],
+        },
+      })
+    );
+    expect(config.github.orgs).toEqual([
+      { org: "example-org", excludedRepos: ["example-org/sample-repo"] },
+    ]);
+  });
+
+  it("loads successfully with bare orgs and no repos", () => {
+    const config = loadConfig(
+      writeConfig({
+        github: {
+          account: "CodeChopsBot",
+          orgs: [{ org: "example-org" }],
+        },
+      })
+    );
+    expect(config.github.orgs).toEqual([{ org: "example-org" }]);
+    expect(config.github.repos).toBeUndefined();
+  });
+
+  it("loads successfully with both repos and orgs configured", () => {
+    const config = loadConfig(
+      writeConfig({
+        github: {
+          account: "CodeChopsBot",
+          repos: ["special-org/special-repo"],
+          orgs: [{ org: "example-org", excludedRepos: ["example-org/sample-repo"] }],
+        },
+      })
+    );
+    expect(config.github.repos).toEqual(["special-org/special-repo"]);
+    expect(config.github.orgs).toEqual([
+      { org: "example-org", excludedRepos: ["example-org/sample-repo"] },
+    ]);
+  });
+
+  it("rejects invalid github.orgs values", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          github: { account: "CodeChopsBot", orgs: "not-an-array" as unknown as string[] },
+        })
+      )
+    ).toThrow(/github\.orgs must be an array/);
+
+    expect(() =>
+      loadConfig(writeConfig({ github: { account: "CodeChopsBot", orgs: ["valid"] } }))
+    ).toThrow(/github\.orgs entries must be org objects/);
+
+    expect(() =>
+      loadConfig(
+        writeConfig({ github: { account: "CodeChopsBot", orgs: [{ org: "invalid/org" }] } })
+      )
+    ).toThrow(/github\.orgs org object must specify a valid organization name/);
+
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          github: {
+            account: "CodeChopsBot",
+            orgs: [{ name: "unsupported-alias" } as unknown as { org: string }],
+          },
+        })
+      )
+    ).toThrow(/github\.orgs org object must specify a valid organization name/);
+
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          github: {
+            account: "CodeChopsBot",
+            orgs: [{ org: "valid-org", excludedRepos: ["invalid-repo-without-slash"] }],
+          },
+        })
+      )
+    ).toThrow(
+      /github\.orgs excludedRepos must be an array of repository names in owner\/name format/
+    );
+
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          github: {
+            account: "CodeChopsBot",
+            orgs: [{ org: "valid-org", excludedRepos: ["other-org/repo"] }],
+          },
+        })
+      )
+    ).toThrow(/github\.orgs excludedRepos entries must belong to their configured organization/);
+  });
+});
+
+describe("loadConfig removed targets field", () => {
+  it("rejects top-level targets with migration guidance", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          targets: [{ repo: "dummy-org/repo", localPath: "/tmp/repo" }],
+        })
+      )
+    ).toThrow(/top-level targets is no longer supported; use github\.repos and github\.orgs/);
+  });
+});
+
+describe("loadConfig removed eventSources field", () => {
+  it("rejects explicit root eventSources with migration guidance", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          eventSources: [{ kind: "github_repo", repo: "dummy-org/repo" }],
+        })
+      )
+    ).toThrow(/top-level eventSources is no longer supported; use github\.repos and github\.orgs/);
   });
 });
 
@@ -716,6 +881,42 @@ describe("loadConfig understanding and glassGoals ", () => {
     const home = writeConfig({ understanding: { rootNodeId: "   " } });
     expect(() => loadConfig(home)).toThrow(
       /understanding\.rootNodeId must be a non-empty string when set/
+    );
+  });
+
+  it("loads understanding.mount configuration", () => {
+    const home = writeConfig({
+      understanding: {
+        mount: {
+          enabled: true,
+        },
+      },
+    });
+    const config = loadConfig(home);
+    expect(config.understanding?.mount).toEqual({
+      enabled: true,
+    });
+  });
+
+  it("rejects non-mapping understanding.mount", () => {
+    const home = writeConfig({ understanding: { mount: "true" } });
+    expect(() => loadConfig(home)).toThrow(/understanding\.mount must be a mapping when set/);
+  });
+
+  it("rejects non-boolean understanding.mount.enabled", () => {
+    const home = writeConfig({ understanding: { mount: { enabled: "yes" } } });
+    expect(() => loadConfig(home)).toThrow(
+      /understanding\.mount\.enabled must be a boolean when set/
+    );
+  });
+
+  it("rejects understanding.mount.enabled under container-boundary sandbox", () => {
+    const home = writeConfig({
+      sandbox: "container-boundary",
+      understanding: { mount: { enabled: true } },
+    });
+    expect(() => loadConfig(home)).toThrow(
+      /understanding\.mount\.enabled requires sandbox: "bwrap"/
     );
   });
 

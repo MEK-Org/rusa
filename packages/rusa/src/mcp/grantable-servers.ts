@@ -161,7 +161,9 @@ export function buildGrantableServers(
     map.set(CHAT_WRITE_MCP_NAME, (selfId, params, options) => {
       // params are e.g. ["spaces/AAAA", "spaces/BBBB"] from "chat-write:spaces/AAAA" etc.
       // Or if they were granted "*", we can support that, though typically spaces are passed.
-      const allowedSpaces = params.map((p) => (p.startsWith("spaces/") ? p : `spaces/${p}`));
+      const allowedSpaces = params.map((p) =>
+        p === "*" ? "*" : p.startsWith("spaces/") ? p : `spaces/${p}`
+      );
       if (!deps.chatClient) throw new Error("chatClient is required for chat-write capability");
       const workDir = deps.actorRootFor?.(selfId);
       return createChatWriteMcpServer(selfId, deps.chatClient, {
@@ -235,6 +237,11 @@ export async function handleCapabilityRevoked(
 ): Promise<void> {
   const currentLock = revokeMutexes.get(actorId) ?? Promise.resolve();
   const nextLock = currentLock.then(async () => {
+    if (capability.startsWith("chat-read:") || capability === "chat-read") {
+      // Chat reads are implicit and unscoped for all actors; read-grant revocation
+      // never modifies or tears down the default chat-read endpoint.
+      return;
+    }
     let baseCapability = capability;
     if (capability.startsWith("chat-write:")) {
       baseCapability = "chat-write";

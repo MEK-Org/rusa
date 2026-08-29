@@ -202,15 +202,69 @@ export interface NodeView {
  * answered "not found"). Exported because the distiller and LLM-retrieval tool
  * loops are readers too, and each had its own inline copy of the rule .
  */
+/**
+ * Resolves the effective status of a goal at a given timestamp, mirroring the
+ * Goals core status model (status entries, clearStatus, archiveStatus tombstones,
+ * and startTime/endTime time-bounds).
+ */
+export function getEffectiveGoalStatus(
+  goal: Goal,
+  now: number = Date.now()
+): StatusLogEntry | null {
+  const archivedStatusIds = new Set<string>();
+  for (const entry of goal.log) {
+    if (entry.type !== "status" && entry.type !== "archiveStatus" && entry.type !== "clearStatus") {
+      continue;
+    }
+    // Canonical pathless status read ignores instance-specific (path-scoped) entries
+    if (entry.path && entry.path.length > 0) {
+      continue;
+    }
+    if (entry.type === "clearStatus") {
+      return null;
+    }
+    if (entry.type === "archiveStatus") {
+      archivedStatusIds.add(entry.id);
+      continue;
+    }
+    if (entry.type === "status") {
+      const statusEntry = entry as StatusLogEntry;
+      if (archivedStatusIds.has(statusEntry.id)) {
+        continue;
+      }
+      const startMs = typeof statusEntry.startTime === "number" ? statusEntry.startTime : null;
+      const endMs = typeof statusEntry.endTime === "number" ? statusEntry.endTime : null;
+
+      if (startMs !== null && startMs > now) {
+        continue;
+      }
+      if (endMs !== null && endMs <= now) {
+        continue;
+      }
+      return statusEntry;
+    }
+  }
+  return null;
+}
+
+export function isArchivedGoal(goal: Goal, now: number = Date.now()): boolean {
+  const effective = getEffectiveGoalStatus(goal, now);
+  return effective?.status === "ar";
+}
+
 export function isVisibleNode(
   goals: Map<string, Goal>,
   id: string,
   reachable: Set<string> | null,
-  rootNodeId?: string
+  rootNodeId?: string,
+  now: number = Date.now()
 ): boolean {
   if (rootNodeId && id === rootNodeId) return false;
   if (reachable && !reachable.has(id)) return false;
-  return goals.has(id);
+  const goal = goals.get(id);
+  if (!goal) return false;
+  if (isArchivedGoal(goal, now)) return false;
+  return true;
 }
 
 export function viewNode(syncClient: SyncClient, id: string, rootNodeId?: string): NodeView | null {
@@ -225,10 +279,10 @@ export function viewNode(syncClient: SyncClient, id: string, rootNodeId?: string
     title: goal.text,
     contents: getNodeContents(goal),
     parents: Array.from(goal.superGoalIds)
-      .filter((pid) => (rootNodeId ? pid !== rootNodeId && reachable?.has(pid) : goals.has(pid)))
+      .filter((pid) => isVisibleNode(goals, pid, reachable, rootNodeId))
       .map((pid) => ({ id: pid, title: goals.get(pid)?.text })),
     children: Array.from(goal.subGoalIds)
-      .filter((cid) => (reachable ? reachable.has(cid) : goals.has(cid)))
+      .filter((cid) => isVisibleNode(goals, cid, reachable, rootNodeId))
       .map((cid) => ({ id: cid, title: goals.get(cid)?.text })),
   };
 }
@@ -249,21 +303,25 @@ export function listChildren(
   rootNodeId?: string
 ): { id: string; title: string; childCount: number }[] | null {
   const goals = syncClient.getGoals();
+  const rootExists = Boolean(rootNodeId && goals.has(rootNodeId));
   const reachable = rootNodeId ? getReachableNodeIds(goals, rootNodeId) : null;
   if (parentId !== undefined && !isVisibleNode(goals, parentId, reachable, rootNodeId)) return null;
 
-  const effectiveParentId =
-    parentId ?? (rootNodeId && goals.has(rootNodeId) ? rootNodeId : undefined);
+  const effectiveParentId = parentId ?? (rootExists ? rootNodeId : undefined);
 
   let ids: string[];
   if (effectiveParentId) {
     ids = Array.from(goals.get(effectiveParentId)?.subGoalIds ?? []).filter((cid) =>
-      reachable ? reachable.has(cid) : goals.has(cid)
+      isVisibleNode(goals, cid, reachable, rootNodeId)
     );
   } else {
     ids = Array.from(goals.values())
       .filter((g) => Array.from(g.superGoalIds).every((pid) => !goals.has(pid)))
-      .map((g) => g.id);
+      .map((g) => g.id)
+      .filter((id) => {
+        const g = goals.get(id);
+        return g && !isArchivedGoal(g);
+      });
   }
 
   return ids
@@ -271,7 +329,7 @@ export function listChildren(
       const g = goals.get(id);
       if (!g) return null;
       const childCount = Array.from(g.subGoalIds).filter((cid) =>
-        reachable ? reachable.has(cid) : goals.has(cid)
+        isVisibleNode(goals, cid, reachable, rootNodeId)
       ).length;
       return {
         id,

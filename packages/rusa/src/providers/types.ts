@@ -8,6 +8,8 @@ export type SandboxOptions = {
   worktreePath: string;
   /** True when the sandboxed actor is the E2E "root-agent" test double. */
   isE2eRoot?: boolean;
+  /** Host directory containing the rendered read-only Integrated Understanding snapshot to mount at /tmp/understanding */
+  understandingMount?: string;
 };
 
 /**

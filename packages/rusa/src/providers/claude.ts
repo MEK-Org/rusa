@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { unlinkSync, writeFileSync } from "node:fs";
+import { rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderConfig } from "../config/types.js";
@@ -116,7 +116,7 @@ export class ClaudeProvider implements CodingProvider {
     const cleanupTempPaths = () => {
       for (const p of tempPaths) {
         try {
-          unlinkSync(p);
+          rmSync(p, { recursive: true, force: true });
         } catch {
           /* best effort */
         }
@@ -153,9 +153,13 @@ export class ClaudeProvider implements CodingProvider {
         opts.sandbox.worktreePath,
         "claude",
         mcpConfigSource,
-        opts.sandbox.isE2eRoot
+        opts.sandbox.isE2eRoot,
+        opts.sandbox.understandingMount
       );
       tempPaths.push(...bwrapResult.tempPaths);
+      if (opts.sandbox.understandingMount) {
+        tempPaths.push(opts.sandbox.understandingMount);
+      }
       spawnArgs = buildActorBwrapCommand(bwrapResult, resolvedCommand, args);
       spawnCommand = "bwrap";
     }

@@ -3,7 +3,7 @@ import { basename, isAbsolute, relative, resolve } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import mime from "mime";
 import { z } from "zod";
-import { type ChatClient, MAX_CHAT_ATTACHMENT_BYTES } from "../chat/types.js";
+import { type ChatClient, type ChatSpace, MAX_CHAT_ATTACHMENT_BYTES } from "../chat/types.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 
@@ -11,21 +11,33 @@ export const CHAT_WRITE_MCP_NAME = "chat-write";
 export const CHAT_READ_MCP_NAME = "chat-read";
 
 export const ATTACHMENT_RESOURCE_NAME_RE =
-  /^spaces\/[^/]+(?:\/messages\/[^/]+)?\/attachments\/[^/]+$/;
+  /^(?:spaces\/[^/]+\/messages\/[^/]+\/attachments\/[^/]+|media\/.+)$/;
 
 export function inferChatMimeType(filename: string): string {
   return mime.getType(filename) ?? "application/octet-stream";
 }
 
-/** Read-only Google Chat tools, mounted for every actor when Chat is configured. */
+export interface ChatReadMcpOptions {
+  allowedSpaces?: string[];
+  isFenced?: () => boolean;
+  maxAttachmentBytes?: number;
+}
+
+/** Read-only Google Chat tools, mounted for root or granted to space-scoped actors. */
 export function createChatReadMcpServer(
   chatClient: ChatClient,
-  options?: { isFenced?: () => boolean; maxAttachmentBytes?: number }
+  options?: ChatReadMcpOptions
 ): McpServer {
   const server = createMcpServer(
     { name: CHAT_READ_MCP_NAME, version: "0.1.0" },
     { isFenced: options?.isFenced }
   );
+
+  const isAllowed = (spaceName: string) => {
+    if (!options?.allowedSpaces || options.allowedSpaces.length === 0) return true;
+    if (options.allowedSpaces.includes("*")) return true;
+    return options.allowedSpaces.includes(spaceName);
+  };
 
   server.registerTool(
     "get_message",
@@ -40,6 +52,11 @@ export function createChatReadMcpServer(
       try {
         if (!/^spaces\/[^/]+\/messages\/[^/]+$/.test(messageName)) {
           throw new Error("messageName must be in format spaces/SPACE/messages/MESSAGE");
+        }
+        const spaceMatch = /^spaces\/([^/]+)/.exec(messageName);
+        const spaceName = spaceMatch ? `spaces/${spaceMatch[1]}` : "";
+        if (!isAllowed(spaceName)) {
+          throw new Error(`access denied: space ${spaceName} is not in allowed spaces`);
         }
         return toolOk(await chatClient.getMessage(messageName));
       } catch (err) {
@@ -57,16 +74,21 @@ export function createChatReadMcpServer(
         attachmentName: z
           .string()
           .describe(
-            "Attachment resource name, e.g. spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT"
+            "Attachment resource name in format spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT"
           ),
       },
     },
     async ({ attachmentName }) => {
       try {
-        if (!ATTACHMENT_RESOURCE_NAME_RE.test(attachmentName)) {
+        if (!/^spaces\/[^/]+\/messages\/[^/]+\/attachments\/[^/]+$/.test(attachmentName)) {
           throw new Error(
-            "attachmentName must be in format spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT or spaces/SPACE/attachments/ATTACHMENT"
+            "attachmentName must be in format spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT"
           );
+        }
+        const spaceMatch = /^spaces\/([^/]+)/.exec(attachmentName);
+        const spaceName = spaceMatch ? `spaces/${spaceMatch[1]}` : "";
+        if (spaceName && !isAllowed(spaceName)) {
+          throw new Error(`access denied: space ${spaceName} is not in allowed spaces`);
         }
         return toolOk(await chatClient.getAttachment(attachmentName));
       } catch (err) {
@@ -79,12 +101,13 @@ export function createChatReadMcpServer(
     "download_attachment",
     {
       title: "Download a Google Chat attachment's binary content",
-      description: "Download an attachment's raw bytes and return them as a base64-encoded string.",
+      description:
+        "Download an attachment's raw bytes and return them as a base64-encoded string. For space-scoped actors, requires the attachment resource name (spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT); unscoped servers also accept opaque media tokens (media/...).",
       inputSchema: {
         resourceName: z
           .string()
           .describe(
-            "Attachment resource name or attachmentDataRef resourceName (e.g. spaces/SPACE/attachments/ATTACHMENT or spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT)"
+            "Attachment resource name in format spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT (or media/... token for unscoped servers)"
           ),
       },
     },
@@ -92,8 +115,22 @@ export function createChatReadMcpServer(
       try {
         if (!ATTACHMENT_RESOURCE_NAME_RE.test(resourceName)) {
           throw new Error(
-            "resourceName must be in format spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT or spaces/SPACE/attachments/ATTACHMENT"
+            "resourceName must be in format spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT or media/..."
           );
+        }
+        const isScoped =
+          options?.allowedSpaces &&
+          options.allowedSpaces.length > 0 &&
+          !options.allowedSpaces.includes("*");
+        if (isScoped && resourceName.startsWith("media/")) {
+          throw new Error(
+            "access denied: raw media/ tokens are not permitted for space-scoped chat-read; specify the attachment resource name (spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT)"
+          );
+        }
+        const spaceMatch = /^spaces\/([^/]+)/.exec(resourceName);
+        const spaceName = spaceMatch ? `spaces/${spaceMatch[1]}` : "";
+        if (spaceName && !isAllowed(spaceName)) {
+          throw new Error(`access denied: space ${spaceName} is not in allowed spaces`);
         }
         const result = await chatClient.downloadAttachment(resourceName);
         const maxBytes = options?.maxAttachmentBytes ?? MAX_CHAT_ATTACHMENT_BYTES;
@@ -122,12 +159,34 @@ export function createChatReadMcpServer(
     },
     async ({ pageSize, pageToken }) => {
       try {
-        return toolOk(
-          await chatClient.listSpaces({
-            ...(pageSize !== undefined ? { pageSize } : {}),
-            ...(pageToken ? { pageToken } : {}),
-          })
-        );
+        if (
+          options?.allowedSpaces &&
+          options.allowedSpaces.length > 0 &&
+          !options.allowedSpaces.includes("*")
+        ) {
+          const matchedSpaces: ChatSpace[] = [];
+          let currentToken = pageToken;
+          do {
+            const page = await chatClient.listSpaces({
+              ...(pageSize !== undefined ? { pageSize } : {}),
+              ...(currentToken ? { pageToken: currentToken } : {}),
+            });
+            for (const s of page.spaces ?? []) {
+              if (isAllowed(s.name)) {
+                matchedSpaces.push(s);
+              }
+            }
+            currentToken = page.nextPageToken;
+          } while (currentToken && matchedSpaces.length < options.allowedSpaces.length);
+          return toolOk({
+            spaces: matchedSpaces,
+          });
+        }
+        const result = await chatClient.listSpaces({
+          ...(pageSize !== undefined ? { pageSize } : {}),
+          ...(pageToken ? { pageToken } : {}),
+        });
+        return toolOk(result);
       } catch (err) {
         return toolError(err);
       }
@@ -170,6 +229,9 @@ export function createChatReadMcpServer(
       try {
         if (!/^spaces\/[^/]+$/.test(spaceName)) {
           throw new Error("spaceName must be in format spaces/SPACE");
+        }
+        if (!isAllowed(spaceName)) {
+          throw new Error(`access denied: space ${spaceName} is not in allowed spaces`);
         }
         if (threadName && !/^spaces\/[^/]+\/threads\/[^/]+$/.test(threadName)) {
           throw new Error("threadName must be in format spaces/SPACE/threads/THREAD");

@@ -55,6 +55,19 @@ accepts only entries selected in this run. Leave deferred work unhandled. If
 unhandled work remains when you finish, the mesh will queue a follow-up run.`;
 
 /**
+ * Writing-for-agents discipline.
+ * Injected at prompt assembly into every worker prompt (and root prompt) so guidance
+ * on crafting effective prompts/charters is shared across all actors without needing
+ * to hand-edit individual charters.
+ */
+export const WRITING_FOR_AGENTS_DISCIPLINE = `## Writing for agents
+When drafting instructions, charters, or sub-task prompts for other agents:
+- **Anchor completion in verified evidence:** Define "done" as showing the concrete command or artifact already produced, together with its observed result — not a claimed condition.
+- **State desired behavior positively:** State what to do directly rather than forbidding unwanted actions.
+- **Prefer compact, connotation-rich phrasing:** Use tight idioms and direct imperatives over long procedural explanations (e.g. "keep the loop tight", "make it go red first").
+- **Rely on the single source of truth:** Point to the authoritative record instead of restating it; prune instructions that no longer change behavior.`;
+
+/**
  * Standing conduct norms for interacting with external systems .
  * Injected at prompt assembly into every actor prompt (root and workers alike).
  * Ratified by Operator (2026-08-19) following the OpenClaw incident: restricts identity/ownership
@@ -110,6 +123,8 @@ export interface WorkerPromptContext {
   parentId: string;
   /** Extra actors this worker may message, already resolved to display labels. */
   handles?: ResolvedHandle[];
+  /** Whether the Integrated Understanding read-only filesystem mount is enabled. */
+  understandingMountEnabled?: boolean;
 }
 
 /** A short, one-line label for an actor, derived from its charter. */
@@ -230,6 +245,9 @@ export function buildWorkerPrompt(
   priorContext?: string
 ): string {
   const shortId = ctx.threadId.slice(0, 8);
+  const mountNotice = ctx.understandingMountEnabled
+    ? "\n\nA read-only snapshot of the integrated understanding is mounted at /tmp/understanding; grep and read it directly."
+    : "";
   const workingDir = `
 
 ---
@@ -245,7 +263,7 @@ When you change code: work on a branch namespaced to you (e.g.
 \`rusa/${shortId}/<short-topic>\`) so you never collide, commit, push, and open a PR
 with your tools. Your charter defines the scope — it may span several repos or
 several PRs. Don't touch the user's live working trees or anything outside your
-directory.`;
+directory.${mountNotice}`;
   return `${buildWorkerScaffold(ctx)}
 
 ${FORWARD_PROGRESS_DISCIPLINE}
@@ -255,6 +273,8 @@ ${DELEGATION_DISCIPLINE}
 ${GROUNDING_DISCIPLINE}
 
 ${INBOX_DISCIPLINE}
+
+${WRITING_FOR_AGENTS_DISCIPLINE}
 
 ${EXTERNAL_CONDUCT_POLICY}
 

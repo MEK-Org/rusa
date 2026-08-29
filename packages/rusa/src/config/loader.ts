@@ -10,7 +10,12 @@ import {
   SECRETS_DIRNAME,
   WEBHOOK_SECRET_FILENAME,
 } from "./secrets.js";
-import { DEFAULT_DEPLOY_BRANCH, type QuotaThrottleConfig, type RusaConfig } from "./types.js";
+import {
+  DEFAULT_DEPLOY_BRANCH,
+  type GitHubOrgConfig,
+  type QuotaThrottleConfig,
+  type RusaConfig,
+} from "./types.js";
 
 export { resolveHome } from "./secrets.js";
 
@@ -101,6 +106,16 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
 
   const raw = readFileSync(configPath, "utf-8");
   const rawParsed = parseYaml(raw) as RusaConfig;
+  if ("targets" in (rawParsed as unknown as Record<string, unknown>)) {
+    throw new Error(
+      "config.yaml: top-level targets is no longer supported; use github.repos and github.orgs"
+    );
+  }
+  if ("eventSources" in (rawParsed as unknown as Record<string, unknown>)) {
+    throw new Error(
+      "config.yaml: top-level eventSources is no longer supported; use github.repos and github.orgs"
+    );
+  }
   if (options?.profile !== undefined) {
     rawParsed.profile = options.profile;
   }
@@ -140,20 +155,70 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     }
     parsed.github.workerTokenPath = parsed.github.workerTokenPath.trim();
   }
-  if (parsed.github.repo !== undefined) {
-    if (typeof parsed.github.repo !== "string" || !parsed.github.repo.trim()) {
-      throw new Error("config.yaml: github.repo must be a non-empty string when set");
+  if (parsed.github.repos !== undefined) {
+    if (
+      !Array.isArray(parsed.github.repos) ||
+      parsed.github.repos.some(
+        (repo) =>
+          typeof repo !== "string" || !repo.trim() || !/^[^/\s]+\/[^/\s]+$/.test(repo.trim())
+      )
+    ) {
+      throw new Error(
+        "config.yaml: github.repos must be an array of repository names in owner/name format when set"
+      );
     }
-    // Reject INTERNAL whitespace too, not just the outer trim: `owner name/repo`
-    // is not a GitHub slug. This must stay identical to the quickstart prompt's
-    // validator (`quickstart.ts`) — one value with two validators means the
-    // LOOSER one governs, and this is the looser one, because it guards the
-    // hand-edited config path that never goes through the prompt at all.
-    const match = parsed.github.repo.trim().match(/^[^/\s]+\/[^/\s]+$/);
-    if (!match) {
-      throw new Error("config.yaml: github.repo must be in owner/name format");
+    parsed.github.repos = parsed.github.repos.map((repo) => repo.trim());
+  }
+  if (parsed.github.orgs !== undefined) {
+    if (!Array.isArray(parsed.github.orgs)) {
+      throw new Error("config.yaml: github.orgs must be an array of org objects when set");
     }
-    parsed.github.repo = parsed.github.repo.trim();
+    const validatedOrgs: GitHubOrgConfig[] = [];
+    for (const item of parsed.github.orgs) {
+      if (typeof item === "object" && item !== null && !Array.isArray(item)) {
+        const record = item as unknown as Record<string, unknown>;
+        const orgName = record.org;
+
+        if (typeof orgName !== "string" || !orgName.trim() || !/^[^/\s]+$/.test(orgName.trim())) {
+          throw new Error(
+            "config.yaml: github.orgs org object must specify a valid organization name without slashes"
+          );
+        }
+
+        let excludedRepos: string[] | undefined;
+        if (record.excludedRepos !== undefined) {
+          if (
+            !Array.isArray(record.excludedRepos) ||
+            record.excludedRepos.some(
+              (repo) =>
+                typeof repo !== "string" || !repo.trim() || !/^[^/\s]+\/[^/\s]+$/.test(repo.trim())
+            )
+          ) {
+            throw new Error(
+              "config.yaml: github.orgs excludedRepos must be an array of repository names in owner/name format when set"
+            );
+          }
+          excludedRepos = record.excludedRepos.map((repo) => (repo as string).trim());
+          if (
+            excludedRepos.some(
+              (repo) => repo.split("/")[0]?.toLowerCase() !== orgName.trim().toLowerCase()
+            )
+          ) {
+            throw new Error(
+              "config.yaml: github.orgs excludedRepos entries must belong to their configured organization"
+            );
+          }
+        }
+
+        validatedOrgs.push({
+          org: orgName.trim(),
+          ...(excludedRepos ? { excludedRepos } : {}),
+        });
+      } else {
+        throw new Error("config.yaml: github.orgs entries must be org objects");
+      }
+    }
+    parsed.github.orgs = validatedOrgs;
   }
   if (!parsed.providers || Object.keys(parsed.providers).length === 0) {
     throw new Error("config.yaml: at least one provider is required");
@@ -344,6 +409,21 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       }
       understanding.rootNodeId = understanding.rootNodeId.trim();
     }
+    if (understanding.mount !== undefined) {
+      if (
+        typeof understanding.mount !== "object" ||
+        understanding.mount === null ||
+        Array.isArray(understanding.mount)
+      ) {
+        throw new Error("config.yaml: understanding.mount must be a mapping when set");
+      }
+      if (
+        understanding.mount.enabled !== undefined &&
+        typeof understanding.mount.enabled !== "boolean"
+      ) {
+        throw new Error("config.yaml: understanding.mount.enabled must be a boolean when set");
+      }
+    }
   }
 
   const nestedGg = parsed.understanding?.glassGoals;
@@ -416,6 +496,12 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     }
   } else {
     parsed.sandbox = "bwrap";
+  }
+
+  if (parsed.understanding?.mount?.enabled === true && parsed.sandbox === "container-boundary") {
+    throw new Error(
+      'config.yaml: understanding.mount.enabled requires sandbox: "bwrap" (found "container-boundary")'
+    );
   }
 
   if (parsed.gitBridgePort !== undefined) {

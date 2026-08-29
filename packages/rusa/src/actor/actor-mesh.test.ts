@@ -1945,6 +1945,29 @@ describe("ActorMesh", () => {
     ]);
   });
 
+  it("requires a space name for chat-write grants", () => {
+    const { mesh, registry } = setup({
+      grantableCapabilities: new Set(["chat-write"]),
+    });
+    registry.upsert({
+      id: "worker-thread",
+      charter: "doc-toolkit steward",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+
+    expect(() => mesh.grantCapability("worker-thread", "chat-write", "root")).toThrow(
+      "bare chat-write grant is not allowed"
+    );
+    expect(() => mesh.grantCapability("worker-thread", "chat-write:", "root")).toThrow(
+      "bare chat-write grant is not allowed"
+    );
+
+    mesh.grantCapability("worker-thread", "chat-write:spaces/AAQA29JwOwg", "root");
+    expect(mesh.activeCapabilitiesFor("worker-thread")).toEqual(["chat-write:spaces/AAQA29JwOwg"]);
+  });
+
   it("a parent grants an allow-listed secret to its DIRECT child, audited with peerId = grantor", async () => {
     const events: MeshEventInput[] = [];
     const { mesh } = setup({
@@ -2847,6 +2870,85 @@ describe("ActorMesh", () => {
       mesh.delegateEventSource(pr, child, parent);
 
       expect(() => mesh.reclaimEventSource(pr, sibling)).toThrow(/effective owner after reclaim/);
+    });
+
+    it("an actor may self-delegate a strict descendant of a parent it effectively owns", () => {
+      const { mesh } = setup();
+      const actor = mesh.spawn({ charter: "repo steward", parentId: "root" });
+
+      mesh.subscribeEventSource(
+        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+        actor,
+        "root"
+      );
+
+      // Actor owns the repo. It can self-delegate a branch.
+      expect(() =>
+        mesh.delegateEventSource(
+          { kind: "github_branch", repo: "dummy-org/dummy-repo", ref: "staging" },
+          actor,
+          actor
+        )
+      ).not.toThrow();
+    });
+
+    it("an actor may not self-delegate an unrelated resource", () => {
+      const { mesh } = setup();
+      const actor = mesh.spawn({ charter: "steward", parentId: "root" });
+
+      mesh.subscribeEventSource(
+        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+        actor,
+        "root"
+      );
+
+      // Cannot self-delegate an unrelated branch
+      expect(() =>
+        mesh.delegateEventSource(
+          { kind: "github_branch", repo: "dummy-org/other-repo", ref: "staging" },
+          actor,
+          actor
+        )
+      ).toThrow(/strict descendant of an already-owned parent/);
+    });
+
+    it("holding only the exact resource is not sufficient", () => {
+      const { mesh } = setup();
+      const actor = mesh.spawn({ charter: "steward", parentId: "root" });
+      const branch = {
+        kind: "github_branch" as const,
+        repo: "dummy-org/dummy-repo",
+        ref: "staging",
+      };
+
+      // actor gets the branch exactly (not the parent repo)
+      mesh.subscribeEventSource(branch, actor, "root");
+
+      // Cannot self-delegate the exact resource they hold unless they own a parent
+      expect(() => mesh.delegateEventSource(branch, actor, actor)).toThrow(
+        /strict descendant of an already-owned parent/
+      );
+    });
+
+    it("an existing exact row is ignored only while checking ancestor ownership", () => {
+      const { mesh } = setup();
+      const actor = mesh.spawn({ charter: "steward", parentId: "root" });
+      const branch = {
+        kind: "github_branch" as const,
+        repo: "dummy-org/dummy-repo",
+        ref: "staging",
+      };
+
+      // actor holds the repo (parent) AND holds the branch (exact)
+      mesh.subscribeEventSource(
+        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+        actor,
+        "root"
+      );
+      mesh.subscribeEventSource(branch, actor, "root");
+
+      // Can self-delegate the exact resource because they ALSO own the parent
+      expect(() => mesh.delegateEventSource(branch, actor, actor)).not.toThrow();
     });
 
     it("routes repo events to the subscriber when live", async () => {
