@@ -2209,7 +2209,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     provider: config.rootActor?.provider,
     model: config.rootActor?.model,
     context: config.rootActor?.context,
-    sessionId: loadRootSessionId(sessionFile),
+    sessionId:
+      config.rootActor?.context?.type === "portable" ? undefined : loadRootSessionId(sessionFile),
     status: "active",
     createdAt: new Date().toISOString(),
   };
@@ -2247,8 +2248,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     rootControl.recordDriverAttached("e2e-controller");
     console.log(`[root] driver=external tools=${rootMcp.map((u) => u.name).join(",")}`);
   } else {
+    const rootContext = config.rootActor?.context;
+    const sessionDescription =
+      rootContext?.type === "portable"
+        ? `portable/${rootContext.mode} (stateless)`
+        : (loadRootSessionId(sessionFile) ?? "(new)");
     console.log(
-      `[root] provider=${provider.name} session=${loadRootSessionId(sessionFile) ?? "(new)"} tools=${rootMcp.map((u) => u.name).join(",")}`
+      `[root] provider=${provider.name} session=${sessionDescription} tools=${rootMcp.map((u) => u.name).join(",")}`
     );
   }
 
