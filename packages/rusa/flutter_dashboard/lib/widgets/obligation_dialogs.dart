@@ -10,16 +10,14 @@ Future<void> showCreateObligationDialog(
   DashboardStore store, {
   String? defaultParentId,
   String? defaultOwnerId,
-  String defaultOwnerKind = 'actor',
   VoidCallback? onCreated,
 }) async {
   final formKey = GlobalKey<FormState>();
   final intentCtrl = TextEditingController();
-  final ownerIdCtrl = TextEditingController(text: (defaultOwnerId == 'human:operator' ? 'human operator' : defaultOwnerId) ?? (defaultOwnerKind == 'human' ? 'human operator' : ''));
+  final ownerIdCtrl = TextEditingController(text: (defaultOwnerId == 'human:operator' ? 'human operator' : defaultOwnerId) ?? '');
   final parentIdCtrl = TextEditingController(text: defaultParentId ?? '');
   final externalRefCtrl = TextEditingController();
   final priorityCtrl = TextEditingController();
-  String ownerKind = defaultOwnerKind;
   bool isSubmitting = false;
 
   await showDialog<void>(
@@ -94,9 +92,6 @@ Future<void> showCreateObligationDialog(
                     OwnerSelector(
                       store: store,
                       ownerIdCtrl: ownerIdCtrl,
-                      onOwnerKindChanged: (kind) {
-                        setState(() => ownerKind = kind);
-                      },
                       decoration: const InputDecoration(
                         hintText: 'e.g. root, cloudy-porpoise',
                         hintStyle: TextStyle(color: MeshColors.textMuted, fontSize: 12),
@@ -180,7 +175,7 @@ Future<void> showCreateObligationDialog(
 
                         final typedText = ownerIdCtrl.text.trim();
                         String resolvedId;
-                        if (ownerKind == 'human' && (typedText == 'operator' || typedText == 'human:operator' || typedText == 'human operator')) {
+                        if (typedText == 'operator' || typedText == 'human:operator' || typedText == 'human operator') {
                           resolvedId = 'human:operator';
                         } else {
                           final matches = store.actorStates.value.actors.values
@@ -190,7 +185,6 @@ Future<void> showCreateObligationDialog(
                         }
 
                         await store.api.createObligation(
-                          ownerKind: ownerKind,
                           ownerId: resolvedId,
                           parentId: parentId,
                           intent: intentCtrl.text.trim(),
@@ -387,7 +381,6 @@ Future<void> showReassignObligationDialog(
 }) async {
   final formKey = GlobalKey<FormState>();
   final ownerIdCtrl = TextEditingController(text: '');
-  var ownerKind = obligation.owner.kind;
   var isSubmitting = false;
 
   await showDialog<void>(
@@ -407,16 +400,13 @@ Future<void> showReassignObligationDialog(
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
-                  'Current owner: ${obligation.owner.kind}:${obligation.owner.kind == 'actor' ? (store.actor(obligation.owner.id)?.handle ?? obligation.owner.id) : obligation.owner.id}',
+                  'Current owner: ${store.actor(obligation.ownerId)?.handle ?? obligation.ownerId}',
                   style: const TextStyle(color: MeshColors.textMuted, fontFamily: kMonoFontFamily),
                 ),
                 const SizedBox(height: 16),
                 OwnerSelector(
                   store: store,
                   ownerIdCtrl: ownerIdCtrl,
-                  onOwnerKindChanged: (kind) {
-                    setState(() => ownerKind = kind);
-                  },
                   decoration: const InputDecoration(
                     labelText: 'Owner ID or Handle *',
                     hintText: 'e.g. cloudy-porpoise, operator, or UUID',
@@ -444,7 +434,7 @@ Future<void> showReassignObligationDialog(
                     try {
                       final typedText = ownerIdCtrl.text.trim();
                       String resolvedId;
-                      if (ownerKind == 'human' && (typedText == 'operator' || typedText == 'human:operator' || typedText == 'human operator')) {
+                      if (typedText == 'operator' || typedText == 'human:operator' || typedText == 'human operator') {
                         resolvedId = 'human:operator';
                       } else {
                         final matches = store.actorStates.value.actors.values
@@ -455,7 +445,6 @@ Future<void> showReassignObligationDialog(
 
                       await store.api.reassignObligation(
                         obligation.id,
-                        ownerKind: ownerKind,
                         ownerId: resolvedId,
                       );
                       if (context.mounted) {

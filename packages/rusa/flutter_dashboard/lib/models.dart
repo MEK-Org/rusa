@@ -818,28 +818,14 @@ class LiveOutputChunk {
   );
 }
 
-class ObligationOwner {
-  const ObligationOwner({required this.kind, required this.id});
-
-  final String kind; // "actor" | "human"
-  final String id;
-
-  factory ObligationOwner.fromJson(Map<String, dynamic> j) => ObligationOwner(
-    kind: j['kind'] as String? ?? 'actor',
-    id: j['id'] as String? ?? '',
-  );
-
-  Map<String, dynamic> toJson() => {
-    'kind': kind,
-    'id': id,
-  };
-}
-
 class ObligationDto {
   const ObligationDto({
     required this.id,
     this.parentId,
-    required this.owner,
+    required this.ownerId,
+    this.creatorId,
+    this.createdAt,
+    this.updatedAt,
     this.intent,
     this.externalRef,
     required this.status,
@@ -850,7 +836,16 @@ class ObligationDto {
 
   final String id;
   final String? parentId;
-  final ObligationOwner owner;
+  /// One entity id in the mesh's single id space: an actor UUID, `root`,
+  /// `human:*`, or `system:*`. The category is read off the prefix — there is
+  /// no separate owner "kind".
+  final String ownerId;
+
+  /// Who raised this obligation; immutable across reassignment. Null means
+  /// genuinely unknown (a row predating attribution), never inferred.
+  final String? creatorId;
+  final String? createdAt;
+  final String? updatedAt;
   final String? intent;
   final String? externalRef;
   final String status; // "ready" | "waiting" | "done" | "cancelled"
@@ -871,7 +866,10 @@ class ObligationDto {
     return ObligationDto(
       id: j['id'] as String? ?? '',
       parentId: j['parentId'] as String?,
-      owner: ObligationOwner.fromJson(j['owner'] as Map<String, dynamic>),
+      ownerId: j['ownerId'] as String? ?? '',
+      creatorId: j['creatorId'] as String?,
+      createdAt: j['createdAt'] as String?,
+      updatedAt: j['updatedAt'] as String?,
       intent: j['intent'] as String?,
       externalRef: extRef,
       status: j['status'] as String? ?? 'ready',

@@ -18,7 +18,6 @@ void main() {
         expect(req.url.path, '/api/mesh/obligations');
         expect(req.method, 'POST');
         final parsed = jsonDecode(req.body) as Map<String, dynamic>;
-        expect(parsed['ownerKind'], 'actor');
         expect(parsed['ownerId'], 'cloudy-porpoise');
         expect(parsed['intent'], 'Test create');
         expect(parsed['priority'], 50.0);
@@ -28,7 +27,7 @@ void main() {
             'obligation': {
               'id': 'ob-new-1',
               'parentId': null,
-              'owner': {'kind': 'actor', 'id': 'cloudy-porpoise'},
+              'ownerId': 'cloudy-porpoise',
               'intent': 'Test create',
               'externalRef': null,
               'status': 'ready',
@@ -43,14 +42,13 @@ void main() {
 
       final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
       final result = await api.createObligation(
-        ownerKind: 'actor',
         ownerId: 'cloudy-porpoise',
         intent: 'Test create',
         priority: 50.0,
       );
 
       expect(result.id, 'ob-new-1');
-      expect(result.owner.id, 'cloudy-porpoise');
+      expect(result.ownerId, 'cloudy-porpoise');
       expect(result.effectivePriority, 50.0);
     });
 
@@ -67,7 +65,7 @@ void main() {
             'obligation': {
               'id': 'ob-123',
               'parentId': null,
-              'owner': {'kind': 'actor', 'id': 'root'},
+              'ownerId': 'root',
               'intent': 'Discharged task',
               'externalRef': null,
               'status': 'done',
@@ -103,7 +101,7 @@ void main() {
             'obligation': {
               'id': 'ob-target',
               'parentId': null,
-              'owner': {'kind': 'actor', 'id': 'root'},
+              'ownerId': 'root',
               'intent': 'Reordered',
               'externalRef': null,
               'status': 'ready',
@@ -141,7 +139,7 @@ void main() {
             'obligation': {
               'id': 'ob-child',
               'parentId': 'ob-new-parent',
-              'owner': {'kind': 'actor', 'id': 'root'},
+              'ownerId': 'root',
               'intent': 'Reparented child',
               'externalRef': null,
               'status': 'ready',
@@ -165,14 +163,14 @@ void main() {
       final mockClient = MockClient((req) async {
         expect(req.url.path, '/api/mesh/obligations/ob-owner/reassign');
         expect(req.method, 'POST');
-        expect(jsonDecode(req.body), {'ownerKind': 'human', 'ownerId': 'Operator'});
+        expect(jsonDecode(req.body), {'ownerId': 'human:operator'});
         return http.Response(
           jsonEncode({
             'ok': true,
             'obligation': {
               'id': 'ob-owner',
               'parentId': null,
-              'owner': {'kind': 'human', 'id': 'Operator'},
+              'ownerId': 'human:operator',
               'intent': 'Reassigned task',
               'externalRef': null,
               'status': 'ready',
@@ -187,10 +185,9 @@ void main() {
       final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
       final result = await api.reassignObligation(
         'ob-owner',
-        ownerKind: 'human',
-        ownerId: 'Operator',
+        ownerId: 'human:operator',
       );
-      expect(result.owner.id, 'Operator');
+      expect(result.ownerId, 'human:operator');
     });
   });
 
