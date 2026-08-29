@@ -2,6 +2,8 @@
  * Configuration types for rusa.
  */
 
+import type { ContextConfig } from "../actor/thread-registry.js";
+
 export const DEFAULT_DEPLOY_BRANCH = "master";
 export type SandboxMode = "container-boundary" | "bwrap";
 
@@ -306,6 +308,12 @@ export interface RootActorConfig {
    * support it.
    */
   fallbackModel?: string | string[];
+  /**
+   * Working-memory ownership and policy for the root. Omit for the native,
+   * provider-session-backed default; portable roots run stateless and receive
+   * mesh-managed context using the same ledger/tail modes as spawned actors.
+   */
+  context?: ContextConfig;
   /**
    * The root actor's standing charter (its identity + how it should behave),
    * prepended to every wake. Per-instance customization — the identity is the

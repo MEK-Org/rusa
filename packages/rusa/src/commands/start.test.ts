@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,6 +7,7 @@ import { Actor, type RunAbandon } from "../actor/actor.js";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
+import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
 import { closeDb, getRepositories } from "../db/index.js";
@@ -1661,6 +1662,184 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect((rootActor as unknown as { opts: { addDirs?: string[] } }).opts.addDirs).toEqual([
       expectedRoot,
     ]);
+  });
+
+  it("runs a configured portable root stateless and injects its own recent context", async () => {
+    let mesh: ActorMesh | undefined;
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          context: { type: "portable", mode: "tail" },
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+    const rootAgentDir = join(homeDir, "root-agent");
+    mkdirSync(rootAgentDir, { recursive: true });
+    writeFileSync(
+      join(rootAgentDir, "session.json"),
+      JSON.stringify({ sessionId: "stale-native" }),
+      {
+        encoding: "utf8",
+        flag: "w",
+      }
+    );
+
+    const logSpy = vi.spyOn(console, "log");
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    if (!mesh) throw new Error("mesh not ready");
+    expect(mesh.registry.get("root")?.context).toEqual({ type: "portable", mode: "tail" });
+    const rootActor = mesh.get("root");
+    if (!rootActor) throw new Error("root actor not ready");
+    const actorOpts = (
+      rootActor as unknown as {
+        opts: {
+          loadSessionId: () => string | undefined;
+          saveSessionId: (id: string) => void;
+          buildPrompt: () => { prompt: string; injectRecord?: { runCount: number } };
+        };
+      }
+    ).opts;
+
+    expect(actorOpts.loadSessionId()).toBeUndefined();
+    actorOpts.saveSessionId("must-not-persist");
+    expect(mesh.registry.get("root")?.sessionId).toBeUndefined();
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("session=portable/tail (stateless)")
+    );
+    expect(JSON.parse(readFileSync(join(rootAgentDir, "session.json"), "utf8"))).toEqual({
+      sessionId: "stale-native",
+    });
+
+    mesh.recordEvent({
+      kind: "run_end",
+      actorId: "root",
+      success: true,
+      body: "PORTABLE_ROOT_CONTEXT_MARKER",
+    });
+    const built = actorOpts.buildPrompt();
+    expect(built.prompt).toContain("PORTABLE_ROOT_CONTEXT_MARKER");
+    expect(built.injectRecord?.runCount).toBe(1);
+  });
+
+  it("applies the existing ledger API-key requirement to a portable root", async () => {
+    let ready = false;
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          context: { type: "portable", mode: "ledger" },
+        },
+      }),
+      "utf8"
+    );
+
+    await runStart({
+      e2e: {
+        onReady: () => {
+          ready = true;
+        },
+      },
+    });
+
+    expect(ready).toBe(false);
+    expect(process.exit).toHaveBeenCalledWith(1);
+  });
+
+  it("compacts root ledger state and records the lifecycle event after a run", async () => {
+    let mesh: ActorMesh | undefined;
+    const compactSpy = vi
+      .spyOn(GeminiPortableContextCompactor.prototype, "compact")
+      .mockImplementation(async ({ state, messages, now }) => ({
+        state: {
+          ...state,
+          generation: state.generation + 1,
+          updatedAt: now,
+          lastFoldedMessageEventId: messages.at(-1)?.id ?? null,
+        },
+        quarantined: [],
+        operations: 0,
+      }));
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          context: { type: "portable", mode: "ledger" },
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    if (!mesh) throw new Error("mesh not ready");
+    mesh.recordEvent({
+      kind: "message_received",
+      actorId: "root",
+      body: "Remember this root instruction.",
+      payload: JSON.stringify({ from: "operator" }),
+    });
+    const rootActor = mesh.get("root");
+    if (!rootActor) throw new Error("root actor not ready");
+    const onRunEnd = (
+      rootActor as unknown as {
+        opts: {
+          onRunEnd?: (result: {
+            success: boolean;
+            output: string;
+            exitCode: number;
+          }) => Promise<void>;
+        };
+      }
+    ).opts.onRunEnd;
+    await onRunEnd?.({ success: true, output: "root completed", exitCode: 0 });
+
+    expect(compactSpy).toHaveBeenCalledOnce();
+    const state = JSON.parse(
+      readFileSync(join(homeDir, "portable-context", "root.json"), "utf8")
+    ) as { generation: number; lastFoldedMessageEventId: string | null };
+    expect(state.generation).toBe(1);
+    expect(state.lastFoldedMessageEventId).toBeTruthy();
+    const compacted = getRepositories().meshEvents.listEventsByActors(["root"], {
+      kinds: ["portable_context_compacted"],
+      limit: 10,
+    }).events;
+    expect(compacted).toHaveLength(1);
+    expect(compacted[0]?.detail).toContain("generation 1");
+    compactSpy.mockRestore();
   });
 
   it("does not infer polling scope from git remote when github config has no scope", async () => {

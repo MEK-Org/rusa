@@ -40,8 +40,11 @@ export function isContextSelection(value: unknown): value is ContextSelection {
  */
 export function resolveContextSelection(
   selection: unknown,
-  opts: { compactionModel?: string } = {}
+  opts: { compactionModel?: unknown } = {}
 ): ContextConfig | undefined {
+  if (opts.compactionModel !== undefined && typeof opts.compactionModel !== "string") {
+    throw new Error("compactionModel must be a string when set");
+  }
   const compactionModel = opts.compactionModel?.trim() || undefined;
   const raw = typeof selection === "string" ? selection.trim() : selection;
 
@@ -71,6 +74,32 @@ export function resolveContextSelection(
     return { type: "portable", mode: "tail" };
   }
   return { type: "portable", mode: "ledger", compactionModel };
+}
+
+/**
+ * Validate and normalize the durable object form used in configuration and the
+ * thread registry. The mode-specific rules stay delegated to
+ * {@link resolveContextSelection}, so YAML and spawn callers cannot drift.
+ */
+export function resolveContextConfig(value: unknown): ContextConfig | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("context must be a mapping when set");
+  }
+
+  const context = value as Record<string, unknown>;
+  if (context.type === "native") {
+    if (context.mode !== undefined) {
+      throw new Error("mode is meaningless for native context");
+    }
+    return resolveContextSelection("native", { compactionModel: context.compactionModel });
+  }
+  if (context.type === "portable") {
+    return resolveContextSelection(context.mode, { compactionModel: context.compactionModel });
+  }
+  throw new Error(
+    `unknown context type: ${String(context.type)} (expected one of native, portable)`
+  );
 }
 
 /**
