@@ -55,11 +55,13 @@ woke you and whether it actually calls for a response.`;
  * default) plus the stable inbox work contract. `rootHandle` is
  * the root's signing byline — pass `resolveRootHandle(config)` so a
  * configured instance signs under its own identity; defaults to today's
- * `generateHandle("root")` (`root-actor`).
+ * `generateHandle("root")` (`root-actor`). `priorContext` carries the same
+ * pre-rendered mesh-owned context block used for portable spawned actors.
  */
 export function buildRootPrompt(
   charter: string = ROOT_ACTOR_CHARTER,
-  rootHandle: string = generateHandle("root")
+  rootHandle: string = generateHandle("root"),
+  priorContext?: string
 ): string {
   return `${charter}
 
@@ -75,7 +77,7 @@ ${EXTERNAL_CONDUCT_POLICY}
 
 ${signatureDiscipline(rootHandle)}
 
-Begin by listing work from the durable inbox.`;
+${priorContext ? `---\n${priorContext.trim()}\n\n` : ""}Begin by listing work from the durable inbox.`;
 }
 
 // Testing tombstone (PR ISSUE_NUM): this module intentionally has no unit tests for

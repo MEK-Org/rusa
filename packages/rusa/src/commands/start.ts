@@ -572,6 +572,18 @@ function assemblePortableInjection(
   return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
 }
 
+function assembleConfiguredPortableInjection(
+  record: ThreadRecord,
+  apiKey: string | null,
+  store: PortableContextStore
+): { priorContext: string; injectRecord: InjectRecord } | undefined {
+  if (record.context?.type !== "portable") return undefined;
+  if (record.context.mode === "ledger" && !apiKey) {
+    throw new Error("portable context ledger mode requires geminiApiKey");
+  }
+  return assemblePortableInjection(record.id, record.context.mode, store);
+}
+
 function messageSender(payload: string | null): string | null {
   if (!payload) return null;
   try {
@@ -653,7 +665,7 @@ export async function compactPortableContext(input: {
  * Start rusa as the single **root actor** over an {@link ActorMesh}.
  *
  * Inbound GitHub webhooks and Google Chat messages wake the root, which runs the
- * configured provider (default agy) with its continued session and MCP tools —
+ * configured provider (default agy) with its configured context and MCP tools —
  * tracker + chat + the agent-execution ("mesh") server that lets it delegate to
  * worker actors. Workers are the same {@link Actor} loop, get their own
  * per-actor agent-execution endpoint (identity baked in), report to their parent,
@@ -1285,6 +1297,29 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     }
   };
 
+  const compactPortableActorAfterRun = async (
+    actorId: string
+  ): Promise<PortableContextCompactionSummary | null> => {
+    const current = registry.get(actorId);
+    const context = current?.context?.type === "portable" ? current.context : undefined;
+    const compactor = context?.mode === "ledger" ? compactorFor(context) : null;
+    if (context?.mode !== "ledger" || !compactor) return null;
+    try {
+      return await compactPortableContext({
+        actorId,
+        store: portableContextStore,
+        compactor,
+      });
+    } catch (err) {
+      // Keep the previous state and watermark. The exact message remains in the
+      // recent raw journal and will be retried after the next run.
+      console.warn(
+        `[portable-context] compaction failed for ${actorId}: ${err instanceof Error ? err.message : String(err)}`
+      );
+      return null;
+    }
+  };
+
   // ── Actor mesh: the root plus any worker threads it spawns ──
   const mesh = new ActorMesh({
     registry,
@@ -1620,21 +1655,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           buildPrompt: () => {
             const r = registry.get(id);
             if (!r) return { prompt: "No active thread record." };
-            if (
-              r.context?.type === "portable" &&
-              r.context.mode === "ledger" &&
-              !portableContextApiKey
-            ) {
-              throw new Error("portable context ledger mode requires geminiApiKey");
-            }
             const handles = resolveHandleLabels(r.handles, (hid) => registry.get(hid)?.charter);
             // Portable-context actors (design ISSUE_NUM) get their own recent run outputs
             // assembled into a stateless prefix; the per-run inject record rides on
             // this run's `run_start` event, not its own event kind.
-            const injection =
-              r.context?.type === "portable"
-                ? assemblePortableInjection(id, r.context.mode, portableContextStore)
-                : undefined;
+            const injection = assembleConfiguredPortableInjection(
+              r,
+              portableContextApiKey,
+              portableContextStore
+            );
             return {
               prompt: buildWorkerPrompt(
                 r.charter,
@@ -1729,33 +1758,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                   : undefined,
             });
             ctx.onRunEnd(result);
-            const current = registry.get(id);
-            const portableContext =
-              current?.context?.type === "portable" ? current.context : undefined;
-            const portableContextCompactor =
-              portableContext?.mode === "ledger" ? compactorFor(portableContext) : null;
-            if (portableContext?.mode === "ledger" && portableContextCompactor) {
-              try {
-                const compacted = await compactPortableContext({
-                  actorId: id,
-                  store: portableContextStore,
-                  compactor: portableContextCompactor,
-                });
-                if (compacted) {
-                  mesh.recordEvent({
-                    kind: "portable_context_compacted",
-                    actorId: id,
-                    detail: describeCompaction(compacted),
-                    body: JSON.stringify(compacted),
-                  });
-                }
-              } catch (err) {
-                // Keep the previous state and watermark. The exact message remains
-                // in the recent raw journal and will be retried after the next run.
-                console.warn(
-                  `[portable-context] compaction failed for ${id}: ${err instanceof Error ? err.message : String(err)}`
-                );
-              }
+            const compacted = await compactPortableActorAfterRun(id);
+            if (compacted) {
+              mesh.recordEvent({
+                kind: "portable_context_compacted",
+                actorId: id,
+                detail: describeCompaction(compacted),
+                body: JSON.stringify(compacted),
+              });
             }
             if (!result.success && !result.capped) {
               await routeRunFailure(
@@ -2055,14 +2065,28 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       addDirs,
       sandbox: Boolean(opts?.e2e),
       isE2eRoot: Boolean(opts?.e2e),
-      loadSessionId: () => loadRootSessionId(sessionFile),
+      loadSessionId: () =>
+        registry.get(rootId)?.context?.type === "portable"
+          ? undefined
+          : loadRootSessionId(sessionFile),
       saveSessionId: (id) => {
+        if (registry.get(rootId)?.context?.type === "portable") return;
         saveRootSessionId(sessionFile, id); // root session file stays authoritative for the root
         registry.patch(rootId, { sessionId: id });
       },
-      buildPrompt: () => ({
-        prompt: buildRootPrompt(config.rootActor?.charter, rootHandle),
-      }),
+      buildPrompt: () => {
+        const record = registry.get(rootId);
+        if (!record) return { prompt: "No active root thread record." };
+        const injection = assembleConfiguredPortableInjection(
+          record,
+          portableContextApiKey,
+          portableContextStore
+        );
+        return {
+          prompt: buildRootPrompt(config.rootActor?.charter, rootHandle, injection?.priorContext),
+          injectRecord: injection?.injectRecord,
+        };
+      },
       fallback: fallbackModels
         ? {
             models: fallbackModels,
@@ -2108,10 +2132,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           detail: context.mode,
         });
       },
-      onRunStart: (responsive) =>
+      onRunStart: (responsive, injectRecord) =>
         mesh.recordEvent({
           kind: "run_start",
           actorId: rootId,
+          detail: injectRecord
+            ? `ctx ${injectRecord.bytes}B/${injectRecord.runCount}r/${injectRecord.hash.slice(0, 12)}`
+            : undefined,
+          body: injectRecord ? JSON.stringify(injectRecord) : undefined,
           payload: JSON.stringify({
             provider: providerThrottleKey(provider.providerName, config),
             responsive,
@@ -2153,6 +2181,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                 })
               : undefined,
         });
+        const compacted = await compactPortableActorAfterRun(rootId);
+        if (compacted) {
+          mesh.recordEvent({
+            kind: "portable_context_compacted",
+            actorId: rootId,
+            detail: describeCompaction(compacted),
+            body: JSON.stringify(compacted),
+          });
+        }
         if (!result.success && !result.capped) {
           await routeRunFailure(
             failureSink,
@@ -2171,6 +2208,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     isRoot: true,
     provider: config.rootActor?.provider,
     model: config.rootActor?.model,
+    context: config.rootActor?.context,
     sessionId: loadRootSessionId(sessionFile),
     status: "active",
     createdAt: new Date().toISOString(),

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1661,6 +1661,109 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect((rootActor as unknown as { opts: { addDirs?: string[] } }).opts.addDirs).toEqual([
       expectedRoot,
     ]);
+  });
+
+  it("runs a configured portable root stateless and injects its own recent context", async () => {
+    let mesh: ActorMesh | undefined;
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          context: { type: "portable", mode: "tail" },
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+    const rootAgentDir = join(homeDir, "root-agent");
+    mkdirSync(rootAgentDir, { recursive: true });
+    writeFileSync(
+      join(rootAgentDir, "session.json"),
+      JSON.stringify({ sessionId: "stale-native" }),
+      {
+        encoding: "utf8",
+        flag: "w",
+      }
+    );
+
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    if (!mesh) throw new Error("mesh not ready");
+    expect(mesh.registry.get("root")?.context).toEqual({ type: "portable", mode: "tail" });
+    const rootActor = mesh.get("root");
+    if (!rootActor) throw new Error("root actor not ready");
+    const actorOpts = (
+      rootActor as unknown as {
+        opts: {
+          loadSessionId: () => string | undefined;
+          saveSessionId: (id: string) => void;
+          buildPrompt: () => { prompt: string; injectRecord?: { runCount: number } };
+        };
+      }
+    ).opts;
+
+    expect(actorOpts.loadSessionId()).toBeUndefined();
+    actorOpts.saveSessionId("must-not-persist");
+    expect(mesh.registry.get("root")?.sessionId).toBe("stale-native");
+
+    mesh.recordEvent({
+      kind: "run_end",
+      actorId: "root",
+      success: true,
+      body: "PORTABLE_ROOT_CONTEXT_MARKER",
+    });
+    const built = actorOpts.buildPrompt();
+    expect(built.prompt).toContain("PORTABLE_ROOT_CONTEXT_MARKER");
+    expect(built.injectRecord?.runCount).toBe(1);
+  });
+
+  it("applies the existing ledger API-key requirement to a portable root", async () => {
+    let mesh: ActorMesh | undefined;
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: {
+          provider: "antigravity",
+          context: { type: "portable", mode: "ledger" },
+        },
+      }),
+      "utf8"
+    );
+
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    if (!mesh) throw new Error("mesh not ready");
+    const rootActor = mesh.get("root");
+    if (!rootActor) throw new Error("root actor not ready");
+    const buildPrompt = (
+      rootActor as unknown as { opts: { buildPrompt: () => { prompt: string } } }
+    ).opts.buildPrompt;
+    expect(() => buildPrompt()).toThrow("portable context ledger mode requires geminiApiKey");
   });
 
   it("does not infer polling scope from git remote when github config has no scope", async () => {
