@@ -130,6 +130,19 @@ vi.mock("../providers/sandbox.js", async (importOriginal) => ({
   assertBwrapAvailable: sandboxMock.assertBwrapAvailable,
 }));
 
+// `runStart` fires the boot/daily model-catalog probe as
+// `void refreshConfiguredProviderModelCatalogs(...)`, which drives the real `codex` and `agy`
+// binaries — codex through a real tmux PTY against the host's shared `~/.codex`. Nothing awaits
+// it, so an unmocked unit run starts external CLI trees that outlive the test (#88).
+const modelScrapeMock = vi.hoisted(() => ({
+  refreshConfiguredProviderModelCatalogs: vi.fn(async () => {}),
+}));
+
+vi.mock("../providers/model-scrape.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../providers/model-scrape.js")>()),
+  refreshConfiguredProviderModelCatalogs: modelScrapeMock.refreshConfiguredProviderModelCatalogs,
+}));
+
 import {
   getShutdownExitCode,
   isLegacyWorktreeKey,
@@ -325,6 +338,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     gitHttpServerMock.startGitHttpServer.mockClear();
     gitHttpServerMock.servers.length = 0;
     sandboxMock.assertBwrapAvailable.mockReset();
+    modelScrapeMock.refreshConfiguredProviderModelCatalogs.mockClear();
     pollerMock.startGitHubEventPoller.mockClear();
     for (const method of Object.values(e2eInstanceManagerMock)) method.mockClear();
     serviceInstanceMock.resolveRepoRoot.mockImplementation(
@@ -468,6 +482,25 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // signal to the parent now, not something the worker self-heals from.
       expect(kimiActorOpts.fallback).toBeUndefined();
     });
+  });
+
+  it("drives the boot model-catalog probe through the injected fake, not a real CLI", async () => {
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    await readyPromise;
+
+    // Regression guard for #88. The boot probe is unconditional, so this asserts the mock above is
+    // actually engaged: drop it and the count stays 0 while the suite silently goes back to
+    // spawning real codex/agy trees that no test awaits.
+    expect(modelScrapeMock.refreshConfiguredProviderModelCatalogs).toHaveBeenCalled();
   });
 
   it("warns at boot when the self-update tool mounts without errorChat configured", async () => {
