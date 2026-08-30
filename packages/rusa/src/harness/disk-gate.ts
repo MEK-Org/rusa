@@ -515,7 +515,7 @@ export class DiskUsageSampler {
  * This exists so the production wiring can be exercised. Every cell above drives the
  * sampler through injected deps, which proves the logic and proves nothing about whether
  * the driver hands it a live reader — a check that can only be satisfied by a fake is the
- * `boundModel` mistake (a comparison of two nulls, passing on the absence of evidence).
+ * model-identity mistake (a comparison of two nulls, passing on the absence of evidence).
  * Constructing it here means one call site, one test, and no way for the rig to keep a
  * watch that measures nothing while looking like it does.
  *

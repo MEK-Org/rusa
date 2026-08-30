@@ -85,6 +85,7 @@ export type MeshEventKind =
   // the datum — nothing may synthesize one on the kill path, or the distinction
   // collapses back into inference.
   | "run_first_chunk"
+  // A run produced a result. `payload` = {@link RunEndPayload}.
   | "run_end"
   // The other way a queued run opportunity ends: it was abandoned before it
   // produced a result, so there is nothing to report. `actorId` = the actor,
@@ -155,6 +156,68 @@ export const RUN_TERMINAL_EVENT_KINDS = [
   "run_end",
   "run_abandoned",
 ] as const satisfies readonly MeshEventKind[];
+
+/**
+ * JSON `payload` of a `run_end` event.
+ *
+ * `model` is the run-scoped answer to "what did this actor actually run on?" —
+ * the provider's own report (`RunResult.model`), recorded against the ONE run it
+ * describes. It lives here rather than on the thread record because the thread is
+ * the wrong scope for it: a per-actor copy is written on every run and cleared on
+ * none, so an actor moved from a reporting provider to a non-reporting one keeps
+ * answering with the model it LEFT, indefinitely and with no way to tell. That
+ * stale copy is what this arc removed; recording the value against its run is what
+ * replaces it.
+ *
+ * Absent means the provider did not report one. It is never the configured model,
+ * and a reader must not substitute one — see `harness/model-identity.ts`.
+ */
+export interface RunEndPayload {
+  /** True when the supervisor grace-killed the run after the yield grace period. */
+  graceKilled?: boolean;
+  /** The declared yield status ('complete' | 'blocked') if the run yielded. */
+  yieldStatus?: string;
+  /** What the provider reported this run ran on. Absent = not reported. */
+  model?: string;
+}
+
+/**
+ * Build a `run_end` payload from a finished run.
+ *
+ * Lives beside {@link RunEndPayload} and {@link runEndModel} on purpose: writer, reader
+ * and shape in one place, so a key added to one cannot go missing from the others. The
+ * two call sites (root and worker) previously each carried their own hand-copied JSON
+ * literal, which is two chances to forget.
+ *
+ * `undefined` when there is nothing to say, so an ordinary run still records no payload
+ * rather than an object of nulls.
+ */
+export function runEndPayload(result: RunEndPayload): string | undefined {
+  if (!result.graceKilled && !result.yieldStatus && !result.model) return undefined;
+  return JSON.stringify({
+    graceKilled: result.graceKilled,
+    yieldStatus: result.yieldStatus,
+    model: result.model,
+  } satisfies RunEndPayload);
+}
+
+/**
+ * What the provider reported this run ran on, or null if it reported nothing.
+ *
+ * Null is a THIRD state, not a default: absent payload, unparseable payload, and a
+ * payload whose provider stayed silent are all "not reported", and a caller that
+ * collapses them into the configured model reintroduces the bug
+ * `harness/model-identity.ts` was written for.
+ */
+export function runEndModel(payload: string | null | undefined): string | null {
+  if (!payload) return null;
+  try {
+    const model = (JSON.parse(payload) as Partial<RunEndPayload>).model;
+    return typeof model === "string" && model.length > 0 ? model : null;
+  } catch {
+    return null;
+  }
+}
 
 /** JSON `payload` of a `run_abandoned` event. */
 export interface RunAbandonedPayload {

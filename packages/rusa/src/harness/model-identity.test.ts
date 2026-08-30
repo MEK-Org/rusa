@@ -2,32 +2,32 @@ import { describe, expect, it } from "vitest";
 
 import { assessModelIdentity, mergeValidity } from "./ab-metrics.js";
 import {
-  BOUND_MODEL_CAPTURE_PROVIDERS,
-  capturesBoundModel,
   checkModelIdentity,
   comparabilityCaveat,
   comparabilityOf,
+  MODEL_REPORTING_PROVIDERS,
+  reportsRunModel,
 } from "./model-identity.js";
 
 const TWO_NULLS = {
-  native: { provider: "kimi", boundModel: null },
-  portable: { provider: "kimi", boundModel: null },
+  native: { provider: "kimi", model: null },
+  portable: { provider: "kimi", model: null },
 };
 const SAME = {
-  native: { provider: "codex", boundModel: "gpt-5.5-codex" },
-  portable: { provider: "codex", boundModel: "gpt-5.5-codex" },
+  native: { provider: "codex", model: "gpt-5.5-codex" },
+  portable: { provider: "codex", model: "gpt-5.5-codex" },
 };
 const DIFFERS = {
-  native: { provider: "codex", boundModel: "gpt-5.5-codex" },
-  portable: { provider: "codex", boundModel: "gpt-5.1-codex" },
+  native: { provider: "codex", model: "gpt-5.5-codex" },
+  portable: { provider: "codex", model: "gpt-5.1-codex" },
 };
 
 describe("model identity across A/B arms ", () => {
   it("reports NOT CAPTURED — never a pass — when neither arm reported a bound model", () => {
-    // This is the g2v3d shape verbatim: kimi on both sides, boundModel null on both.
+    // This is the g2v3d shape verbatim: kimi on both sides, nothing reported on either.
     const verdict = checkModelIdentity({
-      native: { provider: "kimi", boundModel: null },
-      portable: { provider: "kimi", boundModel: null },
+      native: { provider: "kimi", model: null },
+      portable: { provider: "kimi", model: null },
     });
 
     expect(verdict.status).toBe("not-captured");
@@ -39,8 +39,8 @@ describe("model identity across A/B arms ", () => {
 
   it("says out loud that matching nulls are absence of evidence", () => {
     const { message } = checkModelIdentity({
-      native: { provider: "kimi", boundModel: null },
-      portable: { provider: "kimi", boundModel: null },
+      native: { provider: "kimi", model: null },
+      portable: { provider: "kimi", model: null },
     });
 
     expect(message).toContain("NOT CAPTURED");
@@ -52,21 +52,21 @@ describe("model identity across A/B arms ", () => {
 
   it("names the reason as a missing adapter feature, not a failed read", () => {
     const { message, uncapturableArms } = checkModelIdentity({
-      native: { provider: "kimi", boundModel: null },
-      portable: { provider: "kimi", boundModel: null },
+      native: { provider: "kimi", model: null },
+      portable: { provider: "kimi", model: null },
     });
 
     expect(uncapturableArms).toEqual(["native", "portable"]);
-    expect(message).toContain("no adapter for kimi populates it");
+    expect(message).toContain("no adapter for kimi reports it");
     expect(message).toContain("only codex does");
   });
 
   it("distinguishes an unexplained null on a provider that CAN capture", () => {
-    // codex populates boundModel, so a null here is a real anomaly worth investigating —
+    // codex reports the model it ran, so a null here is a real anomaly worth investigating —
     // a different diagnosis from kimi's structural absence, and worded differently.
     const { message, uncapturableArms } = checkModelIdentity({
-      native: { provider: "codex", boundModel: null },
-      portable: { provider: "codex", boundModel: null },
+      native: { provider: "codex", model: null },
+      portable: { provider: "codex", model: null },
     });
 
     expect(uncapturableArms).toEqual([]);
@@ -75,8 +75,8 @@ describe("model identity across A/B arms ", () => {
 
   it("verifies identity only when both arms actually reported the same model", () => {
     const verdict = checkModelIdentity({
-      native: { provider: "codex", boundModel: "gpt-5.5-codex" },
-      portable: { provider: "codex", boundModel: "gpt-5.5-codex" },
+      native: { provider: "codex", model: "gpt-5.5-codex" },
+      portable: { provider: "codex", model: "gpt-5.5-codex" },
     });
 
     expect(verdict.ok).toBe(true);
@@ -86,13 +86,13 @@ describe("model identity across A/B arms ", () => {
 
   it("voids the comparison when the arms demonstrably bound different models", () => {
     const verdict = checkModelIdentity({
-      native: { provider: "codex", boundModel: "gpt-5.5-codex" },
-      portable: { provider: "codex", boundModel: "gpt-5.1-codex" },
+      native: { provider: "codex", model: "gpt-5.5-codex" },
+      portable: { provider: "codex", model: "gpt-5.1-codex" },
     });
 
     expect(verdict.ok).toBe(false);
     expect(verdict.status).toBe("differs");
-    expect(verdict.message).toContain("ARMS BOUND DIFFERENT MODELS");
+    expect(verdict.message).toContain("ARMS RAN DIFFERENT MODELS");
     expect(verdict.message).toContain("void");
     // both sides named, so the reader doesn't have to open the report to see which is which
     expect(verdict.message).toContain("native=gpt-5.5-codex");
@@ -101,8 +101,8 @@ describe("model identity across A/B arms ", () => {
 
   it("treats one-sided capture as unknown, not as a match", () => {
     const verdict = checkModelIdentity({
-      native: { provider: "codex", boundModel: "gpt-5.5-codex" },
-      portable: { provider: "kimi", boundModel: null },
+      native: { provider: "codex", model: "gpt-5.5-codex" },
+      portable: { provider: "kimi", model: null },
     });
 
     expect(verdict.status).toBe("partial");
@@ -112,22 +112,42 @@ describe("model identity across A/B arms ", () => {
   });
 
   it("keeps the raw per-arm values so the report shows the nulls rather than hiding them", () => {
-    const { boundModels } = checkModelIdentity({
-      native: { provider: "kimi", boundModel: null },
-      portable: { provider: "kimi", boundModel: "kimi-k2.5" },
+    const { models } = checkModelIdentity({
+      native: { provider: "kimi", model: null },
+      portable: { provider: "kimi", model: "kimi-k2.5" },
     });
 
-    expect(boundModels).toEqual({ native: null, portable: "kimi-k2.5" });
+    expect(models).toEqual({ native: null, portable: "kimi-k2.5" });
+  });
+
+  it("refuses to call two matching CONFIGURED models a measurement", () => {
+    // The failure the field rename made reachable. `boundModel` could only ever hold a
+    // read-back, so a non-null value WAS a measurement. `model` is one careless caller
+    // away from the arm's configured model — which is non-null on every arm and equal on
+    // both whenever the run pinned a model, i.e. exactly when a false "same ✓" is most
+    // tempting. Both arms here look fully populated and must still read NOT CAPTURED.
+    const verdict = checkModelIdentity({
+      native: { provider: "kimi", model: "kimi-k2.5" },
+      portable: { provider: "kimi", model: "kimi-k2.5" },
+    });
+
+    expect(verdict.ok).toBeNull();
+    expect(verdict.status).toBe("not-captured");
+    expect(verdict.capturedArms).toEqual([]);
+    // The values are still reported verbatim — refusing the inference is not the same as
+    // hiding the data a reader needs to see why.
+    expect(verdict.models).toEqual({ native: "kimi-k2.5", portable: "kimi-k2.5" });
+    expect(comparabilityOf(verdict)).toBe("unverified");
   });
 
   it("knows exactly which providers capture — codex today, nothing else", () => {
-    expect([...BOUND_MODEL_CAPTURE_PROVIDERS]).toEqual(["codex"]);
-    expect(capturesBoundModel("codex")).toBe(true);
-    expect(capturesBoundModel("kimi")).toBe(false);
-    expect(capturesBoundModel("claude")).toBe(false);
+    expect([...MODEL_REPORTING_PROVIDERS]).toEqual(["codex"]);
+    expect(reportsRunModel("codex")).toBe(true);
+    expect(reportsRunModel("kimi")).toBe(false);
+    expect(reportsRunModel("claude")).toBe(false);
     // an unknown/absent provider starts out non-capturing, which is the truth
-    expect(capturesBoundModel(null)).toBe(false);
-    expect(capturesBoundModel(undefined)).toBe(false);
+    expect(reportsRunModel(null)).toBe(false);
+    expect(reportsRunModel(undefined)).toBe(false);
   });
 });
 
@@ -163,7 +183,7 @@ describe("what an unverified identity does to the run's verdict", () => {
 
     expect(validity.valid).toBe(false);
     expect(validity.fatal).toHaveLength(1);
-    expect(validity.fatal[0]).toContain("ARMS BOUND DIFFERENT MODELS");
+    expect(validity.fatal[0]).toContain("ARMS RAN DIFFERENT MODELS");
     expect(comparabilityOf(checkModelIdentity(DIFFERS))).toBe("void");
   });
 
@@ -188,8 +208,8 @@ describe("what an unverified identity does to the run's verdict", () => {
 
   it("caveats the one-sided case too — partial capture is not verification", () => {
     const partial = checkModelIdentity({
-      native: { provider: "codex", boundModel: "gpt-5.5-codex" },
-      portable: { provider: "kimi", boundModel: null },
+      native: { provider: "codex", model: "gpt-5.5-codex" },
+      portable: { provider: "kimi", model: null },
     });
 
     expect(comparabilityOf(partial)).toBe("unverified");

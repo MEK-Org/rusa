@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { MeshActor } from "../actor/actor-mesh.js";
 import { ActorMesh } from "../actor/actor-mesh.js";
 import { InMemoryThreadRegistry } from "../actor/thread-registry.js";
-import { adoptRigHolder, RIG_HOLDER_ID } from "./ab-context.js";
+import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
+import { adoptRigHolder, lastReportedModel, RIG_HOLDER_ID } from "./ab-context.js";
 
 const ROOT_ID = "root";
 
@@ -115,5 +116,60 @@ describe("A/B arm parenting ", () => {
     expect(registry.get(holderId)?.parentId).toBeNull();
     expect(mesh.isAncestorOf(ROOT_ID, arms.native)).toBe(false);
     expect(mesh.isAncestorOf(ROOT_ID, arms.portable)).toBe(false);
+  });
+});
+
+describe("the model an arm actually ran", () => {
+  const event = (partial: Partial<MeshEvent>): MeshEvent => ({
+    id: "e",
+    ts: "2026-01-01T00:00:00Z",
+    kind: "run_end",
+    actorId: "native",
+    detail: null,
+    body: null,
+    payload: null,
+    success: true,
+    ...partial,
+  });
+
+  it("answers with the arm's LAST reporting run, not its first", () => {
+    // A long arm can be re-pinned mid-run. Describing it by the model it started on
+    // would attribute the whole arm to a model that stopped running partway through.
+    expect(
+      lastReportedModel(
+        [
+          event({ payload: JSON.stringify({ model: "gpt-5.1-codex" }) }),
+          event({ payload: JSON.stringify({ model: "gpt-5.5-codex" }) }),
+        ],
+        "native"
+      )
+    ).toBe("gpt-5.5-codex");
+  });
+
+  it("skips a later silent run rather than letting it erase the reading", () => {
+    // Only codex reports. A trailing run that said nothing is not evidence the arm
+    // stopped running that model — it is evidence nobody looked on that run.
+    expect(
+      lastReportedModel(
+        [event({ payload: JSON.stringify({ model: "gpt-5.5-codex" }) }), event({ payload: null })],
+        "native"
+      )
+    ).toBe("gpt-5.5-codex");
+  });
+
+  it("reads only this arm's own run_end events", () => {
+    // The other arm's model must never leak across: that would manufacture agreement
+    // between the two arms, which is precisely the claim this feeds.
+    const events = [
+      event({ actorId: "portable", payload: JSON.stringify({ model: "kimi-k2.5" }) }),
+      event({ actorId: "native", kind: "run_start", payload: JSON.stringify({ model: "wrong" }) }),
+    ];
+    expect(lastReportedModel(events, "native")).toBeNull();
+    expect(lastReportedModel(events, "portable")).toBe("kimi-k2.5");
+  });
+
+  it("is null when the arm never reported one", () => {
+    expect(lastReportedModel([], "native")).toBeNull();
+    expect(lastReportedModel([event({ payload: null })], "native")).toBeNull();
   });
 });

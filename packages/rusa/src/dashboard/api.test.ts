@@ -299,16 +299,21 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads surfaces one model and does not leak a stale bound-model readback", () => {
-    // A record that still carries a bound-model readback — the shape that produced the
-    // old "MODEL DIVERGED" badge once an actor was moved off codex and the stale codex
-    // readback outlived the move. The API must publish the configured model and nothing
-    // to compare it against.
+    // A registry record that still carries the removed `boundModel` key. The cast is the
+    // point, not a workaround: the field is gone from `ThreadRecord`, but the registry is
+    // a JSON file loaded with a cast and rewritten whole, so every record written before
+    // this change still carries the key on disk. This is that record.
+    //
+    // It is the shape that produced the old "MODEL DIVERGED" badge — an actor moved off
+    // codex, its codex readback outliving the move because nothing ever cleared it. The
+    // API must publish the configured model, prefer nothing to it, and expose nothing to
+    // compare it against.
     registry.upsert({
       ...rec(UUID_A, "root", "active"),
       provider: "codex",
       model: "gpt-5-codex",
       boundModel: "gpt-5.5",
-    });
+    } as ThreadRecord);
 
     const { res } = call(deps, "GET", "/api/mesh/threads");
     expect(res.statusCode).toBe(200);

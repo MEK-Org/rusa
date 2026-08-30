@@ -2,6 +2,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ActorMesh, MeshActor } from "../actor/actor-mesh.js";
+import { runEndModel } from "../actor/mesh-events.js";
 import { portableContextMaxRuns } from "../actor/portable-context.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import type { RusaConfig } from "../config/types.js";
@@ -1067,11 +1068,16 @@ async function runProviderContextABBody(
         {
           actorId: id,
           provider: rec?.provider ?? null,
-          model: rec?.model ?? null,
-          // Read back from the provider session after the first run — the arm's ACTUAL
-          // model, which is what a comparability claim rests on. Null on every provider
-          // but codex; `modelIdentity` below is what stops that null reading as a pass.
-          boundModel: rec?.boundModel ?? null,
+          // What the arm's runs REPORTED they ran on — the arm's ACTUAL model, which is
+          // what a comparability claim rests on, and deliberately NOT the model the arm
+          // was configured with. Null on every provider but codex; `modelIdentity` below
+          // is what stops that null reading as a pass.
+          //
+          // Read run-scoped off `run_end` rather than off the thread record. A per-thread
+          // copy is written on every run and cleared on none, so an actor moved from a
+          // reporting provider to a non-reporting one answers with the model it LEFT,
+          // indefinitely — a stale value that reads exactly like a fresh one.
+          model: lastReportedModel(events, id),
           firstStepStartedAt: windows[0]?.startedAt ?? null,
           lastStepEndedAt: windows[windows.length - 1]?.endedAt ?? null,
           stepWindows: windows,
@@ -1175,6 +1181,11 @@ async function runProviderContextABBody(
         reason: headroom.provenance === "not-checked" ? headroom.reason : null,
         overridden: headroom.fits === false ? (opts.allowOverWindow ?? false) : false,
       },
+      // The driver's OWN invocation, recorded as provenance: what this `ab-context` run
+      // was asked to launch. Deliberately kept through the divergence teardown, because
+      // it is not half of a divergence pair — nothing compares it to what the arms ran,
+      // and no surface derives a verdict from the difference. It is the only record of
+      // what was asked for, and `armProvenance.model` (what ran) cannot answer that.
       requestedProvider: opts.provider ?? null,
       requestedModel: opts.model ?? null,
       // Whether the arms are even comparable. `ok: null` means NOT CAPTURED — nobody
@@ -1262,6 +1273,23 @@ async function runProviderContextABBody(
 }
 
 /** Parse the `sourceEventIds` out of a `run_start` inject body (an InjectRecord JSON). */
+/**
+ * What the actor's most recent reporting run said it ran on, or null if none reported.
+ *
+ * Newest-first so a long arm is described by the model it finished on rather than the one
+ * it started on. Null is a real answer — "nothing reported" — and callers must not fill it
+ * in from configuration; see `harness/model-identity.ts`.
+ */
+export function lastReportedModel(events: MeshEvent[], actorId: string): string | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.actorId !== actorId || event.kind !== "run_end") continue;
+    const model = runEndModel(event.payload);
+    if (model) return model;
+  }
+  return null;
+}
+
 function parseSourceIds(body: string | null): string[] | null {
   if (!body) return null;
   try {

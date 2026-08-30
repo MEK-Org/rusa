@@ -91,10 +91,18 @@ export interface RunResult {
    */
   sessionId?: string;
   /**
-   * Provider read-back of the model actually bound for this session/run. This is
-   * observability only; callers must not use it to choose or mutate providers.
+   * The model this run actually ran on, as the provider itself reported it —
+   * not the model that was requested. Observability only; callers must not use
+   * it to choose or mutate providers.
+   *
+   * **Absent means NOT REPORTED, never "the configured one".** Only adapters on
+   * {@link MODEL_REPORTING_PROVIDERS} populate it, so a reader that substitutes
+   * the configured model here turns "nobody looked" into a measurement — the
+   * failure `harness/model-identity.ts` exists to prevent. Consumers that only
+   * need a label may fall back (`result.model ?? provider.model`); consumers
+   * making a claim about what ran may not.
    */
-  boundModel?: string;
+  model?: string;
   /**
    * Provider read-back of tokens attributable to this invocation.
    * Observability only; callers must not use it to choose or mutate providers.

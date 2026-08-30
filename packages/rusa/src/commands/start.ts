@@ -52,7 +52,11 @@ import { handleHostJobExit } from "../actor/host-job-exit.js";
 import { ensureWakeOnExitScript } from "../actor/host-job-runner.js";
 import { FileHostJobStore } from "../actor/host-job-store.js";
 import type { InboxEntry, InboxStore } from "../actor/inbox-store.js";
-import type { MeshEventSink, RunAbandonedPayload } from "../actor/mesh-events.js";
+import {
+  type MeshEventSink,
+  type RunAbandonedPayload,
+  runEndPayload,
+} from "../actor/mesh-events.js";
 import {
   assemblePortableContext,
   assemblePortableContextV2,
@@ -1742,20 +1746,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               payload: JSON.stringify({ started } satisfies RunAbandonedPayload),
             }),
           onRunEnd: async (result) => {
-            if (result.boundModel) registry.patch(id, { boundModel: result.boundModel });
             mesh.recordEvent({
               kind: "run_end",
               actorId: id,
               success: result.success,
               detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
               body: result.output,
-              payload:
-                result.graceKilled || result.yieldStatus
-                  ? JSON.stringify({
-                      graceKilled: result.graceKilled,
-                      yieldStatus: result.yieldStatus,
-                    })
-                  : undefined,
+              payload: runEndPayload(result),
             });
             ctx.onRunEnd(result);
             const compacted = await compactPortableActorAfterRun(id);
@@ -1772,7 +1769,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                 failureSink,
                 id,
                 result,
-                formatProviderLabel(actor.getProvider(), result.boundModel)
+                formatProviderLabel(actor.getProvider(), result.model)
               );
             }
           },
@@ -2165,7 +2162,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           payload: JSON.stringify({ started } satisfies RunAbandonedPayload),
         }),
       onRunEnd: async (result) => {
-        if (result.boundModel) registry.patch(rootId, { boundModel: result.boundModel });
         mesh.finishInboxRun(rootId);
         mesh.recordEvent({
           kind: "run_end",
@@ -2173,13 +2169,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           success: result.success,
           detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
           body: result.output,
-          payload:
-            result.graceKilled || result.yieldStatus
-              ? JSON.stringify({
-                  graceKilled: result.graceKilled,
-                  yieldStatus: result.yieldStatus,
-                })
-              : undefined,
+          payload: runEndPayload(result),
         });
         const compacted = await compactPortableActorAfterRun(rootId);
         if (compacted) {
@@ -2195,7 +2185,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             failureSink,
             rootId,
             result,
-            formatProviderLabel(provider, result.boundModel)
+            formatProviderLabel(provider, result.model)
           );
         }
       },

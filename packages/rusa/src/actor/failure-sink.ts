@@ -38,13 +38,19 @@ export interface FailureSinkDeps {
 
 /**
  * Format a `<provider>/<model>` label for a failure notice's exhaustion lead
- * line. `boundModel` (the provider's read-back of the model actually bound
- * for the run) takes precedence over the provider's configured/pinned model,
- * since it reflects what actually ran.
+ * line. `runModel` — what the provider reported it actually ran (`RunResult.model`)
+ * — takes precedence over the configured/pinned model, because the decision the
+ * parent has to make (wait out the timer, respawn on another tier, re-scope)
+ * turns on which model is the one that ran out.
+ *
+ * Falling back to the pin is sound HERE and nowhere that makes a claim: this is a
+ * label on a notice that is being sent regardless, so a configured-model name beats
+ * no name. A gate asserting two runs used the same model may not fall back the same
+ * way — see `harness/model-identity.ts`.
  */
-export function formatProviderLabel(provider: CodingProvider, boundModel?: string): string {
+export function formatProviderLabel(provider: CodingProvider, runModel?: string): string {
   const name = provider.providerName ?? provider.name;
-  const model = boundModel ?? provider.model;
+  const model = runModel ?? provider.model;
   return model ? `${name}/${model}` : name;
 }
 
