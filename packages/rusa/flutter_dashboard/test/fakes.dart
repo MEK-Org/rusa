@@ -354,13 +354,33 @@ class FakeApi extends DashboardApi {
   // ── Inbox routes ──
   Map<String, dynamic> inboxResult = {'entries': []};
 
+  /// Per-status pages, so a test can hold an outstanding entry and a resolved
+  /// one apart. Falls back to [inboxResult] for any status not set here.
+  final Map<String, Map<String, dynamic>> inboxResultsByStatus = {};
+
+  final markInboxHandledCalls =
+      <({String actorId, String entryId, String? reason})>[];
+  Object? markInboxHandledError;
+
   @override
   Future<Map<String, dynamic>> fetchInbox(
     String actorId, {
     String status = 'all',
     int limit = 20,
   }) async {
-    return inboxResult;
+    return inboxResultsByStatus[status] ?? inboxResult;
+  }
+
+  @override
+  Future<void> markInboxHandled(
+    String actorId,
+    String entryId, {
+    String? reason,
+  }) async {
+    markInboxHandledCalls
+        .add((actorId: actorId, entryId: entryId, reason: reason));
+    final err = markInboxHandledError;
+    if (err != null) throw err;
   }
 
   // ── Obligations routes ──

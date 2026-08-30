@@ -804,6 +804,95 @@ describe("handleMeshApiRequest", () => {
     expect(JSON.stringify(entry)).not.toContain(messageId);
   });
 
+  describe("POST /api/mesh/actors/:id/inbox/handled", () => {
+    const post = async (actorId: string, body: unknown) => {
+      const { res } = call(
+        deps,
+        "POST",
+        `/api/mesh/actors/${actorId}/inbox/handled`,
+        JSON.stringify(body)
+      );
+      await new Promise((resolve) => process.nextTick(resolve));
+      await new Promise((resolve) => process.nextTick(resolve));
+      return res;
+    };
+
+    const appendEntry = (id: string, actorId = UUID_A) => {
+      inbox.append([{ id, actorId, source: "mesh:root", payload: { type: "mesh.message" } }]);
+    };
+
+    it("clears the entry and stops it counting against the actor", async () => {
+      appendEntry("stale-entry");
+      expect(inbox.countUnhandled(UUID_A)).toBe(1);
+
+      const res = await post(UUID_A, { entryId: "stale-entry", reason: "run cancelled by hand" });
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toMatchObject({ ok: true, alreadyHandled: false });
+      // The point of the feature: the actor is no longer queued for it.
+      expect(inbox.countUnhandled(UUID_A)).toBe(0);
+      expect(inbox.actorsWithUnhandled().map((a) => a.actorId)).not.toContain(UUID_A);
+    });
+
+    it("names the operator in the note, with and without a reason", async () => {
+      appendEntry("with-reason");
+      appendEntry("without-reason");
+
+      await post(UUID_A, { entryId: "with-reason", reason: "prod sent this to staging" });
+      await post(UUID_A, { entryId: "without-reason" });
+
+      const notes = inbox
+        .list(UUID_A, { status: "handled" })
+        .entries.map((entry) => entry.handledNote);
+      // Attribution is unconditional: a note is the only thing distinguishing
+      // an operator's dismissal from the actor's own account of its work.
+      expect(notes).toContain(
+        "Cleared from the dashboard by the operator: prod sent this to staging"
+      );
+      expect(notes).toContain("Cleared from the dashboard by the operator; no reason given.");
+    });
+
+    it("reports a second clear without overwriting the first note", async () => {
+      appendEntry("double-clicked");
+      await post(UUID_A, { entryId: "double-clicked", reason: "first" });
+
+      const res = await post(UUID_A, { entryId: "double-clicked", reason: "second" });
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).alreadyHandled).toBe(true);
+      expect(inbox.read(UUID_A, "double-clicked")?.handledNote).toBe(
+        "Cleared from the dashboard by the operator: first"
+      );
+    });
+
+    it("404s an entry belonging to a different actor", async () => {
+      appendEntry("owned-by-a", UUID_A);
+
+      const res = await post(UUID_B, { entryId: "owned-by-a" });
+
+      expect(res.statusCode).toBe(404);
+      // Still unhandled for its real owner — the wrong actor cannot clear it.
+      expect(inbox.countUnhandled(UUID_A)).toBe(1);
+    });
+
+    it("rejects a missing entryId and an over-long reason", async () => {
+      appendEntry("long-reason");
+
+      expect((await post(UUID_A, {})).statusCode).toBe(400);
+      const tooLong = await post(UUID_A, { entryId: "long-reason", reason: "x".repeat(2001) });
+      expect(tooLong.statusCode).toBe(400);
+      expect(inbox.countUnhandled(UUID_A)).toBe(1);
+    });
+
+    it("503s when no inbox is bound", async () => {
+      const bound = deps.inbox;
+      deps.inbox = undefined;
+      const res = await post(UUID_A, { entryId: "anything" });
+      deps.inbox = bound;
+      expect(res.statusCode).toBe(503);
+    });
+  });
+
   it("GET /api/mesh/events filters by kind", () => {
     meshEvents.record({ kind: "run_start", actorId: UUID_A, detail: "s" });
     meshEvents.record({ kind: "message_sent", actorId: UUID_A, detail: "m" });

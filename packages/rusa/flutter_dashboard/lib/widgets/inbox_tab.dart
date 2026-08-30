@@ -270,6 +270,112 @@ class _InboxTabState extends State<InboxTab> {
     );
   }
 
+  /// Clear an entry the actor should not have to answer. The reason is
+  /// optional — the ask in #66 is to remove friction, not add a form — but the
+  /// server records the operator as the party who cleared it either way.
+  Future<void> _dismiss(Map<String, dynamic> entry) async {
+    final entryId = entry['id']?.toString() ?? '';
+    if (entryId.isEmpty) return;
+    final reason = await _askDismissReason(entry);
+    if (reason == null) return;
+    try {
+      await widget.store.api.markInboxHandled(
+        widget.actorId,
+        entryId,
+        reason: reason.isEmpty ? null : reason,
+      );
+      _refresh();
+    } catch (err) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to dismiss: $err'),
+          backgroundColor: MeshColors.statusHalted,
+        ),
+      );
+    }
+  }
+
+  /// Returns the operator's reason, `''` for none, or `null` if they backed out.
+  Future<String?> _askDismissReason(Map<String, dynamic> entry) {
+    final reasonCtrl = TextEditingController();
+    final source = entry['source']?.toString() ?? '';
+    return showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: MeshColors.bgSecondary,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(10),
+          side: const BorderSide(color: MeshColors.border),
+        ),
+        title: const Text(
+          'Dismiss inbox signal',
+          style: TextStyle(
+            color: MeshColors.textPrimary,
+            fontSize: 16,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        content: SizedBox(
+          width: 420,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                source.isEmpty ? entry['id']?.toString() ?? '' : source,
+                style: const TextStyle(
+                  color: MeshColors.accent,
+                  fontSize: 12,
+                  fontFamily: kMonoFontFamily,
+                ),
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                'The actor will no longer be queued for this signal. It is '
+                'recorded as cleared by the operator.',
+                style: TextStyle(color: MeshColors.textMuted, fontSize: 12, height: 1.4),
+              ),
+              const SizedBox(height: 14),
+              TextField(
+                controller: reasonCtrl,
+                autofocus: true,
+                maxLines: 2,
+                style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13),
+                decoration: const InputDecoration(
+                  labelText: 'Reason (optional)',
+                  labelStyle: TextStyle(color: MeshColors.textSecondary, fontSize: 12),
+                  hintText: 'e.g. run cancelled by hand; nothing left to answer',
+                  hintStyle: TextStyle(color: MeshColors.textMuted, fontSize: 12),
+                  filled: true,
+                  fillColor: MeshColors.bgPrimary,
+                  border: OutlineInputBorder(borderSide: BorderSide(color: MeshColors.border)),
+                  contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                ),
+                onSubmitted: (value) => Navigator.of(dialogContext).pop(value.trim()),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            style: TextButton.styleFrom(foregroundColor: MeshColors.textSecondary),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(dialogContext).pop(reasonCtrl.text.trim()),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: MeshColors.accent,
+              foregroundColor: MeshColors.bgPrimary,
+            ),
+            child: const Text('Dismiss'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _sectionPanel(List<dynamic> entries) => DecoratedBox(
         decoration: BoxDecoration(
           color: MeshColors.bgSecondary,
@@ -326,6 +432,23 @@ class _InboxTabState extends State<InboxTab> {
                   color: MeshColors.textMuted,
                   fontSize: 11,
                   fontFamily: kMonoFontFamily,
+                ),
+              ),
+            ],
+            // Only an outstanding entry is dismissible. A resolved one already
+            // carries someone's account of it, and the server will not let a
+            // second clear overwrite that note.
+            if (!handled) ...[
+              const SizedBox(width: 8),
+              TextButton.icon(
+                onPressed: () => _dismiss(e),
+                icon: const Icon(Icons.check_circle_outline, size: 14),
+                label: const Text('Dismiss', style: TextStyle(fontSize: 11)),
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  foregroundColor: MeshColors.textSecondary,
                 ),
               ),
             ],
