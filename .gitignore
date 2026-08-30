@@ -23,6 +23,10 @@ build/
 meta_coder_dashboard.iml
 .antigravitycli/
 
+# Claude Code local state: settings, agents, and the scratch git worktrees it
+# creates under .claude/worktrees. Entirely local — never committed.
+.claude/
+
 # Generated e2e run reports (pnpm e2e report) — local artifacts, never committed.
 e2e-reports/
 
