@@ -259,6 +259,9 @@ Use a plain \`git clone\` — never \`--single-branch\` or \`--depth\`. Those na
 \`remote.origin.fetch\`, and after that \`git fetch\` exits 0 with no output forever
 while every branch outside the refspec silently stops advancing, so reads off
 \`origin/<branch>\` stay confidently stale.
+After cloning, you must always run:
+\`git submodule update --init --recursive\`
+to fetch required workspace packages from submodules.
 When you change code: work on a branch namespaced to you (e.g.
 \`rusa/${shortId}/<short-topic>\`) so you never collide, commit, push, and open a PR
 with your tools. Your charter defines the scope — it may span several repos or
