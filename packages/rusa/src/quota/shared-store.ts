@@ -21,10 +21,24 @@ export const QUOTA_RAW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
  */
 export const QUOTA_OBSERVATION_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
-// The product requirement is a PD controller. These are deliberately fixed
+// The product requirement is a PID controller. These are deliberately fixed
 // implementation constants rather than configuration that no caller uses.
 export const QUOTA_KP_SECONDS_PER_POINT = 120;
 export const QUOTA_KD_SECONDS_SQUARED_PER_POINT = 1800;
+/**
+ * Integral time: how long a standing error must persist before the integral
+ * term contributes as much period as the proportional term already does. One
+ * hour is deliberately conservative for this five-minute observation loop and
+ * is twice the existing derivative filter's time constant.
+ */
+export const QUOTA_INTEGRAL_TIME_SECONDS = 3600;
+export const QUOTA_KI_SECONDS_PER_POINT_SECOND =
+  QUOTA_KP_SECONDS_PER_POINT / QUOTA_INTEGRAL_TIME_SECONDS;
+/**
+ * Largest observation gap integrated as a single step. Never infer more area
+ * than one normal five-minute observation slot from an unobserved gap.
+ */
+export const QUOTA_INTEGRAL_MAX_STEP_SECONDS = SLOT_MS / 1000;
 export const QUOTA_DERIVATIVE_TAU_SECONDS = 1800;
 export const QUOTA_ACTUATOR_SMOOTHING = 0.25;
 export const QUOTA_MAX_SLEW_SECONDS = 900;
@@ -126,6 +140,7 @@ interface ReasonedObservation {
   uncappedIntervalSeconds: number;
   controllerError: number;
   controllerDerivative: number;
+  controllerIntegral: number | null;
   percentLeft: number;
   observedAt: string;
 }
@@ -142,7 +157,7 @@ interface StoredScrapeRow {
 /**
  * WAL-backed quota storage shared by every instance using the same provider
  * credentials. Raw evidence is retained for 30 days; compact canonical
- * observations and controller memory remain durable.
+ * observations and PID controller memory remain durable.
  */
 export class SharedQuotaStore {
   readonly db: Database.Database;
@@ -152,9 +167,9 @@ export class SharedQuotaStore {
   constructor(readonly databasePath: string) {
     mkdirSync(dirname(databasePath), { recursive: true });
     this.db = new Database(databasePath);
+    this.db.pragma("busy_timeout = 10000");
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
-    this.db.pragma("busy_timeout = 10000");
     this.ensureSchema();
   }
 
@@ -198,6 +213,7 @@ export class SharedQuotaStore {
         processed INTEGER NOT NULL DEFAULT 0,
         controller_error REAL,
         controller_derivative REAL,
+        controller_integral REAL,
         uncapped_interval_seconds REAL,
         interval_seconds REAL,
         PRIMARY KEY(provider, kind, observed_slot)
@@ -212,6 +228,29 @@ export class SharedQuotaStore {
         ON quota_observations(provider, kind, observed_at DESC)
         WHERE interval_seconds IS NOT NULL;
     `);
+    this.ensureColumns();
+  }
+
+  /**
+   * `CREATE TABLE IF NOT EXISTS` is a no-op against a database created before a
+   * column existed, so widen those tables in place. The shared quota database is
+   * opened directly by every instance rather than through the instance migration
+   * runner, so its schema has to evolve here.
+   */
+  private ensureColumns(): void {
+    const widen = this.db.transaction(() => {
+      const columns = new Set(
+        (
+          this.db.prepare("PRAGMA table_info(quota_observations)").all() as Array<{ name: string }>
+        ).map((column) => column.name)
+      );
+      if (!columns.has("controller_integral")) {
+        this.db.exec("ALTER TABLE quota_observations ADD COLUMN controller_integral REAL");
+      }
+    });
+    // Every process acquires the write reservation before inspecting the
+    // schema, so a waiter rechecks after the winning ALTER has committed.
+    widen.immediate();
   }
 
   pruneRawScrapes(nowMs = Date.now()): number {
@@ -372,6 +411,7 @@ export class SharedQuotaStore {
         `SELECT interval_seconds AS intervalSeconds,
                 controller_error AS controllerError,
                 controller_derivative AS controllerDerivative,
+                controller_integral AS controllerIntegral,
                 observed_at AS observedAt, reset_at_iso AS resetAtIso
          FROM quota_observations
          WHERE provider = ? AND kind = ? AND interval_seconds IS NOT NULL
@@ -382,6 +422,7 @@ export class SharedQuotaStore {
           intervalSeconds: number;
           controllerError: number;
           controllerDerivative: number;
+          controllerIntegral: number | null;
           observedAt: string;
           resetAtIso: string | null;
         }
@@ -407,12 +448,32 @@ export class SharedQuotaStore {
       dtSeconds > 0 ? dtSeconds / (QUOTA_DERIVATIVE_TAU_SECONDS + dtSeconds) : 1;
     const previousDerivative = cycleChanged ? 0 : (previous?.controllerDerivative ?? 0);
     const derivative = previousDerivative + derivativeAlpha * (rawDerivative - previousDerivative);
-    const uncappedCandidate = Math.max(
-      0,
-      QUOTA_KP_SECONDS_PER_POINT * error + QUOTA_KD_SECONDS_SQUARED_PER_POINT * derivative
-    );
-    // A rollover resets the derivative, not the actuator. This resumes from
-    // the last reasoned period rather than treating the exhaustion wait as one.
+    const integralDtSeconds = cycleChanged
+      ? 0
+      : Math.min(dtSeconds, QUOTA_INTEGRAL_MAX_STEP_SECONDS);
+    const previousIntegral = cycleChanged ? 0 : (previous?.controllerIntegral ?? 0);
+    const candidateIntegral = previousIntegral + error * integralDtSeconds;
+    const rawWithoutIntegral =
+      QUOTA_KP_SECONDS_PER_POINT * error + QUOTA_KD_SECONDS_SQUARED_PER_POINT * derivative;
+    const rawInterval = (accumulated: number) =>
+      rawWithoutIntegral + QUOTA_KI_SECONDS_PER_POINT_SECOND * accumulated;
+    // Conditional-integration anti-windup. Accept the portion of this step that
+    // reaches a raw actuator bound, but do not add area beyond it. If earlier
+    // state is already beyond today's reachable bound, hold it rather than
+    // fabricating opposite-signed area; a later reversing error can unwind it.
+    const candidateRaw = rawInterval(candidateIntegral);
+    let integral = candidateIntegral;
+    if (error > 0 && candidateRaw > opts.maxIntervalSeconds) {
+      const upperBound =
+        (opts.maxIntervalSeconds - rawWithoutIntegral) / QUOTA_KI_SECONDS_PER_POINT_SECOND;
+      integral = Math.min(candidateIntegral, Math.max(previousIntegral, upperBound));
+    } else if (error < 0 && candidateRaw < 0) {
+      const lowerBound = -rawWithoutIntegral / QUOTA_KI_SECONDS_PER_POINT_SECOND;
+      integral = Math.max(candidateIntegral, Math.min(previousIntegral, lowerBound));
+    }
+    const uncappedCandidate = Math.max(0, rawInterval(integral));
+    // A rollover resets the controller memory, not the actuator. This resumes
+    // from the last reasoned period rather than treating the exhaustion wait as one.
     const previousInterval = previous?.intervalSeconds ?? 0;
     const smoothed =
       previousInterval + QUOTA_ACTUATOR_SMOOTHING * (uncappedCandidate - previousInterval);
@@ -429,12 +490,13 @@ export class SharedQuotaStore {
       .prepare(
         `UPDATE quota_observations
          SET processed = 1, controller_error = ?, controller_derivative = ?,
-             uncapped_interval_seconds = ?, interval_seconds = ?
+             controller_integral = ?, uncapped_interval_seconds = ?, interval_seconds = ?
          WHERE provider = ? AND kind = ? AND observed_slot = ?`
       )
       .run(
         error,
         derivative,
+        integral,
         uncappedInterval,
         interval,
         observation.provider,
@@ -485,6 +547,7 @@ export class SharedQuotaStore {
                 uncapped_interval_seconds AS uncappedIntervalSeconds,
                 controller_error AS controllerError,
                 controller_derivative AS controllerDerivative,
+                controller_integral AS controllerIntegral,
                 percent_left AS percentLeft, observed_at AS observedAt
          FROM quota_observations o
          WHERE provider = ? AND interval_seconds IS NOT NULL
