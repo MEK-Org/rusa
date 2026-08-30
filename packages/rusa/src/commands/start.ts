@@ -1447,6 +1447,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     recordChat: (opts) => getRepositories().meshChat.record(opts),
     capabilityGrants,
     eventSubscriptions,
+    // Ownership authority for issue/PR event sources: a live
+    // obligation's owner governs its linked source and supersedes any manual
+    // delegation on it.
+    //
+    // Resolved lazily, like `recordChat` above: the repository container is not
+    // guaranteed to exist when the mesh is constructed, and reaching for it
+    // here rather than at routing time hangs boot.
+    obligations: {
+      findLiveByExternalRef: (ref) => getRepositories().obligations.findLiveByExternalRef(ref),
+    },
     inboxStore,
     onInboxEntriesSeen: (_actorId, entries) =>
       reactToQueuedInboxEntries(issueClient, entries, console.warn, chatClient ?? undefined),

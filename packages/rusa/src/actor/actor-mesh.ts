@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
 import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../mcp/stamp.js";
+import { isActorEntityId } from "../obligations/obligation.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import {
   type CapabilityGrantStore,
@@ -16,6 +17,7 @@ import {
   type EventResource,
   type EventSubscription,
   type EventSubscriptionStore,
+  eventResourceReference,
   InMemoryEventSubscriptionStore,
   parentOf,
   resourceKey,
@@ -335,6 +337,12 @@ export interface ActorMeshOptions {
    */
   capabilityGrants?: CapabilityGrantStore;
   eventSubscriptions?: EventSubscriptionStore;
+  /**
+   * Ownership authority for issue/PR event sources. Optional: without
+   * it, routing falls back entirely to subscriptions, which is what every mesh
+   * built before obligations existed does.
+   */
+  obligations?: { findLiveByExternalRef(ref: string): { ownerId: string } | null };
   /** Durable actor inbox used for singleton wake recovery. Optional for isolated tests. */
   inboxStore?: InboxStore;
   /** General lifecycle hook matching onYield. */
@@ -409,6 +417,9 @@ export class ActorMesh {
   }) => string;
   private readonly grants: CapabilityGrantStore;
   private readonly eventSubscriptions: EventSubscriptionStore;
+  private readonly obligations?: {
+    findLiveByExternalRef(ref: string): { ownerId: string } | null;
+  };
   private readonly inboxStore?: InboxStore;
   private readonly onQueued?: ActorMeshOptions["onQueued"];
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
@@ -455,6 +466,7 @@ export class ActorMesh {
     this.validateModel = opts.validateModel;
     this.grants = opts.capabilityGrants ?? new InMemoryCapabilityGrantStore();
     this.eventSubscriptions = opts.eventSubscriptions ?? new InMemoryEventSubscriptionStore();
+    this.obligations = opts.obligations;
     this.inboxStore = opts.inboxStore;
     this.onQueued = opts.onQueued;
     this.onInboxEntriesSeen = opts.onInboxEntriesSeen;
@@ -1194,6 +1206,29 @@ export class ActorMesh {
     // Atomicity Invariant: The check `this.live.has(sub.actorId)` and the delivery
     // via `requestRun` happen in the same synchronous section with no await.
     while (current) {
+      // The obligation store is the ownership authority for linked issue/PR
+      // work. Consulted before the subscription store at every rung of
+      // the climb, so a live obligation supersedes any manual delegation on the
+      // same source — and so a comment event resolves to the obligation on its
+      // issue one level up, which the path grammar makes free.
+      //
+      // Derived, never written: nothing here deactivates a subscription. The
+      // prior subscriber is superseded rather than destroyed, which keeps the
+      // audit history intact and makes replay and restart reconstruct the same
+      // answer with no chance of reviving a stale owner.
+      const governing = this.obligationOwnerFor(current);
+      if (governing) {
+        // A human owner stops the walk without producing a destination. Falling
+        // through would hand their work to whichever actor happened to be
+        // subscribed earlier, which is precisely the stale authority this
+        // overlay forbids; their attention belongs on the dashboard surface.
+        if (!isActorEntityId(governing)) return destinations;
+        if (this.live.has(governing) && !destinations.includes(governing)) {
+          destinations.push(governing);
+          return destinations;
+        }
+      }
+
       const activeSubs = this.eventSubscriptions.activeForResource(current);
       for (const sub of activeSubs) {
         if (
@@ -1226,6 +1261,20 @@ export class ActorMesh {
     }
 
     return destinations;
+  }
+
+  /**
+   * The owner of the live obligation claiming this event source, if any.
+   *
+   * Returns an entity id, which may be a human — the caller decides what that
+   * means for routing. Absent an obligation repository (a mesh built without
+   * one, as in many tests) this is always undefined and routing is unchanged.
+   */
+  private obligationOwnerFor(resource: EventResource): string | undefined {
+    if (!this.obligations) return undefined;
+    const reference = eventResourceReference(resource);
+    if (!reference) return undefined;
+    return this.obligations.findLiveByExternalRef(reference.key)?.ownerId;
   }
 
   private effectiveOwnerOf(
