@@ -1,7 +1,7 @@
 import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted, type RUN_TERMINAL_EVENT_KINDS } from "../actor/mesh-events.js";
 import type { ThreadRecord } from "../actor/thread-registry.js";
-import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
+import type { MeshEvent, MeshEventKind } from "../db/repositories/mesh-event-repository.js";
 
 export type CommitmentKind =
   | "actor_completion"
@@ -144,6 +144,98 @@ const PROGRESS_KINDS: ReadonlySet<string> = new Set([
   "event_source_subscribed",
   "event_source_unsubscribed",
 ]);
+
+/**
+ * What the projection reads from an event of each kind: nothing at all, its
+ * fields, or its fields *and* its `body`.
+ *
+ * This exists because the reader pays for every byte it does not read.
+ * `projectOpenCommitments` is a fold over the whole history, and the dashboard
+ * handed it one via `meshEvents.list()` — `SELECT e.*`, every kind, bodies
+ * included. On the live mesh that was 74,015 rows carrying 185 MB of strings
+ * and 579 MB of RSS per call, to answer questions that touch 46,086 rows and
+ * 23 MB. `run_end` bodies alone are 138 MB of run transcripts, and nothing
+ * here reads one.
+ *
+ * A total `Record` over `MeshEventKind` on purpose, the same reason
+ * {@link RUN_TERMINAL_PROGRESS_RULES} is one: a new kind fails to compile until
+ * somebody decides whether the ledger reads it. The dangerous direction is
+ * `ignored` on a kind that matters — the projection would quietly stop seeing
+ * it, and a set of kinds cannot express that omission as an error, only as an
+ * absence nobody notices. `commitment-ledger.filter.test.ts` holds the claim to
+ * account: every `ignored` kind must demonstrably change nothing, and every
+ * non-`fields-and-body` kind's body must change nothing.
+ */
+type LedgerRead = "ignored" | "fields" | "fields-and-body";
+
+const LEDGER_READS: Readonly<Record<MeshEventKind, LedgerRead>> = {
+  // Progress, and the events the per-actor branches key off.
+  actor_spawned: "fields",
+  actor_revived: "fields",
+  actor_charter_set: "fields",
+  actor_model_set: "fields",
+  handle_granted: "fields",
+  capability_granted: "fields",
+  capability_revoked: "fields",
+  run_start: "fields",
+  run_continued: "fields",
+  run_end: "fields",
+  run_abandoned: "fields",
+  continuation_capped: "fields",
+  actor_retired: "fields",
+  scheduled_wake: "fields",
+  event_source_subscribed: "fields",
+  event_source_unsubscribed: "fields",
+
+  // The two kinds whose prose is evidence: a yield note carries `waiting on`,
+  // and a sent message carries the tracking/resolved lines.
+  run_yielded: "fields-and-body",
+  message_sent: "fields-and-body",
+
+  // Read by nobody here. Each is either the scheduler acting rather than the
+  // actor (`run_queued`, `run_coalesced`, `run_abandoned`'s queued half), a
+  // finer-grained facet of a run this projection already sees whole
+  // (`run_first_chunk`, `portable_context_compacted`), or an effect on some
+  // system other than the mesh's own commitments.
+  root_control_action: "ignored",
+  message_received: "ignored",
+  actor_reparented: "ignored",
+  run_queued: "ignored",
+  run_first_chunk: "ignored",
+  portable_context_compacted: "ignored",
+  run_coalesced: "ignored",
+  stamp_invalid: "ignored",
+  host_job_submitted: "ignored",
+  host_job_stopped: "ignored",
+  host_job_exited: "ignored",
+  email_sent: "ignored",
+  calendar_read: "ignored",
+  drive_read: "ignored",
+  calendar_write: "ignored",
+};
+
+const ledgerKindsWhere = (...reads: LedgerRead[]): readonly MeshEventKind[] =>
+  Object.entries(LEDGER_READS)
+    .filter(([, read]) => reads.includes(read))
+    .map(([kind]) => kind as MeshEventKind);
+
+/**
+ * The only kinds {@link projectOpenCommitments} reads. Feeding it any other
+ * event changes nothing it returns, so a reader may filter them out in SQL and
+ * never materialise them.
+ */
+export const COMMITMENT_LEDGER_KINDS: readonly MeshEventKind[] = ledgerKindsWhere(
+  "fields",
+  "fields-and-body"
+);
+
+/**
+ * The only kinds whose `body` it reads. Subset of {@link COMMITMENT_LEDGER_KINDS}
+ * by construction — both are derived from the one table, so they cannot drift
+ * into a body that is fetched for a kind that was filtered out.
+ */
+export const COMMITMENT_LEDGER_BODY_KINDS: readonly MeshEventKind[] =
+  ledgerKindsWhere("fields-and-body");
 
 /**
  * Did this event show the actor doing something?

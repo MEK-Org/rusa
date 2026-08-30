@@ -3,6 +3,8 @@ import { z } from "zod";
 import type { ThreadRegistry } from "../actor/thread-registry.js";
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import {
+  COMMITMENT_LEDGER_BODY_KINDS,
+  COMMITMENT_LEDGER_KINDS,
   type CommitmentThresholds,
   DEFAULT_COMMITMENT_THRESHOLDS,
   projectOpenCommitments,
@@ -74,7 +76,9 @@ export function createStuckLoopDetectorMcpServer(
         return toolOk(
           projectOpenCommitments({
             threads: deps.registry.list(),
-            events: deps.meshEvents.list(),
+            events: deps.meshEvents.listByKinds(COMMITMENT_LEDGER_KINDS, {
+              bodyKinds: COMMITMENT_LEDGER_BODY_KINDS,
+            }),
             now: now ? new Date(now) : undefined,
             minConfidence: min_confidence,
             ownerActorId: owner_actor_id,
