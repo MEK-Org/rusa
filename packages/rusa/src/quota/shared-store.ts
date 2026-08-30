@@ -154,6 +154,50 @@ interface StoredScrapeRow {
   parse_error: string | null;
 }
 
+/** How long an opener will wait for a lock held by another instance. */
+const BUSY_TIMEOUT_MS = 10_000;
+
+/**
+ * Block this thread: the store is constructed synchronously, so there is no
+ * turn of the event loop to await on.
+ */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Widen a legacy rollback-journal database to WAL, waiting out any instance
+ * that is doing the same thing at the same moment.
+ *
+ * `busy_timeout` does not cover this call, which is why it is not enough to
+ * raise it. The conversion needs an EXCLUSIVE lock, and when a peer already
+ * holds RESERVED — exactly what another opener holds partway through its own
+ * conversion — SQLite skips the busy handler to avoid a deadlock and returns
+ * SQLITE_BUSY immediately. Measured against a peer in `BEGIN IMMEDIATE`: 1ms,
+ * versus the full 10s wait when that peer holds only SHARED. So the opener has
+ * to come back and ask again; no timeout value substitutes for that.
+ *
+ * The wait is jittered because the openers that collide here are by
+ * construction running the same code at the same instant, and a fixed backoff
+ * would march them into the same collision together.
+ *
+ * Reachable only while a database is still pre-WAL: once converted, this
+ * pragma is a no-op that takes no exclusive lock.
+ */
+function widenToWal(db: Database.Database): void {
+  const deadline = Date.now() + BUSY_TIMEOUT_MS;
+  for (;;) {
+    try {
+      db.pragma("journal_mode = WAL");
+      return;
+    } catch (error) {
+      const busy = (error as { code?: string } | null)?.code === "SQLITE_BUSY";
+      if (!busy || Date.now() >= deadline) throw error;
+      sleepSync(Math.ceil(1 + Math.random() * 25));
+    }
+  }
+}
+
 /**
  * WAL-backed quota storage shared by every instance using the same provider
  * credentials. Raw evidence is retained for 30 days; compact canonical
@@ -167,8 +211,8 @@ export class SharedQuotaStore {
   constructor(readonly databasePath: string) {
     mkdirSync(dirname(databasePath), { recursive: true });
     this.db = new Database(databasePath);
-    this.db.pragma("busy_timeout = 10000");
-    this.db.pragma("journal_mode = WAL");
+    this.db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
+    widenToWal(this.db);
     this.db.pragma("foreign_keys = ON");
     this.ensureSchema();
   }
