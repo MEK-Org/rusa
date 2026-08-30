@@ -234,6 +234,78 @@ describe("refreshConfiguredProviderModelCatalogs", () => {
     expect(mockScrapeCodex).toHaveBeenCalled();
     expect(mockScrapeAgy).toHaveBeenCalled();
   });
+
+  it("hands every prober the caller's abort signal", async () => {
+    const mockScrapeCodex = vi.fn().mockResolvedValue("codex screen");
+    const mockScrapeAgy = vi.fn().mockResolvedValue("agy screen");
+    const controller = new AbortController();
+
+    const config = {
+      providers: { codex: { command: "codex" }, agy: { command: "agy" } },
+    } as unknown as RusaConfig;
+
+    await refreshConfiguredProviderModelCatalogs({
+      config,
+      workersDir: "/tmp/test-workers",
+      signal: controller.signal,
+      probers: { scrapeCodex: mockScrapeCodex, scrapeAgy: mockScrapeAgy },
+    });
+
+    // Identity, not just presence: the probers honour a signal already, so what
+    // was broken is that they were handed nobody's - the owner's signal has to
+    // arrive intact at the leaf for an abort to reach a running probe.
+    expect(mockScrapeCodex.mock.calls[0]?.[0]?.signal).toBe(controller.signal);
+    expect(mockScrapeAgy.mock.calls[0]?.[0]?.signal).toBe(controller.signal);
+  });
+
+  it("starts no probe at all when the signal is already aborted", async () => {
+    const mockScrapeCodex = vi.fn().mockResolvedValue("codex screen");
+    const mockScrapeAgy = vi.fn().mockResolvedValue("agy screen");
+    const controller = new AbortController();
+    controller.abort();
+
+    const config = {
+      providers: { codex: { command: "codex" }, agy: { command: "agy" } },
+    } as unknown as RusaConfig;
+
+    await refreshConfiguredProviderModelCatalogs({
+      config,
+      workersDir: "/tmp/test-workers",
+      signal: controller.signal,
+      probers: { scrapeCodex: mockScrapeCodex, scrapeAgy: mockScrapeAgy },
+    });
+
+    // Aborting a probe that never started is not the same as not starting it:
+    // a spawned-then-aborted codex probe still leaves a temp dir behind.
+    expect(mockScrapeCodex).not.toHaveBeenCalled();
+    expect(mockScrapeAgy).not.toHaveBeenCalled();
+  });
+
+  it("reports an aborted provider as unknown without logging a provider failure", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const res = await refreshProviderModelCatalog({
+        provider: "codex",
+        workersDir: "/tmp/test-workers",
+        signal: controller.signal,
+        probers: { scrapeCodex: vi.fn().mockResolvedValue("codex screen") },
+      });
+
+      expect(res.status).toBe("unknown");
+      // A restart aborts one probe per configured provider. Routing that through
+      // the failure log would print an error line per provider on every restart,
+      // for a decision the owner made itself.
+      expect(errorSpy).not.toHaveBeenCalled();
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
 });
 
 describe("scrapeCodexModelScreen", () => {
