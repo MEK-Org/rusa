@@ -126,7 +126,7 @@ class _OverviewTabState extends State<OverviewTab> {
     );
   }
 
-  /// Remaining quota over the prior 3 days, backed by durable provider scrapes.
+  /// Quota pacing over the prior 3 days, backed by durable provider scrapes.
   Widget _buildQuotaPoolsCard() {
     return StreamBuilder<List<Object?>>(
       stream: Rx.combineLatest2<QuotaHistoryDto?, bool, List<Object?>>(
@@ -150,15 +150,13 @@ class _OverviewTabState extends State<OverviewTab> {
               _sectionHeader(
                 Icons.show_chart,
                 MeshColors.accent,
-                'Weekly Quota Remaining — Prior 3 Days',
+                'Quota Pacing — Prior 3 Days',
               ),
               const SizedBox(height: 4),
-              Text(
-                'predicate: first normalized weekly window used by each provider ring',
-                style: kMonoStyle.copyWith(
-                  color: MeshColors.textMuted,
-                  fontSize: 11,
-                ),
+              const Text(
+                'How each provider has been pacing through its weekly quota '
+                'over the last three days.',
+                style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
               ),
               const SizedBox(height: 14),
               if (history == null)
@@ -259,12 +257,10 @@ class _OverviewTabState extends State<OverviewTab> {
                     trailing: trailingControls,
                   ),
                   const SizedBox(height: 4),
-                  Text(
-                    'predicate: owner == \'human:operator\' (ready first, tap item or focus link to open in Work)',
-                    style: kMonoStyle.copyWith(
-                      color: MeshColors.textMuted,
-                      fontSize: 11,
-                    ),
+                  const Text(
+                    'The obligations you own, with the ones ready to work on '
+                    'first. Tap an obligation to open it in Work.',
+                    style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
                   ),
                   const SizedBox(height: 14),
                   if (snap.connectionState != ConnectionState.done && snap.data == null)
@@ -553,12 +549,9 @@ class _OverviewTabState extends State<OverviewTab> {
                 ),
               ),
               const SizedBox(height: 4),
-              Text(
-                'predicate: thread.runState == \'running\' (tap card to select & navigate)',
-                style: kMonoStyle.copyWith(
-                  color: MeshColors.textMuted,
-                  fontSize: 11,
-                ),
+              const Text(
+                'The actors working right now. Tap one to open it.',
+                style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
               ),
               const SizedBox(height: 14),
               if (runningThreads.isEmpty)
@@ -672,9 +665,10 @@ class _OverviewTabState extends State<OverviewTab> {
                 ),
               ),
               const SizedBox(height: 4),
-              Text(
-                'provider queue heads show their exact eligible-start time',
-                style: kMonoStyle.copyWith(color: MeshColors.textMuted, fontSize: 11),
+              const Text(
+                'The actors waiting for a provider slot. The actor at the head '
+                'of each provider queue shows when its slot opens.',
+                style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
               ),
               const SizedBox(height: 14),
               if (queued.isEmpty)
@@ -776,12 +770,10 @@ class _OverviewTabState extends State<OverviewTab> {
                 ),
               ),
               const SizedBox(height: 4),
-              Text(
-                'predicate: kind == \'run_yielded\' events sorted newest-first',
-                style: kMonoStyle.copyWith(
-                  color: MeshColors.textMuted,
-                  fontSize: 11,
-                ),
+              const Text(
+                'The most recent times an actor paused and handed control '
+                'back, newest first.',
+                style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
               ),
               const SizedBox(height: 12),
               _buildYieldFilterBar(),

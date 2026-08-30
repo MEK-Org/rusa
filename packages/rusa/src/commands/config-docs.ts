@@ -46,6 +46,10 @@ Minimal example:
   rootActor:
     provider: antigravity
     # model: "Gemini 3.1 Pro (High)"   # optional; omit for the provider default
+    # context:                       # optional; omit for native provider sessions
+    #   type: portable
+    #   mode: ledger                # ledger (requires geminiApiKey) or tail
+    #   compactionModel: gemini-3.1-flash-lite
     # handle: ember-familiar           # optional; a secondary instance's own display handle 
     # avatar: /path/to/ember.jpg       # optional; overrides the bundled root avatar image
 
@@ -152,13 +156,19 @@ rootActor:
   fallbackModel            Optional string or list. Model(s) the root actor falls back to when the primary
                            model is overloaded or unavailable, tried in order via a freshly resolved
                            provider (root-only — ISSUE_NUM; providers.<name>.fallbackModel is rejected).
+  context                  Optional. Working-memory policy. Omit for native provider sessions, or set
+                           {type: portable, mode: ledger|tail}. Ledger mode requires geminiApiKey and
+                           optionally accepts compactionModel; tail mode never compacts.
   charter                  Optional. The root actor's standing charter, prepended to every wake. Built-in
                            default if omitted.
   handle                   Optional. Overrides the root actor's display handle (default: derived, "root-actor").
                            Lets a secondary instance sharing the bot account (e.g. staging) present under its own
                            identity in GitHub signing bylines, the dashboard, and its avatar .
+                           Also titles the dashboard page and names the installed PWA ("Ember Familiar").
   avatar                   Optional. Path to a root avatar image, overriding the bundled default. Falls back to
                            the bundled image when unset or the path doesn't resolve to an existing file.
+                           A root image — this or one uploaded from the dashboard — also becomes the dashboard's
+                           favicon and app icon (#48).
 
 webhook:
 

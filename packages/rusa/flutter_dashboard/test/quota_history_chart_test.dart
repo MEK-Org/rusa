@@ -38,7 +38,7 @@ void main() {
     ],
   );
 
-  testWidgets('plots only weekly remaining quota and labels the latest value', (
+  testWidgets('plots weekly headroom and throttle period, each with a key', (
     tester,
   ) async {
     tester.view.physicalSize = const Size(900, 1200);
@@ -60,29 +60,26 @@ void main() {
       ),
     );
 
-    expect(find.byKey(const Key('quota-history-chart')), findsOneWidget);
+    // The absolute remaining-quota chart is gone; headroom leads instead.
+    expect(find.byKey(const Key('quota-history-chart')), findsNothing);
     expect(find.byKey(const Key('quota-pace-error-chart')), findsOneWidget);
-    expect(find.text('Claude'), findsOneWidget);
+    expect(
+      find.byKey(const Key('quota-throttle-interval-chart')),
+      findsOneWidget,
+    );
+    expect(find.text('Quota Headroom'), findsOneWidget);
+    expect(find.text('Throttle Period'), findsOneWidget);
+    expect(
+      find.text('Pace-Controller Error — Delta from Target %'),
+      findsNothing,
+    );
+    // One color key per chart.
+    expect(find.text('Claude'), findsNWidgets(2));
     expect(find.text('Claude · Weekly'), findsNothing);
     expect(find.text('Claude · Session'), findsNothing);
     expect(find.text('55% · as of 2026-07-26T19:00:00.000Z'), findsNothing);
-    expect(
-      find.text('Pace-Controller Error — Delta from Target %'),
-      findsOneWidget,
-    );
-    expect(find.text('now'), findsNWidgets(3));
+    expect(find.text('now'), findsNWidgets(2));
     expect(find.byType(LinearProgressIndicator), findsNothing);
-
-    final paint = tester.widget<CustomPaint>(
-      find.byKey(const Key('quota-history-chart')),
-    );
-    final painter = paint.painter! as QuotaHistoryChartPainter;
-    expect(
-      painter.series.single.points.map((point) => point.remainingPercent),
-      [80, 55],
-    );
-    expect(painter.start, DateTime.parse('2026-07-23T20:00:00.000Z'));
-    expect(painter.end, DateTime.parse('2026-07-26T20:00:00.000Z'));
 
     final errorPaint = tester.widget<CustomPaint>(
       find.byKey(const Key('quota-pace-error-chart')),
@@ -91,6 +88,13 @@ void main() {
     expect(errorPainter.series.single.provider, 'claude');
     expect(errorPainter.start, DateTime.parse('2026-07-23T20:00:00.000Z'));
     expect(errorPainter.end, DateTime.parse('2026-07-26T20:00:00.000Z'));
+
+    final throttlePaint = tester.widget<CustomPaint>(
+      find.byKey(const Key('quota-throttle-interval-chart')),
+    );
+    final throttlePainter =
+        throttlePaint.painter! as QuotaThrottleIntervalChartPainter;
+    expect(throttlePainter.series.single.provider, 'claude');
   });
 
   testWidgets(
@@ -117,7 +121,7 @@ void main() {
         findsOneWidget,
       );
       expect(find.text('55% · as of 2026-07-26T19:00:00.000Z'), findsNothing);
-      expect(find.text('cached'), findsNWidgets(3));
+      expect(find.text('cached'), findsNWidgets(2));
       expect(find.text('now'), findsNothing);
     },
   );
@@ -144,8 +148,8 @@ void main() {
       find.text('No quota readings recorded in the prior 3 days.'),
       findsOneWidget,
     );
-    expect(find.byKey(const Key('quota-history-chart')), findsNothing);
     expect(find.byKey(const Key('quota-pace-error-chart')), findsNothing);
+    expect(find.byKey(const Key('quota-throttle-interval-chart')), findsNothing);
   });
 
   testWidgets(
@@ -226,4 +230,63 @@ void main() {
       ]);
     },
   );
+
+  group('ThrottleLogAxis', () {
+    QuotaHistorySeriesDto seriesWith(List<double?> intervals) =>
+        QuotaHistorySeriesDto(
+          provider: 'claude',
+          windowId: 'weekly',
+          label: 'Weekly',
+          points: [
+            for (var i = 0; i < intervals.length; i++)
+              QuotaHistoryPointDto(
+                observedAt: '2026-07-26T0$i:00:00.000Z',
+                remainingPercent: 50,
+                intervalSeconds: intervals[i],
+              ),
+          ],
+        );
+
+    test('rounds the observed range outward to whole decades', () {
+      final axis = ThrottleLogAxis.forSeries([
+        seriesWith([12.0, 340.0]),
+      ]);
+      expect(axis.minExponent, 1);
+      expect(axis.maxExponent, 3);
+      expect(axis.floorSeconds, 10.0);
+      expect(axis.ceilSeconds, 1000.0);
+    });
+
+    test('spaces readings logarithmically rather than linearly', () {
+      final axis = ThrottleLogAxis.forSeries([
+        seriesWith([1.0, 100.0]),
+      ]);
+      expect(axis.fractionOf(1), closeTo(0.0, 1e-9));
+      expect(axis.fractionOf(10), closeTo(0.5, 1e-9));
+      expect(axis.fractionOf(100), closeTo(1.0, 1e-9));
+      // A 2s change near the floor is far more visible than the same change
+      // near the ceiling — that is the point of the log scale.
+      final lowStep = axis.fractionOf(3) - axis.fractionOf(1);
+      final highStep = axis.fractionOf(100) - axis.fractionOf(98);
+      expect(lowStep, greaterThan(highStep * 10));
+    });
+
+    test('keeps a full decade for a flat series and pins sub-second readings', () {
+      final axis = ThrottleLogAxis.forSeries([
+        seriesWith([0.0, 0.25, null]),
+      ]);
+      expect(axis.minExponent, 0);
+      expect(axis.maxExponent, 1);
+      expect(axis.fractionOf(0), 0.0);
+      expect(axis.fractionOf(0.25), 0.0);
+    });
+
+    test('falls back to a default decade when no interval was recorded', () {
+      final axis = ThrottleLogAxis.forSeries([
+        seriesWith([null, null]),
+      ]);
+      expect(axis.floorSeconds, 1.0);
+      expect(axis.ceilSeconds, 10.0);
+    });
+  });
 }

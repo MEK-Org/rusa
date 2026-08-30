@@ -62,6 +62,57 @@ describe("loadConfig geminiApiKey (optional)", () => {
   });
 });
 
+describe("loadConfig rootActor.context", () => {
+  it("normalizes a valid portable ledger context", () => {
+    const config = loadConfig(
+      writeConfig({
+        rootActor: {
+          provider: "codex",
+          context: {
+            type: "portable",
+            mode: "ledger",
+            compactionModel: "  gemini-test  ",
+          },
+        },
+      })
+    );
+
+    expect(config.rootActor?.context).toEqual({
+      type: "portable",
+      mode: "ledger",
+      compactionModel: "gemini-test",
+    });
+  });
+
+  it.each([
+    [{ type: "portible", mode: "tail" }, /unknown context type/],
+    [{ type: "portable", mode: "typo" }, /unknown context selection/],
+    [
+      { type: "portable", mode: "tail", compactionModel: "gemini-test" },
+      /compactionModel is meaningless for tail mode/,
+    ],
+    [{ type: "native", mode: "tail" }, /mode is meaningless for native context/],
+  ])("rejects malformed or meaningless context %#", (context, message) => {
+    expect(() => loadConfig(writeConfig({ rootActor: { provider: "codex", context } }))).toThrow(
+      message
+    );
+  });
+
+  it("rejects ledger mode when no Gemini key is available", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          geminiApiKey: undefined,
+          rootActor: {
+            provider: "codex",
+            context: { type: "portable", mode: "ledger" },
+          },
+        })
+      )
+    ).toThrow(/portable ledger mode needs a Gemini API key/);
+  });
+});
+
 describe("loadConfig mistralApiKey (optional)", () => {
   it("keeps an explicit mistralApiKey", () => {
     expect(loadConfig(writeConfig({ mistralApiKey: "mistral-test" })).mistralApiKey).toBe(

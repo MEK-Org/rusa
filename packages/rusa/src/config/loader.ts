@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { assertSpawnContextSupported, resolveContextConfig } from "../actor/context-selection.js";
 import {
   GEMINI_API_KEY_SECRET_FILENAME,
   MISTRAL_API_KEY_SECRET_FILENAME,
@@ -222,6 +223,15 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   }
   if (!parsed.providers || Object.keys(parsed.providers).length === 0) {
     throw new Error("config.yaml: at least one provider is required");
+  }
+  if (parsed.rootActor?.context !== undefined) {
+    try {
+      parsed.rootActor.context = resolveContextConfig(parsed.rootActor.context);
+    } catch (err) {
+      throw new Error(
+        `config.yaml: rootActor.context: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
   }
   if (parsed.understanding?.rootNodeId !== undefined) {
     if (
@@ -544,6 +554,17 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   }
 
   applySecretFiles(parsed, mcHome);
+
+  try {
+    assertSpawnContextSupported(
+      { context: parsed.rootActor?.context },
+      { ledgerCompactionAvailable: Boolean(parsed.geminiApiKey?.trim()) }
+    );
+  } catch (err) {
+    throw new Error(
+      `config.yaml: rootActor.context: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
 
   return parsed;
 }
