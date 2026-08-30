@@ -27,20 +27,18 @@ export const QUOTA_KP_SECONDS_PER_POINT = 120;
 export const QUOTA_KD_SECONDS_SQUARED_PER_POINT = 1800;
 /**
  * Integral time: how long a standing error must persist before the integral
- * term contributes as much period as the proportional term already does. Set to
- * four times the derivative time (Kd/Kp = 900s), the conventional ratio that
- * keeps the lag the integrator adds clear of the derivative's phase lead.
+ * term contributes as much period as the proportional term already does. One
+ * hour is deliberately conservative for this five-minute observation loop and
+ * is twice the existing derivative filter's time constant.
  */
 export const QUOTA_INTEGRAL_TIME_SECONDS = 3600;
 export const QUOTA_KI_SECONDS_PER_POINT_SECOND =
   QUOTA_KP_SECONDS_PER_POINT / QUOTA_INTEGRAL_TIME_SECONDS;
 /**
- * Largest observation gap integrated as a single step. Observations normally
- * land one 5-minute slot apart, so this only bites after a restart or against
- * the lone reasoned row retention preserves as controller memory, where the
- * true gap can be days and would otherwise dump a huge area into the sum.
+ * Largest observation gap integrated as a single step. Never infer more area
+ * than one normal five-minute observation slot from an unobserved gap.
  */
-export const QUOTA_INTEGRAL_MAX_STEP_SECONDS = 3600;
+export const QUOTA_INTEGRAL_MAX_STEP_SECONDS = SLOT_MS / 1000;
 export const QUOTA_DERIVATIVE_TAU_SECONDS = 1800;
 export const QUOTA_ACTUATOR_SMOOTHING = 0.25;
 export const QUOTA_MAX_SLEW_SECONDS = 900;
@@ -97,8 +95,6 @@ export interface PersistedQuotaBucketStatus {
   timeRemainingPct: number;
   error: number;
   derivative: number;
-  /** Accumulated error in point-seconds; the integral term's own memory. */
-  integral: number;
   requiredIntervalSeconds: number;
   resetAtIso: string | null;
   observedAt: string;
@@ -171,9 +167,9 @@ export class SharedQuotaStore {
   constructor(readonly databasePath: string) {
     mkdirSync(dirname(databasePath), { recursive: true });
     this.db = new Database(databasePath);
+    this.db.pragma("busy_timeout = 10000");
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
-    this.db.pragma("busy_timeout = 10000");
     this.ensureSchema();
   }
 
@@ -242,14 +238,19 @@ export class SharedQuotaStore {
    * runner, so its schema has to evolve here.
    */
   private ensureColumns(): void {
-    const columns = new Set(
-      (
-        this.db.prepare("PRAGMA table_info(quota_observations)").all() as Array<{ name: string }>
-      ).map((column) => column.name)
-    );
-    if (!columns.has("controller_integral")) {
-      this.db.exec("ALTER TABLE quota_observations ADD COLUMN controller_integral REAL");
-    }
+    const widen = this.db.transaction(() => {
+      const columns = new Set(
+        (
+          this.db.prepare("PRAGMA table_info(quota_observations)").all() as Array<{ name: string }>
+        ).map((column) => column.name)
+      );
+      if (!columns.has("controller_integral")) {
+        this.db.exec("ALTER TABLE quota_observations ADD COLUMN controller_integral REAL");
+      }
+    });
+    // Every process acquires the write reservation before inspecting the
+    // schema, so a waiter rechecks after the winning ALTER has committed.
+    widen.immediate();
   }
 
   pruneRawScrapes(nowMs = Date.now()): number {
@@ -447,24 +448,30 @@ export class SharedQuotaStore {
       dtSeconds > 0 ? dtSeconds / (QUOTA_DERIVATIVE_TAU_SECONDS + dtSeconds) : 1;
     const previousDerivative = cycleChanged ? 0 : (previous?.controllerDerivative ?? 0);
     const derivative = previousDerivative + derivativeAlpha * (rawDerivative - previousDerivative);
-    const integralDtSeconds = Math.min(dtSeconds, QUOTA_INTEGRAL_MAX_STEP_SECONDS);
+    const integralDtSeconds = cycleChanged
+      ? 0
+      : Math.min(dtSeconds, QUOTA_INTEGRAL_MAX_STEP_SECONDS);
     const previousIntegral = cycleChanged ? 0 : (previous?.controllerIntegral ?? 0);
     const candidateIntegral = previousIntegral + error * integralDtSeconds;
+    const rawWithoutIntegral =
+      QUOTA_KP_SECONDS_PER_POINT * error + QUOTA_KD_SECONDS_SQUARED_PER_POINT * derivative;
     const rawInterval = (accumulated: number) =>
-      QUOTA_KP_SECONDS_PER_POINT * error +
-      QUOTA_KI_SECONDS_PER_POINT_SECOND * accumulated +
-      QUOTA_KD_SECONDS_SQUARED_PER_POINT * derivative;
-    // Conditional-integration anti-windup. The actuator saturates at zero below
-    // and `maxIntervalSeconds` above, so hold the accumulator whenever the new
-    // area would only push a pinned actuator further into the bound it is
-    // already against. Unwinding is always allowed: an error of the opposite
-    // sign moves off the bound, so the integrator never has to drain before the
-    // controller can respond.
+      rawWithoutIntegral + QUOTA_KI_SECONDS_PER_POINT_SECOND * accumulated;
+    // Conditional-integration anti-windup. Accept the portion of this step that
+    // reaches a raw actuator bound, but do not add area beyond it. If earlier
+    // state is already beyond today's reachable bound, hold it rather than
+    // fabricating opposite-signed area; a later reversing error can unwind it.
     const candidateRaw = rawInterval(candidateIntegral);
-    const windingUp =
-      (error < 0 && candidateRaw <= 0) || (error > 0 && candidateRaw >= opts.maxIntervalSeconds);
-    const integral = windingUp ? previousIntegral : candidateIntegral;
-    const uncappedCandidate = Math.max(0, windingUp ? rawInterval(integral) : candidateRaw);
+    let integral = candidateIntegral;
+    if (error > 0 && candidateRaw > opts.maxIntervalSeconds) {
+      const upperBound =
+        (opts.maxIntervalSeconds - rawWithoutIntegral) / QUOTA_KI_SECONDS_PER_POINT_SECOND;
+      integral = Math.min(candidateIntegral, Math.max(previousIntegral, upperBound));
+    } else if (error < 0 && candidateRaw < 0) {
+      const lowerBound = -rawWithoutIntegral / QUOTA_KI_SECONDS_PER_POINT_SECOND;
+      integral = Math.max(candidateIntegral, Math.min(previousIntegral, lowerBound));
+    }
+    const uncappedCandidate = Math.max(0, rawInterval(integral));
     // A rollover resets the controller memory, not the actuator. This resumes
     // from the last reasoned period rather than treating the exhaustion wait as one.
     const previousInterval = previous?.intervalSeconds ?? 0;
@@ -611,7 +618,6 @@ export class SharedQuotaStore {
               : 0,
           error: row.controllerError,
           derivative: row.controllerDerivative,
-          integral: row.controllerIntegral ?? 0,
           requiredIntervalSeconds: row.intervalSeconds,
           resetAtIso: latest.resetAtIso,
           observedAt: latest.observedAt,

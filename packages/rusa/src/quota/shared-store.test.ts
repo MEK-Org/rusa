@@ -1,11 +1,14 @@
+import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ProviderQuotaSnapshot, QuotaWindowKind } from "../mcp/quota-mcp.js";
 import {
   QUOTA_ACTUATOR_SMOOTHING,
+  QUOTA_DERIVATIVE_TAU_SECONDS,
   QUOTA_INTEGRAL_MAX_STEP_SECONDS,
   QUOTA_INTEGRAL_TIME_SECONDS,
   QUOTA_KD_SECONDS_SQUARED_PER_POINT,
@@ -483,19 +486,97 @@ function reasonedRows(store: SharedQuotaStore, provider: string, kind = "weekly"
     .all(provider, kind) as ReasonedRow[];
 }
 
+interface ConcurrentOpener {
+  child: ChildProcessWithoutNullStreams;
+  ready: Promise<void>;
+  completed: Promise<void>;
+}
+
+function startConcurrentOpener(moduleUrl: string, databasePath: string): ConcurrentOpener {
+  const script = `
+    import { SharedQuotaStore } from ${JSON.stringify(moduleUrl)};
+    process.stdout.write("ready\\n");
+    process.stdin.once("data", () => {
+      try {
+        const store = new SharedQuotaStore(process.argv[1]);
+        store.close();
+      } catch (error) {
+        console.error(error);
+        process.exitCode = 1;
+      }
+    });
+  `;
+  const child = spawn(
+    process.execPath,
+    [
+      "--no-warnings",
+      "--experimental-transform-types",
+      "--input-type=module",
+      "-e",
+      script,
+      databasePath,
+    ],
+    { stdio: ["pipe", "pipe", "pipe"] }
+  );
+  let output = "";
+  let errorOutput = "";
+  let readyResolve: (() => void) | undefined;
+  let readyReject: ((error: Error) => void) | undefined;
+  const ready = new Promise<void>((resolve, reject) => {
+    readyResolve = resolve;
+    readyReject = reject;
+  });
+  const completed = new Promise<void>((resolve, reject) => {
+    child.once("error", (error) => {
+      readyReject?.(error);
+      reject(error);
+    });
+    child.once("close", (code) => {
+      if (code === 0) resolve();
+      else {
+        const error = new Error(`concurrent opener exited ${code}: ${errorOutput || output}`);
+        readyReject?.(error);
+        reject(error);
+      }
+    });
+  });
+  child.stdout.on("data", (chunk: Buffer) => {
+    output += chunk.toString();
+    if (output.includes("ready\n")) readyResolve?.();
+  });
+  child.stderr.on("data", (chunk: Buffer) => {
+    errorOutput += chunk.toString();
+  });
+  return { child, ready, completed };
+}
+
 describe("SharedQuotaStore PID integral term", () => {
   it("accumulates standing error so one integral time doubles the proportional response", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-integral-"));
     roots.push(root);
     const store = new SharedQuotaStore(join(root, "shared.db"));
     try {
-      store.configureController({ maxIntervalSeconds: 3600 });
+      store.configureController({ maxIntervalSeconds: 36000 });
       const reset = "2030-01-08T00:00:00.000Z";
-      recordObservation(store, "claude", "2030-01-01T00:00:00.000Z", 90, reset);
-      recordObservation(store, "claude", "2030-01-01T01:00:00.000Z", 89, reset);
+      const startedMs = Date.parse("2030-01-01T00:00:00.000Z");
+      const resetMs = Date.parse(reset);
+      const standingError = 10;
+      for (let slot = 0; slot <= 12; slot += 1) {
+        const observedMs = startedMs + slot * 5 * 60 * 1000;
+        const timeRemainingPct = ((resetMs - observedMs) / (7 * 24 * 60 * 60 * 1000)) * 100;
+        recordObservation(
+          store,
+          "claude",
+          new Date(observedMs).toISOString(),
+          timeRemainingPct - standingError,
+          reset
+        );
+      }
 
       const rows = reasonedRows(store, "claude");
-      expect(rows).toHaveLength(2);
+      expect(rows).toHaveLength(13);
+      expect(QUOTA_INTEGRAL_TIME_SECONDS).toBe(2 * QUOTA_DERIVATIVE_TAU_SECONDS);
+      expect(QUOTA_INTEGRAL_MAX_STEP_SECONDS).toBe(5 * 60);
 
       // A cold start has no elapsed time to integrate over, so the first
       // decision is the pure proportional one a PD controller would have made.
@@ -504,54 +585,87 @@ describe("SharedQuotaStore PID integral term", () => {
 
       // One integral time of standing error later, the accumulated area asks
       // for exactly as much period as the proportional term already does.
-      const second = rows[1] as ReasonedRow;
-      expect(second.integral).toBeCloseTo(second.error * QUOTA_INTEGRAL_TIME_SECONDS, 6);
-      const proportional = QUOTA_KP_SECONDS_PER_POINT * second.error;
-      const integralTerm = QUOTA_KI_SECONDS_PER_POINT_SECOND * second.integral;
+      const final = rows.at(-1) as ReasonedRow;
+      expect(final.integral).toBeCloseTo(final.error * QUOTA_INTEGRAL_TIME_SECONDS, 6);
+      const proportional = QUOTA_KP_SECONDS_PER_POINT * final.error;
+      const integralTerm = QUOTA_KI_SECONDS_PER_POINT_SECOND * final.integral;
       expect(integralTerm).toBeCloseTo(proportional, 6);
 
       // The persisted period is the actuator command, so the doubled controller
       // output reaches it through the smoothing filter.
       const commanded =
-        proportional + integralTerm + QUOTA_KD_SECONDS_SQUARED_PER_POINT * second.derivative;
-      const held = rows[0]?.interval as number;
-      expect(second.uncapped).toBeCloseTo(held + QUOTA_ACTUATOR_SMOOTHING * (commanded - held), 6);
+        proportional + integralTerm + QUOTA_KD_SECONDS_SQUARED_PER_POINT * final.derivative;
+      const held = rows.at(-2)?.interval as number;
+      expect(final.uncapped).toBeCloseTo(held + QUOTA_ACTUATOR_SMOOTHING * (commanded - held), 6);
     } finally {
       store.close();
     }
   });
 
-  it("holds the accumulator against the cap so the period falls as soon as error reverses", () => {
+  it("fills the reachable upper range, unwinds on reversal, and does not wind below zero", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-antiwindup-"));
     roots.push(root);
     const store = new SharedQuotaStore(join(root, "shared.db"));
-    const maxIntervalSeconds = 60;
+    const maxIntervalSeconds = 1450;
     try {
       store.configureController({ maxIntervalSeconds });
       const reset = "2030-01-08T00:00:00.000Z";
-      // Burn far ahead of pace for hours; every decision saturates the cap.
-      recordObservation(store, "claude", "2030-01-01T00:00:00.000Z", 50, reset);
-      recordObservation(store, "claude", "2030-01-01T01:00:00.000Z", 40, reset);
-      recordObservation(store, "claude", "2030-01-01T02:00:00.000Z", 30, reset);
-      recordObservation(store, "claude", "2030-01-01T03:00:00.000Z", 20, reset);
+      const startedMs = Date.parse("2030-01-04T12:00:00.000Z");
+      const resetMs = Date.parse(reset);
+      const percentLeftForError = (observedMs: number, error: number) =>
+        ((resetMs - observedMs) / (7 * 24 * 60 * 60 * 1000)) * 100 - error;
 
-      const saturated = reasonedRows(store, "claude");
-      expect(saturated).toHaveLength(4);
-      for (const row of saturated) {
-        expect(row.error).toBeGreaterThan(0);
-        expect(row.uncapped).toBeGreaterThan(maxIntervalSeconds);
-        expect(row.interval).toBe(maxIntervalSeconds);
-        // Conditional integration refuses to bank area while pinned at the cap.
-        expect(row.integral).toBe(0);
+      for (let slot = 0; slot <= 3; slot += 1) {
+        const observedMs = startedMs + slot * 5 * 60 * 1000;
+        recordObservation(
+          store,
+          "claude",
+          new Date(observedMs).toISOString(),
+          percentLeftForError(observedMs, 10),
+          reset
+        );
       }
+      const upperRows = reasonedRows(store, "claude");
+      const beforeBound = upperRows.at(-2) as ReasonedRow;
+      const atBound = upperRows.at(-1) as ReasonedRow;
+      expect(atBound.integral).toBeGreaterThan(beforeBound.integral);
+      expect(
+        QUOTA_KP_SECONDS_PER_POINT * atBound.error +
+          QUOTA_KI_SECONDS_PER_POINT_SECOND * atBound.integral +
+          QUOTA_KD_SECONDS_SQUARED_PER_POINT * atBound.derivative
+      ).toBeCloseTo(maxIntervalSeconds, 6);
 
-      // Quota is replenished and consumption falls behind pace. A wound-up
-      // integrator would keep the actuator pinned while it drained; this one
-      // comes off the cap on the very next decision.
-      recordObservation(store, "claude", "2030-01-01T04:00:00.000Z", 99, reset);
+      const reversalMs = startedMs + 4 * 5 * 60 * 1000;
+      recordObservation(
+        store,
+        "claude",
+        new Date(reversalMs).toISOString(),
+        percentLeftForError(reversalMs, -1),
+        reset
+      );
       const released = reasonedRows(store, "claude").at(-1) as ReasonedRow;
       expect(released.error).toBeLessThan(0);
+      expect(released.integral).toBeLessThan(atBound.integral);
       expect(released.interval).toBeLessThan(maxIntervalSeconds);
+
+      recordObservation(
+        store,
+        "codex",
+        new Date(startedMs).toISOString(),
+        percentLeftForError(startedMs, -10),
+        reset
+      );
+      recordObservation(
+        store,
+        "codex",
+        new Date(startedMs + 5 * 60 * 1000).toISOString(),
+        percentLeftForError(startedMs + 5 * 60 * 1000, -10),
+        reset
+      );
+      for (const row of reasonedRows(store, "codex")) {
+        expect(row.integral).toBe(0);
+        expect(row.interval).toBe(0);
+      }
     } finally {
       store.close();
     }
@@ -588,12 +702,9 @@ describe("SharedQuotaStore PID integral term", () => {
         "2030-01-15T00:00:00.000Z"
       );
       const rolledOver = reasonedRows(store, "claude").at(-1) as ReasonedRow;
-      // The new cycle integrates one clamped step of its own error, with nothing
-      // inherited from the exhausted window.
-      expect(rolledOver.integral).toBeCloseTo(
-        rolledOver.error * QUOTA_INTEGRAL_MAX_STEP_SECONDS,
-        6
-      );
+      // The first observation establishes the new cycle's error without
+      // importing elapsed time from the prior cycle.
+      expect(rolledOver.integral).toBe(0);
       expect(rolledOver.integral).toBeLessThan(carried.integral);
     } finally {
       store.close();
@@ -619,7 +730,7 @@ describe("SharedQuotaStore PID integral term", () => {
     }
   });
 
-  it("widens a database created before the accumulator column existed", () => {
+  it("widens a legacy database safely when several processes open it together", async () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-integral-schema-"));
     roots.push(root);
     const path = join(root, "shared.db");
@@ -654,6 +765,12 @@ describe("SharedQuotaStore PID integral term", () => {
       .run();
     legacy.close();
 
+    const moduleUrl = pathToFileURL(join(process.cwd(), "src/quota/shared-store.ts")).href;
+    const openers = Array.from({ length: 6 }, () => startConcurrentOpener(moduleUrl, path));
+    await Promise.all(openers.map((opener) => opener.ready));
+    for (const opener of openers) opener.child.stdin.end("open\n");
+    await Promise.all(openers.map((opener) => opener.completed));
+
     const store = new SharedQuotaStore(path);
     try {
       expect(
@@ -673,13 +790,9 @@ describe("SharedQuotaStore PID integral term", () => {
         "2030-01-08T00:00:00.000Z"
       );
       const next = reasonedRows(store, "claude").at(-1) as ReasonedRow;
-      expect(next.integral).toBeCloseTo(next.error * QUOTA_INTEGRAL_TIME_SECONDS, 6);
-      expect(store.getProviderThrottle("claude")?.buckets[0]?.integral).toBeCloseTo(
-        next.integral,
-        6
-      );
+      expect(next.integral).toBeCloseTo(next.error * QUOTA_INTEGRAL_MAX_STEP_SECONDS, 6);
     } finally {
       store.close();
     }
-  });
+  }, 15_000);
 });
