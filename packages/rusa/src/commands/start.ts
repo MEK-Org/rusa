@@ -114,7 +114,10 @@ import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { isSelfAuthoredLedgerSource } from "../db/repositories/mesh-event-repository.js";
 import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
-import { deriveGitHubInboxNotification } from "../github/inbox-notification.js";
+import {
+  checkSuiteWakesAnyone,
+  deriveGitHubInboxNotification,
+} from "../github/inbox-notification.js";
 import { startGitHubEventPoller } from "../github/poller.js";
 import { startGitHttpServer } from "../gitops/git-http-server.js";
 import {
@@ -2380,6 +2383,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     if (NEVER_DELIVERED_EVENT_TYPES.has(`${event}/${action}`)) {
       const summary = `sender=${sender ?? "<unknown>"} repo=${repo}${number != null ? `#${number}` : ""}`;
       console.log(`[webhook] never-delivered event dropped: ${event}/${action} (${summary})`);
+      return;
+    }
+    // Not in the set above, because the set reads a type string and the
+    // deciding field is in the payload: a check suite wakes its owner when it
+    // is red and stays quiet when it is green.
+    if (event === "check_suite" && action === "completed" && !checkSuiteWakesAnyone(payload)) {
+      const summary = `sender=${sender ?? "<unknown>"} repo=${repo}${number != null ? `#${number}` : ""}`;
+      console.log(`[webhook] non-actionable check suite dropped: ${event}/${action} (${summary})`);
       return;
     }
 

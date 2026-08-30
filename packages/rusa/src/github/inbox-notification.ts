@@ -100,3 +100,66 @@ export function deriveGitHubInboxNotification(
 function integerId(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) ? value : undefined;
 }
+
+/**
+ * GitHub's conclusions for a completed check suite.
+ *
+ * Listed rather than taken as `string` so {@link CHECK_SUITE_WAKES} can be a
+ * total `Record` over them.
+ */
+type CheckSuiteConclusion =
+  | "success"
+  | "failure"
+  | "neutral"
+  | "cancelled"
+  | "timed_out"
+  | "action_required"
+  | "stale"
+  | "startup_failure"
+  | "skipped";
+
+/**
+ * Whether a completed check suite is something an actor has to act on.
+ *
+ * A green suite is a status transition the gate already tracks, and it arrives
+ * once per re-run: root's inbox took ~10 of them in two wakes off one
+ * obligations stack, none actionable. A red one means somebody has work, so
+ * this cannot be a blanket drop of `check_suite.completed` — the distinction
+ * is the whole point.
+ *
+ * Total on purpose: a conclusion GitHub adds later fails to compile until
+ * somebody decides which it is. The unrecognised case still wakes (see
+ * {@link checkSuiteWakesAnyone}), because the two directions are not
+ * symmetrical — an extra wake is noise somebody clears, while a suppressed one
+ * is a red CI nobody is told about.
+ */
+const CHECK_SUITE_WAKES: Readonly<Record<CheckSuiteConclusion, boolean>> = {
+  failure: true,
+  timed_out: true,
+  action_required: true,
+  // The suite never ran. Nobody is coming to tell you again.
+  startup_failure: true,
+
+  success: false,
+  neutral: false,
+  skipped: false,
+  // Both mean superseded, not broken: a newer suite is running or has run, and
+  // it will announce its own conclusion. Waking on these would restore exactly
+  // the per-re-run churn this filter exists to stop.
+  cancelled: false,
+  stale: false,
+};
+
+/**
+ * Should this `check_suite` webhook payload wake anybody?
+ *
+ * Answers `true` for anything it does not recognise — a payload with no
+ * conclusion, a conclusion GitHub added since, a shape that isn't a check
+ * suite at all. Over-filtering here is silent, and a silently swallowed red CI
+ * is worse than a noisy green one.
+ */
+export function checkSuiteWakesAnyone(payload: Record<string, unknown>): boolean {
+  const conclusion = (payload.check_suite as { conclusion?: unknown } | undefined)?.conclusion;
+  if (typeof conclusion !== "string") return true;
+  return CHECK_SUITE_WAKES[conclusion as CheckSuiteConclusion] ?? true;
+}

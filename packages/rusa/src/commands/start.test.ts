@@ -2605,7 +2605,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       );
     });
 
-    it("drops check_run.completed and still delivers check_suite.completed", async () => {
+    it("drops check_run.completed and a green check suite, and still delivers a red one", async () => {
       let emitGitHubEvent:
         | ((event: string, payload: Record<string, unknown>) => Promise<void>)
         | undefined;
@@ -2642,10 +2642,104 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
       expect(requestRunCalls).toHaveLength(0);
 
+      // Green is a status transition the gate already tracks, and it arrives
+      // once per re-run — the churn this filter exists to stop.
       await emitGitHubEvent("check_suite", {
         action: "completed",
         repository: { full_name: "dummy-org/dummy-repo" },
         check_suite: { id: 456, conclusion: "success" },
+        sender: { login: "github-actions[bot]" },
+      });
+
+      expect(requestRunCalls).toHaveLength(0);
+
+      // Red means somebody has work, so this is not a blanket drop of the kind.
+      await emitGitHubEvent("check_suite", {
+        action: "completed",
+        repository: { full_name: "dummy-org/dummy-repo" },
+        check_suite: { id: 457, conclusion: "failure" },
+        sender: { login: "github-actions[bot]" },
+      });
+
+      expect(requestRunCalls).toEqual([{ actorId: "root", reason: "{}" }]);
+    });
+
+    it("wakes a check suite's owner: the PR's when it has one, the repo's when it does not", async () => {
+      let emitGitHubEvent:
+        | ((event: string, payload: Record<string, unknown>) => Promise<void>)
+        | undefined;
+      let mesh: ActorMesh | undefined;
+
+      const readyPromise = new Promise<void>((resolve) => {
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              mesh = handles.mesh;
+              emitGitHubEvent = handles.emitGitHubEvent;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+
+      await readyPromise;
+      if (!mesh || !emitGitHubEvent) {
+        throw new Error("Mesh or emitGitHubEvent not ready");
+      }
+
+      const prWorker = mesh.spawn({
+        charter: "pr tasks",
+        parentId: "root",
+        provider: "antigravity",
+        model: "Gemini 3.7 Flash (High)",
+      });
+      mesh.subscribeEventSource(
+        { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 77 },
+        prWorker,
+        "root"
+      );
+      mesh.subscribeEventSource(
+        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+        "root",
+        "root"
+      );
+
+      // Carries a PR: its owner is woken, and the repo owner is not.
+      await emitGitHubEvent("check_suite", {
+        action: "completed",
+        repository: { full_name: "dummy-org/dummy-repo" },
+        check_suite: {
+          id: 500,
+          conclusion: "failure",
+          pull_requests: [{ number: 77 }],
+          head_branch: "steward/whatever",
+        },
+        sender: { login: "github-actions[bot]" },
+      });
+
+      expect(requestRunCalls).toEqual([{ actorId: prWorker, reason: "{}" }]);
+      requestRunCalls.length = 0;
+
+      // No PR and nobody on the branch: it climbs to the repo owner rather
+      // than reaching everybody or nobody.
+      await emitGitHubEvent("check_suite", {
+        action: "completed",
+        repository: { full_name: "dummy-org/dummy-repo" },
+        check_suite: { id: 501, conclusion: "failure", pull_requests: [] },
+        sender: { login: "github-actions[bot]" },
+      });
+
+      expect(requestRunCalls).toEqual([{ actorId: "root", reason: "{}" }]);
+      requestRunCalls.length = 0;
+
+      // A PR nobody owns: red CI must not fall on the floor, so it climbs to
+      // the repo owner. This is the half that breaks if `check_suite.completed`
+      // stops being allowed past `mayBubbleToParent`.
+      await emitGitHubEvent("check_suite", {
+        action: "completed",
+        repository: { full_name: "dummy-org/dummy-repo" },
+        check_suite: { id: 502, conclusion: "failure", pull_requests: [{ number: 999 }] },
         sender: { login: "github-actions[bot]" },
       });
 
@@ -2787,11 +2881,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // Retire worker (no longer live)
     mesh.retire(workerId);
 
-    // Emit event
+    // Emit event. The conclusion has to be one that wakes somebody: this test
+    // is about the bubbling walk, but a green suite is now dropped before it
+    // reaches routing, which would make the walk untestable through this event.
     await emitGitHubEvent("check_suite", {
       action: "completed",
       repository: { full_name: "dummy-org/dummy-repo" },
-      check_suite: { id: 123, conclusion: "success" },
+      check_suite: { id: 123, conclusion: "failure" },
       sender: { login: "someone-else" },
     });
 
