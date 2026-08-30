@@ -181,17 +181,45 @@ type Encoding = (typeof ENCODINGS)[number];
 /**
  * Pick an encoding the client actually asked for.
  *
- * Deliberately a substring test and not a full RFC 9110 parse: the only clients
- * are this repo's Flutter dashboard and curl, `q=0` disqualification has never
- * arisen, and a wrong guess here is a correctness bug in exchange for nothing.
- * If a client ever needs to refuse an encoding it lists, parse properly then.
+ * Splits the header into tokens and reads each one's `q`, rather than testing
+ * the raw string for a substring. Both halves of that are load-bearing:
+ * `br;q=0, gzip` says *not* brotli, and a substring test reads it as the exact
+ * opposite — sending a body the client told us it cannot accept. Token
+ * boundaries matter for the same reason: `xbr` is not an offer of brotli.
+ *
+ * Not a full RFC 9110 parse. It answers one question — may we use this codec —
+ * and preference stays ours, best ratio first, rather than being reordered by
+ * the client's q-values. That is the part with no correctness stake: picking a
+ * client's second choice is a ratio decision, picking one it forbade is a
+ * broken response.
  */
 function negotiateEncoding(req: IncomingMessage | undefined): Encoding | undefined {
   // `headers` is optional-chained too: a ServerResponse always has a real
   // request behind it in production, but not every embedder's double does.
   const header = req?.headers?.["accept-encoding"];
-  const accepted = (Array.isArray(header) ? header.join(",") : (header ?? "")).toLowerCase();
-  return ENCODINGS.find((encoding) => accepted.includes(encoding));
+  const raw = Array.isArray(header) ? header.join(",") : (header ?? "");
+
+  /** Token to q-value. Absent means the client never mentioned it at all. */
+  const weights = new Map<string, number>();
+  for (const element of raw.split(",")) {
+    const [token, ...params] = element.split(";");
+    const name = token.trim().toLowerCase();
+    if (!name) continue;
+    const q = params
+      .map((param) => param.trim().toLowerCase())
+      .find((param) => param.startsWith("q="))
+      ?.slice(2);
+    // A malformed q is the spec's default of 1, not a rejection: only an
+    // explicit, readable zero should cost a client its compression.
+    const weight = q === undefined ? 1 : Number.parseFloat(q);
+    weights.set(name, Number.isNaN(weight) ? 1 : weight);
+  }
+
+  // `*` covers whatever the client did not name. An absent header names
+  // nothing and matches no wildcard, so nothing is acceptable and the body
+  // goes out uncompressed — which is the safe reading of silence.
+  const wildcard = weights.get("*") ?? 0;
+  return ENCODINGS.find((encoding) => (weights.get(encoding) ?? wildcard) > 0);
 }
 
 function compress(encoding: Encoding, payload: Buffer): Promise<Buffer> {

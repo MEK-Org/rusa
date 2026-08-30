@@ -380,6 +380,94 @@ describe("handleMeshApiRequest", () => {
       expect(res.headers.Vary).toBe("Accept-Encoding");
     });
 
+    it("honours a codec the client explicitly refused with q=0", async () => {
+      seedBulk();
+      // The case a substring test gets exactly backwards: this header offers
+      // gzip and *forbids* brotli, and reading it as "mentions br" ships a
+      // body the client said it cannot accept.
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "br;q=0, gzip");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBe("gzip");
+      const decoded = gunzipSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+    });
+
+    it("sends identity when every codec it can produce is refused", async () => {
+      seedBulk();
+      const { res } = call(
+        deps,
+        "GET",
+        "/api/mesh/threads",
+        undefined,
+        "br;q=0, gzip;q=0.0, *;q=0"
+      );
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBeUndefined();
+      expect(JSON.parse(res.body).threads).toHaveLength(61);
+    });
+
+    it("does not read a codec name out of a longer token", async () => {
+      seedBulk();
+      // `xbr` and `gzipped` are not offers of `br` and `gzip`.
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "xbr, gzipped");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBeUndefined();
+      expect(JSON.parse(res.body).threads).toHaveLength(61);
+    });
+
+    it("takes the wildcard as permission for a codec the client did not name", async () => {
+      seedBulk();
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "*");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBe("br");
+      const decoded = brotliDecompressSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+    });
+
+    it("lets an explicit refusal beat a permissive wildcard", async () => {
+      seedBulk();
+      // `*` allows everything unnamed; `br;q=0` names brotli to refuse it.
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "*, br;q=0");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBe("gzip");
+      const decoded = gunzipSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+    });
+
+    it("keeps a codec whose q is merely low, or unreadable", async () => {
+      seedBulk();
+      // Only an explicit zero disqualifies. A low q is still a yes, and a
+      // malformed one falls back to the spec's default of 1 rather than
+      // silently costing the client its compression.
+      const { res } = call(
+        deps,
+        "GET",
+        "/api/mesh/threads",
+        undefined,
+        "br;q=0.01, gzip;q=nonsense"
+      );
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBe("br");
+      const decoded = brotliDecompressSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+    });
+
+    it("reads tokens through whitespace and case the way clients send them", async () => {
+      seedBulk();
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "  GZIP ;  Q=1.0 ");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBe("gzip");
+      const decoded = gunzipSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+    });
+
     it("does not compress when no request is reachable from the response", async () => {
       seedBulk();
       // MockRes's default `req` carries no headers at all — the shape an
