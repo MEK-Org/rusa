@@ -11,7 +11,7 @@ import {
   CodexProvider,
   codexRolloutExists,
   codexRolloutResumable,
-  extractCodexBoundModel,
+  extractCodexSessionModel,
   extractNewestCodexSessionId,
   overrideTomlModel,
   parseCodexModel,
@@ -411,7 +411,7 @@ trust_level = "trusted"
           `${JSON.stringify({ timestamp: "t", type: "session_meta", payload: { id: ID, cwd: "/wt" } })}\n` +
             `${JSON.stringify({ timestamp: "t", type: "turn_context", payload: { model: "gpt-5.5" } })}\n`
         );
-        expect(extractCodexBoundModel(root, ID)).toBe("gpt-5.5");
+        expect(extractCodexSessionModel(root, ID)).toBe("gpt-5.5");
       } finally {
         rmSync(root, { recursive: true, force: true });
       }

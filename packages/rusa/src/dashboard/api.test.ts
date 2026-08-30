@@ -298,22 +298,31 @@ describe("handleMeshApiRequest", () => {
     expect(threads.find((t: { id: string }) => t.id === UUID_B).status).toBe("retired");
   });
 
-  it("GET /api/mesh/threads surfaces requested and bound models for divergence display", () => {
+  it("GET /api/mesh/threads surfaces one model and does not leak a stale bound-model readback", () => {
+    // A registry record that still carries the removed `boundModel` key. The cast is the
+    // point, not a workaround: the field is gone from `ThreadRecord`, but the registry is
+    // a JSON file loaded with a cast and rewritten whole, so every record written before
+    // this change still carries the key on disk. This is that record.
+    //
+    // It is the shape that produced the old "MODEL DIVERGED" badge — an actor moved off
+    // codex, its codex readback outliving the move because nothing ever cleared it. The
+    // API must publish the configured model, prefer nothing to it, and expose nothing to
+    // compare it against.
     registry.upsert({
       ...rec(UUID_A, "root", "active"),
       provider: "codex",
       model: "gpt-5-codex",
       boundModel: "gpt-5.5",
-    });
+    } as ThreadRecord);
 
     const { res } = call(deps, "GET", "/api/mesh/threads");
     expect(res.statusCode).toBe(200);
     const { threads } = JSON.parse(res.body);
     const actor = threads.find((t: { id: string }) => t.id === UUID_A);
     expect(actor.provider).toBe("codex");
-    expect(actor.requestedModel).toBe("gpt-5-codex");
-    expect(actor.boundModel).toBe("gpt-5.5");
-    expect(actor.model).toBe("gpt-5.5");
+    expect(actor.model).toBe("gpt-5-codex");
+    expect(actor.requestedModel).toBeUndefined();
+    expect(actor.boundModel).toBeUndefined();
   });
 
   it("GET /api/mesh/threads shows the default root handle when no identity is configured", () => {

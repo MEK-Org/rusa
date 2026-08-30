@@ -2,6 +2,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ActorMesh, MeshActor } from "../actor/actor-mesh.js";
+import { runEndModel } from "../actor/mesh-events.js";
 import { portableContextMaxRuns } from "../actor/portable-context.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import type { RusaConfig } from "../config/types.js";
@@ -63,6 +64,7 @@ import {
   checkModelIdentity,
   comparabilityCaveat,
   comparabilityOf,
+  type RunModelCoverage,
 } from "../harness/model-identity.js";
 import {
   type CaptureQuotaDeps,
@@ -1067,11 +1069,25 @@ async function runProviderContextABBody(
         {
           actorId: id,
           provider: rec?.provider ?? null,
-          model: rec?.model ?? null,
-          // Read back from the provider session after the first run — the arm's ACTUAL
-          // model, which is what a comparability claim rests on. Null on every provider
-          // but codex; `modelIdentity` below is what stops that null reading as a pass.
-          boundModel: rec?.boundModel ?? null,
+          // What the arm's runs REPORTED they ran on — the arm's ACTUAL models, which is
+          // what a comparability claim rests on, and deliberately NOT the model the arm
+          // was configured with. Empty on every provider but codex; `modelIdentity` below
+          // is what stops that emptiness reading as a pass.
+          //
+          // Read run-scoped off `run_end` rather than off the thread record. A per-thread
+          // copy is written on every run and cleared on none, so an actor moved from a
+          // reporting provider to a non-reporting one answers with the model it LEFT,
+          // indefinitely — a stale value that reads exactly like a fresh one.
+          //
+          // Carried as the whole list rather than collapsed to one value here: an arm
+          // that re-pinned mid-scenario HAS no single value, and choosing one for it
+          // would launder a void run into a comparable-looking one.
+          // The count travels with the list. `checkModelIdentity` does not read it — the
+          // verdict is the same with or without it — but the `same` verdict's message
+          // says "all arms ran X", and on a six-step arm that sentence is only as wide
+          // as the runs that actually reported. The coverage is what lets a reader see
+          // how wide that is instead of taking the wording at face value.
+          ...armRunModels(events, id),
           firstStepStartedAt: windows[0]?.startedAt ?? null,
           lastStepEndedAt: windows[windows.length - 1]?.endedAt ?? null,
           stepWindows: windows,
@@ -1175,6 +1191,11 @@ async function runProviderContextABBody(
         reason: headroom.provenance === "not-checked" ? headroom.reason : null,
         overridden: headroom.fits === false ? (opts.allowOverWindow ?? false) : false,
       },
+      // The driver's OWN invocation, recorded as provenance: what this `ab-context` run
+      // was asked to launch. Deliberately kept through the divergence teardown, because
+      // it is not half of a divergence pair — nothing compares it to what the arms ran,
+      // and no surface derives a verdict from the difference. It is the only record of
+      // what was asked for, and `armProvenance.models` (what ran) cannot answer that.
       requestedProvider: opts.provider ?? null,
       requestedModel: opts.model ?? null,
       // Whether the arms are even comparable. `ok: null` means NOT CAPTURED — nobody
@@ -1259,6 +1280,48 @@ async function runProviderContextABBody(
     process.exitCode = 1;
   }
   await handles.shutdown();
+}
+
+/**
+ * What an arm's own runs said they ran on: every DISTINCT model in the order first seen,
+ * and how many of the arm's runs reported one at all.
+ *
+ * A list rather than "the model it finished on": an arm runs once per scenario step, so
+ * reducing its history to a single value hides a mid-run model change behind whichever
+ * end you pick, and `checkModelIdentity` would then compare a claim that is only true of
+ * part of the arm. Empty is a real answer — "nothing reported" — and callers must not
+ * fill it in from configuration; see `harness/model-identity.ts`.
+ *
+ * Runs that reported nothing contribute nothing rather than truncating the scan. A codex
+ * run legitimately reports nothing whenever its rollout cannot be read back
+ * (`captureModel` in `providers/codex.ts`), so treating one silent run as a reason to
+ * discard the runs that did report would make the gate read UNVERIFIED on a read hiccup
+ * — trading a working check for alarm fatigue. What the gate refuses is an unbacked
+ * claim; one agreeing report is backing, and a contradicting one is caught above.
+ *
+ * The count ships with the list, out of ONE scan, rather than from a second exported
+ * helper. Two loops would each carry their own idea of which events belong to the arm,
+ * and the day one of those predicates changes the coverage would silently describe a
+ * different population than the models it is offered as coverage OF — a number that
+ * looks like evidence and is not, which is the whole failure class this area exists to
+ * refuse.
+ */
+export function armRunModels(
+  events: MeshEvent[],
+  actorId: string
+): { models: string[]; coverage: RunModelCoverage } {
+  const models: string[] = [];
+  let reported = 0;
+  let total = 0;
+  for (const event of events) {
+    if (event.actorId !== actorId || event.kind !== "run_end") continue;
+    total += 1;
+    const model = runEndModel(event.payload);
+    if (!model) continue;
+    reported += 1;
+    if (!models.includes(model)) models.push(model);
+  }
+  return { models, coverage: { reported, total } };
 }
 
 /** Parse the `sourceEventIds` out of a `run_start` inject body (an InjectRecord JSON). */

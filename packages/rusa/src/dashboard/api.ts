@@ -126,9 +126,8 @@ interface ThreadDto {
   parentId: string | null;
   status: string;
   provider: string | null;
-  requestedModel: string | null;
+  /** The single authoritative model for this actor, as configured in the registry. */
   model: string | null;
-  boundModel: string | null;
   charter: string;
   title: string;
   createdAt: string;
@@ -886,9 +885,7 @@ export function handleMeshApiRequest(
         parentId: r.parentId,
         status: r.status,
         provider: r.provider ?? null,
-        requestedModel: r.model ?? null,
-        model: r.boundModel ?? r.model ?? null,
-        boundModel: r.boundModel ?? null,
+        model: r.model ?? null,
         charter: r.charter,
         title: r.title ?? summarizeCharter(r.charter),
         createdAt: r.createdAt,

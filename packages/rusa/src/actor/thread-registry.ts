@@ -83,10 +83,14 @@ export interface ThreadRecord {
    * provider). Lets a parent delegate to a different harness/tier than itself.
    */
   provider?: string;
-  /** Optional model/tier id passed to the provider (e.g. a stronger model for review). */
+  /**
+   * Optional model/tier id passed to the provider (e.g. a stronger model for review).
+   * This is a spawn INPUT — `createActor` feeds it to `resolveProvider` on every
+   * wake — so nothing may overwrite it with a provider read-back: that would make
+   * one run's report the next run's request. What a run actually ran on is
+   * run-scoped and lives on the `run_end` event ({@link RunEndPayload}).
+   */
   model?: string;
-  /** Model/tier id read back from the provider session after the actor first runs. */
-  boundModel?: string;
   /** Provider session/conversation id = the working-memory handle (B.2); set after first run. */
   sessionId?: string;
   /**
