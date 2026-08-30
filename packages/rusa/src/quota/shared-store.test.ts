@@ -17,6 +17,7 @@ import {
   QUOTA_OBSERVATION_RETENTION_MS,
   QUOTA_RAW_RETENTION_MS,
   SharedQuotaStore,
+  widenToWal,
 } from "./shared-store.js";
 
 const roots: string[] = [];
@@ -550,6 +551,85 @@ function startConcurrentOpener(moduleUrl: string, databasePath: string): Concurr
   return { child, ready, completed };
 }
 
+interface LockHolder {
+  holding: Promise<void>;
+  completed: Promise<void>;
+}
+
+/**
+ * Holds a lock on `databasePath` from another process for `holdMs`.
+ *
+ * The two states differ in exactly the way the conversion cares about.
+ * RESERVED is what a second opener holds partway through its own legacy->WAL
+ * conversion, and it is the one state where SQLite skips the busy handler
+ * entirely — the concurrent-conversion race in deterministic form, without
+ * depending on scheduler luck. SHARED is the state the handler *does* cover,
+ * so a peer holding it makes a single pragma sit for the connection's whole
+ * `busy_timeout`; that is what the budget-boundary test needs.
+ */
+function startLockHolder(
+  databasePath: string,
+  holdMs: number,
+  lock: "reserved" | "shared"
+): LockHolder {
+  const begin =
+    lock === "reserved" ? "BEGIN IMMEDIATE" : "BEGIN; SELECT count(*) FROM legacy_marker;";
+  const script = `
+    import Database from "better-sqlite3";
+    const db = new Database(process.argv[1]);
+    db.exec(process.argv[3]);
+    process.stdout.write("holding\\n");
+    setTimeout(() => {
+      db.exec("COMMIT");
+      db.close();
+    }, Number(process.argv[2]));
+  `;
+  const child = spawn(
+    process.execPath,
+    [
+      "--no-warnings",
+      "--experimental-transform-types",
+      "--input-type=module",
+      "-e",
+      script,
+      databasePath,
+      String(holdMs),
+      begin,
+    ],
+    { stdio: ["pipe", "pipe", "pipe"] }
+  );
+  let output = "";
+  let errorOutput = "";
+  let holdingResolve: (() => void) | undefined;
+  let holdingReject: ((error: Error) => void) | undefined;
+  const holding = new Promise<void>((resolve, reject) => {
+    holdingResolve = resolve;
+    holdingReject = reject;
+  });
+  const completed = new Promise<void>((resolve, reject) => {
+    child.once("error", (error) => {
+      holdingReject?.(error);
+      reject(error);
+    });
+    child.once("close", (code) => {
+      if (code === 0) resolve();
+      else {
+        const error = new Error(`${lock} holder exited ${code}: ${errorOutput || output}`);
+        holdingReject?.(error);
+        reject(error);
+      }
+    });
+  });
+  child.stdout.on("data", (chunk: Buffer) => {
+    output += chunk.toString();
+    if (output.includes("holding\n")) holdingResolve?.();
+  });
+  child.stderr.on("data", (chunk: Buffer) => {
+    errorOutput += chunk.toString();
+  });
+  return { holding, completed };
+}
+
 describe("SharedQuotaStore PID integral term", () => {
   it("accumulates standing error so one integral time doubles the proportional response", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-integral-"));
@@ -795,4 +875,58 @@ describe("SharedQuotaStore PID integral term", () => {
       store.close();
     }
   }, 15_000);
+
+  it("waits out an opener that is already mid-conversion instead of failing the open", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-wal-race-"));
+    roots.push(root);
+    const path = join(root, "shared.db");
+    const legacy = new Database(path);
+    // Any table will do: what makes this a legacy database is that it exists
+    // in rollback-journal mode, so opening it has to convert it.
+    legacy.exec("CREATE TABLE legacy_marker (a INTEGER)");
+    legacy.close();
+
+    // `busy_timeout` cannot cover this: against a peer holding RESERVED,
+    // SQLite returns SQLITE_BUSY in about a millisecond rather than waiting,
+    // so the opener has to come back on its own.
+    const peer = startLockHolder(path, 500, "reserved");
+    await peer.holding;
+
+    const store = new SharedQuotaStore(path);
+    try {
+      expect(store.db.pragma("journal_mode", { simple: true })).toBe("wal");
+    } finally {
+      store.close();
+    }
+    await peer.completed;
+  }, 20_000);
+
+  it("spends one conversion budget in total, not one per attempt", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-wal-budget-"));
+    roots.push(root);
+    const path = join(root, "shared.db");
+    const legacy = new Database(path);
+    legacy.exec("CREATE TABLE legacy_marker (a INTEGER)");
+    legacy.close();
+
+    // SHARED is the state SQLite's busy handler *does* cover, so one pragma
+    // against this peer sits for the connection's whole `busy_timeout`.
+    const peer = startLockHolder(path, 4_000, "shared");
+    await peer.holding;
+
+    const db = new Database(path);
+    // A connection that already carries the ordinary budget, as the store's
+    // did before the conversion was given a budget of its own. The conversion
+    // must not inherit it: uncapped, this single attempt alone would take the
+    // full 3s, fifteen times the budget it was asked for.
+    db.pragma("busy_timeout = 3000");
+    const started = Date.now();
+    try {
+      expect(() => widenToWal(db, 200)).toThrow(/database is locked/);
+      expect(Date.now() - started).toBeLessThan(1_500);
+    } finally {
+      db.close();
+    }
+    await peer.completed;
+  }, 30_000);
 });
