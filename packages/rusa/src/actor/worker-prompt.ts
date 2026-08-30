@@ -259,7 +259,7 @@ Use a plain \`git clone\` — never \`--single-branch\` or \`--depth\`. Those na
 \`remote.origin.fetch\`, and after that \`git fetch\` exits 0 with no output forever
 while every branch outside the refspec silently stops advancing, so reads off
 \`origin/<branch>\` stay confidently stale.
-After cloning, you must always run:
+After cloning, you must change directory to the cloned repository root and run:
 \`git submodule update --init --recursive\`
 to fetch required workspace packages from submodules.
 When you change code: work on a branch namespaced to you (e.g.
