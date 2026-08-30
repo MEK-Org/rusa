@@ -791,6 +791,55 @@ describe("SharedQuotaStore PID integral term", () => {
     }
   });
 
+  it("treats a refill as a cycle boundary even when the reset instant did not move", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-refill-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 36000 });
+      const reset = "2030-01-08T00:00:00.000Z";
+      recordObservation(store, "claude", "2030-01-01T00:00:00.000Z", 90, reset);
+      recordObservation(store, "claude", "2030-01-01T01:00:00.000Z", 80, reset);
+      const carried = reasonedRows(store, "claude").at(-1) as ReasonedRow;
+      expect(carried.integral).toBeGreaterThan(0);
+      expect(carried.derivative).not.toBe(0);
+
+      // Remaining quota jumps 80 -> 99 while `reset_at` stays exactly where it
+      // was, so the reset-instant test alone cannot see this. Without the
+      // refill test the error's sharp fall reads as genuine progress and
+      // relaxes the interval for the next half hour.
+      recordObservation(store, "claude", "2030-01-01T02:00:00.000Z", 99, reset);
+      const refilled = reasonedRows(store, "claude").at(-1) as ReasonedRow;
+      expect(refilled.derivative).toBe(0);
+      expect(refilled.integral).toBe(0);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("keeps controller memory when remaining quota only wobbles within the noise floor", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-refill-epsilon-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    try {
+      store.configureController({ maxIntervalSeconds: 36000 });
+      const reset = "2030-01-08T00:00:00.000Z";
+      recordObservation(store, "claude", "2030-01-01T00:00:00.000Z", 90, reset);
+      recordObservation(store, "claude", "2030-01-01T01:00:00.000Z", 80, reset);
+      const carried = reasonedRows(store, "claude").at(-1) as ReasonedRow;
+
+      // A one-point rise is display rounding, not a refill. The other half of
+      // the threshold: were any rise treated as a boundary, rounding alone
+      // would wipe the accumulator and the derivative filter repeatedly.
+      recordObservation(store, "claude", "2030-01-01T02:00:00.000Z", 81, reset);
+      const wobbled = reasonedRows(store, "claude").at(-1) as ReasonedRow;
+      expect(wobbled.derivative).not.toBe(0);
+      expect(wobbled.integral).toBeGreaterThan(carried.integral);
+    } finally {
+      store.close();
+    }
+  });
+
   it("clamps the integrated step so a long observation gap cannot dump days of area", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-integral-gap-"));
     roots.push(root);
