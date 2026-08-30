@@ -19,6 +19,8 @@ import type { MeshEventRepository } from "../db/repositories/mesh-event-reposito
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { ObligationStatus } from "../obligations/obligation.js";
 import {
+  COMMITMENT_LEDGER_BODY_KINDS,
+  COMMITMENT_LEDGER_KINDS,
   type CommitmentLedgerReport,
   projectOpenCommitments,
 } from "../observability/commitment-ledger.js";
@@ -842,13 +844,18 @@ export function handleMeshApiRequest(
     // mesh_events(actor_id, ts) makes this cheap .
     const lastActiveByActor = meshEvents.latestActivityByActor();
 
-    // Cached ledger projection to avoid unbounded mesh_events.list() scan on every poll
+    // Cached ledger projection, recomputed whenever a new event lands. The cache
+    // is what makes the common poll ~30ms; the read below is what the miss costs,
+    // and every actor list after a restart pays one. So the miss reads the kinds
+    // the projection can act on and the bodies it can read, and nothing else.
     const currentMaxRowid = meshEvents.getMaxRowid();
     let cached = commitmentLedgerCache.get(meshEvents);
     if (!cached || cached.maxRowid !== currentMaxRowid) {
       const ledger = projectOpenCommitments({
         threads: registry.list(),
-        events: meshEvents.list(),
+        events: meshEvents.listByKinds(COMMITMENT_LEDGER_KINDS, {
+          bodyKinds: COMMITMENT_LEDGER_BODY_KINDS,
+        }),
         rootHandle,
       });
       cached = { maxRowid: currentMaxRowid, ledger };
