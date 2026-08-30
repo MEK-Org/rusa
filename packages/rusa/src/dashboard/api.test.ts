@@ -868,7 +868,7 @@ describe("handleMeshApiRequest", () => {
     expect(JSON.parse(res.body)).toEqual({ events: [], nextCursor: null });
   });
 
-  it("GET /api/mesh/inbox resolves a mesh message body without exposing its id", () => {
+  it("GET /api/mesh/inbox resolves a mesh message body into the payload, not its id", () => {
     const messageId = meshChat.record({
       id: "message-for-inbox",
       senderId: "root",
@@ -892,7 +892,18 @@ describe("handleMeshApiRequest", () => {
       fromId: "root",
       content: "Please review the dashboard Inbox tab.",
     });
-    expect(JSON.stringify(entry)).not.toContain(messageId);
+
+    // The id is still absent from the payload — content belongs there, not an
+    // opaque handle, which is what this test was written to pin. It now appears
+    // alongside as a citation: `reference` is the same resolved shape an
+    // obligation's artifacts carry, so one widget renders both, and the ref is
+    // exactly what an actor cites when closing an obligation on this message.
+    expect(JSON.stringify(entry.payload)).not.toContain(messageId);
+    expect(entry.reference).toMatchObject({
+      ref: `mesh:messages/${messageId}`,
+      scheme: "mesh",
+      body: "Please review the dashboard Inbox tab.",
+    });
   });
 
   describe("POST /api/mesh/actors/:id/inbox/handled", () => {
@@ -1674,6 +1685,38 @@ describe("handleMeshApiRequest", () => {
         await new Promise((resolve) => process.nextTick(resolve));
         expect(res.statusCode).toBe(201);
         expect(JSON.parse(res.body).obligation.creatorId).toBe(HUMAN_OPERATOR);
+      });
+
+      it("returns cited artifacts with mesh chat resolved and other schemes named", async () => {
+        registry.upsert(rec(UUID_A, "root", "active"));
+        obligations.create({ id: "cited", ownerId: UUID_A, title: "Game Type" });
+        const messageId = meshChat.record({
+          senderId: HUMAN_OPERATOR,
+          recipientId: UUID_A,
+          body: "A monster-catching JRPG in a cave.",
+        });
+        obligations.attachArtifact("cited", `mesh:messages/${messageId}`, {
+          label: "the answer",
+          attachedBy: UUID_A,
+        });
+        obligations.attachArtifact("cited", "github:MEK-Org/rusa/issues/33");
+
+        const { res } = call(deps, "GET", "/api/mesh/obligations/cited");
+        await new Promise((resolve) => process.nextTick(resolve));
+        const artifacts = JSON.parse(res.body).artifacts as Array<{
+          artifact: { ref: string; label: string | null };
+          reference: { body: string } | null;
+        }>;
+
+        expect(artifacts).toHaveLength(2);
+        const chat = artifacts.find((a) => a.artifact.ref.startsWith("mesh:"));
+        expect(chat?.reference?.body).toBe("A monster-catching JRPG in a cave.");
+        expect(chat?.artifact.label).toBe("the answer");
+        // v1 resolves mesh chat only. The GitHub citation still comes back —
+        // an unresolvable citation is not the same as an absent one.
+        const gh = artifacts.find((a) => a.artifact.ref.startsWith("github:"));
+        expect(gh).toBeDefined();
+        expect(gh?.reference).toBeNull();
       });
 
       it("rejects a create with no title", async () => {
