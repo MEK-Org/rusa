@@ -23,6 +23,81 @@ const DIFFERS = {
 };
 
 describe("model identity across A/B arms ", () => {
+  it("says how wide the reading is when some runs reported nothing", () => {
+    // The unqualified sentence is a claim about every run. An arm runs once per scenario
+    // step and codex reports nothing whenever its rollout cannot be read back, so on a
+    // six-step arm "all arms ran X" can rest on one reading out of six. The count is the
+    // honest instrument: it does not move the verdict, it tells the reader what the
+    // verdict is standing on.
+    const verdict = checkModelIdentity({
+      native: {
+        provider: "codex",
+        models: ["gpt-5.5-codex"],
+        coverage: { reported: 3, total: 6 },
+      },
+      portable: {
+        provider: "codex",
+        models: ["gpt-5.5-codex"],
+        coverage: { reported: 6, total: 6 },
+      },
+    });
+
+    expect(verdict.message).toContain("native 3/6");
+    expect(verdict.message).toContain("portable 6/6");
+    // Both halves, or the count reads as a false alarm one way and a rubber stamp the other.
+    expect(verdict.message).toContain("UNMEASURED, not confirmed");
+    expect(verdict.message).toContain("nothing contradicts gpt-5.5-codex");
+    // and it must not keep claiming the whole arm
+    expect(verdict.message).not.toContain("all arms ran");
+  });
+
+  it("does not let incomplete coverage move the verdict", () => {
+    // The rejected alternative was to force `unverified` on any silent run. Reporting is
+    // best-effort per run, so that fires on an ordinary read hiccup and the steady state
+    // is a gate that is red nearly always — which gets switched off, and then carries no
+    // information at all. Pinned so a later change cannot quietly spend the verdict on
+    // the count.
+    const arms = {
+      native: { provider: "codex", models: ["gpt-5.5-codex"] },
+      portable: { provider: "codex", models: ["gpt-5.5-codex"] },
+    };
+    const thin = checkModelIdentity({
+      native: { ...arms.native, coverage: { reported: 1, total: 6 } },
+      portable: { ...arms.portable, coverage: { reported: 1, total: 6 } },
+    });
+
+    expect(thin.ok).toBe(true);
+    expect(thin.status).toBe("same");
+    expect(comparabilityOf(thin)).toBe("verified");
+    expect(thin.ok).toBe(checkModelIdentity(arms).ok);
+    expect(thin.status).toBe(checkModelIdentity(arms).status);
+  });
+
+  it("says so when every run did report, so full coverage is legible as full", () => {
+    // A reader who only ever sees the qualified form has no baseline to read it against.
+    const verdict = checkModelIdentity({
+      native: { provider: "codex", models: ["gpt-5.5-codex"], coverage: { reported: 6, total: 6 } },
+      portable: {
+        provider: "codex",
+        models: ["gpt-5.5-codex"],
+        coverage: { reported: 6, total: 6 },
+      },
+    });
+
+    expect(verdict.message).toContain("all arms ran gpt-5.5-codex");
+    expect(verdict.message).toContain("every run reported");
+    expect(verdict.message).toContain("native 6/6, portable 6/6");
+  });
+
+  it("omits the coverage clause when a caller has no run history to offer", () => {
+    // Coverage annotates the reading; a caller holding models from somewhere else still
+    // gets the verdict. What it must not do is invent a count, which would be a number
+    // that looks like evidence and is not.
+    const verdict = checkModelIdentity(SAME);
+
+    expect(verdict.message).toBe("model identity verified — all arms ran gpt-5.5-codex");
+  });
+
   it("reports NOT CAPTURED — never a pass — when neither arm reported a bound model", () => {
     // This is the g2v3d shape verbatim: kimi on both sides, nothing reported on either.
     const verdict = checkModelIdentity({

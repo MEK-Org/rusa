@@ -59,6 +59,29 @@ export type ModelIdentityStatus =
   /** Some arms reported one and some did not — the arms cannot be compared to each other. */
   | "partial";
 
+/**
+ * How many of an arm's runs reported a model, out of how many ran.
+ *
+ * An ANNOTATION on the reading, never an input to it: no branch in
+ * {@link checkModelIdentity} reads these numbers, and the verdict is identical with and
+ * without them (asserted). That is deliberate. Reporting is best-effort per run —
+ * `captureModel` returns nothing whenever there is no sessions dir, no session id, no
+ * rollout file, or an unparseable one — so a six-step arm has six chances to go quiet,
+ * and downgrading the verdict on any silent run would make the gate read UNVERIFIED
+ * nearly always. A gate that is always red carries no information and gets switched off,
+ * which is the failure `ab-metrics.ts` already refuses to walk into.
+ *
+ * What incomplete coverage genuinely means is that the evidence is thinner than the
+ * verdict's wording implies — so it is surfaced as a COUNT for a human to weigh, rather
+ * than spent on a verdict the data cannot support in either direction.
+ */
+export interface RunModelCoverage {
+  /** Runs that reported a model. */
+  reported: number;
+  /** Runs the arm ran at all. */
+  total: number;
+}
+
 export interface ArmModelIdentity {
   /** The provider the arm actually ran on, as recorded in the registry. */
   provider: string | null;
@@ -79,6 +102,12 @@ export interface ArmModelIdentity {
    * which is not a pass.
    */
   models: readonly string[];
+  /**
+   * How much of the arm was actually looked at. Optional because it only annotates the
+   * message — a caller with no run history (a unit fixture, a caller holding models from
+   * somewhere else) still gets the same verdict, just without the coverage clause.
+   */
+  coverage?: RunModelCoverage;
 }
 
 export interface ModelIdentityVerdict {
@@ -289,6 +318,40 @@ export function checkModelIdentity(arms: Record<string, ArmModelIdentity>): Mode
     models,
     capturedArms,
     uncapturableArms,
-    message: `model identity verified — all arms ran ${distinct[0]}`,
+    message: `model identity ${sameMessage(distinct[0] as string, keys, arms)}`,
   };
+}
+
+/**
+ * The `same` verdict's wording, qualified by how much of the arms was actually read.
+ *
+ * The unqualified sentence — "verified — all arms ran X" — is a claim about EVERY run,
+ * and an arm runs once per scenario step. When some of those runs reported nothing, the
+ * evidence covers the runs that spoke, not the arm. Saying so in the line the operator
+ * actually reads is the honest instrument; the alternative on offer was to force the
+ * verdict to `unverified` on any silent run, which fires on an ordinary rollout-read
+ * hiccup and trains the reader to skip this line entirely.
+ *
+ * The silent runs are called UNMEASURED rather than a mismatch on purpose: nothing
+ * contradicts X (a contradiction is caught above, as `inconsistent` or `differs`), and
+ * equally nothing rules out a silent run having run something else. Both halves have to
+ * be said, or the count reads as either a false alarm or a rubber stamp.
+ */
+function sameMessage(
+  model: string,
+  keys: readonly string[],
+  arms: Record<string, ArmModelIdentity>
+): string {
+  const covered = keys.filter((k) => arms[k]?.coverage != null);
+  if (covered.length < keys.length) return `verified — all arms ran ${model}`;
+
+  const counts = covered
+    .map((k) => `${k} ${arms[k]?.coverage?.reported}/${arms[k]?.coverage?.total}`)
+    .join(", ");
+  const complete = covered.every((k) => arms[k]?.coverage?.reported === arms[k]?.coverage?.total);
+  return complete
+    ? `verified — all arms ran ${model}, and every run reported (${counts})`
+    : `verified ON THE RUNS THAT REPORTED — those ran ${model} (${counts}). The silent ` +
+        `runs are UNMEASURED, not confirmed: nothing contradicts ${model}, and nothing ` +
+        `rules out a silent run having run something else.`;
 }

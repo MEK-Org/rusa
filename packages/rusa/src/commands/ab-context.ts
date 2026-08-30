@@ -64,6 +64,7 @@ import {
   checkModelIdentity,
   comparabilityCaveat,
   comparabilityOf,
+  type RunModelCoverage,
 } from "../harness/model-identity.js";
 import {
   type CaptureQuotaDeps,
@@ -1081,7 +1082,12 @@ async function runProviderContextABBody(
           // Carried as the whole list rather than collapsed to one value here: an arm
           // that re-pinned mid-scenario HAS no single value, and choosing one for it
           // would launder a void run into a comparable-looking one.
-          models: reportedModels(events, id),
+          // The count travels with the list. `checkModelIdentity` does not read it — the
+          // verdict is the same with or without it — but the `same` verdict's message
+          // says "all arms ran X", and on a six-step arm that sentence is only as wide
+          // as the runs that actually reported. The coverage is what lets a reader see
+          // how wide that is instead of taking the wording at face value.
+          ...armRunModels(events, id),
           firstStepStartedAt: windows[0]?.startedAt ?? null,
           lastStepEndedAt: windows[windows.length - 1]?.endedAt ?? null,
           stepWindows: windows,
@@ -1277,8 +1283,8 @@ async function runProviderContextABBody(
 }
 
 /**
- * Every DISTINCT model the actor's runs reported they ran on, in the order first seen;
- * empty when none reported.
+ * What an arm's own runs said they ran on: every DISTINCT model in the order first seen,
+ * and how many of the arm's runs reported one at all.
  *
  * A list rather than "the model it finished on": an arm runs once per scenario step, so
  * reducing its history to a single value hides a mid-run model change behind whichever
@@ -1292,15 +1298,30 @@ async function runProviderContextABBody(
  * discard the runs that did report would make the gate read UNVERIFIED on a read hiccup
  * — trading a working check for alarm fatigue. What the gate refuses is an unbacked
  * claim; one agreeing report is backing, and a contradicting one is caught above.
+ *
+ * The count ships with the list, out of ONE scan, rather than from a second exported
+ * helper. Two loops would each carry their own idea of which events belong to the arm,
+ * and the day one of those predicates changes the coverage would silently describe a
+ * different population than the models it is offered as coverage OF — a number that
+ * looks like evidence and is not, which is the whole failure class this area exists to
+ * refuse.
  */
-export function reportedModels(events: MeshEvent[], actorId: string): string[] {
-  const seen: string[] = [];
+export function armRunModels(
+  events: MeshEvent[],
+  actorId: string
+): { models: string[]; coverage: RunModelCoverage } {
+  const models: string[] = [];
+  let reported = 0;
+  let total = 0;
   for (const event of events) {
     if (event.actorId !== actorId || event.kind !== "run_end") continue;
+    total += 1;
     const model = runEndModel(event.payload);
-    if (model && !seen.includes(model)) seen.push(model);
+    if (!model) continue;
+    reported += 1;
+    if (!models.includes(model)) models.push(model);
   }
-  return seen;
+  return { models, coverage: { reported, total } };
 }
 
 /** Parse the `sourceEventIds` out of a `run_start` inject body (an InjectRecord JSON). */
