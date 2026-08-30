@@ -2776,6 +2776,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   let diskAlertCheck: ReturnType<typeof setInterval> | null = null;
   let quotaThrottleCheck: ReturnType<typeof setInterval> | null = null;
   let modelProbeCheck: ReturnType<typeof setInterval> | null = null;
+  // The interval handle says nothing about a probe already in flight, so keep
+  // both a way to stop one (the signal) and a way to wait for it (the promise).
+  const modelProbeAbort = new AbortController();
+  let modelProbeInFlight: Promise<void> | null = null;
   const shutdown = async (reason: "deploy" | null = null) => {
     if (!running) return;
     // Stop the supervised e2e unit before committing this process to shutdown.
@@ -2788,6 +2792,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     if (diskAlertCheck) clearInterval(diskAlertCheck);
     if (quotaThrottleCheck) clearInterval(quotaThrottleCheck);
     if (modelProbeCheck) clearInterval(modelProbeCheck);
+    // Clearing the interval only stops the next probe. Abort reaches the one
+    // running now - it kills the spawned tree synchronously - and awaiting it
+    // is what gives the prober's `finally` a turn to remove its temp dir before
+    // process.exit ends the loop. Without the await the tree still dies, but the
+    // 0-byte socket dir it left behind never gets cleaned up.
+    modelProbeAbort.abort();
+    if (modelProbeInFlight) await modelProbeInFlight;
     if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
     if (trackerHygieneTimer) clearInterval(trackerHygieneTimer);
     mesh.shutdownAll(); // stops the root and any live workers (registry untouched)
@@ -2892,10 +2903,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
   // Probe model catalogs on startup and daily thereafter
   if (running) {
-    void refreshConfiguredProviderModelCatalogs({
+    modelProbeInFlight = refreshConfiguredProviderModelCatalogs({
       config,
       workersDir,
       scrapeStore: modelScrapesStore,
+      signal: modelProbeAbort.signal,
     }).catch((err) => {
       console.error(
         `[start] model catalog probe failed: ${err instanceof Error ? err.message : String(err)}`
@@ -2904,10 +2916,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     modelProbeCheck = setInterval(
       () => {
         if (!running) return;
-        void refreshConfiguredProviderModelCatalogs({
+        modelProbeInFlight = refreshConfiguredProviderModelCatalogs({
           config,
           workersDir,
           scrapeStore: modelScrapesStore,
+          signal: modelProbeAbort.signal,
         }).catch((err) => {
           console.error(
             `[start] scheduled model catalog probe failed: ${err instanceof Error ? err.message : String(err)}`

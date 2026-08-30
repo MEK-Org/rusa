@@ -135,7 +135,7 @@ vi.mock("../providers/sandbox.js", async (importOriginal) => ({
 // binaries — codex through a real tmux PTY against the host's shared `~/.codex`. Nothing awaits
 // it, so an unmocked unit run starts external CLI trees that outlive the test (#88).
 const modelScrapeMock = vi.hoisted(() => ({
-  refreshConfiguredProviderModelCatalogs: vi.fn(async () => {}),
+  refreshConfiguredProviderModelCatalogs: vi.fn(async (_deps: { signal?: AbortSignal }) => {}),
 }));
 
 vi.mock("../providers/model-scrape.js", async (importOriginal) => ({
@@ -501,6 +501,58 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // actually engaged: drop it and the count stays 0 while the suite silently goes back to
     // spawning real codex/agy trees that no test awaits.
     expect(modelScrapeMock.refreshConfiguredProviderModelCatalogs).toHaveBeenCalled();
+  });
+
+  it("shutdown aborts the in-flight model probe and waits for it to settle", async () => {
+    // Regression guard for #89. The probe is fired without being retained, so the interval
+    // handle says nothing about one already running: `clearInterval` only stops the *next*
+    // probe. Two separate things have to hold at shutdown, and each assertion below pins one.
+    let probeSignal: AbortSignal | undefined;
+    let probeSettled = false;
+    modelScrapeMock.refreshConfiguredProviderModelCatalogs.mockImplementationOnce(
+      async (deps: { signal?: AbortSignal }) => {
+        probeSignal = deps.signal;
+        // Stands in for a probe blocked on a real CLI tree: it settles only when told to.
+        await new Promise<void>((resolve) => {
+          deps.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        probeSettled = true;
+      }
+    );
+
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    await readyPromise;
+
+    // The probe is still running at this point — nothing has resolved it.
+    expect(probeSignal).toBeDefined();
+    expect(probeSignal?.aborted).toBe(false);
+    expect(probeSettled).toBe(false);
+
+    const shutdown = shutdownFn;
+    shutdownFn = undefined;
+    await shutdown?.();
+
+    // (1) The probe was reachable. This is the assertion that goes red against the old
+    // shape: with no `signal` at the call site the probe cannot be stopped at all, and
+    // with the signal but no `modelProbeAbort.abort()` shutdown blocks on it forever.
+    expect(probeSignal?.aborted).toBe(true);
+    // (2) By the time shutdown returns, the probe has finished rather than been left
+    // running. Stated plainly for the next reader: this does *not* pin the
+    // `await modelProbeInFlight` in `shutdown` — remove that await and this still passes,
+    // because the half-dozen `await`s that follow it (mcp/webhook/dashboard close) each
+    // flush the microtask queue and let the prober's `finally` run anyway. The await is
+    // there to make the ordering a guarantee instead of a by-product of what happens to
+    // be awaited after it; no test can distinguish the two today.
+    expect(probeSettled).toBe(true);
   });
 
   it("warns at boot when the self-update tool mounts without errorChat configured", async () => {
