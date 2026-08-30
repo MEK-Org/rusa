@@ -36,7 +36,7 @@ The root `quickstart` command accepts the following options:
    The interactive wizard collects configuration details and writes them directly inside the volume:
    * **Local repository**: An optional local Git repository path. The wizard records the selection in its output but does not yet copy it into the container or configure a GitHub subscription; completing that host-to-container bridge is tracked in [#69](https://github.com/MEK-Org/rusa/issues/69).
    * **Coding LLM providers**: Choose one or more of `codex`, `claude`, `antigravity`, or `kimi` (defaults to `codex`).
-   * **Provider sign-in**: For `codex`, `claude`, and `antigravity`, quickstart hands the real terminal to that vendor's CLI login, then verifies the login before continuing (for `antigravity`, exit the CLI session via `Ctrl+D Ctrl+D` or `/exit` after logging in to proceed). No API key is pasted into Rusa. Quickstart login for `kimi` is not supported yet (tracked in ISSUE_NUM); complete authentication with the vendor's own CLI.
+   * **Provider sign-in**: For `codex`, `claude`, and `antigravity`, quickstart hands the real terminal to that vendor's CLI login, then verifies the login before continuing (for `antigravity`, exit the CLI session via `Ctrl+D Ctrl+D` or `/exit` after logging in to proceed). No API key is pasted into Rusa. Quickstart login for `kimi` is not supported yet; complete authentication with the vendor's own CLI.
    * **Verification record**: Quickstart writes each supported provider's pass/fail verification result and exit code to `$RUSA_HOME/logs/quickstart-provider-login.jsonl`; it never captures vendor login output.
    * **Gemini API key**: Used for background classification and avatar tasks and written to the Rusa secrets directory.
    * **Root handle**: The display identity for the local root actor.
@@ -140,7 +140,7 @@ The flip is **inert until both steps 2 and 3 are done** — the config key with 
 **Behavior:**
 * **Key unset (default)**: identical to today — every sandboxed worker sees the host's real `~/.config/gh`. The service logs a one-line warning at the first sandboxed spawn so this exposure stays visible in the logs.
 * **Key set, file present**: sandboxed workers' `~/.config/gh` is replaced with a synthesized config carrying only the scoped PAT; `GH_TOKEN`/`GITHUB_TOKEN` are cleared inside the sandbox so they can't override it; and the host's own write-capable token file is hidden from the sandbox's read scope.
-* **Key set, file missing**: sandboxed workers **refuse to spawn** — this is deliberately fail-closed (mirroring the boot-gate precedent in ISSUE_NUM) rather than silently falling back to the host's write-capable token, which would defeat the point of the split.
+* **Key set, file missing**: sandboxed workers **refuse to spawn** — this is deliberately fail-closed, the same way a missing required credential stops boot, rather than silently falling back to the host's write-capable token, which would defeat the point of the split.
 * This only affects **sandboxed worker actors**. The root actor always runs unsandboxed on the host plane and keeps using the host's own GitHub credential regardless of this setting.
 
 ---

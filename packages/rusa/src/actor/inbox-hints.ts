@@ -75,7 +75,11 @@ export function resolveInboxHint(entry: InboxEntry): string | undefined {
       spaceName ??
       (threadName?.includes("/threads/") ? threadName.split("/threads/")[0] : undefined);
 
-    // Issue #1493, #1595, #1719: Google Chat threading guidance
+    // Google Chat gives every message a threadName, including one that heads no
+    // thread yet, so its presence alone does not mean "this message is in a
+    // thread" -- reading it that way makes a reply open a thread underneath a
+    // standalone message. The id comparison below is what separates the two, and
+    // the hints say so explicitly because the two payloads look alike.
     const isThreadHead = isGchatThreadHead(messageName, threadName);
 
     if (threadName && !isThreadHead) {
