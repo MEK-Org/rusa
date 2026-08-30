@@ -241,6 +241,38 @@ describe("reconcileEventSources", () => {
     expect(second.store.activeForResource(system)).toEqual([]);
   });
 
+  // A delegation disappearing across a restart reads like lost state, and is
+  // not: reconciliation prunes exactly what config no longer reaches. These two
+  // pin the rule from the surviving side, which had no coverage — narrowing
+  // config to drop a delegation is tested above, keeping one is not.
+  it("keeps a delegation of a repo under a still-configured org", () => {
+    const store = new InMemoryEventSubscriptionStore();
+    const repo = { kind: "github_repo", repo: "dummy-org/dummy-repo" } as const;
+    store.subscribe(sub({ resource: repo, actorId: "child", subscribedBy: "root" }));
+
+    const result = reconcileEventSources(store, [rootOrg], rootId, () => "2026-07-02T00:00:00Z");
+
+    expect(result.droppedDelegations).toEqual([]);
+    expect(result.store.activeForResource(repo).map((s) => s.actorId)).toEqual(["child"]);
+    // The org above it still seeds to root, so the delegation narrows rather
+    // than replaces: repo events reach the child, org-wide ones still reach root.
+    expect(result.store.activeForResource(rootOrg).map((s) => s.actorId)).toEqual(["root"]);
+  });
+
+  it("lets a delegation of a configured repo outrank the implied root seed", () => {
+    const store = new InMemoryEventSubscriptionStore();
+    const repo = { kind: "github_repo", repo: "dummy-org/dummy-repo" } as const;
+    store.subscribe(sub({ resource: repo, actorId: "child", subscribedBy: "root" }));
+
+    // Same resource on both sides of the union: config implies root, the
+    // persistent store records the delegation away from it. Restart must not
+    // hand the repo back to root.
+    const result = reconcileEventSources(store, [repo], rootId, () => "2026-07-02T00:00:00Z");
+
+    expect(result.droppedDelegations).toEqual([]);
+    expect(result.store.activeForResource(repo).map((s) => s.actorId)).toEqual(["child"]);
+  });
+
   it("drops orphaned delegations in the persistent store", () => {
     const store = new InMemoryEventSubscriptionStore();
     store.subscribe(sub({ resource: removedOrg, actorId: "child", subscribedBy: "root" }));
