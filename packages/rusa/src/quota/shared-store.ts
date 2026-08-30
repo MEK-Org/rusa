@@ -181,12 +181,25 @@ function sleepSync(ms: number): void {
  * construction running the same code at the same instant, and a fixed backoff
  * would march them into the same collision together.
  *
+ * `budgetMs` is the whole cost of converting, not the cost of one attempt: each
+ * attempt is handed only what is left of it. That cap is load-bearing, not
+ * tidiness. SQLite's busy handler carries its own full `busy_timeout` into
+ * every call, so without it a peer that holds RESERVED for most of the budget
+ * — fast SQLITE_BUSY, this loop spinning — and then drops to SHARED buys a
+ * second full wait inside the next single pragma, and a connection promising a
+ * 10s open takes 20s. Capping is what makes the two waits one, and it does so
+ * whatever `busy_timeout` the connection arrived with.
+ *
  * Reachable only while a database is still pre-WAL: once converted, this
  * pragma is a no-op that takes no exclusive lock.
+ *
+ * Exported for the boundary test, which shrinks `budgetMs` so it can assert the
+ * bound in milliseconds instead of tens of seconds.
  */
-function widenToWal(db: Database.Database): void {
-  const deadline = Date.now() + BUSY_TIMEOUT_MS;
+export function widenToWal(db: Database.Database, budgetMs: number = BUSY_TIMEOUT_MS): void {
+  const deadline = Date.now() + budgetMs;
   for (;;) {
+    db.pragma(`busy_timeout = ${Math.max(0, deadline - Date.now())}`);
     try {
       db.pragma("journal_mode = WAL");
       return;
@@ -211,8 +224,10 @@ export class SharedQuotaStore {
   constructor(readonly databasePath: string) {
     mkdirSync(dirname(databasePath), { recursive: true });
     this.db = new Database(databasePath);
-    this.db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
+    // The conversion runs its own budget, then hands the connection the
+    // ordinary one it keeps for the rest of its life.
     widenToWal(this.db);
+    this.db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
     this.db.pragma("foreign_keys = ON");
     this.ensureSchema();
   }

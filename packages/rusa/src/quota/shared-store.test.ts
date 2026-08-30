@@ -17,6 +17,7 @@ import {
   QUOTA_OBSERVATION_RETENTION_MS,
   QUOTA_RAW_RETENTION_MS,
   SharedQuotaStore,
+  widenToWal,
 } from "./shared-store.js";
 
 const roots: string[] = [];
@@ -550,24 +551,33 @@ function startConcurrentOpener(moduleUrl: string, databasePath: string): Concurr
   return { child, ready, completed };
 }
 
-interface ReservedHolder {
+interface LockHolder {
   holding: Promise<void>;
   completed: Promise<void>;
 }
 
 /**
- * Holds a RESERVED lock on `databasePath` from another process for `holdMs`.
+ * Holds a lock on `databasePath` from another process for `holdMs`.
  *
- * RESERVED is the state a second opener is in partway through its own
- * legacy->WAL conversion, and it is the one lock state where SQLite skips the
- * busy handler entirely — so this is the concurrent-conversion race above in
- * deterministic form, without depending on scheduler luck.
+ * The two states differ in exactly the way the conversion cares about.
+ * RESERVED is what a second opener holds partway through its own legacy->WAL
+ * conversion, and it is the one state where SQLite skips the busy handler
+ * entirely — the concurrent-conversion race in deterministic form, without
+ * depending on scheduler luck. SHARED is the state the handler *does* cover,
+ * so a peer holding it makes a single pragma sit for the connection's whole
+ * `busy_timeout`; that is what the budget-boundary test needs.
  */
-function startReservedHolder(databasePath: string, holdMs: number): ReservedHolder {
+function startLockHolder(
+  databasePath: string,
+  holdMs: number,
+  lock: "reserved" | "shared"
+): LockHolder {
+  const begin =
+    lock === "reserved" ? "BEGIN IMMEDIATE" : "BEGIN; SELECT count(*) FROM legacy_marker;";
   const script = `
     import Database from "better-sqlite3";
     const db = new Database(process.argv[1]);
-    db.exec("BEGIN IMMEDIATE");
+    db.exec(process.argv[3]);
     process.stdout.write("holding\\n");
     setTimeout(() => {
       db.exec("COMMIT");
@@ -584,6 +594,7 @@ function startReservedHolder(databasePath: string, holdMs: number): ReservedHold
       script,
       databasePath,
       String(holdMs),
+      begin,
     ],
     { stdio: ["pipe", "pipe", "pipe"] }
   );
@@ -603,7 +614,7 @@ function startReservedHolder(databasePath: string, holdMs: number): ReservedHold
     child.once("close", (code) => {
       if (code === 0) resolve();
       else {
-        const error = new Error(`reserved holder exited ${code}: ${errorOutput || output}`);
+        const error = new Error(`${lock} holder exited ${code}: ${errorOutput || output}`);
         holdingReject?.(error);
         reject(error);
       }
@@ -878,7 +889,7 @@ describe("SharedQuotaStore PID integral term", () => {
     // `busy_timeout` cannot cover this: against a peer holding RESERVED,
     // SQLite returns SQLITE_BUSY in about a millisecond rather than waiting,
     // so the opener has to come back on its own.
-    const peer = startReservedHolder(path, 500);
+    const peer = startLockHolder(path, 500, "reserved");
     await peer.holding;
 
     const store = new SharedQuotaStore(path);
@@ -889,4 +900,33 @@ describe("SharedQuotaStore PID integral term", () => {
     }
     await peer.completed;
   }, 20_000);
+
+  it("spends one conversion budget in total, not one per attempt", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-wal-budget-"));
+    roots.push(root);
+    const path = join(root, "shared.db");
+    const legacy = new Database(path);
+    legacy.exec("CREATE TABLE legacy_marker (a INTEGER)");
+    legacy.close();
+
+    // SHARED is the state SQLite's busy handler *does* cover, so one pragma
+    // against this peer sits for the connection's whole `busy_timeout`.
+    const peer = startLockHolder(path, 4_000, "shared");
+    await peer.holding;
+
+    const db = new Database(path);
+    // A connection that already carries the ordinary budget, as the store's
+    // did before the conversion was given a budget of its own. The conversion
+    // must not inherit it: uncapped, this single attempt alone would take the
+    // full 3s, fifteen times the budget it was asked for.
+    db.pragma("busy_timeout = 3000");
+    const started = Date.now();
+    try {
+      expect(() => widenToWal(db, 200)).toThrow(/database is locked/);
+      expect(Date.now() - started).toBeLessThan(1_500);
+    } finally {
+      db.close();
+    }
+    await peer.completed;
+  }, 30_000);
 });
