@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { brotliDecompressSync, gunzipSync } from "node:zlib";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorMesh } from "../actor/actor-mesh.js";
@@ -27,12 +28,14 @@ class MockReq extends EventEmitter {
 }
 
 class MockRes extends EventEmitter {
-  req = new EventEmitter();
+  req: EventEmitter & { headers?: Record<string, string> } = new EventEmitter();
   statusCode = 0;
   headers: Record<string, string> = {};
   body = "";
   writes: string[] = [];
   ended = false;
+  /** Unstringified, so a compressed body survives for round-tripping. */
+  raw: Buffer | undefined;
 
   writeHead(status: number, headers?: Record<string, string>): this {
     this.statusCode = status;
@@ -43,9 +46,16 @@ class MockRes extends EventEmitter {
     this.writes.push(chunk);
     return true;
   }
-  end(body?: string): this {
-    if (body) this.body += body;
+  end(body?: string | Buffer): this {
+    if (body) {
+      this.raw = Buffer.isBuffer(body) ? body : Buffer.from(body);
+      this.body += body;
+    }
     this.ended = true;
+    // A real ServerResponse emits this; without it a caller awaiting a
+    // response that lands off the threadpool has nothing to wait on but the
+    // clock. See `settled`.
+    this.emit("finish");
     return this;
   }
 }
@@ -54,12 +64,16 @@ function call(
   deps: DashboardDataDeps | null,
   method: string,
   path: string,
-  body?: string
+  body?: string,
+  acceptEncoding?: string
 ): { handled: boolean; res: MockRes; req: MockReq } {
   const req = new MockReq();
   req.method = method;
   req.url = path;
   const res = new MockRes();
+  // Production reads the header off `res.req`; mirror that wiring rather than
+  // adding a second path into sendJson that only tests would use.
+  if (acceptEncoding !== undefined) res.req.headers = { "accept-encoding": acceptEncoding };
   const url = new URL(path, "http://localhost");
   const handled = handleMeshApiRequest(
     req as unknown as IncomingMessage,
@@ -282,6 +296,190 @@ describe("handleMeshApiRequest", () => {
     expect(JSON.parse(res2.body)).toEqual({ error: "model is required" });
 
     deps.rootControl = control;
+  });
+
+  describe("response compression", () => {
+    /** Enough threads that the JSON clears MIN_COMPRESS_BYTES several times over. */
+    const seedBulk = (): void => {
+      registry.upsert(rec("root", null, "active"));
+      for (let i = 0; i < 60; i++) {
+        const id = `cccccccc-0000-4000-8000-${String(i).padStart(12, "0")}`;
+        registry.upsert({
+          id,
+          charter: `charter ${id} `.repeat(40),
+          parentId: "root",
+          status: "active",
+          createdAt: "2026-06-21T00:00:00.000Z",
+        });
+      }
+    };
+
+    /**
+     * Wait for the response itself, not for a number of event-loop turns.
+     *
+     * Compression resolves on the threadpool, so the response lands after the
+     * handler returns. Spinning a fixed count of `setImmediate`s to cover that
+     * is not a timeout — the turns drain in well under a millisecond, while
+     * zlib takes tens of them on a loaded box. That budget held locally and
+     * ran out on CI, where it read as `Content-Encoding: undefined` and looked
+     * like a negotiation bug rather than a test that stopped waiting.
+     */
+    const settled = (res: MockRes): Promise<void> =>
+      res.ended ? Promise.resolve() : new Promise((resolve) => res.once("finish", () => resolve()));
+
+    it("compresses a large body with brotli, preferring it over gzip", async () => {
+      seedBulk();
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "gzip, deflate, br");
+      await settled(res);
+
+      expect(res.statusCode).toBe(200);
+      expect(res.headers["Content-Encoding"]).toBe("br");
+      expect(res.raw).toBeDefined();
+      // The bytes are really brotli, and really the same document.
+      const decoded = brotliDecompressSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+      expect((res.raw as Buffer).byteLength).toBeLessThan(Buffer.byteLength(decoded));
+    });
+
+    it("falls back to gzip for a client that does not speak brotli", async () => {
+      seedBulk();
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "gzip, deflate");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBe("gzip");
+      const decoded = gunzipSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+    });
+
+    it("sends a large body uncompressed when the client accepts nothing", async () => {
+      seedBulk();
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "identity");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBeUndefined();
+      expect(JSON.parse(res.body).threads).toHaveLength(61);
+    });
+
+    it("leaves a small body alone even when the client would take brotli", async () => {
+      registry.upsert(rec("root", null, "active"));
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "br");
+      await settled(res);
+
+      // Below the threshold a round trip through the threadpool buys nothing.
+      expect(res.headers["Content-Encoding"]).toBeUndefined();
+      expect(JSON.parse(res.body).threads).toHaveLength(1);
+    });
+
+    it("always varies on Accept-Encoding, including when it did not compress", async () => {
+      registry.upsert(rec("root", null, "active"));
+      const { res } = call(deps, "GET", "/api/mesh/threads");
+      await settled(res);
+
+      // A cache that missed this header could hand a br body to a client that
+      // never asked for one.
+      expect(res.headers.Vary).toBe("Accept-Encoding");
+    });
+
+    it("honours a codec the client explicitly refused with q=0", async () => {
+      seedBulk();
+      // The case a substring test gets exactly backwards: this header offers
+      // gzip and *forbids* brotli, and reading it as "mentions br" ships a
+      // body the client said it cannot accept.
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "br;q=0, gzip");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBe("gzip");
+      const decoded = gunzipSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+    });
+
+    it("sends identity when every codec it can produce is refused", async () => {
+      seedBulk();
+      const { res } = call(
+        deps,
+        "GET",
+        "/api/mesh/threads",
+        undefined,
+        "br;q=0, gzip;q=0.0, *;q=0"
+      );
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBeUndefined();
+      expect(JSON.parse(res.body).threads).toHaveLength(61);
+    });
+
+    it("does not read a codec name out of a longer token", async () => {
+      seedBulk();
+      // `xbr` and `gzipped` are not offers of `br` and `gzip`.
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "xbr, gzipped");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBeUndefined();
+      expect(JSON.parse(res.body).threads).toHaveLength(61);
+    });
+
+    it("takes the wildcard as permission for a codec the client did not name", async () => {
+      seedBulk();
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "*");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBe("br");
+      const decoded = brotliDecompressSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+    });
+
+    it("lets an explicit refusal beat a permissive wildcard", async () => {
+      seedBulk();
+      // `*` allows everything unnamed; `br;q=0` names brotli to refuse it.
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "*, br;q=0");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBe("gzip");
+      const decoded = gunzipSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+    });
+
+    it("keeps a codec whose q is merely low, or unreadable", async () => {
+      seedBulk();
+      // Only an explicit zero disqualifies. A low q is still a yes, and a
+      // malformed one falls back to the spec's default of 1 rather than
+      // silently costing the client its compression.
+      const { res } = call(
+        deps,
+        "GET",
+        "/api/mesh/threads",
+        undefined,
+        "br;q=0.01, gzip;q=nonsense"
+      );
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBe("br");
+      const decoded = brotliDecompressSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+    });
+
+    it("reads tokens through whitespace and case the way clients send them", async () => {
+      seedBulk();
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "  GZIP ;  Q=1.0 ");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBe("gzip");
+      const decoded = gunzipSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+    });
+
+    it("does not compress when no request is reachable from the response", async () => {
+      seedBulk();
+      // MockRes's default `req` carries no headers at all — the shape an
+      // embedder's double can have. Negotiation must read that as "no
+      // encoding offered" rather than throwing.
+      const { res } = call(deps, "GET", "/api/mesh/threads");
+      await settled(res);
+
+      expect(res.statusCode).toBe(200);
+      expect(res.headers["Content-Encoding"]).toBeUndefined();
+      expect(JSON.parse(res.body).threads).toHaveLength(61);
+    });
   });
 
   it("GET /api/mesh/threads lists threads with deterministic handles", () => {
