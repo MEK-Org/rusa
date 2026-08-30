@@ -186,8 +186,19 @@ export async function scrapeCodexModelScreen(opts: ModelProbeOptions): Promise<s
   const q = JSON.stringify;
   const trustArg = `-c projects.${q(opts.actorDir)}.trust_level="trusted"`;
   // The caller's timeout is the probe's declared lifetime, so it is also the
-  // deadline for anything the probe spawns; no separate knob to drift.
-  const script = buildCodexModelTmuxScript(cliCommand, sock, trustArg, Math.ceil(timeoutMs / 1000));
+  // deadline for anything the probe spawns; no separate knob to drift. The
+  // extra second is what keeps this a pure backstop: the child is spawned
+  // before the Node-side timer is armed, and a busy event loop can delay that
+  // timer further, so an exactly-equal inner deadline could fire first and cut
+  // short a probe the Node side would have let finish. One second of grace is
+  // far more than the spawn-plus-scheduling skew, so the Node deadline wins by
+  // construction, and an abandoned tree still self-reaps a second later.
+  const script = buildCodexModelTmuxScript(
+    cliCommand,
+    sock,
+    trustArg,
+    Math.ceil(timeoutMs / 1000) + 1
+  );
 
   const killTmux = () => {
     try {

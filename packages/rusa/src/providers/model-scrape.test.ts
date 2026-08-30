@@ -332,6 +332,24 @@ done
       execFileSync("ps", ["-eo", "pid=,args="], { encoding: "utf8" })
         .split("\n")
         .filter((line) => line.includes(`-S ${sock} new-session`));
+    // A dead server is only a proxy for what #84 actually exhausted: the
+    // Codex/Node descendants holding the inotify instances. tmux runs the pane
+    // command in a process group of its own - distinct from the server's - and
+    // that group holds the whole tree (`timeout`, the CLI, and any grandchild
+    // it spawns), so draining it is the real "no orphaned probe processes"
+    // check. The server's own argv embeds the pane command verbatim, hence the
+    // new-session exclusion; without it the server is misread as a descendant.
+    const paneGroupOf = (bin: string): number | undefined => {
+      const line = execFileSync("ps", ["-eo", "pgid=,args="], { encoding: "utf8" })
+        .split("\n")
+        .find((l) => l.includes(bin) && !l.includes("new-session"));
+      const pgid = Number(line?.trim().split(/\s+/)[0]);
+      return Number.isInteger(pgid) ? pgid : undefined;
+    };
+    const paneGroupSize = (pgid: number) =>
+      execFileSync("ps", ["-eo", "pgid="], { encoding: "utf8" })
+        .split("\n")
+        .filter((l) => Number(l.trim()) === pgid).length;
 
     const before = probeDirs();
     // The probe creates its temp dir synchronously, so it is observable as soon
@@ -349,27 +367,42 @@ done
     const tempHome = join(tmpdir(), created[0]);
     const sock = join(tempHome, "model-tmux.sock");
 
+    let paneGroup: number | undefined;
     try {
       for (let i = 0; i < 100 && serversFor(sock).length === 0; i++) {
         await new Promise((r) => setTimeout(r, 100));
       }
       expect(serversFor(sock).length).toBeGreaterThan(0);
+      // Take the descendants' group while they are alive; once they exit there
+      // is nothing left to derive it from.
+      paneGroup = paneGroupOf(mockBin);
+      expect(paneGroup).toBeDefined();
+      expect(paneGroupSize(paneGroup as number)).toBeGreaterThan(0);
 
       // Slam the door: the socket is gone, so no kill-server can ever land.
       rmSync(tempHome, { recursive: true, force: true });
       await expect(pending).rejects.toThrow();
 
-      for (let i = 0; i < 150 && serversFor(sock).length > 0; i++) {
+      for (
+        let i = 0;
+        i < 150 && (serversFor(sock).length > 0 || paneGroupSize(paneGroup as number) > 0);
+        i++
+      ) {
         await new Promise((r) => setTimeout(r, 100));
       }
       expect(serversFor(sock)).toEqual([]);
+      // The point of the fix: the tree the probe spawned is gone too, not just
+      // the daemon that supervised it.
+      expect(paneGroupSize(paneGroup as number)).toBe(0);
     } finally {
       // A failing run deliberately creates an unreapable server; never let one
-      // escape onto the shared box.
+      // escape onto the shared box - and reap the descendant group too, since
+      // that is the residue #84 was actually about.
       for (const line of serversFor(sock)) {
         const pid = Number(line.trim().split(/\s+/)[0]);
         if (Number.isInteger(pid)) spawnSync("kill", ["-9", String(pid)]);
       }
+      if (paneGroup !== undefined) spawnSync("kill", ["-9", `-${paneGroup}`]);
       rmSync(tempHome, { recursive: true, force: true });
       rmSync(actorDir, { recursive: true, force: true });
     }
