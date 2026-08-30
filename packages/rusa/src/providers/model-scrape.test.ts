@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -300,8 +301,93 @@ done
     }
   });
 
+  it("leaves no tmux server behind when its socket is destroyed before teardown ", async () => {
+    // The production leak shape. The tmux server the probe starts lives in its
+    // own session, so killing the wrapper's process group cannot reach it, and
+    // its socket sits under a temp dir the probe deletes on the way out. Once
+    // that dir is gone, `tmux -S <sock> kill-server` can never reach the server
+    // again - a transient miss becomes a permanent orphan holding an inotify
+    // instance. Destroying the socket mid-probe reproduces that deterministically.
+    const actorDir = mkdtempSync(join(tmpdir(), "codex-test-actor-orphan-"));
+    const mockBin = join(actorDir, "mock-codex-hang.sh");
+    writeFileSync(
+      mockBin,
+      `#!/bin/bash
+echo "OpenAI Codex"
+echo "Ask Codex to do anything"
+while true; do
+  sleep 1
+done
+`,
+      { mode: 0o755 }
+    );
+
+    const probeDirs = () =>
+      new Set(readdirSync(tmpdir()).filter((n) => n.startsWith("rusa-codex-model-")));
+    // Match only the daemonised server: its argv carries the expanded socket
+    // path, where the wrapper shell's argv still holds the literal "$SOCK".
+    // Scoping to this probe's own socket also keeps a shared box's other runs
+    // from being read as our orphans.
+    const serversFor = (sock: string) =>
+      execFileSync("ps", ["-eo", "pid=,args="], { encoding: "utf8" })
+        .split("\n")
+        .filter((line) => line.includes(`-S ${sock} new-session`));
+
+    const before = probeDirs();
+    // The probe creates its temp dir synchronously, so it is observable as soon
+    // as the call returns a promise.
+    const pending = scrapeCodexModelScreen({
+      actorDir,
+      cliCommand: mockBin,
+      timeoutMs: 4_000,
+    });
+    // Keep an early assertion failure from surfacing as an unhandled rejection:
+    // the probe is still in flight and will reject once its deadline lands.
+    pending.catch(() => {});
+    const created = [...probeDirs()].filter((n) => !before.has(n));
+    expect(created).toHaveLength(1);
+    const tempHome = join(tmpdir(), created[0]);
+    const sock = join(tempHome, "model-tmux.sock");
+
+    try {
+      for (let i = 0; i < 100 && serversFor(sock).length === 0; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(serversFor(sock).length).toBeGreaterThan(0);
+
+      // Slam the door: the socket is gone, so no kill-server can ever land.
+      rmSync(tempHome, { recursive: true, force: true });
+      await expect(pending).rejects.toThrow();
+
+      for (let i = 0; i < 150 && serversFor(sock).length > 0; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(serversFor(sock)).toEqual([]);
+    } finally {
+      // A failing run deliberately creates an unreapable server; never let one
+      // escape onto the shared box.
+      for (const line of serversFor(sock)) {
+        const pid = Number(line.trim().split(/\s+/)[0]);
+        if (Number.isInteger(pid)) spawnSync("kill", ["-9", String(pid)]);
+      }
+      rmSync(tempHome, { recursive: true, force: true });
+      rmSync(actorDir, { recursive: true, force: true });
+    }
+  }, 45_000);
+
   it("generates tmux script with autocomplete confirmation and render error check ", () => {
-    const script = buildCodexModelTmuxScript("codex", "/tmp/sock", '-c projects.trust="trusted"');
+    const script = buildCodexModelTmuxScript(
+      "codex",
+      "/tmp/sock",
+      '-c projects.trust="trusted"',
+      90
+    );
+    // The session's command carries its own deadline, so an abandoned probe
+    // tree reaps itself even if nothing else ever kills it - and the server
+    // starts on stock settings, since that self-reaping relies on exit-empty
+    // being on and a user tmux.conf is free to turn it off.
+    expect(script).toContain('timeout --kill-after=5 90 "codex"');
+    expect(script).toContain('tmux -f /dev/null -S "$SOCK" new-session');
     expect(script).toContain("Ask Codex to do anything");
     expect(script).toContain("ERROR: composer never became ready in Codex session");
     expect(script).toContain('tmux -S "$SOCK" send-keys -t "$S" -l "/model"');

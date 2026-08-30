@@ -25,7 +25,8 @@ export interface ModelProbeOptions {
 export function buildCodexModelTmuxScript(
   cliCommand: string,
   sockPath: string,
-  trustArg = ""
+  trustArg: string,
+  deadlineSeconds: number
 ): string {
   const q = JSON.stringify;
   return [
@@ -33,7 +34,20 @@ export function buildCodexModelTmuxScript(
     `SOCK=${q(sockPath)}`,
     "S=probe",
     'tmux -S "$SOCK" kill-server 2>/dev/null || true',
-    `tmux -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 ${q(cliCommand)}${trustArg ? ` ${trustArg}` : ""}`,
+    // Bound the session's own command so the probe tree cannot outlive the
+    // probe. Every other reaping path can be cut: the tmux server runs in its
+    // own session, so a process-group kill never reaches it, and its socket
+    // lives under a temp dir this probe deletes on the way out - once that dir
+    // is gone `kill-server` can never reach the server again. When the command
+    // exits the session ends, and tmux's default exit-empty shuts the server
+    // down, needing neither this process, nor the wrapper shell, nor the socket.
+    // The 5s --kill-after grace covers a CLI that ignores the initial TERM.
+    // -f /dev/null starts the server on stock settings: that self-reaping turns
+    // on tmux's exit-empty, which a stray `set -s exit-empty off` in a user or
+    // system tmux.conf would otherwise disable, stranding an empty server for
+    // good. It also keeps someone's status bar or key bindings out of the pane
+    // text this probe greps.
+    `tmux -f /dev/null -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 timeout --kill-after=5 ${deadlineSeconds} ${q(cliCommand)}${trustArg ? ` ${trustArg}` : ""}`,
     // Wait up to ~20s for the composer prompt to become ready (not just the banner).
     "ready=0",
     "for i in $(seq 1 40); do",
@@ -171,7 +185,9 @@ export async function scrapeCodexModelScreen(opts: ModelProbeOptions): Promise<s
   const sock = join(tempHome, "model-tmux.sock");
   const q = JSON.stringify;
   const trustArg = `-c projects.${q(opts.actorDir)}.trust_level="trusted"`;
-  const script = buildCodexModelTmuxScript(cliCommand, sock, trustArg);
+  // The caller's timeout is the probe's declared lifetime, so it is also the
+  // deadline for anything the probe spawns; no separate knob to drift.
+  const script = buildCodexModelTmuxScript(cliCommand, sock, trustArg, Math.ceil(timeoutMs / 1000));
 
   const killTmux = () => {
     try {
