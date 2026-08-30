@@ -16,6 +16,11 @@ import {
   getDashboardHtml,
   hasDashboardAsset,
 } from "../dashboard/assets.js";
+import {
+  applyBrandingToHtml,
+  applyBrandingToManifest,
+  resolveDashboardBranding,
+} from "../dashboard/branding.js";
 import { handleIuReportsApiRequest, type IuReportsApiDeps } from "../dashboard/iu-reports-api.js";
 import type { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { handleQuotaApiRequest, type QuotaApiDeps } from "../dashboard/quota-api.js";
@@ -296,8 +301,31 @@ export function createDashboardRequestHandler(
     if (handleMeshApiRequest(req, res, requestUrl, dataDeps)) return;
 
     if (serveUi && req.method === "GET" && !pathname.startsWith("/api/")) {
-      // Serve a built static asset if one matches the path.
-      const staticAsset = getDashboardAsset(pathname);
+      // This instance's own name and face (#48), from the configured root
+      // actor. Resolved per request, not once at startup, because an operator can
+      // upload a new root image from the dashboard while the server runs.
+      const branding = resolveDashboardBranding(options.mesh?.rootIdentity);
+
+      // The manifest carries the installed PWA's name and icon, so it is rewritten
+      // rather than served verbatim.
+      if (pathname === "/manifest.json") {
+        const manifest = getDashboardAsset(pathname);
+        if (manifest) {
+          const body = applyBrandingToManifest(manifest.body.toString("utf8"), branding);
+          res.writeHead(200, {
+            "Content-Type": manifest.contentType,
+            // Tracks live config and the uploaded root image, so it must not be
+            // held past the change that produced it.
+            "Cache-Control": "no-store",
+          });
+          res.end(body);
+          return;
+        }
+      }
+
+      // Serve a built static asset if one matches the path. `index.html` is
+      // excluded so an explicit request for it gets the same branded shell as `/`.
+      const staticAsset = pathname === "/index.html" ? null : getDashboardAsset(pathname);
       if (staticAsset) {
         res.writeHead(200, { "Content-Type": staticAsset.contentType });
         res.end(staticAsset.body);
@@ -307,8 +335,12 @@ export function createDashboardRequestHandler(
       // refresh keeps working — when the Flutter assets have been built.
       if (hasDashboardAsset("index.html")) {
         try {
-          const html = getDashboardHtml();
-          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+          const html = applyBrandingToHtml(getDashboardHtml(), branding);
+          res.writeHead(200, {
+            "Content-Type": "text/html; charset=utf-8",
+            // The title and icon links are branded per request; see above.
+            "Cache-Control": "no-store",
+          });
           res.end(html);
           return;
         } catch (err) {

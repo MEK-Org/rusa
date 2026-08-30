@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:web/web.dart' as web;
 
 import 'api.dart';
 import 'avatar_upload_web.dart';
+import 'dashboard_title.dart';
 import 'iu/iu_reports_view.dart';
 import 'iu/iu_tree_view.dart';
 import 'sse.dart';
@@ -16,16 +18,22 @@ import 'widgets/dashboard_body.dart';
 /// SSE stream and renders the locked V1.4.0 design: an alive-actor tree on the
 /// left and the selected actor's Events / Live Output on the right.
 void main() {
-  runApp(const RusaDashboardApp());
+  // Read the served shell's title before the first frame — see
+  // `dashboard_title.dart` for why MaterialApp would otherwise overwrite it.
+  runApp(RusaDashboardApp(title: resolveDashboardTitle(web.document.title)));
 }
 
 class RusaDashboardApp extends StatelessWidget {
-  const RusaDashboardApp({super.key});
+  const RusaDashboardApp({super.key, this.title = defaultDashboardTitle});
+
+  /// Browser tab title; the served `index.html`'s, branded with this instance's
+  /// configured root actor name when one is set.
+  final String title;
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'rusa mesh',
+      title: title,
       debugShowCheckedModeBanner: false,
       theme: buildMeshTheme(),
       home: const DashboardPage(),

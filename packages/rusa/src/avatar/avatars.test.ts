@@ -7,12 +7,14 @@ import {
   avatarCachePath,
   avatarsDir,
   backfillAvatars,
+  configuredRootAvatarPath,
   generateAvatarForce,
   generateAvatarOnce,
   isPngSignature,
   isRootHandle,
   readAvatar,
   rootAvatarPath,
+  rootBrandingImage,
   splitHandle,
   uploadAvatar,
 } from "./avatars.js";
@@ -333,5 +335,37 @@ describe("with an isolated RUSA_HOME", () => {
     } finally {
       fetchMock.mockRestore();
     }
+  });
+
+  it("rootBrandingImage ignores the bundled default that readAvatar falls back to", () => {
+    // The whole point of the branding accessor: `readAvatar` must always produce
+    // something for root, but the bundled robot is generic rusa artwork shared by
+    // every install, so it is not this root's face and must not brand the page.
+    expect(readAvatar("root")).not.toBeNull();
+    expect(rootBrandingImage()).toBeNull();
+  });
+
+  it("rootBrandingImage picks up an uploaded root image, with a stamp that tracks it", () => {
+    uploadAvatar("root", PNG_BYTES);
+    const first = rootBrandingImage();
+    expect(first?.path).toBe(avatarCachePath("root"));
+    expect(first?.contentType).toBe("image/png");
+
+    uploadAvatar("root", Buffer.concat([PNG_BYTES, Buffer.from("-grown")]));
+    expect(rootBrandingImage()?.version).not.toBe(first?.version);
+  });
+
+  it("rootBrandingImage sniffs a JPEG override without reading the whole file", () => {
+    const overridePath = join(home, "ember.jpg");
+    writeFileSync(overridePath, Buffer.from([0xff, 0xd8, 0xff, 0x00]));
+    expect(rootBrandingImage({ avatarPath: overridePath })?.contentType).toBe("image/jpeg");
+  });
+
+  it("configuredRootAvatarPath resolves only a path that exists", () => {
+    const overridePath = join(home, "ember.png");
+    expect(configuredRootAvatarPath(overridePath)).toBeNull();
+    writeFileSync(overridePath, PNG_BYTES);
+    expect(configuredRootAvatarPath(overridePath)).toBe(overridePath);
+    expect(configuredRootAvatarPath(undefined)).toBeNull();
   });
 });
