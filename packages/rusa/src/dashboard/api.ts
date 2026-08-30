@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { brotliCompress, gzip, constants as zlibConstants } from "node:zlib";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
 import { generateHandle } from "../actor/handle-generator.js";
@@ -152,13 +153,101 @@ interface ThreadDto {
   ownerExpectsRetirement?: boolean | null;
 }
 
+/**
+ * Below this, compression costs more than it saves: a round trip through the
+ * threadpool to shave a few hundred bytes off a response that already fits in
+ * one segment. Most of this file's replies are small errors and acks.
+ */
+const MIN_COMPRESS_BYTES = 1024;
+
+/**
+ * Brotli's quality, chosen by measurement rather than taken from the default.
+ *
+ * On a 1.86 MB actor list, quality 11 — what `brotliCompress` uses if you say
+ * nothing — spends **3654ms** to reach 12.2% of the original. Quality 5 reaches
+ * 15.0% in 50ms. The last three points of ratio cost seventy times the CPU, so
+ * the default is the one setting this must not accept: it would replace a slow
+ * response with a slower one.
+ *
+ * For reference on the same payload, gzip lands at 19.9% in 32ms — which is why
+ * brotli is preferred when offered, and why gzip is a perfectly good fallback.
+ */
+const BROTLI_QUALITY = 5;
+
+/** The encodings this server can produce, best ratio first. */
+const ENCODINGS = ["br", "gzip"] as const;
+type Encoding = (typeof ENCODINGS)[number];
+
+/**
+ * Pick an encoding the client actually asked for.
+ *
+ * Deliberately a substring test and not a full RFC 9110 parse: the only clients
+ * are this repo's Flutter dashboard and curl, `q=0` disqualification has never
+ * arisen, and a wrong guess here is a correctness bug in exchange for nothing.
+ * If a client ever needs to refuse an encoding it lists, parse properly then.
+ */
+function negotiateEncoding(req: IncomingMessage | undefined): Encoding | undefined {
+  // `headers` is optional-chained too: a ServerResponse always has a real
+  // request behind it in production, but not every embedder's double does.
+  const header = req?.headers?.["accept-encoding"];
+  const accepted = (Array.isArray(header) ? header.join(",") : (header ?? "")).toLowerCase();
+  return ENCODINGS.find((encoding) => accepted.includes(encoding));
+}
+
+function compress(encoding: Encoding, payload: Buffer): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const done = (err: Error | null, out: Buffer) => (err ? reject(err) : resolve(out));
+    if (encoding === "gzip") {
+      gzip(payload, done);
+      return;
+    }
+    brotliCompress(
+      payload,
+      {
+        params: {
+          [zlibConstants.BROTLI_PARAM_QUALITY]: BROTLI_QUALITY,
+          [zlibConstants.BROTLI_PARAM_SIZE_HINT]: payload.byteLength,
+        },
+      },
+      done
+    );
+  });
+}
+
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const payload = JSON.stringify(body);
-  res.writeHead(status, {
+  const payload = Buffer.from(JSON.stringify(body), "utf-8");
+  // `Vary` regardless of what this particular response did: the header
+  // describes the endpoint's behaviour, and omitting it on the uncompressed
+  // branch is how an intermediary caches a br body for a client that can't read it.
+  const headers: Record<string, string> = {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
-  });
-  res.end(payload);
+    Vary: "Accept-Encoding",
+  };
+
+  const encoding =
+    payload.byteLength >= MIN_COMPRESS_BYTES ? negotiateEncoding(res.req) : undefined;
+  if (!encoding) {
+    res.writeHead(status, headers);
+    res.end(payload);
+    return;
+  }
+
+  // Off the event loop: zlib's async form runs on the threadpool, so a 2 MB
+  // body costs this request latency and not every concurrent one.
+  compress(encoding, payload).then(
+    (compressed) => {
+      if (res.writableEnded) return;
+      res.writeHead(status, { ...headers, "Content-Encoding": encoding });
+      res.end(compressed);
+    },
+    () => {
+      // Compression is an optimisation; failing it must not fail the response.
+      if (res.writableEnded) return;
+      res.writeHead(status, headers);
+      res.end(payload);
+    }
+  );
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
