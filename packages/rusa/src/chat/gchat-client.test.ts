@@ -223,6 +223,22 @@ describe("GchatClient reads", () => {
     ).rejects.toThrow("invalid attachment resource name");
   });
 
+  it("rejects getAttachment near-miss names locally, without calling Google", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const client = new GchatClient(credentialsDir());
+
+    for (const name of [
+      "spaces/A/not-messages/M1/attachments/ATT1",
+      "spaces/A/attachments/ATT1",
+      "spaces/A/messages/M1/attachments/ATT1/extra",
+      "spaces/A/messages/M1/attachments/",
+    ]) {
+      await expect(client.getAttachment(name)).rejects.toThrow("invalid attachment resource name");
+    }
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("rejects getAttachment if the parent message does not carry the attachment", async () => {
     vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(

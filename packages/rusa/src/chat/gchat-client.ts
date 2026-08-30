@@ -14,6 +14,7 @@ import {
   type ListChatSpaceMembersOptions,
   type ListChatSpacesOptions,
   MAX_CHAT_ATTACHMENT_BYTES,
+  MESSAGE_ATTACHMENT_NAME_RE,
 } from "./types.js";
 
 export { defaultGchatConfigDir, type GchatIdentity, loadGchatIdentity } from "./gchat-oauth.js";
@@ -172,13 +173,12 @@ export class GchatClient implements ChatClient {
    * inline, so we resolve metadata from the parent message instead.
    */
   async getAttachment(attachmentName: string): Promise<ChatAttachment> {
-    const separator = attachmentName.indexOf("/attachments/");
-    if (!attachmentName.startsWith("spaces/") || separator < 0) {
+    const messageName = MESSAGE_ATTACHMENT_NAME_RE.exec(attachmentName)?.[1];
+    if (!messageName) {
       throw new Error(
         `invalid attachment resource name: expected spaces/{space}/messages/{message}/attachments/{attachment} (got ${attachmentName})`
       );
     }
-    const messageName = attachmentName.slice(0, separator);
     const message = await this.getMessage(messageName);
     const attachment = message.attachment?.find((a) => a.name === attachmentName);
     if (!attachment) {
