@@ -306,6 +306,94 @@ describe("refreshConfiguredProviderModelCatalogs", () => {
       warnSpy.mockRestore();
     }
   });
+
+  // The two above abort BEFORE the probe starts, which the pre-entry guard catches.
+  // These abort a probe that is already running - the case #89 is actually about, and
+  // the one where the leaf rejects and the rejection reaches a catch. A prober that
+  // only settles on abort is what makes "in flight" real rather than a comment.
+  const blockedProber = (controller: AbortController) =>
+    vi.fn(
+      (o: { signal?: AbortSignal }) =>
+        new Promise<string>((_resolve, reject) => {
+          o.signal?.addEventListener("abort", () => reject(new Error("probe aborted")));
+          controller.abort();
+        })
+    );
+
+  it("stays quiet when codex is aborted mid-probe, not just before it starts", async () => {
+    const controller = new AbortController();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const res = await refreshProviderModelCatalog({
+        provider: "codex",
+        workersDir: "/tmp/test-workers",
+        signal: controller.signal,
+        probers: { scrapeCodex: blockedProber(controller) },
+      });
+
+      // Narrowed rather than asserted: `message` lives only on the unknown arm of
+      // ModelCatalogExtraction, so this also pins that an aborted probe never comes
+      // back as `known`.
+      if (res.status !== "unknown") throw new Error(`expected unknown, got ${res.status}`);
+      expect(res.message).toBe("model probe aborted");
+      // Indistinguishable from the pre-entry abort: same owner decision, same silence.
+      expect(errorSpy).not.toHaveBeenCalled();
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("stays quiet when agy is aborted mid-probe", async () => {
+    const controller = new AbortController();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const res = await refreshProviderModelCatalog({
+        provider: "agy",
+        workersDir: "/tmp/test-workers",
+        signal: controller.signal,
+        probers: { scrapeAgy: blockedProber(controller) },
+      });
+
+      if (res.status !== "unknown") throw new Error(`expected unknown, got ${res.status}`);
+      expect(res.message).toBe("model probe aborted");
+      expect(errorSpy).not.toHaveBeenCalled();
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("still reports a genuine probe failure loudly", async () => {
+    // The other half of the branch: silence is conditioned on the OWNER having
+    // aborted, so an ordinary rejection must not inherit it. Without this, adding
+    // the quiet path could have muted every provider failure and no test would say so.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const res = await refreshProviderModelCatalog({
+        provider: "codex",
+        workersDir: "/tmp/test-workers",
+        probers: { scrapeCodex: vi.fn().mockRejectedValue(new Error("codex exploded")) },
+      });
+
+      if (res.status !== "unknown") throw new Error(`expected unknown, got ${res.status}`);
+      expect(res.message).toContain("codex exploded");
+      // Either channel: logFailedRefresh downgrades to a warning when a
+      // last-known-good catalog survives, and that choice is not what this pins.
+      expect(errorSpy.mock.calls.length + warnSpy.mock.calls.length).toBeGreaterThan(0);
+    } finally {
+      errorSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
 });
 
 describe("scrapeCodexModelScreen", () => {
