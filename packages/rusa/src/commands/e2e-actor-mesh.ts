@@ -421,6 +421,51 @@ export function startRootControlServer(opts: {
           send(res, 200, { ok: true });
           return;
         }
+        if (url.pathname === "/obligations") {
+          // The external driver IS the operator, so the creator is the shared
+          // HUMAN_OPERATOR id — the same server-side binding the actor MCP does
+          // with its own actor id, never a value read off the request.
+          const obligation = getRepositories().obligations.create({
+            ownerId: String(body.ownerId ?? ""),
+            parentId: body.parentId == null ? null : String(body.parentId),
+            intent: body.intent == null ? null : String(body.intent),
+            title: String(body.title ?? ""),
+            externalRef: body.externalRef == null ? null : String(body.externalRef),
+            priority: typeof body.priority === "number" ? body.priority : null,
+            creatorId: HUMAN_OPERATOR,
+          });
+          send(res, 200, { obligation });
+          return;
+        }
+        const statusMatch = url.pathname.match(/^\/obligations\/([^/]+)\/status$/);
+        if (statusMatch) {
+          const obligation = getRepositories().obligations.setTerminalStatus(
+            decodeURIComponent(statusMatch[1]),
+            body.status === "cancelled" ? "cancelled" : "done",
+            typeof body.note === "string" ? body.note : null,
+            typeof body.resolutionRef === "string" ? body.resolutionRef : null
+          );
+          send(res, 200, { obligation });
+          return;
+        }
+        const reassignMatch = url.pathname.match(/^\/obligations\/([^/]+)\/reassign$/);
+        if (reassignMatch) {
+          const obligation = getRepositories().obligations.reassign(
+            decodeURIComponent(reassignMatch[1]),
+            String(body.ownerId ?? "")
+          );
+          send(res, 200, { obligation });
+          return;
+        }
+        const reparentMatch = url.pathname.match(/^\/obligations\/([^/]+)\/reparent$/);
+        if (reparentMatch) {
+          const obligation = getRepositories().obligations.reparent(
+            decodeURIComponent(reparentMatch[1]),
+            body.parentId == null ? null : String(body.parentId)
+          );
+          send(res, 200, { obligation });
+          return;
+        }
         send(res, 404, { error: "not found" });
       })
       .catch((err) => {

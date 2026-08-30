@@ -819,6 +819,89 @@ describe("ActorMesh", () => {
     expect(fake("root").calls.length).toBe(beforeUnhandledRepeat);
   });
 
+  it("collapses a run's ready-head churn into the one net transition", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, tick } = setup({ inboxStore });
+    const headEntries = () =>
+      inboxStore.entries.filter(
+        (entry) =>
+          entry.actorId === "root" &&
+          (entry.payload as { type?: string }).type === "obligation.ready_head"
+      );
+
+    mesh.actorQueued("root", { responsive: true, mode: "ordinary" });
+
+    // The shape a real root produced on 2026-08-30: create the parent, then
+    // nest a child under it. Both move root's head, and the first head is
+    // waiting again by the time the run ends.
+    expect(
+      mesh.deliverReadyHeadAttention("root", { id: "parent", intent: "root goal" }, null)
+    ).toBe(false);
+    expect(
+      mesh.deliverReadyHeadAttention("root", { id: "child", intent: "first pass" }, "parent")
+    ).toBe(false);
+    expect(headEntries()).toHaveLength(0);
+
+    mesh.finishInboxRun("root");
+    await tick();
+
+    const delivered = headEntries();
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0].source).toBe("obligation:child");
+  });
+
+  it("says nothing when a run leaves its head where it found it", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, tick } = setup({ inboxStore });
+    const headEntries = () =>
+      inboxStore.entries.filter(
+        (entry) =>
+          entry.actorId === "root" &&
+          (entry.payload as { type?: string }).type === "obligation.ready_head"
+      );
+
+    mesh.actorQueued("root", { responsive: true, mode: "ordinary" });
+    mesh.deliverReadyHeadAttention("root", { id: "b", intent: null }, "a");
+    mesh.deliverReadyHeadAttention("root", { id: "a", intent: null }, "b");
+    mesh.finishInboxRun("root");
+    await tick();
+
+    // Churned and settled back: waking an actor about the head it already had
+    // is the noise this collapse exists to remove.
+    expect(headEntries()).toHaveLength(0);
+  });
+
+  it("says nothing when a run ends with no ready head at all", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, tick } = setup({ inboxStore });
+    const headEntries = () =>
+      inboxStore.entries.filter(
+        (entry) =>
+          entry.actorId === "root" &&
+          (entry.payload as { type?: string }).type === "obligation.ready_head"
+      );
+
+    mesh.actorQueued("root", { responsive: true, mode: "ordinary" });
+    mesh.deliverReadyHeadAttention("root", { id: "parent", intent: null }, null);
+    // Filing a question owned by the operator under it leaves root waiting with
+    // nothing ready — there is no obligation to point it at.
+    mesh.deliverReadyHeadAttention("root", null, "parent");
+    mesh.finishInboxRun("root");
+    await tick();
+
+    expect(headEntries()).toHaveLength(0);
+  });
+
+  it("delivers immediately when no run is open", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh } = setup({ inboxStore });
+
+    // Every non-run producer — a peer's mutation, the dashboard, a cron — must
+    // still wake the actor at once.
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: null }, null)).toBe(true);
+    expect(mesh.deliverReadyHeadAttention("root", null, "ob-1")).toBe(false);
+  });
+
   it("does not deliver ready-head attention to a retired actor", async () => {
     const inboxStore = createMemoryInboxStore();
     const { mesh, registry } = setup({ inboxStore });

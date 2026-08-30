@@ -13,6 +13,7 @@ Future<void> showCreateObligationDialog(
   VoidCallback? onCreated,
 }) async {
   final formKey = GlobalKey<FormState>();
+  final titleCtrl = TextEditingController();
   final intentCtrl = TextEditingController();
   final ownerIdCtrl = TextEditingController(text: (defaultOwnerId == 'human:operator' ? 'human operator' : defaultOwnerId) ?? '');
   final parentIdCtrl = TextEditingController(text: defaultParentId ?? '');
@@ -70,20 +71,39 @@ Future<void> showCreateObligationDialog(
                         ),
                       ),
                     ],
-                    const Text('Intent / Description *', style: TextStyle(color: MeshColors.textSecondary, fontSize: 12)),
+                    const Text('Title *', style: TextStyle(color: MeshColors.textSecondary, fontSize: 12)),
+                    const SizedBox(height: 4),
+                    TextFormField(
+                      controller: titleCtrl,
+                      maxLength: kObligationTitleMax,
+                      style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13),
+                      decoration: const InputDecoration(
+                        hintText: 'e.g. Game Type',
+                        hintStyle: TextStyle(color: MeshColors.textMuted, fontSize: 12),
+                        filled: true,
+                        fillColor: MeshColors.bgPrimary,
+                        border: OutlineInputBorder(borderSide: BorderSide(color: MeshColors.border)),
+                        contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        counterStyle: TextStyle(color: MeshColors.textMuted, fontSize: 10),
+                      ),
+                      validator: (val) => (val == null || val.trim().isEmpty) ? 'Title is required' : null,
+                    ),
+                    const SizedBox(height: 12),
+                    const Text('Intent / Description', style: TextStyle(color: MeshColors.textSecondary, fontSize: 12)),
                     const SizedBox(height: 4),
                     TextFormField(
                       controller: intentCtrl,
+                      maxLines: 4,
+                      minLines: 2,
                       style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13),
                       decoration: const InputDecoration(
-                        hintText: 'e.g. Implement obligation write UI',
+                        hintText: 'What should become true, in words that still read months from now.',
                         hintStyle: TextStyle(color: MeshColors.textMuted, fontSize: 12),
                         filled: true,
                         fillColor: MeshColors.bgPrimary,
                         border: OutlineInputBorder(borderSide: BorderSide(color: MeshColors.border)),
                         contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                       ),
-                      validator: (val) => (val == null || val.trim().isEmpty) ? 'Intent is required' : null,
                     ),
                     const SizedBox(height: 12),
                     const SizedBox(height: 12),
@@ -184,10 +204,12 @@ Future<void> showCreateObligationDialog(
                           resolvedId = matches.isNotEmpty ? matches.first : typedText;
                         }
 
+                        final bodyText = intentCtrl.text.trim();
                         await store.api.createObligation(
                           ownerId: resolvedId,
+                          title: titleCtrl.text.trim(),
                           parentId: parentId,
-                          intent: intentCtrl.text.trim(),
+                          intent: bodyText.isEmpty ? null : bodyText,
                           externalRef: externalRef,
                           priority: priority,
                         );
@@ -257,7 +279,7 @@ Future<void> showReparentObligationDialog(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'Target: ${obligation.intent ?? obligation.id}',
+                    'Target: ${obligation.heading}',
                     style: const TextStyle(color: MeshColors.textPrimary, fontWeight: FontWeight.w600, fontSize: 13),
                   ),
                   const SizedBox(height: 4),
@@ -481,6 +503,15 @@ Future<void> confirmAndSetObligationStatus(
   VoidCallback? onUpdated,
 }) async {
   final label = status == 'done' ? 'Mark Done' : 'Cancel';
+  // The note is the only record of *why* this transition happened. For a
+  // cancellation it is the only trace the intent ever existed, and for a
+  // human-owned decision child it is the answer itself, so it is offered on
+  // every transition rather than only on cancel.
+  //
+  // Captured through onChanged rather than a TextEditingController: the dialog
+  // keeps rebuilding the field through its exit animation, so a controller
+  // disposed on the await's far side is used after disposal.
+  var note = '';
   final confirmed = await showDialog<bool>(
     context: context,
     builder: (dialogContext) => AlertDialog(
@@ -493,9 +524,40 @@ Future<void> confirmAndSetObligationStatus(
         '$label Obligation?',
         style: const TextStyle(color: MeshColors.textPrimary, fontSize: 16, fontWeight: FontWeight.bold),
       ),
-      content: Text(
-        'Are you sure you want to transition "${obligation.intent ?? obligation.id}" to status "$status"?',
-        style: const TextStyle(color: MeshColors.textSecondary, fontSize: 13),
+      // SizedBox inside a scroll view, matching the create/reparent dialogs:
+      // AlertDialog wraps content in IntrinsicWidth, and a TextField has no
+      // bounded intrinsic width, so an unwrapped one overflows the flex.
+      content: SingleChildScrollView(
+        child: SizedBox(
+          width: 440,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Are you sure you want to transition "${obligation.heading}" to status "$status"?',
+                style: const TextStyle(color: MeshColors.textSecondary, fontSize: 13),
+              ),
+              const SizedBox(height: 14),
+              Text(
+                status == 'done' ? 'Why is this done? (optional)' : 'Why cancel? (optional)',
+                style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12),
+              ),
+              const SizedBox(height: 4),
+              TextField(
+                onChanged: (value) => note = value,
+                maxLines: 3,
+                style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13),
+                decoration: InputDecoration(
+                  hintText: status == 'done'
+                      ? 'What became true, or the answer if this was a question.'
+                      : 'Why this intent is no longer current.',
+                  hintStyle: const TextStyle(color: MeshColors.textMuted, fontSize: 12),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
       actions: [
         TextButton(
@@ -517,7 +579,14 @@ Future<void> confirmAndSetObligationStatus(
   if (confirmed != true || !context.mounted) return;
 
   try {
-    await store.api.setObligationStatus(obligation.id, status);
+    // Blank stays null all the way down: "no reason given" has one
+    // representation, and it is not the empty string.
+    final trimmed = note.trim();
+    await store.api.setObligationStatus(
+      obligation.id,
+      status,
+      note: trimmed.isEmpty ? null : trimmed,
+    );
     if (context.mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Obligation transitioned to $status')),

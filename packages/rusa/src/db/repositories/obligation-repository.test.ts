@@ -1,9 +1,13 @@
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Obligation } from "../../obligations/obligation.js";
+import { asGitHubIssue } from "../../references/reference.js";
 import { obligations } from "../migrations/0016_obligations.js";
 import { obligationPriority } from "../migrations/0017_obligation_priority.js";
 import { obligationTimestamps } from "../migrations/0025_obligation_timestamps.js";
+import { obligationTerminalNote } from "../migrations/0026_obligation_terminal_note.js";
+import { obligationTitle } from "../migrations/0027_obligation_title.js";
+import { obligationArtifacts } from "../migrations/0028_obligation_artifacts.js";
 import { ObligationRepository } from "./obligation-repository.js";
 
 describe("ObligationRepository", () => {
@@ -17,6 +21,9 @@ describe("ObligationRepository", () => {
     obligations.up(db);
     obligationPriority.up(db);
     obligationTimestamps.up(db);
+    obligationTerminalNote.up(db);
+    obligationTitle.up(db);
+    obligationArtifacts.up(db);
     now = 1_000;
     repository = new ObligationRepository(
       db,
@@ -27,6 +34,7 @@ describe("ObligationRepository", () => {
 
   it("stamps createdAt/updatedAt on create and advances updatedAt on mutation", async () => {
     const created = repository.create({
+      title: "stamped",
       id: "stamped",
       ownerId: "actor-a",
       intent: "ship the slice",
@@ -46,33 +54,53 @@ describe("ObligationRepository", () => {
   });
 
   describe("ready-head attention (#1645)", () => {
-    let heads: Array<{ ownerId: string; headId: string }>;
+    let heads: Array<{ ownerId: string; headId: string | null }>;
 
     beforeEach(() => {
       heads = [];
       repository.setReadyHeadListener(({ ownerId, head }) =>
-        heads.push({ ownerId, headId: head.id })
+        heads.push({ ownerId, headId: head?.id ?? null })
       );
     });
 
     it("announces a head on create, and not again for work that lands behind it", () => {
-      repository.create({ id: "first", ownerId: "actor-a", priority: 10 });
+      repository.create({
+        title: "first",
+        id: "first",
+        ownerId: "actor-a",
+        priority: 10,
+      });
       expect(heads).toEqual([{ ownerId: "actor-a", headId: "first" }]);
 
       // Lower priority = behind the head. #1645: no event for non-head readiness.
       heads = [];
-      repository.create({ id: "second", ownerId: "actor-a", priority: 20 });
+      repository.create({
+        title: "second",
+        id: "second",
+        ownerId: "actor-a",
+        priority: 20,
+      });
       expect(heads).toEqual([]);
     });
 
     it("carries the head it displaced, so a restored head is not a repeat", () => {
-      const transitions: Array<{ from: string | null; to: string }> = [];
+      const transitions: Array<{ from: string | null; to: string | null }> = [];
       repository.setReadyHeadListener(({ head, previousHeadId }) =>
-        transitions.push({ from: previousHeadId, to: head.id })
+        transitions.push({ from: previousHeadId, to: head?.id ?? null })
       );
 
-      repository.create({ id: "first", ownerId: "actor-a", priority: 10 });
-      repository.create({ id: "urgent", ownerId: "actor-a", priority: 1 });
+      repository.create({
+        title: "first",
+        id: "first",
+        ownerId: "actor-a",
+        priority: 10,
+      });
+      repository.create({
+        title: "urgent",
+        id: "urgent",
+        ownerId: "actor-a",
+        priority: 1,
+      });
       repository.setTerminalStatus("urgent", "done");
 
       // "first" is the head twice, and only `previousHeadId` separates the two.
@@ -97,9 +125,10 @@ describe("ObligationRepository", () => {
       // stranding an actor on work it believes it never created.
       expect(() =>
         repository.create({
+          title: "committed",
           id: "committed",
           ownerId: "actor-a",
-          externalRef: "github_issue:o/r#1",
+          externalRef: "github:o/r/issues/1",
         })
       ).not.toThrow();
       expect(repository.get("committed")?.ownerId).toBe("actor-a");
@@ -164,27 +193,54 @@ describe("ObligationRepository", () => {
     });
 
     it("announces the displacing obligation when new work takes the head", () => {
-      repository.create({ id: "first", ownerId: "actor-a", priority: 10 });
+      repository.create({
+        title: "first",
+        id: "first",
+        ownerId: "actor-a",
+        priority: 10,
+      });
       heads = [];
 
-      repository.create({ id: "urgent", ownerId: "actor-a", priority: 1 });
+      repository.create({
+        title: "urgent",
+        id: "urgent",
+        ownerId: "actor-a",
+        priority: 1,
+      });
 
       expect(heads).toEqual([{ ownerId: "actor-a", headId: "urgent" }]);
     });
 
     it("announces to the receiving actor on reassignment, and only to them", () => {
-      repository.create({ id: "work", ownerId: "actor-a", priority: 10 });
+      repository.create({
+        title: "work",
+        id: "work",
+        ownerId: "actor-a",
+        priority: 10,
+      });
       heads = [];
 
       repository.reassign("work", "actor-b");
 
-      // actor-a LOST a head — losing one is not attention-worthy, only gaining.
-      expect(heads).toEqual([{ ownerId: "actor-b", headId: "work" }]);
+      // Both sides are reported: actor-a's head vanished, actor-b gained one.
+      // Losing a head is still not attention-worthy — the mesh delivers nothing
+      // for a null head — but the change has to reach it, or a consumer that
+      // collapses a run's churn would keep announcing a head that had gone.
+      expect(heads).toEqual([
+        { ownerId: "actor-a", headId: null },
+        { ownerId: "actor-b", headId: "work" },
+      ]);
     });
 
     it("announces a parent re-readied by its last child going terminal", () => {
-      repository.create({ id: "parent", ownerId: "actor-a", priority: 10 });
       repository.create({
+        title: "parent",
+        id: "parent",
+        ownerId: "actor-a",
+        priority: 10,
+      });
+      repository.create({
+        title: "child",
         id: "child",
         parentId: "parent",
         ownerId: "actor-b",
@@ -194,26 +250,76 @@ describe("ObligationRepository", () => {
       repository.setTerminalStatus("child", "done");
 
       // The parent's owner was never named by the caller; the head diff finds it.
-      expect(heads).toEqual([{ ownerId: "actor-a", headId: "parent" }]);
+      // actor-b's head went terminal, so they are reported as having none.
+      expect(heads).toEqual([
+        { ownerId: "actor-b", headId: null },
+        { ownerId: "actor-a", headId: "parent" },
+      ]);
     });
 
     it("announces heirs when a retiring actor's work moves", () => {
-      repository.create({ id: "inherited", ownerId: "actor-b", priority: 10 });
+      repository.create({
+        title: "inherited",
+        id: "inherited",
+        ownerId: "actor-b",
+        priority: 10,
+      });
       heads = [];
 
       repository.inheritRetiringActorObligationsInternal("actor-b", "actor-a");
 
-      expect(heads).toEqual([{ ownerId: "actor-a", headId: "inherited" }]);
+      expect(heads).toEqual([
+        { ownerId: "actor-b", headId: null },
+        { ownerId: "actor-a", headId: "inherited" },
+      ]);
+    });
+
+    it("reports a head that vanished, so a collapsed run cannot announce a stale one", () => {
+      repository.create({ title: "parent", id: "parent", ownerId: "actor-a", priority: 10 });
+      heads = [];
+
+      // Filing a child under your own head is the shape that motivated this:
+      // the parent goes waiting the instant the child lands, so the head an
+      // eager consumer just heard about is already gone.
+      repository.create({ title: "child", id: "child", parentId: "parent", ownerId: "actor-a" });
+
+      expect(heads).toEqual([{ ownerId: "actor-a", headId: "child" }]);
+
+      heads = [];
+      repository.create({
+        title: "grandchild",
+        id: "grandchild",
+        parentId: "child",
+        ownerId: "actor-b",
+      });
+
+      // actor-a now has nothing ready at all: parent waits on child, child waits
+      // on the grandchild that actor-b owns.
+      expect(heads).toEqual([
+        { ownerId: "actor-a", headId: null },
+        { ownerId: "actor-b", headId: "grandchild" },
+      ]);
     });
 
     it("stays silent for human owners — their head belongs in the dashboard, not an inbox", () => {
-      repository.create({ id: "operator-work", ownerId: "human:operator", priority: 10 });
+      repository.create({
+        title: "operator-work",
+        id: "operator-work",
+        ownerId: "human:operator",
+        priority: 10,
+      });
       expect(heads).toEqual([]);
     });
 
     it("announces nothing when a rolled-back mutation never commits", () => {
-      repository.create({ id: "parent", ownerId: "actor-a", priority: 10 });
       repository.create({
+        title: "parent",
+        id: "parent",
+        ownerId: "actor-a",
+        priority: 10,
+      });
+      repository.create({
+        title: "child",
         id: "child",
         parentId: "parent",
         ownerId: "actor-b",
@@ -227,12 +333,192 @@ describe("ObligationRepository", () => {
     });
 
     it("reports a head identical to the first row of the owner's own ready queue", () => {
-      repository.create({ id: "a", ownerId: "actor-a", priority: 30 });
-      repository.create({ id: "b", ownerId: "actor-a", priority: 20 });
-      repository.create({ id: "c", ownerId: "actor-a", priority: 10 });
+      repository.create({
+        title: "a",
+        id: "a",
+        ownerId: "actor-a",
+        priority: 30,
+      });
+      repository.create({
+        title: "b",
+        id: "b",
+        ownerId: "actor-a",
+        priority: 20,
+      });
+      repository.create({
+        title: "c",
+        id: "c",
+        ownerId: "actor-a",
+        priority: 10,
+      });
 
       const queue = repository.listOwned("actor-a", { status: "ready" });
       expect(heads.at(-1)).toEqual({ ownerId: "actor-a", headId: queue[0].id });
+    });
+  });
+
+  it("records why an obligation terminated, for done and for cancelled alike", () => {
+    repository.create({
+      title: "answered",
+      id: "answered",
+      ownerId: "human:operator",
+      intent: "pick a stack",
+    });
+    repository.create({
+      title: "dropped",
+      id: "dropped",
+      ownerId: "actor-a",
+      intent: "port to Godot",
+    });
+
+    const done = repository.setTerminalStatus(
+      "answered",
+      "done",
+      "Flutter — tooling is already wired."
+    );
+    expect(done.terminalNote).toBe("Flutter — tooling is already wired.");
+
+    const cancelled = repository.setTerminalStatus(
+      "dropped",
+      "cancelled",
+      "Stack decided elsewhere."
+    );
+    expect(cancelled.terminalNote).toBe("Stack decided elsewhere.");
+  });
+
+  it("keeps one representation of 'no reason given'", () => {
+    // A blank note and an omitted note are the same fact, and the column's
+    // CHECK rejects the blank string outright — so the repository coerces
+    // rather than letting a caller trip a constraint on whitespace.
+    for (const [id, note] of [
+      ["omitted", undefined],
+      ["explicit-null", null],
+      ["blank", "   \n  "],
+    ] as Array<[string, string | null | undefined]>) {
+      repository.create({
+        title: "task",
+        id,
+        ownerId: "actor-a",
+      });
+      expect(repository.setTerminalStatus(id, "done", note).terminalNote).toBeNull();
+    }
+  });
+
+  it("trims a note so leading indentation never becomes part of the reason", () => {
+    repository.create({
+      title: "padded",
+      id: "padded",
+      ownerId: "actor-a",
+    });
+    expect(
+      repository.setTerminalStatus("padded", "cancelled", "  superseded by #61\n").terminalNote
+    ).toBe("superseded by #61");
+  });
+
+  it("leaves a live obligation's note null and does not disturb it on unrelated mutation", () => {
+    const live = repository.create({
+      title: "live",
+      id: "live",
+      ownerId: "actor-a",
+    });
+    expect(live.terminalNote).toBeNull();
+    expect(repository.reassign("live", "actor-b").terminalNote).toBeNull();
+  });
+
+  it("requires a heading, and keeps it to one short line", () => {
+    expect(() => repository.create({ title: "  ", ownerId: "actor-a" })).toThrow(
+      /title is required/
+    );
+    expect(() => repository.create({ title: "two\nlines", ownerId: "actor-a" })).toThrow(
+      /single line/
+    );
+    expect(() => repository.create({ title: "x".repeat(201), ownerId: "actor-a" })).toThrow(
+      /cannot exceed/
+    );
+    // Exactly at the cap is fine; the message points at intent for the rest.
+    expect(repository.create({ title: "x".repeat(200), ownerId: "actor-a" }).title).toHaveLength(
+      200
+    );
+    expect(repository.create({ title: "  Game Type  ", ownerId: "actor-a" }).title).toBe(
+      "Game Type"
+    );
+  });
+
+  it("keeps the heading and the body as separate fields", () => {
+    const created = repository.create({
+      title: "Game Type",
+      ownerId: "human:operator",
+      intent: "What kind of game Delve is, settled well enough to build against.",
+    });
+    expect(created.title).toBe("Game Type");
+    expect(created.intent).toBe(
+      "What kind of game Delve is, settled well enough to build against."
+    );
+  });
+
+  describe("artifacts", () => {
+    it("cites artifacts, and citing the same one twice is not an error", () => {
+      repository.create({ title: "Game Type", id: "q", ownerId: "human:operator" });
+
+      const first = repository.attachArtifact("q", "mesh:messages/msg-1", {
+        label: "the ask",
+        attachedBy: "actor-a",
+      });
+      const again = repository.attachArtifact("q", "mesh:messages/msg-1", {
+        attachedBy: "actor-b",
+      });
+
+      // Idempotent per (obligation, ref): the first attachment's attribution
+      // wins, so the record of who first cited it stays honest.
+      expect(again.id).toBe(first.id);
+      expect(again.attachedBy).toBe("actor-a");
+      expect(again.label).toBe("the ask");
+      expect(repository.listArtifacts("q")).toHaveLength(1);
+    });
+
+    it("validates the ref grammar", () => {
+      repository.create({ title: "Game Type", id: "q", ownerId: "actor-a" });
+      for (const bad of [
+        "msg-1",
+        "carrier_pigeon:m/1",
+        "mesh:",
+        "mesh:messages/a b",
+        "mesh:messages",
+        "github:o/r/issues/1#issuecomment-2",
+      ]) {
+        expect(() => repository.attachArtifact("q", bad)).toThrow();
+      }
+      expect(repository.attachArtifact("q", "gchat:spaces/s/messages/m").ref).toBe(
+        "gchat:spaces/s/messages/m"
+      );
+    });
+
+    it("attaches the resolving artifact as part of the transition", () => {
+      repository.create({ title: "Game Type", id: "q", ownerId: "human:operator" });
+
+      const resolved = repository.setTerminalStatus(
+        "q",
+        "done",
+        "A monster-catching JRPG in a cave.",
+        "mesh:messages/msg-7"
+      );
+
+      expect(resolved.resolutionRef).toBe("mesh:messages/msg-7");
+      expect(resolved.terminalNote).toBe("A monster-catching JRPG in a cave.");
+      // One call, not two: evidence that only lands if a second call succeeds
+      // is evidence that goes missing on a crash.
+      expect(repository.listArtifacts("q").map((a) => a.ref)).toEqual(["mesh:messages/msg-7"]);
+    });
+
+    it("leaves resolutionRef null when nothing is cited, and rejects a bad ref", () => {
+      repository.create({ title: "Quiet", id: "quiet", ownerId: "actor-a" });
+      expect(repository.setTerminalStatus("quiet", "done").resolutionRef).toBeNull();
+
+      repository.create({ title: "Bad", id: "bad", ownerId: "actor-a" });
+      expect(() => repository.setTerminalStatus("bad", "done", null, "nope:x")).toThrow();
+      // The transition is rolled back with it — a rejected citation must not
+      // leave the obligation terminal with no record of why.
+      expect(repository.require("bad").status).toBe("ready");
     });
   });
 
@@ -263,11 +549,13 @@ describe("ObligationRepository", () => {
       // Fresh ids per case rather than deleting: obligations reference their
       // parent with ON DELETE RESTRICT, so a blanket delete trips the FK.
       repository.create({
+        title: `anchor-${name}`,
         id: `anchor-${name}`,
         ownerId: "actor-a",
         priority: 1,
       });
       const before = repository.create({
+        title: `subject-${name}`,
         id: `subject-${name}`,
         parentId: `anchor-${name}`,
         ownerId: "actor-b",
@@ -285,6 +573,7 @@ describe("ObligationRepository", () => {
 
   it("records an immutable creator that survives reassignment", async () => {
     const created = repository.create({
+      title: "owned-elsewhere",
       id: "owned-elsewhere",
       ownerId: "actor-b",
       creatorId: "human:operator",
@@ -304,6 +593,7 @@ describe("ObligationRepository", () => {
     // Actor UUID, root, human:*, system:* — all the same space, no `kind`.
     for (const creator of ["actor-a", "root", "human:operator", "system:tracker-hygiene"]) {
       const o = repository.create({
+        title: `by-${creator}`,
         id: `by-${creator}`,
         ownerId: "actor-a",
         creatorId: creator,
@@ -313,6 +603,7 @@ describe("ObligationRepository", () => {
 
     expect(() =>
       repository.create({
+        title: "blank-creator",
         id: "blank-creator",
         ownerId: "actor-a",
         creatorId: "  ",
@@ -322,6 +613,7 @@ describe("ObligationRepository", () => {
 
   it("records an honest unknown creator rather than inferring one from the owner", () => {
     const created = repository.create({
+      title: "no-principal",
       id: "no-principal",
       ownerId: "actor-a",
     });
@@ -329,8 +621,14 @@ describe("ObligationRepository", () => {
   });
 
   it("stamps mutations that do not go through setTerminalStatus", async () => {
-    repository.create({ id: "root", ownerId: "actor-a", priority: 10 });
+    repository.create({
+      title: "root",
+      id: "root",
+      ownerId: "actor-a",
+      priority: 10,
+    });
     const child = repository.create({
+      title: "child",
       id: "child",
       parentId: "root",
       ownerId: "actor-b",
@@ -346,78 +644,103 @@ describe("ObligationRepository", () => {
 
   it("represents exactly one validated owner while treating human ids as opaque handles", () => {
     const actorOwned = repository.create({
+      title: "actor-work",
       id: "actor-work",
       ownerId: "actor-a",
       intent: "ship the slice",
     });
     const humanOwned = repository.create({
+      title: "human-work",
       id: "human-work",
       ownerId: "human:operator",
     });
 
     expect(actorOwned.ownerId).toEqual("actor-a");
     expect(humanOwned.ownerId).toEqual("human:operator");
-    expect(() => repository.create({ id: "missing-actor", ownerId: "unknown" })).toThrow(
-      "actor owner does not exist"
-    );
-    expect(() => repository.create({ id: "blank-owner", ownerId: "   " })).toThrow(
-      "entity id is required"
-    );
+    expect(() =>
+      repository.create({
+        title: "missing-actor",
+        id: "missing-actor",
+        ownerId: "unknown",
+      })
+    ).toThrow("actor owner does not exist");
+    expect(() =>
+      repository.create({
+        title: "blank-owner",
+        id: "blank-owner",
+        ownerId: "   ",
+      })
+    ).toThrow("entity id is required");
     // `human:*` and `system:*` are not in the thread registry, so they must NOT
     // be run through the actor-existence check that rejects "unknown".
     expect(() =>
-      repository.create({ id: "system-owned", ownerId: "system:tracker-hygiene" })
+      repository.create({
+        title: "system-owned",
+        id: "system-owned",
+        ownerId: "system:tracker-hygiene",
+      })
     ).not.toThrow();
   });
 
   it("validates one supported external ref, enforces live uniqueness, and permits terminal reuse", () => {
     const original = repository.create({
+      title: "original",
       id: "original",
       ownerId: "actor-a",
-      externalRef: "github_issue:dummy-org/dummy-repo#1485",
+      externalRef: "github:dummy-org/dummy-repo/issues/1485",
     });
-    expect(original.externalRef).toMatchObject({
-      kind: "github_issue",
+    expect(original.externalRef?.key).toBe("github:dummy-org/dummy-repo/issues/1485");
+    const originalRef = original.externalRef;
+    if (!originalRef) throw new Error("expected an external ref");
+    expect(asGitHubIssue(originalRef)).toMatchObject({
       owner: "dummy-org",
       repo: "dummy-repo",
+      collection: "issues",
       number: 1485,
     });
 
     expect(() =>
       repository.create({
+        title: "duplicate",
         id: "duplicate",
         ownerId: "actor-b",
-        externalRef: "github_issue:dummy-org/dummy-repo#1485",
+        externalRef: "github:dummy-org/dummy-repo/issues/1485",
       })
     ).toThrow("already uses external ref");
     expect(() =>
       repository.create({
+        title: "bad-ref",
         id: "bad-ref",
         ownerId: "actor-a",
-        externalRef: "https://github.com/dummy-org/dummy-repo/issues/1485",
+        externalRef: "github:dummy-org/dummy-repo/issues/1485/comments/9",
       })
     ).toThrow("external ref must be");
     expect(() =>
       repository.create({
+        title: "oversized-owner",
         id: "oversized-owner",
         ownerId: "actor-a",
-        externalRef: `github_issue:${"a".repeat(40)}/rusa#1`,
+        externalRef: `github:${"a".repeat(40)}/rusa/issues/1`,
       })
     ).toThrow("external ref owner cannot exceed 39 characters");
     expect(() =>
       repository.create({
+        title: "oversized-repo",
         id: "oversized-repo",
         ownerId: "actor-a",
-        externalRef: `github_issue:dummy-org/${"b".repeat(101)}#1`,
+        externalRef: `github:dummy-org/${"b".repeat(101)}/issues/1`,
       })
     ).toThrow("external ref repository cannot exceed 100 characters");
 
     const maxBounds = repository.create({
+      title: "max-bounds",
       id: "max-bounds",
       ownerId: "actor-a",
-      externalRef: `github_issue:${"a".repeat(39)}/${"b".repeat(100)}#1`,
+      externalRef: `github:${"a".repeat(39)}/${"b".repeat(100)}/issues/1`,
     });
-    expect(maxBounds.externalRef).toMatchObject({
+    const maxRef = maxBounds.externalRef;
+    if (!maxRef) throw new Error("expected an external ref");
+    expect(asGitHubIssue(maxRef)).toMatchObject({
       owner: "a".repeat(39),
       repo: "b".repeat(100),
     });
@@ -426,21 +749,35 @@ describe("ObligationRepository", () => {
     repository.setTerminalStatus("max-bounds", "done");
     expect(
       repository.create({
+        title: "successor",
         id: "successor",
         ownerId: "actor-b",
-        externalRef: "github_issue:dummy-org/dummy-repo#1485",
+        externalRef: "github:dummy-org/dummy-repo/issues/1485",
       }).status
     ).toBe("ready");
   });
 
   it("blocks a parent on live children and re-readies at its retained priority", () => {
-    repository.create({ id: "first", ownerId: "actor-a" });
-    repository.create({ id: "parent", ownerId: "actor-a" });
-    repository.create({ id: "third", ownerId: "actor-a" });
+    repository.create({
+      title: "first",
+      id: "first",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "parent",
+      id: "parent",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "third",
+      id: "third",
+      ownerId: "actor-a",
+    });
     repository.setPriorityInternal("third", 100);
     repository.setPriorityInternal("parent", 200);
     repository.setPriorityInternal("first", 300);
     repository.create({
+      title: "child",
       id: "child",
       parentId: "parent",
       ownerId: "actor-b",
@@ -466,9 +803,21 @@ describe("ObligationRepository", () => {
   });
 
   it("rejects invalid, nonadjacent, cross-owner, and non-ready priority moves", () => {
-    repository.create({ id: "first", ownerId: "actor-a" });
-    repository.create({ id: "second", ownerId: "actor-a" });
-    repository.create({ id: "foreign", ownerId: "actor-b" });
+    repository.create({
+      title: "first",
+      id: "first",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "second",
+      id: "second",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "foreign",
+      id: "foreign",
+      ownerId: "actor-b",
+    });
 
     expect(() => repository.movePriorityInternal("second", "foreign", null)).toThrow(
       "neighbors must be adjacent ready obligations owned by the target owner"
@@ -476,7 +825,12 @@ describe("ObligationRepository", () => {
     expect(() => repository.movePriorityInternal("second", "first", "first")).toThrow(
       "neighbors must be adjacent"
     );
-    repository.create({ id: "child", parentId: "first", ownerId: "actor-b" });
+    repository.create({
+      title: "child",
+      id: "child",
+      parentId: "first",
+      ownerId: "actor-b",
+    });
     expect(() => repository.movePriorityInternal("first", null, "second")).toThrow(
       "only ready obligations can be reordered"
     );
@@ -486,15 +840,27 @@ describe("ObligationRepository", () => {
   });
 
   it("resolves nullable child priority through the nearest explicit ancestor", () => {
-    repository.create({ id: "root", ownerId: "actor-a", priority: 10 });
-    repository.create({ id: "child", parentId: "root", ownerId: "actor-b" });
     repository.create({
+      title: "root",
+      id: "root",
+      ownerId: "actor-a",
+      priority: 10,
+    });
+    repository.create({
+      title: "child",
+      id: "child",
+      parentId: "root",
+      ownerId: "actor-b",
+    });
+    repository.create({
+      title: "override",
       id: "override",
       parentId: "child",
       ownerId: "actor-c",
       priority: 20,
     });
     repository.create({
+      title: "leaf",
       id: "leaf",
       parentId: "override",
       ownerId: "actor-a",
@@ -513,14 +879,21 @@ describe("ObligationRepository", () => {
   });
 
   it("moves a subtree by clearing every descendant override", () => {
-    repository.create({ id: "root", ownerId: "actor-a", priority: 10 });
     repository.create({
+      title: "root",
+      id: "root",
+      ownerId: "actor-a",
+      priority: 10,
+    });
+    repository.create({
+      title: "child",
       id: "child",
       parentId: "root",
       ownerId: "actor-b",
       priority: 20,
     });
     repository.create({
+      title: "leaf",
       id: "leaf",
       parentId: "child",
       ownerId: "actor-c",
@@ -539,18 +912,26 @@ describe("ObligationRepository", () => {
   });
 
   it("materializes null direct-child branches for self moves until a later subtree move", () => {
-    repository.create({ id: "root", ownerId: "actor-a", priority: 10 });
     repository.create({
+      title: "root",
+      id: "root",
+      ownerId: "actor-a",
+      priority: 10,
+    });
+    repository.create({
+      title: "inheriting",
       id: "inheriting",
       parentId: "root",
       ownerId: "actor-b",
     });
     repository.create({
+      title: "leaf",
       id: "leaf",
       parentId: "inheriting",
       ownerId: "actor-c",
     });
     repository.create({
+      title: "explicit",
       id: "explicit",
       parentId: "root",
       ownerId: "actor-b",
@@ -570,10 +951,30 @@ describe("ObligationRepository", () => {
   });
 
   it("uses midpoint moves and repairs equal-priority suffixes at +1 increments", () => {
-    repository.create({ id: "a", ownerId: "actor-a", priority: 10 });
-    repository.create({ id: "b", ownerId: "actor-a", priority: 20 });
-    repository.create({ id: "c", ownerId: "actor-a", priority: 30 });
-    repository.create({ id: "moved", ownerId: "actor-a", priority: 40 });
+    repository.create({
+      title: "a",
+      id: "a",
+      ownerId: "actor-a",
+      priority: 10,
+    });
+    repository.create({
+      title: "b",
+      id: "b",
+      ownerId: "actor-a",
+      priority: 20,
+    });
+    repository.create({
+      title: "c",
+      id: "c",
+      ownerId: "actor-a",
+      priority: 30,
+    });
+    repository.create({
+      title: "moved",
+      id: "moved",
+      ownerId: "actor-a",
+      priority: 40,
+    });
 
     expect(repository.movePriorityInternal("moved", "a", "b").effectivePriority).toBe(15);
     expect(repository.listOwned("actor-a", { status: "ready" }).map((o) => o.id)).toEqual([
@@ -594,9 +995,24 @@ describe("ObligationRepository", () => {
   });
 
   it("moves correctly across the full finite REAL magnitude range", () => {
-    repository.create({ id: "low", ownerId: "actor-a", priority: -1e308 });
-    repository.create({ id: "high", ownerId: "actor-a", priority: 1e308 });
-    repository.create({ id: "moved", ownerId: "actor-a", priority: 0 });
+    repository.create({
+      title: "low",
+      id: "low",
+      ownerId: "actor-a",
+      priority: -1e308,
+    });
+    repository.create({
+      title: "high",
+      id: "high",
+      ownerId: "actor-a",
+      priority: 1e308,
+    });
+    repository.create({
+      title: "moved",
+      id: "moved",
+      ownerId: "actor-a",
+      priority: 0,
+    });
 
     expect(repository.movePriorityInternal("moved", "low", "high").effectivePriority).toBe(0);
     expect(repository.movePriorityInternal("moved", null, "low").effectivePriority).toSatisfy(
@@ -608,10 +1024,30 @@ describe("ObligationRepository", () => {
   });
 
   it("repairs large equal-priority bands using the next representable values", () => {
-    repository.create({ id: "a", ownerId: "actor-a", priority: 1e308 });
-    repository.create({ id: "b", ownerId: "actor-a", priority: 1e308 });
-    repository.create({ id: "c", ownerId: "actor-a", priority: 1e308 });
-    repository.create({ id: "moved", ownerId: "actor-a", priority: 1.5e308 });
+    repository.create({
+      title: "a",
+      id: "a",
+      ownerId: "actor-a",
+      priority: 1e308,
+    });
+    repository.create({
+      title: "b",
+      id: "b",
+      ownerId: "actor-a",
+      priority: 1e308,
+    });
+    repository.create({
+      title: "c",
+      id: "c",
+      ownerId: "actor-a",
+      priority: 1e308,
+    });
+    repository.create({
+      title: "moved",
+      id: "moved",
+      ownerId: "actor-a",
+      priority: 1.5e308,
+    });
 
     repository.movePriorityInternal("moved", "a", "b");
     const moved = repository.require("moved").effectivePriority;
@@ -624,13 +1060,19 @@ describe("ObligationRepository", () => {
   });
 
   it("keeps a parent waiting until every direct child is terminal", () => {
-    repository.create({ id: "parent", ownerId: "actor-a" });
     repository.create({
+      title: "parent",
+      id: "parent",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "child-a",
       id: "child-a",
       parentId: "parent",
       ownerId: "actor-b",
     });
     repository.create({
+      title: "child-b",
       id: "child-b",
       parentId: "parent",
       ownerId: "human:operator",
@@ -643,8 +1085,13 @@ describe("ObligationRepository", () => {
   });
 
   it("guards terminal transitions with live children and makes terminal state final", () => {
-    repository.create({ id: "parent", ownerId: "actor-a" });
     repository.create({
+      title: "parent",
+      id: "parent",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "child",
       id: "child",
       parentId: "parent",
       ownerId: "actor-b",
@@ -663,6 +1110,7 @@ describe("ObligationRepository", () => {
     );
     expect(() =>
       repository.create({
+        title: "late-child",
         id: "late-child",
         parentId: "parent",
         ownerId: "actor-b",
@@ -672,16 +1120,19 @@ describe("ObligationRepository", () => {
 
   it("returns a complete tree that names the live child explaining waiting", () => {
     repository.create({
+      title: "root",
       id: "root",
       ownerId: "actor-a",
-      externalRef: "github_pr:dummy-org/dummy-repo#2000",
+      externalRef: "github:dummy-org/dummy-repo/pulls/2000",
     });
     repository.create({
+      title: "review",
       id: "review",
       parentId: "root",
       ownerId: "human:operator",
     });
     repository.create({
+      title: "check",
       id: "check",
       parentId: "review",
       ownerId: "actor-b",
@@ -700,6 +1151,7 @@ describe("ObligationRepository", () => {
   it("does not cap or warn on an owner ready queue", () => {
     for (let index = 0; index < 150; index += 1) {
       repository.create({
+        title: "work-${index.toString().padStart(3, ",
         id: `work-${index.toString().padStart(3, "0")}`,
         ownerId: "actor-a",
       });
@@ -713,6 +1165,7 @@ describe("ObligationRepository", () => {
   it("provides bounded pages without capping the durable queue", () => {
     for (let index = 0; index < 150; index += 1) {
       repository.create({
+        title: "work-${index.toString().padStart(3, ",
         id: `work-${index.toString().padStart(3, "0")}`,
         ownerId: "actor-a",
       });
@@ -731,13 +1184,34 @@ describe("ObligationRepository", () => {
   });
 
   it("internally inherits only a retiring actor's nonterminal obligations", () => {
-    repository.create({ id: "parent-existing", ownerId: "actor-b" });
-    repository.create({ id: "retiring-first", ownerId: "actor-a" });
-    repository.create({ id: "retiring-second", ownerId: "actor-a" });
-    repository.create({ id: "retiring-terminal", ownerId: "actor-a" });
-    repository.setTerminalStatus("retiring-terminal", "done");
-    repository.create({ id: "waiting-parent", ownerId: "actor-a" });
     repository.create({
+      title: "parent-existing",
+      id: "parent-existing",
+      ownerId: "actor-b",
+    });
+    repository.create({
+      title: "retiring-first",
+      id: "retiring-first",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "retiring-second",
+      id: "retiring-second",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "retiring-terminal",
+      id: "retiring-terminal",
+      ownerId: "actor-a",
+    });
+    repository.setTerminalStatus("retiring-terminal", "done");
+    repository.create({
+      title: "waiting-parent",
+      id: "waiting-parent",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "child-keeps-owner",
       id: "child-keeps-owner",
       parentId: "waiting-parent",
       ownerId: "actor-c",
@@ -768,8 +1242,16 @@ describe("ObligationRepository", () => {
   });
 
   it("supports child-first inheritance moving upward again when the parent retires", () => {
-    repository.create({ id: "grandparent-existing", ownerId: "actor-c" });
-    repository.create({ id: "child-work", ownerId: "actor-a" });
+    repository.create({
+      title: "grandparent-existing",
+      id: "grandparent-existing",
+      ownerId: "actor-c",
+    });
+    repository.create({
+      title: "child-work",
+      id: "child-work",
+      ownerId: "actor-a",
+    });
 
     expect(repository.inheritRetiringActorObligationsInternal("actor-a", "actor-b")).toEqual({
       ready: 1,
@@ -788,7 +1270,11 @@ describe("ObligationRepository", () => {
   });
 
   it("leaves root/no-parent inheritance visibly unresolved and validates the recipient", () => {
-    repository.create({ id: "root-work", ownerId: "actor-a" });
+    repository.create({
+      title: "root-work",
+      id: "root-work",
+      ownerId: "actor-a",
+    });
 
     expect(() => repository.inheritRetiringActorObligationsInternal("actor-a", null)).toThrow(
       "root/no-parent behavior is unresolved (ISSUE_NUM Q69)"
@@ -814,9 +1300,18 @@ describe("ObligationRepository", () => {
 
   describe("list and listPage", () => {
     it("filters obligations by ownerId, status, and rootsOnly with pagination", () => {
-      repository.create({ id: "root-1", ownerId: "actor-a" });
-      repository.create({ id: "root-2", ownerId: "human:operator" });
       repository.create({
+        title: "root-1",
+        id: "root-1",
+        ownerId: "actor-a",
+      });
+      repository.create({
+        title: "root-2",
+        id: "root-2",
+        ownerId: "human:operator",
+      });
+      repository.create({
+        title: "child-1",
         id: "child-1",
         parentId: "root-1",
         ownerId: "actor-a",
@@ -850,12 +1345,14 @@ describe("ObligationRepository", () => {
   describe("reassign", () => {
     it("moves ready and waiting work between actor and human queues without changing the deliverable", () => {
       repository.create({
+        title: "parent",
         id: "parent",
         ownerId: "actor-a",
-        externalRef: "github_issue:dummy-org/dummy-repo#1636",
+        externalRef: "github:dummy-org/dummy-repo/issues/1636",
         priority: 42.5,
       });
       repository.create({
+        title: "child",
         id: "child",
         parentId: "parent",
         ownerId: "actor-b",
@@ -880,7 +1377,11 @@ describe("ObligationRepository", () => {
     });
 
     it("validates actor targets, permits same-owner no-op, and rejects terminal obligations", () => {
-      const task = repository.create({ id: "task", ownerId: "actor-a" });
+      const task = repository.create({
+        title: "task",
+        id: "task",
+        ownerId: "actor-a",
+      });
       expect(repository.reassign("task", task.ownerId)).toEqual(task);
       expect(() => repository.reassign("task", "missing")).toThrow("actor owner does not exist");
       repository.setTerminalStatus("task", "done");
@@ -892,9 +1393,18 @@ describe("ObligationRepository", () => {
 
   describe("reparent", () => {
     it("reparents a child to a new parent, updating both parents' ready/waiting states", () => {
-      const p1 = repository.create({ id: "parent-1", ownerId: "actor-a" });
-      const p2 = repository.create({ id: "parent-2", ownerId: "actor-a" });
+      const p1 = repository.create({
+        title: "parent-1",
+        id: "parent-1",
+        ownerId: "actor-a",
+      });
+      const p2 = repository.create({
+        title: "parent-2",
+        id: "parent-2",
+        ownerId: "actor-a",
+      });
       repository.create({
+        title: "child-1",
         id: "child-1",
         parentId: "parent-1",
         ownerId: "actor-a",
@@ -916,8 +1426,13 @@ describe("ObligationRepository", () => {
     });
 
     it("reparents a child to root, assigning a valid clock priority when stored priority was null", () => {
-      repository.create({ id: "parent-1", ownerId: "actor-a" });
+      repository.create({
+        title: "parent-1",
+        id: "parent-1",
+        ownerId: "actor-a",
+      });
       const child = repository.create({
+        title: "child-1",
         id: "child-1",
         parentId: "parent-1",
         ownerId: "actor-a",
@@ -932,9 +1447,18 @@ describe("ObligationRepository", () => {
     });
 
     it("preserves explicit priority when reparenting", () => {
-      repository.create({ id: "p1", ownerId: "actor-a" });
-      repository.create({ id: "p2", ownerId: "actor-a" });
       repository.create({
+        title: "p1",
+        id: "p1",
+        ownerId: "actor-a",
+      });
+      repository.create({
+        title: "p2",
+        id: "p2",
+        ownerId: "actor-a",
+      });
+      repository.create({
+        title: "c1",
         id: "c1",
         parentId: "p1",
         ownerId: "actor-a",
@@ -947,18 +1471,28 @@ describe("ObligationRepository", () => {
     });
 
     it("rejects reparenting to self, cycle creation, terminal parent, and terminal target", () => {
-      repository.create({ id: "root-a", ownerId: "actor-a" });
       repository.create({
+        title: "root-a",
+        id: "root-a",
+        ownerId: "actor-a",
+      });
+      repository.create({
+        title: "child-a",
         id: "child-a",
         parentId: "root-a",
         ownerId: "actor-a",
       });
       repository.create({
+        title: "grandchild-a",
         id: "grandchild-a",
         parentId: "child-a",
         ownerId: "actor-a",
       });
-      repository.create({ id: "terminal-root", ownerId: "actor-a" });
+      repository.create({
+        title: "terminal-root",
+        id: "terminal-root",
+        ownerId: "actor-a",
+      });
       repository.setTerminalStatus("terminal-root", "done");
 
       // Self-parenting

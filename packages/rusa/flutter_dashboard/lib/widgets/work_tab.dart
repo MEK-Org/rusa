@@ -342,7 +342,7 @@ class _WorkTabState extends State<WorkTab> {
                                     crossAxisAlignment: CrossAxisAlignment.start,
                                     children: [
                                       Text(
-                                        node.obligation.intent ?? node.obligation.id,
+                                        node.obligation.heading,
                                         maxLines: 1,
                                         overflow: TextOverflow.ellipsis,
                                         style: TextStyle(
@@ -435,7 +435,6 @@ class _DetailView extends StatelessWidget {
 
         final data = snapshot.data!;
         final o = data.obligation;
-        final hasIntent = o.intent != null && o.intent!.trim().isNotEmpty;
 
         return ListView(
           padding: const EdgeInsets.all(24),
@@ -458,13 +457,24 @@ class _DetailView extends StatelessWidget {
             ),
             const SizedBox(height: 12),
             SelectableText(
-              hasIntent ? o.intent! : o.id,
+              o.heading,
               style: const TextStyle(
                 color: MeshColors.textPrimary,
                 fontSize: 22,
                 fontWeight: FontWeight.bold,
               ),
             ),
+            if (o.body != null) ...[
+              const SizedBox(height: 10),
+              SelectableText(
+                o.body!,
+                style: const TextStyle(
+                  color: MeshColors.textSecondary,
+                  fontSize: 13.5,
+                  height: 1.5,
+                ),
+              ),
+            ],
             const SizedBox(height: 24),
             _SectionHeader('OWNER'),
             _ownerPanel(o.ownerId),

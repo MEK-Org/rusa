@@ -5,11 +5,14 @@ import {
   type EntityId,
   isTerminalObligationStatus,
   type Obligation,
+  type ObligationArtifact,
   type ObligationStatus,
   type ObligationTree,
   ObligationValidationError,
   parseExternalRef,
+  parseObligationReference,
   validateEntityId,
+  validateObligationTitle,
 } from "../../obligations/obligation.js";
 
 interface ObligationRow {
@@ -25,12 +28,26 @@ interface ObligationRow {
   created_at: string | null;
   updated_at: string | null;
   creator_id: string | null;
+  terminal_note: string | null;
+  title: string | null;
+  resolution_ref: string | null;
+}
+
+interface ObligationArtifactRow {
+  id: string;
+  obligation_id: string;
+  ref: string;
+  label: string | null;
+  attached_by: string | null;
+  attached_at: string;
 }
 
 export interface CreateObligationInput {
   id?: string;
   parentId?: string | null;
   ownerId: EntityId;
+  /** The heading. Required: a node with no heading cannot appear in a call-list. */
+  title: string;
   intent?: string | null;
   externalRef?: string | null;
   /** Explicit finite priority. Children inherit when omitted/null; roots default to the clock. */
@@ -74,7 +91,18 @@ export interface OwnedObligationPageOptions extends ObligationPageOptions {
 /** An actor gained a ready head it did not previously have. */
 export interface ReadyHeadChange {
   ownerId: EntityId;
-  head: Obligation;
+  /**
+   * The owner's new ready head, or `null` when they no longer have one — the
+   * queue emptied, or the head became a waiting parent the moment a child was
+   * filed under it.
+   *
+   * Emitting the disappearance matters because a consumer that collapses a
+   * run's churn into one net transition cannot otherwise tell "still the head"
+   * from "stopped being the head": it would announce a head that had already
+   * gone waiting, which is precisely what a live root did on 2026-08-30 when it
+   * created a root obligation and immediately nested a child under it.
+   */
+  head: Obligation | null;
   /**
    * The head this one displaced, or `null` when the owner had no ready head.
    *
@@ -177,6 +205,18 @@ function validatePage(options: ObligationPageOptions): { limit: number; offset: 
   return { limit: options.limit, offset };
 }
 
+/**
+ * A terminal note is free prose or nothing. Whitespace-only input collapses to
+ * NULL so "no reason given" has exactly one representation — the same invariant
+ * 0026's CHECK enforces at the column, kept here so a caller gets the coercion
+ * rather than a constraint error.
+ */
+function normalizeTerminalNote(note: string | null | undefined): string | null {
+  if (note == null) return null;
+  const trimmed = note.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 function toObligation(row: ObligationRow): Obligation {
   assertObligationStatus(row.status);
   return {
@@ -192,6 +232,20 @@ function toObligation(row: ObligationRow): Obligation {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     creatorId: row.creator_id,
+    terminalNote: row.terminal_note,
+    title: row.title,
+    resolutionRef: row.resolution_ref,
+  };
+}
+
+function toArtifact(row: ObligationArtifactRow): ObligationArtifact {
+  return {
+    id: row.id,
+    obligationId: row.obligation_id,
+    ref: row.ref,
+    label: row.label,
+    attachedBy: row.attached_by,
+    attachedAt: row.attached_at,
   };
 }
 
@@ -395,6 +449,7 @@ export class ObligationRepository {
       const parentId = input.parentId ?? null;
       if (parentId === id) throw new ObligationValidationError("obligation cannot parent itself");
       const ownerId = validateEntityId(input.ownerId);
+      const title = validateObligationTitle(input.title);
       if (isActorEntityId(ownerId) && this.actorExists && !this.actorExists(ownerId)) {
         throw new ObligationValidationError(`actor owner does not exist: ${ownerId}`);
       }
@@ -422,14 +477,15 @@ export class ObligationRepository {
         this.db
           .prepare(
             `INSERT INTO obligations
-               (id, parent_id, owner_id, intent, external_ref, status, priority,
+               (id, parent_id, owner_id, title, intent, external_ref, status, priority,
                 created_at, updated_at, creator_id)
-             VALUES (?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?)`
+             VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?)`
           )
           .run(
             id,
             parentId,
             ownerId,
+            title,
             input.intent ?? null,
             externalRef,
             priority,
@@ -802,7 +858,60 @@ export class ObligationRepository {
   }
 
   /** Internal terminal transition; the future service layer owns discharge authorization/ACK. */
-  setTerminalStatus(id: string, status: "done" | "cancelled"): Obligation {
+  /**
+   * Cite an artifact on an obligation. Idempotent per `(obligation, ref)` so a
+   * retry — or an actor attaching the same message twice while reasoning about
+   * it — is not an error; the first attachment's attribution and timestamp win,
+   * which keeps the record of who first cited it honest.
+   */
+  attachArtifact(
+    obligationId: string,
+    ref: string,
+    options?: { label?: string | null; attachedBy?: EntityId | null }
+  ): ObligationArtifact {
+    return this.mutate(() => {
+      this.require(obligationId);
+      const key = parseObligationReference(ref).key;
+      const label = options?.label == null ? null : options.label.trim() || null;
+      const attachedBy = options?.attachedBy == null ? null : validateEntityId(options.attachedBy);
+      this.db
+        .prepare(
+          `INSERT INTO obligation_artifacts (id, obligation_id, ref, label, attached_by, attached_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(obligation_id, ref) DO NOTHING`
+        )
+        .run(randomUUID(), obligationId, key, label, attachedBy, this.stamp());
+      const row = this.db
+        .prepare("SELECT * FROM obligation_artifacts WHERE obligation_id = ? AND ref = ?")
+        .get(obligationId, key) as ObligationArtifactRow;
+      return toArtifact(row);
+    });
+  }
+
+  /** Every artifact cited by an obligation, oldest first. */
+  listArtifacts(obligationId: string): ObligationArtifact[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM obligation_artifacts
+         WHERE obligation_id = ?
+         ORDER BY attached_at, id`
+      )
+      .all(obligationId) as ObligationArtifactRow[];
+    return rows.map(toArtifact);
+  }
+
+  setTerminalStatus(
+    id: string,
+    status: "done" | "cancelled",
+    /** Why, in the terminating principal's words. Omitted means no reason given. */
+    note?: string | null,
+    /**
+     * The artifact that settled this — the message that answered the question,
+     * the PR that delivered the work. Attached to the obligation if it is not
+     * already, so citing evidence never needs two calls.
+     */
+    resolutionRef?: string | null
+  ): Obligation {
     return this.mutate(() => {
       const obligation = this.require(id);
       if (isTerminalObligationStatus(obligation.status)) {
@@ -817,9 +926,25 @@ export class ObligationRepository {
         );
       }
 
+      const resolution = resolutionRef == null ? null : parseObligationReference(resolutionRef).key;
+      if (resolution !== null) {
+        // Same transaction as the transition: evidence that arrives only if a
+        // second call succeeds is evidence that goes missing on a crash.
+        this.db
+          .prepare(
+            `INSERT INTO obligation_artifacts (id, obligation_id, ref, label, attached_by, attached_at)
+             VALUES (?, ?, ?, NULL, NULL, ?)
+             ON CONFLICT(obligation_id, ref) DO NOTHING`
+          )
+          .run(randomUUID(), id, resolution, this.stamp());
+      }
       this.db
-        .prepare("UPDATE obligations SET status = ?, updated_at = ? WHERE id = ?")
-        .run(status, this.stamp(), id);
+        .prepare(
+          `UPDATE obligations
+           SET status = ?, terminal_note = ?, resolution_ref = ?, updated_at = ?
+           WHERE id = ?`
+        )
+        .run(status, normalizeTerminalNote(note), resolution, this.stamp(), id);
       if (obligation.parentId !== null) this.reReadyParentIfUnblocked(obligation.parentId);
       return this.require(id);
     });

@@ -76,6 +76,9 @@ ObligationDto makeObligation(
   double? priority,
   double effectivePriority = 100.0,
   String? prioritySourceId,
+  String? terminalNote,
+  String? title,
+  String? resolutionRef,
 }) =>
     ObligationDto(
       id: id,
@@ -87,6 +90,11 @@ ObligationDto makeObligation(
       priority: priority,
       effectivePriority: effectivePriority,
       prioritySourceId: prioritySourceId,
+      terminalNote: terminalNote,
+      // Defaults to the intent's heading so existing fixtures keep rendering
+      // the label their assertions look for.
+      title: title ?? intent ?? 'intent $id',
+      resolutionRef: resolutionRef,
     );
 
 /// Fake REST API with canned responses; records the actor lists it was queried
@@ -417,8 +425,8 @@ class FakeApi extends DashboardApi {
   List<ObligationDto> obligationsResult = [];
   Map<String, ObligationDetailSnapshot> obligationDetails = {};
   Map<String, ObligationTreeDto> obligationTrees = {};
-  final createObligationCalls = <({String ownerId, String? parentId, String? intent, String? externalRef, double? priority})>[];
-  final statusCalls = <({String id, String status})>[];
+  final createObligationCalls = <({String ownerId, String title, String? parentId, String? intent, String? externalRef, double? priority})>[];
+  final statusCalls = <({String id, String status, String? note, String? resolutionRef})>[];
   final reorderCalls = <({String id, String? previousId, String? nextId, String scope})>[];
   final reparentCalls = <({String id, String? parentId})>[];
   final reassignCalls = <({String id, String ownerId})>[];
@@ -490,6 +498,7 @@ class FakeApi extends DashboardApi {
   @override
   Future<ObligationDto> createObligation({
     required String ownerId,
+    required String title,
     String? parentId,
     String? intent,
     String? externalRef,
@@ -497,6 +506,7 @@ class FakeApi extends DashboardApi {
   }) async {
     createObligationCalls.add((
       ownerId: ownerId,
+      title: title,
       parentId: parentId,
       intent: intent,
       externalRef: externalRef,
@@ -506,6 +516,7 @@ class FakeApi extends DashboardApi {
       'ob-${obligationsResult.length + 1}',
       parentId: parentId,
       ownerId: ownerId,
+      title: title,
       intent: intent,
       externalRef: externalRef,
       priority: priority,
@@ -515,8 +526,13 @@ class FakeApi extends DashboardApi {
   }
 
   @override
-  Future<ObligationDto> setObligationStatus(String id, String status) async {
-    statusCalls.add((id: id, status: status));
+  Future<ObligationDto> setObligationStatus(
+    String id,
+    String status, {
+    String? note,
+    String? resolutionRef,
+  }) async {
+    statusCalls.add((id: id, status: status, note: note, resolutionRef: resolutionRef));
     final index = obligationsResult.indexWhere((o) => o.id == id);
     if (index >= 0) {
       final old = obligationsResult[index];
@@ -530,6 +546,9 @@ class FakeApi extends DashboardApi {
         priority: old.priority,
         effectivePriority: old.effectivePriority,
         prioritySourceId: old.prioritySourceId,
+        terminalNote: note,
+        title: old.title,
+        resolutionRef: resolutionRef,
       );
       obligationsResult[index] = updated;
       return updated;

@@ -382,6 +382,7 @@ class DashboardApi {
 
   Future<ObligationDto> createObligation({
     required String ownerId,
+    required String title,
     String? parentId,
     String? intent,
     String? externalRef,
@@ -390,6 +391,7 @@ class DashboardApi {
     final uri = _u('/api/mesh/obligations');
     final payload = {
       'ownerId': ownerId,
+      'title': title,
       'parentId': ?parentId,
       'intent': ?intent,
       'externalRef': ?externalRef,
@@ -410,15 +412,28 @@ class DashboardApi {
     return ObligationDto.fromJson(json['obligation'] as Map<String, dynamic>);
   }
 
-  Future<ObligationDto> setObligationStatus(String id, String status) async {
+  Future<ObligationDto> setObligationStatus(
+    String id,
+    String status, {
+    String? note,
+    String? resolutionRef,
+  }) async {
     final uri = _u('/api/mesh/obligations/$id/status');
+    final trimmed = note?.trim();
     final res = await _client.post(
       uri,
       headers: {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
       },
-      body: jsonEncode({'status': status}),
+      body: jsonEncode({
+        'status': status,
+        // Omitted rather than sent as '' so the server records "no reason
+        // given" as null, matching the repository's own normalization.
+        if (trimmed != null && trimmed.isNotEmpty) 'note': trimmed,
+        if (resolutionRef != null && resolutionRef.trim().isNotEmpty)
+          'resolutionRef': resolutionRef.trim(),
+      }),
     );
     if (res.statusCode != 200) {
       throw DashboardApiException(uri, res.statusCode, res.body);

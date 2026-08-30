@@ -80,6 +80,10 @@ describe("Database Migration System", () => {
       "0023_drop_mesh_events_peer_id",
       "0024_rename_thread_events",
       "0025_obligation_timestamps",
+      "0026_obligation_terminal_note",
+      "0027_obligation_title",
+      "0028_obligation_artifacts",
+      "0029_reference_grammar",
     ]);
 
     const meshEventsColumns = (
