@@ -3,7 +3,7 @@ import type { MeshActor } from "../actor/actor-mesh.js";
 import { ActorMesh } from "../actor/actor-mesh.js";
 import { InMemoryThreadRegistry } from "../actor/thread-registry.js";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
-import { adoptRigHolder, lastReportedModel, RIG_HOLDER_ID } from "./ab-context.js";
+import { adoptRigHolder, RIG_HOLDER_ID, reportedModels } from "./ab-context.js";
 
 const ROOT_ID = "root";
 
@@ -132,29 +132,51 @@ describe("the model an arm actually ran", () => {
     ...partial,
   });
 
-  it("answers with the arm's LAST reporting run, not its first", () => {
-    // A long arm can be re-pinned mid-run. Describing it by the model it started on
-    // would attribute the whole arm to a model that stopped running partway through.
+  it("keeps BOTH models when an arm was re-pinned mid-run", () => {
+    // The reading this replaced answered with the last reporting run, which described a
+    // six-step arm by the model it finished on. `checkModelIdentity` then compared that
+    // one value against the other arm and could return `same ✓` for a run in which half
+    // the steps ran something else. Order is first-seen, so the report shows the move.
     expect(
-      lastReportedModel(
+      reportedModels(
         [
           event({ payload: JSON.stringify({ model: "gpt-5.1-codex" }) }),
           event({ payload: JSON.stringify({ model: "gpt-5.5-codex" }) }),
         ],
         "native"
       )
-    ).toBe("gpt-5.5-codex");
+    ).toEqual(["gpt-5.1-codex", "gpt-5.5-codex"]);
   });
 
-  it("skips a later silent run rather than letting it erase the reading", () => {
-    // Only codex reports. A trailing run that said nothing is not evidence the arm
-    // stopped running that model — it is evidence nobody looked on that run.
+  it("collapses repeats — a steady arm reports one model, however many runs it took", () => {
+    // Distinct values only. Counting occurrences would make every multi-step arm look
+    // like it changed models and void every run the gate exists to let through.
     expect(
-      lastReportedModel(
-        [event({ payload: JSON.stringify({ model: "gpt-5.5-codex" }) }), event({ payload: null })],
+      reportedModels(
+        [
+          event({ payload: JSON.stringify({ model: "gpt-5.5-codex" }) }),
+          event({ payload: JSON.stringify({ model: "gpt-5.5-codex" }) }),
+          event({ payload: JSON.stringify({ model: "gpt-5.5-codex" }) }),
+        ],
         "native"
       )
-    ).toBe("gpt-5.5-codex");
+    ).toEqual(["gpt-5.5-codex"]);
+  });
+
+  it("skips a silent run rather than letting it erase the reading", () => {
+    // Only codex reports, and it reports nothing whenever its rollout cannot be read
+    // back. A silent run is not evidence the arm stopped running that model — it is
+    // evidence nobody looked on that run, so it must not discard the runs that did.
+    expect(
+      reportedModels(
+        [
+          event({ payload: JSON.stringify({ model: "gpt-5.5-codex" }) }),
+          event({ payload: null }),
+          event({ payload: JSON.stringify({ model: "gpt-5.5-codex" }) }),
+        ],
+        "native"
+      )
+    ).toEqual(["gpt-5.5-codex"]);
   });
 
   it("reads only this arm's own run_end events", () => {
@@ -164,12 +186,12 @@ describe("the model an arm actually ran", () => {
       event({ actorId: "portable", payload: JSON.stringify({ model: "kimi-k2.5" }) }),
       event({ actorId: "native", kind: "run_start", payload: JSON.stringify({ model: "wrong" }) }),
     ];
-    expect(lastReportedModel(events, "native")).toBeNull();
-    expect(lastReportedModel(events, "portable")).toBe("kimi-k2.5");
+    expect(reportedModels(events, "native")).toEqual([]);
+    expect(reportedModels(events, "portable")).toEqual(["kimi-k2.5"]);
   });
 
-  it("is null when the arm never reported one", () => {
-    expect(lastReportedModel([], "native")).toBeNull();
-    expect(lastReportedModel([event({ payload: null })], "native")).toBeNull();
+  it("is empty when the arm never reported one", () => {
+    expect(reportedModels([], "native")).toEqual([]);
+    expect(reportedModels([event({ payload: null })], "native")).toEqual([]);
   });
 });

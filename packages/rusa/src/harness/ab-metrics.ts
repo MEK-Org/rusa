@@ -375,7 +375,11 @@ export function assessModelIdentity(verdict: ModelIdentityVerdict): RunValidity 
   switch (verdict.status) {
     case "same":
       return { valid: true, fatal: [], warnings: [] };
+    // Both are demonstrated, not merely unmeasured: the arms ran different models, or one
+    // arm ran different models from itself. Either way the delta has no single condition
+    // to be attributed to, which is the definition of fatal here.
     case "differs":
+    case "inconsistent":
       return { valid: false, fatal: [verdict.message], warnings: [] };
     case "not-captured":
     case "partial":

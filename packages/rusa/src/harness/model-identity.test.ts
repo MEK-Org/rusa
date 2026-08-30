@@ -10,24 +10,24 @@ import {
 } from "./model-identity.js";
 
 const TWO_NULLS = {
-  native: { provider: "kimi", model: null },
-  portable: { provider: "kimi", model: null },
+  native: { provider: "kimi", models: [] },
+  portable: { provider: "kimi", models: [] },
 };
 const SAME = {
-  native: { provider: "codex", model: "gpt-5.5-codex" },
-  portable: { provider: "codex", model: "gpt-5.5-codex" },
+  native: { provider: "codex", models: ["gpt-5.5-codex"] },
+  portable: { provider: "codex", models: ["gpt-5.5-codex"] },
 };
 const DIFFERS = {
-  native: { provider: "codex", model: "gpt-5.5-codex" },
-  portable: { provider: "codex", model: "gpt-5.1-codex" },
+  native: { provider: "codex", models: ["gpt-5.5-codex"] },
+  portable: { provider: "codex", models: ["gpt-5.1-codex"] },
 };
 
 describe("model identity across A/B arms ", () => {
   it("reports NOT CAPTURED — never a pass — when neither arm reported a bound model", () => {
     // This is the g2v3d shape verbatim: kimi on both sides, nothing reported on either.
     const verdict = checkModelIdentity({
-      native: { provider: "kimi", model: null },
-      portable: { provider: "kimi", model: null },
+      native: { provider: "kimi", models: [] },
+      portable: { provider: "kimi", models: [] },
     });
 
     expect(verdict.status).toBe("not-captured");
@@ -39,8 +39,8 @@ describe("model identity across A/B arms ", () => {
 
   it("says out loud that matching nulls are absence of evidence", () => {
     const { message } = checkModelIdentity({
-      native: { provider: "kimi", model: null },
-      portable: { provider: "kimi", model: null },
+      native: { provider: "kimi", models: [] },
+      portable: { provider: "kimi", models: [] },
     });
 
     expect(message).toContain("NOT CAPTURED");
@@ -52,8 +52,8 @@ describe("model identity across A/B arms ", () => {
 
   it("names the reason as a missing adapter feature, not a failed read", () => {
     const { message, uncapturableArms } = checkModelIdentity({
-      native: { provider: "kimi", model: null },
-      portable: { provider: "kimi", model: null },
+      native: { provider: "kimi", models: [] },
+      portable: { provider: "kimi", models: [] },
     });
 
     expect(uncapturableArms).toEqual(["native", "portable"]);
@@ -65,8 +65,8 @@ describe("model identity across A/B arms ", () => {
     // codex reports the model it ran, so a null here is a real anomaly worth investigating —
     // a different diagnosis from kimi's structural absence, and worded differently.
     const { message, uncapturableArms } = checkModelIdentity({
-      native: { provider: "codex", model: null },
-      portable: { provider: "codex", model: null },
+      native: { provider: "codex", models: [] },
+      portable: { provider: "codex", models: [] },
     });
 
     expect(uncapturableArms).toEqual([]);
@@ -75,8 +75,8 @@ describe("model identity across A/B arms ", () => {
 
   it("verifies identity only when both arms actually reported the same model", () => {
     const verdict = checkModelIdentity({
-      native: { provider: "codex", model: "gpt-5.5-codex" },
-      portable: { provider: "codex", model: "gpt-5.5-codex" },
+      native: { provider: "codex", models: ["gpt-5.5-codex"] },
+      portable: { provider: "codex", models: ["gpt-5.5-codex"] },
     });
 
     expect(verdict.ok).toBe(true);
@@ -86,8 +86,8 @@ describe("model identity across A/B arms ", () => {
 
   it("voids the comparison when the arms demonstrably bound different models", () => {
     const verdict = checkModelIdentity({
-      native: { provider: "codex", model: "gpt-5.5-codex" },
-      portable: { provider: "codex", model: "gpt-5.1-codex" },
+      native: { provider: "codex", models: ["gpt-5.5-codex"] },
+      portable: { provider: "codex", models: ["gpt-5.1-codex"] },
     });
 
     expect(verdict.ok).toBe(false);
@@ -99,10 +99,76 @@ describe("model identity across A/B arms ", () => {
     expect(verdict.message).toContain("portable=gpt-5.1-codex");
   });
 
+  it("voids the run when ONE arm did not run a single model throughout", () => {
+    // The counterexample this state exists for: codex re-pins on tier escalation, so a
+    // multi-step arm can run A for its first steps and B for the rest. Collapsing that
+    // to either end makes the report claim the whole arm ran one model — and here the
+    // collapse would land on the OTHER arm's value, producing a clean `same ✓` for a run
+    // in which half the native arm ran something else entirely.
+    const verdict = checkModelIdentity({
+      native: { provider: "codex", models: ["gpt-5.5-codex", "gpt-5.1-codex"] },
+      portable: { provider: "codex", models: ["gpt-5.1-codex"] },
+    });
+
+    expect(verdict.ok).toBe(false);
+    expect(verdict.status).toBe("inconsistent");
+    expect(verdict.message).toContain("ARM CHANGED MODELS MID-RUN");
+    // named in the order they ran, so the reader can see it moved rather than just that
+    // two values exist
+    expect(verdict.message).toContain("native ran gpt-5.5-codex then gpt-5.1-codex");
+    expect(comparabilityOf(verdict)).toBe("void");
+  });
+
+  it("calls a mid-run change void even when the other arm never reported", () => {
+    // Ordering matters here: this shape is ALSO `partial` (portable never reported), and
+    // partial is only a warning. A demonstrated change must not be downgraded into an
+    // unmeasured one by the arm that happens to be unmeasurable.
+    const verdict = checkModelIdentity({
+      native: { provider: "codex", models: ["gpt-5.5-codex", "gpt-5.1-codex"] },
+      portable: { provider: "kimi", models: [] },
+    });
+
+    expect(verdict.status).toBe("inconsistent");
+    expect(assessModelIdentity(verdict).valid).toBe(false);
+    expect(assessModelIdentity(verdict).fatal).toHaveLength(1);
+  });
+
+  it("does not read a repeated model as a change", () => {
+    // Six steps all reporting the same model is the ordinary healthy shape; only DISTINCT
+    // values count, or every long arm would void itself.
+    const verdict = checkModelIdentity({
+      native: { provider: "codex", models: ["gpt-5.5-codex"] },
+      portable: { provider: "codex", models: ["gpt-5.5-codex"] },
+    });
+
+    expect(verdict.status).toBe("same");
+    expect(verdict.ok).toBe(true);
+  });
+
+  it("tells the judge WHICH kind of mismatch it was", () => {
+    // Both statuses are `void`, but "the variants ran different models" is a false
+    // description of a run where one variant ran two — and the judge is told to refuse
+    // the package either way, so the sentence has to be true.
+    const inconsistent = comparabilityCaveat(
+      checkModelIdentity({
+        native: { provider: "codex", models: ["gpt-5.5-codex", "gpt-5.1-codex"] },
+        portable: { provider: "codex", models: ["gpt-5.1-codex"] },
+      })
+    );
+
+    expect(inconsistent).toContain("did not run a single model throughout");
+    expect(comparabilityCaveat(checkModelIdentity(DIFFERS))).toContain(
+      "demonstrably ran on different models"
+    );
+    // still blind — the caveat travels with the package
+    expect(inconsistent).not.toContain("native");
+    expect(inconsistent).not.toContain("portable");
+  });
+
   it("treats one-sided capture as unknown, not as a match", () => {
     const verdict = checkModelIdentity({
-      native: { provider: "codex", model: "gpt-5.5-codex" },
-      portable: { provider: "kimi", model: null },
+      native: { provider: "codex", models: ["gpt-5.5-codex"] },
+      portable: { provider: "kimi", models: [] },
     });
 
     expect(verdict.status).toBe("partial");
@@ -113,11 +179,11 @@ describe("model identity across A/B arms ", () => {
 
   it("keeps the raw per-arm values so the report shows the nulls rather than hiding them", () => {
     const { models } = checkModelIdentity({
-      native: { provider: "kimi", model: null },
-      portable: { provider: "kimi", model: "kimi-k2.5" },
+      native: { provider: "kimi", models: [] },
+      portable: { provider: "kimi", models: ["kimi-k2.5"] },
     });
 
-    expect(models).toEqual({ native: null, portable: "kimi-k2.5" });
+    expect(models).toEqual({ native: [], portable: ["kimi-k2.5"] });
   });
 
   it("refuses to call two matching CONFIGURED models a measurement", () => {
@@ -127,8 +193,8 @@ describe("model identity across A/B arms ", () => {
     // both whenever the run pinned a model, i.e. exactly when a false "same ✓" is most
     // tempting. Both arms here look fully populated and must still read NOT CAPTURED.
     const verdict = checkModelIdentity({
-      native: { provider: "kimi", model: "kimi-k2.5" },
-      portable: { provider: "kimi", model: "kimi-k2.5" },
+      native: { provider: "kimi", models: ["kimi-k2.5"] },
+      portable: { provider: "kimi", models: ["kimi-k2.5"] },
     });
 
     expect(verdict.ok).toBeNull();
@@ -136,7 +202,7 @@ describe("model identity across A/B arms ", () => {
     expect(verdict.capturedArms).toEqual([]);
     // The values are still reported verbatim — refusing the inference is not the same as
     // hiding the data a reader needs to see why.
-    expect(verdict.models).toEqual({ native: "kimi-k2.5", portable: "kimi-k2.5" });
+    expect(verdict.models).toEqual({ native: ["kimi-k2.5"], portable: ["kimi-k2.5"] });
     expect(comparabilityOf(verdict)).toBe("unverified");
   });
 
@@ -208,8 +274,8 @@ describe("what an unverified identity does to the run's verdict", () => {
 
   it("caveats the one-sided case too — partial capture is not verification", () => {
     const partial = checkModelIdentity({
-      native: { provider: "codex", model: "gpt-5.5-codex" },
-      portable: { provider: "kimi", model: null },
+      native: { provider: "codex", models: ["gpt-5.5-codex"] },
+      portable: { provider: "kimi", models: [] },
     });
 
     expect(comparabilityOf(partial)).toBe("unverified");

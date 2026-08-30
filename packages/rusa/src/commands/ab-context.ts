@@ -1068,16 +1068,20 @@ async function runProviderContextABBody(
         {
           actorId: id,
           provider: rec?.provider ?? null,
-          // What the arm's runs REPORTED they ran on — the arm's ACTUAL model, which is
+          // What the arm's runs REPORTED they ran on — the arm's ACTUAL models, which is
           // what a comparability claim rests on, and deliberately NOT the model the arm
-          // was configured with. Null on every provider but codex; `modelIdentity` below
-          // is what stops that null reading as a pass.
+          // was configured with. Empty on every provider but codex; `modelIdentity` below
+          // is what stops that emptiness reading as a pass.
           //
           // Read run-scoped off `run_end` rather than off the thread record. A per-thread
           // copy is written on every run and cleared on none, so an actor moved from a
           // reporting provider to a non-reporting one answers with the model it LEFT,
           // indefinitely — a stale value that reads exactly like a fresh one.
-          model: lastReportedModel(events, id),
+          //
+          // Carried as the whole list rather than collapsed to one value here: an arm
+          // that re-pinned mid-scenario HAS no single value, and choosing one for it
+          // would launder a void run into a comparable-looking one.
+          models: reportedModels(events, id),
           firstStepStartedAt: windows[0]?.startedAt ?? null,
           lastStepEndedAt: windows[windows.length - 1]?.endedAt ?? null,
           stepWindows: windows,
@@ -1185,7 +1189,7 @@ async function runProviderContextABBody(
       // was asked to launch. Deliberately kept through the divergence teardown, because
       // it is not half of a divergence pair — nothing compares it to what the arms ran,
       // and no surface derives a verdict from the difference. It is the only record of
-      // what was asked for, and `armProvenance.model` (what ran) cannot answer that.
+      // what was asked for, and `armProvenance.models` (what ran) cannot answer that.
       requestedProvider: opts.provider ?? null,
       requestedModel: opts.model ?? null,
       // Whether the arms are even comparable. `ok: null` means NOT CAPTURED — nobody
@@ -1272,24 +1276,34 @@ async function runProviderContextABBody(
   await handles.shutdown();
 }
 
-/** Parse the `sourceEventIds` out of a `run_start` inject body (an InjectRecord JSON). */
 /**
- * What the actor's most recent reporting run said it ran on, or null if none reported.
+ * Every DISTINCT model the actor's runs reported they ran on, in the order first seen;
+ * empty when none reported.
  *
- * Newest-first so a long arm is described by the model it finished on rather than the one
- * it started on. Null is a real answer — "nothing reported" — and callers must not fill it
- * in from configuration; see `harness/model-identity.ts`.
+ * A list rather than "the model it finished on": an arm runs once per scenario step, so
+ * reducing its history to a single value hides a mid-run model change behind whichever
+ * end you pick, and `checkModelIdentity` would then compare a claim that is only true of
+ * part of the arm. Empty is a real answer — "nothing reported" — and callers must not
+ * fill it in from configuration; see `harness/model-identity.ts`.
+ *
+ * Runs that reported nothing contribute nothing rather than truncating the scan. A codex
+ * run legitimately reports nothing whenever its rollout cannot be read back
+ * (`captureModel` in `providers/codex.ts`), so treating one silent run as a reason to
+ * discard the runs that did report would make the gate read UNVERIFIED on a read hiccup
+ * — trading a working check for alarm fatigue. What the gate refuses is an unbacked
+ * claim; one agreeing report is backing, and a contradicting one is caught above.
  */
-export function lastReportedModel(events: MeshEvent[], actorId: string): string | null {
-  for (let i = events.length - 1; i >= 0; i--) {
-    const event = events[i];
+export function reportedModels(events: MeshEvent[], actorId: string): string[] {
+  const seen: string[] = [];
+  for (const event of events) {
     if (event.actorId !== actorId || event.kind !== "run_end") continue;
     const model = runEndModel(event.payload);
-    if (model) return model;
+    if (model && !seen.includes(model)) seen.push(model);
   }
-  return null;
+  return seen;
 }
 
+/** Parse the `sourceEventIds` out of a `run_start` inject body (an InjectRecord JSON). */
 function parseSourceIds(body: string | null): string[] | null {
   if (!body) return null;
   try {

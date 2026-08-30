@@ -49,6 +49,11 @@ export type ModelIdentityStatus =
   | "same"
   /** Every arm reported a model and at least two differ — the comparison is void. */
   | "differs"
+  /**
+   * At least one arm's OWN runs reported more than one model, so that arm has no single
+   * "what it ran" to put on its side of the comparison — the run is void.
+   */
+  | "inconsistent"
   /** No arm reported one. Not a pass. */
   | "not-captured"
   /** Some arms reported one and some did not — the arms cannot be compared to each other. */
@@ -58,13 +63,22 @@ export interface ArmModelIdentity {
   /** The provider the arm actually ran on, as recorded in the registry. */
   provider: string | null;
   /**
-   * What the arm's runs REPORTED they actually ran on, or null when nothing reported.
+   * Every DISTINCT model the arm's runs REPORTED they actually ran on, in the order
+   * first seen; empty when nothing reported.
    *
    * Read run-scoped, off the arm's `run_end` events — NOT the arm's configured model.
    * Substituting the configured value here would make every arm look measured and turn
    * this whole module into the rubber stamp it exists to prevent.
+   *
+   * A LIST rather than one value because an arm is not guaranteed to be internally
+   * consistent. An arm runs once per scenario step, and codex re-pins on tier
+   * escalation, so a six-step arm can report A for three steps and B for the rest.
+   * Collapsing that to a single string — first or last — makes the report claim the
+   * whole arm ran a model that half of it did not, and then `same ✓` compares two claims
+   * neither of which is true. Empty stays the module's third state: nothing reported,
+   * which is not a pass.
    */
-  model: string | null;
+  models: readonly string[];
 }
 
 export interface ModelIdentityVerdict {
@@ -76,8 +90,8 @@ export interface ModelIdentityVerdict {
    */
   ok: boolean | null;
   status: ModelIdentityStatus;
-  /** Per-arm reported model, verbatim, including the nulls. */
-  models: Record<string, string | null>;
+  /** Per-arm reported models, verbatim, including the empties. */
+  models: Record<string, readonly string[]>;
   /** Arm keys whose reading counts as a measurement. */
   capturedArms: string[];
   /**
@@ -112,6 +126,7 @@ export function comparabilityOf(verdict: ModelIdentityVerdict): Comparability {
     case "same":
       return "verified";
     case "differs":
+    case "inconsistent":
       return "void";
     case "not-captured":
     case "partial":
@@ -143,8 +158,15 @@ export function comparabilityCaveat(verdict: ModelIdentityVerdict): string | nul
         "to attribute it solely to the condition under test."
       );
     case "void":
+      // Still one decision point — comparability — but two ways to reach it, and the
+      // judge needs to know which. "The variants ran different models" would be a false
+      // description of a run where BOTH variants ran the same set, one of them twice.
       return (
-        "MODEL IDENTITY MISMATCH: the variants demonstrably ran on different models, so " +
+        (verdict.status === "inconsistent"
+          ? "MODEL IDENTITY MISMATCH: at least one variant did not run a single model " +
+            "throughout — it reported more than one across its own steps, so "
+          : "MODEL IDENTITY MISMATCH: the variants demonstrably ran on different " +
+            "models, so ") +
         "no delta between them can be attributed to the condition under test. This " +
         "package should not have been routed."
       );
@@ -166,7 +188,9 @@ export function reportsRunModel(provider: string | null | undefined): boolean {
  */
 export function checkModelIdentity(arms: Record<string, ArmModelIdentity>): ModelIdentityVerdict {
   const keys = Object.keys(arms);
-  const models = Object.fromEntries(keys.map((k) => [k, arms[k]?.model ?? null]));
+  const models: Record<string, readonly string[]> = Object.fromEntries(
+    keys.map((k) => [k, arms[k]?.models ?? []])
+  );
   const uncapturableArms = keys.filter((k) => !reportsRunModel(arms[k]?.provider));
   // An arm counts as MEASURED only if it reported a model AND its provider is one that
   // reports models at all. The second half is the load-bearing one now: while this field
@@ -181,11 +205,37 @@ export function checkModelIdentity(arms: Record<string, ArmModelIdentity>): Mode
   // MODEL_REPORTING_PROVIDERS has its readings ignored and the run reads NOT CAPTURED.
   // That is the safe direction — loud, honest, one array entry to fix — and it is the
   // same bet the whitelist already makes by being a whitelist.
-  const capturedArms = keys.filter((k) => models[k] != null && reportsRunModel(arms[k]?.provider));
+  const capturedArms = keys.filter(
+    (k) => models[k].length > 0 && reportsRunModel(arms[k]?.provider)
+  );
 
   const why = uncapturableArms.length
     ? `no adapter for ${[...new Set(uncapturableArms.map((k) => arms[k]?.provider ?? "unknown"))].join("/")} reports it — only ${MODEL_REPORTING_PROVIDERS.join(", ")} does`
     : "the adapter should populate it but did not — investigate rather than assume";
+
+  // Checked FIRST — before the absence cases and before comparing the arms to each
+  // other — because an arm whose own runs disagree has no single value to put on its
+  // side of that comparison, so every verdict below it would be computed from a number
+  // that does not exist. Positive evidence of voidness also outranks a missing reading
+  // on the other arm: a run where one side changed models mid-experiment is void whether
+  // or not the other side was ever measured, and reporting it as `partial` (a warning)
+  // would downgrade a demonstrated defect into an unmeasured one.
+  const inconsistentArms = capturedArms.filter((k) => models[k].length > 1);
+  if (inconsistentArms.length > 0) {
+    return {
+      ok: false,
+      status: "inconsistent",
+      models,
+      capturedArms,
+      uncapturableArms,
+      message:
+        `ARM CHANGED MODELS MID-RUN — ${inconsistentArms
+          .map((k) => `${k} ran ${models[k].join(" then ")}`)
+          .join("; ")}. The comparison is void regardless of everything else: an arm ` +
+        `that did not run one model throughout has no single model to attribute its ` +
+        `half of the delta to.`,
+    };
+  }
 
   if (capturedArms.length === 0) {
     return {
@@ -211,12 +261,14 @@ export function checkModelIdentity(arms: Record<string, ArmModelIdentity>): Mode
       uncapturableArms,
       message:
         `model identity NOT CAPTURED on ${missing.join(", ")} (${why}) while ` +
-        `${capturedArms.map((k) => `${k}=${models[k]}`).join(", ")} reported one. ` +
+        `${capturedArms.map((k) => `${k}=${models[k][0]}`).join(", ")} reported one. ` +
         `A comparison needs both sides — this is unknown, not a pass. See ISSUE_NUM.`,
     };
   }
 
-  const distinct = [...new Set(capturedArms.map((k) => models[k] as string))];
+  // Safe to index [0]: `inconsistent` returned above, so every captured arm has
+  // exactly one reported model by the time control reaches here.
+  const distinct = [...new Set(capturedArms.map((k) => models[k][0] as string))];
   if (distinct.length > 1) {
     return {
       ok: false,
@@ -225,7 +277,7 @@ export function checkModelIdentity(arms: Record<string, ArmModelIdentity>): Mode
       capturedArms,
       uncapturableArms,
       message:
-        `ARMS RAN DIFFERENT MODELS — ${keys.map((k) => `${k}=${models[k]}`).join(", ")}. ` +
+        `ARMS RAN DIFFERENT MODELS — ${keys.map((k) => `${k}=${models[k][0] ?? "null"}`).join(", ")}. ` +
         `The comparison is void regardless of everything else: a quality delta between the ` +
         `arms cannot be attributed to the context regime.`,
     };
