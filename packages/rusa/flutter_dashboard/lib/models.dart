@@ -30,9 +30,7 @@ class ThreadDto {
     required this.parentId,
     required this.status,
     required this.provider,
-    required this.requestedModel,
     required this.model,
-    required this.boundModel,
     required this.charter,
     this.title = '',
     required this.createdAt,
@@ -50,9 +48,9 @@ class ThreadDto {
   final String? parentId;
   final String status; // "active" | "retired"
   final String? provider;
-  final String? requestedModel;
+
+  /// The single authoritative model for this actor, as the server reports it.
   final String? model;
-  final String? boundModel;
   final String charter;
   final String title;
   final String createdAt;
@@ -73,10 +71,6 @@ class ThreadDto {
   final bool? ownerExpectsRetirement;
 
   bool get isRetired => status == 'retired';
-  bool get modelDiverged =>
-      requestedModel != null &&
-      boundModel != null &&
-      requestedModel != boundModel;
 
   ThreadDto copyWith({
     String? id,
@@ -84,9 +78,7 @@ class ThreadDto {
     String? parentId,
     String? status,
     String? provider,
-    String? requestedModel,
     String? model,
-    String? boundModel,
     String? charter,
     String? title,
     String? createdAt,
@@ -103,9 +95,7 @@ class ThreadDto {
     parentId: parentId ?? this.parentId,
     status: status ?? this.status,
     provider: provider ?? this.provider,
-    requestedModel: requestedModel ?? this.requestedModel,
     model: model ?? this.model,
-    boundModel: boundModel ?? this.boundModel,
     charter: charter ?? this.charter,
     title: title ?? this.title,
     createdAt: createdAt ?? this.createdAt,
@@ -126,9 +116,7 @@ class ThreadDto {
     parentId: j['parentId'] as String?,
     status: j['status'] as String,
     provider: j['provider'] as String?,
-    requestedModel: (j['requestedModel'] as String?) ?? (j['model'] as String?),
     model: j['model'] as String?,
-    boundModel: j['boundModel'] as String?,
     charter: j['charter'] as String? ?? '',
     title: j['title'] as String? ?? '',
     createdAt: j['createdAt'] as String? ?? '',
@@ -176,9 +164,7 @@ class ActorViewState {
   String get status => thread.status;
   bool get isRetired => thread.isRetired;
   String? get provider => thread.provider;
-  String? get requestedModel => thread.requestedModel;
   String? get model => thread.model;
-  String? get boundModel => thread.boundModel;
   String get charter => thread.charter;
   String get title => thread.title;
   String get createdAt => thread.createdAt;
@@ -188,7 +174,6 @@ class ActorViewState {
   String? get waitingOn => thread.waitingOn;
   String? get nextProviderAvailableAt => thread.nextProviderAvailableAt;
   bool? get ownerExpectsRetirement => thread.ownerExpectsRetirement;
-  bool get modelDiverged => thread.modelDiverged;
 
   bool get isRunning => runState == RunState.running;
   bool get isWindingDown => runState == RunState.windingDown;

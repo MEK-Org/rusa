@@ -395,20 +395,14 @@ void main() {
     },
   );
 
-  testWidgets('renders bound model and loud requested-bound divergence', (
+  testWidgets('renders a single model with no divergence surface', (
     tester,
   ) async {
     await tester.runAsync(() async {
       final api = FakeApi()
         ..threadsResult = [
           makeThread('root', created: 't0'),
-          makeThread(
-            'a',
-            parent: 'root',
-            created: 't1',
-            requestedModel: 'gpt-5-codex',
-            boundModel: 'gpt-5.5',
-          ),
+          makeThread('a', parent: 'root', created: 't1', model: 'gpt-5-codex'),
         ];
       final store = DashboardStore(api: api, stream: FakeStream());
       await store.init();
@@ -416,34 +410,34 @@ void main() {
       await tester.pumpWidget(_harness(store));
       await tester.pump(const Duration(milliseconds: 50));
 
-      expect(find.text('gpt-5.5'), findsOneWidget);
-      expect(find.text('DIFF'), findsOneWidget);
+      expect(find.text('gpt-5-codex'), findsOneWidget);
+      // The tree's compact divergence chip is gone, not merely unlit.
+      expect(find.text('DIFF'), findsNothing);
 
       await tester.tap(find.text('a-handle'));
       await tester.pump(const Duration(milliseconds: 50));
 
-      expect(find.text('MODEL DIVERGED'), findsOneWidget);
-      
+      expect(find.text('MODEL DIVERGED'), findsNothing);
+
       await tester.ensureVisible(find.text('Info'));
       await tester.tap(find.text('Info'));
       // Pump several frames to complete the swipe animation without pumpAndSettle
       for (int i = 0; i < 10; i++) {
         await tester.pump(const Duration(milliseconds: 100));
       }
-      
 
+      // One model row, and no second value to compare it against.
       expect(
-        find.textContaining('Bound model: ', findRichText: true),
+        find.textContaining('Model: ', findRichText: true),
         findsOneWidget,
       );
       expect(
         find.textContaining('Requested: ', findRichText: true),
-        findsOneWidget,
+        findsNothing,
       );
-      expect(find.text('gpt-5.5'), findsWidgets);
       expect(
         find.textContaining('gpt-5-codex', findRichText: true),
-        findsOneWidget,
+        findsWidgets,
       );
 
       await store.dispose();

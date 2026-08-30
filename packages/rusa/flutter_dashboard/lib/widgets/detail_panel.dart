@@ -359,7 +359,6 @@ class _DetailPanelState extends State<DetailPanel>
                     ),
                   ),
                   _statusBadge(a),
-                  if (a.modelDiverged) _modelDivergenceBadge(),
                   if (!a.isRetired) ..._quickActions(a),
                 ],
               ),
@@ -501,25 +500,6 @@ class _DetailPanelState extends State<DetailPanel>
     );
   }
 
-  Widget _modelDivergenceBadge() => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-    decoration: BoxDecoration(
-      color: MeshColors.statusHalted.withValues(alpha: 0.14),
-      borderRadius: BorderRadius.circular(4),
-      border: Border.all(
-        color: MeshColors.statusHalted.withValues(alpha: 0.65),
-      ),
-    ),
-    child: const Text(
-      'MODEL DIVERGED',
-      style: TextStyle(
-        color: MeshColors.statusHalted,
-        fontSize: 11,
-        fontWeight: FontWeight.w800,
-      ),
-    ),
-  );
-
   Widget _tabBar(bool isConversationMode) => StreamBuilder<List<Object?>>(
     stream: Rx.combineLatestList<Object?>([
       widget.store.events,
@@ -632,9 +612,7 @@ class _InfoView extends StatelessWidget {
             children: [
               _meta('Parent', parentHandle),
               if (actor.provider != null) _meta('Provider', actor.provider!),
-              if (actor.model != null) _meta('Bound model', actor.model!),
-              if (actor.requestedModel != null)
-                _meta('Requested', actor.requestedModel!),
+              if (actor.model != null) _meta('Model', actor.model!),
               if (actor.commitmentKind != null)
                 _meta('Work state', actor.commitmentKind!),
               if (actor.waitingOn != null)

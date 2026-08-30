@@ -298,7 +298,11 @@ describe("handleMeshApiRequest", () => {
     expect(threads.find((t: { id: string }) => t.id === UUID_B).status).toBe("retired");
   });
 
-  it("GET /api/mesh/threads surfaces requested and bound models for divergence display", () => {
+  it("GET /api/mesh/threads surfaces one model and does not leak a stale bound-model readback", () => {
+    // A record that still carries a bound-model readback — the shape that produced the
+    // old "MODEL DIVERGED" badge once an actor was moved off codex and the stale codex
+    // readback outlived the move. The API must publish the configured model and nothing
+    // to compare it against.
     registry.upsert({
       ...rec(UUID_A, "root", "active"),
       provider: "codex",
@@ -311,9 +315,9 @@ describe("handleMeshApiRequest", () => {
     const { threads } = JSON.parse(res.body);
     const actor = threads.find((t: { id: string }) => t.id === UUID_A);
     expect(actor.provider).toBe("codex");
-    expect(actor.requestedModel).toBe("gpt-5-codex");
-    expect(actor.boundModel).toBe("gpt-5.5");
-    expect(actor.model).toBe("gpt-5.5");
+    expect(actor.model).toBe("gpt-5-codex");
+    expect(actor.requestedModel).toBeUndefined();
+    expect(actor.boundModel).toBeUndefined();
   });
 
   it("GET /api/mesh/threads shows the default root handle when no identity is configured", () => {
