@@ -52,6 +52,10 @@ class MockRes extends EventEmitter {
       this.body += body;
     }
     this.ended = true;
+    // A real ServerResponse emits this; without it a caller awaiting a
+    // response that lands off the threadpool has nothing to wait on but the
+    // clock. See `settled`.
+    this.emit("finish");
     return this;
   }
 }
@@ -310,11 +314,18 @@ describe("handleMeshApiRequest", () => {
       }
     };
 
-    const settled = async (res: MockRes): Promise<void> => {
-      // Compression resolves on the threadpool, so the response lands a tick
-      // or more after the handler returns.
-      for (let i = 0; i < 200 && !res.ended; i++) await new Promise(setImmediate);
-    };
+    /**
+     * Wait for the response itself, not for a number of event-loop turns.
+     *
+     * Compression resolves on the threadpool, so the response lands after the
+     * handler returns. Spinning a fixed count of `setImmediate`s to cover that
+     * is not a timeout — the turns drain in well under a millisecond, while
+     * zlib takes tens of them on a loaded box. That budget held locally and
+     * ran out on CI, where it read as `Content-Encoding: undefined` and looked
+     * like a negotiation bug rather than a test that stopped waiting.
+     */
+    const settled = (res: MockRes): Promise<void> =>
+      res.ended ? Promise.resolve() : new Promise((resolve) => res.once("finish", () => resolve()));
 
     it("compresses a large body with brotli, preferring it over gzip", async () => {
       seedBulk();
