@@ -294,7 +294,7 @@ describe("commitment ledger projection", () => {
     ]);
   });
 
-  it("projects tracked message commitments as open Matt-ask loops", () => {
+  it("projects tracked message commitments as open operator-ask loops", () => {
     const report = projectOpenCommitments({
       now: NOW,
       threads: [],
@@ -638,14 +638,14 @@ function buildMvpStoryboardSnapshots(): CommitmentLedgerStoryboardSnapshot[] {
       title: "T1 registered",
       now: new Date("2026-06-30T18:45:00.000Z"),
       narration:
-        "Two Matt-asks have been acknowledged with Tracking lines, so the ledger can show owner, done-when, and age immediately instead of relying on Matt to remember.",
+        "Two operator-asks have been acknowledged with Tracking lines, so the ledger can show owner, done-when, and age immediately instead of relying on the operator to remember.",
     },
     {
       id: "t2",
       title: "T2 the slip",
       now: new Date("2026-07-01T22:10:00.000Z"),
       narration:
-        "Mocked time jumps forward: one ask dissolved because root drove it to done, while #531 is still open after 27h 30m. A single mechanical row is present but does not crowd the Matt-ask.",
+        "Mocked time jumps forward: one ask dissolved because root drove it to done, while #531 is still open after 27h 30m. A single mechanical row is present but does not crowd the operator-ask.",
     },
     {
       id: "t3",

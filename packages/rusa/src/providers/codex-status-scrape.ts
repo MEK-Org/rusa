@@ -118,7 +118,7 @@ export function buildTmuxScript(
     "  sleep 1",
     '  tmux -S "$SOCK" send-keys -t "$S" Enter',
     // Bounded wait to render something for THIS /status (defaults to ~10s, aligning
-    // with Matt's ~10s re-send bound in issue #8); the outer loop's backoff then
+    // with the ~10s re-send bound recorded in issue #8); the outer loop's backoff then
     // re-issues on a placeholder.
     `  local deadline=$((SECONDS + ${attemptSecs}))`,
     '  while [ "$SECONDS" -lt "$deadline" ] && [ "$SECONDS" -lt "$BUDGET_S" ]; do',
