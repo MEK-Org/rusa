@@ -161,8 +161,30 @@ export class GchatClient implements ChatClient {
     return r.spaceType ?? r.type ?? "UNKNOWN";
   }
 
+  /**
+   * Read one attachment's metadata.
+   *
+   * Google gates `spaces.messages.attachments.get` behind the `chat.bot` scope,
+   * which belongs to a Chat *app* identity and can never be granted to a user
+   * OAuth consent — so calling it as the gchat user always 403s
+   * `ACCESS_TOKEN_SCOPE_INSUFFICIENT`. `messages.get` is satisfied by our
+   * `chat.messages` scope and already carries the same attachment records
+   * inline, so we resolve metadata from the parent message instead.
+   */
   async getAttachment(attachmentName: string): Promise<ChatAttachment> {
-    return (await this.call("GET", attachmentName)) as ChatAttachment;
+    const separator = attachmentName.indexOf("/attachments/");
+    if (!attachmentName.startsWith("spaces/") || separator < 0) {
+      throw new Error(
+        `invalid attachment resource name: expected spaces/{space}/messages/{message}/attachments/{attachment} (got ${attachmentName})`
+      );
+    }
+    const messageName = attachmentName.slice(0, separator);
+    const message = await this.getMessage(messageName);
+    const attachment = message.attachment?.find((a) => a.name === attachmentName);
+    if (!attachment) {
+      throw new Error(`attachment ${attachmentName} is not present on message ${messageName}`);
+    }
+    return attachment;
   }
 
   private async readBodyWithLimit(resp: Response, maxBytes: number): Promise<Buffer> {
