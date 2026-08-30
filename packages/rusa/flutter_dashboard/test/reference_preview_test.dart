@@ -94,6 +94,40 @@ void main() {
       expect(find.text('mesh:messages/abc'), findsOneWidget);
     });
 
+    testWidgets('is only as tall as the text it quotes', (tester) async {
+      tester.view.physicalSize = const Size(1200, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      Future<double> heightOf(String body) async {
+        await tester.pumpWidget(MaterialApp(
+          home: Scaffold(
+            body: ListView(children: [
+              ReferencePreview(
+                reference: ReferenceDto(
+                  ref: 'mesh:messages/abc',
+                  scheme: 'mesh',
+                  title: 'human:operator → root',
+                  body: body,
+                ),
+              ),
+            ]),
+          ),
+        ));
+        await tester.pumpAndSettle();
+        return tester.getSize(find.byType(SelectableText).first).height;
+      }
+
+      final oneLine = await heightOf('Can you help me plan it out?');
+      final fourLines = await heightOf(List.filled(4, 'line').join('\n'));
+
+      // Regression guard. SelectableText wraps an EditableText, which sizes to
+      // `maxLines` rather than to its content — passing one made a single-line
+      // citation render eight lines tall. Height must track the text.
+      expect(oneLine, lessThan(30));
+      expect(fourLines, greaterThan(oneLine * 3));
+    });
+
     testWidgets('says why it could not expand, rather than showing nothing', (tester) async {
       await tester.pumpWidget(_host(const ReferencePreview(
         reference: ReferenceDto(

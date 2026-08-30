@@ -22,7 +22,6 @@ class ReferencePreview extends StatelessWidget {
     required this.reference,
     this.label,
     this.attachedBy,
-    this.maxLines = 8,
   });
 
   final ReferenceDto reference;
@@ -30,7 +29,6 @@ class ReferencePreview extends StatelessWidget {
   /// Optional gloss from whoever cited it: why this is attached.
   final String? label;
   final String? attachedBy;
-  final int maxLines;
 
   @override
   Widget build(BuildContext context) {
@@ -47,6 +45,7 @@ class ReferencePreview extends StatelessWidget {
         border: Border.all(color: MeshColors.border),
       ),
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
@@ -91,9 +90,12 @@ class ReferencePreview extends StatelessWidget {
           ],
           const SizedBox(height: 8),
           if (hasBody)
+            // No `maxLines`: SelectableText wraps an EditableText, which sizes
+            // itself to `maxLines` rather than to its content, so a one-line
+            // citation rendered eight lines tall. The card is meant to be as
+            // tall as what it is quoting.
             SelectableText(
               body,
-              maxLines: maxLines,
               style: const TextStyle(
                 color: Color(0xFFCBD5E1),
                 fontSize: 12,
