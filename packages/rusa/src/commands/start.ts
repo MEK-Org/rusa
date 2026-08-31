@@ -2,11 +2,8 @@ import {
   appendFileSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   readFileSync,
   rmSync,
-  statSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -795,28 +792,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     console.warn(
       `[start] failed to ingest Kimi host models: ${err instanceof Error ? err.message : String(err)}`
     );
-  }
-
-  // Boot-time sweep of stale codex auth temp files (skipped in test runner to prevent races with concurrent tests)
-  if (process.env.NODE_ENV !== "test") {
-    try {
-      const files = readdirSync("/tmp");
-      const now = Date.now();
-      for (const file of files) {
-        if (file.startsWith("rusa-auth-codex-")) {
-          try {
-            const stats = statSync(join("/tmp", file));
-            if (now - stats.mtimeMs > 5_000) {
-              unlinkSync(join("/tmp", file));
-            }
-          } catch {
-            // best effort
-          }
-        }
-      }
-    } catch {
-      // best effort
-    }
   }
 
   console.log(`Authenticated as ${config.github.account}`);
