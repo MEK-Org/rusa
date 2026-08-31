@@ -632,7 +632,7 @@ describe("handleMeshApiRequest", () => {
     // inside the 140th one and ends the excerpt on half a character.
     registry.upsert({
       id: UUID_A,
-      charter: "\u{1F9ED}".repeat(200),
+      charter: "\u{1F9ED}".repeat(400),
       parentId: null,
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
