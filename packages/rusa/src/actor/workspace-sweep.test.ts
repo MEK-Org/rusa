@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
-  actorWorkspaceNames,
   orphanedWorkspaces,
+  removableWorkspaceNames,
   sweepOrphanedWorkspaces,
 } from "./workspace-sweep.js";
 
@@ -36,7 +36,21 @@ describe("workspace sweep", () => {
   };
 
   it("names every spelling the provider has used for one actor's workspace", () => {
-    expect(actorWorkspaceNames(LIVE)).toEqual(["worker-a1b2c3d4", "a1b2c3d4", LIVE]);
+    expect(removableWorkspaceNames(RETIRED, REGISTRY)).toEqual([
+      "worker-9f8e7d6c",
+      "9f8e7d6c",
+      RETIRED,
+    ]);
+  });
+
+  it("names only the whole-id spelling when a live actor shares the prefix", () => {
+    // Retiring an actor is the other half of the same collision the sweep
+    // guards: the short spellings could be the live neighbour's workspace, and
+    // this one is deleting while that neighbour is mid-run.
+    const neighbour = "a1b2c3d4-9999-4222-8333-555566667777";
+    expect(
+      removableWorkspaceNames(neighbour, [...REGISTRY, { id: neighbour, retired: true }])
+    ).toEqual([neighbour]);
   });
 
   it("removes both of a retired actor's workspaces and keeps a live actor's", () => {
@@ -59,10 +73,10 @@ describe("workspace sweep", () => {
   it("claims all three spellings of a retired actor's workspace", () => {
     // All three are on disk in the same provider area: `worker-<prefix>` is what
     // it writes now, and the bare prefix and the whole actor id are older.
-    for (const name of actorWorkspaceNames(RETIRED)) dir(scratchDir, name);
+    for (const name of removableWorkspaceNames(RETIRED, REGISTRY)) dir(scratchDir, name);
 
     expect(orphanedWorkspaces({ workersDir, scratchDir, actors: REGISTRY }).sort()).toEqual(
-      actorWorkspaceNames(RETIRED)
+      removableWorkspaceNames(RETIRED, REGISTRY)
         .map((name) => join(scratchDir, name))
         .sort()
     );

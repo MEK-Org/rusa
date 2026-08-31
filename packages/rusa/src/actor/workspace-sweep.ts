@@ -37,9 +37,44 @@ function workspaceActorPrefix(name: string): string | null {
   return WORKSPACE_NAME.exec(name)?.[1] ?? null;
 }
 
-/** Every path a provider CLI might have given `actorId`, so retirement can delete it. */
-export function actorWorkspaceNames(actorId: string): string[] {
+/** An actor as this module needs to see it: an id, and whether it still runs. */
+export interface ActorLiveness {
+  id: string;
+  retired: boolean;
+}
+
+/**
+ * The id prefixes of the actors still running — the claim that keeps a
+ * directory. `except` is the actor being retired right now, whose own record
+ * may still read active at the moment its cleanup runs; it must not be counted
+ * as the live claimant on its own workspace.
+ */
+function liveActorPrefixes(actors: readonly ActorLiveness[], except?: string): Set<string> {
+  const live = new Set<string>();
+  for (const actor of actors) {
+    if (actor.retired || actor.id === except) continue;
+    live.add(actor.id.slice(0, 8));
+  }
+  return live;
+}
+
+/**
+ * The workspaces of `actorId` that are safe to remove now that it has retired.
+ *
+ * The whole-id spelling names one actor and always goes. The two short
+ * spellings carry only the id's leading eight hex characters, which another
+ * actor may answer to as well — and the two mistakes cost very differently:
+ * leaving a retired actor's directory delays a cleanup until some later boot
+ * sweep, where removing a live actor's takes its work in progress with it. So a
+ * contested short spelling is left behind, for the sweep to collect once the
+ * actor holding the prefix has retired too.
+ */
+export function removableWorkspaceNames(
+  actorId: string,
+  actors: readonly ActorLiveness[]
+): string[] {
   const prefix = actorId.slice(0, 8);
+  if (liveActorPrefixes(actors, actorId).has(prefix)) return [actorId];
   return [`worker-${prefix}`, prefix, actorId];
 }
 
@@ -65,7 +100,7 @@ export interface WorkspaceSweepOptions {
    * unless this says its actor retired, so a registry that cannot be read
    * sweeps nothing rather than everything.
    */
-  actors: readonly { id: string; retired: boolean }[];
+  actors: readonly ActorLiveness[];
 }
 
 /**
@@ -77,10 +112,10 @@ export interface WorkspaceSweepOptions {
  * retired actor, so none is ever a candidate.
  */
 export function orphanedWorkspaces(opts: WorkspaceSweepOptions): string[] {
-  const live = new Set<string>();
+  const live = liveActorPrefixes(opts.actors);
   const retired = new Set<string>();
   for (const actor of opts.actors) {
-    (actor.retired ? retired : live).add(actor.id.slice(0, 8));
+    if (actor.retired) retired.add(actor.id.slice(0, 8));
   }
 
   const orphans: string[] = [];

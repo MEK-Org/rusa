@@ -105,12 +105,12 @@ describe("createStartRetireCleanups", () => {
     // workspace rather than clearing the shared area.
     mkdirSync(join(scratchDir, "worker-9f8e7d6c"), { recursive: true });
 
-    const cleanups = createStartRetireCleanups(
-      workersDir,
-      { async cancel() {} },
-      undefined,
-      scratchDir
-    );
+    // The registry still reads this actor as active while its own cleanup runs,
+    // which must not count as the live claim on its own workspace.
+    const cleanups = createStartRetireCleanups(workersDir, { async cancel() {} }, undefined, {
+      dir: scratchDir,
+      listActors: () => [{ id: actorId, retired: false }],
+    });
     const record: ThreadRecord = {
       id: actorId,
       charter: "worker",
@@ -124,6 +124,42 @@ describe("createStartRetireCleanups", () => {
     for (const workspace of workspaces) expect(existsSync(workspace)).toBe(false);
     expect(existsSync(join(workersDir, actorId))).toBe(false);
     expect(existsSync(join(scratchDir, "worker-9f8e7d6c"))).toBe(true);
+    rmSync(scratchDir, { recursive: true, force: true });
+  });
+
+  it("keeps the short workspace spellings a live actor also answers to", async () => {
+    const actorId = "a1b2c3d4-1111-4222-8333-555566667777";
+    // Eight hex characters is short enough to collide, and the two shorter
+    // spellings carry nothing else. This actor is retiring; the other is mid-run.
+    const liveNeighbour = "a1b2c3d4-9999-4222-8333-555566667777";
+    const scratchDir = mkdtempSync(join(tmpdir(), "rusa-scratch-"));
+    const contested = ["worker-a1b2c3d4", "a1b2c3d4"].map((n) => join(scratchDir, n));
+    const own = join(scratchDir, actorId);
+    mkdirSync(join(workersDir, actorId), { recursive: true });
+    for (const workspace of [...contested, own]) mkdirSync(workspace, { recursive: true });
+
+    const cleanups = createStartRetireCleanups(workersDir, { async cancel() {} }, undefined, {
+      dir: scratchDir,
+      listActors: () => [
+        { id: actorId, retired: true },
+        { id: liveNeighbour, retired: false },
+      ],
+    });
+    const record: ThreadRecord = {
+      id: actorId,
+      charter: "worker",
+      parentId: "root",
+      status: "retired",
+      createdAt: "2026-01-01T00:00:00Z",
+    };
+
+    for (const cleanup of cleanups) await cleanup.run(record);
+
+    // The whole-id spelling names one actor, so it goes regardless.
+    expect(existsSync(own)).toBe(false);
+    // The ambiguous ones stay: a delayed cleanup costs disk, deleting them
+    // costs the neighbour the run it is in the middle of.
+    for (const workspace of contested) expect(existsSync(workspace)).toBe(true);
     rmSync(scratchDir, { recursive: true, force: true });
   });
 
