@@ -215,4 +215,30 @@ describe("0025_obligation_timestamps", () => {
     expect(read(db, "new-1")).toEqual(before);
     expect(columnNames(db).filter((name) => name === "created_at")).toHaveLength(1);
   });
+
+  it("seeds existing ready heads into obligation_ready_heads", () => {
+    const db = seedDb();
+    insertObligation(db, "ob-a", "actor-a");
+    const hasKind = (
+      db.prepare("PRAGMA table_info(obligations)").all() as Array<{ name: string }>
+    ).some((column) => column.name === "owner_kind");
+    const columns = hasKind
+      ? "(id, parent_id, owner_kind, owner_id, intent, status, priority)"
+      : "(id, parent_id, owner_id, intent, status, priority)";
+    const values = hasKind
+      ? "(?, NULL, 'actor', 'actor-b', 'waiting intent', 'waiting', 1)"
+      : "(?, NULL, 'actor-b', 'waiting intent', 'waiting', 1)";
+    db.prepare(`INSERT INTO obligations ${columns} VALUES ${values}`).run("ob-b");
+
+    obligationTimestamps.up(db);
+
+    const heads = db.prepare("SELECT * FROM obligation_ready_heads").all();
+    expect(heads).toHaveLength(1);
+    expect(heads[0]).toMatchObject({
+      owner_id: "actor-a",
+      head_id: "ob-a",
+      previous_head_id: null,
+      sequence: 1,
+    });
+  });
 });

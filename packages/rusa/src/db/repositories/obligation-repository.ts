@@ -274,7 +274,8 @@ export class ObligationRepository {
     const rows = this.db
       .prepare(
         `SELECT owner_id, head_id, previous_head_id, sequence
-         FROM obligation_ready_heads`
+         FROM obligation_ready_heads
+         WHERE head_id IS NOT NULL`
       )
       .all() as Array<{
       owner_id: string;
@@ -337,7 +338,18 @@ export class ObligationRepository {
 
       for (const ownerId of before.keys()) {
         if (!after.has(ownerId) && isActorEntityId(ownerId)) {
-          this.db.prepare(`DELETE FROM obligation_ready_heads WHERE owner_id = ?`).run(ownerId);
+          const previousHeadId = before.get(ownerId) ?? null;
+          const now = this.stamp();
+          this.db
+            .prepare(
+              `UPDATE obligation_ready_heads
+               SET head_id = NULL,
+                   previous_head_id = ?,
+                   sequence = sequence + 1,
+                   updated_at = ?
+               WHERE owner_id = ?`
+            )
+            .run(previousHeadId, now, ownerId);
         }
       }
 

@@ -147,12 +147,41 @@ export const obligationTimestamps: Migration = {
 
       CREATE TABLE IF NOT EXISTS obligation_ready_heads (
         owner_id TEXT PRIMARY KEY,
-        head_id TEXT NOT NULL,
+        head_id TEXT,
         previous_head_id TEXT,
         sequence INTEGER NOT NULL DEFAULT 1,
         updated_at TEXT NOT NULL,
         FOREIGN KEY (head_id) REFERENCES obligations(id) ON DELETE CASCADE
       );
+    `);
+
+    // Seed existing ready heads in migration 0025.
+    const now = new Date().toISOString();
+    db.exec(`
+      WITH RECURSIVE
+        effective_priority(id, effective_priority, priority_source_id) AS (
+          SELECT id, priority, id FROM obligations WHERE parent_id IS NULL
+          UNION ALL
+          SELECT child.id,
+                 COALESCE(child.priority, parent.effective_priority),
+                 CASE WHEN child.priority IS NOT NULL THEN child.id ELSE parent.priority_source_id END
+          FROM obligations child
+          JOIN effective_priority parent ON parent.id = child.parent_id
+        )
+      INSERT OR IGNORE INTO obligation_ready_heads (owner_id, head_id, previous_head_id, sequence, updated_at)
+      SELECT owner_id, id, NULL, 1, '${now}'
+      FROM (
+        SELECT obligation.owner_id,
+               obligation.id,
+               ROW_NUMBER() OVER (
+                 PARTITION BY obligation.owner_id
+                 ORDER BY effective_priority.effective_priority, obligation.id
+               ) AS rank
+        FROM obligations obligation
+        JOIN effective_priority ON effective_priority.id = obligation.id
+        WHERE obligation.status = 'ready'
+      )
+      WHERE rank = 1
     `);
   },
 };
