@@ -837,7 +837,9 @@ describe("ActorMesh", () => {
     const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
 
     const obligations = {
-      readyHeads: () => [["root", "ob-1"] as [string, string]],
+      readyHeadTransitions: () => [
+        { ownerId: "root", headId: "ob-1", previousHeadId: null, sequence: 1 },
+      ],
       get: (id: string) => (id === "ob-1" ? { id: "ob-1", intent: "repair me" } : null),
     };
 
@@ -873,8 +875,8 @@ describe("ActorMesh", () => {
     const { mesh, fake, tick } = setup({ inboxStore });
     const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
 
-    // Simulate transition-derived delivery during runtime (e.g. ob-0 -> ob-1)
-    mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, "ob-0");
+    // Simulate transition-derived delivery during runtime (e.g. ob-0 -> ob-1, sequence 1)
+    mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, "ob-0", 1);
     await tick();
     expect(rootEntries()).toHaveLength(1);
     expect(rootEntries()[0].source).toBe("obligation:ob-1");
@@ -883,7 +885,9 @@ describe("ActorMesh", () => {
 
     // Simulate restart and run reconcileReadyHeads
     const obligations = {
-      readyHeads: () => [["root", "ob-1"] as [string, string]],
+      readyHeadTransitions: () => [
+        { ownerId: "root", headId: "ob-1", previousHeadId: "ob-0", sequence: 1 },
+      ],
       get: (id: string) => (id === "ob-1" ? { id: "ob-1", intent: "ship it" } : null),
     };
 
@@ -895,33 +899,27 @@ describe("ActorMesh", () => {
     expect(fake("root").calls.length).toBe(callsBeforeReconcile);
   });
 
-  it("reconciles a missed recurrence transition when head H was previously handled, displaced by X, and becomes head again", async () => {
+  it("reconciles a missed recurrence transition when multiple consecutive listener failures occurred", async () => {
     const inboxStore = createMemoryInboxStore();
     const { mesh, fake, tick } = setup({ inboxStore });
     const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
 
-    // 1. H becomes head initially (none -> ob-H). Delivered and handled.
-    mesh.deliverReadyHeadAttention("root", { id: "ob-H", intent: "do H" }, null);
+    // 1. H becomes head initially (sequence 1). Delivered and handled.
+    mesh.deliverReadyHeadAttention("root", { id: "ob-H", intent: "do H" }, null, 1);
     await tick();
     const entryH1 = rootEntries().find((e) => e.source === "obligation:ob-H");
     expect(entryH1).toBeDefined();
     if (!entryH1) return;
     inboxStore.markHandled("root", [entryH1.id]);
 
-    // 2. X displaces H (ob-H -> ob-X). Delivered and handled.
-    mesh.deliverReadyHeadAttention("root", { id: "ob-X", intent: "do X" }, "ob-H");
-    await tick();
-    const entryX = rootEntries().find((e) => e.source === "obligation:ob-X");
-    expect(entryX).toBeDefined();
-    if (!entryX) return;
-    inboxStore.markHandled("root", [entryX.id]);
+    // 2. H -> X commits (sequence 2), listener fails (not delivered to inbox).
+    // 3. X -> H commits (sequence 3), listener fails (not delivered to inbox).
 
-    // 3. X completes and H becomes head again (ob-X -> ob-H), but listener/notification was lost (crash).
-    // Note: deliverReadyHeadAttention is NOT called for ob-X -> ob-H.
-
-    // 4. Boot reconciliation runs:
+    // 4. Boot reconciliation runs with persistent transition fact (sequence 3, prev: ob-X, head: ob-H):
     const obligations = {
-      readyHeads: () => [["root", "ob-H"] as [string, string]],
+      readyHeadTransitions: () => [
+        { ownerId: "root", headId: "ob-H", previousHeadId: "ob-X", sequence: 3 },
+      ],
       get: (id: string) => (id === "ob-H" ? { id: "ob-H", intent: "do H" } : null),
     };
 
@@ -929,9 +927,9 @@ describe("ActorMesh", () => {
     mesh.reconcileReadyHeads(obligations);
     await tick();
 
-    // Boot detects that last delivered head was ob-X while current head is ob-H, and delivers ob-X -> ob-H attention.
-    expect(rootEntries()).toHaveLength(3);
-    const newEntry = rootEntries()[2];
+    // Boot delivers sequence 3 (ob-X -> ob-H) attention.
+    expect(rootEntries()).toHaveLength(2);
+    const newEntry = rootEntries()[1];
     expect(newEntry.source).toBe("obligation:ob-H");
     expect(newEntry.payload).toMatchObject({
       type: "obligation.ready_head",
@@ -940,20 +938,12 @@ describe("ActorMesh", () => {
     });
     expect(fake("root").calls.length).toBeGreaterThan(callsBefore);
 
-    // 5. Repeat boot pass before handling is idempotent (unhandled ob-H entry is active).
+    // 5. Subsequent boot passes are idempotent.
     const callsBeforePass2 = fake("root").calls.length;
     mesh.reconcileReadyHeads(obligations);
     await tick();
-    expect(rootEntries()).toHaveLength(3);
+    expect(rootEntries()).toHaveLength(2);
     expect(fake("root").calls.length).toBe(callsBeforePass2);
-
-    // 6. After actor handles the new ob-X -> ob-H entry, boot pass remains idempotent because latest delivered head is ob-H.
-    inboxStore.markHandled("root", [newEntry.id]);
-    const callsBeforePass3 = fake("root").calls.length;
-    mesh.reconcileReadyHeads(obligations);
-    await tick();
-    expect(rootEntries()).toHaveLength(3);
-    expect(fake("root").calls.length).toBe(callsBeforePass3);
   });
 
   it("skips non-actor owners and retired actors during ready-head reconciliation", async () => {

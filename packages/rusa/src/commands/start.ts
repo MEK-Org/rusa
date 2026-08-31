@@ -1806,8 +1806,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // that is still undefined.
   //
   // Boot sweep below over `readyHeads()` reconciles heads at startup.
-  readyHeadSink = ({ ownerId, head, previousHeadId }) => {
-    mesh.deliverReadyHeadAttention(ownerId, { id: head.id, intent: head.intent }, previousHeadId);
+  readyHeadSink = ({ ownerId, head, previousHeadId, sequence }) => {
+    mesh.deliverReadyHeadAttention(
+      ownerId,
+      { id: head.id, intent: head.intent },
+      previousHeadId,
+      sequence
+    );
   };
 
   const rootControl = new RootControlService({

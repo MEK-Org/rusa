@@ -144,6 +144,15 @@ export const obligationTimestamps: Migration = {
     db.exec(`
       CREATE INDEX IF NOT EXISTS idx_obligations_created_at
         ON obligations(created_at);
+
+      CREATE TABLE IF NOT EXISTS obligation_ready_heads (
+        owner_id TEXT PRIMARY KEY,
+        head_id TEXT NOT NULL,
+        previous_head_id TEXT,
+        sequence INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (head_id) REFERENCES obligations(id) ON DELETE CASCADE
+      );
     `);
   },
 };

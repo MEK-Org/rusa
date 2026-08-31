@@ -107,7 +107,7 @@ describe("ObligationRepository", () => {
       warn.mockRestore();
     });
 
-    it("returns readyHeads for all owners with ready obligations allowing boot recovery", () => {
+    it("returns readyHeads and readyHeadTransitions with sequence numbers allowing boot recovery", () => {
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       repository.setReadyHeadListener(() => {
         throw new Error("inbox is unavailable");
@@ -119,6 +119,14 @@ describe("ObligationRepository", () => {
       const headsMap = repository.readyHeads();
       expect(headsMap.get("actor-a")).toBe("ob-a");
       expect(headsMap.get("actor-b")).toBe("ob-b");
+
+      const transitions = repository.readyHeadTransitions();
+      expect(transitions).toEqual(
+        expect.arrayContaining([
+          { ownerId: "actor-a", headId: "ob-a", previousHeadId: null, sequence: 1 },
+          { ownerId: "actor-b", headId: "ob-b", previousHeadId: null, sequence: 1 },
+        ])
+      );
       warn.mockRestore();
     });
 

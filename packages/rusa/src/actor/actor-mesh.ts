@@ -625,63 +625,53 @@ export class ActorMesh {
   }
 
   /**
-   * Returns the obligationId of the most recent ready-head attention entry delivered to this actor, or null if none.
-   */
-  private getLatestDeliveredHeadId(actorId: string): string | null {
-    if (!this.inboxStore) return null;
-    let cursor: string | undefined;
-    while (true) {
-      const page = this.inboxStore.list(actorId, { status: "all", limit: 100, cursor });
-      for (const entry of page.entries) {
-        if (entry.payload?.type === "obligation.ready_head") {
-          return (entry.payload.obligationId as string) ?? null;
-        }
-        if (entry.source.startsWith("obligation:")) {
-          return entry.source.slice("obligation:".length);
-        }
-      }
-      if (!page.nextCursor || page.entries.length === 0) break;
-      cursor = page.nextCursor;
-    }
-    return null;
-  }
-
-  /**
    * Boot recovery for ready-head inbox attention (#1645).
    *
    * Verifies that every active actor with a ready head has durable attention in
-   * its inbox. If attention for the current ready head is absent (e.g. due to
-   * process crash or listener failure during obligation commit), delivers it.
-   * If attention for the head was already delivered, no duplicate entry is created.
+   * its inbox. Keyed by exact transition fact and sequence persisted in SQLite.
    */
   reconcileReadyHeads(obligations: {
-    readyHeads(): Iterable<[string, string]>;
+    readyHeadTransitions?(): Iterable<{
+      ownerId: string;
+      headId: string;
+      previousHeadId: string | null;
+      sequence: number;
+    }>;
+    readyHeads?(): Iterable<[string, string]>;
     get(id: string): { id: string; intent: string | null } | null;
   }): void {
     if (!this.inboxStore) return;
     try {
-      for (const [ownerId, headId] of obligations.readyHeads()) {
-        if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) continue;
-        const actorId = this.resolveThreadId(ownerId);
-        const record = this.registry.get(actorId);
-        if (!record || record.status !== "active") continue;
-
-        const unhandled = this.inboxStore.list(actorId, {
-          source: `obligation:${headId}`,
-          status: "unhandled",
-        });
-        if (unhandled.entries.length > 0) continue;
-
-        const latestDeliveredHeadId = this.getLatestDeliveredHeadId(actorId);
-        if (latestDeliveredHeadId === headId) continue;
-
-        const head = obligations.get(headId);
-        if (!head) continue;
-        this.deliverReadyHeadAttention(
-          actorId,
-          { id: head.id, intent: head.intent },
-          latestDeliveredHeadId
-        );
+      if (typeof obligations.readyHeadTransitions === "function") {
+        for (const {
+          ownerId,
+          headId,
+          previousHeadId,
+          sequence,
+        } of obligations.readyHeadTransitions()) {
+          if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) continue;
+          const actorId = this.resolveThreadId(ownerId);
+          const record = this.registry.get(actorId);
+          if (!record || record.status !== "active") continue;
+          const head = obligations.get(headId);
+          if (!head) continue;
+          this.deliverReadyHeadAttention(
+            actorId,
+            { id: head.id, intent: head.intent },
+            previousHeadId,
+            sequence
+          );
+        }
+      } else if (typeof obligations.readyHeads === "function") {
+        for (const [ownerId, headId] of obligations.readyHeads()) {
+          if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) continue;
+          const actorId = this.resolveThreadId(ownerId);
+          const record = this.registry.get(actorId);
+          if (!record || record.status !== "active") continue;
+          const head = obligations.get(headId);
+          if (!head) continue;
+          this.deliverReadyHeadAttention(actorId, { id: head.id, intent: head.intent }, null, null);
+        }
       }
     } catch (err) {
       this.log(
@@ -797,14 +787,16 @@ export class ActorMesh {
   deliverReadyHeadAttention(
     actorId: string,
     head: { id: string; intent: string | null },
-    previousHeadId: string | null = null
+    previousHeadId: string | null = null,
+    sequence: number | null = null
   ): boolean {
     actorId = this.resolveThreadId(actorId);
     if (!this.inboxStore) return false;
     const record = this.registry.get(actorId);
     if (!record || record.status !== "active") return false;
+    const seqKey = sequence !== null ? `:${sequence}` : "";
     const entryId = deduplicatedInboxEntryId(
-      `obligation-head:${actorId}:${previousHeadId ?? "none"}->${head.id}`,
+      `obligation-head:${actorId}:${previousHeadId ?? "none"}->${head.id}${seqKey}`,
       actorId
     );
     const entries = this.inboxStore.append([
@@ -820,11 +812,10 @@ export class ActorMesh {
       },
     ]);
     if (entries.length === 0) {
-      // Already delivered for this exact transition. While it is still
-      // unhandled the wake is outstanding and a second entry is only noise;
-      // once handled, the head has come back the same way it came the first
-      // time, so nudge rather than going silent.
-      if (this.inboxStore.read(actorId, entryId)?.handledAt) this.notifyInboxChanged(actorId);
+      // Already delivered for this exact transition.
+      if (sequence === null && this.inboxStore.read(actorId, entryId)?.handledAt) {
+        this.notifyInboxChanged(actorId);
+      }
       return false;
     }
     this.notifyInboxChanged(actorId);

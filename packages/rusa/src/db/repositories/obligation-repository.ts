@@ -83,6 +83,8 @@ export interface ReadyHeadChange {
    * and a consumer that deduplicates on head identity needs to.
    */
   previousHeadId: string | null;
+  /** Monotonically increasing sequence number for head changes on this owner. */
+  sequence?: number;
 }
 
 export interface ObligationPage {
@@ -232,6 +234,13 @@ export class ObligationRepository {
    * byte-identical to `listOwned`'s ordering (effective priority, then id) or
    * an actor would be told about a head its own queue does not show first.
    */
+  /**
+   * Current ready head per owner, keyed by owner id.
+   *
+   * "Head" is the first row of the owner's ready queue, which must stay
+   * byte-identical to `listOwned`'s ordering (effective priority, then id) or
+   * an actor would be told about a head its own queue does not show first.
+   */
   readyHeads(): Map<string, string> {
     const rows = this.db
       .prepare(
@@ -254,49 +263,31 @@ export class ObligationRepository {
   }
 
   /**
-   * Run a mutation and report any actor whose ready head changed as a result.
-   *
-   * Diffing a head snapshot rather than reasoning per-operation is deliberate:
-   * #1645 requires covering create, reorder, all-children-terminal re-ready,
-   * reassignment and retirement inheritance, and several of those move a head
-   * for an owner the caller never named (a re-readied parent, the far side of a
-   * reassignment, every heir of a retiring actor). An operation-by-operation
-   * rule would have to re-derive that fan-out and would silently miss the next
-   * producer added; the diff cannot.
-   *
-   * Notification happens AFTER the transaction returns, so a rolled-back
-   * mutation cannot announce a head that was never committed.
+   * Current ready head transition records per owner, persisted transactionally in SQLite.
    */
-  private tracked<T>(run: () => T): T {
-    const listener = this.readyHeadListener;
-    if (!listener) return run();
-    const before = this.readyHeads();
-    const result = run();
-    const after = this.readyHeads();
-    for (const [ownerId, headId] of after) {
-      const previousHeadId = before.get(ownerId) ?? null;
-      if (previousHeadId === headId) continue;
-      // #1645: head attention for the operator belongs in the dashboard/digest,
-      // and a system component has no inbox — only actors are woken.
-      if (!isActorEntityId(ownerId)) continue;
-      const head = this.get(headId);
-      if (!head) continue;
-      // The mutation is already committed; attention is a downstream effect of
-      // it, not part of it. Letting an inbox write failure propagate would
-      // report failure for durable work — and the caller's natural retry of
-      // `create_obligation` then trips the external-ref uniqueness guard,
-      // stranding an actor on work it believes it never created.
-      try {
-        listener({ ownerId, head, previousHeadId });
-      } catch (err) {
-        console.warn(
-          `[obligations] ready-head listener failed for ${ownerId}: ${
-            err instanceof Error ? err.message : String(err)
-          }`
-        );
-      }
-    }
-    return result;
+  readyHeadTransitions(): Array<{
+    ownerId: EntityId;
+    headId: string;
+    previousHeadId: string | null;
+    sequence: number;
+  }> {
+    const rows = this.db
+      .prepare(
+        `SELECT owner_id, head_id, previous_head_id, sequence
+         FROM obligation_ready_heads`
+      )
+      .all() as Array<{
+      owner_id: string;
+      head_id: string;
+      previous_head_id: string | null;
+      sequence: number;
+    }>;
+    return rows.map((row) => ({
+      ownerId: row.owner_id,
+      headId: row.head_id,
+      previousHeadId: row.previous_head_id,
+      sequence: row.sequence,
+    }));
   }
 
   /**
@@ -305,9 +296,70 @@ export class ObligationRepository {
    * Every state-changing repository method routes through here, so a new
    * mutation cannot be added that commits without being observed — the same
    * reason `updated_at` is set at every UPDATE rather than left to a caller.
+   *
+   * Ready-head transitions are written transactionally inside SQLite to
+   * guarantee durability across restarts and process downtime.
    */
   private mutate<T>(work: () => T): T {
-    return this.tracked(() => this.db.transaction(work)());
+    const changes: ReadyHeadChange[] = [];
+    const result = this.db.transaction(() => {
+      const before = this.readyHeads();
+      const res = work();
+      const after = this.readyHeads();
+
+      for (const [ownerId, headId] of after) {
+        const previousHeadId = before.get(ownerId) ?? null;
+        if (previousHeadId === headId) continue;
+        if (!isActorEntityId(ownerId)) continue;
+        const head = this.get(headId);
+        if (!head) continue;
+
+        const now = this.stamp();
+        this.db
+          .prepare(
+            `INSERT INTO obligation_ready_heads (owner_id, head_id, previous_head_id, sequence, updated_at)
+             VALUES (?, ?, ?, 1, ?)
+             ON CONFLICT(owner_id) DO UPDATE SET
+               previous_head_id = excluded.previous_head_id,
+               head_id = excluded.head_id,
+               sequence = sequence + 1,
+               updated_at = excluded.updated_at`
+          )
+          .run(ownerId, headId, previousHeadId, now);
+
+        const seqRow = this.db
+          .prepare(`SELECT sequence FROM obligation_ready_heads WHERE owner_id = ?`)
+          .get(ownerId) as { sequence: number } | undefined;
+        const sequence = seqRow?.sequence ?? 1;
+
+        changes.push({ ownerId, head, previousHeadId, sequence });
+      }
+
+      for (const ownerId of before.keys()) {
+        if (!after.has(ownerId) && isActorEntityId(ownerId)) {
+          this.db.prepare(`DELETE FROM obligation_ready_heads WHERE owner_id = ?`).run(ownerId);
+        }
+      }
+
+      return res;
+    })();
+
+    const listener = this.readyHeadListener;
+    if (listener) {
+      for (const change of changes) {
+        try {
+          listener(change);
+        } catch (err) {
+          console.warn(
+            `[obligations] ready-head listener failed for ${change.ownerId}: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+        }
+      }
+    }
+
+    return result;
   }
 
   /**
