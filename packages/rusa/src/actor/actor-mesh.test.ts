@@ -821,6 +821,90 @@ describe("ActorMesh", () => {
     expect(inboxStore.entries.filter((entry) => entry.actorId === id)).toHaveLength(0);
   });
 
+  it("reconciles missing ready-head attention on boot and repair", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, fake, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    const obligations = {
+      readyHeads: () => [["root", "ob-1"] as [string, string]],
+      get: (id: string) => (id === "ob-1" ? { id: "ob-1", intent: "repair me" } : null),
+    };
+
+    // Before reconciliation: inbox has 0 entries for root.
+    expect(rootEntries()).toHaveLength(0);
+
+    // Run boot reconciliation for ready heads
+    mesh.reconcileReadyHeads(obligations);
+    await tick();
+
+    // Missed attention was delivered and actor nudged
+    expect(rootEntries()).toHaveLength(1);
+    expect(rootEntries()[0].source).toBe("obligation:ob-1");
+    expect(rootEntries()[0].payload).toMatchObject({
+      type: "obligation.ready_head",
+      obligationId: "ob-1",
+      intent: "repair me",
+    });
+    expect(fake("root").calls.length).toBeGreaterThan(0);
+
+    // Second boot reconciliation pass (restart idempotence test):
+    // Attention for ob-1 is already in inbox, so no new entry or duplicate wake occurs.
+    const callCountBefore = fake("root").calls.length;
+    mesh.reconcileReadyHeads(obligations);
+    await tick();
+
+    expect(rootEntries()).toHaveLength(1);
+    expect(fake("root").calls.length).toBe(callCountBefore);
+  });
+
+  it("is idempotent when transition-based attention was already delivered before restart", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, fake, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    // Simulate transition-derived delivery during runtime (e.g. ob-0 -> ob-1)
+    mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, "ob-0");
+    await tick();
+    expect(rootEntries()).toHaveLength(1);
+    expect(rootEntries()[0].source).toBe("obligation:ob-1");
+
+    const callsBeforeReconcile = fake("root").calls.length;
+
+    // Simulate restart and run reconcileReadyHeads
+    const obligations = {
+      readyHeads: () => [["root", "ob-1"] as [string, string]],
+      get: (id: string) => (id === "ob-1" ? { id: "ob-1", intent: "ship it" } : null),
+    };
+
+    mesh.reconcileReadyHeads(obligations);
+    await tick();
+
+    // No duplicate entry or extra wake!
+    expect(rootEntries()).toHaveLength(1);
+    expect(fake("root").calls.length).toBe(callsBeforeReconcile);
+  });
+
+  it("skips non-actor owners and retired actors during ready-head reconciliation", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, registry } = setup({ inboxStore });
+    const retiredId = mesh.spawn({ charter: "worker", parentId: "root" });
+    registry.patch(retiredId, { status: "retired" });
+
+    const obligations = {
+      readyHeads: () =>
+        [
+          ["human:matt", "ob-human"],
+          ["system:cron", "ob-sys"],
+          [retiredId, "ob-retired"],
+        ] as [string, string][],
+      get: (id: string) => ({ id, intent: null }),
+    };
+
+    mesh.reconcileReadyHeads(obligations);
+    expect(inboxStore.entries).toHaveLength(0);
+  });
+
   it("re-queues an actor that leaves inbox work unhandled, and stops once the inbox drains", async () => {
     const inboxStore = createMemoryInboxStore();
     // Handle exactly one entry per run so the actor deliberately under-drains,

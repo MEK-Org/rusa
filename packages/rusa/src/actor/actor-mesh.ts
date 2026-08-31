@@ -625,6 +625,41 @@ export class ActorMesh {
   }
 
   /**
+   * Boot recovery for ready-head inbox attention (#1645).
+   *
+   * Verifies that every active actor with a ready head has durable attention in
+   * its inbox. If attention for the current ready head is absent (e.g. due to
+   * process crash or listener failure during obligation commit), delivers it.
+   * If attention for the head was already delivered, no duplicate entry is created.
+   */
+  reconcileReadyHeads(obligations: {
+    readyHeads(): Iterable<[string, string]>;
+    get(id: string): { id: string; intent: string | null } | null;
+  }): void {
+    if (!this.inboxStore) return;
+    try {
+      for (const [ownerId, headId] of obligations.readyHeads()) {
+        if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) continue;
+        const actorId = this.resolveThreadId(ownerId);
+        const record = this.registry.get(actorId);
+        if (!record || record.status !== "active") continue;
+        const existing = this.inboxStore.list(actorId, {
+          source: `obligation:${headId}`,
+          status: "all",
+        });
+        if (existing.entries.length > 0) continue;
+        const head = obligations.get(headId);
+        if (!head) continue;
+        this.deliverReadyHeadAttention(actorId, { id: head.id, intent: head.intent }, null);
+      }
+    } catch (err) {
+      this.log(
+        `ready-head reconciliation failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  /**
    * Notify an actor that its durable worklist changed. If an execution
    * opportunity is already queued, the new entry joins it and becomes seen
    * immediately; only deliveries during an active run set the dirty follow-up.
