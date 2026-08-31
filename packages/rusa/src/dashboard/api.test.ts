@@ -627,6 +627,28 @@ describe("handleMeshApiRequest", () => {
     expect(dto.charterPreview).toBe("short charter\nline 2");
   });
 
+  it("GET /api/mesh/threads clips a charter on a character, not a code unit", () => {
+    // Emoji are two UTF-16 code units each, so a code-unit slice at 280 lands
+    // inside the 140th one and ends the excerpt on half a character.
+    registry.upsert({
+      id: UUID_A,
+      charter: "\u{1F9ED}".repeat(200),
+      parentId: null,
+      status: "active",
+      createdAt: "2026-06-21T00:00:00.000Z",
+    });
+
+    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { threads } = JSON.parse(res.body);
+    const dto = threads.find((t: { id: string }) => t.id === UUID_A);
+
+    // 280 characters plus the ellipsis, the same budget the test above asserts.
+    expect([...dto.charterPreview]).toHaveLength(281);
+    expect(dto.charterPreview.endsWith("\u{1F9ED}\u2026")).toBe(true);
+    // No lone surrogate: re-encoding is lossless only if every pair survived.
+    expect(Buffer.from(dto.charterPreview, "utf8").toString("utf8")).toBe(dto.charterPreview);
+  });
+
   it("GET /api/mesh/threads/charter serves the one actor's full charter", () => {
     const long = `${"pursue the objective. ".repeat(60)}TAIL-MARKER`;
     registry.upsert({

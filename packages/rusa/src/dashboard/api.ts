@@ -127,16 +127,21 @@ const MAX_AVATAR_UPLOAD_BYTES = 5 * 1024 * 1024;
 /**
  * How much of a charter the actor list carries. The list is a tree of handles
  * with a two-line excerpt under each; the full text only ever renders in the
- * detail panel, one actor at a time. Sending all of it made `charter` 86.7% of
- * a 1.9 MB response (#104) — assembled and serialised for all 506 actors on
- * every poll to satisfy a view that clips it.
+ * detail panel, one actor at a time. Sending all of it made `charter` far and
+ * away the largest thing in the response — one multi-kilobyte field per actor,
+ * assembled and serialised on every poll to satisfy a view that clips it. The
+ * measurement is on #104, where it can be restated as the mesh grows rather
+ * than going stale in a comment.
  */
 const CHARTER_PREVIEW_CHARS = 280;
 
 /** The leading slice of `charter` the list view can actually show. */
 function charterPreview(charter: string): string {
-  if (charter.length <= CHARTER_PREVIEW_CHARS) return charter;
-  return `${charter.slice(0, CHARTER_PREVIEW_CHARS).trimEnd()}\u2026`;
+  // By code point, not by UTF-16 code unit: charters contain emoji, and a
+  // `slice` that lands mid-surrogate-pair ends the excerpt on a broken glyph.
+  const points = [...charter];
+  if (points.length <= CHARTER_PREVIEW_CHARS) return charter;
+  return `${points.slice(0, CHARTER_PREVIEW_CHARS).join("").trimEnd()}\u2026`;
 }
 
 /** A thread as the dashboard tree consumes it: handle up front, UUID for detail. */

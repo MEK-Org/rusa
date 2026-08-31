@@ -606,7 +606,15 @@ class _InfoView extends StatefulWidget {
 class _InfoViewState extends State<_InfoView> {
   /// The full charter once it arrives. Null means "still the preview".
   String? _charter;
+
+  /// The actor and preview the charter on screen was fetched for. Set while a
+  /// fetch is in flight and kept if it succeeds; a failure clears it.
   String? _loadedFor;
+
+  /// A charter is editable, so the actor's id alone does not identify one. The
+  /// preview travels with the list on every poll and changes when the charter
+  /// does, which is what lets an edit reach an open panel.
+  String get _fetchKey => '${widget.actor.id}\u0000${widget.actor.charterPreview}';
 
   @override
   void initState() {
@@ -617,23 +625,29 @@ class _InfoViewState extends State<_InfoView> {
   @override
   void didUpdateWidget(_InfoView old) {
     super.didUpdateWidget(old);
-    // The tab is reused across selections, so a new actor has to re-fetch —
-    // otherwise the panel shows the previous actor's charter under a new handle.
-    if (old.actor.id != widget.actor.id) _loadCharter();
+    // Ask on every rebuild and let the key decide, so all three reasons to
+    // re-fetch are one condition: a new actor (the tab is reused across
+    // selections, so otherwise the panel shows the previous actor's charter
+    // under a new handle), an edited charter, and a fetch that failed.
+    _loadCharter();
   }
 
   Future<void> _loadCharter() async {
+    final key = _fetchKey;
+    if (_loadedFor == key) return;
+    _loadedFor = key;
     final id = widget.actor.id;
-    if (_loadedFor == id) return;
-    _loadedFor = id;
     setState(() => _charter = null);
     try {
       final charter = await widget.store.fetchCharter(id);
       // The operator can select another actor while this is in flight.
-      if (!mounted || _loadedFor != id) return;
+      if (!mounted || _loadedFor != key) return;
       setState(() => _charter = charter);
     } catch (_) {
-      // The preview stays on screen; the store has already surfaced the error.
+      // The preview stays on screen and the store has already surfaced the
+      // error — but release the key, so the next poll retries rather than
+      // pinning the panel to the preview for as long as this actor is selected.
+      if (_loadedFor == key) _loadedFor = null;
     }
   }
 
