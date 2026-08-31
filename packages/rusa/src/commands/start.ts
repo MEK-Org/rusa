@@ -112,7 +112,7 @@ import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import type { QuotaApiDeps } from "../dashboard/quota-api.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { isSelfAuthoredLedgerSource } from "../db/repositories/mesh-event-repository.js";
-import type { ReadyHeadChange } from "../db/repositories/obligation-repository.js";
+import { isActorEntityId, type ReadyHeadChange } from "../db/repositories/obligation-repository.js";
 import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
 import {
@@ -1805,9 +1805,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // the dashboard binding its port. A head change cannot commit into a sink
   // that is still undefined.
   //
-  // Boot is not covered: nothing re-derives heads at startup, so a head that
-  // moved while the process was down is never announced. Closing that needs a
-  // boot sweep over `readyHeads()`, which this branch does not implement.
+  // Boot sweep below over `readyHeads()` reconciles heads at startup.
   readyHeadSink = ({ ownerId, head, previousHeadId }) => {
     mesh.deliverReadyHeadAttention(ownerId, { id: head.id, intent: head.intent }, previousHeadId);
   };
@@ -2288,6 +2286,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   mesh.rehydrateAll();
   mesh.reconcilePendingDeliveries();
   mesh.reconcileInbox();
+  // Boot sweep over readyHeads(): deliver ready-head inbox attention for any
+  // active actor with a ready head, ensuring attention is not missed due to
+  // process downtime or a post-commit listener failure.
+  for (const [ownerId, headId] of getRepositories().obligations.readyHeads()) {
+    if (!isActorEntityId(ownerId)) continue;
+    const head = getRepositories().obligations.get(headId);
+    if (!head) continue;
+    mesh.deliverReadyHeadAttention(ownerId, { id: head.id, intent: head.intent }, null);
+  }
   const restored = registry.list().filter((r) => r.status === "active" && r.id !== rootId);
   if (restored.length > 0) {
     console.log(`[mesh] rehydrated ${restored.length} active thread(s) from the registry`);

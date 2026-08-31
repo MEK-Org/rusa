@@ -124,7 +124,7 @@ const PROJECTED_OBLIGATION = `
  * are not in the thread registry, so validating them against it would reject
  * legitimate owners.
  */
-function isActorEntityId(id: EntityId): boolean {
+export function isActorEntityId(id: EntityId): boolean {
   return !id.startsWith("human:") && !id.startsWith("system:");
 }
 
@@ -232,7 +232,7 @@ export class ObligationRepository {
    * byte-identical to `listOwned`'s ordering (effective priority, then id) or
    * an actor would be told about a head its own queue does not show first.
    */
-  private readyHeads(): Map<string, string> {
+  readyHeads(): Map<string, string> {
     const rows = this.db
       .prepare(
         `${EFFECTIVE_PRIORITY_CTE}

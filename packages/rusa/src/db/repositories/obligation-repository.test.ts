@@ -107,6 +107,21 @@ describe("ObligationRepository", () => {
       warn.mockRestore();
     });
 
+    it("returns readyHeads for all owners with ready obligations allowing boot recovery", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      repository.setReadyHeadListener(() => {
+        throw new Error("inbox is unavailable");
+      });
+
+      repository.create({ id: "ob-a", ownerId: "actor-a", priority: 5 });
+      repository.create({ id: "ob-b", ownerId: "actor-b", priority: 1 });
+
+      const headsMap = repository.readyHeads();
+      expect(headsMap.get("actor-a")).toBe("ob-a");
+      expect(headsMap.get("actor-b")).toBe("ob-b");
+      warn.mockRestore();
+    });
+
     it("announces the displacing obligation when new work takes the head", () => {
       repository.create({ id: "first", ownerId: "actor-a", priority: 10 });
       heads = [];
