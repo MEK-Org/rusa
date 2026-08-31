@@ -625,6 +625,28 @@ export class ActorMesh {
   }
 
   /**
+   * Returns the obligationId of the most recent ready-head attention entry delivered to this actor, or null if none.
+   */
+  private getLatestDeliveredHeadId(actorId: string): string | null {
+    if (!this.inboxStore) return null;
+    let cursor: string | undefined;
+    while (true) {
+      const page = this.inboxStore.list(actorId, { status: "all", limit: 100, cursor });
+      for (const entry of page.entries) {
+        if (entry.payload?.type === "obligation.ready_head") {
+          return (entry.payload.obligationId as string) ?? null;
+        }
+        if (entry.source.startsWith("obligation:")) {
+          return entry.source.slice("obligation:".length);
+        }
+      }
+      if (!page.nextCursor || page.entries.length === 0) break;
+      cursor = page.nextCursor;
+    }
+    return null;
+  }
+
+  /**
    * Boot recovery for ready-head inbox attention (#1645).
    *
    * Verifies that every active actor with a ready head has durable attention in
@@ -643,14 +665,23 @@ export class ActorMesh {
         const actorId = this.resolveThreadId(ownerId);
         const record = this.registry.get(actorId);
         if (!record || record.status !== "active") continue;
-        const existing = this.inboxStore.list(actorId, {
+
+        const unhandled = this.inboxStore.list(actorId, {
           source: `obligation:${headId}`,
-          status: "all",
+          status: "unhandled",
         });
-        if (existing.entries.length > 0) continue;
+        if (unhandled.entries.length > 0) continue;
+
+        const latestDeliveredHeadId = this.getLatestDeliveredHeadId(actorId);
+        if (latestDeliveredHeadId === headId) continue;
+
         const head = obligations.get(headId);
         if (!head) continue;
-        this.deliverReadyHeadAttention(actorId, { id: head.id, intent: head.intent }, null);
+        this.deliverReadyHeadAttention(
+          actorId,
+          { id: head.id, intent: head.intent },
+          latestDeliveredHeadId
+        );
       }
     } catch (err) {
       this.log(
