@@ -1527,7 +1527,7 @@ describe("GitHubIssueClient", () => {
       },
     });
 
-    const prs = await new GitHubIssueClient().getOpenPullRequestsByAuthor(REPO, "bot");
+    const prs = await new GitHubIssueClient().getOpenPullRequestsByAuthor(REPO, "BOT");
     expect(prs).toEqual([
       {
         number: 1,
@@ -1871,6 +1871,7 @@ describe("parseIssueNumberFromBranch", () => {
     ["mc/feat/issue-519-tutor-api-keys", 519],
     ["bot/issue-477-parent-pays-subject-edit", 477],
     ["issue-42", 42],
+    ["steward/120-author-scoped-pr-list", 120],
   ])("reads the issue number out of %s", (ref, expected) => {
     expect(parseIssueNumberFromBranch(ref)).toBe(expected);
   });

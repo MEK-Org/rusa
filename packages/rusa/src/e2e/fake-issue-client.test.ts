@@ -64,7 +64,7 @@ describe("FakeIssueClient", () => {
       body: "b",
       reviewer: "human",
     });
-    const prs = await client.getOpenPullRequestsByAuthor(REPO, BOT);
+    const prs = await client.getOpenPullRequestsByAuthor(REPO, BOT.toUpperCase());
     expect(prs).toHaveLength(1);
     expect(prs[0].issueNumber).toBe(7);
     expect(prs[0].headRef).toBe("mc/issue-7");

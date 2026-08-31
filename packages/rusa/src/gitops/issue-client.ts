@@ -174,15 +174,18 @@ const GREEN_CI_CONCLUSIONS = new Set(["success", "skipped", "neutral"]);
 
 /**
  * Reads an issue number out of a branch name, for the `issueNumber` hint on
- * {@link OpenPullRequest}. Matches an `issue-<n>` segment anywhere in the ref, so
- * `mc/issue-42`, `mc/fix/issue-42-slug` and `bot/issue-42-slug` all resolve.
+ * {@link OpenPullRequest}. Matches an `issue-<n>` segment anywhere in the ref, or
+ * a `steward/<n>-<slug>` pattern, so `mc/issue-42`, `steward/120-author-scoped-pr-list`,
+ * `mc/fix/issue-42-slug` and `bot/issue-42-slug` all resolve.
  *
  * Both boundaries are deliberate: `reissue-42` is not issue 42, and `issue-42x`
- * is not a number worth trusting. A ref this cannot read yields `null`, which
- * callers must treat as "no issue named" rather than as grounds to drop the PR.
+ * is not a number worth trusting. Hyphenated suffixes (`issue-42-slug`, `120-slug`)
+ * are supported via non-alphanumeric trailing lookahead. A ref this cannot read
+ * yields `null`, which callers must treat as "no issue named" rather than as grounds
+ * to drop the PR.
  */
 export function parseIssueNumberFromBranch(branchName: string): number | null {
-  const match = branchName.match(/(?:^|[^a-z0-9])issue-(\d+)(?![a-z0-9])/i);
+  const match = branchName.match(/(?:(?:^|[^a-z0-9])issue-|steward\/)(\d+)(?![a-z0-9])/i);
   return match ? Number.parseInt(match[1], 10) : null;
 }
 
@@ -1254,7 +1257,10 @@ export class GitHubIssueClient implements IssueClient {
   }
 
   async getOpenPullRequestsByAuthor(repo: string, author: string): Promise<OpenPullRequest[]> {
-    return (await this.fetchOpenPullRequests(repo)).filter((pr) => pr.author === author);
+    const targetAuthor = author.toLowerCase();
+    return (await this.fetchOpenPullRequests(repo)).filter(
+      (pr) => pr.author.toLowerCase() === targetAuthor
+    );
   }
 
   async getOpenPullRequests(repo: string): Promise<OpenPullRequest[]> {
