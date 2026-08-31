@@ -794,6 +794,10 @@ export class ActorMesh {
     if (!this.inboxStore) return false;
     const record = this.registry.get(actorId);
     if (!record || record.status !== "active") return false;
+    // Keying on transition + sequence ensures exact-once durable inbox delivery across restarts.
+    // If the owner's queue completely drains and the exact same transition later recurs,
+    // sequence resets to 1; ON CONFLICT DO NOTHING suppresses duplicate inbox rows if the
+    // prior entry remains, while live notifyInboxChanged wakes the active actor.
     const seqKey = sequence !== null ? `:${sequence}` : "";
     const entryId = deduplicatedInboxEntryId(
       `obligation-head:${actorId}:${previousHeadId ?? "none"}->${head.id}${seqKey}`,
@@ -812,8 +816,8 @@ export class ActorMesh {
       },
     ]);
     if (entries.length === 0) {
-      // Already delivered for this exact transition.
-      if (sequence === null && this.inboxStore.read(actorId, entryId)?.handledAt) {
+      // Already delivered for this exact transition sequence. Wakes active actor if handled.
+      if (this.inboxStore.read(actorId, entryId)?.handledAt) {
         this.notifyInboxChanged(actorId);
       }
       return false;

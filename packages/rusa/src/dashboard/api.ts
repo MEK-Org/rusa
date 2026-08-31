@@ -29,22 +29,6 @@ import {
 } from "../observability/commitment-ledger.js";
 import type { SseHub } from "./sse.js";
 
-/**
- * Resolve an owner id supplied by the dashboard to one the mesh can route to.
- *
- * The dashboard is the operator's console, so its owner ids come from typed
- * input — and the Flutter owner dialog falls back to the raw text when no
- * handle matches. With `owner_kind` gone there is no second field to disagree
- * with, and production wires `ObligationRepository` without an `actorExists`
- * probe, so an unvalidated id here creates live work owned by something that
- * appears in no queue and wakes nobody: exactly the owner drift `0025` exists
- * to clean up, re-entering through the write boundary.
- *
- * Accepted: a live actor id, or the single operator id. `system:*` owners are
- * refused because nothing mints them today; that is a deliberate narrowing of
- * `EntityId` at this surface, not a claim about the id space.
- */
-
 /** Everything the mesh Data API needs, injected by the server wiring. */
 export interface DashboardDataDeps {
   registry: ThreadRegistry;
