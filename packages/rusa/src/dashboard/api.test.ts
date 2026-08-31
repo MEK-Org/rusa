@@ -1524,9 +1524,18 @@ describe("handleMeshApiRequest", () => {
   describe("Obligations REST API", () => {
     describe("GET /api/mesh/obligations", () => {
       it("lists obligations with filters and pagination", async () => {
-        obligations.create({ id: "root-1", ownerId: "actor-1" });
-        obligations.create({ id: "root-2", ownerId: "human:operator" });
         obligations.create({
+          title: "root-1",
+          id: "root-1",
+          ownerId: "actor-1",
+        });
+        obligations.create({
+          title: "root-2",
+          id: "root-2",
+          ownerId: "human:operator",
+        });
+        obligations.create({
+          title: "child-1",
           id: "child-1",
           parentId: "root-1",
           ownerId: "actor-1",
@@ -1567,13 +1576,19 @@ describe("handleMeshApiRequest", () => {
 
     describe("GET /api/mesh/obligations/:id", () => {
       it("returns obligation with parent, children, and blockingChildren", async () => {
-        obligations.create({ id: "root-task", ownerId: "actor-1" });
         obligations.create({
+          title: "root-task",
+          id: "root-task",
+          ownerId: "actor-1",
+        });
+        obligations.create({
+          title: "sub-1",
           id: "sub-1",
           parentId: "root-task",
           ownerId: "actor-2",
         });
         obligations.create({
+          title: "sub-2",
           id: "sub-2",
           parentId: "root-task",
           ownerId: "actor-2",
@@ -1599,8 +1614,13 @@ describe("handleMeshApiRequest", () => {
 
     describe("GET /api/mesh/obligations/:id/tree", () => {
       it("returns complete subtree", async () => {
-        obligations.create({ id: "root-task", ownerId: "actor-1" });
         obligations.create({
+          title: "root-task",
+          id: "root-task",
+          ownerId: "actor-1",
+        });
+        obligations.create({
+          title: "child-task",
           id: "child-task",
           parentId: "root-task",
           ownerId: "actor-2",
@@ -1625,6 +1645,7 @@ describe("handleMeshApiRequest", () => {
         registry.upsert(rec(UUID_A, "root", "active"));
         const body = JSON.stringify({
           ownerId: UUID_A,
+          title: "Build feature",
           intent: "build feature",
         });
         const { res } = call(deps, "POST", "/api/mesh/obligations", body);
@@ -1632,6 +1653,7 @@ describe("handleMeshApiRequest", () => {
         expect(res.statusCode).toBe(201);
         const data = JSON.parse(res.body);
         expect(data.obligation.ownerId).toBe(UUID_A);
+        expect(data.obligation.title).toBe("Build feature");
         expect(data.obligation.intent).toBe("build feature");
         // The dashboard binds the creator from the server's own identity; a
         // null here would be an unrecoverable loss of attribution (#1671).
@@ -1643,11 +1665,29 @@ describe("handleMeshApiRequest", () => {
           deps,
           "POST",
           "/api/mesh/obligations",
-          JSON.stringify({ ownerId: HUMAN_OPERATOR, creatorId: "actor-impostor" })
+          JSON.stringify({
+            ownerId: HUMAN_OPERATOR,
+            title: "Decide",
+            creatorId: "actor-impostor",
+          })
         );
         await new Promise((resolve) => process.nextTick(resolve));
         expect(res.statusCode).toBe(201);
         expect(JSON.parse(res.body).obligation.creatorId).toBe(HUMAN_OPERATOR);
+      });
+
+      it("rejects a create with no title", async () => {
+        registry.upsert(rec(UUID_A, "root", "active"));
+        for (const body of [
+          JSON.stringify({ ownerId: UUID_A, intent: "no heading" }),
+          JSON.stringify({ ownerId: UUID_A, title: "   ", intent: "blank heading" }),
+        ]) {
+          const { res } = call(deps, "POST", "/api/mesh/obligations", body);
+          await new Promise((resolve) => process.nextTick(resolve));
+          // A node with no heading cannot appear in a call-list, which is the
+          // one thing the human-decision contract needs it for.
+          expect(res.statusCode).toBe(400);
+        }
       });
 
       it("rejects an owner that is neither a live actor nor the operator", async () => {
@@ -1657,7 +1697,7 @@ describe("handleMeshApiRequest", () => {
             deps,
             "POST",
             "/api/mesh/obligations",
-            JSON.stringify({ ownerId, intent: "typo" })
+            JSON.stringify({ ownerId, title: "Typo", intent: "typo" })
           );
           await new Promise((resolve) => process.nextTick(resolve));
           // A typed handle that resolves to nothing must not become live work
@@ -1681,7 +1721,11 @@ describe("handleMeshApiRequest", () => {
 
     describe("POST /api/mesh/obligations/:id/status", () => {
       it("transitions status and returns 200", async () => {
-        obligations.create({ id: "task-1", ownerId: "actor-1" });
+        obligations.create({
+          title: "task-1",
+          id: "task-1",
+          ownerId: "actor-1",
+        });
 
         const { res } = call(
           deps,
@@ -1706,12 +1750,59 @@ describe("handleMeshApiRequest", () => {
         await new Promise((resolve) => process.nextTick(resolve));
         expect(res.statusCode).toBe(404);
       });
+
+      it("records the operator's stated reason", async () => {
+        obligations.create({
+          title: "decide-stack",
+          id: "decide-stack",
+          ownerId: HUMAN_OPERATOR,
+        });
+
+        const { res } = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/decide-stack/status",
+          JSON.stringify({ status: "done", note: "Flutter. Tooling is already wired here." })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(res.statusCode).toBe(200);
+        expect(JSON.parse(res.body).obligation.terminalNote).toBe(
+          "Flutter. Tooling is already wired here."
+        );
+      });
+
+      it("drops a non-string note rather than coercing it into a reason", async () => {
+        obligations.create({
+          title: "coerce-me",
+          id: "coerce-me",
+          ownerId: "actor-1",
+        });
+
+        const { res } = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/coerce-me/status",
+          JSON.stringify({ status: "cancelled", note: { why: "nope" } })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        // "[object Object]" stored as a stated reason is worse than no reason.
+        expect(res.statusCode).toBe(200);
+        expect(JSON.parse(res.body).obligation.terminalNote).toBeNull();
+      });
     });
 
     describe("POST /api/mesh/obligations/:id/reorder", () => {
       it("reorders obligation and returns 200", async () => {
-        obligations.create({ id: "first", ownerId: "actor-1" });
-        obligations.create({ id: "second", ownerId: "actor-1" });
+        obligations.create({
+          title: "first",
+          id: "first",
+          ownerId: "actor-1",
+        });
+        obligations.create({
+          title: "second",
+          id: "second",
+          ownerId: "actor-1",
+        });
 
         const { res } = call(
           deps,
@@ -1731,9 +1822,22 @@ describe("handleMeshApiRequest", () => {
 
     describe("POST /api/mesh/obligations/:id/reparent", () => {
       it("reparents obligation and returns 200", async () => {
-        obligations.create({ id: "p1", ownerId: "actor-1" });
-        obligations.create({ id: "p2", ownerId: "actor-1" });
-        obligations.create({ id: "c1", parentId: "p1", ownerId: "actor-1" });
+        obligations.create({
+          title: "p1",
+          id: "p1",
+          ownerId: "actor-1",
+        });
+        obligations.create({
+          title: "p2",
+          id: "p2",
+          ownerId: "actor-1",
+        });
+        obligations.create({
+          title: "c1",
+          id: "c1",
+          parentId: "p1",
+          ownerId: "actor-1",
+        });
 
         const { res } = call(
           deps,
@@ -1749,7 +1853,11 @@ describe("handleMeshApiRequest", () => {
       });
 
       it("400s on self-parenting or cycle", async () => {
-        obligations.create({ id: "task-self", ownerId: "actor-1" });
+        obligations.create({
+          title: "task-self",
+          id: "task-self",
+          ownerId: "actor-1",
+        });
 
         const { res } = call(
           deps,
@@ -1764,7 +1872,11 @@ describe("handleMeshApiRequest", () => {
 
     describe("POST /api/mesh/obligations/:id/reassign", () => {
       it("reassigns an obligation for a trusted operator", async () => {
-        obligations.create({ id: "task-owner", ownerId: "actor-1" });
+        obligations.create({
+          title: "task-owner",
+          id: "task-owner",
+          ownerId: "actor-1",
+        });
         const { res } = call(
           deps,
           "POST",
@@ -1777,7 +1889,11 @@ describe("handleMeshApiRequest", () => {
       });
 
       it("validates the new owner and returns 404 for missing work", async () => {
-        obligations.create({ id: "task-owner", ownerId: "actor-1" });
+        obligations.create({
+          title: "task-owner",
+          id: "task-owner",
+          ownerId: "actor-1",
+        });
         // With owner_kind gone the only malformed owner is a blank id; the
         // route must still reject it rather than write an empty owner.
         const invalid = call(

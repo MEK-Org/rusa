@@ -1886,7 +1886,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   readyHeadSink = ({ ownerId, head, previousHeadId, sequence }) => {
     mesh.deliverReadyHeadAttention(
       ownerId,
-      { id: head.id, intent: head.intent },
+      head === null ? null : { id: head.id, intent: head.intent },
       previousHeadId,
       sequence
     );

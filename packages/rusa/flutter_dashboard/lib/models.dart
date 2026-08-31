@@ -821,11 +821,16 @@ class LiveOutputChunk {
   );
 }
 
+/// Longest an obligation heading may be. Mirrors `OBLIGATION_TITLE_MAX` on the
+/// server, which rejects anything longer.
+const int kObligationTitleMax = 200;
+
 class ObligationDto {
   const ObligationDto({
     required this.id,
     this.parentId,
     required this.ownerId,
+    this.title,
     this.creatorId,
     this.createdAt,
     this.updatedAt,
@@ -835,6 +840,8 @@ class ObligationDto {
     this.priority,
     required this.effectivePriority,
     this.prioritySourceId,
+    this.terminalNote,
+    this.resolutionRef,
   });
 
   final String id;
@@ -843,6 +850,10 @@ class ObligationDto {
   /// `human:*`, or `system:*`. The category is read off the prefix — there is
   /// no separate owner "kind".
   final String ownerId;
+
+  /// The heading — short, and what a queue shows. Null only for rows that
+  /// predate the title/body split with no intent to derive one from.
+  final String? title;
 
   /// Who raised this obligation; immutable across reassignment. Null means
   /// genuinely unknown (a row predating attribution), never inferred.
@@ -856,6 +867,35 @@ class ObligationDto {
   final double effectivePriority;
   final String? prioritySourceId;
 
+  /// Which attached artifact settled this obligation, as a `kind:value` ref.
+  /// Distinct from [externalRef], which is an identity claim.
+  final String? resolutionRef;
+
+  /// Why this obligation was completed or cancelled, in the terminating
+  /// principal's own words. Null while live, and null for a terminal
+  /// obligation whose reason was never stated or predates the column.
+  final String? terminalNote;
+
+  /// What to show as the heading. Prefers [title]; falls back to [intent] so a
+  /// row written before the split still reads, rather than rendering blank.
+  String get heading {
+    final t = title?.trim();
+    if (t != null && t.isNotEmpty) return t;
+    final i = intent?.trim();
+    if (i == null || i.isEmpty) return 'Untitled Obligation';
+    final firstLine = i.split('\n').first.trim();
+    return firstLine.isEmpty ? 'Untitled Obligation' : firstLine;
+  }
+
+  /// The fuller statement, or null when there isn't one worth showing. A row
+  /// written before the title/body split has an intent whose first line *is*
+  /// the heading, so rendering both would echo it under itself.
+  String? get body {
+    final i = intent?.trim();
+    if (i == null || i.isEmpty || i == heading) return null;
+    return i;
+  }
+
   bool get isReady => status == 'ready';
   bool get isWaiting => status == 'waiting';
   bool get isDone => status == 'done';
@@ -863,6 +903,8 @@ class ObligationDto {
   bool get isTerminal => status == 'done' || status == 'cancelled';
 
   factory ObligationDto.fromJson(Map<String, dynamic> j) {
+    // The server sends a parsed reference object; older rows and some fixtures
+    // send the bare canonical string. Both reduce to the same `key`.
     final dynamic rawRef = j['externalRef'];
     final String? extRef = rawRef is Map ? rawRef['key'] as String? : rawRef as String?;
 
@@ -870,6 +912,7 @@ class ObligationDto {
       id: j['id'] as String? ?? '',
       parentId: j['parentId'] as String?,
       ownerId: j['ownerId'] as String? ?? '',
+      title: j['title'] as String?,
       creatorId: j['creatorId'] as String?,
       createdAt: j['createdAt'] as String?,
       updatedAt: j['updatedAt'] as String?,
@@ -879,6 +922,8 @@ class ObligationDto {
       priority: (j['priority'] as num?)?.toDouble(),
       effectivePriority: (j['effectivePriority'] as num?)?.toDouble() ?? 0.0,
       prioritySourceId: j['prioritySourceId'] as String?,
+      terminalNote: j['terminalNote'] as String?,
+      resolutionRef: j['resolutionRef'] as String?,
     );
   }
 }

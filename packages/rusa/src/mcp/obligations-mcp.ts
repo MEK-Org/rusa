@@ -2,7 +2,8 @@ import { Buffer } from "node:buffer";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
-import type { ObligationStatus } from "../obligations/obligation.js";
+import { OBLIGATION_TITLE_MAX, type ObligationStatus } from "../obligations/obligation.js";
+import { REFERENCE_SCHEMES } from "../references/reference.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 
@@ -15,6 +16,8 @@ type ObligationServerRepository = Pick<
   | "listOwnedPage"
   | "create"
   | "setTerminalStatus"
+  | "attachArtifact"
+  | "listArtifacts"
   | "movePriorityInternal"
   | "reassign"
   | "reparent"
@@ -155,6 +158,7 @@ export function createObligationsMcpServer(
         });
         return toolOk({
           obligation,
+          artifacts: repository.listArtifacts(id),
           parent: obligation.parentId === null ? null : repository.get(obligation.parentId),
           children: {
             items: children.obligations,
@@ -231,21 +235,23 @@ export function createObligationsMcpServer(
     {
       title: "Create a new obligation",
       description:
-        "Create a new obligation. If parent_id is specified, the parent obligation transitions to waiting if it was ready.",
+        "Create a new obligation. `title` is the heading a queue shows; keep it to one short line and put the detail in `intent`. If parent_id is specified, the parent obligation transitions to waiting if it was ready.",
       inputSchema: {
         owner_id: z.string().trim().min(1),
+        title: z.string().trim().min(1).max(OBLIGATION_TITLE_MAX),
         parent_id: z.string().trim().min(1).nullable().optional(),
         intent: z.string().nullable().optional(),
         external_ref: z.string().trim().min(1).nullable().optional(),
         priority: z.number().finite().nullable().optional(),
       },
     },
-    async ({ owner_id, parent_id, intent, external_ref, priority }) => {
+    async ({ owner_id, title, parent_id, intent, external_ref, priority }) => {
       try {
         const owner = options?.resolveOwner?.(owner_id) ?? { ok: true as const, ownerId: owner_id };
         if (!owner.ok) return toolError(new Error(owner.error));
         const obligation = repository.create({
           ownerId: owner.ownerId,
+          title,
           parentId: parent_id ?? null,
           intent: intent ?? null,
           externalRef: external_ref ?? null,
@@ -269,16 +275,50 @@ export function createObligationsMcpServer(
     {
       title: "Set terminal status for an obligation",
       description:
-        "Transition an obligation to 'done' or 'cancelled'. It must have no live children. If the parent was waiting and has no remaining live children, the parent re-readies at its retained priority.",
+        "Transition an obligation to 'done' or 'cancelled'. It must have no live children. If the parent was waiting and has no remaining live children, the parent re-readies at its retained priority. Pass `note` to record why in words, and `resolution_ref` to cite what settled it (e.g. the mesh_chat message that answered the question) — the ref is attached to the obligation as part of the same transition.",
       inputSchema: {
         id: z.string().trim().min(1),
         status: z.enum(["done", "cancelled"]),
+        note: z.string().nullable().optional(),
+        resolution_ref: z.string().trim().min(1).nullable().optional(),
       },
     },
-    async ({ id, status }) => {
+    async ({ id, status, note, resolution_ref }) => {
       try {
-        const obligation = repository.setTerminalStatus(id, status);
+        const obligation = repository.setTerminalStatus(
+          id,
+          status,
+          note ?? null,
+          resolution_ref ?? null
+        );
         return toolOk({ obligation });
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "attach_artifact",
+    {
+      title: "Cite an artifact on an obligation",
+      description: `Attach a reference to something that bears on this obligation — the chat message that raised it, the review that changed it, the PR that carries it. Refs are '<scheme>:<path>', scheme one of: ${REFERENCE_SCHEMES.join(", ")}, and the path is collection/id pairs: github:OWNER/REPO/issues/33, github:OWNER/REPO/issues/33/comments/12345, gchat:spaces/S/messages/M, mesh:messages/<id>. Attaching the same ref twice is a no-op, not an error. This is not external_ref, which asserts the obligation *is* that GitHub issue or PR.`,
+      inputSchema: {
+        obligation_id: z.string().trim().min(1),
+        ref: z.string().trim().min(1),
+        label: z.string().nullable().optional(),
+      },
+    },
+    async ({ obligation_id, ref, label }) => {
+      try {
+        const artifact = repository.attachArtifact(obligation_id, ref, {
+          label: label ?? null,
+          // Bound server-side from this server's identity, exactly like
+          // `creatorId` on create: who cited a thing is attribution, and
+          // attribution is never accepted as model payload (#1671).
+          attachedBy: actorId,
+        });
+        return toolOk({ artifact });
       } catch (err) {
         return toolError(err);
       }

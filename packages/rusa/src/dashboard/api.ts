@@ -795,6 +795,11 @@ export function handleMeshApiRequest(
           }
           const rawParentId = body.parentId ?? body.parent_id;
           const parentId = typeof rawParentId === "string" ? rawParentId.trim() : null;
+          const title = typeof body.title === "string" ? body.title : "";
+          if (!title.trim()) {
+            sendJson(res, 400, { error: "title is required" });
+            return;
+          }
           const intent = typeof body.intent === "string" ? body.intent : null;
           const rawExternalRef = body.externalRef ?? body.external_ref;
           const externalRef = typeof rawExternalRef === "string" ? rawExternalRef.trim() : null;
@@ -812,6 +817,7 @@ export function handleMeshApiRequest(
             const obligation = obligations.create({
               ownerId: owner.ownerId,
               parentId,
+              title,
               intent,
               externalRef,
               priority,
@@ -859,13 +865,21 @@ export function handleMeshApiRequest(
             sendJson(res, 400, { error: "status must be 'done' or 'cancelled'" });
             return;
           }
+          // Free prose or nothing. A non-string `note` is dropped rather than
+          // coerced: "[object Object]" as a stated reason is worse than none.
+          const note = typeof body.note === "string" ? body.note : null;
+          const rawResolutionRef = body.resolutionRef ?? body.resolution_ref;
+          const resolutionRef =
+            typeof rawResolutionRef === "string" && rawResolutionRef.trim()
+              ? rawResolutionRef.trim()
+              : null;
           const existing = obligations.get(id);
           if (!existing) {
             sendJson(res, 404, { error: "obligation not found" });
             return;
           }
           try {
-            const obligation = obligations.setTerminalStatus(id, status);
+            const obligation = obligations.setTerminalStatus(id, status, note, resolutionRef);
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });

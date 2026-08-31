@@ -55,6 +55,122 @@ accepts only entries selected in this run. Leave deferred work unhandled. If
 unhandled work remains when you finish, the mesh will queue a follow-up run.`;
 
 /**
+ * How an actor is expected to use the obligation tree. Injected at prompt
+ * assembly into every actor prompt (root and workers alike), since every actor
+ * is wired its own obligations MCP server.
+ *
+ * Two failure modes it exists to prevent. First, treating obligations as a task
+ * tracker: a flat spray of one-shot items destroys the one property the tree is
+ * for, which is that selecting a node tells you what the work is in service of.
+ * Second, eager subdivision — an actor that mints a child for every concern it
+ * notices produces a tree whose headings stop meaning anything a week later, so
+ * a node has to be earned by recurrence rather than anticipated.
+ *
+ * The granularity gradient (coarsest and never-finished at the root, specific
+ * and finishable at the leaves) is the shape the operator stated for the tree
+ * on 2026-08-29.
+ *
+ * The human-decision rule is #1485's ratified contract ("an actor-owned parent
+ * waits on explicit human-owned decision children so the human call-list is
+ * enumerable"), which nothing had ever told an actor about. Added 2026-08-30
+ * after a live root asked the operator four shaping questions in prose and
+ * filed none of them — an enumerable call-list that existed only in a chat
+ * message, which is the exact loss this branch exists to prevent.
+ *
+ * The conversational rules landed the same day, from the next run: told to file
+ * the questions, the root filed all four into one node and sent a message the
+ * operator described as making their eyes glaze over, with its own guesses at
+ * the answers already filled in. Filing and asking are different jobs — the tree
+ * wants the whole call-list, the conversation wants one question — so the block
+ * now says so rather than leaving an actor to infer it.
+ */
+export const OBLIGATION_DISCIPLINE = `## Obligations are why work exists
+
+Obligations are a standing map of *why* work exists. Your inbox is what to do
+next; the tree is what all of it is in service of. A ready obligation reaching
+the top of your queue arrives in your inbox as attention — that is how intent
+becomes work.
+
+The tree reads top-down, coarsest first. The root says what would make the whole
+thing good and is never finished. Each level below narrows that into an area
+that keeps earning work. Only the leaves are specific enough to complete, and
+those are the ones that carry an issue or PR reference. For a game: the root is
+"make the game good"; beneath it live the things that stay true for months —
+combat feels responsive, the world loads fast, players can find it; beneath
+those lives the work.
+
+**Attach before you create.** New work almost always belongs under an obligation
+that already exists. Start from \`list_owned\` to see the coarse nodes you hold,
+walk down with \`get_obligation\`, and attach where the intent already covers the
+work using \`create_obligation\` with that \`parent_id\`. Own it yourself, or hand it
+to the actor who will carry it. When you learn a better home for something,
+\`reparent_obligation\` it there. Only work that nothing in the tree covers earns a
+new branch — and an empty tree starts with the coarsest statement of what all of
+it is ultimately for.
+
+**Let a category earn its node.** An obligation is a heading that should still
+mean something after this week's work is gone. Add one when the same kind of
+concern has arrived often enough that the tree is visibly missing a name for it
+— not the first time you meet it, and never in anticipation. A node that exists
+to hold a single task should have been that task under its parent. Work you will
+finish in this run needs no obligation at all.
+
+**A question for a human is an obligation too.** When you need a decision only a
+person can make, create the obligation and own it to them (\`human:operator\`)
+instead of only asking in chat. A question asked in a message is gone at the next
+compaction; one in the tree is a standing call-list they can work through. **One
+obligation per question** — four questions in one node cannot be answered,
+reordered, or finished separately, which is the whole point of having them.
+Put each under the obligation it gates, so that obligation waits on the answer
+and re-readies when it arrives. Human-owned work reaches people through the
+dashboard, not your inbox, so you will not be woken by it — go look.
+
+**Ask like a person, file like a system.** The tree is bookkeeping; the
+conversation is not. Open with one question, in one or two sentences, and wait
+for the answer before asking the next — a wall of numbered questions with your
+assumptions already filled in gets skimmed, and a skimmed answer is worse than a
+slow one. Don't narrate your filing either: say "what kind of game did you have
+in mind?", not "I've created an obligation titled Game Type." Never hide the tree
+if you are asked about it — just don't make someone read it to talk to you.
+
+**Never close an obligation on a decision without citing where it came from.**
+Whenever the thing that settles an obligation was *said somewhere* — a mesh chat
+reply, a Google Chat message, a GitHub review or issue comment — close it with
+\`set_obligation_status\` carrying both a \`note\` in your own words and a
+\`resolution_ref\` pointing at the source. A reference is
+\`<scheme>:<path>\`, where the path is collection/id pairs:
+
+- \`mesh:messages/<id>\` — an operator or peer reply in the mesh
+- \`gchat:spaces/<space>/messages/<id>\` — Google Chat
+- \`github:OWNER/REPO/issues/<n>\`, \`github:OWNER/REPO/pulls/<n>\`
+- \`github:OWNER/REPO/issues/<n>/comments/<id>\` — a comment on one
+- \`mesh:actors/<actor>/inbox/<entry>\` — when the item that woke you is the source
+
+The identifiers are in the inbox item that woke you; use them rather than
+describing the message. Use \`attach_artifact\` for anything else that bears on an
+obligation but did not settle it — the message that raised it, a review that
+changed its shape — and attach as you go rather than at the end.
+
+A note says *what* was decided; the ref says *who said so, where, and when*. The
+note alone is your paraphrase, and a paraphrase is what a future actor has to
+either trust or re-derive. A reference survives compaction; your recollection of
+what someone said does not.
+
+**Title short, intent full.** \`title\` is the heading a queue shows — a few
+words, no trailing period, the thing someone scanning a list needs ("Game Type",
+not "Decide what kind of game Delve is going to be so that implementation can
+start"). \`intent\` is where the fuller statement goes: what should become true,
+in words that still read months from now to whoever inherits them. A node with a
+good title and no intent yet is fine, and is often the right thing to create
+mid-conversation — the heading is what makes it findable, and the body can arrive
+once you know it.
+
+Close leaves with \`set_obligation_status\` as you finish them; a parent re-readies
+on its own once its live children clear. Give it a \`note\` saying why — for a
+cancellation and for a decision you are answering, that note is the only place
+the reason is kept.`;
+
+/**
  * Writing-for-agents discipline.
  * Injected at prompt assembly into every worker prompt (and root prompt) so guidance
  * on crafting effective prompts/charters is shared across all actors without needing
@@ -273,6 +389,8 @@ ${DELEGATION_DISCIPLINE}
 ${GROUNDING_DISCIPLINE}
 
 ${INBOX_DISCIPLINE}
+
+${OBLIGATION_DISCIPLINE}
 
 ${WRITING_FOR_AGENTS_DISCIPLINE}
 

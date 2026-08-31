@@ -7,6 +7,9 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { obligations } from "../db/migrations/0016_obligations.js";
 import { obligationPriority } from "../db/migrations/0017_obligation_priority.js";
 import { obligationTimestamps } from "../db/migrations/0025_obligation_timestamps.js";
+import { obligationTerminalNote } from "../db/migrations/0026_obligation_terminal_note.js";
+import { obligationTitle } from "../db/migrations/0027_obligation_title.js";
+import { obligationArtifacts } from "../db/migrations/0028_obligation_artifacts.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { createObligationsMcpServer } from "./obligations-mcp.js";
@@ -34,13 +37,17 @@ describe("obligations MCP", () => {
     obligations.up(db);
     obligationPriority.up(db);
     obligationTimestamps.up(db);
+    obligationTerminalNote.up(db);
+    obligationTitle.up(db);
+    obligationArtifacts.up(db);
     repository = new ObligationRepository(db);
   });
 
-  it("exposes all 7 obligation tools", async () => {
+  it("exposes all 8 obligation tools", async () => {
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
     const { tools } = await client.listTools();
     expect(tools.map((tool) => tool.name).sort()).toEqual([
+      "attach_artifact",
       "create_obligation",
       "get_obligation",
       "list_owned",
@@ -56,6 +63,7 @@ describe("obligations MCP", () => {
     const res = (await client.callTool({
       name: "create_obligation",
       arguments: {
+        title: "raised here, owned there",
         // Raised by actor-a, OWNED by actor-b — the case the creator column
         // exists for (#1671: reassignment must not destroy who raised it).
         owner_id: "actor-b",
@@ -84,6 +92,7 @@ describe("obligations MCP", () => {
     const res = (await client.callTool({
       name: "create_obligation",
       arguments: {
+        title: "attempted attribution laundering",
         owner_id: "actor-a",
         intent: "attempted attribution laundering",
         created_by: "human:operator",
@@ -102,6 +111,7 @@ describe("obligations MCP", () => {
     const rootRes = (await client.callTool({
       name: "create_obligation",
       arguments: {
+        title: "build feature",
         owner_id: "actor-a",
         intent: "build feature",
       },
@@ -113,6 +123,7 @@ describe("obligations MCP", () => {
     const childRes = (await client.callTool({
       name: "create_obligation",
       arguments: {
+        title: "subtask",
         owner_id: "actor-b",
         parent_id: rootData.obligation.id,
         intent: "subtask",
@@ -128,11 +139,13 @@ describe("obligations MCP", () => {
 
   it("transitions status via set_obligation_status and re-readies parent at retained priority", async () => {
     repository.create({
+      title: "root-task",
       id: "root-task",
       ownerId: "actor-a",
       priority: 100,
     });
     repository.create({
+      title: "child-task",
       id: "child-task",
       parentId: "root-task",
       ownerId: "actor-a",
@@ -169,7 +182,7 @@ describe("obligations MCP", () => {
     for (const ownerId of ["actor-nonexistent", "actor-retired", "system:mesh"]) {
       const res = (await client.callTool({
         name: "create_obligation",
-        arguments: { owner_id: ownerId, intent: "typo" },
+        arguments: { title: "typo", owner_id: ownerId, intent: "typo" },
       })) as CallToolResult;
       expect(res.isError, ownerId).toBe(true);
     }
@@ -181,15 +194,69 @@ describe("obligations MCP", () => {
     for (const ownerId of ["actor-a", "human:operator"]) {
       const res = (await client.callTool({
         name: "create_obligation",
-        arguments: { owner_id: ownerId, intent: "fine" },
+        arguments: { title: "fine", owner_id: ownerId, intent: "fine" },
       })) as CallToolResult;
       expect(res.isError, ownerId).toBeFalsy();
     }
   });
 
+  it("records the actor's stated reason on the terminal transition", async () => {
+    repository.create({
+      title: "why-task",
+      id: "why-task",
+      ownerId: "actor-a",
+    });
+
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const res = (await client.callTool({
+      name: "set_obligation_status",
+      arguments: {
+        id: "why-task",
+        status: "cancelled",
+        note: "Superseded by the ancestry projection; this framing no longer applies.",
+      },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    const { obligation } = dataOf(res) as { obligation: { terminalNote: string | null } };
+    expect(obligation.terminalNote).toBe(
+      "Superseded by the ancestry projection; this framing no longer applies."
+    );
+    expect(repository.require("why-task").terminalNote).toBe(
+      "Superseded by the ancestry projection; this framing no longer applies."
+    );
+  });
+
+  it("leaves the reason null when the actor gives none", async () => {
+    repository.create({
+      title: "silent-task",
+      id: "silent-task",
+      ownerId: "actor-a",
+    });
+
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const res = (await client.callTool({
+      name: "set_obligation_status",
+      arguments: { id: "silent-task", status: "done" },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    // Optional, not required: an actor that finishes work without narrating it
+    // still gets a clean transition rather than a validation failure.
+    expect(repository.require("silent-task").terminalNote).toBeNull();
+  });
+
   it("reorders obligations via reorder_obligation", async () => {
-    repository.create({ id: "first", ownerId: "actor-a" });
-    repository.create({ id: "second", ownerId: "actor-a" });
+    repository.create({
+      title: "first",
+      id: "first",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "second",
+      id: "second",
+      ownerId: "actor-a",
+    });
 
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
     const reorderRes = (await client.callTool({
@@ -208,9 +275,22 @@ describe("obligations MCP", () => {
   });
 
   it("reparents an obligation via reparent_obligation", async () => {
-    repository.create({ id: "p1", ownerId: "actor-a" });
-    repository.create({ id: "p2", ownerId: "actor-a" });
-    repository.create({ id: "c1", parentId: "p1", ownerId: "actor-a" });
+    repository.create({
+      title: "p1",
+      id: "p1",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "p2",
+      id: "p2",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "c1",
+      id: "c1",
+      parentId: "p1",
+      ownerId: "actor-a",
+    });
 
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
     const reparentRes = (await client.callTool({
@@ -231,7 +311,11 @@ describe("obligations MCP", () => {
   });
 
   it("reassigns owned work and reports the previous owner", async () => {
-    repository.create({ id: "task", ownerId: "actor-a" });
+    repository.create({
+      title: "task",
+      id: "task",
+      ownerId: "actor-a",
+    });
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
     const result = (await client.callTool({
       name: "reassign_obligation",
@@ -246,7 +330,11 @@ describe("obligations MCP", () => {
   });
 
   it("rejects unauthorized reassignment and honors an injected ancestor policy", async () => {
-    repository.create({ id: "foreign", ownerId: "actor-b" });
+    repository.create({
+      title: "foreign",
+      id: "foreign",
+      ownerId: "actor-b",
+    });
     const denied = await connect(createObligationsMcpServer(repository, "actor-a"));
     const deniedResult = (await denied.callTool({
       name: "reassign_obligation",
@@ -267,9 +355,21 @@ describe("obligations MCP", () => {
   });
 
   it("binds list_owned to the actor and preserves ready queue order", async () => {
-    repository.create({ id: "first", ownerId: "actor-a" });
-    repository.create({ id: "second", ownerId: "actor-a" });
-    repository.create({ id: "foreign", ownerId: "actor-b" });
+    repository.create({
+      title: "first",
+      id: "first",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "second",
+      id: "second",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "foreign",
+      id: "foreign",
+      ownerId: "actor-b",
+    });
     repository.movePriorityInternal("second", null, "first");
 
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
@@ -290,11 +390,13 @@ describe("obligations MCP", () => {
 
   it("explains a waiting obligation and names its cross-owner blocker in one read", async () => {
     repository.create({
+      title: "parent",
       id: "parent",
       ownerId: "actor-a",
       intent: "deliver the requested change",
     });
     repository.create({
+      title: "blocker",
       id: "blocker",
       parentId: "parent",
       ownerId: "actor-b",
@@ -335,7 +437,11 @@ describe("obligations MCP", () => {
 
   it("bounds owner queues and binds continuation cursors to actor and filter", async () => {
     for (const id of ["first", "second", "third"]) {
-      repository.create({ id, ownerId: "actor-a" });
+      repository.create({
+        title: "task",
+        id,
+        ownerId: "actor-a",
+      });
     }
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
     const first = (await client.callTool({
@@ -374,14 +480,20 @@ describe("obligations MCP", () => {
   });
 
   it("pages children and live blockers independently without hiding the blocker", async () => {
-    repository.create({ id: "parent", ownerId: "actor-a" });
     repository.create({
+      title: "parent",
+      id: "parent",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "a-terminal",
       id: "a-terminal",
       parentId: "parent",
       ownerId: "actor-b",
     });
     repository.setTerminalStatus("a-terminal", "done");
     repository.create({
+      title: "z-live",
       id: "z-live",
       parentId: "parent",
       ownerId: "actor-b",

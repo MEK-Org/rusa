@@ -422,6 +422,23 @@ export class ActorMesh {
   >();
   private readonly pendingDeliveryTimers = new Map<string, NodeJS.Timeout>();
   private readonly selectedInboxEntryIds = new Map<string, string[]>();
+  /** Actors currently inside a run, for the ready-head window below. */
+  private readonly actorsInRun = new Set<string>();
+  /**
+   * Ready-head churn observed while an actor is mid-run, collapsed at run end
+   * into the single net transition (#1645 follow-up, operator 2026-08-30).
+   *
+   * An actor that files a question under the obligation it is working moves its
+   * own head twice in one run — once when the parent is created, again when the
+   * child makes that parent wait — so delivering per mutation wakes it about
+   * work it just did, and about a head that had already gone waiting by the
+   * time the entry landed. `from` is the head the first change displaced; `to`
+   * is the head as of the latest change, or null once the queue has no head.
+   */
+  private readonly runHeadNet = new Map<
+    string,
+    { from: string | null; to: { id: string; intent: string | null } | null }
+  >();
   /**
    * Ids whose {@link retire} is currently unwinding. A subtree retire recurses
    * into children *before* marking itself retired, so an ancestor mid-retire
@@ -710,6 +727,10 @@ export class ActorMesh {
   actorQueued(actorId: string, context: { responsive: boolean; mode: ActorRunMode }): InboxEntry[] {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
+    // Open the run-scoped head window. An actor absent from this set delivers
+    // head attention immediately, which is what every non-run producer wants.
+    this.actorsInRun.add(actorId);
+    this.runHeadNet.delete(actorId);
     const entries = context.mode === "ordinary" ? this.markInboxSeen(actorId) : [];
     try {
       this.onQueued?.(actorId, context);
@@ -761,6 +782,26 @@ export class ActorMesh {
   finishInboxRun(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
+    this.flushRunHeadAttention(actorId);
+  }
+
+  /**
+   * Deliver at most one entry for everything a run did to its own ready head.
+   *
+   * The net transition is the head the run started with against the head it
+   * ended with. If they match, the run churned and settled back — nothing to
+   * say. If it ended with no head at all (every ready obligation became a
+   * waiting parent, typically because the actor filed a question for a human
+   * under it), there is nothing to point at, so nothing is delivered.
+   */
+  private flushRunHeadAttention(actorId: string): void {
+    this.actorsInRun.delete(actorId);
+    const net = this.runHeadNet.get(actorId);
+    this.runHeadNet.delete(actorId);
+    // Nothing moved, it settled back where it started, or it ended with no head
+    // at all — in the last case there is no obligation to point the actor at.
+    if (!net || net.to === null || net.to.id === net.from) return;
+    this.appendReadyHeadEntry(actorId, net.to, net.from);
   }
 
   /**
@@ -786,11 +827,30 @@ export class ActorMesh {
    */
   deliverReadyHeadAttention(
     actorId: string,
-    head: { id: string; intent: string | null },
+    /** The new head, or null when the owner no longer has one. */
+    head: { id: string; intent: string | null } | null,
     previousHeadId: string | null = null,
     sequence: number | null = null
   ): boolean {
     actorId = this.resolveThreadId(actorId);
+    // Mid-run: accumulate rather than deliver. `from` is fixed by the first
+    // change of the run so the collapsed entry describes where the run started,
+    // not where its last mutation happened to leave off.
+    if (this.actorsInRun.has(actorId)) {
+      const net = this.runHeadNet.get(actorId);
+      this.runHeadNet.set(actorId, { from: net ? net.from : previousHeadId, to: head });
+      return false;
+    }
+    if (head === null) return false;
+    return this.appendReadyHeadEntry(actorId, head, previousHeadId, sequence);
+  }
+
+  private appendReadyHeadEntry(
+    actorId: string,
+    head: { id: string; intent: string | null },
+    previousHeadId: string | null,
+    sequence: number | null = null
+  ): boolean {
     if (!this.inboxStore) return false;
     const record = this.registry.get(actorId);
     if (!record || record.status !== "active") return false;
