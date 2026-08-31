@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Actor } from "../actor/actor.js";
 import {
@@ -99,7 +99,11 @@ import {
 } from "../actor/wake-cron.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "../actor/worker-prompt.js";
 import type { ActorLiveness } from "../actor/workspace-sweep.js";
-import { removableWorkspaceNames, sweepOrphanedWorkspaces } from "../actor/workspace-sweep.js";
+import {
+  removableWorkspaceNames,
+  sweepOrphanedWorkspaces,
+  unattributedCheckouts,
+} from "../actor/workspace-sweep.js";
 import { backfillAvatars, kickAvatarGeneration } from "../avatar/avatars.js";
 import { GoogleCalendarClientProvider } from "../calendar/calendar-client.js";
 import { GchatClient, loadGchatIdentity } from "../chat/gchat-client.js";
@@ -900,6 +904,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     });
     if (sweptWorkspaces.length > 0) {
       console.log(`[start] removed ${sweptWorkspaces.length} workspace(s) of retired actors`);
+    }
+    // Checkouts the sweep will never claim, because they name no actor. Naming
+    // them once a boot is what keeps a hand-named directory from holding a
+    // repository in the shared area indefinitely without anyone knowing.
+    const strayCheckouts = unattributedCheckouts({
+      workersDir,
+      scratchDir: antigravityScratchDir(),
+      actors: actorLiveness(),
+    });
+    if (strayCheckouts.length > 0) {
+      console.warn(
+        `[start] ${strayCheckouts.length} checkout(s) in the provider's area name no actor and were left in place: ${strayCheckouts.map((path) => basename(path)).join(", ")}`
+      );
     }
   }
   const sharedQuotaStore = config.quota?.databasePath

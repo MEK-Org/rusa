@@ -19,7 +19,7 @@
  * Nothing is deleted on the strength of its name alone.
  */
 
-import { readdirSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -132,6 +132,37 @@ export function orphanedWorkspaces(opts: WorkspaceSweepOptions): string[] {
     }
   }
   return orphans;
+}
+
+/**
+ * Repository checkouts in the provider's area that name no actor at all.
+ *
+ * The sweep removes only what it can attribute to a retired actor, which is the
+ * right rule for deleting — but it also means a directory someone named by hand
+ * (`mc-1283`, `pr1587`) keeps its checkout indefinitely and silently, and a
+ * checkout is precisely the exposure #3 is about: repository content every
+ * worker can read. Those are reported rather than removed.
+ *
+ * Reported, because content is not evidence of ownership. The same area holds
+ * shared clones that are legitimately in use, and nothing in a directory
+ * distinguishes one of those from a stray — so deleting on the strength of
+ * "looks like a repo" would eventually take a clone someone is working in,
+ * which costs far more than a directory that lingers until a human reads the
+ * line and removes it.
+ */
+export function unattributedCheckouts(opts: WorkspaceSweepOptions): string[] {
+  const known = new Set(opts.actors.map((actor) => actor.id.slice(0, 8)));
+  const found: string[] = [];
+  for (const name of subdirectories(opts.scratchDir)) {
+    const prefix = workspaceActorPrefix(name);
+    // A name that resolves to an actor is already this module's business: live
+    // ones are kept and retired ones are swept, and neither is a stray.
+    if (prefix && known.has(prefix)) continue;
+    // `.git` is a directory in a clone and a file in a worktree; either says
+    // this directory holds a repository rather than a cache or a scratch file.
+    if (existsSync(join(opts.scratchDir, name, ".git"))) found.push(join(opts.scratchDir, name));
+  }
+  return found;
 }
 
 /**

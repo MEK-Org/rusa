@@ -1,11 +1,12 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   orphanedWorkspaces,
   removableWorkspaceNames,
   sweepOrphanedWorkspaces,
+  unattributedCheckouts,
 } from "./workspace-sweep.js";
 
 const LIVE = "a1b2c3d4-1111-4222-8333-555566667777";
@@ -112,6 +113,44 @@ describe("workspace sweep", () => {
     for (const name of ["root", "quota-probe-kimi", "model-probe-claude"]) {
       expect(existsSync(join(workersDir, name))).toBe(true);
     }
+  });
+
+  it("reports a hand-named checkout the sweep will never claim", () => {
+    // The four spellings that actually accumulated in the shared area: named by
+    // hand, so they resolve to no actor, so the sweep leaves them holding a
+    // clone forever. Reporting is the whole remedy — they stay on disk.
+    for (const name of ["hotfix", "ticket-1283", "pr1587", "staging-clone"]) {
+      dir(scratchDir, name, ".git");
+    }
+    // A directory without a repository in it is not this report's business.
+    dir(scratchDir, "node_modules");
+    // `.git` is a file in a worktree, and that is still a checkout.
+    dir(scratchDir, "detached-worktree");
+    writeFileSync(join(scratchDir, "detached-worktree", ".git"), "gitdir: /elsewhere");
+
+    const strays = unattributedCheckouts({ workersDir, scratchDir, actors: REGISTRY });
+
+    expect(strays.map((path) => basename(path)).sort()).toEqual([
+      "detached-worktree",
+      "hotfix",
+      "pr1587",
+      "staging-clone",
+      "ticket-1283",
+    ]);
+    for (const name of ["hotfix", "ticket-1283", "pr1587", "staging-clone"]) {
+      expect(existsSync(join(scratchDir, name))).toBe(true);
+    }
+  });
+
+  it("leaves an actor's own checkout out of the stray report, live or retired", () => {
+    // Both of these resolve to an actor, so they are already the sweep's
+    // business — the live one is kept and the retired one is removed. Naming
+    // either here would report a directory that is being handled correctly.
+    dir(scratchDir, `worker-${LIVE.slice(0, 8)}`, ".git");
+    dir(scratchDir, `worker-${RETIRED.slice(0, 8)}`, ".git");
+    dir(scratchDir, RETIRED, ".git");
+
+    expect(unattributedCheckouts({ workersDir, scratchDir, actors: REGISTRY })).toEqual([]);
   });
 
   it("sweeps nothing when the registry is unreadable, rather than everything", () => {
