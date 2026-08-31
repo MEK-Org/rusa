@@ -1268,7 +1268,7 @@ describe("sandbox bwrap args", () => {
     rmSync(generatedNpmrc, { force: true });
   });
 
-  it("binds the per-invocation mcp config and auth to /tmp for codex", async () => {
+  it("binds the per-invocation mcp config and shared host auth to /tmp for codex", async () => {
     const home = mkdtempSync(join(tmpdir(), "mc-home-"));
     tempDirs.push(home);
     process.env.HOME = home;
@@ -1296,13 +1296,21 @@ describe("sandbox bwrap args", () => {
     expect(args[configIndex - 1]).toBe("/tmp/mcp-temp-config.toml");
     expect(args[configIndex - 2]).toBe("--bind");
 
+    const hostAuthPath = join(home, ".codex", "auth.json");
     const authIndex = args.indexOf("/tmp/auth.json");
     expect(authIndex).toBeGreaterThan(-1);
-    expect(args[authIndex - 1]).toBe("/tmp/rusa-auth-codex-worktree.json");
+    expect(args[authIndex - 1]).toBe(hostAuthPath);
     expect(args[authIndex - 2]).toBe("--bind");
 
-    expect(tempPaths).toContain("/tmp/rusa-auth-codex-worktree.json");
-    tempDirs.push(...tempPaths);
+    // Auth refreshes must land in the one file every codex session reads. It is
+    // live host state, not a per-run copy to sweep at teardown.
+    expect(tempPaths).not.toContain(hostAuthPath);
+    expect(tempPaths).not.toContain("/tmp/rusa-auth-codex-worktree.json");
+
+    const sibling = buildActorBwrapArgs("/tmp/sibling-worktree", "codex");
+    const siblingAuthIndex = sibling.args.indexOf("/tmp/auth.json");
+    expect(sibling.args[siblingAuthIndex - 1]).toBe(hostAuthPath);
+    tempDirs.push("/tmp/rusa-codex-sessions-sibling-worktree");
 
     expect(args.join(" ")).toContain("--setenv CODEX_HOME /tmp");
     expect(args.join(" ")).not.toContain(`--bind ${join(home, ".codex")} ${join(home, ".codex")}`);

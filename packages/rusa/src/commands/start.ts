@@ -797,7 +797,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     );
   }
 
-  // Boot-time sweep of stale codex auth temp files (skipped in test runner to prevent races with concurrent tests)
+  // Migration cleanup: releases before #127 copied Codex credentials into
+  // /tmp/rusa-auth-codex-* and a crash could strand those copies. New runs bind
+  // the live host auth file directly, but retain this small boot sweep so an
+  // upgrade removes credential files left by the old implementation.
   if (process.env.NODE_ENV !== "test") {
     try {
       const files = readdirSync("/tmp");
