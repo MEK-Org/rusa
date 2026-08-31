@@ -4895,6 +4895,21 @@ describe("ActorMesh", () => {
       expect(woken).toEqual([]);
     });
 
+    it("does not revive a stale subscriber when the governing actor is absent", async () => {
+      const woken = await wokenBy(
+        owning({ [REF]: "retired-owner" }),
+        (mesh) => {
+          const delegate = mesh.spawn({ charter: "stale delegate", parentId: "root" });
+          mesh.subscribeEventSource(issue, delegate, "root");
+        },
+        issue
+      );
+
+      // Ownership inheritance normally rewrites this id during retirement, but
+      // routing must remain fail-closed if it observes an inconsistent instant.
+      expect(woken).toEqual([]);
+    });
+
     it("leaves a source the grammar cannot name entirely to subscriptions", async () => {
       // Only an issue or PR can be an obligation's identity, so a repo-level
       // source has no reference to match and routes as it always did.

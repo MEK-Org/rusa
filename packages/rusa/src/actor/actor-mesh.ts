@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
 import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../mcp/stamp.js";
-import { isActorEntityId } from "../obligations/obligation.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import {
   type CapabilityGrantStore,
@@ -1218,15 +1217,14 @@ export class ActorMesh {
       // answer with no chance of reviving a stale owner.
       const governing = this.obligationOwnerFor(current);
       if (governing) {
-        // A human owner stops the walk without producing a destination. Falling
-        // through would hand their work to whichever actor happened to be
-        // subscribed earlier, which is precisely the stale authority this
-        // overlay forbids; their attention belongs on the dashboard surface.
-        if (!isActorEntityId(governing)) return destinations;
+        // The claim is authoritative even when its owner is not runnable. A
+        // human/system owner, or a temporarily absent actor, produces no
+        // destination; falling through would hand their work to whichever actor
+        // happened to be subscribed earlier.
         if (this.live.has(governing) && !destinations.includes(governing)) {
           destinations.push(governing);
-          return destinations;
         }
+        return destinations;
       }
 
       const activeSubs = this.eventSubscriptions.activeForResource(current);
