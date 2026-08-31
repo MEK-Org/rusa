@@ -138,14 +138,14 @@ export function createTrackerMcpServer(
     {
       title: "List open pull requests",
       description:
-        "List open pull requests. When author is provided, preserves the legacy author-scoped rusa branch behavior; when omitted, returns all open PRs with best-effort parsed issue numbers.",
+        "List open pull requests, optionally scoped to one author. Every open PR is returned either way; `issueNumber` is parsed from the branch name and is null when the branch names no issue.",
       inputSchema: {
         repo: z.string(),
         author: z
           .string()
           .optional()
           .describe(
-            "GitHub login to scope to. Omitting it selects a different code path, not a wider filter: the unscoped branch, whose issue numbers are BEST-EFFORT PARSED rather than authoritative. Passing `undefined` explicitly takes that same branch."
+            "GitHub login to scope to. Omitting it returns every open PR regardless of author."
           ),
       },
     },

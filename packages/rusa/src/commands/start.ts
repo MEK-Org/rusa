@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Actor } from "../actor/actor.js";
 import {
@@ -98,6 +98,12 @@ import {
   writeWakePort,
 } from "../actor/wake-cron.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "../actor/worker-prompt.js";
+import type { ActorLiveness } from "../actor/workspace-sweep.js";
+import {
+  removableWorkspaceNames,
+  sweepOrphanedWorkspaces,
+  unattributedCheckouts,
+} from "../actor/workspace-sweep.js";
 import { backfillAvatars, kickAvatarGeneration } from "../avatar/avatars.js";
 import { GoogleCalendarClientProvider } from "../calendar/calendar-client.js";
 import { GchatClient, loadGchatIdentity } from "../chat/gchat-client.js";
@@ -173,6 +179,7 @@ import {
   runTrackerHygiene,
 } from "../observability/tracker-hygiene.js";
 
+import { antigravityScratchDir } from "../providers/antigravity.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import {
   ingestKimiHostModels,
@@ -401,10 +408,19 @@ export function postBackOnlinePing(opts: {
   }
 }
 
+/**
+ * @param scratch Where the provider CLI keeps its own copy of the actor's
+ * workspace, and who is running in that area right now. Omitted, the second
+ * workspace is simply not cleaned — passing the path in rather than reading the
+ * home directory here is what lets a test say which directory it means, and the
+ * two travel as one argument because deleting by an eight-character prefix
+ * without knowing who else answers to it is the collision this guards.
+ */
 export function createStartRetireCleanups(
   workersDir: string,
   wakeCron: Pick<CrontabWakeCron, "cancel">,
-  e2eInstance?: Pick<E2EInstanceManager, "stopForActorRetirement">
+  e2eInstance?: Pick<E2EInstanceManager, "stopForActorRetirement">,
+  scratch?: { dir: string; listActors: () => readonly ActorLiveness[] }
 ): RetireCleanup[] {
   return [
     ...(e2eInstance
@@ -427,6 +443,30 @@ export function createStartRetireCleanups(
         rmSync(join(workersDir, record.id), { recursive: true, force: true });
       },
     },
+    ...(scratch
+      ? [
+          {
+            // The provider CLI keeps a workspace of its own, which nothing used
+            // to remove — so it outlived the actor and stayed readable to every
+            // worker that came after (#3). Deferred for the same reason as the
+            // work directory above: the provider process writes there until the
+            // run ends.
+            name: "provider scratch workdir",
+            deferUntilRunEnd: true,
+            run: (record: ThreadRecord) => {
+              // Every spelling this actor's workspace may carry that no live
+              // actor also answers to: the provider has named this directory
+              // differently over time, and two of the three name an actor only
+              // by its first eight characters. Removing a path that is not
+              // there is a no-op. The registry is read here rather than at
+              // construction because who is live changes between retirements.
+              for (const name of removableWorkspaceNames(record.id, scratch.listActors())) {
+                rmSync(join(scratch.dir, name), { recursive: true, force: true });
+              }
+            },
+          },
+        ]
+      : []),
     {
       name: "cron wake",
       run: (record) => wakeCron.cancel(record.id),
@@ -859,6 +899,40 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const modelScrapesStore = getRepositories().modelScrapes;
   const workersDir = join(mcHome, "workers");
   mkdirSync(workersDir, { recursive: true });
+  // Boot-time sweep of the workspaces of actors that have retired. Retirement
+  // deletes both of an actor's directories, so what survives to here is either a
+  // restart that interrupted that, or a workspace from before the provider's own
+  // scratch area was cleaned at all (#3). Skipped in the test runner alongside
+  // the other boot sweeps.
+  // Who the registry knows and whether they still run, read fresh at every use:
+  // both the boot sweep below and each retirement cleanup decide what to delete
+  // from this, and it changes underneath them.
+  const actorLiveness = (): ActorLiveness[] =>
+    registry.list().map((record) => ({ id: record.id, retired: record.status === "retired" }));
+  if (process.env.NODE_ENV !== "test") {
+    const sweptWorkspaces = sweepOrphanedWorkspaces({
+      workersDir,
+      scratchDir: antigravityScratchDir(),
+      actors: actorLiveness(),
+      log: (message) => console.warn(message),
+    });
+    if (sweptWorkspaces.length > 0) {
+      console.log(`[start] removed ${sweptWorkspaces.length} workspace(s) of retired actors`);
+    }
+    // Checkouts the sweep will never claim, because they name no actor. Naming
+    // them once a boot is what keeps a hand-named directory from holding a
+    // repository in the shared area indefinitely without anyone knowing.
+    const strayCheckouts = unattributedCheckouts({
+      workersDir,
+      scratchDir: antigravityScratchDir(),
+      actors: actorLiveness(),
+    });
+    if (strayCheckouts.length > 0) {
+      console.warn(
+        `[start] ${strayCheckouts.length} checkout(s) in the provider's area name no actor and were left in place: ${strayCheckouts.map((path) => basename(path)).join(", ")}`
+      );
+    }
+  }
   const sharedQuotaStore = config.quota?.databasePath
     ? new SharedQuotaStore(resolveQuotaDatabasePath(config.quota.databasePath, mcHome))
     : null;
@@ -1398,7 +1472,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       return notifyingParent ? deliverable : undefined;
     },
     log: (m) => console.log(`[mesh] ${m}`),
-    retireCleanups: createStartRetireCleanups(workersDir, wakeCron, e2eInstance),
+    retireCleanups: createStartRetireCleanups(workersDir, wakeCron, e2eInstance, {
+      dir: antigravityScratchDir(),
+      listActors: actorLiveness,
+    }),
     // Eagerly generate this actor's avatar on spawn . Strictly
     // fire-and-forget and failure-isolated inside kickAvatarGeneration — a single
     // attempt, no retries, never blocks or affects wake/run/retry. Root is

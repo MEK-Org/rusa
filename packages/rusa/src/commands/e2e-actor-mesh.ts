@@ -483,7 +483,7 @@ function fakeChatMessage(seq: number, text: string, dm: boolean): ChatMessage {
  *    (wakes the root). `dm` defaults to true; a room message sets mentionsSelf.
  *  - `GET  /chat/outbox` → `{ sent, reactions }` the root produced.
  */
-function startChatControlServer(opts: {
+export function startChatControlServer(opts: {
   port: number;
   chatSource: FakeChatSource;
   chatClient: FakeChatClient;
@@ -509,6 +509,19 @@ function startChatControlServer(opts: {
             const { text, dm } = JSON.parse(raw || "{}") as { text?: string; dm?: boolean };
             if (!text) return send(400, { error: "text is required" });
             const msg = fakeChatMessage(++seq, text, dm !== false);
+            // Deliver AND make readable. The source only wakes the actor; the
+            // chat-read MCP answers `get_message`/`list_messages` out of
+            // `FakeChatClient.messages`, which nothing was populating. So a
+            // woken root followed its inbox item to the source, got "message
+            // not found", and — correctly, per the grounding discipline —
+            // refused to guess and asked the operator to resend. The edge
+            // looked wired and was write-only.
+            opts.chatClient.messages.push({
+              name: msg.name,
+              text: msg.text,
+              sender: { name: msg.senderName, displayName: msg.senderDisplayName },
+              createTime: new Date().toISOString(),
+            });
             await opts.chatSource.emit(msg);
             send(200, { ok: true, delivered: msg.name });
           } catch (err) {

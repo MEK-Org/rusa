@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import type { QuotaScrape } from "../db/repositories/quota-scrape-repository.js";
+import { BUSY_TIMEOUT_MS, widenToWal } from "../db/wal.js";
 import type { ProviderQuotaSnapshot, QuotaWindowKind } from "../mcp/quota-mcp.js";
 
 const SLOT_MS = 5 * 60 * 1000;
@@ -42,6 +43,19 @@ export const QUOTA_INTEGRAL_MAX_STEP_SECONDS = SLOT_MS / 1000;
 export const QUOTA_DERIVATIVE_TAU_SECONDS = 1800;
 export const QUOTA_ACTUATOR_SMOOTHING = 0.25;
 export const QUOTA_MAX_SLEW_SECONDS = 900;
+/**
+ * A rise in remaining quota above this many points is read as a refill rather
+ * than a measurement. Inside one window `percentLeft` only falls — consumption
+ * is the only thing that moves it — so a genuine rise means the budget was
+ * replenished under us.
+ *
+ * This is a noise floor, not a sensitivity knob. The reading is parsed from a
+ * rendered percentage, so display rounding can move it by a point without any
+ * underlying change; two points clears that with margin. Sensitivity is not the
+ * binding constraint in the other direction, because a real refill moves tens
+ * of points at once — a weekly window returns to ~100 from single digits.
+ */
+export const QUOTA_REFILL_EPSILON_POINTS = 2;
 
 export function resolveQuotaDatabasePath(configuredPath: string, rusaHome: string): string {
   const expanded =
@@ -152,63 +166,6 @@ interface StoredScrapeRow {
   raw_output: string;
   parsed_state: string | null;
   parse_error: string | null;
-}
-
-/** How long an opener will wait for a lock held by another instance. */
-const BUSY_TIMEOUT_MS = 10_000;
-
-/**
- * Block this thread: the store is constructed synchronously, so there is no
- * turn of the event loop to await on.
- */
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-/**
- * Widen a legacy rollback-journal database to WAL, waiting out any instance
- * that is doing the same thing at the same moment.
- *
- * `busy_timeout` does not cover this call, which is why it is not enough to
- * raise it. The conversion needs an EXCLUSIVE lock, and when a peer already
- * holds RESERVED — exactly what another opener holds partway through its own
- * conversion — SQLite skips the busy handler to avoid a deadlock and returns
- * SQLITE_BUSY immediately. Measured against a peer in `BEGIN IMMEDIATE`: 1ms,
- * versus the full 10s wait when that peer holds only SHARED. So the opener has
- * to come back and ask again; no timeout value substitutes for that.
- *
- * The wait is jittered because the openers that collide here are by
- * construction running the same code at the same instant, and a fixed backoff
- * would march them into the same collision together.
- *
- * `budgetMs` is the whole cost of converting, not the cost of one attempt: each
- * attempt is handed only what is left of it. That cap is load-bearing, not
- * tidiness. SQLite's busy handler carries its own full `busy_timeout` into
- * every call, so without it a peer that holds RESERVED for most of the budget
- * — fast SQLITE_BUSY, this loop spinning — and then drops to SHARED buys a
- * second full wait inside the next single pragma, and a connection promising a
- * 10s open takes 20s. Capping is what makes the two waits one, and it does so
- * whatever `busy_timeout` the connection arrived with.
- *
- * Reachable only while a database is still pre-WAL: once converted, this
- * pragma is a no-op that takes no exclusive lock.
- *
- * Exported for the boundary test, which shrinks `budgetMs` so it can assert the
- * bound in milliseconds instead of tens of seconds.
- */
-export function widenToWal(db: Database.Database, budgetMs: number = BUSY_TIMEOUT_MS): void {
-  const deadline = Date.now() + budgetMs;
-  for (;;) {
-    db.pragma(`busy_timeout = ${Math.max(0, deadline - Date.now())}`);
-    try {
-      db.pragma("journal_mode = WAL");
-      return;
-    } catch (error) {
-      const busy = (error as { code?: string } | null)?.code === "SQLITE_BUSY";
-      if (!busy || Date.now() >= deadline) throw error;
-      sleepSync(Math.ceil(1 + Math.random() * 25));
-    }
-  }
 }
 
 /**
@@ -471,7 +428,8 @@ export class SharedQuotaStore {
                 controller_error AS controllerError,
                 controller_derivative AS controllerDerivative,
                 controller_integral AS controllerIntegral,
-                observed_at AS observedAt, reset_at_iso AS resetAtIso
+                observed_at AS observedAt, reset_at_iso AS resetAtIso,
+                percent_left AS percentLeft
          FROM quota_observations
          WHERE provider = ? AND kind = ? AND interval_seconds IS NOT NULL
          ORDER BY observed_at DESC, rowid DESC LIMIT 1`
@@ -484,6 +442,7 @@ export class SharedQuotaStore {
           controllerIntegral: number | null;
           observedAt: string;
           resetAtIso: string | null;
+          percentLeft: number;
         }
       | undefined;
     const timeRemainingPct = Math.min(
@@ -491,10 +450,29 @@ export class SharedQuotaStore {
       Math.max(0, ((resetMs - observedMs) / observation.windowMs) * 100)
     );
     const error = timeRemainingPct - observation.percentLeft;
-    const cycleChanged =
+    // A cycle boundary is anything that makes the previous error incomparable
+    // to this one, and there are two independent signals for it. Either is
+    // sufficient:
+    //
+    //  1. the reset instant moved — we are budgeting against a different window;
+    //  2. remaining quota rose — the budget refilled underneath us.
+    //
+    // (2) is not implied by (1). A refill whose `reset_at` did not move with it,
+    // or one where the previous row carried no `reset_at` at all, leaves (1)
+    // false. Error is `timeRemainingPct - percentLeft`, so the refill makes the
+    // error fall sharply, and with (1) false that fall is read as genuine
+    // progress rather than the discontinuity it is. It does not merely spike:
+    // `QUOTA_KD_SECONDS_SQUARED_PER_POINT` and `QUOTA_DERIVATIVE_TAU_SECONDS`
+    // share an 1800 s constant, so the misread relaxes the interval across
+    // roughly half an hour of subsequent observations.
+    const resetMoved =
       previous?.resetAtIso != null &&
       Math.abs(Date.parse(previous.resetAtIso) - resetMs) >
         Math.min(60 * 60 * 1000, observation.windowMs * 0.05);
+    const quotaRefilled =
+      previous != null &&
+      observation.percentLeft - previous.percentLeft > QUOTA_REFILL_EPSILON_POINTS;
+    const cycleChanged = resetMoved || quotaRefilled;
     const previousObservedMs = previous ? Date.parse(previous.observedAt) : Number.NaN;
     const dtSeconds = Number.isFinite(previousObservedMs)
       ? Math.max(1, (observedMs - previousObservedMs) / 1000)

@@ -31,7 +31,7 @@ class ThreadDto {
     required this.status,
     required this.provider,
     required this.model,
-    required this.charter,
+    required this.charterPreview,
     this.title = '',
     required this.createdAt,
     this.lastActiveAt,
@@ -51,7 +51,10 @@ class ThreadDto {
 
   /// The single authoritative model for this actor, as the server reports it.
   final String? model;
-  final String charter;
+  /// The leading slice of the charter the server sends with the list — enough
+  /// for the two-line excerpt in the overview, never the whole text. The full
+  /// charter is fetched per actor when the detail panel opens one.
+  final String charterPreview;
   final String title;
   final String createdAt;
 
@@ -79,7 +82,7 @@ class ThreadDto {
     String? status,
     String? provider,
     String? model,
-    String? charter,
+    String? charterPreview,
     String? title,
     String? createdAt,
     String? lastActiveAt,
@@ -96,7 +99,7 @@ class ThreadDto {
     status: status ?? this.status,
     provider: provider ?? this.provider,
     model: model ?? this.model,
-    charter: charter ?? this.charter,
+    charterPreview: charterPreview ?? this.charterPreview,
     title: title ?? this.title,
     createdAt: createdAt ?? this.createdAt,
     lastActiveAt: lastActiveAt ?? this.lastActiveAt,
@@ -117,7 +120,7 @@ class ThreadDto {
     status: j['status'] as String,
     provider: j['provider'] as String?,
     model: j['model'] as String?,
-    charter: j['charter'] as String? ?? '',
+    charterPreview: j['charterPreview'] as String? ?? '',
     title: j['title'] as String? ?? '',
     createdAt: j['createdAt'] as String? ?? '',
     lastActiveAt: j['lastActiveAt'] as String?,
@@ -165,7 +168,7 @@ class ActorViewState {
   bool get isRetired => thread.isRetired;
   String? get provider => thread.provider;
   String? get model => thread.model;
-  String get charter => thread.charter;
+  String get charterPreview => thread.charterPreview;
   String get title => thread.title;
   String get createdAt => thread.createdAt;
   String? get lastActiveAt => thread.lastActiveAt;

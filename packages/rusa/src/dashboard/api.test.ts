@@ -585,6 +585,97 @@ describe("handleMeshApiRequest", () => {
     expect(child.title).toBe("Custom Title");
   });
 
+  it("GET /api/mesh/threads sends a clipped charter preview, not the whole charter", () => {
+    // A charter well past the preview budget, with a distinctive tail so the
+    // assertion is about the bytes on the wire rather than about a length.
+    const long = `${"pursue the objective. ".repeat(60)}TAIL-MARKER`;
+    registry.upsert({
+      id: UUID_A,
+      charter: long,
+      parentId: null,
+      status: "active",
+      createdAt: "2026-06-21T00:00:00.000Z",
+    });
+
+    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { threads } = JSON.parse(res.body);
+    const dto = threads.find((t: { id: string }) => t.id === UUID_A);
+
+    expect(dto.charter).toBeUndefined();
+    expect(dto.charterPreview.startsWith("pursue the objective.")).toBe(true);
+    expect(dto.charterPreview.endsWith("\u2026")).toBe(true);
+    expect(dto.charterPreview.length).toBeLessThanOrEqual(281);
+    // The point of the change: the tail never reaches the client on this route.
+    expect(res.body.includes("TAIL-MARKER")).toBe(false);
+  });
+
+  it("GET /api/mesh/threads leaves a charter inside the budget exactly as it is", () => {
+    registry.upsert({
+      id: UUID_A,
+      charter: "short charter\nline 2",
+      parentId: null,
+      status: "active",
+      createdAt: "2026-06-21T00:00:00.000Z",
+    });
+
+    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { threads } = JSON.parse(res.body);
+    const dto = threads.find((t: { id: string }) => t.id === UUID_A);
+
+    // No ellipsis, no trimming: a charter that fits is not a truncated one, and
+    // the detail panel must not be told to go fetch a longer version.
+    expect(dto.charterPreview).toBe("short charter\nline 2");
+  });
+
+  it("GET /api/mesh/threads clips a charter on a character, not a code unit", () => {
+    // Emoji are two UTF-16 code units each, so a code-unit slice at 280 lands
+    // inside the 140th one and ends the excerpt on half a character.
+    registry.upsert({
+      id: UUID_A,
+      charter: "\u{1F9ED}".repeat(400),
+      parentId: null,
+      status: "active",
+      createdAt: "2026-06-21T00:00:00.000Z",
+    });
+
+    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { threads } = JSON.parse(res.body);
+    const dto = threads.find((t: { id: string }) => t.id === UUID_A);
+
+    // 280 characters plus the ellipsis, the same budget the test above asserts.
+    expect([...dto.charterPreview]).toHaveLength(281);
+    expect(dto.charterPreview.endsWith("\u{1F9ED}\u2026")).toBe(true);
+    // No lone surrogate: re-encoding is lossless only if every pair survived.
+    expect(Buffer.from(dto.charterPreview, "utf8").toString("utf8")).toBe(dto.charterPreview);
+  });
+
+  it("GET /api/mesh/threads/charter serves the one actor's full charter", () => {
+    const long = `${"pursue the objective. ".repeat(60)}TAIL-MARKER`;
+    registry.upsert({
+      id: UUID_A,
+      charter: long,
+      parentId: null,
+      status: "active",
+      createdAt: "2026-06-21T00:00:00.000Z",
+    });
+
+    const { res } = call(deps, "GET", `/api/mesh/threads/charter?id=${UUID_A}`);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ id: UUID_A, charter: long });
+  });
+
+  it("GET /api/mesh/threads/charter 404s for an unknown or missing id", () => {
+    registry.upsert(rec(UUID_A, null, "active"));
+
+    const unknown = call(deps, "GET", "/api/mesh/threads/charter?id=nope").res;
+    expect(unknown.statusCode).toBe(404);
+    expect(JSON.parse(unknown.body)).toEqual({ error: "thread not found" });
+
+    // No `id` at all must not fall through to the list route below it.
+    const missing = call(deps, "GET", "/api/mesh/threads/charter").res;
+    expect(missing.statusCode).toBe(404);
+  });
+
   it("GET /api/mesh/threads reports halted:false and every thread idle by default", () => {
     registry.upsert(rec("root", null, "active"));
     registry.upsert(rec(UUID_A, "root", "active"));
@@ -802,6 +893,95 @@ describe("handleMeshApiRequest", () => {
       content: "Please review the dashboard Inbox tab.",
     });
     expect(JSON.stringify(entry)).not.toContain(messageId);
+  });
+
+  describe("POST /api/mesh/actors/:id/inbox/handled", () => {
+    const post = async (actorId: string, body: unknown) => {
+      const { res } = call(
+        deps,
+        "POST",
+        `/api/mesh/actors/${actorId}/inbox/handled`,
+        JSON.stringify(body)
+      );
+      await new Promise((resolve) => process.nextTick(resolve));
+      await new Promise((resolve) => process.nextTick(resolve));
+      return res;
+    };
+
+    const appendEntry = (id: string, actorId = UUID_A) => {
+      inbox.append([{ id, actorId, source: "mesh:root", payload: { type: "mesh.message" } }]);
+    };
+
+    it("clears the entry and stops it counting against the actor", async () => {
+      appendEntry("stale-entry");
+      expect(inbox.countUnhandled(UUID_A)).toBe(1);
+
+      const res = await post(UUID_A, { entryId: "stale-entry", reason: "run cancelled by hand" });
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toMatchObject({ ok: true, alreadyHandled: false });
+      // The point of the feature: the actor is no longer queued for it.
+      expect(inbox.countUnhandled(UUID_A)).toBe(0);
+      expect(inbox.actorsWithUnhandled().map((a) => a.actorId)).not.toContain(UUID_A);
+    });
+
+    it("names the operator in the note, with and without a reason", async () => {
+      appendEntry("with-reason");
+      appendEntry("without-reason");
+
+      await post(UUID_A, { entryId: "with-reason", reason: "prod sent this to staging" });
+      await post(UUID_A, { entryId: "without-reason" });
+
+      const notes = inbox
+        .list(UUID_A, { status: "handled" })
+        .entries.map((entry) => entry.handledNote);
+      // Attribution is unconditional: a note is the only thing distinguishing
+      // an operator's dismissal from the actor's own account of its work.
+      expect(notes).toContain(
+        "Cleared from the dashboard by the operator: prod sent this to staging"
+      );
+      expect(notes).toContain("Cleared from the dashboard by the operator; no reason given.");
+    });
+
+    it("reports a second clear without overwriting the first note", async () => {
+      appendEntry("double-clicked");
+      await post(UUID_A, { entryId: "double-clicked", reason: "first" });
+
+      const res = await post(UUID_A, { entryId: "double-clicked", reason: "second" });
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).alreadyHandled).toBe(true);
+      expect(inbox.read(UUID_A, "double-clicked")?.handledNote).toBe(
+        "Cleared from the dashboard by the operator: first"
+      );
+    });
+
+    it("404s an entry belonging to a different actor", async () => {
+      appendEntry("owned-by-a", UUID_A);
+
+      const res = await post(UUID_B, { entryId: "owned-by-a" });
+
+      expect(res.statusCode).toBe(404);
+      // Still unhandled for its real owner — the wrong actor cannot clear it.
+      expect(inbox.countUnhandled(UUID_A)).toBe(1);
+    });
+
+    it("rejects a missing entryId and an over-long reason", async () => {
+      appendEntry("long-reason");
+
+      expect((await post(UUID_A, {})).statusCode).toBe(400);
+      const tooLong = await post(UUID_A, { entryId: "long-reason", reason: "x".repeat(2001) });
+      expect(tooLong.statusCode).toBe(400);
+      expect(inbox.countUnhandled(UUID_A)).toBe(1);
+    });
+
+    it("503s when no inbox is bound", async () => {
+      const bound = deps.inbox;
+      deps.inbox = undefined;
+      const res = await post(UUID_A, { entryId: "anything" });
+      deps.inbox = bound;
+      expect(res.statusCode).toBe(503);
+    });
   });
 
   it("GET /api/mesh/events filters by kind", () => {

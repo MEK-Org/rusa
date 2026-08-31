@@ -335,7 +335,7 @@ ThreadDto _thread(
   status: status,
   provider: provider,
   model: model,
-  charter: charter,
+  charterPreview: charter,
   title: charter,
   createdAt: created,
   runState: run,

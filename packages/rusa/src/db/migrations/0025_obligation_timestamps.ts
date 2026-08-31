@@ -157,7 +157,7 @@ export const obligationTimestamps: Migration = {
 
     // Seed existing ready heads in migration 0025.
     const now = new Date().toISOString();
-    db.exec(`
+    db.prepare(`
       WITH RECURSIVE
         effective_priority(id, effective_priority, priority_source_id) AS (
           SELECT id, priority, id FROM obligations WHERE parent_id IS NULL
@@ -169,7 +169,7 @@ export const obligationTimestamps: Migration = {
           JOIN effective_priority parent ON parent.id = child.parent_id
         )
       INSERT OR IGNORE INTO obligation_ready_heads (owner_id, head_id, previous_head_id, sequence, updated_at)
-      SELECT owner_id, id, NULL, 1, '${now}'
+      SELECT owner_id, id, NULL, 1, ?
       FROM (
         SELECT obligation.owner_id,
                obligation.id,
@@ -182,6 +182,6 @@ export const obligationTimestamps: Migration = {
         WHERE obligation.status = 'ready'
       )
       WHERE rank = 1
-    `);
+    `).run(now);
   },
 };

@@ -103,7 +103,7 @@ describe("deriveGitHubInboxNotification", () => {
     }
   });
 
-  describe("check_suite and check_run routing (#1593)", () => {
+  describe("check_suite and check_run routing", () => {
     it("routes check_suite with pull_requests present to github_pr", () => {
       const notification = deriveGitHubInboxNotification("check_suite", {
         action: "completed",

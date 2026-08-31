@@ -319,7 +319,10 @@ export class LocalTracker {
   }
 
   listOpenPrsByAuthor(author: string): TrackerPr[] {
-    return this.listPrs().filter((pr) => pr.state === "open" && pr.author === author);
+    const targetAuthor = author.toLowerCase();
+    return this.listPrs().filter(
+      (pr) => pr.state === "open" && pr.author.toLowerCase() === targetAuthor
+    );
   }
 
   addPrLabel(prNumber: number, label: string): void {

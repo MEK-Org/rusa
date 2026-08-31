@@ -128,7 +128,7 @@ describe("inbox hints", () => {
       );
     });
 
-    it("provides top-level guidance for thread-head message with single-id format (#1719)", () => {
+    it("provides top-level guidance for thread-head message with single-id format", () => {
       const entry = makeEntry({
         source: "chat_space:spaces/AAA",
         payload: {
@@ -144,7 +144,7 @@ describe("inbox hints", () => {
       );
     });
 
-    it("recovers spaceName from threadName for thread-head message when spaceName is omitted (#1719)", () => {
+    it("recovers spaceName from threadName for thread-head message when spaceName is omitted", () => {
       const entry = makeEntry({
         source: "unknown",
         payload: {
@@ -159,7 +159,7 @@ describe("inbox hints", () => {
       );
     });
 
-    it("provides threading guidance with payload check when message is a genuine in-thread reply (#1719)", () => {
+    it("provides threading guidance with payload check when message is a genuine in-thread reply", () => {
       const entry = makeEntry({
         source: "chat_space:spaces/AAA",
         payload: {

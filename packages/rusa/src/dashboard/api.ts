@@ -21,12 +21,6 @@ import type { ObligationRepository } from "../db/repositories/obligation-reposit
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { ObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
-import {
-  COMMITMENT_LEDGER_BODY_KINDS,
-  COMMITMENT_LEDGER_KINDS,
-  type CommitmentLedgerReport,
-  projectOpenCommitments,
-} from "../observability/commitment-ledger.js";
 import type { SseHub } from "./sse.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
@@ -36,7 +30,10 @@ export interface DashboardDataDeps {
   meshChat: MeshChatRepository;
   /** Durable obligation repository for task and dependency management. */
   obligations?: ObligationRepository;
-  /** Durable actor inbox, intentionally exposed read-only to the dashboard. */
+  /**
+   * Durable actor inbox. Read-only to the dashboard apart from a single write:
+   * the operator clearing an entry the actor should not have to answer (#66).
+   */
   inbox?: InboxStore;
   sseHub: SseHub;
   /** The live ActorMesh instance. */
@@ -123,6 +120,25 @@ const MAX_ACTORS = 200;
 const DEFAULT_LIMIT = 50;
 /** Cap on a manually-uploaded avatar's decoded byte size (5 MB). */
 const MAX_AVATAR_UPLOAD_BYTES = 5 * 1024 * 1024;
+/**
+ * How much of a charter the actor list carries. The list is a tree of handles
+ * with a two-line excerpt under each; the full text only ever renders in the
+ * detail panel, one actor at a time. Sending all of it made `charter` far and
+ * away the largest thing in the response — one multi-kilobyte field per actor,
+ * assembled and serialised on every poll to satisfy a view that clips it. The
+ * measurement is on #104, where it can be restated as the mesh grows rather
+ * than going stale in a comment.
+ */
+const CHARTER_PREVIEW_CHARS = 280;
+
+/** The leading slice of `charter` the list view can actually show. */
+function charterPreview(charter: string): string {
+  // By code point, not by UTF-16 code unit: charters contain emoji, and a
+  // `slice` that lands mid-surrogate-pair ends the excerpt on a broken glyph.
+  const points = [...charter];
+  if (points.length <= CHARTER_PREVIEW_CHARS) return charter;
+  return `${points.slice(0, CHARTER_PREVIEW_CHARS).join("").trimEnd()}\u2026`;
+}
 
 /** A thread as the dashboard tree consumes it: handle up front, UUID for detail. */
 interface ThreadDto {
@@ -133,7 +149,12 @@ interface ThreadDto {
   provider: string | null;
   /** The single authoritative model for this actor, as configured in the registry. */
   model: string | null;
-  charter: string;
+  /**
+   * The leading `CHARTER_PREVIEW_CHARS` characters of the charter, ellipsised
+   * when clipped. The full text is detail data: `GET
+   * /api/mesh/threads/charter?id=<threadId>`.
+   */
+  charterPreview: string;
   title: string;
   createdAt: string;
   /**
@@ -145,14 +166,30 @@ interface ThreadDto {
   chatDisabled: boolean;
   /** ISO-8601 timestamp of the actor's most recent mesh event, or null if none. */
   lastActiveAt: string | null;
-  /** The most critical open commitment row kind for this thread, if any. */
-  commitmentKind?: string | null;
-  /** What this thread is blocked waiting on. */
-  waitingOn?: string | null;
   /** Exact provider-pacer release time, populated only for a provider queue head. */
   nextProviderAvailableAt?: string | null;
-  /** Whether the owner expects to retire this thread. */
-  ownerExpectsRetirement?: boolean | null;
+}
+
+/**
+ * Ceiling on the operator's own words when clearing an inbox entry, matching
+ * the ceiling `mark_handled` applies to an actor's note. The attribution
+ * prefix is added on top and is not spent from this budget.
+ */
+const MAX_INBOX_REASON_CHARS = 2_000;
+
+/**
+ * The note stored when the operator clears an entry from the dashboard.
+ *
+ * The dashboard renders a note under "Addressed:" with nothing to say who
+ * wrote it, so an operator's dismissal and an actor's account of its own work
+ * are indistinguishable once stored. Naming the operator unconditionally —
+ * reason given or not — keeps a dismissal from reading as a report of work the
+ * actor never did.
+ */
+function operatorHandledNote(reason: string): string {
+  return reason
+    ? `Cleared from the dashboard by the operator: ${reason}`
+    : "Cleared from the dashboard by the operator; no reason given.";
 }
 
 /**
@@ -346,11 +383,6 @@ function parseKinds(url: URL): string[] | undefined {
     .filter(Boolean);
   return kinds.length > 0 ? kinds : undefined;
 }
-
-const commitmentLedgerCache = new WeakMap<
-  MeshEventRepository,
-  { maxRowid: number; ledger: CommitmentLedgerReport }
->();
 
 /**
  * Dispatch a `/api/mesh/*` request. Returns true if it owned the request
@@ -547,6 +579,82 @@ export function handleMeshApiRequest(
       } catch (err) {
         sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
       }
+      return true;
+    }
+
+    // POST /api/mesh/actors/<id>/inbox/handled — the operator clears one entry.
+    //
+    // An entry can outlive the reason it was delivered: the operator cancels a
+    // run by hand, or a signal arrives from another instance that was never
+    // this actor's to answer. Nothing else retires it — an unhandled entry
+    // keeps the actor queued for work it cannot resolve, and the actor's only
+    // way out is to burn a run marking something handled it never had to do.
+    //
+    // Deliberately not the `mark_handled` MCP tool. That gates on entries
+    // selected during the run, because handling there is an actor's judgment
+    // about its own worklist; an operator is not in a run and has no selection
+    // to make. What does carry over is the note, which the store keeps.
+    //
+    // No registry lookup: unlike interrupt and run-now, this is meaningful for
+    // a retired actor — stale entries are exactly what an operator wants to
+    // clear — and the (actor, entry) pair is checked by the store anyway.
+    const inboxHandledMatch = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/inbox\/handled$/);
+    if (inboxHandledMatch) {
+      if (!deps?.inbox) {
+        sendJson(res, 503, { error: "inbox data unavailable" });
+        return true;
+      }
+      const inbox = deps.inbox;
+      const actorId = decodeURIComponent(inboxHandledMatch[1]);
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            sendJson(res, 400, { error: "Missing or invalid body" });
+            return;
+          }
+          const body = parsed as Record<string, unknown>;
+          const entryId = typeof body.entryId === "string" ? body.entryId.trim() : "";
+          if (!entryId) {
+            sendJson(res, 400, { error: "entryId is required" });
+            return;
+          }
+          const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+          if (reason.length > MAX_INBOX_REASON_CHARS) {
+            sendJson(res, 400, {
+              error: `reason must be ${MAX_INBOX_REASON_CHARS} characters or fewer`,
+            });
+            return;
+          }
+          try {
+            const [result] = inbox.markHandled(
+              actorId,
+              [entryId],
+              undefined,
+              operatorHandledNote(reason)
+            );
+            // `alreadyHandled` is reported rather than treated as an error: the
+            // store leaves an existing note alone, so a double-click cannot
+            // overwrite an actor's own account, and the caller's view is simply
+            // one refresh behind.
+            sendJson(res, 200, {
+              ok: true,
+              id: result.id,
+              handledAt: result.handledAt.toISOString(),
+              alreadyHandled: result.alreadyHandled,
+            });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            sendJson(res, message === "inbox entry not found" ? 404 : 400, { error: message });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
       return true;
     }
 
@@ -953,6 +1061,21 @@ export function handleMeshApiRequest(
     return true;
   }
 
+  // GET /api/mesh/threads/charter?id=<threadId> — one actor's full charter.
+  // The list carries only a preview; this is where the detail panel gets the
+  // rest, for the one actor the operator actually opened. Declared before the
+  // list route because the dispatcher matches on exact pathname.
+  if (pathname === "/api/mesh/threads/charter") {
+    const id = url.searchParams.get("id");
+    const thread = id ? registry.get(id) : undefined;
+    if (!thread) {
+      sendJson(res, 404, { error: "thread not found" });
+      return true;
+    }
+    sendJson(res, 200, { id: thread.id, charter: thread.charter });
+    return true;
+  }
+
   // GET /api/mesh/threads — every thread (active + retired), handle up front.
   if (pathname === "/api/mesh/threads") {
     // One synchronous snapshot of the running set, classified against every
@@ -967,40 +1090,7 @@ export function handleMeshApiRequest(
     // mesh_events(actor_id, ts) makes this cheap .
     const lastActiveByActor = meshEvents.latestActivityByActor();
 
-    // Cached ledger projection, recomputed whenever a new event lands. The cache
-    // is what makes the common poll ~30ms; the read below is what the miss costs,
-    // and every actor list after a restart pays one. So the miss reads the kinds
-    // the projection can act on and the bodies it can read, and nothing else.
-    const currentMaxRowid = meshEvents.getMaxRowid();
-    let cached = commitmentLedgerCache.get(meshEvents);
-    if (!cached || cached.maxRowid !== currentMaxRowid) {
-      const ledger = projectOpenCommitments({
-        threads: registry.list(),
-        events: meshEvents.listByKinds(COMMITMENT_LEDGER_KINDS, {
-          bodyKinds: COMMITMENT_LEDGER_BODY_KINDS,
-        }),
-        rootHandle,
-      });
-      cached = { maxRowid: currentMaxRowid, ledger };
-      commitmentLedgerCache.set(meshEvents, cached);
-    }
-    const ledger = cached.ledger;
-    const threadCommitments = new Map<
-      string,
-      { kind: string; waitingOn: string | null; ownerExpectsRetirement: boolean | null }
-    >();
-    for (const row of ledger.rows) {
-      if (row.subject_actor_id && !threadCommitments.has(row.subject_actor_id)) {
-        threadCommitments.set(row.subject_actor_id, {
-          kind: row.kind,
-          waitingOn: row.waiting_on,
-          ownerExpectsRetirement: row.owner_expects_retirement,
-        });
-      }
-    }
-
     const threads: ThreadDto[] = registry.list().map((r) => {
-      const commitment = threadCommitments.get(r.id);
       let runState: "running" | "queued" | "winding_down" | "idle" = "idle";
       if (typeof deps.mesh?.activeRunState === "function") {
         runState = deps.mesh.activeRunState(r.id)?.phase ?? "idle";
@@ -1016,16 +1106,13 @@ export function handleMeshApiRequest(
         status: r.status,
         provider: r.provider ?? null,
         model: r.model ?? null,
-        charter: r.charter,
+        charterPreview: charterPreview(r.charter),
         title: r.title ?? summarizeCharter(r.charter),
         createdAt: r.createdAt,
         runState,
         chatDisabled: r.status === "retired",
         lastActiveAt: lastActiveByActor.get(r.id) ?? null,
-        commitmentKind: commitment?.kind ?? null,
-        waitingOn: commitment?.waitingOn ?? null,
         nextProviderAvailableAt: providerQueueHeads.get(r.id) ?? null,
-        ownerExpectsRetirement: commitment?.ownerExpectsRetirement ?? null,
       };
     });
     sendJson(res, 200, { halted: deps.isHalted?.() ?? false, threads });
