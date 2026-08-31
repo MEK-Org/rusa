@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Multi-stage Dockerfile for MEK-Org/meta-coder packaging (PR-2)
+# Multi-stage Dockerfile for MEK-Org/rusa packaging
 
 # --- Stage 1: Flutter Builder ---
 FROM ubuntu:22.04 AS flutter-builder

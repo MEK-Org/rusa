@@ -92,7 +92,7 @@ describe("commitment ledger projection", () => {
     });
   });
 
-  it("does not emit missed_wake alerts for scheduled wakes (#1521)", () => {
+  it("does not emit missed_wake alerts for scheduled wakes", () => {
     const report = projectOpenCommitments({
       now: NOW,
       threads: [
@@ -179,7 +179,8 @@ describe("commitment ledger projection", () => {
   it("decides every run-terminal kind explicitly, so none can be silently omitted", () => {
     // The structural half. `RUN_TERMINAL_EVENT_KINDS` exists so the producer and
     // every reader that tracks runs stay in step; this reader had taken `run_end`
-    // and silently omitted `run_abandoned` (#1567, and #1363 before it). The
+    // and silently omitted `run_abandoned` -- twice, as two separate regressions,
+    // which is why this is a structural check and not one more case test. The
     // `Record` type makes a new terminal kind a compile error until it is
     // decided; this asserts the runtime shape both ways, so a stale entry for a
     // removed kind is caught too.
@@ -327,7 +328,7 @@ describe("commitment ledger projection", () => {
     ]);
   });
 
-  it("resolves the configured root display handle as an owner reference (#664)", () => {
+  it("resolves the configured root display handle as an owner reference", () => {
     const report = projectOpenCommitments({
       now: NOW,
       rootHandle: "ember-familiar",
