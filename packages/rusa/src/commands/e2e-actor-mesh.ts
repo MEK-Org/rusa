@@ -21,6 +21,7 @@ import { PID_FILE, provisionE2EInstance, resumeE2EInstance } from "../e2e/provis
 import { startTrackerServer } from "../e2e/tracker-server.js";
 import { setIssueClient } from "../gitops/issue-client.js";
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
+import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { assertBwrapAvailable } from "../providers/sandbox.js";
 import { type RunStartE2EHandles, runStart } from "./start.js";
 
