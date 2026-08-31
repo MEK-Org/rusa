@@ -33,6 +33,18 @@ class DashboardApi {
     return ThreadsSnapshot.fromJson(await _getJson(_u('/api/mesh/threads')));
   }
 
+  /// `GET /api/mesh/threads/charter` → one actor's full charter.
+  ///
+  /// The thread list carries only a clipped preview, since it is the same field
+  /// for every actor on every poll. The whole text is fetched here, for the one
+  /// actor whose detail panel is open.
+  Future<String> fetchCharter(String threadId) async {
+    final json = await _getJson(
+      _u('/api/mesh/threads/charter', {'id': threadId}),
+    );
+    return json['charter'] as String? ?? '';
+  }
+
   Future<List<String>> fetchRootControlProviders() async {
     final json = await _getJson(_u('/api/mesh/control/options'));
     return (json['providers'] as List<dynamic>? ?? const [])

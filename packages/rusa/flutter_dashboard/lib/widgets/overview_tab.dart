@@ -610,10 +610,10 @@ class _OverviewTabState extends State<OverviewTab> {
                                         ),
                                     ],
                                   ),
-                                  if (t.charter.isNotEmpty) ...[
+                                  if (t.charterPreview.isNotEmpty) ...[
                                     const SizedBox(height: 6),
                                     Text(
-                                      t.charter,
+                                      t.charterPreview,
                                       maxLines: 2,
                                       overflow: TextOverflow.ellipsis,
                                       style: const TextStyle(
