@@ -20,6 +20,7 @@ import type { MeshEventRepository } from "../db/repositories/mesh-event-reposito
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { ObligationStatus } from "../obligations/obligation.js";
+import { resolveObligationOwner } from "../obligations/owner.js";
 import {
   COMMITMENT_LEDGER_BODY_KINDS,
   COMMITMENT_LEDGER_KINDS,
@@ -43,19 +44,6 @@ import type { SseHub } from "./sse.js";
  * refused because nothing mints them today; that is a deliberate narrowing of
  * `EntityId` at this surface, not a claim about the id space.
  */
-function resolveObligationOwner(
-  registry: ThreadRegistry,
-  rawOwnerId: string
-): { ok: true; ownerId: string } | { ok: false; error: string } {
-  const ownerId = rawOwnerId.trim();
-  if (ownerId === HUMAN_OPERATOR) return { ok: true, ownerId };
-  const record = registry.get(ownerId);
-  if (!record) return { ok: false, error: `unknown obligation owner: ${ownerId}` };
-  if (record.status !== "active") {
-    return { ok: false, error: `obligation owner is not active: ${ownerId}` };
-  }
-  return { ok: true, ownerId };
-}
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
 export interface DashboardDataDeps {

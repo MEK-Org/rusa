@@ -21,6 +21,20 @@ type ObligationServerRepository = Pick<
 >;
 
 export interface ObligationsMcpOptions {
+  /**
+   * Resolve a requested owner to one the mesh can route to, or refuse it.
+   *
+   * Injected because this module has no registry. Absent, any nonblank string
+   * is accepted — which is what production did, since `ObligationRepository` is
+   * constructed there without an `actorExists` probe, leaving the repository's
+   * own guard inert. That admitted nonexistent actors and arbitrary `system:*`
+   * ids: exactly the owner drift `0025` migrates away, re-entering through the
+   * write boundary.
+   */
+  resolveOwner?: (
+    rawOwnerId: string
+  ) => { ok: true; ownerId: string } | { ok: false; error: string };
+
   isFenced?: () => boolean;
   /** Whether this actor may change the current obligation's owner. */
   canReassign?: (
@@ -228,8 +242,10 @@ export function createObligationsMcpServer(
     },
     async ({ owner_id, parent_id, intent, external_ref, priority }) => {
       try {
+        const owner = options?.resolveOwner?.(owner_id) ?? { ok: true as const, ownerId: owner_id };
+        if (!owner.ok) return toolError(new Error(owner.error));
         const obligation = repository.create({
-          ownerId: owner_id,
+          ownerId: owner.ownerId,
           parentId: parent_id ?? null,
           intent: intent ?? null,
           externalRef: external_ref ?? null,
@@ -316,7 +332,9 @@ export function createObligationsMcpServer(
           ? options.canReassign(actorId, current)
           : current.ownerId === actorId;
         if (!authorized) throw new Error("not authorized to reassign this obligation");
-        const obligation = repository.reassign(id, owner_id);
+        const owner = options?.resolveOwner?.(owner_id) ?? { ok: true as const, ownerId: owner_id };
+        if (!owner.ok) throw new Error(owner.error);
+        const obligation = repository.reassign(id, owner.ownerId);
         return toolOk({ obligation, previousOwnerId: current.ownerId });
       } catch (err) {
         return toolError(err);

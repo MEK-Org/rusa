@@ -8,6 +8,7 @@ import { obligations } from "../db/migrations/0016_obligations.js";
 import { obligationPriority } from "../db/migrations/0017_obligation_priority.js";
 import { obligationTimestamps } from "../db/migrations/0025_obligation_timestamps.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import { resolveObligationOwner } from "../obligations/owner.js";
 import { createObligationsMcpServer } from "./obligations-mcp.js";
 
 async function connect(server: McpServer): Promise<Client> {
@@ -148,6 +149,42 @@ describe("obligations MCP", () => {
     const rootAfter = repository.require("root-task");
     expect(rootAfter.status).toBe("ready");
     expect(rootAfter.priority).toBe(100); // Retained priority, NEVER head return!
+  });
+
+  it("refuses an owner the mesh cannot route to", async () => {
+    // The drift `0025` migrates away came back in through this surface: a
+    // nonexistent actor or an invented `system:*` id produced live work that
+    // appears in no queue and wakes nobody.
+    const registry = new Map([
+      ["actor-a", { status: "active" }],
+      ["actor-retired", { status: "retired" }],
+    ]);
+    const client = await connect(
+      createObligationsMcpServer(repository, "actor-a", {
+        resolveOwner: (raw) =>
+          resolveObligationOwner({ get: (id: string) => registry.get(id) as never }, raw),
+      })
+    );
+
+    for (const ownerId of ["actor-nonexistent", "actor-retired", "system:mesh"]) {
+      const res = (await client.callTool({
+        name: "create_obligation",
+        arguments: { owner_id: ownerId, intent: "typo" },
+      })) as CallToolResult;
+      expect(res.isError, ownerId).toBe(true);
+    }
+    expect(repository.list()).toHaveLength(0);
+
+    // A live actor and the canonical operator id are both legitimate: owning
+    // work to another actor is why `creator_id` exists, and owning it to the
+    // operator is the human-decision contract.
+    for (const ownerId of ["actor-a", "human:operator"]) {
+      const res = (await client.callTool({
+        name: "create_obligation",
+        arguments: { owner_id: ownerId, intent: "fine" },
+      })) as CallToolResult;
+      expect(res.isError, ownerId).toBeFalsy();
+    }
   });
 
   it("reorders obligations via reorder_obligation", async () => {

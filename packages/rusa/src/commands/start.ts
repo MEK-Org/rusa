@@ -165,6 +165,7 @@ import {
   UNDERSTANDING_READ_MCP_NAME,
 } from "../mcp/understanding-mcp.js";
 import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "../mcp/update-mcp.js";
+import { resolveObligationOwner } from "../obligations/owner.js";
 import { DiskUsageAlert } from "../observability/disk-alert.js";
 import {
   containsSnoozeCommand,
@@ -849,6 +850,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     unsyncedCount: () => getLocalUnderstandingUnsyncedCount(mcHome),
   };
   const registry = new FileThreadRegistry(join(mcHome, "threads.json"));
+  // The obligation store's actor guard is only real once it can see the
+  // registry. Built from a Database alone, the container cannot do this itself,
+  // and without this line every owner check in the repository is inert.
+  getRepositories().setActorExists((actorId) => registry.get(actorId)?.status === "active");
   const rootId = resolveRootThreadId(registry);
   const inboxStore = getRepositories().inbox;
   const modelScrapesStore = getRepositories().modelScrapes;
@@ -1512,6 +1517,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const obligationsUrl = mcpHttp.addServer(`${id}:${OBLIGATIONS_MCP_NAME}`, () =>
           createObligationsMcpServer(getRepositories().obligations, id, {
             isFenced,
+            resolveOwner: (raw) => resolveObligationOwner(registry, raw),
             canReassign: (callerId, obligation) => mesh.isAncestorOf(callerId, obligation.ownerId),
           })
         );
@@ -1917,6 +1923,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const rootObligationsUrl = mcpHttp.addServer(`${rootId}:${OBLIGATIONS_MCP_NAME}`, () =>
     createObligationsMcpServer(getRepositories().obligations, rootId, {
       canReassign: () => true,
+      resolveOwner: (raw) => resolveObligationOwner(registry, raw),
     })
   );
   const rootPnpmInstallUrl = mcpHttp.addServer(`${rootId}:${PNPM_INSTALL_MCP_NAME}`, () =>

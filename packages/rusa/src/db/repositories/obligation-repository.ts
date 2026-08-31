@@ -197,7 +197,7 @@ function toObligation(row: ObligationRow): Obligation {
 export class ObligationRepository {
   constructor(
     private readonly db: Database.Database,
-    private readonly actorExists?: (actorId: string) => boolean,
+    private actorExists?: (actorId: string) => boolean,
     private readonly now: () => number = Date.now
   ) {}
 
@@ -208,6 +208,18 @@ export class ObligationRepository {
    * does not exist yet when the repository container is built.
    */
   private readyHeadListener?: (change: ReadyHeadChange) => void;
+
+  /**
+   * Supply the actor-existence probe after construction.
+   *
+   * Needed because the production container is built from a `Database` alone,
+   * before the thread registry exists — which is why the constructor argument
+   * was never passed there, leaving the guard inert on every production path
+   * while reading as if it applied.
+   */
+  setActorExists(probe: (actorId: string) => boolean): void {
+    this.actorExists = probe;
+  }
 
   setReadyHeadListener(listener: ((change: ReadyHeadChange) => void) | undefined): void {
     this.readyHeadListener = listener;
