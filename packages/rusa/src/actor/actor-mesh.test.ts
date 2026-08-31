@@ -4829,8 +4829,14 @@ describe("ActorMesh", () => {
 
     it("falls back to subscriptions when no live obligation is linked", async () => {
       let delegate = "";
+      const lookedUp: string[] = [];
       const woken = await wokenBy(
-        owning({}),
+        {
+          findLiveByExternalRef: (ref) => {
+            lookedUp.push(ref);
+            return null;
+          },
+        },
         (mesh) => {
           delegate = mesh.spawn({ charter: "delegate", parentId: "root" });
           mesh.subscribeEventSource(issue, delegate, "root");
@@ -4839,6 +4845,7 @@ describe("ActorMesh", () => {
       );
 
       expect(woken).toEqual([delegate]);
+      expect(lookedUp).toEqual([REF]);
     });
 
     it("maps a linked pull request to its obligation owner", async () => {

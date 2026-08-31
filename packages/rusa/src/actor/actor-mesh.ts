@@ -1209,10 +1209,13 @@ export class ActorMesh {
       ignoreExactResource?: EventResource;
       eventPayload?: InboxPayload;
       enforceBubblingPolicy?: boolean;
+      /** A precomputed exact-resource lookup; `null` means it found no claim. */
+      exactObligationOwner?: string | null;
     } = {}
   ): string[] {
     const destinations: string[] = [];
     let current: EventResource | undefined = resource;
+    let exact = true;
 
     // Atomicity Invariant: The check `this.live.has(sub.actorId)` and the delivery
     // via `requestRun` happen in the same synchronous section with no await.
@@ -1227,7 +1230,11 @@ export class ActorMesh {
       // prior subscriber is superseded rather than destroyed, which keeps the
       // audit history intact and makes replay and restart reconstruct the same
       // answer with no chance of reviving a stale owner.
-      const governing = this.obligationOwnerFor(current);
+      const governing =
+        exact && opts.exactObligationOwner !== undefined
+          ? (opts.exactObligationOwner ?? undefined)
+          : this.obligationOwnerFor(current);
+      exact = false;
       if (governing) {
         // The claim is authoritative even when its owner is not runnable. A
         // human/system owner, or a temporarily absent actor, produces no
@@ -1430,21 +1437,24 @@ export class ActorMesh {
     // A live obligation is the ownership authority even when the event carries
     // a bot-authored directed target. Directives remain useful for unclaimed
     // work, but cannot route claimed work around its current owner.
-    const governing = this.obligationOwnerFor(resource);
-    if (governing) {
-      destinations = this.live.has(governing) ? [governing] : [];
-    } else if (opts.directedTarget) {
-      const directedTarget = this.resolveLiveActor(opts.directedTarget);
-      if (directedTarget) {
-        this.log(`mesh:deliver directed-delivered to ${opts.directedTarget} (${eventSummary})`);
-        destinations = [directedTarget.id];
-        directed = true;
+    if (opts.directedTarget) {
+      const governing = this.obligationOwnerFor(resource);
+      if (governing) {
+        destinations = this.live.has(governing) ? [governing] : [];
       } else {
-        this.log(`mesh:deliver target not live: ${opts.directedTarget} — directive ignored`);
-        destinations = this.resolveLiveEventDestinations(resource, {
-          enforceBubblingPolicy: true,
-          eventPayload: opts.inboxPayload,
-        });
+        const directedTarget = this.resolveLiveActor(opts.directedTarget);
+        if (directedTarget) {
+          this.log(`mesh:deliver directed-delivered to ${opts.directedTarget} (${eventSummary})`);
+          destinations = [directedTarget.id];
+          directed = true;
+        } else {
+          this.log(`mesh:deliver target not live: ${opts.directedTarget} — directive ignored`);
+          destinations = this.resolveLiveEventDestinations(resource, {
+            enforceBubblingPolicy: true,
+            eventPayload: opts.inboxPayload,
+            exactObligationOwner: null,
+          });
+        }
       }
     } else {
       destinations = this.resolveLiveEventDestinations(resource, {
