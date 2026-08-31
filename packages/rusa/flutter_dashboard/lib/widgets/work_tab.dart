@@ -8,6 +8,7 @@ import 'avatar.dart';
 import 'header.dart';
 import 'obligation_card.dart';
 import 'obligation_dialogs.dart';
+import 'reference_preview.dart';
 
 class WorkTab extends StatefulWidget {
   const WorkTab({
@@ -476,6 +477,25 @@ class _DetailView extends StatelessWidget {
               ),
             ],
             const SizedBox(height: 24),
+            if (data.artifacts.isNotEmpty) ...[
+              _SectionHeader('CITED ARTIFACTS'),
+              for (final artifact in data.artifacts)
+                ReferencePreview(
+                  reference: artifact.reference ??
+                      // Unresolvable in v1 (anything but mesh chat). Still shown:
+                      // the citation exists and is worth seeing even when we
+                      // cannot expand it.
+                      ReferenceDto(
+                        ref: artifact.ref,
+                        scheme: artifact.ref.split(':').first,
+                        title: artifact.ref,
+                        unavailable: 'Not resolvable yet — only mesh chat is read back so far.',
+                      ),
+                  label: artifact.label,
+                  attachedBy: artifact.attachedBy,
+                ),
+              const SizedBox(height: 16),
+            ],
             _SectionHeader('OWNER'),
             _ownerPanel(o.ownerId),
             if (o.externalRef != null && o.externalRef!.trim().isNotEmpty) ...[

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
+import 'reference_preview.dart';
 import '../util.dart';
 import 'header.dart';
 import 'obligation_card.dart';
@@ -393,6 +394,9 @@ class _InboxTabState extends State<InboxTab> {
 
   Widget _entryCard(Map<String, dynamic> e) {
     final payload = e['payload'] as Map<String, dynamic>? ?? const {};
+    final rawReference = e['reference'];
+    final reference =
+        rawReference is Map<String, dynamic> ? ReferenceDto.fromJson(rawReference) : null;
     final handled = e['handledAt'] != null;
     final arrivedAt = e['deliveredAt'] ?? e['seenAt'] ?? e['createdAt'];
     final handledAt = e['handledAt'];
@@ -452,15 +456,23 @@ class _InboxTabState extends State<InboxTab> {
             ],
           ]),
           const SizedBox(height: 9),
-          Text(
-            content.isEmpty ? 'No attached contents.' : content,
-            style: const TextStyle(
-              color: Color(0xFFCBD5E1),
-              height: 1.5,
-              fontFamily: kMonoFontFamily,
-              fontSize: 12.5,
+          // A reference the server could resolve renders through the same
+          // widget as an obligation's cited artifacts. Everything else keeps
+          // the raw payload dump, which is honest for v1: no resolver exists
+          // for those sources yet, and inventing a prettier rendering would
+          // hide that.
+          if (reference != null)
+            ReferencePreview(reference: reference)
+          else
+            Text(
+              content.isEmpty ? 'No attached contents.' : content,
+              style: const TextStyle(
+                color: Color(0xFFCBD5E1),
+                height: 1.5,
+                fontFamily: kMonoFontFamily,
+                fontSize: 12.5,
+              ),
             ),
-          ),
           if (handled) ...[
             const SizedBox(height: 10),
             Container(

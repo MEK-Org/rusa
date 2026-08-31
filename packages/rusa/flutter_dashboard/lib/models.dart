@@ -825,6 +825,80 @@ class LiveOutputChunk {
 /// server, which rejects anything longer.
 const int kObligationTitleMax = 200;
 
+/// A reference resolved down to what the UI needs to show it, mirroring the
+/// server's `ResolvedReference`.
+///
+/// One shape for every source so the obligation and inbox call sites can reuse
+/// one rendering. In v1 only mesh chat actually resolves; anything else arrives
+/// with [unavailable] set and is shown as a citation that cannot yet be
+/// expanded, rather than as an empty one.
+class ReferenceDto {
+  const ReferenceDto({
+    required this.ref,
+    required this.scheme,
+    required this.title,
+    this.body,
+    this.author,
+    this.timestamp,
+    this.url,
+    this.unavailable,
+  });
+
+  final String ref;
+  final String scheme;
+  final String title;
+  final String? body;
+  final String? author;
+  final String? timestamp;
+  final String? url;
+
+  /// Why [body] is absent, when it is. Distinguishes "no text" from "could not
+  /// read it" from "no such thing".
+  final String? unavailable;
+
+  bool get isResolved => body != null && body!.trim().isNotEmpty;
+
+  factory ReferenceDto.fromJson(Map<String, dynamic> j) => ReferenceDto(
+    ref: j['ref'] as String? ?? '',
+    scheme: j['scheme'] as String? ?? 'mesh',
+    title: j['title'] as String? ?? j['ref'] as String? ?? '',
+    body: j['body'] as String?,
+    author: j['author'] as String?,
+    timestamp: j['timestamp'] as String?,
+    url: j['url'] as String?,
+    unavailable: j['unavailable'] as String?,
+  );
+}
+
+/// An artifact cited by an obligation, with its reference resolved when we can.
+class ObligationArtifactDto {
+  const ObligationArtifactDto({
+    required this.ref,
+    this.label,
+    this.attachedBy,
+    this.attachedAt,
+    this.reference,
+  });
+
+  final String ref;
+  final String? label;
+  final String? attachedBy;
+  final String? attachedAt;
+  final ReferenceDto? reference;
+
+  factory ObligationArtifactDto.fromJson(Map<String, dynamic> j) {
+    final artifact = (j['artifact'] as Map<String, dynamic>?) ?? j;
+    final resolved = j['reference'];
+    return ObligationArtifactDto(
+      ref: artifact['ref'] as String? ?? '',
+      label: artifact['label'] as String?,
+      attachedBy: artifact['attachedBy'] as String?,
+      attachedAt: artifact['attachedAt'] as String?,
+      reference: resolved is Map<String, dynamic> ? ReferenceDto.fromJson(resolved) : null,
+    );
+  }
+}
+
 class ObligationDto {
   const ObligationDto({
     required this.id,
@@ -988,12 +1062,14 @@ class ObligationDetailSnapshot {
     this.parent,
     required this.children,
     required this.blockingChildren,
+    this.artifacts = const [],
   });
 
   final ObligationDto obligation;
   final ObligationDto? parent;
   final List<ObligationDto> children;
   final List<ObligationDto> blockingChildren;
+  final List<ObligationArtifactDto> artifacts;
 
   factory ObligationDetailSnapshot.fromJson(Map<String, dynamic> j) => ObligationDetailSnapshot(
     obligation: ObligationDto.fromJson(j['obligation'] as Map<String, dynamic>),
@@ -1016,5 +1092,10 @@ class ObligationDetailSnapshot {
                 .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
                 .toList()
             : const <ObligationDto>[],
+    artifacts: (j['artifacts'] is List)
+        ? (j['artifacts'] as List<dynamic>)
+            .map((e) => ObligationArtifactDto.fromJson(e as Map<String, dynamic>))
+            .toList()
+        : const <ObligationArtifactDto>[],
   );
 }

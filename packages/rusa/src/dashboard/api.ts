@@ -21,6 +21,7 @@ import type { ObligationRepository } from "../db/repositories/obligation-reposit
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { ObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
+import { resolveReferenceSync } from "../references/resolve.js";
 import type { SseHub } from "./sse.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
@@ -365,10 +366,16 @@ function resolveInboxPage(page: InboxPage, meshChat: MeshChatRepository): InboxP
         messageId?: unknown;
       };
       if (typeof messageId !== "string") return entry;
-      const message = meshChat.getById(messageId);
+      // `content` is kept as-is so nothing that reads it today regresses;
+      // `reference` is the addition, so the dashboard can render an inbox item
+      // through the same widget as an obligation's cited artifacts. Only mesh
+      // chat resolves in v1 — every other payload keeps its raw JSON, which is
+      // the honest rendering until those sources have resolvers.
+      const reference = resolveReferenceSync(`mesh:messages/${messageId}`, { meshChat });
       return {
         ...entry,
-        payload: message ? { ...payload, content: message.body } : payload,
+        payload: reference.body !== null ? { ...payload, content: reference.body } : payload,
+        reference,
       };
     }),
   };
@@ -1274,11 +1281,19 @@ export function handleMeshApiRequest(
       blockingOnly: true,
     });
     const parent = obligation.parentId ? deps.obligations.get(obligation.parentId) : null;
+    const artifacts = deps.obligations.listArtifacts(id).map((artifact) => ({
+      artifact,
+      // v1 resolves mesh chat only; anything else comes back with `unavailable`
+      // set, which the dashboard renders as a citation it cannot yet expand
+      // rather than as an empty one.
+      reference: resolveReferenceSync(artifact.ref, { meshChat: deps.meshChat }),
+    }));
     sendJson(res, 200, {
       obligation,
       parent,
       children: children.obligations,
       blockingChildren: blockingChildren.obligations,
+      artifacts,
     });
     return true;
   }
