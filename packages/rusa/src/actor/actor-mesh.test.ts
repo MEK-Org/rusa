@@ -790,12 +790,12 @@ describe("ActorMesh", () => {
     expect(rootEntries()).toHaveLength(3);
   });
 
-  it("nudges rather than going silent when a handled transition recurs", async () => {
+  it("does not re-wake actor when an already delivered transition sequence is repeated after being handled", async () => {
     const inboxStore = createMemoryInboxStore();
     const { mesh, fake, tick } = setup({ inboxStore });
     const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
 
-    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null)).toBe(
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null, 1)).toBe(
       true
     );
     await tick();
@@ -803,22 +803,20 @@ describe("ActorMesh", () => {
 
     // Still unhandled: the wake is outstanding, so a repeat is pure noise.
     const beforeUnhandledRepeat = fake("root").calls.length;
-    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null)).toBe(
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null, 1)).toBe(
       false
     );
     await tick();
     expect(fake("root").calls.length).toBe(beforeUnhandledRepeat);
 
-    // Once handled, the same transition recurring means the head came back the
-    // way it came the first time. The entry id cannot express that, so the
-    // durable entry is not duplicated — but the actor is still woken.
+    // Once handled, repeating the exact same transition sequence does NOT re-wake the actor.
     inboxStore.markHandled("root", [rootEntries()[0].id]);
-    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null)).toBe(
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null, 1)).toBe(
       false
     );
     await tick();
     expect(rootEntries()).toHaveLength(1);
-    expect(fake("root").calls.length).toBeGreaterThan(beforeUnhandledRepeat);
+    expect(fake("root").calls.length).toBe(beforeUnhandledRepeat);
   });
 
   it("does not deliver ready-head attention to a retired actor", async () => {
