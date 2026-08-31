@@ -21,7 +21,6 @@ import { PID_FILE, provisionE2EInstance, resumeE2EInstance } from "../e2e/provis
 import { startTrackerServer } from "../e2e/tracker-server.js";
 import { setIssueClient } from "../gitops/issue-client.js";
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
-import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { assertBwrapAvailable } from "../providers/sandbox.js";
 import { type RunStartE2EHandles, runStart } from "./start.js";
 
@@ -328,53 +327,6 @@ export function startRootControlServer(opts: {
       );
       return;
     }
-    if (req.method === "GET" && url.pathname === "/obligations") {
-      const ownerId = url.searchParams.get("ownerId");
-      const status = url.searchParams.get("status") as
-        | "ready"
-        | "waiting"
-        | "done"
-        | "cancelled"
-        | null;
-      send(res, 200, {
-        obligations: getRepositories().obligations.list({
-          ...(ownerId ? { ownerId } : {}),
-          ...(status ? { status } : {}),
-          rootsOnly: url.searchParams.get("rootsOnly") === "true",
-        }),
-      });
-      return;
-    }
-    const obligationMatch = url.pathname.match(/^\/obligations\/([^/]+)$/);
-    if (req.method === "GET" && obligationMatch) {
-      const id = decodeURIComponent(obligationMatch[1]);
-      const repo = getRepositories().obligations;
-      const obligation = repo.get(id);
-      if (!obligation) {
-        send(res, 404, { error: "obligation not found" });
-        return;
-      }
-      // Walk to the root and hand back the whole chain. This is the projection
-      // the ancestry-hint design needs: selecting a node should carry down what
-      // it descends from, so a contradiction with an ancestor's intent is
-      // visible without a second lookup.
-      const ancestry: (typeof obligation)[] = [];
-      const seen = new Set<string>([id]);
-      let cursor = obligation.parentId;
-      while (cursor && !seen.has(cursor)) {
-        seen.add(cursor);
-        const parent = repo.get(cursor);
-        if (!parent) break;
-        ancestry.unshift(parent);
-        cursor = parent.parentId;
-      }
-      send(res, 200, {
-        obligation,
-        ancestry,
-        children: repo.listChildren(id),
-      });
-      return;
-    }
     if (req.method !== "POST") {
       send(res, 404, { error: "not found" });
       return;
@@ -467,48 +419,6 @@ export function startRootControlServer(opts: {
             "e2e-controller"
           );
           send(res, 200, { ok: true });
-          return;
-        }
-        if (url.pathname === "/obligations") {
-          // The external driver IS the operator, so the creator is the shared
-          // HUMAN_OPERATOR id — the same server-side binding the actor MCP does
-          // with its own actor id, never a value read off the request.
-          const obligation = getRepositories().obligations.create({
-            ownerId: String(body.ownerId ?? ""),
-            parentId: body.parentId == null ? null : String(body.parentId),
-            intent: body.intent == null ? null : String(body.intent),
-            externalRef: body.externalRef == null ? null : String(body.externalRef),
-            priority: typeof body.priority === "number" ? body.priority : null,
-            creatorId: HUMAN_OPERATOR,
-          });
-          send(res, 200, { obligation });
-          return;
-        }
-        const statusMatch = url.pathname.match(/^\/obligations\/([^/]+)\/status$/);
-        if (statusMatch) {
-          const obligation = getRepositories().obligations.setTerminalStatus(
-            decodeURIComponent(statusMatch[1]),
-            body.status === "cancelled" ? "cancelled" : "done"
-          );
-          send(res, 200, { obligation });
-          return;
-        }
-        const reassignMatch = url.pathname.match(/^\/obligations\/([^/]+)\/reassign$/);
-        if (reassignMatch) {
-          const obligation = getRepositories().obligations.reassign(
-            decodeURIComponent(reassignMatch[1]),
-            String(body.ownerId ?? "")
-          );
-          send(res, 200, { obligation });
-          return;
-        }
-        const reparentMatch = url.pathname.match(/^\/obligations\/([^/]+)\/reparent$/);
-        if (reparentMatch) {
-          const obligation = getRepositories().obligations.reparent(
-            decodeURIComponent(reparentMatch[1]),
-            body.parentId == null ? null : String(body.parentId)
-          );
-          send(res, 200, { obligation });
           return;
         }
         send(res, 404, { error: "not found" });
