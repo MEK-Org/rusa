@@ -4,6 +4,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { runMigrations } from "./migrations/runner.js";
 import { Repositories } from "./repositories/index.js";
+import { widenToWal } from "./wal.js";
 
 let db: Database.Database | null = null;
 let repositories: Repositories | null = null;
@@ -46,7 +47,11 @@ export function initDb(mcHome: string): Database.Database {
   db = new Database(dbPath);
 
   // WAL for better concurrent read performance; enforce relational constraints.
-  db.pragma("journal_mode = WAL");
+  // The conversion goes through `widenToWal` rather than the bare pragma: a
+  // second process opening this same instance's still-legacy database at the
+  // same instant holds RESERVED, and the bare pragma fails against that
+  // immediately instead of waiting.
+  widenToWal(db);
   db.pragma("foreign_keys = ON");
 
   runMigrations(db);
