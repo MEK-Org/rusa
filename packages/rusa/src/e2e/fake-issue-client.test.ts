@@ -70,6 +70,21 @@ describe("FakeIssueClient", () => {
     expect(prs[0].headRef).toBe("mc/issue-7");
   });
 
+  it("lists the bot's open PRs whose branch names no issue", async () => {
+    const { client } = setup();
+    await client.createPullRequest({
+      repo: REPO,
+      head: "mc/fix/flaky-teardown",
+      title: "t",
+      body: "b",
+      reviewer: "human",
+    });
+    const prs = await client.getOpenPullRequestsByAuthor(REPO, BOT);
+    expect(prs).toHaveLength(1);
+    expect(prs[0].headRef).toBe("mc/fix/flaky-teardown");
+    expect(prs[0].issueNumber).toBeNull();
+  });
+
   it("records the orchestrator's own comments without feeding intake back", async () => {
     const events: string[] = [];
     const tracker = new LocalTracker({

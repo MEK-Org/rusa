@@ -172,6 +172,20 @@ interface ReportedCiRun {
 
 const GREEN_CI_CONCLUSIONS = new Set(["success", "skipped", "neutral"]);
 
+/**
+ * Reads an issue number out of a branch name, for the `issueNumber` hint on
+ * {@link OpenPullRequest}. Matches an `issue-<n>` segment anywhere in the ref, so
+ * `mc/issue-42`, `mc/fix/issue-42-slug` and `bot/issue-42-slug` all resolve.
+ *
+ * Both boundaries are deliberate: `reissue-42` is not issue 42, and `issue-42x`
+ * is not a number worth trusting. A ref this cannot read yields `null`, which
+ * callers must treat as "no issue named" rather than as grounds to drop the PR.
+ */
+export function parseIssueNumberFromBranch(branchName: string): number | null {
+  const match = branchName.match(/(?:^|[^a-z0-9])issue-(\d+)(?![a-z0-9])/i);
+  return match ? Number.parseInt(match[1], 10) : null;
+}
+
 export interface OpenPullRequest {
   number: number;
   title: string;
@@ -294,15 +308,14 @@ export interface IssueClient {
    */
   createPullRequest(opts: CreatePROptions): Promise<CreatedPullRequest>;
   /**
-   * Query open pull requests created by a specific author. Returns PRs whose
-   * branch matches the rusa pattern (mc/issue-{number}), carrying the
-   * parsed issue number.
+   * Query open pull requests created by a specific author. Returns every open
+   * PR by that author; `issueNumber` is a best-effort read of the branch name
+   * and is null when the branch names no issue.
    */
   getOpenPullRequestsByAuthor(repo: string, author: string): Promise<OpenPullRequest[]>;
   /**
-   * Query all open pull requests. The parsed issue number is populated when the
-   * branch matches the rusa pattern, but non-matching branches are still
-   * returned for survey workflows.
+   * Query all open pull requests, on the same terms as the author-scoped call
+   * minus the author filter.
    */
   getOpenPullRequests(repo: string): Promise<OpenPullRequest[]>;
   /** Query issues with optional state and label filters. */
@@ -1241,9 +1254,7 @@ export class GitHubIssueClient implements IssueClient {
   }
 
   async getOpenPullRequestsByAuthor(repo: string, author: string): Promise<OpenPullRequest[]> {
-    return (await this.fetchOpenPullRequests(repo))
-      .filter((pr) => pr.author === author)
-      .filter((pr): pr is OpenPullRequest => pr.issueNumber !== null);
+    return (await this.fetchOpenPullRequests(repo)).filter((pr) => pr.author === author);
   }
 
   async getOpenPullRequests(repo: string): Promise<OpenPullRequest[]> {
@@ -1295,10 +1306,6 @@ export class GitHubIssueClient implements IssueClient {
     }>(`/repos/${repo}/pulls`, new URLSearchParams({ state: "open", per_page: "100" }));
 
     return prs.map((pr) => {
-      // Extract issue number from branch name pattern mc/issue-{number}
-      const match = pr.head.ref.match(/^mc\/issue-(\d+)$/);
-      const issueNumber = match ? parseInt(match[1], 10) : null;
-
       return {
         number: pr.number,
         title: pr.title,
@@ -1311,7 +1318,7 @@ export class GitHubIssueClient implements IssueClient {
           .map((label) => (typeof label === "string" ? label : (label.name ?? "")))
           .filter((label) => label.length > 0),
         updatedAt: pr.updated_at,
-        issueNumber,
+        issueNumber: parseIssueNumberFromBranch(pr.head.ref),
       };
     });
   }
