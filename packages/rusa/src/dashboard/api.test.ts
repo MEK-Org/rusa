@@ -1856,6 +1856,118 @@ describe("handleMeshApiRequest", () => {
       });
     });
 
+    describe("POST /api/mesh/obligations/:id/external-ref", () => {
+      it("links, relinks and unlinks after creation", async () => {
+        registry.upsert(rec(UUID_A, "root", "active"));
+        obligations.create({ id: "linkable", ownerId: UUID_A, title: "Ship it" });
+
+        const link = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/linkable/external-ref",
+          JSON.stringify({ externalRef: "github:MEK-Org/rusa/issues/33" })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(link.res.statusCode).toBe(200);
+        expect(JSON.parse(link.res.body).obligation.externalRef.key).toBe(
+          "github:MEK-Org/rusa/issues/33"
+        );
+
+        // A blank string unlinks, so the UI can clear the field without a
+        // separate control.
+        const clear = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/linkable/external-ref",
+          JSON.stringify({ externalRef: "  " })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(JSON.parse(clear.res.body).obligation.externalRef).toBeNull();
+      });
+
+      it("accepts a repository and rejects a sub-resource", async () => {
+        registry.upsert(rec(UUID_A, "root", "active"));
+        obligations.create({ id: "repo-level", ownerId: UUID_A, title: "Keep rusa releasable" });
+
+        const ok = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/repo-level/external-ref",
+          JSON.stringify({ externalRef: "github:MEK-Org/rusa" })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(ok.res.statusCode).toBe(200);
+
+        const bad = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/repo-level/external-ref",
+          JSON.stringify({ externalRef: "github:MEK-Org/rusa/issues/33/comments/9" })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        // The server owns the grammar; its complaint is what the dialog shows.
+        expect(bad.res.statusCode).toBe(400);
+        expect(JSON.parse(bad.res.body).error).toContain("external ref must name");
+      });
+
+      it("lets an explicit camelCase null unlink even when the legacy alias is present", async () => {
+        registry.upsert(rec(UUID_A, "root", "active"));
+        obligations.create({
+          id: "explicit-unlink",
+          ownerId: UUID_A,
+          title: "Correct the link",
+          externalRef: "github:MEK-Org/rusa/issues/33",
+        });
+
+        const unlink = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/explicit-unlink/external-ref",
+          JSON.stringify({
+            externalRef: null,
+            external_ref: "github:MEK-Org/rusa/issues/34",
+          })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+
+        expect(unlink.res.statusCode).toBe(200);
+        expect(JSON.parse(unlink.res.body).obligation.externalRef).toBeNull();
+      });
+
+      it("rejects an omitted ref rather than treating it as an unlink", async () => {
+        registry.upsert(rec(UUID_A, "root", "active"));
+        obligations.create({
+          id: "keep-link",
+          ownerId: UUID_A,
+          title: "Keep the link",
+          externalRef: "github:MEK-Org/rusa",
+        });
+
+        const missing = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/keep-link/external-ref",
+          JSON.stringify({})
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+
+        expect(missing.res.statusCode).toBe(400);
+        expect(JSON.parse(missing.res.body).error).toBe("externalRef is required");
+        expect(obligations.require("keep-link").externalRef?.key).toBe("github:MEK-Org/rusa");
+      });
+
+      it("404s for an unknown obligation", async () => {
+        const { res } = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/missing/external-ref",
+          JSON.stringify({ externalRef: "github:MEK-Org/rusa" })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(res.statusCode).toBe(404);
+      });
+    });
+
     describe("POST /api/mesh/obligations/:id/reorder", () => {
       it("reorders obligation and returns 200", async () => {
         obligations.create({

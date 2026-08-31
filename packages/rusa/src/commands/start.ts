@@ -1598,7 +1598,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           createObligationsMcpServer(getRepositories().obligations, id, {
             isFenced,
             resolveOwner: (raw) => resolveObligationOwner(registry, raw),
-            canReassign: (callerId, obligation) => mesh.isAncestorOf(callerId, obligation.ownerId),
+            canManage: (callerId, obligation) => mesh.isAncestorOf(callerId, obligation.ownerId),
           })
         );
         const meshChatUrl = mcpHttp.addServer(`${id}:${MESH_CHAT_MCP_NAME}`, () =>
@@ -2005,7 +2005,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   );
   const rootObligationsUrl = mcpHttp.addServer(`${rootId}:${OBLIGATIONS_MCP_NAME}`, () =>
     createObligationsMcpServer(getRepositories().obligations, rootId, {
-      canReassign: () => true,
+      canManage: () => true,
       resolveOwner: (raw) => resolveObligationOwner(registry, raw),
     })
   );

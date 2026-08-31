@@ -16,6 +16,7 @@ type ObligationServerRepository = Pick<
   | "listOwnedPage"
   | "create"
   | "setTerminalStatus"
+  | "setExternalRef"
   | "attachArtifact"
   | "listArtifacts"
   | "movePriorityInternal"
@@ -39,11 +40,8 @@ export interface ObligationsMcpOptions {
   ) => { ok: true; ownerId: string } | { ok: false; error: string };
 
   isFenced?: () => boolean;
-  /** Whether this actor may change the current obligation's owner. */
-  canReassign?: (
-    actorId: string,
-    obligation: ReturnType<ObligationRepository["require"]>
-  ) => boolean;
+  /** Whether this actor may make an owner-authorized mutation to an obligation. */
+  canManage?: (actorId: string, obligation: ReturnType<ObligationRepository["require"]>) => boolean;
 }
 
 const DEFAULT_PAGE_LIMIT = 50;
@@ -130,6 +128,8 @@ export function createObligationsMcpServer(
     { isFenced: options?.isFenced }
   );
   const ownerId = actorId;
+  const canManage = (obligation: ReturnType<ObligationRepository["require"]>): boolean =>
+    options?.canManage ? options.canManage(actorId, obligation) : obligation.ownerId === actorId;
 
   server.registerTool(
     "get_obligation",
@@ -299,10 +299,33 @@ export function createObligationsMcpServer(
   );
 
   server.registerTool(
+    "set_external_ref",
+    {
+      title: "Link or unlink the issue/PR/repo this obligation is",
+      description:
+        "Set the obligation's identity claim — the external object this obligation *is* — or pass null to unlink. Accepts a GitHub owner, repository, issue or pull request: github:OWNER, github:OWNER/REPO, github:OWNER/REPO/issues/33, github:OWNER/REPO/pulls/76. At most one live obligation may claim a given ref. This is not attach_artifact: a comment or review is evidence *about* the work, so cite it as an artifact instead.",
+      inputSchema: {
+        id: z.string().trim().min(1),
+        external_ref: z.string().trim().min(1).nullable(),
+      },
+    },
+    async ({ id, external_ref }) => {
+      try {
+        const current = repository.get(id);
+        if (!current) throw new Error("obligation not found");
+        if (!canManage(current)) throw new Error("not authorized to change this obligation's ref");
+        return toolOk({ obligation: repository.setExternalRef(id, external_ref ?? null) });
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
     "attach_artifact",
     {
       title: "Cite an artifact on an obligation",
-      description: `Attach a reference to something that bears on this obligation — the chat message that raised it, the review that changed it, the PR that carries it. Refs are '<scheme>:<path>', scheme one of: ${REFERENCE_SCHEMES.join(", ")}, and the path is collection/id pairs: github:OWNER/REPO/issues/33, github:OWNER/REPO/issues/33/comments/12345, gchat:spaces/S/messages/M, mesh:messages/<id>. Attaching the same ref twice is a no-op, not an error. This is not external_ref, which asserts the obligation *is* that GitHub issue or PR.`,
+      description: `Attach a reference to something that bears on this obligation — the chat message that raised it, the review that changed it, the PR that carries it. Refs are '<scheme>:<path>', scheme one of: ${REFERENCE_SCHEMES.join(", ")}, and the path is collection/id pairs: github:OWNER/REPO/issues/33, github:OWNER/REPO/issues/33/comments/12345, gchat:spaces/S/messages/M, mesh:messages/<id>. Attaching the same ref twice is a no-op, not an error. This is not external_ref, which asserts the obligation *is* a GitHub owner, repository, issue or pull request.`,
       inputSchema: {
         obligation_id: z.string().trim().min(1),
         ref: z.string().trim().min(1),
@@ -368,10 +391,7 @@ export function createObligationsMcpServer(
       try {
         const current = repository.get(id);
         if (!current) throw new Error("obligation not found");
-        const authorized = options?.canReassign
-          ? options.canReassign(actorId, current)
-          : current.ownerId === actorId;
-        if (!authorized) throw new Error("not authorized to reassign this obligation");
+        if (!canManage(current)) throw new Error("not authorized to reassign this obligation");
         const owner = options?.resolveOwner?.(owner_id) ?? { ok: true as const, ownerId: owner_id };
         if (!owner.ok) throw new Error(owner.error);
         const obligation = repository.reassign(id, owner.ownerId);

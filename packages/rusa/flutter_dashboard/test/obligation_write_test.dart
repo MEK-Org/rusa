@@ -157,6 +157,58 @@ void main() {
       expect(result.terminalNote, isNull);
     });
 
+    test('setObligationExternalRef sends the raw ref and parses the result', () async {
+      final mockClient = MockClient((req) async {
+        expect(req.url.path, '/api/mesh/obligations/ob-1/external-ref');
+        final parsed = jsonDecode(req.body) as Map<String, dynamic>;
+        // Sent verbatim: the grammar is the server's to define, and validating
+        // it twice gives two places to disagree.
+        expect(parsed['externalRef'], 'github:MEK-Org/rusa');
+        return http.Response(
+          jsonEncode({
+            'ok': true,
+            'obligation': {
+              'id': 'ob-1',
+              'ownerId': 'root',
+              'title': 'Keep rusa releasable',
+              'externalRef': {'key': 'github:MEK-Org/rusa'},
+              'status': 'ready',
+              'effectivePriority': 1.0,
+            }
+          }),
+          200,
+        );
+      });
+
+      final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
+      final result = await api.setObligationExternalRef('ob-1', '  github:MEK-Org/rusa  ');
+      expect(result.externalRef, 'github:MEK-Org/rusa');
+    });
+
+    test('a blank ref is sent as null, meaning unlink', () async {
+      final mockClient = MockClient((req) async {
+        final parsed = jsonDecode(req.body) as Map<String, dynamic>;
+        expect(parsed['externalRef'], isNull);
+        return http.Response(
+          jsonEncode({
+            'ok': true,
+            'obligation': {
+              'id': 'ob-1',
+              'ownerId': 'root',
+              'title': 'Unlinked',
+              'externalRef': null,
+              'status': 'ready',
+              'effectivePriority': 1.0,
+            }
+          }),
+          200,
+        );
+      });
+
+      final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
+      expect((await api.setObligationExternalRef('ob-1', '   ')).externalRef, isNull);
+    });
+
     test('reorderObligation sends POST with previousId, nextId, and scope', () async {
       final mockClient = MockClient((req) async {
         expect(req.url.path, '/api/mesh/obligations/ob-target/reorder');
@@ -447,6 +499,105 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('actor-ghost'), findsOneWidget);
       expect(find.text('Actor — not in this mesh view'), findsOneWidget);
+    });
+
+    testWidgets('opens the external-ref dialog and unlinks through the API', (tester) async {
+      tester.view.physicalSize = const Size(1280, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      api.obligationsResult = [
+        makeObligation(
+          'ob-linked',
+          intent: 'Linked work',
+          externalRef: 'github:MEK-Org/rusa/issues/33',
+        ),
+      ];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: WorkTab(store: store, onSelectView: (_) {}),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Linked work'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Change or unlink'));
+      await tester.pumpAndSettle();
+      expect(find.text('External Reference'), findsOneWidget);
+
+      await tester.enterText(find.byType(TextField), '');
+      await tester.tap(find.widgetWithText(ElevatedButton, 'Save'));
+      await tester.pumpAndSettle();
+
+      expect(api.externalRefCalls.single.id, 'ob-linked');
+      expect(api.externalRefCalls.single.ref, '');
+      expect(find.text('External Reference'), findsNothing);
+    });
+
+    testWidgets('keeps the external-ref dialog open and shows the server error', (tester) async {
+      tester.view.physicalSize = const Size(1280, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      api.externalRefError = StateError('external ref must name a GitHub target');
+      api.obligationsResult = [makeObligation('ob-linkable', intent: 'Linkable work')];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: WorkTab(store: store, onSelectView: (_) {}),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Linkable work'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Link an issue, PR or repo'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField), 'github:MEK-Org/rusa/comments/9');
+      await tester.tap(find.widgetWithText(ElevatedButton, 'Save'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('External Reference'), findsOneWidget);
+      expect(find.text('Bad state: external ref must name a GitHub target'), findsOneWidget);
+    });
+
+    testWidgets('does not offer external-ref editing for a terminal obligation', (tester) async {
+      tester.view.physicalSize = const Size(1280, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      api.obligationsResult = [
+        makeObligation(
+          'ob-done',
+          intent: 'Finished work',
+          externalRef: 'github:MEK-Org/rusa',
+          status: 'done',
+        ),
+      ];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: WorkTab(store: store, onSelectView: (_) {}),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('Show Done'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Finished work'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('github:MEK-Org/rusa'), findsOneWidget);
+      expect(find.byTooltip('Change or unlink'), findsNothing);
+      expect(find.byTooltip('Link an issue, PR or repo'), findsNothing);
     });
 
     testWidgets('allows creating a new root obligation from sidebar', (tester) async {

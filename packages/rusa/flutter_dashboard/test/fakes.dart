@@ -556,6 +556,36 @@ class FakeApi extends DashboardApi {
     return makeObligation(id, status: status);
   }
 
+  final externalRefCalls = <({String id, String? ref})>[];
+  Object? externalRefError;
+
+  @override
+  Future<ObligationDto> setObligationExternalRef(String id, String? ref) async {
+    externalRefCalls.add((id: id, ref: ref));
+    if (externalRefError case final error?) throw error;
+    final index = obligationsResult.indexWhere((o) => o.id == id);
+    final trimmed = ref?.trim();
+    final next = (trimmed == null || trimmed.isEmpty) ? null : trimmed;
+    if (index >= 0) {
+      final old = obligationsResult[index];
+      final updated = makeObligation(
+        old.id,
+        parentId: old.parentId,
+        ownerId: old.ownerId,
+        title: old.title,
+        intent: old.intent,
+        externalRef: next,
+        status: old.status,
+        priority: old.priority,
+        effectivePriority: old.effectivePriority,
+        prioritySourceId: old.prioritySourceId,
+      );
+      obligationsResult[index] = updated;
+      return updated;
+    }
+    return makeObligation(id, externalRef: next);
+  }
+
   @override
   Future<ObligationDto> reorderObligation(
     String id, {

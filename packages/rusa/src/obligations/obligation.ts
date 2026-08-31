@@ -1,4 +1,10 @@
-import { asGitHubIssue, parseReference, type Reference } from "../references/reference.js";
+import {
+  asGitHubTarget,
+  GITHUB_OWNER_MAX,
+  GITHUB_REPO_MAX,
+  parseReference,
+  type Reference,
+} from "../references/reference.js";
 
 export type ObligationStatus = "ready" | "waiting" | "done" | "cancelled";
 
@@ -16,9 +22,9 @@ export type EntityId = string;
 
 /**
  * An obligation's identity claim: "this obligation *is* that external object".
- * Restricted to a GitHub issue or pull request, and unique across live
- * obligations — which is exactly why it is not the same relation as an attached
- * artifact, where many obligations may cite one thing.
+ * Restricted to a GitHub owner, repository, issue or pull request, and unique
+ * across live obligations — which is exactly why it is not the same relation as
+ * an attached artifact, where many obligations may cite one thing.
  */
 export type ObligationExternalRef = Reference;
 
@@ -170,28 +176,36 @@ export function parseObligationReference(value: string): Reference {
  * Validate an obligation's identity claim.
  *
  * Narrower than {@link parseReference} on purpose: `external_ref` asserts the
- * obligation *is* the referenced object and the store enforces one live claim
- * per ref, so it only accepts the two kinds that can carry that meaning. An
- * artifact citation, which asserts only relevance, accepts any reference.
+ * obligation *is* the referenced object, and the store enforces one live claim
+ * per ref. So it accepts only what can carry that meaning — a GitHub owner,
+ * repository, issue, or pull request.
+ *
+ * Sub-resources are refused. A comment or review is evidence *about* something,
+ * never the same thing as it; that belongs in the obligation's artifacts, where
+ * many obligations may cite one thing.
  */
 export function parseExternalRef(value: string): ObligationExternalRef {
   const reference = parseObligationReference(value);
-  const issue = asGitHubIssue(reference);
-  if (!issue) {
+  const target = asGitHubTarget(reference);
+  if (!target) {
     throw new ObligationValidationError(
-      "external ref must be a GitHub issue or pull request itself, " +
-        "e.g. github:OWNER/REPO/issues/33 — a comment on one is evidence about it, " +
-        "not the same thing as it, so attach that as an artifact instead"
+      "external ref must name a GitHub owner, repository, issue or pull request — " +
+        "e.g. github:MEK-Org, github:MEK-Org/rusa, or github:MEK-Org/rusa/issues/33. " +
+        "A comment or review is evidence about an obligation, not the same thing as " +
+        "it, so attach that as an artifact instead"
     );
   }
-  // GitHub's real limits. Kept from the retired parser: a ref that cannot name
-  // a real repository is a typo, and catching it here beats storing an identity
-  // claim that will never resolve.
-  if (issue.owner.length > 39) {
-    throw new ObligationValidationError("external ref owner cannot exceed 39 characters");
+  // GitHub's own limits, applied here rather than in the grammar so the caller
+  // is told which bound it broke instead of just "not a valid target".
+  if (target.owner.length > GITHUB_OWNER_MAX) {
+    throw new ObligationValidationError(
+      `external ref owner cannot exceed ${GITHUB_OWNER_MAX} characters`
+    );
   }
-  if (issue.repo.length > 100) {
-    throw new ObligationValidationError("external ref repository cannot exceed 100 characters");
+  if (target.level !== "owner" && target.repo.length > GITHUB_REPO_MAX) {
+    throw new ObligationValidationError(
+      `external ref repository cannot exceed ${GITHUB_REPO_MAX} characters`
+    );
   }
   return reference;
 }

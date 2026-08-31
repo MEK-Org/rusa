@@ -864,6 +864,54 @@ export class ObligationRepository {
     });
   }
 
+  /**
+   * Link, relink, or unlink an obligation's identity claim after creation.
+   *
+   * `external_ref` was previously write-once at create, which made the common
+   * cases impossible: an obligation raised from a conversation and only later
+   * given the issue it turned into, or one linked to the wrong number.
+   *
+   * Passing `null` unlinks. Unlinking is a real operation, not a workaround —
+   * the live-uniqueness index means a mislinked obligation otherwise occupies a
+   * ref that its rightful claimant cannot then take.
+   *
+   * Terminal obligations are frozen, consistent with {@link reassign} and
+   * `reparent`: a closed obligation's identity is part of the record.
+   */
+  setExternalRef(id: string, ref: string | null): Obligation {
+    return this.mutate(() => {
+      const obligation = this.require(id);
+      if (isTerminalObligationStatus(obligation.status)) {
+        throw new ObligationValidationError(
+          "terminal obligations cannot change their external ref"
+        );
+      }
+      const externalRef = ref === null ? null : parseExternalRef(ref).key;
+      if (externalRef === (obligation.externalRef?.key ?? null)) {
+        return obligation;
+      }
+
+      try {
+        this.db
+          .prepare("UPDATE obligations SET external_ref = ?, updated_at = ? WHERE id = ?")
+          .run(externalRef, this.stamp(), id);
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          error.message.includes("UNIQUE constraint failed: obligations.external_ref")
+        ) {
+          // Same message as `create`, because it is the same invariant: one
+          // live obligation per external ref is what makes the ref an identity.
+          throw new ObligationValidationError(
+            `a nonterminal obligation already uses external ref: ${externalRef}`
+          );
+        }
+        throw error;
+      }
+      return this.require(id);
+    });
+  }
+
   /** Internal terminal transition; the future service layer owns discharge authorization/ACK. */
   /**
    * Cite an artifact on an obligation. Idempotent per `(obligation, ref)` so a

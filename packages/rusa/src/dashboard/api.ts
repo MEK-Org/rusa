@@ -896,6 +896,59 @@ export function handleMeshApiRequest(
       return true;
     }
 
+    // POST /api/mesh/obligations/:id/external-ref — link, relink or unlink the
+    // issue/PR/repo this obligation is. `externalRef: null` unlinks.
+    const externalRefMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/external-ref$/);
+    if (externalRefMatch) {
+      const obligations = deps?.obligations;
+      if (!obligations) {
+        sendJson(res, 503, { error: "obligations data unavailable" });
+        return true;
+      }
+      const id = decodeURIComponent(externalRefMatch[1]);
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            sendJson(res, 400, { error: "Missing or invalid body" });
+            return;
+          }
+          const body = parsed as Record<string, unknown>;
+          if (!Object.hasOwn(body, "externalRef") && !Object.hasOwn(body, "external_ref")) {
+            sendJson(res, 400, { error: "externalRef is required" });
+            return;
+          }
+          const raw = Object.hasOwn(body, "externalRef") ? body.externalRef : body.external_ref;
+          if (raw !== null && typeof raw !== "string") {
+            sendJson(res, 400, { error: "externalRef must be a string or null" });
+            return;
+          }
+          // A blank string means "unlink" rather than "the empty ref", so the
+          // UI can clear the field without a separate control.
+          const externalRef = raw === null || raw.trim() === "" ? null : raw.trim();
+          if (!obligations.get(id)) {
+            sendJson(res, 404, { error: "obligation not found" });
+            return;
+          }
+          try {
+            sendJson(res, 200, {
+              ok: true,
+              obligation: obligations.setExternalRef(id, externalRef),
+            });
+          } catch (err) {
+            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
     // POST /api/mesh/obligations/:id/reorder — reorder within queue
     const reorderMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/reorder$/);
     if (reorderMatch) {

@@ -145,7 +145,7 @@ Future<void> showCreateObligationDialog(
                       controller: externalRefCtrl,
                       style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13, fontFamily: kMonoFontFamily),
                       decoration: const InputDecoration(
-                        hintText: 'e.g. github_issue:Rusa-Org/rusaISSUE_NUM',
+                        hintText: 'e.g. github:MEK-Org/rusa/issues/33, or github:MEK-Org/rusa',
                         hintStyle: TextStyle(color: MeshColors.textMuted, fontSize: 12),
                         filled: true,
                         fillColor: MeshColors.bgPrimary,
@@ -488,6 +488,124 @@ Future<void> showReassignObligationDialog(
             child: isSubmitting
                 ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
                 : const Text('Reassign'),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+/// Link, relink or unlink the issue/PR/repo an obligation *is*.
+///
+/// Takes the reference syntax raw and lets the server validate it: the grammar
+/// is the server's to define, and mirroring its rules in the client would give
+/// two places to disagree about what a valid ref looks like.
+Future<void> showEditExternalRefDialog(
+  BuildContext context,
+  DashboardStore store,
+  ObligationDto obligation, {
+  VoidCallback? onUpdated,
+}) async {
+  final controller = TextEditingController(text: obligation.externalRef ?? '');
+  var submitting = false;
+  String? error;
+
+  await showDialog<void>(
+    context: context,
+    builder: (dialogContext) => StatefulBuilder(
+      builder: (context, setState) => AlertDialog(
+        backgroundColor: MeshColors.bgSecondary,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(10),
+          side: const BorderSide(color: MeshColors.border),
+        ),
+        title: const Text(
+          'External Reference',
+          style: TextStyle(color: MeshColors.textPrimary, fontSize: 16, fontWeight: FontWeight.bold),
+        ),
+        content: SingleChildScrollView(
+          child: SizedBox(
+            width: 440,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'The object this obligation IS. Leave blank to unlink.',
+                  style: TextStyle(color: MeshColors.textSecondary, fontSize: 12.5),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: controller,
+                  autofocus: true,
+                  style: const TextStyle(
+                    color: MeshColors.textPrimary,
+                    fontSize: 13,
+                    fontFamily: kMonoFontFamily,
+                  ),
+                  decoration: const InputDecoration(
+                    hintText: 'github:MEK-Org/rusa/issues/33',
+                    hintStyle: TextStyle(color: MeshColors.textMuted, fontSize: 12),
+                    filled: true,
+                    fillColor: MeshColors.bgPrimary,
+                    border: OutlineInputBorder(borderSide: BorderSide(color: MeshColors.border)),
+                    contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'An owner, repository, issue or pull request:\n'
+                  'github:MEK-Org  ·  github:MEK-Org/rusa  ·  github:MEK-Org/rusa/pulls/76',
+                  style: TextStyle(
+                    color: MeshColors.textMuted,
+                    fontSize: 11,
+                    fontFamily: kMonoFontFamily,
+                    height: 1.5,
+                  ),
+                ),
+                if (error != null) ...[
+                  const SizedBox(height: 10),
+                  Text(
+                    error!,
+                    style: const TextStyle(color: MeshColors.statusHalted, fontSize: 12),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: submitting ? null : () => Navigator.of(dialogContext).pop(),
+            child: const Text('Cancel', style: TextStyle(color: MeshColors.textSecondary)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: MeshColors.accent,
+              foregroundColor: MeshColors.bgPrimary,
+            ),
+            onPressed: submitting
+                ? null
+                : () async {
+                    setState(() {
+                      submitting = true;
+                      error = null;
+                    });
+                    try {
+                      await store.api.setObligationExternalRef(obligation.id, controller.text);
+                      if (dialogContext.mounted) Navigator.of(dialogContext).pop();
+                      onUpdated?.call();
+                    } catch (e) {
+                      // The server owns the grammar, so its complaint is the
+                      // one worth showing — verbatim, in the dialog, rather
+                      // than as a snackbar the operator has to chase.
+                      setState(() {
+                        submitting = false;
+                        error = '$e';
+                      });
+                    }
+                  },
+            child: Text(submitting ? 'Saving...' : 'Save'),
           ),
         ],
       ),

@@ -522,6 +522,73 @@ describe("ObligationRepository", () => {
     });
   });
 
+  describe("setExternalRef", () => {
+    it("links, relinks and unlinks after creation", () => {
+      const created = repository.create({ title: "Ship it", id: "work", ownerId: "actor-a" });
+      expect(created.externalRef).toBeNull();
+
+      expect(
+        repository.setExternalRef("work", "github:MEK-Org/rusa/issues/33").externalRef?.key
+      ).toBe("github:MEK-Org/rusa/issues/33");
+      // Relinking a mistyped number, and unlinking entirely, are both ordinary.
+      expect(
+        repository.setExternalRef("work", "github:MEK-Org/rusa/issues/34").externalRef?.key
+      ).toBe("github:MEK-Org/rusa/issues/34");
+      expect(repository.setExternalRef("work", null).externalRef).toBeNull();
+    });
+
+    it("frees the ref for its rightful claimant when unlinked", () => {
+      repository.create({ title: "Wrong", id: "wrong", ownerId: "actor-a" });
+      repository.create({ title: "Right", id: "right", ownerId: "actor-b" });
+      repository.setExternalRef("wrong", "github:MEK-Org/rusa/issues/33");
+
+      // Live uniqueness holds while the mislink stands...
+      expect(() => repository.setExternalRef("right", "github:MEK-Org/rusa/issues/33")).toThrow(
+        "already uses external ref"
+      );
+      // ...and unlinking is what releases it. Without this the claim would be
+      // stuck on the wrong obligation for as long as that obligation lives.
+      repository.setExternalRef("wrong", null);
+      expect(
+        repository.setExternalRef("right", "github:MEK-Org/rusa/issues/33").externalRef?.key
+      ).toBe("github:MEK-Org/rusa/issues/33");
+    });
+
+    it("treats case variants as one live identity claim", () => {
+      repository.create({ title: "First", id: "first-claim", ownerId: "actor-a" });
+      repository.create({ title: "Second", id: "second-claim", ownerId: "actor-b" });
+      repository.setExternalRef("first-claim", "github:MEK-Org/rusa");
+
+      expect(() => repository.setExternalRef("second-claim", "github:mek-org/RUSA")).toThrow(
+        "already uses external ref"
+      );
+    });
+
+    it("accepts a repository or an owner as the identity", () => {
+      repository.create({ title: "Keep rusa releasable", id: "repo-level", ownerId: "actor-a" });
+      expect(repository.setExternalRef("repo-level", "github:MEK-Org/rusa").externalRef?.key).toBe(
+        "github:MEK-Org/rusa"
+      );
+      repository.create({ title: "Org health", id: "org-level", ownerId: "actor-a" });
+      expect(repository.setExternalRef("org-level", "github:MEK-Org").externalRef?.key).toBe(
+        "github:MEK-Org"
+      );
+    });
+
+    it("rejects a sub-resource and freezes a terminal obligation's identity", () => {
+      repository.create({ title: "Work", id: "sub", ownerId: "actor-a" });
+      expect(() =>
+        repository.setExternalRef("sub", "github:MEK-Org/rusa/issues/33/comments/9")
+      ).toThrow("external ref must name");
+
+      repository.create({ title: "Done", id: "closed", ownerId: "actor-a" });
+      repository.setTerminalStatus("closed", "done");
+      expect(() => repository.setExternalRef("closed", "github:MEK-Org/rusa")).toThrow(
+        "terminal obligations cannot change their external ref"
+      );
+    });
+  });
+
   it("has no UPDATE on obligations that forgets updated_at (drift guard for the trigger we chose not to use)", async () => {
     // The operator ruled against stamping via SQLite triggers on #1671 (2026-08-22):
     // triggers are "opaque to the codebase". Repository writes are visible but
@@ -714,7 +781,7 @@ describe("ObligationRepository", () => {
         ownerId: "actor-a",
         externalRef: "github:dummy-org/dummy-repo/issues/1485/comments/9",
       })
-    ).toThrow("external ref must be");
+    ).toThrow("external ref must name");
     expect(() =>
       repository.create({
         title: "oversized-owner",
