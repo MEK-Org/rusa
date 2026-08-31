@@ -154,6 +154,49 @@ export class MeshEventRepository {
   }
 
   /**
+   * Events of the given `kinds`, oldest-first, with `body` populated only for
+   * `bodyKinds`. Every other event's body comes back `null` — not because it is
+   * missing, but because the caller said it does not read it.
+   *
+   * For a reader that folds over the whole history, that second half is the
+   * expensive one. `mesh_events` on the live mesh is 70 MB of leaf pages plus
+   * 120 MB of overflow pages, and the overflow is almost entirely run
+   * transcripts on `run_end` — 138 MB that {@link list} materialises into JS
+   * strings on every call and that the commitment ledger, its only whole-history
+   * reader, never looks at. Measured on that database through the actor list's
+   * cache miss, which is the ledger's one hot caller: 1748 ms and +511 MB RSS
+   * with {@link list}, 763 ms and +77 MB with this read, for a byte-identical
+   * response.
+   *
+   * Body resolution is unchanged — `body` and the `mesh_chat` join are selected
+   * together for `bodyKinds` and resolved by {@link toMeshEvent}, so a
+   * spine-participating event still reads its prose from `mesh_chat` alone and
+   * never rescues a stale `mesh_events.body`.
+   */
+  listByKinds(kinds: readonly string[], opts: { bodyKinds: readonly string[] }): MeshEvent[] {
+    if (kinds.length === 0) return [];
+    const kindHoles = kinds.map(() => "?").join(",");
+    // An empty body set is a legitimate ask ("none of them"), and `IN ()` is a
+    // syntax error, so say it as a constant instead of building empty holes.
+    const wantsBody =
+      opts.bodyKinds.length === 0 ? "0" : `e.kind IN (${opts.bodyKinds.map(() => "?").join(",")})`;
+    const rows = this.db
+      .prepare(`
+        SELECT e.id, e.ts, e.kind, e.actor_id, e.detail, e.success, e.payload,
+               CASE WHEN ${wantsBody} THEN e.body END AS body,
+               CASE WHEN ${wantsBody} THEN c.body END AS chat_body
+        FROM mesh_events e
+        LEFT JOIN mesh_chat c ON json_extract(e.payload, '$.messageId') = c.id
+        WHERE e.kind IN (${kindHoles})
+        ORDER BY e.rowid ASC
+      `)
+      .all(...opts.bodyKinds, ...opts.bodyKinds, ...kinds) as (MeshEventRow & {
+      chat_body?: string | null;
+    })[];
+    return rows.map(toMeshEvent);
+  }
+
+  /**
    * Forward, all-actors **windowed** scan — the nightly distiller's mesh_events read
    * (ISSUE_NUM phase 2a), served via `GET /api/mesh/events?since=&until=`. Events in the
    * half-open window `[sinceISO, untilISO)` (`untilISO` optional — omitted = open-

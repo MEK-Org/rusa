@@ -71,10 +71,8 @@ void main() {
       parentId: 'root',
       status: 'active',
       provider: 'claude',
-      requestedModel: 'claude-3-5-sonnet',
       model: 'claude-3-5-sonnet',
-      boundModel: 'claude-3-5-sonnet',
-      charter: 'test charter',
+      charterPreview: 'test charter',
       title: 'test title',
       createdAt: '2026-01-01T00:00:00Z',
     );
@@ -135,10 +133,8 @@ void main() {
       parentId: null,
       status: 'active',
       provider: null,
-      requestedModel: null,
       model: null,
-      boundModel: null,
-      charter: '',
+      charterPreview: '',
       createdAt: '2026-01-01T00:00:00Z',
     );
     const thread2 = ThreadDto(
@@ -147,10 +143,8 @@ void main() {
       parentId: 'a1',
       status: 'active',
       provider: null,
-      requestedModel: null,
       model: null,
-      boundModel: null,
-      charter: '',
+      charterPreview: '',
       createdAt: '2026-01-01T00:01:00Z',
     );
     const thread3 = ThreadDto(
@@ -159,10 +153,8 @@ void main() {
       parentId: 'a1',
       status: 'retired',
       provider: null,
-      requestedModel: null,
       model: null,
-      boundModel: null,
-      charter: '',
+      charterPreview: '',
       createdAt: '2026-01-01T00:02:00Z',
     );
 

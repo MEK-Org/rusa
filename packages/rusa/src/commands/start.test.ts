@@ -130,6 +130,19 @@ vi.mock("../providers/sandbox.js", async (importOriginal) => ({
   assertBwrapAvailable: sandboxMock.assertBwrapAvailable,
 }));
 
+// `runStart` fires the boot/daily model-catalog probe as
+// `void refreshConfiguredProviderModelCatalogs(...)`, which drives the real `codex` and `agy`
+// binaries — codex through a real tmux PTY against the host's shared `~/.codex`. Nothing awaits
+// it, so an unmocked unit run starts external CLI trees that outlive the test (#88).
+const modelScrapeMock = vi.hoisted(() => ({
+  refreshConfiguredProviderModelCatalogs: vi.fn(async (_deps: { signal?: AbortSignal }) => {}),
+}));
+
+vi.mock("../providers/model-scrape.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../providers/model-scrape.js")>()),
+  refreshConfiguredProviderModelCatalogs: modelScrapeMock.refreshConfiguredProviderModelCatalogs,
+}));
+
 import {
   getShutdownExitCode,
   isLegacyWorktreeKey,
@@ -325,6 +338,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     gitHttpServerMock.startGitHttpServer.mockClear();
     gitHttpServerMock.servers.length = 0;
     sandboxMock.assertBwrapAvailable.mockReset();
+    modelScrapeMock.refreshConfiguredProviderModelCatalogs.mockClear();
     pollerMock.startGitHubEventPoller.mockClear();
     for (const method of Object.values(e2eInstanceManagerMock)) method.mockClear();
     serviceInstanceMock.resolveRepoRoot.mockImplementation(
@@ -468,6 +482,77 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // signal to the parent now, not something the worker self-heals from.
       expect(kimiActorOpts.fallback).toBeUndefined();
     });
+  });
+
+  it("drives the boot model-catalog probe through the injected fake, not a real CLI", async () => {
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    await readyPromise;
+
+    // Regression guard for #88. The boot probe is unconditional, so this asserts the mock above is
+    // actually engaged: drop it and the count stays 0 while the suite silently goes back to
+    // spawning real codex/agy trees that no test awaits.
+    expect(modelScrapeMock.refreshConfiguredProviderModelCatalogs).toHaveBeenCalled();
+  });
+
+  it("shutdown aborts the in-flight model probe and waits for it to settle", async () => {
+    // Regression guard for #89. The probe is fired without being retained, so the interval
+    // handle says nothing about one already running: `clearInterval` only stops the *next*
+    // probe. Two separate things have to hold at shutdown, and each assertion below pins one.
+    let probeSignal: AbortSignal | undefined;
+    let probeSettled = false;
+    modelScrapeMock.refreshConfiguredProviderModelCatalogs.mockImplementationOnce(
+      async (deps: { signal?: AbortSignal }) => {
+        probeSignal = deps.signal;
+        // Stands in for a probe blocked on a real CLI tree: it settles only when told to.
+        await new Promise<void>((resolve) => {
+          deps.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        probeSettled = true;
+      }
+    );
+
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    await readyPromise;
+
+    // The probe is still running at this point — nothing has resolved it.
+    expect(probeSignal).toBeDefined();
+    expect(probeSignal?.aborted).toBe(false);
+    expect(probeSettled).toBe(false);
+
+    const shutdown = shutdownFn;
+    shutdownFn = undefined;
+    await shutdown?.();
+
+    // (1) The probe was reachable. This is the assertion that goes red against the old
+    // shape: with no `signal` at the call site the probe cannot be stopped at all, and
+    // with the signal but no `modelProbeAbort.abort()` shutdown blocks on it forever.
+    expect(probeSignal?.aborted).toBe(true);
+    // (2) By the time shutdown returns, the probe has finished rather than been left
+    // running. Stated plainly for the next reader: this does *not* pin the
+    // `await modelProbeInFlight` in `shutdown` — remove that await and this still passes,
+    // because the half-dozen `await`s that follow it (mcp/webhook/dashboard close) each
+    // flush the microtask queue and let the prober's `finally` run anyway. The await is
+    // there to make the ordering a guarantee instead of a by-product of what happens to
+    // be awaited after it; no test can distinguish the two today.
+    expect(probeSettled).toBe(true);
   });
 
   it("warns at boot when the self-update tool mounts without errorChat configured", async () => {
@@ -2520,7 +2605,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       );
     });
 
-    it("drops check_run.completed and still delivers check_suite.completed", async () => {
+    it("drops check_run.completed and a green check suite, and still delivers a red one", async () => {
       let emitGitHubEvent:
         | ((event: string, payload: Record<string, unknown>) => Promise<void>)
         | undefined;
@@ -2557,10 +2642,104 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
       expect(requestRunCalls).toHaveLength(0);
 
+      // Green is a status transition the gate already tracks, and it arrives
+      // once per re-run — the churn this filter exists to stop.
       await emitGitHubEvent("check_suite", {
         action: "completed",
         repository: { full_name: "dummy-org/dummy-repo" },
         check_suite: { id: 456, conclusion: "success" },
+        sender: { login: "github-actions[bot]" },
+      });
+
+      expect(requestRunCalls).toHaveLength(0);
+
+      // Red means somebody has work, so this is not a blanket drop of the kind.
+      await emitGitHubEvent("check_suite", {
+        action: "completed",
+        repository: { full_name: "dummy-org/dummy-repo" },
+        check_suite: { id: 457, conclusion: "failure" },
+        sender: { login: "github-actions[bot]" },
+      });
+
+      expect(requestRunCalls).toEqual([{ actorId: "root", reason: "{}" }]);
+    });
+
+    it("wakes a check suite's owner: the PR's when it has one, the repo's when it does not", async () => {
+      let emitGitHubEvent:
+        | ((event: string, payload: Record<string, unknown>) => Promise<void>)
+        | undefined;
+      let mesh: ActorMesh | undefined;
+
+      const readyPromise = new Promise<void>((resolve) => {
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              mesh = handles.mesh;
+              emitGitHubEvent = handles.emitGitHubEvent;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+
+      await readyPromise;
+      if (!mesh || !emitGitHubEvent) {
+        throw new Error("Mesh or emitGitHubEvent not ready");
+      }
+
+      const prWorker = mesh.spawn({
+        charter: "pr tasks",
+        parentId: "root",
+        provider: "antigravity",
+        model: "Gemini 3.7 Flash (High)",
+      });
+      mesh.subscribeEventSource(
+        { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 77 },
+        prWorker,
+        "root"
+      );
+      mesh.subscribeEventSource(
+        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+        "root",
+        "root"
+      );
+
+      // Carries a PR: its owner is woken, and the repo owner is not.
+      await emitGitHubEvent("check_suite", {
+        action: "completed",
+        repository: { full_name: "dummy-org/dummy-repo" },
+        check_suite: {
+          id: 500,
+          conclusion: "failure",
+          pull_requests: [{ number: 77 }],
+          head_branch: "steward/whatever",
+        },
+        sender: { login: "github-actions[bot]" },
+      });
+
+      expect(requestRunCalls).toEqual([{ actorId: prWorker, reason: "{}" }]);
+      requestRunCalls.length = 0;
+
+      // No PR and nobody on the branch: it climbs to the repo owner rather
+      // than reaching everybody or nobody.
+      await emitGitHubEvent("check_suite", {
+        action: "completed",
+        repository: { full_name: "dummy-org/dummy-repo" },
+        check_suite: { id: 501, conclusion: "failure", pull_requests: [] },
+        sender: { login: "github-actions[bot]" },
+      });
+
+      expect(requestRunCalls).toEqual([{ actorId: "root", reason: "{}" }]);
+      requestRunCalls.length = 0;
+
+      // A PR nobody owns: red CI must not fall on the floor, so it climbs to
+      // the repo owner. This is the half that breaks if `check_suite.completed`
+      // stops being allowed past `mayBubbleToParent`.
+      await emitGitHubEvent("check_suite", {
+        action: "completed",
+        repository: { full_name: "dummy-org/dummy-repo" },
+        check_suite: { id: 502, conclusion: "failure", pull_requests: [{ number: 999 }] },
         sender: { login: "github-actions[bot]" },
       });
 
@@ -2702,11 +2881,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // Retire worker (no longer live)
     mesh.retire(workerId);
 
-    // Emit event
+    // Emit event. The conclusion has to be one that wakes somebody: this test
+    // is about the bubbling walk, but a green suite is now dropped before it
+    // reaches routing, which would make the walk untestable through this event.
     await emitGitHubEvent("check_suite", {
       action: "completed",
       repository: { full_name: "dummy-org/dummy-repo" },
-      check_suite: { id: 123, conclusion: "success" },
+      check_suite: { id: 123, conclusion: "failure" },
       sender: { login: "someone-else" },
     });
 

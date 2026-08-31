@@ -560,13 +560,13 @@ describe("Actor", () => {
         success: false,
         output: "Weekly quota exhausted for this model; reset later.",
         exitCode: 1,
-        boundModel: "fable-5-bound",
+        model: "fable-5-bound",
       }),
       "fable-5"
     );
     const fallbackProvider = new FakeProvider(() => {
       actor.declareYield();
-      return { output: "fallback ok", boundModel: "backup-model-bound" };
+      return { output: "fallback ok", model: "backup-model-bound" };
     }, "backup-model");
     const seen: RunResult[] = [];
     const logs: string[] = [];
@@ -592,7 +592,7 @@ describe("Actor", () => {
     expect(fallbackProvider.calls).toHaveLength(1);
     expect(seen).toHaveLength(1);
     expect(seen[0]?.success).toBe(true);
-    expect(seen[0]?.boundModel).toBe("backup-model-bound");
+    expect(seen[0]?.model).toBe("backup-model-bound");
     expect(logs.join("")).toContain(
       "primary fable-5 exhausted; continuing on fallback backup-model"
     );

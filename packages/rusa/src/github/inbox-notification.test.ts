@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { resourceKey } from "../actor/event-subscriptions.js";
-import { deriveGitHubInboxNotification } from "./inbox-notification.js";
+import { checkSuiteWakesAnyone, deriveGitHubInboxNotification } from "./inbox-notification.js";
 
 describe("deriveGitHubInboxNotification", () => {
   it("uses an issue source and keeps only the comment-specific identifier", () => {
@@ -103,7 +103,7 @@ describe("deriveGitHubInboxNotification", () => {
     }
   });
 
-  describe("check_suite and check_run routing (#1593)", () => {
+  describe("check_suite and check_run routing", () => {
     it("routes check_suite with pull_requests present to github_pr", () => {
       const notification = deriveGitHubInboxNotification("check_suite", {
         action: "completed",
@@ -262,5 +262,51 @@ describe("deriveGitHubInboxNotification", () => {
       expect(notificationSuite.payload).toEqual({ type: "check_suite" });
       expect(notificationRun.payload).toEqual({ type: "check_run" });
     });
+  });
+});
+
+describe("checkSuiteWakesAnyone", () => {
+  const suite = (conclusion: unknown): Record<string, unknown> => ({
+    action: "completed",
+    repository: { full_name: "dummy-org/dummy-repo" },
+    check_suite: { id: 456, conclusion },
+  });
+
+  it("stays quiet for a suite that concluded with nothing to do", () => {
+    expect(checkSuiteWakesAnyone(suite("success"))).toBe(false);
+    expect(checkSuiteWakesAnyone(suite("neutral"))).toBe(false);
+    expect(checkSuiteWakesAnyone(suite("skipped"))).toBe(false);
+  });
+
+  it("stays quiet for a superseded suite, because its replacement will report", () => {
+    expect(checkSuiteWakesAnyone(suite("cancelled"))).toBe(false);
+    expect(checkSuiteWakesAnyone(suite("stale"))).toBe(false);
+  });
+
+  it("wakes for every conclusion that leaves somebody with work", () => {
+    expect(checkSuiteWakesAnyone(suite("failure"))).toBe(true);
+    expect(checkSuiteWakesAnyone(suite("timed_out"))).toBe(true);
+    expect(checkSuiteWakesAnyone(suite("action_required"))).toBe(true);
+    expect(checkSuiteWakesAnyone(suite("startup_failure"))).toBe(true);
+  });
+
+  it("wakes when it cannot read the conclusion at all", () => {
+    // The failure mode worth avoiding is a red suite nobody hears about, so an
+    // unrecognised or missing conclusion is delivered rather than dropped.
+    expect(checkSuiteWakesAnyone(suite("some_new_github_conclusion"))).toBe(true);
+    expect(checkSuiteWakesAnyone(suite(null))).toBe(true);
+    expect(checkSuiteWakesAnyone(suite(undefined))).toBe(true);
+    expect(checkSuiteWakesAnyone({ action: "completed" })).toBe(true);
+  });
+
+  it("does not confuse a conclusion with the in-progress status that precedes it", () => {
+    // `check_suite.requested` and `.rerequested` carry a null conclusion; they
+    // are filtered by action upstream, and this predicate must not silence them.
+    expect(
+      checkSuiteWakesAnyone({
+        action: "requested",
+        check_suite: { id: 456, status: "queued", conclusion: null },
+      })
+    ).toBe(true);
   });
 });

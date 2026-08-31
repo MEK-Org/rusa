@@ -550,4 +550,62 @@ describe("MeshEventRepository", () => {
       ]);
     });
   });
+  describe("listByKinds (the ledger reader's narrowed list)", () => {
+    beforeEach(() => {
+      db.prepare(
+        `INSERT INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id)
+         VALUES ('m1', '2026-07-19T00:00:00.000Z', 'root', 'worker-1', 'the chat body', NULL)`
+      ).run();
+      repo.record({ kind: "run_queued", actorId: "worker-1", body: "queued noise" });
+      repo.record({ kind: "run_start", actorId: "worker-1", body: "an inject record" });
+      repo.record({
+        kind: "run_end",
+        actorId: "worker-1",
+        success: true,
+        body: "a run transcript",
+      });
+      repo.record({
+        kind: "message_sent",
+        actorId: "worker-1",
+        payload: JSON.stringify({ messageId: "m1", to: "root" }),
+        body: "stale duplicate",
+      });
+      repo.record({ kind: "run_yielded", actorId: "worker-1", detail: "complete", body: "a note" });
+    });
+
+    it("returns only the requested kinds, still in rowid order", () => {
+      const events = repo.listByKinds(["run_end", "run_start"], { bodyKinds: [] });
+      expect(events.map((e) => e.kind)).toEqual(["run_start", "run_end"]);
+    });
+
+    it("narrows `list()` without otherwise changing a single field", () => {
+      const kinds = ["run_queued", "run_start", "run_end", "message_sent", "run_yielded"];
+      expect(repo.listByKinds(kinds, { bodyKinds: kinds })).toEqual(repo.list());
+    });
+
+    it("blanks the body of a kind the caller did not ask a body for", () => {
+      // The whole point: `run_end` bodies are 138 MB of transcripts on the live
+      // mesh, and the ledger never reads one. Fetching the row must not fetch them.
+      const [runEnd] = repo.listByKinds(["run_end"], { bodyKinds: ["run_yielded"] });
+      expect(runEnd).toMatchObject({ kind: "run_end", success: true });
+      expect(runEnd.body).toBeNull();
+    });
+
+    it("still reads a wanted body from mesh_chat rather than the event row", () => {
+      const [sent] = repo.listByKinds(["message_sent"], { bodyKinds: ["message_sent"] });
+      expect(sent.body).toBe("the chat body");
+    });
+
+    it("takes an empty body list as 'none of them', not as a SQL syntax error", () => {
+      // `IN ()` does not parse, so the empty case has to be said as a constant.
+      const bodies = repo
+        .listByKinds(["run_yielded", "message_sent"], { bodyKinds: [] })
+        .map((e) => e.body);
+      expect(bodies).toEqual([null, null]);
+    });
+
+    it("returns nothing for an empty kinds list", () => {
+      expect(repo.listByKinds([], { bodyKinds: ["run_end"] })).toEqual([]);
+    });
+  });
 });

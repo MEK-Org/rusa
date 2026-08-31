@@ -173,7 +173,7 @@ describe("GchatClient reads", () => {
     });
   });
 
-  it("gets attachment metadata by resource name", async () => {
+  it("gets attachment metadata from the parent message, not the chat.bot-gated endpoint", async () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(
@@ -184,11 +184,20 @@ describe("GchatClient reads", () => {
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            name: "spaces/A/messages/M1/attachments/ATT1",
-            contentName: "photo.png",
-            contentType: "image/png",
-            attachmentDataRef: { resourceName: "spaces/A/attachments/UPL1" },
-            source: "UPLOADED_CONTENT",
+            name: "spaces/A/messages/M1",
+            attachment: [
+              {
+                name: "spaces/A/messages/M1/attachments/OTHER",
+                contentName: "other.png",
+              },
+              {
+                name: "spaces/A/messages/M1/attachments/ATT1",
+                contentName: "photo.png",
+                contentType: "image/png",
+                attachmentDataRef: { resourceName: "spaces/A/attachments/UPL1" },
+                source: "UPLOADED_CONTENT",
+              },
+            ],
           }),
           { status: 200 }
         )
@@ -204,8 +213,46 @@ describe("GchatClient reads", () => {
       contentType: "image/png",
     });
     expect(fetchMock.mock.calls[1]?.[0]).toBe(
-      "https://chat.googleapis.com/v1/spaces/A/messages/M1/attachments/ATT1"
+      "https://chat.googleapis.com/v1/spaces/A/messages/M1"
     );
+  });
+
+  it("rejects getAttachment if the resource name is not a message attachment", async () => {
+    await expect(
+      new GchatClient(credentialsDir()).getAttachment("media/DATAREF_123")
+    ).rejects.toThrow("invalid attachment resource name");
+  });
+
+  it("rejects getAttachment near-miss names locally, without calling Google", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const client = new GchatClient(credentialsDir());
+
+    for (const name of [
+      "spaces/A/not-messages/M1/attachments/ATT1",
+      "spaces/A/attachments/ATT1",
+      "spaces/A/messages/M1/attachments/ATT1/extra",
+      "spaces/A/messages/M1/attachments/",
+    ]) {
+      await expect(client.getAttachment(name)).rejects.toThrow("invalid attachment resource name");
+    }
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects getAttachment if the parent message does not carry the attachment", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: "token", expires_in: 3600 }), {
+          status: 200,
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ name: "spaces/A/messages/M1" }), { status: 200 })
+      );
+
+    await expect(
+      new GchatClient(credentialsDir()).getAttachment("spaces/A/messages/M1/attachments/ATT1")
+    ).rejects.toThrow("is not present on message spaces/A/messages/M1");
   });
 
   it("downloads binary attachment contents via direct media token", async () => {
@@ -235,7 +282,7 @@ describe("GchatClient reads", () => {
     ).rejects.toThrow("invalid attachment resource name");
   });
 
-  it("resolves human-readable message attachment name via getAttachment before downloading", async () => {
+  it("resolves human-readable message attachment name via the parent message before downloading", async () => {
     const fileBytes = Buffer.from("resolved binary content");
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
@@ -247,9 +294,14 @@ describe("GchatClient reads", () => {
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            name: "spaces/A/messages/M1/attachments/ATT1",
-            attachmentDataRef: { resourceName: "spaces/A/attachments/DATAREF_99" },
-            source: "UPLOADED_CONTENT",
+            name: "spaces/A/messages/M1",
+            attachment: [
+              {
+                name: "spaces/A/messages/M1/attachments/ATT1",
+                attachmentDataRef: { resourceName: "spaces/A/attachments/DATAREF_99" },
+                source: "UPLOADED_CONTENT",
+              },
+            ],
           }),
           { status: 200 }
         )
@@ -262,7 +314,7 @@ describe("GchatClient reads", () => {
 
     expect(downloaded).toEqual(fileBytes);
     expect(fetchMock.mock.calls[1]?.[0]).toBe(
-      "https://chat.googleapis.com/v1/spaces/A/messages/M1/attachments/ATT1"
+      "https://chat.googleapis.com/v1/spaces/A/messages/M1"
     );
     expect(fetchMock.mock.calls[2]?.[0]).toBe(
       "https://chat.googleapis.com/v1/media/spaces%2FA%2Fattachments%2FDATAREF_99?alt=media"
@@ -279,8 +331,8 @@ describe("GchatClient reads", () => {
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            name: "spaces/A/messages/M1/attachments/ATT1",
-            source: "DRIVE_FILE",
+            name: "spaces/A/messages/M1",
+            attachment: [{ name: "spaces/A/messages/M1/attachments/ATT1", source: "DRIVE_FILE" }],
           }),
           { status: 200 }
         )
@@ -301,8 +353,10 @@ describe("GchatClient reads", () => {
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            name: "spaces/A/messages/M1/attachments/ATT1",
-            source: "UPLOADED_CONTENT",
+            name: "spaces/A/messages/M1",
+            attachment: [
+              { name: "spaces/A/messages/M1/attachments/ATT1", source: "UPLOADED_CONTENT" },
+            ],
           }),
           { status: 200 }
         )

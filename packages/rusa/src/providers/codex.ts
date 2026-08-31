@@ -160,10 +160,13 @@ function basenameMatch(path: string): string | undefined {
 
 /**
  * Read the model Codex recorded for a session. The rollout's
- * `turn_context.payload.model` is provider-side read-back, unlike the spawn
- * request slug.
+ * `turn_context.payload.model` is what codex says it ran, unlike the spawn
+ * request slug — which is the whole reason this read exists.
  */
-export function extractCodexBoundModel(sessionsDir: string, sessionId: string): string | undefined {
+export function extractCodexSessionModel(
+  sessionsDir: string,
+  sessionId: string
+): string | undefined {
   const file = findCodexRolloutFile(sessionsDir, sessionId);
   if (!file) return undefined;
   try {
@@ -417,8 +420,11 @@ export class CodexProvider implements CodingProvider {
     // nulls out a known session.
     const captureSessionId = (): string | undefined =>
       sessionsDir ? (extractNewestCodexSessionId(sessionsDir) ?? opts.session?.id) : undefined;
-    const captureBoundModel = (sessionId: string | undefined): string | undefined =>
-      sessionsDir && sessionId ? extractCodexBoundModel(sessionsDir, sessionId) : undefined;
+    // What codex says it actually ran, read back off the rollout. Undefined when
+    // there is no rollout to read — NOT REPORTED, which downstream must not
+    // launder into the configured model. See `RunResult.model`.
+    const captureModel = (sessionId: string | undefined): string | undefined =>
+      sessionsDir && sessionId ? extractCodexSessionModel(sessionsDir, sessionId) : undefined;
 
     // Spawn codex once with the given CLI args and resolve a RunResult. Does NOT
     // clean up temp files — run() does that once in `finally`, after any retry.
@@ -427,10 +433,10 @@ export class CodexProvider implements CodingProvider {
         ? buildActorBwrapCommand(bwrapResult, command, codexArgs)
         : codexArgs;
       const buildResultWithSession = (
-        base: Omit<RunResult, "sessionId" | "boundModel" | "tokenUsage">
+        base: Omit<RunResult, "sessionId" | "model" | "tokenUsage">
       ): RunResult => {
         const sessionId = captureSessionId();
-        const boundModel = captureBoundModel(sessionId);
+        const model = captureModel(sessionId);
         const totals =
           sessionsDir && sessionId
             ? extractCodexTokenUsageFromStore(sessionsDir, sessionId, runStartedAt)
@@ -438,10 +444,13 @@ export class CodexProvider implements CodingProvider {
         return {
           ...base,
           sessionId,
-          boundModel,
+          model,
+          // Spend attribution follows what RAN, falling back to the pin only so a
+          // missing read-back does not orphan the tokens. A label may fall back;
+          // a measurement may not — see `RunResult.model`.
           tokenUsage: totals
-            ? attributedTokenUsage("codex", boundModel ?? this.model ?? null, totals)
-            : unattributedTokenUsage("codex", boundModel ?? this.model ?? null),
+            ? attributedTokenUsage("codex", model ?? this.model ?? null, totals)
+            : unattributedTokenUsage("codex", model ?? this.model ?? null),
         };
       };
 

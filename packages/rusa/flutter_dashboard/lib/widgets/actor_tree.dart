@@ -517,19 +517,12 @@ class _ActorRowState extends State<_ActorRow> {
                             overflow: TextOverflow.ellipsis,
                             style: kMonoStyle.copyWith(
                               fontSize: 11,
-                              color: thread.modelDiverged
-                                  ? MeshColors.statusHalted
-                                  : MeshColors.textSecondary,
+                              color: MeshColors.textSecondary,
                             ),
                           ),
                         ),
-                      if (thread.modelDiverged) ...[
-                        if (thread.model != null) const SizedBox(width: 6),
-                        const _DivergenceBadge(compact: true),
-                      ],
                       if (thread.commitmentKind != null) ...[
-                        if (thread.model != null || thread.modelDiverged)
-                          const SizedBox(width: 6),
+                        if (thread.model != null) const SizedBox(width: 6),
                         _WorkStateBadge(
                           kind: thread.commitmentKind!,
                           compact: true,
@@ -672,37 +665,6 @@ class _ActorRowState extends State<_ActorRow> {
           child: child,
         );
       },
-    );
-  }
-}
-
-class _DivergenceBadge extends StatelessWidget {
-  const _DivergenceBadge({this.compact = false});
-
-  final bool compact;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: EdgeInsets.symmetric(
-        horizontal: compact ? 5 : 7,
-        vertical: compact ? 2 : 3,
-      ),
-      decoration: BoxDecoration(
-        color: MeshColors.statusHalted.withValues(alpha: 0.14),
-        borderRadius: BorderRadius.circular(4),
-        border: Border.all(
-          color: MeshColors.statusHalted.withValues(alpha: 0.6),
-        ),
-      ),
-      child: Text(
-        compact ? 'DIFF' : 'MODEL DIFF',
-        style: TextStyle(
-          color: MeshColors.statusHalted,
-          fontSize: compact ? 9 : 10,
-          fontWeight: FontWeight.w800,
-        ),
-      ),
     );
   }
 }

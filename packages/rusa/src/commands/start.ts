@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Actor } from "../actor/actor.js";
 import {
@@ -52,7 +52,11 @@ import { handleHostJobExit } from "../actor/host-job-exit.js";
 import { ensureWakeOnExitScript } from "../actor/host-job-runner.js";
 import { FileHostJobStore } from "../actor/host-job-store.js";
 import type { InboxEntry, InboxStore } from "../actor/inbox-store.js";
-import type { MeshEventSink, RunAbandonedPayload } from "../actor/mesh-events.js";
+import {
+  type MeshEventSink,
+  type RunAbandonedPayload,
+  runEndPayload,
+} from "../actor/mesh-events.js";
 import {
   assemblePortableContext,
   assemblePortableContextV2,
@@ -94,6 +98,12 @@ import {
   writeWakePort,
 } from "../actor/wake-cron.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "../actor/worker-prompt.js";
+import type { ActorLiveness } from "../actor/workspace-sweep.js";
+import {
+  removableWorkspaceNames,
+  sweepOrphanedWorkspaces,
+  unattributedCheckouts,
+} from "../actor/workspace-sweep.js";
 import { backfillAvatars, kickAvatarGeneration } from "../avatar/avatars.js";
 import { GoogleCalendarClientProvider } from "../calendar/calendar-client.js";
 import { GchatClient, loadGchatIdentity } from "../chat/gchat-client.js";
@@ -110,7 +120,10 @@ import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { isSelfAuthoredLedgerSource } from "../db/repositories/mesh-event-repository.js";
 import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
-import { deriveGitHubInboxNotification } from "../github/inbox-notification.js";
+import {
+  checkSuiteWakesAnyone,
+  deriveGitHubInboxNotification,
+} from "../github/inbox-notification.js";
 import { startGitHubEventPoller } from "../github/poller.js";
 import { startGitHttpServer } from "../gitops/git-http-server.js";
 import {
@@ -164,6 +177,7 @@ import {
   runTrackerHygiene,
 } from "../observability/tracker-hygiene.js";
 
+import { antigravityScratchDir } from "../providers/antigravity.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import {
   ingestKimiHostModels,
@@ -392,10 +406,19 @@ export function postBackOnlinePing(opts: {
   }
 }
 
+/**
+ * @param scratch Where the provider CLI keeps its own copy of the actor's
+ * workspace, and who is running in that area right now. Omitted, the second
+ * workspace is simply not cleaned — passing the path in rather than reading the
+ * home directory here is what lets a test say which directory it means, and the
+ * two travel as one argument because deleting by an eight-character prefix
+ * without knowing who else answers to it is the collision this guards.
+ */
 export function createStartRetireCleanups(
   workersDir: string,
   wakeCron: Pick<CrontabWakeCron, "cancel">,
-  e2eInstance?: Pick<E2EInstanceManager, "stopForActorRetirement">
+  e2eInstance?: Pick<E2EInstanceManager, "stopForActorRetirement">,
+  scratch?: { dir: string; listActors: () => readonly ActorLiveness[] }
 ): RetireCleanup[] {
   return [
     ...(e2eInstance
@@ -418,6 +441,30 @@ export function createStartRetireCleanups(
         rmSync(join(workersDir, record.id), { recursive: true, force: true });
       },
     },
+    ...(scratch
+      ? [
+          {
+            // The provider CLI keeps a workspace of its own, which nothing used
+            // to remove — so it outlived the actor and stayed readable to every
+            // worker that came after (#3). Deferred for the same reason as the
+            // work directory above: the provider process writes there until the
+            // run ends.
+            name: "provider scratch workdir",
+            deferUntilRunEnd: true,
+            run: (record: ThreadRecord) => {
+              // Every spelling this actor's workspace may carry that no live
+              // actor also answers to: the provider has named this directory
+              // differently over time, and two of the three name an actor only
+              // by its first eight characters. Removing a path that is not
+              // there is a no-op. The registry is read here rather than at
+              // construction because who is live changes between retirements.
+              for (const name of removableWorkspaceNames(record.id, scratch.listActors())) {
+                rmSync(join(scratch.dir, name), { recursive: true, force: true });
+              }
+            },
+          },
+        ]
+      : []),
     {
       name: "cron wake",
       run: (record) => wakeCron.cancel(record.id),
@@ -838,6 +885,40 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const modelScrapesStore = getRepositories().modelScrapes;
   const workersDir = join(mcHome, "workers");
   mkdirSync(workersDir, { recursive: true });
+  // Boot-time sweep of the workspaces of actors that have retired. Retirement
+  // deletes both of an actor's directories, so what survives to here is either a
+  // restart that interrupted that, or a workspace from before the provider's own
+  // scratch area was cleaned at all (#3). Skipped in the test runner alongside
+  // the other boot sweeps.
+  // Who the registry knows and whether they still run, read fresh at every use:
+  // both the boot sweep below and each retirement cleanup decide what to delete
+  // from this, and it changes underneath them.
+  const actorLiveness = (): ActorLiveness[] =>
+    registry.list().map((record) => ({ id: record.id, retired: record.status === "retired" }));
+  if (process.env.NODE_ENV !== "test") {
+    const sweptWorkspaces = sweepOrphanedWorkspaces({
+      workersDir,
+      scratchDir: antigravityScratchDir(),
+      actors: actorLiveness(),
+      log: (message) => console.warn(message),
+    });
+    if (sweptWorkspaces.length > 0) {
+      console.log(`[start] removed ${sweptWorkspaces.length} workspace(s) of retired actors`);
+    }
+    // Checkouts the sweep will never claim, because they name no actor. Naming
+    // them once a boot is what keeps a hand-named directory from holding a
+    // repository in the shared area indefinitely without anyone knowing.
+    const strayCheckouts = unattributedCheckouts({
+      workersDir,
+      scratchDir: antigravityScratchDir(),
+      actors: actorLiveness(),
+    });
+    if (strayCheckouts.length > 0) {
+      console.warn(
+        `[start] ${strayCheckouts.length} checkout(s) in the provider's area name no actor and were left in place: ${strayCheckouts.map((path) => basename(path)).join(", ")}`
+      );
+    }
+  }
   const sharedQuotaStore = config.quota?.databasePath
     ? new SharedQuotaStore(resolveQuotaDatabasePath(config.quota.databasePath, mcHome))
     : null;
@@ -1377,7 +1458,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       return notifyingParent ? deliverable : undefined;
     },
     log: (m) => console.log(`[mesh] ${m}`),
-    retireCleanups: createStartRetireCleanups(workersDir, wakeCron, e2eInstance),
+    retireCleanups: createStartRetireCleanups(workersDir, wakeCron, e2eInstance, {
+      dir: antigravityScratchDir(),
+      listActors: actorLiveness,
+    }),
     // Eagerly generate this actor's avatar on spawn . Strictly
     // fire-and-forget and failure-isolated inside kickAvatarGeneration — a single
     // attempt, no retries, never blocks or affects wake/run/retry. Root is
@@ -1742,20 +1826,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               payload: JSON.stringify({ started } satisfies RunAbandonedPayload),
             }),
           onRunEnd: async (result) => {
-            if (result.boundModel) registry.patch(id, { boundModel: result.boundModel });
             mesh.recordEvent({
               kind: "run_end",
               actorId: id,
               success: result.success,
               detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
               body: result.output,
-              payload:
-                result.graceKilled || result.yieldStatus
-                  ? JSON.stringify({
-                      graceKilled: result.graceKilled,
-                      yieldStatus: result.yieldStatus,
-                    })
-                  : undefined,
+              payload: runEndPayload(result),
             });
             ctx.onRunEnd(result);
             const compacted = await compactPortableActorAfterRun(id);
@@ -1772,7 +1849,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                 failureSink,
                 id,
                 result,
-                formatProviderLabel(actor.getProvider(), result.boundModel)
+                formatProviderLabel(actor.getProvider(), result.model)
               );
             }
           },
@@ -2165,7 +2242,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           payload: JSON.stringify({ started } satisfies RunAbandonedPayload),
         }),
       onRunEnd: async (result) => {
-        if (result.boundModel) registry.patch(rootId, { boundModel: result.boundModel });
         mesh.finishInboxRun(rootId);
         mesh.recordEvent({
           kind: "run_end",
@@ -2173,13 +2249,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           success: result.success,
           detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
           body: result.output,
-          payload:
-            result.graceKilled || result.yieldStatus
-              ? JSON.stringify({
-                  graceKilled: result.graceKilled,
-                  yieldStatus: result.yieldStatus,
-                })
-              : undefined,
+          payload: runEndPayload(result),
         });
         const compacted = await compactPortableActorAfterRun(rootId);
         if (compacted) {
@@ -2195,7 +2265,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             failureSink,
             rootId,
             result,
-            formatProviderLabel(provider, result.boundModel)
+            formatProviderLabel(provider, result.model)
           );
         }
       },
@@ -2390,6 +2460,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     if (NEVER_DELIVERED_EVENT_TYPES.has(`${event}/${action}`)) {
       const summary = `sender=${sender ?? "<unknown>"} repo=${repo}${number != null ? `#${number}` : ""}`;
       console.log(`[webhook] never-delivered event dropped: ${event}/${action} (${summary})`);
+      return;
+    }
+    // Not in the set above, because the set reads a type string and the
+    // deciding field is in the payload: a check suite wakes its owner when it
+    // is red and stays quiet when it is green.
+    if (event === "check_suite" && action === "completed" && !checkSuiteWakesAnyone(payload)) {
+      const summary = `sender=${sender ?? "<unknown>"} repo=${repo}${number != null ? `#${number}` : ""}`;
+      console.log(`[webhook] non-actionable check suite dropped: ${event}/${action} (${summary})`);
       return;
     }
 
@@ -2786,6 +2864,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   let diskAlertCheck: ReturnType<typeof setInterval> | null = null;
   let quotaThrottleCheck: ReturnType<typeof setInterval> | null = null;
   let modelProbeCheck: ReturnType<typeof setInterval> | null = null;
+  // The interval handle says nothing about a probe already in flight, so keep
+  // both a way to stop one (the signal) and a way to wait for it (the promise).
+  const modelProbeAbort = new AbortController();
+  let modelProbeInFlight: Promise<void> | null = null;
   const shutdown = async (reason: "deploy" | null = null) => {
     if (!running) return;
     // Stop the supervised e2e unit before committing this process to shutdown.
@@ -2798,6 +2880,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     if (diskAlertCheck) clearInterval(diskAlertCheck);
     if (quotaThrottleCheck) clearInterval(quotaThrottleCheck);
     if (modelProbeCheck) clearInterval(modelProbeCheck);
+    // Clearing the interval only stops the next probe. Abort reaches the one
+    // running now - it kills the spawned tree synchronously - and awaiting it
+    // is what gives the prober's `finally` a turn to remove its temp dir before
+    // process.exit ends the loop. Without the await the tree still dies, but the
+    // 0-byte socket dir it left behind never gets cleaned up.
+    modelProbeAbort.abort();
+    if (modelProbeInFlight) await modelProbeInFlight;
     if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
     if (trackerHygieneTimer) clearInterval(trackerHygieneTimer);
     mesh.shutdownAll(); // stops the root and any live workers (registry untouched)
@@ -2902,10 +2991,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
   // Probe model catalogs on startup and daily thereafter
   if (running) {
-    void refreshConfiguredProviderModelCatalogs({
+    modelProbeInFlight = refreshConfiguredProviderModelCatalogs({
       config,
       workersDir,
       scrapeStore: modelScrapesStore,
+      signal: modelProbeAbort.signal,
     }).catch((err) => {
       console.error(
         `[start] model catalog probe failed: ${err instanceof Error ? err.message : String(err)}`
@@ -2914,10 +3004,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     modelProbeCheck = setInterval(
       () => {
         if (!running) return;
-        void refreshConfiguredProviderModelCatalogs({
+        modelProbeInFlight = refreshConfiguredProviderModelCatalogs({
           config,
           workersDir,
           scrapeStore: modelScrapesStore,
+          signal: modelProbeAbort.signal,
         }).catch((err) => {
           console.error(
             `[start] scheduled model catalog probe failed: ${err instanceof Error ? err.message : String(err)}`

@@ -888,6 +888,23 @@ class DashboardStore {
     }
   }
 
+  /// The full charter for one actor, fetched on demand.
+  ///
+  /// The thread list only carries a preview, so the detail panel asks for the
+  /// rest when the operator opens an actor. Not cached here: the panel holds
+  /// the result for as long as it shows it, and a charter can be edited, so a
+  /// store-level cache would go stale with nothing to invalidate it.
+  Future<String> fetchCharter(String threadId) async {
+    try {
+      final charter = await _api.fetchCharter(threadId);
+      _error.add(null);
+      return charter;
+    } catch (e) {
+      _error.add('$e');
+      rethrow;
+    }
+  }
+
   /// Interrupt a running or queued actor .
   Future<void> interruptActor(String actorId) async {
     try {
@@ -1013,10 +1030,8 @@ class DashboardStore {
         parentId: null,
         status: 'active',
         provider: null,
-        requestedModel: null,
         model: null,
-        boundModel: null,
-        charter: '',
+        charterPreview: '',
         createdAt: DateTime.now().toIso8601String(),
         runState: next,
       );

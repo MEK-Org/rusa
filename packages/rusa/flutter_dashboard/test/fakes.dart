@@ -17,18 +17,16 @@ ThreadDto makeThread(
   String? lastActiveAt,
   RunState runState = RunState.unknown,
   String? title,
-  String? requestedModel,
-  String? boundModel,
+  String? model,
+  String? charterPreview,
 }) => ThreadDto(
   id: id,
   handle: '$id-handle',
   parentId: parent,
   status: status,
   provider: null,
-  requestedModel: requestedModel,
-  model: boundModel ?? requestedModel,
-  boundModel: boundModel,
-  charter: 'charter $id',
+  model: model,
+  charterPreview: charterPreview ?? 'charter $id',
   title: title ?? 'charter $id',
   createdAt: created,
   lastActiveAt: lastActiveAt,
@@ -142,6 +140,36 @@ class FakeApi extends DashboardApi {
   @override
   Future<List<String>> fetchRootControlProviders() async =>
       rootControlProviders;
+
+  /// Full charters the detail panel can pull, keyed by thread id. Absent means
+  /// the server had nothing to add beyond the preview — which is what the real
+  /// route answers for a short charter, and is why the fallback below is the
+  /// preview rather than empty: the route reads the same field the list clipped,
+  /// so it cannot answer with less than the list already carried.
+  final charters = <String, String>{};
+  final charterCalls = <String>[];
+  Object? charterError;
+
+  /// When non-empty, each fetchCharter takes the next of these instead of
+  /// answering at once — lets a test hold two fetches open and resolve them in
+  /// whichever order it likes.
+  final charterGates = <Completer<String>>[];
+
+  @override
+  Future<String> fetchCharter(String threadId) async {
+    charterCalls.add(threadId);
+    final err = charterError;
+    if (err != null) throw err;
+    if (charterGates.isNotEmpty) return charterGates.removeAt(0).future;
+    return charters[threadId] ?? _previewOf(threadId);
+  }
+
+  String _previewOf(String threadId) {
+    for (final thread in threadsResult) {
+      if (thread.id == threadId) return thread.charterPreview;
+    }
+    return '';
+  }
 
   @override
   Future<String> spawnRootChild({
@@ -357,13 +385,33 @@ class FakeApi extends DashboardApi {
   // ── Inbox routes ──
   Map<String, dynamic> inboxResult = {'entries': []};
 
+  /// Per-status pages, so a test can hold an outstanding entry and a resolved
+  /// one apart. Falls back to [inboxResult] for any status not set here.
+  final Map<String, Map<String, dynamic>> inboxResultsByStatus = {};
+
+  final markInboxHandledCalls =
+      <({String actorId, String entryId, String? reason})>[];
+  Object? markInboxHandledError;
+
   @override
   Future<Map<String, dynamic>> fetchInbox(
     String actorId, {
     String status = 'all',
     int limit = 20,
   }) async {
-    return inboxResult;
+    return inboxResultsByStatus[status] ?? inboxResult;
+  }
+
+  @override
+  Future<void> markInboxHandled(
+    String actorId,
+    String entryId, {
+    String? reason,
+  }) async {
+    markInboxHandledCalls
+        .add((actorId: actorId, entryId: entryId, reason: reason));
+    final err = markInboxHandledError;
+    if (err != null) throw err;
   }
 
   // ── Obligations routes ──

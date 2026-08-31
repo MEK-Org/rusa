@@ -33,6 +33,18 @@ class DashboardApi {
     return ThreadsSnapshot.fromJson(await _getJson(_u('/api/mesh/threads')));
   }
 
+  /// `GET /api/mesh/threads/charter` → one actor's full charter.
+  ///
+  /// The thread list carries only a clipped preview, since it is the same field
+  /// for every actor on every poll. The whole text is fetched here, for the one
+  /// actor whose detail panel is open.
+  Future<String> fetchCharter(String threadId) async {
+    final json = await _getJson(
+      _u('/api/mesh/threads/charter', {'id': threadId}),
+    );
+    return json['charter'] as String? ?? '';
+  }
+
   Future<List<String>> fetchRootControlProviders() async {
     final json = await _getJson(_u('/api/mesh/control/options'));
     return (json['providers'] as List<dynamic>? ?? const [])
@@ -148,6 +160,28 @@ class DashboardApi {
         'status': status,
         'limit': '$limit',
       }));
+
+  /// `POST /api/mesh/actors/:actorId/inbox/handled` — clear one inbox entry
+  /// the actor should not have to answer. `reason` is the operator's own
+  /// words; the server always records who cleared it, reason or not.
+  Future<void> markInboxHandled(
+    String actorId,
+    String entryId, {
+    String? reason,
+  }) async {
+    final uri = _u('/api/mesh/actors/$actorId/inbox/handled');
+    final res = await _client.post(
+      uri,
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({'entryId': entryId, 'reason': ?reason}),
+    );
+    if (res.statusCode != 200) {
+      throw DashboardApiException(uri, res.statusCode, res.body);
+    }
+  }
 
   /// `POST /api/mesh/actors/:actorId/chat` — send a chat message to an actor.
   Future<void> sendChatMessage(

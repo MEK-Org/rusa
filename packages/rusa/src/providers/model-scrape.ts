@@ -25,7 +25,8 @@ export interface ModelProbeOptions {
 export function buildCodexModelTmuxScript(
   cliCommand: string,
   sockPath: string,
-  trustArg = ""
+  trustArg: string,
+  deadlineSeconds: number
 ): string {
   const q = JSON.stringify;
   return [
@@ -33,7 +34,20 @@ export function buildCodexModelTmuxScript(
     `SOCK=${q(sockPath)}`,
     "S=probe",
     'tmux -S "$SOCK" kill-server 2>/dev/null || true',
-    `tmux -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 ${q(cliCommand)}${trustArg ? ` ${trustArg}` : ""}`,
+    // Bound the session's own command so the probe tree cannot outlive the
+    // probe. Every other reaping path can be cut: the tmux server runs in its
+    // own session, so a process-group kill never reaches it, and its socket
+    // lives under a temp dir this probe deletes on the way out - once that dir
+    // is gone `kill-server` can never reach the server again. When the command
+    // exits the session ends, and tmux's default exit-empty shuts the server
+    // down, needing neither this process, nor the wrapper shell, nor the socket.
+    // The 5s --kill-after grace covers a CLI that ignores the initial TERM.
+    // -f /dev/null starts the server on stock settings: that self-reaping turns
+    // on tmux's exit-empty, which a stray `set -s exit-empty off` in a user or
+    // system tmux.conf would otherwise disable, stranding an empty server for
+    // good. It also keeps someone's status bar or key bindings out of the pane
+    // text this probe greps.
+    `tmux -f /dev/null -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 timeout --kill-after=5 ${deadlineSeconds} ${q(cliCommand)}${trustArg ? ` ${trustArg}` : ""}`,
     // Wait up to ~20s for the composer prompt to become ready (not just the banner).
     "ready=0",
     "for i in $(seq 1 40); do",
@@ -171,7 +185,20 @@ export async function scrapeCodexModelScreen(opts: ModelProbeOptions): Promise<s
   const sock = join(tempHome, "model-tmux.sock");
   const q = JSON.stringify;
   const trustArg = `-c projects.${q(opts.actorDir)}.trust_level="trusted"`;
-  const script = buildCodexModelTmuxScript(cliCommand, sock, trustArg);
+  // The caller's timeout is the probe's declared lifetime, so it is also the
+  // deadline for anything the probe spawns; no separate knob to drift. The
+  // extra second is what keeps this a pure backstop: the child is spawned
+  // before the Node-side timer is armed, and a busy event loop can delay that
+  // timer further, so an exactly-equal inner deadline could fire first and cut
+  // short a probe the Node side would have let finish. One second of grace is
+  // far more than the spawn-plus-scheduling skew, so the Node deadline wins by
+  // construction, and an abandoned tree still self-reaps a second later.
+  const script = buildCodexModelTmuxScript(
+    cliCommand,
+    sock,
+    trustArg,
+    Math.ceil(timeoutMs / 1000) + 1
+  );
 
   const killTmux = () => {
     try {
@@ -272,6 +299,23 @@ function logFailedRefresh(provider: string, message: string, scrapeStore?: Model
 }
 
 /**
+ * The result of a probe the OWNER cancelled — never logged.
+ *
+ * Shared by the pre-entry guard and both in-flight catches so the two cannot drift: a
+ * shutdown that lands before the probe starts and one that lands mid-probe are the same
+ * event, and a caller must not be able to tell them apart by the noise they make. An
+ * aborted probe is the owner's own decision, not a provider failure, so routing it
+ * through `logFailedRefresh` would print an error line per configured provider on every
+ * restart and write a failure into the scrape store for a provider that was working.
+ *
+ * A fresh object each call: `entries` is handed to callers, and one shared array would
+ * let a mutation by one of them alter what the next one sees.
+ */
+function abortedProbeResult(): ModelCatalogExtraction {
+  return { status: "unknown", entries: [], message: "model probe aborted" };
+}
+
+/**
  * Probe a single provider's available models and persist the scrape.
  */
 export async function refreshProviderModelCatalog(opts: {
@@ -279,13 +323,30 @@ export async function refreshProviderModelCatalog(opts: {
   workersDir: string;
   scrapeStore?: ModelScrapeStore;
   geminiApiKey?: string;
+  /**
+   * Aborts the probe. The leaf probers already honour a signal; this is the
+   * hop that was dropping it, so an owner shutting down could not reach them.
+   */
+  signal?: AbortSignal;
   probers?: {
     scrapeCodex?: (opts: ModelProbeOptions) => Promise<string>;
     scrapeAgy?: (opts: ModelProbeOptions) => Promise<string>;
   };
 }): Promise<ModelCatalogExtraction> {
-  const { provider, workersDir, scrapeStore, geminiApiKey, probers } = opts;
+  const { provider, workersDir, scrapeStore, geminiApiKey, signal, probers } = opts;
   const actorDir = join(workersDir, `model-probe-${provider}`);
+
+  // Don't start a probe for an owner that has already stopped. Today every
+  // provider's probe is launched in the same tick as the caller's Promise.all,
+  // so an abort cannot land between this check and the leaf attaching its abort
+  // listener - but that is an implicit property of the current call shape, and
+  // without this guard the whole design rests on it silently. Returning quietly
+  // rather than through logFailedRefresh: an aborted probe is the owner's own
+  // decision, not a provider failure, so a restart should not print an error
+  // line per provider it never reached.
+  if (signal?.aborted) {
+    return abortedProbeResult();
+  }
 
   if (provider === "kimi") {
     const entries = ingestKimiHostModels({ scrapeStore });
@@ -299,8 +360,11 @@ export async function refreshProviderModelCatalog(opts: {
 
   if (provider === "agy" || provider === "antigravity") {
     try {
-      const probe = probers?.scrapeAgy ?? (() => scrapeAgyModels({}));
-      const rawOutput = await probe({ actorDir });
+      // scrapeAgyModels takes its own option shape and ignores actorDir, so pass
+      // only the signal rather than relying on structural compatibility.
+      const probe =
+        probers?.scrapeAgy ?? ((o: ModelProbeOptions) => scrapeAgyModels({ signal: o.signal }));
+      const rawOutput = await probe({ actorDir, signal });
       const entries = parseAgyModelsOutput(rawOutput);
 
       const scrapedAt = new Date().toISOString();
@@ -326,6 +390,13 @@ export async function refreshProviderModelCatalog(opts: {
       logFailedRefresh(provider, message, scrapeStore);
       return { status: "unknown", entries: [], message };
     } catch (err) {
+      // The abort we asked for, arriving as a rejection. `scrapeAgyModels` rejects with
+      // `agy models aborted` when the owner's signal fires mid-probe, and that is the
+      // case this whole seam exists to serve - so it must not come back out as a
+      // provider failure. Checked on the signal rather than on the error's shape: the
+      // message is the leaf's to word, and matching on it would make this silently stop
+      // working the day that string changes.
+      if (signal?.aborted) return abortedProbeResult();
       const message = `agy models probe failed: ${err instanceof Error ? err.message : String(err)}`;
       logFailedRefresh(provider, message, scrapeStore);
       return { status: "unknown", entries: [], message };
@@ -336,7 +407,7 @@ export async function refreshProviderModelCatalog(opts: {
   try {
     if (provider === "codex") {
       const probe = probers?.scrapeCodex ?? scrapeCodexModelScreen;
-      rawOutput = await probe({ actorDir });
+      rawOutput = await probe({ actorDir, signal });
     } else {
       const message = `no probe implemented for provider "${provider}"`;
       logFailedRefresh(provider, message, scrapeStore);
@@ -347,6 +418,10 @@ export async function refreshProviderModelCatalog(opts: {
       };
     }
   } catch (err) {
+    // Same owner-initiated abort as the agy path above, and deliberately the same
+    // branch: two probers whose abort semantics diverge would mean a restart is quiet
+    // or noisy depending on which providers happen to be configured.
+    if (signal?.aborted) return abortedProbeResult();
     const message = `model probe failed for provider "${provider}": ${err instanceof Error ? err.message : String(err)}`;
     logFailedRefresh(provider, message, scrapeStore);
     return {
@@ -379,6 +454,8 @@ export async function refreshConfiguredProviderModelCatalogs(deps: {
   config: RusaConfig;
   workersDir: string;
   scrapeStore?: ModelScrapeStore;
+  /** Aborts every probe this call starts. See `refreshProviderModelCatalog`. */
+  signal?: AbortSignal;
   probers?: {
     scrapeCodex?: (opts: ModelProbeOptions) => Promise<string>;
     scrapeAgy?: (opts: ModelProbeOptions) => Promise<string>;
@@ -395,6 +472,7 @@ export async function refreshConfiguredProviderModelCatalogs(deps: {
           workersDir: deps.workersDir,
           scrapeStore: deps.scrapeStore,
           geminiApiKey: deps.config.geminiApiKey,
+          signal: deps.signal,
           probers: deps.probers,
         });
       } catch (err) {

@@ -150,7 +150,11 @@ class _DetailPanelState extends State<DetailPanel>
                         ConversationTab(store: widget.store),
                         EventsTab(store: widget.store),
                         LiveOutputTab(store: widget.store),
-                        _InfoView(actor: actor!, parentHandle: parentHandle),
+                        _InfoView(
+                          actor: actor!,
+                          parentHandle: parentHandle,
+                          store: widget.store,
+                        ),
                         InboxTab(actorId: actor.id, store: widget.store, onSelectView: widget.onSelectView),
                       ]
                     : [
@@ -160,7 +164,11 @@ class _DetailPanelState extends State<DetailPanel>
                         ),
                         EventsTab(store: widget.store),
                         LiveOutputTab(store: widget.store),
-                        _InfoView(actor: actor!, parentHandle: parentHandle),
+                        _InfoView(
+                          actor: actor!,
+                          parentHandle: parentHandle,
+                          store: widget.store,
+                        ),
                         InboxTab(actorId: actor.id, store: widget.store, onSelectView: widget.onSelectView),
                       ],
               ),
@@ -359,7 +367,6 @@ class _DetailPanelState extends State<DetailPanel>
                     ),
                   ),
                   _statusBadge(a),
-                  if (a.modelDiverged) _modelDivergenceBadge(),
                   if (!a.isRetired) ..._quickActions(a),
                 ],
               ),
@@ -501,25 +508,6 @@ class _DetailPanelState extends State<DetailPanel>
     );
   }
 
-  Widget _modelDivergenceBadge() => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-    decoration: BoxDecoration(
-      color: MeshColors.statusHalted.withValues(alpha: 0.14),
-      borderRadius: BorderRadius.circular(4),
-      border: Border.all(
-        color: MeshColors.statusHalted.withValues(alpha: 0.65),
-      ),
-    ),
-    child: const Text(
-      'MODEL DIVERGED',
-      style: TextStyle(
-        color: MeshColors.statusHalted,
-        fontSize: 11,
-        fontWeight: FontWeight.w800,
-      ),
-    ),
-  );
-
   Widget _tabBar(bool isConversationMode) => StreamBuilder<List<Object?>>(
     stream: Rx.combineLatestList<Object?>([
       widget.store.events,
@@ -595,11 +583,97 @@ class _DetailPanelState extends State<DetailPanel>
 
 /// The actor's Info tab: contains metadata like work-states and the full (possibly very long)
 /// charter text in a scrollable, selectable view.
-class _InfoView extends StatelessWidget {
-  const _InfoView({required this.actor, required this.parentHandle});
+///
+/// The thread list only carries a clipped preview of the charter, because it is
+/// the same field for every actor on every poll. This is the one place the whole
+/// text is shown, so this is the one place that asks for it — the preview renders
+/// immediately and is replaced in place when the fetch lands.
+class _InfoView extends StatefulWidget {
+  const _InfoView({
+    required this.actor,
+    required this.parentHandle,
+    required this.store,
+  });
 
   final ThreadDto actor;
   final String parentHandle;
+  final DashboardStore store;
+
+  @override
+  State<_InfoView> createState() => _InfoViewState();
+}
+
+class _InfoViewState extends State<_InfoView> {
+  /// The full charter once it arrives. Null means "still the preview".
+  String? _charter;
+
+  /// The actor the charter on screen was fetched for. Set while a fetch is in
+  /// flight and kept if it succeeds; a failure clears it.
+  ///
+  /// The id, and not the charter's content, is deliberately the whole identity
+  /// here: an open panel holds the text it fetched when it opened. A charter
+  /// *can* change under it — `setThreadCharter` re-scopes a long-lived actor —
+  /// and until this panel is closed and reopened it will keep showing the text
+  /// from when it opened. That is a real, accepted narrowing: before the charter
+  /// moved off the list it rode every poll, so an edit reached an open panel on
+  /// its own. Keying on `charterPreview` would appear to restore that but would
+  /// only ever catch edits inside the leading `CHARTER_PREVIEW_CHARS`; an edit
+  /// past the clip leaves the preview byte-identical and the panel silently
+  /// stale, which is worse than not claiming the behaviour at all. If tracking
+  /// live edits is ever actually wanted, the honest trigger already exists and
+  /// is not a poll diff: `setThreadCharter` records an `actor_charter_set` mesh
+  /// event, which this panel could listen for.
+  String? _loadedFor;
+
+  /// Which fetch is the current one. Two fetches for the *same* actor can be in
+  /// flight at once — select A, select B, select A again — and they need not
+  /// come back in the order they were sent, so the id cannot tell them apart.
+  int _fetch = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadCharter();
+  }
+
+  @override
+  void didUpdateWidget(_InfoView old) {
+    super.didUpdateWidget(old);
+    // Ask on every rebuild and let `_loadedFor` decide, so both reasons to
+    // re-fetch are one condition: a new actor (the tab is reused across
+    // selections, so otherwise the panel shows the previous actor's charter
+    // under a new handle), and a fetch that failed.
+    _loadCharter();
+  }
+
+  Future<void> _loadCharter() async {
+    final id = widget.actor.id;
+    if (_loadedFor == id) return;
+    _loadedFor = id;
+    final fetch = ++_fetch;
+    setState(() => _charter = null);
+    try {
+      final charter = await widget.store.fetchCharter(id);
+      // Anything sent since this supersedes it, whichever actor it was asking
+      // for: another actor selected, or a second look at the same one after a
+      // failure. Only the newest answer is allowed to land.
+      if (!mounted || fetch != _fetch) return;
+      setState(() => _charter = charter);
+    } catch (_) {
+      // The preview stays on screen and the store has already surfaced the
+      // error — but release the id, so the next poll retries rather than
+      // pinning the panel to the preview for as long as this actor is selected.
+      if (fetch == _fetch) _loadedFor = null;
+    }
+  }
+
+  ThreadDto get actor => widget.actor;
+  String get parentHandle => widget.parentHandle;
+
+  /// The preview until the full charter lands, and after that the full charter.
+  /// Falling back to the preview rather than to empty means a failed or slow
+  /// fetch degrades to less text, not to "No charter."
+  String get charter => _charter ?? widget.actor.charterPreview;
 
   Widget _meta(String label, String value) => RichText(
     text: TextSpan(
@@ -632,9 +706,7 @@ class _InfoView extends StatelessWidget {
             children: [
               _meta('Parent', parentHandle),
               if (actor.provider != null) _meta('Provider', actor.provider!),
-              if (actor.model != null) _meta('Bound model', actor.model!),
-              if (actor.requestedModel != null)
-                _meta('Requested', actor.requestedModel!),
+              if (actor.model != null) _meta('Model', actor.model!),
               if (actor.commitmentKind != null)
                 _meta('Work state', actor.commitmentKind!),
               if (actor.waitingOn != null)
@@ -653,13 +725,13 @@ class _InfoView extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 12),
-          actor.charter.isEmpty
+          charter.isEmpty
               ? const Text(
                   'No charter.',
                   style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
                 )
               : SelectableText(
-                  actor.charter,
+                  charter,
                   style: const TextStyle(
                     color: MeshColors.textSecondary,
                     fontSize: 13,

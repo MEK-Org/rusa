@@ -30,11 +30,11 @@ describe("ObligationRepository", () => {
     });
     const humanOwned = repository.create({
       id: "human-work",
-      owner: { kind: "human", id: "matt" },
+      owner: { kind: "human", id: "human:operator" },
     });
 
     expect(actorOwned.owner).toEqual({ kind: "actor", id: "actor-a" });
-    expect(humanOwned.owner).toEqual({ kind: "human", id: "matt" });
+    expect(humanOwned.owner).toEqual({ kind: "human", id: "human:operator" });
     expect(() =>
       repository.create({ id: "missing-actor", owner: { kind: "actor", id: "unknown" } })
     ).toThrow("actor owner does not exist");
@@ -551,12 +551,12 @@ describe("ObligationRepository", () => {
       });
 
       const before = repository.require("parent");
-      const humanOwned = repository.reassign("parent", { kind: "human", id: "Matt" });
-      expect(humanOwned).toEqual({ ...before, owner: { kind: "human", id: "Matt" } });
+      const humanOwned = repository.reassign("parent", { kind: "human", id: "human:operator" });
+      expect(humanOwned).toEqual({ ...before, owner: { kind: "human", id: "human:operator" } });
       expect(repository.listOwned({ kind: "actor", id: "actor-a" })).toEqual([]);
-      expect(repository.listOwned({ kind: "human", id: "Matt" }).map((o) => o.id)).toEqual([
-        "parent",
-      ]);
+      expect(
+        repository.listOwned({ kind: "human", id: "human:operator" }).map((o) => o.id)
+      ).toEqual(["parent"]);
 
       const actorOwned = repository.reassign("parent", { kind: "actor", id: "actor-c" });
       expect(actorOwned).toEqual({ ...before, owner: { kind: "actor", id: "actor-c" } });
@@ -570,7 +570,7 @@ describe("ObligationRepository", () => {
         "actor owner does not exist"
       );
       repository.setTerminalStatus("task", "done");
-      expect(() => repository.reassign("task", { kind: "human", id: "Matt" })).toThrow(
+      expect(() => repository.reassign("task", { kind: "human", id: "human:operator" })).toThrow(
         "terminal obligations cannot be reassigned"
       );
     });

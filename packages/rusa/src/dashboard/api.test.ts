@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { brotliDecompressSync, gunzipSync } from "node:zlib";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorMesh } from "../actor/actor-mesh.js";
@@ -27,12 +28,14 @@ class MockReq extends EventEmitter {
 }
 
 class MockRes extends EventEmitter {
-  req = new EventEmitter();
+  req: EventEmitter & { headers?: Record<string, string> } = new EventEmitter();
   statusCode = 0;
   headers: Record<string, string> = {};
   body = "";
   writes: string[] = [];
   ended = false;
+  /** Unstringified, so a compressed body survives for round-tripping. */
+  raw: Buffer | undefined;
 
   writeHead(status: number, headers?: Record<string, string>): this {
     this.statusCode = status;
@@ -43,9 +46,16 @@ class MockRes extends EventEmitter {
     this.writes.push(chunk);
     return true;
   }
-  end(body?: string): this {
-    if (body) this.body += body;
+  end(body?: string | Buffer): this {
+    if (body) {
+      this.raw = Buffer.isBuffer(body) ? body : Buffer.from(body);
+      this.body += body;
+    }
     this.ended = true;
+    // A real ServerResponse emits this; without it a caller awaiting a
+    // response that lands off the threadpool has nothing to wait on but the
+    // clock. See `settled`.
+    this.emit("finish");
     return this;
   }
 }
@@ -54,12 +64,16 @@ function call(
   deps: DashboardDataDeps | null,
   method: string,
   path: string,
-  body?: string
+  body?: string,
+  acceptEncoding?: string
 ): { handled: boolean; res: MockRes; req: MockReq } {
   const req = new MockReq();
   req.method = method;
   req.url = path;
   const res = new MockRes();
+  // Production reads the header off `res.req`; mirror that wiring rather than
+  // adding a second path into sendJson that only tests would use.
+  if (acceptEncoding !== undefined) res.req.headers = { "accept-encoding": acceptEncoding };
   const url = new URL(path, "http://localhost");
   const handled = handleMeshApiRequest(
     req as unknown as IncomingMessage,
@@ -284,6 +298,190 @@ describe("handleMeshApiRequest", () => {
     deps.rootControl = control;
   });
 
+  describe("response compression", () => {
+    /** Enough threads that the JSON clears MIN_COMPRESS_BYTES several times over. */
+    const seedBulk = (): void => {
+      registry.upsert(rec("root", null, "active"));
+      for (let i = 0; i < 60; i++) {
+        const id = `cccccccc-0000-4000-8000-${String(i).padStart(12, "0")}`;
+        registry.upsert({
+          id,
+          charter: `charter ${id} `.repeat(40),
+          parentId: "root",
+          status: "active",
+          createdAt: "2026-06-21T00:00:00.000Z",
+        });
+      }
+    };
+
+    /**
+     * Wait for the response itself, not for a number of event-loop turns.
+     *
+     * Compression resolves on the threadpool, so the response lands after the
+     * handler returns. Spinning a fixed count of `setImmediate`s to cover that
+     * is not a timeout — the turns drain in well under a millisecond, while
+     * zlib takes tens of them on a loaded box. That budget held locally and
+     * ran out on CI, where it read as `Content-Encoding: undefined` and looked
+     * like a negotiation bug rather than a test that stopped waiting.
+     */
+    const settled = (res: MockRes): Promise<void> =>
+      res.ended ? Promise.resolve() : new Promise((resolve) => res.once("finish", () => resolve()));
+
+    it("compresses a large body with brotli, preferring it over gzip", async () => {
+      seedBulk();
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "gzip, deflate, br");
+      await settled(res);
+
+      expect(res.statusCode).toBe(200);
+      expect(res.headers["Content-Encoding"]).toBe("br");
+      expect(res.raw).toBeDefined();
+      // The bytes are really brotli, and really the same document.
+      const decoded = brotliDecompressSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+      expect((res.raw as Buffer).byteLength).toBeLessThan(Buffer.byteLength(decoded));
+    });
+
+    it("falls back to gzip for a client that does not speak brotli", async () => {
+      seedBulk();
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "gzip, deflate");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBe("gzip");
+      const decoded = gunzipSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+    });
+
+    it("sends a large body uncompressed when the client accepts nothing", async () => {
+      seedBulk();
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "identity");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBeUndefined();
+      expect(JSON.parse(res.body).threads).toHaveLength(61);
+    });
+
+    it("leaves a small body alone even when the client would take brotli", async () => {
+      registry.upsert(rec("root", null, "active"));
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "br");
+      await settled(res);
+
+      // Below the threshold a round trip through the threadpool buys nothing.
+      expect(res.headers["Content-Encoding"]).toBeUndefined();
+      expect(JSON.parse(res.body).threads).toHaveLength(1);
+    });
+
+    it("always varies on Accept-Encoding, including when it did not compress", async () => {
+      registry.upsert(rec("root", null, "active"));
+      const { res } = call(deps, "GET", "/api/mesh/threads");
+      await settled(res);
+
+      // A cache that missed this header could hand a br body to a client that
+      // never asked for one.
+      expect(res.headers.Vary).toBe("Accept-Encoding");
+    });
+
+    it("honours a codec the client explicitly refused with q=0", async () => {
+      seedBulk();
+      // The case a substring test gets exactly backwards: this header offers
+      // gzip and *forbids* brotli, and reading it as "mentions br" ships a
+      // body the client said it cannot accept.
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "br;q=0, gzip");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBe("gzip");
+      const decoded = gunzipSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+    });
+
+    it("sends identity when every codec it can produce is refused", async () => {
+      seedBulk();
+      const { res } = call(
+        deps,
+        "GET",
+        "/api/mesh/threads",
+        undefined,
+        "br;q=0, gzip;q=0.0, *;q=0"
+      );
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBeUndefined();
+      expect(JSON.parse(res.body).threads).toHaveLength(61);
+    });
+
+    it("does not read a codec name out of a longer token", async () => {
+      seedBulk();
+      // `xbr` and `gzipped` are not offers of `br` and `gzip`.
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "xbr, gzipped");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBeUndefined();
+      expect(JSON.parse(res.body).threads).toHaveLength(61);
+    });
+
+    it("takes the wildcard as permission for a codec the client did not name", async () => {
+      seedBulk();
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "*");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBe("br");
+      const decoded = brotliDecompressSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+    });
+
+    it("lets an explicit refusal beat a permissive wildcard", async () => {
+      seedBulk();
+      // `*` allows everything unnamed; `br;q=0` names brotli to refuse it.
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "*, br;q=0");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBe("gzip");
+      const decoded = gunzipSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+    });
+
+    it("keeps a codec whose q is merely low, or unreadable", async () => {
+      seedBulk();
+      // Only an explicit zero disqualifies. A low q is still a yes, and a
+      // malformed one falls back to the spec's default of 1 rather than
+      // silently costing the client its compression.
+      const { res } = call(
+        deps,
+        "GET",
+        "/api/mesh/threads",
+        undefined,
+        "br;q=0.01, gzip;q=nonsense"
+      );
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBe("br");
+      const decoded = brotliDecompressSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+    });
+
+    it("reads tokens through whitespace and case the way clients send them", async () => {
+      seedBulk();
+      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "  GZIP ;  Q=1.0 ");
+      await settled(res);
+
+      expect(res.headers["Content-Encoding"]).toBe("gzip");
+      const decoded = gunzipSync(res.raw as Buffer).toString("utf-8");
+      expect(JSON.parse(decoded).threads).toHaveLength(61);
+    });
+
+    it("does not compress when no request is reachable from the response", async () => {
+      seedBulk();
+      // MockRes's default `req` carries no headers at all — the shape an
+      // embedder's double can have. Negotiation must read that as "no
+      // encoding offered" rather than throwing.
+      const { res } = call(deps, "GET", "/api/mesh/threads");
+      await settled(res);
+
+      expect(res.statusCode).toBe(200);
+      expect(res.headers["Content-Encoding"]).toBeUndefined();
+      expect(JSON.parse(res.body).threads).toHaveLength(61);
+    });
+  });
+
   it("GET /api/mesh/threads lists threads with deterministic handles", () => {
     registry.upsert(rec("root", null, "active"));
     registry.upsert(rec(UUID_A, "root", "active"));
@@ -298,22 +496,31 @@ describe("handleMeshApiRequest", () => {
     expect(threads.find((t: { id: string }) => t.id === UUID_B).status).toBe("retired");
   });
 
-  it("GET /api/mesh/threads surfaces requested and bound models for divergence display", () => {
+  it("GET /api/mesh/threads surfaces one model and does not leak a stale bound-model readback", () => {
+    // A registry record that still carries the removed `boundModel` key. The cast is the
+    // point, not a workaround: the field is gone from `ThreadRecord`, but the registry is
+    // a JSON file loaded with a cast and rewritten whole, so every record written before
+    // this change still carries the key on disk. This is that record.
+    //
+    // It is the shape that produced the old "MODEL DIVERGED" badge — an actor moved off
+    // codex, its codex readback outliving the move because nothing ever cleared it. The
+    // API must publish the configured model, prefer nothing to it, and expose nothing to
+    // compare it against.
     registry.upsert({
       ...rec(UUID_A, "root", "active"),
       provider: "codex",
       model: "gpt-5-codex",
       boundModel: "gpt-5.5",
-    });
+    } as ThreadRecord);
 
     const { res } = call(deps, "GET", "/api/mesh/threads");
     expect(res.statusCode).toBe(200);
     const { threads } = JSON.parse(res.body);
     const actor = threads.find((t: { id: string }) => t.id === UUID_A);
     expect(actor.provider).toBe("codex");
-    expect(actor.requestedModel).toBe("gpt-5-codex");
-    expect(actor.boundModel).toBe("gpt-5.5");
-    expect(actor.model).toBe("gpt-5.5");
+    expect(actor.model).toBe("gpt-5-codex");
+    expect(actor.requestedModel).toBeUndefined();
+    expect(actor.boundModel).toBeUndefined();
   });
 
   it("GET /api/mesh/threads shows the default root handle when no identity is configured", () => {
@@ -376,6 +583,97 @@ describe("handleMeshApiRequest", () => {
 
     expect(root.title).toBe("root charter");
     expect(child.title).toBe("Custom Title");
+  });
+
+  it("GET /api/mesh/threads sends a clipped charter preview, not the whole charter", () => {
+    // A charter well past the preview budget, with a distinctive tail so the
+    // assertion is about the bytes on the wire rather than about a length.
+    const long = `${"pursue the objective. ".repeat(60)}TAIL-MARKER`;
+    registry.upsert({
+      id: UUID_A,
+      charter: long,
+      parentId: null,
+      status: "active",
+      createdAt: "2026-06-21T00:00:00.000Z",
+    });
+
+    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { threads } = JSON.parse(res.body);
+    const dto = threads.find((t: { id: string }) => t.id === UUID_A);
+
+    expect(dto.charter).toBeUndefined();
+    expect(dto.charterPreview.startsWith("pursue the objective.")).toBe(true);
+    expect(dto.charterPreview.endsWith("\u2026")).toBe(true);
+    expect(dto.charterPreview.length).toBeLessThanOrEqual(281);
+    // The point of the change: the tail never reaches the client on this route.
+    expect(res.body.includes("TAIL-MARKER")).toBe(false);
+  });
+
+  it("GET /api/mesh/threads leaves a charter inside the budget exactly as it is", () => {
+    registry.upsert({
+      id: UUID_A,
+      charter: "short charter\nline 2",
+      parentId: null,
+      status: "active",
+      createdAt: "2026-06-21T00:00:00.000Z",
+    });
+
+    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { threads } = JSON.parse(res.body);
+    const dto = threads.find((t: { id: string }) => t.id === UUID_A);
+
+    // No ellipsis, no trimming: a charter that fits is not a truncated one, and
+    // the detail panel must not be told to go fetch a longer version.
+    expect(dto.charterPreview).toBe("short charter\nline 2");
+  });
+
+  it("GET /api/mesh/threads clips a charter on a character, not a code unit", () => {
+    // Emoji are two UTF-16 code units each, so a code-unit slice at 280 lands
+    // inside the 140th one and ends the excerpt on half a character.
+    registry.upsert({
+      id: UUID_A,
+      charter: "\u{1F9ED}".repeat(400),
+      parentId: null,
+      status: "active",
+      createdAt: "2026-06-21T00:00:00.000Z",
+    });
+
+    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { threads } = JSON.parse(res.body);
+    const dto = threads.find((t: { id: string }) => t.id === UUID_A);
+
+    // 280 characters plus the ellipsis, the same budget the test above asserts.
+    expect([...dto.charterPreview]).toHaveLength(281);
+    expect(dto.charterPreview.endsWith("\u{1F9ED}\u2026")).toBe(true);
+    // No lone surrogate: re-encoding is lossless only if every pair survived.
+    expect(Buffer.from(dto.charterPreview, "utf8").toString("utf8")).toBe(dto.charterPreview);
+  });
+
+  it("GET /api/mesh/threads/charter serves the one actor's full charter", () => {
+    const long = `${"pursue the objective. ".repeat(60)}TAIL-MARKER`;
+    registry.upsert({
+      id: UUID_A,
+      charter: long,
+      parentId: null,
+      status: "active",
+      createdAt: "2026-06-21T00:00:00.000Z",
+    });
+
+    const { res } = call(deps, "GET", `/api/mesh/threads/charter?id=${UUID_A}`);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ id: UUID_A, charter: long });
+  });
+
+  it("GET /api/mesh/threads/charter 404s for an unknown or missing id", () => {
+    registry.upsert(rec(UUID_A, null, "active"));
+
+    const unknown = call(deps, "GET", "/api/mesh/threads/charter?id=nope").res;
+    expect(unknown.statusCode).toBe(404);
+    expect(JSON.parse(unknown.body)).toEqual({ error: "thread not found" });
+
+    // No `id` at all must not fall through to the list route below it.
+    const missing = call(deps, "GET", "/api/mesh/threads/charter").res;
+    expect(missing.statusCode).toBe(404);
   });
 
   it("GET /api/mesh/threads reports halted:false and every thread idle by default", () => {
@@ -595,6 +893,95 @@ describe("handleMeshApiRequest", () => {
       content: "Please review the dashboard Inbox tab.",
     });
     expect(JSON.stringify(entry)).not.toContain(messageId);
+  });
+
+  describe("POST /api/mesh/actors/:id/inbox/handled", () => {
+    const post = async (actorId: string, body: unknown) => {
+      const { res } = call(
+        deps,
+        "POST",
+        `/api/mesh/actors/${actorId}/inbox/handled`,
+        JSON.stringify(body)
+      );
+      await new Promise((resolve) => process.nextTick(resolve));
+      await new Promise((resolve) => process.nextTick(resolve));
+      return res;
+    };
+
+    const appendEntry = (id: string, actorId = UUID_A) => {
+      inbox.append([{ id, actorId, source: "mesh:root", payload: { type: "mesh.message" } }]);
+    };
+
+    it("clears the entry and stops it counting against the actor", async () => {
+      appendEntry("stale-entry");
+      expect(inbox.countUnhandled(UUID_A)).toBe(1);
+
+      const res = await post(UUID_A, { entryId: "stale-entry", reason: "run cancelled by hand" });
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toMatchObject({ ok: true, alreadyHandled: false });
+      // The point of the feature: the actor is no longer queued for it.
+      expect(inbox.countUnhandled(UUID_A)).toBe(0);
+      expect(inbox.actorsWithUnhandled().map((a) => a.actorId)).not.toContain(UUID_A);
+    });
+
+    it("names the operator in the note, with and without a reason", async () => {
+      appendEntry("with-reason");
+      appendEntry("without-reason");
+
+      await post(UUID_A, { entryId: "with-reason", reason: "prod sent this to staging" });
+      await post(UUID_A, { entryId: "without-reason" });
+
+      const notes = inbox
+        .list(UUID_A, { status: "handled" })
+        .entries.map((entry) => entry.handledNote);
+      // Attribution is unconditional: a note is the only thing distinguishing
+      // an operator's dismissal from the actor's own account of its work.
+      expect(notes).toContain(
+        "Cleared from the dashboard by the operator: prod sent this to staging"
+      );
+      expect(notes).toContain("Cleared from the dashboard by the operator; no reason given.");
+    });
+
+    it("reports a second clear without overwriting the first note", async () => {
+      appendEntry("double-clicked");
+      await post(UUID_A, { entryId: "double-clicked", reason: "first" });
+
+      const res = await post(UUID_A, { entryId: "double-clicked", reason: "second" });
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).alreadyHandled).toBe(true);
+      expect(inbox.read(UUID_A, "double-clicked")?.handledNote).toBe(
+        "Cleared from the dashboard by the operator: first"
+      );
+    });
+
+    it("404s an entry belonging to a different actor", async () => {
+      appendEntry("owned-by-a", UUID_A);
+
+      const res = await post(UUID_B, { entryId: "owned-by-a" });
+
+      expect(res.statusCode).toBe(404);
+      // Still unhandled for its real owner — the wrong actor cannot clear it.
+      expect(inbox.countUnhandled(UUID_A)).toBe(1);
+    });
+
+    it("rejects a missing entryId and an over-long reason", async () => {
+      appendEntry("long-reason");
+
+      expect((await post(UUID_A, {})).statusCode).toBe(400);
+      const tooLong = await post(UUID_A, { entryId: "long-reason", reason: "x".repeat(2001) });
+      expect(tooLong.statusCode).toBe(400);
+      expect(inbox.countUnhandled(UUID_A)).toBe(1);
+    });
+
+    it("503s when no inbox is bound", async () => {
+      const bound = deps.inbox;
+      deps.inbox = undefined;
+      const res = await post(UUID_A, { entryId: "anything" });
+      deps.inbox = bound;
+      expect(res.statusCode).toBe(503);
+    });
   });
 
   it("GET /api/mesh/events filters by kind", () => {

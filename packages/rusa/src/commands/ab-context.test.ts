@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { MeshActor } from "../actor/actor-mesh.js";
 import { ActorMesh } from "../actor/actor-mesh.js";
 import { InMemoryThreadRegistry } from "../actor/thread-registry.js";
-import { adoptRigHolder, RIG_HOLDER_ID } from "./ab-context.js";
+import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
+import { adoptRigHolder, armRunModels, RIG_HOLDER_ID } from "./ab-context.js";
 
 const ROOT_ID = "root";
 
@@ -115,5 +116,121 @@ describe("A/B arm parenting ", () => {
     expect(registry.get(holderId)?.parentId).toBeNull();
     expect(mesh.isAncestorOf(ROOT_ID, arms.native)).toBe(false);
     expect(mesh.isAncestorOf(ROOT_ID, arms.portable)).toBe(false);
+  });
+});
+
+describe("the model an arm actually ran", () => {
+  const event = (partial: Partial<MeshEvent>): MeshEvent => ({
+    id: "e",
+    ts: "2026-01-01T00:00:00Z",
+    kind: "run_end",
+    actorId: "native",
+    detail: null,
+    body: null,
+    payload: null,
+    success: true,
+    ...partial,
+  });
+
+  it("keeps BOTH models when an arm was re-pinned mid-run", () => {
+    // The reading this replaced answered with the last reporting run, which described a
+    // six-step arm by the model it finished on. `checkModelIdentity` then compared that
+    // one value against the other arm and could return `same ✓` for a run in which half
+    // the steps ran something else. Order is first-seen, so the report shows the move.
+    expect(
+      armRunModels(
+        [
+          event({ payload: JSON.stringify({ model: "gpt-5.1-codex" }) }),
+          event({ payload: JSON.stringify({ model: "gpt-5.5-codex" }) }),
+        ],
+        "native"
+      ).models
+    ).toEqual(["gpt-5.1-codex", "gpt-5.5-codex"]);
+  });
+
+  it("collapses repeats — a steady arm reports one model, however many runs it took", () => {
+    // Distinct values only. Counting occurrences would make every multi-step arm look
+    // like it changed models and void every run the gate exists to let through.
+    expect(
+      armRunModels(
+        [
+          event({ payload: JSON.stringify({ model: "gpt-5.5-codex" }) }),
+          event({ payload: JSON.stringify({ model: "gpt-5.5-codex" }) }),
+          event({ payload: JSON.stringify({ model: "gpt-5.5-codex" }) }),
+        ],
+        "native"
+      ).models
+    ).toEqual(["gpt-5.5-codex"]);
+  });
+
+  it("skips a silent run rather than letting it erase the reading", () => {
+    // Only codex reports, and it reports nothing whenever its rollout cannot be read
+    // back. A silent run is not evidence the arm stopped running that model — it is
+    // evidence nobody looked on that run, so it must not discard the runs that did.
+    expect(
+      armRunModels(
+        [
+          event({ payload: JSON.stringify({ model: "gpt-5.5-codex" }) }),
+          event({ payload: null }),
+          event({ payload: JSON.stringify({ model: "gpt-5.5-codex" }) }),
+        ],
+        "native"
+      ).models
+    ).toEqual(["gpt-5.5-codex"]);
+  });
+
+  it("reads only this arm's own run_end events", () => {
+    // The other arm's model must never leak across: that would manufacture agreement
+    // between the two arms, which is precisely the claim this feeds.
+    const events = [
+      event({ actorId: "portable", payload: JSON.stringify({ model: "kimi-k2.5" }) }),
+      event({ actorId: "native", kind: "run_start", payload: JSON.stringify({ model: "wrong" }) }),
+    ];
+    expect(armRunModels(events, "native").models).toEqual([]);
+    expect(armRunModels(events, "portable").models).toEqual(["kimi-k2.5"]);
+  });
+
+  it("is empty when the arm never reported one", () => {
+    expect(armRunModels([], "native").models).toEqual([]);
+    expect(armRunModels([event({ payload: null })], "native").models).toEqual([]);
+  });
+
+  it("counts the runs it skipped, so the reading's width is visible", () => {
+    // The models list alone cannot distinguish "every run said X" from "one run out of
+    // six said X and the rest said nothing" — both read `["gpt-5.5-codex"]`. The count
+    // is the difference, and it is what the `same` verdict's wording is measured against.
+    const { models, coverage } = armRunModels(
+      [
+        event({ payload: JSON.stringify({ model: "gpt-5.5-codex" }) }),
+        event({ payload: null }),
+        event({ payload: JSON.stringify({ graceKilled: true }) }),
+      ],
+      "native"
+    );
+
+    expect(models).toEqual(["gpt-5.5-codex"]);
+    expect(coverage).toEqual({ reported: 1, total: 3 });
+  });
+
+  it("counts over the same runs the models come from, never another arm's", () => {
+    // The count is offered as coverage OF this list, so it has to be drawn from exactly
+    // the population the list is. A total that swept in the other arm's runs, or the
+    // arm's own run_start events, would understate coverage against runs that were never
+    // candidates to report.
+    const events = [
+      event({ actorId: "portable", payload: JSON.stringify({ model: "kimi-k2.5" }) }),
+      event({ actorId: "native", kind: "run_start", payload: null }),
+      event({ actorId: "native", payload: JSON.stringify({ model: "gpt-5.5-codex" }) }),
+    ];
+
+    expect(armRunModels(events, "native").coverage).toEqual({ reported: 1, total: 1 });
+    expect(armRunModels(events, "portable").coverage).toEqual({ reported: 1, total: 1 });
+  });
+
+  it("reports zero of zero for an arm that never ran", () => {
+    // Not the same fact as "ran and stayed silent" (0 of 6), and the verdict message
+    // distinguishes them. Both are still NOT a pass — that is `checkModelIdentity`'s
+    // call, made on the empty models list, not on this count.
+    expect(armRunModels([], "native").coverage).toEqual({ reported: 0, total: 0 });
   });
 });

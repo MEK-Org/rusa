@@ -11,6 +11,16 @@
 
 export const MAX_CHAT_ATTACHMENT_BYTES = 50 * 1024 * 1024; // 50MB default
 
+/**
+ * Exact grammar of a message-attachment resource name. Capture group 1 is the
+ * parent message name, which is where an attachment's metadata actually lives
+ * (`spaces.messages.attachments.get` is `chat.bot`-gated, `messages.get` is not).
+ */
+export const MESSAGE_ATTACHMENT_NAME_RE = /^(spaces\/[^/]+\/messages\/[^/]+)\/attachments\/[^/]+$/;
+
+/** Opaque media token accepted directly by `media.download`. */
+export const MEDIA_TOKEN_RE = /^media\/.+$/;
+
 export interface ChatAttachmentDataRef {
   /** Resource name for the uploaded attachment media. */
   resourceName?: string;

@@ -133,8 +133,8 @@ describe("assembleBlindPackage", () => {
   describe("run caveats  — bounds that must travel WITH the artifact", () => {
     const caveat = comparabilityCaveat(
       checkModelIdentity({
-        native: { provider: "kimi", boundModel: null },
-        portable: { provider: "kimi", boundModel: null },
+        native: { provider: "kimi", models: [] },
+        portable: { provider: "kimi", models: [] },
       })
     ) as string;
 
@@ -163,8 +163,8 @@ describe("assembleBlindPackage", () => {
       expect(
         comparabilityCaveat(
           checkModelIdentity({
-            native: { provider: "codex", boundModel: "m" },
-            portable: { provider: "codex", boundModel: "m" },
+            native: { provider: "codex", models: ["m"] },
+            portable: { provider: "codex", models: ["m"] },
           })
         )
       ).toBeNull();

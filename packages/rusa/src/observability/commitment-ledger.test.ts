@@ -92,7 +92,7 @@ describe("commitment ledger projection", () => {
     });
   });
 
-  it("does not emit missed_wake alerts for scheduled wakes (#1521)", () => {
+  it("does not emit missed_wake alerts for scheduled wakes", () => {
     const report = projectOpenCommitments({
       now: NOW,
       threads: [
@@ -179,7 +179,8 @@ describe("commitment ledger projection", () => {
   it("decides every run-terminal kind explicitly, so none can be silently omitted", () => {
     // The structural half. `RUN_TERMINAL_EVENT_KINDS` exists so the producer and
     // every reader that tracks runs stay in step; this reader had taken `run_end`
-    // and silently omitted `run_abandoned` (#1567, and #1363 before it). The
+    // and silently omitted `run_abandoned` -- twice, as two separate regressions,
+    // which is why this is a structural check and not one more case test. The
     // `Record` type makes a new terminal kind a compile error until it is
     // decided; this asserts the runtime shape both ways, so a stale entry for a
     // removed kind is caught too.
@@ -294,7 +295,7 @@ describe("commitment ledger projection", () => {
     ]);
   });
 
-  it("projects tracked message commitments as open Matt-ask loops", () => {
+  it("projects tracked message commitments as open operator-ask loops", () => {
     const report = projectOpenCommitments({
       now: NOW,
       threads: [],
@@ -327,7 +328,7 @@ describe("commitment ledger projection", () => {
     ]);
   });
 
-  it("resolves the configured root display handle as an owner reference (#664)", () => {
+  it("resolves the configured root display handle as an owner reference", () => {
     const report = projectOpenCommitments({
       now: NOW,
       rootHandle: "ember-familiar",
@@ -638,14 +639,14 @@ function buildMvpStoryboardSnapshots(): CommitmentLedgerStoryboardSnapshot[] {
       title: "T1 registered",
       now: new Date("2026-06-30T18:45:00.000Z"),
       narration:
-        "Two Matt-asks have been acknowledged with Tracking lines, so the ledger can show owner, done-when, and age immediately instead of relying on Matt to remember.",
+        "Two operator-asks have been acknowledged with Tracking lines, so the ledger can show owner, done-when, and age immediately instead of relying on the operator to remember.",
     },
     {
       id: "t2",
       title: "T2 the slip",
       now: new Date("2026-07-01T22:10:00.000Z"),
       narration:
-        "Mocked time jumps forward: one ask dissolved because root drove it to done, while #531 is still open after 27h 30m. A single mechanical row is present but does not crowd the Matt-ask.",
+        "Mocked time jumps forward: one ask dissolved because root drove it to done, while #531 is still open after 27h 30m. A single mechanical row is present but does not crowd the operator-ask.",
     },
     {
       id: "t3",

@@ -3,15 +3,18 @@ import { basename, isAbsolute, relative, resolve } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import mime from "mime";
 import { z } from "zod";
-import { type ChatClient, type ChatSpace, MAX_CHAT_ATTACHMENT_BYTES } from "../chat/types.js";
+import {
+  type ChatClient,
+  type ChatSpace,
+  MAX_CHAT_ATTACHMENT_BYTES,
+  MEDIA_TOKEN_RE,
+  MESSAGE_ATTACHMENT_NAME_RE,
+} from "../chat/types.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 
 export const CHAT_WRITE_MCP_NAME = "chat-write";
 export const CHAT_READ_MCP_NAME = "chat-read";
-
-export const ATTACHMENT_RESOURCE_NAME_RE =
-  /^(?:spaces\/[^/]+\/messages\/[^/]+\/attachments\/[^/]+|media\/.+)$/;
 
 export function inferChatMimeType(filename: string): string {
   return mime.getType(filename) ?? "application/octet-stream";
@@ -80,7 +83,7 @@ export function createChatReadMcpServer(
     },
     async ({ attachmentName }) => {
       try {
-        if (!/^spaces\/[^/]+\/messages\/[^/]+\/attachments\/[^/]+$/.test(attachmentName)) {
+        if (!MESSAGE_ATTACHMENT_NAME_RE.test(attachmentName)) {
           throw new Error(
             "attachmentName must be in format spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT"
           );
@@ -113,7 +116,7 @@ export function createChatReadMcpServer(
     },
     async ({ resourceName }) => {
       try {
-        if (!ATTACHMENT_RESOURCE_NAME_RE.test(resourceName)) {
+        if (!MESSAGE_ATTACHMENT_NAME_RE.test(resourceName) && !MEDIA_TOKEN_RE.test(resourceName)) {
           throw new Error(
             "resourceName must be in format spaces/SPACE/messages/MESSAGE/attachments/ATTACHMENT or media/..."
           );
