@@ -174,4 +174,33 @@ describe("workspace sweep", () => {
       })
     ).toEqual([]);
   });
+
+  it("keeps short prefix workspaces under scratchDir during collision but sweeps the exact full-ID folder", () => {
+    // Under scratchDir, the short spelling is contested and must survive.
+    // The exact full ID spelling is unambiguous and should be deleted.
+    const retiredCollision = "a1b2c3d4-9999-4222-8333-555566667777";
+    const actors = [
+      { id: LIVE, retired: false }, // live actor prefix 'a1b2c3d4'
+      { id: retiredCollision, retired: true }, // retired actor prefix 'a1b2c3d4'
+    ];
+    dir(scratchDir, "worker-a1b2c3d4");
+    dir(scratchDir, "a1b2c3d4");
+    dir(scratchDir, retiredCollision);
+
+    const orphans = orphanedWorkspaces({ workersDir, scratchDir, actors });
+
+    expect(orphans).toEqual([join(scratchDir, retiredCollision)]);
+  });
+
+  it("does not sweep short prefix spellings under workersDir even if they belong to a retired actor", () => {
+    // workersDir only holds exact actor IDs (full UUIDs). Prefix spellings under
+    // workersDir must not be swept, even if the registry says they correspond to a retired actor.
+    dir(workersDir, "worker-9f8e7d6c");
+    dir(workersDir, "9f8e7d6c");
+    dir(workersDir, RETIRED);
+
+    const orphans = orphanedWorkspaces({ workersDir, scratchDir, actors: REGISTRY });
+
+    expect(orphans).toEqual([join(workersDir, RETIRED)]);
+  });
 });

@@ -113,24 +113,44 @@ export interface WorkspaceSweepOptions {
  */
 export function orphanedWorkspaces(opts: WorkspaceSweepOptions): string[] {
   const live = liveActorPrefixes(opts.actors);
-  const retired = new Set<string>();
+  const retiredIds = new Set<string>();
+  const retiredPrefixes = new Set<string>();
   for (const actor of opts.actors) {
-    if (actor.retired) retired.add(actor.id.slice(0, 8));
+    if (actor.retired) {
+      retiredIds.add(actor.id);
+      retiredPrefixes.add(actor.id.slice(0, 8));
+    }
   }
 
   const orphans: string[] = [];
-  for (const [dir, names] of [
-    [opts.workersDir, subdirectories(opts.workersDir)],
-    [opts.scratchDir, subdirectories(opts.scratchDir)],
-  ] as const) {
-    for (const name of names) {
-      const prefix = workspaceActorPrefix(name);
-      // A prefix shared by a live actor keeps the directory: eight hex is short,
-      // and losing a retired actor's workspace to a collision costs a delayed
-      // cleanup, where losing a live actor's costs it the work in progress.
-      if (prefix && retired.has(prefix) && !live.has(prefix)) orphans.push(join(dir, name));
+
+  // workersDir holds only directories named with the exact actor ID (full UUID).
+  for (const name of subdirectories(opts.workersDir)) {
+    if (retiredIds.has(name)) {
+      orphans.push(join(opts.workersDir, name));
     }
   }
+
+  // scratchDir can hold full UUID, worker-<prefix>, or bare <prefix> spellings.
+  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  const PREFIX_REGEX = /^(?:worker-)?([0-9a-f]{8})$/;
+
+  for (const name of subdirectories(opts.scratchDir)) {
+    if (UUID_REGEX.test(name)) {
+      if (retiredIds.has(name)) {
+        orphans.push(join(opts.scratchDir, name));
+      }
+    } else {
+      const match = PREFIX_REGEX.exec(name);
+      if (match) {
+        const prefix = match[1];
+        if (retiredPrefixes.has(prefix) && !live.has(prefix)) {
+          orphans.push(join(opts.scratchDir, name));
+        }
+      }
+    }
+  }
+
   return orphans;
 }
 
