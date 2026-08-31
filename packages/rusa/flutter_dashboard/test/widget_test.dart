@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/api.dart';
@@ -582,6 +584,69 @@ void main() {
         find.text('Hold the line, and here is the rest of it.'),
         findsNothing,
       );
+
+      await store.dispose();
+    });
+  });
+
+  testWidgets('the Info tab keeps the newest charter when answers race', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      // One per fetch, so the test decides which answer arrives first.
+      final gates = [
+        Completer<String>(),
+        Completer<String>(),
+        Completer<String>(),
+      ];
+      final api = FakeApi()
+        ..threadsResult = [
+          makeThread('root', created: 't0'),
+          makeThread(
+            'a',
+            parent: 'root',
+            created: 't1',
+            charterPreview: 'Hold the line\u2026',
+          ),
+          makeThread(
+            'b',
+            parent: 'root',
+            created: 't2',
+            charterPreview: 'Hold another line\u2026',
+          ),
+        ]
+        ..charterGates.addAll(gates);
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+
+      await tester.pumpWidget(_harness(store));
+      await tester.pump(const Duration(milliseconds: 50));
+
+      // Select a, then b, then a again: two fetches for a are open at once,
+      // and the panel cannot tell them apart by which actor they name.
+      for (final handle in ['a-handle', 'b-handle', 'a-handle']) {
+        await tester.tap(find.text(handle));
+        await tester.pump(const Duration(milliseconds: 50));
+        await tester.ensureVisible(find.text('Info'));
+        await tester.tap(find.text('Info'));
+        for (int i = 0; i < 5; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+      }
+      expect(api.charterCalls, ['a', 'b', 'a']);
+
+      // The second look at a answers first; the first one lands after it.
+      gates[2].complete('a, as it is now.');
+      for (int i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      gates[0].complete('a, as it was.');
+      for (int i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+
+      expect(find.text('a, as it is now.'), findsOneWidget);
+      expect(find.text('a, as it was.'), findsNothing);
 
       await store.dispose();
     });

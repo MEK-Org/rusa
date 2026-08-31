@@ -611,6 +611,11 @@ class _InfoViewState extends State<_InfoView> {
   /// fetch is in flight and kept if it succeeds; a failure clears it.
   String? _loadedFor;
 
+  /// Which fetch is the current one. Two fetches for the *same* key can be in
+  /// flight at once — select A, select B, select A again — and they need not
+  /// come back in the order they were sent, so the key cannot tell them apart.
+  int _fetch = 0;
+
   /// A charter is editable, so the actor's id alone does not identify one. The
   /// preview travels with the list on every poll and changes when the charter
   /// does, which is what lets an edit reach an open panel.
@@ -636,18 +641,21 @@ class _InfoViewState extends State<_InfoView> {
     final key = _fetchKey;
     if (_loadedFor == key) return;
     _loadedFor = key;
+    final fetch = ++_fetch;
     final id = widget.actor.id;
     setState(() => _charter = null);
     try {
       final charter = await widget.store.fetchCharter(id);
-      // The operator can select another actor while this is in flight.
-      if (!mounted || _loadedFor != key) return;
+      // Anything sent since this supersedes it, whatever it was asking for:
+      // another actor selected, an edited charter, or a second look at the
+      // same one. Only the newest answer is allowed to land.
+      if (!mounted || fetch != _fetch) return;
       setState(() => _charter = charter);
     } catch (_) {
       // The preview stays on screen and the store has already surfaced the
       // error — but release the key, so the next poll retries rather than
       // pinning the panel to the preview for as long as this actor is selected.
-      if (_loadedFor == key) _loadedFor = null;
+      if (fetch == _fetch) _loadedFor = null;
     }
   }
 

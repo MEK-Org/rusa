@@ -142,17 +142,33 @@ class FakeApi extends DashboardApi {
       rootControlProviders;
 
   /// Full charters the detail panel can pull, keyed by thread id. Absent means
-  /// the server had nothing to add beyond the preview.
+  /// the server had nothing to add beyond the preview — which is what the real
+  /// route answers for a short charter, and is why the fallback below is the
+  /// preview rather than empty: the route reads the same field the list clipped,
+  /// so it cannot answer with less than the list already carried.
   final charters = <String, String>{};
   final charterCalls = <String>[];
   Object? charterError;
+
+  /// When non-empty, each fetchCharter takes the next of these instead of
+  /// answering at once — lets a test hold two fetches open and resolve them in
+  /// whichever order it likes.
+  final charterGates = <Completer<String>>[];
 
   @override
   Future<String> fetchCharter(String threadId) async {
     charterCalls.add(threadId);
     final err = charterError;
     if (err != null) throw err;
-    return charters[threadId] ?? '';
+    if (charterGates.isNotEmpty) return charterGates.removeAt(0).future;
+    return charters[threadId] ?? _previewOf(threadId);
+  }
+
+  String _previewOf(String threadId) {
+    for (final thread in threadsResult) {
+      if (thread.id == threadId) return thread.charterPreview;
+    }
+    return '';
   }
 
   @override
