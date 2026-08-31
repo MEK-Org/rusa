@@ -34,7 +34,10 @@ export interface DashboardDataDeps {
   meshChat: MeshChatRepository;
   /** Durable obligation repository for task and dependency management. */
   obligations?: ObligationRepository;
-  /** Durable actor inbox, intentionally exposed read-only to the dashboard. */
+  /**
+   * Durable actor inbox. Read-only to the dashboard apart from a single write:
+   * the operator clearing an entry the actor should not have to answer (#66).
+   */
   inbox?: InboxStore;
   sseHub: SseHub;
   /** The live ActorMesh instance. */
@@ -151,6 +154,28 @@ interface ThreadDto {
   nextProviderAvailableAt?: string | null;
   /** Whether the owner expects to retire this thread. */
   ownerExpectsRetirement?: boolean | null;
+}
+
+/**
+ * Ceiling on the operator's own words when clearing an inbox entry, matching
+ * the ceiling `mark_handled` applies to an actor's note. The attribution
+ * prefix is added on top and is not spent from this budget.
+ */
+const MAX_INBOX_REASON_CHARS = 2_000;
+
+/**
+ * The note stored when the operator clears an entry from the dashboard.
+ *
+ * The dashboard renders a note under "Addressed:" with nothing to say who
+ * wrote it, so an operator's dismissal and an actor's account of its own work
+ * are indistinguishable once stored. Naming the operator unconditionally —
+ * reason given or not — keeps a dismissal from reading as a report of work the
+ * actor never did.
+ */
+function operatorHandledNote(reason: string): string {
+  return reason
+    ? `Cleared from the dashboard by the operator: ${reason}`
+    : "Cleared from the dashboard by the operator; no reason given.";
 }
 
 /**
@@ -545,6 +570,82 @@ export function handleMeshApiRequest(
       } catch (err) {
         sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
       }
+      return true;
+    }
+
+    // POST /api/mesh/actors/<id>/inbox/handled — the operator clears one entry.
+    //
+    // An entry can outlive the reason it was delivered: the operator cancels a
+    // run by hand, or a signal arrives from another instance that was never
+    // this actor's to answer. Nothing else retires it — an unhandled entry
+    // keeps the actor queued for work it cannot resolve, and the actor's only
+    // way out is to burn a run marking something handled it never had to do.
+    //
+    // Deliberately not the `mark_handled` MCP tool. That gates on entries
+    // selected during the run, because handling there is an actor's judgment
+    // about its own worklist; an operator is not in a run and has no selection
+    // to make. What does carry over is the note, which the store keeps.
+    //
+    // No registry lookup: unlike interrupt and run-now, this is meaningful for
+    // a retired actor — stale entries are exactly what an operator wants to
+    // clear — and the (actor, entry) pair is checked by the store anyway.
+    const inboxHandledMatch = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/inbox\/handled$/);
+    if (inboxHandledMatch) {
+      if (!deps?.inbox) {
+        sendJson(res, 503, { error: "inbox data unavailable" });
+        return true;
+      }
+      const inbox = deps.inbox;
+      const actorId = decodeURIComponent(inboxHandledMatch[1]);
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            sendJson(res, 400, { error: "Missing or invalid body" });
+            return;
+          }
+          const body = parsed as Record<string, unknown>;
+          const entryId = typeof body.entryId === "string" ? body.entryId.trim() : "";
+          if (!entryId) {
+            sendJson(res, 400, { error: "entryId is required" });
+            return;
+          }
+          const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+          if (reason.length > MAX_INBOX_REASON_CHARS) {
+            sendJson(res, 400, {
+              error: `reason must be ${MAX_INBOX_REASON_CHARS} characters or fewer`,
+            });
+            return;
+          }
+          try {
+            const [result] = inbox.markHandled(
+              actorId,
+              [entryId],
+              undefined,
+              operatorHandledNote(reason)
+            );
+            // `alreadyHandled` is reported rather than treated as an error: the
+            // store leaves an existing note alone, so a double-click cannot
+            // overwrite an actor's own account, and the caller's view is simply
+            // one refresh behind.
+            sendJson(res, 200, {
+              ok: true,
+              id: result.id,
+              handledAt: result.handledAt.toISOString(),
+              alreadyHandled: result.alreadyHandled,
+            });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            sendJson(res, message === "inbox entry not found" ? 404 : 400, { error: message });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
       return true;
     }
 
