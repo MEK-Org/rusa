@@ -185,7 +185,7 @@ const GREEN_CI_CONCLUSIONS = new Set(["success", "skipped", "neutral"]);
  * to drop the PR.
  */
 export function parseIssueNumberFromBranch(branchName: string): number | null {
-  const match = branchName.match(/(?:(?:^|[^a-z0-9])issue-|steward\/)(\d+)(?![a-z0-9])/i);
+  const match = branchName.match(/(?:^|[^a-z0-9])(?:issue-|steward\/)(\d+)(?![a-z0-9])/i);
   return match ? Number.parseInt(match[1], 10) : null;
 }
 

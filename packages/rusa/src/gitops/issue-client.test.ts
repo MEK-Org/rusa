@@ -1880,6 +1880,9 @@ describe("parseIssueNumberFromBranch", () => {
     ["feature/foo"],
     // "issue-" must start a segment: reissue-42 is not issue 42.
     ["mc/reissue-42"],
+    // "steward/" must start a segment or follow a non-alphanumeric boundary.
+    ["nonsteward/120-unrelated"],
+    ["xsteward/120-foo"],
     // A number that runs into more text is not a number we can trust.
     ["mc/issue-42x"],
     ["mc/issue-"],
