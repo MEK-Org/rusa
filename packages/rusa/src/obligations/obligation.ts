@@ -1,6 +1,16 @@
 export type ObligationStatus = "ready" | "waiting" | "done" | "cancelled";
 
-export type ObligationOwner = { kind: "actor"; id: string } | { kind: "human"; id: string };
+/**
+ * One entity in the mesh's single id space: an actor UUID, `root`, `human:*`,
+ * or `system:*`.
+ *
+ * Deliberately an id alone, not an id plus a `kind`. `mcp/stamp.ts` already
+ * mints `human:operator` / `system:mesh` / `system:tracker-hygiene` into the
+ * same space actor ids live in, and `isHumanOperator(actorId)` reads the
+ * category off the prefix — so a stored kind would restate what the id already
+ * says, and could drift from it.
+ */
+export type EntityId = string;
 
 export type GitHubExternalRef = {
   kind: "github_issue" | "github_pr";
@@ -19,7 +29,7 @@ export type GitHubExternalRef = {
 export interface Obligation {
   id: string;
   parentId: string | null;
-  owner: ObligationOwner;
+  ownerId: EntityId;
   intent: string | null;
   externalRef: GitHubExternalRef | null;
   status: ObligationStatus;
@@ -29,6 +39,21 @@ export interface Obligation {
   effectivePriority: number;
   /** Obligation whose explicit priority supplies effectivePriority. */
   prioritySourceId: string;
+  /**
+   * When this obligation was created (ISO-8601). `null` only for rows that
+   * predate the timestamp columns and have no recoverable creation time —
+   * never a stand-in for "now".
+   */
+  createdAt: string | null;
+  /** When this obligation was last mutated (ISO-8601); see {@link createdAt}. */
+  updatedAt: string | null;
+  /**
+   * The entity that raised this obligation. Immutable: reassignment moves
+   * {@link ownerId} and leaves this alone, which is the whole point of recording
+   * it (#1671). `null` means genuinely unknown — legacy rows, or a caller with
+   * no identity to bind — and is never backfilled by inference from `owner`.
+   */
+  creatorId: EntityId | null;
 }
 
 export interface ObligationTree {
@@ -58,12 +83,9 @@ export function assertObligationStatus(value: string): asserts value is Obligati
   }
 }
 
-export function validateObligationOwner(owner: ObligationOwner): ObligationOwner {
-  if (owner.kind !== "actor" && owner.kind !== "human") {
-    throw new ObligationValidationError("obligation owner kind must be actor or human");
-  }
-  if (!owner.id.trim()) throw new ObligationValidationError("obligation owner id is required");
-  return owner;
+export function validateEntityId(id: EntityId): EntityId {
+  if (!id.trim()) throw new ObligationValidationError("entity id is required");
+  return id;
 }
 
 export function parseExternalRef(value: string): GitHubExternalRef {

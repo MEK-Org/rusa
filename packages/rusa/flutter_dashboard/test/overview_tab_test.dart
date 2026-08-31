@@ -62,7 +62,7 @@ void main() {
         final api = FakeApi()
           ..threadsResult = [makeThread('root')]
           ..obligationsResult = [
-            makeObligation('actor-ob', ownerKind: 'actor', ownerId: 'root', intent: 'Actor task'),
+            makeObligation('actor-ob', ownerId: 'root', intent: 'Actor task'),
           ];
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
@@ -87,7 +87,6 @@ void main() {
       await tester.runAsync(() async {
         final readyOb = makeObligation(
           'ob-ready',
-          ownerKind: 'human',
           ownerId: 'human:operator',
           intent: 'Approve PR review',
           status: 'ready',
@@ -97,7 +96,6 @@ void main() {
         );
         final waitingOb = makeObligation(
           'ob-waiting',
-          ownerKind: 'human',
           ownerId: 'human:operator',
           intent: 'Merge deploy release',
           status: 'waiting',
@@ -106,14 +104,12 @@ void main() {
         final blockerChild = makeObligation(
           'ob-blocker',
           parentId: 'ob-waiting',
-          ownerKind: 'actor',
           ownerId: 'worker-1',
           intent: 'CI pass',
           status: 'ready',
         );
         final actorOnlyOb = makeObligation(
           'ob-actor-only',
-          ownerKind: 'actor',
           ownerId: 'worker-1',
           intent: 'Unrelated actor job',
           status: 'ready',
@@ -144,7 +140,7 @@ void main() {
         // Check waiting items and blocker
         expect(find.text('Merge deploy release'), findsOneWidget);
         expect(find.text('Blocked by direct children:'), findsOneWidget);
-        expect(find.textContaining('CI pass (actor: worker-1)'), findsOneWidget);
+        expect(find.textContaining('CI pass (worker-1)'), findsOneWidget);
 
         // Unrelated actor obligation is NOT in My Queue
         expect(find.text('Unrelated actor job'), findsNothing);
@@ -167,7 +163,6 @@ void main() {
       await tester.runAsync(() async {
         final ob1 = makeObligation(
           'ob-1',
-          ownerKind: 'human',
           ownerId: 'human:operator',
           intent: 'Decision 1',
           status: 'ready',
@@ -175,7 +170,6 @@ void main() {
         );
         final ob2 = makeObligation(
           'ob-2',
-          ownerKind: 'human',
           ownerId: 'human:operator',
           intent: 'Decision 2',
           status: 'ready',
@@ -215,7 +209,6 @@ void main() {
       await tester.runAsync(() async {
         final humanOb = makeObligation(
           'ob-human',
-          ownerKind: 'human',
           ownerId: 'human:operator',
           intent: 'Human obligation',
           status: 'ready',

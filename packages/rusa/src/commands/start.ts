@@ -118,6 +118,7 @@ import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import type { QuotaApiDeps } from "../dashboard/quota-api.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
 import { isSelfAuthoredLedgerSource } from "../db/repositories/mesh-event-repository.js";
+import type { ReadyHeadChange } from "../db/repositories/obligation-repository.js";
 import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
 import {
@@ -170,6 +171,7 @@ import {
   UNDERSTANDING_READ_MCP_NAME,
 } from "../mcp/understanding-mcp.js";
 import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "../mcp/update-mcp.js";
+import { resolveObligationOwner } from "../obligations/owner.js";
 import { DiskUsageAlert } from "../observability/disk-alert.js";
 import {
   containsSnoozeCommand,
@@ -613,7 +615,7 @@ function assemblePortableInjection(
           runs,
           // Read-through only. The prompt shows work state; it never authors it
           // — the obligation store stays the sole lifecycle authority .
-          obligations: getRepositories().obligations.listOwned({ kind: "actor", id }),
+          obligations: getRepositories().obligations.listOwned(id),
         })
       : assemblePortableContext(runs);
   return portable ? { priorContext: portable.section, injectRecord: portable.record } : undefined;
@@ -771,6 +773,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   initDb(mcHome);
   console.log("✓ Database ready");
 
+  // #1645 ready-head attention. Attached here, immediately after initDb, rather
+  // than beside the mesh: `getRepositories()` throws once the database is
+  // closed, and in a process that runs more than one instance (the tests, the
+  // e2e manager) a prior shutdown can land mid-startup. The sink is filled in
+  // once the mesh exists; until then a head change is simply not routed.
+  let readyHeadSink: ((change: ReadyHeadChange) => void) | undefined;
+  getRepositories().obligations.setReadyHeadListener((change) => readyHeadSink?.(change));
+
   try {
     populateModelCatalogsFromDb(getRepositories().modelScrapes);
   } catch (err) {
@@ -880,6 +890,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     unsyncedCount: () => getLocalUnderstandingUnsyncedCount(mcHome),
   };
   const registry = new FileThreadRegistry(join(mcHome, "threads.json"));
+  // The obligation store's actor guard is only real once it can see the
+  // registry. Built from a Database alone, the container cannot do this itself,
+  // and without this line every owner check in the repository is inert.
+  getRepositories().setActorExists((actorId) => registry.get(actorId)?.status === "active");
   const rootId = resolveRootThreadId(registry);
   const inboxStore = getRepositories().inbox;
   const modelScrapesStore = getRepositories().modelScrapes;
@@ -1580,8 +1594,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const obligationsUrl = mcpHttp.addServer(`${id}:${OBLIGATIONS_MCP_NAME}`, () =>
           createObligationsMcpServer(getRepositories().obligations, id, {
             isFenced,
-            canReassign: (callerId, obligation) =>
-              obligation.owner.kind === "actor" && mesh.isAncestorOf(callerId, obligation.owner.id),
+            resolveOwner: (raw) => resolveObligationOwner(registry, raw),
+            canReassign: (callerId, obligation) => mesh.isAncestorOf(callerId, obligation.ownerId),
           })
         );
         const meshChatUrl = mcpHttp.addServer(`${id}:${MESH_CHAT_MCP_NAME}`, () =>
@@ -1863,6 +1877,21 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }
     },
   });
+  // Route head changes as soon as the mesh exists — ahead of rehydration, which
+  // is what registers the per-actor obligations MCP servers, and well ahead of
+  // the dashboard binding its port. A head change cannot commit into a sink
+  // that is still undefined.
+  //
+  // Boot sweep below over `readyHeads()` reconciles heads at startup.
+  readyHeadSink = ({ ownerId, head, previousHeadId, sequence }) => {
+    mesh.deliverReadyHeadAttention(
+      ownerId,
+      { id: head.id, intent: head.intent },
+      previousHeadId,
+      sequence
+    );
+  };
+
   const rootControl = new RootControlService({
     mesh,
     rootId: rootId,
@@ -1974,6 +2003,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const rootObligationsUrl = mcpHttp.addServer(`${rootId}:${OBLIGATIONS_MCP_NAME}`, () =>
     createObligationsMcpServer(getRepositories().obligations, rootId, {
       canReassign: () => true,
+      resolveOwner: (raw) => resolveObligationOwner(registry, raw),
     })
   );
   const rootPnpmInstallUrl = mcpHttp.addServer(`${rootId}:${PNPM_INSTALL_MCP_NAME}`, () =>
@@ -2338,6 +2368,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   mesh.rehydrateAll();
   mesh.reconcilePendingDeliveries();
   mesh.reconcileInbox();
+  try {
+    mesh.reconcileReadyHeads(getRepositories().obligations);
+  } catch (_err) {
+    // Database may be closed during test shutdown/teardown races
+  }
   const restored = registry.list().filter((r) => r.status === "active" && r.id !== rootId);
   if (restored.length > 0) {
     console.log(`[mesh] rehydrated ${restored.length} active thread(s) from the registry`);
@@ -2934,6 +2969,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }
     }
     sharedQuotaStore?.close();
+    // `closeDb()` below drops the repository container, but the listener it
+    // holds is a closure over this `runStart`'s `readyHeadSink`. Clearing the
+    // sink first stops a dead mesh being reachable through that closure, and
+    // clearing the sink rather than the listener avoids touching the database
+    // on a shutdown path that is about to close it.
+    readyHeadSink = undefined;
     closeDb();
     console.log("✓ Goodbye!");
     process.exit(getShutdownExitCode(reason));

@@ -1,7 +1,9 @@
 import Database from "better-sqlite3";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Obligation } from "../../obligations/obligation.js";
 import { obligations } from "../migrations/0016_obligations.js";
 import { obligationPriority } from "../migrations/0017_obligation_priority.js";
+import { obligationTimestamps } from "../migrations/0025_obligation_timestamps.js";
 import { ObligationRepository } from "./obligation-repository.js";
 
 describe("ObligationRepository", () => {
@@ -14,6 +16,7 @@ describe("ObligationRepository", () => {
     db.pragma("foreign_keys = ON");
     obligations.up(db);
     obligationPriority.up(db);
+    obligationTimestamps.up(db);
     now = 1_000;
     repository = new ObligationRepository(
       db,
@@ -22,37 +25,355 @@ describe("ObligationRepository", () => {
     );
   });
 
+  it("stamps createdAt/updatedAt on create and advances updatedAt on mutation", async () => {
+    const created = repository.create({
+      id: "stamped",
+      ownerId: "actor-a",
+      intent: "ship the slice",
+    });
+
+    expect(created.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(created.updatedAt).toBe(created.createdAt);
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    repository.setTerminalStatus("stamped", "done");
+
+    const after = repository.require("stamped");
+    expect(after.createdAt).toBe(created.createdAt);
+    expect(Date.parse(after.updatedAt as string)).toBeGreaterThan(
+      Date.parse(created.updatedAt as string)
+    );
+  });
+
+  describe("ready-head attention (#1645)", () => {
+    let heads: Array<{ ownerId: string; headId: string }>;
+
+    beforeEach(() => {
+      heads = [];
+      repository.setReadyHeadListener(({ ownerId, head }) =>
+        heads.push({ ownerId, headId: head.id })
+      );
+    });
+
+    it("announces a head on create, and not again for work that lands behind it", () => {
+      repository.create({ id: "first", ownerId: "actor-a", priority: 10 });
+      expect(heads).toEqual([{ ownerId: "actor-a", headId: "first" }]);
+
+      // Lower priority = behind the head. #1645: no event for non-head readiness.
+      heads = [];
+      repository.create({ id: "second", ownerId: "actor-a", priority: 20 });
+      expect(heads).toEqual([]);
+    });
+
+    it("carries the head it displaced, so a restored head is not a repeat", () => {
+      const transitions: Array<{ from: string | null; to: string }> = [];
+      repository.setReadyHeadListener(({ head, previousHeadId }) =>
+        transitions.push({ from: previousHeadId, to: head.id })
+      );
+
+      repository.create({ id: "first", ownerId: "actor-a", priority: 10 });
+      repository.create({ id: "urgent", ownerId: "actor-a", priority: 1 });
+      repository.setTerminalStatus("urgent", "done");
+
+      // "first" is the head twice, and only `previousHeadId` separates the two.
+      // Without it a consumer deduplicating on head identity cannot tell the
+      // restored head from a replay, and goes silent on live work.
+      expect(transitions).toEqual([
+        { from: null, to: "first" },
+        { from: "first", to: "urgent" },
+        { from: "urgent", to: "first" },
+      ]);
+    });
+
+    it("keeps a committed mutation successful when the listener throws", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      repository.setReadyHeadListener(() => {
+        throw new Error("inbox is unavailable");
+      });
+
+      // Attention is a downstream effect of a committed write, not part of it.
+      // Propagating would report failure for durable work — and the caller's
+      // retry of create would then trip the external-ref uniqueness guard,
+      // stranding an actor on work it believes it never created.
+      expect(() =>
+        repository.create({
+          id: "committed",
+          ownerId: "actor-a",
+          externalRef: "github_issue:o/r#1",
+        })
+      ).not.toThrow();
+      expect(repository.get("committed")?.ownerId).toBe("actor-a");
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("ready-head listener failed"));
+      warn.mockRestore();
+    });
+
+    it("returns readyHeads and readyHeadTransitions with sequence numbers allowing boot recovery", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      repository.setReadyHeadListener(() => {
+        throw new Error("inbox is unavailable");
+      });
+
+      repository.create({ id: "ob-a", ownerId: "actor-a", priority: 5 });
+      repository.create({ id: "ob-b", ownerId: "actor-b", priority: 1 });
+
+      const headsMap = repository.readyHeads();
+      expect(headsMap.get("actor-a")).toBe("ob-a");
+      expect(headsMap.get("actor-b")).toBe("ob-b");
+
+      const transitions = repository.readyHeadTransitions();
+      expect(transitions).toEqual(
+        expect.arrayContaining([
+          { ownerId: "actor-a", headId: "ob-a", previousHeadId: null, sequence: 1 },
+          { ownerId: "actor-b", headId: "ob-b", previousHeadId: null, sequence: 1 },
+        ])
+      );
+      warn.mockRestore();
+    });
+
+    it("preserves and increments the sequence number when queue drains completely and recurs", () => {
+      // 1. Initial ready head "ob-1" (sequence 1)
+      repository.create({ id: "ob-1", ownerId: "actor-a", priority: 10 });
+      let transitions = repository.readyHeadTransitions();
+      expect(transitions).toEqual([
+        { ownerId: "actor-a", headId: "ob-1", previousHeadId: null, sequence: 1 },
+      ]);
+
+      // 2. Complete terminal status on "ob-1" -> queue is empty!
+      repository.setTerminalStatus("ob-1", "done");
+      transitions = repository.readyHeadTransitions();
+      expect(transitions).toEqual([]);
+
+      // Check the raw database state of obligation_ready_heads
+      const rawRows = db
+        .prepare("SELECT * FROM obligation_ready_heads WHERE owner_id = 'actor-a'")
+        .all();
+      expect(rawRows).toHaveLength(1);
+      expect(rawRows[0]).toMatchObject({
+        owner_id: "actor-a",
+        head_id: null,
+        previous_head_id: "ob-1",
+        sequence: 2,
+      });
+
+      // 3. Add a new ready head "ob-2" for the same owner.
+      repository.create({ id: "ob-2", ownerId: "actor-a", priority: 10 });
+      transitions = repository.readyHeadTransitions();
+      expect(transitions).toEqual([
+        { ownerId: "actor-a", headId: "ob-2", previousHeadId: null, sequence: 3 },
+      ]);
+    });
+
+    it("announces the displacing obligation when new work takes the head", () => {
+      repository.create({ id: "first", ownerId: "actor-a", priority: 10 });
+      heads = [];
+
+      repository.create({ id: "urgent", ownerId: "actor-a", priority: 1 });
+
+      expect(heads).toEqual([{ ownerId: "actor-a", headId: "urgent" }]);
+    });
+
+    it("announces to the receiving actor on reassignment, and only to them", () => {
+      repository.create({ id: "work", ownerId: "actor-a", priority: 10 });
+      heads = [];
+
+      repository.reassign("work", "actor-b");
+
+      // actor-a LOST a head — losing one is not attention-worthy, only gaining.
+      expect(heads).toEqual([{ ownerId: "actor-b", headId: "work" }]);
+    });
+
+    it("announces a parent re-readied by its last child going terminal", () => {
+      repository.create({ id: "parent", ownerId: "actor-a", priority: 10 });
+      repository.create({
+        id: "child",
+        parentId: "parent",
+        ownerId: "actor-b",
+      });
+      heads = [];
+
+      repository.setTerminalStatus("child", "done");
+
+      // The parent's owner was never named by the caller; the head diff finds it.
+      expect(heads).toEqual([{ ownerId: "actor-a", headId: "parent" }]);
+    });
+
+    it("announces heirs when a retiring actor's work moves", () => {
+      repository.create({ id: "inherited", ownerId: "actor-b", priority: 10 });
+      heads = [];
+
+      repository.inheritRetiringActorObligationsInternal("actor-b", "actor-a");
+
+      expect(heads).toEqual([{ ownerId: "actor-a", headId: "inherited" }]);
+    });
+
+    it("stays silent for human owners — their head belongs in the dashboard, not an inbox", () => {
+      repository.create({ id: "operator-work", ownerId: "human:operator", priority: 10 });
+      expect(heads).toEqual([]);
+    });
+
+    it("announces nothing when a rolled-back mutation never commits", () => {
+      repository.create({ id: "parent", ownerId: "actor-a", priority: 10 });
+      repository.create({
+        id: "child",
+        parentId: "parent",
+        ownerId: "actor-b",
+      });
+      heads = [];
+
+      // A parent with a live child cannot go terminal; the transaction throws.
+      expect(() => repository.setTerminalStatus("parent", "done")).toThrow();
+
+      expect(heads).toEqual([]);
+    });
+
+    it("reports a head identical to the first row of the owner's own ready queue", () => {
+      repository.create({ id: "a", ownerId: "actor-a", priority: 30 });
+      repository.create({ id: "b", ownerId: "actor-a", priority: 20 });
+      repository.create({ id: "c", ownerId: "actor-a", priority: 10 });
+
+      const queue = repository.listOwned("actor-a", { status: "ready" });
+      expect(heads.at(-1)).toEqual({ ownerId: "actor-a", headId: queue[0].id });
+    });
+  });
+
+  it("has no UPDATE on obligations that forgets updated_at (drift guard for the trigger we chose not to use)", async () => {
+    // The operator ruled against stamping via SQLite triggers on #1671 (2026-08-22):
+    // triggers are "opaque to the codebase". Repository writes are visible but
+    // missable, so the guarantee has to live here instead: every mutation
+    // statement in the repository must set updated_at, and this test fails when
+    // a new one does not.
+    const { readFileSync } = await import("node:fs");
+    // Vitest can hand back a non-file import.meta.url, so resolve from the
+    // package root (the test process cwd) instead.
+    const source = readFileSync("src/db/repositories/obligation-repository.ts", "utf8");
+    const updates = source.match(/UPDATE\s+obligations\b[\s\S]*?(?=`|")/g) ?? [];
+    expect(updates.length).toBeGreaterThan(0);
+    const missing = updates.filter((statement) => !/updated_at\s*=/.test(statement));
+    expect(missing).toEqual([]);
+  });
+
+  it("stamps every public mutation, not just the ones with a bespoke test", async () => {
+    const mutate: Array<[string, (name: string) => void]> = [
+      ["setTerminalStatus", (n) => repository.setTerminalStatus(`subject-${n}`, "done")],
+      ["reassign", (n) => repository.reassign(`subject-${n}`, "actor-c")],
+      ["reparent", (n) => repository.reparent(`subject-${n}`, null)],
+      ["setPriorityInternal", (n) => repository.setPriorityInternal(`subject-${n}`, 77)],
+    ];
+    for (const [name, apply] of mutate) {
+      // Fresh ids per case rather than deleting: obligations reference their
+      // parent with ON DELETE RESTRICT, so a blanket delete trips the FK.
+      repository.create({
+        id: `anchor-${name}`,
+        ownerId: "actor-a",
+        priority: 1,
+      });
+      const before = repository.create({
+        id: `subject-${name}`,
+        parentId: `anchor-${name}`,
+        ownerId: "actor-b",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 3));
+      apply(name);
+      const after = repository.require(`subject-${name}`);
+      expect(
+        Date.parse(after.updatedAt as string),
+        `${name} did not advance updatedAt`
+      ).toBeGreaterThan(Date.parse(before.updatedAt as string));
+      expect(after.createdAt, `${name} moved createdAt`).toBe(before.createdAt);
+    }
+  });
+
+  it("records an immutable creator that survives reassignment", async () => {
+    const created = repository.create({
+      id: "owned-elsewhere",
+      ownerId: "actor-b",
+      creatorId: "human:operator",
+      intent: "raised by one entity, owned by another",
+    });
+
+    expect(created.creatorId).toBe("human:operator");
+    expect(created.ownerId).toEqual("actor-b");
+
+    repository.reassign("owned-elsewhere", "actor-c");
+    const moved = repository.require("owned-elsewhere");
+    expect(moved.ownerId).toEqual("actor-c");
+    expect(moved.creatorId).toBe("human:operator");
+  });
+
+  it("accepts any id in the mesh's one id space and rejects a blank one", () => {
+    // Actor UUID, root, human:*, system:* — all the same space, no `kind`.
+    for (const creator of ["actor-a", "root", "human:operator", "system:tracker-hygiene"]) {
+      const o = repository.create({
+        id: `by-${creator}`,
+        ownerId: "actor-a",
+        creatorId: creator,
+      });
+      expect(o.creatorId).toBe(creator);
+    }
+
+    expect(() =>
+      repository.create({
+        id: "blank-creator",
+        ownerId: "actor-a",
+        creatorId: "  ",
+      })
+    ).toThrow("entity id is required");
+  });
+
+  it("records an honest unknown creator rather than inferring one from the owner", () => {
+    const created = repository.create({
+      id: "no-principal",
+      ownerId: "actor-a",
+    });
+    expect(created.creatorId).toBeNull();
+  });
+
+  it("stamps mutations that do not go through setTerminalStatus", async () => {
+    repository.create({ id: "root", ownerId: "actor-a", priority: 10 });
+    const child = repository.create({
+      id: "child",
+      parentId: "root",
+      ownerId: "actor-b",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    repository.reassign("child", "actor-c");
+
+    expect(Date.parse(repository.require("child").updatedAt as string)).toBeGreaterThan(
+      Date.parse(child.updatedAt as string)
+    );
+  });
+
   it("represents exactly one validated owner while treating human ids as opaque handles", () => {
     const actorOwned = repository.create({
       id: "actor-work",
-      owner: { kind: "actor", id: "actor-a" },
+      ownerId: "actor-a",
       intent: "ship the slice",
     });
     const humanOwned = repository.create({
       id: "human-work",
-      owner: { kind: "human", id: "human:operator" },
+      ownerId: "human:operator",
     });
 
-    expect(actorOwned.owner).toEqual({ kind: "actor", id: "actor-a" });
-    expect(humanOwned.owner).toEqual({ kind: "human", id: "human:operator" });
+    expect(actorOwned.ownerId).toEqual("actor-a");
+    expect(humanOwned.ownerId).toEqual("human:operator");
+    expect(() => repository.create({ id: "missing-actor", ownerId: "unknown" })).toThrow(
+      "actor owner does not exist"
+    );
+    expect(() => repository.create({ id: "blank-owner", ownerId: "   " })).toThrow(
+      "entity id is required"
+    );
+    // `human:*` and `system:*` are not in the thread registry, so they must NOT
+    // be run through the actor-existence check that rejects "unknown".
     expect(() =>
-      repository.create({ id: "missing-actor", owner: { kind: "actor", id: "unknown" } })
-    ).toThrow("actor owner does not exist");
-    expect(() =>
-      repository.create({ id: "empty-human", owner: { kind: "human", id: " " } })
-    ).toThrow("owner id is required");
-    expect(() =>
-      repository.create({
-        id: "invalid-kind",
-        owner: { kind: "team", id: "actor-a" } as never,
-      })
-    ).toThrow("owner kind must be actor or human");
+      repository.create({ id: "system-owned", ownerId: "system:tracker-hygiene" })
+    ).not.toThrow();
   });
 
   it("validates one supported external ref, enforces live uniqueness, and permits terminal reuse", () => {
     const original = repository.create({
       id: "original",
-      owner: { kind: "actor", id: "actor-a" },
+      ownerId: "actor-a",
       externalRef: "github_issue:dummy-org/dummy-repo#1485",
     });
     expect(original.externalRef).toMatchObject({
@@ -65,35 +386,35 @@ describe("ObligationRepository", () => {
     expect(() =>
       repository.create({
         id: "duplicate",
-        owner: { kind: "actor", id: "actor-b" },
+        ownerId: "actor-b",
         externalRef: "github_issue:dummy-org/dummy-repo#1485",
       })
     ).toThrow("already uses external ref");
     expect(() =>
       repository.create({
         id: "bad-ref",
-        owner: { kind: "actor", id: "actor-a" },
+        ownerId: "actor-a",
         externalRef: "https://github.com/dummy-org/dummy-repo/issues/1485",
       })
     ).toThrow("external ref must be");
     expect(() =>
       repository.create({
         id: "oversized-owner",
-        owner: { kind: "actor", id: "actor-a" },
+        ownerId: "actor-a",
         externalRef: `github_issue:${"a".repeat(40)}/rusa#1`,
       })
     ).toThrow("external ref owner cannot exceed 39 characters");
     expect(() =>
       repository.create({
         id: "oversized-repo",
-        owner: { kind: "actor", id: "actor-a" },
+        ownerId: "actor-a",
         externalRef: `github_issue:dummy-org/${"b".repeat(101)}#1`,
       })
     ).toThrow("external ref repository cannot exceed 100 characters");
 
     const maxBounds = repository.create({
       id: "max-bounds",
-      owner: { kind: "actor", id: "actor-a" },
+      ownerId: "actor-a",
       externalRef: `github_issue:${"a".repeat(39)}/${"b".repeat(100)}#1`,
     });
     expect(maxBounds.externalRef).toMatchObject({
@@ -106,45 +427,48 @@ describe("ObligationRepository", () => {
     expect(
       repository.create({
         id: "successor",
-        owner: { kind: "actor", id: "actor-b" },
+        ownerId: "actor-b",
         externalRef: "github_issue:dummy-org/dummy-repo#1485",
       }).status
     ).toBe("ready");
   });
 
   it("blocks a parent on live children and re-readies at its retained priority", () => {
-    repository.create({ id: "first", owner: { kind: "actor", id: "actor-a" } });
-    repository.create({ id: "parent", owner: { kind: "actor", id: "actor-a" } });
-    repository.create({ id: "third", owner: { kind: "actor", id: "actor-a" } });
+    repository.create({ id: "first", ownerId: "actor-a" });
+    repository.create({ id: "parent", ownerId: "actor-a" });
+    repository.create({ id: "third", ownerId: "actor-a" });
     repository.setPriorityInternal("third", 100);
     repository.setPriorityInternal("parent", 200);
     repository.setPriorityInternal("first", 300);
     repository.create({
       id: "child",
       parentId: "parent",
-      owner: { kind: "actor", id: "actor-b" },
+      ownerId: "actor-b",
       intent: "review the parent artifact",
     });
 
     expect(repository.require("parent").status).toBe("waiting");
-    expect(
-      repository.listOwned({ kind: "actor", id: "actor-a" }, { status: "ready" }).map((o) => o.id)
-    ).toEqual(["third", "first"]);
+    expect(repository.listOwned("actor-a", { status: "ready" }).map((o) => o.id)).toEqual([
+      "third",
+      "first",
+    ]);
     expect(repository.getTree("parent").blockingChildren.map((o) => o.id)).toEqual(["child"]);
 
     repository.setTerminalStatus("child", "done");
 
     expect(repository.require("parent").status).toBe("ready");
-    expect(
-      repository.listOwned({ kind: "actor", id: "actor-a" }, { status: "ready" }).map((o) => o.id)
-    ).toEqual(["third", "parent", "first"]);
+    expect(repository.listOwned("actor-a", { status: "ready" }).map((o) => o.id)).toEqual([
+      "third",
+      "parent",
+      "first",
+    ]);
     expect(repository.getTree("parent").blockingChildren).toEqual([]);
   });
 
   it("rejects invalid, nonadjacent, cross-owner, and non-ready priority moves", () => {
-    repository.create({ id: "first", owner: { kind: "actor", id: "actor-a" } });
-    repository.create({ id: "second", owner: { kind: "actor", id: "actor-a" } });
-    repository.create({ id: "foreign", owner: { kind: "actor", id: "actor-b" } });
+    repository.create({ id: "first", ownerId: "actor-a" });
+    repository.create({ id: "second", ownerId: "actor-a" });
+    repository.create({ id: "foreign", ownerId: "actor-b" });
 
     expect(() => repository.movePriorityInternal("second", "foreign", null)).toThrow(
       "neighbors must be adjacent ready obligations owned by the target owner"
@@ -152,7 +476,7 @@ describe("ObligationRepository", () => {
     expect(() => repository.movePriorityInternal("second", "first", "first")).toThrow(
       "neighbors must be adjacent"
     );
-    repository.create({ id: "child", parentId: "first", owner: { kind: "actor", id: "actor-b" } });
+    repository.create({ id: "child", parentId: "first", ownerId: "actor-b" });
     expect(() => repository.movePriorityInternal("first", null, "second")).toThrow(
       "only ready obligations can be reordered"
     );
@@ -162,18 +486,18 @@ describe("ObligationRepository", () => {
   });
 
   it("resolves nullable child priority through the nearest explicit ancestor", () => {
-    repository.create({ id: "root", owner: { kind: "actor", id: "actor-a" }, priority: 10 });
-    repository.create({ id: "child", parentId: "root", owner: { kind: "actor", id: "actor-b" } });
+    repository.create({ id: "root", ownerId: "actor-a", priority: 10 });
+    repository.create({ id: "child", parentId: "root", ownerId: "actor-b" });
     repository.create({
       id: "override",
       parentId: "child",
-      owner: { kind: "actor", id: "actor-c" },
+      ownerId: "actor-c",
       priority: 20,
     });
     repository.create({
       id: "leaf",
       parentId: "override",
-      owner: { kind: "actor", id: "actor-a" },
+      ownerId: "actor-a",
     });
 
     expect(repository.require("child")).toMatchObject({
@@ -189,17 +513,17 @@ describe("ObligationRepository", () => {
   });
 
   it("moves a subtree by clearing every descendant override", () => {
-    repository.create({ id: "root", owner: { kind: "actor", id: "actor-a" }, priority: 10 });
+    repository.create({ id: "root", ownerId: "actor-a", priority: 10 });
     repository.create({
       id: "child",
       parentId: "root",
-      owner: { kind: "actor", id: "actor-b" },
+      ownerId: "actor-b",
       priority: 20,
     });
     repository.create({
       id: "leaf",
       parentId: "child",
-      owner: { kind: "actor", id: "actor-c" },
+      ownerId: "actor-c",
       priority: 30,
     });
 
@@ -215,21 +539,21 @@ describe("ObligationRepository", () => {
   });
 
   it("materializes null direct-child branches for self moves until a later subtree move", () => {
-    repository.create({ id: "root", owner: { kind: "actor", id: "actor-a" }, priority: 10 });
+    repository.create({ id: "root", ownerId: "actor-a", priority: 10 });
     repository.create({
       id: "inheriting",
       parentId: "root",
-      owner: { kind: "actor", id: "actor-b" },
+      ownerId: "actor-b",
     });
     repository.create({
       id: "leaf",
       parentId: "inheriting",
-      owner: { kind: "actor", id: "actor-c" },
+      ownerId: "actor-c",
     });
     repository.create({
       id: "explicit",
       parentId: "root",
-      owner: { kind: "actor", id: "actor-b" },
+      ownerId: "actor-b",
       priority: 20,
     });
 
@@ -246,15 +570,18 @@ describe("ObligationRepository", () => {
   });
 
   it("uses midpoint moves and repairs equal-priority suffixes at +1 increments", () => {
-    repository.create({ id: "a", owner: { kind: "actor", id: "actor-a" }, priority: 10 });
-    repository.create({ id: "b", owner: { kind: "actor", id: "actor-a" }, priority: 20 });
-    repository.create({ id: "c", owner: { kind: "actor", id: "actor-a" }, priority: 30 });
-    repository.create({ id: "moved", owner: { kind: "actor", id: "actor-a" }, priority: 40 });
+    repository.create({ id: "a", ownerId: "actor-a", priority: 10 });
+    repository.create({ id: "b", ownerId: "actor-a", priority: 20 });
+    repository.create({ id: "c", ownerId: "actor-a", priority: 30 });
+    repository.create({ id: "moved", ownerId: "actor-a", priority: 40 });
 
     expect(repository.movePriorityInternal("moved", "a", "b").effectivePriority).toBe(15);
-    expect(
-      repository.listOwned({ kind: "actor", id: "actor-a" }, { status: "ready" }).map((o) => o.id)
-    ).toEqual(["a", "moved", "b", "c"]);
+    expect(repository.listOwned("actor-a", { status: "ready" }).map((o) => o.id)).toEqual([
+      "a",
+      "moved",
+      "b",
+      "c",
+    ]);
 
     repository.setPriorityInternal("a", 10);
     repository.setPriorityInternal("b", 10);
@@ -267,9 +594,9 @@ describe("ObligationRepository", () => {
   });
 
   it("moves correctly across the full finite REAL magnitude range", () => {
-    repository.create({ id: "low", owner: { kind: "actor", id: "actor-a" }, priority: -1e308 });
-    repository.create({ id: "high", owner: { kind: "actor", id: "actor-a" }, priority: 1e308 });
-    repository.create({ id: "moved", owner: { kind: "actor", id: "actor-a" }, priority: 0 });
+    repository.create({ id: "low", ownerId: "actor-a", priority: -1e308 });
+    repository.create({ id: "high", ownerId: "actor-a", priority: 1e308 });
+    repository.create({ id: "moved", ownerId: "actor-a", priority: 0 });
 
     expect(repository.movePriorityInternal("moved", "low", "high").effectivePriority).toBe(0);
     expect(repository.movePriorityInternal("moved", null, "low").effectivePriority).toSatisfy(
@@ -281,10 +608,10 @@ describe("ObligationRepository", () => {
   });
 
   it("repairs large equal-priority bands using the next representable values", () => {
-    repository.create({ id: "a", owner: { kind: "actor", id: "actor-a" }, priority: 1e308 });
-    repository.create({ id: "b", owner: { kind: "actor", id: "actor-a" }, priority: 1e308 });
-    repository.create({ id: "c", owner: { kind: "actor", id: "actor-a" }, priority: 1e308 });
-    repository.create({ id: "moved", owner: { kind: "actor", id: "actor-a" }, priority: 1.5e308 });
+    repository.create({ id: "a", ownerId: "actor-a", priority: 1e308 });
+    repository.create({ id: "b", ownerId: "actor-a", priority: 1e308 });
+    repository.create({ id: "c", ownerId: "actor-a", priority: 1e308 });
+    repository.create({ id: "moved", ownerId: "actor-a", priority: 1.5e308 });
 
     repository.movePriorityInternal("moved", "a", "b");
     const moved = repository.require("moved").effectivePriority;
@@ -297,16 +624,16 @@ describe("ObligationRepository", () => {
   });
 
   it("keeps a parent waiting until every direct child is terminal", () => {
-    repository.create({ id: "parent", owner: { kind: "actor", id: "actor-a" } });
+    repository.create({ id: "parent", ownerId: "actor-a" });
     repository.create({
       id: "child-a",
       parentId: "parent",
-      owner: { kind: "actor", id: "actor-b" },
+      ownerId: "actor-b",
     });
     repository.create({
       id: "child-b",
       parentId: "parent",
-      owner: { kind: "human", id: "reviewer" },
+      ownerId: "human:operator",
     });
 
     repository.setTerminalStatus("child-a", "done");
@@ -316,11 +643,11 @@ describe("ObligationRepository", () => {
   });
 
   it("guards terminal transitions with live children and makes terminal state final", () => {
-    repository.create({ id: "parent", owner: { kind: "actor", id: "actor-a" } });
+    repository.create({ id: "parent", ownerId: "actor-a" });
     repository.create({
       id: "child",
       parentId: "parent",
-      owner: { kind: "actor", id: "actor-b" },
+      ownerId: "actor-b",
     });
 
     expect(() => repository.setTerminalStatus("parent", "cancelled")).toThrow(
@@ -338,7 +665,7 @@ describe("ObligationRepository", () => {
       repository.create({
         id: "late-child",
         parentId: "parent",
-        owner: { kind: "actor", id: "actor-b" },
+        ownerId: "actor-b",
       })
     ).toThrow("cannot add a child to a terminal obligation");
   });
@@ -346,25 +673,25 @@ describe("ObligationRepository", () => {
   it("returns a complete tree that names the live child explaining waiting", () => {
     repository.create({
       id: "root",
-      owner: { kind: "actor", id: "actor-a" },
+      ownerId: "actor-a",
       externalRef: "github_pr:dummy-org/dummy-repo#2000",
     });
     repository.create({
       id: "review",
       parentId: "root",
-      owner: { kind: "human", id: "reviewer" },
+      ownerId: "human:operator",
     });
     repository.create({
       id: "check",
       parentId: "review",
-      owner: { kind: "actor", id: "actor-b" },
+      ownerId: "actor-b",
     });
 
     const tree = repository.getTree("root");
     expect(tree.obligation).toMatchObject({
       id: "root",
       status: "waiting",
-      owner: { kind: "actor", id: "actor-a" },
+      ownerId: "actor-a",
     });
     expect(tree.blockingChildren.map((o) => o.id)).toEqual(["review"]);
     expect(tree.children[0]?.blockingChildren.map((o) => o.id)).toEqual(["check"]);
@@ -374,10 +701,10 @@ describe("ObligationRepository", () => {
     for (let index = 0; index < 150; index += 1) {
       repository.create({
         id: `work-${index.toString().padStart(3, "0")}`,
-        owner: { kind: "actor", id: "actor-a" },
+        ownerId: "actor-a",
       });
     }
-    const queue = repository.listOwned({ kind: "actor", id: "actor-a" }, { status: "ready" });
+    const queue = repository.listOwned("actor-a", { status: "ready" });
     expect(queue).toHaveLength(150);
     expect(queue.at(0)?.id).toBe("work-000");
     expect(queue.at(-1)?.id).toBe("work-149");
@@ -387,18 +714,12 @@ describe("ObligationRepository", () => {
     for (let index = 0; index < 150; index += 1) {
       repository.create({
         id: `work-${index.toString().padStart(3, "0")}`,
-        owner: { kind: "actor", id: "actor-a" },
+        ownerId: "actor-a",
       });
     }
 
-    const first = repository.listOwnedPage(
-      { kind: "actor", id: "actor-a" },
-      { status: "ready", limit: 50 }
-    );
-    const last = repository.listOwnedPage(
-      { kind: "actor", id: "actor-a" },
-      { status: "ready", limit: 50, offset: 100 }
-    );
+    const first = repository.listOwnedPage("actor-a", { status: "ready", limit: 50 });
+    const last = repository.listOwnedPage("actor-a", { status: "ready", limit: 50, offset: 100 });
 
     expect(first).toMatchObject({ total: 150, hasMore: true });
     expect(first.obligations).toHaveLength(50);
@@ -406,20 +727,20 @@ describe("ObligationRepository", () => {
     expect(last).toMatchObject({ total: 150, hasMore: false });
     expect(last.obligations).toHaveLength(50);
     expect(last.obligations.at(-1)?.id).toBe("work-149");
-    expect(repository.listOwned({ kind: "actor", id: "actor-a" })).toHaveLength(150);
+    expect(repository.listOwned("actor-a")).toHaveLength(150);
   });
 
   it("internally inherits only a retiring actor's nonterminal obligations", () => {
-    repository.create({ id: "parent-existing", owner: { kind: "actor", id: "actor-b" } });
-    repository.create({ id: "retiring-first", owner: { kind: "actor", id: "actor-a" } });
-    repository.create({ id: "retiring-second", owner: { kind: "actor", id: "actor-a" } });
-    repository.create({ id: "retiring-terminal", owner: { kind: "actor", id: "actor-a" } });
+    repository.create({ id: "parent-existing", ownerId: "actor-b" });
+    repository.create({ id: "retiring-first", ownerId: "actor-a" });
+    repository.create({ id: "retiring-second", ownerId: "actor-a" });
+    repository.create({ id: "retiring-terminal", ownerId: "actor-a" });
     repository.setTerminalStatus("retiring-terminal", "done");
-    repository.create({ id: "waiting-parent", owner: { kind: "actor", id: "actor-a" } });
+    repository.create({ id: "waiting-parent", ownerId: "actor-a" });
     repository.create({
       id: "child-keeps-owner",
       parentId: "waiting-parent",
-      owner: { kind: "actor", id: "actor-c" },
+      ownerId: "actor-c",
     });
     const storedPriorities = new Map(
       ["retiring-first", "retiring-second", "waiting-parent"].map((id) => [
@@ -434,27 +755,21 @@ describe("ObligationRepository", () => {
     });
     expect(
       repository
-        .listOwned({ kind: "actor", id: "actor-b" }, { status: "ready" })
+        .listOwned("actor-b", { status: "ready" })
         .map((o) => o.id)
         .sort()
     ).toEqual(["parent-existing", "retiring-first", "retiring-second"].sort());
-    expect(repository.require("waiting-parent").owner).toEqual({ kind: "actor", id: "actor-b" });
-    expect(repository.require("child-keeps-owner").owner).toEqual({
-      kind: "actor",
-      id: "actor-c",
-    });
-    expect(repository.require("retiring-terminal").owner).toEqual({
-      kind: "actor",
-      id: "actor-a",
-    });
+    expect(repository.require("waiting-parent").ownerId).toEqual("actor-b");
+    expect(repository.require("child-keeps-owner").ownerId).toEqual("actor-c");
+    expect(repository.require("retiring-terminal").ownerId).toEqual("actor-a");
     for (const [id, priority] of storedPriorities) {
       expect(repository.require(id).priority).toBe(priority);
     }
   });
 
   it("supports child-first inheritance moving upward again when the parent retires", () => {
-    repository.create({ id: "grandparent-existing", owner: { kind: "actor", id: "actor-c" } });
-    repository.create({ id: "child-work", owner: { kind: "actor", id: "actor-a" } });
+    repository.create({ id: "grandparent-existing", ownerId: "actor-c" });
+    repository.create({ id: "child-work", ownerId: "actor-a" });
 
     expect(repository.inheritRetiringActorObligationsInternal("actor-a", "actor-b")).toEqual({
       ready: 1,
@@ -466,14 +781,14 @@ describe("ObligationRepository", () => {
     });
     expect(
       repository
-        .listOwned({ kind: "actor", id: "actor-c" }, { status: "ready" })
+        .listOwned("actor-c", { status: "ready" })
         .map((o) => o.id)
         .sort()
     ).toEqual(["grandparent-existing", "child-work"].sort());
   });
 
   it("leaves root/no-parent inheritance visibly unresolved and validates the recipient", () => {
-    repository.create({ id: "root-work", owner: { kind: "actor", id: "actor-a" } });
+    repository.create({ id: "root-work", ownerId: "actor-a" });
 
     expect(() => repository.inheritRetiringActorObligationsInternal("actor-a", null)).toThrow(
       "root/no-parent behavior is unresolved (ISSUE_NUM Q69)"
@@ -481,34 +796,30 @@ describe("ObligationRepository", () => {
     expect(() => repository.inheritRetiringActorObligationsInternal("actor-a", "unknown")).toThrow(
       "actor owner does not exist: unknown"
     );
-    expect(repository.require("root-work").owner).toEqual({ kind: "actor", id: "actor-a" });
+    expect(repository.require("root-work").ownerId).toEqual("actor-a");
   });
 
   it("enforces reserved status and relational invariants at the persistence boundary", () => {
     const insert = db.prepare(
       `INSERT INTO obligations
-         (id, parent_id, owner_kind, owner_id, intent, external_ref, status, priority)
-       VALUES (?, ?, ?, ?, NULL, NULL, ?, 0)`
+         (id, parent_id, owner_id, intent, external_ref, status, priority)
+       VALUES (?, ?, ?, NULL, NULL, ?, 0)`
     );
-    expect(() => insert.run("snoozed", null, "actor", "actor-a", "snoozed")).toThrow(
+    expect(() => insert.run("snoozed", null, "actor-a", "snoozed")).toThrow(
       "CHECK constraint failed"
     );
-    expect(() => insert.run("ownerless", null, "actor", " ", "ready")).toThrow(
-      "CHECK constraint failed"
-    );
-    expect(() => insert.run("self", "self", "actor", "actor-a", "ready")).toThrow(
-      "CHECK constraint failed"
-    );
+    expect(() => insert.run("ownerless", null, " ", "ready")).toThrow("CHECK constraint failed");
+    expect(() => insert.run("self", "self", "actor-a", "ready")).toThrow("CHECK constraint failed");
   });
 
   describe("list and listPage", () => {
-    it("filters obligations by ownerKind, ownerId, status, and rootsOnly with pagination", () => {
-      repository.create({ id: "root-1", owner: { kind: "actor", id: "actor-a" } });
-      repository.create({ id: "root-2", owner: { kind: "human", id: "user-1" } });
+    it("filters obligations by ownerId, status, and rootsOnly with pagination", () => {
+      repository.create({ id: "root-1", ownerId: "actor-a" });
+      repository.create({ id: "root-2", ownerId: "human:operator" });
       repository.create({
         id: "child-1",
         parentId: "root-1",
-        owner: { kind: "actor", id: "actor-a" },
+        ownerId: "actor-a",
       });
       repository.setTerminalStatus("root-2", "done");
 
@@ -518,7 +829,7 @@ describe("ObligationRepository", () => {
       const roots = repository.list({ rootsOnly: true });
       expect(roots.map((o) => o.id).sort()).toEqual(["root-1", "root-2"].sort());
 
-      const actorA = repository.list({ ownerKind: "actor", ownerId: "actor-a" });
+      const actorA = repository.list({ ownerId: "actor-a" });
       expect(actorA.map((o) => o.id).sort()).toEqual(["child-1", "root-1"].sort());
 
       const done = repository.list({ status: "done" });
@@ -540,37 +851,40 @@ describe("ObligationRepository", () => {
     it("moves ready and waiting work between actor and human queues without changing the deliverable", () => {
       repository.create({
         id: "parent",
-        owner: { kind: "actor", id: "actor-a" },
+        ownerId: "actor-a",
         externalRef: "github_issue:dummy-org/dummy-repo#1636",
         priority: 42.5,
       });
       repository.create({
         id: "child",
         parentId: "parent",
-        owner: { kind: "actor", id: "actor-b" },
+        ownerId: "actor-b",
       });
 
       const before = repository.require("parent");
-      const humanOwned = repository.reassign("parent", { kind: "human", id: "human:operator" });
-      expect(humanOwned).toEqual({ ...before, owner: { kind: "human", id: "human:operator" } });
-      expect(repository.listOwned({ kind: "actor", id: "actor-a" })).toEqual([]);
-      expect(
-        repository.listOwned({ kind: "human", id: "human:operator" }).map((o) => o.id)
-      ).toEqual(["parent"]);
+      // `updatedAt` is excluded from the identity comparison because reassigning
+      // is a mutation and must advance it; that it advances is asserted in the
+      // timestamp tests. Comparing the rest pins that nothing ELSE moved.
+      const identity = ({ ownerId: _ownerId, updatedAt: _updatedAt, ...rest }: Obligation) => rest;
 
-      const actorOwned = repository.reassign("parent", { kind: "actor", id: "actor-c" });
-      expect(actorOwned).toEqual({ ...before, owner: { kind: "actor", id: "actor-c" } });
+      const humanOwned = repository.reassign("parent", "human:operator");
+      expect(identity(humanOwned)).toEqual(identity(before));
+      expect(humanOwned.ownerId).toEqual("human:operator");
+      expect(repository.listOwned("actor-a")).toEqual([]);
+      expect(repository.listOwned("human:operator").map((o) => o.id)).toEqual(["parent"]);
+
+      const actorOwned = repository.reassign("parent", "actor-c");
+      expect(identity(actorOwned)).toEqual(identity(before));
+      expect(actorOwned.ownerId).toEqual("actor-c");
       expect(repository.getTree("parent").children[0].obligation.id).toBe("child");
     });
 
     it("validates actor targets, permits same-owner no-op, and rejects terminal obligations", () => {
-      const task = repository.create({ id: "task", owner: { kind: "actor", id: "actor-a" } });
-      expect(repository.reassign("task", task.owner)).toEqual(task);
-      expect(() => repository.reassign("task", { kind: "actor", id: "missing" })).toThrow(
-        "actor owner does not exist"
-      );
+      const task = repository.create({ id: "task", ownerId: "actor-a" });
+      expect(repository.reassign("task", task.ownerId)).toEqual(task);
+      expect(() => repository.reassign("task", "missing")).toThrow("actor owner does not exist");
       repository.setTerminalStatus("task", "done");
-      expect(() => repository.reassign("task", { kind: "human", id: "human:operator" })).toThrow(
+      expect(() => repository.reassign("task", "human:operator")).toThrow(
         "terminal obligations cannot be reassigned"
       );
     });
@@ -578,12 +892,12 @@ describe("ObligationRepository", () => {
 
   describe("reparent", () => {
     it("reparents a child to a new parent, updating both parents' ready/waiting states", () => {
-      const p1 = repository.create({ id: "parent-1", owner: { kind: "actor", id: "actor-a" } });
-      const p2 = repository.create({ id: "parent-2", owner: { kind: "actor", id: "actor-a" } });
+      const p1 = repository.create({ id: "parent-1", ownerId: "actor-a" });
+      const p2 = repository.create({ id: "parent-2", ownerId: "actor-a" });
       repository.create({
         id: "child-1",
         parentId: "parent-1",
-        owner: { kind: "actor", id: "actor-a" },
+        ownerId: "actor-a",
       });
 
       expect(repository.require("parent-1").status).toBe("waiting");
@@ -602,11 +916,11 @@ describe("ObligationRepository", () => {
     });
 
     it("reparents a child to root, assigning a valid clock priority when stored priority was null", () => {
-      repository.create({ id: "parent-1", owner: { kind: "actor", id: "actor-a" } });
+      repository.create({ id: "parent-1", ownerId: "actor-a" });
       const child = repository.create({
         id: "child-1",
         parentId: "parent-1",
-        owner: { kind: "actor", id: "actor-a" },
+        ownerId: "actor-a",
       });
       expect(child.priority).toBeNull();
 
@@ -618,12 +932,12 @@ describe("ObligationRepository", () => {
     });
 
     it("preserves explicit priority when reparenting", () => {
-      repository.create({ id: "p1", owner: { kind: "actor", id: "actor-a" } });
-      repository.create({ id: "p2", owner: { kind: "actor", id: "actor-a" } });
+      repository.create({ id: "p1", ownerId: "actor-a" });
+      repository.create({ id: "p2", ownerId: "actor-a" });
       repository.create({
         id: "c1",
         parentId: "p1",
-        owner: { kind: "actor", id: "actor-a" },
+        ownerId: "actor-a",
         priority: 42.5,
       });
 
@@ -633,18 +947,18 @@ describe("ObligationRepository", () => {
     });
 
     it("rejects reparenting to self, cycle creation, terminal parent, and terminal target", () => {
-      repository.create({ id: "root-a", owner: { kind: "actor", id: "actor-a" } });
+      repository.create({ id: "root-a", ownerId: "actor-a" });
       repository.create({
         id: "child-a",
         parentId: "root-a",
-        owner: { kind: "actor", id: "actor-a" },
+        ownerId: "actor-a",
       });
       repository.create({
         id: "grandchild-a",
         parentId: "child-a",
-        owner: { kind: "actor", id: "actor-a" },
+        ownerId: "actor-a",
       });
-      repository.create({ id: "terminal-root", owner: { kind: "actor", id: "actor-a" } });
+      repository.create({ id: "terminal-root", ownerId: "actor-a" });
       repository.setTerminalStatus("terminal-root", "done");
 
       // Self-parenting

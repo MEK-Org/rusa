@@ -2,20 +2,19 @@ import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import {
   assertObligationStatus,
+  type EntityId,
   isTerminalObligationStatus,
   type Obligation,
-  type ObligationOwner,
   type ObligationStatus,
   type ObligationTree,
   ObligationValidationError,
   parseExternalRef,
-  validateObligationOwner,
+  validateEntityId,
 } from "../../obligations/obligation.js";
 
 interface ObligationRow {
   id: string;
   parent_id: string | null;
-  owner_kind: string;
   owner_id: string;
   intent: string | null;
   external_ref: string | null;
@@ -23,16 +22,26 @@ interface ObligationRow {
   priority: number | null;
   effective_priority: number;
   priority_source_id: string;
+  created_at: string | null;
+  updated_at: string | null;
+  creator_id: string | null;
 }
 
 export interface CreateObligationInput {
   id?: string;
   parentId?: string | null;
-  owner: ObligationOwner;
+  ownerId: EntityId;
   intent?: string | null;
   externalRef?: string | null;
   /** Explicit finite priority. Children inherit when omitted/null; roots default to the clock. */
   priority?: number | null;
+  /**
+   * The entity raising this obligation, bound by the calling server — never
+   * taken from model-supplied payload (#1671 trust boundary). Omitted only by
+   * callers with no identity to bind, which records an honest unknown rather
+   * than inferring one from `owner`.
+   */
+  creatorId?: EntityId | null;
 }
 
 export type PriorityScope = "subtree" | "self";
@@ -42,8 +51,7 @@ export interface ListOwnedObligationsOptions {
 }
 
 export interface ListObligationsOptions {
-  ownerKind?: ObligationOwner["kind"];
-  ownerId?: string;
+  ownerId?: EntityId;
   status?: ObligationStatus;
   rootsOnly?: boolean;
 }
@@ -61,6 +69,22 @@ export interface ChildObligationPageOptions extends ObligationPageOptions {
 
 export interface OwnedObligationPageOptions extends ObligationPageOptions {
   status?: ObligationStatus;
+}
+
+/** An actor gained a ready head it did not previously have. */
+export interface ReadyHeadChange {
+  ownerId: EntityId;
+  head: Obligation;
+  /**
+   * The head this one displaced, or `null` when the owner had no ready head.
+   *
+   * Carried because `head` alone cannot tell "this obligation reached the head
+   * for the first time" from "it reached the head again after being displaced",
+   * and a consumer that deduplicates on head identity needs to.
+   */
+  previousHeadId: string | null;
+  /** Monotonically increasing sequence number for head changes on this owner. */
+  sequence?: number;
 }
 
 export interface ObligationPage {
@@ -95,6 +119,16 @@ const PROJECTED_OBLIGATION = `
   FROM obligations obligation
   JOIN effective_priority ON effective_priority.id = obligation.id
 `;
+
+/**
+ * Whether an entity id names a mesh actor, as opposed to the operator or a
+ * system component. Actor existence is checkable; `human:*` and `system:*` ids
+ * are not in the thread registry, so validating them against it would reject
+ * legitimate owners.
+ */
+export function isActorEntityId(id: EntityId): boolean {
+  return !id.startsWith("human:") && !id.startsWith("system:");
+}
 
 function validatePriority(priority: number): number {
   if (!Number.isFinite(priority)) {
@@ -145,20 +179,19 @@ function validatePage(options: ObligationPageOptions): { limit: number; offset: 
 
 function toObligation(row: ObligationRow): Obligation {
   assertObligationStatus(row.status);
-  const owner = validateObligationOwner({
-    kind: row.owner_kind as ObligationOwner["kind"],
-    id: row.owner_id,
-  });
   return {
     id: row.id,
     parentId: row.parent_id,
-    owner,
+    ownerId: validateEntityId(row.owner_id),
     intent: row.intent,
     externalRef: row.external_ref === null ? null : parseExternalRef(row.external_ref),
     status: row.status,
     priority: row.priority,
     effectivePriority: validatePriority(row.effective_priority),
     prioritySourceId: row.priority_source_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    creatorId: row.creator_id,
   };
 }
 
@@ -166,19 +199,204 @@ function toObligation(row: ObligationRow): Obligation {
 export class ObligationRepository {
   constructor(
     private readonly db: Database.Database,
-    private readonly actorExists?: (actorId: string) => boolean,
+    private actorExists?: (actorId: string) => boolean,
     private readonly now: () => number = Date.now
   ) {}
 
+  /**
+   * Notified when an ACTOR owner gains a ready head it did not have before.
+   *
+   * Set after construction rather than injected: the mesh that consumes this
+   * does not exist yet when the repository container is built.
+   */
+  private readyHeadListener?: (change: ReadyHeadChange) => void;
+
+  /**
+   * Supply the actor-existence probe after construction.
+   *
+   * Needed because the production container is built from a `Database` alone,
+   * before the thread registry exists — which is why the constructor argument
+   * was never passed there, leaving the guard inert on every production path
+   * while reading as if it applied.
+   */
+  setActorExists(probe: (actorId: string) => boolean): void {
+    this.actorExists = probe;
+  }
+
+  setReadyHeadListener(listener: ((change: ReadyHeadChange) => void) | undefined): void {
+    this.readyHeadListener = listener;
+  }
+
+  /**
+   * Current ready head per owner, keyed by owner id.
+   *
+   * "Head" is the first row of the owner's ready queue, which must stay
+   * byte-identical to `listOwned`'s ordering (effective priority, then id) or
+   * an actor would be told about a head its own queue does not show first.
+   */
+  /**
+   * Current ready head per owner, keyed by owner id.
+   *
+   * "Head" is the first row of the owner's ready queue, which must stay
+   * byte-identical to `listOwned`'s ordering (effective priority, then id) or
+   * an actor would be told about a head its own queue does not show first.
+   */
+  readyHeads(): Map<string, string> {
+    const rows = this.db
+      .prepare(
+        `${EFFECTIVE_PRIORITY_CTE}
+         SELECT owner_id, id FROM (
+           SELECT obligation.owner_id,
+                  obligation.id,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY obligation.owner_id
+                    ORDER BY effective_priority.effective_priority, obligation.id
+                  ) AS rank
+           FROM obligations obligation
+           JOIN effective_priority ON effective_priority.id = obligation.id
+           WHERE obligation.status = 'ready'
+         )
+         WHERE rank = 1`
+      )
+      .all() as Array<{ owner_id: string; id: string }>;
+    return new Map(rows.map((row) => [row.owner_id, row.id]));
+  }
+
+  /**
+   * Current ready head transition records per owner, persisted transactionally in SQLite.
+   */
+  readyHeadTransitions(): Array<{
+    ownerId: EntityId;
+    headId: string;
+    previousHeadId: string | null;
+    sequence: number;
+  }> {
+    const rows = this.db
+      .prepare(
+        `SELECT owner_id, head_id, previous_head_id, sequence
+         FROM obligation_ready_heads
+         WHERE head_id IS NOT NULL`
+      )
+      .all() as Array<{
+      owner_id: string;
+      head_id: string;
+      previous_head_id: string | null;
+      sequence: number;
+    }>;
+    return rows.map((row) => ({
+      ownerId: row.owner_id,
+      headId: row.head_id,
+      previousHeadId: row.previous_head_id,
+      sequence: row.sequence,
+    }));
+  }
+
+  /**
+   * The single mutation seam: one transaction, with ready-head tracking around it.
+   *
+   * Every state-changing repository method routes through here, so a new
+   * mutation cannot be added that commits without being observed — the same
+   * reason `updated_at` is set at every UPDATE rather than left to a caller.
+   *
+   * Ready-head transitions are written transactionally inside SQLite to
+   * guarantee durability across restarts and process downtime.
+   */
+  private mutate<T>(work: () => T): T {
+    const changes: ReadyHeadChange[] = [];
+    const result = this.db.transaction(() => {
+      const before = this.readyHeads();
+      const res = work();
+      const after = this.readyHeads();
+
+      for (const [ownerId, headId] of after) {
+        const previousHeadId = before.get(ownerId) ?? null;
+        if (previousHeadId === headId) continue;
+        if (!isActorEntityId(ownerId)) continue;
+        const head = this.get(headId);
+        if (!head) continue;
+
+        const now = this.stamp();
+        this.db
+          .prepare(
+            `INSERT INTO obligation_ready_heads (owner_id, head_id, previous_head_id, sequence, updated_at)
+             VALUES (?, ?, ?, 1, ?)
+             ON CONFLICT(owner_id) DO UPDATE SET
+               previous_head_id = excluded.previous_head_id,
+               head_id = excluded.head_id,
+               sequence = sequence + 1,
+               updated_at = excluded.updated_at`
+          )
+          .run(ownerId, headId, previousHeadId, now);
+
+        const seqRow = this.db
+          .prepare(`SELECT sequence FROM obligation_ready_heads WHERE owner_id = ?`)
+          .get(ownerId) as { sequence: number } | undefined;
+        const sequence = seqRow?.sequence ?? 1;
+
+        changes.push({ ownerId, head, previousHeadId, sequence });
+      }
+
+      for (const ownerId of before.keys()) {
+        if (!after.has(ownerId) && isActorEntityId(ownerId)) {
+          const previousHeadId = before.get(ownerId) ?? null;
+          const now = this.stamp();
+          this.db
+            .prepare(
+              `UPDATE obligation_ready_heads
+               SET head_id = NULL,
+                   previous_head_id = ?,
+                   sequence = sequence + 1,
+                   updated_at = ?
+               WHERE owner_id = ?`
+            )
+            .run(previousHeadId, now, ownerId);
+        }
+      }
+
+      return res;
+    })();
+
+    const listener = this.readyHeadListener;
+    if (listener) {
+      for (const change of changes) {
+        try {
+          listener(change);
+        } catch (err) {
+          console.warn(
+            `[obligations] ready-head listener failed for ${change.ownerId}: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+        }
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * The wall-clock stamp for a write, in the ISO-8601 shape `mesh_events` uses.
+   *
+   * Derived from the injected clock so tests can pin it, and read once per
+   * statement rather than once per transaction: two mutations in one
+   * transaction are two mutations, and collapsing them would make an
+   * `updated_at` comparison lie about which write was last.
+   */
+  private stamp(): string {
+    return new Date(this.now()).toISOString();
+  }
+
   create(input: CreateObligationInput): Obligation {
-    return this.db.transaction(() => {
+    return this.mutate(() => {
+      const stampedAt = this.stamp();
+      const creatorId = input.creatorId == null ? null : validateEntityId(input.creatorId);
       const id = input.id ?? randomUUID();
       if (!id.trim()) throw new ObligationValidationError("obligation id is required");
       const parentId = input.parentId ?? null;
       if (parentId === id) throw new ObligationValidationError("obligation cannot parent itself");
-      const owner = validateObligationOwner(input.owner);
-      if (owner.kind === "actor" && this.actorExists && !this.actorExists(owner.id)) {
-        throw new ObligationValidationError(`actor owner does not exist: ${owner.id}`);
+      const ownerId = validateEntityId(input.ownerId);
+      if (isActorEntityId(ownerId) && this.actorExists && !this.actorExists(ownerId)) {
+        throw new ObligationValidationError(`actor owner does not exist: ${ownerId}`);
       }
       // PROVISIONAL ISSUE_NUM Q72: human IDs are opaque nonempty handles; no registry exists yet.
       const externalRef =
@@ -204,10 +422,21 @@ export class ObligationRepository {
         this.db
           .prepare(
             `INSERT INTO obligations
-               (id, parent_id, owner_kind, owner_id, intent, external_ref, status, priority)
-             VALUES (?, ?, ?, ?, ?, ?, 'ready', ?)`
+               (id, parent_id, owner_id, intent, external_ref, status, priority,
+                created_at, updated_at, creator_id)
+             VALUES (?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?)`
           )
-          .run(id, parentId, owner.kind, owner.id, input.intent ?? null, externalRef, priority);
+          .run(
+            id,
+            parentId,
+            ownerId,
+            input.intent ?? null,
+            externalRef,
+            priority,
+            stampedAt,
+            stampedAt,
+            creatorId
+          );
       } catch (error) {
         if (
           error instanceof Error &&
@@ -222,12 +451,14 @@ export class ObligationRepository {
 
       if (parentId !== null) {
         this.db
-          .prepare("UPDATE obligations SET status = 'waiting' WHERE id = ? AND status = 'ready'")
-          .run(parentId);
+          .prepare(
+            "UPDATE obligations SET status = 'waiting', updated_at = ? WHERE id = ? AND status = 'ready'"
+          )
+          .run(this.stamp(), parentId);
       }
 
       return this.require(id);
-    })();
+    });
   }
 
   get(id: string): Obligation | null {
@@ -284,16 +515,16 @@ export class ObligationRepository {
     };
   }
 
-  listOwned(owner: ObligationOwner, options: ListOwnedObligationsOptions = {}): Obligation[] {
-    validateObligationOwner(owner);
-    const params: string[] = [owner.kind, owner.id];
+  listOwned(ownerId: EntityId, options: ListOwnedObligationsOptions = {}): Obligation[] {
+    validateEntityId(ownerId);
+    const params: string[] = [ownerId];
     const statusClause = options.status === undefined ? "" : " AND obligation.status = ?";
     if (options.status !== undefined) params.push(options.status);
     return (
       this.db
         .prepare(
           `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
-           WHERE obligation.owner_kind = ? AND obligation.owner_id = ?${statusClause}
+           WHERE obligation.owner_id = ?${statusClause}
            ORDER BY
              CASE obligation.status WHEN 'ready' THEN 0 WHEN 'waiting' THEN 1 ELSE 2 END,
              effective_priority.effective_priority,
@@ -304,16 +535,16 @@ export class ObligationRepository {
   }
 
   /** Bounded owner-queue read for externally serialized projections. */
-  listOwnedPage(owner: ObligationOwner, options: OwnedObligationPageOptions): ObligationPage {
-    validateObligationOwner(owner);
+  listOwnedPage(ownerId: EntityId, options: OwnedObligationPageOptions): ObligationPage {
+    validateEntityId(ownerId);
     const { limit, offset } = validatePage(options);
-    const params: Array<string | number> = [owner.kind, owner.id];
+    const params: Array<string | number> = [ownerId];
     const statusClause = options.status === undefined ? "" : " AND obligation.status = ?";
     if (options.status !== undefined) params.push(options.status);
     const rows = this.db
       .prepare(
         `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
-         WHERE obligation.owner_kind = ? AND obligation.owner_id = ?${statusClause}
+         WHERE obligation.owner_id = ?${statusClause}
          ORDER BY
            CASE obligation.status WHEN 'ready' THEN 0 WHEN 'waiting' THEN 1 ELSE 2 END,
            effective_priority.effective_priority,
@@ -325,7 +556,7 @@ export class ObligationRepository {
       this.db
         .prepare(
           `SELECT COUNT(*) AS count FROM obligations obligation
-           WHERE obligation.owner_kind = ? AND obligation.owner_id = ?${statusClause}`
+           WHERE obligation.owner_id = ?${statusClause}`
         )
         .get(...params) as { count: number }
     ).count;
@@ -339,10 +570,6 @@ export class ObligationRepository {
   list(options: ListObligationsOptions = {}): Obligation[] {
     const clauses: string[] = [];
     const params: string[] = [];
-    if (options.ownerKind) {
-      clauses.push("obligation.owner_kind = ?");
-      params.push(options.ownerKind);
-    }
     if (options.ownerId) {
       clauses.push("obligation.owner_id = ?");
       params.push(options.ownerId);
@@ -373,10 +600,6 @@ export class ObligationRepository {
     const { limit, offset } = validatePage(options);
     const clauses: string[] = [];
     const params: Array<string | number> = [];
-    if (options.ownerKind) {
-      clauses.push("obligation.owner_kind = ?");
-      params.push(options.ownerKind);
-    }
     if (options.ownerId) {
       clauses.push("obligation.owner_id = ?");
       params.push(options.ownerId);
@@ -433,10 +656,10 @@ export class ObligationRepository {
 
   /** Apply an explicit priority using the v1 subtree/self inheritance contract. */
   setPriorityInternal(id: string, priority: number, scope: PriorityScope = "subtree"): Obligation {
-    return this.db.transaction(() => {
+    return this.mutate(() => {
       this.applyPriority(id, validatePriority(priority), scope);
       return this.require(id);
-    })();
+    });
   }
 
   /**
@@ -450,12 +673,12 @@ export class ObligationRepository {
     nextId: string | null,
     scope: PriorityScope = "subtree"
   ): Obligation {
-    return this.db.transaction(() => {
+    return this.mutate(() => {
       const target = this.require(id);
       if (target.status !== "ready") {
         throw new ObligationValidationError("only ready obligations can be reordered");
       }
-      const queue = this.listOwned(target.owner, { status: "ready" }).filter(
+      const queue = this.listOwned(target.ownerId, { status: "ready" }).filter(
         (obligation) => obligation.id !== id
       );
       const previousIndex = previousId === null ? -1 : queue.findIndex((o) => o.id === previousId);
@@ -513,12 +736,12 @@ export class ObligationRepository {
           // Numeric collision repair is not a semantic subtree reprioritization:
           // preserve explicit descendant exceptions while inherited descendants follow.
           this.db
-            .prepare("UPDATE obligations SET priority = ? WHERE id = ?")
-            .run(cursor, obligation.id);
+            .prepare("UPDATE obligations SET priority = ?, updated_at = ? WHERE id = ?")
+            .run(cursor, this.stamp(), obligation.id);
         }
       }
       return this.require(id);
-    })();
+    });
   }
 
   /**
@@ -531,56 +754,56 @@ export class ObligationRepository {
     retiringActorId: string,
     parentActorId: string | null
   ): RetirementInheritanceResult {
-    return this.db.transaction(() => {
-      const retiringOwner = validateObligationOwner({ kind: "actor", id: retiringActorId });
+    return this.mutate(() => {
+      const retiringOwner = validateEntityId(retiringActorId);
       if (parentActorId === null) {
         throw new ObligationValidationError(
           "retirement inheritance requires an actor parent; root/no-parent behavior is unresolved (ISSUE_NUM Q69)"
         );
       }
-      const parentOwner = validateObligationOwner({ kind: "actor", id: parentActorId });
-      if (retiringOwner.id === parentOwner.id) {
+      const parentOwner = validateEntityId(parentActorId);
+      if (retiringOwner === parentOwner) {
         throw new ObligationValidationError("retiring actor cannot inherit its own obligations");
       }
-      if (this.actorExists && !this.actorExists(parentOwner.id)) {
-        throw new ObligationValidationError(`actor owner does not exist: ${parentOwner.id}`);
+      if (this.actorExists && !this.actorExists(parentOwner)) {
+        throw new ObligationValidationError(`actor owner does not exist: ${parentOwner}`);
       }
 
       return {
-        ready: this.transferOwnedStatus(retiringOwner.id, parentOwner.id, "ready"),
-        waiting: this.transferOwnedStatus(retiringOwner.id, parentOwner.id, "waiting"),
+        ready: this.transferOwnedStatus(retiringOwner, parentOwner, "ready"),
+        waiting: this.transferOwnedStatus(retiringOwner, parentOwner, "waiting"),
       };
-    })();
+    });
   }
 
   /**
    * Change the owner of one live obligation without changing its identity,
    * position, ancestry, or state. Authorization belongs to the calling surface.
    */
-  reassign(id: string, newOwner: ObligationOwner): Obligation {
-    return this.db.transaction(() => {
+  reassign(id: string, newOwnerId: EntityId): Obligation {
+    return this.mutate(() => {
       const obligation = this.require(id);
       if (isTerminalObligationStatus(obligation.status)) {
         throw new ObligationValidationError("terminal obligations cannot be reassigned");
       }
-      const owner = validateObligationOwner(newOwner);
-      if (owner.kind === "actor" && this.actorExists && !this.actorExists(owner.id)) {
-        throw new ObligationValidationError(`actor owner does not exist: ${owner.id}`);
+      const ownerId = validateEntityId(newOwnerId);
+      if (isActorEntityId(ownerId) && this.actorExists && !this.actorExists(ownerId)) {
+        throw new ObligationValidationError(`actor owner does not exist: ${ownerId}`);
       }
-      if (owner.kind === obligation.owner.kind && owner.id === obligation.owner.id) {
+      if (ownerId === obligation.ownerId) {
         return obligation;
       }
 
       this.db
-        .prepare("UPDATE obligations SET owner_kind = ?, owner_id = ? WHERE id = ?")
-        .run(owner.kind, owner.id, id);
+        .prepare("UPDATE obligations SET owner_id = ?, updated_at = ? WHERE id = ?")
+        .run(ownerId, this.stamp(), id);
       return this.require(id);
-    })();
+    });
   }
 
   /** Internal terminal transition; the future service layer owns discharge authorization/ACK. */
   setTerminalStatus(id: string, status: "done" | "cancelled"): Obligation {
-    return this.db.transaction(() => {
+    return this.mutate(() => {
       const obligation = this.require(id);
       if (isTerminalObligationStatus(obligation.status)) {
         throw new ObligationValidationError("terminal obligations cannot be reopened or changed");
@@ -594,10 +817,12 @@ export class ObligationRepository {
         );
       }
 
-      this.db.prepare("UPDATE obligations SET status = ? WHERE id = ?").run(status, id);
+      this.db
+        .prepare("UPDATE obligations SET status = ?, updated_at = ? WHERE id = ?")
+        .run(status, this.stamp(), id);
       if (obligation.parentId !== null) this.reReadyParentIfUnblocked(obligation.parentId);
       return this.require(id);
-    })();
+    });
   }
 
   /**
@@ -606,7 +831,7 @@ export class ObligationRepository {
    * and new parents' waiting/ready states and rejects cycles and self-parenting.
    */
   reparent(id: string, newParentId: string | null): Obligation {
-    return this.db.transaction(() => {
+    return this.mutate(() => {
       const obligation = this.require(id);
       if (isTerminalObligationStatus(obligation.status)) {
         throw new ObligationValidationError("terminal obligations cannot be reparented");
@@ -648,16 +873,22 @@ export class ObligationRepository {
 
       if (newParentId === null && obligation.priority === null) {
         this.db
-          .prepare("UPDATE obligations SET parent_id = ?, priority = ? WHERE id = ?")
-          .run(null, validatePriority(this.now()), id);
+          .prepare(
+            "UPDATE obligations SET parent_id = ?, priority = ?, updated_at = ? WHERE id = ?"
+          )
+          .run(null, validatePriority(this.now()), this.stamp(), id);
       } else {
-        this.db.prepare("UPDATE obligations SET parent_id = ? WHERE id = ?").run(newParentId, id);
+        this.db
+          .prepare("UPDATE obligations SET parent_id = ?, updated_at = ? WHERE id = ?")
+          .run(newParentId, this.stamp(), id);
       }
 
       if (newParentId !== null) {
         this.db
-          .prepare("UPDATE obligations SET status = 'waiting' WHERE id = ? AND status = 'ready'")
-          .run(newParentId);
+          .prepare(
+            "UPDATE obligations SET status = 'waiting', updated_at = ? WHERE id = ? AND status = 'ready'"
+          )
+          .run(this.stamp(), newParentId);
       }
 
       if (oldParentId !== null) {
@@ -665,7 +896,7 @@ export class ObligationRepository {
       }
 
       return this.require(id);
-    })();
+    });
   }
 
   reorder(
@@ -690,10 +921,10 @@ export class ObligationRepository {
       this.db
         .prepare(
           `UPDATE obligations
-           SET priority = ?
+           SET priority = ?, updated_at = ?
            WHERE parent_id = ? AND priority IS NULL`
         )
-        .run(obligation.effectivePriority, id);
+        .run(obligation.effectivePriority, this.stamp(), id);
     } else {
       this.db
         .prepare(
@@ -704,12 +935,16 @@ export class ObligationRepository {
              FROM obligations child
              JOIN descendants parent ON child.parent_id = parent.id
            )
-           UPDATE obligations SET priority = NULL
+           UPDATE obligations SET priority = NULL, updated_at = ?
            WHERE id IN (SELECT id FROM descendants)`
         )
-        .run(id);
+        // The CTE's parent_id placeholder is bound FIRST: it precedes the SET
+        // clause in statement text, which is where better-sqlite3 takes order from.
+        .run(id, this.stamp());
     }
-    this.db.prepare("UPDATE obligations SET priority = ? WHERE id = ?").run(priority, id);
+    this.db
+      .prepare("UPDATE obligations SET priority = ?, updated_at = ? WHERE id = ?")
+      .run(priority, this.stamp(), id);
   }
 
   /** Transfer ownership while preserving the obligation's stored/effective priority. */
@@ -722,7 +957,7 @@ export class ObligationRepository {
       .prepare(
         `SELECT COUNT(*) AS count
          FROM obligations
-         WHERE owner_kind = 'actor' AND owner_id = ? AND status = ?`
+         WHERE owner_id = ? AND status = ?`
       )
       .get(retiringActorId, status) as { count: number };
     if (source.count === 0) return 0;
@@ -730,10 +965,10 @@ export class ObligationRepository {
     const result = this.db
       .prepare(
         `UPDATE obligations
-         SET owner_id = ?
-         WHERE owner_kind = 'actor' AND owner_id = ? AND status = ?`
+         SET owner_id = ?, updated_at = ?
+         WHERE owner_id = ? AND status = ?`
       )
-      .run(parentActorId, retiringActorId, status);
+      .run(parentActorId, this.stamp(), retiringActorId, status);
     return result.changes;
   }
 
@@ -747,6 +982,8 @@ export class ObligationRepository {
       )
       .get(parentId) as { count: number };
     if (liveChildren.count !== 0) return;
-    this.db.prepare("UPDATE obligations SET status = 'ready' WHERE id = ?").run(parentId);
+    this.db
+      .prepare("UPDATE obligations SET status = 'ready', updated_at = ? WHERE id = ?")
+      .run(this.stamp(), parentId);
   }
 }

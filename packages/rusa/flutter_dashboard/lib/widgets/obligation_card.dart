@@ -53,7 +53,7 @@ class ObligationRow extends StatelessWidget {
         if (showOwner) ...[
           const SizedBox(height: 2),
           Text(
-            'Owner: ${obligation.owner.kind}:${obligation.owner.kind == 'actor' ? (store.actor(obligation.owner.id)?.handle ?? obligation.owner.id) : obligation.owner.id}',
+            'Owner: ${store.actor(obligation.ownerId)?.handle ?? obligation.ownerId}',
             style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),
           ),
         ],
@@ -103,8 +103,7 @@ class ObligationRow extends StatelessWidget {
                     context,
                     store,
                     defaultParentId: obligation.id,
-                    defaultOwnerId: obligation.owner.kind == 'actor' ? obligation.owner.id : null,
-                    defaultOwnerKind: obligation.owner.kind,
+                    defaultOwnerId: obligation.ownerId,
                     onCreated: onMutated,
                   );
                   break;
@@ -228,7 +227,7 @@ class ObligationRow extends StatelessWidget {
                       Padding(
                         padding: const EdgeInsets.only(top: 4),
                         child: Text(
-                          '• ${blocker.intent ?? blocker.id} (${blocker.owner.kind}: ${blocker.owner.kind == 'actor' ? (store.actor(blocker.owner.id)?.handle ?? blocker.owner.id) : blocker.owner.id})',
+                          '• ${blocker.intent ?? blocker.id} (${store.actor(blocker.ownerId)?.handle ?? blocker.ownerId})',
                           style: const TextStyle(
                             color: Color(0xFFFECDD3),
                             fontSize: 11.5,

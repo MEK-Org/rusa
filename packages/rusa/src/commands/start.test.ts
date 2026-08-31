@@ -482,6 +482,69 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // signal to the parent now, not something the worker self-heals from.
       expect(kimiActorOpts.fallback).toBeUndefined();
     });
+
+    it("boot wires the obligation store's actor guard, so it is not inert", async () => {
+      // Deliberately asserted through a real `runStart`, not by injecting the
+      // probe. The defect this pins was precisely that the production container
+      // is built from a Database alone and nobody supplied one, so the guard
+      // read as if it applied while never running. A test that constructed the
+      // repository itself would have passed throughout.
+      writeFileSync(
+        join(homeDir, "threads.json"),
+        JSON.stringify({
+          threads: [
+            { id: "root", charter: "root", parentId: null, isRoot: true, status: "active" },
+            {
+              id: "live-worker",
+              charter: "worker",
+              parentId: "root",
+              provider: "kimi",
+              status: "active",
+            },
+            {
+              id: "retired-worker",
+              charter: "worker",
+              parentId: "root",
+              provider: "kimi",
+              status: "retired",
+            },
+          ],
+        }),
+        "utf8"
+      );
+
+      await new Promise<void>((resolve) => {
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+
+      // Read the live id back out of the registry boot actually loaded, rather
+      // than assuming the file we wrote survived `resolveRootThreadId`.
+      const threads = JSON.parse(readFileSync(join(homeDir, "threads.json"), "utf8")) as {
+        threads: Array<{ id: string; status: string }>;
+      };
+      const liveId = threads.threads.find((t) => t.status === "active")?.id;
+      expect(liveId).toBeDefined();
+
+      const obligations = getRepositories().obligations;
+      expect(() => obligations.create({ ownerId: String(liveId), intent: "fine" })).not.toThrow();
+      for (const ownerId of ["never-existed", "retired-worker"]) {
+        expect(() => obligations.create({ ownerId, intent: "drift" }), ownerId).toThrow(
+          /actor owner does not exist/
+        );
+      }
+      // The operator is not an actor and must still be ownable — the whole
+      // human-decision contract depends on it.
+      expect(() =>
+        obligations.create({ ownerId: "human:operator", intent: "decide" })
+      ).not.toThrow();
+    });
   });
 
   it("drives the boot model-catalog probe through the injected fake, not a real CLI", async () => {

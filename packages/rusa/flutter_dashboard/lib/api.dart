@@ -338,7 +338,6 @@ class DashboardApi {
   // ── Obligations read routes ──
 
   Future<ObligationPage> fetchObligations({
-    String? ownerKind,
     String? ownerId,
     String? status,
     bool? rootsOnly,
@@ -346,7 +345,6 @@ class DashboardApi {
     int? offset,
   }) async {
     final q = <String, String>{
-      'ownerKind':? ownerKind,
       'ownerId':? ownerId,
       'status':? status,
       if (rootsOnly != null) 'rootsOnly': '$rootsOnly',
@@ -383,7 +381,6 @@ class DashboardApi {
   // ── Obligations write routes ──
 
   Future<ObligationDto> createObligation({
-    required String ownerKind,
     required String ownerId,
     String? parentId,
     String? intent,
@@ -392,7 +389,6 @@ class DashboardApi {
   }) async {
     final uri = _u('/api/mesh/obligations');
     final payload = {
-      'ownerKind': ownerKind,
       'ownerId': ownerId,
       'parentId': ?parentId,
       'intent': ?intent,
@@ -480,7 +476,6 @@ class DashboardApi {
 
   Future<ObligationDto> reassignObligation(
     String id, {
-    required String ownerKind,
     required String ownerId,
   }) async {
     final uri = _u('/api/mesh/obligations/$id/reassign');
@@ -490,7 +485,7 @@ class DashboardApi {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
       },
-      body: jsonEncode({'ownerKind': ownerKind, 'ownerId': ownerId}),
+      body: jsonEncode({'ownerId': ownerId}),
     );
     if (res.statusCode != 200) {
       throw DashboardApiException(uri, res.statusCode, res.body);

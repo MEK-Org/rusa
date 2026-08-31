@@ -7,7 +7,7 @@ void main() {
       final json = {
         'id': 'ob-123',
         'parentId': null,
-        'owner': {'kind': 'actor', 'id': 'test-actor'},
+        'ownerId': 'test-actor',
         'intent': 'Test intent',
         'externalRef': {
           'kind': 'github_issue',
@@ -31,7 +31,7 @@ void main() {
       final json = {
         'id': 'ob-456',
         'parentId': null,
-        'owner': {'kind': 'actor', 'id': 'test-actor'},
+        'ownerId': 'test-actor',
         'intent': 'Test intent 2',
         'externalRef': 'github_issue:dummy-org/dummy-repoISSUE_NUM',
         'status': 'ready',
@@ -49,7 +49,7 @@ void main() {
       final json = {
         'id': 'ob-789',
         'parentId': null,
-        'owner': {'kind': 'actor', 'id': 'test-actor'},
+        'ownerId': 'test-actor',
         'intent': 'Test intent 3',
         'externalRef': null,
         'status': 'ready',

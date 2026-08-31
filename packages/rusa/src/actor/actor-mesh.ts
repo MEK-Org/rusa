@@ -625,6 +625,62 @@ export class ActorMesh {
   }
 
   /**
+   * Boot recovery for ready-head inbox attention (#1645).
+   *
+   * Verifies that every active actor with a ready head has durable attention in
+   * its inbox. Keyed by exact transition fact and sequence persisted in SQLite.
+   */
+  reconcileReadyHeads(obligations: {
+    readyHeadTransitions?(): Iterable<{
+      ownerId: string;
+      headId: string;
+      previousHeadId: string | null;
+      sequence: number;
+    }>;
+    readyHeads?(): Iterable<[string, string]>;
+    get(id: string): { id: string; intent: string | null } | null;
+  }): void {
+    if (!this.inboxStore) return;
+    try {
+      if (typeof obligations.readyHeadTransitions === "function") {
+        for (const {
+          ownerId,
+          headId,
+          previousHeadId,
+          sequence,
+        } of obligations.readyHeadTransitions()) {
+          if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) continue;
+          const actorId = this.resolveThreadId(ownerId);
+          const record = this.registry.get(actorId);
+          if (!record || record.status !== "active") continue;
+          const head = obligations.get(headId);
+          if (!head) continue;
+          this.deliverReadyHeadAttention(
+            actorId,
+            { id: head.id, intent: head.intent },
+            previousHeadId,
+            sequence
+          );
+        }
+      } else if (typeof obligations.readyHeads === "function") {
+        for (const [ownerId, headId] of obligations.readyHeads()) {
+          if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) continue;
+          const actorId = this.resolveThreadId(ownerId);
+          const record = this.registry.get(actorId);
+          if (!record || record.status !== "active") continue;
+          const head = obligations.get(headId);
+          if (!head) continue;
+          this.deliverReadyHeadAttention(actorId, { id: head.id, intent: head.intent }, null, null);
+        }
+      }
+    } catch (err) {
+      this.log(
+        `ready-head reconciliation failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  /**
    * Notify an actor that its durable worklist changed. If an execution
    * opportunity is already queued, the new entry joins it and becomes seen
    * immediately; only deliveries during an active run set the dirty follow-up.
@@ -705,6 +761,63 @@ export class ActorMesh {
   finishInboxRun(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
+  }
+
+  /**
+   * Durable attention for an actor that gained a new ready head (#1645).
+   *
+   * The obligation store stays the work-state authority; this is only the wake
+   * surface. `append` is `ON CONFLICT(id) DO NOTHING`, so exact-once comes from
+   * the entry id — but the id is derived from the *transition* (which head this
+   * one displaced), not from the resulting head alone.
+   *
+   * Keying on the head alone made the id permanent per (actor, obligation),
+   * which is exactly-once but not live. An actor notified about head H that
+   * marked the entry handled while deferring H, then worked a higher-priority
+   * H0, got nothing at all when H became its head again: no entry, no nudge,
+   * and `reconcileInbox` could not rescue it because the only entry for H was
+   * already handled. Keying on `previousHeadId -> head.id` makes that a
+   * distinct transition, so the actor is woken again.
+   *
+   * A restart or a replay of the same committed transition is still silent.
+   * The residual case — the identical transition recurring after the actor
+   * handled it — cannot be expressed in the id, and falls back to a live nudge:
+   * it wakes a running mesh but is not durable across a restart.
+   */
+  deliverReadyHeadAttention(
+    actorId: string,
+    head: { id: string; intent: string | null },
+    previousHeadId: string | null = null,
+    sequence: number | null = null
+  ): boolean {
+    actorId = this.resolveThreadId(actorId);
+    if (!this.inboxStore) return false;
+    const record = this.registry.get(actorId);
+    if (!record || record.status !== "active") return false;
+    // Keying on transition + sequence ensures exact-once durable inbox delivery across restarts.
+    // ON CONFLICT DO NOTHING suppresses duplicate inbox rows if the prior entry remains.
+    const seqKey = sequence !== null ? `:${sequence}` : "";
+    const entryId = deduplicatedInboxEntryId(
+      `obligation-head:${actorId}:${previousHeadId ?? "none"}->${head.id}${seqKey}`,
+      actorId
+    );
+    const entries = this.inboxStore.append([
+      {
+        id: entryId,
+        actorId,
+        source: `obligation:${head.id}`,
+        payload: {
+          type: "obligation.ready_head",
+          obligationId: head.id,
+          intent: head.intent ?? undefined,
+        } as unknown as InboxPayload,
+      },
+    ]);
+    if (entries.length === 0) {
+      return false;
+    }
+    this.notifyInboxChanged(actorId);
+    return true;
   }
 
   inboxHandled(actorId: string): void {

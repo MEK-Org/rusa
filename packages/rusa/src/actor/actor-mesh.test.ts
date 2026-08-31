@@ -45,26 +45,43 @@ function createMemoryInboxStore(): InboxStore & { entries: InboxEntry[] } {
   return {
     entries,
     append: (inputs) => {
-      const inserted = inputs.map((input, index) => ({
-        id: input.id ?? `entry-${entries.length + index + 1}`,
-        actorId: input.actorId,
-        source: input.source,
-        deliveredAt: input.deliveredAt ?? new Date("2026-01-01T00:00:00Z"),
-        seenAt: null,
-        handledAt: null,
-        handledNote: null,
-        payload: input.payload,
-      }));
+      // Mirrors InboxRepository: the insert is `ON CONFLICT(id) DO NOTHING` and
+      // the return is filtered to rows actually inserted, so a caller-supplied
+      // duplicate id is suppressed and reported as "nothing new". Without this
+      // the fake silently grants at-least-once where the real store gives
+      // exactly-once, and dedupe-dependent behaviour cannot be tested here.
+      const inserted = inputs
+        .map((input, index) => ({
+          id: input.id ?? `entry-${entries.length + index + 1}`,
+          actorId: input.actorId,
+          source: input.source,
+          deliveredAt: input.deliveredAt ?? new Date("2026-01-01T00:00:00Z"),
+          seenAt: null,
+          handledAt: null,
+          handledNote: null,
+          payload: input.payload,
+        }))
+        .filter((row) => !entries.some((existing) => existing.id === row.id));
       entries.push(...inserted);
       return inserted;
     },
-    list: (actorId: string, _options: InboxListOptions = {}): InboxPage => ({
-      entries: entries.filter((entry) => entry.actorId === actorId && entry.handledAt === null),
-      unhandledCount: entries.filter(
-        (entry) => entry.actorId === actorId && entry.handledAt === null
-      ).length,
-      nextCursor: null,
-    }),
+    list: (actorId: string, options: InboxListOptions = {}): InboxPage => {
+      const status = options.status ?? "unhandled";
+      let matched = entries.filter((entry) => entry.actorId === actorId);
+      if (status === "unhandled") matched = matched.filter((entry) => entry.handledAt === null);
+      else if (status === "handled") matched = matched.filter((entry) => entry.handledAt !== null);
+      if (options.source !== undefined) {
+        matched = matched.filter((entry) => entry.source === options.source);
+      }
+      matched = [...matched].reverse();
+      return {
+        entries: matched,
+        unhandledCount: entries.filter(
+          (entry) => entry.actorId === actorId && entry.handledAt === null
+        ).length,
+        nextCursor: null,
+      };
+    },
     read: (actorId: string, entryId: string) =>
       entries.find((entry) => entry.actorId === actorId && entry.id === entryId) ?? null,
     countUnhandled: (actorId: string) =>
@@ -733,6 +750,258 @@ describe("ActorMesh", () => {
     const calls = fake("t1").calls;
     expect(calls).toHaveLength(1);
     expect(calls[0]?.prompt).toContain("Work from your inbox");
+  });
+
+  it("delivers ready-head attention exactly once per transition, across repeats and restarts", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null)).toBe(
+      true
+    );
+    await tick();
+
+    const first = rootEntries();
+    expect(first).toHaveLength(1);
+    expect(first[0].source).toBe("obligation:ob-1");
+    expect(first[0].payload).toMatchObject({ type: "obligation.ready_head", obligationId: "ob-1" });
+
+    // Replay of the same transition — and, since the id is derived from the
+    // transition rather than a run, this is also what a restart looks like.
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null)).toBe(
+      false
+    );
+    expect(rootEntries()).toHaveLength(1);
+
+    // A genuinely different head is genuinely new attention.
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-2", intent: "next" }, "ob-1")).toBe(
+      true
+    );
+    expect(rootEntries()).toHaveLength(2);
+
+    // ob-1 becoming the head again after ob-2 displaced it is a NEW transition,
+    // not a repeat of the first one. Keying on the head alone made this silent,
+    // which left an actor that had already handled the ob-1 entry sitting on
+    // live work with nothing to wake it.
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, "ob-2")).toBe(
+      true
+    );
+    expect(rootEntries()).toHaveLength(3);
+  });
+
+  it("does not re-wake actor when an already delivered transition sequence is repeated after being handled", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, fake, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null, 1)).toBe(
+      true
+    );
+    await tick();
+    expect(rootEntries()).toHaveLength(1);
+
+    // Still unhandled: the wake is outstanding, so a repeat is pure noise.
+    const beforeUnhandledRepeat = fake("root").calls.length;
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null, 1)).toBe(
+      false
+    );
+    await tick();
+    expect(fake("root").calls.length).toBe(beforeUnhandledRepeat);
+
+    // Once handled, repeating the exact same transition sequence does NOT re-wake the actor.
+    inboxStore.markHandled("root", [rootEntries()[0].id]);
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null, 1)).toBe(
+      false
+    );
+    await tick();
+    expect(rootEntries()).toHaveLength(1);
+    expect(fake("root").calls.length).toBe(beforeUnhandledRepeat);
+  });
+
+  it("does not deliver ready-head attention to a retired actor", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, registry } = setup({ inboxStore });
+    const id = mesh.spawn({ charter: "worker", parentId: "root" });
+    registry.patch(id, { status: "retired" });
+
+    expect(mesh.deliverReadyHeadAttention(id, { id: "ob-1", intent: null })).toBe(false);
+    expect(inboxStore.entries.filter((entry) => entry.actorId === id)).toHaveLength(0);
+  });
+
+  it("reconciles missing ready-head attention on boot and repair", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, fake, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    const obligations = {
+      readyHeadTransitions: () => [
+        { ownerId: "root", headId: "ob-1", previousHeadId: null, sequence: 1 },
+      ],
+      get: (id: string) => (id === "ob-1" ? { id: "ob-1", intent: "repair me" } : null),
+    };
+
+    // Before reconciliation: inbox has 0 entries for root.
+    expect(rootEntries()).toHaveLength(0);
+
+    // Run boot reconciliation for ready heads
+    mesh.reconcileReadyHeads(obligations);
+    await tick();
+
+    // Missed attention was delivered and actor nudged
+    expect(rootEntries()).toHaveLength(1);
+    expect(rootEntries()[0].source).toBe("obligation:ob-1");
+    expect(rootEntries()[0].payload).toMatchObject({
+      type: "obligation.ready_head",
+      obligationId: "ob-1",
+      intent: "repair me",
+    });
+    expect(fake("root").calls.length).toBeGreaterThan(0);
+
+    // Second boot reconciliation pass (restart idempotence test):
+    // Attention for ob-1 is already in inbox, so no new entry or duplicate wake occurs.
+    const callCountBefore = fake("root").calls.length;
+    mesh.reconcileReadyHeads(obligations);
+    await tick();
+
+    expect(rootEntries()).toHaveLength(1);
+    expect(fake("root").calls.length).toBe(callCountBefore);
+  });
+
+  it("is idempotent when transition-based attention was already delivered before restart", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, fake, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    // Simulate transition-derived delivery during runtime (e.g. ob-0 -> ob-1, sequence 1)
+    mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, "ob-0", 1);
+    await tick();
+    expect(rootEntries()).toHaveLength(1);
+    expect(rootEntries()[0].source).toBe("obligation:ob-1");
+
+    const callsBeforeReconcile = fake("root").calls.length;
+
+    // Simulate restart and run reconcileReadyHeads
+    const obligations = {
+      readyHeadTransitions: () => [
+        { ownerId: "root", headId: "ob-1", previousHeadId: "ob-0", sequence: 1 },
+      ],
+      get: (id: string) => (id === "ob-1" ? { id: "ob-1", intent: "ship it" } : null),
+    };
+
+    mesh.reconcileReadyHeads(obligations);
+    await tick();
+
+    // No duplicate entry or extra wake!
+    expect(rootEntries()).toHaveLength(1);
+    expect(fake("root").calls.length).toBe(callsBeforeReconcile);
+  });
+
+  it("reconciles a missed recurrence transition when multiple consecutive listener failures occurred", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, fake, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    // 1. H becomes head initially (sequence 1). Delivered and handled.
+    mesh.deliverReadyHeadAttention("root", { id: "ob-H", intent: "do H" }, null, 1);
+    await tick();
+    const entryH1 = rootEntries().find((e) => e.source === "obligation:ob-H");
+    expect(entryH1).toBeDefined();
+    if (!entryH1) return;
+    inboxStore.markHandled("root", [entryH1.id]);
+
+    // 2. H -> X commits (sequence 2), listener fails (not delivered to inbox).
+    // 3. X -> H commits (sequence 3), listener fails (not delivered to inbox).
+
+    // 4. Boot reconciliation runs with persistent transition fact (sequence 3, prev: ob-X, head: ob-H):
+    const obligations = {
+      readyHeadTransitions: () => [
+        { ownerId: "root", headId: "ob-H", previousHeadId: "ob-X", sequence: 3 },
+      ],
+      get: (id: string) => (id === "ob-H" ? { id: "ob-H", intent: "do H" } : null),
+    };
+
+    const callsBefore = fake("root").calls.length;
+    mesh.reconcileReadyHeads(obligations);
+    await tick();
+
+    // Boot delivers sequence 3 (ob-X -> ob-H) attention.
+    expect(rootEntries()).toHaveLength(2);
+    const newEntry = rootEntries()[1];
+    expect(newEntry.source).toBe("obligation:ob-H");
+    expect(newEntry.payload).toMatchObject({
+      type: "obligation.ready_head",
+      obligationId: "ob-H",
+      intent: "do H",
+    });
+    expect(fake("root").calls.length).toBeGreaterThan(callsBefore);
+
+    // 5. Subsequent boot passes are idempotent.
+    const callsBeforePass2 = fake("root").calls.length;
+    mesh.reconcileReadyHeads(obligations);
+    await tick();
+    expect(rootEntries()).toHaveLength(2);
+    expect(fake("root").calls.length).toBe(callsBeforePass2);
+  });
+
+  it("skips non-actor owners and retired actors during ready-head reconciliation", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, registry } = setup({ inboxStore });
+    const retiredId = mesh.spawn({ charter: "worker", parentId: "root" });
+    registry.patch(retiredId, { status: "retired" });
+
+    const obligations = {
+      readyHeads: () =>
+        [
+          ["human:matt", "ob-human"],
+          ["system:cron", "ob-sys"],
+          [retiredId, "ob-retired"],
+        ] as [string, string][],
+      get: (id: string) => ({ id, intent: null }),
+    };
+
+    mesh.reconcileReadyHeads(obligations);
+    expect(inboxStore.entries).toHaveLength(0);
+  });
+
+  it("re-queues an actor that leaves inbox work unhandled, and stops once the inbox drains", async () => {
+    const inboxStore = createMemoryInboxStore();
+    // Handle exactly one entry per run so the actor deliberately under-drains,
+    // which is the deferral pattern the inbox contract is meant to support.
+    const { mesh, fake, tick } = setup({
+      inboxStore,
+      createActor: undefined,
+    });
+    inboxStore.append([
+      { actorId: "root", source: "mesh:a", payload: payload("mesh.message") },
+      { actorId: "root", source: "mesh:b", payload: payload("mesh.message") },
+      { actorId: "root", source: "mesh:c", payload: payload("mesh.message") },
+    ]);
+
+    const handleOne = () => {
+      const next = inboxStore.list("root").entries[0];
+      if (!next) return 0;
+      mesh.selectInboxEntries("root", [next.id]);
+      inboxStore.markHandled("root", [next.id]);
+      mesh.inboxHandled("root");
+      return inboxStore.countUnhandled("root");
+    };
+
+    expect(handleOne()).toBe(2);
+    await tick();
+    expect(fake("root").calls.length).toBeGreaterThan(0);
+
+    const afterFirst = fake("root").calls.length;
+    expect(handleOne()).toBe(1);
+    await tick();
+    expect(fake("root").calls.length).toBeGreaterThan(afterFirst);
+
+    // Draining the last entry must NOT schedule another run: an empty inbox is
+    // the termination condition, otherwise the actor spins forever.
+    const afterSecond = fake("root").calls.length;
+    expect(handleOne()).toBe(0);
+    await tick();
+    expect(fake("root").calls).toHaveLength(afterSecond);
   });
 
   it("delivers a system.disk event to the system subscriber as responsive inbox work", async () => {

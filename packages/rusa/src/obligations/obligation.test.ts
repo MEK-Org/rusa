@@ -4,7 +4,7 @@ import {
   isTerminalObligationStatus,
   ObligationValidationError,
   parseExternalRef,
-  validateObligationOwner,
+  validateEntityId,
 } from "./obligation.js";
 
 describe("parseExternalRef", () => {
@@ -73,22 +73,21 @@ describe("parseExternalRef", () => {
   });
 });
 
-describe("obligation owner and status helpers", () => {
-  it("validates obligation owner kinds and IDs", () => {
-    expect(validateObligationOwner({ kind: "actor", id: "actor-1" })).toEqual({
-      kind: "actor",
-      id: "actor-1",
-    });
-    expect(validateObligationOwner({ kind: "human", id: "operator" })).toEqual({
-      kind: "human",
-      id: "operator",
-    });
-    expect(() => validateObligationOwner({ kind: "other" as never, id: "1" })).toThrow(
-      ObligationValidationError
-    );
-    expect(() => validateObligationOwner({ kind: "actor", id: "   " })).toThrow(
-      ObligationValidationError
-    );
+describe("obligation entity and status helpers", () => {
+  it("accepts every id in the mesh's one id space and rejects a blank one", () => {
+    // Actor UUIDs, `root`, `human:*` and `system:*` all live in one space, and
+    // the category is read off the prefix — there is no separate owner "kind".
+    for (const id of [
+      "actor-1",
+      "root",
+      "human:operator",
+      "system:mesh",
+      "system:tracker-hygiene",
+    ]) {
+      expect(validateEntityId(id)).toBe(id);
+    }
+    expect(() => validateEntityId("   ")).toThrow(ObligationValidationError);
+    expect(() => validateEntityId("")).toThrow(ObligationValidationError);
   });
 
   it("identifies terminal obligation statuses and asserts valid statuses", () => {

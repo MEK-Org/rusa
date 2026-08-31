@@ -467,7 +467,7 @@ class _DetailView extends StatelessWidget {
             ),
             const SizedBox(height: 24),
             _SectionHeader('OWNER'),
-            _ownerPanel(o.owner),
+            _ownerPanel(o.ownerId),
             if (o.externalRef != null && o.externalRef!.trim().isNotEmpty) ...[
               const SizedBox(height: 24),
               _SectionHeader('EXTERNAL LINK'),
@@ -485,9 +485,26 @@ class _DetailView extends StatelessWidget {
     );
   }
 
-  Widget _ownerPanel(ObligationOwner owner) {
-    final isActor = owner.kind == 'actor';
-    final displayId = isActor ? (store.actor(owner.id)?.handle ?? owner.id) : owner.id;
+  Widget _ownerPanel(String ownerId) {
+    // One id space: the category is read off the id's prefix, the same way
+    // `isHumanOperator` does server-side. A known actor renders as its handle;
+    // anything else renders as the id itself.
+    final isHuman = ownerId.startsWith('human:');
+    final isSystem = ownerId.startsWith('system:');
+    final isActor = !isHuman && !isSystem;
+    final displayId = store.actor(ownerId)?.handle ?? ownerId;
+    // The second line exists to disambiguate the first. When the first line
+    // already IS the raw id — the operator, a system component, or an actor
+    // this dashboard has no record of — repeating it says nothing, so fall back
+    // to the category the prefix encodes. That is the cue the old `Kind: ACTOR`
+    // line carried before owner_kind was dropped.
+    final ownerSubtitle = displayId != ownerId
+        ? ownerId
+        : isHuman
+            ? 'Operator'
+            : isSystem
+                ? 'System component'
+                : 'Actor — not in this mesh view';
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -499,7 +516,7 @@ class _DetailView extends StatelessWidget {
       child: Row(
         children: [
           if (isActor)
-            ActorAvatar(id: owner.id, size: 28)
+            ActorAvatar(id: ownerId, size: 28)
           else
             const CircleAvatar(
               radius: 14,
@@ -521,7 +538,7 @@ class _DetailView extends StatelessWidget {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  'Kind: ${owner.kind.toUpperCase()}',
+                  ownerSubtitle,
                   style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),
                 ),
               ],
@@ -530,13 +547,13 @@ class _DetailView extends StatelessWidget {
           if (isActor)
             TextButton(
               onPressed: () {
-                store.clickActor(owner.id);
+                store.clickActor(ownerId);
                 store.setDetailPanelIndex(4); // Select Inbox tab
                 onSelectView(DashboardView.actors);
               },
               child: const Text('View Owner Inbox →', style: TextStyle(color: MeshColors.accent)),
             )
-          else if (owner.kind == 'human')
+          else if (isHuman)
             TextButton(
               onPressed: () {
                 onSelectView(DashboardView.overview);
@@ -601,10 +618,7 @@ class _DetailView extends StatelessWidget {
                   context,
                   store,
                   defaultParentId: data.obligation.id,
-                  defaultOwnerId: data.obligation.owner.kind == 'actor'
-                      ? data.obligation.owner.id
-                      : null,
-                  defaultOwnerKind: data.obligation.owner.kind,
+                  defaultOwnerId: data.obligation.ownerId,
                   onCreated: onMutated,
                 ),
                 icon: const Icon(Icons.add, size: 14),
@@ -797,8 +811,7 @@ class _DetailView extends StatelessWidget {
                     context,
                     store,
                     defaultParentId: o.id,
-                    defaultOwnerId: o.owner.kind == 'actor' ? o.owner.id : null,
-                    defaultOwnerKind: o.owner.kind,
+                    defaultOwnerId: o.ownerId,
                     onCreated: onMutated,
                   ),
                   icon: const Icon(Icons.add_task, size: 16),
