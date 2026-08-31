@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
 import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../mcp/stamp.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
+import { parseReference } from "../references/reference.js";
 import {
   type CapabilityGrantStore,
   InMemoryCapabilityGrantStore,
@@ -16,7 +17,6 @@ import {
   type EventResource,
   type EventSubscription,
   type EventSubscriptionStore,
-  eventResourceReference,
   InMemoryEventSubscriptionStore,
   parentOf,
   resourceKey,
@@ -43,6 +43,18 @@ import type { ActorRunMode, RunNudge } from "./trigger-runner.js";
 
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
 export const SCHEDULER_SENDER_ID = "scheduler";
+
+/** Map the routable GitHub resources an obligation may claim to its identity key. */
+function eventResourceReferenceKey(resource: EventResource): string | undefined {
+  if (resource.kind !== "github_issue" && resource.kind !== "github_pr") return undefined;
+  const collection = resource.kind === "github_pr" ? "pulls" : "issues";
+  try {
+    return parseReference(`github:${resource.repo}/${collection}/${resource.number}`).key;
+  } catch {
+    // An invalid repo cannot name an obligation. Preserve normal event routing.
+    return undefined;
+  }
+}
 
 /** Runtime contract the mesh needs for routing; provider-backed Actor is one implementation. */
 export interface MeshActor {
@@ -1270,9 +1282,9 @@ export class ActorMesh {
    */
   private obligationOwnerFor(resource: EventResource): string | undefined {
     if (!this.obligations) return undefined;
-    const reference = eventResourceReference(resource);
-    if (!reference) return undefined;
-    return this.obligations.findLiveByExternalRef(reference.key)?.ownerId;
+    const referenceKey = eventResourceReferenceKey(resource);
+    if (!referenceKey) return undefined;
+    return this.obligations.findLiveByExternalRef(referenceKey)?.ownerId;
   }
 
   private effectiveOwnerOf(
@@ -1415,7 +1427,13 @@ export class ActorMesh {
   ): Promise<void> {
     let destinations: string[];
     let directed = false;
-    if (opts.directedTarget) {
+    // A live obligation is the ownership authority even when the event carries
+    // a bot-authored directed target. Directives remain useful for unclaimed
+    // work, but cannot route claimed work around its current owner.
+    const governing = this.obligationOwnerFor(resource);
+    if (governing) {
+      destinations = this.live.has(governing) ? [governing] : [];
+    } else if (opts.directedTarget) {
       const directedTarget = this.resolveLiveActor(opts.directedTarget);
       if (directedTarget) {
         this.log(`mesh:deliver directed-delivered to ${opts.directedTarget} (${eventSummary})`);

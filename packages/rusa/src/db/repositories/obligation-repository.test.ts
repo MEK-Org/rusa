@@ -765,10 +765,8 @@ describe("ObligationRepository", () => {
       externalRef: "github:dummy-org/dummy-repo/issues/7",
     });
 
-    expect(repository.findLiveByExternalRef("github:DUMMY-ORG/DUMMY-REPO/issues/7")).toMatchObject({
-      id: "claimed",
+    expect(repository.findLiveByExternalRef("github:DUMMY-ORG/DUMMY-REPO/issues/7")).toEqual({
       ownerId: "actor-b",
-      status: "ready",
     });
 
     repository.setTerminalStatus("claimed", "done");

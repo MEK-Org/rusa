@@ -3,7 +3,6 @@ import type Database from "better-sqlite3";
 import {
   assertObligationStatus,
   type EntityId,
-  isActorEntityId,
   isTerminalObligationStatus,
   type Obligation,
   type ObligationArtifact,
@@ -15,6 +14,10 @@ import {
   validateEntityId,
   validateObligationTitle,
 } from "../../obligations/obligation.js";
+
+function isActorEntityId(id: EntityId): boolean {
+  return !id.startsWith("human:") && !id.startsWith("system:");
+}
 
 interface ObligationRow {
   id: string;
@@ -898,17 +901,17 @@ export class ObligationRepository {
    * stop governing its issue's events, and the same index frees its ref for
    * reuse by a successor.
    */
-  findLiveByExternalRef(ref: string): Obligation | null {
+  findLiveByExternalRef(ref: string): { ownerId: EntityId } | null {
     const row = this.db
       .prepare(
-        `${EFFECTIVE_PRIORITY_CTE}
-         ${PROJECTED_OBLIGATION}
-         WHERE obligation.external_ref = ? COLLATE NOCASE
-           AND obligation.status IN ('ready', 'waiting')
+        `SELECT owner_id
+         FROM obligations
+         WHERE external_ref = ? COLLATE NOCASE
+           AND status IN ('ready', 'waiting')
          LIMIT 1`
       )
-      .get(ref) as ObligationRow | undefined;
-    return row ? toObligation(row) : null;
+      .get(ref) as { owner_id: EntityId } | undefined;
+    return row ? { ownerId: row.owner_id } : null;
   }
 
   /** Every artifact cited by an obligation, oldest first. */

@@ -147,18 +147,6 @@ export function validateObligationTitle(title: string): string {
   return collapsed;
 }
 
-/**
- * Whether an entity id names a mesh actor, as opposed to the operator or a
- * system component.
- *
- * The category is read off the prefix, which is the whole point of the one id
- * space: `human:*` and `system:*` are not in the thread registry, so anything
- * that resolves an id to a running actor has to exclude them first.
- */
-export function isActorEntityId(id: EntityId): boolean {
-  return !id.startsWith("human:") && !id.startsWith("system:");
-}
-
 export function validateEntityId(id: EntityId): EntityId {
   if (!id.trim()) throw new ObligationValidationError("entity id is required");
   return id;

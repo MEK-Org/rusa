@@ -1,5 +1,4 @@
 import { readFileSync, writeFileSync } from "node:fs";
-import { parseReference, type Reference } from "../references/reference.js";
 
 /**
  * Event-source subscriptions (design ISSUE_NUM, phase 1). An actor subscribes to an
@@ -91,30 +90,6 @@ export const resourceKey = (resource: EventResource): string => {
       return "system";
   }
 };
-
-/**
- * The reference naming this event source, when the grammar can express it.
- *
- * The bridge between the two ownership models: an obligation's `external_ref`
- * is a {@link Reference}, an event source is an {@link EventResource}, and
- * routing has to ask whether they denote the same thing. Only issue and PR
- * sources map today, because those are the only two an obligation may claim as
- * its identity.
- *
- * `null` for everything else, which the caller reads as "no obligation can
- * govern this source" and falls through to ordinary subscription routing.
- */
-export function eventResourceReference(resource: EventResource): Reference | null {
-  if (resource.kind !== "github_issue" && resource.kind !== "github_pr") return null;
-  const collection = resource.kind === "github_pr" ? "pulls" : "issues";
-  try {
-    return parseReference(`github:${resource.repo}/${collection}/${resource.number}`);
-  } catch {
-    // A repo string that is not `owner/name` cannot name a reference. Routing
-    // continues without the overlay rather than failing the delivery.
-    return null;
-  }
-}
 
 export const sameResource = (a: EventResource, b: EventResource): boolean => {
   if (a.kind !== b.kind) return false;

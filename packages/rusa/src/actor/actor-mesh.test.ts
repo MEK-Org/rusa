@@ -1,6 +1,9 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { runMigrations } from "../db/migrations/runner.js";
+import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import { resolveStampedAuthor, SYSTEM_TRACKER_HYGIENE } from "../mcp/stamp.js";
 import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
@@ -10,6 +13,7 @@ import { Actor } from "./actor.js";
 import type {
   ActorFactoryContext,
   ActorMeshOptions,
+  EventDeliveryOptions,
   RetireCleanup,
   SpawnRequest,
 } from "./actor-mesh.js";
@@ -4770,7 +4774,8 @@ describe("ActorMesh", () => {
       obligations: ActorMeshOptions["obligations"],
       wire: (mesh: ReturnType<typeof setup>["mesh"]) => void,
       resource: EventResource,
-      afterFirstDelivery?: (mesh: ReturnType<typeof setup>["mesh"]) => void
+      afterFirstDelivery?: (mesh: ReturnType<typeof setup>["mesh"]) => void,
+      deliveryOptions?: (mesh: ReturnType<typeof setup>["mesh"]) => EventDeliveryOptions
     ): Promise<string[]> {
       const events: Array<{ kind: string; actorId?: string | null }> = [];
       let mesh!: ReturnType<typeof setup>["mesh"];
@@ -4786,7 +4791,10 @@ describe("ActorMesh", () => {
       const env = setup({ obligations, sharedProvider: provider, events: (e) => events.push(e) });
       mesh = env.mesh;
       wire(mesh);
-      mesh.deliverEvent(resource, "event", { inboxPayload: payload("issues.opened") });
+      mesh.deliverEvent(resource, "event", {
+        ...deliveryOptions?.(mesh),
+        inboxPayload: payload("issues.opened"),
+      });
       await env.tick();
       if (afterFirstDelivery) {
         afterFirstDelivery(mesh);
@@ -4833,6 +4841,38 @@ describe("ActorMesh", () => {
       expect(woken).toEqual([delegate]);
     });
 
+    it("maps a linked pull request to its obligation owner", async () => {
+      const pull = { kind: "github_pr" as const, repo: "MEK-Org/rusa", number: 33 };
+      let owner = "";
+      const woken = await wokenBy(
+        owning({ "github:MEK-Org/rusa/pulls/33": "t1" }),
+        (mesh) => {
+          owner = mesh.spawn({ charter: "pull request owner", parentId: "root" });
+        },
+        pull
+      );
+
+      expect(woken).toEqual([owner]);
+    });
+
+    it("keeps a directed target from bypassing the obligation owner", async () => {
+      let directedTarget = "";
+      let owner = "";
+      const woken = await wokenBy(
+        owning({ [REF]: "t2" }),
+        (mesh) => {
+          directedTarget = mesh.spawn({ charter: "directed target", parentId: "root" });
+          owner = mesh.spawn({ charter: "obligation owner", parentId: "root" });
+        },
+        issue,
+        undefined,
+        () => ({ directedTarget })
+      );
+
+      expect(woken).toEqual([owner]);
+      expect(woken).not.toContain(directedTarget);
+    });
+
     it("routes the next event to a reassigned obligation owner without synchronizing subscriptions", async () => {
       const ownerByRef: Record<string, string> = {};
       let firstOwner = "";
@@ -4854,6 +4894,40 @@ describe("ActorMesh", () => {
       );
 
       expect(woken).toEqual([firstOwner, secondOwner]);
+    });
+
+    it("routes through the real repository after an actual reassignment", async () => {
+      const db = new Database(":memory:");
+      try {
+        runMigrations(db);
+        const repository = new ObligationRepository(db, (id) => id === "t1" || id === "t2");
+        repository.create({
+          id: "linked-work",
+          title: "Linked work",
+          ownerId: "t1",
+          externalRef: REF,
+        });
+
+        let firstOwner = "";
+        let secondOwner = "";
+        const woken = await wokenBy(
+          repository,
+          (mesh) => {
+            firstOwner = mesh.spawn({ charter: "first owner", parentId: "root" });
+            secondOwner = mesh.spawn({ charter: "second owner", parentId: "root" });
+          },
+          issue,
+          (mesh) => {
+            repository.reassign("linked-work", secondOwner);
+            mesh.deliverEvent(issue, "event", { inboxPayload: payload("issues.edited") });
+          }
+        );
+
+        expect(firstOwner).toBe("t1");
+        expect(woken).toEqual([firstOwner, secondOwner]);
+      } finally {
+        db.close();
+      }
     });
 
     it("routes the next event to the parent that inherited a retiring actor's obligation", async () => {
