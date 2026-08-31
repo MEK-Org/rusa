@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { asGitHubIssue } from "../references/reference.js";
+import { asGitHubIssue, asGitHubTarget } from "../references/reference.js";
 import {
   assertObligationStatus,
   isTerminalObligationStatus,
@@ -29,11 +29,28 @@ describe("parseExternalRef", () => {
     });
   });
 
+  it("accepts an owner and a repository, not just an issue or PR", () => {
+    // An obligation may be about a whole repo ("keep rusa releasable") or a
+    // whole org, not only a single numbered item.
+    expect(parseExternalRef("github:MEK-Org").key).toBe("github:MEK-Org");
+    expect(parseExternalRef("github:MEK-Org/rusa").key).toBe("github:MEK-Org/rusa");
+    expect(asGitHubTarget(parseExternalRef("github:MEK-Org"))).toEqual({
+      level: "owner",
+      owner: "MEK-Org",
+    });
+    expect(asGitHubTarget(parseExternalRef("github:MEK-Org/rusa"))).toEqual({
+      level: "repo",
+      owner: "MEK-Org",
+      repo: "rusa",
+    });
+    expect(asGitHubTarget(parseExternalRef("github:MEK-Org/rusa/pulls/76"))?.level).toBe("pull");
+  });
+
   it("refuses a comment as an identity claim", () => {
     // A comment is evidence *about* an issue, never the same thing as it — and
     // external_ref is unique per live obligation, which a comment cannot be.
     expect(() => parseExternalRef("github:dummy-org/dummy-repo/issues/1666/comments/9")).toThrow(
-      "external ref must be"
+      "external ref must name"
     );
   });
 

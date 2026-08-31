@@ -43,7 +43,7 @@ describe("obligations MCP", () => {
     repository = new ObligationRepository(db);
   });
 
-  it("exposes all 8 obligation tools", async () => {
+  it("exposes all 9 obligation tools", async () => {
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
     const { tools } = await client.listTools();
     expect(tools.map((tool) => tool.name).sort()).toEqual([
@@ -54,6 +54,7 @@ describe("obligations MCP", () => {
       "reassign_obligation",
       "reorder_obligation",
       "reparent_obligation",
+      "set_external_ref",
       "set_obligation_status",
     ]);
   });
@@ -246,6 +247,66 @@ describe("obligations MCP", () => {
     expect(repository.require("silent-task").terminalNote).toBeNull();
   });
 
+  it("links and unlinks an identity claim after creation", async () => {
+    repository.create({ title: "Ship it", id: "linkable", ownerId: "actor-a" });
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+
+    const linked = (await client.callTool({
+      name: "set_external_ref",
+      arguments: { id: "linkable", external_ref: "github:MEK-Org/rusa" },
+    })) as CallToolResult;
+    expect(linked.isError).toBeFalsy();
+    expect(repository.require("linkable").externalRef?.key).toBe("github:MEK-Org/rusa");
+
+    const cleared = (await client.callTool({
+      name: "set_external_ref",
+      arguments: { id: "linkable", external_ref: null },
+    })) as CallToolResult;
+    expect(cleared.isError).toBeFalsy();
+    expect(repository.require("linkable").externalRef).toBeNull();
+  });
+
+  it("rejects a foreign identity mutation and honors the owner-ancestor policy", async () => {
+    repository.create({
+      title: "Foreign work",
+      id: "foreign-ref",
+      ownerId: "actor-b",
+      externalRef: "github:MEK-Org/rusa/issues/33",
+    });
+    const denied = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const deniedResult = (await denied.callTool({
+      name: "set_external_ref",
+      arguments: { id: "foreign-ref", external_ref: null },
+    })) as CallToolResult;
+    expect(deniedResult.isError).toBe(true);
+    expect(repository.require("foreign-ref").externalRef?.key).toBe(
+      "github:MEK-Org/rusa/issues/33"
+    );
+
+    const ancestor = await connect(
+      createObligationsMcpServer(repository, "actor-a", { canManage: () => true })
+    );
+    const ancestorResult = (await ancestor.callTool({
+      name: "set_external_ref",
+      arguments: { id: "foreign-ref", external_ref: "github:MEK-Org/rusa" },
+    })) as CallToolResult;
+    expect(ancestorResult.isError).toBeFalsy();
+    expect(repository.require("foreign-ref").externalRef?.key).toBe("github:MEK-Org/rusa");
+  });
+
+  it("refuses a sub-resource as an identity claim", async () => {
+    repository.create({ title: "Work", id: "sub", ownerId: "actor-a" });
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+
+    const res = (await client.callTool({
+      name: "set_external_ref",
+      arguments: { id: "sub", external_ref: "github:MEK-Org/rusa/issues/33/comments/9" },
+    })) as CallToolResult;
+
+    // A comment is evidence about the work; attach_artifact is its home.
+    expect(res.isError).toBe(true);
+  });
+
   it("reorders obligations via reorder_obligation", async () => {
     repository.create({
       title: "first",
@@ -344,7 +405,7 @@ describe("obligations MCP", () => {
     expect(repository.require("foreign").ownerId).toBe("actor-b");
 
     const authorized = await connect(
-      createObligationsMcpServer(repository, "actor-a", { canReassign: () => true })
+      createObligationsMcpServer(repository, "actor-a", { canManage: () => true })
     );
     const authorizedResult = (await authorized.callTool({
       name: "reassign_obligation",

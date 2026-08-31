@@ -45,12 +45,20 @@ describe("reference grammar", () => {
       "github:o//r",
       "github:o/r/../x",
       "mesh: messages/1",
-      "github:o", // a repo needs owner AND name
       "github:o/r/issues", // dangling collection with no id
       "gchat:spaces", // same
     ]) {
       expect(isReference(bad), bad).toBe(false);
     }
+  });
+
+  it("names a scheme's root partially, so parents round-trip", () => {
+    // `referenceParent` walks a repository up to its owner, so the grammar has
+    // to parse what it produces; an obligation may also be about a whole org.
+    expect(parseReference("github:MEK-Org").key).toBe("github:MEK-Org");
+    expect(isReference("github:MEK-Org")).toBe(true);
+    // But a dangling collection is still nonsense at any depth.
+    expect(isReference("github:MEK-Org/rusa/issues")).toBe(false);
   });
 
   it("walks up by collection/id pairs", () => {

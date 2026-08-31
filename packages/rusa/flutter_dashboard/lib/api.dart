@@ -442,6 +442,26 @@ class DashboardApi {
     return ObligationDto.fromJson(json['obligation'] as Map<String, dynamic>);
   }
 
+  /// `POST /api/mesh/obligations/:id/external-ref` — link, relink or unlink the
+  /// issue/PR/repo this obligation *is*. A null or blank [ref] unlinks.
+  Future<ObligationDto> setObligationExternalRef(String id, String? ref) async {
+    final uri = _u('/api/mesh/obligations/$id/external-ref');
+    final trimmed = ref?.trim();
+    final res = await _client.post(
+      uri,
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({'externalRef': (trimmed == null || trimmed.isEmpty) ? null : trimmed}),
+    );
+    if (res.statusCode != 200) {
+      throw DashboardApiException(uri, res.statusCode, res.body);
+    }
+    final json = jsonDecode(res.body) as Map<String, dynamic>;
+    return ObligationDto.fromJson(json['obligation'] as Map<String, dynamic>);
+  }
+
   Future<ObligationDto> reorderObligation(
     String id, {
     String? previousId,

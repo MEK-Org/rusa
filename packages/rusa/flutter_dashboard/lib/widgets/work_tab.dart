@@ -498,11 +498,12 @@ class _DetailView extends StatelessWidget {
             ],
             _SectionHeader('OWNER'),
             _ownerPanel(o.ownerId),
-            if (o.externalRef != null && o.externalRef!.trim().isNotEmpty) ...[
-              const SizedBox(height: 24),
-              _SectionHeader('EXTERNAL LINK'),
-              _externalRefPanel(o.externalRef!),
-            ],
+            // Shown even when absent: linking an obligation to the issue it
+            // turned into is a normal later step, and a section that only
+            // appears once a ref exists gives no way to add the first one.
+            const SizedBox(height: 24),
+            _SectionHeader('EXTERNAL LINK'),
+            _externalRefPanel(context, o),
             const SizedBox(height: 24),
             _SectionHeader('CHILDREN'),
             _childrenPanel(context, data),
@@ -595,7 +596,40 @@ class _DetailView extends StatelessWidget {
     );
   }
 
-  Widget _externalRefPanel(String ref) {
+  Widget _externalRefPanel(BuildContext context, ObligationDto o) {
+    final ref = o.externalRef?.trim() ?? '';
+    final edit = o.isTerminal
+        ? null
+        : IconButton(
+            icon: const Icon(Icons.edit_outlined, size: 16, color: MeshColors.textSecondary),
+            tooltip: ref.isEmpty ? 'Link an issue, PR or repo' : 'Change or unlink',
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+            onPressed: () => showEditExternalRefDialog(context, store, o, onUpdated: onMutated),
+          );
+    if (ref.isEmpty) {
+      return Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: MeshColors.bgSecondary,
+          border: Border.all(color: MeshColors.border),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          children: [
+            const Icon(Icons.link_off, color: MeshColors.textMuted, size: 20),
+            const SizedBox(width: 12),
+            const Expanded(
+              child: Text(
+                'Not linked to an issue, PR or repository.',
+                style: TextStyle(color: MeshColors.textMuted, fontSize: 12.5),
+              ),
+            ),
+            ?edit,
+          ],
+        ),
+      );
+    }
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -617,6 +651,7 @@ class _DetailView extends StatelessWidget {
               ),
             ),
           ),
+          ?edit,
         ],
       ),
     );
