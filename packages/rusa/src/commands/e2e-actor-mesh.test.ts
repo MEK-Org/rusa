@@ -1,7 +1,12 @@
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ExternalRootDriver } from "../actor/external-root-driver.js";
-import { createDashboardE2EQuotaApi, startRootControlServer } from "./e2e-actor-mesh.js";
+import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
+import {
+  createDashboardE2EQuotaApi,
+  startChatControlServer,
+  startRootControlServer,
+} from "./e2e-actor-mesh.js";
 import type { RunStartE2EHandles } from "./start.js";
 
 describe("external root E2E control server", () => {
@@ -141,5 +146,39 @@ describe("dashboard E2E quota fixture", () => {
     expect(codex.limits?.map((limit) => limit.percentLeft)).toEqual([0, 100]);
     expect(codex.status).toBe("available");
     expect(fixture.now?.()).toBe(now);
+  });
+});
+
+describe("chat E2E control server", () => {
+  let close: (() => Promise<void>) | undefined;
+
+  afterEach(async () => close?.());
+
+  it("populates FakeChatClient messages when POSTing to /chat/send so messages are readable", async () => {
+    const chatSource = new FakeChatSource();
+    await chatSource.start(() => {});
+    const chatClient = new FakeChatClient();
+    const server = startChatControlServer({ port: 0, chatSource, chatClient });
+    await new Promise<void>((resolve) => server.once("listening", resolve));
+    close = () =>
+      new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    const port = (server.address() as AddressInfo).port;
+
+    const res = await fetch(`http://127.0.0.1:${port}/chat/send`, {
+      method: "POST",
+      body: JSON.stringify({ text: "Hello E2E", dm: true }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; delivered: string };
+    expect(body.ok).toBe(true);
+    expect(body.delivered).toBeDefined();
+
+    const fetched = await chatClient.getMessage(body.delivered);
+    expect(fetched).toEqual(
+      expect.objectContaining({
+        name: body.delivered,
+        text: "Hello E2E",
+      })
+    );
   });
 });

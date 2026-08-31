@@ -483,7 +483,7 @@ function fakeChatMessage(seq: number, text: string, dm: boolean): ChatMessage {
  *    (wakes the root). `dm` defaults to true; a room message sets mentionsSelf.
  *  - `GET  /chat/outbox` → `{ sent, reactions }` the root produced.
  */
-function startChatControlServer(opts: {
+export function startChatControlServer(opts: {
   port: number;
   chatSource: FakeChatSource;
   chatClient: FakeChatClient;
