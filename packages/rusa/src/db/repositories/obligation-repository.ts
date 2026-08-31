@@ -15,6 +15,10 @@ import {
   validateObligationTitle,
 } from "../../obligations/obligation.js";
 
+function isActorEntityId(id: EntityId): boolean {
+  return !id.startsWith("human:") && !id.startsWith("system:");
+}
+
 interface ObligationRow {
   id: string;
   parent_id: string | null;
@@ -147,16 +151,6 @@ const PROJECTED_OBLIGATION = `
   FROM obligations obligation
   JOIN effective_priority ON effective_priority.id = obligation.id
 `;
-
-/**
- * Whether an entity id names a mesh actor, as opposed to the operator or a
- * system component. Actor existence is checkable; `human:*` and `system:*` ids
- * are not in the thread registry, so validating them against it would reject
- * legitimate owners.
- */
-export function isActorEntityId(id: EntityId): boolean {
-  return !id.startsWith("human:") && !id.startsWith("system:");
-}
 
 function validatePriority(priority: number): number {
   if (!Number.isFinite(priority)) {
@@ -893,6 +887,31 @@ export class ObligationRepository {
         .get(obligationId, key) as ObligationArtifactRow;
       return toArtifact(row);
     });
+  }
+
+  /**
+   * The one live obligation claiming this external reference, if any.
+   *
+   * At most one can exist: `idx_obligations_live_external_ref` is unique over
+   * nonterminal rows, which is what makes an external ref an *identity* claim
+   * rather than a mere association — and what lets event routing treat the
+   * answer as authoritative rather than as one opinion among several.
+   *
+   * Terminal obligations are excluded deliberately. A closed obligation should
+   * stop governing its issue's events, and the same index frees its ref for
+   * reuse by a successor.
+   */
+  findLiveByExternalRef(ref: string): { ownerId: EntityId } | null {
+    const row = this.db
+      .prepare(
+        `SELECT owner_id
+         FROM obligations
+         WHERE external_ref = ? COLLATE NOCASE
+           AND status IN ('ready', 'waiting')
+         LIMIT 1`
+      )
+      .get(ref) as { owner_id: EntityId } | undefined;
+    return row ? { ownerId: row.owner_id } : null;
   }
 
   /** Every artifact cited by an obligation, oldest first. */

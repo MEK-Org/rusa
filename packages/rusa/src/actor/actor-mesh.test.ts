@@ -1,6 +1,9 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { runMigrations } from "../db/migrations/runner.js";
+import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import { resolveStampedAuthor, SYSTEM_TRACKER_HYGIENE } from "../mcp/stamp.js";
 import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
@@ -10,11 +13,13 @@ import { Actor } from "./actor.js";
 import type {
   ActorFactoryContext,
   ActorMeshOptions,
+  EventDeliveryOptions,
   RetireCleanup,
   SpawnRequest,
 } from "./actor-mesh.js";
 import { ActorMesh } from "./actor-mesh.js";
 import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
+import type { EventResource } from "./event-subscriptions.js";
 import { routeRunFailure } from "./failure-sink.js";
 import type {
   InboxActorWork,
@@ -157,6 +162,7 @@ function setup(
     onModelSet?: ActorMeshOptions["onModelSet"];
     createActor?: ActorMeshOptions["createActor"];
     rootId?: string;
+    obligations?: ActorMeshOptions["obligations"];
   } = {}
 ) {
   const registry = new InMemoryThreadRegistry();
@@ -177,6 +183,7 @@ function setup(
     events: opts.events,
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
     inboxStore: opts.inboxStore ?? createMemoryInboxStore(),
+    obligations: opts.obligations,
     onInboxEntriesSeen: opts.onInboxEntriesSeen,
     grantableCapabilities: opts.grantableCapabilities,
     idgen: opts.idgen ?? (() => `t${++seq}`),
@@ -4744,6 +4751,261 @@ describe("ActorMesh", () => {
       expect(() => mesh.runNow("ghost-actor", "dashboard")).toThrow(
         "cannot run unknown actor ghost-actor"
       );
+    });
+  });
+
+  describe("obligation-governed event source ownership", () => {
+    /** A stand-in obligation store: the mesh only ever asks it one question. */
+    const owning = (byRef: Record<string, string>): ActorMeshOptions["obligations"] => ({
+      findLiveByExternalRef: (ref) => (byRef[ref] ? { ownerId: byRef[ref] } : null),
+    });
+
+    const issue = { kind: "github_issue" as const, repo: "MEK-Org/rusa", number: 33 };
+    const REF = "github:MEK-Org/rusa/issues/33";
+
+    /**
+     * Deliver an event and report which actors it woke.
+     *
+     * Uses the shared-provider + `run_yielded` pattern the other event-routing
+     * tests use: a spawned actor only reaches the event sink once something
+     * actually runs it, so the provider has to declare a yield.
+     */
+    async function wokenBy(
+      obligations: ActorMeshOptions["obligations"],
+      wire: (mesh: ReturnType<typeof setup>["mesh"]) => void,
+      resource: EventResource,
+      afterFirstDelivery?: (mesh: ReturnType<typeof setup>["mesh"]) => void,
+      deliveryOptions?: (mesh: ReturnType<typeof setup>["mesh"]) => EventDeliveryOptions
+    ): Promise<string[]> {
+      const events: Array<{ kind: string; actorId?: string | null }> = [];
+      let mesh!: ReturnType<typeof setup>["mesh"];
+      const running: string[] = [];
+      const provider = new FakeProvider((opts) => {
+        // The scaffold names the running actor's own thread id in its prompt,
+        // which is the only handle a shared provider has on who it is running.
+        const id = /thread `([^`]+)`/.exec(opts.prompt ?? "")?.[1] ?? "";
+        running.push(id);
+        if (id) mesh.declareYield(id, "complete", "done");
+        return {};
+      });
+      const env = setup({ obligations, sharedProvider: provider, events: (e) => events.push(e) });
+      mesh = env.mesh;
+      wire(mesh);
+      mesh.deliverEvent(resource, "event", {
+        ...deliveryOptions?.(mesh),
+        inboxPayload: payload("issues.opened"),
+      });
+      await env.tick();
+      if (afterFirstDelivery) {
+        afterFirstDelivery(mesh);
+        await env.tick();
+      }
+      return [
+        ...new Set(
+          events
+            .filter((e) => e.kind === "run_yielded" && e.actorId)
+            .map((e) => e.actorId as string)
+        ),
+      ];
+    }
+
+    it("routes a linked issue to the obligation owner, superseding a manual delegation", async () => {
+      let delegate = "";
+      let owner = "";
+      const woken = await wokenBy(
+        owning({ [REF]: "t2" }),
+        (mesh) => {
+          delegate = mesh.spawn({ charter: "earlier delegate", parentId: "root" });
+          owner = mesh.spawn({ charter: "obligation owner", parentId: "root" });
+          mesh.subscribeEventSource(issue, delegate, "root");
+        },
+        issue
+      );
+
+      expect(owner).toBe("t2");
+      expect(woken).toEqual([owner]);
+      expect(woken).not.toContain(delegate);
+    });
+
+    it("falls back to subscriptions when no live obligation is linked", async () => {
+      let delegate = "";
+      const lookedUp: string[] = [];
+      const woken = await wokenBy(
+        {
+          findLiveByExternalRef: (ref) => {
+            lookedUp.push(ref);
+            return null;
+          },
+        },
+        (mesh) => {
+          delegate = mesh.spawn({ charter: "delegate", parentId: "root" });
+          mesh.subscribeEventSource(issue, delegate, "root");
+        },
+        issue
+      );
+
+      expect(woken).toEqual([delegate]);
+      expect(lookedUp).toEqual([REF]);
+    });
+
+    it("maps a linked pull request to its obligation owner", async () => {
+      const pull = { kind: "github_pr" as const, repo: "MEK-Org/rusa", number: 33 };
+      let owner = "";
+      const woken = await wokenBy(
+        owning({ "github:MEK-Org/rusa/pulls/33": "t1" }),
+        (mesh) => {
+          owner = mesh.spawn({ charter: "pull request owner", parentId: "root" });
+        },
+        pull
+      );
+
+      expect(woken).toEqual([owner]);
+    });
+
+    it("keeps a directed target from bypassing the obligation owner", async () => {
+      let directedTarget = "";
+      let owner = "";
+      const woken = await wokenBy(
+        owning({ [REF]: "t2" }),
+        (mesh) => {
+          directedTarget = mesh.spawn({ charter: "directed target", parentId: "root" });
+          owner = mesh.spawn({ charter: "obligation owner", parentId: "root" });
+        },
+        issue,
+        undefined,
+        () => ({ directedTarget })
+      );
+
+      expect(woken).toEqual([owner]);
+      expect(woken).not.toContain(directedTarget);
+    });
+
+    it("routes the next event to a reassigned obligation owner without synchronizing subscriptions", async () => {
+      const ownerByRef: Record<string, string> = {};
+      let firstOwner = "";
+      let secondOwner = "";
+      const woken = await wokenBy(
+        owning(ownerByRef),
+        (mesh) => {
+          firstOwner = mesh.spawn({ charter: "first obligation owner", parentId: "root" });
+          secondOwner = mesh.spawn({ charter: "reassigned obligation owner", parentId: "root" });
+          ownerByRef[REF] = firstOwner;
+        },
+        issue,
+        (mesh) => {
+          // This is the repository state change made by reassign(). No event
+          // subscription write accompanies it: routing reads ownership anew.
+          ownerByRef[REF] = secondOwner;
+          mesh.deliverEvent(issue, "event", { inboxPayload: payload("issues.edited") });
+        }
+      );
+
+      expect(woken).toEqual([firstOwner, secondOwner]);
+    });
+
+    it("routes through the real repository after an actual reassignment", async () => {
+      const db = new Database(":memory:");
+      try {
+        runMigrations(db);
+        const repository = new ObligationRepository(db, (id) => id === "t1" || id === "t2");
+        repository.create({
+          id: "linked-work",
+          title: "Linked work",
+          ownerId: "t1",
+          externalRef: REF,
+        });
+
+        let firstOwner = "";
+        let secondOwner = "";
+        const woken = await wokenBy(
+          repository,
+          (mesh) => {
+            firstOwner = mesh.spawn({ charter: "first owner", parentId: "root" });
+            secondOwner = mesh.spawn({ charter: "second owner", parentId: "root" });
+          },
+          issue,
+          (mesh) => {
+            repository.reassign("linked-work", secondOwner);
+            mesh.deliverEvent(issue, "event", { inboxPayload: payload("issues.edited") });
+          }
+        );
+
+        expect(firstOwner).toBe("t1");
+        expect(woken).toEqual([firstOwner, secondOwner]);
+      } finally {
+        db.close();
+      }
+    });
+
+    it("routes the next event to the parent that inherited a retiring actor's obligation", async () => {
+      const ownerByRef: Record<string, string> = {};
+      let retiringOwner = "";
+      let parent = "";
+      const woken = await wokenBy(
+        owning(ownerByRef),
+        (mesh) => {
+          parent = mesh.spawn({ charter: "parent", parentId: "root" });
+          retiringOwner = mesh.spawn({ charter: "retiring obligation owner", parentId: parent });
+          ownerByRef[REF] = retiringOwner;
+        },
+        issue,
+        (mesh) => {
+          // Mirrors inheritRetiringActorObligationsInternal(): the live claim
+          // stays the same and its owner changes to the retiring actor's parent.
+          ownerByRef[REF] = parent;
+          mesh.deliverEvent(issue, "event", { inboxPayload: payload("issues.edited") });
+        }
+      );
+
+      expect(woken).toEqual([retiringOwner, parent]);
+    });
+
+    it("wakes nobody when the obligation owner is the human operator", async () => {
+      const woken = await wokenBy(
+        owning({ [REF]: "human:operator" }),
+        (mesh) => {
+          const delegate = mesh.spawn({ charter: "stale delegate", parentId: "root" });
+          mesh.subscribeEventSource(issue, delegate, "root");
+        },
+        issue
+      );
+
+      // No surrogate actor stands in for a human owner, and the earlier
+      // subscriber must not remain authoritative. The walk stops rather than
+      // bubbling; their attention belongs on the dashboard surface.
+      expect(woken).toEqual([]);
+    });
+
+    it("does not revive a stale subscriber when the governing actor is absent", async () => {
+      const woken = await wokenBy(
+        owning({ [REF]: "retired-owner" }),
+        (mesh) => {
+          const delegate = mesh.spawn({ charter: "stale delegate", parentId: "root" });
+          mesh.subscribeEventSource(issue, delegate, "root");
+        },
+        issue
+      );
+
+      // Ownership inheritance normally rewrites this id during retirement, but
+      // routing must remain fail-closed if it observes an inconsistent instant.
+      expect(woken).toEqual([]);
+    });
+
+    it("leaves a source the grammar cannot name entirely to subscriptions", async () => {
+      // Only an issue or PR can be an obligation's identity, so a repo-level
+      // source has no reference to match and routes as it always did.
+      const repoResource = { kind: "github_repo" as const, repo: "MEK-Org/rusa" };
+      let steward = "";
+      const woken = await wokenBy(
+        owning({ [REF]: "someone-else" }),
+        (mesh) => {
+          steward = mesh.spawn({ charter: "repo steward", parentId: "root" });
+          mesh.subscribeEventSource(repoResource, steward, "root");
+        },
+        repoResource
+      );
+
+      expect(woken).toEqual([steward]);
     });
   });
 });

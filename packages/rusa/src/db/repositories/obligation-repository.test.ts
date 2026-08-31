@@ -757,6 +757,22 @@ describe("ObligationRepository", () => {
     ).toBe("ready");
   });
 
+  it("finds the live obligation claiming an external ref and excludes it once terminal", () => {
+    repository.create({
+      title: "claimed work",
+      id: "claimed",
+      ownerId: "actor-b",
+      externalRef: "github:dummy-org/dummy-repo/issues/7",
+    });
+
+    expect(repository.findLiveByExternalRef("github:DUMMY-ORG/DUMMY-REPO/issues/7")).toEqual({
+      ownerId: "actor-b",
+    });
+
+    repository.setTerminalStatus("claimed", "done");
+    expect(repository.findLiveByExternalRef("github:dummy-org/dummy-repo/issues/7")).toBeNull();
+  });
+
   it("blocks a parent on live children and re-readies at its retained priority", () => {
     repository.create({
       title: "first",
