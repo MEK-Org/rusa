@@ -25,16 +25,28 @@ import { join } from "node:path";
 /**
  * The three spellings of one actor's workspace, all seen live in the same
  * provider area: `worker-a1b2c3d4`, the bare `a1b2c3d4`, and the whole actor id.
- * The first two carry only the id's leading segment, which is why the caller
- * supplies the registry — eight hex characters name an actor only if an actor
- * by that prefix exists.
  */
 const WORKSPACE_NAME =
-  /^(?:worker-)?([0-9a-f]{8})(?:-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$/;
+  /^(?:worker-)?([0-9a-f]{8})(-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$/;
+
+/**
+ * Who a workspace directory names — and, just as importantly, how precisely.
+ *
+ * The whole id names exactly one actor, so it can be matched against the
+ * registry outright. The two short spellings carry only the id's leading eight
+ * hex characters, which several actors may answer to, so they are a claim to be
+ * checked against who is live rather than an identification. Collapsing the two
+ * into a bare prefix is what let a directory be deleted on a match it never
+ * really had, so the distinction is preserved here rather than at each caller.
+ */
+type WorkspaceName = { kind: "id"; id: string } | { kind: "prefix"; prefix: string };
 
 /** The actor a workspace directory is named for, or null if it names no actor. */
-function workspaceActorPrefix(name: string): string | null {
-  return WORKSPACE_NAME.exec(name)?.[1] ?? null;
+function workspaceActorName(name: string): WorkspaceName | null {
+  const match = WORKSPACE_NAME.exec(name);
+  if (!match) return null;
+  const [, prefix, rest] = match;
+  return rest ? { kind: "id", id: prefix + rest } : { kind: "prefix", prefix };
 }
 
 /** An actor as this module needs to see it: an id, and whether it still runs. */
@@ -124,31 +136,28 @@ export function orphanedWorkspaces(opts: WorkspaceSweepOptions): string[] {
 
   const orphans: string[] = [];
 
-  // workersDir holds only directories named with the exact actor ID (full UUID).
+  // rusa names its own worker directories with the whole actor id, so nothing
+  // here is ever ambiguous and only an exact retired record sweeps one. The
+  // provider's short spellings are not this directory's problem.
   for (const name of subdirectories(opts.workersDir)) {
-    if (retiredIds.has(name)) {
-      orphans.push(join(opts.workersDir, name));
-    }
+    if (retiredIds.has(name)) orphans.push(join(opts.workersDir, name));
   }
 
-  // scratchDir can hold full UUID, worker-<prefix>, or bare <prefix> spellings.
-  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-  const PREFIX_REGEX = /^(?:worker-)?([0-9a-f]{8})$/;
-
+  // The provider's area is where all three spellings appear, so what a name
+  // proves differs by which one it is.
   for (const name of subdirectories(opts.scratchDir)) {
-    if (UUID_REGEX.test(name)) {
-      if (retiredIds.has(name)) {
-        orphans.push(join(opts.scratchDir, name));
-      }
-    } else {
-      const match = PREFIX_REGEX.exec(name);
-      if (match) {
-        const prefix = match[1];
-        if (retiredPrefixes.has(prefix) && !live.has(prefix)) {
-          orphans.push(join(opts.scratchDir, name));
-        }
-      }
-    }
+    const named = workspaceActorName(name);
+    if (!named) continue;
+    // A whole id identifies its actor outright. A short spelling is a claim
+    // several actors may share: it sweeps only if some retired actor answers to
+    // it and no live one does, because eight hex characters are short, and
+    // losing a retired actor's workspace to a collision costs a delayed cleanup
+    // where losing a live actor's costs it the work in progress.
+    const sweepable =
+      named.kind === "id"
+        ? retiredIds.has(named.id)
+        : retiredPrefixes.has(named.prefix) && !live.has(named.prefix);
+    if (sweepable) orphans.push(join(opts.scratchDir, name));
   }
 
   return orphans;
@@ -171,13 +180,22 @@ export function orphanedWorkspaces(opts: WorkspaceSweepOptions): string[] {
  * line and removes it.
  */
 export function unattributedCheckouts(opts: WorkspaceSweepOptions): string[] {
-  const known = new Set(opts.actors.map((actor) => actor.id.slice(0, 8)));
+  const knownIds = new Set(opts.actors.map((actor) => actor.id));
+  const knownPrefixes = new Set(opts.actors.map((actor) => actor.id.slice(0, 8)));
   const found: string[] = [];
   for (const name of subdirectories(opts.scratchDir)) {
-    const prefix = workspaceActorPrefix(name);
+    const named = workspaceActorName(name);
     // A name that resolves to an actor is already this module's business: live
-    // ones are kept and retired ones are swept, and neither is a stray.
-    if (prefix && known.has(prefix)) continue;
+    // ones are kept and retired ones are swept, and neither is a stray. That
+    // has to be judged at the same precision the sweep uses, or the two
+    // disagree in the gap between them: a directory spelled out in full that
+    // matches no actor is one the sweep will never remove, so a live actor
+    // merely sharing its first eight characters must not excuse it from the
+    // report as well.
+    const attributed =
+      named !== null &&
+      (named.kind === "id" ? knownIds.has(named.id) : knownPrefixes.has(named.prefix));
+    if (attributed) continue;
     // `.git` is a directory in a clone and a file in a worktree; either says
     // this directory holds a repository rather than a cache or a scratch file.
     if (existsSync(join(opts.scratchDir, name, ".git"))) found.push(join(opts.scratchDir, name));

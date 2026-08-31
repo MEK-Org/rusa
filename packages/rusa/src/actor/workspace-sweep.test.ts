@@ -153,6 +153,20 @@ describe("workspace sweep", () => {
     expect(unattributedCheckouts({ workersDir, scratchDir, actors: REGISTRY })).toEqual([]);
   });
 
+  it("reports a full-id checkout that names no actor even when a known actor shares its prefix", () => {
+    // The twin of the sweep's own collision bug: this directory is spelled out
+    // in full and matches no actor record, so the sweep will never remove it —
+    // and if the report resolves it to just eight characters, a live actor
+    // holding that prefix hides it from the report too. Swept by neither and
+    // named by neither is exactly how a checkout sits there unnoticed.
+    const unknownSharingLivePrefix = `${LIVE.slice(0, 8)}-9999-4222-8333-555566667777`;
+    dir(scratchDir, unknownSharingLivePrefix, ".git");
+
+    expect(unattributedCheckouts({ workersDir, scratchDir, actors: REGISTRY })).toEqual([
+      join(scratchDir, unknownSharingLivePrefix),
+    ]);
+  });
+
   it("sweeps nothing when the registry is unreadable, rather than everything", () => {
     // An empty actor list is the shape a failed registry read takes. Requiring a
     // retired record to match means that state removes nothing on its own.
