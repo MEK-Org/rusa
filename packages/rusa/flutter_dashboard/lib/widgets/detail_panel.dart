@@ -607,19 +607,28 @@ class _InfoViewState extends State<_InfoView> {
   /// The full charter once it arrives. Null means "still the preview".
   String? _charter;
 
-  /// The actor and preview the charter on screen was fetched for. Set while a
-  /// fetch is in flight and kept if it succeeds; a failure clears it.
+  /// The actor the charter on screen was fetched for. Set while a fetch is in
+  /// flight and kept if it succeeds; a failure clears it.
+  ///
+  /// The id, and not the charter's content, is deliberately the whole identity
+  /// here: an open panel holds the text it fetched when it opened. A charter
+  /// *can* change under it — `setThreadCharter` re-scopes a long-lived actor —
+  /// and until this panel is closed and reopened it will keep showing the text
+  /// from when it opened. That is a real, accepted narrowing: before the charter
+  /// moved off the list it rode every poll, so an edit reached an open panel on
+  /// its own. Keying on `charterPreview` would appear to restore that but would
+  /// only ever catch edits inside the leading `CHARTER_PREVIEW_CHARS`; an edit
+  /// past the clip leaves the preview byte-identical and the panel silently
+  /// stale, which is worse than not claiming the behaviour at all. If tracking
+  /// live edits is ever actually wanted, the honest trigger already exists and
+  /// is not a poll diff: `setThreadCharter` records an `actor_charter_set` mesh
+  /// event, which this panel could listen for.
   String? _loadedFor;
 
-  /// Which fetch is the current one. Two fetches for the *same* key can be in
+  /// Which fetch is the current one. Two fetches for the *same* actor can be in
   /// flight at once — select A, select B, select A again — and they need not
-  /// come back in the order they were sent, so the key cannot tell them apart.
+  /// come back in the order they were sent, so the id cannot tell them apart.
   int _fetch = 0;
-
-  /// A charter is editable, so the actor's id alone does not identify one. The
-  /// preview travels with the list on every poll and changes when the charter
-  /// does, which is what lets an edit reach an open panel.
-  String get _fetchKey => '${widget.actor.id}\u0000${widget.actor.charterPreview}';
 
   @override
   void initState() {
@@ -630,30 +639,29 @@ class _InfoViewState extends State<_InfoView> {
   @override
   void didUpdateWidget(_InfoView old) {
     super.didUpdateWidget(old);
-    // Ask on every rebuild and let the key decide, so all three reasons to
+    // Ask on every rebuild and let `_loadedFor` decide, so both reasons to
     // re-fetch are one condition: a new actor (the tab is reused across
     // selections, so otherwise the panel shows the previous actor's charter
-    // under a new handle), an edited charter, and a fetch that failed.
+    // under a new handle), and a fetch that failed.
     _loadCharter();
   }
 
   Future<void> _loadCharter() async {
-    final key = _fetchKey;
-    if (_loadedFor == key) return;
-    _loadedFor = key;
-    final fetch = ++_fetch;
     final id = widget.actor.id;
+    if (_loadedFor == id) return;
+    _loadedFor = id;
+    final fetch = ++_fetch;
     setState(() => _charter = null);
     try {
       final charter = await widget.store.fetchCharter(id);
-      // Anything sent since this supersedes it, whatever it was asking for:
-      // another actor selected, an edited charter, or a second look at the
-      // same one. Only the newest answer is allowed to land.
+      // Anything sent since this supersedes it, whichever actor it was asking
+      // for: another actor selected, or a second look at the same one after a
+      // failure. Only the newest answer is allowed to land.
       if (!mounted || fetch != _fetch) return;
       setState(() => _charter = charter);
     } catch (_) {
       // The preview stays on screen and the store has already surfaced the
-      // error — but release the key, so the next poll retries rather than
+      // error — but release the id, so the next poll retries rather than
       // pinning the panel to the preview for as long as this actor is selected.
       if (fetch == _fetch) _loadedFor = null;
     }
