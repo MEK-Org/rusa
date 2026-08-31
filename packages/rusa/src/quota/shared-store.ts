@@ -42,6 +42,19 @@ export const QUOTA_INTEGRAL_MAX_STEP_SECONDS = SLOT_MS / 1000;
 export const QUOTA_DERIVATIVE_TAU_SECONDS = 1800;
 export const QUOTA_ACTUATOR_SMOOTHING = 0.25;
 export const QUOTA_MAX_SLEW_SECONDS = 900;
+/**
+ * A rise in remaining quota above this many points is read as a refill rather
+ * than a measurement. Inside one window `percentLeft` only falls — consumption
+ * is the only thing that moves it — so a genuine rise means the budget was
+ * replenished under us.
+ *
+ * This is a noise floor, not a sensitivity knob. The reading is parsed from a
+ * rendered percentage, so display rounding can move it by a point without any
+ * underlying change; two points clears that with margin. Sensitivity is not the
+ * binding constraint in the other direction, because a real refill moves tens
+ * of points at once — a weekly window returns to ~100 from single digits.
+ */
+export const QUOTA_REFILL_EPSILON_POINTS = 2;
 
 export function resolveQuotaDatabasePath(configuredPath: string, rusaHome: string): string {
   const expanded =
@@ -471,7 +484,8 @@ export class SharedQuotaStore {
                 controller_error AS controllerError,
                 controller_derivative AS controllerDerivative,
                 controller_integral AS controllerIntegral,
-                observed_at AS observedAt, reset_at_iso AS resetAtIso
+                observed_at AS observedAt, reset_at_iso AS resetAtIso,
+                percent_left AS percentLeft
          FROM quota_observations
          WHERE provider = ? AND kind = ? AND interval_seconds IS NOT NULL
          ORDER BY observed_at DESC, rowid DESC LIMIT 1`
@@ -484,6 +498,7 @@ export class SharedQuotaStore {
           controllerIntegral: number | null;
           observedAt: string;
           resetAtIso: string | null;
+          percentLeft: number;
         }
       | undefined;
     const timeRemainingPct = Math.min(
@@ -491,10 +506,29 @@ export class SharedQuotaStore {
       Math.max(0, ((resetMs - observedMs) / observation.windowMs) * 100)
     );
     const error = timeRemainingPct - observation.percentLeft;
-    const cycleChanged =
+    // A cycle boundary is anything that makes the previous error incomparable
+    // to this one, and there are two independent signals for it. Either is
+    // sufficient:
+    //
+    //  1. the reset instant moved — we are budgeting against a different window;
+    //  2. remaining quota rose — the budget refilled underneath us.
+    //
+    // (2) is not implied by (1). A refill whose `reset_at` did not move with it,
+    // or one where the previous row carried no `reset_at` at all, leaves (1)
+    // false. Error is `timeRemainingPct - percentLeft`, so the refill makes the
+    // error fall sharply, and with (1) false that fall is read as genuine
+    // progress rather than the discontinuity it is. It does not merely spike:
+    // `QUOTA_KD_SECONDS_SQUARED_PER_POINT` and `QUOTA_DERIVATIVE_TAU_SECONDS`
+    // share an 1800 s constant, so the misread relaxes the interval across
+    // roughly half an hour of subsequent observations.
+    const resetMoved =
       previous?.resetAtIso != null &&
       Math.abs(Date.parse(previous.resetAtIso) - resetMs) >
         Math.min(60 * 60 * 1000, observation.windowMs * 0.05);
+    const quotaRefilled =
+      previous != null &&
+      observation.percentLeft - previous.percentLeft > QUOTA_REFILL_EPSILON_POINTS;
+    const cycleChanged = resetMoved || quotaRefilled;
     const previousObservedMs = previous ? Date.parse(previous.observedAt) : Number.NaN;
     const dtSeconds = Number.isFinite(previousObservedMs)
       ? Math.max(1, (observedMs - previousObservedMs) / 1000)
