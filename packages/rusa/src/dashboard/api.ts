@@ -124,6 +124,20 @@ const MAX_ACTORS = 200;
 const DEFAULT_LIMIT = 50;
 /** Cap on a manually-uploaded avatar's decoded byte size (5 MB). */
 const MAX_AVATAR_UPLOAD_BYTES = 5 * 1024 * 1024;
+/**
+ * How much of a charter the actor list carries. The list is a tree of handles
+ * with a two-line excerpt under each; the full text only ever renders in the
+ * detail panel, one actor at a time. Sending all of it made `charter` 86.7% of
+ * a 1.9 MB response (#104) — assembled and serialised for all 506 actors on
+ * every poll to satisfy a view that clips it.
+ */
+const CHARTER_PREVIEW_CHARS = 280;
+
+/** The leading slice of `charter` the list view can actually show. */
+function charterPreview(charter: string): string {
+  if (charter.length <= CHARTER_PREVIEW_CHARS) return charter;
+  return `${charter.slice(0, CHARTER_PREVIEW_CHARS).trimEnd()}\u2026`;
+}
 
 /** A thread as the dashboard tree consumes it: handle up front, UUID for detail. */
 interface ThreadDto {
@@ -134,7 +148,12 @@ interface ThreadDto {
   provider: string | null;
   /** The single authoritative model for this actor, as configured in the registry. */
   model: string | null;
-  charter: string;
+  /**
+   * The leading `CHARTER_PREVIEW_CHARS` characters of the charter, ellipsised
+   * when clipped. The full text is detail data: `GET
+   * /api/mesh/threads/charter?id=<threadId>`.
+   */
+  charterPreview: string;
   title: string;
   createdAt: string;
   /**
@@ -1048,6 +1067,21 @@ export function handleMeshApiRequest(
     return true;
   }
 
+  // GET /api/mesh/threads/charter?id=<threadId> — one actor's full charter.
+  // The list carries only a preview; this is where the detail panel gets the
+  // rest, for the one actor the operator actually opened. Declared before the
+  // list route because the dispatcher matches on exact pathname.
+  if (pathname === "/api/mesh/threads/charter") {
+    const id = url.searchParams.get("id");
+    const thread = id ? registry.get(id) : undefined;
+    if (!thread) {
+      sendJson(res, 404, { error: "thread not found" });
+      return true;
+    }
+    sendJson(res, 200, { id: thread.id, charter: thread.charter });
+    return true;
+  }
+
   // GET /api/mesh/threads — every thread (active + retired), handle up front.
   if (pathname === "/api/mesh/threads") {
     // One synchronous snapshot of the running set, classified against every
@@ -1111,7 +1145,7 @@ export function handleMeshApiRequest(
         status: r.status,
         provider: r.provider ?? null,
         model: r.model ?? null,
-        charter: r.charter,
+        charterPreview: charterPreview(r.charter),
         title: r.title ?? summarizeCharter(r.charter),
         createdAt: r.createdAt,
         runState,

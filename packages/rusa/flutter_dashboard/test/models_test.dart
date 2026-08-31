@@ -72,7 +72,7 @@ void main() {
       status: 'active',
       provider: 'claude',
       model: 'claude-3-5-sonnet',
-      charter: 'test charter',
+      charterPreview: 'test charter',
       title: 'test title',
       createdAt: '2026-01-01T00:00:00Z',
     );
@@ -134,7 +134,7 @@ void main() {
       status: 'active',
       provider: null,
       model: null,
-      charter: '',
+      charterPreview: '',
       createdAt: '2026-01-01T00:00:00Z',
     );
     const thread2 = ThreadDto(
@@ -144,7 +144,7 @@ void main() {
       status: 'active',
       provider: null,
       model: null,
-      charter: '',
+      charterPreview: '',
       createdAt: '2026-01-01T00:01:00Z',
     );
     const thread3 = ThreadDto(
@@ -154,7 +154,7 @@ void main() {
       status: 'retired',
       provider: null,
       model: null,
-      charter: '',
+      charterPreview: '',
       createdAt: '2026-01-01T00:02:00Z',
     );
 

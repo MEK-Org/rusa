@@ -585,6 +585,75 @@ describe("handleMeshApiRequest", () => {
     expect(child.title).toBe("Custom Title");
   });
 
+  it("GET /api/mesh/threads sends a clipped charter preview, not the whole charter", () => {
+    // A charter well past the preview budget, with a distinctive tail so the
+    // assertion is about the bytes on the wire rather than about a length.
+    const long = `${"pursue the objective. ".repeat(60)}TAIL-MARKER`;
+    registry.upsert({
+      id: UUID_A,
+      charter: long,
+      parentId: null,
+      status: "active",
+      createdAt: "2026-06-21T00:00:00.000Z",
+    });
+
+    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { threads } = JSON.parse(res.body);
+    const dto = threads.find((t: { id: string }) => t.id === UUID_A);
+
+    expect(dto.charter).toBeUndefined();
+    expect(dto.charterPreview.startsWith("pursue the objective.")).toBe(true);
+    expect(dto.charterPreview.endsWith("\u2026")).toBe(true);
+    expect(dto.charterPreview.length).toBeLessThanOrEqual(281);
+    // The point of the change: the tail never reaches the client on this route.
+    expect(res.body.includes("TAIL-MARKER")).toBe(false);
+  });
+
+  it("GET /api/mesh/threads leaves a charter inside the budget exactly as it is", () => {
+    registry.upsert({
+      id: UUID_A,
+      charter: "short charter\nline 2",
+      parentId: null,
+      status: "active",
+      createdAt: "2026-06-21T00:00:00.000Z",
+    });
+
+    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { threads } = JSON.parse(res.body);
+    const dto = threads.find((t: { id: string }) => t.id === UUID_A);
+
+    // No ellipsis, no trimming: a charter that fits is not a truncated one, and
+    // the detail panel must not be told to go fetch a longer version.
+    expect(dto.charterPreview).toBe("short charter\nline 2");
+  });
+
+  it("GET /api/mesh/threads/charter serves the one actor's full charter", () => {
+    const long = `${"pursue the objective. ".repeat(60)}TAIL-MARKER`;
+    registry.upsert({
+      id: UUID_A,
+      charter: long,
+      parentId: null,
+      status: "active",
+      createdAt: "2026-06-21T00:00:00.000Z",
+    });
+
+    const { res } = call(deps, "GET", `/api/mesh/threads/charter?id=${UUID_A}`);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ id: UUID_A, charter: long });
+  });
+
+  it("GET /api/mesh/threads/charter 404s for an unknown or missing id", () => {
+    registry.upsert(rec(UUID_A, null, "active"));
+
+    const unknown = call(deps, "GET", "/api/mesh/threads/charter?id=nope").res;
+    expect(unknown.statusCode).toBe(404);
+    expect(JSON.parse(unknown.body)).toEqual({ error: "thread not found" });
+
+    // No `id` at all must not fall through to the list route below it.
+    const missing = call(deps, "GET", "/api/mesh/threads/charter").res;
+    expect(missing.statusCode).toBe(404);
+  });
+
   it("GET /api/mesh/threads reports halted:false and every thread idle by default", () => {
     registry.upsert(rec("root", null, "active"));
     registry.upsert(rec(UUID_A, "root", "active"));

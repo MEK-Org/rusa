@@ -395,6 +395,85 @@ void main() {
     },
   );
 
+  testWidgets('the Info tab swaps the charter preview for the full charter', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final api = FakeApi()
+        ..threadsResult = [
+          makeThread('root', created: 't0'),
+          makeThread(
+            'a',
+            parent: 'root',
+            created: 't1',
+            charterPreview: 'Hold the line\u2026',
+          ),
+        ]
+        ..charters['a'] = 'Hold the line, and here is the rest of it.';
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+
+      await tester.pumpWidget(_harness(store));
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.tap(find.text('a-handle'));
+      await tester.pump(const Duration(milliseconds: 50));
+
+      await tester.ensureVisible(find.text('Info'));
+      await tester.tap(find.text('Info'));
+      for (int i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+
+      // Asked once, for the actor that is actually open.
+      expect(api.charterCalls, ['a']);
+      expect(
+        find.text('Hold the line, and here is the rest of it.'),
+        findsOneWidget,
+      );
+      // The clipped version is gone rather than sitting above the full text.
+      expect(find.text('Hold the line\u2026'), findsNothing);
+
+      await store.dispose();
+    });
+  });
+
+  testWidgets('the Info tab keeps the preview when the charter fetch fails', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final api = FakeApi()
+        ..threadsResult = [
+          makeThread('root', created: 't0'),
+          makeThread(
+            'a',
+            parent: 'root',
+            created: 't1',
+            charterPreview: 'Hold the line\u2026',
+          ),
+        ]
+        ..charterError = Exception('offline');
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+
+      await tester.pumpWidget(_harness(store));
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.tap(find.text('a-handle'));
+      await tester.pump(const Duration(milliseconds: 50));
+
+      await tester.ensureVisible(find.text('Info'));
+      await tester.tap(find.text('Info'));
+      for (int i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+
+      // A failed fetch degrades to less charter, never to "No charter."
+      expect(find.text('Hold the line\u2026'), findsOneWidget);
+      expect(find.text('No charter.'), findsNothing);
+
+      await store.dispose();
+    });
+  });
+
   testWidgets('renders a single model with no divergence surface', (
     tester,
   ) async {

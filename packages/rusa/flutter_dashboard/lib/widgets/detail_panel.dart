@@ -150,7 +150,11 @@ class _DetailPanelState extends State<DetailPanel>
                         ConversationTab(store: widget.store),
                         EventsTab(store: widget.store),
                         LiveOutputTab(store: widget.store),
-                        _InfoView(actor: actor!, parentHandle: parentHandle),
+                        _InfoView(
+                          actor: actor!,
+                          parentHandle: parentHandle,
+                          store: widget.store,
+                        ),
                         InboxTab(actorId: actor.id, store: widget.store, onSelectView: widget.onSelectView),
                       ]
                     : [
@@ -160,7 +164,11 @@ class _DetailPanelState extends State<DetailPanel>
                         ),
                         EventsTab(store: widget.store),
                         LiveOutputTab(store: widget.store),
-                        _InfoView(actor: actor!, parentHandle: parentHandle),
+                        _InfoView(
+                          actor: actor!,
+                          parentHandle: parentHandle,
+                          store: widget.store,
+                        ),
                         InboxTab(actorId: actor.id, store: widget.store, onSelectView: widget.onSelectView),
                       ],
               ),
@@ -575,11 +583,67 @@ class _DetailPanelState extends State<DetailPanel>
 
 /// The actor's Info tab: contains metadata like work-states and the full (possibly very long)
 /// charter text in a scrollable, selectable view.
-class _InfoView extends StatelessWidget {
-  const _InfoView({required this.actor, required this.parentHandle});
+///
+/// The thread list only carries a clipped preview of the charter, because it is
+/// the same field for every actor on every poll. This is the one place the whole
+/// text is shown, so this is the one place that asks for it — the preview renders
+/// immediately and is replaced in place when the fetch lands.
+class _InfoView extends StatefulWidget {
+  const _InfoView({
+    required this.actor,
+    required this.parentHandle,
+    required this.store,
+  });
 
   final ThreadDto actor;
   final String parentHandle;
+  final DashboardStore store;
+
+  @override
+  State<_InfoView> createState() => _InfoViewState();
+}
+
+class _InfoViewState extends State<_InfoView> {
+  /// The full charter once it arrives. Null means "still the preview".
+  String? _charter;
+  String? _loadedFor;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadCharter();
+  }
+
+  @override
+  void didUpdateWidget(_InfoView old) {
+    super.didUpdateWidget(old);
+    // The tab is reused across selections, so a new actor has to re-fetch —
+    // otherwise the panel shows the previous actor's charter under a new handle.
+    if (old.actor.id != widget.actor.id) _loadCharter();
+  }
+
+  Future<void> _loadCharter() async {
+    final id = widget.actor.id;
+    if (_loadedFor == id) return;
+    _loadedFor = id;
+    setState(() => _charter = null);
+    try {
+      final charter = await widget.store.fetchCharter(id);
+      // The operator can select another actor while this is in flight.
+      if (!mounted || _loadedFor != id) return;
+      setState(() => _charter = charter);
+    } catch (_) {
+      // The preview stays on screen; the store has already surfaced the error.
+    }
+  }
+
+  ThreadDto get actor => widget.actor;
+  String get parentHandle => widget.parentHandle;
+
+  /// The preview until the full charter lands, and after that the full charter.
+  /// Falling back to the preview rather than to empty means a failed or slow
+  /// fetch degrades to less text, not to "No charter."
+  String get charter => _charter ?? widget.actor.charterPreview;
 
   Widget _meta(String label, String value) => RichText(
     text: TextSpan(
@@ -631,13 +695,13 @@ class _InfoView extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 12),
-          actor.charter.isEmpty
+          charter.isEmpty
               ? const Text(
                   'No charter.',
                   style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
                 )
               : SelectableText(
-                  actor.charter,
+                  charter,
                   style: const TextStyle(
                     color: MeshColors.textSecondary,
                     fontSize: 13,

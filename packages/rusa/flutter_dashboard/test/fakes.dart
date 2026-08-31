@@ -18,6 +18,7 @@ ThreadDto makeThread(
   RunState runState = RunState.unknown,
   String? title,
   String? model,
+  String? charterPreview,
 }) => ThreadDto(
   id: id,
   handle: '$id-handle',
@@ -25,7 +26,7 @@ ThreadDto makeThread(
   status: status,
   provider: null,
   model: model,
-  charter: 'charter $id',
+  charterPreview: charterPreview ?? 'charter $id',
   title: title ?? 'charter $id',
   createdAt: created,
   lastActiveAt: lastActiveAt,
@@ -139,6 +140,20 @@ class FakeApi extends DashboardApi {
   @override
   Future<List<String>> fetchRootControlProviders() async =>
       rootControlProviders;
+
+  /// Full charters the detail panel can pull, keyed by thread id. Absent means
+  /// the server had nothing to add beyond the preview.
+  final charters = <String, String>{};
+  final charterCalls = <String>[];
+  Object? charterError;
+
+  @override
+  Future<String> fetchCharter(String threadId) async {
+    charterCalls.add(threadId);
+    final err = charterError;
+    if (err != null) throw err;
+    return charters[threadId] ?? '';
+  }
 
   @override
   Future<String> spawnRootChild({
