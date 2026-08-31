@@ -79,6 +79,7 @@ void main() {
           title: 'human:operator → root',
           body: 'A monster-catching JRPG in a cave.',
           author: 'human:operator',
+          url: 'https://example.test/citation',
         ),
         label: "Operator's answer",
         attachedBy: 'root',
@@ -87,6 +88,8 @@ void main() {
       expect(find.text('MESH'), findsOneWidget);
       expect(find.text('human:operator → root'), findsOneWidget);
       expect(find.text('A monster-catching JRPG in a cave.'), findsOneWidget);
+      expect(find.text('by human:operator'), findsOneWidget);
+      expect(find.text('https://example.test/citation'), findsOneWidget);
       expect(find.text("Operator's answer"), findsOneWidget);
       expect(find.text('cited by root'), findsOneWidget);
       // The ref itself stays visible and selectable — a citation you cannot

@@ -13,10 +13,8 @@ import {
  * A reference rendered down to what any surface needs to show it: what it is,
  * who said it, when, the text itself, and where to go look.
  *
- * One shape for every source, so the dashboard has one widget rather than a
- * branch per provider, and so an obligation's cited artifacts and an actor's
- * inbox items render identically — they are the same thing seen from two
- * directions (operator, 2026-08-30).
+ * One shape for every source, so current dashboard call sites can share one
+ * rendering rather than duplicating source-specific presentation rules.
  */
 export interface ResolvedReference {
   /** The canonical `<scheme>:<path>` string this resolves. */
@@ -111,6 +109,42 @@ function resolveMesh(reference: Reference, deps: ReferenceResolverDeps): Resolve
   }
 
   return unresolved(reference, reference.key, "unrecognised mesh resource");
+}
+
+/**
+ * Resolve references that only need local, synchronous stores.
+ *
+ * The dashboard uses this path so its request handler stays synchronous while
+ * still sharing the canonical parser and mesh resolver. External schemes remain
+ * visible with an explicit reason instead of being collapsed into a null value.
+ */
+export function resolveReferenceSync(
+  ref: string,
+  deps: Pick<ReferenceResolverDeps, "meshChat" | "inbox">
+): ResolvedReference {
+  let reference: Reference;
+  try {
+    reference = parseReference(ref);
+  } catch (err) {
+    return {
+      ref,
+      scheme: "mesh",
+      title: ref,
+      body: null,
+      author: null,
+      timestamp: null,
+      url: null,
+      unavailable: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  try {
+    return reference.scheme === "mesh"
+      ? resolveMesh(reference, deps)
+      : unresolved(reference, reference.key, "not resolved by the synchronous dashboard path");
+  } catch (err) {
+    return unresolved(reference, reference.key, err instanceof Error ? err.message : String(err));
+  }
 }
 
 async function resolveGchat(

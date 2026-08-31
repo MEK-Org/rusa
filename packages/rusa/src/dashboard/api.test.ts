@@ -906,6 +906,25 @@ describe("handleMeshApiRequest", () => {
     });
   });
 
+  it("GET /api/mesh/inbox preserves a dangling mesh citation and its failure reason", () => {
+    inbox.append([
+      {
+        id: "dangling-inbox-entry",
+        actorId: UUID_A,
+        source: "mesh:root",
+        payload: { type: "mesh.message", messageId: "missing-message", fromId: "root" },
+      },
+    ]);
+
+    const { res } = call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
+    const entry = JSON.parse(res.body).entries[0];
+    expect(entry.reference).toMatchObject({
+      ref: "mesh:messages/missing-message",
+      body: null,
+      unavailable: "message not found",
+    });
+  });
+
   describe("POST /api/mesh/actors/:id/inbox/handled", () => {
     const post = async (actorId: string, body: unknown) => {
       const { res } = call(
@@ -1712,11 +1731,14 @@ describe("handleMeshApiRequest", () => {
         const chat = artifacts.find((a) => a.artifact.ref.startsWith("mesh:"));
         expect(chat?.reference?.body).toBe("A monster-catching JRPG in a cave.");
         expect(chat?.artifact.label).toBe("the answer");
-        // v1 resolves mesh chat only. The GitHub citation still comes back —
-        // an unresolvable citation is not the same as an absent one.
+        // v1 resolves mesh chat only. The GitHub citation still comes back with
+        // an explicit reason — an unresolvable citation is not an absent one.
         const gh = artifacts.find((a) => a.artifact.ref.startsWith("github:"));
         expect(gh).toBeDefined();
-        expect(gh?.reference).toBeNull();
+        expect(gh?.reference).toMatchObject({
+          scheme: "github",
+          unavailable: "not resolved by the synchronous dashboard path",
+        });
       });
 
       it("rejects a create with no title", async () => {

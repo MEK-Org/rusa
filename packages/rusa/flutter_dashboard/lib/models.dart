@@ -828,10 +828,9 @@ const int kObligationTitleMax = 200;
 /// A reference resolved down to what the UI needs to show it, mirroring the
 /// server's `ResolvedReference`.
 ///
-/// One shape for every source so an obligation's cited artifacts and an actor's
-/// inbox items render through the same widget — they are the same thing seen
-/// from two directions. In v1 only mesh chat actually resolves; anything else
-/// arrives with [unavailable] set and is shown as a citation that cannot yet be
+/// One shape for every source so the obligation and inbox call sites can reuse
+/// one rendering. In v1 only mesh chat actually resolves; anything else arrives
+/// with [unavailable] set and is shown as a citation that cannot yet be
 /// expanded, rather than as an empty one.
 class ReferenceDto {
   const ReferenceDto({

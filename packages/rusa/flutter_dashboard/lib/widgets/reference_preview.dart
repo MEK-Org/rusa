@@ -6,11 +6,8 @@ import '../util.dart';
 
 /// One rendering for any resolved reference.
 ///
-/// Shared deliberately: an obligation's cited artifacts and an actor's inbox
-/// items are the same thing seen from two directions — something that was said
-/// somewhere, which the mesh is pointing at. Rendering them through one widget
-/// keeps them recognisable as the same kind of object, and means a new source
-/// only has to teach the *server* how to resolve it.
+/// Shared by the obligation and inbox call sites so source metadata is presented
+/// consistently without two copies of the same card.
 ///
 /// In v1 only mesh chat resolves to real text. Everything else arrives with
 /// [ReferenceDto.unavailable] set and renders as a citation we can name but not
@@ -88,6 +85,16 @@ class ReferencePreview extends StatelessWidget {
               ),
             ),
           ],
+          if (reference.author != null && reference.author!.trim().isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              'by ${reference.author}',
+              style: const TextStyle(
+                color: MeshColors.textMuted,
+                fontSize: 10.5,
+              ),
+            ),
+          ],
           const SizedBox(height: 8),
           if (hasBody)
             // No `maxLines`: SelectableText wraps an EditableText, which sizes
@@ -133,6 +140,17 @@ class ReferencePreview extends StatelessWidget {
               ],
             ],
           ),
+          if (reference.url != null && reference.url!.trim().isNotEmpty) ...[
+            const SizedBox(height: 6),
+            SelectableText(
+              reference.url!,
+              style: const TextStyle(
+                color: MeshColors.accent,
+                fontSize: 10.5,
+                fontFamily: kMonoFontFamily,
+              ),
+            ),
+          ],
         ],
       ),
     );
