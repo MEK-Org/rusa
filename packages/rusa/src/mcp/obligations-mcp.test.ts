@@ -182,7 +182,7 @@ describe("obligations MCP", () => {
     for (const ownerId of ["actor-nonexistent", "actor-retired", "system:mesh"]) {
       const res = (await client.callTool({
         name: "create_obligation",
-        arguments: { owner_id: ownerId, intent: "typo" },
+        arguments: { title: "typo", owner_id: ownerId, intent: "typo" },
       })) as CallToolResult;
       expect(res.isError, ownerId).toBe(true);
     }
@@ -194,7 +194,7 @@ describe("obligations MCP", () => {
     for (const ownerId of ["actor-a", "human:operator"]) {
       const res = (await client.callTool({
         name: "create_obligation",
-        arguments: { owner_id: ownerId, intent: "fine" },
+        arguments: { title: "fine", owner_id: ownerId, intent: "fine" },
       })) as CallToolResult;
       expect(res.isError, ownerId).toBeFalsy();
     }

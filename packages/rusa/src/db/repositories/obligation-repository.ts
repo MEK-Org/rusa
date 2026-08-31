@@ -362,6 +362,30 @@ export class ObligationRepository {
       const res = work();
       const after = this.readyHeads();
 
+      for (const ownerId of before.keys()) {
+        if (!after.has(ownerId) && isActorEntityId(ownerId)) {
+          const previousHeadId = before.get(ownerId) ?? null;
+          const now = this.stamp();
+          this.db
+            .prepare(
+              `UPDATE obligation_ready_heads
+               SET head_id = NULL,
+                   previous_head_id = ?,
+                   sequence = sequence + 1,
+                   updated_at = ?
+               WHERE owner_id = ?`
+            )
+            .run(previousHeadId, now, ownerId);
+
+          const seqRow = this.db
+            .prepare(`SELECT sequence FROM obligation_ready_heads WHERE owner_id = ?`)
+            .get(ownerId) as { sequence: number } | undefined;
+          const sequence = seqRow?.sequence ?? 1;
+
+          changes.push({ ownerId, head: null, previousHeadId, sequence });
+        }
+      }
+
       for (const [ownerId, headId] of after) {
         const previousHeadId = before.get(ownerId) ?? null;
         if (previousHeadId === headId) continue;
@@ -388,23 +412,6 @@ export class ObligationRepository {
         const sequence = seqRow?.sequence ?? 1;
 
         changes.push({ ownerId, head, previousHeadId, sequence });
-      }
-
-      for (const ownerId of before.keys()) {
-        if (!after.has(ownerId) && isActorEntityId(ownerId)) {
-          const previousHeadId = before.get(ownerId) ?? null;
-          const now = this.stamp();
-          this.db
-            .prepare(
-              `UPDATE obligation_ready_heads
-               SET head_id = NULL,
-                   previous_head_id = ?,
-                   sequence = sequence + 1,
-                   updated_at = ?
-               WHERE owner_id = ?`
-            )
-            .run(previousHeadId, now, ownerId);
-        }
       }
 
       return res;

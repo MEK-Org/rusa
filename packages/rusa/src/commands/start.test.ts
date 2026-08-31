@@ -533,16 +533,19 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(liveId).toBeDefined();
 
       const obligations = getRepositories().obligations;
-      expect(() => obligations.create({ ownerId: String(liveId), intent: "fine" })).not.toThrow();
+      expect(() =>
+        obligations.create({ title: "fine", ownerId: String(liveId), intent: "fine" })
+      ).not.toThrow();
       for (const ownerId of ["never-existed", "retired-worker"]) {
-        expect(() => obligations.create({ ownerId, intent: "drift" }), ownerId).toThrow(
-          /actor owner does not exist/
-        );
+        expect(
+          () => obligations.create({ title: "drift", ownerId, intent: "drift" }),
+          ownerId
+        ).toThrow(/actor owner does not exist/);
       }
       // The operator is not an actor and must still be ownable — the whole
       // human-decision contract depends on it.
       expect(() =>
-        obligations.create({ ownerId: "human:operator", intent: "decide" })
+        obligations.create({ title: "decide", ownerId: "human:operator", intent: "decide" })
       ).not.toThrow();
     });
   });

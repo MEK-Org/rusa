@@ -142,8 +142,8 @@ describe("ObligationRepository", () => {
         throw new Error("inbox is unavailable");
       });
 
-      repository.create({ id: "ob-a", ownerId: "actor-a", priority: 5 });
-      repository.create({ id: "ob-b", ownerId: "actor-b", priority: 1 });
+      repository.create({ title: "Task A", id: "ob-a", ownerId: "actor-a", priority: 5 });
+      repository.create({ title: "Task B", id: "ob-b", ownerId: "actor-b", priority: 1 });
 
       const headsMap = repository.readyHeads();
       expect(headsMap.get("actor-a")).toBe("ob-a");
@@ -161,7 +161,7 @@ describe("ObligationRepository", () => {
 
     it("preserves and increments the sequence number when queue drains completely and recurs", () => {
       // 1. Initial ready head "ob-1" (sequence 1)
-      repository.create({ id: "ob-1", ownerId: "actor-a", priority: 10 });
+      repository.create({ title: "Task 1", id: "ob-1", ownerId: "actor-a", priority: 10 });
       let transitions = repository.readyHeadTransitions();
       expect(transitions).toEqual([
         { ownerId: "actor-a", headId: "ob-1", previousHeadId: null, sequence: 1 },
@@ -185,7 +185,7 @@ describe("ObligationRepository", () => {
       });
 
       // 3. Add a new ready head "ob-2" for the same owner.
-      repository.create({ id: "ob-2", ownerId: "actor-a", priority: 10 });
+      repository.create({ title: "Task 2", id: "ob-2", ownerId: "actor-a", priority: 10 });
       transitions = repository.readyHeadTransitions();
       expect(transitions).toEqual([
         { ownerId: "actor-a", headId: "ob-2", previousHeadId: null, sequence: 3 },
