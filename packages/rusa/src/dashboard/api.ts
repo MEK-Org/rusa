@@ -19,12 +19,6 @@ import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { ObligationStatus } from "../obligations/obligation.js";
-import {
-  COMMITMENT_LEDGER_BODY_KINDS,
-  COMMITMENT_LEDGER_KINDS,
-  type CommitmentLedgerReport,
-  projectOpenCommitments,
-} from "../observability/commitment-ledger.js";
 import type { SseHub } from "./sse.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
@@ -170,14 +164,8 @@ interface ThreadDto {
   chatDisabled: boolean;
   /** ISO-8601 timestamp of the actor's most recent mesh event, or null if none. */
   lastActiveAt: string | null;
-  /** The most critical open commitment row kind for this thread, if any. */
-  commitmentKind?: string | null;
-  /** What this thread is blocked waiting on. */
-  waitingOn?: string | null;
   /** Exact provider-pacer release time, populated only for a provider queue head. */
   nextProviderAvailableAt?: string | null;
-  /** Whether the owner expects to retire this thread. */
-  ownerExpectsRetirement?: boolean | null;
 }
 
 /**
@@ -393,11 +381,6 @@ function parseKinds(url: URL): string[] | undefined {
     .filter(Boolean);
   return kinds.length > 0 ? kinds : undefined;
 }
-
-const commitmentLedgerCache = new WeakMap<
-  MeshEventRepository,
-  { maxRowid: number; ledger: CommitmentLedgerReport }
->();
 
 /**
  * Dispatch a `/api/mesh/*` request. Returns true if it owned the request
@@ -1101,40 +1084,7 @@ export function handleMeshApiRequest(
     // mesh_events(actor_id, ts) makes this cheap .
     const lastActiveByActor = meshEvents.latestActivityByActor();
 
-    // Cached ledger projection, recomputed whenever a new event lands. The cache
-    // is what makes the common poll ~30ms; the read below is what the miss costs,
-    // and every actor list after a restart pays one. So the miss reads the kinds
-    // the projection can act on and the bodies it can read, and nothing else.
-    const currentMaxRowid = meshEvents.getMaxRowid();
-    let cached = commitmentLedgerCache.get(meshEvents);
-    if (!cached || cached.maxRowid !== currentMaxRowid) {
-      const ledger = projectOpenCommitments({
-        threads: registry.list(),
-        events: meshEvents.listByKinds(COMMITMENT_LEDGER_KINDS, {
-          bodyKinds: COMMITMENT_LEDGER_BODY_KINDS,
-        }),
-        rootHandle,
-      });
-      cached = { maxRowid: currentMaxRowid, ledger };
-      commitmentLedgerCache.set(meshEvents, cached);
-    }
-    const ledger = cached.ledger;
-    const threadCommitments = new Map<
-      string,
-      { kind: string; waitingOn: string | null; ownerExpectsRetirement: boolean | null }
-    >();
-    for (const row of ledger.rows) {
-      if (row.subject_actor_id && !threadCommitments.has(row.subject_actor_id)) {
-        threadCommitments.set(row.subject_actor_id, {
-          kind: row.kind,
-          waitingOn: row.waiting_on,
-          ownerExpectsRetirement: row.owner_expects_retirement,
-        });
-      }
-    }
-
     const threads: ThreadDto[] = registry.list().map((r) => {
-      const commitment = threadCommitments.get(r.id);
       let runState: "running" | "queued" | "winding_down" | "idle" = "idle";
       if (typeof deps.mesh?.activeRunState === "function") {
         runState = deps.mesh.activeRunState(r.id)?.phase ?? "idle";
@@ -1156,10 +1106,7 @@ export function handleMeshApiRequest(
         runState,
         chatDisabled: r.status === "retired",
         lastActiveAt: lastActiveByActor.get(r.id) ?? null,
-        commitmentKind: commitment?.kind ?? null,
-        waitingOn: commitment?.waitingOn ?? null,
         nextProviderAvailableAt: providerQueueHeads.get(r.id) ?? null,
-        ownerExpectsRetirement: commitment?.ownerExpectsRetirement ?? null,
       };
     });
     sendJson(res, 200, { halted: deps.isHalted?.() ?? false, threads });
