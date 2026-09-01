@@ -198,6 +198,7 @@ class DashboardStore {
   final _conversation = BehaviorSubject<ChatView>.seeded(const ChatView());
   final _operatorChat = BehaviorSubject<ChatView>.seeded(const ChatView());
   final _live = BehaviorSubject<List<LiveLine>>.seeded(const []);
+  var _liveCodeUnits = 0;
   final _quota = BehaviorSubject<QuotaSnapshotDto?>.seeded(null);
   final _quotaHistory = BehaviorSubject<QuotaHistoryDto?>.seeded(null);
   final _yieldEvents = BehaviorSubject<List<MeshEvent>>.seeded(const []);
@@ -690,6 +691,7 @@ class DashboardStore {
     // Reset the merged events view + seam de-dupe for the new selection.
     _seenEventIds.clear();
     _events.add(const EventsView());
+    _liveCodeUnits = 0;
     _live.add(const []);
     unawaited(_loadEvents(reset: true));
 
@@ -1196,29 +1198,37 @@ class DashboardStore {
   }
 
   void _appendLive(LiveLine line) {
-    final next = List<LiveLine>.of(_live.value)
-      ..addAll(_splitLiveLineForRendering(line));
-    var codeUnits = next.fold<int>(
-      0,
-      (total, entry) => total + entry.text.length,
-    );
+    final additions = _splitLiveLineForRendering(line);
+    final next = List<LiveLine>.of(_live.value)..addAll(additions);
+    var codeUnits = _liveCodeUnits;
+    for (final addition in additions) {
+      codeUnits += addition.text.length;
+    }
+    var firstRetained = 0;
     var elided = false;
-    while (next.length > _kLiveBufferCap ||
+    while (next.length - firstRetained > _kLiveBufferCap ||
         codeUnits > _kLiveBufferCodeUnitCap) {
-      codeUnits -= next.removeAt(0).text.length;
+      codeUnits -= next[firstRetained++].text.length;
       elided = true;
     }
-    if (elided && (next.isEmpty || !next.first.isGap)) {
+    final needsGap =
+        elided && (firstRetained == next.length || !next[firstRetained].isGap);
+    if (needsGap) {
       // Reserve room for the visible gap marker itself. This normally removes
       // at most one additional render block.
-      while (next.isNotEmpty &&
-          (next.length >= _kLiveBufferCap ||
+      while (firstRetained < next.length &&
+          (next.length - firstRetained >= _kLiveBufferCap ||
               codeUnits + _kLiveGap.text.length > _kLiveBufferCodeUnitCap)) {
-        codeUnits -= next.removeAt(0).text.length;
+        codeUnits -= next[firstRetained++].text.length;
       }
-      next.insert(0, _kLiveGap);
     }
-    _live.add(next);
+    final retained = firstRetained == 0 ? next : next.sublist(firstRetained);
+    if (needsGap) {
+      retained.insert(0, _kLiveGap);
+      codeUnits += _kLiveGap.text.length;
+    }
+    _liveCodeUnits = codeUnits;
+    _live.add(retained);
   }
 
   List<LiveLine> _splitLiveLineForRendering(LiveLine line) {

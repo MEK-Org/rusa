@@ -541,6 +541,11 @@ void main() {
         retained.fold<int>(0, (total, line) => total + line.text.length),
         lessThanOrEqualTo(8 * 1024 * 1024),
       );
+
+      store.clickActor('a');
+      stream.liveCtrl.add(const LiveOutputChunk(actorId: 'a', text: 'fresh'));
+      await pumpEventQueue();
+      expect(store.live.value.map((line) => line.text), ['fresh']);
       await store.dispose();
     },
   );
