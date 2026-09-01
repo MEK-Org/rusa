@@ -294,7 +294,6 @@ type QueuedReactionTarget =
  */
 function queuedReactionTarget(entry: InboxEntry): QueuedReactionTarget | null {
   const { payload } = entry;
-  if (payload.receipt === "deferred") return null;
   if (payload.type === "gchat.message") {
     return typeof payload.messageName === "string"
       ? { kind: "gchat", messageName: payload.messageName }
