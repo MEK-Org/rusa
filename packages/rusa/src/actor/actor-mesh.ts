@@ -458,7 +458,6 @@ export class ActorMesh {
   private readonly live = new Map<string, MeshActor>();
   private readonly runtimeStreamId = randomUUID();
   private runtimeRevision = 0;
-  private readonly runtimeStates = new Map<string, ActorRuntimeState>();
   private readonly runtimeStateListeners = new Set<(delta: ActorRuntimeStateDelta) => void>();
   private readonly activeRunCounts = new Map<string, number>();
   private readonly deferredRetireCleanups = new Map<
@@ -2085,7 +2084,9 @@ export class ActorMesh {
     return {
       streamId: this.runtimeStreamId,
       revision: this.runtimeRevision,
-      states: new Map(this.runtimeStates),
+      states: new Map(
+        [...this.live].map(([actorId, actor]) => [actorId, this.runtimeStateOf(actor)])
+      ),
     };
   }
 
@@ -2097,8 +2098,6 @@ export class ActorMesh {
 
   /** The sole revision authority for actor-published runtime transitions. */
   actorRuntimeStateChanged(actorId: string, runState: ActorRuntimeState): void {
-    if (this.runtimeStates.get(actorId) === runState) return;
-    this.runtimeStates.set(actorId, runState);
     const delta: ActorRuntimeStateDelta = {
       streamId: this.runtimeStreamId,
       revision: ++this.runtimeRevision,

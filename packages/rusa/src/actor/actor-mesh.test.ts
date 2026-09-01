@@ -20,6 +20,7 @@ import type {
 import { ActorMesh } from "./actor-mesh.js";
 import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
 import type { EventResource } from "./event-subscriptions.js";
+import { ExternalRootDriver } from "./external-root-driver.js";
 import { routeRunFailure } from "./failure-sink.js";
 import type {
   InboxActorWork,
@@ -306,34 +307,53 @@ describe("ActorMesh", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  it("sequences two actors on one contiguous runtime revision", () => {
-    const { mesh } = setup();
-    const child = mesh.spawn({ charter: "worker", parentId: "root" });
+  it("sequences real actor and external-root transitions on one contiguous revision", async () => {
+    const { mesh, root, tick } = setup();
+    const externalId = "external";
+    const external = new ExternalRootDriver(
+      externalId,
+      () => "2026-01-01T00:00:00Z",
+      (state) => mesh.actorRuntimeStateChanged(externalId, state)
+    );
+    mesh.adopt(
+      {
+        id: externalId,
+        charter: "external root",
+        parentId: "root",
+        isRoot: false,
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      },
+      external
+    );
     const before = mesh.runtimeStateSnapshot();
     const deltas: Array<{ actorId: string; revision: number; runState: string }> = [];
     mesh.onRuntimeStateDelta((delta) => deltas.push(delta));
 
-    mesh.actorRuntimeStateChanged("root", "queued");
-    mesh.actorRuntimeStateChanged("root", "queued");
-    mesh.actorRuntimeStateChanged(child, "running");
+    external.requestRun();
+    external.requestRun({ priority: "responsive" });
+    root.requestRun();
+    await tick();
+    const [wake] = external.listWakes();
+    if (!wake) throw new Error("external wake not queued");
+    external.acknowledge([wake.id]);
 
-    expect(deltas).toEqual([
-      {
-        actorId: "root",
-        revision: before.revision + 1,
-        runState: "queued",
-        streamId: before.streamId,
-      },
-      {
-        actorId: child,
-        revision: before.revision + 2,
-        runState: "running",
-        streamId: before.streamId,
-      },
-    ]);
+    expect(deltas.map(({ revision }) => revision)).toEqual(
+      deltas.map((_, index) => before.revision + index + 1)
+    );
+    expect(
+      deltas.filter(({ actorId, runState }) => actorId === externalId && runState === "queued")
+    ).toHaveLength(1);
+    expect(deltas).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ actorId: "root", runState: "queued" }),
+        expect.objectContaining({ actorId: "root", runState: "running" }),
+        expect.objectContaining({ actorId: externalId, runState: "idle" }),
+      ])
+    );
     const after = mesh.runtimeStateSnapshot();
-    expect(after.states.get("root")).toBe("queued");
-    expect(after.states.get(child)).toBe("running");
+    expect(after.states.get("root")).toBe("idle");
+    expect(after.states.get(externalId)).toBe("idle");
   });
 
   it("passes the provider through the shared rate gate", async () => {

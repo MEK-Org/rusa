@@ -221,7 +221,6 @@ class DashboardStore {
   Timer? _runtimeRetry;
   _RuntimePhase _runtimePhase = _RuntimePhase.uninitialized;
   RuntimeCursor? _runtimeCursor;
-  String? _helloStreamId;
   final List<ActorRuntimeStateDelta> _runtimeBuffer = [];
   Future<void>? _runtimeSyncTask;
   bool _runtimeSyncAgain = false;
@@ -1018,8 +1017,8 @@ class DashboardStore {
   }
 
   void _onRuntimeHello(RuntimeHello hello) {
-    final changed = _helloStreamId != null && _helloStreamId != hello.streamId;
-    _helloStreamId = hello.streamId;
+    final cursor = _runtimeCursor;
+    final changed = cursor != null && cursor.streamId != hello.streamId;
     unawaited(_requestRuntimeSync(clearBuffer: changed));
   }
 

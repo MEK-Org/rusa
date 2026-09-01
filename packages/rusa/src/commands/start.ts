@@ -2197,7 +2197,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   );
   rootMcp.push({ name: PNPM_HARDLINKS_MCP_NAME, url: pnpmHardlinksUrl });
 
-  const externalRoot = opts?.e2e?.rootDriver === "external" ? new ExternalRootDriver(rootId) : null;
+  const externalRoot =
+    opts?.e2e?.rootDriver === "external"
+      ? new ExternalRootDriver(rootId, undefined, (state) =>
+          mesh.actorRuntimeStateChanged(rootId, state)
+        )
+      : null;
   let root: MeshActor;
   root =
     externalRoot ??
