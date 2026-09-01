@@ -939,7 +939,9 @@ class DashboardStore {
 
   void _onMeshEvent(MeshEvent e) {
     _applyRunState(e);
-    if (e.kind == 'actor_spawned' || e.kind == 'actor_retired') {
+    if (e.kind == 'actor_spawned' ||
+        e.kind == 'actor_retired' ||
+        e.kind == 'actor_model_set') {
       _scheduleTopologyRefresh();
     }
     if (e.kind == 'run_yielded') {

@@ -2636,7 +2636,7 @@ describe("ActorMesh", () => {
   it("setActorModel updates the record model, emits event, and enforces authority", async () => {
     const events: MeshEventInput[] = [];
     const modelSets: Array<{ actorId: string; newModel: string }> = [];
-    const { mesh, registry } = setup({
+    const { mesh, registry, tick } = setup({
       events: (event) => events.push(event),
       onModelSet: (actorId, newModel) => modelSets.push({ actorId, newModel }),
       validateModel: (_record, newModel) => {
@@ -2647,9 +2647,16 @@ describe("ActorMesh", () => {
     const child = mesh.spawn({ charter: "child", parentId: parent, model: "claude-sonnet-5" });
     const sibling = mesh.spawn({ charter: "sibling", parentId: "root" });
 
-    // Parent can update child's model
+    // Parent can stage a child's model. Even while idle, the child keeps its
+    // current model through the next dispatched run and applies at run end.
     mesh.setActorModel(child, "claude-opus-4-8", parent);
+    expect(registry.get(child)?.model).toBe("claude-sonnet-5");
+    expect(registry.get(child)?.desiredModel).toBe("claude-opus-4-8");
+    expect(modelSets).toEqual([]);
+    mesh.sendMessage(child, "apply staged model", parent);
+    await tick();
     expect(registry.get(child)?.model).toBe("claude-opus-4-8");
+    expect(registry.get(child)?.desiredModel).toBeUndefined();
     expect(modelSets).toEqual([{ actorId: child, newModel: "claude-opus-4-8" }]);
     expect(events).toContainEqual(
       expect.objectContaining({
@@ -2660,8 +2667,11 @@ describe("ActorMesh", () => {
       })
     );
 
-    // Root can update any child's model
+    // Root can stage any child's model under the same boundary rule.
     mesh.setActorModel(parent, "gemini-3.1-pro", "root");
+    expect(registry.get(parent)?.model).toBe("claude-sonnet-5");
+    mesh.sendMessage(parent, "apply staged model", "root");
+    await tick();
     expect(registry.get(parent)?.model).toBe("gemini-3.1-pro");
 
     // An actor cannot set its own model (tier-raising guard)
@@ -2688,7 +2698,7 @@ describe("ActorMesh", () => {
   it("setActorModel supports cross-provider moves for portable actors and rejects them for native actors", async () => {
     const events: MeshEventInput[] = [];
     const validations: Array<{ recordId: string; newModel: string; newProvider?: string }> = [];
-    const { mesh, registry } = setup({
+    const { mesh, registry, tick } = setup({
       events: (event) => events.push(event),
       validateModel: (record, newModel, newProvider) => {
         validations.push({ recordId: record.id, newModel, newProvider });
@@ -2707,8 +2717,15 @@ describe("ActorMesh", () => {
       context: { type: "portable", mode: "ledger" },
     });
     mesh.setActorModel(ledgerChild, "gemini-3.7-flash-high", "root", "antigravity");
+    expect(registry.get(ledgerChild)?.provider).toBe("claude");
+    expect(registry.get(ledgerChild)?.model).toBe("claude-opus-4-8");
+    expect(registry.get(ledgerChild)?.desiredProvider).toBe("antigravity");
+    expect(registry.get(ledgerChild)?.desiredModel).toBe("gemini-3.7-flash-high");
+    mesh.sendMessage(ledgerChild, "apply staged provider", "root");
+    await tick();
     expect(registry.get(ledgerChild)?.provider).toBe("antigravity");
     expect(registry.get(ledgerChild)?.model).toBe("gemini-3.7-flash-high");
+    expect(registry.get(ledgerChild)?.desiredModel).toBeUndefined();
     expect(validations).toContainEqual({
       recordId: ledgerChild,
       newModel: "gemini-3.7-flash-high",
@@ -2731,6 +2748,10 @@ describe("ActorMesh", () => {
       context: { type: "portable", mode: "tail" },
     });
     mesh.setActorModel(tailChild, "gpt-5.6-sol", "root", "codex");
+    expect(registry.get(tailChild)?.provider).toBe("claude");
+    expect(registry.get(tailChild)?.model).toBe("claude-sonnet-5");
+    mesh.sendMessage(tailChild, "apply staged provider", "root");
+    await tick();
     expect(registry.get(tailChild)?.provider).toBe("codex");
     expect(registry.get(tailChild)?.model).toBe("gpt-5.6-sol");
 
@@ -2767,6 +2788,9 @@ describe("ActorMesh", () => {
 
     // 6. Native actor accepts model update when explicit provider equals existing provider
     mesh.setActorModel(nativeChild, "claude-opus-4-8", "root", "claude");
+    expect(registry.get(nativeChild)?.model).toBe("claude-sonnet-5");
+    mesh.sendMessage(nativeChild, "apply staged model", "root");
+    await tick();
     expect(registry.get(nativeChild)?.provider).toBe("claude");
     expect(registry.get(nativeChild)?.model).toBe("claude-opus-4-8");
 
@@ -2907,6 +2931,9 @@ describe("ActorMesh", () => {
     });
     // Move to provider-b
     dynamicMeshSetup.mesh.setActorModel(movingWorker, "model-b", "root", "provider-b");
+    expect(dynamicMeshSetup.registry.get(movingWorker)?.provider).toBe("provider-a");
+    dynamicMeshSetup.mesh.sendMessage(movingWorker, "apply staged provider", "root");
+    await dynamicMeshSetup.tick();
     expect(dynamicMeshSetup.registry.get(movingWorker)?.provider).toBe("provider-b");
 
     // When provider-b is halted, wake is skipped (provider-a halt does not block it)

@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+const _keepThreadField = Object();
+
 // Dart mirrors of the PR2 dashboard Data API JSON shapes
 // (`packages/rusa/src/dashboard/api.ts` +
 // `db/repositories/mesh-event-repository.ts`). Field names and nullability
@@ -91,8 +93,8 @@ class ThreadDto {
     String? status,
     String? provider,
     String? model,
-    String? desiredModel,
-    String? desiredProvider,
+    Object? desiredModel = _keepThreadField,
+    Object? desiredProvider = _keepThreadField,
     String? charterPreview,
     String? title,
     String? createdAt,
@@ -110,8 +112,12 @@ class ThreadDto {
     status: status ?? this.status,
     provider: provider ?? this.provider,
     model: model ?? this.model,
-    desiredModel: desiredModel ?? this.desiredModel,
-    desiredProvider: desiredProvider ?? this.desiredProvider,
+    desiredModel: identical(desiredModel, _keepThreadField)
+        ? this.desiredModel
+        : desiredModel as String?,
+    desiredProvider: identical(desiredProvider, _keepThreadField)
+        ? this.desiredProvider
+        : desiredProvider as String?,
     charterPreview: charterPreview ?? this.charterPreview,
     title: title ?? this.title,
     createdAt: createdAt ?? this.createdAt,

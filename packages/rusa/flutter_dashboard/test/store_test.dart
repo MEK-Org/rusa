@@ -16,6 +16,17 @@ Future<DashboardStore> _booted(FakeApi api, FakeStream stream) async {
 }
 
 void main() {
+  test('ThreadDto copyWith can clear staged model fields', () {
+    final staged = makeThread(
+      'a',
+      desiredModel: 'claude-opus-4-8',
+      desiredProvider: 'claude',
+    );
+    final cleared = staged.copyWith(desiredModel: null, desiredProvider: null);
+    expect(cleared.desiredModel, isNull);
+    expect(cleared.desiredProvider, isNull);
+  });
+
   test('init loads dashboard quota provider config', () async {
     final api = FakeApi()
       ..threadsResult = [makeThread('root', created: 't0')]
@@ -575,6 +586,45 @@ void main() {
       await store.dispose();
     },
   );
+
+  test('actor_model_set refreshes and clears the staged dashboard model', () {
+    fakeAsync((async) {
+      final stream = FakeStream();
+      final api = FakeApi()
+        ..threadsResult = [
+          makeThread(
+            'a',
+            model: 'claude-sonnet-5',
+            desiredModel: 'claude-opus-4-8',
+            runState: RunState.running,
+          ),
+        ];
+      final store = DashboardStore(api: api, stream: stream);
+      unawaited(store.init());
+      async.flushMicrotasks();
+
+      expect(store.actor('a')?.thread.model, 'claude-sonnet-5');
+      expect(store.actor('a')?.thread.desiredModel, 'claude-opus-4-8');
+
+      api.threadsResult = [
+        makeThread(
+          'a',
+          model: 'claude-opus-4-8',
+          runState: RunState.idle,
+        ),
+      ];
+      stream.meshCtrl.add(makeEvent('model-1', 'actor_model_set', actor: 'a'));
+      async.flushMicrotasks();
+      async.elapse(const Duration(milliseconds: 400));
+      async.flushMicrotasks();
+
+      expect(store.actor('a')?.thread.model, 'claude-opus-4-8');
+      expect(store.actor('a')?.thread.desiredModel, isNull);
+
+      unawaited(store.dispose());
+      async.flushMicrotasks();
+    });
+  });
 
   test(
     'reducer fix: continuation_capped and root_control_action do NOT transition to idle',
