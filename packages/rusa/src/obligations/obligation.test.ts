@@ -104,13 +104,7 @@ describe("obligation entity and status helpers", () => {
   it("accepts every id in the mesh's one id space and rejects a blank one", () => {
     // Actor UUIDs, `root`, `human:*` and `system:*` all live in one space, and
     // the category is read off the prefix — there is no separate owner "kind".
-    for (const id of [
-      "actor-1",
-      "root",
-      "human:operator",
-      "system:mesh",
-      "system:tracker-hygiene",
-    ]) {
+    for (const id of ["actor-1", "root", "human:operator", "system:mesh", "system:service"]) {
       expect(validateEntityId(id)).toBe(id);
     }
     expect(() => validateEntityId("   ")).toThrow(ObligationValidationError);

@@ -49,7 +49,6 @@ function recordingIssueClient(): { client: IssueClient; calls: Call[] } {
           author,
           labels: [],
           updatedAt: "2026-01-02T00:00:00Z",
-          issueNumber: 1,
         },
       ];
     },
@@ -66,7 +65,6 @@ function recordingIssueClient(): { client: IssueClient; calls: Call[] } {
           author: "human",
           labels: [],
           updatedAt: "2026-01-02T00:00:00Z",
-          issueNumber: null,
         },
       ];
     },
@@ -809,7 +807,7 @@ describe("tracker MCP server", () => {
       name: "list_open_prs",
       arguments: { repo: "o/r", author: "bot" },
     })) as CallToolResult;
-    expect(JSON.parse(textOf(res))).toMatchObject([{ number: 1, author: "bot", issueNumber: 1 }]);
+    expect(JSON.parse(textOf(res))).toMatchObject([{ number: 1, author: "bot" }]);
     expect(calls).toContainEqual({ method: "getOpenPullRequestsByAuthor", args: ["o/r", "bot"] });
   });
 
@@ -821,7 +819,7 @@ describe("tracker MCP server", () => {
       arguments: { repo: "o/r" },
     })) as CallToolResult;
     expect(JSON.parse(textOf(res))).toMatchObject([
-      { number: 2, author: "human", headRefName: "feature/all", issueNumber: null },
+      { number: 2, author: "human", headRefName: "feature/all" },
     ]);
     expect(calls).toContainEqual({ method: "getOpenPullRequests", args: ["o/r"] });
   });

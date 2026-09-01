@@ -10,7 +10,6 @@ import {
   type IssueClient,
   PullRequestChecksUnreadableError,
   PullRequestHeadAdvancedError,
-  parseIssueNumberFromBranch,
 } from "./issue-client.js";
 
 interface RecordedRequest {
@@ -1539,7 +1538,6 @@ describe("GitHubIssueClient", () => {
         author: "bot",
         labels: ["owner:bot"],
         updatedAt: "2026-01-02T00:00:00Z",
-        issueNumber: 42,
       },
       {
         number: 3,
@@ -1551,7 +1549,6 @@ describe("GitHubIssueClient", () => {
         author: "bot",
         labels: [],
         updatedAt: "2026-01-04T00:00:00Z",
-        issueNumber: null,
       },
     ]);
   });
@@ -1596,7 +1593,6 @@ describe("GitHubIssueClient", () => {
         author: "bot",
         labels: ["owner:bot"],
         updatedAt: "2026-01-02T00:00:00Z",
-        issueNumber: 42,
       },
       {
         number: 2,
@@ -1608,7 +1604,6 @@ describe("GitHubIssueClient", () => {
         author: "human",
         labels: [],
         updatedAt: "2026-01-03T00:00:00Z",
-        issueNumber: null,
       },
     ]);
   });
@@ -1861,32 +1856,5 @@ describe("GitHubIssueClient", () => {
     });
 
     await expect(new GitHubIssueClient().addSubIssue(REPO, 1, 2)).rejects.toThrow("GraphQL error");
-  });
-});
-
-describe("parseIssueNumberFromBranch", () => {
-  it.each([
-    ["mc/issue-451", 451],
-    ["mc/fix/issue-451-trial-messaging", 451],
-    ["mc/feat/issue-519-tutor-api-keys", 519],
-    ["bot/issue-477-parent-pays-subject-edit", 477],
-    ["issue-42", 42],
-    ["steward/120-author-scoped-pr-list", 120],
-  ])("reads the issue number out of %s", (ref, expected) => {
-    expect(parseIssueNumberFromBranch(ref)).toBe(expected);
-  });
-
-  it.each([
-    ["feature/foo"],
-    // "issue-" must start a segment: reissue-42 is not issue 42.
-    ["mc/reissue-42"],
-    // "steward/" must start a segment or follow a non-alphanumeric boundary.
-    ["nonsteward/120-unrelated"],
-    ["xsteward/120-foo"],
-    // A number that runs into more text is not a number we can trust.
-    ["mc/issue-42x"],
-    ["mc/issue-"],
-  ])("returns null for %s rather than guessing", (ref) => {
-    expect(parseIssueNumberFromBranch(ref)).toBeNull();
   });
 });

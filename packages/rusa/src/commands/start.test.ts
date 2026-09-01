@@ -79,10 +79,6 @@ vi.mock("../github/poller.js", async (importActual) => {
   };
 });
 
-const trackerHygieneMock = vi.hoisted(() => ({
-  runTrackerHygiene: vi.fn(() => Promise.resolve([])),
-}));
-
 const gitHttpServerMock = vi.hoisted(() => {
   const servers: {
     close: ReturnType<typeof vi.fn>;
@@ -105,21 +101,6 @@ const gitHttpServerMock = vi.hoisted(() => {
 const sandboxMock = vi.hoisted(() => ({
   assertBwrapAvailable: vi.fn(),
 }));
-
-vi.mock("../observability/tracker-hygiene.js", async () => {
-  const actual = await vi.importActual<typeof import("../observability/tracker-hygiene.js")>(
-    "../observability/tracker-hygiene.js"
-  );
-  return {
-    ...actual,
-    DEFAULT_TRACKER_HYGIENE_THRESHOLDS: {
-      staleAfterMs: 24 * 60 * 60 * 1000,
-      closeAfterMs: 168 * 60 * 60 * 1000,
-      pingBackoffMs: [0, 24, 48, 96].map((hours) => hours * 60 * 60 * 1000),
-    },
-    runTrackerHygiene: trackerHygieneMock.runTrackerHygiene,
-  };
-});
 
 vi.mock("../gitops/git-http-server.js", () => ({
   startGitHttpServer: gitHttpServerMock.startGitHttpServer,
@@ -334,7 +315,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     process.exit = vi.fn();
     shutdownFn = undefined;
     requestRunCalls = [];
-    trackerHygieneMock.runTrackerHygiene.mockClear();
     gitHttpServerMock.startGitHttpServer.mockClear();
     gitHttpServerMock.servers.length = 0;
     sandboxMock.assertBwrapAvailable.mockReset();
@@ -1394,7 +1374,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     );
   });
 
-  it("skips the queued-run :eyes: for /snooze but keeps it for ordinary comments ", async () => {
+  it("adds mechanical eyes for ordinary comments on queued run", async () => {
     let emitGitHubEvent:
       | ((event: string, payload: Record<string, unknown>, deliveryId?: string) => Promise<void>)
       | undefined;
@@ -1427,14 +1407,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await emitGitHubEvent("issue_comment", {
       action: "created",
       repository: { full_name: "dummy-org/dummy-repo" },
-      comment: { id: 123, body: "/snooze 2w" },
-      issue: { number: 456 },
-      sender: { login: "someone-else" },
-    });
-
-    await emitGitHubEvent("issue_comment", {
-      action: "created",
-      repository: { full_name: "dummy-org/dummy-repo" },
       comment: { id: 124, body: "ordinary update" },
       issue: { number: 457 },
       sender: { login: "someone-else" },
@@ -1442,10 +1414,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     mesh.actorQueued("root", { responsive: false, mode: "ordinary" });
 
-    // The generic queued-run receipt must be skipped for snooze
-    // commands; the actual success receipt is added later by tracker-hygiene
-    // only after the durable suppression marker is recorded. Ordinary comments
-    // must still receive the generic receipt.
     expect(issueClient.commentReactionsAdded).toEqual([
       { repo: "dummy-org/dummy-repo", commentId: 124, reaction: "eyes", scope: "issue" },
     ]);
@@ -1633,153 +1601,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }
     throw new Error(message);
   }
-
-  it("does not run tracker hygiene when omitted from config", async () => {
-    let sigintListener: NodeJS.SignalsListener | undefined;
-    const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
-      if (event === "SIGINT") {
-        sigintListener = listener as NodeJS.SignalsListener;
-      }
-      return process;
-    });
-    const issueClient = new MockIssueClient();
-    setIssueClient(issueClient as unknown as IssueClient);
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: {
-          account: "mock-bot",
-          ingestionMode: "poll",
-          pollIntervalSeconds: 300,
-          repos: ["dummy-org/dummy-repo"],
-        },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity" },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    try {
-      void runStart({ noDashboardServer: true });
-      await waitUntil(() => sigintListener !== undefined, "start did not install shutdown handler");
-
-      expect(trackerHygieneMock.runTrackerHygiene).not.toHaveBeenCalled();
-      expect(pollerMock.startGitHubEventPoller).toHaveBeenCalledWith(
-        expect.objectContaining({ repos: ["dummy-org/dummy-repo"] })
-      );
-      sigintListener?.("SIGINT");
-      expect(e2eInstanceManagerMock.stopForMeshShutdown).toHaveBeenCalledOnce();
-    } finally {
-      processOnSpy.mockRestore();
-    }
-  });
-
-  it("runs tracker hygiene for every explicit github.repos entry when enabled", async () => {
-    let sigintListener: NodeJS.SignalsListener | undefined;
-    const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
-      if (event === "SIGINT") {
-        sigintListener = listener as NodeJS.SignalsListener;
-      }
-      return process;
-    });
-    const issueClient = new MockIssueClient();
-    setIssueClient(issueClient as unknown as IssueClient);
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: {
-          account: "mock-bot",
-          ingestionMode: "poll",
-          pollIntervalSeconds: 300,
-          repos: ["dummy-org/dummy-repo", "other-org/other-repo"],
-        },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity" },
-        observability: { trackerHygiene: { enabled: true } },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    try {
-      void runStart({ noDashboardServer: true });
-      await waitUntil(
-        () => trackerHygieneMock.runTrackerHygiene.mock.calls.length === 2,
-        "tracker hygiene did not run"
-      );
-
-      expect(trackerHygieneMock.runTrackerHygiene).toHaveBeenNthCalledWith(
-        1,
-        issueClient,
-        expect.objectContaining({
-          resolveHandle: expect.any(Function),
-          sendMessage: expect.any(Function),
-        }),
-        expect.objectContaining({
-          repo: "dummy-org/dummy-repo",
-          closeAction: "log",
-        })
-      );
-      expect(trackerHygieneMock.runTrackerHygiene).toHaveBeenNthCalledWith(
-        2,
-        issueClient,
-        expect.objectContaining({
-          resolveHandle: expect.any(Function),
-          sendMessage: expect.any(Function),
-        }),
-        expect.objectContaining({
-          repo: "other-org/other-repo",
-          closeAction: "log",
-        })
-      );
-      expect(pollerMock.startGitHubEventPoller).toHaveBeenCalledWith(
-        expect.objectContaining({
-          repos: ["dummy-org/dummy-repo", "other-org/other-repo"],
-        })
-      );
-      sigintListener?.("SIGINT");
-    } finally {
-      processOnSpy.mockRestore();
-    }
-  }, 15_000);
-
-  it("skips configured tracker hygiene while halted", async () => {
-    let sigintListener: NodeJS.SignalsListener | undefined;
-    const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
-      if (event === "SIGINT") sigintListener = listener as NodeJS.SignalsListener;
-      return process;
-    });
-    const issueClient = new MockIssueClient();
-    setIssueClient(issueClient as unknown as IssueClient);
-    new HaltSwitch(join(homeDir, "HALT")).halt("maintenance");
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: {
-          account: "mock-bot",
-          ingestionMode: "poll",
-          pollIntervalSeconds: 300,
-          repos: ["dummy-org/dummy-repo"],
-        },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity" },
-        observability: { trackerHygiene: { enabled: true } },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    try {
-      void runStart({ noDashboardServer: true });
-      await waitUntil(() => sigintListener !== undefined, "start did not install shutdown handler");
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(trackerHygieneMock.runTrackerHygiene).not.toHaveBeenCalled();
-      sigintListener?.("SIGINT");
-    } finally {
-      processOnSpy.mockRestore();
-    }
-  }, 15_000);
 
   it("constructs the root actor with a non-empty addDirs equal to the resolved repo root", async () => {
     let mesh: ActorMesh | undefined;
@@ -2005,16 +1826,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const issueClient = new MockIssueClient();
     setIssueClient(issueClient as unknown as IssueClient);
 
-    // Capture console.error logs
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
         github: { account: "mock-bot", ingestionMode: "poll", pollIntervalSeconds: 300 },
         providers: { antigravity: { cliCommand: "agy" } },
         rootActor: { provider: "antigravity" },
-        observability: { trackerHygiene: { enabled: true } },
         geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
@@ -2024,18 +1841,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
       void runStart({ noDashboardServer: true });
       await waitUntil(() => sigintListener !== undefined, "start did not install shutdown handler");
 
-      // Verify tracker hygiene was NOT called
-      expect(trackerHygieneMock.runTrackerHygiene).not.toHaveBeenCalled();
-
-      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("github.repos is empty"));
-
       // Verify poller was NOT started
       expect(pollerMock.startGitHubEventPoller).not.toHaveBeenCalled();
 
       sigintListener?.("SIGINT");
     } finally {
       processOnSpy.mockRestore();
-      errorSpy.mockRestore();
     }
   });
 

@@ -20,7 +20,6 @@ import {
   type PullRequestChecksStatus,
   PullRequestChecksUnreadableError,
   type PullRequestDetails,
-  parseIssueNumberFromBranch,
   type ReactionContent,
 } from "../gitops/issue-client.js";
 import type { LocalTracker, ReviewState } from "./local-tracker.js";
@@ -386,7 +385,6 @@ export class FakeIssueClient implements IssueClient {
       author: pr.author,
       labels: pr.labels,
       updatedAt: pr.updatedAt,
-      issueNumber: parseIssueNumberFromBranch(pr.headRef),
     };
   }
 }

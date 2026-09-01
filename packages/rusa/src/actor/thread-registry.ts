@@ -136,9 +136,9 @@ export interface ThreadRegistry {
   /**
    * Resolve a generated display handle (or direct id) back to a durable thread id.
    * Handle matches are scoped to ACTIVE records only — a retired record must never
-   * shadow a live actor on a handle collision, or routing (e.g. tracker-hygiene
-   * owner pings, ISSUE_NUM/ISSUE_NUM) would silently drop to the dead thread. A direct id
-   * still resolves regardless of status (an explicit id is not a collision).
+   * shadow a live actor on a handle collision, or routing would silently drop to
+   * the dead thread. A direct id still resolves regardless of status (an explicit
+   * id is not a collision).
    */
   resolveHandle(handleOrId: string, handleForId?: (id: string) => string): string | null;
   /** Shallow-merge changes into an existing record (no-op if id is unknown). */

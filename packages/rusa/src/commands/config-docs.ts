@@ -81,14 +81,6 @@ Minimal example:
     maxBytesPerInvocation: 209715200
 
   observability:
-    trackerHygiene:
-      enabled: true
-      # closeAction: log  # log (default) or close
-      # areaStewardHandle: cloudy-porpoise
-      # intervalSeconds: 21600
-      # staleAfterHours: 24
-      # closeAfterHours: 168
-      # pingBackoffHours: [0, 24, 48, 96]
     diskAlert:
       # enabled: true
       # volume: "/"
@@ -211,22 +203,6 @@ invocationDebug:
                            Default: 30.
   maxBytesPerInvocation    Optional number. Hard cap in bytes across prompt, transcript, raw streams,
                            and failure patch for one invocation. Default: 209715200 (200 MB).
-
-observability.trackerHygiene:
-
-  enabled                  Optional boolean. Owner/stale tracker automation is disabled by default;
-                           set enabled: true to activate.
-  closeAction              Optional. "log" (default) logs would-have-closed lines for stale closes;
-                           "close" actually closes stale issues.
-  intervalSeconds          Optional number. Scan cadence. Default: 21600 (6 hours).
-  areaStewardHandle        Optional handle. Used in unowned issue/PR comments. Defaults to the
-                           configured root handle.
-  staleAfterHours          Optional number. Quiet period before the first stale owner ping.
-                           Default: 24.
-  closeAfterHours          Optional number. Quiet period before close after at least one ping.
-                           Default: 168.
-  pingBackoffHours         Optional list of numbers. Incremental backoff in hours for repeated
-                           owner pings. Default: [0, 24, 48, 96].
 
 observability.diskAlert:
 

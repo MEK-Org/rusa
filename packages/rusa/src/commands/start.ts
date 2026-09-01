@@ -13,12 +13,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Actor } from "../actor/actor.js";
-import {
-  ActorMesh,
-  type MeshActor,
-  type RetireCleanup,
-  SCHEDULER_SENDER_ID,
-} from "../actor/actor-mesh.js";
+import { ActorMesh, type MeshActor, type RetireCleanup } from "../actor/actor-mesh.js";
 import {
   CAPABILITY_GRANTS_FILENAME,
   FileCapabilityGrantStore,
@@ -173,11 +168,6 @@ import {
 import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "../mcp/update-mcp.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { DiskUsageAlert } from "../observability/disk-alert.js";
-import {
-  containsSnoozeCommand,
-  DEFAULT_TRACKER_HYGIENE_THRESHOLDS,
-  runTrackerHygiene,
-} from "../observability/tracker-hygiene.js";
 
 import { antigravityScratchDir } from "../providers/antigravity.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
@@ -234,8 +224,6 @@ import {
   WebhookSilenceDetector,
 } from "../webhook/silence-detector.js";
 import { resolveRepoRoot } from "./service-instance.js";
-
-const MS_PER_HOUR = 60 * 60 * 1000;
 
 // `update` tool bounds . Per-step HARD timeouts so a hung build can't wedge
 // root; a bounded drain so a stuck worker can't block the restart forever.
@@ -1009,10 +997,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     }
   })();
   const addDirs: string[] = repoRoot ? [repoRoot] : [];
-  const trackerHygieneRepos = config.github.repos ?? [];
-  if (trackerHygieneRepos.length === 0 && config.observability?.trackerHygiene?.enabled === true) {
-    console.error("[start] github.repos is empty. Tracker hygiene is DISABLED for this run.");
-  }
   // Append-only observability log: every message, wake, spawn, and retire lands
   // in `mesh_events` so a run can be replayed as a timeline by `rusa report`.
   // After persisting, broadcast the stored row to any live dashboard SSE clients
@@ -2523,17 +2507,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     if (repoFullName) {
       const notification = deriveGitHubInboxNotification(event, payload);
       if (!notification) throw new Error("GitHub event repository could not be resolved");
-      const commentBody = (payload.comment as { body?: string } | undefined)?.body;
-      // Snooze commands retain their dedicated durable-marker receipt path.
-      const inboxPayload =
-        commentBody && containsSnoozeCommand(commentBody)
-          ? { ...notification.payload, receipt: "deferred" }
-          : notification.payload;
       await mesh.deliverEvent(notification.resource, eventSummary, {
         directedTarget,
         stampedAuthor,
         instanceId: rootHandle,
-        inboxPayload,
+        inboxPayload: notification.payload,
         inboxDedupeKey: deliveryId ? `github:${deliveryId}` : undefined,
       });
     } else {
@@ -2577,72 +2555,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           onEvent,
         })
       : null;
-  let trackerHygieneTimer: ReturnType<typeof setInterval> | null = null;
-  const trackerHygieneConfig = config.observability?.trackerHygiene;
-  if (!e2eMode && trackerHygieneConfig?.enabled === true && trackerHygieneRepos.length > 0) {
-    const intervalSeconds = trackerHygieneConfig?.intervalSeconds ?? 6 * 60 * 60;
-    const areaStewardHandle = trackerHygieneConfig?.areaStewardHandle ?? rootHandle;
-    const thresholds = {
-      staleAfterMs: (trackerHygieneConfig?.staleAfterHours ?? 24) * MS_PER_HOUR,
-      closeAfterMs: (trackerHygieneConfig?.closeAfterHours ?? 168) * MS_PER_HOUR,
-      pingBackoffMs:
-        trackerHygieneConfig?.pingBackoffHours?.map((hours) => hours * MS_PER_HOUR) ??
-        DEFAULT_TRACKER_HYGIENE_THRESHOLDS.pingBackoffMs,
-    };
-    const runTrackerHygieneOnce = async () => {
-      if (haltSwitch.hasActiveHalt()) {
-        console.log("[tracker-hygiene] HALT active — scan skipped");
-        return;
-      }
-      for (const repo of trackerHygieneRepos) {
-        const actions = await runTrackerHygiene(
-          issueClient,
-          {
-            resolveHandle: (handle) =>
-              registry.resolveHandle(handle, (id) =>
-                id === rootId ? rootHandle : generateHandle(id)
-              ),
-            sendMessage: (toId, body) => mesh.sendMessage(toId, body, SCHEDULER_SENDER_ID),
-          },
-          {
-            repo,
-            areaStewardHandle,
-            automationAuthor: botLogin,
-            closeAction: trackerHygieneConfig?.closeAction ?? "log",
-            thresholds,
-            log: (message) => console.warn(message),
-            // Same instance id `mesh.deliverEvent` is called with for this
-            // instance's own writes — lets the system:* suppression rule
-            // recognize the stamp as this instance's (ISSUE_NUM leg 1).
-            instanceId: rootHandle,
-          }
-        );
-        if (actions.length > 0) {
-          console.log(
-            `[tracker-hygiene] ${repo}: ${actions
-              .map((action) => `${action.kind}#${action.number}`)
-              .join(", ")}`
-          );
-        }
-      }
-    };
-    void runTrackerHygieneOnce().catch((err) => {
-      console.warn(
-        `[tracker-hygiene] scan failed: ${err instanceof Error ? err.message : String(err)}`
-      );
-    });
-    trackerHygieneTimer = setInterval(
-      () =>
-        void runTrackerHygieneOnce().catch((err) => {
-          console.warn(
-            `[tracker-hygiene] scan failed: ${err instanceof Error ? err.message : String(err)}`
-          );
-        }),
-      intervalSeconds * 1000
-    );
-    trackerHygieneTimer.unref?.();
-  }
-
   // Walkie-talkie mode, server half : gated on geminiApiKey (transcription
   // and TTS are host-side Gemini calls — the key never reaches workers). When
   // absent the voice routes 503 with a clear error and nothing else changes.
@@ -2936,7 +2848,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     modelProbeAbort.abort();
     if (modelProbeInFlight) await modelProbeInFlight;
     if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
-    if (trackerHygieneTimer) clearInterval(trackerHygieneTimer);
     mesh.shutdownAll(); // stops the root and any live workers (registry untouched)
     errorNotifier?.close(); // cancel any pending coalesced failure summary
     if (weSubscriber) {
