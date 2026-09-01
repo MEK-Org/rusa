@@ -149,16 +149,26 @@ describe("InboxFocusResolver", () => {
     expect(focus.listEntryObligationIds("actor-a", "general")).toEqual(["issue-work"]);
 
     runs.start({ id: "run-2b", actorId: "actor-a" });
-    resolver.select({
+    const second = resolver.select({
       runId: "run-2b",
       actorId: "actor-a",
       entries: [entry] as InboxEntry[],
       explicitObligationId: "sibling-work",
     });
+    expect(second).toMatchObject({ related: true, diagnostics: [] });
     expect(focus.listEntryObligationIds("actor-a", "general")).toEqual([
       "issue-work",
       "sibling-work",
     ]);
+
+    runs.start({ id: "run-2c", actorId: "actor-a" });
+    const subsequent = resolver.select({
+      runId: "run-2c",
+      actorId: "actor-a",
+      entries: [entry] as InboxEntry[],
+      explicitObligationId: "sibling-work",
+    });
+    expect(subsequent).toMatchObject({ related: true, diagnostics: [] });
   });
 
   it("does not silently associate a general entry on inferred focus", () => {
@@ -254,6 +264,7 @@ describe("InboxFocusResolver", () => {
     });
 
     expect(result.related).toBe(false);
+    expect(result.diagnostics[0]).toContain("sibling (sibling-work)");
     expect(result.diagnostics[0]).toContain("outside issue-work");
     expect(result.primaryObligationId).toBe("issue-work");
   });

@@ -136,23 +136,35 @@ export class InboxFocusResolver {
       }
     }
 
-    const unrelated =
-      primary === null
-        ? []
-        : candidates.filter((candidate) => !this.related(primary.id, candidate));
-    const related = primary === null ? null : unrelated.length === 0;
-    if (primary && unrelated.length > 0) {
-      diagnostics.push(
-        `selected entries also resolve to obligations outside ${primary.id}'s ancestor/descendant chain: ${unrelated.sort().join(", ")}`
-      );
-    }
-
     const associations = new Map<string, readonly string[]>();
     if (resolution === "explicit" && primary) {
       for (const entry of input.entries) {
         if (!obligationBackedEntries.has(entry.id)) associations.set(entry.id, [primary.id]);
       }
     }
+
+    // Relatedness is per entry, not per association. A general entry may
+    // deliberately bear on unrelated obligations; it is related to the chosen
+    // focus when any of its durable associations is on that focus's chain.
+    const unrelatedEntries =
+      primary === null
+        ? []
+        : input.entries.flatMap((entry) => {
+            const ids = new Set(candidatesByEntry.get(entry.id) ?? []);
+            for (const id of associations.get(entry.id) ?? []) ids.add(id);
+            if (ids.size === 0 || [...ids].some((id) => this.related(primary.id, id))) return [];
+            return [{ entryId: entry.id, obligationIds: [...ids].sort() }];
+          });
+    const related = primary === null ? null : unrelatedEntries.length === 0;
+    if (primary && unrelatedEntries.length > 0) {
+      const details = unrelatedEntries
+        .map(({ entryId, obligationIds }) => `${entryId} (${obligationIds.join(", ")})`)
+        .join("; ");
+      diagnostics.push(
+        `selected entries bound only to obligations outside ${primary.id}'s ancestor/descendant chain: ${details}`
+      );
+    }
+
     this.focus.recordSelection({
       runId: input.runId,
       actorId: input.actorId,
