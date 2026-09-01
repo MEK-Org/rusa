@@ -58,6 +58,36 @@ describe("Actor", () => {
     expect(provider.calls[0]?.prompt).toBe("PROMPT: inbox work");
   });
 
+  it("publishes actor-owned runtime transitions and waits for outer flag clear before idle", async () => {
+    let resolveProvider!: (result: Partial<RunResult>) => void;
+    let resolveRunEnd!: () => void;
+    const provider = new FakeProvider(
+      () => new Promise<Partial<RunResult>>((resolve) => (resolveProvider = resolve))
+    );
+    const states: string[] = [];
+    const actor = makeActor(
+      {
+        onRuntimeStateChanged: (state) => states.push(state),
+        onRunEnd: () => new Promise<void>((resolve) => (resolveRunEnd = resolve)),
+      },
+      provider
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(states).toEqual(["queued", "running"]);
+
+    actor.declareYield();
+    expect(states).toEqual(["queued", "running", "winding_down"]);
+    resolveProvider({ success: true, output: "done", exitCode: 0 });
+    await flush();
+    expect(states).toEqual(["queued", "running", "winding_down"]);
+
+    resolveRunEnd();
+    await flush();
+    expect(states).toEqual(["queued", "running", "winding_down", "idle"]);
+  });
+
   it("passes bwrap sandbox options to the provider when enabled", async () => {
     const provider = new FakeProvider();
     const actor = makeActor({ sandbox: true }, provider);

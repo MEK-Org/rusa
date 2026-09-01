@@ -705,6 +705,33 @@ describe("handleMeshApiRequest", () => {
     expect(body.threads.every((t: { runState: string }) => t.runState === "idle")).toBe(true);
   });
 
+  it("GET /api/mesh/threads returns cursor and run states from one runtime capture", () => {
+    registry.upsert(rec("root", null, "active"));
+    registry.upsert(rec(UUID_A, "root", "active"));
+    const snapshot = {
+      streamId: "epoch-a",
+      revision: 17,
+      states: new Map([
+        ["root", "idle" as const],
+        [UUID_A, "winding_down" as const],
+      ]),
+    };
+    const runtimeStateSnapshot = vi.fn(() => snapshot);
+    deps = {
+      ...deps,
+      mesh: { runtimeStateSnapshot } as unknown as ActorMesh,
+      runningThreadIds: () => new Set([UUID_A]),
+    };
+
+    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    expect(runtimeStateSnapshot).toHaveBeenCalledTimes(1);
+    expect(body.runtimeCursor).toEqual({ streamId: "epoch-a", revision: 17 });
+    expect(body.threads.find((thread: { id: string }) => thread.id === UUID_A).runState).toBe(
+      "winding_down"
+    );
+  });
+
   it("GET /api/mesh/threads surfaces halt, queued, and running snapshots", () => {
     registry.upsert(rec("root", null, "active"));
     registry.upsert(rec(UUID_A, "root", "active"));

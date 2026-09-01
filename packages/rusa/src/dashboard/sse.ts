@@ -1,4 +1,5 @@
 import type { ServerResponse } from "node:http";
+import type { ActorRuntimeStateDelta, ActorRuntimeStateSnapshot } from "../actor/actor-mesh.js";
 import type { LiveOutputChunk, MeshEventEmitter } from "./mesh-event-emitter.js";
 
 /**
@@ -190,6 +191,10 @@ export interface SseHubOptions {
   maxClients?: number;
   maxQueuePerClient?: number;
   maxChunksPerActor?: number;
+  runtimeState?: {
+    runtimeStateSnapshot(): ActorRuntimeStateSnapshot;
+    onRuntimeStateDelta(listener: (delta: ActorRuntimeStateDelta) => void): () => void;
+  };
 }
 
 /**
@@ -203,6 +208,7 @@ export class SseHub {
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private readonly unsubscribers: Array<() => void> = [];
   private readonly liveBuffer: LiveOutputBuffer;
+  private readonly runtimeState: SseHubOptions["runtimeState"];
 
   private readonly maxClients: number;
   private readonly maxQueuePerClient: number;
@@ -213,6 +219,7 @@ export class SseHub {
   ) {
     this.maxClients = opts.maxClients ?? DEFAULT_MAX_CLIENTS;
     this.maxQueuePerClient = opts.maxQueuePerClient ?? DEFAULT_MAX_QUEUE;
+    this.runtimeState = opts.runtimeState;
     this.liveBuffer = new LiveOutputBuffer({ maxChunksPerActor: opts.maxChunksPerActor });
     // One subscription per channel; fan out to the client set. Each per-client
     // write is isolated so one dead socket can't break the emit (which runs
@@ -245,6 +252,21 @@ export class SseHub {
         }
       })
     );
+    if (opts.runtimeState) {
+      this.unsubscribers.push(
+        opts.runtimeState.onRuntimeStateDelta((delta) => {
+          const text = frame("actor_runtime_state", delta);
+          for (const client of this.clients) {
+            if (client.channel !== "mesh") continue;
+            try {
+              client.send(text);
+            } catch {
+              this.remove(client);
+            }
+          }
+        })
+      );
+    }
   }
 
   /** Number of live connections (for tests / a future stats line). */
@@ -315,6 +337,9 @@ export class SseHub {
       this.remove(client);
       onClose?.();
     });
+    if (channel === "mesh" && this.runtimeState) {
+      client.send(frame("hello", { streamId: this.runtimeState.runtimeStateSnapshot().streamId }));
+    }
     this.clients.add(client);
     this.ensureHeartbeat();
 

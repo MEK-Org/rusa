@@ -13,6 +13,12 @@ import 'voice_platform.dart';
 
 export 'models.dart' show DotState;
 
+enum _RuntimePhase { uninitialized, syncing, live }
+
+const int _kRuntimeDeltaBufferCap = 100;
+const Duration _kRuntimeRetryInitial = Duration(milliseconds: 250);
+const Duration _kRuntimeRetryMax = Duration(seconds: 5);
+
 /// One line in the merged live-output console.
 class LiveLine {
   const LiveLine({
@@ -162,14 +168,16 @@ class DashboardStore {
   final AvatarFilePicker? avatarFilePicker;
   final _subs = <StreamSubscription<dynamic>>[];
 
-  final _actorStates =
-      BehaviorSubject<ActorStateSnapshot>.seeded(const ActorStateSnapshot());
+  final _actorStates = BehaviorSubject<ActorStateSnapshot>.seeded(
+    const ActorStateSnapshot(),
+  );
   final _halted = BehaviorSubject<bool>.seeded(false);
   final _showRetired = BehaviorSubject<bool>.seeded(false);
   final _selection = BehaviorSubject<Set<String>>.seeded(const {});
   final _collapsed = BehaviorSubject<Set<String>>.seeded(const {});
-  final _customActorOrder =
-      BehaviorSubject<Map<String, List<String>>>.seeded(const {});
+  final _customActorOrder = BehaviorSubject<Map<String, List<String>>>.seeded(
+    const {},
+  );
   final _primary = BehaviorSubject<String?>.seeded(null);
   final _kindFilter = BehaviorSubject<String?>.seeded(null);
   final _events = BehaviorSubject<EventsView>.seeded(const EventsView());
@@ -210,6 +218,13 @@ class DashboardStore {
 
   Timer? _topologyDebounce;
   Timer? _quotaPoll;
+  Timer? _runtimeRetry;
+  _RuntimePhase _runtimePhase = _RuntimePhase.uninitialized;
+  RuntimeCursor? _runtimeCursor;
+  final List<ActorRuntimeStateDelta> _runtimeBuffer = [];
+  Future<void>? _runtimeSyncTask;
+  bool _runtimeSyncAgain = false;
+  Duration _runtimeRetryDelay = _kRuntimeRetryInitial;
 
   // ── Exposed streams ──
   ValueStream<ActorStateSnapshot> get actorStates => _actorStates.stream;
@@ -268,6 +283,8 @@ class DashboardStore {
     _subs.add(_stream.meshEvents.listen(_onMeshEvent));
     _subs.add(_stream.liveOutput.listen(_onLiveOutput));
     _subs.add(_stream.elided.listen((_) => _onElided()));
+    _subs.add(_stream.runtimeHello.listen(_onRuntimeHello));
+    _subs.add(_stream.runtimeStates.listen(_onRuntimeState));
     _stream.connect(const []); // mesh_event flows for all actors regardless
     await refreshThreads();
     unawaited(refreshDashboardConfig());
@@ -295,19 +312,15 @@ class DashboardStore {
   }
 
   Future<void> refreshThreads() async {
-    try {
-      final snap = await _api.fetchThreads();
-      _halted.add(snap.halted);
-      _updateActorStatesFromThreads(snap.threads);
-      _error.add(null);
-    } catch (e) {
-      _error.add('$e');
-    }
+    await _requestRuntimeSync();
   }
 
   Future<void> refreshYieldEvents() async {
     try {
-      final window = DateTime.now().subtract(const Duration(days: 7)).toUtc().toIso8601String();
+      final window = DateTime.now()
+          .subtract(const Duration(days: 7))
+          .toUtc()
+          .toIso8601String();
       final page = await _api.fetchEvents(
         since: window,
         kinds: const ['run_yielded'],
@@ -398,9 +411,8 @@ class DashboardStore {
     }
   }
 
-  /// Update the normalized actor-state snapshot from the server thread list.
-  /// Preserves live run-states for actors already known in the snapshot or live stream,
-  /// but updates thread metadata. New actors are seeded with their initial payload state.
+  /// Replace the normalized actor-state snapshot from one authoritative server
+  /// capture. Buffered deltas are applied only after its runtime cursor.
   void _updateActorStatesFromThreads(List<ThreadDto> threads) {
     final cur = _actorStates.value;
     final updatedActors = <String, ActorViewState>{};
@@ -411,11 +423,13 @@ class DashboardStore {
       updatedActors[t.id] = ActorViewState(thread: t, runState: t.runState);
     }
 
-    _actorStates.add(ActorStateSnapshot(
-      revision: cur.revision + 1,
-      actors: updatedActors,
-      orderedIds: orderedIds,
-    ));
+    _actorStates.add(
+      ActorStateSnapshot(
+        revision: cur.revision + 1,
+        actors: updatedActors,
+        orderedIds: orderedIds,
+      ),
+    );
   }
 
   // ── Tree flattening (visible order = the basis for shift-range) ──
@@ -427,7 +441,9 @@ class DashboardStore {
   /// subtree is skipped whole. This is exactly the render order, so shift-range
   /// over it matches the UI.
   List<ThreadDto> flattenedVisible() {
-    final all = _actorStates.value.orderedIds.map((id) => _actorStates.value.actors[id]!.thread).toList();
+    final all = _actorStates.value.orderedIds
+        .map((id) => _actorStates.value.actors[id]!.thread)
+        .toList();
     final show = _showRetired.value;
     final collapsedSet = _collapsed.value;
     final customOrder = _customActorOrder.value;
@@ -571,9 +587,14 @@ class DashboardStore {
   /// Sorts siblings respecting an optional custom ordering. Actors present in
   /// [customOrder] are sorted by their index; unindexed actors follow, sorted
   /// by [ThreadDto.createdAt] ascending with [ThreadDto.id] tiebreak.
-  static void _sortSiblings(List<ThreadDto> siblings, List<String>? customOrder) {
+  static void _sortSiblings(
+    List<ThreadDto> siblings,
+    List<String>? customOrder,
+  ) {
     if (customOrder != null && customOrder.isNotEmpty) {
-      final indexMap = {for (var i = 0; i < customOrder.length; i++) customOrder[i]: i};
+      final indexMap = {
+        for (var i = 0; i < customOrder.length; i++) customOrder[i]: i,
+      };
       siblings.sort((a, b) {
         final aIdx = indexMap[a.id];
         final bIdx = indexMap[b.id];
@@ -842,7 +863,11 @@ class DashboardStore {
       throw StateError(message);
     }
     try {
-      await _api.uploadAvatar(id, base64Encode(picked.bytes), picked.contentType);
+      await _api.uploadAvatar(
+        id,
+        base64Encode(picked.bytes),
+        picked.contentType,
+      );
       _avatarEpoch.add(_avatarEpoch.value + 1);
       _error.add(null);
     } catch (e) {
@@ -909,16 +934,6 @@ class DashboardStore {
   Future<void> interruptActor(String actorId) async {
     try {
       await _api.interruptActor(actorId);
-      final cur = _actorStates.value;
-      final existing = cur.actors[actorId];
-      if (existing != null) {
-        final updatedActors = Map<String, ActorViewState>.of(cur.actors);
-        updatedActors[actorId] = existing.copyWith(runState: RunState.idle);
-        _actorStates.add(cur.copyWith(
-          revision: cur.revision + 1,
-          actors: updatedActors,
-        ));
-      }
       _error.add(null);
     } catch (e) {
       _error.add('$e');
@@ -938,7 +953,6 @@ class DashboardStore {
   // ── Live SSE handlers ──
 
   void _onMeshEvent(MeshEvent e) {
-    _applyRunState(e);
     if (e.kind == 'actor_spawned' ||
         e.kind == 'actor_retired' ||
         e.kind == 'actor_model_set') {
@@ -1002,55 +1016,157 @@ class DashboardStore {
     }
   }
 
-  void _applyRunState(MeshEvent e) {
-    final id = e.actorId;
-    if (id == null) return;
-    RunState? next;
-    switch (e.kind) {
-      case 'run_queued':
-      case 'run_continued':
-        next = RunState.queued;
-      case 'run_start':
-        next = RunState.running;
-      case 'run_yielded':
-        next = RunState.windingDown;
-      case 'run_end':
-      case 'run_abandoned':
-        next = RunState.idle;
-    }
-    if (next == null) return;
+  void _onRuntimeHello(RuntimeHello hello) {
+    final cursor = _runtimeCursor;
+    final changed = cursor != null && cursor.streamId != hello.streamId;
+    unawaited(_requestRuntimeSync(clearBuffer: changed));
+  }
 
+  void _onRuntimeState(ActorRuntimeStateDelta delta) {
+    if (delta.runState == RunState.unknown) {
+      unawaited(_requestRuntimeSync(clearBuffer: true));
+      return;
+    }
+    final cursor = _runtimeCursor;
+    if (_runtimePhase == _RuntimePhase.syncing) {
+      _bufferRuntimeState(delta);
+      return;
+    }
+    if (_runtimePhase == _RuntimePhase.uninitialized || cursor == null) {
+      _bufferRuntimeState(delta);
+      unawaited(
+        _requestRuntimeSync(
+          clearBuffer: cursor != null && cursor.streamId != delta.streamId,
+        ),
+      );
+      return;
+    }
+    if (delta.streamId != cursor.streamId) {
+      _runtimeBuffer.clear();
+      _bufferRuntimeState(delta);
+      unawaited(_requestRuntimeSync());
+      return;
+    }
+    if (delta.revision <= cursor.revision) return;
+    if (delta.revision == cursor.revision + 1 && _applyRuntimeState(delta)) {
+      _runtimeCursor = RuntimeCursor(
+        streamId: cursor.streamId,
+        revision: delta.revision,
+      );
+      return;
+    }
+    _bufferRuntimeState(delta);
+    unawaited(_requestRuntimeSync());
+  }
+
+  void _bufferRuntimeState(ActorRuntimeStateDelta delta) {
+    _runtimeBuffer.removeWhere(
+      (existing) =>
+          existing.streamId == delta.streamId &&
+          existing.revision == delta.revision,
+    );
+    _runtimeBuffer.add(delta);
+    _runtimeBuffer.sort((a, b) => a.revision.compareTo(b.revision));
+    if (_runtimeBuffer.length > _kRuntimeDeltaBufferCap) {
+      _runtimeBuffer.clear();
+      _runtimeSyncAgain = true;
+    }
+  }
+
+  bool _applyRuntimeState(ActorRuntimeStateDelta delta) {
     final cur = _actorStates.value;
+    final existing = cur.actors[delta.actorId];
+    if (existing == null) return false;
     final updatedActors = Map<String, ActorViewState>.of(cur.actors);
-    final existing = updatedActors[id];
-    if (existing != null) {
-      updatedActors[id] = existing.copyWith(runState: next);
-    } else {
-      final placeholderThread = ThreadDto(
-        id: id,
-        handle: id,
-        parentId: null,
-        status: 'active',
-        provider: null,
-        model: null,
-        charterPreview: '',
-        createdAt: DateTime.now().toIso8601String(),
-        runState: next,
-      );
-      updatedActors[id] = ActorViewState(
-        thread: placeholderThread,
-        runState: next,
-      );
-    }
-    final ordered = cur.orderedIds.contains(id)
-        ? cur.orderedIds
-        : [...cur.orderedIds, id];
-    _actorStates.add(ActorStateSnapshot(
-      revision: cur.revision + 1,
-      actors: updatedActors,
-      orderedIds: ordered,
-    ));
+    updatedActors[delta.actorId] = existing.copyWith(
+      thread: existing.thread.copyWith(runState: delta.runState),
+      runState: delta.runState,
+    );
+    _actorStates.add(
+      cur.copyWith(revision: cur.revision + 1, actors: updatedActors),
+    );
+    return true;
+  }
 
+  Future<void> _requestRuntimeSync({bool clearBuffer = false}) {
+    if (clearBuffer) _runtimeBuffer.clear();
+    _runtimePhase = _RuntimePhase.syncing;
+    _runtimeSyncAgain = true;
+    final active = _runtimeSyncTask;
+    if (active != null) return active;
+    late final Future<void> task;
+    task = _runRuntimeSync().whenComplete(() {
+      if (identical(_runtimeSyncTask, task)) _runtimeSyncTask = null;
+    });
+    _runtimeSyncTask = task;
+    return task;
+  }
+
+  Future<void> _runRuntimeSync() async {
+    while (_runtimeSyncAgain) {
+      _runtimeSyncAgain = false;
+      ThreadsSnapshot snap;
+      try {
+        snap = await _api.fetchThreads();
+      } catch (e) {
+        _error.add('$e');
+        _scheduleRuntimeRetry();
+        return;
+      }
+      _runtimeRetry?.cancel();
+      _runtimeRetry = null;
+      _runtimeRetryDelay = _kRuntimeRetryInitial;
+      _halted.add(snap.halted);
+      _updateActorStatesFromThreads(snap.threads);
+      _runtimeCursor = snap.runtimeCursor;
+      _error.add(null);
+      if (!_drainRuntimeBuffer()) _runtimeSyncAgain = true;
+    }
+    _runtimePhase = _RuntimePhase.live;
+  }
+
+  bool _drainRuntimeBuffer() {
+    final cursor = _runtimeCursor;
+    if (cursor == null) {
+      _runtimeBuffer.clear();
+      return true;
+    }
+    final pending =
+        _runtimeBuffer
+            .where(
+              (delta) =>
+                  delta.streamId == cursor.streamId &&
+                  delta.revision > cursor.revision,
+            )
+            .toList()
+          ..sort((a, b) => a.revision.compareTo(b.revision));
+    _runtimeBuffer.clear();
+    var revision = cursor.revision;
+    for (final delta in pending) {
+      if (delta.revision <= revision) continue;
+      if (delta.revision != revision + 1 || !_applyRuntimeState(delta)) {
+        return false;
+      }
+      revision = delta.revision;
+    }
+    _runtimeCursor = RuntimeCursor(
+      streamId: cursor.streamId,
+      revision: revision,
+    );
+    return true;
+  }
+
+  void _scheduleRuntimeRetry() {
+    if (_runtimeRetry?.isActive ?? false) return;
+    final delay = _runtimeRetryDelay;
+    final doubled = delay * 2;
+    _runtimeRetryDelay = doubled > _kRuntimeRetryMax
+        ? _kRuntimeRetryMax
+        : doubled;
+    _runtimeRetry = Timer(delay, () {
+      _runtimeRetry = null;
+      unawaited(_requestRuntimeSync());
+    });
   }
 
   void _onLiveOutput(LiveOutputChunk chunk) {
@@ -1064,6 +1180,7 @@ class DashboardStore {
     _appendLive(
       const LiveLine(actorId: '', text: '… output elided …', isGap: true),
     );
+    unawaited(_requestRuntimeSync());
   }
 
   void _appendLive(LiveLine line) {
@@ -1085,6 +1202,7 @@ class DashboardStore {
   Future<void> dispose() async {
     _topologyDebounce?.cancel();
     _quotaPoll?.cancel();
+    _runtimeRetry?.cancel();
     for (final s in _subs) {
       await s.cancel();
     }

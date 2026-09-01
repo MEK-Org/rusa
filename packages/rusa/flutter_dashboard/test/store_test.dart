@@ -15,6 +15,18 @@ Future<DashboardStore> _booted(FakeApi api, FakeStream stream) async {
   return store;
 }
 
+ActorRuntimeStateDelta _runtime(
+  int revision,
+  String actorId,
+  RunState runState, {
+  String streamId = 'stream-a',
+}) => ActorRuntimeStateDelta(
+  streamId: streamId,
+  revision: revision,
+  actorId: actorId,
+  runState: runState,
+);
+
 void main() {
   test('ThreadDto copyWith can clear staged model fields', () {
     final staged = makeThread(
@@ -52,6 +64,7 @@ void main() {
           .subtract(const Duration(days: 1))
           .toIso8601String();
       final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
         ..threadsResult = [
           makeThread('root', created: 't0'),
           makeThread('a', parent: 'root', created: 't1'),
@@ -256,7 +269,11 @@ void main() {
         'child-1',
         'child-2',
       ]);
-      expect(cache.storedActorOrder?['root'], ['child-3', 'child-1', 'child-2']);
+      expect(cache.storedActorOrder?['root'], [
+        'child-3',
+        'child-1',
+        'child-2',
+      ]);
 
       // Move child-1 after child-2
       store.reorderActor('child-1', 'child-2', before: false);
@@ -266,7 +283,11 @@ void main() {
         'child-2',
         'child-1',
       ]);
-      expect(cache.storedActorOrder?['root'], ['child-3', 'child-2', 'child-1']);
+      expect(cache.storedActorOrder?['root'], [
+        'child-3',
+        'child-2',
+        'child-1',
+      ]);
 
       // Move child-3 after child-2
       store.reorderActor('child-3', 'child-2', before: false);
@@ -281,48 +302,45 @@ void main() {
     },
   );
 
-  test(
-    'reorderActor rejects cross-parent actor drags (v1 constraint)',
-    () async {
-      final api = FakeApi()
-        ..threadsResult = [
-          makeThread('root', created: 't0'),
-          makeThread('parent-a', parent: 'root', created: 't1'),
-          makeThread('child-a1', parent: 'parent-a', created: 't2'),
-          makeThread('parent-b', parent: 'root', created: 't3'),
-          makeThread('child-b1', parent: 'parent-b', created: 't4'),
-        ];
-      final cache = FakeTreePreferencesCache();
-      final store = DashboardStore(
-        api: api,
-        stream: FakeStream(),
-        treePreferencesCache: cache,
-      );
-      await store.init();
-      await pumpEventQueue();
+  test('reorderActor rejects cross-parent actor drags (v1 constraint)', () async {
+    final api = FakeApi()
+      ..threadsResult = [
+        makeThread('root', created: 't0'),
+        makeThread('parent-a', parent: 'root', created: 't1'),
+        makeThread('child-a1', parent: 'parent-a', created: 't2'),
+        makeThread('parent-b', parent: 'root', created: 't3'),
+        makeThread('child-b1', parent: 'parent-b', created: 't4'),
+      ];
+    final cache = FakeTreePreferencesCache();
+    final store = DashboardStore(
+      api: api,
+      stream: FakeStream(),
+      treePreferencesCache: cache,
+    );
+    await store.init();
+    await pumpEventQueue();
 
-      final initialOrder = store.flattenedVisible().map((t) => t.id).toList();
-      expect(initialOrder, [
-        'root',
-        'parent-a',
-        'child-a1',
-        'parent-b',
-        'child-b1',
-      ]);
+    final initialOrder = store.flattenedVisible().map((t) => t.id).toList();
+    expect(initialOrder, [
+      'root',
+      'parent-a',
+      'child-a1',
+      'parent-b',
+      'child-b1',
+    ]);
 
-      // Attempt to drag child-b1 onto child-a1 (different parents: parent-b vs parent-a)
-      store.reorderActor('child-b1', 'child-a1', before: true);
-      expect(store.flattenedVisible().map((t) => t.id), initialOrder);
-      expect(cache.saveActorOrderCount, 0);
+    // Attempt to drag child-b1 onto child-a1 (different parents: parent-b vs parent-a)
+    store.reorderActor('child-b1', 'child-a1', before: true);
+    expect(store.flattenedVisible().map((t) => t.id), initialOrder);
+    expect(cache.saveActorOrderCount, 0);
 
-      // Attempt to drag child-a1 onto root (different parents: parent-a vs null)
-      store.reorderActor('child-a1', 'root', before: true);
-      expect(store.flattenedVisible().map((t) => t.id), initialOrder);
-      expect(cache.saveActorOrderCount, 0);
+    // Attempt to drag child-a1 onto root (different parents: parent-a vs null)
+    store.reorderActor('child-a1', 'root', before: true);
+    expect(store.flattenedVisible().map((t) => t.id), initialOrder);
+    expect(cache.saveActorOrderCount, 0);
 
-      await store.dispose();
-    },
-  );
+    await store.dispose();
+  });
 
   test(
     'persists custom actor ordering across store reloads via TreePreferencesCache',
@@ -487,6 +505,7 @@ void main() {
     'dotFor: retired wins; seeded run-state drives the dot; SSE transitions update it',
     () async {
       final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
         ..threadsResult = [
           makeThread(
             'a',
@@ -516,16 +535,16 @@ void main() {
         DotState.active,
       ); // seeded running → green
 
-      // Live SSE transitions still drive the dot.
-      stream.meshCtrl.add(makeEvent('q1', 'run_queued', actor: 'a'));
+      // Only the authoritative runtime channel drives the dot.
+      stream.runtimeStatesCtrl.add(_runtime(1, 'a', RunState.queued));
       await pumpEventQueue();
       expect(store.dotFor(api.threadsResult[0]), DotState.queued);
 
-      stream.meshCtrl.add(makeEvent('e1', 'run_start', actor: 'a'));
+      stream.runtimeStatesCtrl.add(_runtime(2, 'a', RunState.running));
       await pumpEventQueue();
       expect(store.dotFor(api.threadsResult[0]), DotState.active);
 
-      stream.meshCtrl.add(makeEvent('e2', 'run_end', actor: 'a'));
+      stream.runtimeStatesCtrl.add(_runtime(3, 'a', RunState.idle));
       await pumpEventQueue();
       expect(store.dotFor(api.threadsResult[0]), DotState.idle);
       await store.dispose();
@@ -536,6 +555,10 @@ void main() {
     'actorStates stream and selectors: normalized single source of truth with live updates',
     () async {
       final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(
+          streamId: 'stream-a',
+          revision: 10,
+        )
         ..threadsResult = [
           makeThread('a', parent: 'root', runState: RunState.idle),
           makeThread('b', parent: 'root', runState: RunState.queued),
@@ -550,8 +573,7 @@ void main() {
       expect(store.actor('b')?.runState, RunState.queued);
       expect(store.actor('c')?.runState, RunState.running);
 
-      // SSE run_start moves 'b' to running
-      stream.meshCtrl.add(makeEvent('e1', 'run_start', actor: 'b'));
+      stream.runtimeStatesCtrl.add(_runtime(11, 'b', RunState.running));
       await pumpEventQueue();
 
       expect(store.runningActors.map((a) => a.id), ['b', 'c']);
@@ -559,24 +581,21 @@ void main() {
       expect(store.actor('b')?.runState, RunState.running);
       expect(store.actor('b')?.dotState, DotState.active);
 
-      // SSE run_yielded moves 'c' to windingDown (still in runningActors)
-      stream.meshCtrl.add(makeEvent('e2', 'run_yielded', actor: 'c'));
+      stream.runtimeStatesCtrl.add(_runtime(12, 'c', RunState.windingDown));
       await pumpEventQueue();
 
       expect(store.runningActors.map((a) => a.id), ['b', 'c']);
       expect(store.actor('c')?.runState, RunState.windingDown);
       expect(store.actor('c')?.dotState, DotState.active);
 
-      // SSE run_end moves 'c' to idle
-      stream.meshCtrl.add(makeEvent('e3', 'run_end', actor: 'c'));
+      stream.runtimeStatesCtrl.add(_runtime(13, 'c', RunState.idle));
       await pumpEventQueue();
 
       expect(store.runningActors.map((a) => a.id), ['b']);
       expect(store.actor('c')?.runState, RunState.idle);
       expect(store.actor('c')?.dotState, DotState.idle);
 
-      // SSE run_abandoned moves 'b' to idle
-      stream.meshCtrl.add(makeEvent('e4', 'run_abandoned', actor: 'b'));
+      stream.runtimeStatesCtrl.add(_runtime(14, 'b', RunState.idle));
       await pumpEventQueue();
 
       expect(store.runningActors, isEmpty);
@@ -591,6 +610,7 @@ void main() {
     fakeAsync((async) {
       final stream = FakeStream();
       final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
         ..threadsResult = [
           makeThread(
             'a',
@@ -607,11 +627,7 @@ void main() {
       expect(store.actor('a')?.thread.desiredModel, 'claude-opus-4-8');
 
       api.threadsResult = [
-        makeThread(
-          'a',
-          model: 'claude-opus-4-8',
-          runState: RunState.idle,
-        ),
+        makeThread('a', model: 'claude-opus-4-8', runState: RunState.idle),
       ];
       stream.meshCtrl.add(makeEvent('model-1', 'actor_model_set', actor: 'a'));
       async.flushMicrotasks();
@@ -630,6 +646,7 @@ void main() {
     'reducer fix: continuation_capped and root_control_action do NOT transition to idle',
     () async {
       final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
         ..threadsResult = [
           makeThread('a', parent: 'root', runState: RunState.running),
         ];
@@ -650,8 +667,12 @@ void main() {
       expect(store.actor('a')?.runState, RunState.running);
       expect(store.dotFor(api.threadsResult[0]), DotState.active);
 
-      // Genuine terminal bracket run_end DOES make it idle
+      // Audit history is no longer runtime-state authority, including run_end.
       stream.meshCtrl.add(makeEvent('e3', 'run_end', actor: 'a'));
+      await pumpEventQueue();
+      expect(store.actor('a')?.runState, RunState.running);
+
+      stream.runtimeStatesCtrl.add(_runtime(1, 'a', RunState.idle));
       await pumpEventQueue();
       expect(store.actor('a')?.runState, RunState.idle);
       expect(store.dotFor(api.threadsResult[0]), DotState.idle);
@@ -661,9 +682,10 @@ void main() {
   );
 
   test(
-    'interruptActor updates normalized actorStates and runState to idle',
+    'interruptActor waits for authoritative runtime state instead of writing optimistically',
     () async {
       final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
         ..threadsResult = [
           makeThread('a', parent: 'root', runState: RunState.running),
         ];
@@ -673,6 +695,10 @@ void main() {
       expect(store.runningActors.map((a) => a.id), ['a']);
 
       await store.interruptActor('a');
+
+      expect(store.runningActors.map((a) => a.id), ['a']);
+      stream.runtimeStatesCtrl.add(_runtime(1, 'a', RunState.idle));
+      await pumpEventQueue();
 
       expect(store.runningActors, isEmpty);
       expect(store.actor('a')?.runState, RunState.idle);
@@ -696,29 +722,36 @@ void main() {
     },
   );
 
-  test('topology refresh unconditionally adopts the snapshot run state to heal dropped SSE events', () async {
-    final api = FakeApi()
-      ..threadsResult = [
-        makeThread('a', parent: 'root', runState: RunState.running),
-      ];
-    final stream = FakeStream();
-    final store = DashboardStore(api: api, stream: stream);
-    await store.init(); // opens stream, then fetches/seeds threads
-    await pumpEventQueue();
+  test(
+    'topology refresh unconditionally adopts the snapshot run state to heal dropped SSE events',
+    () async {
+      final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
+        ..threadsResult = [
+          makeThread('a', parent: 'root', runState: RunState.running),
+        ];
+      final stream = FakeStream();
+      final store = DashboardStore(api: api, stream: stream);
+      await store.init(); // opens stream, then fetches/seeds threads
+      await pumpEventQueue();
 
-    // A live run_end moves it to idle.
-    stream.meshCtrl.add(makeEvent('e1', 'run_end', actor: 'a'));
-    await pumpEventQueue();
-    expect(store.actor('a')?.runState, RunState.idle);
+      stream.runtimeStatesCtrl.add(_runtime(1, 'a', RunState.idle));
+      await pumpEventQueue();
+      expect(store.actor('a')?.runState, RunState.idle);
 
-    // BUT a subsequent topology refresh showing it still 'running' MUST win, 
-    // because the dashboard must trust the server's API snapshot.
-    await store.refreshThreads();
-    await pumpEventQueue();
-    expect(store.dotFor(api.threadsResult[0]), DotState.active);
-    expect(store.actor('a')?.runState, RunState.running);
-    await store.dispose();
-  });
+      api.runtimeCursor = const RuntimeCursor(
+        streamId: 'stream-a',
+        revision: 2,
+      );
+      // BUT a subsequent topology refresh showing it still 'running' MUST win,
+      // because the dashboard must trust the server's API snapshot.
+      await store.refreshThreads();
+      await pumpEventQueue();
+      expect(store.dotFor(api.threadsResult[0]), DotState.active);
+      expect(store.actor('a')?.runState, RunState.running);
+      await store.dispose();
+    },
+  );
 
   test(
     'halted: seeded from the threads payload and exposed as a stream',
@@ -729,6 +762,199 @@ void main() {
       final store = await _booted(api, FakeStream());
       expect(store.halted.value, true);
       await store.dispose();
+    },
+  );
+
+  test(
+    'runtime deltas buffer through bootstrap, drain in order, and drop stale duplicates',
+    () async {
+      final bootstrap = Completer<ThreadsSnapshot>();
+      final api = FakeApi()..threadSnapshotGates.add(bootstrap);
+      final stream = FakeStream();
+      final store = DashboardStore(api: api, stream: stream);
+      final init = store.init();
+      await pumpEventQueue();
+
+      stream.runtimeStatesCtrl
+        ..add(_runtime(1, 'a', RunState.running))
+        ..add(_runtime(1, 'a', RunState.running))
+        ..add(_runtime(2, 'a', RunState.windingDown));
+      bootstrap.complete(
+        ThreadsSnapshot(
+          halted: false,
+          runtimeCursor: const RuntimeCursor(streamId: 'stream-a', revision: 0),
+          threads: [makeThread('a', runState: RunState.idle)],
+        ),
+      );
+      await init;
+      await pumpEventQueue();
+
+      expect(api.threadsCallCount, 1);
+      expect(store.actor('a')?.runState, RunState.windingDown);
+
+      stream.runtimeStatesCtrl
+        ..add(_runtime(1, 'a', RunState.queued))
+        ..add(_runtime(3, 'a', RunState.idle));
+      await pumpEventQueue();
+      expect(store.actor('a')?.runState, RunState.idle);
+      expect(api.threadsCallCount, 1);
+      await store.dispose();
+    },
+  );
+
+  test(
+    'a revision gap reconciles once while later deltas share the in-flight snapshot',
+    () async {
+      final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
+        ..threadsResult = [makeThread('a', runState: RunState.idle)];
+      final stream = FakeStream();
+      final store = await _booted(api, stream);
+      final gate = Completer<ThreadsSnapshot>();
+      api.threadSnapshotGates.add(gate);
+
+      stream.runtimeStatesCtrl.add(_runtime(2, 'a', RunState.running));
+      await pumpEventQueue();
+      stream.runtimeStatesCtrl.add(_runtime(3, 'a', RunState.windingDown));
+      await pumpEventQueue();
+      expect(api.threadsCallCount, 2);
+
+      gate.complete(
+        ThreadsSnapshot(
+          halted: false,
+          runtimeCursor: const RuntimeCursor(streamId: 'stream-a', revision: 1),
+          threads: [makeThread('a', runState: RunState.queued)],
+        ),
+      );
+      await pumpEventQueue();
+      expect(store.actor('a')?.runState, RunState.windingDown);
+      expect(api.threadsCallCount, 2);
+      await store.dispose();
+    },
+  );
+
+  test(
+    'unknown actors reconcile from topology instead of creating placeholders',
+    () async {
+      final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
+        ..threadsResult = [makeThread('a', runState: RunState.idle)];
+      final stream = FakeStream();
+      final store = await _booted(api, stream);
+      final gate = Completer<ThreadsSnapshot>();
+      api.threadSnapshotGates.add(gate);
+
+      stream.runtimeStatesCtrl.add(_runtime(1, 'new', RunState.running));
+      await pumpEventQueue();
+      expect(store.actor('new'), isNull);
+
+      gate.complete(
+        ThreadsSnapshot(
+          halted: false,
+          runtimeCursor: const RuntimeCursor(streamId: 'stream-a', revision: 1),
+          threads: [
+            makeThread('a', runState: RunState.idle),
+            makeThread('new', runState: RunState.running),
+          ],
+        ),
+      );
+      await pumpEventQueue();
+      expect(store.actor('new')?.thread.handle, 'new-handle');
+      expect(store.actor('new')?.runState, RunState.running);
+      await store.dispose();
+    },
+  );
+
+  test(
+    'hello, epoch changes, and elided frames each force an authoritative resync',
+    () async {
+      final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
+        ..threadsResult = [makeThread('a', runState: RunState.idle)];
+      final stream = FakeStream();
+      final store = await _booted(api, stream);
+
+      stream.runtimeHelloCtrl.add(const RuntimeHello(streamId: 'stream-a'));
+      await pumpEventQueue();
+      expect(api.threadsCallCount, 2);
+
+      api
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-b', revision: 4)
+        ..threadsResult = [makeThread('a', runState: RunState.running)];
+      stream.runtimeHelloCtrl.add(const RuntimeHello(streamId: 'stream-b'));
+      await pumpEventQueue();
+      expect(api.threadsCallCount, 3);
+      expect(store.actor('a')?.runState, RunState.running);
+
+      stream.elidedCtrl.add(null);
+      await pumpEventQueue();
+      expect(api.threadsCallCount, 4);
+      await store.dispose();
+    },
+  );
+
+  test(
+    'runtime buffer overflow discards deltas and requires one more snapshot pass',
+    () async {
+      final first = Completer<ThreadsSnapshot>();
+      final api = FakeApi()
+        ..threadSnapshotGates.add(first)
+        ..runtimeCursor = const RuntimeCursor(
+          streamId: 'stream-a',
+          revision: 101,
+        )
+        ..threadsResult = [makeThread('a', runState: RunState.running)];
+      final stream = FakeStream();
+      final store = DashboardStore(api: api, stream: stream);
+      final init = store.init();
+      await pumpEventQueue();
+
+      for (var revision = 1; revision <= 101; revision++) {
+        stream.runtimeStatesCtrl.add(_runtime(revision, 'a', RunState.running));
+      }
+      await pumpEventQueue();
+      first.complete(
+        ThreadsSnapshot(
+          halted: false,
+          runtimeCursor: const RuntimeCursor(streamId: 'stream-a', revision: 0),
+          threads: [makeThread('a', runState: RunState.idle)],
+        ),
+      );
+      await init;
+      await pumpEventQueue();
+      expect(api.threadsCallCount, 2);
+      expect(store.actor('a')?.runState, RunState.running);
+      await store.dispose();
+    },
+  );
+
+  test(
+    'snapshot failures retain rendered state and retry with bounded backoff',
+    () {
+      fakeAsync((async) {
+        final api = FakeApi()
+          ..threadsError = StateError('offline')
+          ..runtimeCursor = const RuntimeCursor(
+            streamId: 'stream-a',
+            revision: 0,
+          )
+          ..threadsResult = [makeThread('a', runState: RunState.idle)];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        unawaited(store.init());
+        async.flushMicrotasks();
+        expect(store.actor('a'), isNull);
+        expect(store.error.value, contains('offline'));
+
+        api.threadsError = null;
+        async.elapse(const Duration(milliseconds: 250));
+        async.flushMicrotasks();
+        expect(api.threadsCallCount, 2);
+        expect(store.actor('a')?.runState, RunState.idle);
+        expect(store.error.value, isNull);
+
+        unawaited(store.dispose());
+        async.flushMicrotasks();
+      });
     },
   );
 
@@ -880,10 +1106,7 @@ void main() {
       final api = FakeApi()
         ..threadsResult = [makeThread('a', parent: 'root', created: 't1')]
         ..chatPages = [
-          ChatPage(
-            chat: [makeChat('e1')],
-            nextCursor: null,
-          ),
+          ChatPage(chat: [makeChat('e1')], nextCursor: null),
         ];
       final stream = FakeStream();
       final store = await _booted(api, stream);
@@ -1160,7 +1383,7 @@ void main() {
 
       expect(store.quota.value?.generatedAt, 'last-known');
       expect(store.quotaStale.value, true);
-      // Quota revalidation failure must not pollute the global dashboard error bar 
+      // Quota revalidation failure must not pollute the global dashboard error bar
       expect(store.error.value, isNull);
 
       // Network exception (e.g. timeout / connection closed) also marks stale and avoids global error bar
@@ -1199,34 +1422,37 @@ void main() {
     });
   });
 
-  test('refreshQuotaHistory updates quota history and clears stale flag', () async {
-    const firstHistory = QuotaHistoryDto(
-      generatedAt: 'first',
-      historySince: '2026-07-01T00:00:00.000Z',
-      history: [],
-    );
-    const secondHistory = QuotaHistoryDto(
-      generatedAt: 'second',
-      historySince: '2026-07-01T00:00:00.000Z',
-      history: [],
-    );
-    final api = FakeApi()
-      ..threadsResult = [makeThread('root', created: 't0')]
-      ..quotaHistoryResult = firstHistory;
-    final store = DashboardStore(api: api, stream: FakeStream());
-    await store.refreshQuotaHistory();
+  test(
+    'refreshQuotaHistory updates quota history and clears stale flag',
+    () async {
+      const firstHistory = QuotaHistoryDto(
+        generatedAt: 'first',
+        historySince: '2026-07-01T00:00:00.000Z',
+        history: [],
+      );
+      const secondHistory = QuotaHistoryDto(
+        generatedAt: 'second',
+        historySince: '2026-07-01T00:00:00.000Z',
+        history: [],
+      );
+      final api = FakeApi()
+        ..threadsResult = [makeThread('root', created: 't0')]
+        ..quotaHistoryResult = firstHistory;
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.refreshQuotaHistory();
 
-    expect(store.quotaHistory.value?.generatedAt, 'first');
-    expect(store.quotaHistoryStale.value, false);
+      expect(store.quotaHistory.value?.generatedAt, 'first');
+      expect(store.quotaHistoryStale.value, false);
 
-    api.quotaHistoryResult = secondHistory;
-    await store.refreshQuotaHistory();
+      api.quotaHistoryResult = secondHistory;
+      await store.refreshQuotaHistory();
 
-    expect(store.quotaHistory.value?.generatedAt, 'second');
-    expect(store.quotaHistoryStale.value, false);
+      expect(store.quotaHistory.value?.generatedAt, 'second');
+      expect(store.quotaHistoryStale.value, false);
 
-    await store.dispose();
-  });
+      await store.dispose();
+    },
+  );
 
   test('a 503 on quota history reports null and does not mark stale', () async {
     final api = FakeApi()
@@ -1244,35 +1470,38 @@ void main() {
     await store.dispose();
   });
 
-  test('a failed history revalidation retains history and marks it stale without setting global error', () async {
-    final api = FakeApi()
-      ..quotaHistoryResult = const QuotaHistoryDto(
-        generatedAt: 'last-known',
-        historySince: '2026-07-01T00:00:00.000Z',
-        history: [],
+  test(
+    'a failed history revalidation retains history and marks it stale without setting global error',
+    () async {
+      final api = FakeApi()
+        ..quotaHistoryResult = const QuotaHistoryDto(
+          generatedAt: 'last-known',
+          historySince: '2026-07-01T00:00:00.000Z',
+          history: [],
+        );
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.refreshQuotaHistory();
+      expect(store.quotaHistoryStale.value, false);
+
+      api.quotaHistoryError = DashboardApiException(
+        Uri.parse('/api/quota/history'),
+        500,
+        'fetch failed',
       );
-    final store = DashboardStore(api: api, stream: FakeStream());
-    await store.refreshQuotaHistory();
-    expect(store.quotaHistoryStale.value, false);
+      await store.refreshQuotaHistory();
 
-    api.quotaHistoryError = DashboardApiException(
-      Uri.parse('/api/quota/history'),
-      500,
-      'fetch failed',
-    );
-    await store.refreshQuotaHistory();
+      expect(store.quotaHistory.value?.generatedAt, 'last-known');
+      expect(store.quotaHistoryStale.value, true);
+      expect(store.error.value, isNull);
 
-    expect(store.quotaHistory.value?.generatedAt, 'last-known');
-    expect(store.quotaHistoryStale.value, true);
-    expect(store.error.value, isNull);
+      api.quotaHistoryError = Exception('Connection timeout');
+      await store.refreshQuotaHistory();
+      expect(store.quotaHistoryStale.value, true);
+      expect(store.error.value, isNull);
 
-    api.quotaHistoryError = Exception('Connection timeout');
-    await store.refreshQuotaHistory();
-    expect(store.quotaHistoryStale.value, true);
-    expect(store.error.value, isNull);
-
-    await store.dispose();
-  });
+      await store.dispose();
+    },
+  );
 
   test('conversation: live SSE dedupes message_sent + message_received for the '
       'same messageId — each message renders exactly once ', () async {
@@ -1319,93 +1548,99 @@ void main() {
     await store.dispose();
   });
 
-  test('overview: yieldEvents captures history and live run_yielded SSE events', () async {
-    final api = FakeApi()
-      ..threadsResult = [makeThread('worker-1', parent: 'root', created: 't1')]
-      ..eventPages = [
-        EventPage(
-          events: [
-            makeEvent(
-              'y1',
-              'run_yielded',
-              actor: 'worker-1',
-              detail: 'complete',
-              body: 'Finished charter task',
-            ),
-          ],
-          nextCursor: null,
+  test(
+    'overview: yieldEvents captures history and live run_yielded SSE events',
+    () async {
+      final api = FakeApi()
+        ..threadsResult = [
+          makeThread('worker-1', parent: 'root', created: 't1'),
+        ]
+        ..eventPages = [
+          EventPage(
+            events: [
+              makeEvent(
+                'y1',
+                'run_yielded',
+                actor: 'worker-1',
+                detail: 'complete',
+                body: 'Finished charter task',
+              ),
+            ],
+            nextCursor: null,
+          ),
+        ];
+      final stream = FakeStream();
+      final store = await _booted(api, stream);
+      await store.refreshYieldEvents();
+
+      expect(store.yieldEvents.value.length, 1);
+      expect(store.yieldEvents.value.first.id, 'y1');
+
+      stream.meshCtrl.add(
+        makeEvent(
+          'y2',
+          'run_yielded',
+          actor: 'worker-1',
+          detail: 'blocked',
+          body: 'Blocked on review',
         ),
-      ];
-    final stream = FakeStream();
-    final store = await _booted(api, stream);
-    await store.refreshYieldEvents();
+      );
+      await pumpEventQueue();
 
-    expect(store.yieldEvents.value.length, 1);
-    expect(store.yieldEvents.value.first.id, 'y1');
+      expect(store.yieldEvents.value.length, 2);
+      expect(store.yieldEvents.value.first.id, 'y2');
+      expect(store.yieldEvents.value.first.detail, 'blocked');
 
-    stream.meshCtrl.add(
-      makeEvent(
-        'y2',
-        'run_yielded',
-        actor: 'worker-1',
-        detail: 'blocked',
-        body: 'Blocked on review',
-      ),
-    );
-    await pumpEventQueue();
+      await store.dispose();
+    },
+  );
 
-    expect(store.yieldEvents.value.length, 2);
-    expect(store.yieldEvents.value.first.id, 'y2');
-    expect(store.yieldEvents.value.first.detail, 'blocked');
+  test(
+    'overview: yieldEvents populates even when threads are empty at init',
+    () async {
+      final api = FakeApi()
+        ..threadsResult = []
+        ..eventPages = [
+          EventPage(
+            events: [
+              makeEvent(
+                'y1',
+                'run_yielded',
+                actor: 'worker-1',
+                detail: 'complete',
+                body: 'Finished charter task',
+              ),
+            ],
+            nextCursor: null,
+          ),
+        ];
+      final stream = FakeStream();
+      final store = await _booted(api, stream);
+      await store.refreshYieldEvents();
 
-    await store.dispose();
-  });
+      expect(store.yieldEvents.value.length, 1);
+      expect(store.yieldEvents.value.first.id, 'y1');
 
-  test('overview: yieldEvents populates even when threads are empty at init', () async {
-    final api = FakeApi()
-      ..threadsResult = []
-      ..eventPages = [
-        EventPage(
-          events: [
-            makeEvent(
-              'y1',
-              'run_yielded',
-              actor: 'worker-1',
-              detail: 'complete',
-              body: 'Finished charter task',
-            ),
-          ],
-          nextCursor: null,
-        ),
-      ];
-    final stream = FakeStream();
-    final store = await _booted(api, stream);
-    await store.refreshYieldEvents();
+      await store.dispose();
+    },
+  );
 
-    expect(store.yieldEvents.value.length, 1);
-    expect(store.yieldEvents.value.first.id, 'y1');
+  test(
+    'overview: refreshYieldEvents requests descending order and registers since parameter',
+    () async {
+      final api = FakeApi()
+        ..threadsResult = []
+        ..eventPages = [const EventPage(events: [], nextCursor: null)];
+      final stream = FakeStream();
+      final store = await _booted(api, stream);
+      await store.refreshYieldEvents();
 
-    await store.dispose();
-  });
+      expect(api.eventSinceCalls.length, 1);
+      expect(api.eventSinceCalls.first, isNotNull);
+      expect(api.eventOrderCalls.length, 1);
+      expect(api.eventOrderCalls.first, 'desc');
 
-  test('overview: refreshYieldEvents requests descending order and registers since parameter', () async {
-    final api = FakeApi()
-      ..threadsResult = []
-      ..eventPages = [
-        const EventPage(
-          events: [],
-          nextCursor: null,
-        ),
-      ];
-    final stream = FakeStream();
-    final store = await _booted(api, stream);
-    await store.refreshYieldEvents();
-
-    expect(api.eventSinceCalls.length, 1);
-    expect(api.eventSinceCalls.first, isNotNull);
-    expect(api.eventOrderCalls.length, 1);
-    expect(api.eventOrderCalls.first, 'desc');
-
-    await store.dispose();
-  });
+      await store.dispose();
+    },
+  );
 }

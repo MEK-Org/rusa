@@ -1879,6 +1879,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               detail: context.mode,
             });
           },
+          onRuntimeStateChanged: ctx.onRuntimeStateChanged,
           onRunStart: (responsive, injectRecord) => {
             const providerName = providerThrottleKey(actor.getProvider().providerName, config);
             const runId = beginActorRun(id, providerName);
@@ -2239,7 +2240,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   );
   rootMcp.push({ name: PNPM_HARDLINKS_MCP_NAME, url: pnpmHardlinksUrl });
 
-  const externalRoot = opts?.e2e?.rootDriver === "external" ? new ExternalRootDriver(rootId) : null;
+  const externalRoot =
+    opts?.e2e?.rootDriver === "external"
+      ? new ExternalRootDriver(rootId, undefined, (state) =>
+          mesh.actorRuntimeStateChanged(rootId, state)
+        )
+      : null;
   let root: MeshActor;
   root =
     externalRoot ??
@@ -2318,6 +2324,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           detail: context.mode,
         });
       },
+      onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
       onRunStart: (responsive, injectRecord) => {
         const providerName = providerThrottleKey(provider.providerName, config);
         const runId = beginActorRun(rootId, providerName);

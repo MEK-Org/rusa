@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { ServerResponse } from "node:http";
 import { describe, expect, it } from "vitest";
+import type { ActorRuntimeStateDelta } from "../actor/actor-mesh.js";
 import { MeshEventEmitter } from "./mesh-event-emitter.js";
 import { LiveOutputBuffer, SseHub } from "./sse.js";
 
@@ -114,6 +115,31 @@ describe("SseHub", () => {
     expect(res.headers["Content-Type"]).toContain("text/event-stream");
     expect(res.headers["X-Accel-Buffering"]).toBe("no");
     expect(res.writes[0]).toBe(": connected\n\n");
+    hub.close();
+  });
+
+  it("writes runtime hello before registering the client and then relays sequenced deltas", () => {
+    let listener: ((delta: ActorRuntimeStateDelta) => void) | undefined;
+    const runtimeState = {
+      runtimeStateSnapshot: () => ({
+        streamId: "epoch-a",
+        revision: 4,
+        states: new Map(),
+      }),
+      onRuntimeStateDelta: (next: typeof listener) => {
+        listener = next;
+        return () => {
+          listener = undefined;
+        };
+      },
+    };
+    const hub = new SseHub(new MeshEventEmitter(), { runtimeState });
+    const res = connect(hub, ["a"]);
+
+    expect(res.dataFrames()[0]).toBe('event: hello\ndata: {"streamId":"epoch-a"}\n\n');
+    listener?.({ streamId: "epoch-a", revision: 5, actorId: "a", runState: "running" });
+    expect(res.dataFrames()[1]).toContain("event: actor_runtime_state");
+    expect(res.dataFrames()[1]).toContain('"revision":5');
     hub.close();
   });
 

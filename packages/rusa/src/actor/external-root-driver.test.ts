@@ -21,11 +21,14 @@ describe("ExternalRootDriver", () => {
   });
 
   it("acknowledges the selected execution opportunity", () => {
-    const driver = new ExternalRootDriver("root");
+    const states: string[] = [];
+    const driver = new ExternalRootDriver("root", undefined, (state) => states.push(state));
+    driver.requestRun();
     driver.requestRun();
     const wake = driver.listWakes()[0];
     if (!wake) throw new Error("wake not queued");
     expect(driver.acknowledge([wake.id])).toHaveLength(1);
     expect(driver.listWakes()).toEqual([]);
+    expect(states).toEqual(["queued", "idle"]);
   });
 });

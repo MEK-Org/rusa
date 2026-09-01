@@ -19,7 +19,8 @@ export class ExternalRootDriver implements MeshActor {
 
   constructor(
     id: string,
-    private readonly now: () => string = () => new Date().toISOString()
+    private readonly now: () => string = () => new Date().toISOString(),
+    private readonly onRuntimeStateChanged?: (state: "queued" | "idle") => void
   ) {
     this.id = id;
   }
@@ -35,6 +36,7 @@ export class ExternalRootDriver implements MeshActor {
       receivedAt: this.now(),
       responsive: nudge.priority === "responsive",
     };
+    this.onRuntimeStateChanged?.("queued");
   }
 
   listWakes(): ExternalRootWake[] {
@@ -45,6 +47,7 @@ export class ExternalRootDriver implements MeshActor {
     if (!this.wake || !new Set(wakeIds).has(this.wake.id)) return [];
     const acknowledged = structuredClone(this.wake);
     this.wake = null;
+    this.onRuntimeStateChanged?.("idle");
     return [acknowledged];
   }
 
