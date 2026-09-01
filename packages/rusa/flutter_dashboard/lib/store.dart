@@ -31,6 +31,11 @@ class LiveLine {
 
   /// A drop-oldest gap (the server's named `elided` frame).
   final bool isGap;
+
+  /// Largest text block handed to one SelectableText. Flutter shapes an entire
+  /// block even when most of it is outside the ListView viewport, so keeping
+  /// blocks small is what makes the live tail genuinely lazy.
+  static const int maxRenderCodeUnits = 16 * 1024;
 }
 
 /// The Events tab view-state: a newest-first page plus its cursor/loading flags.
@@ -87,6 +92,15 @@ class ChatView {
 }
 
 const int _kLiveBufferCap = 2000;
+// stdout chunks are commonly tens of KiB. A count-only cap therefore allowed a
+// modest 32 MiB ASCII tail to become a multi-GiB Flutter text layout. Eight Mi
+// UTF-16 code units keeps ample recent context while bounding retained text.
+const int _kLiveBufferCodeUnitCap = 8 * 1024 * 1024;
+const LiveLine _kLiveGap = LiveLine(
+  actorId: '',
+  text: '… output elided …',
+  isGap: true,
+);
 const int _kEventsPageSize = 50;
 
 /// Retired actors whose most recent mesh event is older than this are hidden
@@ -184,6 +198,7 @@ class DashboardStore {
   final _conversation = BehaviorSubject<ChatView>.seeded(const ChatView());
   final _operatorChat = BehaviorSubject<ChatView>.seeded(const ChatView());
   final _live = BehaviorSubject<List<LiveLine>>.seeded(const []);
+  var _liveCodeUnits = 0;
   final _quota = BehaviorSubject<QuotaSnapshotDto?>.seeded(null);
   final _quotaHistory = BehaviorSubject<QuotaHistoryDto?>.seeded(null);
   final _yieldEvents = BehaviorSubject<List<MeshEvent>>.seeded(const []);
@@ -676,6 +691,7 @@ class DashboardStore {
     // Reset the merged events view + seam de-dupe for the new selection.
     _seenEventIds.clear();
     _events.add(const EventsView());
+    _liveCodeUnits = 0;
     _live.add(const []);
     unawaited(_loadEvents(reset: true));
 
@@ -1177,19 +1193,69 @@ class DashboardStore {
   }
 
   void _onElided() {
-    _appendLive(
-      const LiveLine(actorId: '', text: '… output elided …', isGap: true),
-    );
+    _appendLive(_kLiveGap);
     unawaited(_requestRuntimeSync());
   }
 
   void _appendLive(LiveLine line) {
-    final next = List<LiveLine>.of(_live.value)..add(line);
-    if (next.length > _kLiveBufferCap) {
-      next.removeRange(0, next.length - _kLiveBufferCap);
+    final additions = _splitLiveLineForRendering(line);
+    final next = List<LiveLine>.of(_live.value)..addAll(additions);
+    var codeUnits = _liveCodeUnits;
+    for (final addition in additions) {
+      codeUnits += addition.text.length;
     }
-    _live.add(next);
+    var firstRetained = 0;
+    var elided = false;
+    while (next.length - firstRetained > _kLiveBufferCap ||
+        codeUnits > _kLiveBufferCodeUnitCap) {
+      codeUnits -= next[firstRetained++].text.length;
+      elided = true;
+    }
+    final needsGap =
+        elided && (firstRetained == next.length || !next[firstRetained].isGap);
+    if (needsGap) {
+      // Reserve room for the visible gap marker itself. This normally removes
+      // at most one additional render block.
+      while (firstRetained < next.length &&
+          (next.length - firstRetained >= _kLiveBufferCap ||
+              codeUnits + _kLiveGap.text.length > _kLiveBufferCodeUnitCap)) {
+        codeUnits -= next[firstRetained++].text.length;
+      }
+    }
+    final retained = firstRetained == 0 ? next : next.sublist(firstRetained);
+    if (needsGap) {
+      retained.insert(0, _kLiveGap);
+      codeUnits += _kLiveGap.text.length;
+    }
+    _liveCodeUnits = codeUnits;
+    _live.add(retained);
   }
+
+  List<LiveLine> _splitLiveLineForRendering(LiveLine line) {
+    if (line.isGap || line.text.length <= LiveLine.maxRenderCodeUnits) {
+      return [line];
+    }
+    final pieces = <LiveLine>[];
+    var start = 0;
+    while (start < line.text.length) {
+      final candidate = start + LiveLine.maxRenderCodeUnits;
+      var end = candidate < line.text.length ? candidate : line.text.length;
+      // Do not split a UTF-16 surrogate pair at a render-block boundary.
+      if (end < line.text.length &&
+          end > start &&
+          _isHighSurrogate(line.text.codeUnitAt(end - 1))) {
+        end--;
+      }
+      pieces.add(
+        LiveLine(actorId: line.actorId, text: line.text.substring(start, end)),
+      );
+      start = end;
+    }
+    return pieces;
+  }
+
+  bool _isHighSurrogate(int codeUnit) =>
+      codeUnit >= 0xD800 && codeUnit <= 0xDBFF;
 
   void _scheduleTopologyRefresh() {
     _topologyDebounce?.cancel();

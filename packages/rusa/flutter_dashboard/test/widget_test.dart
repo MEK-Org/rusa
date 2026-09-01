@@ -10,6 +10,7 @@ import 'package:rusa_dashboard/widgets/actor_tree.dart';
 import 'package:rusa_dashboard/widgets/avatar.dart';
 import 'package:rusa_dashboard/widgets/detail_panel.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
+import 'package:rusa_dashboard/widgets/live_output_tab.dart';
 
 import 'fakes.dart';
 
@@ -250,6 +251,46 @@ void main() {
       await store.dispose();
     });
   });
+
+  testWidgets(
+    'live output never lays out the whole retained tail as one block',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [makeThread('a', runState: RunState.running)];
+        final stream = FakeStream();
+        final store = DashboardStore(api: api, stream: stream);
+        await store.init();
+        store.clickActor('a');
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(body: LiveOutputTab(store: store)),
+          ),
+        );
+
+        final text = List.filled(40000, 'x').join();
+        stream.liveCtrl.add(LiveOutputChunk(actorId: 'a', text: text));
+        await Future<void>.delayed(Duration.zero);
+        await tester.pump(const Duration(milliseconds: 250));
+
+        expect(store.live.value, hasLength(3));
+        final renderedLiveBlocks = tester
+            .widgetList<SelectableText>(find.byType(SelectableText))
+            .map((widget) => widget.data)
+            .whereType<String>()
+            .where((value) => value.startsWith('x'));
+        expect(renderedLiveBlocks, isNotEmpty);
+        expect(
+          renderedLiveBlocks.every(
+            (value) => value.length <= LiveLine.maxRenderCodeUnits,
+          ),
+          isTrue,
+        );
+        await store.dispose();
+      });
+    },
+  );
 
   testWidgets(
     'renders state-driven action buttons: Run Now and Cancel for queued actors, and Interrupt (stop) for running actors',
