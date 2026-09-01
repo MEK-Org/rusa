@@ -931,7 +931,7 @@ describe("agent-execution MCP server", () => {
         name: "spawn_thread",
         arguments: { charter: "child", provider: "claude", model: "claude-sonnet-4-6" },
       });
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
       await rootClient.callTool({
         name: "delegate_event_source",
         arguments: {
@@ -1004,6 +1004,13 @@ describe("agent-execution MCP server", () => {
         name: "spawn_thread",
         arguments: { charter: "child", provider: "claude", model: "claude-sonnet-4-6" },
       });
+      const invalidRes = (await parentClient.callTool({
+        name: "delegate_event_source",
+        arguments: { child_thread_id: "t2", source: "not-a-reference" },
+      })) as CallToolResult;
+      expect(invalidRes.isError).toBe(true);
+      expect(dataOf(invalidRes)).toContain("reference must be <scheme>:<path>");
+
       mesh.subscribeEventSource("github:dummy-org", "root", "root");
       await rootClient.callTool({
         name: "delegate_event_source",
@@ -1053,7 +1060,7 @@ describe("agent-execution MCP server", () => {
         name: "spawn_thread",
         arguments: { charter: "child", provider: "claude", model: "claude-sonnet-4-6" },
       });
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
       await rootClient.callTool({
         name: "delegate_event_source",
         arguments: {
@@ -1128,7 +1135,7 @@ describe("agent-execution MCP server", () => {
         name: "spawn_thread",
         arguments: { charter: "system owner", provider: "claude", model: "claude-sonnet-4-6" },
       });
-      mesh.subscribeEventSource({ kind: "system" }, "root", "root");
+      mesh.subscribeEventSource("system:events", "root", "root");
 
       const result = (await rootClient.callTool({
         name: "delegate_event_source",
@@ -1173,7 +1180,7 @@ describe("agent-execution MCP server", () => {
     it("lets root delegate from its org root source and list the assignment", async () => {
       const { mesh } = setup();
       const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
       await client.callTool({
         name: "spawn_thread",

@@ -9,6 +9,7 @@ import {
   InMemoryEventSubscriptionStore,
   isStrictSubResourceOf,
   isSubResourceOf,
+  normalizeEventResource,
   parentOf,
   reconcileEventSources,
   resourceKey,
@@ -463,6 +464,38 @@ describe("UnionEventSubscriptionStore and implied persistence", () => {
     ]);
   });
 
+  it("drops an invalid legacy resource instead of rewriting it as canonical v3", () => {
+    const file = join(tmpdir(), `event-subs-test-invalid-${Date.now()}.json`);
+    const rootId = "root";
+    writeFileSync(
+      file,
+      JSON.stringify({
+        version: 2,
+        subscriptions: [
+          {
+            resource: "not-a-reference",
+            actorId: "invalid-worker",
+            subscribedBy: rootId,
+            subscribedAt: "2026-01-01T00:00:00Z",
+          },
+          {
+            resource: { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+            actorId: "valid-worker",
+            subscribedBy: rootId,
+            subscribedAt: "2026-01-01T00:00:00Z",
+          },
+        ],
+      })
+    );
+
+    const store = new FileEventSubscriptionStore(file, rootId);
+    expect(store.list().map((subscription) => subscription.actorId)).toEqual(["valid-worker"]);
+    expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({
+      version: 3,
+      subscriptions: [expect.objectContaining({ resource: REPO, actorId: "valid-worker" })],
+    });
+  });
+
   it("locks the existing same-key inactive-collision behavior", () => {
     const file = join(tmpdir(), `event-subs-test-tombstone-${Date.now()}.json`);
     writeFileSync(file, JSON.stringify({ version: 3, subscriptions: [] }));
@@ -548,11 +581,18 @@ describe("Event Resource Primitives with Reference Grammar", () => {
   });
 
   describe("resourceKey", () => {
-    it("returns canonical key for references and legacy objects", () => {
+    it("returns canonical keys while the migration boundary accepts a legacy object", () => {
       expect(resourceKey(chatSpace)).toBe("gchat:spaces/123");
       expect(resourceKey(system)).toBe("system:events");
-      expect(resourceKey({ kind: "github_issue", repo: "o/r", number: 42 })).toBe(
+      expect(normalizeEventResource({ kind: "github_issue", repo: "o/r", number: 42 })).toBe(
         "github:o/r/issues/42"
+      );
+      expect(() => normalizeEventResource("not-a-reference")).toThrow(/<scheme>:<path>/);
+      expect(normalizeEventResource("github:o/r/branches/feature%2fchild")).toBe(
+        "github:o/r/branches/feature%2Fchild"
+      );
+      expect(normalizeEventResource("github:o/r/branches/refs%2Fheads%2Ffeature%2Fchild")).toBe(
+        "github:o/r/branches/feature%2Fchild"
       );
     });
   });
@@ -560,7 +600,7 @@ describe("Event Resource Primitives with Reference Grammar", () => {
   describe("sameResource", () => {
     it("returns true for same chat_space", () => {
       expect(sameResource(chatSpace, chatSpace)).toBe(true);
-      expect(sameResource(chatSpace, { kind: "chat_space", space: "spaces/123" })).toBe(true);
+      expect(sameResource(chatSpace, "gchat:spaces/123")).toBe(true);
     });
 
     it("returns false for different chat_spaces", () => {

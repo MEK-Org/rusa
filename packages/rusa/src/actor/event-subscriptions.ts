@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import {
+  asGitHubBranch,
   githubBranchReference,
   isDescendantOf,
   parseReference,
@@ -27,8 +28,11 @@ export type EventSourceKind =
   | "chat_space"
   | "system";
 
-export type EventResource =
-  | string
+/** The one canonical event-source representation used by stores and routing. */
+export type EventResource = string;
+
+/** Legacy input accepted only while reading old files and decomposed MCP arguments. */
+export type LegacyEventResourceInput =
   | Reference
   | { kind: "github_org"; org: string }
   | { kind: "github_repo"; repo: string }
@@ -78,57 +82,46 @@ export interface EventSubscriptionStore {
   activeForResource(resource: EventResource): EventSubscription[];
 }
 
-/** Normalize any event resource (reference, string, or legacy object) into a canonical reference string. */
-export function normalizeEventResource(resource: unknown): string {
+/** Normalize a boundary input into one validated canonical reference string. */
+export function normalizeEventResource(
+  resource: EventResource | LegacyEventResourceInput
+): EventResource {
+  let candidate: string | undefined;
   if (typeof resource === "string") {
     const trimmed = resource.trim();
-    if (!trimmed) return trimmed;
+    candidate = trimmed;
     // Legacy string format conversions
     if (trimmed.startsWith("github_org:")) {
-      return `github:${trimmed.slice("github_org:".length)}`;
-    }
-    if (trimmed.startsWith("github_repo:")) {
-      return `github:${trimmed.slice("github_repo:".length)}`;
-    }
-    if (trimmed.startsWith("github_issue:") || trimmed.startsWith("github_pr:")) {
+      candidate = `github:${trimmed.slice("github_org:".length)}`;
+    } else if (trimmed.startsWith("github_repo:")) {
+      candidate = `github:${trimmed.slice("github_repo:".length)}`;
+    } else if (trimmed.startsWith("github_issue:") || trimmed.startsWith("github_pr:")) {
       const isPr = trimmed.startsWith("github_pr:");
       const rest = trimmed.slice(isPr ? "github_pr:".length : "github_issue:".length);
       const match = /^(.+)#([1-9]\d*)$/.exec(rest);
       if (match) {
-        return `github:${match[1]}/${isPr ? "pulls" : "issues"}/${match[2]}`;
+        candidate = `github:${match[1]}/${isPr ? "pulls" : "issues"}/${match[2]}`;
       }
-    }
-    if (trimmed.startsWith("github_branch:")) {
+    } else if (trimmed.startsWith("github_branch:")) {
       const rest = trimmed.slice("github_branch:".length);
       const atIdx = rest.indexOf("@");
       if (atIdx > 0) {
         const repo = rest.slice(0, atIdx);
         const ref = rest.slice(atIdx + 1);
-        return githubBranchReference(repo, ref);
+        candidate = githubBranchReference(repo, ref);
       }
-    }
-    if (trimmed === "chat") {
-      return "gchat:spaces";
-    }
-    if (trimmed.startsWith("chat_space:")) {
+    } else if (trimmed === "chat") {
+      candidate = "gchat:spaces";
+    } else if (trimmed.startsWith("chat_space:")) {
       const space = trimmed.slice("chat_space:".length);
-      return `gchat:${space.startsWith("spaces/") ? space : `spaces/${space}`}`;
+      candidate = `gchat:${space.startsWith("spaces/") ? space : `spaces/${space}`}`;
+    } else if (trimmed === "system") {
+      candidate = "system:events";
     }
-    if (trimmed === "system") {
-      return "system:events";
-    }
-    try {
-      return parseReference(trimmed).key;
-    } catch {
-      return trimmed;
-    }
-  }
-
-  if (typeof resource === "object" && resource !== null) {
+  } else if (typeof resource === "object" && resource !== null) {
     if ("key" in resource && typeof (resource as Reference).key === "string") {
-      return (resource as Reference).key;
-    }
-    if ("kind" in resource) {
+      candidate = (resource as Reference).key;
+    } else if ("kind" in resource) {
       const legacy = resource as {
         kind: string;
         org?: string;
@@ -139,26 +132,38 @@ export function normalizeEventResource(resource: unknown): string {
       };
       switch (legacy.kind) {
         case "github_org":
-          return `github:${legacy.org}`;
+          candidate = `github:${legacy.org}`;
+          break;
         case "github_repo":
-          return `github:${legacy.repo}`;
+          candidate = `github:${legacy.repo}`;
+          break;
         case "github_issue":
-          return `github:${legacy.repo}/issues/${legacy.number}`;
+          candidate = `github:${legacy.repo}/issues/${legacy.number}`;
+          break;
         case "github_pr":
-          return `github:${legacy.repo}/pulls/${legacy.number}`;
+          candidate = `github:${legacy.repo}/pulls/${legacy.number}`;
+          break;
         case "github_branch":
-          return githubBranchReference(legacy.repo ?? "", legacy.ref ?? "");
+          candidate = githubBranchReference(legacy.repo ?? "", legacy.ref ?? "");
+          break;
         case "chat":
-          return "gchat:spaces";
+          candidate = "gchat:spaces";
+          break;
         case "chat_space":
-          return `gchat:${legacy.space?.startsWith("spaces/") ? legacy.space : `spaces/${legacy.space}`}`;
+          candidate = `gchat:${legacy.space?.startsWith("spaces/") ? legacy.space : `spaces/${legacy.space}`}`;
+          break;
         case "system":
-          return "system:events";
+          candidate = "system:events";
+          break;
       }
     }
   }
 
-  return String(resource);
+  const parsed = parseReference(candidate ?? String(resource));
+  const branch = asGitHubBranch(parsed);
+  return branch
+    ? githubBranchReference(`${branch.owner}/${branch.repo}`, branch.branch)
+    : parsed.key;
 }
 
 export const resourceKey = (resource: EventResource): string => normalizeEventResource(resource);
@@ -366,7 +371,17 @@ export class FileEventSubscriptionStore implements EventSubscriptionStore {
       }
       for (const s of parsed.subscriptions ?? []) {
         didLoadSubscriptions = true;
-        const normalizedResource = normalizeEventResource(s.resource);
+        let normalizedResource: EventResource;
+        try {
+          normalizedResource = normalizeEventResource(
+            s.resource as EventResource | LegacyEventResourceInput
+          );
+        } catch {
+          // Invalid legacy rows cannot participate in reference routing. Drop
+          // them explicitly and rewrite the file without blessing them as v3.
+          needsMigrationFlush = true;
+          continue;
+        }
         if (isUnversioned && s.actorId === rootId && s.subscribedBy === rootId) {
           continue;
         }

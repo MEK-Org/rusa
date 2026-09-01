@@ -2,6 +2,7 @@ import type { InboxStore } from "../actor/inbox-store.js";
 import type { ChatClient } from "../chat/types.js";
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import {
+  asGitHubBranch,
   asGitHubIssue,
   parseReference,
   type Reference,
@@ -179,8 +180,20 @@ async function resolveGitHub(
   reference: Reference,
   deps: ReferenceResolverDeps
 ): Promise<ResolvedReference> {
+  const branch = asGitHubBranch(reference);
   const issue = asGitHubIssue(reference);
   const url = referenceUrl(reference);
+
+  if (branch) {
+    return {
+      ...unresolved(
+        reference,
+        `${branch.owner}/${branch.repo}@${branch.branch}`,
+        "branch content is not fetched"
+      ),
+      url,
+    };
+  }
 
   if (!issue) {
     // A sub-resource — a comment or a review. Unlike the previous grammar, the

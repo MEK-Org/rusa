@@ -61,6 +61,7 @@ describe("reference grammar", () => {
     expect(isReference("github:MEK-Org")).toBe(true);
     expect(parseReference("gchat:spaces").key).toBe("gchat:spaces");
     expect(isReference("gchat:spaces")).toBe(true);
+    expect(referenceParent(parseReference("gchat:spaces"))).toBeNull();
     // But a dangling collection is still nonsense at any depth.
     expect(isReference("github:MEK-Org/rusa/issues")).toBe(false);
     expect(isReference("gchat:spaces/AAAA/messages")).toBe(false);
@@ -174,6 +175,9 @@ describe("reference grammar", () => {
       branch: "mc/0940705a/fix",
     });
     expect(asGitHubBranch(parseReference("github:MEK-Org/rusa/branches/%"))).toBeNull();
+    expect(referenceUrl(branchRef)).toBe(
+      "https://github.com/MEK-Org/rusa/tree/mc%2F0940705a%2Ffix"
+    );
     expect(referenceParent(branchRef)?.key).toBe("github:MEK-Org/rusa");
     expect(isDescendantOf(branchRef, parseReference("github:MEK-Org/rusa"))).toBe(true);
   });

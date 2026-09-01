@@ -176,6 +176,9 @@ export function isReference(value: string): boolean {
 export function referenceParent(reference: Reference): Reference | null {
   const root = ROOT_SEGMENTS[reference.scheme];
   const segments = [...reference.segments];
+  if (reference.scheme === "gchat" && segments.length === 1 && segments[0] === "spaces") {
+    return null;
+  }
   if (reference.scheme === "gchat" && segments.length === 2 && segments[0] === "spaces") {
     return {
       scheme: "gchat",
@@ -328,6 +331,10 @@ export function asGitHubTarget(reference: Reference): GitHubTarget | null {
  */
 export function referenceUrl(reference: Reference): string | null {
   if (reference.scheme !== "github") return null;
+  const branch = asGitHubBranch(reference);
+  if (branch) {
+    return `https://github.com/${branch.owner}/${branch.repo}/tree/${encodeURIComponent(branch.branch)}`;
+  }
   const segments = [...reference.segments];
 
   let anchor = "";
