@@ -154,6 +154,7 @@ function setup(
     }) => string;
     idgen?: () => string;
     onYield?: (actorId: string, ctx: { notifyingParent: boolean }) => string | null | undefined;
+    recordRunYield?: ActorMeshOptions["recordRunYield"];
     inboxStore?: InboxStore;
     onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
     grantableCapabilities?: ReadonlySet<string>;
@@ -188,6 +189,7 @@ function setup(
     grantableCapabilities: opts.grantableCapabilities,
     idgen: opts.idgen ?? (() => `t${++seq}`),
     onYield: opts.onYield,
+    recordRunYield: opts.recordRunYield,
     now: () => "2026-01-01T00:00:00Z",
     onRetire: opts.onRetire,
     onSpawn: opts.onSpawn,
@@ -1127,6 +1129,7 @@ describe("ActorMesh", () => {
   it("mechanically notifies the parent when a parent-triggered run yields", async () => {
     const chat: { senderId: string; recipientId: string; body: string; sessionId?: string }[] = [];
     const inboxStore = createMemoryInboxStore();
+    const recordRunYield = vi.fn(() => "durable-run-1");
     let mesh!: ReturnType<typeof setup>["mesh"];
     let id!: string;
     const provider = new FakeProvider(() => {
@@ -1140,6 +1143,7 @@ describe("ActorMesh", () => {
         return "msg";
       },
       inboxStore,
+      recordRunYield,
     });
     mesh = env.mesh;
     id = mesh.spawn({ charter: "do work", parentId: "root" });
@@ -1153,11 +1157,12 @@ describe("ActorMesh", () => {
     expect(inboxStore.entries.find((entry) => entry.actorId === "root")?.payload).toMatchObject({
       type: "mesh.mechanical_note",
       note: `[yield/complete] ${id}: done`,
-      runId: id,
+      runId: "durable-run-1",
       actorId: id,
       status: "complete",
       fromId: id,
     });
+    expect(recordRunYield).toHaveBeenCalledWith(id, "complete", "done");
     expect(env.fake("root").calls.at(-1)?.prompt).toContain("Work from your inbox");
   });
 

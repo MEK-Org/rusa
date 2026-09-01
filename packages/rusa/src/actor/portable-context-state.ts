@@ -11,7 +11,7 @@ import {
 import { join } from "node:path";
 import { z } from "zod";
 
-export const PORTABLE_CONTEXT_SCHEMA_VERSION = 2 as const;
+export const PORTABLE_CONTEXT_SCHEMA_VERSION = 3 as const;
 
 /**
  * Every kind a *persisted* ledger file may contain.
@@ -81,12 +81,10 @@ const portableMemoryItemSchema = z.object({
 });
 export type PortableMemoryItem = z.infer<typeof portableMemoryItemSchema>;
 
-export const portableContextStateSchema = z.object({
-  schemaVersion: z.literal(PORTABLE_CONTEXT_SCHEMA_VERSION),
+const portableContextStateFields = {
   actorId: z.string().min(1),
   generation: z.number().int().nonnegative(),
   updatedAt: z.string().min(1),
-  lastFoldedMessageEventId: z.string().min(1).nullable(),
   compactor: z
     .object({
       provider: z.literal("gemini"),
@@ -94,8 +92,36 @@ export const portableContextStateSchema = z.object({
     })
     .nullable(),
   items: z.array(portableMemoryItemSchema),
+};
+
+export const portableContextStateSchema = z.object({
+  schemaVersion: z.literal(PORTABLE_CONTEXT_SCHEMA_VERSION),
+  ...portableContextStateFields,
+  /** Durable mesh_chat or actor_runs id; never a mesh_events cursor after v3 writes. */
+  lastFoldedSourceId: z.string().min(1).nullable(),
 });
 export type PortableContextState = z.infer<typeof portableContextStateSchema>;
+
+const portableContextStateV2Schema = z.object({
+  schemaVersion: z.literal(2),
+  ...portableContextStateFields,
+  lastFoldedMessageEventId: z.string().min(1).nullable(),
+});
+
+function parsePortableContextState(value: unknown): PortableContextState {
+  const version =
+    value !== null && typeof value === "object" && "schemaVersion" in value
+      ? (value as { schemaVersion?: unknown }).schemaVersion
+      : undefined;
+  if (version !== 2) return portableContextStateSchema.parse(value);
+  const legacy = portableContextStateV2Schema.parse(value);
+  return portableContextStateSchema.parse({
+    ...legacy,
+    schemaVersion: PORTABLE_CONTEXT_SCHEMA_VERSION,
+    lastFoldedSourceId: legacy.lastFoldedMessageEventId,
+    lastFoldedMessageEventId: undefined,
+  });
+}
 
 export function emptyPortableContextState(actorId: string): PortableContextState {
   return {
@@ -103,7 +129,7 @@ export function emptyPortableContextState(actorId: string): PortableContextState
     actorId,
     generation: 0,
     updatedAt: new Date(0).toISOString(),
-    lastFoldedMessageEventId: null,
+    lastFoldedSourceId: null,
     compactor: null,
     items: [],
   };
@@ -115,7 +141,7 @@ export interface PortableContextStore {
   pathFor(actorId: string): string;
 }
 
-/** Human-readable, atomically replaced materialized cache over mesh_events. */
+/** Human-readable, atomically replaced cache over durable chat/run sources. */
 export class FilePortableContextStore implements PortableContextStore {
   constructor(private readonly dir: string) {}
 
@@ -126,7 +152,7 @@ export class FilePortableContextStore implements PortableContextStore {
   load(actorId: string): PortableContextState {
     const path = this.pathFor(actorId);
     if (!existsSync(path)) return emptyPortableContextState(actorId);
-    const parsed = portableContextStateSchema.parse(JSON.parse(readFileSync(path, "utf8")));
+    const parsed = parsePortableContextState(JSON.parse(readFileSync(path, "utf8")));
     if (parsed.actorId !== actorId) {
       throw new Error(
         `portable context actor mismatch: expected ${actorId}, got ${parsed.actorId}`

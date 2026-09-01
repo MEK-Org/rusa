@@ -16,24 +16,24 @@ import {
  * agy actor with no compaction knob) with a bounded, deterministic seed.
  *
  * This module is the pure assembly step. It has no db dependency — the wiring
- * (start.ts) fetches the actor's `run_end` events and hands them here — mirroring
+ * (start.ts) fetches the actor's durable run records and hands them here — mirroring
  * the actor layer's other pure seams (mesh-events, failure-sink).
  */
 
 /** A prior run's output: the raw material for portable-context assembly. */
 export interface PriorRun {
-  /** The source mesh_event id — recorded in the inject record for provenance. */
+  /** The source actor_run id — recorded in the inject record for provenance. */
   id: string;
   /** ISO stamp of the run, used only for the per-run header in the section. */
   ts: string;
-  /** The run's captured output (a `run_end` body); may be null/empty. */
+  /** The run's captured output; may be null/empty. */
   body: string | null;
 }
 
 /**
  * The per-run inject record (design ISSUE_NUM, root's one attached requirement).
  * Emitted at inject time so "what was injected into run X" is answerable even
- * after the source `run_end` rows age out. `bytes` is the A/B PRIMARY metric
+ * after observability events age out. `bytes` is the A/B PRIMARY metric
  * (injected prefix size); `hash` makes the byte-cap's drop-oldest prefix shift
  * explicit; `sourceEventIds` are the exact runs the prefix was built from.
  */
@@ -42,7 +42,7 @@ export interface InjectRecord {
   bytes: number;
   /** sha256 of the rendered section; pins exactly what was injected. */
   hash: string;
-  /** Source `run_end` event ids, oldest→newest, that the prefix was built from. */
+  /** Source actor_run ids, oldest→newest. The field name is retained for wire compatibility. */
   sourceEventIds: string[];
   /** How many prior runs survived the byte cap. */
   runCount: number;
