@@ -3133,7 +3133,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
           projectId: "test",
           subscription: "test",
           pubsubKeyPath: "/dev/null",
-          gchat: "all",
+          // Outbound grants do not narrow the root's inbound event source.
+          gchat: ["spaces/OUTBOUND_ONLY"],
         },
         observability: {
           diskAlert: {

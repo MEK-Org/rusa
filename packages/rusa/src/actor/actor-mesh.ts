@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
 import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../mcp/stamp.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
+import { asGitHubIssue, parseReference } from "../references/reference.js";
 import {
   type CapabilityGrantStore,
   InMemoryCapabilityGrantStore,
@@ -42,6 +43,17 @@ import type { ActorRunMode, RunNudge } from "./trigger-runner.js";
 
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
 export const SCHEDULER_SENDER_ID = "scheduler";
+
+/** Map only the issue-shaped event resources obligations may govern. */
+function eventResourceObligationKey(resource: EventResource): string | undefined {
+  const key = resourceKey(resource);
+  try {
+    return asGitHubIssue(parseReference(key)) ? key : undefined;
+  } catch {
+    // An invalid resource cannot name an obligation. Preserve subscription routing.
+    return undefined;
+  }
+}
 
 /** Runtime contract the mesh needs for routing; provider-backed Actor is one implementation. */
 export interface MeshActor {
@@ -1276,7 +1288,8 @@ export class ActorMesh {
    */
   private obligationOwnerFor(resource: EventResource): string | undefined {
     if (!this.obligations) return undefined;
-    const referenceKey = resourceKey(resource);
+    const referenceKey = eventResourceObligationKey(resource);
+    if (!referenceKey) return undefined;
     return this.obligations.findLiveByExternalRef(referenceKey)?.ownerId;
   }
 

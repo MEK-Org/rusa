@@ -4991,13 +4991,14 @@ describe("ActorMesh", () => {
       expect(woken).toEqual([]);
     });
 
-    it("leaves a source the grammar cannot name entirely to subscriptions", async () => {
-      // Only an issue or PR can be an obligation's identity, so a repo-level
-      // source has no reference to match and routes as it always did.
+    it("leaves repo-level sources to subscriptions even when an obligation claims the repo", async () => {
+      // Repo-level obligations are valid identity claims, but #85 is an
+      // identifier migration rather than an expansion of obligation-governed
+      // routing. Only issue/PR events and their descendants are governed here.
       const repoResource = { kind: "github_repo" as const, repo: "MEK-Org/rusa" };
       let steward = "";
       const woken = await wokenBy(
-        owning({ [REF]: "someone-else" }),
+        owning({ "github:MEK-Org/rusa": "someone-else" }),
         (mesh) => {
           steward = mesh.spawn({ charter: "repo steward", parentId: "root" });
           mesh.subscribeEventSource(repoResource, steward, "root");

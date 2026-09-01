@@ -41,10 +41,8 @@
  *    integration, the entity in the path. Adding discussions or releases costs
  *    nothing. The previous grammar needed an enum member per pair, which is why
  *    a bare `github_comment:<id>` came out an orphan naming no issue.
- * 2. **Containment is a prefix test** ({@link isDescendantOf}) rather than a
- *    hand-written switch per kind — which is what `event-subscriptions.ts`
- *    currently spends `resourceKey`, `sameResource`, `parentOf` and
- *    `isSubResourceOf` on.
+ * 2. **Containment is a prefix test** ({@link isDescendantOf}) rather than the
+ *    hand-written per-kind hierarchy that event subscriptions previously used.
  * 3. **One spelling.** An abbreviated alternate was considered and rejected:
  *    dedupe is string equality (`UNIQUE(obligation_id, ref)`, `resolution_ref`
  *    as text), and a model writing either spelling would produce duplicate
@@ -240,7 +238,11 @@ export function asGitHubBranch(reference: Reference): GitHubBranchReference | nu
   if (reference.segments.length !== 4) return null;
   const [owner, repo, collection, rawBranch] = reference.segments;
   if (!owner || !repo || collection !== "branches" || !rawBranch) return null;
-  return { owner, repo, branch: decodeURIComponent(rawBranch) };
+  try {
+    return { owner, repo, branch: decodeURIComponent(rawBranch) };
+  } catch {
+    return null;
+  }
 }
 
 /**

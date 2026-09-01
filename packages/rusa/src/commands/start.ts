@@ -363,13 +363,10 @@ function configuredRootEventSources(config: RusaConfig): EventResource[] {
   }
 
   if (config.chat) {
-    if (Array.isArray(config.chat.gchat)) {
-      for (const space of config.chat.gchat) {
-        configured.push(`gchat:${space.startsWith("spaces/") ? space : `spaces/${space}`}`);
-      }
-    } else {
-      configured.push("gchat:spaces");
-    }
+    // `chat.gchat` is an outbound capability grant, not an inbound event
+    // subscription boundary. Configuring chat keeps the existing all-spaces
+    // event ownership; ingestion exclusions remain `chat.excludedSpaces`.
+    configured.push("gchat:spaces");
   }
 
   // Disk alerts are a host-owned event source, so configuring the producer is

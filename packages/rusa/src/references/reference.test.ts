@@ -173,6 +173,7 @@ describe("reference grammar", () => {
       repo: "rusa",
       branch: "mc/0940705a/fix",
     });
+    expect(asGitHubBranch(parseReference("github:MEK-Org/rusa/branches/%"))).toBeNull();
     expect(referenceParent(branchRef)?.key).toBe("github:MEK-Org/rusa");
     expect(isDescendantOf(branchRef, parseReference("github:MEK-Org/rusa"))).toBe(true);
   });
