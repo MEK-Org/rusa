@@ -24,8 +24,11 @@ import { assertSpawnContextSupported } from "../actor/context-selection.js";
 import { E2EInstanceManager } from "../actor/e2e-instance-manager.js";
 import {
   type EventResource,
+  type EventSubscriptionAuditEvent,
+  type EventSubscriptionStore,
   FileEventSubscriptionStore,
   isSubResourceOf,
+  missingAuditedEventSubscriptions,
   normalizeEventResource,
   reconcileEventSources,
   resourceKey,
@@ -549,6 +552,32 @@ export function mechanicallySubscribeCreatedResource(
   }
 }
 
+/**
+ * Warn about audit-confirmed configured subscriptions missing from the behavioral store.
+ * The audit stream is diagnostic only: this never reconstructs routing state from events.
+ */
+export function warnMissingConfiguredEventSubscriptionsAtBoot(
+  store: EventSubscriptionStore,
+  auditEvents: readonly EventSubscriptionAuditEvent[],
+  configuredRoots: readonly EventResource[],
+  warn: (message: string) => void = console.warn
+): Array<{ resource: EventResource; actorId: string }> {
+  const missing = missingAuditedEventSubscriptions(store, auditEvents).filter(({ resource }) =>
+    configuredRoots.some((configuredRoot) => isSubResourceOf(resource, configuredRoot))
+  );
+  if (missing.length === 0) return [];
+
+  const shown = missing.slice(0, 10);
+  const identities = shown.map(({ resource, actorId }) => `${resource} -> ${actorId}`).join(", ");
+  const remainder = missing.length - shown.length;
+  warn(
+    `[mesh] event subscription consistency: ${missing.length} ` +
+      `audit-confirmed active subscription(s) absent from the durable store: ${identities}` +
+      (remainder > 0 ? ` (+${remainder} more)` : "")
+  );
+  return missing;
+}
+
 function loadRootSessionId(file: string): string | undefined {
   try {
     return (JSON.parse(readFileSync(file, "utf-8")) as { sessionId?: string }).sessionId;
@@ -786,6 +815,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     activeRunIds.delete(actorId);
     return runId;
   };
+
+  // Capture the disposable audit projection while this startup unquestionably
+  // owns an open DB handle. Some boot paths cross asynchronous probes before
+  // the subscription store is constructed; tests and multi-instance shutdowns
+  // may close the shared handle during that gap.
+  const eventSubscriptionAudit = getRepositories().meshEvents.listByKinds(
+    ["event_source_subscribed", "event_source_unsubscribed"],
+    { bodyKinds: [] }
+  );
+  const configuredRoots = configuredRootEventSources(config);
 
   // #1645 ready-head attention. Attached here, immediately after initDb, rather
   // than beside the mesh: `getRepositories()` throws once the database is
@@ -1224,6 +1263,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     join(mcHome, "event-subscriptions.json"),
     rootId
   );
+  warnMissingConfiguredEventSubscriptionsAtBoot(
+    persistentEventSubscriptions,
+    eventSubscriptionAudit,
+    configuredRoots
+  );
   // Host-plane host-jobs capability : durable per-actor job records, keyed
   // the same way capabilityGrants/eventSubscriptions are.
   const hostJobStore = new FileHostJobStore(join(mcHome, "host-jobs.json"));
@@ -1232,7 +1276,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     workersDir,
     handleForId: (id) => (id === rootId ? rootHandle : generateHandle(id)),
   });
-  const configuredRoots = configuredRootEventSources(config);
   const rootSourceSync = reconcileEventSources(
     persistentEventSubscriptions,
     configuredRoots,
