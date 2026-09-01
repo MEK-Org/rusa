@@ -931,7 +931,7 @@ describe("agent-execution MCP server", () => {
         name: "spawn_thread",
         arguments: { charter: "child", provider: "claude", model: "claude-sonnet-4-6" },
       });
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
       await rootClient.callTool({
         name: "delegate_event_source",
         arguments: {
@@ -951,7 +951,9 @@ describe("agent-execution MCP server", () => {
         },
       })) as CallToolResult;
       expect(delegateRes.isError).toBeFalsy();
-      expect(dataOf(delegateRes)).toContain("delegated github_pr:dummy-org/dummy-repo#616");
+      expect(dataOf(delegateRes)).toContain(
+        "delegated github:dummy-org/dummy-repo/pulls/616 to t2"
+      );
 
       let listRes = (await rootClient.callTool({
         name: "list_subscriptions",
@@ -961,7 +963,7 @@ describe("agent-execution MCP server", () => {
         expect.arrayContaining([
           expect.objectContaining({
             actorId: "t2",
-            resource: { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 616 },
+            resource: "github:dummy-org/dummy-repo/pulls/616",
             subscribedBy: "t1",
           }),
         ])
@@ -972,7 +974,7 @@ describe("agent-execution MCP server", () => {
         arguments: { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 616 },
       })) as CallToolResult;
       expect(reclaimRes.isError).toBeFalsy();
-      expect(dataOf(reclaimRes)).toContain("reclaimed github_pr:dummy-org/dummy-repo#616");
+      expect(dataOf(reclaimRes)).toContain("reclaimed github:dummy-org/dummy-repo/pulls/616");
 
       listRes = (await rootClient.callTool({
         name: "list_subscriptions",
@@ -982,7 +984,63 @@ describe("agent-execution MCP server", () => {
         expect.arrayContaining([
           expect.objectContaining({
             actorId: "t1",
-            resource: { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 616 },
+            resource: "github:dummy-org/dummy-repo/pulls/616",
+            subscribedBy: "t1",
+          }),
+        ])
+      );
+    });
+
+    it("accepts a direct URL-style reference source string through the tool schema", async () => {
+      const { mesh } = setup();
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+      await rootClient.callTool({
+        name: "spawn_thread",
+        arguments: { charter: "parent", provider: "claude", model: "claude-sonnet-4-6" },
+      });
+      const parentClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
+      await parentClient.callTool({
+        name: "spawn_thread",
+        arguments: { charter: "child", provider: "claude", model: "claude-sonnet-4-6" },
+      });
+      const invalidRes = (await parentClient.callTool({
+        name: "delegate_event_source",
+        arguments: { child_thread_id: "t2", source: "not-a-reference" },
+      })) as CallToolResult;
+      expect(invalidRes.isError).toBe(true);
+      expect(dataOf(invalidRes)).toContain("reference must be <scheme>:<path>");
+
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
+      await rootClient.callTool({
+        name: "delegate_event_source",
+        arguments: {
+          child_thread_id: "t1",
+          source: "github:dummy-org/dummy-repo",
+        },
+      });
+
+      const delegateRes = (await parentClient.callTool({
+        name: "delegate_event_source",
+        arguments: {
+          child_thread_id: "t2",
+          source: "github:dummy-org/dummy-repo/issues/42",
+        },
+      })) as CallToolResult;
+      expect(delegateRes.isError).toBeFalsy();
+      expect(dataOf(delegateRes)).toContain(
+        "delegated github:dummy-org/dummy-repo/issues/42 to t2"
+      );
+
+      const listRes = (await rootClient.callTool({
+        name: "list_subscriptions",
+        arguments: {},
+      })) as CallToolResult;
+      expect(dataOf(listRes)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            actorId: "t2",
+            resource: "github:dummy-org/dummy-repo/issues/42",
             subscribedBy: "t1",
           }),
         ])
@@ -1002,7 +1060,7 @@ describe("agent-execution MCP server", () => {
         name: "spawn_thread",
         arguments: { charter: "child", provider: "claude", model: "claude-sonnet-4-6" },
       });
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
       await rootClient.callTool({
         name: "delegate_event_source",
         arguments: {
@@ -1025,7 +1083,7 @@ describe("agent-execution MCP server", () => {
       })) as CallToolResult;
       expect(delegateRes.isError).toBeFalsy();
       expect(dataOf(delegateRes)).toContain(
-        "delegated github_branch:dummy-org/dummy-repo@refs/heads/staging"
+        "delegated github:dummy-org/dummy-repo/branches/staging to t2"
       );
 
       let listRes = (await rootClient.callTool({
@@ -1036,11 +1094,7 @@ describe("agent-execution MCP server", () => {
         expect.arrayContaining([
           expect.objectContaining({
             actorId: "t2",
-            resource: {
-              kind: "github_branch",
-              repo: "dummy-org/dummy-repo",
-              ref: "refs/heads/staging",
-            },
+            resource: "github:dummy-org/dummy-repo/branches/staging",
             subscribedBy: "t1",
           }),
         ])
@@ -1056,7 +1110,7 @@ describe("agent-execution MCP server", () => {
       })) as CallToolResult;
       expect(reclaimRes.isError).toBeFalsy();
       expect(dataOf(reclaimRes)).toContain(
-        "reclaimed github_branch:dummy-org/dummy-repo@refs/heads/staging"
+        "reclaimed github:dummy-org/dummy-repo/branches/staging"
       );
 
       listRes = (await rootClient.callTool({
@@ -1067,11 +1121,7 @@ describe("agent-execution MCP server", () => {
         expect.arrayContaining([
           expect.objectContaining({
             actorId: "t1",
-            resource: {
-              kind: "github_branch",
-              repo: "dummy-org/dummy-repo",
-              ref: "refs/heads/staging",
-            },
+            resource: "github:dummy-org/dummy-repo/branches/staging",
             subscribedBy: "t1",
           }),
         ])
@@ -1085,7 +1135,7 @@ describe("agent-execution MCP server", () => {
         name: "spawn_thread",
         arguments: { charter: "system owner", provider: "claude", model: "claude-sonnet-4-6" },
       });
-      mesh.subscribeEventSource({ kind: "system" }, "root", "root");
+      mesh.subscribeEventSource("system:events", "root", "root");
 
       const result = (await rootClient.callTool({
         name: "delegate_event_source",
@@ -1093,10 +1143,10 @@ describe("agent-execution MCP server", () => {
       })) as CallToolResult;
 
       expect(result.isError).toBeFalsy();
-      expect(dataOf(result)).toContain("delegated system to t1");
+      expect(dataOf(result)).toContain("delegated system:events to t1");
       expect(mesh.listSubscriptions()).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ actorId: "t1", resource: { kind: "system" } }),
+          expect.objectContaining({ actorId: "t1", resource: "system:events" }),
         ])
       );
     });
@@ -1130,7 +1180,7 @@ describe("agent-execution MCP server", () => {
     it("lets root delegate from its org root source and list the assignment", async () => {
       const { mesh } = setup();
       const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
       await client.callTool({
         name: "spawn_thread",
@@ -1155,12 +1205,12 @@ describe("agent-execution MCP server", () => {
         expect.arrayContaining([
           expect.objectContaining({
             actorId: "root",
-            resource: { kind: "github_org", org: "dummy-org" },
+            resource: "github:dummy-org",
             subscribedBy: "root",
           }),
           expect.objectContaining({
             actorId: "t1",
-            resource: { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+            resource: "github:dummy-org/dummy-repo",
             subscribedBy: "root",
           }),
         ])

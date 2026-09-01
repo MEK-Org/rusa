@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
 import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../mcp/stamp.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
-import { parseReference } from "../references/reference.js";
+import { asGitHubIssue, parseReference } from "../references/reference.js";
 import {
   type CapabilityGrantStore,
   InMemoryCapabilityGrantStore,
@@ -44,14 +44,13 @@ import type { ActorRunMode, RunNudge } from "./trigger-runner.js";
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
 export const SCHEDULER_SENDER_ID = "scheduler";
 
-/** Map the routable GitHub resources an obligation may claim to its identity key. */
-function eventResourceReferenceKey(resource: EventResource): string | undefined {
-  if (resource.kind !== "github_issue" && resource.kind !== "github_pr") return undefined;
-  const collection = resource.kind === "github_pr" ? "pulls" : "issues";
+/** Map only the issue-shaped event resources obligations may govern. */
+function eventResourceObligationKey(resource: EventResource): string | undefined {
+  const key = resourceKey(resource);
   try {
-    return parseReference(`github:${resource.repo}/${collection}/${resource.number}`).key;
+    return asGitHubIssue(parseReference(key)) ? key : undefined;
   } catch {
-    // An invalid repo cannot name an obligation. Preserve normal event routing.
+    // An invalid resource cannot name an obligation. Preserve subscription routing.
     return undefined;
   }
 }
@@ -1289,7 +1288,7 @@ export class ActorMesh {
    */
   private obligationOwnerFor(resource: EventResource): string | undefined {
     if (!this.obligations) return undefined;
-    const referenceKey = eventResourceReferenceKey(resource);
+    const referenceKey = eventResourceObligationKey(resource);
     if (!referenceKey) return undefined;
     return this.obligations.findLiveByExternalRef(referenceKey)?.ownerId;
   }
@@ -1305,15 +1304,11 @@ export class ActorMesh {
    * Subscribe an actor to an event source. Records an audit event.
    * Throws if another actor is already actively subscribed to the event source.
    */
-  subscribeEventSource(
-    resource: EventSubscription["resource"],
-    actorId: string,
-    subscribedBy: string
-  ): void {
+  subscribeEventSource(resource: EventResource, actorId: string, subscribedBy: string): void {
     actorId = this.resolveThreadId(actorId);
     subscribedBy = this.resolveThreadId(subscribedBy);
     const subscription: EventSubscription = {
-      resource,
+      resource: resourceKey(resource),
       actorId,
       subscribedBy,
       subscribedAt: this.now(),
@@ -1394,11 +1389,7 @@ export class ActorMesh {
   /**
    * Unsubscribe an actor from an event source. Records an audit event.
    */
-  unsubscribeEventSource(
-    resource: EventSubscription["resource"],
-    actorId: string,
-    at: string
-  ): void {
+  unsubscribeEventSource(resource: EventResource, actorId: string, at: string): void {
     actorId = this.resolveThreadId(actorId);
     this.eventSubscriptions.unsubscribe(resource, actorId, at);
     this.recordEvent({

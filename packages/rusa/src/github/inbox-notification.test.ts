@@ -13,7 +13,7 @@ describe("deriveGitHubInboxNotification", () => {
     });
 
     if (!notification) throw new Error("notification not derived");
-    expect(resourceKey(notification.resource)).toBe("github_issue:dummy-org/dummy-repo#903");
+    expect(resourceKey(notification.resource)).toBe("github:dummy-org/dummy-repo/issues/903");
     expect(notification.payload).toEqual({
       type: "issue_comment.created",
       commentId: 4959289232,
@@ -29,7 +29,7 @@ describe("deriveGitHubInboxNotification", () => {
     });
 
     if (!notification) throw new Error("notification not derived");
-    expect(resourceKey(notification.resource)).toBe("github_pr:dummy-org/dummy-repo#910");
+    expect(resourceKey(notification.resource)).toBe("github:dummy-org/dummy-repo/pulls/910");
     expect(notification.payload).toEqual({
       type: "issue_comment.created",
       commentId: 4960049260,
@@ -44,7 +44,7 @@ describe("deriveGitHubInboxNotification", () => {
     });
 
     if (!notification) throw new Error("notification not derived");
-    expect(resourceKey(notification.resource)).toBe("github_pr:dummy-org/dummy-repo#910");
+    expect(resourceKey(notification.resource)).toBe("github:dummy-org/dummy-repo/pulls/910");
     expect(notification.payload).toEqual({ type: "pull_request.synchronize" });
   });
 
@@ -56,7 +56,7 @@ describe("deriveGitHubInboxNotification", () => {
     });
 
     if (!notification) throw new Error("notification not derived");
-    expect(resourceKey(notification.resource)).toBe("github_pr:dummy-org/dummy-repo#910");
+    expect(resourceKey(notification.resource)).toBe("github:dummy-org/dummy-repo/pulls/910");
     expect(notification.payload).toEqual({ type: "pull_request.closed", merged: true });
   });
 
@@ -69,9 +69,7 @@ describe("deriveGitHubInboxNotification", () => {
     });
 
     if (!notification) throw new Error("notification not derived");
-    expect(resourceKey(notification.resource)).toBe(
-      "github_branch:dummy-org/dummy-repo@refs/heads/staging"
-    );
+    expect(resourceKey(notification.resource)).toBe("github:dummy-org/dummy-repo/branches/staging");
     expect(notification.payload).toEqual({ type: "push" });
   });
 
@@ -83,7 +81,7 @@ describe("deriveGitHubInboxNotification", () => {
     });
 
     if (!notification) throw new Error("notification not derived");
-    expect(resourceKey(notification.resource)).toBe("github_repo:dummy-org/dummy-repo");
+    expect(resourceKey(notification.resource)).toBe("github:dummy-org/dummy-repo");
     expect(notification.payload).toEqual({ type: "push" });
   });
 
@@ -97,7 +95,7 @@ describe("deriveGitHubInboxNotification", () => {
 
       if (!notification) throw new Error("notification not derived");
       expect(resourceKey(notification.resource)).toBe(
-        "github_branch:dummy-org/dummy-repo@refs/heads/worker"
+        "github:dummy-org/dummy-repo/branches/worker"
       );
       expect(notification.payload).toEqual({ type: event });
     }
@@ -116,7 +114,7 @@ describe("deriveGitHubInboxNotification", () => {
       });
 
       if (!notification) throw new Error("notification not derived");
-      expect(resourceKey(notification.resource)).toBe("github_pr:dummy-org/dummy-repo#1593");
+      expect(resourceKey(notification.resource)).toBe("github:dummy-org/dummy-repo/pulls/1593");
       expect(notification.payload).toEqual({ type: "check_suite.completed" });
     });
 
@@ -133,7 +131,7 @@ describe("deriveGitHubInboxNotification", () => {
 
       if (!notification) throw new Error("notification not derived");
       expect(resourceKey(notification.resource)).toBe(
-        "github_branch:dummy-org/dummy-repo@refs/heads/staging"
+        "github:dummy-org/dummy-repo/branches/staging"
       );
       expect(notification.payload).toEqual({ type: "check_suite.completed" });
     });
@@ -150,7 +148,7 @@ describe("deriveGitHubInboxNotification", () => {
 
       if (!notification) throw new Error("notification not derived");
       expect(resourceKey(notification.resource)).toBe(
-        "github_branch:dummy-org/dummy-repo@refs/heads/mc/0940705a/fix"
+        "github:dummy-org/dummy-repo/branches/mc%2F0940705a%2Ffix"
       );
       expect(notification.payload).toEqual({ type: "check_suite.rerequested" });
     });
@@ -163,7 +161,7 @@ describe("deriveGitHubInboxNotification", () => {
       });
 
       if (!notification) throw new Error("notification not derived");
-      expect(resourceKey(notification.resource)).toBe("github_repo:dummy-org/dummy-repo");
+      expect(resourceKey(notification.resource)).toBe("github:dummy-org/dummy-repo");
       expect(notification.payload).toEqual({ type: "check_suite.completed" });
     });
 
@@ -178,7 +176,7 @@ describe("deriveGitHubInboxNotification", () => {
       });
 
       if (!notification) throw new Error("notification not derived");
-      expect(resourceKey(notification.resource)).toBe("github_pr:dummy-org/dummy-repo#1593");
+      expect(resourceKey(notification.resource)).toBe("github:dummy-org/dummy-repo/pulls/1593");
       expect(notification.payload).toEqual({ type: "check_run.completed" });
     });
 
@@ -196,7 +194,7 @@ describe("deriveGitHubInboxNotification", () => {
       });
 
       if (!notification) throw new Error("notification not derived");
-      expect(resourceKey(notification.resource)).toBe("github_pr:dummy-org/dummy-repo#1593");
+      expect(resourceKey(notification.resource)).toBe("github:dummy-org/dummy-repo/pulls/1593");
       expect(notification.payload).toEqual({ type: "check_run.completed" });
     });
 
@@ -212,7 +210,7 @@ describe("deriveGitHubInboxNotification", () => {
 
       if (!notification) throw new Error("notification not derived");
       expect(resourceKey(notification.resource)).toBe(
-        "github_branch:dummy-org/dummy-repo@refs/heads/staging"
+        "github:dummy-org/dummy-repo/branches/staging"
       );
       expect(notification.payload).toEqual({ type: "check_run.completed" });
     });
@@ -231,7 +229,7 @@ describe("deriveGitHubInboxNotification", () => {
 
       if (!notification) throw new Error("notification not derived");
       expect(resourceKey(notification.resource)).toBe(
-        "github_branch:dummy-org/dummy-repo@refs/heads/feature-branch"
+        "github:dummy-org/dummy-repo/branches/feature-branch"
       );
       expect(notification.payload).toEqual({ type: "check_run.completed" });
     });
@@ -244,7 +242,7 @@ describe("deriveGitHubInboxNotification", () => {
       });
 
       if (!notification) throw new Error("notification not derived");
-      expect(resourceKey(notification.resource)).toBe("github_repo:dummy-org/dummy-repo");
+      expect(resourceKey(notification.resource)).toBe("github:dummy-org/dummy-repo");
       expect(notification.payload).toEqual({ type: "check_run.completed" });
     });
 

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  asGitHubBranch,
   asGitHubIssue,
+  githubBranchReference,
   isDescendantOf,
   isReference,
   parseReference,
@@ -46,7 +48,7 @@ describe("reference grammar", () => {
       "github:o/r/../x",
       "mesh: messages/1",
       "github:o/r/issues", // dangling collection with no id
-      "gchat:spaces", // same
+      "gchat:spaces/AAAA/messages", // same
     ]) {
       expect(isReference(bad), bad).toBe(false);
     }
@@ -57,8 +59,12 @@ describe("reference grammar", () => {
     // to parse what it produces; an obligation may also be about a whole org.
     expect(parseReference("github:MEK-Org").key).toBe("github:MEK-Org");
     expect(isReference("github:MEK-Org")).toBe(true);
+    expect(parseReference("gchat:spaces").key).toBe("gchat:spaces");
+    expect(isReference("gchat:spaces")).toBe(true);
+    expect(referenceParent(parseReference("gchat:spaces"))).toBeNull();
     // But a dangling collection is still nonsense at any depth.
     expect(isReference("github:MEK-Org/rusa/issues")).toBe(false);
+    expect(isReference("gchat:spaces/AAAA/messages")).toBe(false);
   });
 
   it("walks up by collection/id pairs", () => {
@@ -138,5 +144,41 @@ describe("reference grammar", () => {
       "https://github.com/MEK-Org/rusa/issues/33#issuecomment-12345"
     );
     expect(referenceUrl(parseReference("mesh:messages/1"))).toBeNull();
+  });
+
+  it("parses system scheme references", () => {
+    const systemEvent = parseReference("system:events");
+    expect(systemEvent.scheme).toBe("system");
+    expect(systemEvent.key).toBe("system:events");
+    expect(referenceParent(systemEvent)).toBeNull();
+
+    const diskAlert = parseReference("system:events/alerts/disk");
+    expect(referenceParent(diskAlert)?.key).toBe("system:events");
+    expect(isDescendantOf(diskAlert, systemEvent)).toBe(true);
+  });
+
+  it("handles GitHub branch references and encoding", () => {
+    expect(githubBranchReference("MEK-Org/rusa", "staging")).toBe(
+      "github:MEK-Org/rusa/branches/staging"
+    );
+    expect(githubBranchReference("MEK-Org/rusa", "refs/heads/staging")).toBe(
+      "github:MEK-Org/rusa/branches/staging"
+    );
+    expect(githubBranchReference("MEK-Org/rusa", "refs/heads/mc/0940705a/fix")).toBe(
+      "github:MEK-Org/rusa/branches/mc%2F0940705a%2Ffix"
+    );
+
+    const branchRef = parseReference("github:MEK-Org/rusa/branches/mc%2F0940705a%2Ffix");
+    expect(asGitHubBranch(branchRef)).toEqual({
+      owner: "MEK-Org",
+      repo: "rusa",
+      branch: "mc/0940705a/fix",
+    });
+    expect(asGitHubBranch(parseReference("github:MEK-Org/rusa/branches/%"))).toBeNull();
+    expect(referenceUrl(branchRef)).toBe(
+      "https://github.com/MEK-Org/rusa/tree/mc%2F0940705a%2Ffix"
+    );
+    expect(referenceParent(branchRef)?.key).toBe("github:MEK-Org/rusa");
+    expect(isDescendantOf(branchRef, parseReference("github:MEK-Org/rusa"))).toBe(true);
   });
 });

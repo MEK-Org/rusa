@@ -125,7 +125,7 @@ export function createTrackerMcpServer(
           body: appendPreCreationAuthorStamp(args.body, args.repo),
         });
         options.onWrite?.();
-        notifyResourceCreated({ kind: "github_pr", repo: args.repo, number: pr.number });
+        notifyResourceCreated(`github:${args.repo}/pulls/${pr.number}`);
         return toolOk(pr.htmlUrl);
       } catch (err) {
         return toolError(err);
@@ -274,7 +274,7 @@ export function createTrackerMcpServer(
         const stampedBody = appendPreCreationAuthorStamp(body, repo);
         const issue = await issueClient.createIssue({ repo, title, body: stampedBody, labels });
         options.onWrite?.();
-        notifyResourceCreated({ kind: "github_issue", repo, number: issue.number });
+        notifyResourceCreated(`github:${repo}/issues/${issue.number}`);
         return toolOk(issue.htmlUrl);
       } catch (err) {
         return toolError(err);

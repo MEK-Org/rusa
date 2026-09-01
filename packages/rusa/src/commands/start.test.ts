@@ -216,38 +216,38 @@ describe("start command tests", () => {
     const subscribeEventSource = vi.fn();
     const log = vi.fn();
     const mesh = { subscribeEventSource };
-    const configuredRoots = [{ kind: "github_org" as const, org: "configured-org" }];
+    const configuredRoots = ["github:configured-org"];
 
     for (const actorId of ["root", "worker"]) {
       mechanicallySubscribeCreatedResource(
         mesh,
         configuredRoots,
-        { kind: "github_issue", repo: "configured-org/repo", number: 72 },
+        "github:configured-org/repo/issues/72",
         actorId,
         log
       );
       mechanicallySubscribeCreatedResource(
         mesh,
         configuredRoots,
-        { kind: "github_issue", repo: "other-org/repo", number: 72 },
+        "github:other-org/repo/issues/72",
         actorId,
         log
       );
     }
 
     expect(subscribeEventSource.mock.calls).toEqual([
-      [{ kind: "github_issue", repo: "configured-org/repo", number: 72 }, "root", "root"],
-      [{ kind: "github_issue", repo: "configured-org/repo", number: 72 }, "worker", "worker"],
+      ["github:configured-org/repo/issues/72", "root", "root"],
+      ["github:configured-org/repo/issues/72", "worker", "worker"],
     ]);
     expect(log).toHaveBeenCalledTimes(2);
     expect(log).toHaveBeenCalledWith(
       expect.stringContaining(
-        "github_issue:other-org/repo#72 to root skipped: not anchored in config"
+        "github:other-org/repo/issues/72 to root skipped: not anchored in config"
       )
     );
     expect(log).toHaveBeenCalledWith(
       expect.stringContaining(
-        "github_issue:other-org/repo#72 to worker skipped: not anchored in config"
+        "github:other-org/repo/issues/72 to worker skipped: not anchored in config"
       )
     );
   });
@@ -1174,12 +1174,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // Real topology : root retains the covering org source it delegates
     // slices from — the retired subscriber's event bubbles to root via that
     // source, not via the removed catch-all .
-    mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
-    mesh.subscribeEventSource(
-      { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-      workerId,
-      "root"
-    );
+    mesh.subscribeEventSource("github:dummy-org", "root", "root");
+    mesh.subscribeEventSource("github:dummy-org/dummy-repo", workerId, "root");
 
     // Emit event with repo
     await emitGitHubEvent(
@@ -1204,7 +1200,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(inbox.entries).toHaveLength(1);
     expect(inbox.entries[0]).toMatchObject({
       actorId: workerId,
-      source: "github_issue:dummy-org/dummy-repo#456",
+      source: "github:dummy-org/dummy-repo/issues/456",
       seenAt: null,
       handledAt: null,
       payload: {
@@ -1325,7 +1321,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(getRepositories().inbox.list("root").entries).toEqual([
       expect.objectContaining({
         actorId: "root",
-        source: "system",
+        source: "system:events",
         payload: expect.objectContaining({
           type: "system.disk",
           priority: "responsive",
@@ -1368,7 +1364,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(mesh?.listSubscriptions()).toContainEqual(
       expect.objectContaining({
         actorId: "root",
-        resource: { kind: "system" },
+        resource: "system:events",
         subscribedBy: "root",
       })
     );
@@ -1402,7 +1398,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     if (!mesh || !emitGitHubEvent) throw new Error("Mesh or emitGitHubEvent not ready");
 
     // A covering source is required for emitGitHubEvent to persist inbox work.
-    mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+    mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
     await emitGitHubEvent("issue_comment", {
       action: "created",
@@ -1442,7 +1438,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
     await readyPromise;
     if (!mesh || !emitGitHubEvent) throw new Error("mesh not ready");
-    mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+    mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
     await emitGitHubEvent(
       "issue_comment",
@@ -2047,12 +2043,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+          resource: "github:dummy-org/dummy-repo",
         }),
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "chat" },
+          resource: "gchat:spaces",
         }),
       ])
     );
@@ -2180,7 +2176,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       provider: "antigravity",
       model: "Gemini 3.7 Flash (High)",
     });
-    mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+    mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
     await emitGitHubEvent("issue_comment", {
       action: "created",
@@ -2220,7 +2216,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       throw new Error("Mesh or emitGitHubEvent not ready");
     }
 
-    mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+    mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
     await emitGitHubEvent("issue_comment", {
       action: "created",
@@ -2264,11 +2260,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       }
       // The class is non-allowlisted, so use an exact issue subscription to
       // isolate the sender-filter behavior this test owns.
-      mesh.subscribeEventSource(
-        { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 456 },
-        "root",
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo/issues/456", "root", "root");
 
       // "issues"/"labeled" is on the explicit v1 never-notify list (tracker
       // churn the hygiene/ownership machinery generates) and the sender is
@@ -2336,11 +2328,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!mesh || !emitGitHubEvent) {
         throw new Error("Mesh or emitGitHubEvent not ready");
       }
-      mesh.subscribeEventSource(
-        { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 456 },
-        "root",
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo/issues/456", "root", "root");
 
       await emitGitHubEvent("issues", {
         action: "labeled",
@@ -2379,7 +2367,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!mesh || !emitGitHubEvent) {
         throw new Error("Mesh or emitGitHubEvent not ready");
       }
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
       // issue_comment/created is body-ful, so this rule never engages — but
       // the comment carries no author stamp at all, so the existing
@@ -2421,7 +2409,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!mesh || !emitGitHubEvent) {
         throw new Error("Mesh or emitGitHubEvent not ready");
       }
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
       // pull_request/closed (a merge) is deliberately NOT suppressed: humans
       // merge PRs, and staging-deploy flows subscribe to merge-adjacent
@@ -2465,7 +2453,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!mesh || !emitGitHubEvent) {
         throw new Error("Mesh or emitGitHubEvent not ready");
       }
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
       await emitGitHubEvent("check_run", {
         action: "created",
@@ -2508,7 +2496,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!mesh || !emitGitHubEvent) {
         throw new Error("Mesh or emitGitHubEvent not ready");
       }
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
       await emitGitHubEvent("check_run", {
         action: "completed",
@@ -2571,16 +2559,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
         provider: "antigravity",
         model: "Gemini 3.7 Flash (High)",
       });
-      mesh.subscribeEventSource(
-        { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 77 },
-        prWorker,
-        "root"
-      );
-      mesh.subscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        "root",
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo/pulls/77", prWorker, "root");
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", "root", "root");
 
       // Carries a PR: its owner is woken, and the repo owner is not.
       await emitGitHubEvent("check_suite", {
@@ -2664,7 +2644,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     if (!mesh || !emitGitHubEvent) {
       throw new Error("Mesh or emitGitHubEvent not ready");
     }
-    mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+    mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
     await emitGitHubEvent("issue_comment", {
       action: "created",
@@ -2748,12 +2728,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // Real topology : root retains the covering org source it delegates
     // slices from — the retired subscriber's event bubbles to root via that
     // source, not via the removed catch-all .
-    mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
-    mesh.subscribeEventSource(
-      { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-      workerId,
-      "root"
-    );
+    mesh.subscribeEventSource("github:dummy-org", "root", "root");
+    mesh.subscribeEventSource("github:dummy-org/dummy-repo", workerId, "root");
 
     // Retire worker (no longer live)
     mesh.retire(workerId);
@@ -2812,16 +2788,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       model: "Gemini 3.7 Flash (High)",
     });
 
-    mesh.subscribeEventSource(
-      { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 123 },
-      issueWorker,
-      "root"
-    );
-    mesh.subscribeEventSource(
-      { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 456 },
-      prWorker,
-      "root"
-    );
+    mesh.subscribeEventSource("github:dummy-org/dummy-repo/issues/123", issueWorker, "root");
+    mesh.subscribeEventSource("github:dummy-org/dummy-repo/pulls/456", prWorker, "root");
 
     // 1. True issue comment -> github_issue
     await emitGitHubEvent("issue_comment", {
@@ -3085,7 +3053,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       provider: "antigravity",
       model: "Gemini 3.7 Flash (High)",
     });
-    mesh.delegateEventSource({ kind: "chat_space", space: "spaces/delegated" }, childId, "root");
+    mesh.delegateEventSource("gchat:spaces/delegated", childId, "root");
 
     await chatSource.emit({
       name: "msg-delegated",
@@ -3137,7 +3105,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
           projectId: "test",
           subscription: "test",
           pubsubKeyPath: "/dev/null",
-          gchat: "all",
+          // Outbound grants do not narrow the root's inbound event source.
+          gchat: ["spaces/OUTBOUND_ONLY"],
         },
         observability: {
           diskAlert: {
@@ -3171,27 +3140,27 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "github_repo", repo: "custom-org/custom-repo" },
+          resource: "github:custom-org/custom-repo",
         }),
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "github_org", org: "target-org" },
+          resource: "github:target-org",
         }),
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "github_org", org: "extra-org" },
+          resource: "github:extra-org",
         }),
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "chat" },
+          resource: "gchat:spaces",
         }),
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "system" },
+          resource: "system:events",
         }),
       ])
     );

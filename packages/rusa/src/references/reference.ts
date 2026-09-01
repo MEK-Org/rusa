@@ -41,10 +41,8 @@
  *    integration, the entity in the path. Adding discussions or releases costs
  *    nothing. The previous grammar needed an enum member per pair, which is why
  *    a bare `github_comment:<id>` came out an orphan naming no issue.
- * 2. **Containment is a prefix test** ({@link isDescendantOf}) rather than a
- *    hand-written switch per kind — which is what `event-subscriptions.ts`
- *    currently spends `resourceKey`, `sameResource`, `parentOf` and
- *    `isSubResourceOf` on.
+ * 2. **Containment is a prefix test** ({@link isDescendantOf}) rather than the
+ *    hand-written per-kind hierarchy that event subscriptions previously used.
  * 3. **One spelling.** An abbreviated alternate was considered and rejected:
  *    dedupe is string equality (`UNIQUE(obligation_id, ref)`, `resolution_ref`
  *    as text), and a model writing either spelling would produce duplicate
@@ -52,7 +50,7 @@
  */
 
 /** Integrations that can be referenced. One per external system, not per entity. */
-export const REFERENCE_SCHEMES = ["github", "gchat", "mesh"] as const;
+export const REFERENCE_SCHEMES = ["github", "gchat", "mesh", "system"] as const;
 
 export type ReferenceScheme = (typeof REFERENCE_SCHEMES)[number];
 
@@ -77,13 +75,15 @@ const SCHEMES = new Set<string>(REFERENCE_SCHEMES);
  * How many leading segments name the scheme's root resource. Everything after
  * is `collection/id` pairs.
  *
- * GitHub is 2 because `OWNER/REPO` is one identifier; the others are 0 because
- * their paths are pairs from the start.
+ * GitHub is 2 because `OWNER/REPO` is one identifier; system is 1 because the root
+ * resource is a top-level domain (e.g. `events`); the others are 0 because their
+ * paths are pairs from the start.
  */
 const ROOT_SEGMENTS: Record<ReferenceScheme, number> = {
   github: 2,
   gchat: 0,
   mesh: 0,
+  system: 1,
 };
 
 /**
@@ -137,7 +137,9 @@ export function parseReference(value: string): Reference {
   // or user, above any repository. Required for consistency as much as for
   // convenience — `referenceParent` walks a repo up to its owner, so a grammar
   // that produced owner refs but refused to parse them would contradict itself.
-  const isPartialRoot = root > 1 && segments.length < root;
+  const isPartialRoot =
+    (root > 1 && segments.length < root) ||
+    (scheme === "gchat" && segments.length === 1 && segments[0] === "spaces");
   if (segments.length < 1) {
     throw new InvalidReferenceError(`a ${scheme} reference needs at least one path segment`);
   }
@@ -174,6 +176,16 @@ export function isReference(value: string): boolean {
 export function referenceParent(reference: Reference): Reference | null {
   const root = ROOT_SEGMENTS[reference.scheme];
   const segments = [...reference.segments];
+  if (reference.scheme === "gchat" && segments.length === 1 && segments[0] === "spaces") {
+    return null;
+  }
+  if (reference.scheme === "gchat" && segments.length === 2 && segments[0] === "spaces") {
+    return {
+      scheme: "gchat",
+      segments: ["spaces"],
+      key: "gchat:spaces",
+    };
+  }
   if (segments.length > root) {
     segments.length = segments.length - 2;
   } else if (segments.length > 1) {
@@ -212,6 +224,39 @@ export interface GitHubIssueReference {
   repo: string;
   collection: GitHubIssueCollection;
   number: number;
+}
+
+/** A GitHub branch, destructured for callers that need its parts. */
+export interface GitHubBranchReference {
+  owner: string;
+  repo: string;
+  branch: string;
+}
+
+/**
+ * Read a reference as a GitHub branch, or null if it is anything else.
+ */
+export function asGitHubBranch(reference: Reference): GitHubBranchReference | null {
+  if (reference.scheme !== "github") return null;
+  if (reference.segments.length !== 4) return null;
+  const [owner, repo, collection, rawBranch] = reference.segments;
+  if (!owner || !repo || collection !== "branches" || !rawBranch) return null;
+  try {
+    return { owner, repo, branch: decodeURIComponent(rawBranch) };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Format a canonical GitHub branch reference.
+ *
+ * Strips any leading `refs/heads/` prefix and URL-encodes the branch name if it
+ * contains slashes.
+ */
+export function githubBranchReference(repo: string, branch: string): string {
+  const cleanBranch = branch.replace(/^refs\/heads\//, "");
+  return `github:${repo}/branches/${encodeURIComponent(cleanBranch)}`;
 }
 
 /**
@@ -286,6 +331,10 @@ export function asGitHubTarget(reference: Reference): GitHubTarget | null {
  */
 export function referenceUrl(reference: Reference): string | null {
   if (reference.scheme !== "github") return null;
+  const branch = asGitHubBranch(reference);
+  if (branch) {
+    return `https://github.com/${branch.owner}/${branch.repo}/tree/${encodeURIComponent(branch.branch)}`;
+  }
   const segments = [...reference.segments];
 
   let anchor = "";
