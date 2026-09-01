@@ -243,6 +243,7 @@ function setup(
         beforeRun: ctx.beforeRun,
         onQueued: ctx.onQueued,
         onRunEnd: ctx.onRunEnd,
+        onRuntimeStateChanged: ctx.onRuntimeStateChanged,
         debounceMs: DEBOUNCE,
       });
       return actor;
@@ -267,6 +268,7 @@ function setup(
     buildPrompt: () => ({ prompt: "Work from your inbox." }),
     onQueued: (context) => mesh.actorQueued(rootId, context),
     onRunEnd: () => mesh.finishInboxRun(rootId),
+    onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
     debounceMs: DEBOUNCE,
   });
   mesh.adopt(
@@ -303,6 +305,36 @@ const payload = (type: string, merged?: boolean): InboxPayload =>
 describe("ActorMesh", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
+
+  it("sequences two actors on one contiguous runtime revision", () => {
+    const { mesh } = setup();
+    const child = mesh.spawn({ charter: "worker", parentId: "root" });
+    const before = mesh.runtimeStateSnapshot();
+    const deltas: Array<{ actorId: string; revision: number; runState: string }> = [];
+    mesh.onRuntimeStateDelta((delta) => deltas.push(delta));
+
+    mesh.actorRuntimeStateChanged("root", "queued");
+    mesh.actorRuntimeStateChanged("root", "queued");
+    mesh.actorRuntimeStateChanged(child, "running");
+
+    expect(deltas).toEqual([
+      {
+        actorId: "root",
+        revision: before.revision + 1,
+        runState: "queued",
+        streamId: before.streamId,
+      },
+      {
+        actorId: child,
+        revision: before.revision + 2,
+        runState: "running",
+        streamId: before.streamId,
+      },
+    ]);
+    const after = mesh.runtimeStateSnapshot();
+    expect(after.states.get("root")).toBe("queued");
+    expect(after.states.get(child)).toBe("running");
+  });
 
   it("passes the provider through the shared rate gate", async () => {
     const registry = new InMemoryThreadRegistry();

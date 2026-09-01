@@ -258,8 +258,18 @@ void main() {
         final api = FakeApi()
           ..threadsResult = [
             makeThread('root', created: 't0', runState: RunState.idle),
-            makeThread('queued-actor', parent: 'root', created: 't1', runState: RunState.queued),
-            makeThread('running-actor', parent: 'root', created: 't2', runState: RunState.running),
+            makeThread(
+              'queued-actor',
+              parent: 'root',
+              created: 't1',
+              runState: RunState.queued,
+            ),
+            makeThread(
+              'running-actor',
+              parent: 'root',
+              created: 't2',
+              runState: RunState.running,
+            ),
           ];
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
@@ -284,7 +294,9 @@ void main() {
         // Tap Cancel queued run button on queued actor
         await tester.tap(find.byTooltip('Cancel queued run'));
         await tester.pump(const Duration(milliseconds: 50));
-        expect(api.interruptCalls, [(actorId: 'queued-actor', by: 'human:operator')]);
+        expect(api.interruptCalls, [
+          (actorId: 'queued-actor', by: 'human:operator'),
+        ]);
 
         // Tap Interrupt button on running actor
         await tester.tap(find.byTooltip('Interrupt'));
@@ -300,13 +312,22 @@ void main() {
   );
 
   testWidgets(
-    'ActorTree and DetailPanel reactively synchronize on SSE lifecycle events ',
+    'ActorTree and DetailPanel react to authoritative runtime state deltas',
     (tester) async {
       await tester.runAsync(() async {
         final api = FakeApi()
+          ..runtimeCursor = const RuntimeCursor(
+            streamId: 'stream-a',
+            revision: 0,
+          )
           ..threadsResult = [
             makeThread('root', created: 't0', runState: RunState.idle),
-            makeThread('a', parent: 'root', created: 't1', runState: RunState.idle),
+            makeThread(
+              'a',
+              parent: 'root',
+              created: 't1',
+              runState: RunState.idle,
+            ),
           ];
         final stream = FakeStream();
         final store = DashboardStore(api: api, stream: stream);
@@ -322,8 +343,15 @@ void main() {
         expect(find.byTooltip('Run now'), findsOneWidget);
         expect(find.byTooltip('Interrupt'), findsNothing);
 
-        // SSE: 'a' transitions to running (run_start)
-        stream.meshCtrl.add(makeEvent('e1', 'run_start', actor: 'a'));
+        // The authoritative stream transitions 'a' to running.
+        stream.runtimeStatesCtrl.add(
+          const ActorRuntimeStateDelta(
+            streamId: 'stream-a',
+            revision: 1,
+            actorId: 'a',
+            runState: RunState.running,
+          ),
+        );
         await tester.pump(const Duration(milliseconds: 50));
         await tester.pump(const Duration(milliseconds: 50));
 
@@ -331,8 +359,15 @@ void main() {
         expect(find.byTooltip('Interrupt'), findsNWidgets(2));
         expect(find.byTooltip('Run now'), findsNothing);
 
-        // SSE: 'a' transitions to queued (run_queued)
-        stream.meshCtrl.add(makeEvent('e2', 'run_queued', actor: 'a'));
+        // 'a' transitions to queued.
+        stream.runtimeStatesCtrl.add(
+          const ActorRuntimeStateDelta(
+            streamId: 'stream-a',
+            revision: 2,
+            actorId: 'a',
+            runState: RunState.queued,
+          ),
+        );
         await tester.pump(const Duration(milliseconds: 50));
         await tester.pump(const Duration(milliseconds: 50));
 
@@ -341,8 +376,15 @@ void main() {
         expect(find.byTooltip('Cancel queued run'), findsNWidgets(2));
         expect(find.byTooltip('Interrupt'), findsNothing);
 
-        // SSE: 'a' transitions to idle (run_end)
-        stream.meshCtrl.add(makeEvent('e3', 'run_end', actor: 'a'));
+        // 'a' transitions to idle.
+        stream.runtimeStatesCtrl.add(
+          const ActorRuntimeStateDelta(
+            streamId: 'stream-a',
+            revision: 3,
+            actorId: 'a',
+            runState: RunState.idle,
+          ),
+        );
         await tester.pump(const Duration(milliseconds: 50));
         await tester.pump(const Duration(milliseconds: 50));
 
@@ -382,7 +424,10 @@ void main() {
         expect(find.text('from b-handle'), findsOneWidget);
         expect(find.text('→ b-handle'), findsNWidgets(2));
         expect(find.text('to unknown'), findsNothing);
-        expect(find.text('Please check the dashboard event log.'), findsOneWidget);
+        expect(
+          find.text('Please check the dashboard event log.'),
+          findsOneWidget,
+        );
         expect(find.text('I will check it now.'), findsOneWidget);
         expect(find.text('a6bf1ca9-43eb-466d-a06d-3a08e4f09605'), findsNothing);
         expect(find.text('d1411b1f-ec2e-498a-b140-cafc2049ba22'), findsNothing);
@@ -637,52 +682,56 @@ void main() {
     });
   });
 
-  testWidgets('renders pending desiredModel in tree and detail panel as applies after next run', (
-    tester,
-  ) async {
-    await tester.runAsync(() async {
-      final api = FakeApi()
-        ..threadsResult = [
-          makeThread('root', created: 't0'),
-          makeThread(
-            'a',
-            parent: 'root',
-            created: 't1',
-            provider: 'claude',
-            model: 'gemini-3.7-flash-high',
-            desiredModel: 'claude-opus-4-8',
+  testWidgets(
+    'renders pending desiredModel in tree and detail panel as applies after next run',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [
+            makeThread('root', created: 't0'),
+            makeThread(
+              'a',
+              parent: 'root',
+              created: 't1',
+              provider: 'claude',
+              model: 'gemini-3.7-flash-high',
+              desiredModel: 'claude-opus-4-8',
+            ),
+          ];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+
+        await tester.pumpWidget(_harness(store));
+        await tester.pump(const Duration(milliseconds: 50));
+
+        // Tree shows pending model transition
+        expect(
+          find.text('gemini-3.7-flash-high → claude-opus-4-8'),
+          findsOneWidget,
+        );
+
+        await tester.tap(find.text('a-handle'));
+        await tester.pump(const Duration(milliseconds: 50));
+
+        await tester.ensureVisible(find.text('Info'));
+        await tester.tap(find.text('Info'));
+        for (int i = 0; i < 10; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+
+        // Detail panel shows "gemini-3.7-flash-high → claude-opus-4-8 (applies after next run)"
+        expect(
+          find.textContaining(
+            'gemini-3.7-flash-high → claude-opus-4-8 (applies after next run)',
+            findRichText: true,
           ),
-        ];
-      final store = DashboardStore(api: api, stream: FakeStream());
-      await store.init();
+          findsOneWidget,
+        );
 
-      await tester.pumpWidget(_harness(store));
-      await tester.pump(const Duration(milliseconds: 50));
-
-      // Tree shows pending model transition
-      expect(find.text('gemini-3.7-flash-high → claude-opus-4-8'), findsOneWidget);
-
-      await tester.tap(find.text('a-handle'));
-      await tester.pump(const Duration(milliseconds: 50));
-
-      await tester.ensureVisible(find.text('Info'));
-      await tester.tap(find.text('Info'));
-      for (int i = 0; i < 10; i++) {
-        await tester.pump(const Duration(milliseconds: 100));
-      }
-
-      // Detail panel shows "gemini-3.7-flash-high → claude-opus-4-8 (applies after next run)"
-      expect(
-        find.textContaining(
-          'gemini-3.7-flash-high → claude-opus-4-8 (applies after next run)',
-          findRichText: true,
-        ),
-        findsOneWidget,
-      );
-
-      await store.dispose();
-    });
-  });
+        await store.dispose();
+      });
+    },
+  );
 
   testWidgets('Show Retired toggle reveals recently retired actors', (
     tester,
@@ -967,10 +1016,18 @@ void main() {
     (tester) async {
       await tester.runAsync(() async {
         final now = DateTime.now().toUtc();
-        final recentIso = now.subtract(const Duration(seconds: 30)).toIso8601String();
-        final minutesAgoIso = now.subtract(const Duration(minutes: 5)).toIso8601String();
-        final hoursAgoIso = now.subtract(const Duration(hours: 2)).toIso8601String();
-        final daysAgoIso = now.subtract(const Duration(days: 2)).toIso8601String();
+        final recentIso = now
+            .subtract(const Duration(seconds: 30))
+            .toIso8601String();
+        final minutesAgoIso = now
+            .subtract(const Duration(minutes: 5))
+            .toIso8601String();
+        final hoursAgoIso = now
+            .subtract(const Duration(hours: 2))
+            .toIso8601String();
+        final daysAgoIso = now
+            .subtract(const Duration(days: 2))
+            .toIso8601String();
 
         final snapshot = QuotaSnapshotDto(
           generatedAt: now.toIso8601String(),
@@ -1065,7 +1122,9 @@ void main() {
         );
         await tester.pump(const Duration(milliseconds: 50));
 
-        final tooltips = tester.widgetList<Tooltip>(find.byType(Tooltip)).toList();
+        final tooltips = tester
+            .widgetList<Tooltip>(find.byType(Tooltip))
+            .toList();
         // 4 providers in order: Claude, Codex, Agy, Kimi
         expect(tooltips, hasLength(4));
 
@@ -1086,7 +1145,6 @@ void main() {
       });
     },
   );
-
 
   testWidgets(
     'header renders empty inner ring and "window reset at" tooltip when window is past reset (issue #9)',
@@ -1152,14 +1210,15 @@ void main() {
         expect(rings[0].value, 0.9); // weekly: 10% used => 90% remaining
         expect(rings[1].value, 0.0); // 5h: past reset => 0.0 (empty ring)
 
-        final codexTooltip = tester.widget<Tooltip>(
-          find.byType(Tooltip).first,
-        );
+        final codexTooltip = tester.widget<Tooltip>(find.byType(Tooltip).first);
         expect(codexTooltip.message, contains('Weekly: 90% remaining'));
         expect(codexTooltip.message, contains('5h: window reset at '));
         expect(codexTooltip.message, contains('no fresh read since'));
         expect(codexTooltip.message, isNot(contains('5h: 53% remaining')));
-        expect(codexTooltip.message, isNot(contains('5h: 47% quota remaining')));
+        expect(
+          codexTooltip.message,
+          isNot(contains('5h: 47% quota remaining')),
+        );
 
         await store.dispose();
       });
@@ -1311,9 +1370,7 @@ void main() {
     test('window past its reset (resetAtIso < now) reads grey (muted)', () {
       final w = window(
         usedPercent: 53,
-        resetAtIso: now
-            .subtract(const Duration(minutes: 32))
-            .toIso8601String(),
+        resetAtIso: now.subtract(const Duration(minutes: 32)).toIso8601String(),
       );
       expect(quotaScheduleColor(w, now: now), MeshColors.textMuted);
     });
@@ -1554,19 +1611,22 @@ void main() {
       );
     });
 
-    test('renders only pacing line when not expired and no buckets driving pace', () {
-      final tooltip = quotaThrottleTooltip(
-        const QuotaThrottleDto(
-          intervalSeconds: 73,
-          expired: false,
-          updatedAt: '2026-07-22T12:00:00.000Z',
-          buckets: [],
-        ),
-      );
-      expect(tooltip, 'Normal launch pacing: one start every 1.2m');
-      expect(tooltip, isNot(contains('learning')));
-      expect(tooltip, isNot(contains('expired')));
-    });
+    test(
+      'renders only pacing line when not expired and no buckets driving pace',
+      () {
+        final tooltip = quotaThrottleTooltip(
+          const QuotaThrottleDto(
+            intervalSeconds: 73,
+            expired: false,
+            updatedAt: '2026-07-22T12:00:00.000Z',
+            buckets: [],
+          ),
+        );
+        expect(tooltip, 'Normal launch pacing: one start every 1.2m');
+        expect(tooltip, isNot(contains('learning')));
+        expect(tooltip, isNot(contains('expired')));
+      },
+    );
 
     test('explains that previous quota window expired', () {
       expect(
@@ -1584,18 +1644,26 @@ void main() {
   });
 
   group('kDefaultQuotaProviders', () {
-    test('kimi surfaces the five_hour session window (inner ring), ISSUE_NUM', () {
-      final kimi = kDefaultQuotaProviders['kimi'];
-      expect(kimi, isNotNull);
-      expect(kimi!.primaryWindow, 'weekly');
-      // Regression for the weekly-only opt-out: kimi's DTO now carries both
-      // windows, so the inner ring must be wired to five_hour like codex/agy.
-      expect(kimi.sessionWindow, 'five_hour');
-      expect(kimi.sessionWindow, kDefaultQuotaProviders['agy']!.sessionWindow);
-    });
+    test(
+      'kimi surfaces the five_hour session window (inner ring), ISSUE_NUM',
+      () {
+        final kimi = kDefaultQuotaProviders['kimi'];
+        expect(kimi, isNotNull);
+        expect(kimi!.primaryWindow, 'weekly');
+        // Regression for the weekly-only opt-out: kimi's DTO now carries both
+        // windows, so the inner ring must be wired to five_hour like codex/agy.
+        expect(kimi.sessionWindow, 'five_hour');
+        expect(
+          kimi.sessionWindow,
+          kDefaultQuotaProviders['agy']!.sessionWindow,
+        );
+      },
+    );
   });
 
-  testWidgets('ActorTree supports drag-to-reorder for sibling actors', (tester) async {
+  testWidgets('ActorTree supports drag-to-reorder for sibling actors', (
+    tester,
+  ) async {
     await tester.runAsync(() async {
       final api = FakeApi()
         ..threadsResult = [
@@ -1619,16 +1687,23 @@ void main() {
       expect(find.byType(DragTarget<ThreadDto>), findsNWidgets(3));
 
       // Find Draggable for child-2
-      final child2Finder = find.widgetWithText(Draggable<ThreadDto>, 'child-2-handle');
+      final child2Finder = find.widgetWithText(
+        Draggable<ThreadDto>,
+        'child-2-handle',
+      );
       expect(child2Finder, findsOneWidget);
 
       // Find DragTarget for child-1
-      final child1Target = find.widgetWithText(DragTarget<ThreadDto>, 'child-1-handle');
+      final child1Target = find.widgetWithText(
+        DragTarget<ThreadDto>,
+        'child-1-handle',
+      );
       expect(child1Target, findsOneWidget);
 
       // Drag child-2 onto child-1 (upper half -> before child-1)
       final firstLocation = tester.getCenter(child2Finder);
-      final targetTopLocation = tester.getTopLeft(child1Target) + const Offset(20, 5);
+      final targetTopLocation =
+          tester.getTopLeft(child1Target) + const Offset(20, 5);
 
       final gesture = await tester.startGesture(firstLocation);
       await tester.pump(const Duration(milliseconds: 50));
@@ -1649,7 +1724,9 @@ void main() {
     });
   });
 
-  testWidgets('ActorTree uses LongPressDraggable when touchTargets is true', (tester) async {
+  testWidgets('ActorTree uses LongPressDraggable when touchTargets is true', (
+    tester,
+  ) async {
     await tester.runAsync(() async {
       final api = FakeApi()
         ..threadsResult = [
@@ -1666,9 +1743,7 @@ void main() {
 
       await tester.pumpWidget(
         MaterialApp(
-          home: Scaffold(
-            body: ActorTree(store: store, touchTargets: true),
-          ),
+          home: Scaffold(body: ActorTree(store: store, touchTargets: true)),
         ),
       );
       await tester.pump(const Duration(milliseconds: 50));

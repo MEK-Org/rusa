@@ -158,26 +158,74 @@ class ThreadDto {
 /// mesh halt state (the emergency brake), so the header can reflect a HALTED
 /// system without a second fetch.
 class ThreadsSnapshot {
-  const ThreadsSnapshot({required this.halted, required this.threads});
+  const ThreadsSnapshot({
+    required this.halted,
+    required this.threads,
+    this.runtimeCursor,
+  });
 
   final bool halted;
   final List<ThreadDto> threads;
+  final RuntimeCursor? runtimeCursor;
 
   factory ThreadsSnapshot.fromJson(Map<String, dynamic> j) => ThreadsSnapshot(
     halted: j['halted'] as bool? ?? false,
+    runtimeCursor: j['runtimeCursor'] == null
+        ? null
+        : RuntimeCursor.fromJson(j['runtimeCursor'] as Map<String, dynamic>),
     threads: (j['threads'] as List<dynamic>? ?? const [])
         .map((e) => ThreadDto.fromJson(e as Map<String, dynamic>))
         .toList(),
   );
 }
 
+class RuntimeCursor {
+  const RuntimeCursor({required this.streamId, required this.revision});
+
+  final String streamId;
+  final int revision;
+
+  factory RuntimeCursor.fromJson(Map<String, dynamic> j) => RuntimeCursor(
+    streamId: j['streamId'] as String,
+    revision: j['revision'] as int,
+  );
+}
+
+class RuntimeHello {
+  const RuntimeHello({required this.streamId});
+
+  final String streamId;
+
+  factory RuntimeHello.fromJson(Map<String, dynamic> j) =>
+      RuntimeHello(streamId: j['streamId'] as String);
+}
+
+class ActorRuntimeStateDelta {
+  const ActorRuntimeStateDelta({
+    required this.streamId,
+    required this.revision,
+    required this.actorId,
+    required this.runState,
+  });
+
+  final String streamId;
+  final int revision;
+  final String actorId;
+  final RunState runState;
+
+  factory ActorRuntimeStateDelta.fromJson(Map<String, dynamic> j) =>
+      ActorRuntimeStateDelta(
+        streamId: j['streamId'] as String,
+        revision: j['revision'] as int,
+        actorId: j['actorId'] as String,
+        runState: runStateFromJson(j['runState']),
+      );
+}
+
 /// Normalized view state for a single actor in the mesh.
 /// Combines the underlying [ThreadDto] metadata with the live, reactive [RunState].
 class ActorViewState {
-  const ActorViewState({
-    required this.thread,
-    required this.runState,
-  });
+  const ActorViewState({required this.thread, required this.runState});
 
   final ThreadDto thread;
   final RunState runState;
@@ -221,13 +269,11 @@ class ActorViewState {
     }
   }
 
-  ActorViewState copyWith({
-    ThreadDto? thread,
-    RunState? runState,
-  }) => ActorViewState(
-    thread: thread ?? this.thread,
-    runState: runState ?? this.runState,
-  );
+  ActorViewState copyWith({ThreadDto? thread, RunState? runState}) =>
+      ActorViewState(
+        thread: thread ?? this.thread,
+        runState: runState ?? this.runState,
+      );
 
   @override
   bool operator ==(Object other) =>
@@ -339,7 +385,9 @@ class MeshEvent {
         if (decoded.containsKey('to')) return decoded['to'] as String?;
         if (kind == 'message_received') return actorId;
         // If it's a legacy message_sent (migrated with 'from' but no 'to'), actorId is the recipient.
-        if (kind == 'message_sent' && !decoded.containsKey('to')) return actorId;
+        if (kind == 'message_sent' && !decoded.containsKey('to')) {
+          return actorId;
+        }
       } catch (_) {}
     }
     return null;
@@ -697,10 +745,7 @@ class QuotaHistorySeriesDto {
 }
 
 class QuotaSnapshotDto {
-  const QuotaSnapshotDto({
-    required this.generatedAt,
-    required this.providers,
-  });
+  const QuotaSnapshotDto({required this.generatedAt, required this.providers});
 
   final String generatedAt;
   final List<ProviderQuotaDto> providers;
@@ -917,7 +962,9 @@ class ObligationArtifactDto {
       label: artifact['label'] as String?,
       attachedBy: artifact['attachedBy'] as String?,
       attachedAt: artifact['attachedAt'] as String?,
-      reference: resolved is Map<String, dynamic> ? ReferenceDto.fromJson(resolved) : null,
+      reference: resolved is Map<String, dynamic>
+          ? ReferenceDto.fromJson(resolved)
+          : null,
     );
   }
 }
@@ -943,6 +990,7 @@ class ObligationDto {
 
   final String id;
   final String? parentId;
+
   /// One entity id in the mesh's single id space: an actor UUID, `root`,
   /// `human:*`, or `system:*`. The category is read off the prefix — there is
   /// no separate owner "kind".
@@ -1003,7 +1051,9 @@ class ObligationDto {
     // The server sends a parsed reference object; older rows and some fixtures
     // send the bare canonical string. Both reduce to the same `key`.
     final dynamic rawRef = j['externalRef'];
-    final String? extRef = rawRef is Map ? rawRef['key'] as String? : rawRef as String?;
+    final String? extRef = rawRef is Map
+        ? rawRef['key'] as String?
+        : rawRef as String?;
 
     return ObligationDto(
       id: j['id'] as String? ?? '',
@@ -1026,7 +1076,11 @@ class ObligationDto {
 }
 
 class ObligationPage {
-  const ObligationPage({required this.obligations, required this.total, required this.hasMore});
+  const ObligationPage({
+    required this.obligations,
+    required this.total,
+    required this.hasMore,
+  });
 
   final List<ObligationDto> obligations;
   final int total;
@@ -1052,31 +1106,39 @@ class ObligationTreeDto {
   final List<ObligationTreeDto> children;
   final List<ObligationDto> blockingChildren;
 
-  factory ObligationTreeDto.fromJson(Map<String, dynamic> j) => ObligationTreeDto(
-    obligation: ObligationDto.fromJson(j['obligation'] as Map<String, dynamic>),
-    children: (j['children'] as List<dynamic>? ?? const [])
-        .map((e) => ObligationTreeDto.fromJson(e as Map<String, dynamic>))
-        .toList(),
-    blockingChildren: (j['blockingChildren'] as List<dynamic>? ?? const [])
-        .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
-        .toList(),
-  );
+  factory ObligationTreeDto.fromJson(Map<String, dynamic> j) =>
+      ObligationTreeDto(
+        obligation: ObligationDto.fromJson(
+          j['obligation'] as Map<String, dynamic>,
+        ),
+        children: (j['children'] as List<dynamic>? ?? const [])
+            .map((e) => ObligationTreeDto.fromJson(e as Map<String, dynamic>))
+            .toList(),
+        blockingChildren: (j['blockingChildren'] as List<dynamic>? ?? const [])
+            .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
+            .toList(),
+      );
 }
 
 class ObligationListPage {
-  const ObligationListPage({required this.items, required this.total, required this.hasMore});
+  const ObligationListPage({
+    required this.items,
+    required this.total,
+    required this.hasMore,
+  });
 
   final List<ObligationDto> items;
   final int total;
   final bool hasMore;
 
-  factory ObligationListPage.fromJson(Map<String, dynamic> j) => ObligationListPage(
-    items: (j['items'] as List<dynamic>? ?? const [])
-        .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
-        .toList(),
-    total: j['total'] as int? ?? 0,
-    hasMore: j['hasMore'] as bool? ?? false,
-  );
+  factory ObligationListPage.fromJson(Map<String, dynamic> j) =>
+      ObligationListPage(
+        items: (j['items'] as List<dynamic>? ?? const [])
+            .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
+            .toList(),
+        total: j['total'] as int? ?? 0,
+        hasMore: j['hasMore'] as bool? ?? false,
+      );
 }
 
 class ObligationDetailSnapshot {
@@ -1094,31 +1156,40 @@ class ObligationDetailSnapshot {
   final List<ObligationDto> blockingChildren;
   final List<ObligationArtifactDto> artifacts;
 
-  factory ObligationDetailSnapshot.fromJson(Map<String, dynamic> j) => ObligationDetailSnapshot(
+  factory ObligationDetailSnapshot.fromJson(
+    Map<String, dynamic> j,
+  ) => ObligationDetailSnapshot(
     obligation: ObligationDto.fromJson(j['obligation'] as Map<String, dynamic>),
-    parent: j['parent'] == null ? null : ObligationDto.fromJson(j['parent'] as Map<String, dynamic>),
+    parent: j['parent'] == null
+        ? null
+        : ObligationDto.fromJson(j['parent'] as Map<String, dynamic>),
     children: (j['children'] is List)
         ? (j['children'] as List<dynamic>)
-            .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
-            .toList()
-        : (j['children'] is Map<String, dynamic> && j['children']['items'] is List)
-            ? (j['children']['items'] as List<dynamic>)
-                .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
-                .toList()
-            : const <ObligationDto>[],
+              .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
+              .toList()
+        : (j['children'] is Map<String, dynamic> &&
+              j['children']['items'] is List)
+        ? (j['children']['items'] as List<dynamic>)
+              .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
+              .toList()
+        : const <ObligationDto>[],
     blockingChildren: (j['blockingChildren'] is List)
         ? (j['blockingChildren'] as List<dynamic>)
-            .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
-            .toList()
-        : (j['blockingChildren'] is Map<String, dynamic> && j['blockingChildren']['items'] is List)
-            ? (j['blockingChildren']['items'] as List<dynamic>)
-                .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
-                .toList()
-            : const <ObligationDto>[],
+              .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
+              .toList()
+        : (j['blockingChildren'] is Map<String, dynamic> &&
+              j['blockingChildren']['items'] is List)
+        ? (j['blockingChildren']['items'] as List<dynamic>)
+              .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
+              .toList()
+        : const <ObligationDto>[],
     artifacts: (j['artifacts'] is List)
         ? (j['artifacts'] as List<dynamic>)
-            .map((e) => ObligationArtifactDto.fromJson(e as Map<String, dynamic>))
-            .toList()
+              .map(
+                (e) =>
+                    ObligationArtifactDto.fromJson(e as Map<String, dynamic>),
+              )
+              .toList()
         : const <ObligationArtifactDto>[],
   );
 }

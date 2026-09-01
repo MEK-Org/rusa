@@ -74,6 +74,21 @@ export interface MeshActor {
   getProvider?(): CodingProvider;
 }
 
+export type ActorRuntimeState = "queued" | "running" | "winding_down" | "idle";
+
+export interface ActorRuntimeStateDelta {
+  streamId: string;
+  revision: number;
+  actorId: string;
+  runState: ActorRuntimeState;
+}
+
+export interface ActorRuntimeStateSnapshot {
+  streamId: string;
+  revision: number;
+  states: ReadonlyMap<string, ActorRuntimeState>;
+}
+
 export interface SpawnRequest {
   /** What the new actor owns — authored by the spawning message (B.5). */
   charter: string;
@@ -171,6 +186,8 @@ export interface ActorFactoryContext {
   onQueued: (context: { responsive: boolean; mode: ActorRunMode }) => void;
   /** Post-run accounting (budget) + completion-review hook. */
   onRunEnd: (result: RunResult) => void;
+  /** Forward the actor-owned runtime state to the mesh-wide sequencer. */
+  onRuntimeStateChanged: (state: ActorRuntimeState) => void;
 }
 
 export type ActorFactory = (ctx: ActorFactoryContext) => MeshActor;
@@ -439,6 +456,10 @@ export class ActorMesh {
   private readonly grantable: ReadonlySet<string>;
   private readonly log: (msg: string) => void;
   private readonly live = new Map<string, MeshActor>();
+  private readonly runtimeStreamId = randomUUID();
+  private runtimeRevision = 0;
+  private readonly runtimeStates = new Map<string, ActorRuntimeState>();
+  private readonly runtimeStateListeners = new Set<(delta: ActorRuntimeStateDelta) => void>();
   private readonly activeRunCounts = new Map<string, number>();
   private readonly deferredRetireCleanups = new Map<
     string,
@@ -587,6 +608,7 @@ export class ActorMesh {
     const existing = this.registry.get(record.id);
     this.registry.upsert(existing ? { ...existing, ...record } : record);
     this.live.set(record.id, actor);
+    this.actorRuntimeStateChanged(record.id, this.runtimeStateOf(actor));
   }
 
   /**
@@ -605,6 +627,7 @@ export class ActorMesh {
     try {
       const actor = this.createActor(this.factoryContext(record));
       this.live.set(record.id, actor);
+      this.actorRuntimeStateChanged(record.id, this.runtimeStateOf(actor));
       this.log(`rehydrated ${record.id} (parent ${record.parentId})`);
     } catch (err) {
       this.log(
@@ -965,6 +988,7 @@ export class ActorMesh {
       throw err;
     }
     this.live.set(id, actor);
+    this.actorRuntimeStateChanged(id, this.runtimeStateOf(actor));
     // Genuine-birth side-effect hook (out-of-band, fire-and-forget) — e.g. kick
     // off avatar generation . Guarded like onRetire so a hook throw can
     // never break spawning, and only here (not createActor, which rehydrate
@@ -2056,6 +2080,47 @@ export class ActorMesh {
     return null;
   }
 
+  /** One synchronous capture used to populate both the REST cursor and thread states. */
+  runtimeStateSnapshot(): ActorRuntimeStateSnapshot {
+    return {
+      streamId: this.runtimeStreamId,
+      revision: this.runtimeRevision,
+      states: new Map(this.runtimeStates),
+    };
+  }
+
+  /** Subscribe to already-sequenced runtime deltas. */
+  onRuntimeStateDelta(listener: (delta: ActorRuntimeStateDelta) => void): () => void {
+    this.runtimeStateListeners.add(listener);
+    return () => this.runtimeStateListeners.delete(listener);
+  }
+
+  /** The sole revision authority for actor-published runtime transitions. */
+  actorRuntimeStateChanged(actorId: string, runState: ActorRuntimeState): void {
+    if (this.runtimeStates.get(actorId) === runState) return;
+    this.runtimeStates.set(actorId, runState);
+    const delta: ActorRuntimeStateDelta = {
+      streamId: this.runtimeStreamId,
+      revision: ++this.runtimeRevision,
+      actorId,
+      runState,
+    };
+    for (const listener of this.runtimeStateListeners) {
+      try {
+        listener(delta);
+      } catch (err) {
+        this.log(
+          `runtime state listener failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+  }
+
+  private runtimeStateOf(actor: MeshActor): ActorRuntimeState {
+    if (actor.isRunning) return actor.isYielded ? "winding_down" : "running";
+    return actor.isQueued ? "queued" : "idle";
+  }
+
   /** True only if the actor is live and declared yield during its active run. */
   isYielded(actorId: string): boolean {
     actorId = this.resolveThreadId(actorId);
@@ -2494,6 +2559,7 @@ export class ActorMesh {
       this.onRevive?.(updatedRecord);
       const actor = this.createActor(this.factoryContext(updatedRecord));
       this.live.set(id, actor);
+      this.actorRuntimeStateChanged(id, this.runtimeStateOf(actor));
     } catch (err) {
       this.live.delete(id);
       this.registry.patch(id, { status: "retired" });
@@ -2650,6 +2716,7 @@ export class ActorMesh {
         this.finishInboxRun(record.id);
         this.accountRun(record.id, result);
       },
+      onRuntimeStateChanged: (state) => this.actorRuntimeStateChanged(record.id, state),
     };
   }
 

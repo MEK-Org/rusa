@@ -12,6 +12,8 @@ abstract interface class MeshStreamSource {
   Stream<MeshEvent> get meshEvents;
   Stream<LiveOutputChunk> get liveOutput;
   Stream<void> get elided;
+  Stream<RuntimeHello> get runtimeHello;
+  Stream<ActorRuntimeStateDelta> get runtimeStates;
 
   /// (Re)open the stream filtered to [actors] for the live_output channel.
   /// mesh_event still arrives for every actor regardless of this filter.

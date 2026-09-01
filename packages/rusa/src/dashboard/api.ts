@@ -1156,6 +1156,10 @@ export function handleMeshApiRequest(
 
   // GET /api/mesh/threads — every thread (active + retired), handle up front.
   if (pathname === "/api/mesh/threads") {
+    const runtime =
+      typeof deps.mesh?.runtimeStateSnapshot === "function"
+        ? deps.mesh.runtimeStateSnapshot()
+        : null;
     // One synchronous snapshot of the running set, classified against every
     // thread in a single pass — no await between reads, so the view can't tear.
     const running = deps.runningThreadIds?.() ?? new Set<string>();
@@ -1170,8 +1174,8 @@ export function handleMeshApiRequest(
 
     const threads: ThreadDto[] = registry.list().map((r) => {
       let runState: "running" | "queued" | "winding_down" | "idle" = "idle";
-      if (typeof deps.mesh?.activeRunState === "function") {
-        runState = deps.mesh.activeRunState(r.id)?.phase ?? "idle";
+      if (runtime) {
+        runState = runtime.states.get(r.id) ?? "idle";
       } else if (running.has(r.id)) {
         runState = deps.isYielded?.(r.id) ? "winding_down" : "running";
       } else if (queued.has(r.id)) {
@@ -1195,7 +1199,11 @@ export function handleMeshApiRequest(
         nextProviderAvailableAt: providerQueueHeads.get(r.id) ?? null,
       };
     });
-    sendJson(res, 200, { halted: deps.isHalted?.() ?? false, threads });
+    sendJson(res, 200, {
+      halted: deps.isHalted?.() ?? false,
+      runtimeCursor: runtime ? { streamId: runtime.streamId, revision: runtime.revision } : null,
+      threads,
+    });
     return true;
   }
 

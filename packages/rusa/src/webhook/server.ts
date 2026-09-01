@@ -444,7 +444,9 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
   // When a live mesh is bound, stand up the SSE fan-out hub and the Data API
   // deps; both are torn down with the server. Without it, the handler 503s the
   // mesh routes and only serves the static UI.
-  const sseHub = options.mesh ? new SseHub(options.mesh.emitter) : null;
+  const sseHub = options.mesh
+    ? new SseHub(options.mesh.emitter, { runtimeState: options.mesh.mesh })
+    : null;
   const dataDeps: DashboardDataDeps | null =
     options.mesh && sseHub
       ? {

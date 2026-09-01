@@ -1836,6 +1836,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               detail: context.mode,
             });
           },
+          onRuntimeStateChanged: ctx.onRuntimeStateChanged,
           onRunStart: (responsive, injectRecord) => {
             const providerName = providerThrottleKey(actor.getProvider().providerName, config);
             const runId = beginActorRun(id, providerName);
@@ -2275,6 +2276,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           detail: context.mode,
         });
       },
+      onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
       onRunStart: (responsive, injectRecord) => {
         const providerName = providerThrottleKey(provider.providerName, config);
         const runId = beginActorRun(rootId, providerName);
