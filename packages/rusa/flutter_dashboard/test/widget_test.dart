@@ -637,6 +637,53 @@ void main() {
     });
   });
 
+  testWidgets('renders pending desiredModel in tree and detail panel as applies after next run', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final api = FakeApi()
+        ..threadsResult = [
+          makeThread('root', created: 't0'),
+          makeThread(
+            'a',
+            parent: 'root',
+            created: 't1',
+            provider: 'claude',
+            model: 'gemini-3.7-flash-high',
+            desiredModel: 'claude-opus-4-8',
+          ),
+        ];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+
+      await tester.pumpWidget(_harness(store));
+      await tester.pump(const Duration(milliseconds: 50));
+
+      // Tree shows pending model transition
+      expect(find.text('gemini-3.7-flash-high → claude-opus-4-8'), findsOneWidget);
+
+      await tester.tap(find.text('a-handle'));
+      await tester.pump(const Duration(milliseconds: 50));
+
+      await tester.ensureVisible(find.text('Info'));
+      await tester.tap(find.text('Info'));
+      for (int i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+
+      // Detail panel shows "gemini-3.7-flash-high → claude-opus-4-8 (applies after next run)"
+      expect(
+        find.textContaining(
+          'gemini-3.7-flash-high → claude-opus-4-8 (applies after next run)',
+          findRichText: true,
+        ),
+        findsOneWidget,
+      );
+
+      await store.dispose();
+    });
+  });
+
   testWidgets('Show Retired toggle reveals recently retired actors', (
     tester,
   ) async {

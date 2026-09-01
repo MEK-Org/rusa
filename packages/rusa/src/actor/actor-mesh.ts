@@ -2319,7 +2319,7 @@ export class ActorMesh {
    * a non-root parent may only set the model for its own descendants (and never
    * raise its own tier).
    * Optionally moves portable (ledger/tail) actors across providers.
-   * Takes effect on the actor's NEXT run.
+   * Takes effect at the end of the actor's next run.
    */
   setActorModel(id: string, model: string, requestedBy: string, provider?: string): void {
     id = this.resolveThreadId(id);
@@ -2339,10 +2339,6 @@ export class ActorMesh {
         );
       }
     }
-    const liveActor = this.live.get(id);
-    if (liveActor && (liveActor.isRunning || liveActor.isQueued)) {
-      throw new Error(`Cannot change model or provider while actor ${id} is running or queued`);
-    }
     const trimmedModel = model.trim();
     if (!trimmedModel) {
       throw new Error(`Cannot set an empty model on thread: ${id}`);
@@ -2358,29 +2354,56 @@ export class ActorMesh {
     if (this.validateModel) {
       this.validateModel(record, trimmedModel, trimmedProvider);
     }
+    // One boundary contract for every run state: the in-flight run, or the next
+    // dispatched run when idle/queued, completes on the current model. The
+    // desired value is applied only when that run ends.
+    const patch: Partial<ThreadRecord> = {
+      desiredModel: trimmedModel,
+      desiredProvider: trimmedProvider,
+    };
+    this.registry.patch(id, patch);
+  }
+
+  /**
+   * Apply the pending model/provider change at the end of the next run boundary.
+   */
+  private applyPendingModel(id: string): void {
+    const record = this.registry.get(id);
+    if (!record || !record.desiredModel) return;
+
+    const trimmedModel = record.desiredModel;
+    const trimmedProvider = record.desiredProvider;
     const oldModel = record.model;
     const oldProvider = record.provider;
-    const patch: Partial<ThreadRecord> = { model: trimmedModel };
+
+    const patch: Partial<ThreadRecord> = {
+      model: trimmedModel,
+      desiredModel: undefined,
+      desiredProvider: undefined,
+    };
     if (trimmedProvider !== undefined) {
       patch.provider = trimmedProvider;
     }
     this.registry.patch(id, patch);
+
     const verified = this.registry.get(id);
     if (
       verified?.model !== trimmedModel ||
       (trimmedProvider !== undefined && verified?.provider !== trimmedProvider)
     ) {
-      throw new Error(`Failed to verify model update for thread: ${id}`);
+      throw new Error(`Failed to verify deferred model update for thread: ${id}`);
     }
+
     this.onModelSet?.(id, trimmedModel, verified);
+
     const detail =
       trimmedProvider && trimmedProvider !== oldProvider
         ? `${oldProvider ?? "default"}:${oldModel ?? "default"} -> ${trimmedProvider}:${trimmedModel}`
         : `${oldModel ?? "default"} -> ${trimmedModel}`;
+
     this.recordEvent({
       kind: "actor_model_set",
       actorId: id,
-
       detail,
     });
   }
@@ -2625,6 +2648,7 @@ export class ActorMesh {
       onRunEnd: (result) => {
         this.finishInboxRun(record.id);
         this.accountRun(record.id, result);
+        this.applyPendingModel(record.id);
       },
     };
   }

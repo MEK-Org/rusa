@@ -3018,10 +3018,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("claude");
     expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
 
-    // Valid target provider + model succeeds
+    // Valid target provider + model stages for the next run boundary.
     activeMesh.setActorModel(portableWorkerId, "Gemini 3.7 Flash (High)", "root", "antigravity");
-    expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("antigravity");
-    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Gemini 3.7 Flash (High)");
+    expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("claude");
+    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
+    expect(activeMesh.registry.get(portableWorkerId)?.desiredProvider).toBe("antigravity");
+    expect(activeMesh.registry.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash (High)");
 
     // Invalid model for target provider fails validation
     expect(() => {
@@ -3032,7 +3034,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "antigravity"
       );
     }).toThrow(/model pin validation failed/);
-    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Gemini 3.7 Flash (High)");
+    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
+    expect(activeMesh.registry.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash (High)");
+    expect(activeMesh.registry.get(portableWorkerId)?.desiredProvider).toBe("antigravity");
   });
 
   it("routes delegated chat spaces to the delegatee while others bubble to root", async () => {

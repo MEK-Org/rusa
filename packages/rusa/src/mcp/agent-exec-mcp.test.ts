@@ -1310,7 +1310,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     expect((res.content[0] as { text: string }).text).toMatch(/invalid cron/);
   });
 
-  it("set_thread_model updates an actor's model via MCP tool", async () => {
+  it("set_thread_model stages an actor's model via MCP tool", async () => {
     const { mesh, registry } = setup();
     const childId = mesh.spawn({
       charter: "worker",
@@ -1326,7 +1326,8 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     })) as CallToolResult;
 
     expect(res.isError).toBeFalsy();
-    expect(registry.get(childId)?.model).toBe("claude-opus-4-8");
+    expect(registry.get(childId)?.model).toBe("claude-sonnet-5");
+    expect(registry.get(childId)?.desiredModel).toBe("claude-opus-4-8");
   });
 
   it("set_thread_model fails when an actor tries to raise its own tier", async () => {
@@ -1379,8 +1380,10 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     expect((res1.content[0] as { text: string }).text).toContain(
       `set model for ${portableChild} to gemini-3.7-flash-high (provider: antigravity)`
     );
-    expect(registry.get(portableChild)?.provider).toBe("antigravity");
-    expect(registry.get(portableChild)?.model).toBe("gemini-3.7-flash-high");
+    expect(registry.get(portableChild)?.provider).toBe("claude");
+    expect(registry.get(portableChild)?.model).toBe("claude-opus-4-8");
+    expect(registry.get(portableChild)?.desiredProvider).toBe("antigravity");
+    expect(registry.get(portableChild)?.desiredModel).toBe("gemini-3.7-flash-high");
 
     // 2. Refuse move on native actor
     const res2 = (await client.callTool({
