@@ -53,6 +53,9 @@ export function buildAntigravityArgs(o: AntigravityArgsOptions): string[] {
     args.push("--add-dir", dir);
   }
   if (o.model) args.push("--model", o.model);
+  // agy 1.1.10+ resolves --effort against the model selected by --model. The
+  // explicit flag therefore owns the effective reasoning level even when an
+  // older passable display label still contains a parenthesized level.
   if (o.effort) args.push("--effort", o.effort);
   // agy's --print-timeout is a wall-clock execution ceiling (verified empirically).
   // Set it to match the full invocation budget (o.timeoutMs) so active streaming tasks are not cut short.

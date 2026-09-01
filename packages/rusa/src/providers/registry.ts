@@ -15,7 +15,7 @@ import type { CodingProvider } from "./types.js";
 // "antigravity".
 interface ProviderAdapter {
   create: (name: string, config: ProviderConfig, model?: string, effort?: string) => CodingProvider;
-  /** Native CLI vocabulary. Absent means the adapter has no effort control. */
+  /** Provider-level native CLI vocabulary. Absent means no effort control. */
   efforts?: readonly string[];
 }
 
@@ -26,7 +26,7 @@ const providerAdapters: Readonly<Record<string, ProviderAdapter>> = {
   },
   codex: {
     create: (name, config, model, effort) => new CodexProvider(name, config, model, effort),
-    efforts: ["none", "low", "medium", "high", "xhigh", "max"],
+    efforts: ["none", "low", "medium", "high", "xhigh", "max", "ultra"],
   },
   agy: {
     create: (name, config, model, effort) =>
@@ -50,7 +50,7 @@ function getEffectiveProviderConfig(
 export const DEFAULT_ROOT_PROVIDER = "antigravity";
 
 /** The native CLI capability family behind a logical provider config key. */
-function providerCapabilityName(providerName: string, config: RusaConfig): string {
+export function providerCapabilityName(providerName: string, config: RusaConfig): string {
   return getEffectiveProviderConfig(providerName, config)?.cliCommand?.trim() || providerName;
 }
 

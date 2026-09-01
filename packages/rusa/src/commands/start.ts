@@ -178,6 +178,7 @@ import { refreshConfiguredProviderModelCatalogs } from "../providers/model-scrap
 import {
   DEFAULT_ROOT_PROVIDER,
   normalizeFallbackModel,
+  providerCapabilityName,
   resolveProvider,
   resolveRootProvider,
   validateProviderSelection,
@@ -942,7 +943,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     },
     unsyncedCount: () => getLocalUnderstandingUnsyncedCount(mcHome),
   };
-  const registry = new FileThreadRegistry(join(mcHome, "threads.json"));
+  const registry = new FileThreadRegistry(join(mcHome, "threads.json"), (providerName) =>
+    providerCapabilityName(providerName, config)
+  );
   // The obligation store's actor guard is only real once it can see the
   // registry. Built from a Database alone, the container cannot do this itself,
   // and without this line every owner check in the repository is inert.

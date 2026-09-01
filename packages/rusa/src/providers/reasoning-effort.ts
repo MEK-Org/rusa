@@ -41,6 +41,11 @@ export function normalizeModelEffortSelection(
   const legacyEffort = parsed.reasoningEffort
     ? normalizeReasoningEffort(parsed.reasoningEffort)
     : undefined;
+  if (parsed.model !== model && legacyEffort === undefined) {
+    throw new Error(
+      `unrecognized legacy Codex model qualifier in "${model}"; pass the model slug and effort as separate settings`
+    );
+  }
   if (explicitEffort && legacyEffort && explicitEffort !== legacyEffort) {
     throw new Error(
       `conflicting reasoning efforts for provider "codex": model pin carries "${legacyEffort}" but effort is "${explicitEffort}"`
@@ -53,10 +58,10 @@ export function normalizeModelEffortSelection(
 }
 
 /**
- * Validate an explicit provider/model/effort combination against capability
- * data supplied by the provider adapter. Keeping that data an argument makes
- * the validator the stable choke point if a richer capability source earns its
- * way in later.
+ * Validate an explicit effort against the provider adapter's native vocabulary.
+ * Model-specific compatibility remains owned by the native CLI/server: keeping
+ * a second model×effort matrix here would drift and could reject newly valid
+ * combinations. Native failures retain the exact selection in failure notices.
  */
 export function validateReasoningEffort(
   provider: string,

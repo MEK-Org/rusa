@@ -142,6 +142,23 @@ describe("buildAntigravityArgs", () => {
     ]);
   });
 
+  it("lets explicit effort override the level in a legacy passable display label", () => {
+    const args = buildAntigravityArgs({
+      prompt: "hi",
+      model: "Gemini 3.1 Pro (High)",
+      effort: "low",
+      timeoutMs: 60_000,
+    });
+    expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2)).toEqual([
+      "--model",
+      "Gemini 3.1 Pro (High)",
+    ]);
+    expect(args.slice(args.indexOf("--effort"), args.indexOf("--effort") + 2)).toEqual([
+      "--effort",
+      "low",
+    ]);
+  });
+
   it("omits --conversation when starting fresh", () => {
     const args = buildAntigravityArgs({ prompt: "hi", timeoutMs: 60_000 });
     expect(args).not.toContain("--conversation");

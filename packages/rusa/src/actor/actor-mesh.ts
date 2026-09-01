@@ -259,7 +259,7 @@ export interface ActorMeshOptions {
   /** Synchronous validator before setting an actor's model in-place . */
   validateModel?: (
     record: ThreadRecord,
-    newModel: string,
+    newModel: string | undefined,
     newProvider?: string,
     newEffort?: string
   ) => ModelEffortSelection | undefined;
@@ -423,7 +423,7 @@ export class ActorMesh {
   private readonly validateSpawn?: (req: SpawnRequest) => ModelEffortSelection | undefined;
   private readonly validateModel?: (
     record: ThreadRecord,
-    newModel: string,
+    newModel: string | undefined,
     newProvider?: string,
     newEffort?: string
   ) => ModelEffortSelection | undefined;
@@ -2460,7 +2460,7 @@ export class ActorMesh {
           ? initialSelection.effort
           : record.effort;
     const selection =
-      this.validateModel?.(record, nextModel ?? "", trimmedProvider, requestedEffort) ??
+      this.validateModel?.(record, nextModel, trimmedProvider, requestedEffort) ??
       normalizeModelEffortSelection(effectiveProvider, nextModel, requestedEffort);
     const validatedModel = selection.model ?? nextModel;
     const validatedEffort = selection.effort;

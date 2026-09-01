@@ -6,6 +6,7 @@ import { FileThreadRegistry } from "../actor/thread-registry.js";
 import { loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { getRepositories, initDb } from "../db/index.js";
+import { providerCapabilityName } from "../providers/registry.js";
 import { startDashboardServer } from "../webhook/server.js";
 
 /**
@@ -38,7 +39,9 @@ ${"━".repeat(26)}
   const dashboardBindHost = config.dashboard?.bindHost ?? "127.0.0.1";
   // Open the persisted db + registry so the Data API serves real mesh data.
   initDb(mcHome);
-  const registry = new FileThreadRegistry(join(mcHome, "threads.json"));
+  const registry = new FileThreadRegistry(join(mcHome, "threads.json"), (providerName) =>
+    providerCapabilityName(providerName, config)
+  );
   const rootRecord = registry.list().find((record) => record.isRoot === true);
   // The HALT sentinel is a plain file against the same home, so this read-only
   // viewer can surface the halt state even though no mesh runs in this process.

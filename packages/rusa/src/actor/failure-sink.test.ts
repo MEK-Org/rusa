@@ -7,6 +7,7 @@ import type { RunResult } from "../providers/types.js";
 import type { MechanicalInboxForensics } from "./actor-mesh.js";
 import {
   type FailureSinkDeps,
+  formatProviderLabel,
   isHumanOperatorCancelled,
   routeContinuationCapped,
   routeRunFailure,
@@ -54,6 +55,18 @@ function makeDeps(
 }
 
 describe("routeRunFailure", () => {
+  it("labels the exact provider/model/effort selection", () => {
+    expect(
+      formatProviderLabel({
+        name: "configured alias",
+        providerName: "codex",
+        model: "gpt-5.6-sol",
+        effort: "xhigh",
+        run: async () => ({ success: true, output: "", exitCode: 0 }),
+      })
+    ).toBe("codex/gpt-5.6-sol @ xhigh");
+  });
+
   it("appends a sub-actor's failure to its parent's inbox", () => {
     const { deps, toParent, toChat } = makeDeps({ w1: { id: "w1", parentId: "root" } });
     routeRunFailure(deps, "w1", FAIL);
@@ -160,7 +173,7 @@ describe("routeRunFailure", () => {
       expect(body).toContain("boom");
     });
 
-    it("keeps today's format when classify reports not exhausted", async () => {
+    it("attributes a native rejection when classify reports not exhausted", async () => {
       const { deps, toParent } = makeDeps(
         { w1: { id: "w1", parentId: "root" } },
         { classify: async () => ({ exhausted: false }) }
@@ -168,7 +181,9 @@ describe("routeRunFailure", () => {
       await routeRunFailure(deps, "w1", FAIL, "claude/claude-sonnet-5");
       const body = toParent[0]?.body ?? "";
       expect(body).not.toContain("quota exhausted");
-      expect(body).toBe("[run failed] (exit 1)\n\nboom\nstack trace");
+      expect(body).toBe(
+        "[run failed] provider selection claude/claude-sonnet-5 failed.\n\n(exit 1)\n\nboom\nstack trace"
+      );
     });
 
     it("does not label network transient failures as quota exhausted ", async () => {
@@ -186,16 +201,19 @@ describe("routeRunFailure", () => {
       await routeRunFailure(deps, "w1", networkFail, "antigravity");
       const body = toParent[0]?.body ?? "";
       expect(body).not.toContain("quota exhausted");
-      expect(body).toContain("[run failed] (exit 1)");
+      expect(body).toContain("[run failed] provider selection antigravity failed.");
+      expect(body).toContain("(exit 1)");
       expect(body).toContain("connect ETIMEDOUT");
     });
 
-    it("keeps today's format when no classifier is configured", async () => {
+    it("attributes a native rejection when no classifier is configured", async () => {
       const { deps, toParent } = makeDeps({ w1: { id: "w1", parentId: "root" } });
       await routeRunFailure(deps, "w1", FAIL, "claude/claude-sonnet-5");
       const body = toParent[0]?.body ?? "";
       expect(body).not.toContain("quota exhausted");
-      expect(body).toBe("[run failed] (exit 1)\n\nboom\nstack trace");
+      expect(body).toBe(
+        "[run failed] provider selection claude/claude-sonnet-5 failed.\n\n(exit 1)\n\nboom\nstack trace"
+      );
     });
   });
 

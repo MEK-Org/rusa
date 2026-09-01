@@ -2746,7 +2746,7 @@ describe("ActorMesh", () => {
 
   it("persists, updates, and clears effort independently at run boundaries", async () => {
     const events: MeshEventInput[] = [];
-    const validations: Array<{ model: string; effort?: string }> = [];
+    const validations: Array<{ model?: string; effort?: string }> = [];
     const { mesh, registry, tick } = setup({
       events: (event) => events.push(event),
       validateModel: (_record, model, _provider, effort) => {
@@ -2787,6 +2787,23 @@ describe("ActorMesh", () => {
     await tick();
     expect(registry.get(child)?.effort).toBeUndefined();
     expect(registry.get(child)?.desiredEffort).toBeUndefined();
+  });
+
+  it("supports an effort-only update when the root uses its provider's default model", () => {
+    const validations: Array<{ model?: string; effort?: string }> = [];
+    const { mesh, registry } = setup({
+      validateModel: (_record, model, _provider, effort) => {
+        validations.push({ model, effort });
+        return { model, effort };
+      },
+    });
+    registry.patch("root", { provider: "claude", model: undefined });
+
+    mesh.setActorModel("root", undefined, "root", undefined, "high");
+
+    expect(validations).toEqual([{ model: undefined, effort: "high" }]);
+    expect(registry.get("root")).toMatchObject({ desiredEffort: "high" });
+    expect(registry.get("root")?.desiredModel).toBeUndefined();
   });
 
   it("lets only the root set its own portable model at its run boundary", () => {
@@ -2841,7 +2858,7 @@ describe("ActorMesh", () => {
 
   it("setActorModel supports cross-provider moves for portable actors and rejects them for native actors", async () => {
     const events: MeshEventInput[] = [];
-    const validations: Array<{ recordId: string; newModel: string; newProvider?: string }> = [];
+    const validations: Array<{ recordId: string; newModel?: string; newProvider?: string }> = [];
     const { mesh, registry, tick } = setup({
       events: (event) => events.push(event),
       validateModel: (record, newModel, newProvider) => {

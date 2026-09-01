@@ -18,6 +18,9 @@ describe("reasoning effort", () => {
     expect(() => normalizeModelEffortSelection("codex", "gpt-5.6-sol medium", "high")).toThrow(
       /conflicting reasoning efforts/
     );
+    expect(() => normalizeModelEffortSelection("codex", "gpt-5.6-sol unexpected")).toThrow(
+      /unrecognized legacy Codex model qualifier/
+    );
   });
 
   it("leaves non-Codex model vocabulary intact", () => {
@@ -40,6 +43,16 @@ describe("reasoning effort", () => {
     expect(() =>
       validateReasoningEffort("antigravity", "gemini", "xhigh", ["low", "medium", "high"])
     ).toThrow(/acceptable values: "low", "medium", "high"/);
+    expect(() =>
+      validateReasoningEffort("codex", "gpt-5.6-sol", "ultra", [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra",
+      ])
+    ).not.toThrow();
     expect(() => validateReasoningEffort("kimi", "kimi-code", "high", undefined)).toThrow(
       /does not expose/
     );
