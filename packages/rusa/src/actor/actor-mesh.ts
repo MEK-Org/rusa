@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
 import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../mcp/stamp.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
+import { asGitHubIssue, parseReference } from "../references/reference.js";
 import {
   type CapabilityGrantStore,
   InMemoryCapabilityGrantStore,
@@ -42,6 +43,17 @@ import type { ActorRunMode, RunNudge } from "./trigger-runner.js";
 
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
 export const SCHEDULER_SENDER_ID = "scheduler";
+
+/** Map only the issue-shaped event resources obligations may govern. */
+function eventResourceObligationKey(resource: EventResource): string | undefined {
+  const key = resourceKey(resource);
+  try {
+    return asGitHubIssue(parseReference(key)) ? key : undefined;
+  } catch {
+    // An invalid resource cannot name an obligation. Preserve subscription routing.
+    return undefined;
+  }
+}
 
 /** Runtime contract the mesh needs for routing; provider-backed Actor is one implementation. */
 export interface MeshActor {
@@ -335,6 +347,12 @@ export interface ActorMeshOptions {
    */
   capabilityGrants?: CapabilityGrantStore;
   eventSubscriptions?: EventSubscriptionStore;
+  /**
+   * Ownership authority for issue/PR event sources. Optional: without
+   * it, routing falls back entirely to subscriptions, which is what every mesh
+   * built before obligations existed does.
+   */
+  obligations?: { findLiveByExternalRef(ref: string): { ownerId: string } | null };
   /** Durable actor inbox used for singleton wake recovery. Optional for isolated tests. */
   inboxStore?: InboxStore;
   /** General lifecycle hook matching onYield. */
@@ -409,6 +427,9 @@ export class ActorMesh {
   }) => string;
   private readonly grants: CapabilityGrantStore;
   private readonly eventSubscriptions: EventSubscriptionStore;
+  private readonly obligations?: {
+    findLiveByExternalRef(ref: string): { ownerId: string } | null;
+  };
   private readonly inboxStore?: InboxStore;
   private readonly onQueued?: ActorMeshOptions["onQueued"];
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
@@ -422,6 +443,23 @@ export class ActorMesh {
   >();
   private readonly pendingDeliveryTimers = new Map<string, NodeJS.Timeout>();
   private readonly selectedInboxEntryIds = new Map<string, string[]>();
+  /** Actors currently inside a run, for the ready-head window below. */
+  private readonly actorsInRun = new Set<string>();
+  /**
+   * Ready-head churn observed while an actor is mid-run, collapsed at run end
+   * into the single net transition (#1645 follow-up, operator 2026-08-30).
+   *
+   * An actor that files a question under the obligation it is working moves its
+   * own head twice in one run — once when the parent is created, again when the
+   * child makes that parent wait — so delivering per mutation wakes it about
+   * work it just did, and about a head that had already gone waiting by the
+   * time the entry landed. `from` is the head the first change displaced; `to`
+   * is the head as of the latest change, or null once the queue has no head.
+   */
+  private readonly runHeadNet = new Map<
+    string,
+    { from: string | null; to: { id: string; intent: string | null } | null }
+  >();
   /**
    * Ids whose {@link retire} is currently unwinding. A subtree retire recurses
    * into children *before* marking itself retired, so an ancestor mid-retire
@@ -438,6 +476,7 @@ export class ActorMesh {
     this.validateModel = opts.validateModel;
     this.grants = opts.capabilityGrants ?? new InMemoryCapabilityGrantStore();
     this.eventSubscriptions = opts.eventSubscriptions ?? new InMemoryEventSubscriptionStore();
+    this.obligations = opts.obligations;
     this.inboxStore = opts.inboxStore;
     this.onQueued = opts.onQueued;
     this.onInboxEntriesSeen = opts.onInboxEntriesSeen;
@@ -625,6 +664,62 @@ export class ActorMesh {
   }
 
   /**
+   * Boot recovery for ready-head inbox attention (#1645).
+   *
+   * Verifies that every active actor with a ready head has durable attention in
+   * its inbox. Keyed by exact transition fact and sequence persisted in SQLite.
+   */
+  reconcileReadyHeads(obligations: {
+    readyHeadTransitions?(): Iterable<{
+      ownerId: string;
+      headId: string;
+      previousHeadId: string | null;
+      sequence: number;
+    }>;
+    readyHeads?(): Iterable<[string, string]>;
+    get(id: string): { id: string; intent: string | null } | null;
+  }): void {
+    if (!this.inboxStore) return;
+    try {
+      if (typeof obligations.readyHeadTransitions === "function") {
+        for (const {
+          ownerId,
+          headId,
+          previousHeadId,
+          sequence,
+        } of obligations.readyHeadTransitions()) {
+          if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) continue;
+          const actorId = this.resolveThreadId(ownerId);
+          const record = this.registry.get(actorId);
+          if (!record || record.status !== "active") continue;
+          const head = obligations.get(headId);
+          if (!head) continue;
+          this.deliverReadyHeadAttention(
+            actorId,
+            { id: head.id, intent: head.intent },
+            previousHeadId,
+            sequence
+          );
+        }
+      } else if (typeof obligations.readyHeads === "function") {
+        for (const [ownerId, headId] of obligations.readyHeads()) {
+          if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) continue;
+          const actorId = this.resolveThreadId(ownerId);
+          const record = this.registry.get(actorId);
+          if (!record || record.status !== "active") continue;
+          const head = obligations.get(headId);
+          if (!head) continue;
+          this.deliverReadyHeadAttention(actorId, { id: head.id, intent: head.intent }, null, null);
+        }
+      }
+    } catch (err) {
+      this.log(
+        `ready-head reconciliation failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  /**
    * Notify an actor that its durable worklist changed. If an execution
    * opportunity is already queued, the new entry joins it and becomes seen
    * immediately; only deliveries during an active run set the dirty follow-up.
@@ -654,6 +749,10 @@ export class ActorMesh {
   actorQueued(actorId: string, context: { responsive: boolean; mode: ActorRunMode }): InboxEntry[] {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
+    // Open the run-scoped head window. An actor absent from this set delivers
+    // head attention immediately, which is what every non-run producer wants.
+    this.actorsInRun.add(actorId);
+    this.runHeadNet.delete(actorId);
     const entries = context.mode === "ordinary" ? this.markInboxSeen(actorId) : [];
     try {
       this.onQueued?.(actorId, context);
@@ -705,6 +804,106 @@ export class ActorMesh {
   finishInboxRun(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
+    this.flushRunHeadAttention(actorId);
+    // Both factory-created workers and the externally-created root finish runs
+    // through this boundary. Applying here lets the root stage its own model
+    // without giving arbitrary actors self-set authority.
+    this.applyPendingModel(actorId);
+  }
+
+  /**
+   * Deliver at most one entry for everything a run did to its own ready head.
+   *
+   * The net transition is the head the run started with against the head it
+   * ended with. If they match, the run churned and settled back — nothing to
+   * say. If it ended with no head at all (every ready obligation became a
+   * waiting parent, typically because the actor filed a question for a human
+   * under it), there is nothing to point at, so nothing is delivered.
+   */
+  private flushRunHeadAttention(actorId: string): void {
+    this.actorsInRun.delete(actorId);
+    const net = this.runHeadNet.get(actorId);
+    this.runHeadNet.delete(actorId);
+    // Nothing moved, it settled back where it started, or it ended with no head
+    // at all — in the last case there is no obligation to point the actor at.
+    if (!net || net.to === null || net.to.id === net.from) return;
+    this.appendReadyHeadEntry(actorId, net.to, net.from);
+  }
+
+  /**
+   * Durable attention for an actor that gained a new ready head (#1645).
+   *
+   * The obligation store stays the work-state authority; this is only the wake
+   * surface. `append` is `ON CONFLICT(id) DO NOTHING`, so exact-once comes from
+   * the entry id — but the id is derived from the *transition* (which head this
+   * one displaced), not from the resulting head alone.
+   *
+   * Keying on the head alone made the id permanent per (actor, obligation),
+   * which is exactly-once but not live. An actor notified about head H that
+   * marked the entry handled while deferring H, then worked a higher-priority
+   * H0, got nothing at all when H became its head again: no entry, no nudge,
+   * and `reconcileInbox` could not rescue it because the only entry for H was
+   * already handled. Keying on `previousHeadId -> head.id` makes that a
+   * distinct transition, so the actor is woken again.
+   *
+   * A restart or a replay of the same committed transition is still silent.
+   * The residual case — the identical transition recurring after the actor
+   * handled it — cannot be expressed in the id, and falls back to a live nudge:
+   * it wakes a running mesh but is not durable across a restart.
+   */
+  deliverReadyHeadAttention(
+    actorId: string,
+    /** The new head, or null when the owner no longer has one. */
+    head: { id: string; intent: string | null } | null,
+    previousHeadId: string | null = null,
+    sequence: number | null = null
+  ): boolean {
+    actorId = this.resolveThreadId(actorId);
+    // Mid-run: accumulate rather than deliver. `from` is fixed by the first
+    // change of the run so the collapsed entry describes where the run started,
+    // not where its last mutation happened to leave off.
+    if (this.actorsInRun.has(actorId)) {
+      const net = this.runHeadNet.get(actorId);
+      this.runHeadNet.set(actorId, { from: net ? net.from : previousHeadId, to: head });
+      return false;
+    }
+    if (head === null) return false;
+    return this.appendReadyHeadEntry(actorId, head, previousHeadId, sequence);
+  }
+
+  private appendReadyHeadEntry(
+    actorId: string,
+    head: { id: string; intent: string | null },
+    previousHeadId: string | null,
+    sequence: number | null = null
+  ): boolean {
+    if (!this.inboxStore) return false;
+    const record = this.registry.get(actorId);
+    if (!record || record.status !== "active") return false;
+    // Keying on transition + sequence ensures exact-once durable inbox delivery across restarts.
+    // ON CONFLICT DO NOTHING suppresses duplicate inbox rows if the prior entry remains.
+    const seqKey = sequence !== null ? `:${sequence}` : "";
+    const entryId = deduplicatedInboxEntryId(
+      `obligation-head:${actorId}:${previousHeadId ?? "none"}->${head.id}${seqKey}`,
+      actorId
+    );
+    const entries = this.inboxStore.append([
+      {
+        id: entryId,
+        actorId,
+        source: `obligation:${head.id}`,
+        payload: {
+          type: "obligation.ready_head",
+          obligationId: head.id,
+          intent: head.intent ?? undefined,
+        } as unknown as InboxPayload,
+      },
+    ]);
+    if (entries.length === 0) {
+      return false;
+    }
+    this.notifyInboxChanged(actorId);
+    return true;
   }
 
   inboxHandled(actorId: string): void {
@@ -1013,14 +1212,43 @@ export class ActorMesh {
       ignoreExactResource?: EventResource;
       eventPayload?: InboxPayload;
       enforceBubblingPolicy?: boolean;
+      /** A precomputed exact-resource lookup; `null` means it found no claim. */
+      exactObligationOwner?: string | null;
     } = {}
   ): string[] {
     const destinations: string[] = [];
     let current: EventResource | undefined = resource;
+    let exact = true;
 
     // Atomicity Invariant: The check `this.live.has(sub.actorId)` and the delivery
     // via `requestRun` happen in the same synchronous section with no await.
     while (current) {
+      // The obligation store is the ownership authority for linked issue/PR
+      // work. Consulted before the subscription store at every rung of
+      // the climb, so a live obligation supersedes any manual delegation on the
+      // same source — and so a comment event resolves to the obligation on its
+      // issue one level up, which the path grammar makes free.
+      //
+      // Derived, never written: nothing here deactivates a subscription. The
+      // prior subscriber is superseded rather than destroyed, which keeps the
+      // audit history intact and makes replay and restart reconstruct the same
+      // answer with no chance of reviving a stale owner.
+      const governing =
+        exact && opts.exactObligationOwner !== undefined
+          ? (opts.exactObligationOwner ?? undefined)
+          : this.obligationOwnerFor(current);
+      exact = false;
+      if (governing) {
+        // The claim is authoritative even when its owner is not runnable. A
+        // human/system owner, or a temporarily absent actor, produces no
+        // destination; falling through would hand their work to whichever actor
+        // happened to be subscribed earlier.
+        if (this.live.has(governing) && !destinations.includes(governing)) {
+          destinations.push(governing);
+        }
+        return destinations;
+      }
+
       const activeSubs = this.eventSubscriptions.activeForResource(current);
       for (const sub of activeSubs) {
         if (
@@ -1055,6 +1283,20 @@ export class ActorMesh {
     return destinations;
   }
 
+  /**
+   * The owner of the live obligation claiming this event source, if any.
+   *
+   * Returns an entity id, which may be a human — the caller decides what that
+   * means for routing. Absent an obligation repository (a mesh built without
+   * one, as in many tests) this is always undefined and routing is unchanged.
+   */
+  private obligationOwnerFor(resource: EventResource): string | undefined {
+    if (!this.obligations) return undefined;
+    const referenceKey = eventResourceObligationKey(resource);
+    if (!referenceKey) return undefined;
+    return this.obligations.findLiveByExternalRef(referenceKey)?.ownerId;
+  }
+
   private effectiveOwnerOf(
     resource: EventResource,
     opts: { ignoreExactResource?: EventResource } = {}
@@ -1066,15 +1308,11 @@ export class ActorMesh {
    * Subscribe an actor to an event source. Records an audit event.
    * Throws if another actor is already actively subscribed to the event source.
    */
-  subscribeEventSource(
-    resource: EventSubscription["resource"],
-    actorId: string,
-    subscribedBy: string
-  ): void {
+  subscribeEventSource(resource: EventResource, actorId: string, subscribedBy: string): void {
     actorId = this.resolveThreadId(actorId);
     subscribedBy = this.resolveThreadId(subscribedBy);
     const subscription: EventSubscription = {
-      resource,
+      resource: resourceKey(resource),
       actorId,
       subscribedBy,
       subscribedAt: this.now(),
@@ -1155,11 +1393,7 @@ export class ActorMesh {
   /**
    * Unsubscribe an actor from an event source. Records an audit event.
    */
-  unsubscribeEventSource(
-    resource: EventSubscription["resource"],
-    actorId: string,
-    at: string
-  ): void {
+  unsubscribeEventSource(resource: EventResource, actorId: string, at: string): void {
     actorId = this.resolveThreadId(actorId);
     this.eventSubscriptions.unsubscribe(resource, actorId, at);
     this.recordEvent({
@@ -1195,18 +1429,27 @@ export class ActorMesh {
   ): Promise<void> {
     let destinations: string[];
     let directed = false;
+    // A live obligation is the ownership authority even when the event carries
+    // a bot-authored directed target. Directives remain useful for unclaimed
+    // work, but cannot route claimed work around its current owner.
     if (opts.directedTarget) {
-      const directedTarget = this.resolveLiveActor(opts.directedTarget);
-      if (directedTarget) {
-        this.log(`mesh:deliver directed-delivered to ${opts.directedTarget} (${eventSummary})`);
-        destinations = [directedTarget.id];
-        directed = true;
+      const governing = this.obligationOwnerFor(resource);
+      if (governing) {
+        destinations = this.live.has(governing) ? [governing] : [];
       } else {
-        this.log(`mesh:deliver target not live: ${opts.directedTarget} — directive ignored`);
-        destinations = this.resolveLiveEventDestinations(resource, {
-          enforceBubblingPolicy: true,
-          eventPayload: opts.inboxPayload,
-        });
+        const directedTarget = this.resolveLiveActor(opts.directedTarget);
+        if (directedTarget) {
+          this.log(`mesh:deliver directed-delivered to ${opts.directedTarget} (${eventSummary})`);
+          destinations = [directedTarget.id];
+          directed = true;
+        } else {
+          this.log(`mesh:deliver target not live: ${opts.directedTarget} — directive ignored`);
+          destinations = this.resolveLiveEventDestinations(resource, {
+            enforceBubblingPolicy: true,
+            eventPayload: opts.inboxPayload,
+            exactObligationOwner: null,
+          });
+        }
       }
     } else {
       destinations = this.resolveLiveEventDestinations(resource, {
@@ -1230,7 +1473,7 @@ export class ActorMesh {
     }
 
     // A verified `system:*` stamp marks a persistence-only write performed by
-    // mesh infrastructure (e.g. tracker-hygiene) rather than a peer actor — it
+    // mesh infrastructure rather than a peer actor — it
     // withholds delivery to EVERY destination, not just an author-match. Only a
     // verified stamp may trigger this (opts.stampedAuthor only exists when
     // resolveStampedAuthor's HMAC + freshness checks passed in start.ts); an
@@ -2068,10 +2311,11 @@ export class ActorMesh {
   /**
    * Update an existing actor's model in-place in the thread registry .
    * Root or parent-gated: root may set the model for any thread in its subtree;
+   * root may also set its own model;
    * a non-root parent may only set the model for its own descendants (and never
    * raise its own tier).
    * Optionally moves portable (ledger/tail) actors across providers.
-   * Takes effect on the actor's NEXT run.
+   * Takes effect at the end of the actor's next run.
    */
   setActorModel(id: string, model: string, requestedBy: string, provider?: string): void {
     id = this.resolveThreadId(id);
@@ -2091,10 +2335,6 @@ export class ActorMesh {
         );
       }
     }
-    const liveActor = this.live.get(id);
-    if (liveActor && (liveActor.isRunning || liveActor.isQueued)) {
-      throw new Error(`Cannot change model or provider while actor ${id} is running or queued`);
-    }
     const trimmedModel = model.trim();
     if (!trimmedModel) {
       throw new Error(`Cannot set an empty model on thread: ${id}`);
@@ -2110,29 +2350,56 @@ export class ActorMesh {
     if (this.validateModel) {
       this.validateModel(record, trimmedModel, trimmedProvider);
     }
+    // One boundary contract for every run state: the in-flight run, or the next
+    // dispatched run when idle/queued, completes on the current model. The
+    // desired value is applied only when that run ends.
+    const patch: Partial<ThreadRecord> = {
+      desiredModel: trimmedModel,
+      desiredProvider: trimmedProvider,
+    };
+    this.registry.patch(id, patch);
+  }
+
+  /**
+   * Apply the pending model/provider change at the end of the next run boundary.
+   */
+  private applyPendingModel(id: string): void {
+    const record = this.registry.get(id);
+    if (!record || !record.desiredModel) return;
+
+    const trimmedModel = record.desiredModel;
+    const trimmedProvider = record.desiredProvider;
     const oldModel = record.model;
     const oldProvider = record.provider;
-    const patch: Partial<ThreadRecord> = { model: trimmedModel };
+
+    const patch: Partial<ThreadRecord> = {
+      model: trimmedModel,
+      desiredModel: undefined,
+      desiredProvider: undefined,
+    };
     if (trimmedProvider !== undefined) {
       patch.provider = trimmedProvider;
     }
     this.registry.patch(id, patch);
+
     const verified = this.registry.get(id);
     if (
       verified?.model !== trimmedModel ||
       (trimmedProvider !== undefined && verified?.provider !== trimmedProvider)
     ) {
-      throw new Error(`Failed to verify model update for thread: ${id}`);
+      throw new Error(`Failed to verify deferred model update for thread: ${id}`);
     }
+
     this.onModelSet?.(id, trimmedModel, verified);
+
     const detail =
       trimmedProvider && trimmedProvider !== oldProvider
         ? `${oldProvider ?? "default"}:${oldModel ?? "default"} -> ${trimmedProvider}:${trimmedModel}`
         : `${oldModel ?? "default"} -> ${trimmedModel}`;
+
     this.recordEvent({
       kind: "actor_model_set",
       actorId: id,
-
       detail,
     });
   }

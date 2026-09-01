@@ -432,13 +432,19 @@ describe("obligation projection (ISSUE_NUM, ratified in ISSUE_NUM comment 536984
   ): Obligation => ({
     id,
     parentId: null,
-    owner: { kind: "actor", id: "actor-a" },
+    ownerId: "actor-a",
     intent,
     externalRef,
     status,
     priority,
     effectivePriority: priority,
     prioritySourceId: id,
+    createdAt: "2026-08-29T00:00:00.000Z",
+    updatedAt: "2026-08-29T00:00:00.000Z",
+    creatorId: "actor-a",
+    terminalNote: null,
+    title: intent,
+    resolutionRef: null,
   });
 
   const OBLIGATIONS_HEADING = "### Your obligations (system of record)";
@@ -548,7 +554,7 @@ describe("obligation projection (ISSUE_NUM, ratified in ISSUE_NUM comment 536984
   // can make.
   it("bounds the whole line, not just the intent (max-size GitHub ref)", () => {
     // GitHub's own maxima: 39-character owner, 100-character repository.
-    const ref = parseExternalRef(`github_issue:${"o".repeat(39)}/${"r".repeat(100)}#1`);
+    const ref = parseExternalRef(`github:${"o".repeat(39)}/${"r".repeat(100)}/issues/1`);
     const section = project([
       obligation(
         "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
@@ -568,12 +574,11 @@ describe("obligation projection (ISSUE_NUM, ratified in ISSUE_NUM comment 536984
     // Defense in depth: `parseExternalRef` rejects owner > 39 and repo > 100, but if
     // an oversized ref were ever held in memory past the whole 32KB fixed-section ceiling,
     // the prompt assembler must still bound the line and not throw.
+    const vastOwner = "o".repeat(PORTABLE_CONTEXT_MAX_BYTES + 1_000);
     const ref: Obligation["externalRef"] = {
-      kind: "github_pr",
-      owner: "o".repeat(PORTABLE_CONTEXT_MAX_BYTES + 1_000),
-      repo: "repo",
-      number: 7,
-      key: `github_pr:${"o".repeat(PORTABLE_CONTEXT_MAX_BYTES + 1_000)}/repo#7`,
+      scheme: "github",
+      segments: [vastOwner, "repo", "pulls", "7"],
+      key: `github:${vastOwner}/repo/pulls/7`,
     };
     const section = project([obligation("ob-vast-ref", "ready", "Work", 1, ref)]);
     expect(obligationsSectionBytes(section)).toBeLessThanOrEqual(

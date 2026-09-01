@@ -338,7 +338,6 @@ class DashboardApi {
   // ── Obligations read routes ──
 
   Future<ObligationPage> fetchObligations({
-    String? ownerKind,
     String? ownerId,
     String? status,
     bool? rootsOnly,
@@ -346,7 +345,6 @@ class DashboardApi {
     int? offset,
   }) async {
     final q = <String, String>{
-      'ownerKind':? ownerKind,
       'ownerId':? ownerId,
       'status':? status,
       if (rootsOnly != null) 'rootsOnly': '$rootsOnly',
@@ -383,8 +381,8 @@ class DashboardApi {
   // ── Obligations write routes ──
 
   Future<ObligationDto> createObligation({
-    required String ownerKind,
     required String ownerId,
+    required String title,
     String? parentId,
     String? intent,
     String? externalRef,
@@ -392,8 +390,8 @@ class DashboardApi {
   }) async {
     final uri = _u('/api/mesh/obligations');
     final payload = {
-      'ownerKind': ownerKind,
       'ownerId': ownerId,
+      'title': title,
       'parentId': ?parentId,
       'intent': ?intent,
       'externalRef': ?externalRef,
@@ -414,15 +412,48 @@ class DashboardApi {
     return ObligationDto.fromJson(json['obligation'] as Map<String, dynamic>);
   }
 
-  Future<ObligationDto> setObligationStatus(String id, String status) async {
+  Future<ObligationDto> setObligationStatus(
+    String id,
+    String status, {
+    String? note,
+    String? resolutionRef,
+  }) async {
     final uri = _u('/api/mesh/obligations/$id/status');
+    final trimmed = note?.trim();
     final res = await _client.post(
       uri,
       headers: {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
       },
-      body: jsonEncode({'status': status}),
+      body: jsonEncode({
+        'status': status,
+        // Omitted rather than sent as '' so the server records "no reason
+        // given" as null, matching the repository's own normalization.
+        if (trimmed != null && trimmed.isNotEmpty) 'note': trimmed,
+        if (resolutionRef != null && resolutionRef.trim().isNotEmpty)
+          'resolutionRef': resolutionRef.trim(),
+      }),
+    );
+    if (res.statusCode != 200) {
+      throw DashboardApiException(uri, res.statusCode, res.body);
+    }
+    final json = jsonDecode(res.body) as Map<String, dynamic>;
+    return ObligationDto.fromJson(json['obligation'] as Map<String, dynamic>);
+  }
+
+  /// `POST /api/mesh/obligations/:id/external-ref` — link, relink or unlink the
+  /// issue/PR/repo this obligation *is*. A null or blank [ref] unlinks.
+  Future<ObligationDto> setObligationExternalRef(String id, String? ref) async {
+    final uri = _u('/api/mesh/obligations/$id/external-ref');
+    final trimmed = ref?.trim();
+    final res = await _client.post(
+      uri,
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({'externalRef': (trimmed == null || trimmed.isEmpty) ? null : trimmed}),
     );
     if (res.statusCode != 200) {
       throw DashboardApiException(uri, res.statusCode, res.body);
@@ -480,7 +511,6 @@ class DashboardApi {
 
   Future<ObligationDto> reassignObligation(
     String id, {
-    required String ownerKind,
     required String ownerId,
   }) async {
     final uri = _u('/api/mesh/obligations/$id/reassign');
@@ -490,7 +520,7 @@ class DashboardApi {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
       },
-      body: jsonEncode({'ownerKind': ownerKind, 'ownerId': ownerId}),
+      body: jsonEncode({'ownerId': ownerId}),
     );
     if (res.statusCode != 200) {
       throw DashboardApiException(uri, res.statusCode, res.body);

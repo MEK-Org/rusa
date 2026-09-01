@@ -21,6 +21,7 @@ import { PID_FILE, provisionE2EInstance, resumeE2EInstance } from "../e2e/provis
 import { startTrackerServer } from "../e2e/tracker-server.js";
 import { setIssueClient } from "../gitops/issue-client.js";
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
+import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { assertBwrapAvailable } from "../providers/sandbox.js";
 import { type RunStartE2EHandles, runStart } from "./start.js";
 
@@ -421,6 +422,51 @@ export function startRootControlServer(opts: {
           send(res, 200, { ok: true });
           return;
         }
+        if (url.pathname === "/obligations") {
+          // The external driver IS the operator, so the creator is the shared
+          // HUMAN_OPERATOR id — the same server-side binding the actor MCP does
+          // with its own actor id, never a value read off the request.
+          const obligation = getRepositories().obligations.create({
+            ownerId: String(body.ownerId ?? ""),
+            parentId: body.parentId == null ? null : String(body.parentId),
+            intent: body.intent == null ? null : String(body.intent),
+            title: String(body.title ?? ""),
+            externalRef: body.externalRef == null ? null : String(body.externalRef),
+            priority: typeof body.priority === "number" ? body.priority : null,
+            creatorId: HUMAN_OPERATOR,
+          });
+          send(res, 200, { obligation });
+          return;
+        }
+        const statusMatch = url.pathname.match(/^\/obligations\/([^/]+)\/status$/);
+        if (statusMatch) {
+          const obligation = getRepositories().obligations.setTerminalStatus(
+            decodeURIComponent(statusMatch[1]),
+            body.status === "cancelled" ? "cancelled" : "done",
+            typeof body.note === "string" ? body.note : null,
+            typeof body.resolutionRef === "string" ? body.resolutionRef : null
+          );
+          send(res, 200, { obligation });
+          return;
+        }
+        const reassignMatch = url.pathname.match(/^\/obligations\/([^/]+)\/reassign$/);
+        if (reassignMatch) {
+          const obligation = getRepositories().obligations.reassign(
+            decodeURIComponent(reassignMatch[1]),
+            String(body.ownerId ?? "")
+          );
+          send(res, 200, { obligation });
+          return;
+        }
+        const reparentMatch = url.pathname.match(/^\/obligations\/([^/]+)\/reparent$/);
+        if (reparentMatch) {
+          const obligation = getRepositories().obligations.reparent(
+            decodeURIComponent(reparentMatch[1]),
+            body.parentId == null ? null : String(body.parentId)
+          );
+          send(res, 200, { obligation });
+          return;
+        }
         send(res, 404, { error: "not found" });
       })
       .catch((err) => {
@@ -483,7 +529,7 @@ function fakeChatMessage(seq: number, text: string, dm: boolean): ChatMessage {
  *    (wakes the root). `dm` defaults to true; a room message sets mentionsSelf.
  *  - `GET  /chat/outbox` → `{ sent, reactions }` the root produced.
  */
-function startChatControlServer(opts: {
+export function startChatControlServer(opts: {
   port: number;
   chatSource: FakeChatSource;
   chatClient: FakeChatClient;
@@ -509,6 +555,19 @@ function startChatControlServer(opts: {
             const { text, dm } = JSON.parse(raw || "{}") as { text?: string; dm?: boolean };
             if (!text) return send(400, { error: "text is required" });
             const msg = fakeChatMessage(++seq, text, dm !== false);
+            // Deliver AND make readable. The source only wakes the actor; the
+            // chat-read MCP answers `get_message`/`list_messages` out of
+            // `FakeChatClient.messages`, which nothing was populating. So a
+            // woken root followed its inbox item to the source, got "message
+            // not found", and — correctly, per the grounding discipline —
+            // refused to guess and asked the operator to resend. The edge
+            // looked wired and was write-only.
+            opts.chatClient.messages.push({
+              name: msg.name,
+              text: msg.text,
+              sender: { name: msg.senderName, displayName: msg.senderDisplayName },
+              createTime: new Date().toISOString(),
+            });
             await opts.chatSource.emit(msg);
             send(200, { ok: true, delivered: msg.name });
           } catch (err) {

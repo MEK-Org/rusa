@@ -35,3 +35,13 @@ or a PR body, and lands on whatever happens to occupy that number here.
 - **`ISSUE_NUM` is an elided foreign reference,** not a real number — it marks
   where one used to be. When you touch such a line, replace the placeholder with
   the reasoning rather than with a number.
+
+## GitHub username mentions
+
+This repository is public, so an `@username` notifies a real GitHub account. Use
+the `@` sigil only when the username is explicitly known to belong to this
+project. The complete known set is `AlabasterAxe`, `CodeChopsBot`, and
+`SiliconFamiliar` (and mentioning `SiliconFamiliar` is usually unnecessary).
+
+For every other person or actor, write the name without `@`. A plausible handle
+is not evidence that the matching GitHub account is the intended recipient.

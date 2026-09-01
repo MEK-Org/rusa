@@ -1488,7 +1488,7 @@ describe("GitHubIssueClient", () => {
     );
   });
 
-  it("filters open PRs by author and parses the issue number from the branch", async () => {
+  it("filters open PRs by author, keeping branches that carry no issue number", async () => {
     installFetch({
       [`GET /repos/${REPO}/pulls?state=open&per_page=100&page=1`]: {
         json: [
@@ -1526,7 +1526,7 @@ describe("GitHubIssueClient", () => {
       },
     });
 
-    const prs = await new GitHubIssueClient().getOpenPullRequestsByAuthor(REPO, "bot");
+    const prs = await new GitHubIssueClient().getOpenPullRequestsByAuthor(REPO, "BOT");
     expect(prs).toEqual([
       {
         number: 1,
@@ -1538,7 +1538,17 @@ describe("GitHubIssueClient", () => {
         author: "bot",
         labels: ["owner:bot"],
         updatedAt: "2026-01-02T00:00:00Z",
-        issueNumber: 42,
+      },
+      {
+        number: 3,
+        title: "Ours, but not an mc branch",
+        headRef: "feature/foo",
+        headRefName: "feature/foo",
+        htmlUrl: "u3",
+        body: "b",
+        author: "bot",
+        labels: [],
+        updatedAt: "2026-01-04T00:00:00Z",
       },
     ]);
   });
@@ -1583,7 +1593,6 @@ describe("GitHubIssueClient", () => {
         author: "bot",
         labels: ["owner:bot"],
         updatedAt: "2026-01-02T00:00:00Z",
-        issueNumber: 42,
       },
       {
         number: 2,
@@ -1595,7 +1604,6 @@ describe("GitHubIssueClient", () => {
         author: "human",
         labels: [],
         updatedAt: "2026-01-03T00:00:00Z",
-        issueNumber: null,
       },
     ]);
   });

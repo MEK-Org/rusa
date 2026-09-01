@@ -505,14 +505,17 @@ class _ActorRowState extends State<_ActorRow> {
                     color: MeshColors.textMuted,
                   ),
                 ),
-                if (thread.model != null || thread.commitmentKind != null) ...[
+                if (thread.model != null || thread.desiredModel != null || thread.commitmentKind != null) ...[
                   const SizedBox(height: 4),
                   Row(
                     children: [
-                      if (thread.model != null)
+                      if (thread.model != null || thread.desiredModel != null)
                         Flexible(
                           child: Text(
-                            thread.model!,
+                            thread.desiredModel != null &&
+                                    thread.desiredModel != thread.model
+                                ? '${thread.model ?? "default"} → ${thread.desiredModel}'
+                                : (thread.model ?? ''),
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: kMonoStyle.copyWith(
@@ -522,7 +525,7 @@ class _ActorRowState extends State<_ActorRow> {
                           ),
                         ),
                       if (thread.commitmentKind != null) ...[
-                        if (thread.model != null) const SizedBox(width: 6),
+                        if (thread.model != null || thread.desiredModel != null) const SizedBox(width: 6),
                         _WorkStateBadge(
                           kind: thread.commitmentKind!,
                           compact: true,

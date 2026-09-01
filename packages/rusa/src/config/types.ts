@@ -35,7 +35,7 @@ export interface GitHubConfig {
   ingestionMode?: "webhook" | "poll";
   /**
    * GitHub repositories in "owner/name" format that this instance subscribes to
-   * and polls. Tracker hygiene scans every configured repository.
+   * and polls.
    */
   repos?: string[];
   /**
@@ -250,23 +250,6 @@ export interface InvocationDebugConfig {
   maxBytesPerInvocation?: number;
 }
 
-export interface TrackerHygieneConfig {
-  /** Enable owner-label and stale-issue automation. Defaults to false. */
-  enabled?: boolean;
-  /** Whether stale closes are logged only or actually applied. Defaults to "log". */
-  closeAction?: "log" | "close";
-  /** Scan interval in seconds. Defaults to 6 hours. */
-  intervalSeconds?: number;
-  /** Owner handle surfaced for unowned issue/PR assignment. Defaults to rootActor.handle. */
-  areaStewardHandle?: string;
-  /** Quiet hours before the first stale ping. Defaults to 24. */
-  staleAfterHours?: number;
-  /** Quiet hours before auto-close after at least one ping. Defaults to 168. */
-  closeAfterHours?: number;
-  /** Ping backoff in hours. Defaults to 0, 24, 48, 96. */
-  pingBackoffHours?: number[];
-}
-
 export interface DiskAlertConfig {
   /** Enable disk-usage alert. Defaults to true. */
   enabled?: boolean;
@@ -283,7 +266,6 @@ export interface DiskAlertConfig {
 }
 
 export interface ObservabilityConfig {
-  trackerHygiene?: TrackerHygieneConfig;
   diskAlert?: DiskAlertConfig;
 }
 

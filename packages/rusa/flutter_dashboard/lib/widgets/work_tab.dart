@@ -8,6 +8,7 @@ import 'avatar.dart';
 import 'header.dart';
 import 'obligation_card.dart';
 import 'obligation_dialogs.dart';
+import 'reference_preview.dart';
 
 class WorkTab extends StatefulWidget {
   const WorkTab({
@@ -342,7 +343,7 @@ class _WorkTabState extends State<WorkTab> {
                                     crossAxisAlignment: CrossAxisAlignment.start,
                                     children: [
                                       Text(
-                                        node.obligation.intent ?? node.obligation.id,
+                                        node.obligation.heading,
                                         maxLines: 1,
                                         overflow: TextOverflow.ellipsis,
                                         style: TextStyle(
@@ -435,7 +436,6 @@ class _DetailView extends StatelessWidget {
 
         final data = snapshot.data!;
         final o = data.obligation;
-        final hasIntent = o.intent != null && o.intent!.trim().isNotEmpty;
 
         return ListView(
           padding: const EdgeInsets.all(24),
@@ -458,21 +458,52 @@ class _DetailView extends StatelessWidget {
             ),
             const SizedBox(height: 12),
             SelectableText(
-              hasIntent ? o.intent! : o.id,
+              o.heading,
               style: const TextStyle(
                 color: MeshColors.textPrimary,
                 fontSize: 22,
                 fontWeight: FontWeight.bold,
               ),
             ),
-            const SizedBox(height: 24),
-            _SectionHeader('OWNER'),
-            _ownerPanel(o.owner),
-            if (o.externalRef != null && o.externalRef!.trim().isNotEmpty) ...[
-              const SizedBox(height: 24),
-              _SectionHeader('EXTERNAL LINK'),
-              _externalRefPanel(o.externalRef!),
+            if (o.body != null) ...[
+              const SizedBox(height: 10),
+              SelectableText(
+                o.body!,
+                style: const TextStyle(
+                  color: MeshColors.textSecondary,
+                  fontSize: 13.5,
+                  height: 1.5,
+                ),
+              ),
             ],
+            const SizedBox(height: 24),
+            if (data.artifacts.isNotEmpty) ...[
+              _SectionHeader('CITED ARTIFACTS'),
+              for (final artifact in data.artifacts)
+                ReferencePreview(
+                  reference: artifact.reference ??
+                      // Unresolvable in v1 (anything but mesh chat). Still shown:
+                      // the citation exists and is worth seeing even when we
+                      // cannot expand it.
+                      ReferenceDto(
+                        ref: artifact.ref,
+                        scheme: artifact.ref.split(':').first,
+                        title: artifact.ref,
+                        unavailable: 'Not resolvable yet — only mesh chat is read back so far.',
+                      ),
+                  label: artifact.label,
+                  attachedBy: artifact.attachedBy,
+                ),
+              const SizedBox(height: 16),
+            ],
+            _SectionHeader('OWNER'),
+            _ownerPanel(o.ownerId),
+            // Shown even when absent: linking an obligation to the issue it
+            // turned into is a normal later step, and a section that only
+            // appears once a ref exists gives no way to add the first one.
+            const SizedBox(height: 24),
+            _SectionHeader('EXTERNAL LINK'),
+            _externalRefPanel(context, o),
             const SizedBox(height: 24),
             _SectionHeader('CHILDREN'),
             _childrenPanel(context, data),
@@ -485,9 +516,26 @@ class _DetailView extends StatelessWidget {
     );
   }
 
-  Widget _ownerPanel(ObligationOwner owner) {
-    final isActor = owner.kind == 'actor';
-    final displayId = isActor ? (store.actor(owner.id)?.handle ?? owner.id) : owner.id;
+  Widget _ownerPanel(String ownerId) {
+    // One id space: the category is read off the id's prefix, the same way
+    // `isHumanOperator` does server-side. A known actor renders as its handle;
+    // anything else renders as the id itself.
+    final isHuman = ownerId.startsWith('human:');
+    final isSystem = ownerId.startsWith('system:');
+    final isActor = !isHuman && !isSystem;
+    final displayId = store.actor(ownerId)?.handle ?? ownerId;
+    // The second line exists to disambiguate the first. When the first line
+    // already IS the raw id — the operator, a system component, or an actor
+    // this dashboard has no record of — repeating it says nothing, so fall back
+    // to the category the prefix encodes. That is the cue the old `Kind: ACTOR`
+    // line carried before owner_kind was dropped.
+    final ownerSubtitle = displayId != ownerId
+        ? ownerId
+        : isHuman
+            ? 'Operator'
+            : isSystem
+                ? 'System component'
+                : 'Actor — not in this mesh view';
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -499,7 +547,7 @@ class _DetailView extends StatelessWidget {
       child: Row(
         children: [
           if (isActor)
-            ActorAvatar(id: owner.id, size: 28)
+            ActorAvatar(id: ownerId, size: 28)
           else
             const CircleAvatar(
               radius: 14,
@@ -521,7 +569,7 @@ class _DetailView extends StatelessWidget {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  'Kind: ${owner.kind.toUpperCase()}',
+                  ownerSubtitle,
                   style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),
                 ),
               ],
@@ -530,13 +578,13 @@ class _DetailView extends StatelessWidget {
           if (isActor)
             TextButton(
               onPressed: () {
-                store.clickActor(owner.id);
+                store.clickActor(ownerId);
                 store.setDetailPanelIndex(4); // Select Inbox tab
                 onSelectView(DashboardView.actors);
               },
               child: const Text('View Owner Inbox →', style: TextStyle(color: MeshColors.accent)),
             )
-          else if (owner.kind == 'human')
+          else if (isHuman)
             TextButton(
               onPressed: () {
                 onSelectView(DashboardView.overview);
@@ -548,7 +596,40 @@ class _DetailView extends StatelessWidget {
     );
   }
 
-  Widget _externalRefPanel(String ref) {
+  Widget _externalRefPanel(BuildContext context, ObligationDto o) {
+    final ref = o.externalRef?.trim() ?? '';
+    final edit = o.isTerminal
+        ? null
+        : IconButton(
+            icon: const Icon(Icons.edit_outlined, size: 16, color: MeshColors.textSecondary),
+            tooltip: ref.isEmpty ? 'Link an issue, PR or repo' : 'Change or unlink',
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+            onPressed: () => showEditExternalRefDialog(context, store, o, onUpdated: onMutated),
+          );
+    if (ref.isEmpty) {
+      return Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: MeshColors.bgSecondary,
+          border: Border.all(color: MeshColors.border),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          children: [
+            const Icon(Icons.link_off, color: MeshColors.textMuted, size: 20),
+            const SizedBox(width: 12),
+            const Expanded(
+              child: Text(
+                'Not linked to an issue, PR or repository.',
+                style: TextStyle(color: MeshColors.textMuted, fontSize: 12.5),
+              ),
+            ),
+            ?edit,
+          ],
+        ),
+      );
+    }
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -570,6 +651,7 @@ class _DetailView extends StatelessWidget {
               ),
             ),
           ),
+          ?edit,
         ],
       ),
     );
@@ -601,10 +683,7 @@ class _DetailView extends StatelessWidget {
                   context,
                   store,
                   defaultParentId: data.obligation.id,
-                  defaultOwnerId: data.obligation.owner.kind == 'actor'
-                      ? data.obligation.owner.id
-                      : null,
-                  defaultOwnerKind: data.obligation.owner.kind,
+                  defaultOwnerId: data.obligation.ownerId,
                   onCreated: onMutated,
                 ),
                 icon: const Icon(Icons.add, size: 14),
@@ -797,8 +876,7 @@ class _DetailView extends StatelessWidget {
                     context,
                     store,
                     defaultParentId: o.id,
-                    defaultOwnerId: o.owner.kind == 'actor' ? o.owner.id : null,
-                    defaultOwnerKind: o.owner.kind,
+                    defaultOwnerId: o.ownerId,
                     onCreated: onMutated,
                   ),
                   icon: const Icon(Icons.add_task, size: 16),

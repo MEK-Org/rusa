@@ -91,6 +91,16 @@ export interface ThreadRecord {
    * run-scoped and lives on the `run_end` event ({@link RunEndPayload}).
    */
   model?: string;
+  /**
+   * Pending model change staged via `set_actor_model` to apply at the end of the
+   * next run boundary.
+   */
+  desiredModel?: string;
+  /**
+   * Pending provider change staged via `set_actor_model` to apply at the end of
+   * the next run boundary.
+   */
+  desiredProvider?: string;
   /** Provider session/conversation id = the working-memory handle (B.2); set after first run. */
   sessionId?: string;
   /**
@@ -136,9 +146,9 @@ export interface ThreadRegistry {
   /**
    * Resolve a generated display handle (or direct id) back to a durable thread id.
    * Handle matches are scoped to ACTIVE records only — a retired record must never
-   * shadow a live actor on a handle collision, or routing (e.g. tracker-hygiene
-   * owner pings, ISSUE_NUM/ISSUE_NUM) would silently drop to the dead thread. A direct id
-   * still resolves regardless of status (an explicit id is not a collision).
+   * shadow a live actor on a handle collision, or routing would silently drop to
+   * the dead thread. A direct id still resolves regardless of status (an explicit
+   * id is not a collision).
    */
   resolveHandle(handleOrId: string, handleForId?: (id: string) => string): string | null;
   /** Shallow-merge changes into an existing record (no-op if id is unknown). */

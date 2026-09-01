@@ -4,10 +4,10 @@ import {
   HUMAN_OPERATOR,
   isHumanOperator,
   isSystemActor,
+  MESH_SYSTEM,
   parseAuthor,
   resolveStampedAuthor,
   type StampAnomaly,
-  SYSTEM_TRACKER_HYGIENE,
   stampAuthor,
   stripAuthorStamps,
   verifyAuthorStamp,
@@ -134,8 +134,8 @@ describe("Author Identity Stamp Security & HMAC Verification", () => {
   });
 
   describe("isSystemActor ", () => {
-    it("recognizes the system: prefix, including SYSTEM_TRACKER_HYGIENE", () => {
-      expect(isSystemActor(SYSTEM_TRACKER_HYGIENE)).toBe(true);
+    it("recognizes the system: prefix, including MESH_SYSTEM", () => {
+      expect(isSystemActor(MESH_SYSTEM)).toBe(true);
       expect(isSystemActor("system:mesh")).toBe(true);
       expect(isSystemActor("system:anything")).toBe(true);
     });
@@ -149,30 +149,30 @@ describe("Author Identity Stamp Security & HMAC Verification", () => {
   });
 
   describe("system stamp round-trip ", () => {
-    it("stampAuthor + verifyAuthorStamp round-trips SYSTEM_TRACKER_HYGIENE through the v2 path", () => {
-      const stamp = stampAuthor(SYSTEM_TRACKER_HYGIENE, repo, issueNumber, instanceId);
-      const body = `Some hygiene comment\n\n${stamp}`;
+    it("stampAuthor + verifyAuthorStamp round-trips MESH_SYSTEM through the v2 path", () => {
+      const stamp = stampAuthor(MESH_SYSTEM, repo, issueNumber, instanceId);
+      const body = `Some system comment\n\n${stamp}`;
 
       const res = verifyAuthorStamp(body, repo, issueNumber);
       expect(res.status).toBe("verified");
-      expect(res.actorId).toBe(SYSTEM_TRACKER_HYGIENE);
+      expect(res.actorId).toBe(MESH_SYSTEM);
       expect(res.instanceId).toBe(instanceId);
       expect(isSystemActor(res.actorId as string)).toBe(true);
     });
 
     it("round-trips through resolveStampedAuthor for a bot-sent comment", () => {
       const botLogin = "rusabot";
-      const stamp = stampAuthor(SYSTEM_TRACKER_HYGIENE, repo, issueNumber, instanceId);
+      const stamp = stampAuthor(MESH_SYSTEM, repo, issueNumber, instanceId);
       const resolved = resolveStampedAuthor({
         event: "issue_comment",
         action: "created",
-        payload: { comment: { body: `hygiene note\n\n${stamp}` } },
+        payload: { comment: { body: `system note\n\n${stamp}` } },
         sender: "RusaBot",
         botLogin,
         repoFullName: repo,
         number: issueNumber,
       });
-      expect(resolved).toEqual({ actorId: SYSTEM_TRACKER_HYGIENE, instanceId });
+      expect(resolved).toEqual({ actorId: MESH_SYSTEM, instanceId });
     });
   });
 });

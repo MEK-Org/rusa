@@ -36,24 +36,38 @@ class ObligationRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final hasIntent = obligation.intent != null && obligation.intent!.trim().isNotEmpty;
+    final body = obligation.body;
     final isWaiting = obligation.isWaiting;
+    // A terminal note only exists on a terminal obligation, but read the field
+    // rather than the status so a note that somehow outlives a transition is
+    // visible rather than silently swallowed.
+    final hasTerminalNote =
+        obligation.terminalNote != null && obligation.terminalNote!.trim().isNotEmpty;
 
     final titleAndOwner = Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          hasIntent ? obligation.intent! : 'Untitled Obligation',
+          obligation.heading,
           style: const TextStyle(
             color: MeshColors.textPrimary,
             fontWeight: FontWeight.w600,
             fontSize: 13.5,
           ),
         ),
+        if (body != null) ...[
+          const SizedBox(height: 4),
+          Text(
+            body,
+            maxLines: 3,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12, height: 1.35),
+          ),
+        ],
         if (showOwner) ...[
           const SizedBox(height: 2),
           Text(
-            'Owner: ${obligation.owner.kind}:${obligation.owner.kind == 'actor' ? (store.actor(obligation.owner.id)?.handle ?? obligation.owner.id) : obligation.owner.id}',
+            'Owner: ${store.actor(obligation.ownerId)?.handle ?? obligation.ownerId}',
             style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),
           ),
         ],
@@ -103,8 +117,7 @@ class ObligationRow extends StatelessWidget {
                     context,
                     store,
                     defaultParentId: obligation.id,
-                    defaultOwnerId: obligation.owner.kind == 'actor' ? obligation.owner.id : null,
-                    defaultOwnerKind: obligation.owner.kind,
+                    defaultOwnerId: obligation.ownerId,
                     onCreated: onMutated,
                   );
                   break;
@@ -200,6 +213,41 @@ class ObligationRow extends StatelessWidget {
                 ],
               ),
             ],
+            if (hasTerminalNote) ...[
+              const SizedBox(height: 12),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  color: MeshColors.bgTertiary,
+                  border: Border(
+                    left: BorderSide(
+                      color: obligation.isDone ? MeshColors.statusActive : MeshColors.statusRetired,
+                      width: 3,
+                    ),
+                  ),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      obligation.isDone ? 'Completed because:' : 'Cancelled because:',
+                      style: const TextStyle(
+                        color: MeshColors.textSecondary,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      obligation.terminalNote!,
+                      style: const TextStyle(color: MeshColors.textPrimary, fontSize: 11.5),
+                    ),
+                  ],
+                ),
+              ),
+            ],
             if (isWaiting && blockers != null && blockers!.isNotEmpty) ...[
               const SizedBox(height: 12),
               Container(
@@ -228,7 +276,7 @@ class ObligationRow extends StatelessWidget {
                       Padding(
                         padding: const EdgeInsets.only(top: 4),
                         child: Text(
-                          '• ${blocker.intent ?? blocker.id} (${blocker.owner.kind}: ${blocker.owner.kind == 'actor' ? (store.actor(blocker.owner.id)?.handle ?? blocker.owner.id) : blocker.owner.id})',
+                          '• ${blocker.intent ?? blocker.id} (${store.actor(blocker.ownerId)?.handle ?? blocker.ownerId})',
                           style: const TextStyle(
                             color: Color(0xFFFECDD3),
                             fontSize: 11.5,

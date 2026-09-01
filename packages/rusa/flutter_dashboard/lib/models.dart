@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+const _keepThreadField = Object();
+
 // Dart mirrors of the PR2 dashboard Data API JSON shapes
 // (`packages/rusa/src/dashboard/api.ts` +
 // `db/repositories/mesh-event-repository.ts`). Field names and nullability
@@ -31,6 +33,8 @@ class ThreadDto {
     required this.status,
     required this.provider,
     required this.model,
+    this.desiredModel,
+    this.desiredProvider,
     required this.charterPreview,
     this.title = '',
     required this.createdAt,
@@ -51,6 +55,13 @@ class ThreadDto {
 
   /// The single authoritative model for this actor, as the server reports it.
   final String? model;
+
+  /// Pending desired model staged for next run boundary, or null if none.
+  final String? desiredModel;
+
+  /// Pending desired provider staged for next run boundary, or null if none.
+  final String? desiredProvider;
+
   /// The leading slice of the charter the server sends with the list — enough
   /// for the two-line excerpt in the overview, never the whole text. The full
   /// charter is fetched per actor when the detail panel opens one.
@@ -82,6 +93,8 @@ class ThreadDto {
     String? status,
     String? provider,
     String? model,
+    Object? desiredModel = _keepThreadField,
+    Object? desiredProvider = _keepThreadField,
     String? charterPreview,
     String? title,
     String? createdAt,
@@ -99,6 +112,12 @@ class ThreadDto {
     status: status ?? this.status,
     provider: provider ?? this.provider,
     model: model ?? this.model,
+    desiredModel: identical(desiredModel, _keepThreadField)
+        ? this.desiredModel
+        : desiredModel as String?,
+    desiredProvider: identical(desiredProvider, _keepThreadField)
+        ? this.desiredProvider
+        : desiredProvider as String?,
     charterPreview: charterPreview ?? this.charterPreview,
     title: title ?? this.title,
     createdAt: createdAt ?? this.createdAt,
@@ -120,6 +139,8 @@ class ThreadDto {
     status: j['status'] as String,
     provider: j['provider'] as String?,
     model: j['model'] as String?,
+    desiredModel: j['desiredModel'] as String?,
+    desiredProvider: j['desiredProvider'] as String?,
     charterPreview: j['charterPreview'] as String? ?? '',
     title: j['title'] as String? ?? '',
     createdAt: j['createdAt'] as String? ?? '',
@@ -168,6 +189,8 @@ class ActorViewState {
   bool get isRetired => thread.isRetired;
   String? get provider => thread.provider;
   String? get model => thread.model;
+  String? get desiredModel => thread.desiredModel;
+  String? get desiredProvider => thread.desiredProvider;
   String get charterPreview => thread.charterPreview;
   String get title => thread.title;
   String get createdAt => thread.createdAt;
@@ -821,45 +844,154 @@ class LiveOutputChunk {
   );
 }
 
-class ObligationOwner {
-  const ObligationOwner({required this.kind, required this.id});
+/// Longest an obligation heading may be. Mirrors `OBLIGATION_TITLE_MAX` on the
+/// server, which rejects anything longer.
+const int kObligationTitleMax = 200;
 
-  final String kind; // "actor" | "human"
-  final String id;
+/// A reference resolved down to what the UI needs to show it, mirroring the
+/// server's `ResolvedReference`.
+///
+/// One shape for every source so the obligation and inbox call sites can reuse
+/// one rendering. In v1 only mesh chat actually resolves; anything else arrives
+/// with [unavailable] set and is shown as a citation that cannot yet be
+/// expanded, rather than as an empty one.
+class ReferenceDto {
+  const ReferenceDto({
+    required this.ref,
+    required this.scheme,
+    required this.title,
+    this.body,
+    this.author,
+    this.timestamp,
+    this.url,
+    this.unavailable,
+  });
 
-  factory ObligationOwner.fromJson(Map<String, dynamic> j) => ObligationOwner(
-    kind: j['kind'] as String? ?? 'actor',
-    id: j['id'] as String? ?? '',
+  final String ref;
+  final String scheme;
+  final String title;
+  final String? body;
+  final String? author;
+  final String? timestamp;
+  final String? url;
+
+  /// Why [body] is absent, when it is. Distinguishes "no text" from "could not
+  /// read it" from "no such thing".
+  final String? unavailable;
+
+  bool get isResolved => body != null && body!.trim().isNotEmpty;
+
+  factory ReferenceDto.fromJson(Map<String, dynamic> j) => ReferenceDto(
+    ref: j['ref'] as String? ?? '',
+    scheme: j['scheme'] as String? ?? 'mesh',
+    title: j['title'] as String? ?? j['ref'] as String? ?? '',
+    body: j['body'] as String?,
+    author: j['author'] as String?,
+    timestamp: j['timestamp'] as String?,
+    url: j['url'] as String?,
+    unavailable: j['unavailable'] as String?,
   );
+}
 
-  Map<String, dynamic> toJson() => {
-    'kind': kind,
-    'id': id,
-  };
+/// An artifact cited by an obligation, with its reference resolved when we can.
+class ObligationArtifactDto {
+  const ObligationArtifactDto({
+    required this.ref,
+    this.label,
+    this.attachedBy,
+    this.attachedAt,
+    this.reference,
+  });
+
+  final String ref;
+  final String? label;
+  final String? attachedBy;
+  final String? attachedAt;
+  final ReferenceDto? reference;
+
+  factory ObligationArtifactDto.fromJson(Map<String, dynamic> j) {
+    final artifact = (j['artifact'] as Map<String, dynamic>?) ?? j;
+    final resolved = j['reference'];
+    return ObligationArtifactDto(
+      ref: artifact['ref'] as String? ?? '',
+      label: artifact['label'] as String?,
+      attachedBy: artifact['attachedBy'] as String?,
+      attachedAt: artifact['attachedAt'] as String?,
+      reference: resolved is Map<String, dynamic> ? ReferenceDto.fromJson(resolved) : null,
+    );
+  }
 }
 
 class ObligationDto {
   const ObligationDto({
     required this.id,
     this.parentId,
-    required this.owner,
+    required this.ownerId,
+    this.title,
+    this.creatorId,
+    this.createdAt,
+    this.updatedAt,
     this.intent,
     this.externalRef,
     required this.status,
     this.priority,
     required this.effectivePriority,
     this.prioritySourceId,
+    this.terminalNote,
+    this.resolutionRef,
   });
 
   final String id;
   final String? parentId;
-  final ObligationOwner owner;
+  /// One entity id in the mesh's single id space: an actor UUID, `root`,
+  /// `human:*`, or `system:*`. The category is read off the prefix — there is
+  /// no separate owner "kind".
+  final String ownerId;
+
+  /// The heading — short, and what a queue shows. Null only for rows that
+  /// predate the title/body split with no intent to derive one from.
+  final String? title;
+
+  /// Who raised this obligation; immutable across reassignment. Null means
+  /// genuinely unknown (a row predating attribution), never inferred.
+  final String? creatorId;
+  final String? createdAt;
+  final String? updatedAt;
   final String? intent;
   final String? externalRef;
   final String status; // "ready" | "waiting" | "done" | "cancelled"
   final double? priority;
   final double effectivePriority;
   final String? prioritySourceId;
+
+  /// Which attached artifact settled this obligation, as a `kind:value` ref.
+  /// Distinct from [externalRef], which is an identity claim.
+  final String? resolutionRef;
+
+  /// Why this obligation was completed or cancelled, in the terminating
+  /// principal's own words. Null while live, and null for a terminal
+  /// obligation whose reason was never stated or predates the column.
+  final String? terminalNote;
+
+  /// What to show as the heading. Prefers [title]; falls back to [intent] so a
+  /// row written before the split still reads, rather than rendering blank.
+  String get heading {
+    final t = title?.trim();
+    if (t != null && t.isNotEmpty) return t;
+    final i = intent?.trim();
+    if (i == null || i.isEmpty) return 'Untitled Obligation';
+    final firstLine = i.split('\n').first.trim();
+    return firstLine.isEmpty ? 'Untitled Obligation' : firstLine;
+  }
+
+  /// The fuller statement, or null when there isn't one worth showing. A row
+  /// written before the title/body split has an intent whose first line *is*
+  /// the heading, so rendering both would echo it under itself.
+  String? get body {
+    final i = intent?.trim();
+    if (i == null || i.isEmpty || i == heading) return null;
+    return i;
+  }
 
   bool get isReady => status == 'ready';
   bool get isWaiting => status == 'waiting';
@@ -868,19 +1000,27 @@ class ObligationDto {
   bool get isTerminal => status == 'done' || status == 'cancelled';
 
   factory ObligationDto.fromJson(Map<String, dynamic> j) {
+    // The server sends a parsed reference object; older rows and some fixtures
+    // send the bare canonical string. Both reduce to the same `key`.
     final dynamic rawRef = j['externalRef'];
     final String? extRef = rawRef is Map ? rawRef['key'] as String? : rawRef as String?;
 
     return ObligationDto(
       id: j['id'] as String? ?? '',
       parentId: j['parentId'] as String?,
-      owner: ObligationOwner.fromJson(j['owner'] as Map<String, dynamic>),
+      ownerId: j['ownerId'] as String? ?? '',
+      title: j['title'] as String?,
+      creatorId: j['creatorId'] as String?,
+      createdAt: j['createdAt'] as String?,
+      updatedAt: j['updatedAt'] as String?,
       intent: j['intent'] as String?,
       externalRef: extRef,
       status: j['status'] as String? ?? 'ready',
       priority: (j['priority'] as num?)?.toDouble(),
       effectivePriority: (j['effectivePriority'] as num?)?.toDouble() ?? 0.0,
       prioritySourceId: j['prioritySourceId'] as String?,
+      terminalNote: j['terminalNote'] as String?,
+      resolutionRef: j['resolutionRef'] as String?,
     );
   }
 }
@@ -945,12 +1085,14 @@ class ObligationDetailSnapshot {
     this.parent,
     required this.children,
     required this.blockingChildren,
+    this.artifacts = const [],
   });
 
   final ObligationDto obligation;
   final ObligationDto? parent;
   final List<ObligationDto> children;
   final List<ObligationDto> blockingChildren;
+  final List<ObligationArtifactDto> artifacts;
 
   factory ObligationDetailSnapshot.fromJson(Map<String, dynamic> j) => ObligationDetailSnapshot(
     obligation: ObligationDto.fromJson(j['obligation'] as Map<String, dynamic>),
@@ -973,5 +1115,10 @@ class ObligationDetailSnapshot {
                 .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
                 .toList()
             : const <ObligationDto>[],
+    artifacts: (j['artifacts'] is List)
+        ? (j['artifacts'] as List<dynamic>)
+            .map((e) => ObligationArtifactDto.fromJson(e as Map<String, dynamic>))
+            .toList()
+        : const <ObligationArtifactDto>[],
   );
 }

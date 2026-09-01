@@ -182,7 +182,6 @@ export interface OpenPullRequest {
   author: string;
   labels: string[];
   updatedAt: string;
-  issueNumber: number | null;
 }
 
 export interface OpenIssue {
@@ -293,16 +292,11 @@ export interface IssueClient {
    * existing PR.
    */
   createPullRequest(opts: CreatePROptions): Promise<CreatedPullRequest>;
-  /**
-   * Query open pull requests created by a specific author. Returns PRs whose
-   * branch matches the rusa pattern (mc/issue-{number}), carrying the
-   * parsed issue number.
-   */
+  /** Query every open pull request created by a specific author. */
   getOpenPullRequestsByAuthor(repo: string, author: string): Promise<OpenPullRequest[]>;
   /**
-   * Query all open pull requests. The parsed issue number is populated when the
-   * branch matches the rusa pattern, but non-matching branches are still
-   * returned for survey workflows.
+   * Query all open pull requests, on the same terms as the author-scoped call
+   * minus the author filter.
    */
   getOpenPullRequests(repo: string): Promise<OpenPullRequest[]>;
   /** Query issues with optional state and label filters. */
@@ -1241,9 +1235,10 @@ export class GitHubIssueClient implements IssueClient {
   }
 
   async getOpenPullRequestsByAuthor(repo: string, author: string): Promise<OpenPullRequest[]> {
-    return (await this.fetchOpenPullRequests(repo))
-      .filter((pr) => pr.author === author)
-      .filter((pr): pr is OpenPullRequest => pr.issueNumber !== null);
+    const targetAuthor = author.toLowerCase();
+    return (await this.fetchOpenPullRequests(repo)).filter(
+      (pr) => pr.author.toLowerCase() === targetAuthor
+    );
   }
 
   async getOpenPullRequests(repo: string): Promise<OpenPullRequest[]> {
@@ -1295,10 +1290,6 @@ export class GitHubIssueClient implements IssueClient {
     }>(`/repos/${repo}/pulls`, new URLSearchParams({ state: "open", per_page: "100" }));
 
     return prs.map((pr) => {
-      // Extract issue number from branch name pattern mc/issue-{number}
-      const match = pr.head.ref.match(/^mc\/issue-(\d+)$/);
-      const issueNumber = match ? parseInt(match[1], 10) : null;
-
       return {
         number: pr.number,
         title: pr.title,
@@ -1311,7 +1302,6 @@ export class GitHubIssueClient implements IssueClient {
           .map((label) => (typeof label === "string" ? label : (label.name ?? "")))
           .filter((label) => label.length > 0),
         updatedAt: pr.updated_at,
-        issueNumber,
       };
     });
   }

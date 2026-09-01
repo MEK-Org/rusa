@@ -36,7 +36,6 @@ class _OverviewTabState extends State<OverviewTab> {
   Future<Map<String, dynamic>> _loadHumanQueue() async {
     final api = widget.store.api;
     final page = await api.fetchObligations(
-      ownerKind: 'human',
       ownerId: 'human:operator',
     );
     final ready = page.obligations.where((o) => o.isReady).toList();
@@ -204,7 +203,6 @@ class _OverviewTabState extends State<OverviewTab> {
                       context,
                       widget.store,
                       defaultOwnerId: 'human:operator',
-                      defaultOwnerKind: 'human',
                       onCreated: _refreshHumanQueue,
                     ),
                     icon: const Icon(Icons.add, size: 14),
@@ -226,7 +224,6 @@ class _OverviewTabState extends State<OverviewTab> {
                       context,
                       widget.store,
                       defaultOwnerId: 'human:operator',
-                      defaultOwnerKind: 'human',
                       onCreated: _refreshHumanQueue,
                     ),
                   ),
@@ -318,7 +315,6 @@ class _OverviewTabState extends State<OverviewTab> {
                                     context,
                                     widget.store,
                                     defaultOwnerId: 'human:operator',
-                                    defaultOwnerKind: 'human',
                                     onCreated: _refreshHumanQueue,
                                   ),
                                   icon: const Icon(Icons.add, size: 14),
@@ -345,7 +341,6 @@ class _OverviewTabState extends State<OverviewTab> {
                                     context,
                                     widget.store,
                                     defaultOwnerId: 'human:operator',
-                                    defaultOwnerKind: 'human',
                                     onCreated: _refreshHumanQueue,
                                   ),
                                   icon: const Icon(Icons.add, size: 14),

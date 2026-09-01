@@ -79,10 +79,6 @@ vi.mock("../github/poller.js", async (importActual) => {
   };
 });
 
-const trackerHygieneMock = vi.hoisted(() => ({
-  runTrackerHygiene: vi.fn(() => Promise.resolve([])),
-}));
-
 const gitHttpServerMock = vi.hoisted(() => {
   const servers: {
     close: ReturnType<typeof vi.fn>;
@@ -105,21 +101,6 @@ const gitHttpServerMock = vi.hoisted(() => {
 const sandboxMock = vi.hoisted(() => ({
   assertBwrapAvailable: vi.fn(),
 }));
-
-vi.mock("../observability/tracker-hygiene.js", async () => {
-  const actual = await vi.importActual<typeof import("../observability/tracker-hygiene.js")>(
-    "../observability/tracker-hygiene.js"
-  );
-  return {
-    ...actual,
-    DEFAULT_TRACKER_HYGIENE_THRESHOLDS: {
-      staleAfterMs: 24 * 60 * 60 * 1000,
-      closeAfterMs: 168 * 60 * 60 * 1000,
-      pingBackoffMs: [0, 24, 48, 96].map((hours) => hours * 60 * 60 * 1000),
-    },
-    runTrackerHygiene: trackerHygieneMock.runTrackerHygiene,
-  };
-});
 
 vi.mock("../gitops/git-http-server.js", () => ({
   startGitHttpServer: gitHttpServerMock.startGitHttpServer,
@@ -235,38 +216,38 @@ describe("start command tests", () => {
     const subscribeEventSource = vi.fn();
     const log = vi.fn();
     const mesh = { subscribeEventSource };
-    const configuredRoots = [{ kind: "github_org" as const, org: "configured-org" }];
+    const configuredRoots = ["github:configured-org"];
 
     for (const actorId of ["root", "worker"]) {
       mechanicallySubscribeCreatedResource(
         mesh,
         configuredRoots,
-        { kind: "github_issue", repo: "configured-org/repo", number: 72 },
+        "github:configured-org/repo/issues/72",
         actorId,
         log
       );
       mechanicallySubscribeCreatedResource(
         mesh,
         configuredRoots,
-        { kind: "github_issue", repo: "other-org/repo", number: 72 },
+        "github:other-org/repo/issues/72",
         actorId,
         log
       );
     }
 
     expect(subscribeEventSource.mock.calls).toEqual([
-      [{ kind: "github_issue", repo: "configured-org/repo", number: 72 }, "root", "root"],
-      [{ kind: "github_issue", repo: "configured-org/repo", number: 72 }, "worker", "worker"],
+      ["github:configured-org/repo/issues/72", "root", "root"],
+      ["github:configured-org/repo/issues/72", "worker", "worker"],
     ]);
     expect(log).toHaveBeenCalledTimes(2);
     expect(log).toHaveBeenCalledWith(
       expect.stringContaining(
-        "github_issue:other-org/repo#72 to root skipped: not anchored in config"
+        "github:other-org/repo/issues/72 to root skipped: not anchored in config"
       )
     );
     expect(log).toHaveBeenCalledWith(
       expect.stringContaining(
-        "github_issue:other-org/repo#72 to worker skipped: not anchored in config"
+        "github:other-org/repo/issues/72 to worker skipped: not anchored in config"
       )
     );
   });
@@ -334,7 +315,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     process.exit = vi.fn();
     shutdownFn = undefined;
     requestRunCalls = [];
-    trackerHygieneMock.runTrackerHygiene.mockClear();
     gitHttpServerMock.startGitHttpServer.mockClear();
     gitHttpServerMock.servers.length = 0;
     sandboxMock.assertBwrapAvailable.mockReset();
@@ -481,6 +461,72 @@ describe("runStart webhook event routing (Phase 4)", () => {
       // Workers never get an actor-level fallback — quota exhaustion is a
       // signal to the parent now, not something the worker self-heals from.
       expect(kimiActorOpts.fallback).toBeUndefined();
+    });
+
+    it("boot wires the obligation store's actor guard, so it is not inert", async () => {
+      // Deliberately asserted through a real `runStart`, not by injecting the
+      // probe. The defect this pins was precisely that the production container
+      // is built from a Database alone and nobody supplied one, so the guard
+      // read as if it applied while never running. A test that constructed the
+      // repository itself would have passed throughout.
+      writeFileSync(
+        join(homeDir, "threads.json"),
+        JSON.stringify({
+          threads: [
+            { id: "root", charter: "root", parentId: null, isRoot: true, status: "active" },
+            {
+              id: "live-worker",
+              charter: "worker",
+              parentId: "root",
+              provider: "kimi",
+              status: "active",
+            },
+            {
+              id: "retired-worker",
+              charter: "worker",
+              parentId: "root",
+              provider: "kimi",
+              status: "retired",
+            },
+          ],
+        }),
+        "utf8"
+      );
+
+      await new Promise<void>((resolve) => {
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+
+      // Read the live id back out of the registry boot actually loaded, rather
+      // than assuming the file we wrote survived `resolveRootThreadId`.
+      const threads = JSON.parse(readFileSync(join(homeDir, "threads.json"), "utf8")) as {
+        threads: Array<{ id: string; status: string }>;
+      };
+      const liveId = threads.threads.find((t) => t.status === "active")?.id;
+      expect(liveId).toBeDefined();
+
+      const obligations = getRepositories().obligations;
+      expect(() =>
+        obligations.create({ title: "fine", ownerId: String(liveId), intent: "fine" })
+      ).not.toThrow();
+      for (const ownerId of ["never-existed", "retired-worker"]) {
+        expect(
+          () => obligations.create({ title: "drift", ownerId, intent: "drift" }),
+          ownerId
+        ).toThrow(/actor owner does not exist/);
+      }
+      // The operator is not an actor and must still be ownable — the whole
+      // human-decision contract depends on it.
+      expect(() =>
+        obligations.create({ title: "decide", ownerId: "human:operator", intent: "decide" })
+      ).not.toThrow();
     });
   });
 
@@ -1128,12 +1174,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // Real topology : root retains the covering org source it delegates
     // slices from — the retired subscriber's event bubbles to root via that
     // source, not via the removed catch-all .
-    mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
-    mesh.subscribeEventSource(
-      { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-      workerId,
-      "root"
-    );
+    mesh.subscribeEventSource("github:dummy-org", "root", "root");
+    mesh.subscribeEventSource("github:dummy-org/dummy-repo", workerId, "root");
 
     // Emit event with repo
     await emitGitHubEvent(
@@ -1158,7 +1200,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(inbox.entries).toHaveLength(1);
     expect(inbox.entries[0]).toMatchObject({
       actorId: workerId,
-      source: "github_issue:dummy-org/dummy-repo#456",
+      source: "github:dummy-org/dummy-repo/issues/456",
       seenAt: null,
       handledAt: null,
       payload: {
@@ -1279,7 +1321,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(getRepositories().inbox.list("root").entries).toEqual([
       expect.objectContaining({
         actorId: "root",
-        source: "system",
+        source: "system:events",
         payload: expect.objectContaining({
           type: "system.disk",
           priority: "responsive",
@@ -1322,13 +1364,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(mesh?.listSubscriptions()).toContainEqual(
       expect.objectContaining({
         actorId: "root",
-        resource: { kind: "system" },
+        resource: "system:events",
         subscribedBy: "root",
       })
     );
   });
 
-  it("skips the queued-run :eyes: for /snooze but keeps it for ordinary comments ", async () => {
+  it("adds mechanical eyes for ordinary comments on queued run", async () => {
     let emitGitHubEvent:
       | ((event: string, payload: Record<string, unknown>, deliveryId?: string) => Promise<void>)
       | undefined;
@@ -1356,15 +1398,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     if (!mesh || !emitGitHubEvent) throw new Error("Mesh or emitGitHubEvent not ready");
 
     // A covering source is required for emitGitHubEvent to persist inbox work.
-    mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
-
-    await emitGitHubEvent("issue_comment", {
-      action: "created",
-      repository: { full_name: "dummy-org/dummy-repo" },
-      comment: { id: 123, body: "/snooze 2w" },
-      issue: { number: 456 },
-      sender: { login: "someone-else" },
-    });
+    mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
     await emitGitHubEvent("issue_comment", {
       action: "created",
@@ -1376,10 +1410,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     mesh.actorQueued("root", { responsive: false, mode: "ordinary" });
 
-    // The generic queued-run receipt must be skipped for snooze
-    // commands; the actual success receipt is added later by tracker-hygiene
-    // only after the durable suppression marker is recorded. Ordinary comments
-    // must still receive the generic receipt.
     expect(issueClient.commentReactionsAdded).toEqual([
       { repo: "dummy-org/dummy-repo", commentId: 124, reaction: "eyes", scope: "issue" },
     ]);
@@ -1408,7 +1438,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
     await readyPromise;
     if (!mesh || !emitGitHubEvent) throw new Error("mesh not ready");
-    mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+    mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
     await emitGitHubEvent(
       "issue_comment",
@@ -1567,153 +1597,6 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }
     throw new Error(message);
   }
-
-  it("does not run tracker hygiene when omitted from config", async () => {
-    let sigintListener: NodeJS.SignalsListener | undefined;
-    const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
-      if (event === "SIGINT") {
-        sigintListener = listener as NodeJS.SignalsListener;
-      }
-      return process;
-    });
-    const issueClient = new MockIssueClient();
-    setIssueClient(issueClient as unknown as IssueClient);
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: {
-          account: "mock-bot",
-          ingestionMode: "poll",
-          pollIntervalSeconds: 300,
-          repos: ["dummy-org/dummy-repo"],
-        },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity" },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    try {
-      void runStart({ noDashboardServer: true });
-      await waitUntil(() => sigintListener !== undefined, "start did not install shutdown handler");
-
-      expect(trackerHygieneMock.runTrackerHygiene).not.toHaveBeenCalled();
-      expect(pollerMock.startGitHubEventPoller).toHaveBeenCalledWith(
-        expect.objectContaining({ repos: ["dummy-org/dummy-repo"] })
-      );
-      sigintListener?.("SIGINT");
-      expect(e2eInstanceManagerMock.stopForMeshShutdown).toHaveBeenCalledOnce();
-    } finally {
-      processOnSpy.mockRestore();
-    }
-  });
-
-  it("runs tracker hygiene for every explicit github.repos entry when enabled", async () => {
-    let sigintListener: NodeJS.SignalsListener | undefined;
-    const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
-      if (event === "SIGINT") {
-        sigintListener = listener as NodeJS.SignalsListener;
-      }
-      return process;
-    });
-    const issueClient = new MockIssueClient();
-    setIssueClient(issueClient as unknown as IssueClient);
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: {
-          account: "mock-bot",
-          ingestionMode: "poll",
-          pollIntervalSeconds: 300,
-          repos: ["dummy-org/dummy-repo", "other-org/other-repo"],
-        },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity" },
-        observability: { trackerHygiene: { enabled: true } },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    try {
-      void runStart({ noDashboardServer: true });
-      await waitUntil(
-        () => trackerHygieneMock.runTrackerHygiene.mock.calls.length === 2,
-        "tracker hygiene did not run"
-      );
-
-      expect(trackerHygieneMock.runTrackerHygiene).toHaveBeenNthCalledWith(
-        1,
-        issueClient,
-        expect.objectContaining({
-          resolveHandle: expect.any(Function),
-          sendMessage: expect.any(Function),
-        }),
-        expect.objectContaining({
-          repo: "dummy-org/dummy-repo",
-          closeAction: "log",
-        })
-      );
-      expect(trackerHygieneMock.runTrackerHygiene).toHaveBeenNthCalledWith(
-        2,
-        issueClient,
-        expect.objectContaining({
-          resolveHandle: expect.any(Function),
-          sendMessage: expect.any(Function),
-        }),
-        expect.objectContaining({
-          repo: "other-org/other-repo",
-          closeAction: "log",
-        })
-      );
-      expect(pollerMock.startGitHubEventPoller).toHaveBeenCalledWith(
-        expect.objectContaining({
-          repos: ["dummy-org/dummy-repo", "other-org/other-repo"],
-        })
-      );
-      sigintListener?.("SIGINT");
-    } finally {
-      processOnSpy.mockRestore();
-    }
-  }, 15_000);
-
-  it("skips configured tracker hygiene while halted", async () => {
-    let sigintListener: NodeJS.SignalsListener | undefined;
-    const processOnSpy = vi.spyOn(process, "on").mockImplementation((event, listener) => {
-      if (event === "SIGINT") sigintListener = listener as NodeJS.SignalsListener;
-      return process;
-    });
-    const issueClient = new MockIssueClient();
-    setIssueClient(issueClient as unknown as IssueClient);
-    new HaltSwitch(join(homeDir, "HALT")).halt("maintenance");
-    writeFileSync(
-      join(homeDir, "config.yaml"),
-      toYaml({
-        github: {
-          account: "mock-bot",
-          ingestionMode: "poll",
-          pollIntervalSeconds: 300,
-          repos: ["dummy-org/dummy-repo"],
-        },
-        providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity" },
-        observability: { trackerHygiene: { enabled: true } },
-        geminiApiKey: "fake-gemini-key",
-      }),
-      "utf8"
-    );
-
-    try {
-      void runStart({ noDashboardServer: true });
-      await waitUntil(() => sigintListener !== undefined, "start did not install shutdown handler");
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(trackerHygieneMock.runTrackerHygiene).not.toHaveBeenCalled();
-      sigintListener?.("SIGINT");
-    } finally {
-      processOnSpy.mockRestore();
-    }
-  }, 15_000);
 
   it("constructs the root actor with a non-empty addDirs equal to the resolved repo root", async () => {
     let mesh: ActorMesh | undefined;
@@ -1939,16 +1822,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const issueClient = new MockIssueClient();
     setIssueClient(issueClient as unknown as IssueClient);
 
-    // Capture console.error logs
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
-
     writeFileSync(
       join(homeDir, "config.yaml"),
       toYaml({
         github: { account: "mock-bot", ingestionMode: "poll", pollIntervalSeconds: 300 },
         providers: { antigravity: { cliCommand: "agy" } },
         rootActor: { provider: "antigravity" },
-        observability: { trackerHygiene: { enabled: true } },
         geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
@@ -1958,18 +1837,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
       void runStart({ noDashboardServer: true });
       await waitUntil(() => sigintListener !== undefined, "start did not install shutdown handler");
 
-      // Verify tracker hygiene was NOT called
-      expect(trackerHygieneMock.runTrackerHygiene).not.toHaveBeenCalled();
-
-      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("github.repos is empty"));
-
       // Verify poller was NOT started
       expect(pollerMock.startGitHubEventPoller).not.toHaveBeenCalled();
 
       sigintListener?.("SIGINT");
     } finally {
       processOnSpy.mockRestore();
-      errorSpy.mockRestore();
     }
   });
 
@@ -2170,12 +2043,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+          resource: "github:dummy-org/dummy-repo",
         }),
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "chat" },
+          resource: "gchat:spaces",
         }),
       ])
     );
@@ -2303,7 +2176,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       provider: "antigravity",
       model: "Gemini 3.7 Flash (High)",
     });
-    mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+    mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
     await emitGitHubEvent("issue_comment", {
       action: "created",
@@ -2343,7 +2216,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       throw new Error("Mesh or emitGitHubEvent not ready");
     }
 
-    mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+    mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
     await emitGitHubEvent("issue_comment", {
       action: "created",
@@ -2387,11 +2260,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       }
       // The class is non-allowlisted, so use an exact issue subscription to
       // isolate the sender-filter behavior this test owns.
-      mesh.subscribeEventSource(
-        { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 456 },
-        "root",
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo/issues/456", "root", "root");
 
       // "issues"/"labeled" is on the explicit v1 never-notify list (tracker
       // churn the hygiene/ownership machinery generates) and the sender is
@@ -2459,11 +2328,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!mesh || !emitGitHubEvent) {
         throw new Error("Mesh or emitGitHubEvent not ready");
       }
-      mesh.subscribeEventSource(
-        { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 456 },
-        "root",
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo/issues/456", "root", "root");
 
       await emitGitHubEvent("issues", {
         action: "labeled",
@@ -2502,7 +2367,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!mesh || !emitGitHubEvent) {
         throw new Error("Mesh or emitGitHubEvent not ready");
       }
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
       // issue_comment/created is body-ful, so this rule never engages — but
       // the comment carries no author stamp at all, so the existing
@@ -2544,7 +2409,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!mesh || !emitGitHubEvent) {
         throw new Error("Mesh or emitGitHubEvent not ready");
       }
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
       // pull_request/closed (a merge) is deliberately NOT suppressed: humans
       // merge PRs, and staging-deploy flows subscribe to merge-adjacent
@@ -2588,7 +2453,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!mesh || !emitGitHubEvent) {
         throw new Error("Mesh or emitGitHubEvent not ready");
       }
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
       await emitGitHubEvent("check_run", {
         action: "created",
@@ -2631,7 +2496,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       if (!mesh || !emitGitHubEvent) {
         throw new Error("Mesh or emitGitHubEvent not ready");
       }
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
       await emitGitHubEvent("check_run", {
         action: "completed",
@@ -2694,16 +2559,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
         provider: "antigravity",
         model: "Gemini 3.7 Flash (High)",
       });
-      mesh.subscribeEventSource(
-        { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 77 },
-        prWorker,
-        "root"
-      );
-      mesh.subscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        "root",
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo/pulls/77", prWorker, "root");
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", "root", "root");
 
       // Carries a PR: its owner is woken, and the repo owner is not.
       await emitGitHubEvent("check_suite", {
@@ -2787,7 +2644,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     if (!mesh || !emitGitHubEvent) {
       throw new Error("Mesh or emitGitHubEvent not ready");
     }
-    mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+    mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
     await emitGitHubEvent("issue_comment", {
       action: "created",
@@ -2871,12 +2728,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // Real topology : root retains the covering org source it delegates
     // slices from — the retired subscriber's event bubbles to root via that
     // source, not via the removed catch-all .
-    mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
-    mesh.subscribeEventSource(
-      { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-      workerId,
-      "root"
-    );
+    mesh.subscribeEventSource("github:dummy-org", "root", "root");
+    mesh.subscribeEventSource("github:dummy-org/dummy-repo", workerId, "root");
 
     // Retire worker (no longer live)
     mesh.retire(workerId);
@@ -2935,16 +2788,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       model: "Gemini 3.7 Flash (High)",
     });
 
-    mesh.subscribeEventSource(
-      { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 123 },
-      issueWorker,
-      "root"
-    );
-    mesh.subscribeEventSource(
-      { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 456 },
-      prWorker,
-      "root"
-    );
+    mesh.subscribeEventSource("github:dummy-org/dummy-repo/issues/123", issueWorker, "root");
+    mesh.subscribeEventSource("github:dummy-org/dummy-repo/pulls/456", prWorker, "root");
 
     // 1. True issue comment -> github_issue
     await emitGitHubEvent("issue_comment", {
@@ -3141,10 +2986,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("claude");
     expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
 
-    // Valid target provider + model succeeds
+    // Valid target provider + model stages for the next run boundary.
     activeMesh.setActorModel(portableWorkerId, "Gemini 3.7 Flash (High)", "root", "antigravity");
-    expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("antigravity");
-    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Gemini 3.7 Flash (High)");
+    expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("claude");
+    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
+    expect(activeMesh.registry.get(portableWorkerId)?.desiredProvider).toBe("antigravity");
+    expect(activeMesh.registry.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash (High)");
 
     // Invalid model for target provider fails validation
     expect(() => {
@@ -3155,7 +3002,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "antigravity"
       );
     }).toThrow(/model pin validation failed/);
-    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Gemini 3.7 Flash (High)");
+    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
+    expect(activeMesh.registry.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash (High)");
+    expect(activeMesh.registry.get(portableWorkerId)?.desiredProvider).toBe("antigravity");
   });
 
   it("routes delegated chat spaces to the delegatee while others bubble to root", async () => {
@@ -3204,7 +3053,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       provider: "antigravity",
       model: "Gemini 3.7 Flash (High)",
     });
-    mesh.delegateEventSource({ kind: "chat_space", space: "spaces/delegated" }, childId, "root");
+    mesh.delegateEventSource("gchat:spaces/delegated", childId, "root");
 
     await chatSource.emit({
       name: "msg-delegated",
@@ -3256,7 +3105,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
           projectId: "test",
           subscription: "test",
           pubsubKeyPath: "/dev/null",
-          gchat: "all",
+          // Outbound grants do not narrow the root's inbound event source.
+          gchat: ["spaces/OUTBOUND_ONLY"],
         },
         observability: {
           diskAlert: {
@@ -3290,27 +3140,27 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "github_repo", repo: "custom-org/custom-repo" },
+          resource: "github:custom-org/custom-repo",
         }),
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "github_org", org: "target-org" },
+          resource: "github:target-org",
         }),
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "github_org", org: "extra-org" },
+          resource: "github:extra-org",
         }),
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "chat" },
+          resource: "gchat:spaces",
         }),
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "system" },
+          resource: "system:events",
         }),
       ])
     );

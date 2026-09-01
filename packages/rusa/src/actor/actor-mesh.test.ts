@@ -1,8 +1,11 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { runMigrations } from "../db/migrations/runner.js";
+import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
-import { resolveStampedAuthor, SYSTEM_TRACKER_HYGIENE } from "../mcp/stamp.js";
+import { MESH_SYSTEM, resolveStampedAuthor } from "../mcp/stamp.js";
 import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
@@ -10,11 +13,13 @@ import { Actor } from "./actor.js";
 import type {
   ActorFactoryContext,
   ActorMeshOptions,
+  EventDeliveryOptions,
   RetireCleanup,
   SpawnRequest,
 } from "./actor-mesh.js";
 import { ActorMesh } from "./actor-mesh.js";
 import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
+import type { EventResource } from "./event-subscriptions.js";
 import { routeRunFailure } from "./failure-sink.js";
 import type {
   InboxActorWork,
@@ -25,7 +30,7 @@ import type {
   InboxStore,
 } from "./inbox-store.js";
 import type { MeshEventInput, MeshEventSink } from "./mesh-events.js";
-import { InMemoryThreadRegistry } from "./thread-registry.js";
+import { InMemoryThreadRegistry, type ThreadRecord } from "./thread-registry.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
 const DEBOUNCE = 10;
@@ -45,26 +50,43 @@ function createMemoryInboxStore(): InboxStore & { entries: InboxEntry[] } {
   return {
     entries,
     append: (inputs) => {
-      const inserted = inputs.map((input, index) => ({
-        id: input.id ?? `entry-${entries.length + index + 1}`,
-        actorId: input.actorId,
-        source: input.source,
-        deliveredAt: input.deliveredAt ?? new Date("2026-01-01T00:00:00Z"),
-        seenAt: null,
-        handledAt: null,
-        handledNote: null,
-        payload: input.payload,
-      }));
+      // Mirrors InboxRepository: the insert is `ON CONFLICT(id) DO NOTHING` and
+      // the return is filtered to rows actually inserted, so a caller-supplied
+      // duplicate id is suppressed and reported as "nothing new". Without this
+      // the fake silently grants at-least-once where the real store gives
+      // exactly-once, and dedupe-dependent behaviour cannot be tested here.
+      const inserted = inputs
+        .map((input, index) => ({
+          id: input.id ?? `entry-${entries.length + index + 1}`,
+          actorId: input.actorId,
+          source: input.source,
+          deliveredAt: input.deliveredAt ?? new Date("2026-01-01T00:00:00Z"),
+          seenAt: null,
+          handledAt: null,
+          handledNote: null,
+          payload: input.payload,
+        }))
+        .filter((row) => !entries.some((existing) => existing.id === row.id));
       entries.push(...inserted);
       return inserted;
     },
-    list: (actorId: string, _options: InboxListOptions = {}): InboxPage => ({
-      entries: entries.filter((entry) => entry.actorId === actorId && entry.handledAt === null),
-      unhandledCount: entries.filter(
-        (entry) => entry.actorId === actorId && entry.handledAt === null
-      ).length,
-      nextCursor: null,
-    }),
+    list: (actorId: string, options: InboxListOptions = {}): InboxPage => {
+      const status = options.status ?? "unhandled";
+      let matched = entries.filter((entry) => entry.actorId === actorId);
+      if (status === "unhandled") matched = matched.filter((entry) => entry.handledAt === null);
+      else if (status === "handled") matched = matched.filter((entry) => entry.handledAt !== null);
+      if (options.source !== undefined) {
+        matched = matched.filter((entry) => entry.source === options.source);
+      }
+      matched = [...matched].reverse();
+      return {
+        entries: matched,
+        unhandledCount: entries.filter(
+          (entry) => entry.actorId === actorId && entry.handledAt === null
+        ).length,
+        nextCursor: null,
+      };
+    },
     read: (actorId: string, entryId: string) =>
       entries.find((entry) => entry.actorId === actorId && entry.id === entryId) ?? null,
     countUnhandled: (actorId: string) =>
@@ -140,6 +162,7 @@ function setup(
     onModelSet?: ActorMeshOptions["onModelSet"];
     createActor?: ActorMeshOptions["createActor"];
     rootId?: string;
+    obligations?: ActorMeshOptions["obligations"];
   } = {}
 ) {
   const registry = new InMemoryThreadRegistry();
@@ -160,6 +183,7 @@ function setup(
     events: opts.events,
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
     inboxStore: opts.inboxStore ?? createMemoryInboxStore(),
+    obligations: opts.obligations,
     onInboxEntriesSeen: opts.onInboxEntriesSeen,
     grantableCapabilities: opts.grantableCapabilities,
     idgen: opts.idgen ?? (() => `t${++seq}`),
@@ -713,7 +737,7 @@ describe("ActorMesh", () => {
     const { mesh, registry, tick } = setup();
     const cronActor = mesh.spawn({ charter: "nightly", parentId: "root" });
     const eventActor = mesh.spawn({ charter: "repo steward", parentId: "root" });
-    const resource = { kind: "github_repo" as const, repo: "dummy-org/dummy-repo" };
+    const resource = "github:dummy-org/dummy-repo";
     mesh.subscribeEventSource(resource, eventActor, "root");
 
     expect(mesh.deliverWake(cronActor, "nightly distill run")).toBe(true);
@@ -735,12 +759,347 @@ describe("ActorMesh", () => {
     expect(calls[0]?.prompt).toContain("Work from your inbox");
   });
 
+  it("delivers ready-head attention exactly once per transition, across repeats and restarts", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null)).toBe(
+      true
+    );
+    await tick();
+
+    const first = rootEntries();
+    expect(first).toHaveLength(1);
+    expect(first[0].source).toBe("obligation:ob-1");
+    expect(first[0].payload).toMatchObject({ type: "obligation.ready_head", obligationId: "ob-1" });
+
+    // Replay of the same transition — and, since the id is derived from the
+    // transition rather than a run, this is also what a restart looks like.
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null)).toBe(
+      false
+    );
+    expect(rootEntries()).toHaveLength(1);
+
+    // A genuinely different head is genuinely new attention.
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-2", intent: "next" }, "ob-1")).toBe(
+      true
+    );
+    expect(rootEntries()).toHaveLength(2);
+
+    // ob-1 becoming the head again after ob-2 displaced it is a NEW transition,
+    // not a repeat of the first one. Keying on the head alone made this silent,
+    // which left an actor that had already handled the ob-1 entry sitting on
+    // live work with nothing to wake it.
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, "ob-2")).toBe(
+      true
+    );
+    expect(rootEntries()).toHaveLength(3);
+  });
+
+  it("does not re-wake actor when an already delivered transition sequence is repeated after being handled", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, fake, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null, 1)).toBe(
+      true
+    );
+    await tick();
+    expect(rootEntries()).toHaveLength(1);
+
+    // Still unhandled: the wake is outstanding, so a repeat is pure noise.
+    const beforeUnhandledRepeat = fake("root").calls.length;
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null, 1)).toBe(
+      false
+    );
+    await tick();
+    expect(fake("root").calls.length).toBe(beforeUnhandledRepeat);
+
+    // Once handled, repeating the exact same transition sequence does NOT re-wake the actor.
+    inboxStore.markHandled("root", [rootEntries()[0].id]);
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, null, 1)).toBe(
+      false
+    );
+    await tick();
+    expect(rootEntries()).toHaveLength(1);
+    expect(fake("root").calls.length).toBe(beforeUnhandledRepeat);
+  });
+
+  it("collapses a run's ready-head churn into the one net transition", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, tick } = setup({ inboxStore });
+    const headEntries = () =>
+      inboxStore.entries.filter(
+        (entry) =>
+          entry.actorId === "root" &&
+          (entry.payload as { type?: string }).type === "obligation.ready_head"
+      );
+
+    mesh.actorQueued("root", { responsive: true, mode: "ordinary" });
+
+    // The shape a real root produced on 2026-08-30: create the parent, then
+    // nest a child under it. Both move root's head, and the first head is
+    // waiting again by the time the run ends.
+    expect(
+      mesh.deliverReadyHeadAttention("root", { id: "parent", intent: "root goal" }, null)
+    ).toBe(false);
+    expect(
+      mesh.deliverReadyHeadAttention("root", { id: "child", intent: "first pass" }, "parent")
+    ).toBe(false);
+    expect(headEntries()).toHaveLength(0);
+
+    mesh.finishInboxRun("root");
+    await tick();
+
+    const delivered = headEntries();
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0].source).toBe("obligation:child");
+  });
+
+  it("says nothing when a run leaves its head where it found it", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, tick } = setup({ inboxStore });
+    const headEntries = () =>
+      inboxStore.entries.filter(
+        (entry) =>
+          entry.actorId === "root" &&
+          (entry.payload as { type?: string }).type === "obligation.ready_head"
+      );
+
+    mesh.actorQueued("root", { responsive: true, mode: "ordinary" });
+    mesh.deliverReadyHeadAttention("root", { id: "b", intent: null }, "a");
+    mesh.deliverReadyHeadAttention("root", { id: "a", intent: null }, "b");
+    mesh.finishInboxRun("root");
+    await tick();
+
+    // Churned and settled back: waking an actor about the head it already had
+    // is the noise this collapse exists to remove.
+    expect(headEntries()).toHaveLength(0);
+  });
+
+  it("says nothing when a run ends with no ready head at all", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, tick } = setup({ inboxStore });
+    const headEntries = () =>
+      inboxStore.entries.filter(
+        (entry) =>
+          entry.actorId === "root" &&
+          (entry.payload as { type?: string }).type === "obligation.ready_head"
+      );
+
+    mesh.actorQueued("root", { responsive: true, mode: "ordinary" });
+    mesh.deliverReadyHeadAttention("root", { id: "parent", intent: null }, null);
+    // Filing a question owned by the operator under it leaves root waiting with
+    // nothing ready — there is no obligation to point it at.
+    mesh.deliverReadyHeadAttention("root", null, "parent");
+    mesh.finishInboxRun("root");
+    await tick();
+
+    expect(headEntries()).toHaveLength(0);
+  });
+
+  it("delivers immediately when no run is open", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh } = setup({ inboxStore });
+
+    // Every non-run producer — a peer's mutation, the dashboard, a cron — must
+    // still wake the actor at once.
+    expect(mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: null }, null)).toBe(true);
+    expect(mesh.deliverReadyHeadAttention("root", null, "ob-1")).toBe(false);
+  });
+
+  it("does not deliver ready-head attention to a retired actor", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, registry } = setup({ inboxStore });
+    const id = mesh.spawn({ charter: "worker", parentId: "root" });
+    registry.patch(id, { status: "retired" });
+
+    expect(mesh.deliverReadyHeadAttention(id, { id: "ob-1", intent: null })).toBe(false);
+    expect(inboxStore.entries.filter((entry) => entry.actorId === id)).toHaveLength(0);
+  });
+
+  it("reconciles missing ready-head attention on boot and repair", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, fake, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    const obligations = {
+      readyHeadTransitions: () => [
+        { ownerId: "root", headId: "ob-1", previousHeadId: null, sequence: 1 },
+      ],
+      get: (id: string) => (id === "ob-1" ? { id: "ob-1", intent: "repair me" } : null),
+    };
+
+    // Before reconciliation: inbox has 0 entries for root.
+    expect(rootEntries()).toHaveLength(0);
+
+    // Run boot reconciliation for ready heads
+    mesh.reconcileReadyHeads(obligations);
+    await tick();
+
+    // Missed attention was delivered and actor nudged
+    expect(rootEntries()).toHaveLength(1);
+    expect(rootEntries()[0].source).toBe("obligation:ob-1");
+    expect(rootEntries()[0].payload).toMatchObject({
+      type: "obligation.ready_head",
+      obligationId: "ob-1",
+      intent: "repair me",
+    });
+    expect(fake("root").calls.length).toBeGreaterThan(0);
+
+    // Second boot reconciliation pass (restart idempotence test):
+    // Attention for ob-1 is already in inbox, so no new entry or duplicate wake occurs.
+    const callCountBefore = fake("root").calls.length;
+    mesh.reconcileReadyHeads(obligations);
+    await tick();
+
+    expect(rootEntries()).toHaveLength(1);
+    expect(fake("root").calls.length).toBe(callCountBefore);
+  });
+
+  it("is idempotent when transition-based attention was already delivered before restart", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, fake, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    // Simulate transition-derived delivery during runtime (e.g. ob-0 -> ob-1, sequence 1)
+    mesh.deliverReadyHeadAttention("root", { id: "ob-1", intent: "ship it" }, "ob-0", 1);
+    await tick();
+    expect(rootEntries()).toHaveLength(1);
+    expect(rootEntries()[0].source).toBe("obligation:ob-1");
+
+    const callsBeforeReconcile = fake("root").calls.length;
+
+    // Simulate restart and run reconcileReadyHeads
+    const obligations = {
+      readyHeadTransitions: () => [
+        { ownerId: "root", headId: "ob-1", previousHeadId: "ob-0", sequence: 1 },
+      ],
+      get: (id: string) => (id === "ob-1" ? { id: "ob-1", intent: "ship it" } : null),
+    };
+
+    mesh.reconcileReadyHeads(obligations);
+    await tick();
+
+    // No duplicate entry or extra wake!
+    expect(rootEntries()).toHaveLength(1);
+    expect(fake("root").calls.length).toBe(callsBeforeReconcile);
+  });
+
+  it("reconciles a missed recurrence transition when multiple consecutive listener failures occurred", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, fake, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    // 1. H becomes head initially (sequence 1). Delivered and handled.
+    mesh.deliverReadyHeadAttention("root", { id: "ob-H", intent: "do H" }, null, 1);
+    await tick();
+    const entryH1 = rootEntries().find((e) => e.source === "obligation:ob-H");
+    expect(entryH1).toBeDefined();
+    if (!entryH1) return;
+    inboxStore.markHandled("root", [entryH1.id]);
+
+    // 2. H -> X commits (sequence 2), listener fails (not delivered to inbox).
+    // 3. X -> H commits (sequence 3), listener fails (not delivered to inbox).
+
+    // 4. Boot reconciliation runs with persistent transition fact (sequence 3, prev: ob-X, head: ob-H):
+    const obligations = {
+      readyHeadTransitions: () => [
+        { ownerId: "root", headId: "ob-H", previousHeadId: "ob-X", sequence: 3 },
+      ],
+      get: (id: string) => (id === "ob-H" ? { id: "ob-H", intent: "do H" } : null),
+    };
+
+    const callsBefore = fake("root").calls.length;
+    mesh.reconcileReadyHeads(obligations);
+    await tick();
+
+    // Boot delivers sequence 3 (ob-X -> ob-H) attention.
+    expect(rootEntries()).toHaveLength(2);
+    const newEntry = rootEntries()[1];
+    expect(newEntry.source).toBe("obligation:ob-H");
+    expect(newEntry.payload).toMatchObject({
+      type: "obligation.ready_head",
+      obligationId: "ob-H",
+      intent: "do H",
+    });
+    expect(fake("root").calls.length).toBeGreaterThan(callsBefore);
+
+    // 5. Subsequent boot passes are idempotent.
+    const callsBeforePass2 = fake("root").calls.length;
+    mesh.reconcileReadyHeads(obligations);
+    await tick();
+    expect(rootEntries()).toHaveLength(2);
+    expect(fake("root").calls.length).toBe(callsBeforePass2);
+  });
+
+  it("skips non-actor owners and retired actors during ready-head reconciliation", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, registry } = setup({ inboxStore });
+    const retiredId = mesh.spawn({ charter: "worker", parentId: "root" });
+    registry.patch(retiredId, { status: "retired" });
+
+    const obligations = {
+      readyHeads: () =>
+        [
+          ["human:matt", "ob-human"],
+          ["system:cron", "ob-sys"],
+          [retiredId, "ob-retired"],
+        ] as [string, string][],
+      get: (id: string) => ({ id, intent: null }),
+    };
+
+    mesh.reconcileReadyHeads(obligations);
+    expect(inboxStore.entries).toHaveLength(0);
+  });
+
+  it("re-queues an actor that leaves inbox work unhandled, and stops once the inbox drains", async () => {
+    const inboxStore = createMemoryInboxStore();
+    // Handle exactly one entry per run so the actor deliberately under-drains,
+    // which is the deferral pattern the inbox contract is meant to support.
+    const { mesh, fake, tick } = setup({
+      inboxStore,
+      createActor: undefined,
+    });
+    inboxStore.append([
+      { actorId: "root", source: "mesh:a", payload: payload("mesh.message") },
+      { actorId: "root", source: "mesh:b", payload: payload("mesh.message") },
+      { actorId: "root", source: "mesh:c", payload: payload("mesh.message") },
+    ]);
+
+    const handleOne = () => {
+      const next = inboxStore.list("root").entries[0];
+      if (!next) return 0;
+      mesh.selectInboxEntries("root", [next.id]);
+      inboxStore.markHandled("root", [next.id]);
+      mesh.inboxHandled("root");
+      return inboxStore.countUnhandled("root");
+    };
+
+    expect(handleOne()).toBe(2);
+    await tick();
+    expect(fake("root").calls.length).toBeGreaterThan(0);
+
+    const afterFirst = fake("root").calls.length;
+    expect(handleOne()).toBe(1);
+    await tick();
+    expect(fake("root").calls.length).toBeGreaterThan(afterFirst);
+
+    // Draining the last entry must NOT schedule another run: an empty inbox is
+    // the termination condition, otherwise the actor spins forever.
+    const afterSecond = fake("root").calls.length;
+    expect(handleOne()).toBe(0);
+    await tick();
+    expect(fake("root").calls).toHaveLength(afterSecond);
+  });
+
   it("delivers a system.disk event to the system subscriber as responsive inbox work", async () => {
     const inboxStore = createMemoryInboxStore();
     const { mesh, fake, tick } = setup({ inboxStore });
-    mesh.subscribeEventSource({ kind: "system" }, "root", "root");
+    mesh.subscribeEventSource("system:events", "root", "root");
 
-    await mesh.deliverEvent({ kind: "system" }, "disk low", {
+    await mesh.deliverEvent("system:events", "disk low", {
       inboxPayload: {
         type: "system.disk",
         priority: "responsive",
@@ -754,7 +1113,7 @@ describe("ActorMesh", () => {
     expect(inboxStore.entries).toEqual([
       expect.objectContaining({
         actorId: "root",
-        source: "system",
+        source: "system:events",
         payload: expect.objectContaining({
           type: "system.disk",
           priority: "responsive",
@@ -944,7 +1303,7 @@ describe("ActorMesh", () => {
     const env = setup({ sharedProvider: provider, events: (e) => events.push(e) });
     mesh = env.mesh;
     id = mesh.spawn({ charter: "repo steward", parentId: "root" });
-    const resource = { kind: "github_repo" as const, repo: "dummy-org/dummy-repo" };
+    const resource = "github:dummy-org/dummy-repo";
     mesh.subscribeEventSource(resource, id, "root");
 
     mesh.deliverEvent(resource, "GitHub issues/opened on dummy-org/dummy-repo", {
@@ -982,7 +1341,7 @@ describe("ActorMesh", () => {
     });
     mesh = env.mesh;
     id = mesh.spawn({ charter: "repo steward", parentId: "root" });
-    const resource = { kind: "github_repo" as const, repo: "dummy-org/dummy-repo" };
+    const resource = "github:dummy-org/dummy-repo";
     mesh.subscribeEventSource(resource, id, "root");
 
     mesh.deliverEvent(resource, "GitHub issues/opened on dummy-org/dummy-repo", {
@@ -1322,8 +1681,8 @@ describe("ActorMesh", () => {
   it("deactivates the retired actor's active event subscriptions", () => {
     const { mesh } = setup();
     const actorId = mesh.spawn({ charter: "repo worker", parentId: "root" });
-    const active = { kind: "github_repo" as const, repo: "dummy-org/dummy-repo" };
-    const alreadyInactive = { kind: "github_repo" as const, repo: "dummy-org/old" };
+    const active = "github:dummy-org/dummy-repo";
+    const alreadyInactive = "github:dummy-org/old";
 
     mesh.subscribeEventSource(active, actorId, "root");
     mesh.subscribeEventSource(alreadyInactive, actorId, "root");
@@ -1334,22 +1693,13 @@ describe("ActorMesh", () => {
     expect(
       mesh
         .listSubscriptions()
-        .find(
-          (s) =>
-            s.actorId === actorId &&
-            s.resource.kind === "github_repo" &&
-            s.resource.repo === active.repo
-        )?.unsubscribedAt
+        .find((s) => s.actorId === actorId && s.resource === "github:dummy-org/dummy-repo")
+        ?.unsubscribedAt
     ).toBe("2026-01-01T00:00:00Z");
     expect(
       mesh
         .listSubscriptions()
-        .find(
-          (s) =>
-            s.actorId === actorId &&
-            s.resource.kind === "github_repo" &&
-            s.resource.repo === alreadyInactive.repo
-        )?.unsubscribedAt
+        .find((s) => s.actorId === actorId && s.resource === "github:dummy-org/old")?.unsubscribedAt
     ).toBe("2025-12-31T00:00:00Z");
   });
 
@@ -2277,7 +2627,7 @@ describe("ActorMesh", () => {
   it("setActorModel updates the record model, emits event, and enforces authority", async () => {
     const events: MeshEventInput[] = [];
     const modelSets: Array<{ actorId: string; newModel: string }> = [];
-    const { mesh, registry } = setup({
+    const { mesh, registry, tick } = setup({
       events: (event) => events.push(event),
       onModelSet: (actorId, newModel) => modelSets.push({ actorId, newModel }),
       validateModel: (_record, newModel) => {
@@ -2288,9 +2638,16 @@ describe("ActorMesh", () => {
     const child = mesh.spawn({ charter: "child", parentId: parent, model: "claude-sonnet-5" });
     const sibling = mesh.spawn({ charter: "sibling", parentId: "root" });
 
-    // Parent can update child's model
+    // Parent can stage a child's model. Even while idle, the child keeps its
+    // current model through the next dispatched run and applies at run end.
     mesh.setActorModel(child, "claude-opus-4-8", parent);
+    expect(registry.get(child)?.model).toBe("claude-sonnet-5");
+    expect(registry.get(child)?.desiredModel).toBe("claude-opus-4-8");
+    expect(modelSets).toEqual([]);
+    mesh.sendMessage(child, "apply staged model", parent);
+    await tick();
     expect(registry.get(child)?.model).toBe("claude-opus-4-8");
+    expect(registry.get(child)?.desiredModel).toBeUndefined();
     expect(modelSets).toEqual([{ actorId: child, newModel: "claude-opus-4-8" }]);
     expect(events).toContainEqual(
       expect.objectContaining({
@@ -2301,8 +2658,11 @@ describe("ActorMesh", () => {
       })
     );
 
-    // Root can update any child's model
+    // Root can stage any child's model under the same boundary rule.
     mesh.setActorModel(parent, "gemini-3.1-pro", "root");
+    expect(registry.get(parent)?.model).toBe("claude-sonnet-5");
+    mesh.sendMessage(parent, "apply staged model", "root");
+    await tick();
     expect(registry.get(parent)?.model).toBe("gemini-3.1-pro");
 
     // An actor cannot set its own model (tier-raising guard)
@@ -2326,10 +2686,60 @@ describe("ActorMesh", () => {
     expect(registry.get(child)?.model).toBe("claude-opus-4-8");
   });
 
+  it("lets only the root set its own portable model at its run boundary", () => {
+    const events: MeshEventInput[] = [];
+    const modelSets: Array<{ actorId: string; newModel: string; record: ThreadRecord }> = [];
+    const { mesh, registry } = setup({
+      events: (event) => events.push(event),
+      onModelSet: (actorId, newModel, record) => modelSets.push({ actorId, newModel, record }),
+    });
+    registry.patch("root", {
+      provider: "claude",
+      model: "claude-opus-4-8",
+      context: { type: "portable", mode: "ledger" },
+    });
+    const child = mesh.spawn({ charter: "child", parentId: "root" });
+
+    mesh.setActorModel("root", "gpt-5.6-sol", "root", "codex");
+
+    expect(registry.get("root")).toMatchObject({
+      provider: "claude",
+      model: "claude-opus-4-8",
+      desiredProvider: "codex",
+      desiredModel: "gpt-5.6-sol",
+    });
+    expect(() => mesh.setActorModel(child, "claude-opus-4-8", child)).toThrow(
+      /cannot set its own model/
+    );
+
+    mesh.finishInboxRun("root");
+
+    expect(registry.get("root")).toMatchObject({
+      provider: "codex",
+      model: "gpt-5.6-sol",
+    });
+    expect(registry.get("root")?.desiredProvider).toBeUndefined();
+    expect(registry.get("root")?.desiredModel).toBeUndefined();
+    expect(modelSets).toEqual([
+      {
+        actorId: "root",
+        newModel: "gpt-5.6-sol",
+        record: expect.objectContaining({ provider: "codex", model: "gpt-5.6-sol" }),
+      },
+    ]);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "actor_model_set",
+        actorId: "root",
+        detail: "claude:claude-opus-4-8 -> codex:gpt-5.6-sol",
+      })
+    );
+  });
+
   it("setActorModel supports cross-provider moves for portable actors and rejects them for native actors", async () => {
     const events: MeshEventInput[] = [];
     const validations: Array<{ recordId: string; newModel: string; newProvider?: string }> = [];
-    const { mesh, registry } = setup({
+    const { mesh, registry, tick } = setup({
       events: (event) => events.push(event),
       validateModel: (record, newModel, newProvider) => {
         validations.push({ recordId: record.id, newModel, newProvider });
@@ -2348,8 +2758,15 @@ describe("ActorMesh", () => {
       context: { type: "portable", mode: "ledger" },
     });
     mesh.setActorModel(ledgerChild, "gemini-3.7-flash-high", "root", "antigravity");
+    expect(registry.get(ledgerChild)?.provider).toBe("claude");
+    expect(registry.get(ledgerChild)?.model).toBe("claude-opus-4-8");
+    expect(registry.get(ledgerChild)?.desiredProvider).toBe("antigravity");
+    expect(registry.get(ledgerChild)?.desiredModel).toBe("gemini-3.7-flash-high");
+    mesh.sendMessage(ledgerChild, "apply staged provider", "root");
+    await tick();
     expect(registry.get(ledgerChild)?.provider).toBe("antigravity");
     expect(registry.get(ledgerChild)?.model).toBe("gemini-3.7-flash-high");
+    expect(registry.get(ledgerChild)?.desiredModel).toBeUndefined();
     expect(validations).toContainEqual({
       recordId: ledgerChild,
       newModel: "gemini-3.7-flash-high",
@@ -2372,6 +2789,10 @@ describe("ActorMesh", () => {
       context: { type: "portable", mode: "tail" },
     });
     mesh.setActorModel(tailChild, "gpt-5.6-sol", "root", "codex");
+    expect(registry.get(tailChild)?.provider).toBe("claude");
+    expect(registry.get(tailChild)?.model).toBe("claude-sonnet-5");
+    mesh.sendMessage(tailChild, "apply staged provider", "root");
+    await tick();
     expect(registry.get(tailChild)?.provider).toBe("codex");
     expect(registry.get(tailChild)?.model).toBe("gpt-5.6-sol");
 
@@ -2408,24 +2829,113 @@ describe("ActorMesh", () => {
 
     // 6. Native actor accepts model update when explicit provider equals existing provider
     mesh.setActorModel(nativeChild, "claude-opus-4-8", "root", "claude");
+    expect(registry.get(nativeChild)?.model).toBe("claude-sonnet-5");
+    mesh.sendMessage(nativeChild, "apply staged model", "root");
+    await tick();
     expect(registry.get(nativeChild)?.provider).toBe("claude");
     expect(registry.get(nativeChild)?.model).toBe("claude-opus-4-8");
 
-    // 7. Refuses model/provider changes while actor is running or queued
-    const busyChild = mesh.spawn({
+    // 7. Defers model/provider changes while actor is running or queued and applies at run end
+    const { provider: deferredRunProvider, releaseAll: releaseDeferred } = deferredProvider();
+    const modelSetCalls: Array<{ actorId: string; newModel: string; record: ThreadRecord }> = [];
+    const busyMeshSetup = setup({
+      sharedProvider: deferredRunProvider,
+      events: (event) => events.push(event),
+      onModelSet: (actorId, newModel, record) => modelSetCalls.push({ actorId, newModel, record }),
+    });
+
+    const busyChild = busyMeshSetup.mesh.spawn({
       charter: "busy child",
       parentId: "root",
       provider: "claude",
       model: "claude-opus-4-8",
       context: { type: "portable", mode: "ledger" },
     });
-    const liveBusyActor = mesh.get(busyChild);
-    if (liveBusyActor) {
-      Object.defineProperty(liveBusyActor, "isRunning", { value: true, configurable: true });
-    }
-    expect(() =>
-      mesh.setActorModel(busyChild, "gemini-3.7-flash-high", "root", "antigravity")
-    ).toThrow(/Cannot change model or provider while actor .* is running or queued/);
+
+    // Start a run so the actor is running
+    busyMeshSetup.mesh.sendMessage(busyChild, "run 1", "root");
+    await busyMeshSetup.tick();
+    expect(busyMeshSetup.mesh.activeRunState(busyChild)?.phase).toBe("running");
+
+    // setActorModel does NOT reject when running; persists desiredModel/desiredProvider
+    busyMeshSetup.mesh.setActorModel(busyChild, "gemini-3.7-flash-high", "root", "antigravity");
+    expect(busyMeshSetup.registry.get(busyChild)?.model).toBe("claude-opus-4-8");
+    expect(busyMeshSetup.registry.get(busyChild)?.provider).toBe("claude");
+    expect(busyMeshSetup.registry.get(busyChild)?.desiredModel).toBe("gemini-3.7-flash-high");
+    expect(busyMeshSetup.registry.get(busyChild)?.desiredProvider).toBe("antigravity");
+    expect(modelSetCalls).toHaveLength(0);
+
+    // Overwrite test (last-write-wins before boundary)
+    busyMeshSetup.mesh.setActorModel(busyChild, "gpt-5.6-sol", "root", "codex");
+    expect(busyMeshSetup.registry.get(busyChild)?.desiredModel).toBe("gpt-5.6-sol");
+    expect(busyMeshSetup.registry.get(busyChild)?.desiredProvider).toBe("codex");
+
+    // Complete the in-flight run; deferred model is applied at the run end boundary
+    releaseDeferred();
+    await busyMeshSetup.tick();
+    expect(busyMeshSetup.registry.get(busyChild)?.model).toBe("gpt-5.6-sol");
+    expect(busyMeshSetup.registry.get(busyChild)?.provider).toBe("codex");
+    expect(busyMeshSetup.registry.get(busyChild)?.desiredModel).toBeUndefined();
+    expect(busyMeshSetup.registry.get(busyChild)?.desiredProvider).toBeUndefined();
+    expect(modelSetCalls).toContainEqual(
+      expect.objectContaining({
+        actorId: busyChild,
+        newModel: "gpt-5.6-sol",
+        record: expect.objectContaining({ model: "gpt-5.6-sol", provider: "codex" }),
+      })
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "actor_model_set",
+        actorId: busyChild,
+        detail: "claude:claude-opus-4-8 -> codex:gpt-5.6-sol",
+      })
+    );
+
+    // Queued run boundary test: occupy the one concurrency slot so this actor is
+    // genuinely waiting in the mesh gate (rather than merely dirty while running).
+    const queuedDeferred = deferredProvider();
+    const queuedMeshSetup = setup({
+      maxConcurrent: 1,
+      sharedProvider: queuedDeferred.provider,
+      events: (event) => events.push(event),
+      onModelSet: (actorId, newModel, record) => modelSetCalls.push({ actorId, newModel, record }),
+    });
+    const blocker = queuedMeshSetup.mesh.spawn({
+      charter: "blocker",
+      parentId: "root",
+    });
+    const queuedChild = queuedMeshSetup.mesh.spawn({
+      charter: "queued child",
+      parentId: "root",
+      provider: "claude",
+      model: "claude-sonnet-5",
+      context: { type: "portable", mode: "ledger" },
+    });
+    queuedMeshSetup.mesh.sendMessage(blocker, "hold the slot", "root");
+    await queuedMeshSetup.tick();
+    expect(queuedMeshSetup.mesh.activeRunState(blocker)?.phase).toBe("running");
+
+    queuedMeshSetup.mesh.sendMessage(queuedChild, "queued run", "root");
+    await queuedMeshSetup.tick();
+    expect(queuedMeshSetup.mesh.activeRunState(queuedChild)?.phase).toBe("queued");
+
+    queuedMeshSetup.mesh.setActorModel(queuedChild, "claude-opus-4-8", "root");
+    expect(queuedMeshSetup.registry.get(queuedChild)?.model).toBe("claude-sonnet-5");
+    expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModel).toBe("claude-opus-4-8");
+
+    // Releasing the blocker admits the queued run, which still uses the old
+    // model. The pending value must survive until that run itself completes.
+    queuedDeferred.releaseAll();
+    await queuedMeshSetup.tick();
+    expect(queuedMeshSetup.mesh.activeRunState(queuedChild)?.phase).toBe("running");
+    expect(queuedMeshSetup.registry.get(queuedChild)?.model).toBe("claude-sonnet-5");
+    expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModel).toBe("claude-opus-4-8");
+
+    queuedDeferred.releaseAll();
+    await queuedMeshSetup.tick();
+    expect(queuedMeshSetup.registry.get(queuedChild)?.model).toBe("claude-opus-4-8");
+    expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModel).toBeUndefined();
 
     // 8. Dynamic provider halt check: moved actor obeys new provider's halt state on wake
     let providerBExecuted = false;
@@ -2462,6 +2972,9 @@ describe("ActorMesh", () => {
     });
     // Move to provider-b
     dynamicMeshSetup.mesh.setActorModel(movingWorker, "model-b", "root", "provider-b");
+    expect(dynamicMeshSetup.registry.get(movingWorker)?.provider).toBe("provider-a");
+    dynamicMeshSetup.mesh.sendMessage(movingWorker, "apply staged provider", "root");
+    await dynamicMeshSetup.tick();
     expect(dynamicMeshSetup.registry.get(movingWorker)?.provider).toBe("provider-b");
 
     // When provider-b is halted, wake is skipped (provider-a halt does not block it)
@@ -2536,14 +3049,10 @@ describe("ActorMesh", () => {
       const actorId = mesh.spawn({ charter: "worker", parentId: "root" });
 
       // Subscribe
-      mesh.subscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        actorId,
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", actorId, "root");
       expect(mesh.listSubscriptions()).toHaveLength(1);
       expect(mesh.listSubscriptions()[0]).toMatchObject({
-        resource: { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+        resource: "github:dummy-org/dummy-repo",
         actorId,
         subscribedBy: "root",
       });
@@ -2552,23 +3061,19 @@ describe("ActorMesh", () => {
       expect(events[2]).toMatchObject({
         kind: "event_source_subscribed",
         actorId,
-        detail: "github_repo:dummy-org/dummy-repo",
+        detail: "github:dummy-org/dummy-repo",
         payload: JSON.stringify({ subscribedBy: "root" }),
       });
 
       // Unsubscribe
-      mesh.unsubscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        actorId,
-        "2026-01-01T12:00:00Z"
-      );
+      mesh.unsubscribeEventSource("github:dummy-org/dummy-repo", actorId, "2026-01-01T12:00:00Z");
       expect(mesh.listSubscriptions()[0].unsubscribedAt).toBe("2026-01-01T12:00:00Z");
 
       expect(events).toHaveLength(4);
       expect(events[3]).toMatchObject({
         kind: "event_source_unsubscribed",
         actorId,
-        detail: "github_repo:dummy-org/dummy-repo",
+        detail: "github:dummy-org/dummy-repo",
         body: "at=2026-01-01T12:00:00Z",
       });
     });
@@ -2578,7 +3083,7 @@ describe("ActorMesh", () => {
       const actor1 = mesh.spawn({ charter: "worker 1", parentId: "root" });
       const actor2 = mesh.spawn({ charter: "worker 2", parentId: "root" });
 
-      const resource = { kind: "github_repo" as const, repo: "dummy-org/dummy-repo" };
+      const resource = "github:dummy-org/dummy-repo";
 
       mesh.subscribeEventSource(resource, actor1, "root");
 
@@ -2597,38 +3102,28 @@ describe("ActorMesh", () => {
       const parent = mesh.spawn({ charter: "repo steward", parentId: "root" });
       const child = mesh.spawn({ charter: "pr worker", parentId: parent });
 
-      mesh.subscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        parent,
-        "root"
-      );
-      mesh.delegateEventSource(
-        { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 616 },
-        child,
-        parent
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", parent, "root");
+      mesh.delegateEventSource("github:dummy-org/dummy-repo/pulls/616", child, parent);
 
       expect(mesh.listSubscriptions()).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             actorId: parent,
-            resource: { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+            resource: "github:dummy-org/dummy-repo",
             subscribedBy: "root",
           }),
           expect.objectContaining({
             actorId: child,
-            resource: { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 616 },
+            resource: "github:dummy-org/dummy-repo/pulls/616",
             subscribedBy: parent,
           }),
         ])
       );
 
-      mesh.deliverEvent(
-        { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 616 },
-        "pr event",
-        { inboxPayload: payload("pull_request.opened") }
-      );
-      mesh.deliverEvent({ kind: "github_repo", repo: "dummy-org/dummy-repo" }, "repo event", {
+      mesh.deliverEvent("github:dummy-org/dummy-repo/pulls/616", "pr event", {
+        inboxPayload: payload("pull_request.opened"),
+      });
+      mesh.deliverEvent("github:dummy-org/dummy-repo", "repo event", {
         inboxPayload: payload("push"),
       });
       await tick();
@@ -2644,22 +3139,14 @@ describe("ActorMesh", () => {
       const parent = mesh.spawn({ charter: "repo steward", parentId: "root" });
       const child = mesh.spawn({ charter: "pr worker", parentId: parent });
 
-      mesh.subscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        parent,
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", parent, "root");
 
       expect(() =>
-        mesh.delegateEventSource(
-          { kind: "github_pr", repo: "dummy-org/other", number: 1 },
-          child,
-          parent
-        )
+        mesh.delegateEventSource("github:dummy-org/other/pulls/1", child, parent)
       ).toThrow(/current effective owner/);
-      expect(() =>
-        mesh.delegateEventSource({ kind: "github_org", org: "dummy-org" }, child, parent)
-      ).toThrow(/current effective owner/);
+      expect(() => mesh.delegateEventSource("github:dummy-org", child, parent)).toThrow(
+        /current effective owner/
+      );
     });
 
     it("hands off an exact resource the delegator itself holds", async () => {
@@ -2668,7 +3155,7 @@ describe("ActorMesh", () => {
       const { mesh, tick, fake } = setup();
       const parent = mesh.spawn({ charter: "pr creator", parentId: "root" });
       const child = mesh.spawn({ charter: "pr worker", parentId: parent });
-      const pr = { kind: "github_pr" as const, repo: "dummy-org/dummy-repo", number: 616 };
+      const pr = "github:dummy-org/dummy-repo/pulls/616";
 
       mesh.subscribeEventSource(pr, parent, parent);
 
@@ -2677,7 +3164,7 @@ describe("ActorMesh", () => {
       const subs = mesh.listSubscriptions();
       expect(subs.find((s) => s.actorId === parent)?.unsubscribedAt).toBe("2026-01-01T00:00:00Z");
       expect(subs.find((s) => s.actorId === child)).toMatchObject({
-        resource: pr,
+        resource: "github:dummy-org/dummy-repo/pulls/616",
         subscribedBy: parent,
         unsubscribedAt: undefined,
       });
@@ -2693,19 +3180,17 @@ describe("ActorMesh", () => {
       const { mesh } = setup();
       const parent = mesh.spawn({ charter: "repo steward", parentId: "root" });
       const sibling = mesh.spawn({ charter: "sibling", parentId: "root" });
-      const pr = { kind: "github_pr" as const, repo: "dummy-org/dummy-repo", number: 616 };
+      const pr = "github:dummy-org/dummy-repo/pulls/616";
 
-      mesh.subscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        parent,
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", parent, "root");
 
       expect(() => mesh.delegateEventSource(pr, sibling, parent)).not.toThrow();
       expect(
         mesh
           .listSubscriptions()
-          .find((s) => s.actorId === sibling && s.resource.kind === "github_pr")?.subscribedBy
+          .find(
+            (s) => s.actorId === sibling && s.resource === "github:dummy-org/dummy-repo/pulls/616"
+          )?.subscribedBy
       ).toBe(parent);
     });
 
@@ -2713,19 +3198,17 @@ describe("ActorMesh", () => {
       const { mesh } = setup();
       const parent = mesh.spawn({ charter: "repo steward", parentId: "root" });
       const child = mesh.spawn({ charter: "child", parentId: parent });
-      const pr = { kind: "github_pr" as const, repo: "dummy-org/dummy-repo", number: 616 };
+      const pr = "github:dummy-org/dummy-repo/pulls/616";
 
-      mesh.subscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        child,
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", child, "root");
 
       expect(() => mesh.delegateEventSource(pr, parent, child)).not.toThrow();
       expect(
         mesh
           .listSubscriptions()
-          .find((s) => s.actorId === parent && s.resource.kind === "github_pr")?.subscribedBy
+          .find(
+            (s) => s.actorId === parent && s.resource === "github:dummy-org/dummy-repo/pulls/616"
+          )?.subscribedBy
       ).toBe(child);
     });
 
@@ -2734,19 +3217,11 @@ describe("ActorMesh", () => {
       const repoOwner = mesh.spawn({ charter: "repo steward", parentId: "root" });
       const issueWorker = mesh.spawn({ charter: "issue worker", parentId: "root" });
 
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
-      mesh.delegateEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        repoOwner,
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
+      mesh.delegateEventSource("github:dummy-org/dummy-repo", repoOwner, "root");
 
       expect(() =>
-        mesh.delegateEventSource(
-          { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 720 },
-          issueWorker,
-          "root"
-        )
+        mesh.delegateEventSource("github:dummy-org/dummy-repo/issues/720", issueWorker, "root")
       ).toThrow(/current effective owner/);
     });
 
@@ -2755,13 +3230,9 @@ describe("ActorMesh", () => {
       const parent = mesh.spawn({ charter: "repo steward", parentId: "root" });
       const child1 = mesh.spawn({ charter: "pr worker 1", parentId: parent });
       const child2 = mesh.spawn({ charter: "pr worker 2", parentId: parent });
-      const pr = { kind: "github_pr" as const, repo: "dummy-org/dummy-repo", number: 616 };
+      const pr = "github:dummy-org/dummy-repo/pulls/616";
 
-      mesh.subscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        parent,
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", parent, "root");
       mesh.delegateEventSource(pr, child1, parent);
 
       expect(() => mesh.delegateEventSource(pr, child2, parent)).toThrow(/current effective owner/);
@@ -2771,17 +3242,13 @@ describe("ActorMesh", () => {
       const { mesh, tick, fake } = setup();
       const child = mesh.spawn({ charter: "repo steward", parentId: "root" });
 
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
-      mesh.delegateEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        child,
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
+      mesh.delegateEventSource("github:dummy-org/dummy-repo", child, "root");
 
-      mesh.deliverEvent({ kind: "github_repo", repo: "dummy-org/dummy-repo" }, "repo event", {
+      mesh.deliverEvent("github:dummy-org/dummy-repo", "repo event", {
         inboxPayload: payload("push"),
       });
-      mesh.deliverEvent({ kind: "github_repo", repo: "dummy-org/other" }, "other repo event", {
+      mesh.deliverEvent("github:dummy-org/other", "other repo event", {
         inboxPayload: payload("issues.opened"),
       });
       await tick();
@@ -2797,23 +3264,13 @@ describe("ActorMesh", () => {
       const parent = mesh.spawn({ charter: "repo steward", parentId: "root" });
       const child = mesh.spawn({ charter: "pr worker", parentId: parent });
 
-      mesh.subscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        parent,
-        "root"
-      );
-      mesh.delegateEventSource(
-        { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 616 },
-        child,
-        parent
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", parent, "root");
+      mesh.delegateEventSource("github:dummy-org/dummy-repo/pulls/616", child, parent);
       mesh.retire(child);
 
-      mesh.deliverEvent(
-        { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 616 },
-        "pr event",
-        { inboxPayload: payload("pull_request.opened") }
-      );
+      mesh.deliverEvent("github:dummy-org/dummy-repo/pulls/616", "pr event", {
+        inboxPayload: payload("pull_request.opened"),
+      });
       await tick();
 
       expect(fake(child).calls).toHaveLength(0);
@@ -2825,13 +3282,9 @@ describe("ActorMesh", () => {
       const { mesh, tick, fake } = setup();
       const parent = mesh.spawn({ charter: "repo steward", parentId: "root" });
       const child = mesh.spawn({ charter: "pr worker", parentId: parent });
-      const pr = { kind: "github_pr" as const, repo: "dummy-org/dummy-repo", number: 616 };
+      const pr = "github:dummy-org/dummy-repo/pulls/616";
 
-      mesh.subscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        parent,
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", parent, "root");
       mesh.delegateEventSource(pr, child, parent);
 
       mesh.deliverEvent(pr, "before reclaim", { inboxPayload: payload("pull_request.opened") });
@@ -2845,13 +3298,18 @@ describe("ActorMesh", () => {
       expect(fake(parent).calls).toHaveLength(1);
       expect(fake(parent).calls[0]?.prompt).toContain("Work from your inbox");
       expect(
-        mesh.listSubscriptions().find((s) => s.actorId === child && s.resource.kind === "github_pr")
-          ?.unsubscribedAt
+        mesh
+          .listSubscriptions()
+          .find(
+            (s) => s.actorId === child && s.resource === "github:dummy-org/dummy-repo/pulls/616"
+          )?.unsubscribedAt
       ).toBe("2026-01-01T00:00:00Z");
       expect(
         mesh
           .listSubscriptions()
-          .find((s) => s.actorId === parent && s.resource.kind === "github_pr")?.subscribedBy
+          .find(
+            (s) => s.actorId === parent && s.resource === "github:dummy-org/dummy-repo/pulls/616"
+          )?.subscribedBy
       ).toBe(parent);
     });
 
@@ -2860,13 +3318,9 @@ describe("ActorMesh", () => {
       const parent = mesh.spawn({ charter: "repo steward", parentId: "root" });
       const child = mesh.spawn({ charter: "pr worker", parentId: parent });
       const sibling = mesh.spawn({ charter: "sibling", parentId: "root" });
-      const pr = { kind: "github_pr" as const, repo: "dummy-org/dummy-repo", number: 616 };
+      const pr = "github:dummy-org/dummy-repo/pulls/616";
 
-      mesh.subscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        parent,
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", parent, "root");
       mesh.delegateEventSource(pr, child, parent);
 
       expect(() => mesh.reclaimEventSource(pr, sibling)).toThrow(/effective owner after reclaim/);
@@ -2876,19 +3330,11 @@ describe("ActorMesh", () => {
       const { mesh } = setup();
       const actor = mesh.spawn({ charter: "repo steward", parentId: "root" });
 
-      mesh.subscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        actor,
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", actor, "root");
 
       // Actor owns the repo. It can self-delegate a branch.
       expect(() =>
-        mesh.delegateEventSource(
-          { kind: "github_branch", repo: "dummy-org/dummy-repo", ref: "staging" },
-          actor,
-          actor
-        )
+        mesh.delegateEventSource("github:dummy-org/dummy-repo/branches/staging", actor, actor)
       ).not.toThrow();
     });
 
@@ -2896,30 +3342,18 @@ describe("ActorMesh", () => {
       const { mesh } = setup();
       const actor = mesh.spawn({ charter: "steward", parentId: "root" });
 
-      mesh.subscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        actor,
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", actor, "root");
 
       // Cannot self-delegate an unrelated branch
       expect(() =>
-        mesh.delegateEventSource(
-          { kind: "github_branch", repo: "dummy-org/other-repo", ref: "staging" },
-          actor,
-          actor
-        )
+        mesh.delegateEventSource("github:dummy-org/other-repo/branches/staging", actor, actor)
       ).toThrow(/strict descendant of an already-owned parent/);
     });
 
     it("holding only the exact resource is not sufficient", () => {
       const { mesh } = setup();
       const actor = mesh.spawn({ charter: "steward", parentId: "root" });
-      const branch = {
-        kind: "github_branch" as const,
-        repo: "dummy-org/dummy-repo",
-        ref: "staging",
-      };
+      const branch = "github:dummy-org/dummy-repo/branches/staging";
 
       // actor gets the branch exactly (not the parent repo)
       mesh.subscribeEventSource(branch, actor, "root");
@@ -2933,18 +3367,10 @@ describe("ActorMesh", () => {
     it("an existing exact row is ignored only while checking ancestor ownership", () => {
       const { mesh } = setup();
       const actor = mesh.spawn({ charter: "steward", parentId: "root" });
-      const branch = {
-        kind: "github_branch" as const,
-        repo: "dummy-org/dummy-repo",
-        ref: "staging",
-      };
+      const branch = "github:dummy-org/dummy-repo/branches/staging";
 
       // actor holds the repo (parent) AND holds the branch (exact)
-      mesh.subscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        actor,
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", actor, "root");
       mesh.subscribeEventSource(branch, actor, "root");
 
       // Can self-delegate the exact resource because they ALSO own the parent
@@ -2956,14 +3382,10 @@ describe("ActorMesh", () => {
       const actorId = mesh.spawn({ charter: "worker", parentId: "root" });
 
       // Subscribe worker to the repo
-      mesh.subscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        actorId,
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", actorId, "root");
 
       // Deliver event
-      mesh.deliverEvent({ kind: "github_repo", repo: "dummy-org/dummy-repo" }, "suite completed", {
+      mesh.deliverEvent("github:dummy-org/dummy-repo", "suite completed", {
         inboxPayload: payload("check_suite.completed"),
       });
       await tick();
@@ -2983,19 +3405,15 @@ describe("ActorMesh", () => {
       // Real topology : root always holds the config-seeded org source;
       // the worker's repo sub is a delegated slice under it. A dead slice-holder
       // must NOT mean silent loss — the walk continues to the ancestor source.
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
-      mesh.subscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        actorId,
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", actorId, "root");
 
       // Retire the worker (makes it not live)
       mesh.retire(actorId);
 
       // Deliver an allowlisted event. A non-allowlisted push would now stop at
       // the retired exact subscriber instead of waking the covering org owner.
-      mesh.deliverEvent({ kind: "github_repo", repo: "dummy-org/dummy-repo" }, "suite completed", {
+      mesh.deliverEvent("github:dummy-org/dummy-repo", "suite completed", {
         inboxPayload: payload("check_suite.completed"),
       });
       await tick();
@@ -3012,17 +3430,11 @@ describe("ActorMesh", () => {
       const { mesh, tick, fake } = setup();
       const actorId = mesh.spawn({ charter: "worker", parentId: "root" });
 
-      mesh.subscribeEventSource(
-        { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 123 },
-        actorId,
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo/issues/123", actorId, "root");
 
-      mesh.deliverEvent(
-        { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 123 },
-        "new comment",
-        { inboxPayload: payload("issue_comment.created") }
-      );
+      mesh.deliverEvent("github:dummy-org/dummy-repo/issues/123", "new comment", {
+        inboxPayload: payload("issue_comment.created"),
+      });
       await tick();
 
       expect(fake(actorId).calls).toHaveLength(1);
@@ -3066,7 +3478,7 @@ describe("ActorMesh", () => {
         onInboxEntriesSeen: () => order.push("reaction"),
       });
       const actorId = mesh.spawn({ charter: "worker", parentId: "root" });
-      const resource = { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 903 } as const;
+      const resource = "github:dummy-org/dummy-repo/issues/903" as const;
       mesh.subscribeEventSource(resource, actorId, "root");
 
       await mesh.deliverEvent(resource, "new comment", {
@@ -3079,7 +3491,7 @@ describe("ActorMesh", () => {
       expect(appended).toEqual([
         {
           actorId,
-          source: "github_issue:dummy-org/dummy-repo#903",
+          source: "github:dummy-org/dummy-repo/issues/903",
           payload: { type: "issue_comment.created", commentId: 4959289232 },
         },
       ]);
@@ -3099,16 +3511,8 @@ describe("ActorMesh", () => {
       });
       const halted = mesh.spawn({ charter: "halted", parentId: "root", provider: "claude" });
       const available = mesh.spawn({ charter: "available", parentId: "root", provider: "agy" });
-      const haltedResource = {
-        kind: "github_issue",
-        repo: "dummy-org/dummy-repo",
-        number: 1288,
-      } as const;
-      const availableResource = {
-        kind: "github_issue",
-        repo: "dummy-org/dummy-repo",
-        number: 1291,
-      } as const;
+      const haltedResource = "github:dummy-org/dummy-repo/issues/1288" as const;
+      const availableResource = "github:dummy-org/dummy-repo/issues/1291" as const;
       mesh.subscribeEventSource(haltedResource, halted, "root");
       mesh.subscribeEventSource(availableResource, available, "root");
 
@@ -3150,7 +3554,7 @@ describe("ActorMesh", () => {
       } as unknown as InboxStore;
       const { mesh, tick, fake } = setup({ inboxStore, onInboxEntriesSeen });
       const actorId = mesh.spawn({ charter: "worker", parentId: "root" });
-      const resource = { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 903 } as const;
+      const resource = "github:dummy-org/dummy-repo/issues/903" as const;
       mesh.subscribeEventSource(resource, actorId, "root");
 
       await expect(
@@ -3187,7 +3591,7 @@ describe("ActorMesh", () => {
 
       const { mesh, tick } = setup({ inboxStore });
       const actorId = mesh.spawn({ charter: "worker", parentId: "root" });
-      const resource = { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 903 } as const;
+      const resource = "github:dummy-org/dummy-repo/issues/903" as const;
       mesh.subscribeEventSource(resource, actorId, "root");
 
       // Deliver first event
@@ -3220,25 +3624,15 @@ describe("ActorMesh", () => {
       const repoActorId = mesh.spawn({ charter: "repo worker", parentId: "root" });
       const issueActorId = mesh.spawn({ charter: "issue worker", parentId: "root" });
 
-      mesh.subscribeEventSource(
-        { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-        repoActorId,
-        "root"
-      );
-      mesh.subscribeEventSource(
-        { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 123 },
-        issueActorId,
-        "root"
-      );
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", repoActorId, "root");
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo/issues/123", issueActorId, "root");
 
       // Retire issue subscriber so it is no longer live
       mesh.retire(issueActorId);
 
-      mesh.deliverEvent(
-        { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 123 },
-        "new comment",
-        { inboxPayload: payload("issue_comment.created") }
-      );
+      mesh.deliverEvent("github:dummy-org/dummy-repo/issues/123", "new comment", {
+        inboxPayload: payload("issue_comment.created"),
+      });
       await tick();
 
       // Issue worker should not be woken
@@ -3254,13 +3648,11 @@ describe("ActorMesh", () => {
       const { mesh, tick, fake } = setup();
       const orgActorId = mesh.spawn({ charter: "org worker", parentId: "root" });
 
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, orgActorId, "root");
+      mesh.subscribeEventSource("github:dummy-org", orgActorId, "root");
 
-      mesh.deliverEvent(
-        { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 123 },
-        "new comment",
-        { inboxPayload: payload("issue_comment.created") }
-      );
+      mesh.deliverEvent("github:dummy-org/dummy-repo/issues/123", "new comment", {
+        inboxPayload: payload("issue_comment.created"),
+      });
       await tick();
 
       // Org worker should be woken (bubbled up 2 levels)
@@ -3273,12 +3665,10 @@ describe("ActorMesh", () => {
     it("routes org-covered events with no more-specific subscriber to root", async () => {
       const { mesh, tick, fake } = setup();
 
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
-      mesh.deliverEvent(
-        { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 123 },
-        "new comment",
-        { inboxPayload: payload("issues.opened") }
-      );
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
+      mesh.deliverEvent("github:dummy-org/dummy-repo/issues/123", "new comment", {
+        inboxPayload: payload("issues.opened"),
+      });
       await tick();
 
       expect(fake("root").calls).toHaveLength(1);
@@ -3288,11 +3678,9 @@ describe("ActorMesh", () => {
     it("drops an event no subscription covers instead of waking root ", async () => {
       const { mesh, tick, fake } = setup();
 
-      mesh.deliverEvent(
-        { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 123 },
-        "new comment",
-        { inboxPayload: payload("issue_comment.created") }
-      );
+      mesh.deliverEvent("github:dummy-org/dummy-repo/issues/123", "new comment", {
+        inboxPayload: payload("issue_comment.created"),
+      });
       await tick();
 
       // No configured/delegated source covers the resource: out-of-scope for
@@ -3305,18 +3693,10 @@ describe("ActorMesh", () => {
         const { mesh, tick, fake } = setup();
         const branchOwner = mesh.spawn({ charter: "deploy staging", parentId: "root" });
         const repoOwner = mesh.spawn({ charter: "repo steward", parentId: "root" });
-        const branch = {
-          kind: "github_branch" as const,
-          repo: "dummy-org/dummy-repo",
-          ref: "refs/heads/staging",
-        };
+        const branch = "github:dummy-org/dummy-repo/branches/staging";
 
         mesh.subscribeEventSource(branch, branchOwner, "root");
-        mesh.subscribeEventSource(
-          { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-          repoOwner,
-          "root"
-        );
+        mesh.subscribeEventSource("github:dummy-org/dummy-repo", repoOwner, "root");
 
         await mesh.deliverEvent(branch, "staging push", {
           inboxPayload: payload("push"),
@@ -3330,16 +3710,8 @@ describe("ActorMesh", () => {
       it("does not bubble a branch push without an exact subscriber", async () => {
         const { mesh, tick, fake, logs } = setup();
         const repoOwner = mesh.spawn({ charter: "repo steward", parentId: "root" });
-        const branch = {
-          kind: "github_branch" as const,
-          repo: "dummy-org/dummy-repo",
-          ref: "refs/heads/worker",
-        };
-        mesh.subscribeEventSource(
-          { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-          repoOwner,
-          "root"
-        );
+        const branch = "github:dummy-org/dummy-repo/branches/worker";
+        mesh.subscribeEventSource("github:dummy-org/dummy-repo", repoOwner, "root");
 
         await mesh.deliverEvent(branch, "worker push", {
           inboxPayload: payload("push"),
@@ -3353,16 +3725,8 @@ describe("ActorMesh", () => {
       it("still bubbles check_suite.completed to the repo owner", async () => {
         const { mesh, tick, fake } = setup();
         const repoOwner = mesh.spawn({ charter: "repo steward", parentId: "root" });
-        const branch = {
-          kind: "github_branch" as const,
-          repo: "dummy-org/dummy-repo",
-          ref: "refs/heads/worker",
-        };
-        mesh.subscribeEventSource(
-          { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-          repoOwner,
-          "root"
-        );
+        const branch = "github:dummy-org/dummy-repo/branches/worker";
+        mesh.subscribeEventSource("github:dummy-org/dummy-repo", repoOwner, "root");
 
         await mesh.deliverEvent(branch, "suite complete", {
           inboxPayload: payload("check_suite.completed"),
@@ -3375,12 +3739,8 @@ describe("ActorMesh", () => {
       it("bubbles merged PR closure but not an unmerged closure", async () => {
         const { mesh, tick, fake } = setup();
         const repoOwner = mesh.spawn({ charter: "repo steward", parentId: "root" });
-        const pr = { kind: "github_pr" as const, repo: "dummy-org/dummy-repo", number: 1022 };
-        mesh.subscribeEventSource(
-          { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-          repoOwner,
-          "root"
-        );
+        const pr = "github:dummy-org/dummy-repo/pulls/1022";
+        mesh.subscribeEventSource("github:dummy-org/dummy-repo", repoOwner, "root");
 
         await mesh.deliverEvent(pr, "closed without merge", {
           inboxPayload: payload("pull_request.closed", false),
@@ -3398,12 +3758,8 @@ describe("ActorMesh", () => {
       it("derives bubbling from eventPayload directly without coupling to scalar options", async () => {
         const { mesh, tick, fake } = setup();
         const repoOwner = mesh.spawn({ charter: "repo steward", parentId: "root" });
-        const pr = { kind: "github_pr" as const, repo: "dummy-org/dummy-repo", number: 1022 };
-        mesh.subscribeEventSource(
-          { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-          repoOwner,
-          "root"
-        );
+        const pr = "github:dummy-org/dummy-repo/pulls/1022";
+        mesh.subscribeEventSource("github:dummy-org/dummy-repo", repoOwner, "root");
 
         // Deliver an unmerged PR closure payload. Bubbling should NOT happen.
         await mesh.deliverEvent(pr, "unmerged via payload", {
@@ -3423,9 +3779,9 @@ describe("ActorMesh", () => {
       it("bubbles chat-space messages to chat but keeps mesh messages directly addressed", async () => {
         const { mesh, tick, fake } = setup();
         const recipient = mesh.spawn({ charter: "message recipient", parentId: "root" });
-        mesh.subscribeEventSource({ kind: "chat" }, "root", "root");
+        mesh.subscribeEventSource("gchat:spaces", "root", "root");
 
-        await mesh.deliverEvent({ kind: "chat_space", space: "spaces/new" }, "chat message", {
+        await mesh.deliverEvent("gchat:spaces/new", "chat message", {
           inboxPayload: payload("gchat.message"),
         });
         await tick();
@@ -3442,14 +3798,10 @@ describe("ActorMesh", () => {
       const { mesh, tick, fake } = setup();
       const actorId = mesh.spawn({ charter: "addressed worker", parentId: "root" });
 
-      mesh.deliverEvent(
-        { kind: "github_issue", repo: "dummy-org/uncovered", number: 123 },
-        "directed comment",
-        {
-          directedTarget: actorId,
-          inboxPayload: payload("issue_comment.created"),
-        }
-      );
+      mesh.deliverEvent("github:dummy-org/uncovered/issues/123", "directed comment", {
+        directedTarget: actorId,
+        inboxPayload: payload("issue_comment.created"),
+      });
       await tick();
 
       expect(fake(actorId).calls).toHaveLength(1);
@@ -3462,14 +3814,10 @@ describe("ActorMesh", () => {
       const { mesh, tick, fake } = setup({ idgen: () => actorId });
       expect(mesh.spawn({ charter: "cloudy worker", parentId: "root" })).toBe(actorId);
 
-      mesh.deliverEvent(
-        { kind: "github_issue", repo: "dummy-org/uncovered", number: 123 },
-        "directed comment",
-        {
-          directedTarget: "cloudy-porpoise",
-          inboxPayload: payload("issue_comment.created"),
-        }
-      );
+      mesh.deliverEvent("github:dummy-org/uncovered/issues/123", "directed comment", {
+        directedTarget: "cloudy-porpoise",
+        inboxPayload: payload("issue_comment.created"),
+      });
       await tick();
 
       expect(fake(actorId).calls).toHaveLength(1);
@@ -3479,12 +3827,11 @@ describe("ActorMesh", () => {
     it("drops an invalid directive but not the event", async () => {
       const { mesh, tick, fake, logs } = setup();
 
-      mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
-      mesh.deliverEvent(
-        { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 123 },
-        "normal fallback",
-        { directedTarget: "not-live", inboxPayload: payload("issue_comment.created") }
-      );
+      mesh.subscribeEventSource("github:dummy-org", "root", "root");
+      mesh.deliverEvent("github:dummy-org/dummy-repo/issues/123", "normal fallback", {
+        directedTarget: "not-live",
+        inboxPayload: payload("issue_comment.created"),
+      });
       await tick();
 
       expect(logs).toContain("mesh:deliver target not live: not-live — directive ignored");
@@ -3495,17 +3842,13 @@ describe("ActorMesh", () => {
     describe("an issue self-echo suppression with author stamps", () => {
       it("suppresses same-actor same-instance self-post", async () => {
         const { mesh, tick, fake, logs } = setup();
-        mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+        mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
-        mesh.deliverEvent(
-          { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 123 },
-          "self-echo test",
-          {
-            stampedAuthor: { actorId: "root", instanceId: "staging-instance" },
-            instanceId: "staging-instance",
-            inboxPayload: payload("issue_comment.created"),
-          }
-        );
+        mesh.deliverEvent("github:dummy-org/dummy-repo/issues/123", "self-echo test", {
+          stampedAuthor: { actorId: "root", instanceId: "staging-instance" },
+          instanceId: "staging-instance",
+          inboxPayload: payload("issue_comment.created"),
+        });
         await tick();
 
         expect(
@@ -3520,17 +3863,13 @@ describe("ActorMesh", () => {
 
       it("delivers cross-instance same-actor same-bot events", async () => {
         const { mesh, tick, fake } = setup();
-        mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+        mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
-        mesh.deliverEvent(
-          { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 123 },
-          "cross-instance test",
-          {
-            stampedAuthor: { actorId: "root", instanceId: "prod-instance" },
-            instanceId: "staging-instance",
-            inboxPayload: payload("issue_comment.created"),
-          }
-        );
+        mesh.deliverEvent("github:dummy-org/dummy-repo/issues/123", "cross-instance test", {
+          stampedAuthor: { actorId: "root", instanceId: "prod-instance" },
+          instanceId: "staging-instance",
+          inboxPayload: payload("issue_comment.created"),
+        });
         await tick();
 
         expect(fake("root").calls).toHaveLength(1);
@@ -3542,13 +3881,13 @@ describe("ActorMesh", () => {
         // biome-ignore lint/suspicious/noExplicitAny: test helper mock
         (mesh as any).eventSubscriptions.activeForResource = () => [
           {
-            resource: { kind: "github_org", org: "dummy-org" },
+            resource: "github:dummy-org",
             actorId: "root",
             subscribedBy: "root",
             subscribedAt: "2026-01-01T00:00:00Z",
           },
           {
-            resource: { kind: "github_org", org: "dummy-org" },
+            resource: "github:dummy-org",
             actorId: "t1",
             subscribedBy: "root",
             subscribedAt: "2026-01-01T00:00:00Z",
@@ -3557,14 +3896,10 @@ describe("ActorMesh", () => {
 
         mesh.spawn({ charter: "t1-worker", parentId: "root" });
 
-        mesh.deliverEvent(
-          { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 123 },
-          "fanned test",
-          {
-            stampedAuthor: { actorId: "t1", instanceId: "staging-instance" },
-            instanceId: "staging-instance",
-          }
-        );
+        mesh.deliverEvent("github:dummy-org/dummy-repo/issues/123", "fanned test", {
+          stampedAuthor: { actorId: "t1", instanceId: "staging-instance" },
+          instanceId: "staging-instance",
+        });
         await tick();
 
         expect(fake("root").calls).toHaveLength(1);
@@ -3579,17 +3914,13 @@ describe("ActorMesh", () => {
 
       it("delivers when stamp identity is missing or unverifiable", async () => {
         const { mesh, tick, fake } = setup();
-        mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+        mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
-        mesh.deliverEvent(
-          { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 123 },
-          "fail-open missing stamp",
-          {
-            stampedAuthor: null,
-            instanceId: "staging-instance",
-            inboxPayload: payload("issue_comment.created"),
-          }
-        );
+        mesh.deliverEvent("github:dummy-org/dummy-repo/issues/123", "fail-open missing stamp", {
+          stampedAuthor: null,
+          instanceId: "staging-instance",
+          inboxPayload: payload("issue_comment.created"),
+        });
         await tick();
 
         expect(fake("root").calls).toHaveLength(1);
@@ -3638,7 +3969,7 @@ describe("ActorMesh", () => {
         // biome-ignore lint/suspicious/noExplicitAny: test helper mock
         (mesh as any).eventSubscriptions.activeForResource = () =>
           ["root", "t1"].map((actorId) => ({
-            resource: { kind: "github_org", org: "dummy-org" },
+            resource: "github:dummy-org",
             actorId,
             subscribedBy: "root",
             subscribedAt: "2026-01-01T00:00:00Z",
@@ -3661,7 +3992,7 @@ describe("ActorMesh", () => {
         });
         expect(stampedAuthor).toEqual({ actorId: "t1", instanceId });
 
-        mesh.deliverEvent({ kind: "github_issue", repo, number: issueNumber }, "peer reply", {
+        mesh.deliverEvent(`github:${repo}/issues/${issueNumber}`, "peer reply", {
           stampedAuthor,
           instanceId,
         });
@@ -3686,13 +4017,13 @@ describe("ActorMesh", () => {
         // biome-ignore lint/suspicious/noExplicitAny: test helper mock
         (mesh as any).eventSubscriptions.activeForResource = () => [
           {
-            resource: { kind: "github_org", org: "dummy-org" },
+            resource: "github:dummy-org",
             actorId: "root",
             subscribedBy: "root",
             subscribedAt: "2026-01-01T00:00:00Z",
           },
           {
-            resource: { kind: "github_org", org: "dummy-org" },
+            resource: "github:dummy-org",
             actorId: "t1",
             subscribedBy: "root",
             subscribedAt: "2026-01-01T00:00:00Z",
@@ -3700,14 +4031,10 @@ describe("ActorMesh", () => {
         ];
         mesh.spawn({ charter: "t1-worker", parentId: "root" });
 
-        mesh.deliverEvent(
-          { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 1048 },
-          "hygiene comment echo",
-          {
-            stampedAuthor: { actorId: SYSTEM_TRACKER_HYGIENE, instanceId: "staging-instance" },
-            instanceId: "staging-instance",
-          }
-        );
+        mesh.deliverEvent("github:dummy-org/dummy-repo/issues/1048", "system comment echo", {
+          stampedAuthor: { actorId: MESH_SYSTEM, instanceId: "staging-instance" },
+          instanceId: "staging-instance",
+        });
         await tick();
 
         // Neither "root" nor "t1" is the stamp's actorId, so an author-match
@@ -3718,7 +4045,7 @@ describe("ActorMesh", () => {
         expect(
           logs.some((l) =>
             l.includes(
-              `system-event suppressed by author stamp: actor=${SYSTEM_TRACKER_HYGIENE} instance=staging-instance`
+              `system-event suppressed by author stamp: actor=${MESH_SYSTEM} instance=staging-instance`
             )
           )
         ).toBe(true);
@@ -3726,10 +4053,10 @@ describe("ActorMesh", () => {
 
       it("delivers when stampedAuthor is null even for a would-be system-shaped wake", async () => {
         const { mesh, tick, fake } = setup();
-        mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+        mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
         mesh.deliverEvent(
-          { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 1048 },
+          "github:dummy-org/dummy-repo/issues/1048",
           "unverified stamp fails open",
           {
             stampedAuthor: null,
@@ -3748,13 +4075,13 @@ describe("ActorMesh", () => {
 
       it("does not suppress on an instanceId mismatch", async () => {
         const { mesh, tick, fake } = setup();
-        mesh.subscribeEventSource({ kind: "github_org", org: "dummy-org" }, "root", "root");
+        mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
         mesh.deliverEvent(
-          { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 1048 },
+          "github:dummy-org/dummy-repo/issues/1048",
           "cross-instance system stamp",
           {
-            stampedAuthor: { actorId: SYSTEM_TRACKER_HYGIENE, instanceId: "prod-instance" },
+            stampedAuthor: { actorId: MESH_SYSTEM, instanceId: "prod-instance" },
             instanceId: "staging-instance",
             inboxPayload: payload("issue_comment.created"),
           }
@@ -4392,6 +4719,262 @@ describe("ActorMesh", () => {
       expect(() => mesh.runNow("ghost-actor", "dashboard")).toThrow(
         "cannot run unknown actor ghost-actor"
       );
+    });
+  });
+
+  describe("obligation-governed event source ownership", () => {
+    /** A stand-in obligation store: the mesh only ever asks it one question. */
+    const owning = (byRef: Record<string, string>): ActorMeshOptions["obligations"] => ({
+      findLiveByExternalRef: (ref) => (byRef[ref] ? { ownerId: byRef[ref] } : null),
+    });
+
+    const REF = "github:MEK-Org/rusa/issues/33";
+    const issue = REF;
+
+    /**
+     * Deliver an event and report which actors it woke.
+     *
+     * Uses the shared-provider + `run_yielded` pattern the other event-routing
+     * tests use: a spawned actor only reaches the event sink once something
+     * actually runs it, so the provider has to declare a yield.
+     */
+    async function wokenBy(
+      obligations: ActorMeshOptions["obligations"],
+      wire: (mesh: ReturnType<typeof setup>["mesh"]) => void,
+      resource: EventResource,
+      afterFirstDelivery?: (mesh: ReturnType<typeof setup>["mesh"]) => void,
+      deliveryOptions?: (mesh: ReturnType<typeof setup>["mesh"]) => EventDeliveryOptions
+    ): Promise<string[]> {
+      const events: Array<{ kind: string; actorId?: string | null }> = [];
+      let mesh!: ReturnType<typeof setup>["mesh"];
+      const running: string[] = [];
+      const provider = new FakeProvider((opts) => {
+        // The scaffold names the running actor's own thread id in its prompt,
+        // which is the only handle a shared provider has on who it is running.
+        const id = /thread `([^`]+)`/.exec(opts.prompt ?? "")?.[1] ?? "";
+        running.push(id);
+        if (id) mesh.declareYield(id, "complete", "done");
+        return {};
+      });
+      const env = setup({ obligations, sharedProvider: provider, events: (e) => events.push(e) });
+      mesh = env.mesh;
+      wire(mesh);
+      mesh.deliverEvent(resource, "event", {
+        ...deliveryOptions?.(mesh),
+        inboxPayload: payload("issues.opened"),
+      });
+      await env.tick();
+      if (afterFirstDelivery) {
+        afterFirstDelivery(mesh);
+        await env.tick();
+      }
+      return [
+        ...new Set(
+          events
+            .filter((e) => e.kind === "run_yielded" && e.actorId)
+            .map((e) => e.actorId as string)
+        ),
+      ];
+    }
+
+    it("routes a linked issue to the obligation owner, superseding a manual delegation", async () => {
+      let delegate = "";
+      let owner = "";
+      const woken = await wokenBy(
+        owning({ [REF]: "t2" }),
+        (mesh) => {
+          delegate = mesh.spawn({ charter: "earlier delegate", parentId: "root" });
+          owner = mesh.spawn({ charter: "obligation owner", parentId: "root" });
+          mesh.subscribeEventSource(issue, delegate, "root");
+        },
+        issue
+      );
+
+      expect(owner).toBe("t2");
+      expect(woken).toEqual([owner]);
+      expect(woken).not.toContain(delegate);
+    });
+
+    it("falls back to subscriptions when no live obligation is linked", async () => {
+      let delegate = "";
+      const lookedUp: string[] = [];
+      const woken = await wokenBy(
+        {
+          findLiveByExternalRef: (ref) => {
+            lookedUp.push(ref);
+            return null;
+          },
+        },
+        (mesh) => {
+          delegate = mesh.spawn({ charter: "delegate", parentId: "root" });
+          mesh.subscribeEventSource(issue, delegate, "root");
+        },
+        issue
+      );
+
+      expect(woken).toEqual([delegate]);
+      expect(lookedUp).toEqual([REF]);
+    });
+
+    it("maps a linked pull request to its obligation owner", async () => {
+      const pull = "github:MEK-Org/rusa/pulls/33";
+      let owner = "";
+      const woken = await wokenBy(
+        owning({ "github:MEK-Org/rusa/pulls/33": "t1" }),
+        (mesh) => {
+          owner = mesh.spawn({ charter: "pull request owner", parentId: "root" });
+        },
+        pull
+      );
+
+      expect(woken).toEqual([owner]);
+    });
+
+    it("keeps a directed target from bypassing the obligation owner", async () => {
+      let directedTarget = "";
+      let owner = "";
+      const woken = await wokenBy(
+        owning({ [REF]: "t2" }),
+        (mesh) => {
+          directedTarget = mesh.spawn({ charter: "directed target", parentId: "root" });
+          owner = mesh.spawn({ charter: "obligation owner", parentId: "root" });
+        },
+        issue,
+        undefined,
+        () => ({ directedTarget })
+      );
+
+      expect(woken).toEqual([owner]);
+      expect(woken).not.toContain(directedTarget);
+    });
+
+    it("routes the next event to a reassigned obligation owner without synchronizing subscriptions", async () => {
+      const ownerByRef: Record<string, string> = {};
+      let firstOwner = "";
+      let secondOwner = "";
+      const woken = await wokenBy(
+        owning(ownerByRef),
+        (mesh) => {
+          firstOwner = mesh.spawn({ charter: "first obligation owner", parentId: "root" });
+          secondOwner = mesh.spawn({ charter: "reassigned obligation owner", parentId: "root" });
+          ownerByRef[REF] = firstOwner;
+        },
+        issue,
+        (mesh) => {
+          // This is the repository state change made by reassign(). No event
+          // subscription write accompanies it: routing reads ownership anew.
+          ownerByRef[REF] = secondOwner;
+          mesh.deliverEvent(issue, "event", { inboxPayload: payload("issues.edited") });
+        }
+      );
+
+      expect(woken).toEqual([firstOwner, secondOwner]);
+    });
+
+    it("routes through the real repository after an actual reassignment", async () => {
+      const db = new Database(":memory:");
+      try {
+        runMigrations(db);
+        const repository = new ObligationRepository(db, (id) => id === "t1" || id === "t2");
+        repository.create({
+          id: "linked-work",
+          title: "Linked work",
+          ownerId: "t1",
+          externalRef: REF,
+        });
+
+        let firstOwner = "";
+        let secondOwner = "";
+        const woken = await wokenBy(
+          repository,
+          (mesh) => {
+            firstOwner = mesh.spawn({ charter: "first owner", parentId: "root" });
+            secondOwner = mesh.spawn({ charter: "second owner", parentId: "root" });
+          },
+          issue,
+          (mesh) => {
+            repository.reassign("linked-work", secondOwner);
+            mesh.deliverEvent(issue, "event", { inboxPayload: payload("issues.edited") });
+          }
+        );
+
+        expect(firstOwner).toBe("t1");
+        expect(woken).toEqual([firstOwner, secondOwner]);
+      } finally {
+        db.close();
+      }
+    });
+
+    it("routes the next event to the parent that inherited a retiring actor's obligation", async () => {
+      const ownerByRef: Record<string, string> = {};
+      let retiringOwner = "";
+      let parent = "";
+      const woken = await wokenBy(
+        owning(ownerByRef),
+        (mesh) => {
+          parent = mesh.spawn({ charter: "parent", parentId: "root" });
+          retiringOwner = mesh.spawn({ charter: "retiring obligation owner", parentId: parent });
+          ownerByRef[REF] = retiringOwner;
+        },
+        issue,
+        (mesh) => {
+          // Mirrors inheritRetiringActorObligationsInternal(): the live claim
+          // stays the same and its owner changes to the retiring actor's parent.
+          ownerByRef[REF] = parent;
+          mesh.deliverEvent(issue, "event", { inboxPayload: payload("issues.edited") });
+        }
+      );
+
+      expect(woken).toEqual([retiringOwner, parent]);
+    });
+
+    it("wakes nobody when the obligation owner is the human operator", async () => {
+      const woken = await wokenBy(
+        owning({ [REF]: "human:operator" }),
+        (mesh) => {
+          const delegate = mesh.spawn({ charter: "stale delegate", parentId: "root" });
+          mesh.subscribeEventSource(issue, delegate, "root");
+        },
+        issue
+      );
+
+      // No surrogate actor stands in for a human owner, and the earlier
+      // subscriber must not remain authoritative. The walk stops rather than
+      // bubbling; their attention belongs on the dashboard surface.
+      expect(woken).toEqual([]);
+    });
+
+    it("does not revive a stale subscriber when the governing actor is absent", async () => {
+      const woken = await wokenBy(
+        owning({ [REF]: "retired-owner" }),
+        (mesh) => {
+          const delegate = mesh.spawn({ charter: "stale delegate", parentId: "root" });
+          mesh.subscribeEventSource(issue, delegate, "root");
+        },
+        issue
+      );
+
+      // Ownership inheritance normally rewrites this id during retirement, but
+      // routing must remain fail-closed if it observes an inconsistent instant.
+      expect(woken).toEqual([]);
+    });
+
+    it("leaves repo-level sources to subscriptions even when an obligation claims the repo", async () => {
+      // Repo-level obligations are valid identity claims, but #85 is an
+      // identifier migration rather than an expansion of obligation-governed
+      // routing. Only issue/PR events and their descendants are governed here.
+      const repoResource = "github:MEK-Org/rusa";
+      let steward = "";
+      const woken = await wokenBy(
+        owning({ "github:MEK-Org/rusa": "someone-else" }),
+        (mesh) => {
+          steward = mesh.spawn({ charter: "repo steward", parentId: "root" });
+          mesh.subscribeEventSource(repoResource, steward, "root");
+        },
+        repoResource
+      );
+
+      expect(woken).toEqual([steward]);
     });
   });
 });

@@ -125,7 +125,7 @@ export function createTrackerMcpServer(
           body: appendPreCreationAuthorStamp(args.body, args.repo),
         });
         options.onWrite?.();
-        notifyResourceCreated({ kind: "github_pr", repo: args.repo, number: pr.number });
+        notifyResourceCreated(`github:${args.repo}/pulls/${pr.number}`);
         return toolOk(pr.htmlUrl);
       } catch (err) {
         return toolError(err);
@@ -138,14 +138,14 @@ export function createTrackerMcpServer(
     {
       title: "List open pull requests",
       description:
-        "List open pull requests. When author is provided, preserves the legacy author-scoped rusa branch behavior; when omitted, returns all open PRs with best-effort parsed issue numbers.",
+        "List open pull requests, optionally scoped to one author. Every open PR is returned either way.",
       inputSchema: {
         repo: z.string(),
         author: z
           .string()
           .optional()
           .describe(
-            "GitHub login to scope to. Omitting it selects a different code path, not a wider filter: the unscoped branch, whose issue numbers are BEST-EFFORT PARSED rather than authoritative. Passing `undefined` explicitly takes that same branch."
+            "GitHub login to scope to. Omitting it returns every open PR regardless of author."
           ),
       },
     },
@@ -274,7 +274,7 @@ export function createTrackerMcpServer(
         const stampedBody = appendPreCreationAuthorStamp(body, repo);
         const issue = await issueClient.createIssue({ repo, title, body: stampedBody, labels });
         options.onWrite?.();
-        notifyResourceCreated({ kind: "github_issue", repo, number: issue.number });
+        notifyResourceCreated(`github:${repo}/issues/${issue.number}`);
         return toolOk(issue.htmlUrl);
       } catch (err) {
         return toolError(err);

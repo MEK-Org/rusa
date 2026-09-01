@@ -2,7 +2,8 @@ import { Buffer } from "node:buffer";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
-import type { ObligationOwner, ObligationStatus } from "../obligations/obligation.js";
+import { OBLIGATION_TITLE_MAX, type ObligationStatus } from "../obligations/obligation.js";
+import { REFERENCE_SCHEMES } from "../references/reference.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 
@@ -15,18 +16,32 @@ type ObligationServerRepository = Pick<
   | "listOwnedPage"
   | "create"
   | "setTerminalStatus"
+  | "setExternalRef"
+  | "attachArtifact"
+  | "listArtifacts"
   | "movePriorityInternal"
   | "reassign"
   | "reparent"
 >;
 
 export interface ObligationsMcpOptions {
+  /**
+   * Resolve a requested owner to one the mesh can route to, or refuse it.
+   *
+   * Injected because this module has no registry. Absent, any nonblank string
+   * is accepted — which is what production did, since `ObligationRepository` is
+   * constructed there without an `actorExists` probe, leaving the repository's
+   * own guard inert. That admitted nonexistent actors and arbitrary `system:*`
+   * ids: exactly the owner drift `0025` migrates away, re-entering through the
+   * write boundary.
+   */
+  resolveOwner?: (
+    rawOwnerId: string
+  ) => { ok: true; ownerId: string } | { ok: false; error: string };
+
   isFenced?: () => boolean;
-  /** Whether this actor may change the current obligation's owner. */
-  canReassign?: (
-    actorId: string,
-    obligation: ReturnType<ObligationRepository["require"]>
-  ) => boolean;
+  /** Whether this actor may make an owner-authorized mutation to an obligation. */
+  canManage?: (actorId: string, obligation: ReturnType<ObligationRepository["require"]>) => boolean;
 }
 
 const DEFAULT_PAGE_LIMIT = 50;
@@ -112,7 +127,9 @@ export function createObligationsMcpServer(
     { name: OBLIGATIONS_MCP_NAME, version: "0.1.0" },
     { isFenced: options?.isFenced }
   );
-  const owner: ObligationOwner = { kind: "actor", id: actorId };
+  const ownerId = actorId;
+  const canManage = (obligation: ReturnType<ObligationRepository["require"]>): boolean =>
+    options?.canManage ? options.canManage(actorId, obligation) : obligation.ownerId === actorId;
 
   server.registerTool(
     "get_obligation",
@@ -141,6 +158,7 @@ export function createObligationsMcpServer(
         });
         return toolOk({
           obligation,
+          artifacts: repository.listArtifacts(id),
           parent: obligation.parentId === null ? null : repository.get(obligation.parentId),
           children: {
             items: children.obligations,
@@ -190,9 +208,9 @@ export function createObligationsMcpServer(
     async ({ status, limit, cursor }) => {
       try {
         const offset = ownedOffset(cursor, actorId, status);
-        const page = repository.listOwnedPage(owner, { status, limit, offset });
+        const page = repository.listOwnedPage(ownerId, { status, limit, offset });
         return toolOk({
-          owner,
+          ownerId,
           obligations: page.obligations,
           total: page.total,
           truncated: offset > 0 || page.hasMore,
@@ -217,24 +235,33 @@ export function createObligationsMcpServer(
     {
       title: "Create a new obligation",
       description:
-        "Create a new obligation. If parent_id is specified, the parent obligation transitions to waiting if it was ready.",
+        "Create a new obligation. `title` is the heading a queue shows; keep it to one short line and put the detail in `intent`. If parent_id is specified, the parent obligation transitions to waiting if it was ready.",
       inputSchema: {
-        owner_kind: z.enum(["actor", "human"]),
         owner_id: z.string().trim().min(1),
+        title: z.string().trim().min(1).max(OBLIGATION_TITLE_MAX),
         parent_id: z.string().trim().min(1).nullable().optional(),
         intent: z.string().nullable().optional(),
         external_ref: z.string().trim().min(1).nullable().optional(),
         priority: z.number().finite().nullable().optional(),
       },
     },
-    async ({ owner_kind, owner_id, parent_id, intent, external_ref, priority }) => {
+    async ({ owner_id, title, parent_id, intent, external_ref, priority }) => {
       try {
+        const owner = options?.resolveOwner?.(owner_id) ?? { ok: true as const, ownerId: owner_id };
+        if (!owner.ok) return toolError(new Error(owner.error));
         const obligation = repository.create({
-          owner: { kind: owner_kind, id: owner_id },
+          ownerId: owner.ownerId,
+          title,
           parentId: parent_id ?? null,
           intent: intent ?? null,
           externalRef: external_ref ?? null,
           priority: priority ?? null,
+          // Bound by the server from this server's actor identity, exactly like
+          // `owner` on list_owned. There is deliberately no `created_by` field
+          // in inputSchema: #1671's trust boundary requires that attribution is
+          // never accepted as model-supplied payload, so an actor cannot claim
+          // to be anyone else — including when it creates work owned by another.
+          creatorId: actorId,
         });
         return toolOk({ obligation });
       } catch (err) {
@@ -248,16 +275,73 @@ export function createObligationsMcpServer(
     {
       title: "Set terminal status for an obligation",
       description:
-        "Transition an obligation to 'done' or 'cancelled'. It must have no live children. If the parent was waiting and has no remaining live children, the parent re-readies at its retained priority.",
+        "Transition an obligation to 'done' or 'cancelled'. It must have no live children. If the parent was waiting and has no remaining live children, the parent re-readies at its retained priority. Pass `note` to record why in words, and `resolution_ref` to cite what settled it (e.g. the mesh_chat message that answered the question) — the ref is attached to the obligation as part of the same transition.",
       inputSchema: {
         id: z.string().trim().min(1),
         status: z.enum(["done", "cancelled"]),
+        note: z.string().nullable().optional(),
+        resolution_ref: z.string().trim().min(1).nullable().optional(),
       },
     },
-    async ({ id, status }) => {
+    async ({ id, status, note, resolution_ref }) => {
       try {
-        const obligation = repository.setTerminalStatus(id, status);
+        const obligation = repository.setTerminalStatus(
+          id,
+          status,
+          note ?? null,
+          resolution_ref ?? null
+        );
         return toolOk({ obligation });
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "set_external_ref",
+    {
+      title: "Link or unlink the issue/PR/repo this obligation is",
+      description:
+        "Set the obligation's identity claim — the external object this obligation *is* — or pass null to unlink. Accepts a GitHub owner, repository, issue or pull request: github:OWNER, github:OWNER/REPO, github:OWNER/REPO/issues/33, github:OWNER/REPO/pulls/76. At most one live obligation may claim a given ref. This is not attach_artifact: a comment or review is evidence *about* the work, so cite it as an artifact instead.",
+      inputSchema: {
+        id: z.string().trim().min(1),
+        external_ref: z.string().trim().min(1).nullable(),
+      },
+    },
+    async ({ id, external_ref }) => {
+      try {
+        const current = repository.get(id);
+        if (!current) throw new Error("obligation not found");
+        if (!canManage(current)) throw new Error("not authorized to change this obligation's ref");
+        return toolOk({ obligation: repository.setExternalRef(id, external_ref ?? null) });
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "attach_artifact",
+    {
+      title: "Cite an artifact on an obligation",
+      description: `Attach a reference to something that bears on this obligation — the chat message that raised it, the review that changed it, the PR that carries it. Refs are '<scheme>:<path>', scheme one of: ${REFERENCE_SCHEMES.join(", ")}, and the path is collection/id pairs: github:OWNER/REPO/issues/33, github:OWNER/REPO/issues/33/comments/12345, gchat:spaces/S/messages/M, mesh:messages/<id>. Attaching the same ref twice is a no-op, not an error. This is not external_ref, which asserts the obligation *is* a GitHub owner, repository, issue or pull request.`,
+      inputSchema: {
+        obligation_id: z.string().trim().min(1),
+        ref: z.string().trim().min(1),
+        label: z.string().nullable().optional(),
+      },
+    },
+    async ({ obligation_id, ref, label }) => {
+      try {
+        const artifact = repository.attachArtifact(obligation_id, ref, {
+          label: label ?? null,
+          // Bound server-side from this server's identity, exactly like
+          // `creatorId` on create: who cited a thing is attribution, and
+          // attribution is never accepted as model payload (#1671).
+          attachedBy: actorId,
+        });
+        return toolOk({ artifact });
       } catch (err) {
         return toolError(err);
       }
@@ -300,20 +384,18 @@ export function createObligationsMcpServer(
         "Change a ready or waiting obligation's owner while preserving its identity, tree position, priority, external reference, and state.",
       inputSchema: {
         id: z.string().trim().min(1),
-        owner_kind: z.enum(["actor", "human"]),
         owner_id: z.string().trim().min(1),
       },
     },
-    async ({ id, owner_kind, owner_id }) => {
+    async ({ id, owner_id }) => {
       try {
         const current = repository.get(id);
         if (!current) throw new Error("obligation not found");
-        const authorized = options?.canReassign
-          ? options.canReassign(actorId, current)
-          : current.owner.kind === "actor" && current.owner.id === actorId;
-        if (!authorized) throw new Error("not authorized to reassign this obligation");
-        const obligation = repository.reassign(id, { kind: owner_kind, id: owner_id });
-        return toolOk({ obligation, previousOwner: current.owner });
+        if (!canManage(current)) throw new Error("not authorized to reassign this obligation");
+        const owner = options?.resolveOwner?.(owner_id) ?? { ok: true as const, ownerId: owner_id };
+        if (!owner.ok) throw new Error(owner.error);
+        const obligation = repository.reassign(id, owner.ownerId);
+        return toolOk({ obligation, previousOwnerId: current.ownerId });
       } catch (err) {
         return toolError(err);
       }

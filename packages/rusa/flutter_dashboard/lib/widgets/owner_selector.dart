@@ -7,14 +7,12 @@ import 'obligation_dialogs.dart';
 class OwnerSelector extends StatelessWidget {
   final DashboardStore store;
   final TextEditingController ownerIdCtrl;
-  final ValueChanged<String> onOwnerKindChanged;
   final InputDecoration decoration;
 
   const OwnerSelector({
     super.key,
     required this.store,
     required this.ownerIdCtrl,
-    required this.onOwnerKindChanged,
     required this.decoration,
   });
 
@@ -34,9 +32,6 @@ class OwnerSelector extends StatelessWidget {
         final all = [...humans, ...actors];
         if (text.isEmpty) return all;
         return all.where((opt) => opt.handle.toLowerCase().contains(text) || opt.id.toLowerCase().contains(text));
-      },
-      onSelected: (selection) {
-        onOwnerKindChanged(selection.kind);
       },
       fieldViewBuilder: (context, textEditingController, focusNode, onFieldSubmitted) {
         WidgetsBinding.instance.addPostFrameCallback((_) {

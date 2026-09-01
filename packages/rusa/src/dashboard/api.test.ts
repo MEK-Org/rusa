@@ -523,6 +523,25 @@ describe("handleMeshApiRequest", () => {
     expect(actor.boundModel).toBeUndefined();
   });
 
+  it("GET /api/mesh/threads surfaces pending desiredModel and desiredProvider when staged", () => {
+    registry.upsert({
+      ...rec(UUID_A, "root", "active"),
+      provider: "claude",
+      model: "claude-sonnet-5",
+      desiredModel: "claude-opus-4-8",
+      desiredProvider: "codex",
+    });
+
+    const { res } = call(deps, "GET", "/api/mesh/threads");
+    expect(res.statusCode).toBe(200);
+    const { threads } = JSON.parse(res.body);
+    const actor = threads.find((t: { id: string }) => t.id === UUID_A);
+    expect(actor.provider).toBe("claude");
+    expect(actor.model).toBe("claude-sonnet-5");
+    expect(actor.desiredModel).toBe("claude-opus-4-8");
+    expect(actor.desiredProvider).toBe("codex");
+  });
+
   it("GET /api/mesh/threads shows the default root handle when no identity is configured", () => {
     registry.upsert({ ...rec("root", null, "active"), isRoot: true });
     const { res } = call(deps, "GET", "/api/mesh/threads");
@@ -868,7 +887,7 @@ describe("handleMeshApiRequest", () => {
     expect(JSON.parse(res.body)).toEqual({ events: [], nextCursor: null });
   });
 
-  it("GET /api/mesh/inbox resolves a mesh message body without exposing its id", () => {
+  it("GET /api/mesh/inbox resolves a mesh message body into the payload, not its id", () => {
     const messageId = meshChat.record({
       id: "message-for-inbox",
       senderId: "root",
@@ -892,7 +911,37 @@ describe("handleMeshApiRequest", () => {
       fromId: "root",
       content: "Please review the dashboard Inbox tab.",
     });
-    expect(JSON.stringify(entry)).not.toContain(messageId);
+
+    // The id is still absent from the payload — content belongs there, not an
+    // opaque handle, which is what this test was written to pin. It now appears
+    // alongside as a citation: `reference` is the same resolved shape an
+    // obligation's artifacts carry, so one widget renders both, and the ref is
+    // exactly what an actor cites when closing an obligation on this message.
+    expect(JSON.stringify(entry.payload)).not.toContain(messageId);
+    expect(entry.reference).toMatchObject({
+      ref: `mesh:messages/${messageId}`,
+      scheme: "mesh",
+      body: "Please review the dashboard Inbox tab.",
+    });
+  });
+
+  it("GET /api/mesh/inbox preserves a dangling mesh citation and its failure reason", () => {
+    inbox.append([
+      {
+        id: "dangling-inbox-entry",
+        actorId: UUID_A,
+        source: "mesh:root",
+        payload: { type: "mesh.message", messageId: "missing-message", fromId: "root" },
+      },
+    ]);
+
+    const { res } = call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
+    const entry = JSON.parse(res.body).entries[0];
+    expect(entry.reference).toMatchObject({
+      ref: "mesh:messages/missing-message",
+      body: null,
+      unavailable: "message not found",
+    });
   });
 
   describe("POST /api/mesh/actors/:id/inbox/handled", () => {
@@ -1524,12 +1573,21 @@ describe("handleMeshApiRequest", () => {
   describe("Obligations REST API", () => {
     describe("GET /api/mesh/obligations", () => {
       it("lists obligations with filters and pagination", async () => {
-        obligations.create({ id: "root-1", owner: { kind: "actor", id: "actor-1" } });
-        obligations.create({ id: "root-2", owner: { kind: "human", id: "user-1" } });
         obligations.create({
+          title: "root-1",
+          id: "root-1",
+          ownerId: "actor-1",
+        });
+        obligations.create({
+          title: "root-2",
+          id: "root-2",
+          ownerId: "human:operator",
+        });
+        obligations.create({
+          title: "child-1",
           id: "child-1",
           parentId: "root-1",
-          owner: { kind: "actor", id: "actor-1" },
+          ownerId: "actor-1",
         });
 
         const { res } = call(deps, "GET", "/api/mesh/obligations");
@@ -1543,15 +1601,15 @@ describe("handleMeshApiRequest", () => {
         const { res: filtered } = call(
           deps,
           "GET",
-          "/api/mesh/obligations?ownerKind=actor&rootsOnly=true"
+          "/api/mesh/obligations?ownerId=actor-1&rootsOnly=true"
         );
         expect(filtered.statusCode).toBe(200);
         const filteredData = JSON.parse(filtered.body);
         expect(filteredData.obligations.map((o: { id: string }) => o.id)).toEqual(["root-1"]);
       });
 
-      it("400s on invalid ownerKind or status", async () => {
-        const { res: badKind } = call(deps, "GET", "/api/mesh/obligations?ownerKind=invalid");
+      it("400s on invalid status", async () => {
+        const { res: badKind } = call(deps, "GET", "/api/mesh/obligations?status=invalid");
         expect(badKind.statusCode).toBe(400);
 
         const { res: badStatus } = call(deps, "GET", "/api/mesh/obligations?status=invalid");
@@ -1567,16 +1625,22 @@ describe("handleMeshApiRequest", () => {
 
     describe("GET /api/mesh/obligations/:id", () => {
       it("returns obligation with parent, children, and blockingChildren", async () => {
-        obligations.create({ id: "root-task", owner: { kind: "actor", id: "actor-1" } });
         obligations.create({
-          id: "sub-1",
-          parentId: "root-task",
-          owner: { kind: "actor", id: "actor-2" },
+          title: "root-task",
+          id: "root-task",
+          ownerId: "actor-1",
         });
         obligations.create({
+          title: "sub-1",
+          id: "sub-1",
+          parentId: "root-task",
+          ownerId: "actor-2",
+        });
+        obligations.create({
+          title: "sub-2",
           id: "sub-2",
           parentId: "root-task",
-          owner: { kind: "actor", id: "actor-2" },
+          ownerId: "actor-2",
         });
         obligations.setTerminalStatus("sub-1", "done");
 
@@ -1599,11 +1663,16 @@ describe("handleMeshApiRequest", () => {
 
     describe("GET /api/mesh/obligations/:id/tree", () => {
       it("returns complete subtree", async () => {
-        obligations.create({ id: "root-task", owner: { kind: "actor", id: "actor-1" } });
         obligations.create({
+          title: "root-task",
+          id: "root-task",
+          ownerId: "actor-1",
+        });
+        obligations.create({
+          title: "child-task",
           id: "child-task",
           parentId: "root-task",
-          owner: { kind: "actor", id: "actor-2" },
+          ownerId: "actor-2",
         });
 
         const { res } = call(deps, "GET", "/api/mesh/obligations/root-task/tree");
@@ -1622,17 +1691,104 @@ describe("handleMeshApiRequest", () => {
 
     describe("POST /api/mesh/obligations", () => {
       it("creates obligation and returns 201", async () => {
+        registry.upsert(rec(UUID_A, "root", "active"));
         const body = JSON.stringify({
-          ownerKind: "actor",
-          ownerId: "actor-1",
+          ownerId: UUID_A,
+          title: "Build feature",
           intent: "build feature",
         });
         const { res } = call(deps, "POST", "/api/mesh/obligations", body);
         await new Promise((resolve) => process.nextTick(resolve));
         expect(res.statusCode).toBe(201);
         const data = JSON.parse(res.body);
-        expect(data.obligation.owner).toEqual({ kind: "actor", id: "actor-1" });
+        expect(data.obligation.ownerId).toBe(UUID_A);
+        expect(data.obligation.title).toBe("Build feature");
         expect(data.obligation.intent).toBe("build feature");
+        // The dashboard binds the creator from the server's own identity; a
+        // null here would be an unrecoverable loss of attribution (#1671).
+        expect(data.obligation.creatorId).toBe(HUMAN_OPERATOR);
+      });
+
+      it("binds the operator as creator without accepting one from the body", async () => {
+        const { res } = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations",
+          JSON.stringify({
+            ownerId: HUMAN_OPERATOR,
+            title: "Decide",
+            creatorId: "actor-impostor",
+          })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(res.statusCode).toBe(201);
+        expect(JSON.parse(res.body).obligation.creatorId).toBe(HUMAN_OPERATOR);
+      });
+
+      it("returns cited artifacts with mesh chat resolved and other schemes named", async () => {
+        registry.upsert(rec(UUID_A, "root", "active"));
+        obligations.create({ id: "cited", ownerId: UUID_A, title: "Game Type" });
+        const messageId = meshChat.record({
+          senderId: HUMAN_OPERATOR,
+          recipientId: UUID_A,
+          body: "A monster-catching JRPG in a cave.",
+        });
+        obligations.attachArtifact("cited", `mesh:messages/${messageId}`, {
+          label: "the answer",
+          attachedBy: UUID_A,
+        });
+        obligations.attachArtifact("cited", "github:MEK-Org/rusa/issues/33");
+
+        const { res } = call(deps, "GET", "/api/mesh/obligations/cited");
+        await new Promise((resolve) => process.nextTick(resolve));
+        const artifacts = JSON.parse(res.body).artifacts as Array<{
+          artifact: { ref: string; label: string | null };
+          reference: { body: string } | null;
+        }>;
+
+        expect(artifacts).toHaveLength(2);
+        const chat = artifacts.find((a) => a.artifact.ref.startsWith("mesh:"));
+        expect(chat?.reference?.body).toBe("A monster-catching JRPG in a cave.");
+        expect(chat?.artifact.label).toBe("the answer");
+        // v1 resolves mesh chat only. The GitHub citation still comes back with
+        // an explicit reason — an unresolvable citation is not an absent one.
+        const gh = artifacts.find((a) => a.artifact.ref.startsWith("github:"));
+        expect(gh).toBeDefined();
+        expect(gh?.reference).toMatchObject({
+          scheme: "github",
+          unavailable: "not resolved by the synchronous dashboard path",
+        });
+      });
+
+      it("rejects a create with no title", async () => {
+        registry.upsert(rec(UUID_A, "root", "active"));
+        for (const body of [
+          JSON.stringify({ ownerId: UUID_A, intent: "no heading" }),
+          JSON.stringify({ ownerId: UUID_A, title: "   ", intent: "blank heading" }),
+        ]) {
+          const { res } = call(deps, "POST", "/api/mesh/obligations", body);
+          await new Promise((resolve) => process.nextTick(resolve));
+          // A node with no heading cannot appear in a call-list, which is the
+          // one thing the human-decision contract needs it for.
+          expect(res.statusCode).toBe(400);
+        }
+      });
+
+      it("rejects an owner that is neither a live actor nor the operator", async () => {
+        registry.upsert(rec(UUID_RETIRED, "root", "retired"));
+        for (const ownerId of ["actor-1", UUID_RETIRED, "system:mesh"]) {
+          const { res } = call(
+            deps,
+            "POST",
+            "/api/mesh/obligations",
+            JSON.stringify({ ownerId, title: "Typo", intent: "typo" })
+          );
+          await new Promise((resolve) => process.nextTick(resolve));
+          // A typed handle that resolves to nothing must not become live work
+          // owned by an id that appears in no queue and wakes nobody.
+          expect(res.statusCode).toBe(400);
+        }
+        expect(obligations.listOwned("actor-1")).toHaveLength(0);
       });
 
       it("400s on invalid payload", async () => {
@@ -1640,7 +1796,7 @@ describe("handleMeshApiRequest", () => {
           deps,
           "POST",
           "/api/mesh/obligations",
-          JSON.stringify({ ownerKind: "invalid" })
+          JSON.stringify({ ownerId: "   " })
         );
         await new Promise((resolve) => process.nextTick(resolve));
         expect(res.statusCode).toBe(400);
@@ -1649,7 +1805,11 @@ describe("handleMeshApiRequest", () => {
 
     describe("POST /api/mesh/obligations/:id/status", () => {
       it("transitions status and returns 200", async () => {
-        obligations.create({ id: "task-1", owner: { kind: "actor", id: "actor-1" } });
+        obligations.create({
+          title: "task-1",
+          id: "task-1",
+          ownerId: "actor-1",
+        });
 
         const { res } = call(
           deps,
@@ -1674,12 +1834,171 @@ describe("handleMeshApiRequest", () => {
         await new Promise((resolve) => process.nextTick(resolve));
         expect(res.statusCode).toBe(404);
       });
+
+      it("records the operator's stated reason", async () => {
+        obligations.create({
+          title: "decide-stack",
+          id: "decide-stack",
+          ownerId: HUMAN_OPERATOR,
+        });
+
+        const { res } = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/decide-stack/status",
+          JSON.stringify({ status: "done", note: "Flutter. Tooling is already wired here." })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(res.statusCode).toBe(200);
+        expect(JSON.parse(res.body).obligation.terminalNote).toBe(
+          "Flutter. Tooling is already wired here."
+        );
+      });
+
+      it("drops a non-string note rather than coercing it into a reason", async () => {
+        obligations.create({
+          title: "coerce-me",
+          id: "coerce-me",
+          ownerId: "actor-1",
+        });
+
+        const { res } = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/coerce-me/status",
+          JSON.stringify({ status: "cancelled", note: { why: "nope" } })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        // "[object Object]" stored as a stated reason is worse than no reason.
+        expect(res.statusCode).toBe(200);
+        expect(JSON.parse(res.body).obligation.terminalNote).toBeNull();
+      });
+    });
+
+    describe("POST /api/mesh/obligations/:id/external-ref", () => {
+      it("links, relinks and unlinks after creation", async () => {
+        registry.upsert(rec(UUID_A, "root", "active"));
+        obligations.create({ id: "linkable", ownerId: UUID_A, title: "Ship it" });
+
+        const link = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/linkable/external-ref",
+          JSON.stringify({ externalRef: "github:MEK-Org/rusa/issues/33" })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(link.res.statusCode).toBe(200);
+        expect(JSON.parse(link.res.body).obligation.externalRef.key).toBe(
+          "github:MEK-Org/rusa/issues/33"
+        );
+
+        // A blank string unlinks, so the UI can clear the field without a
+        // separate control.
+        const clear = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/linkable/external-ref",
+          JSON.stringify({ externalRef: "  " })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(JSON.parse(clear.res.body).obligation.externalRef).toBeNull();
+      });
+
+      it("accepts a repository and rejects a sub-resource", async () => {
+        registry.upsert(rec(UUID_A, "root", "active"));
+        obligations.create({ id: "repo-level", ownerId: UUID_A, title: "Keep rusa releasable" });
+
+        const ok = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/repo-level/external-ref",
+          JSON.stringify({ externalRef: "github:MEK-Org/rusa" })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(ok.res.statusCode).toBe(200);
+
+        const bad = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/repo-level/external-ref",
+          JSON.stringify({ externalRef: "github:MEK-Org/rusa/issues/33/comments/9" })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        // The server owns the grammar; its complaint is what the dialog shows.
+        expect(bad.res.statusCode).toBe(400);
+        expect(JSON.parse(bad.res.body).error).toContain("external ref must name");
+      });
+
+      it("lets an explicit camelCase null unlink even when the legacy alias is present", async () => {
+        registry.upsert(rec(UUID_A, "root", "active"));
+        obligations.create({
+          id: "explicit-unlink",
+          ownerId: UUID_A,
+          title: "Correct the link",
+          externalRef: "github:MEK-Org/rusa/issues/33",
+        });
+
+        const unlink = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/explicit-unlink/external-ref",
+          JSON.stringify({
+            externalRef: null,
+            external_ref: "github:MEK-Org/rusa/issues/34",
+          })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+
+        expect(unlink.res.statusCode).toBe(200);
+        expect(JSON.parse(unlink.res.body).obligation.externalRef).toBeNull();
+      });
+
+      it("rejects an omitted ref rather than treating it as an unlink", async () => {
+        registry.upsert(rec(UUID_A, "root", "active"));
+        obligations.create({
+          id: "keep-link",
+          ownerId: UUID_A,
+          title: "Keep the link",
+          externalRef: "github:MEK-Org/rusa",
+        });
+
+        const missing = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/keep-link/external-ref",
+          JSON.stringify({})
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+
+        expect(missing.res.statusCode).toBe(400);
+        expect(JSON.parse(missing.res.body).error).toBe("externalRef is required");
+        expect(obligations.require("keep-link").externalRef?.key).toBe("github:MEK-Org/rusa");
+      });
+
+      it("404s for an unknown obligation", async () => {
+        const { res } = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/missing/external-ref",
+          JSON.stringify({ externalRef: "github:MEK-Org/rusa" })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(res.statusCode).toBe(404);
+      });
     });
 
     describe("POST /api/mesh/obligations/:id/reorder", () => {
       it("reorders obligation and returns 200", async () => {
-        obligations.create({ id: "first", owner: { kind: "actor", id: "actor-1" } });
-        obligations.create({ id: "second", owner: { kind: "actor", id: "actor-1" } });
+        obligations.create({
+          title: "first",
+          id: "first",
+          ownerId: "actor-1",
+        });
+        obligations.create({
+          title: "second",
+          id: "second",
+          ownerId: "actor-1",
+        });
 
         const { res } = call(
           deps,
@@ -1692,16 +2011,29 @@ describe("handleMeshApiRequest", () => {
         const data = JSON.parse(res.body);
         expect(data.ok).toBe(true);
 
-        const ready = obligations.listOwned({ kind: "actor", id: "actor-1" }, { status: "ready" });
+        const ready = obligations.listOwned("actor-1", { status: "ready" });
         expect(ready.map((o) => o.id)).toEqual(["second", "first"]);
       });
     });
 
     describe("POST /api/mesh/obligations/:id/reparent", () => {
       it("reparents obligation and returns 200", async () => {
-        obligations.create({ id: "p1", owner: { kind: "actor", id: "actor-1" } });
-        obligations.create({ id: "p2", owner: { kind: "actor", id: "actor-1" } });
-        obligations.create({ id: "c1", parentId: "p1", owner: { kind: "actor", id: "actor-1" } });
+        obligations.create({
+          title: "p1",
+          id: "p1",
+          ownerId: "actor-1",
+        });
+        obligations.create({
+          title: "p2",
+          id: "p2",
+          ownerId: "actor-1",
+        });
+        obligations.create({
+          title: "c1",
+          id: "c1",
+          parentId: "p1",
+          ownerId: "actor-1",
+        });
 
         const { res } = call(
           deps,
@@ -1717,7 +2049,11 @@ describe("handleMeshApiRequest", () => {
       });
 
       it("400s on self-parenting or cycle", async () => {
-        obligations.create({ id: "task-self", owner: { kind: "actor", id: "actor-1" } });
+        obligations.create({
+          title: "task-self",
+          id: "task-self",
+          ownerId: "actor-1",
+        });
 
         const { res } = call(
           deps,
@@ -1732,25 +2068,35 @@ describe("handleMeshApiRequest", () => {
 
     describe("POST /api/mesh/obligations/:id/reassign", () => {
       it("reassigns an obligation for a trusted operator", async () => {
-        obligations.create({ id: "task-owner", owner: { kind: "actor", id: "actor-1" } });
+        obligations.create({
+          title: "task-owner",
+          id: "task-owner",
+          ownerId: "actor-1",
+        });
         const { res } = call(
           deps,
           "POST",
           "/api/mesh/obligations/task-owner/reassign",
-          JSON.stringify({ ownerKind: "human", ownerId: "Operator" })
+          JSON.stringify({ ownerId: "human:operator" })
         );
         await new Promise((resolve) => process.nextTick(resolve));
         expect(res.statusCode).toBe(200);
-        expect(JSON.parse(res.body).obligation.owner).toEqual({ kind: "human", id: "Operator" });
+        expect(JSON.parse(res.body).obligation.ownerId).toBe("human:operator");
       });
 
       it("validates the new owner and returns 404 for missing work", async () => {
-        obligations.create({ id: "task-owner", owner: { kind: "actor", id: "actor-1" } });
+        obligations.create({
+          title: "task-owner",
+          id: "task-owner",
+          ownerId: "actor-1",
+        });
+        // With owner_kind gone the only malformed owner is a blank id; the
+        // route must still reject it rather than write an empty owner.
         const invalid = call(
           deps,
           "POST",
           "/api/mesh/obligations/task-owner/reassign",
-          JSON.stringify({ ownerKind: "team", ownerId: "ops" })
+          JSON.stringify({ ownerId: "   " })
         );
         await new Promise((resolve) => process.nextTick(resolve));
         expect(invalid.res.statusCode).toBe(400);
@@ -1759,10 +2105,20 @@ describe("handleMeshApiRequest", () => {
           deps,
           "POST",
           "/api/mesh/obligations/missing/reassign",
-          JSON.stringify({ ownerKind: "human", ownerId: "Operator" })
+          JSON.stringify({ ownerId: "human:operator" })
         );
         await new Promise((resolve) => process.nextTick(resolve));
         expect(missing.res.statusCode).toBe(404);
+
+        const unknownOwner = call(
+          deps,
+          "POST",
+          "/api/mesh/obligations/task-owner/reassign",
+          JSON.stringify({ ownerId: "actor-typo" })
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(unknownOwner.res.statusCode).toBe(400);
+        expect(obligations.get("task-owner")?.ownerId).toBe("actor-1");
       });
     });
   });

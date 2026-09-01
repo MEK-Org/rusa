@@ -49,7 +49,6 @@ function recordingIssueClient(): { client: IssueClient; calls: Call[] } {
           author,
           labels: [],
           updatedAt: "2026-01-02T00:00:00Z",
-          issueNumber: 1,
         },
       ];
     },
@@ -66,7 +65,6 @@ function recordingIssueClient(): { client: IssueClient; calls: Call[] } {
           author: "human",
           labels: [],
           updatedAt: "2026-01-02T00:00:00Z",
-          issueNumber: null,
         },
       ];
     },
@@ -674,21 +672,13 @@ describe("tracker MCP server", () => {
       name: "create_issue",
       arguments: { repo: "owner/repo", title: "T", body: "B" },
     });
-    expect(onResourceCreated).toHaveBeenCalledWith({
-      kind: "github_issue",
-      repo: "owner/repo",
-      number: 123,
-    });
+    expect(onResourceCreated).toHaveBeenCalledWith("github:owner/repo/issues/123");
 
     await client.callTool({
       name: "create_pull_request",
       arguments: { repo: "owner/repo", head: "feature", title: "T", body: "B" },
     });
-    expect(onResourceCreated).toHaveBeenCalledWith({
-      kind: "github_pr",
-      repo: "owner/repo",
-      number: 1,
-    });
+    expect(onResourceCreated).toHaveBeenCalledWith("github:owner/repo/pulls/1");
   });
 
   it("does not fail create_issue if onResourceCreated throws", async () => {
@@ -809,7 +799,7 @@ describe("tracker MCP server", () => {
       name: "list_open_prs",
       arguments: { repo: "o/r", author: "bot" },
     })) as CallToolResult;
-    expect(JSON.parse(textOf(res))).toMatchObject([{ number: 1, author: "bot", issueNumber: 1 }]);
+    expect(JSON.parse(textOf(res))).toMatchObject([{ number: 1, author: "bot" }]);
     expect(calls).toContainEqual({ method: "getOpenPullRequestsByAuthor", args: ["o/r", "bot"] });
   });
 
@@ -821,7 +811,7 @@ describe("tracker MCP server", () => {
       arguments: { repo: "o/r" },
     })) as CallToolResult;
     expect(JSON.parse(textOf(res))).toMatchObject([
-      { number: 2, author: "human", headRefName: "feature/all", issueNumber: null },
+      { number: 2, author: "human", headRefName: "feature/all" },
     ]);
     expect(calls).toContainEqual({ method: "getOpenPullRequests", args: ["o/r"] });
   });

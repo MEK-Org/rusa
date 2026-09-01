@@ -36,6 +36,18 @@ export class Repositories {
     this.modelScrapes = new ModelScrapeRepository(db);
     this.obligations = new ObligationRepository(db);
   }
+
+  /**
+   * Wire the actor-existence probe once the thread registry exists.
+   *
+   * Separate from construction because the registry is built later in boot.
+   * Called from `runStart`; without it the obligation store cannot tell a live
+   * actor from a typo, which is the omission that let owner drift back in
+   * through the write boundary.
+   */
+  setActorExists(probe: (actorId: string) => boolean): void {
+    this.obligations.setActorExists(probe);
+  }
 }
 
 export { InboxRepository } from "./inbox-repository.js";

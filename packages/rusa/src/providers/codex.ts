@@ -406,8 +406,8 @@ export class CodexProvider implements CodingProvider {
       : buildCodexConfigOverrides(opts.mcpServers ?? [], this.model);
 
     // Build the bwrap wrapper ONCE (sandbox setup + per-actor sessions-store bind +
-    // auth temp). Reused across a resume→fresh retry so the second spawn still sees
-    // the bound auth/config; only the codex args after `--` differ per attempt.
+    // shared host auth bind). Reused across a resume→fresh retry so the second spawn
+    // still sees the bound auth/config; only the codex args after `--` differ per attempt.
     let spawnCommand = command;
     const spawnCwd = opts.sandbox ? "/" : opts.cwd;
     let bwrapResult: ActorBwrapResult | undefined;

@@ -17,15 +17,20 @@ ThreadDto makeThread(
   String? lastActiveAt,
   RunState runState = RunState.unknown,
   String? title,
+  String? provider,
   String? model,
+  String? desiredModel,
+  String? desiredProvider,
   String? charterPreview,
 }) => ThreadDto(
   id: id,
   handle: '$id-handle',
   parentId: parent,
   status: status,
-  provider: null,
+  provider: provider,
   model: model,
+  desiredModel: desiredModel,
+  desiredProvider: desiredProvider,
   charterPreview: charterPreview ?? 'charter $id',
   title: title ?? 'charter $id',
   createdAt: created,
@@ -69,7 +74,6 @@ MeshChat makeChat(
 ObligationDto makeObligation(
   String id, {
   String? parentId,
-  String ownerKind = 'actor',
   String ownerId = 'root',
   String? intent,
   String? externalRef,
@@ -77,17 +81,25 @@ ObligationDto makeObligation(
   double? priority,
   double effectivePriority = 100.0,
   String? prioritySourceId,
+  String? terminalNote,
+  String? title,
+  String? resolutionRef,
 }) =>
     ObligationDto(
       id: id,
       parentId: parentId,
-      owner: ObligationOwner(kind: ownerKind, id: ownerId),
+      ownerId: ownerId,
       intent: intent ?? 'intent $id',
       externalRef: externalRef,
       status: status,
       priority: priority,
       effectivePriority: effectivePriority,
       prioritySourceId: prioritySourceId,
+      terminalNote: terminalNote,
+      // Defaults to the intent's heading so existing fixtures keep rendering
+      // the label their assertions look for.
+      title: title ?? intent ?? 'intent $id',
+      resolutionRef: resolutionRef,
     );
 
 /// Fake REST API with canned responses; records the actor lists it was queried
@@ -418,15 +430,14 @@ class FakeApi extends DashboardApi {
   List<ObligationDto> obligationsResult = [];
   Map<String, ObligationDetailSnapshot> obligationDetails = {};
   Map<String, ObligationTreeDto> obligationTrees = {};
-  final createObligationCalls = <({String ownerKind, String ownerId, String? parentId, String? intent, String? externalRef, double? priority})>[];
-  final statusCalls = <({String id, String status})>[];
+  final createObligationCalls = <({String ownerId, String title, String? parentId, String? intent, String? externalRef, double? priority})>[];
+  final statusCalls = <({String id, String status, String? note, String? resolutionRef})>[];
   final reorderCalls = <({String id, String? previousId, String? nextId, String scope})>[];
   final reparentCalls = <({String id, String? parentId})>[];
-  final reassignCalls = <({String id, String ownerKind, String ownerId})>[];
+  final reassignCalls = <({String id, String ownerId})>[];
 
   @override
   Future<ObligationPage> fetchObligations({
-    String? ownerKind,
     String? ownerId,
     String? status,
     bool? rootsOnly,
@@ -434,11 +445,8 @@ class FakeApi extends DashboardApi {
     int? offset,
   }) async {
     var list = obligationsResult;
-    if (ownerKind != null) {
-      list = list.where((o) => o.owner.kind == ownerKind).toList();
-    }
     if (ownerId != null) {
-      list = list.where((o) => o.owner.id == ownerId).toList();
+      list = list.where((o) => o.ownerId == ownerId).toList();
     }
     if (status != null) {
       list = list.where((o) => o.status == status).toList();
@@ -494,16 +502,16 @@ class FakeApi extends DashboardApi {
 
   @override
   Future<ObligationDto> createObligation({
-    required String ownerKind,
     required String ownerId,
+    required String title,
     String? parentId,
     String? intent,
     String? externalRef,
     double? priority,
   }) async {
     createObligationCalls.add((
-      ownerKind: ownerKind,
       ownerId: ownerId,
+      title: title,
       parentId: parentId,
       intent: intent,
       externalRef: externalRef,
@@ -512,8 +520,8 @@ class FakeApi extends DashboardApi {
     final created = makeObligation(
       'ob-${obligationsResult.length + 1}',
       parentId: parentId,
-      ownerKind: ownerKind,
       ownerId: ownerId,
+      title: title,
       intent: intent,
       externalRef: externalRef,
       priority: priority,
@@ -523,19 +531,56 @@ class FakeApi extends DashboardApi {
   }
 
   @override
-  Future<ObligationDto> setObligationStatus(String id, String status) async {
-    statusCalls.add((id: id, status: status));
+  Future<ObligationDto> setObligationStatus(
+    String id,
+    String status, {
+    String? note,
+    String? resolutionRef,
+  }) async {
+    statusCalls.add((id: id, status: status, note: note, resolutionRef: resolutionRef));
     final index = obligationsResult.indexWhere((o) => o.id == id);
     if (index >= 0) {
       final old = obligationsResult[index];
       final updated = makeObligation(
         old.id,
         parentId: old.parentId,
-        ownerKind: old.owner.kind,
-        ownerId: old.owner.id,
+        ownerId: old.ownerId,
         intent: old.intent,
         externalRef: old.externalRef,
         status: status,
+        priority: old.priority,
+        effectivePriority: old.effectivePriority,
+        prioritySourceId: old.prioritySourceId,
+        terminalNote: note,
+        title: old.title,
+        resolutionRef: resolutionRef,
+      );
+      obligationsResult[index] = updated;
+      return updated;
+    }
+    return makeObligation(id, status: status);
+  }
+
+  final externalRefCalls = <({String id, String? ref})>[];
+  Object? externalRefError;
+
+  @override
+  Future<ObligationDto> setObligationExternalRef(String id, String? ref) async {
+    externalRefCalls.add((id: id, ref: ref));
+    if (externalRefError case final error?) throw error;
+    final index = obligationsResult.indexWhere((o) => o.id == id);
+    final trimmed = ref?.trim();
+    final next = (trimmed == null || trimmed.isEmpty) ? null : trimmed;
+    if (index >= 0) {
+      final old = obligationsResult[index];
+      final updated = makeObligation(
+        old.id,
+        parentId: old.parentId,
+        ownerId: old.ownerId,
+        title: old.title,
+        intent: old.intent,
+        externalRef: next,
+        status: old.status,
         priority: old.priority,
         effectivePriority: old.effectivePriority,
         prioritySourceId: old.prioritySourceId,
@@ -543,7 +588,7 @@ class FakeApi extends DashboardApi {
       obligationsResult[index] = updated;
       return updated;
     }
-    return makeObligation(id, status: status);
+    return makeObligation(id, externalRef: next);
   }
 
   @override
@@ -567,8 +612,7 @@ class FakeApi extends DashboardApi {
       final updated = makeObligation(
         old.id,
         parentId: parentId,
-        ownerKind: old.owner.kind,
-        ownerId: old.owner.id,
+        ownerId: old.ownerId,
         intent: old.intent,
         externalRef: old.externalRef,
         status: old.status,
@@ -585,10 +629,9 @@ class FakeApi extends DashboardApi {
   @override
   Future<ObligationDto> reassignObligation(
     String id, {
-    required String ownerKind,
     required String ownerId,
   }) async {
-    reassignCalls.add((id: id, ownerKind: ownerKind, ownerId: ownerId));
+    reassignCalls.add((id: id, ownerId: ownerId));
     final old = obligationsResult.firstWhere(
       (o) => o.id == id,
       orElse: () => makeObligation(id),
@@ -596,7 +639,6 @@ class FakeApi extends DashboardApi {
     return makeObligation(
       old.id,
       parentId: old.parentId,
-      ownerKind: ownerKind,
       ownerId: ownerId,
       intent: old.intent,
       externalRef: old.externalRef,

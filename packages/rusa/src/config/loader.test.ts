@@ -719,30 +719,6 @@ describe("loadConfig providers.<name>.fallbackModel is rejected ", () => {
   });
 });
 
-describe("loadConfig tracker hygiene", () => {
-  it("defaults closeAction to log when tracker hygiene is configured", () => {
-    const config = loadConfig(
-      writeConfig({ observability: { trackerHygiene: { enabled: true } } })
-    );
-
-    expect(config.observability?.trackerHygiene?.closeAction).toBe("log");
-  });
-
-  it("honors explicit closeAction close", () => {
-    const config = loadConfig(
-      writeConfig({ observability: { trackerHygiene: { closeAction: "close" } } })
-    );
-
-    expect(config.observability?.trackerHygiene?.closeAction).toBe("close");
-  });
-
-  it("rejects unknown closeAction values", () => {
-    expect(() =>
-      loadConfig(writeConfig({ observability: { trackerHygiene: { closeAction: "delete" } } }))
-    ).toThrow(/trackerHygiene\.closeAction/);
-  });
-});
-
 describe("loadConfig voice (ISSUE_NUM, optional)", () => {
   it("loads a config that omits the voice section", () => {
     expect(loadConfig(writeConfig()).voice).toBeUndefined();

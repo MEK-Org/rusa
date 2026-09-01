@@ -18,7 +18,10 @@ import {
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { ObligationStatus } from "../obligations/obligation.js";
+import { resolveObligationOwner } from "../obligations/owner.js";
+import { resolveReferenceSync } from "../references/resolve.js";
 import type { SseHub } from "./sse.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
@@ -147,6 +150,10 @@ interface ThreadDto {
   provider: string | null;
   /** The single authoritative model for this actor, as configured in the registry. */
   model: string | null;
+  /** Pending desired model staged for next run boundary, or null if none. */
+  desiredModel?: string | null;
+  /** Pending desired provider staged for next run boundary, or null if none. */
+  desiredProvider?: string | null;
   /**
    * The leading `CHARTER_PREVIEW_CHARS` characters of the charter, ellipsised
    * when clipped. The full text is detail data: `GET
@@ -363,10 +370,16 @@ function resolveInboxPage(page: InboxPage, meshChat: MeshChatRepository): InboxP
         messageId?: unknown;
       };
       if (typeof messageId !== "string") return entry;
-      const message = meshChat.getById(messageId);
+      // `content` is kept as-is so nothing that reads it today regresses;
+      // `reference` is the addition, so the dashboard can render an inbox item
+      // through the same widget as an obligation's cited artifacts. Only mesh
+      // chat resolves in v1 — every other payload keeps its raw JSON, which is
+      // the honest rendering until those sources have resolvers.
+      const reference = resolveReferenceSync(`mesh:messages/${messageId}`, { meshChat });
       return {
         ...entry,
-        payload: message ? { ...payload, content: message.body } : payload,
+        payload: reference.body !== null ? { ...payload, content: reference.body } : payload,
+        reference,
       };
     }),
   };
@@ -786,18 +799,18 @@ export function handleMeshApiRequest(
             return;
           }
           const body = parsed as Record<string, unknown>;
-          const ownerKind = (body.ownerKind ?? body.owner_kind) as string | undefined;
           const ownerId = (body.ownerId ?? body.owner_id) as string | undefined;
-          if (ownerKind !== "actor" && ownerKind !== "human") {
-            sendJson(res, 400, { error: "ownerKind must be 'actor' or 'human'" });
-            return;
-          }
           if (typeof ownerId !== "string" || !ownerId.trim()) {
             sendJson(res, 400, { error: "ownerId is required" });
             return;
           }
           const rawParentId = body.parentId ?? body.parent_id;
           const parentId = typeof rawParentId === "string" ? rawParentId.trim() : null;
+          const title = typeof body.title === "string" ? body.title : "";
+          if (!title.trim()) {
+            sendJson(res, 400, { error: "title is required" });
+            return;
+          }
           const intent = typeof body.intent === "string" ? body.intent : null;
           const rawExternalRef = body.externalRef ?? body.external_ref;
           const externalRef = typeof rawExternalRef === "string" ? rawExternalRef.trim() : null;
@@ -805,13 +818,26 @@ export function handleMeshApiRequest(
           const priority =
             typeof rawPriority === "number" && Number.isFinite(rawPriority) ? rawPriority : null;
 
+          const owner = resolveObligationOwner(deps.registry, ownerId);
+          if (!owner.ok) {
+            sendJson(res, 400, { error: owner.error });
+            return;
+          }
+
           try {
             const obligation = obligations.create({
-              owner: { kind: ownerKind, id: ownerId.trim() },
+              ownerId: owner.ownerId,
               parentId,
+              title,
               intent,
               externalRef,
               priority,
+              // The dashboard IS the operator, so the creator is bound here from
+              // the server's own identity — the same binding the actor MCP does
+              // with its actor id and the e2e control server does with this one.
+              // Missing it made every dashboard-created obligation
+              // creator-unknown, and #1671 forbids recovering that by inference.
+              creatorId: HUMAN_OPERATOR,
             });
             sendJson(res, 201, { obligation });
           } catch (err) {
@@ -850,14 +876,75 @@ export function handleMeshApiRequest(
             sendJson(res, 400, { error: "status must be 'done' or 'cancelled'" });
             return;
           }
+          // Free prose or nothing. A non-string `note` is dropped rather than
+          // coerced: "[object Object]" as a stated reason is worse than none.
+          const note = typeof body.note === "string" ? body.note : null;
+          const rawResolutionRef = body.resolutionRef ?? body.resolution_ref;
+          const resolutionRef =
+            typeof rawResolutionRef === "string" && rawResolutionRef.trim()
+              ? rawResolutionRef.trim()
+              : null;
           const existing = obligations.get(id);
           if (!existing) {
             sendJson(res, 404, { error: "obligation not found" });
             return;
           }
           try {
-            const obligation = obligations.setTerminalStatus(id, status);
+            const obligation = obligations.setTerminalStatus(id, status, note, resolutionRef);
             sendJson(res, 200, { ok: true, obligation });
+          } catch (err) {
+            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
+    // POST /api/mesh/obligations/:id/external-ref — link, relink or unlink the
+    // issue/PR/repo this obligation is. `externalRef: null` unlinks.
+    const externalRefMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)\/external-ref$/);
+    if (externalRefMatch) {
+      const obligations = deps?.obligations;
+      if (!obligations) {
+        sendJson(res, 503, { error: "obligations data unavailable" });
+        return true;
+      }
+      const id = decodeURIComponent(externalRefMatch[1]);
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            sendJson(res, 400, { error: "Missing or invalid body" });
+            return;
+          }
+          const body = parsed as Record<string, unknown>;
+          if (!Object.hasOwn(body, "externalRef") && !Object.hasOwn(body, "external_ref")) {
+            sendJson(res, 400, { error: "externalRef is required" });
+            return;
+          }
+          const raw = Object.hasOwn(body, "externalRef") ? body.externalRef : body.external_ref;
+          if (raw !== null && typeof raw !== "string") {
+            sendJson(res, 400, { error: "externalRef must be a string or null" });
+            return;
+          }
+          // A blank string means "unlink" rather than "the empty ref", so the
+          // UI can clear the field without a separate control.
+          const externalRef = raw === null || raw.trim() === "" ? null : raw.trim();
+          if (!obligations.get(id)) {
+            sendJson(res, 404, { error: "obligation not found" });
+            return;
+          }
+          try {
+            sendJson(res, 200, {
+              ok: true,
+              obligation: obligations.setExternalRef(id, externalRef),
+            });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
           }
@@ -977,12 +1064,7 @@ export function handleMeshApiRequest(
             return;
           }
           const body = parsed as Record<string, unknown>;
-          const ownerKind = (body.ownerKind ?? body.owner_kind) as string | undefined;
           const ownerId = (body.ownerId ?? body.owner_id) as string | undefined;
-          if (ownerKind !== "actor" && ownerKind !== "human") {
-            sendJson(res, 400, { error: "ownerKind must be 'actor' or 'human'" });
-            return;
-          }
           if (typeof ownerId !== "string" || !ownerId.trim()) {
             sendJson(res, 400, { error: "ownerId is required" });
             return;
@@ -991,11 +1073,13 @@ export function handleMeshApiRequest(
             sendJson(res, 404, { error: "obligation not found" });
             return;
           }
+          const owner = resolveObligationOwner(deps.registry, ownerId);
+          if (!owner.ok) {
+            sendJson(res, 400, { error: owner.error });
+            return;
+          }
           try {
-            const obligation = obligations.reassign(id, {
-              kind: ownerKind,
-              id: ownerId.trim(),
-            });
+            const obligation = obligations.reassign(id, owner.ownerId);
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1100,6 +1184,8 @@ export function handleMeshApiRequest(
         status: r.status,
         provider: r.provider ?? null,
         model: r.model ?? null,
+        desiredModel: r.desiredModel ?? null,
+        desiredProvider: r.desiredProvider ?? null,
         charterPreview: charterPreview(r.charter),
         title: r.title ?? summarizeCharter(r.charter),
         createdAt: r.createdAt,
@@ -1186,8 +1272,6 @@ export function handleMeshApiRequest(
       sendJson(res, 503, { error: "obligations data unavailable" });
       return true;
     }
-    const ownerKind =
-      url.searchParams.get("ownerKind") ?? url.searchParams.get("owner_kind") ?? undefined;
     const ownerId =
       url.searchParams.get("ownerId") ?? url.searchParams.get("owner_id") ?? undefined;
     const status = url.searchParams.get("status") ?? undefined;
@@ -1196,17 +1280,12 @@ export function handleMeshApiRequest(
     const limit = clampLimit(url);
     const offset = parsePositiveInt(url, "offset") ?? 0;
 
-    if (ownerKind && ownerKind !== "actor" && ownerKind !== "human") {
-      sendJson(res, 400, { error: "ownerKind must be 'actor' or 'human'" });
-      return true;
-    }
     if (status && !["ready", "waiting", "done", "cancelled"].includes(status)) {
       sendJson(res, 400, { error: "invalid status" });
       return true;
     }
 
     const page = deps.obligations.listPage({
-      ownerKind: ownerKind as "actor" | "human" | undefined,
       ownerId,
       status: status as ObligationStatus | undefined,
       rootsOnly,
@@ -1261,11 +1340,19 @@ export function handleMeshApiRequest(
       blockingOnly: true,
     });
     const parent = obligation.parentId ? deps.obligations.get(obligation.parentId) : null;
+    const artifacts = deps.obligations.listArtifacts(id).map((artifact) => ({
+      artifact,
+      // v1 resolves mesh chat only; anything else comes back with `unavailable`
+      // set, which the dashboard renders as a citation it cannot yet expand
+      // rather than as an empty one.
+      reference: resolveReferenceSync(artifact.ref, { meshChat: deps.meshChat }),
+    }));
     sendJson(res, 200, {
       obligation,
       parent,
       children: children.obligations,
       blockingChildren: blockingChildren.obligations,
+      artifacts,
     });
     return true;
   }

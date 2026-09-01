@@ -2,9 +2,14 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import { CONTEXT_SELECTIONS, resolveContextSelection } from "../actor/context-selection.js";
-import { type EventResource, resourceKey } from "../actor/event-subscriptions.js";
+import {
+  type EventResource,
+  normalizeEventResource,
+  resourceKey,
+} from "../actor/event-subscriptions.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
+import { githubBranchReference } from "../references/reference.js";
 import { toolError, toolOk } from "./result.js";
 import { HUMAN_OPERATOR, isHumanOperator } from "./stamp.js";
 import { createMcpServer } from "./strict-server.js";
@@ -62,6 +67,12 @@ export function createAgentExecMcpServer(
   );
 
   const eventResourceInputSchema = {
+    source: z
+      .string()
+      .optional()
+      .describe(
+        "Canonical URL-style reference string, e.g. github:owner/repo, github:owner/repo/issues/123, gchat:spaces/ABC, system:events."
+      ),
     kind: z
       .enum([
         "github_org",
@@ -73,7 +84,8 @@ export function createAgentExecMcpServer(
         "chat_space",
         "system",
       ])
-      .describe("The event source kind."),
+      .optional()
+      .describe("Legacy event source kind."),
     org: z.string().optional().describe("The organization name (required for github_org)."),
     repo: z
       .string()
@@ -96,7 +108,8 @@ export function createAgentExecMcpServer(
 
   const parseEventResource = (
     args: {
-      kind:
+      source?: string;
+      kind?:
         | "github_org"
         | "github_repo"
         | "github_issue"
@@ -113,33 +126,39 @@ export function createAgentExecMcpServer(
     },
     action = "subscription"
   ): EventResource => {
+    if (args.source) {
+      return normalizeEventResource(args.source);
+    }
     const { kind, org, repo, number, ref, space } = args;
+    if (!kind) {
+      throw new Error(`source or kind is required for ${action}`);
+    }
     if (kind === "chat") {
-      return { kind: "chat" };
+      return "gchat:spaces";
     }
     if (kind === "system") {
-      return { kind: "system" };
+      return "system:events";
     }
     if (kind === "chat_space") {
       if (!space) throw new Error(`space is required for chat_space ${action}`);
-      return { kind, space };
+      return `gchat:${space.startsWith("spaces/") ? space : `spaces/${space}`}`;
     }
     if (kind === "github_org") {
       if (!org) throw new Error(`org is required for github_org ${action}`);
-      return { kind, org };
+      return `github:${org}`;
     }
     if (kind === "github_repo") {
       if (!repo) throw new Error(`repo is required for github_repo ${action}`);
-      return { kind, repo };
+      return `github:${repo}`;
     }
     if (kind === "github_branch") {
       if (!repo) throw new Error(`repo is required for github_branch ${action}`);
       if (!ref) throw new Error(`ref is required for github_branch ${action}`);
-      return { kind, repo, ref };
+      return githubBranchReference(repo, ref);
     }
     if (!repo) throw new Error(`repo is required for ${kind} ${action}`);
     if (number === undefined) throw new Error(`number is required for ${kind} ${action}`);
-    return { kind, repo, number };
+    return `github:${repo}/${kind === "github_pr" ? "pulls" : "issues"}/${number}`;
   };
 
   const rec = mesh.registry.get(selfId);
@@ -482,9 +501,12 @@ export function createAgentExecMcpServer(
         ...eventResourceInputSchema,
       },
     },
-    async ({ child_thread_id, kind, org, repo, number, ref, space }) => {
+    async ({ child_thread_id, source, kind, org, repo, number, ref, space }) => {
       try {
-        const resource = parseEventResource({ kind, org, repo, number, ref, space }, "delegation");
+        const resource = parseEventResource(
+          { source, kind, org, repo, number, ref, space },
+          "delegation"
+        );
         mesh.delegateEventSource(resource, child_thread_id, selfId);
         return toolOk(`delegated ${resourceKey(resource)} to ${child_thread_id}`);
       } catch (err) {
@@ -501,9 +523,12 @@ export function createAgentExecMcpServer(
         "Reclaim an exact delegated event source back to yourself when you would be its effective owner after that exact delegation is removed.",
       inputSchema: eventResourceInputSchema,
     },
-    async ({ kind, org, repo, number, ref, space }) => {
+    async ({ source, kind, org, repo, number, ref, space }) => {
       try {
-        const resource = parseEventResource({ kind, org, repo, number, ref, space }, "reclaim");
+        const resource = parseEventResource(
+          { source, kind, org, repo, number, ref, space },
+          "reclaim"
+        );
         mesh.reclaimEventSource(resource, selfId);
         return toolOk(`reclaimed ${resourceKey(resource)}`);
       } catch (err) {
@@ -572,7 +597,7 @@ export function createAgentExecMcpServer(
       title: "Update an actor's model in-place",
       description:
         "Update an existing actor's model/tier in-place in the thread registry without service restart . " +
-        "Allowed for the actor's parent or root. Takes effect on the actor's next run. " +
+        "Allowed for the actor's parent, or root for any actor including itself. Takes effect at the end of the actor's current or next run. " +
         "Optionally moves portable (ledger/tail) actors across providers. " +
         "Preserves the actor's accumulated context and session history.",
       inputSchema: {

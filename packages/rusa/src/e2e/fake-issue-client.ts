@@ -24,12 +24,6 @@ import {
 } from "../gitops/issue-client.js";
 import type { LocalTracker, ReviewState } from "./local-tracker.js";
 
-/** Parse the issue number from a rusa branch name (mc/issue-{n}). */
-function parseIssueNumberFromBranch(branchName: string): number | null {
-  const match = branchName.match(/^mc\/issue-(\d+)$/);
-  return match ? Number.parseInt(match[1], 10) : null;
-}
-
 /** Maps the REST-shaped review event to the tracker's lowercase verdict. */
 const REVIEW_EVENT_TO_STATE: Record<CreatePullRequestReviewOptions["event"], ReviewState> = {
   APPROVE: "approved",
@@ -83,10 +77,7 @@ export class FakeIssueClient implements IssueClient {
   }
 
   async getOpenPullRequestsByAuthor(_repo: string, author: string): Promise<OpenPullRequest[]> {
-    return this.tracker
-      .listOpenPrsByAuthor(author)
-      .map((pr) => this.toOpenPullRequest(pr))
-      .filter((pr): pr is OpenPullRequest => pr.issueNumber !== null);
+    return this.tracker.listOpenPrsByAuthor(author).map((pr) => this.toOpenPullRequest(pr));
   }
 
   async getOpenPullRequests(_repo: string): Promise<OpenPullRequest[]> {
@@ -394,7 +385,6 @@ export class FakeIssueClient implements IssueClient {
       author: pr.author,
       labels: pr.labels,
       updatedAt: pr.updatedAt,
-      issueNumber: parseIssueNumberFromBranch(pr.headRef),
     };
   }
 }

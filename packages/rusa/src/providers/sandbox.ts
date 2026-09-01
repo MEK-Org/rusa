@@ -174,13 +174,13 @@ const SANDBOX_CODEX_SESSIONS_PATH = "/tmp/sessions";
  * wakes . Lives on host `/tmp` — shadowed from every sibling by their own
  * `--tmpfs /tmp` (the ISSUE_NUM/ISSUE_NUM sibling-shadow property), so a sibling codex
  * actor cannot read another's conversation — and `--bind`-ed into the owner's
- * sandbox at {@link SANDBOX_CODEX_SESSIONS_PATH}. Unlike the auth temp (a secret,
- * copy-and-discarded per run), this is the actor's MEMORY: it is deliberately
+ * sandbox at {@link SANDBOX_CODEX_SESSIONS_PATH}. Unlike the shared host auth file
+ * (account state), this is the actor's MEMORY: it is deliberately
  * NOT swept on run-end, retire, or boot, giving codex revive/redeploy continuity
  * parity with claude's persistent `~/.claude`. Only an actual machine reboot
  * clears it (host `/tmp`), after which the dangling registry sessionId falls back
  * to a fresh run (handled in codex.ts). Keyed by the actor id (= dir basename),
- * matching the `rusa-auth-codex-<id>` convention.
+ * keeping one rollout store per actor.
  */
 export function codexRolloutStoreDir(actorDir: string): string {
   return join("/tmp", `rusa-codex-sessions-${basename(realpathIfExists(actorDir))}`);
@@ -201,7 +201,7 @@ export function codexRolloutStoreDir(actorDir: string): string {
  * slice — a `sessions/` subdir and `session_index.jsonl` — laid out like KIMI_CODE_HOME so
  * each can be `--bind`-ed into place. It lives on host `/tmp` (shadowed from every sibling
  * by their own `--tmpfs /tmp`, so a sibling kimi actor cannot read another's transcript).
- * Like the codex rollout store — and unlike the per-run auth copies (credentials/oauth,
+ * Like the codex rollout store — and unlike the per-run kimi auth copies (credentials/oauth,
  * copy-and-discard) — this is the actor's MEMORY: NOT swept on run-end/retire/redeploy,
  * only a host reboot clears it (host `/tmp`). Keyed by actor id (= dir basename).
  */
@@ -692,8 +692,8 @@ function providerWritableStateDirs(authMode: SandboxAuthMode | undefined): strin
       return [];
     case "codex":
       // Codex CLI stores auth in ~/.codex/auth.json and config in ~/.codex/config.toml.
-      // Inside the sandbox we set CODEX_HOME=/tmp and bind temporary config/auth files
-      // to /tmp/config.toml and /tmp/auth.json, so no writable host state directory is required.
+      // Inside the sandbox we set CODEX_HOME=/tmp and bind the per-run config plus the
+      // shared host auth file to /tmp, so no writable host state directory is required.
       return [];
     case "copilot":
       return [getCopilotHomeConfigPath(), ...getCopilotXdgConfigPaths()];
@@ -858,19 +858,16 @@ function buildMeshActorBwrapArgs(o: {
   }
 
   if (o.authMode === "codex") {
-    // Copy auth.json from host ~/.codex/auth.json to a temp file in /tmp and bind it
+    // Every codex process must read and update the same live auth file. Refresh tokens
+    // rotate globally, so a per-run copy leaves the host with the consumed token when
+    // the copy is swept. Bind only auth.json writable: CODEX_HOME remains the sandbox's
+    // private /tmp, and config/session state stays isolated. Codex's file auth backend
+    // truncates and rewrites auth.json in place, so a file bind supports refresh without
+    // granting the worker write access to the rest of the host ~/.codex directory.
     const hostHome = getHostHomeDir();
     const hostAuthPath = join(hostHome, ".codex", "auth.json");
     if (existsSync(hostAuthPath)) {
-      try {
-        const authData = readFileSync(hostAuthPath);
-        const authTempPath = join("/tmp", `rusa-auth-codex-${basename(o.actorDir)}.json`);
-        writeFileSync(authTempPath, authData, { mode: 0o600 });
-        args.push("--bind", authTempPath, "/tmp/auth.json");
-        tempPaths.push(authTempPath);
-      } catch {
-        // best effort
-      }
+      args.push("--bind", hostAuthPath, "/tmp/auth.json");
     }
 
     // Cross-wake session continuity : persist codex's session rollouts in a
@@ -915,7 +912,8 @@ function buildMeshActorBwrapArgs(o: {
       }
     }
     // OAuth token: copy to a per-actor host-/tmp file and bind writable so token refresh
-    // can succeed within the run (discarded on run-end, same discipline as codex auth).
+    // can succeed within the run. This remains discard-on-run-end because kimi's token
+    // lifecycle is separate from codex's globally rotating shared refresh token.
     const kimiOauthSrc = join(kimiCodeDir, "oauth", "kimi-code");
     if (existsSync(kimiOauthSrc)) {
       try {
