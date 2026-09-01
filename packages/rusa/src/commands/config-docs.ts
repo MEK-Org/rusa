@@ -107,7 +107,7 @@ Top-level fields:
   voice                    Optional. Walkie-talkie transcription/TTS model and voice overrides .
                            The feature is enabled by geminiApiKey; this section only tunes it.
   invocationDebug          Optional. Full invocation artifact capture controls.
-  observability            Optional. Owner-label and stale-tracker automation controls.
+  observability            Optional. Operational alerting controls.
   understanding            Optional. Integrated Understanding settings (rootNodeId, glassGoals backend).
   glassGoals               Optional legacy IU storage section (prefer nesting under understanding.glassGoals).
   smokeTest                Optional legacy runtime smoke-test settings.

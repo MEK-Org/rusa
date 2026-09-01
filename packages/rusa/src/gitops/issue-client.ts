@@ -292,11 +292,7 @@ export interface IssueClient {
    * existing PR.
    */
   createPullRequest(opts: CreatePROptions): Promise<CreatedPullRequest>;
-  /**
-   * Query open pull requests created by a specific author. Returns every open
-   * PR by that author; `issueNumber` is a best-effort read of the branch name
-   * and is null when the branch names no issue.
-   */
+  /** Query every open pull request created by a specific author. */
   getOpenPullRequestsByAuthor(repo: string, author: string): Promise<OpenPullRequest[]>;
   /**
    * Query all open pull requests, on the same terms as the author-scoped call
