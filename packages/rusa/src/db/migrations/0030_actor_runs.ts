@@ -174,15 +174,42 @@ export const actorRuns: Migration = {
         completed && event.success !== null ? event.success : null,
         completed ? exitCode(event.detail) : null,
         completed ? event.body : null,
-        completed ? (stringField(endPayload, "yieldStatus") ?? yielded?.detail ?? null) : null,
-        completed ? (yielded?.body ?? null) : null,
-        completed ? (yielded?.ts ?? null) : null,
+        completed
+          ? (stringField(endPayload, "yieldStatus") ?? yielded?.detail ?? null)
+          : (yielded?.detail ?? null),
+        yielded?.body ?? null,
+        yielded?.ts ?? null,
         stringField(startPayload, "provider"),
         completed ? stringField(endPayload, "model") : null,
         completed ? null : event.detail,
-        completed ? (yielded?.id ?? null) : null
+        yielded?.id ?? null
       );
       open.delete(actorId);
+    }
+
+    // A process can disappear after run_start (including after a yielded note)
+    // without emitting either terminal event. Preserve that lifecycle as
+    // abandoned so a v2 cursor on its yield remains resolvable after upgrade.
+    for (const [actorId, run] of open) {
+      const startPayload = jsonObject(run.start.payload);
+      const yielded = run.yieldEvent;
+      insert.run(
+        run.start.id,
+        actorId,
+        run.start.ts,
+        yielded?.ts ?? run.start.ts,
+        "abandoned",
+        null,
+        null,
+        null,
+        yielded?.detail ?? null,
+        yielded?.body ?? null,
+        yielded?.ts ?? null,
+        stringField(startPayload, "provider"),
+        null,
+        "legacy run ended without a terminal event",
+        yielded?.id ?? null
+      );
     }
   },
 };

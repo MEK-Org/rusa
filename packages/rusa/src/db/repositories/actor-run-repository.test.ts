@@ -93,4 +93,25 @@ describe("ActorRunRepository", () => {
     expect(output).toContain("earlier chars truncated");
     expect(output.endsWith("TAIL")).toBe(true);
   });
+
+  it("abandons prior-process open runs while retaining their yield source", () => {
+    const id = runs.start({
+      id: "interrupted-run",
+      actorId: "actor-a",
+      startedAt: "2026-08-30T00:00:01.000Z",
+    });
+    runs.recordYield(id, "blocked", "waiting", "2026-08-30T00:00:02.000Z");
+
+    expect(
+      runs.abandonOpen("service restarted before run completion", "2026-08-30T00:00:03.000Z")
+    ).toBe(1);
+    expect(runs.getById(id)).toMatchObject({
+      outcome: "abandoned",
+      abandonReason: "service restarted before run completion",
+      yieldNote: "waiting",
+    });
+    expect(runs.listLedgerSourcesAfter("actor-a", null).sources).toEqual([
+      expect.objectContaining({ id, kind: "run_yielded", body: "waiting" }),
+    ]);
+  });
 });

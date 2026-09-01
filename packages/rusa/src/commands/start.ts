@@ -749,6 +749,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   initDb(mcHome);
   console.log("✓ Database ready");
 
+  const recoveredOpenRuns = getRepositories().actorRuns.abandonOpen(
+    "service restarted before run completion"
+  );
+  if (recoveredOpenRuns > 0) {
+    console.warn(`[mesh] recovered ${recoveredOpenRuns} unterminated actor run(s)`);
+  }
+
   const activeRunIds = new Map<string, string>();
   const beginActorRun = (actorId: string, providerName: string): string => {
     if (activeRunIds.has(actorId)) {
@@ -767,7 +774,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       output: result.output,
       yieldStatus: result.yieldStatus,
       yieldNote: result.yieldNote,
-      provider: result.tokenUsage?.provider,
       model: result.model,
     });
     activeRunIds.delete(actorId);

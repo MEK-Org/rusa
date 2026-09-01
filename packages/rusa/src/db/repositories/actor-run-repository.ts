@@ -118,7 +118,6 @@ export class ActorRunRepository {
       output: string;
       yieldStatus?: string;
       yieldNote?: string;
-      provider?: string | null;
       model?: string | null;
     }
   ): void {
@@ -134,7 +133,7 @@ export class ActorRunRepository {
                WHEN COALESCE(?, yield_status) IS NOT NULL THEN COALESCE(yielded_at, ?)
                ELSE yielded_at
              END,
-             provider = COALESCE(?, provider), model = ?
+             model = ?
          WHERE id = ? AND outcome IS NULL`
       )
       .run(
@@ -146,7 +145,6 @@ export class ActorRunRepository {
         yieldNote,
         opts.yieldStatus ?? null,
         endedAt,
-        opts.provider ?? null,
         opts.model ?? null,
         id
       );
@@ -162,6 +160,17 @@ export class ActorRunRepository {
       )
       .run(endedAt ?? new Date().toISOString(), reason, id);
     if (result.changes !== 1) throw new Error(`active actor run not found: ${id}`);
+  }
+
+  /** Close runs left open by a prior process before admitting new work. */
+  abandonOpen(reason: string, endedAt = new Date().toISOString()): number {
+    return this.db
+      .prepare(
+        `UPDATE actor_runs
+         SET ended_at = ?, outcome = 'abandoned', abandon_reason = ?
+         WHERE outcome IS NULL`
+      )
+      .run(endedAt, reason).changes;
   }
 
   getById(id: string): ActorRun | null {

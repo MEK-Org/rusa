@@ -35,7 +35,17 @@ describe("0030_actor_runs", () => {
         ('yield-event', '2026-08-30T00:00:03.000Z', 'run_yielded', 'actor-a', 'blocked',
           'waiting on review', NULL, NULL),
         ('end-1', '2026-08-30T00:00:04.000Z', 'run_end', 'actor-a', 'exit 0',
-          'durable output', '{"yieldStatus":"blocked","model":"gpt-5.5"}', 1);
+          'durable output', '{"yieldStatus":"blocked","model":"gpt-5.5"}', 1),
+        ('start-2', '2026-08-30T00:00:05.000Z', 'run_start', 'actor-b', NULL, NULL,
+          '{"provider":"claude"}', NULL),
+        ('yield-abandoned', '2026-08-30T00:00:06.000Z', 'run_yielded', 'actor-b', 'blocked',
+          'durable abandoned yield', NULL, NULL),
+        ('abandoned-2', '2026-08-30T00:00:07.000Z', 'run_abandoned', 'actor-b', 'unreported',
+          NULL, '{"started":true}', NULL),
+        ('start-3', '2026-08-30T00:00:08.000Z', 'run_start', 'actor-c', NULL, NULL,
+          '{"provider":"kimi"}', NULL),
+        ('yield-unterminated', '2026-08-30T00:00:09.000Z', 'run_yielded', 'actor-c', 'complete',
+          'durable unterminated yield', NULL, NULL);
     `);
 
     actorRuns.up(db);
@@ -62,5 +72,16 @@ describe("0030_actor_runs", () => {
     ).toEqual([["run_yielded", "waiting on review"]]);
     expect(repository.listLedgerSourcesAfter("actor-a", "yield-event").sources).toEqual([]);
     expect(repository.listRecentCompleted("actor-a", 10)[0]?.output).toBe("durable output");
+    expect(repository.getById("abandoned-2")).toMatchObject({
+      outcome: "abandoned",
+      yieldNote: "durable abandoned yield",
+    });
+    expect(repository.listLedgerSourcesAfter("actor-b", "yield-abandoned").sources).toEqual([]);
+    expect(repository.getById("start-3")).toMatchObject({
+      outcome: "abandoned",
+      yieldNote: "durable unterminated yield",
+      abandonReason: "legacy run ended without a terminal event",
+    });
+    expect(repository.listLedgerSourcesAfter("actor-c", "yield-unterminated").sources).toEqual([]);
   });
 });
