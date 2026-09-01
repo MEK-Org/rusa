@@ -45,6 +45,7 @@ describe("Database Migration System", () => {
       "quota_scrapes",
       "model_scrapes",
       "run_token_records",
+      "actor_runs",
       "obligations",
     ]) {
       expect(names.has(t)).toBe(true);
@@ -84,6 +85,7 @@ describe("Database Migration System", () => {
       "0027_obligation_title",
       "0028_obligation_artifacts",
       "0029_reference_grammar",
+      "0030_actor_runs",
     ]);
 
     const meshEventsColumns = (

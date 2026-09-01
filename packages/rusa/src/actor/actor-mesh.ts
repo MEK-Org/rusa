@@ -59,7 +59,7 @@ function eventResourceObligationKey(resource: EventResource): string | undefined
 export interface MeshActor {
   readonly id: string;
   requestRun(nudge?: RunNudge): void;
-  declareYield(status?: string): void;
+  declareYield(status?: string, note?: string): void;
   markUnkillable(): void;
   close(): void;
   readonly isRunning: boolean;
@@ -108,10 +108,10 @@ export type MessageDeliveryResult =
 /**
  * One thread's in-flight run.
  *
- * A run has no identity of its own in this mesh — everywhere a `runId` is carried it
- * holds the ACTOR's id (see the mechanical inbox forensics and the failure sink). So
- * the thread id plus its phase is the most specific name a run has here, and it is what
- * the retire refusal reports.
+ * Scheduling remains keyed by actor: the host-owned run journal carries the
+ * execution's durable identity, while this state only answers whether the one
+ * actor is queued, running, or winding down. The retire refusal therefore names
+ * the thread whose execution prevents retirement.
  */
 export interface ActiveRunState {
   actorId: string;
@@ -291,6 +291,8 @@ export interface ActorMeshOptions {
    * later, unrelated parent notification. Returns optional text to append.
    */
   onYield?: (actorId: string, ctx: { notifyingParent: boolean }) => string | null | undefined;
+  /** Persist the active run's yield fact and return its durable run id. */
+  recordRunYield?: (actorId: string, status: string, note?: string) => string | null;
   /**
    * Called once per actor at genuine birth — inside {@link spawn}, after the live
    * actor is registered — for out-of-band side effects the mesh doesn't own (e.g.
@@ -409,6 +411,7 @@ export class ActorMesh {
     actorId: string,
     ctx: { notifyingParent: boolean }
   ) => string | null | undefined;
+  private readonly recordRunYield?: ActorMeshOptions["recordRunYield"];
   private readonly onSpawn?: (record: ThreadRecord) => void;
   private readonly onRevive?: (record: ThreadRecord) => void;
   private readonly onCapabilityGranted?: (actorId: string, capability: string) => void;
@@ -501,6 +504,7 @@ export class ActorMesh {
     this.handleForId = opts.handleForId ?? generateHandle;
     this.onRetire = opts.onRetire;
     this.onYield = opts.onYield;
+    this.recordRunYield = opts.recordRunYield;
     this.onSpawn = opts.onSpawn;
     this.onRevive = opts.onRevive;
     this.onCapabilityGranted = opts.onCapabilityGranted;
@@ -1834,6 +1838,7 @@ export class ActorMesh {
   declareYield(id: string, status: string, note?: string): void {
     id = this.resolveThreadId(id);
     const actor = this.live.get(id);
+    const runId = actor ? (this.recordRunYield?.(id, status, note) ?? null) : null;
     this.recordEvent({
       kind: "run_yielded",
       actorId: id,
@@ -1844,7 +1849,7 @@ export class ActorMesh {
       this.log(`yield from ${id} dropped — no live actor`);
       return;
     }
-    actor.declareYield(status);
+    actor.declareYield(status, note);
     const parentId = this.registry.get(id)?.parentId;
     const inboxStore = this.inboxStore;
     const notifyingParent = !!(
@@ -1862,7 +1867,7 @@ export class ActorMesh {
         ? `[yield/${status}] ${id}${summary}\n\n${appendix}`
         : `[yield/${status}] ${id}${summary}`;
       this.deliverMechanicalInboxNotice(parentId, body, id, {
-        runId: id,
+        runId: runId ?? id,
         actorId: id,
         status,
       });

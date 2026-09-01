@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { ActorRunRepository } from "./actor-run-repository.js";
 import { InboxRepository } from "./inbox-repository.js";
 import { MaintenanceRepository } from "./maintenance-repository.js";
 import { MeshChatRepository } from "./mesh-chat-repository.js";
@@ -17,6 +18,7 @@ import { RawInputRepository } from "./raw-input-repository.js";
  *  - maintenance — the distillation work queue
  */
 export class Repositories {
+  readonly actorRuns: ActorRunRepository;
   readonly meshEvents: MeshEventRepository;
   readonly rawInputs: RawInputRepository;
   readonly maintenance: MaintenanceRepository;
@@ -27,6 +29,7 @@ export class Repositories {
   readonly obligations: ObligationRepository;
 
   constructor(db: Database.Database) {
+    this.actorRuns = new ActorRunRepository(db);
     this.meshEvents = new MeshEventRepository(db);
     this.rawInputs = new RawInputRepository(db);
     this.maintenance = new MaintenanceRepository(db);
@@ -50,6 +53,13 @@ export class Repositories {
   }
 }
 
+export type {
+  ActorRun,
+  ActorRunOutcome,
+  PortableLedgerSource,
+  PortableLedgerSourceKind,
+} from "./actor-run-repository.js";
+export { ActorRunRepository } from "./actor-run-repository.js";
 export { InboxRepository } from "./inbox-repository.js";
 export { MaintenanceRepository } from "./maintenance-repository.js";
 export type { MeshChat } from "./mesh-chat-repository.js";

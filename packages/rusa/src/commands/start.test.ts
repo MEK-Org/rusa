@@ -10,7 +10,7 @@ import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
-import { closeDb, getRepositories } from "../db/index.js";
+import { closeDb, getDb, getRepositories } from "../db/index.js";
 import type { GitHubPollingIssueClient, IssueClient } from "../gitops/issue-client.js";
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { stampAuthor } from "../mcp/stamp.js";
@@ -1681,6 +1681,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
           loadSessionId: () => string | undefined;
           saveSessionId: (id: string) => void;
           buildPrompt: () => { prompt: string; injectRecord?: { runCount: number } };
+          onRunStart?: (responsive: boolean) => void;
+          onRunEnd?: (result: {
+            success: boolean;
+            output: string;
+            exitCode: number;
+          }) => Promise<void>;
         };
       }
     ).opts;
@@ -1695,11 +1701,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
       sessionId: "stale-native",
     });
 
-    mesh.recordEvent({
-      kind: "run_end",
-      actorId: "root",
+    actorOpts.onRunStart?.(false);
+    await actorOpts.onRunEnd?.({
       success: true,
-      body: "PORTABLE_ROOT_CONTEXT_MARKER",
+      output: "PORTABLE_ROOT_CONTEXT_MARKER",
+      exitCode: 0,
     });
     const built = actorOpts.buildPrompt();
     expect(built.prompt).toContain("PORTABLE_ROOT_CONTEXT_MARKER");
@@ -1742,7 +1748,25 @@ describe("runStart webhook event routing (Phase 4)", () => {
           ...state,
           generation: state.generation + 1,
           updatedAt: now,
-          lastFoldedMessageEventId: messages.at(-1)?.id ?? null,
+          lastFoldedSourceId: messages.at(-1)?.id ?? null,
+          items: [
+            {
+              id: "mem-root-instruction",
+              kind: "decision" as const,
+              priority: "must" as const,
+              status: "active" as const,
+              statement: "The root instruction remains durable.",
+              evidence: [
+                {
+                  eventId: messages[0]?.id ?? "missing-source",
+                  sender: "operator",
+                  ts: messages[0]?.ts ?? now,
+                  quote: "Remember this root instruction.",
+                },
+              ],
+              updatedAt: now,
+            },
+          ],
         },
         quarantined: [],
         operations: 0,
@@ -1774,17 +1798,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
 
     if (!mesh) throw new Error("mesh not ready");
-    mesh.recordEvent({
-      kind: "message_received",
-      actorId: "root",
+    getRepositories().meshChat.record({
+      senderId: "operator",
+      recipientId: "root",
       body: "Remember this root instruction.",
-      payload: JSON.stringify({ from: "operator" }),
     });
     const rootActor = mesh.get("root");
     if (!rootActor) throw new Error("root actor not ready");
-    const onRunEnd = (
+    const actorOpts = (
       rootActor as unknown as {
         opts: {
+          buildPrompt: () => { prompt: string };
+          onRunStart?: (responsive: boolean) => void;
           onRunEnd?: (result: {
             success: boolean;
             output: string;
@@ -1792,21 +1817,47 @@ describe("runStart webhook event routing (Phase 4)", () => {
           }) => Promise<void>;
         };
       }
-    ).opts.onRunEnd;
-    await onRunEnd?.({ success: true, output: "root completed", exitCode: 0 });
+    ).opts;
+    actorOpts.onRunStart?.(false);
+    await actorOpts.onRunEnd?.({ success: true, output: "root completed", exitCode: 0 });
 
     expect(compactSpy).toHaveBeenCalledOnce();
     const state = JSON.parse(
       readFileSync(join(homeDir, "portable-context", "root.json"), "utf8")
-    ) as { generation: number; lastFoldedMessageEventId: string | null };
+    ) as { generation: number; lastFoldedSourceId: string | null };
     expect(state.generation).toBe(1);
-    expect(state.lastFoldedMessageEventId).toBeTruthy();
+    expect(state.lastFoldedSourceId).toBeTruthy();
     const compacted = getRepositories().meshEvents.listEventsByActors(["root"], {
       kinds: ["portable_context_compacted"],
       limit: 10,
     }).events;
     expect(compacted).toHaveLength(1);
     expect(compacted[0]?.detail).toContain("generation 1");
+
+    // mesh_events is an analytics stream, so pruning it must not remove live
+    // prompt state. Recent output comes from actor_runs, recent messages from
+    // mesh_chat, and compacted memory from the portable-context file.
+    getDb().exec("DELETE FROM mesh_events");
+    const built = actorOpts.buildPrompt();
+    expect(built.prompt).toContain("root completed");
+    expect(built.prompt).toContain("Remember this root instruction.");
+    expect(built.prompt).toContain("The root instruction remains durable.");
+
+    // The durable cursor must also advance after truncation, not merely render
+    // the already-materialized state.
+    getRepositories().meshChat.record({
+      senderId: "operator",
+      recipientId: "root",
+      body: "Fold this after truncation.",
+    });
+    actorOpts.onRunStart?.(false);
+    await actorOpts.onRunEnd?.({ success: true, output: "second run", exitCode: 0 });
+    expect(compactSpy).toHaveBeenCalledTimes(2);
+    const advancedState = JSON.parse(
+      readFileSync(join(homeDir, "portable-context", "root.json"), "utf8")
+    ) as { generation: number; lastFoldedSourceId: string | null };
+    expect(advancedState.generation).toBe(2);
+    expect(advancedState.lastFoldedSourceId).not.toBe(state.lastFoldedSourceId);
     compactSpy.mockRestore();
   });
 

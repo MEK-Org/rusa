@@ -113,7 +113,6 @@ import { DEFAULT_DEPLOY_BRANCH } from "../config/types.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import type { QuotaApiDeps } from "../dashboard/quota-api.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
-import { isSelfAuthoredLedgerSource } from "../db/repositories/mesh-event-repository.js";
 import type { ReadyHeadChange } from "../db/repositories/obligation-repository.js";
 import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
@@ -184,7 +183,7 @@ import {
   resolveRootProvider,
 } from "../providers/registry.js";
 import { assertBwrapAvailable, teardownFlutterOverlay } from "../providers/sandbox.js";
-import type { McpServerSpec } from "../providers/types.js";
+import type { McpServerSpec, RunResult } from "../providers/types.js";
 import { resolveQuotaDatabasePath, SharedQuotaStore } from "../quota/shared-store.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
 import { createCommitmentPolarityEvaluator } from "../understanding/commitment-polarity.js";
@@ -568,7 +567,7 @@ function saveRootSessionId(file: string, sessionId: string): void {
 
 /**
  * Assemble a portable-context (design ISSUE_NUM) actor's
- * stateless prefix from its own recent `run_end` outputs, plus the per-run inject
+ * stateless prefix from its own durable recent run outputs, plus the per-run inject
  * record that rides on the run's `run_start` event. Returns undefined when there's
  * nothing injectable yet (e.g. the actor's first run).
  *
@@ -583,25 +582,21 @@ function assemblePortableInjection(
   mode: "tail" | "ledger",
   store: PortableContextStore
 ): { priorContext: string; injectRecord: InjectRecord } | undefined {
-  const { events } = getRepositories().meshEvents.listEventsByActors([id], {
-    kinds: ["run_end"],
-    limit: portableContextMaxRuns(),
-  });
-  const runs = events.map((e) => ({ id: e.id, ts: e.ts, body: e.body }));
+  const repositories = getRepositories();
+  const runs = repositories.actorRuns
+    .listRecentCompleted(id, portableContextMaxRuns())
+    .map((run) => ({ id: run.id, ts: run.endedAt ?? run.startedAt, body: run.output }));
   const portable =
     mode === "ledger"
       ? assemblePortableContextV2({
           state: store.load(id),
-          messages: getRepositories()
-            .meshEvents.listEventsByActors([id], {
-              kinds: ["message_received"],
-              limit: portableContextMaxMessages(),
-            })
-            .events.map((event) => ({
-              id: event.id,
-              ts: event.ts,
-              sender: messageSender(event.payload) ?? "unknown",
-              body: event.body,
+          messages: repositories.meshChat
+            .listReceivedForActor(id, { limit: portableContextMaxMessages() })
+            .map((message) => ({
+              id: message.id,
+              ts: message.ts,
+              sender: message.senderId,
+              body: message.body,
             })),
           runs,
           // Read-through only. The prompt shows work state; it never authors it
@@ -624,16 +619,6 @@ function assembleConfiguredPortableInjection(
   return assemblePortableInjection(record.id, record.context.mode, store);
 }
 
-function messageSender(payload: string | null): string | null {
-  if (!payload) return null;
-  try {
-    const parsed = JSON.parse(payload) as { from?: unknown };
-    return typeof parsed.from === "string" ? parsed.from : null;
-  } catch {
-    return null;
-  }
-}
-
 export async function compactPortableContext(input: {
   actorId: string;
   store: PortableContextStore;
@@ -650,26 +635,26 @@ export async function compactPortableContext(input: {
   let foldStop: PortableContextCompactionSummary["foldStop"] = "drained";
   const quarantinedOperations: QuarantinedOperation[] = [];
   while (true) {
-    const page = getRepositories().meshEvents.listLedgerSourcesAfter(
+    const page = getRepositories().actorRuns.listLedgerSourcesAfter(
       input.actorId,
-      state.lastFoldedMessageEventId,
+      state.lastFoldedSourceId,
       50
     );
-    if (page.events.length === 0) break;
+    if (page.sources.length === 0) break;
     const result = await input.compactor.compact({
       actorId: input.actorId,
       state,
-      messages: page.events,
+      messages: page.sources,
       now: (input.now ?? (() => new Date().toISOString()))(),
     });
     state = result.state;
     quarantinedOperations.push(...result.quarantined);
     operations += result.operations;
     input.store.save(state);
-    folded += page.events.length;
-    foldedSelf += page.events.filter((event) => isSelfAuthoredLedgerSource(event.kind)).length;
-    bytes += page.events.reduce(
-      (sum, event) => sum + Buffer.byteLength(event.body ?? "", "utf8"),
+    folded += page.sources.length;
+    foldedSelf += page.sources.filter((source) => source.kind === "run_yielded").length;
+    bytes += page.sources.reduce(
+      (sum, source) => sum + Buffer.byteLength(source.body ?? "", "utf8"),
       0
     );
     pages += 1;
@@ -763,6 +748,44 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   console.log("Initializing database...");
   initDb(mcHome);
   console.log("✓ Database ready");
+
+  const recoveredOpenRuns = getRepositories().actorRuns.abandonOpen(
+    "service restarted before run completion"
+  );
+  if (recoveredOpenRuns > 0) {
+    console.warn(`[mesh] recovered ${recoveredOpenRuns} unterminated actor run(s)`);
+  }
+
+  const activeRunIds = new Map<string, string>();
+  const beginActorRun = (actorId: string, providerName: string): string => {
+    if (activeRunIds.has(actorId)) {
+      throw new Error(`actor already has an active durable run: ${actorId}`);
+    }
+    const runId = getRepositories().actorRuns.start({ actorId, provider: providerName });
+    activeRunIds.set(actorId, runId);
+    return runId;
+  };
+  const completeActorRun = (actorId: string, result: RunResult): string => {
+    const runId = activeRunIds.get(actorId);
+    if (!runId) throw new Error(`actor has no active durable run: ${actorId}`);
+    getRepositories().actorRuns.complete(runId, {
+      success: result.success,
+      exitCode: result.exitCode,
+      output: result.output,
+      yieldStatus: result.yieldStatus,
+      yieldNote: result.yieldNote,
+      model: result.model,
+    });
+    activeRunIds.delete(actorId);
+    return runId;
+  };
+  const abandonActorRun = (actorId: string, reason: string): string | null => {
+    const runId = activeRunIds.get(actorId);
+    if (!runId) return null;
+    getRepositories().actorRuns.abandon(runId, reason);
+    activeRunIds.delete(actorId);
+    return runId;
+  };
 
   // #1645 ready-head attention. Attached here, immediately after initDb, rather
   // than beside the mesh: `getRepositories()` throws once the database is
@@ -1432,6 +1455,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     },
     events: meshEvents,
     recordChat: (opts) => getRepositories().meshChat.record(opts),
+    recordRunYield: (actorId, status, note) => {
+      const runId = activeRunIds.get(actorId);
+      if (!runId) return null;
+      getRepositories().actorRuns.recordYield(runId, status, note);
+      return runId;
+    },
     capabilityGrants,
     eventSubscriptions,
     // Ownership authority for issue/PR event sources: a live
@@ -1807,7 +1836,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               detail: context.mode,
             });
           },
-          onRunStart: (responsive, injectRecord) =>
+          onRunStart: (responsive, injectRecord) => {
+            const providerName = providerThrottleKey(actor.getProvider().providerName, config);
+            const runId = beginActorRun(id, providerName);
             mesh.recordEvent({
               kind: "run_start",
               actorId: id,
@@ -1816,10 +1847,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                 : undefined,
               body: injectRecord ? JSON.stringify(injectRecord) : undefined,
               payload: JSON.stringify({
-                provider: providerThrottleKey(actor.getProvider().providerName, config),
+                provider: providerName,
                 responsive,
+                runId,
               }),
-            }),
+            });
+          },
           onFirstChunk: () =>
             mesh.recordEvent({
               kind: "run_first_chunk",
@@ -1832,21 +1865,24 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               detail: `count=${count} age=${ageMs}ms`,
             });
           },
-          onRunAbandoned: ({ reason, started }) =>
+          onRunAbandoned: ({ reason, started }) => {
+            if (started) abandonActorRun(id, reason);
             mesh.recordEvent({
               kind: "run_abandoned",
               actorId: id,
               detail: reason,
               payload: JSON.stringify({ started } satisfies RunAbandonedPayload),
-            }),
+            });
+          },
           onRunEnd: async (result) => {
+            const runId = completeActorRun(id, result);
             mesh.recordEvent({
               kind: "run_end",
               actorId: id,
               success: result.success,
               detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
               body: result.output,
-              payload: runEndPayload(result),
+              payload: runEndPayload({ ...result, runId }),
             });
             ctx.onRunEnd(result);
             const compacted = await compactPortableActorAfterRun(id);
@@ -2239,7 +2275,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           detail: context.mode,
         });
       },
-      onRunStart: (responsive, injectRecord) =>
+      onRunStart: (responsive, injectRecord) => {
+        const providerName = providerThrottleKey(provider.providerName, config);
+        const runId = beginActorRun(rootId, providerName);
         mesh.recordEvent({
           kind: "run_start",
           actorId: rootId,
@@ -2248,10 +2286,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             : undefined,
           body: injectRecord ? JSON.stringify(injectRecord) : undefined,
           payload: JSON.stringify({
-            provider: providerThrottleKey(provider.providerName, config),
+            provider: providerName,
             responsive,
+            runId,
           }),
-        }),
+        });
+      },
       onFirstChunk: () =>
         mesh.recordEvent({
           kind: "run_first_chunk",
@@ -2264,22 +2304,25 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           detail: `count=${count} age=${ageMs}ms`,
         });
       },
-      onRunAbandoned: ({ reason, started }) =>
+      onRunAbandoned: ({ reason, started }) => {
+        if (started) abandonActorRun(rootId, reason);
         mesh.recordEvent({
           kind: "run_abandoned",
           actorId: rootId,
           detail: reason,
           payload: JSON.stringify({ started } satisfies RunAbandonedPayload),
-        }),
+        });
+      },
       onRunEnd: async (result) => {
         mesh.finishInboxRun(rootId);
+        const runId = completeActorRun(rootId, result);
         mesh.recordEvent({
           kind: "run_end",
           actorId: rootId,
           success: result.success,
           detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
           body: result.output,
-          payload: runEndPayload(result),
+          payload: runEndPayload({ ...result, runId }),
         });
         const compacted = await compactPortableActorAfterRun(rootId);
         if (compacted) {

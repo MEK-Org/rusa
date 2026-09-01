@@ -1651,7 +1651,7 @@ describe("Actor", () => {
       const onRunEnd = vi.fn();
 
       const provider = new FakeProvider(async (opts: RunOptions) => {
-        actor.declareYield("blocked");
+        actor.declareYield("blocked", "waiting for reviewer");
         return new Promise<RunResult>((resolve) => {
           opts.signal?.addEventListener("abort", () => {
             resolve({
@@ -1677,6 +1677,7 @@ describe("Actor", () => {
           success: true,
           graceKilled: true,
           yieldStatus: "blocked",
+          yieldNote: "waiting for reviewer",
           exitCode: 143,
         })
       );

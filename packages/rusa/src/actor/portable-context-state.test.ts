@@ -36,6 +36,25 @@ describe("FilePortableContextStore", () => {
     expect(readdirSync(dir).some((name) => name.endsWith(".tmp"))).toBe(false);
   });
 
+  it("migrates a v2 event watermark to the durable-source cursor on load", () => {
+    const dir = mkdtempSync(join(tmpdir(), "portable-context-store-"));
+    dirs.push(dir);
+    const store = new FilePortableContextStore(dir);
+    const current = emptyPortableContextState("actor-a");
+    const legacy = {
+      ...current,
+      schemaVersion: 2,
+      lastFoldedSourceId: undefined,
+      lastFoldedMessageEventId: "legacy-message-event",
+    };
+    writeFileSync(store.pathFor("actor-a"), JSON.stringify(legacy), "utf8");
+
+    expect(store.load("actor-a")).toMatchObject({
+      schemaVersion: 3,
+      lastFoldedSourceId: "legacy-message-event",
+    });
+  });
+
   it("still loads a file holding retired kinds (ISSUE_NUM leg 3)", () => {
     // The load path `parse()`s persisted state, so the persisted kind enum is a
     // data-compatibility contract, not just a producer constraint. Narrowing it

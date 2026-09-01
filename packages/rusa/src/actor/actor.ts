@@ -271,6 +271,7 @@ export class Actor {
   private yielded = false;
   /** Status ('complete' | 'blocked') set when the actor calls its yield tool. */
   private yieldStatus?: string;
+  private yieldNote?: string;
   /** True when the last wake was gated off by {@link ActorOptions.beforeRun} (nothing ran). */
   private lastRunSkipped = false;
   /** True when the last run ended in a failure result (non-zero / threw). */
@@ -340,9 +341,10 @@ export class Actor {
    * period timer to forcefully kill the process if it does not exit promptly.
    * Stops the corrective run path; the actor next runs on a real external trigger.
    */
-  declareYield(status?: string): void {
+  declareYield(status?: string, note?: string): void {
     this.yielded = true;
     this.yieldStatus = status ?? "complete";
+    this.yieldNote = note;
     if (this.executing && !this.yieldGraceTimer) {
       this.yieldGraceTimer = setTimeout(() => {
         this.yieldGraceTimer = undefined;
@@ -498,6 +500,7 @@ export class Actor {
     // A yield only counts for the run it was declared in; clear any prior flag.
     this.yielded = false;
     this.yieldStatus = undefined;
+    this.yieldNote = undefined;
     this.runEndReported = false;
     this.runStartReported = false;
     this.currentRunStartTime = new Date();
@@ -751,6 +754,7 @@ export class Actor {
 
     if (this.yielded) {
       result.yieldStatus = this.yieldStatus ?? "complete";
+      result.yieldNote = this.yieldNote;
       if (wasGraceKilled) {
         // Fix ISSUE_NUM: when the supervisor's grace-kill follows a successful yield
         // in the same run, the run-end record must KEEP the yield's status

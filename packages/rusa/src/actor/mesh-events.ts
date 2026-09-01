@@ -52,7 +52,7 @@ export type MeshEventKind =
   // assembled the actor's own recent run outputs into a fresh, stateless prompt,
   // and the inject record rides on this event — `detail` appends a byte/run/hash
   // summary, `body` is the JSON inject record (byte count = the A/B primary
-  // metric, content hash, source run_end event ids). It's a facet of the run, not
+  // metric, content hash, source actor_run ids). It's a facet of the run, not
   // its own kind, so the A/B metric extraction reads injected-bytes-per-run off
   // `run_start`. `body` is absent on runs with no injection (native actors, an
   // owned actor's first run).
@@ -173,6 +173,8 @@ export const RUN_TERMINAL_EVENT_KINDS = [
  * and a reader must not substitute one — see `harness/model-identity.ts`.
  */
 export interface RunEndPayload {
+  /** Durable actor_runs identity for this execution. */
+  runId?: string;
   /** True when the supervisor grace-killed the run after the yield grace period. */
   graceKilled?: boolean;
   /** The declared yield status ('complete' | 'blocked') if the run yielded. */
@@ -193,8 +195,10 @@ export interface RunEndPayload {
  * rather than an object of nulls.
  */
 export function runEndPayload(result: RunEndPayload): string | undefined {
-  if (!result.graceKilled && !result.yieldStatus && !result.model) return undefined;
+  if (!result.runId && !result.graceKilled && !result.yieldStatus && !result.model)
+    return undefined;
   return JSON.stringify({
+    runId: result.runId,
     graceKilled: result.graceKilled,
     yieldStatus: result.yieldStatus,
     model: result.model,

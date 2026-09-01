@@ -83,6 +83,8 @@ export interface RunResult {
   graceKilled?: boolean;
   /** The declared yield status ('complete' | 'blocked') if the run yielded. */
   yieldStatus?: string;
+  /** The actor-authored summary supplied with yield_run, if any. */
+  yieldNote?: string;
   /** True when the run failure is due to continuation-cap exhaustion. */
   capped?: boolean;
   /**
