@@ -950,16 +950,22 @@ export class ObligationRepository {
    * reuse by a successor.
    */
   findLiveByExternalRef(ref: string): { ownerId: EntityId } | null {
+    const row = this.findLiveObligationByExternalRef(ref);
+    return row ? { ownerId: row.ownerId } : null;
+  }
+
+  /** The live obligation identity behind an external reference, for focus resolution. */
+  findLiveObligationByExternalRef(ref: string): { id: string; ownerId: EntityId } | null {
     const row = this.db
       .prepare(
-        `SELECT owner_id
+        `SELECT id, owner_id
          FROM obligations
          WHERE external_ref = ? COLLATE NOCASE
            AND status IN ('ready', 'waiting')
          LIMIT 1`
       )
-      .get(ref) as { owner_id: EntityId } | undefined;
-    return row ? { ownerId: row.owner_id } : null;
+      .get(ref) as { id: string; owner_id: EntityId } | undefined;
+    return row ? { id: row.id, ownerId: row.owner_id } : null;
   }
 
   /** Every artifact cited by an obligation, oldest first. */

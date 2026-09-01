@@ -1,0 +1,265 @@
+import type {
+  InboxFocusRepository,
+  InboxFocusResolution,
+} from "../db/repositories/inbox-focus-repository.js";
+import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
+import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import {
+  isTerminalObligationStatus,
+  type Obligation,
+  type ObligationArtifact,
+} from "../obligations/obligation.js";
+import type { InboxEntry } from "./inbox-store.js";
+
+const CONTEXT_CHILD_LIMIT = 10;
+const CONTEXT_SIBLING_RADIUS = 2;
+const CONTEXT_ARTIFACT_LIMIT = 10;
+const CONTEXT_INTENT_CHARS = 480;
+const CONTEXT_LABEL_CHARS = 160;
+const CONTEXT_EXCERPT_CHARS = 240;
+
+export interface InboxFocusObligation
+  extends Pick<
+    Obligation,
+    "id" | "parentId" | "ownerId" | "title" | "status" | "externalRef" | "resolutionRef"
+  > {
+  intent: string | null;
+  intentTruncated: boolean;
+}
+
+export interface InboxFocusArtifact
+  extends Pick<ObligationArtifact, "id" | "obligationId" | "ref" | "attachedAt"> {
+  label: string | null;
+  labelTruncated: boolean;
+  excerpt: string | null;
+  excerptTruncated: boolean;
+}
+
+export interface InboxObligationContext {
+  obligation: InboxFocusObligation;
+  parent: InboxFocusObligation | null;
+  grandparent: InboxFocusObligation | null;
+  liveChildren: {
+    items: InboxFocusObligation[];
+    total: number;
+    truncated: boolean;
+  };
+  liveSiblings: {
+    items: InboxFocusObligation[];
+    total: number;
+    truncated: boolean;
+  };
+  artifacts: {
+    items: InboxFocusArtifact[];
+    total: number;
+    truncated: boolean;
+  };
+}
+
+export interface ResolvedInboxFocus {
+  primaryObligationId: string | null;
+  resolution: InboxFocusResolution;
+  related: boolean | null;
+  diagnostics: string[];
+  context: InboxObligationContext | null;
+}
+
+function live(obligation: Obligation | null): obligation is Obligation {
+  return obligation !== null && !isTerminalObligationStatus(obligation.status);
+}
+
+/** Resolve and durably record the obligation one inbox selection advances. */
+export class InboxFocusResolver {
+  constructor(
+    private readonly focus: InboxFocusRepository,
+    private readonly obligations: ObligationRepository,
+    private readonly meshChat: MeshChatRepository
+  ) {}
+
+  select(input: {
+    runId: string;
+    actorId: string;
+    entries: InboxEntry[];
+    explicitObligationId?: string;
+  }): ResolvedInboxFocus {
+    const diagnostics: string[] = [];
+    const candidatesByEntry = new Map<string, string[]>();
+
+    for (const entry of input.entries) {
+      const ids = new Set<string>();
+      for (const id of this.focus.listEntryObligationIds(input.actorId, entry.id)) {
+        if (live(this.obligations.get(id))) ids.add(id);
+      }
+      if (entry.payload.type === "obligation.ready_head") {
+        const id = entry.payload.obligationId;
+        if (typeof id === "string" && live(this.obligations.get(id))) ids.add(id);
+      }
+      if (entry.source.startsWith("github:")) {
+        const linked = this.obligations.findLiveObligationByExternalRef(entry.source);
+        if (linked) ids.add(linked.id);
+      }
+      candidatesByEntry.set(entry.id, [...ids]);
+    }
+
+    const candidates = [...new Set([...candidatesByEntry.values()].flat())];
+    let primary: Obligation | null = null;
+    let resolution: InboxFocusResolution;
+
+    if (input.explicitObligationId !== undefined) {
+      const explicit = this.obligations.get(input.explicitObligationId);
+      if (!live(explicit)) {
+        throw new Error(`live obligation not found: ${input.explicitObligationId}`);
+      }
+      primary = explicit;
+      resolution = "explicit";
+    } else if (candidates.length === 0) {
+      resolution = "none";
+    } else {
+      const narrowest = candidates.filter((candidate) =>
+        candidates.every((other) => this.isAncestorOrSelf(other, candidate))
+      );
+      if (narrowest.length === 1) {
+        primary = this.obligations.require(narrowest[0]);
+        resolution = "inferred";
+      } else {
+        resolution = "ambiguous";
+        diagnostics.push(
+          `selection resolves to unrelated obligations: ${candidates.sort().join(", ")}; supply obligation_id to choose the primary focus`
+        );
+      }
+    }
+
+    const unrelated =
+      primary === null
+        ? []
+        : candidates.filter((candidate) => !this.related(primary.id, candidate));
+    const related = primary === null ? null : unrelated.length === 0;
+    if (primary && unrelated.length > 0) {
+      diagnostics.push(
+        `selected entries also resolve to obligations outside ${primary.id}'s ancestor/descendant chain: ${unrelated.sort().join(", ")}`
+      );
+    }
+
+    const associations = new Map<string, readonly string[]>();
+    for (const entry of input.entries) {
+      const candidatesForEntry = candidatesByEntry.get(entry.id) ?? [];
+      if (candidatesForEntry.length > 0) associations.set(entry.id, candidatesForEntry);
+      else if (primary) associations.set(entry.id, [primary.id]);
+    }
+    this.focus.recordSelection({
+      runId: input.runId,
+      actorId: input.actorId,
+      entryIds: input.entries.map((entry) => entry.id),
+      primaryObligationId: primary?.id ?? null,
+      resolution,
+      diagnostics,
+      associations,
+    });
+
+    return {
+      primaryObligationId: primary?.id ?? null,
+      resolution,
+      related,
+      diagnostics,
+      context: primary ? this.contextFor(primary, input.actorId) : null,
+    };
+  }
+
+  private related(left: string, right: string): boolean {
+    return this.isAncestorOrSelf(left, right) || this.isAncestorOrSelf(right, left);
+  }
+
+  private isAncestorOrSelf(ancestorId: string, descendantId: string): boolean {
+    let current = this.obligations.get(descendantId);
+    const seen = new Set<string>();
+    while (current) {
+      if (current.id === ancestorId) return true;
+      if (seen.has(current.id)) return false;
+      seen.add(current.id);
+      current = current.parentId ? this.obligations.get(current.parentId) : null;
+    }
+    return false;
+  }
+
+  private contextFor(obligation: Obligation, actorId: string): InboxObligationContext {
+    const parent = obligation.parentId ? this.obligations.get(obligation.parentId) : null;
+    const grandparent = parent?.parentId ? this.obligations.get(parent.parentId) : null;
+    const allChildren = this.obligations.listChildren(obligation.id).filter(live);
+    const allSiblings = parent
+      ? this.obligations.listChildren(parent.id).filter((candidate) => live(candidate))
+      : [];
+    const siblingIndex = allSiblings.findIndex((candidate) => candidate.id === obligation.id);
+    const siblingStart = Math.max(0, siblingIndex - CONTEXT_SIBLING_RADIUS);
+    const siblingEnd =
+      siblingIndex < 0
+        ? 0
+        : Math.min(allSiblings.length, siblingIndex + CONTEXT_SIBLING_RADIUS + 1);
+    const artifacts = this.obligations.listArtifacts(obligation.id);
+
+    return {
+      obligation: this.projectObligation(obligation),
+      parent: parent ? this.projectObligation(parent) : null,
+      grandparent: grandparent ? this.projectObligation(grandparent) : null,
+      liveChildren: {
+        items: allChildren
+          .slice(0, CONTEXT_CHILD_LIMIT)
+          .map((child) => this.projectObligation(child)),
+        total: allChildren.length,
+        truncated: allChildren.length > CONTEXT_CHILD_LIMIT,
+      },
+      liveSiblings: {
+        items: allSiblings
+          .slice(siblingStart, siblingEnd)
+          .map((sibling) => this.projectObligation(sibling)),
+        total: allSiblings.length,
+        truncated: siblingStart > 0 || siblingEnd < allSiblings.length,
+      },
+      artifacts: {
+        items: artifacts
+          .slice(0, CONTEXT_ARTIFACT_LIMIT)
+          .map((artifact) => this.hydrateArtifact(artifact, actorId)),
+        total: artifacts.length,
+        truncated: artifacts.length > CONTEXT_ARTIFACT_LIMIT,
+      },
+    };
+  }
+
+  private projectObligation(obligation: Obligation): InboxFocusObligation {
+    const intent = obligation.intent;
+    return {
+      id: obligation.id,
+      parentId: obligation.parentId,
+      ownerId: obligation.ownerId,
+      title: obligation.title,
+      status: obligation.status,
+      externalRef: obligation.externalRef,
+      resolutionRef: obligation.resolutionRef,
+      intent: intent?.slice(0, CONTEXT_INTENT_CHARS) ?? null,
+      intentTruncated: (intent?.length ?? 0) > CONTEXT_INTENT_CHARS,
+    };
+  }
+
+  private hydrateArtifact(artifact: ObligationArtifact, actorId: string): InboxFocusArtifact {
+    const label = artifact.label;
+    const projected = {
+      id: artifact.id,
+      obligationId: artifact.obligationId,
+      ref: artifact.ref,
+      attachedAt: artifact.attachedAt,
+      label: label?.slice(0, CONTEXT_LABEL_CHARS) ?? null,
+      labelTruncated: (label?.length ?? 0) > CONTEXT_LABEL_CHARS,
+    };
+    const match = /^mesh:messages\/([^/]+)$/.exec(artifact.ref);
+    if (!match) return { ...projected, excerpt: null, excerptTruncated: false };
+    const message = this.meshChat.getById(match[1]);
+    if (!message || (message.senderId !== actorId && message.recipientId !== actorId)) {
+      return { ...projected, excerpt: null, excerptTruncated: false };
+    }
+    const body = message.body.replace(/\s+/g, " ").trim();
+    return {
+      ...projected,
+      excerpt: body.slice(0, CONTEXT_EXCERPT_CHARS),
+      excerptTruncated: body.length > CONTEXT_EXCERPT_CHARS,
+    };
+  }
+}
