@@ -501,6 +501,50 @@ void main() {
     await store.dispose();
   });
 
+  test('live output is split into bounded lazy-render blocks', () async {
+    final api = FakeApi()..threadsResult = [makeThread('a')];
+    final stream = FakeStream();
+    final store = await _booted(api, stream);
+    store.clickActor('a');
+
+    final text = List.filled(40000, 'x').join();
+    stream.liveCtrl.add(LiveOutputChunk(actorId: 'a', text: text));
+    await pumpEventQueue();
+
+    expect(store.live.value.map((line) => line.text.length), [
+      16384,
+      16384,
+      7232,
+    ]);
+    expect(store.live.value.map((line) => line.text).join(), text);
+    await store.dispose();
+  });
+
+  test(
+    'live output retains at most 8 Mi code units and marks elision',
+    () async {
+      final api = FakeApi()..threadsResult = [makeThread('a')];
+      final stream = FakeStream();
+      final store = await _booted(api, stream);
+      store.clickActor('a');
+
+      final block = List.filled(LiveLine.maxRenderCodeUnits, 'x').join();
+      for (var i = 0; i < 520; i++) {
+        stream.liveCtrl.add(LiveOutputChunk(actorId: 'a', text: block));
+      }
+      await pumpEventQueue();
+
+      final retained = store.live.value;
+      expect(retained.first.isGap, isTrue);
+      expect(retained.where((line) => !line.isGap), hasLength(511));
+      expect(
+        retained.fold<int>(0, (total, line) => total + line.text.length),
+        lessThanOrEqualTo(8 * 1024 * 1024),
+      );
+      await store.dispose();
+    },
+  );
+
   test(
     'dotFor: retired wins; seeded run-state drives the dot; SSE transitions update it',
     () async {

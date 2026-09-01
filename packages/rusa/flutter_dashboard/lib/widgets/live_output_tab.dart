@@ -53,7 +53,8 @@ class _LiveOutputTabState extends State<LiveOutputTab> {
           }
           final multi = selection.length > 1;
           final handles = {
-            for (final a in widget.store.actorStates.value.actors.values) a.thread.id: a.thread.handle,
+            for (final a in widget.store.actorStates.value.actors.values)
+              a.thread.id: a.thread.handle,
           };
           // Only show the blinking cursor when a selected actor is genuinely
           // running; otherwise the run is over, so show an explicit idle marker
@@ -126,7 +127,10 @@ class _LiveOutputTabState extends State<LiveOutputTab> {
         out.add(_Block(actorId: '', text: '', isGap: true));
         continue;
       }
-      if (out.isNotEmpty && !out.last.isGap && out.last.actorId == l.actorId) {
+      if (out.isNotEmpty &&
+          !out.last.isGap &&
+          out.last.actorId == l.actorId &&
+          out.last.text.length + l.text.length <= LiveLine.maxRenderCodeUnits) {
         out.last.text += l.text;
       } else {
         out.add(_Block(actorId: l.actorId, text: l.text));
