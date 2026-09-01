@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import {
   asGitHubBranch,
@@ -396,7 +396,8 @@ export class UnionEventSubscriptionStore implements EventSubscriptionStore {
  * JSON-file-backed subscription store — the durable store, mirroring
  * {@link FileCapabilityGrantStore}: loads once on construction, rewrites the
  * whole file atomically on every mutation. A mutation becomes visible in memory
- * only after its snapshot is durable, so callers never receive a false success.
+ * only after its snapshot has been replaced, so callers never receive a false
+ * success for a failed write or rename.
  */
 export class FileEventSubscriptionStore implements EventSubscriptionStore {
   private mem = new InMemoryEventSubscriptionStore();
@@ -404,7 +405,8 @@ export class FileEventSubscriptionStore implements EventSubscriptionStore {
   constructor(
     private readonly file: string,
     rootId: string,
-    private readonly warn: (message: string) => void = console.warn
+    private readonly warn: (message: string) => void = console.warn,
+    private readonly replaceFile: typeof renameSync = renameSync
   ) {
     let raw: string;
     try {
@@ -418,6 +420,8 @@ export class FileEventSubscriptionStore implements EventSubscriptionStore {
     try {
       parsed = JSON.parse(raw);
     } catch (error) {
+      // Fail closed instead of silently booting with an empty routing authority.
+      // The source file remains untouched for manual repair.
       throw new Error(`invalid event subscription file: ${file}`, { cause: error });
     }
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -440,6 +444,7 @@ export class FileEventSubscriptionStore implements EventSubscriptionStore {
     const isUnversioned = document.version === undefined;
     const rows = (document.subscriptions ?? []) as unknown[];
     let rejected = 0;
+    const parsedRows: Array<{ index: number; subscription: EventSubscription }> = [];
     for (const [index, row] of rows.entries()) {
       try {
         const subscription = parsePersistedSubscription(row);
@@ -450,13 +455,66 @@ export class FileEventSubscriptionStore implements EventSubscriptionStore {
         ) {
           continue;
         }
-        this.mem.restore(subscription);
+        parsedRows.push({ index, subscription });
       } catch (error) {
         rejected += 1;
         this.warn(
           `[mesh] skipped event subscription row ${index + 1}: ${error instanceof Error ? error.message : String(error)}`
         );
       }
+    }
+
+    // Tombstones cannot contend for live ownership, so materialize them first.
+    // For conflicting active rows, prefer the most recent subscription rather
+    // than making JSON array order (normally oldest-first) the routing rule.
+    for (const { subscription } of parsedRows.filter(
+      ({ subscription }) => subscription.unsubscribedAt
+    )) {
+      this.mem.restore(subscription);
+    }
+    const activeRows = parsedRows.filter(({ subscription }) => !subscription.unsubscribedAt);
+    const activeWinners = new Map<string, (typeof activeRows)[number]>();
+    for (const row of activeRows) {
+      const prior = activeWinners.get(row.subscription.resource);
+      if (
+        !prior ||
+        row.subscription.subscribedAt > prior.subscription.subscribedAt ||
+        (row.subscription.subscribedAt === prior.subscription.subscribedAt &&
+          row.index > prior.index)
+      ) {
+        activeWinners.set(row.subscription.resource, row);
+      }
+    }
+    for (const row of activeRows) {
+      const { index, subscription } = row;
+      if (activeWinners.get(subscription.resource) !== row) {
+        rejected += 1;
+        this.warn(
+          `[mesh] skipped event subscription row ${index + 1}: ` +
+            `a newer active subscriber already owns ${subscription.resource}`
+        );
+        continue;
+      }
+      this.mem.restore(subscription);
+    }
+
+    if (rejected > 0) {
+      const recoveryFile = rejectedSnapshotPath(this.file, raw);
+      try {
+        writeFileSync(recoveryFile, raw, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      } catch (error) {
+        if (
+          (error as NodeJS.ErrnoException).code !== "EEXIST" ||
+          readFileSync(recoveryFile, "utf8") !== raw
+        ) {
+          throw new Error(`could not preserve rejected event subscription rows: ${recoveryFile}`, {
+            cause: error,
+          });
+        }
+      }
+      this.warn(
+        `[mesh] preserved ${rejected} rejected event subscription row(s) in ${recoveryFile}`
+      );
     }
 
     const needsMigrationFlush = isUnversioned || (document.version as number | undefined) !== 3;
@@ -470,13 +528,16 @@ export class FileEventSubscriptionStore implements EventSubscriptionStore {
   }
 
   private flush(subscriptions: EventSubscription[]): void {
+    // A same-directory temporary plus rename prevents a process interruption
+    // from exposing a partial JSON document. This is atomic replacement, not an
+    // fsync-based guarantee against host/power loss.
     const temporary = `${this.file}.${process.pid}.${randomUUID()}.tmp`;
     try {
       writeFileSync(temporary, JSON.stringify({ version: 3, subscriptions }, null, 2), {
         encoding: "utf8",
         mode: 0o600,
       });
-      renameSync(temporary, this.file);
+      this.replaceFile(temporary, this.file);
     } catch (error) {
       try {
         unlinkSync(temporary);
@@ -510,6 +571,11 @@ export class FileEventSubscriptionStore implements EventSubscriptionStore {
   activeForResource(resource: EventResource): EventSubscription[] {
     return this.mem.activeForResource(resource);
   }
+}
+
+function rejectedSnapshotPath(file: string, raw: string): string {
+  const digest = createHash("sha256").update(raw).digest("hex");
+  return `${file}.rejected-${digest}.json`;
 }
 
 function parsePersistedSubscription(value: unknown): EventSubscription {

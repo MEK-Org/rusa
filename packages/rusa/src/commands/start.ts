@@ -24,6 +24,8 @@ import { assertSpawnContextSupported } from "../actor/context-selection.js";
 import { E2EInstanceManager } from "../actor/e2e-instance-manager.js";
 import {
   type EventResource,
+  type EventSubscriptionAuditEvent,
+  type EventSubscriptionStore,
   FileEventSubscriptionStore,
   isSubResourceOf,
   missingAuditedEventSubscriptions,
@@ -548,6 +550,32 @@ export function mechanicallySubscribeCreatedResource(
       `[mesh] mechanical subscribe of ${resourceKey(resource)} to ${actorId} skipped: ${err instanceof Error ? err.message : String(err)}`
     );
   }
+}
+
+/**
+ * Warn about audit-confirmed configured subscriptions missing from the behavioral store.
+ * The audit stream is diagnostic only: this never reconstructs routing state from events.
+ */
+export function warnMissingConfiguredEventSubscriptionsAtBoot(
+  store: EventSubscriptionStore,
+  auditEvents: readonly EventSubscriptionAuditEvent[],
+  configuredRoots: readonly EventResource[],
+  warn: (message: string) => void = console.warn
+): Array<{ resource: EventResource; actorId: string }> {
+  const missing = missingAuditedEventSubscriptions(store, auditEvents).filter(({ resource }) =>
+    configuredRoots.some((configuredRoot) => isSubResourceOf(resource, configuredRoot))
+  );
+  if (missing.length === 0) return [];
+
+  const shown = missing.slice(0, 10);
+  const identities = shown.map(({ resource, actorId }) => `${resource} -> ${actorId}`).join(", ");
+  const remainder = missing.length - shown.length;
+  warn(
+    `[mesh] event subscription consistency: ${missing.length} ` +
+      `audit-confirmed active subscription(s) absent from the durable store: ${identities}` +
+      (remainder > 0 ? ` (+${remainder} more)` : "")
+  );
+  return missing;
 }
 
 function loadRootSessionId(file: string): string | undefined {
@@ -1235,18 +1263,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     join(mcHome, "event-subscriptions.json"),
     rootId
   );
-  const missingAuditedSubscriptions = missingAuditedEventSubscriptions(
+  warnMissingConfiguredEventSubscriptionsAtBoot(
     persistentEventSubscriptions,
-    eventSubscriptionAudit
-  ).filter(({ resource }) =>
-    configuredRoots.some((configuredRoot) => isSubResourceOf(resource, configuredRoot))
+    eventSubscriptionAudit,
+    configuredRoots
   );
-  if (missingAuditedSubscriptions.length > 0) {
-    console.warn(
-      `[mesh] event subscription consistency: ${missingAuditedSubscriptions.length} ` +
-        "audit-confirmed active subscription(s) absent from the durable store"
-    );
-  }
   // Host-plane host-jobs capability : durable per-actor job records, keyed
   // the same way capabilityGrants/eventSubscriptions are.
   const hostJobStore = new FileHostJobStore(join(mcHome, "host-jobs.json"));

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
 import { Actor, type RunAbandon } from "../actor/actor.js";
 import type { ActorMesh } from "../actor/actor-mesh.js";
+import { InMemoryEventSubscriptionStore } from "../actor/event-subscriptions.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
@@ -132,6 +133,7 @@ import {
   runStart,
   shouldBindDashboardServer,
   shouldBindWebhookServer,
+  warnMissingConfiguredEventSubscriptionsAtBoot,
 } from "./start.js";
 
 class MockIssueClient implements Partial<IssueClient & GitHubPollingIssueClient> {
@@ -250,6 +252,66 @@ describe("start command tests", () => {
         "github:other-org/repo/issues/72 to worker skipped: not anchored in config"
       )
     );
+  });
+
+  it("warns at boot with bounded identities only for configured missing subscriptions", () => {
+    const store = new InMemoryEventSubscriptionStore();
+    store.subscribe({
+      resource: "github:configured-org/repo/issues/2",
+      actorId: "durable-actor",
+      subscribedBy: "root",
+      subscribedAt: "2026-07-26T00:00:00Z",
+    });
+    const warn = vi.fn();
+    const missing = warnMissingConfiguredEventSubscriptionsAtBoot(
+      store,
+      [
+        {
+          kind: "event_source_subscribed",
+          actorId: "missing-actor",
+          detail: "github:configured-org/repo/issues/1",
+        },
+        {
+          kind: "event_source_subscribed",
+          actorId: "durable-actor",
+          detail: "github:configured-org/repo/issues/2",
+        },
+        {
+          kind: "event_source_subscribed",
+          actorId: "unanchored-actor",
+          detail: "github:other-org/repo/issues/3",
+        },
+      ],
+      ["github:configured-org"],
+      warn
+    );
+
+    expect(missing).toEqual([
+      { resource: "github:configured-org/repo/issues/1", actorId: "missing-actor" },
+    ]);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("github:configured-org/repo/issues/1 -> missing-actor")
+    );
+    expect(warn.mock.calls[0]?.[0]).not.toContain("unanchored-actor");
+  });
+
+  it("bounds boot consistency identities and reports the remainder", () => {
+    const warn = vi.fn();
+    const missing = warnMissingConfiguredEventSubscriptionsAtBoot(
+      new InMemoryEventSubscriptionStore(),
+      Array.from({ length: 12 }, (_, index) => ({
+        kind: "event_source_subscribed",
+        actorId: `actor-${index}`,
+        detail: `github:configured-org/repo/issues/${index + 1}`,
+      })),
+      ["github:configured-org"],
+      warn
+    );
+
+    expect(missing).toHaveLength(12);
+    expect(warn.mock.calls[0]?.[0]).toContain("issues/10 -> actor-9");
+    expect(warn.mock.calls[0]?.[0]).not.toContain("issues/11 -> actor-10");
+    expect(warn.mock.calls[0]?.[0]).toContain("(+2 more)");
   });
 
   it("binds the webhook server only in webhook ingestion mode outside e2e", () => {

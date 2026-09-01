@@ -1,7 +1,7 @@
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type EventResource,
   type EventSubscription,
@@ -183,12 +183,20 @@ describe("FileEventSubscriptionStore", () => {
     expect(readFileSync(file, "utf8")).toBe("{ this is not valid json ]");
   });
 
-  it("surfaces an atomic replace failure and does not publish the mutation in memory", () => {
-    const store = new FileEventSubscriptionStore(file, rootId);
-    mkdirSync(file);
+  it("preserves the prior snapshot when atomic replacement fails", () => {
+    const seed = new FileEventSubscriptionStore(file, rootId);
+    seed.subscribe(sub());
+    const priorSnapshot = readFileSync(file, "utf8");
+    const replaceFile = vi.fn(() => {
+      throw new Error("injected rename failure");
+    });
+    const store = new FileEventSubscriptionStore(file, rootId, () => {}, replaceFile);
 
-    expect(() => store.subscribe(sub())).toThrow();
-    expect(store.list()).toEqual([]);
+    expect(() => store.subscribe(sub({ resource: OTHER, actorId: ACTOR_B }))).toThrow(
+      /injected rename failure/
+    );
+    expect(readFileSync(file, "utf8")).toBe(priorSnapshot);
+    expect(store.list()).toEqual([expect.objectContaining({ actorId: ACTOR_A })]);
     expect(readdirSync(dir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
   });
 
@@ -219,9 +227,46 @@ describe("FileEventSubscriptionStore", () => {
     const warnings: string[] = [];
     const store = new FileEventSubscriptionStore(file, rootId, (message) => warnings.push(message));
 
-    expect(store.activeForResource(REPO).map((row) => row.actorId)).toEqual([ACTOR_A]);
+    expect(store.activeForResource(REPO).map((row) => row.actorId)).toEqual([ACTOR_B]);
     expect(store.activeForResource(OTHER).map((row) => row.actorId)).toEqual([ACTOR_B]);
-    expect(warnings).toHaveLength(2);
+    expect(
+      warnings.filter((message) => message.includes("skipped event subscription row"))
+    ).toHaveLength(2);
+    expect(warnings).toHaveLength(3);
+    expect(warnings.at(-1)).toContain("preserved 2 rejected");
+  });
+
+  it("quarantines rejected evidence before a later reconciliation rewrites the source", () => {
+    const original = JSON.stringify({
+      version: 3,
+      subscriptions: [sub({ actorId: ACTOR_A }), { resource: REPO, actorId: "" }],
+    });
+    writeFileSync(file, original);
+    const store = new FileEventSubscriptionStore(file, rootId, () => {});
+    const recovery = readdirSync(dir).find((name) => name.includes(".rejected-"));
+
+    expect(recovery).toBeDefined();
+    expect(readFileSync(join(dir, recovery as string), "utf8")).toBe(original);
+
+    reconcileEventSources(store, [OTHER], rootId, () => "2026-06-29T00:00:00Z");
+
+    expect(readFileSync(join(dir, recovery as string), "utf8")).toBe(original);
+    expect(readFileSync(file, "utf8")).not.toBe(original);
+    expect(JSON.parse(readFileSync(file, "utf8"))).toMatchObject({ version: 3 });
+  });
+
+  it("chooses the most recent active subscriber independently of file order", () => {
+    const older = sub({ actorId: ACTOR_A, subscribedAt: "2026-06-27T00:00:00Z" });
+    const newer = sub({ actorId: ACTOR_B, subscribedAt: "2026-06-29T00:00:00Z" });
+
+    for (const subscriptions of [
+      [older, newer],
+      [newer, older],
+    ]) {
+      writeFileSync(file, JSON.stringify({ version: 3, subscriptions }));
+      const store = new FileEventSubscriptionStore(file, rootId, () => {});
+      expect(store.activeForResource(REPO).map((row) => row.actorId)).toEqual([ACTOR_B]);
+    }
   });
 
   it("loads an inactive row without tripping over an earlier active holder", () => {
