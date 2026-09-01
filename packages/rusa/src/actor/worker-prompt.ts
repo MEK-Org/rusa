@@ -49,10 +49,7 @@ items. Use each candidate's identifiers to read its content from the source plus
 enough surrounding context to understand it. Do not infer content from metadata.
 After resolving candidates, coalesce related items, prioritize them, and choose a
 bounded work group with \`inbox.select\`. Pay attention to any \`hint\` returned on
-selected entries for channel-specific reply expectations or threading rules.
-Selection also returns the durable obligation focus and its bounded nearby context.
-When the entries do not resolve to one ancestor/descendant chain, pass
-\`obligation_id\` to name the primary focus explicitly. Mark
+selected entries for channel-specific reply expectations or threading rules. Mark
 an entry handled only after you have actually dealt with it; \`mark_handled\`
 accepts only entries selected in this run. Leave deferred work unhandled. If
 unhandled work remains when you finish, the mesh will queue a follow-up run.`;

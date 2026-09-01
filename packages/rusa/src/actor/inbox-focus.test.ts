@@ -6,10 +6,13 @@ import { InboxFocusRepository } from "../db/repositories/inbox-focus-repository.
 import { InboxRepository } from "../db/repositories/inbox-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import { deriveGitHubInboxNotification } from "../github/inbox-notification.js";
+import { resourceKey } from "./event-subscriptions.js";
 import { InboxFocusResolver } from "./inbox-focus.js";
 import type { InboxEntry } from "./inbox-store.js";
 
 describe("InboxFocusResolver", () => {
+  let db: Database.Database;
   let runs: ActorRunRepository;
   let inbox: InboxRepository;
   let focus: InboxFocusRepository;
@@ -18,13 +21,18 @@ describe("InboxFocusResolver", () => {
   let resolver: InboxFocusResolver;
 
   beforeEach(() => {
-    const db = new Database(":memory:");
+    db = new Database(":memory:");
     db.pragma("foreign_keys = ON");
     runMigrations(db);
     runs = new ActorRunRepository(db);
     inbox = new InboxRepository(db);
     focus = new InboxFocusRepository(db);
-    obligations = new ObligationRepository(db, (id) => id === "actor-a");
+    let now = Date.parse("2026-09-01T12:00:00.000Z");
+    obligations = new ObligationRepository(
+      db,
+      (id) => id === "actor-a",
+      () => now++
+    );
     chat = new MeshChatRepository(db);
     resolver = new InboxFocusResolver(focus, obligations, chat);
 
@@ -69,6 +77,12 @@ describe("InboxFocusResolver", () => {
       attachedBy: "actor-a",
       label: "human decision ".repeat(20),
     });
+    const notification = deriveGitHubInboxNotification("issues", {
+      action: "edited",
+      repository: { full_name: "MEK-Org/rusa" },
+      issue: { number: 143 },
+    });
+    if (!notification) throw new Error("GitHub notification not derived");
     const entries = append([
       {
         id: "head",
@@ -77,8 +91,8 @@ describe("InboxFocusResolver", () => {
       },
       {
         id: "issue",
-        source: "github:MEK-Org/rusa/issues/143",
-        payload: { type: "issues.edited" },
+        source: resourceKey(notification.resource),
+        payload: notification.payload,
       },
     ]);
     runs.start({ id: "run-1", actorId: "actor-a" });
@@ -133,6 +147,67 @@ describe("InboxFocusResolver", () => {
       related: true,
     });
     expect(focus.listEntryObligationIds("actor-a", "general")).toEqual(["issue-work"]);
+
+    runs.start({ id: "run-2b", actorId: "actor-a" });
+    resolver.select({
+      runId: "run-2b",
+      actorId: "actor-a",
+      entries: [entry] as InboxEntry[],
+      explicitObligationId: "sibling-work",
+    });
+    expect(focus.listEntryObligationIds("actor-a", "general")).toEqual([
+      "issue-work",
+      "sibling-work",
+    ]);
+  });
+
+  it("does not silently associate a general entry on inferred focus", () => {
+    const entries = append([
+      { id: "general", source: "mesh:root", payload: { type: "mesh.message" } },
+      {
+        id: "issue",
+        source: "github:MEK-Org/rusa/issues/143",
+        payload: { type: "issues.edited" },
+      },
+    ]);
+    runs.start({ id: "run-inferred", actorId: "actor-a" });
+
+    expect(resolver.select({ runId: "run-inferred", actorId: "actor-a", entries })).toMatchObject({
+      primaryObligationId: "issue-work",
+      resolution: "inferred",
+    });
+    expect(focus.listEntryObligationIds("actor-a", "general")).toEqual([]);
+  });
+
+  it("returns recent artifacts while retaining older resolution evidence", () => {
+    const resolution = obligations.attachArtifact("issue-work", "mesh:messages/resolution");
+    db.prepare("UPDATE obligations SET resolution_ref = ? WHERE id = ?").run(
+      resolution.ref,
+      "issue-work"
+    );
+    for (let index = 0; index < 12; index += 1) {
+      obligations.attachArtifact("issue-work", `mesh:messages/recent-${index}`);
+    }
+    const [entry] = append([
+      {
+        id: "issue-artifacts",
+        source: "github:MEK-Org/rusa/issues/143",
+        payload: { type: "issues.edited" },
+      },
+    ]);
+    runs.start({ id: "run-artifacts", actorId: "actor-a" });
+
+    const result = resolver.select({
+      runId: "run-artifacts",
+      actorId: "actor-a",
+      entries: [entry],
+    });
+    const refs = result.context?.artifacts.items.map((artifact) => artifact.ref) ?? [];
+    expect(refs).toHaveLength(10);
+    expect(refs).toContain("mesh:messages/resolution");
+    expect(refs).toContain("mesh:messages/recent-11");
+    expect(refs).not.toContain("mesh:messages/recent-0");
+    expect(result.context?.artifacts).toMatchObject({ total: 13, truncated: true });
   });
 
   it("records unrelated inference as an observe-first ambiguity without rejecting selection", () => {

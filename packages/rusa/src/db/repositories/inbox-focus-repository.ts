@@ -18,13 +18,14 @@ interface FocusRow {
   primary_obligation_id: string | null;
   resolution: InboxFocusResolution;
   selected_at: string;
+  entry_ids_json: string;
   diagnostics_json: string;
 }
 
-function parseDiagnostics(json: string): string[] {
+function parseStringArray(json: string, description: string): string[] {
   const value = JSON.parse(json) as unknown;
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
-    throw new Error("invalid actor run focus diagnostics");
+    throw new Error(`invalid actor run focus ${description}`);
   }
   return value;
 }
@@ -82,13 +83,15 @@ export class InboxFocusRepository {
       this.db
         .prepare(
           `INSERT INTO actor_run_focus
-             (run_id, actor_id, primary_obligation_id, resolution, selected_at, diagnostics_json)
-           VALUES (?, ?, ?, ?, ?, ?)
+             (run_id, actor_id, primary_obligation_id, resolution, selected_at,
+              entry_ids_json, diagnostics_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(run_id) DO UPDATE SET
              actor_id = excluded.actor_id,
              primary_obligation_id = excluded.primary_obligation_id,
              resolution = excluded.resolution,
              selected_at = excluded.selected_at,
+             entry_ids_json = excluded.entry_ids_json,
              diagnostics_json = excluded.diagnostics_json`
         )
         .run(
@@ -97,14 +100,9 @@ export class InboxFocusRepository {
           input.primaryObligationId,
           input.resolution,
           selectedAt.toISOString(),
+          JSON.stringify(entryIds),
           JSON.stringify(diagnostics)
         );
-      this.db.prepare("DELETE FROM actor_run_focus_entries WHERE run_id = ?").run(input.runId);
-      const insertEntry = this.db.prepare(
-        `INSERT INTO actor_run_focus_entries (run_id, actor_id, entry_id)
-         VALUES (?, ?, ?)`
-      );
-      for (const entryId of entryIds) insertEntry.run(input.runId, input.actorId, entryId);
 
       const insertAssociation = this.db.prepare(
         `INSERT INTO inbox_entry_obligations
@@ -138,20 +136,14 @@ export class InboxFocusRepository {
       | FocusRow
       | undefined;
     if (!row) return null;
-    const entries = this.db
-      .prepare(
-        `SELECT entry_id FROM actor_run_focus_entries
-         WHERE run_id = ? ORDER BY rowid`
-      )
-      .all(runId) as Array<{ entry_id: string }>;
     return {
       runId: row.run_id,
       actorId: row.actor_id,
       primaryObligationId: row.primary_obligation_id,
       resolution: row.resolution,
       selectedAt: row.selected_at,
-      diagnostics: parseDiagnostics(row.diagnostics_json),
-      entryIds: entries.map((entry) => entry.entry_id),
+      diagnostics: parseStringArray(row.diagnostics_json, "diagnostics"),
+      entryIds: parseStringArray(row.entry_ids_json, "entry ids"),
     };
   }
 

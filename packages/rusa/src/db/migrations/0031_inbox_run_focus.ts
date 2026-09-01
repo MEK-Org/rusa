@@ -16,25 +16,13 @@ export const inboxRunFocus: Migration = {
       CREATE TABLE actor_run_focus (
         run_id                TEXT PRIMARY KEY REFERENCES actor_runs(id) ON DELETE CASCADE,
         actor_id              TEXT NOT NULL CHECK (length(trim(actor_id)) > 0),
-        primary_obligation_id TEXT REFERENCES obligations(id) ON DELETE RESTRICT,
+        primary_obligation_id TEXT REFERENCES obligations(id) ON DELETE SET NULL,
         resolution            TEXT NOT NULL
           CHECK (resolution IN ('explicit', 'inferred', 'none', 'ambiguous')),
         selected_at           TEXT NOT NULL,
+        entry_ids_json        TEXT NOT NULL CHECK (json_valid(entry_ids_json)),
         diagnostics_json      TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(diagnostics_json))
       );
-
-      CREATE INDEX idx_actor_run_focus_actor_selected
-        ON actor_run_focus(actor_id, selected_at DESC, run_id DESC);
-
-      CREATE TABLE actor_run_focus_entries (
-        run_id   TEXT NOT NULL REFERENCES actor_run_focus(run_id) ON DELETE CASCADE,
-        actor_id TEXT NOT NULL CHECK (length(trim(actor_id)) > 0),
-        entry_id TEXT NOT NULL REFERENCES actor_inbox_entries(id) ON DELETE RESTRICT,
-        PRIMARY KEY (run_id, entry_id)
-      );
-
-      CREATE INDEX idx_actor_run_focus_entries_inbox
-        ON actor_run_focus_entries(actor_id, entry_id, run_id);
 
       CREATE TABLE inbox_entry_obligations (
         actor_id            TEXT NOT NULL CHECK (length(trim(actor_id)) > 0),
@@ -44,9 +32,6 @@ export const inboxRunFocus: Migration = {
         associated_by_run_id TEXT REFERENCES actor_runs(id) ON DELETE SET NULL,
         PRIMARY KEY (actor_id, entry_id, obligation_id)
       );
-
-      CREATE INDEX idx_inbox_entry_obligations_obligation
-        ON inbox_entry_obligations(obligation_id, actor_id, entry_id);
     `);
   },
 };

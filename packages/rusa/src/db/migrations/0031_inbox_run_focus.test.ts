@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { runMigrations } from "./runner.js";
 
 describe("0031_inbox_run_focus", () => {
-  it("creates durable run focus, selected-entry, and many-to-many association tables", () => {
+  it("creates durable run focus and many-to-many association tables", () => {
     const db = new Database(":memory:");
     db.pragma("foreign_keys = ON");
     runMigrations(db);
@@ -19,8 +19,11 @@ describe("0031_inbox_run_focus", () => {
           .all() as Array<{ name: string }>
       ).map((row) => row.name)
     );
-    expect(tables).toEqual(
-      new Set(["actor_run_focus", "actor_run_focus_entries", "inbox_entry_obligations"])
-    );
+    expect(tables).toEqual(new Set(["actor_run_focus", "inbox_entry_obligations"]));
+
+    const focusColumns = db.prepare("PRAGMA table_info(actor_run_focus)").all() as Array<{
+      name: string;
+    }>;
+    expect(focusColumns.map((column) => column.name)).toContain("entry_ids_json");
   });
 });

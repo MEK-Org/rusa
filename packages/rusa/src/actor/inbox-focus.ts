@@ -9,6 +9,7 @@ import {
   type Obligation,
   type ObligationArtifact,
 } from "../obligations/obligation.js";
+import { asGitHubIssue, parseReference } from "../references/reference.js";
 import type { InboxEntry } from "./inbox-store.js";
 
 const CONTEXT_CHILD_LIMIT = 10;
@@ -84,6 +85,7 @@ export class InboxFocusResolver {
   }): ResolvedInboxFocus {
     const diagnostics: string[] = [];
     const candidatesByEntry = new Map<string, string[]>();
+    const obligationBackedEntries = new Set<string>();
 
     for (const entry of input.entries) {
       const ids = new Set<string>();
@@ -92,11 +94,16 @@ export class InboxFocusResolver {
       }
       if (entry.payload.type === "obligation.ready_head") {
         const id = entry.payload.obligationId;
-        if (typeof id === "string" && live(this.obligations.get(id))) ids.add(id);
+        if (typeof id === "string" && live(this.obligations.get(id))) {
+          ids.add(id);
+          obligationBackedEntries.add(entry.id);
+        }
       }
-      if (entry.source.startsWith("github:")) {
-        const linked = this.obligations.findLiveObligationByExternalRef(entry.source);
+      const githubRef = this.githubWorkRef(entry.source);
+      if (githubRef) {
+        const linked = this.obligations.findLiveObligationByExternalRef(githubRef);
         if (linked) ids.add(linked.id);
+        obligationBackedEntries.add(entry.id);
       }
       candidatesByEntry.set(entry.id, [...ids]);
     }
@@ -141,10 +148,10 @@ export class InboxFocusResolver {
     }
 
     const associations = new Map<string, readonly string[]>();
-    for (const entry of input.entries) {
-      const candidatesForEntry = candidatesByEntry.get(entry.id) ?? [];
-      if (candidatesForEntry.length > 0) associations.set(entry.id, candidatesForEntry);
-      else if (primary) associations.set(entry.id, [primary.id]);
+    if (resolution === "explicit" && primary) {
+      for (const entry of input.entries) {
+        if (!obligationBackedEntries.has(entry.id)) associations.set(entry.id, [primary.id]);
+      }
     }
     this.focus.recordSelection({
       runId: input.runId,
@@ -167,6 +174,16 @@ export class InboxFocusResolver {
 
   private related(left: string, right: string): boolean {
     return this.isAncestorOrSelf(left, right) || this.isAncestorOrSelf(right, left);
+  }
+
+  /** Exact issue/PR reference emitted by the shared GitHub inbox grammar. */
+  private githubWorkRef(source: string): string | null {
+    try {
+      const parsed = parseReference(source);
+      return asGitHubIssue(parsed) ? parsed.key : null;
+    } catch {
+      return null;
+    }
   }
 
   private isAncestorOrSelf(ancestorId: string, descendantId: string): boolean {
@@ -194,7 +211,7 @@ export class InboxFocusResolver {
       siblingIndex < 0
         ? 0
         : Math.min(allSiblings.length, siblingIndex + CONTEXT_SIBLING_RADIUS + 1);
-    const artifacts = this.obligations.listArtifacts(obligation.id);
+    const artifacts = this.contextArtifacts(obligation);
 
     return {
       obligation: this.projectObligation(obligation),
@@ -215,13 +232,31 @@ export class InboxFocusResolver {
         truncated: siblingStart > 0 || siblingEnd < allSiblings.length,
       },
       artifacts: {
-        items: artifacts
-          .slice(0, CONTEXT_ARTIFACT_LIMIT)
-          .map((artifact) => this.hydrateArtifact(artifact, actorId)),
-        total: artifacts.length,
-        truncated: artifacts.length > CONTEXT_ARTIFACT_LIMIT,
+        items: artifacts.items.map((artifact) => this.hydrateArtifact(artifact, actorId)),
+        total: artifacts.total,
+        truncated: artifacts.truncated,
       },
     };
+  }
+
+  /** Keep the newest bounded window while never dropping cited resolution evidence. */
+  private contextArtifacts(obligation: Obligation): {
+    items: ObligationArtifact[];
+    total: number;
+    truncated: boolean;
+  } {
+    const all = this.obligations.listArtifacts(obligation.id);
+    let items = all.slice(-CONTEXT_ARTIFACT_LIMIT);
+    const resolution = obligation.resolutionRef
+      ? all.find((artifact) => artifact.ref === obligation.resolutionRef)
+      : undefined;
+    if (resolution && !items.some((artifact) => artifact.id === resolution.id)) {
+      items = [resolution, ...items.slice(-(CONTEXT_ARTIFACT_LIMIT - 1))].sort(
+        (left, right) =>
+          left.attachedAt.localeCompare(right.attachedAt) || left.id.localeCompare(right.id)
+      );
+    }
+    return { items, total: all.length, truncated: all.length > items.length };
   }
 
   private projectObligation(obligation: Obligation): InboxFocusObligation {

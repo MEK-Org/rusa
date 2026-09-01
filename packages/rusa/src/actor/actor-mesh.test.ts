@@ -2603,6 +2603,24 @@ describe("ActorMesh", () => {
     expect(retirement.registry.get(generatedRootId)?.status).toBe("retired");
   });
 
+  it("installs the handled-entry guard only after durable selection succeeds", () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh } = setup({ inboxStore });
+    const [entry] = inboxStore.append([
+      { actorId: "root", source: "mesh:parent", payload: payload("mesh.message") },
+    ]);
+
+    expect(() =>
+      mesh.selectInboxEntries("root", [entry.id], () => {
+        throw new Error("durable focus rejected");
+      })
+    ).toThrow("durable focus rejected");
+    expect(mesh.selectedInboxEntries("root")).toEqual([]);
+
+    expect(mesh.selectInboxEntries("root", [entry.id], () => {})).toEqual([entry]);
+    expect(mesh.selectedInboxEntries("root")).toEqual([entry.id]);
+  });
+
   it("reviveThread flips retired -> active, recreates the actor, keeps sessionId, and runs onRevive", async () => {
     const revived: string[] = [];
     const { mesh, registry, tick } = setup({

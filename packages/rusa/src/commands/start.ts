@@ -50,7 +50,7 @@ import {
 import { handleHostJobExit } from "../actor/host-job-exit.js";
 import { ensureWakeOnExitScript } from "../actor/host-job-runner.js";
 import { FileHostJobStore } from "../actor/host-job-store.js";
-import { InboxFocusResolver } from "../actor/inbox-focus.js";
+import { InboxFocusResolver, type ResolvedInboxFocus } from "../actor/inbox-focus.js";
 import type { InboxEntry, InboxStore } from "../actor/inbox-store.js";
 import {
   type MeshEventSink,
@@ -1664,17 +1664,21 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const inboxUrl = mcpHttp.addServer(`${id}:${INBOX_MCP_NAME}`, () =>
           createInboxMcpServer(inboxStore, id, {
             select: (entryIds, obligationId) => {
-              const entries = mesh.selectInboxEntries(id, entryIds);
               const runId = activeRunIds.get(id);
               if (!runId) throw new Error(`actor has no active durable run: ${id}`);
-              return {
-                entries,
-                focus: inboxFocusResolver.select({
+              let focus: ResolvedInboxFocus | undefined;
+              const entries = mesh.selectInboxEntries(id, entryIds, (selectedEntries) => {
+                focus = inboxFocusResolver.select({
                   runId,
                   actorId: id,
-                  entries,
+                  entries: selectedEntries,
                   explicitObligationId: obligationId,
-                }),
+                });
+              });
+              if (!focus) throw new Error(`run focus was not resolved for actor: ${id}`);
+              return {
+                entries,
+                focus,
               };
             },
             selected: () => mesh.selectedInboxEntries(id),
@@ -2092,17 +2096,21 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const rootInboxUrl = mcpHttp.addServer(`${rootId}:${INBOX_MCP_NAME}`, () =>
     createInboxMcpServer(inboxStore, rootId, {
       select: (entryIds, obligationId) => {
-        const entries = mesh.selectInboxEntries(rootId, entryIds);
         const runId = activeRunIds.get(rootId);
         if (!runId) throw new Error(`actor has no active durable run: ${rootId}`);
-        return {
-          entries,
-          focus: inboxFocusResolver.select({
+        let focus: ResolvedInboxFocus | undefined;
+        const entries = mesh.selectInboxEntries(rootId, entryIds, (selectedEntries) => {
+          focus = inboxFocusResolver.select({
             runId,
             actorId: rootId,
-            entries,
+            entries: selectedEntries,
             explicitObligationId: obligationId,
-          }),
+          });
+        });
+        if (!focus) throw new Error(`run focus was not resolved for actor: ${rootId}`);
+        return {
+          entries,
+          focus,
         };
       },
       selected: () => mesh.selectedInboxEntries(rootId),
