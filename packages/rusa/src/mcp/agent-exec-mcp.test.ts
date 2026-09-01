@@ -225,6 +225,7 @@ describe("agent-execution MCP server", () => {
         charter: "implement X",
         provider: "claude",
         model: "claude-sonnet-4-6",
+        effort: "high",
         max_runs: 5,
       },
     })) as CallToolResult;
@@ -235,6 +236,7 @@ describe("agent-execution MCP server", () => {
     expect(rec?.charter).toBe("implement X");
     expect(rec?.provider).toBe("claude");
     expect(rec?.model).toBe("claude-sonnet-4-6");
+    expect(rec?.effort).toBe("high");
     expect(rec?.budget?.maxRuns).toBe(5);
     // The caller got a handle to its new child.
     expect(registry.get("root")?.handles).toEqual([{ id: "t1" }]);
@@ -1403,6 +1405,33 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     });
   });
 
+  it("set_actor_model stages and clears effort without repeating model", async () => {
+    const { mesh, registry } = setup();
+    const childId = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      effort: "medium",
+    });
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+    const stage = (await client.callTool({
+      name: "set_actor_model",
+      arguments: { actor_id: childId, effort: "xhigh" },
+    })) as CallToolResult;
+    expect(stage.isError).toBeFalsy();
+    expect(registry.get(childId)?.desiredModel).toBeUndefined();
+    expect(registry.get(childId)?.desiredEffort).toBe("xhigh");
+
+    const clear = (await client.callTool({
+      name: "set_actor_model",
+      arguments: { actor_id: childId, effort: null },
+    })) as CallToolResult;
+    expect(clear.isError).toBeFalsy();
+    expect(registry.get(childId)?.desiredEffort).toBeNull();
+  });
+
   it("set_thread_model fails when an actor tries to raise its own tier", async () => {
     const { mesh } = setup();
     const childId = mesh.spawn({
@@ -1451,7 +1480,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     })) as CallToolResult;
     expect(res1.isError).toBeFalsy();
     expect((res1.content[0] as { text: string }).text).toContain(
-      `set model for ${portableChild} to gemini-3.7-flash-high (provider: antigravity)`
+      `staged model gemini-3.7-flash-high, provider antigravity for ${portableChild}`
     );
     expect(registry.get(portableChild)?.provider).toBe("claude");
     expect(registry.get(portableChild)?.model).toBe("claude-opus-4-8");

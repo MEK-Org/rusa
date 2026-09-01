@@ -120,5 +120,7 @@ export interface CodingProvider {
   name: string;
   providerName: string;
   model?: string;
+  /** Explicit provider-native reasoning level; absent means provider default. */
+  effort?: string;
   run(opts: RunOptions): Promise<RunResult>;
 }

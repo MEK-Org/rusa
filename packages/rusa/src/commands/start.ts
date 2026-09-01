@@ -173,17 +173,14 @@ import { resolveObligationOwner } from "../obligations/owner.js";
 import { DiskUsageAlert } from "../observability/disk-alert.js";
 import { antigravityScratchDir } from "../providers/antigravity.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
-import {
-  ingestKimiHostModels,
-  populateModelCatalogsFromDb,
-  validateModelPin,
-} from "../providers/model-catalog.js";
+import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
 import { refreshConfiguredProviderModelCatalogs } from "../providers/model-scrape.js";
 import {
   DEFAULT_ROOT_PROVIDER,
   normalizeFallbackModel,
   resolveProvider,
   resolveRootProvider,
+  validateProviderSelection,
 } from "../providers/registry.js";
 import { assertBwrapAvailable, teardownFlutterOverlay } from "../providers/sandbox.js";
 import type { McpServerSpec, RunResult } from "../providers/types.js";
@@ -1486,15 +1483,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       if (!provider) throw new Error("provider is required");
       const model = req.model?.trim();
       if (!model) throw new Error("model is required");
-      validateModelPin(provider, model);
+      return validateProviderSelection(config, provider, model, req.effort);
     },
-    validateModel: (record, newModel, newProvider) => {
+    validateModel: (record, newModel, newProvider, newEffort) => {
       const effectiveProvider =
         (newProvider?.trim() || record.provider) ??
         config.rootActor?.provider ??
         DEFAULT_ROOT_PROVIDER;
-      validateModelPin(effectiveProvider, newModel);
-      resolveProvider(config, effectiveProvider, newModel);
+      return validateProviderSelection(config, effectiveProvider, newModel, newEffort);
     },
     events: meshEvents,
     recordChat: (opts) => getRepositories().meshChat.record(opts),
@@ -1577,11 +1573,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     onRetire: (record) => {
       teardownActorMcp(record.id);
     },
-    onModelSet: (actorId, newModel, record) => {
+    onModelSet: (actorId, _newModel, record) => {
       try {
         const effectiveProvider =
           record.provider ?? config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER;
-        const updatedProvider = resolveProvider(config, effectiveProvider, newModel);
+        const updatedProvider = resolveProvider(
+          config,
+          effectiveProvider,
+          record.model,
+          record.effort
+        );
         const liveActor = mesh.get(actorId);
         if (liveActor && typeof liveActor.setProvider === "function") {
           liveActor.setProvider(updatedProvider);
@@ -1614,7 +1615,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           workerProvider = resolveProvider(
             config,
             rec.provider ?? config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER,
-            rec.model
+            rec.model,
+            rec.effort
           );
         } catch (err) {
           const reason = err instanceof Error ? err.message : String(err);
@@ -1892,6 +1894,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               body: injectRecord ? JSON.stringify(injectRecord) : undefined,
               payload: JSON.stringify({
                 provider: providerName,
+                model: actor.getProvider().model,
+                effort: actor.getProvider().effort,
                 responsive,
                 runId,
               }),
@@ -2283,7 +2287,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         ? {
             models: fallbackModels,
             resolveProvider: (model) =>
-              resolveProvider(config, config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER, model),
+              resolveProvider(
+                config,
+                config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER,
+                model,
+                config.rootActor?.effort
+              ),
             classify: classifyExhaustion,
           }
         : undefined,
@@ -2337,6 +2346,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           body: injectRecord ? JSON.stringify(injectRecord) : undefined,
           payload: JSON.stringify({
             provider: providerName,
+            model: provider.model,
+            effort: provider.effort,
             responsive,
             runId,
           }),
@@ -2401,6 +2412,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     isRoot: true,
     provider: config.rootActor?.provider,
     model: config.rootActor?.model,
+    effort: config.rootActor?.effort,
     context: config.rootActor?.context,
     sessionId:
       config.rootActor?.context?.type === "portable" ? undefined : loadRootSessionId(sessionFile),

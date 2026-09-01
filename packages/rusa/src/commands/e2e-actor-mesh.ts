@@ -354,6 +354,7 @@ export function startRootControlServer(opts: {
               charter: typeof body.charter === "string" ? body.charter : "",
               provider: typeof body.provider === "string" ? body.provider : "",
               model: typeof body.model === "string" ? body.model : "",
+              effort: typeof body.effort === "string" ? body.effort : undefined,
               maxRuns: typeof body.maxRuns === "number" ? body.maxRuns : undefined,
               title: typeof body.title === "string" ? body.title : undefined,
               context,

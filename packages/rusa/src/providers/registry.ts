@@ -6,21 +6,36 @@ import { CopilotProvider } from "./copilot.js";
 import { FakeProvider } from "./fake-provider.js";
 import { KimiProvider } from "./kimi.js";
 import { validateModelPin } from "./model-catalog.js";
+import type { ModelEffortSelection } from "./reasoning-effort.js";
+import { normalizeModelEffortSelection, validateReasoningEffort } from "./reasoning-effort.js";
 import type { CodingProvider } from "./types.js";
 
 // Keyed by CLI command (the `cliCommand` resolved in getProvider). Antigravity's
 // binary is `agy`, so it registers under "agy" while its provider name is
 // "antigravity".
-const providerConstructors: Record<
-  string,
-  (name: string, config: ProviderConfig, model?: string) => CodingProvider
-> = {
-  claude: (name, config, model) => new ClaudeProvider(name, config, model),
-  codex: (name, config, model) => new CodexProvider(name, config, model),
-  agy: (name, config, model) => new AntigravityProvider(name, config, model),
-  kimi: (name, config, model) => new KimiProvider(name, config, model),
-  copilot: (name, config, model) => new CopilotProvider(name, config, model),
-  fake: (name, _config, _model) => new FakeProvider(undefined, name),
+interface ProviderAdapter {
+  create: (name: string, config: ProviderConfig, model?: string, effort?: string) => CodingProvider;
+  /** Native CLI vocabulary. Absent means the adapter has no effort control. */
+  efforts?: readonly string[];
+}
+
+const providerAdapters: Readonly<Record<string, ProviderAdapter>> = {
+  claude: {
+    create: (name, config, model, effort) => new ClaudeProvider(name, config, model, effort),
+    efforts: ["low", "medium", "high", "xhigh", "max"],
+  },
+  codex: {
+    create: (name, config, model, effort) => new CodexProvider(name, config, model, effort),
+    efforts: ["none", "low", "medium", "high", "xhigh", "max"],
+  },
+  agy: {
+    create: (name, config, model, effort) =>
+      new AntigravityProvider(name, config, model, undefined, effort),
+    efforts: ["low", "medium", "high"],
+  },
+  kimi: { create: (name, config, model) => new KimiProvider(name, config, model) },
+  copilot: { create: (name, config, model) => new CopilotProvider(name, config, model) },
+  fake: { create: (name) => new FakeProvider(undefined, name) },
 };
 
 /** Returns the effective provider config for a given provider name. */
@@ -34,6 +49,50 @@ function getEffectiveProviderConfig(
 /** Default root provider when `config.rootActor` is unset — `agy` (Antigravity). */
 export const DEFAULT_ROOT_PROVIDER = "antigravity";
 
+/** The native CLI capability family behind a logical provider config key. */
+function providerCapabilityName(providerName: string, config: RusaConfig): string {
+  return getEffectiveProviderConfig(providerName, config)?.cliCommand?.trim() || providerName;
+}
+
+/**
+ * The single config-aware validation and normalization boundary for a requested
+ * provider/model/effort combination. Config ingress, spawn, live
+ * reconfiguration, and provider construction all route through this function.
+ */
+export function validateProviderSelection(
+  config: RusaConfig,
+  providerName: string,
+  model?: string,
+  effort?: string
+): ModelEffortSelection {
+  const providerConfig = getEffectiveProviderConfig(providerName, config);
+  if (!providerConfig) {
+    throw new Error(
+      `provider "${providerName}" is not configured under "providers" in config.yaml`
+    );
+  }
+  const capabilityName = providerCapabilityName(providerName, config);
+  const selection = normalizeModelEffortSelection(capabilityName, model, effort);
+  if (model !== undefined && !selection.model) {
+    throw new Error(
+      `empty model slug requested for provider "${providerName}" — refusing to fall back to the provider's default model `
+    );
+  }
+  if (selection.model) {
+    const validation = validateModelPin(capabilityName, selection.model);
+    if (validation.status === "unknown") {
+      console.warn(`[model-catalog] ${validation.warning}`);
+    }
+  }
+  validateReasoningEffort(
+    providerName,
+    selection.model,
+    selection.effort,
+    providerAdapters[capabilityName]?.efforts
+  );
+  return selection;
+}
+
 /**
  * Resolve the provider the root actor runs on. Config-driven and intentionally
  * independent of the DB enabled-models / persona quota routing — the root model
@@ -43,13 +102,13 @@ export const DEFAULT_ROOT_PROVIDER = "antigravity";
  */
 export function resolveRootProvider(config: RusaConfig): CodingProvider {
   const providerName = config.rootActor?.provider?.trim() || DEFAULT_ROOT_PROVIDER;
-  const model = config.rootActor?.model?.trim() || undefined;
-  if (!getEffectiveProviderConfig(providerName, config)) {
-    throw new Error(
-      `rootActor.provider "${providerName}" is not configured under "providers" in config.yaml`
-    );
-  }
-  return instantiateProvider(providerName, model, config);
+  const selection = validateProviderSelection(
+    config,
+    providerName,
+    config.rootActor?.model,
+    config.rootActor?.effort
+  );
+  return instantiateProvider(providerName, selection.model, selection.effort, config);
 }
 
 /**
@@ -77,26 +136,11 @@ export function normalizeFallbackModel(config: RusaConfig): string[] | undefined
 export function resolveProvider(
   config: RusaConfig,
   providerName: string,
-  model?: string
+  model?: string,
+  effort?: string
 ): CodingProvider {
-  if (!getEffectiveProviderConfig(providerName, config)) {
-    throw new Error(
-      `provider "${providerName}" is not configured under "providers" in config.yaml`
-    );
-  }
-  const trimmedModel = model?.trim();
-  if (model !== undefined && !trimmedModel) {
-    throw new Error(
-      `empty model slug requested for provider "${providerName}" — refusing to fall back to the provider's default model `
-    );
-  }
-  if (trimmedModel) {
-    const validation = validateModelPin(providerName, trimmedModel);
-    if (validation.status === "unknown") {
-      console.warn(`[model-catalog] ${validation.warning}`);
-    }
-  }
-  return instantiateProvider(providerName, trimmedModel, config);
+  const selection = validateProviderSelection(config, providerName, model, effort);
+  return instantiateProvider(providerName, selection.model, selection.effort, config);
 }
 
 /**
@@ -108,6 +152,7 @@ export function resolveProvider(
 function instantiateProvider(
   providerName: string,
   modelName: string | undefined,
+  effort: string | undefined,
   config: RusaConfig
 ): CodingProvider {
   const providerConfig = getEffectiveProviderConfig(providerName, config);
@@ -117,15 +162,20 @@ function instantiateProvider(
 
   // Display name is "model (provider)" for CLI execution, or just the provider
   // name when no model is pinned (the CLI then uses its default).
-  const displayName = modelName ? `${modelName} (${providerName})` : providerName;
+  const selectionName = modelName
+    ? `${modelName}${effort ? ` @ ${effort}` : ""}`
+    : effort
+      ? `default @ ${effort}`
+      : undefined;
+  const displayName = selectionName ? `${selectionName} (${providerName})` : providerName;
 
   const command = providerConfig.cliCommand ?? providerName;
-  const ctor = providerConstructors[command];
-  if (!ctor) {
+  const adapter = providerAdapters[command];
+  if (!adapter) {
     throw new Error(
       `No implementation for CLI command "${command}" (requested by provider "${providerName}")`
     );
   }
 
-  return ctor(displayName, providerConfig, modelName);
+  return adapter.create(displayName, providerConfig, modelName, effort);
 }

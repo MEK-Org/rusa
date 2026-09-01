@@ -113,6 +113,50 @@ describe("loadConfig rootActor.context", () => {
   });
 });
 
+describe("loadConfig rootActor effort", () => {
+  it("normalizes first-class effort and legacy Codex model qualifiers", () => {
+    const explicit = loadConfig(
+      writeConfig({
+        rootActor: { provider: "codex", model: "gpt-5.6-sol", effort: "HIGH" },
+      })
+    );
+    expect(explicit.rootActor).toMatchObject({
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      effort: "high",
+    });
+
+    const legacy = loadConfig(
+      writeConfig({ rootActor: { provider: "codex", model: "gpt-5.6-sol extra-high" } })
+    );
+    expect(legacy.rootActor).toMatchObject({
+      model: "gpt-5.6-sol",
+      effort: "xhigh",
+    });
+  });
+
+  it("rejects an effort unsupported by the selected provider", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          providers: { kimi: { cliCommand: "kimi" } },
+          rootActor: { provider: "kimi", model: "kimi-code", effort: "high" },
+        })
+      )
+    ).toThrow(/does not expose a reasoning-effort control/);
+  });
+
+  it("validates effort against the CLI behind a logical provider name", () => {
+    const config = loadConfig(
+      writeConfig({
+        providers: { strong: { cliCommand: "claude" } },
+        rootActor: { provider: "strong", model: "claude-opus-4-8", effort: "MAX" },
+      })
+    );
+    expect(config.rootActor).toMatchObject({ provider: "strong", effort: "max" });
+  });
+});
+
 describe("loadConfig mistralApiKey (optional)", () => {
   it("keeps an explicit mistralApiKey", () => {
     expect(loadConfig(writeConfig({ mistralApiKey: "mistral-test" })).mistralApiKey).toBe(

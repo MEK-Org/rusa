@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -170,5 +170,29 @@ describe("FileThreadRegistry", () => {
     expect(r2.get("a")?.status).toBe("retired");
     expect(r2.get("a")?.sessionId).toBe("s1");
     expect(r2.get("a")?.handles).toEqual([{ id: "b", role: "reviewer" }]);
+  });
+
+  it("migrates recognized legacy Codex effort qualifiers on load", () => {
+    const file = makeFile();
+    writeFileSync(
+      file,
+      JSON.stringify({
+        threads: [
+          rec("codex-worker", {
+            provider: "codex",
+            model: "gpt-5.6-sol extra-high",
+            desiredModel: "gpt-5.6-sol medium",
+          }),
+        ],
+      })
+    );
+
+    const record = new FileThreadRegistry(file).get("codex-worker");
+    expect(record).toMatchObject({
+      model: "gpt-5.6-sol",
+      effort: "xhigh",
+      desiredModel: "gpt-5.6-sol",
+      desiredEffort: "medium",
+    });
   });
 });

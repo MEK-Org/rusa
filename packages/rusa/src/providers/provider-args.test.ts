@@ -51,6 +51,18 @@ describe("buildClaudeArgs", () => {
     expect(args[i + 1]).toBe("claude-opus-4-8");
   });
 
+  it("passes an explicit effort independently from model", () => {
+    const args = buildClaudeArgs({
+      prompt: "hi",
+      model: "claude-opus-4-8",
+      effort: "max",
+    });
+    expect(args.slice(args.indexOf("--effort"), args.indexOf("--effort") + 2)).toEqual([
+      "--effort",
+      "max",
+    ]);
+  });
+
   it("omits MCP/session flags when not requested", () => {
     const args = buildClaudeArgs({ prompt: "hi" });
     expect(args).not.toContain("--resume");
@@ -115,6 +127,19 @@ describe("buildAntigravityArgs", () => {
     });
     expect(args[args.indexOf("--conversation") + 1]).toBe("conv-123");
     expect(args[args.indexOf("--model") + 1]).toBe("Gemini 3.1 Pro (High)");
+  });
+
+  it("passes an explicit effort independently from model", () => {
+    const args = buildAntigravityArgs({
+      prompt: "hi",
+      model: "gemini-3.7-flash",
+      effort: "high",
+      timeoutMs: 60_000,
+    });
+    expect(args.slice(args.indexOf("--effort"), args.indexOf("--effort") + 2)).toEqual([
+      "--effort",
+      "high",
+    ]);
   });
 
   it("omits --conversation when starting fresh", () => {

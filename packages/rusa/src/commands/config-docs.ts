@@ -46,6 +46,7 @@ Minimal example:
   rootActor:
     provider: antigravity
     # model: "Gemini 3.1 Pro (High)"   # optional; omit for the provider default
+    # effort: high                    # optional provider-native reasoning level
     # context:                       # optional; omit for native provider sessions
     #   type: portable
     #   mode: ledger                # ledger (requires geminiApiKey) or tail
@@ -145,6 +146,8 @@ rootActor:
 
   provider                 Required. Provider key (in providers) the root actor runs on.
   model                    Optional. Model id passed to the provider CLI's --model. Provider default if omitted.
+  effort                   Optional. Provider-native reasoning level, stored independently from model. Omit to
+                           preserve the provider/model default.
   fallbackModel            Optional string or list. Model(s) the root actor falls back to when the primary
                            model is overloaded or unavailable, tried in order via a freshly resolved
                            provider (root-only — ISSUE_NUM; providers.<name>.fallbackModel is rejected).

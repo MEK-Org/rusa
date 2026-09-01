@@ -2689,6 +2689,7 @@ describe("ActorMesh", () => {
       onModelSet: (actorId, newModel) => modelSets.push({ actorId, newModel }),
       validateModel: (_record, newModel) => {
         if (newModel === "forbidden-model") throw new Error("forbidden model");
+        return { model: newModel };
       },
     });
     const parent = mesh.spawn({ charter: "parent", parentId: "root", model: "claude-sonnet-5" });
@@ -2741,6 +2742,51 @@ describe("ActorMesh", () => {
     // Validation hook failure aborts before patching registry
     expect(() => mesh.setActorModel(child, "forbidden-model", parent)).toThrow(/forbidden model/);
     expect(registry.get(child)?.model).toBe("claude-opus-4-8");
+  });
+
+  it("persists, updates, and clears effort independently at run boundaries", async () => {
+    const events: MeshEventInput[] = [];
+    const validations: Array<{ model: string; effort?: string }> = [];
+    const { mesh, registry, tick } = setup({
+      events: (event) => events.push(event),
+      validateModel: (_record, model, _provider, effort) => {
+        validations.push({ model, effort });
+        return { model, effort };
+      },
+    });
+    const child = mesh.spawn({
+      charter: "codex child",
+      parentId: "root",
+      provider: "codex",
+      model: "gpt-5.6-sol high",
+    });
+    expect(registry.get(child)).toMatchObject({
+      model: "gpt-5.6-sol",
+      effort: "high",
+    });
+
+    mesh.setActorModel(child, undefined, "root", undefined, "xhigh");
+    expect(registry.get(child)?.effort).toBe("high");
+    expect(registry.get(child)?.desiredEffort).toBe("xhigh");
+    mesh.sendMessage(child, "apply effort", "root");
+    await tick();
+    expect(registry.get(child)?.effort).toBe("xhigh");
+    expect(registry.get(child)?.desiredEffort).toBeUndefined();
+    expect(validations).toContainEqual({ model: "gpt-5.6-sol", effort: "xhigh" });
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "actor_model_set",
+        actorId: child,
+        detail: "gpt-5.6-sol @ high -> gpt-5.6-sol @ xhigh",
+      })
+    );
+
+    mesh.setActorModel(child, undefined, "root", undefined, null);
+    expect(registry.get(child)?.desiredEffort).toBeNull();
+    mesh.sendMessage(child, "restore provider default", "root");
+    await tick();
+    expect(registry.get(child)?.effort).toBeUndefined();
+    expect(registry.get(child)?.desiredEffort).toBeUndefined();
   });
 
   it("lets only the root set its own portable model at its run boundary", () => {
@@ -2803,6 +2849,7 @@ describe("ActorMesh", () => {
         if (newProvider === "antigravity" && newModel === "invalid-model") {
           throw new Error("invalid model for antigravity");
         }
+        return { model: newModel };
       },
     });
 

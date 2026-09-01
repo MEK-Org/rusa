@@ -64,7 +64,7 @@ describe("mesh restart persistence ", () => {
     });
   });
 
-  it("persists pending desiredModel across restarts and applies it at next run boundary", async () => {
+  it("persists pending model and effort across restarts and applies them at the next run boundary", async () => {
     const dir = mkdtempSync(join(tmpdir(), "mc-restart-model-"));
     dirs.push(dir);
     const file = join(dir, "threads.json");
@@ -75,7 +75,9 @@ describe("mesh restart persistence ", () => {
       parentId: "root",
       provider: "claude",
       model: "claude-sonnet-5",
+      effort: "medium",
       desiredModel: "claude-opus-4-8",
+      desiredEffort: "max",
       desiredProvider: "claude",
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
@@ -84,7 +86,9 @@ describe("mesh restart persistence ", () => {
     const registry2 = new FileThreadRegistry(file);
     expect(registry2.get("worker-1")).toMatchObject({
       model: "claude-sonnet-5",
+      effort: "medium",
       desiredModel: "claude-opus-4-8",
+      desiredEffort: "max",
       desiredProvider: "claude",
     });
 
@@ -101,12 +105,16 @@ describe("mesh restart persistence ", () => {
     if (!rec1) throw new Error("worker-1 missing");
     mesh.rehydrate(rec1);
     expect(registry2.get("worker-1")?.model).toBe("claude-sonnet-5");
+    expect(registry2.get("worker-1")?.effort).toBe("medium");
     expect(registry2.get("worker-1")?.desiredModel).toBe("claude-opus-4-8");
+    expect(registry2.get("worker-1")?.desiredEffort).toBe("max");
 
     // Simulate run completing after restart
     runEndCallback?.({ success: true, exitCode: 0, output: "done" });
     expect(registry2.get("worker-1")?.model).toBe("claude-opus-4-8");
+    expect(registry2.get("worker-1")?.effort).toBe("max");
     expect(registry2.get("worker-1")?.desiredModel).toBeUndefined();
+    expect(registry2.get("worker-1")?.desiredEffort).toBeUndefined();
     expect(registry2.get("worker-1")?.desiredProvider).toBeUndefined();
   });
 });

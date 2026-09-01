@@ -150,8 +150,12 @@ interface ThreadDto {
   provider: string | null;
   /** The single authoritative model for this actor, as configured in the registry. */
   model: string | null;
+  /** Explicit provider-native reasoning level, or null for provider default. */
+  effort: string | null;
   /** Pending desired model staged for next run boundary, or null if none. */
   desiredModel?: string | null;
+  /** Pending effort pin; null is also the provider-default state. */
+  desiredEffort?: string | null;
   /** Pending desired provider staged for next run boundary, or null if none. */
   desiredProvider?: string | null;
   /**
@@ -442,6 +446,7 @@ export function handleMeshApiRequest(
                 charter: typeof body.charter === "string" ? body.charter : "",
                 provider: typeof body.provider === "string" ? body.provider : "",
                 model: typeof body.model === "string" ? body.model : "",
+                effort: typeof body.effort === "string" ? body.effort : undefined,
                 maxRuns: typeof body.maxRuns === "number" ? body.maxRuns : undefined,
                 title: typeof body.title === "string" ? body.title : undefined,
                 context,
@@ -1188,7 +1193,9 @@ export function handleMeshApiRequest(
         status: r.status,
         provider: r.provider ?? null,
         model: r.model ?? null,
+        effort: r.effort ?? null,
         desiredModel: r.desiredModel ?? null,
+        ...(r.desiredEffort !== undefined ? { desiredEffort: r.desiredEffort } : {}),
         desiredProvider: r.desiredProvider ?? null,
         charterPreview: charterPreview(r.charter),
         title: r.title ?? summarizeCharter(r.charter),

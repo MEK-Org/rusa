@@ -1,6 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
 import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../mcp/stamp.js";
+import {
+  type ModelEffortSelection,
+  normalizeModelEffortSelection,
+} from "../providers/reasoning-effort.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
 import {
@@ -98,6 +102,8 @@ export interface SpawnRequest {
   provider: string;
   /** Model/tier id for the child's provider. Required . */
   model: string;
+  /** Provider-native reasoning level. Omit to preserve the provider/model default. */
+  effort?: string;
   /** Working-memory ownership and portable-context policy. Missing means native. */
   context?: ContextConfig;
   /** Peers to seed the child's address book with (introductions at birth). */
@@ -249,9 +255,14 @@ export interface ActorMeshOptions {
   /** Builds a live Actor for a thread record (resolves provider/cwd/mcp/session). */
   createActor: ActorFactory;
   /** Synchronous gate run before a spawn id or durable record is created. */
-  validateSpawn?: (req: SpawnRequest) => void;
+  validateSpawn?: (req: SpawnRequest) => ModelEffortSelection | undefined;
   /** Synchronous validator before setting an actor's model in-place . */
-  validateModel?: (record: ThreadRecord, newModel: string, newProvider?: string) => void;
+  validateModel?: (
+    record: ThreadRecord,
+    newModel: string,
+    newProvider?: string,
+    newEffort?: string
+  ) => ModelEffortSelection | undefined;
   /** Cross-actor concurrency cap for non-responsive runs (default 4). */
   maxConcurrent?: number;
   /**
@@ -409,12 +420,13 @@ export interface ActorMeshOptions {
 export class ActorMesh {
   readonly registry: ThreadRegistry;
   private readonly createActor: ActorFactory;
-  private readonly validateSpawn?: (req: SpawnRequest) => void;
+  private readonly validateSpawn?: (req: SpawnRequest) => ModelEffortSelection | undefined;
   private readonly validateModel?: (
     record: ThreadRecord,
     newModel: string,
-    newProvider?: string
-  ) => void;
+    newProvider?: string,
+    newEffort?: string
+  ) => ModelEffortSelection | undefined;
   private readonly limiter: ConcurrencyLimiter;
   private readonly providerGate: NonNullable<ActorMeshOptions["providerGate"]>;
   private readonly isHalted: (provider?: string) => boolean;
@@ -952,9 +964,17 @@ export class ActorMesh {
     if (!charter) throw new Error("charter is required");
     const provider = req.provider?.trim();
     if (!provider) throw new Error("provider is required");
-    const model = req.model?.trim();
+    const initialSelection = normalizeModelEffortSelection(provider, req.model, req.effort);
+    const selection =
+      this.validateSpawn?.({
+        ...req,
+        provider,
+        model: initialSelection.model ?? "",
+        effort: initialSelection.effort,
+      }) ?? initialSelection;
+    const model = selection.model?.trim();
     if (!model) throw new Error("model is required");
-    this.validateSpawn?.(req);
+    const effort = selection.effort;
     const id = this.idgen();
     const parentId = this.resolveThreadId(req.parentId);
     const record: ThreadRecord = {
@@ -963,6 +983,7 @@ export class ActorMesh {
       parentId,
       provider,
       model,
+      effort,
       context: req.context,
       handles: req.handles ? [...req.handles] : undefined,
       // Seed the session so the actor's first run resumes this conversation
@@ -1004,7 +1025,7 @@ export class ActorMesh {
       kind: "actor_spawned",
       actorId: id,
       detail: charter,
-      body: `provider=${provider} model=${model}`,
+      body: `provider=${provider} model=${model}${effort ? ` effort=${effort}` : ""}`,
       // TODO: Consider extracting the human or controller principal and storing it in payload.requestedBy
       payload: JSON.stringify({ parentId }),
     });
@@ -2386,7 +2407,13 @@ export class ActorMesh {
    * Optionally moves portable (ledger/tail) actors across providers.
    * Takes effect at the end of the actor's next run.
    */
-  setActorModel(id: string, model: string, requestedBy: string, provider?: string): void {
+  setActorModel(
+    id: string,
+    model: string | undefined,
+    requestedBy: string,
+    provider?: string,
+    effort?: string | null
+  ): void {
     id = this.resolveThreadId(id);
     requestedBy = this.resolveThreadId(requestedBy);
     const record = this.registry.get(id);
@@ -2404,11 +2431,14 @@ export class ActorMesh {
         );
       }
     }
-    const trimmedModel = model.trim();
-    if (!trimmedModel) {
+    const requestedModel = model?.trim();
+    if (model !== undefined && !requestedModel) {
       throw new Error(`Cannot set an empty model on thread: ${id}`);
     }
     const trimmedProvider = provider?.trim() || undefined;
+    if (model === undefined && effort === undefined && trimmedProvider === undefined) {
+      throw new Error(`Cannot set actor model: model, provider, or effort is required`);
+    }
     if (trimmedProvider !== undefined && trimmedProvider !== record.provider) {
       if (record.context?.type !== "portable") {
         throw new Error(
@@ -2416,16 +2446,35 @@ export class ActorMesh {
         );
       }
     }
-    if (this.validateModel) {
-      this.validateModel(record, trimmedModel, trimmedProvider);
-    }
+    const effectiveProvider = trimmedProvider ?? record.provider ?? "";
+    const initialSelection = normalizeModelEffortSelection(
+      effectiveProvider,
+      requestedModel,
+      typeof effort === "string" ? effort : undefined
+    );
+    const nextModel = initialSelection.model ?? record.model;
+    const requestedEffort =
+      effort === null
+        ? undefined
+        : effort !== undefined || initialSelection.effort !== undefined
+          ? initialSelection.effort
+          : record.effort;
+    const selection =
+      this.validateModel?.(record, nextModel ?? "", trimmedProvider, requestedEffort) ??
+      normalizeModelEffortSelection(effectiveProvider, nextModel, requestedEffort);
+    const validatedModel = selection.model ?? nextModel;
+    const validatedEffort = selection.effort;
     // One boundary contract for every run state: the in-flight run, or the next
     // dispatched run when idle/queued, completes on the current model. The
     // desired value is applied only when that run ends.
-    const patch: Partial<ThreadRecord> = {
-      desiredModel: trimmedModel,
-      desiredProvider: trimmedProvider,
-    };
+    const patch: Partial<ThreadRecord> = { desiredProvider: trimmedProvider };
+    if (model !== undefined) patch.desiredModel = validatedModel;
+    if (effort !== undefined || validatedEffort !== record.effort) {
+      if (effort === null) patch.desiredEffort = null;
+      else if (validatedEffort !== undefined) {
+        patch.desiredEffort = validatedEffort;
+      }
+    }
     this.registry.patch(id, patch);
   }
 
@@ -2434,16 +2483,27 @@ export class ActorMesh {
    */
   private applyPendingModel(id: string): void {
     const record = this.registry.get(id);
-    if (!record || !record.desiredModel) return;
+    if (
+      !record ||
+      (record.desiredModel === undefined &&
+        record.desiredProvider === undefined &&
+        record.desiredEffort === undefined)
+    )
+      return;
 
-    const trimmedModel = record.desiredModel;
+    const trimmedModel = record.desiredModel ?? record.model;
     const trimmedProvider = record.desiredProvider;
     const oldModel = record.model;
     const oldProvider = record.provider;
+    const oldEffort = record.effort;
+    const nextEffort =
+      record.desiredEffort === null ? undefined : (record.desiredEffort ?? record.effort);
 
     const patch: Partial<ThreadRecord> = {
-      model: trimmedModel,
+      ...(record.desiredModel !== undefined ? { model: trimmedModel } : {}),
+      effort: nextEffort,
       desiredModel: undefined,
+      desiredEffort: undefined,
       desiredProvider: undefined,
     };
     if (trimmedProvider !== undefined) {
@@ -2454,17 +2514,21 @@ export class ActorMesh {
     const verified = this.registry.get(id);
     if (
       verified?.model !== trimmedModel ||
+      verified?.effort !== nextEffort ||
       (trimmedProvider !== undefined && verified?.provider !== trimmedProvider)
     ) {
       throw new Error(`Failed to verify deferred model update for thread: ${id}`);
     }
+    if (!verified) throw new Error(`Failed to reload thread after model update: ${id}`);
 
-    this.onModelSet?.(id, trimmedModel, verified);
+    this.onModelSet?.(id, trimmedModel ?? "", verified);
 
+    const oldSelection = `${oldModel ?? "default"}${oldEffort ? ` @ ${oldEffort}` : ""}`;
+    const newSelection = `${trimmedModel ?? "default"}${nextEffort ? ` @ ${nextEffort}` : ""}`;
     const detail =
       trimmedProvider && trimmedProvider !== oldProvider
-        ? `${oldProvider ?? "default"}:${oldModel ?? "default"} -> ${trimmedProvider}:${trimmedModel}`
-        : `${oldModel ?? "default"} -> ${trimmedModel}`;
+        ? `${oldProvider ?? "default"}:${oldSelection} -> ${trimmedProvider}:${newSelection}`
+        : `${oldSelection} -> ${newSelection}`;
 
     this.recordEvent({
       kind: "actor_model_set",
