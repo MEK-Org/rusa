@@ -805,6 +805,10 @@ export class ActorMesh {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
     this.flushRunHeadAttention(actorId);
+    // Both factory-created workers and the externally-created root finish runs
+    // through this boundary. Applying here lets the root stage its own model
+    // without giving arbitrary actors self-set authority.
+    this.applyPendingModel(actorId);
   }
 
   /**
@@ -2307,6 +2311,7 @@ export class ActorMesh {
   /**
    * Update an existing actor's model in-place in the thread registry .
    * Root or parent-gated: root may set the model for any thread in its subtree;
+   * root may also set its own model;
    * a non-root parent may only set the model for its own descendants (and never
    * raise its own tier).
    * Optionally moves portable (ledger/tail) actors across providers.
@@ -2639,7 +2644,6 @@ export class ActorMesh {
       onRunEnd: (result) => {
         this.finishInboxRun(record.id);
         this.accountRun(record.id, result);
-        this.applyPendingModel(record.id);
       },
     };
   }
