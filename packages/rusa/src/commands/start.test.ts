@@ -216,38 +216,38 @@ describe("start command tests", () => {
     const subscribeEventSource = vi.fn();
     const log = vi.fn();
     const mesh = { subscribeEventSource };
-    const configuredRoots = [{ kind: "github_org" as const, org: "configured-org" }];
+    const configuredRoots = ["github:configured-org"];
 
     for (const actorId of ["root", "worker"]) {
       mechanicallySubscribeCreatedResource(
         mesh,
         configuredRoots,
-        { kind: "github_issue", repo: "configured-org/repo", number: 72 },
+        "github:configured-org/repo/issues/72",
         actorId,
         log
       );
       mechanicallySubscribeCreatedResource(
         mesh,
         configuredRoots,
-        { kind: "github_issue", repo: "other-org/repo", number: 72 },
+        "github:other-org/repo/issues/72",
         actorId,
         log
       );
     }
 
     expect(subscribeEventSource.mock.calls).toEqual([
-      [{ kind: "github_issue", repo: "configured-org/repo", number: 72 }, "root", "root"],
-      [{ kind: "github_issue", repo: "configured-org/repo", number: 72 }, "worker", "worker"],
+      ["github:configured-org/repo/issues/72", "root", "root"],
+      ["github:configured-org/repo/issues/72", "worker", "worker"],
     ]);
     expect(log).toHaveBeenCalledTimes(2);
     expect(log).toHaveBeenCalledWith(
       expect.stringContaining(
-        "github_issue:other-org/repo#72 to root skipped: not anchored in config"
+        "github:other-org/repo/issues/72 to root skipped: not anchored in config"
       )
     );
     expect(log).toHaveBeenCalledWith(
       expect.stringContaining(
-        "github_issue:other-org/repo#72 to worker skipped: not anchored in config"
+        "github:other-org/repo/issues/72 to worker skipped: not anchored in config"
       )
     );
   });
@@ -1204,7 +1204,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(inbox.entries).toHaveLength(1);
     expect(inbox.entries[0]).toMatchObject({
       actorId: workerId,
-      source: "github_issue:dummy-org/dummy-repo#456",
+      source: "github:dummy-org/dummy-repo/issues/456",
       seenAt: null,
       handledAt: null,
       payload: {
@@ -1325,7 +1325,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(getRepositories().inbox.list("root").entries).toEqual([
       expect.objectContaining({
         actorId: "root",
-        source: "system",
+        source: "system:events",
         payload: expect.objectContaining({
           type: "system.disk",
           priority: "responsive",
@@ -1368,7 +1368,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(mesh?.listSubscriptions()).toContainEqual(
       expect.objectContaining({
         actorId: "root",
-        resource: { kind: "system" },
+        resource: "system:events",
         subscribedBy: "root",
       })
     );
@@ -2047,12 +2047,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+          resource: "github:dummy-org/dummy-repo",
         }),
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "chat" },
+          resource: "gchat:spaces",
         }),
       ])
     );
@@ -3167,27 +3167,27 @@ describe("runStart webhook event routing (Phase 4)", () => {
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "github_repo", repo: "custom-org/custom-repo" },
+          resource: "github:custom-org/custom-repo",
         }),
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "github_org", org: "target-org" },
+          resource: "github:target-org",
         }),
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "github_org", org: "extra-org" },
+          resource: "github:extra-org",
         }),
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "chat" },
+          resource: "gchat:spaces",
         }),
         expect.objectContaining({
           actorId: "root",
           subscribedBy: "root",
-          resource: { kind: "system" },
+          resource: "system:events",
         }),
       ])
     );

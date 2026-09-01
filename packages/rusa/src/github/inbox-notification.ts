@@ -1,5 +1,6 @@
 import type { EventResource } from "../actor/event-subscriptions.js";
 import type { InboxPayload } from "../actor/inbox-store.js";
+import { githubBranchReference } from "../references/reference.js";
 
 export interface GitHubInboxNotification {
   resource: EventResource;
@@ -7,7 +8,7 @@ export interface GitHubInboxNotification {
 }
 
 /**
- * Derive the one event resource used for both ISSUE_NUM routing and inbox source
+ * Derive the one event resource used for both routing and inbox source
  * serialization, plus event-specific metadata that is not already encoded in
  * that source.
  */
@@ -20,7 +21,7 @@ export function deriveGitHubInboxNotification(
 
   const action = (payload.action as string | undefined)?.trim();
   const type = action ? `${event}.${action}` : event;
-  let resource: EventResource;
+  let resource: string;
 
   if (event === "check_suite" || event === "check_run") {
     const checkSuite = payload.check_suite as
@@ -54,12 +55,11 @@ export function deriveGitHubInboxNotification(
         : undefined;
 
     if (prNumber !== undefined) {
-      resource = { kind: "github_pr", repo, number: prNumber };
+      resource = `github:${repo}/pulls/${prNumber}`;
     } else if (headBranch !== undefined) {
-      const ref = headBranch.startsWith("refs/") ? headBranch : `refs/heads/${headBranch}`;
-      resource = { kind: "github_branch", repo, ref };
+      resource = githubBranchReference(repo, headBranch);
     } else {
-      resource = { kind: "github_repo", repo };
+      resource = `github:${repo}`;
     }
   } else {
     const pullRequest = payload.pull_request as { number?: unknown } | undefined;
@@ -76,13 +76,13 @@ export function deriveGitHubInboxNotification(
           : undefined;
 
     if (ref !== undefined) {
-      resource = { kind: "github_branch", repo, ref };
+      resource = githubBranchReference(repo, ref);
     } else if (isPullRequest && number !== undefined) {
-      resource = { kind: "github_pr", repo, number };
+      resource = `github:${repo}/pulls/${number}`;
     } else if (number !== undefined) {
-      resource = { kind: "github_issue", repo, number };
+      resource = `github:${repo}/issues/${number}`;
     } else {
-      resource = { kind: "github_repo", repo };
+      resource = `github:${repo}`;
     }
   }
 

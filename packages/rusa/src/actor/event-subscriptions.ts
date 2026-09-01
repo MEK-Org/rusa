@@ -1,16 +1,21 @@
 import { readFileSync, writeFileSync } from "node:fs";
+import {
+  githubBranchReference,
+  isDescendantOf,
+  parseReference,
+  type Reference,
+  referenceParent,
+} from "../references/reference.js";
 
 /**
- * Event-source subscriptions (design ISSUE_NUM, phase 1). An actor subscribes to an
- * external event source — in v1 a GitHub repository — so that events from that
- * source (pushes, issues, PRs, …) are routed to it. This module is the pure
- * persistence layer for those subscriptions; the mesh wiring, router, and MCP
- * tools that act on them live one layer up (later phases).
+ * Event-source subscriptions. An actor subscribes to an external event source —
+ * named using the canonical URL-style reference grammar (`<scheme>:<path>`) — so
+ * that events from that source (pushes, issues, PRs, chat messages, ...) are
+ * routed to it. This module is the pure persistence layer for those
+ * subscriptions.
  *
  * Subscriptions attach to the subscriber's **actor id** (its stable thread id),
- * not a handle. Only the root subscribes in v1 ({@link EventSubscription.subscribedBy}),
- * enforced one layer up; this module is pure persistence with one data-layer
- * invariant baked in — see {@link EventSubscriptionStore.subscribe}.
+ * not a handle.
  */
 export type EventSourceKind =
   | "github_org"
@@ -23,6 +28,8 @@ export type EventSourceKind =
   | "system";
 
 export type EventResource =
+  | string
+  | Reference
   | { kind: "github_org"; org: string }
   | { kind: "github_repo"; repo: string }
   | { kind: "github_issue"; repo: string; number: number }
@@ -33,8 +40,8 @@ export type EventResource =
   | { kind: "system" };
 
 export interface EventSubscription {
-  /** The subscribed-to event source. */
-  resource: EventResource;
+  /** The subscribed-to event source (canonical reference string `<scheme>:<path>`). */
+  resource: string;
   /** The subscriber's actor id (stable thread id), not a handle. */
   actorId: string;
   /** Who created the subscription (the root, in v1). */
@@ -62,73 +69,114 @@ export interface EventSubscriptionStore {
    * re-subscribe never throws (it is idempotent), and an inactive
    * (unsubscribed) prior holder does not block a new subscriber.
    */
-  subscribe(subscription: EventSubscription): void;
+  subscribe(subscription: Omit<EventSubscription, "resource"> & { resource: EventResource }): void;
   /** Mark the (resource, actorId) subscription inactive; no-op if none is active. */
-  unsubscribe(resource: EventSubscription["resource"], actorId: string, at: string): void;
+  unsubscribe(resource: EventResource, actorId: string, at: string): void;
   /** Every subscription, active and inactive — the audit/inspection view. */
   list(): EventSubscription[];
   /** The subscriptions currently active for a resource (≤1 by the invariant). */
-  activeForResource(resource: EventSubscription["resource"]): EventSubscription[];
+  activeForResource(resource: EventResource): EventSubscription[];
 }
 
-export const resourceKey = (resource: EventResource): string => {
-  switch (resource.kind) {
-    case "github_org":
-      return `${resource.kind}:${resource.org}`;
-    case "github_repo":
-      return `${resource.kind}:${resource.repo}`;
-    case "github_issue":
-    case "github_pr":
-      return `${resource.kind}:${resource.repo}#${resource.number}`;
-    case "github_branch":
-      return `${resource.kind}:${resource.repo}@${resource.ref}`;
-    case "chat":
-      return "chat";
-    case "chat_space":
-      return `chat_space:${resource.space}`;
-    case "system":
-      return "system";
+/** Normalize any event resource (reference, string, or legacy object) into a canonical reference string. */
+export function normalizeEventResource(resource: unknown): string {
+  if (typeof resource === "string") {
+    const trimmed = resource.trim();
+    if (!trimmed) return trimmed;
+    // Legacy string format conversions
+    if (trimmed.startsWith("github_org:")) {
+      return `github:${trimmed.slice("github_org:".length)}`;
+    }
+    if (trimmed.startsWith("github_repo:")) {
+      return `github:${trimmed.slice("github_repo:".length)}`;
+    }
+    if (trimmed.startsWith("github_issue:") || trimmed.startsWith("github_pr:")) {
+      const isPr = trimmed.startsWith("github_pr:");
+      const rest = trimmed.slice(isPr ? "github_pr:".length : "github_issue:".length);
+      const match = /^(.+)#([1-9]\d*)$/.exec(rest);
+      if (match) {
+        return `github:${match[1]}/${isPr ? "pulls" : "issues"}/${match[2]}`;
+      }
+    }
+    if (trimmed.startsWith("github_branch:")) {
+      const rest = trimmed.slice("github_branch:".length);
+      const atIdx = rest.indexOf("@");
+      if (atIdx > 0) {
+        const repo = rest.slice(0, atIdx);
+        const ref = rest.slice(atIdx + 1);
+        return githubBranchReference(repo, ref);
+      }
+    }
+    if (trimmed === "chat") {
+      return "gchat:spaces";
+    }
+    if (trimmed.startsWith("chat_space:")) {
+      const space = trimmed.slice("chat_space:".length);
+      return `gchat:${space.startsWith("spaces/") ? space : `spaces/${space}`}`;
+    }
+    if (trimmed === "system") {
+      return "system:events";
+    }
+    try {
+      return parseReference(trimmed).key;
+    } catch {
+      return trimmed;
+    }
   }
-};
 
-export const sameResource = (a: EventResource, b: EventResource): boolean => {
-  if (a.kind !== b.kind) return false;
-  switch (a.kind) {
-    case "github_org":
-      return a.org === (b as typeof a).org;
-    case "github_repo":
-      return a.repo === (b as typeof a).repo;
-    case "github_issue":
-    case "github_pr":
-      return a.repo === (b as typeof a).repo && a.number === (b as typeof a).number;
-    case "github_branch":
-      return a.repo === (b as typeof a).repo && a.ref === (b as typeof a).ref;
-    case "chat":
-    case "system":
-      return true;
-    case "chat_space":
-      return a.space === (b as typeof a).space;
+  if (typeof resource === "object" && resource !== null) {
+    if ("key" in resource && typeof (resource as Reference).key === "string") {
+      return (resource as Reference).key;
+    }
+    if ("kind" in resource) {
+      const legacy = resource as {
+        kind: string;
+        org?: string;
+        repo?: string;
+        number?: number;
+        ref?: string;
+        space?: string;
+      };
+      switch (legacy.kind) {
+        case "github_org":
+          return `github:${legacy.org}`;
+        case "github_repo":
+          return `github:${legacy.repo}`;
+        case "github_issue":
+          return `github:${legacy.repo}/issues/${legacy.number}`;
+        case "github_pr":
+          return `github:${legacy.repo}/pulls/${legacy.number}`;
+        case "github_branch":
+          return githubBranchReference(legacy.repo ?? "", legacy.ref ?? "");
+        case "chat":
+          return "gchat:spaces";
+        case "chat_space":
+          return `gchat:${legacy.space?.startsWith("spaces/") ? legacy.space : `spaces/${legacy.space}`}`;
+        case "system":
+          return "system:events";
+      }
+    }
   }
-};
+
+  return String(resource);
+}
+
+export const resourceKey = (resource: EventResource): string => normalizeEventResource(resource);
+
+export const sameResource = (a: EventResource, b: EventResource): boolean =>
+  resourceKey(a) === resourceKey(b);
 
 /**
- * Resolves the parent resource of a given resource in the hierarchy:
- * issue/pr -> repo -> org -> undefined.
+ * Resolves the parent resource of a given resource in the reference hierarchy.
  */
-export function parentOf(resource: EventResource): EventResource | undefined {
-  switch (resource.kind) {
-    case "github_issue":
-    case "github_pr":
-    case "github_branch":
-      return { kind: "github_repo", repo: resource.repo };
-    case "github_repo":
-      return { kind: "github_org", org: resource.repo.split("/")[0] };
-    case "github_org":
-    case "chat":
-    case "system":
-      return undefined;
-    case "chat_space":
-      return { kind: "chat" };
+export function parentOf(resource: EventResource): string | undefined {
+  const key = resourceKey(resource);
+  try {
+    const ref = parseReference(key);
+    const parent = referenceParent(ref);
+    return parent ? parent.key : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -151,7 +199,7 @@ export function reconcileEventSources(
     // but the UnionEventSubscriptionStore means persistent explicit overrides (if any)
     // will take precedence if the root later delegates it or drops it.
     impliedStore.subscribe({
-      resource,
+      resource: resourceKey(resource),
       actorId: rootId,
       subscribedBy: rootId,
       subscribedAt: now(),
@@ -185,14 +233,16 @@ export function reconcileEventSources(
  * Returns true if resource `x` is contained under (is equal to or a descendant of) resource `y`.
  */
 export function isSubResourceOf(x: EventResource, y: EventResource): boolean {
-  let current: EventResource | undefined = x;
-  while (current) {
-    if (sameResource(current, y)) {
-      return true;
-    }
-    current = parentOf(current);
+  const keyX = resourceKey(x);
+  const keyY = resourceKey(y);
+  if (keyX === keyY) return true;
+  try {
+    const refX = parseReference(keyX);
+    const refY = parseReference(keyY);
+    return isDescendantOf(refX, refY);
+  } catch {
+    return false;
   }
-  return false;
 }
 
 /** Returns true if resource `x` is a proper descendant of resource `y`. */
@@ -204,35 +254,41 @@ export function isStrictSubResourceOf(x: EventResource, y: EventResource): boole
 export class InMemoryEventSubscriptionStore implements EventSubscriptionStore {
   private readonly subs = new Map<string, EventSubscription>();
 
-  subscribe(subscription: EventSubscription): void {
-    const { resource, actorId } = subscription;
+  subscribe(subscription: Omit<EventSubscription, "resource"> & { resource: EventResource }): void {
+    const key = resourceKey(subscription.resource);
+    const normalized: EventSubscription = {
+      ...subscription,
+      resource: key,
+    };
     // One active subscriber per resource: a *different* active actor blocks.
-    const holder = this.activeForResource(resource).find((s) => s.actorId !== actorId);
+    const holder = this.activeForResource(key).find((s) => s.actorId !== subscription.actorId);
     if (holder) {
       throw new Error(
-        `event source ${resourceKey(resource)} already has an active subscriber ` +
-          `(actor ${holder.actorId}); unsubscribe it before subscribing actor ${actorId}`
+        `event source ${key} already has an active subscriber ` +
+          `(actor ${holder.actorId}); unsubscribe it before subscribing actor ${subscription.actorId}`
       );
     }
     // Re-subscribing reactivates: drop any prior unsubscription, refresh metadata.
-    this.subs.set(`${resourceKey(resource)}:${actorId}`, {
-      ...subscription,
+    this.subs.set(`${key}:${subscription.actorId}`, {
+      ...normalized,
       unsubscribedAt: undefined,
     });
   }
 
-  unsubscribe(resource: EventSubscription["resource"], actorId: string, at: string): void {
-    const existing = this.subs.get(`${resourceKey(resource)}:${actorId}`);
+  unsubscribe(resource: EventResource, actorId: string, at: string): void {
+    const key = resourceKey(resource);
+    const existing = this.subs.get(`${key}:${actorId}`);
     if (!existing || existing.unsubscribedAt) return;
-    this.subs.set(`${resourceKey(resource)}:${actorId}`, { ...existing, unsubscribedAt: at });
+    this.subs.set(`${key}:${actorId}`, { ...existing, unsubscribedAt: at });
   }
 
   list(): EventSubscription[] {
-    return [...this.subs.values()].map((s) => ({ ...s, resource: { ...s.resource } }));
+    return [...this.subs.values()].map((s) => ({ ...s }));
   }
 
-  activeForResource(resource: EventSubscription["resource"]): EventSubscription[] {
-    return this.list().filter((s) => sameResource(s.resource, resource) && !s.unsubscribedAt);
+  activeForResource(resource: EventResource): EventSubscription[] {
+    const key = resourceKey(resource);
+    return this.list().filter((s) => s.resource === key && !s.unsubscribedAt);
   }
 }
 
@@ -242,42 +298,44 @@ export class UnionEventSubscriptionStore implements EventSubscriptionStore {
     private readonly mutatingStore: EventSubscriptionStore
   ) {}
 
-  subscribe(subscription: EventSubscription): void {
+  subscribe(subscription: Omit<EventSubscription, "resource"> & { resource: EventResource }): void {
     this.mutatingStore.subscribe(subscription);
   }
 
-  unsubscribe(resource: EventSubscription["resource"], actorId: string, at: string): void {
-    const active = this.activeForResource(resource).find((s) => s.actorId === actorId);
+  unsubscribe(resource: EventResource, actorId: string, at: string): void {
+    const key = resourceKey(resource);
+    const active = this.activeForResource(key).find((s) => s.actorId === actorId);
     if (active) {
       // Ensure the row exists in the mutating store so that the unsubscription
       // leaves a permanent tombstone, overriding the base store.
       this.mutatingStore.subscribe(active);
     }
-    this.mutatingStore.unsubscribe(resource, actorId, at);
+    this.mutatingStore.unsubscribe(key, actorId, at);
   }
 
   list(): EventSubscription[] {
     const base = this.baseStore.list();
     const mutating = this.mutatingStore.list();
     const activeMutatingResources = new Set(
-      mutating.filter((s) => !s.unsubscribedAt).map((s) => resourceKey(s.resource))
+      mutating.filter((s) => !s.unsubscribedAt).map((s) => s.resource)
     );
 
     const merged = new Map<string, EventSubscription>();
     for (const s of base) {
-      if (activeMutatingResources.has(resourceKey(s.resource))) {
+      if (activeMutatingResources.has(s.resource)) {
         continue;
       }
-      merged.set(`${resourceKey(s.resource)}:${s.actorId}`, s);
+      merged.set(`${s.resource}:${s.actorId}`, s);
     }
     for (const s of mutating) {
-      merged.set(`${resourceKey(s.resource)}:${s.actorId}`, s);
+      merged.set(`${s.resource}:${s.actorId}`, s);
     }
     return [...merged.values()];
   }
 
-  activeForResource(resource: EventSubscription["resource"]): EventSubscription[] {
-    return this.list().filter((s) => sameResource(s.resource, resource) && !s.unsubscribedAt);
+  activeForResource(resource: EventResource): EventSubscription[] {
+    const key = resourceKey(resource);
+    return this.list().filter((s) => s.resource === key && !s.unsubscribedAt);
   }
 }
 
@@ -296,24 +354,32 @@ export class FileEventSubscriptionStore implements EventSubscriptionStore {
   ) {
     let isUnversioned = false;
     let didLoadSubscriptions = false;
+    let needsMigrationFlush = false;
     try {
       const parsed = JSON.parse(readFileSync(file, "utf-8")) as {
         version?: number;
-        subscriptions?: EventSubscription[];
+        subscriptions?: Array<Omit<EventSubscription, "resource"> & { resource: unknown }>;
       };
       isUnversioned = !parsed.version;
+      if (isUnversioned || (parsed.version && parsed.version < 3)) {
+        needsMigrationFlush = true;
+      }
       for (const s of parsed.subscriptions ?? []) {
         didLoadSubscriptions = true;
+        const normalizedResource = normalizeEventResource(s.resource);
         if (isUnversioned && s.actorId === rootId && s.subscribedBy === rootId) {
           continue;
         }
-        this.mem.subscribe(s);
-        if (s.unsubscribedAt) this.mem.unsubscribe(s.resource, s.actorId, s.unsubscribedAt);
+        this.mem.subscribe({
+          ...s,
+          resource: normalizedResource,
+        });
+        if (s.unsubscribedAt) this.mem.unsubscribe(normalizedResource, s.actorId, s.unsubscribedAt);
       }
     } catch {
       /* missing / empty / invalid → start empty */
     }
-    if (isUnversioned && didLoadSubscriptions) {
+    if ((isUnversioned && didLoadSubscriptions) || (needsMigrationFlush && didLoadSubscriptions)) {
       this.flush();
     }
   }
@@ -322,19 +388,19 @@ export class FileEventSubscriptionStore implements EventSubscriptionStore {
     try {
       writeFileSync(
         this.file,
-        JSON.stringify({ version: 2, subscriptions: this.mem.list() }, null, 2)
+        JSON.stringify({ version: 3, subscriptions: this.mem.list() }, null, 2)
       );
     } catch {
       /* best effort — in-memory copy remains authoritative for this process */
     }
   }
 
-  subscribe(subscription: EventSubscription): void {
+  subscribe(subscription: Omit<EventSubscription, "resource"> & { resource: EventResource }): void {
     this.mem.subscribe(subscription); // throws on a conflicting active subscriber — before any flush
     this.flush();
   }
 
-  unsubscribe(resource: EventSubscription["resource"], actorId: string, at: string): void {
+  unsubscribe(resource: EventResource, actorId: string, at: string): void {
     this.mem.unsubscribe(resource, actorId, at);
     this.flush();
   }
@@ -343,7 +409,7 @@ export class FileEventSubscriptionStore implements EventSubscriptionStore {
     return this.mem.list();
   }
 
-  activeForResource(resource: EventSubscription["resource"]): EventSubscription[] {
+  activeForResource(resource: EventResource): EventSubscription[] {
     return this.mem.activeForResource(resource);
   }
 }

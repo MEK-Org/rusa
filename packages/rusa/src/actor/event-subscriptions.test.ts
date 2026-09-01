@@ -15,17 +15,19 @@ import {
   sameResource,
 } from "./event-subscriptions.js";
 
-const REPO = { kind: "github_repo", repo: "dummy-org/dummy-repo" } as const;
-const OTHER = { kind: "github_repo", repo: "dummy-org/other" } as const;
+const REPO = "github:dummy-org/dummy-repo";
+const OTHER = "github:dummy-org/other";
 const ACTOR_A = "actor-thread-a";
 const ACTOR_B = "actor-thread-b";
 
-const sub = (over: Partial<EventSubscription> = {}): EventSubscription => ({
-  resource: REPO,
+const sub = (
+  over: Partial<Omit<EventSubscription, "resource">> & { resource?: EventResource } = {}
+): EventSubscription => ({
   actorId: ACTOR_A,
   subscribedBy: "root",
   subscribedAt: "2026-06-27T00:00:00Z",
   ...over,
+  resource: resourceKey(over.resource ?? REPO),
 });
 
 describe("InMemoryEventSubscriptionStore", () => {
@@ -203,10 +205,10 @@ describe("FileEventSubscriptionStore", () => {
 });
 
 describe("reconcileEventSources", () => {
-  const rootOrg = { kind: "github_org", org: "dummy-org" } as const;
-  const chat = { kind: "chat" } as const;
-  const system = { kind: "system" } as const;
-  const removedOrg = { kind: "github_org", org: "Old-Org" } as const;
+  const rootOrg = "github:dummy-org";
+  const chat = "gchat:spaces";
+  const system = "system:events";
+  const removedOrg = "github:Old-Org";
   const rootId = "root";
 
   it("seeds configured root sources and is idempotent across reboots", () => {
@@ -247,7 +249,7 @@ describe("reconcileEventSources", () => {
   // config to drop a delegation is tested above, keeping one is not.
   it("keeps a delegation of a repo under a still-configured org", () => {
     const store = new InMemoryEventSubscriptionStore();
-    const repo = { kind: "github_repo", repo: "dummy-org/dummy-repo" } as const;
+    const repo = "github:dummy-org/dummy-repo";
     store.subscribe(sub({ resource: repo, actorId: "child", subscribedBy: "root" }));
 
     const result = reconcileEventSources(store, [rootOrg], rootId, () => "2026-07-02T00:00:00Z");
@@ -261,7 +263,7 @@ describe("reconcileEventSources", () => {
 
   it("lets a delegation of a configured repo outrank the implied root seed", () => {
     const store = new InMemoryEventSubscriptionStore();
-    const repo = { kind: "github_repo", repo: "dummy-org/dummy-repo" } as const;
+    const repo = "github:dummy-org/dummy-repo";
     store.subscribe(sub({ resource: repo, actorId: "child", subscribedBy: "root" }));
 
     // Same resource on both sides of the union: config implies root, the
@@ -278,14 +280,14 @@ describe("reconcileEventSources", () => {
     store.subscribe(sub({ resource: removedOrg, actorId: "child", subscribedBy: "root" }));
     store.subscribe(
       sub({
-        resource: { kind: "github_repo", repo: "Old-Org/dummy-repo" },
+        resource: "github:Old-Org/dummy-repo",
         actorId: "child",
         subscribedBy: "root",
       })
     );
     store.subscribe(
       sub({
-        resource: { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 616 },
+        resource: "github:dummy-org/dummy-repo/pulls/616",
         actorId: "root",
         subscribedBy: "root",
       })
@@ -294,33 +296,23 @@ describe("reconcileEventSources", () => {
     const result = reconcileEventSources(store, [rootOrg], rootId, () => "2026-07-02T00:00:00Z");
 
     expect(result.droppedDelegations.map((s) => s.resource)).toEqual([
-      removedOrg,
-      { kind: "github_repo", repo: "Old-Org/dummy-repo" },
+      "github:Old-Org",
+      "github:Old-Org/dummy-repo",
     ]);
     expect(result.store.activeForResource(removedOrg)).toEqual([]);
     expect(result.store.activeForResource(rootOrg)).toHaveLength(1);
-    expect(
-      result.store.activeForResource({
-        kind: "github_pr",
-        repo: "dummy-org/dummy-repo",
-        number: 616,
-      })
-    ).toHaveLength(1);
+    expect(result.store.activeForResource("github:dummy-org/dummy-repo/pulls/616")).toHaveLength(1);
   });
 
   it("seeds a configured github_repo source and drops orphaned delegations", () => {
     const store = new InMemoryEventSubscriptionStore();
-    const reclaimed = { kind: "github_repo", repo: "dummy-org/reclaimed" } as const;
+    const reclaimed = "github:dummy-org/reclaimed";
     store.subscribe(sub({ resource: reclaimed, actorId: "root", subscribedBy: "root" }));
-    const legacyBranch = {
-      kind: "github_branch",
-      repo: "dummy-org/deploy",
-      ref: "refs/heads/master",
-    } as const;
+    const legacyBranch = "github:dummy-org/deploy/branches/master";
     store.subscribe(sub({ resource: legacyBranch, actorId: "root", subscribedBy: "root" }));
 
     // New config: subscribe root to the test-bed repo only, dropping the org.
-    const testBed = { kind: "github_repo", repo: "dummy-org/dummy-repo-test-bed" } as const;
+    const testBed = "github:dummy-org/dummy-repo-test-bed";
     const result = reconcileEventSources(store, [testBed], rootId, () => "2026-07-02T00:00:00Z");
 
     expect(result.droppedDelegations.map((s) => s.resource)).toEqual([reclaimed, legacyBranch]);
@@ -333,9 +325,9 @@ describe("reconcileEventSources", () => {
 
   it("drops removed chat_space active delegations", () => {
     const store = new InMemoryEventSubscriptionStore();
-    const keptSpace = { kind: "chat_space", space: "spaces/KEPT" } as const;
-    const removedSpace = { kind: "chat_space", space: "spaces/REMOVED" } as const;
-    const childSpace = { kind: "chat_space", space: "spaces/CHILD" } as const;
+    const keptSpace = "gchat:spaces/KEPT";
+    const removedSpace = "gchat:spaces/REMOVED";
+    const childSpace = "gchat:spaces/CHILD";
 
     store.subscribe(sub({ resource: removedSpace, actorId: "child", subscribedBy: "root" }));
     store.subscribe(sub({ resource: childSpace, actorId: "child-1", subscribedBy: "root" }));
@@ -357,9 +349,9 @@ describe("reconcileEventSources", () => {
 });
 
 describe("UnionEventSubscriptionStore and implied persistence", () => {
-  it("shows an implied-only row disappears immediately and stays suppressed after reloading the v2 file", () => {
+  it("shows an implied-only row disappears immediately and stays suppressed after reloading the v2/v3 file", () => {
     const file = join(tmpdir(), `event-subs-test-legacy-${Date.now()}.json`);
-    const rootOrg = { kind: "github_org" as const, org: "dummy-org" };
+    const rootOrg = "github:dummy-org";
     const rootId = "root";
 
     // Legacy file with no version and an implied-only row
@@ -368,7 +360,7 @@ describe("UnionEventSubscriptionStore and implied persistence", () => {
       JSON.stringify({
         subscriptions: [
           {
-            resource: rootOrg,
+            resource: { kind: "github_org", org: "dummy-org" },
             actorId: rootId,
             subscribedBy: rootId,
             subscribedAt: "2025-01-01T00:00:00Z",
@@ -377,7 +369,7 @@ describe("UnionEventSubscriptionStore and implied persistence", () => {
       })
     );
 
-    // Boot 1: The file is unversioned, so it should run the migration, drop the row, and immediately flush version: 2
+    // Boot 1: The file is unversioned, so it should run the migration, drop the row, and immediately flush version: 3
     let sync = reconcileEventSources(
       new FileEventSubscriptionStore(file, rootId),
       [rootOrg],
@@ -390,10 +382,10 @@ describe("UnionEventSubscriptionStore and implied persistence", () => {
 
     // But it has disappeared immediately from the persistent file
     let saved = JSON.parse(readFileSync(file, "utf8"));
-    expect(saved.version).toBe(2);
+    expect(saved.version).toBe(3);
     expect(saved.subscriptions).toEqual([]);
 
-    // Boot 2: Reloading the v2 file. The implied row stays suppressed from disk.
+    // Boot 2: Reloading the v3 file. The implied row stays suppressed from disk.
     sync = reconcileEventSources(
       new FileEventSubscriptionStore(file, rootId),
       [rootOrg],
@@ -406,10 +398,75 @@ describe("UnionEventSubscriptionStore and implied persistence", () => {
     expect(saved.subscriptions).toEqual([]);
   });
 
+  it("migrates version 2 legacy object subscriptions to version 3 canonical reference strings", () => {
+    const file = join(tmpdir(), `event-subs-test-v2-migration-${Date.now()}.json`);
+    const rootId = "root";
+
+    // Version 2 file with legacy object resources
+    writeFileSync(
+      file,
+      JSON.stringify({
+        version: 2,
+        subscriptions: [
+          {
+            resource: { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+            actorId: "child-worker",
+            subscribedBy: rootId,
+            subscribedAt: "2026-01-01T00:00:00Z",
+          },
+          {
+            resource: {
+              kind: "github_branch",
+              repo: "dummy-org/dummy-repo",
+              ref: "refs/heads/staging",
+            },
+            actorId: "deploy-worker",
+            subscribedBy: rootId,
+            subscribedAt: "2026-01-01T00:00:00Z",
+          },
+          {
+            resource: { kind: "chat_space", space: "spaces/ALERT" },
+            actorId: "chat-worker",
+            subscribedBy: rootId,
+            subscribedAt: "2026-01-01T00:00:00Z",
+          },
+        ],
+      })
+    );
+
+    const store = new FileEventSubscriptionStore(file, rootId);
+    expect(store.activeForResource("github:dummy-org/dummy-repo").map((s) => s.actorId)).toEqual([
+      "child-worker",
+    ]);
+    expect(
+      store.activeForResource("github:dummy-org/dummy-repo/branches/staging").map((s) => s.actorId)
+    ).toEqual(["deploy-worker"]);
+    expect(store.activeForResource("gchat:spaces/ALERT").map((s) => s.actorId)).toEqual([
+      "chat-worker",
+    ]);
+
+    const saved = JSON.parse(readFileSync(file, "utf8"));
+    expect(saved.version).toBe(3);
+    expect(saved.subscriptions).toEqual([
+      expect.objectContaining({
+        resource: "github:dummy-org/dummy-repo",
+        actorId: "child-worker",
+      }),
+      expect.objectContaining({
+        resource: "github:dummy-org/dummy-repo/branches/staging",
+        actorId: "deploy-worker",
+      }),
+      expect.objectContaining({
+        resource: "gchat:spaces/ALERT",
+        actorId: "chat-worker",
+      }),
+    ]);
+  });
+
   it("locks the existing same-key inactive-collision behavior", () => {
     const file = join(tmpdir(), `event-subs-test-tombstone-${Date.now()}.json`);
-    writeFileSync(file, JSON.stringify({ version: 2, subscriptions: [] }));
-    const rootOrg = { kind: "github_org" as const, org: "dummy-org" };
+    writeFileSync(file, JSON.stringify({ version: 3, subscriptions: [] }));
+    const rootOrg = "github:dummy-org";
     const rootId = "root";
 
     let sync = reconcileEventSources(
@@ -433,7 +490,7 @@ describe("UnionEventSubscriptionStore and implied persistence", () => {
     expect(saved.subscriptions).toHaveLength(1);
     expect(saved.subscriptions[0].unsubscribedAt).toBe("2026-02-01T00:00:00Z");
 
-    // Boot 2: Reloading the v2 file
+    // Boot 2: Reloading the v3 file
     sync = reconcileEventSources(
       new FileEventSubscriptionStore(file, rootId),
       [rootOrg],
@@ -446,64 +503,57 @@ describe("UnionEventSubscriptionStore and implied persistence", () => {
   });
 });
 
-describe("Event Resource Primitives", () => {
-  const org = { kind: "github_org", org: "dummy-org" } as const;
-  const repo = { kind: "github_repo", repo: "dummy-org/dummy-repo" } as const;
-  const issue = { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 123 } as const;
-  const pr = { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 456 } as const;
-  const branch = {
-    kind: "github_branch",
-    repo: "dummy-org/dummy-repo",
-    ref: "refs/heads/staging",
-  } as const;
-  const chat = { kind: "chat" } as const;
-  const chatSpace = { kind: "chat_space", space: "spaces/123" } as const;
-  const system = { kind: "system" } as const;
+describe("Event Resource Primitives with Reference Grammar", () => {
+  const org = "github:dummy-org";
+  const repo = "github:dummy-org/dummy-repo";
+  const issue = "github:dummy-org/dummy-repo/issues/123";
+  const pr = "github:dummy-org/dummy-repo/pulls/456";
+  const branch = "github:dummy-org/dummy-repo/branches/staging";
+  const chatSpace = "gchat:spaces/123";
+  const chatMessage = "gchat:spaces/123/messages/456";
+  const system = "system:events";
+  const diskAlert = "system:events/alerts/disk";
 
-  const otherOrg = { kind: "github_org", org: "Other-Org" } as const;
-  const otherRepo = { kind: "github_repo", repo: "Other-Org/dummy-repo" } as const;
-  const otherIssue = { kind: "github_issue", repo: "Other-Org/dummy-repo", number: 123 } as const;
-  const otherBranch = {
-    kind: "github_branch",
-    repo: "dummy-org/dummy-repo",
-    ref: "refs/heads/master",
-  } as const;
+  const otherOrg = "github:Other-Org";
+  const otherRepo = "github:Other-Org/dummy-repo";
+  const otherIssue = "github:Other-Org/dummy-repo/issues/123";
+  const otherBranch = "github:dummy-org/dummy-repo/branches/master";
 
   describe("parentOf", () => {
     it("resolves parent of issue/pr/branch to repo", () => {
-      expect(parentOf(issue)).toEqual(repo);
-      expect(parentOf(pr)).toEqual(repo);
-      expect(parentOf(branch)).toEqual(repo);
+      expect(parentOf(issue)).toBe(repo);
+      expect(parentOf(pr)).toBe(repo);
+      expect(parentOf(branch)).toBe(repo);
     });
 
     it("resolves parent of repo to org", () => {
-      expect(parentOf(repo)).toEqual(org);
+      expect(parentOf(repo)).toBe(org);
     });
 
     it("resolves parent of org to undefined", () => {
       expect(parentOf(org)).toBeUndefined();
     });
 
-    it("resolves parent of chat to undefined", () => {
-      expect(parentOf(chat)).toBeUndefined();
+    it("resolves parent of chat message to chat space", () => {
+      expect(parentOf(chatMessage)).toBe(chatSpace);
     });
 
-    it("resolves parent of chat_space to chat", () => {
-      expect(parentOf(chatSpace)).toEqual(chat);
-    });
-
-    it("keeps system as a top-level family", () => {
+    it("resolves parent of root system events to undefined", () => {
       expect(parentOf(system)).toBeUndefined();
+    });
+
+    it("resolves parent of nested system alerts to system events", () => {
+      expect(parentOf(diskAlert)).toBe(system);
     });
   });
 
   describe("resourceKey", () => {
-    it("returns space-specific key for chat_space", () => {
-      expect(resourceKey(chatSpace)).toBe("chat_space:spaces/123");
-    });
-
-    it("returns the family key for system", () => {
-      expect(resourceKey(system)).toBe("system");
+    it("returns canonical key for references and legacy objects", () => {
+      expect(resourceKey(chatSpace)).toBe("gchat:spaces/123");
+      expect(resourceKey(system)).toBe("system:events");
+      expect(resourceKey({ kind: "github_issue", repo: "o/r", number: 42 })).toBe(
+        "github:o/r/issues/42"
+      );
     });
   });
 
@@ -514,7 +564,7 @@ describe("Event Resource Primitives", () => {
     });
 
     it("returns false for different chat_spaces", () => {
-      expect(sameResource(chatSpace, { kind: "chat_space", space: "spaces/456" })).toBe(false);
+      expect(sameResource(chatSpace, "gchat:spaces/456")).toBe(false);
     });
   });
 
@@ -525,7 +575,6 @@ describe("Event Resource Primitives", () => {
       expect(isSubResourceOf(issue, issue)).toBe(true);
       expect(isSubResourceOf(pr, pr)).toBe(true);
       expect(isSubResourceOf(branch, branch)).toBe(true);
-      expect(isSubResourceOf(chat, chat)).toBe(true);
       expect(isSubResourceOf(chatSpace, chatSpace)).toBe(true);
     });
 
@@ -537,7 +586,8 @@ describe("Event Resource Primitives", () => {
       expect(isSubResourceOf(pr, org)).toBe(true);
       expect(isSubResourceOf(branch, repo)).toBe(true);
       expect(isSubResourceOf(branch, org)).toBe(true);
-      expect(isSubResourceOf(chatSpace, chat)).toBe(true);
+      expect(isSubResourceOf(chatMessage, chatSpace)).toBe(true);
+      expect(isSubResourceOf(diskAlert, system)).toBe(true);
     });
 
     it("returns false for descendants", () => {
@@ -569,17 +619,6 @@ describe("Event Resource Primitives", () => {
       expect(isStrictSubResourceOf(repo, issue)).toBe(false);
       expect(isStrictSubResourceOf(pr, issue)).toBe(false);
       expect(isStrictSubResourceOf(branch, repo)).toBe(true);
-    });
-  });
-
-  describe("serialization and round-trip", () => {
-    it("round-trips all kinds through JSON", () => {
-      const resources: EventResource[] = [org, repo, issue, pr];
-      for (const r of resources) {
-        const serialized = JSON.stringify(r);
-        const deserialized = JSON.parse(serialized);
-        expect(deserialized).toEqual(r);
-      }
     });
   });
 });

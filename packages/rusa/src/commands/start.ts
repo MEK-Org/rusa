@@ -26,6 +26,7 @@ import {
   type EventResource,
   FileEventSubscriptionStore,
   isSubResourceOf,
+  normalizeEventResource,
   reconcileEventSources,
   resourceKey,
 } from "../actor/event-subscriptions.js";
@@ -168,7 +169,6 @@ import {
 import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "../mcp/update-mcp.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { DiskUsageAlert } from "../observability/disk-alert.js";
-
 import { antigravityScratchDir } from "../providers/antigravity.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import {
@@ -186,6 +186,7 @@ import {
 import { assertBwrapAvailable, teardownFlutterOverlay } from "../providers/sandbox.js";
 import type { McpServerSpec } from "../providers/types.js";
 import { resolveQuotaDatabasePath, SharedQuotaStore } from "../quota/shared-store.js";
+import { asGitHubIssue, parseReference } from "../references/reference.js";
 import { createCommitmentPolarityEvaluator } from "../understanding/commitment-polarity.js";
 import {
   DistillerCursorStore,
@@ -300,7 +301,16 @@ function queuedReactionTarget(entry: InboxEntry): QueuedReactionTarget | null {
       : null;
   }
 
-  const source = parseGitHubSubjectSource(entry.source);
+  let source: { repo: string; number: number } | null = null;
+  try {
+    const ref = parseReference(normalizeEventResource(entry.source));
+    const issueRef = asGitHubIssue(ref);
+    if (issueRef) {
+      source = { repo: `${issueRef.owner}/${issueRef.repo}`, number: issueRef.number };
+    }
+  } catch {
+    source = null;
+  }
   const commentId =
     typeof payload.commentId === "number" && Number.isSafeInteger(payload.commentId)
       ? payload.commentId
@@ -318,15 +328,6 @@ function queuedReactionTarget(entry: InboxEntry): QueuedReactionTarget | null {
     return { kind: "issue", repo: source.repo, issueNumber: source.number };
   }
   return null;
-}
-
-function parseGitHubSubjectSource(source: string): { repo: string; number: number } | null {
-  const subject = /^(?:github_issue|github_pr):(.+)#([1-9]\d*)$/.exec(source);
-  const repo = subject?.[1];
-  const rawNumber = subject?.[2];
-  if (!repo || !rawNumber) return null;
-  const number = Number(rawNumber);
-  return Number.isSafeInteger(number) ? { repo, number } : null;
 }
 
 function isQuotaThrottleProvider(value: string): value is QuotaThrottleProvider {
@@ -354,22 +355,28 @@ function configuredRootEventSources(config: RusaConfig): EventResource[] {
   const configured: EventResource[] = [];
 
   for (const entry of config.github.orgs ?? []) {
-    configured.push({ kind: "github_org", org: entry.org });
+    configured.push(`github:${entry.org}`);
   }
 
   for (const repo of config.github.repos ?? []) {
-    configured.push({ kind: "github_repo", repo });
+    configured.push(`github:${repo}`);
   }
 
   if (config.chat) {
-    configured.push({ kind: "chat" });
+    if (Array.isArray(config.chat.gchat)) {
+      for (const space of config.chat.gchat) {
+        configured.push(`gchat:${space.startsWith("spaces/") ? space : `spaces/${space}`}`);
+      }
+    } else {
+      configured.push("gchat:spaces");
+    }
   }
 
   // Disk alerts are a host-owned event source, so configuring the producer is
   // also the subscription declaration. Keeping that derivation here avoids a
   // second config knob that can drift from observability.diskAlert.
   if (config.observability?.diskAlert !== undefined) {
-    configured.push({ kind: "system" });
+    configured.push("system:events");
   }
 
   return configured;
@@ -2735,7 +2742,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         return;
       }
       await mesh.deliverEvent(
-        { kind: "chat_space", space: msg.spaceName },
+        `gchat:${msg.spaceName.startsWith("spaces/") ? msg.spaceName : `spaces/${msg.spaceName}`}`,
         `chat message from ${who}`,
         {
           inboxPayload: {
@@ -2939,7 +2946,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   let diskAlert: DiskUsageAlert | null = null;
   if (diskAlertConfig?.enabled !== false) {
     const activeDiskAlert = new DiskUsageAlert(diskAlertConfig, async (event) => {
-      await mesh.deliverEvent({ kind: "system" }, event.message, {
+      await mesh.deliverEvent("system:events", event.message, {
         inboxPayload: event,
         inboxPriority: "responsive",
       });

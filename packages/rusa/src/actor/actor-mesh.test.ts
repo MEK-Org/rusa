@@ -1113,7 +1113,7 @@ describe("ActorMesh", () => {
     expect(inboxStore.entries).toEqual([
       expect.objectContaining({
         actorId: "root",
-        source: "system",
+        source: "system:events",
         payload: expect.objectContaining({
           type: "system.disk",
           priority: "responsive",
@@ -1693,22 +1693,13 @@ describe("ActorMesh", () => {
     expect(
       mesh
         .listSubscriptions()
-        .find(
-          (s) =>
-            s.actorId === actorId &&
-            s.resource.kind === "github_repo" &&
-            s.resource.repo === active.repo
-        )?.unsubscribedAt
+        .find((s) => s.actorId === actorId && s.resource === "github:dummy-org/dummy-repo")
+        ?.unsubscribedAt
     ).toBe("2026-01-01T00:00:00Z");
     expect(
       mesh
         .listSubscriptions()
-        .find(
-          (s) =>
-            s.actorId === actorId &&
-            s.resource.kind === "github_repo" &&
-            s.resource.repo === alreadyInactive.repo
-        )?.unsubscribedAt
+        .find((s) => s.actorId === actorId && s.resource === "github:dummy-org/old")?.unsubscribedAt
     ).toBe("2025-12-31T00:00:00Z");
   });
 
@@ -2902,7 +2893,7 @@ describe("ActorMesh", () => {
       );
       expect(mesh.listSubscriptions()).toHaveLength(1);
       expect(mesh.listSubscriptions()[0]).toMatchObject({
-        resource: { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+        resource: "github:dummy-org/dummy-repo",
         actorId,
         subscribedBy: "root",
       });
@@ -2911,7 +2902,7 @@ describe("ActorMesh", () => {
       expect(events[2]).toMatchObject({
         kind: "event_source_subscribed",
         actorId,
-        detail: "github_repo:dummy-org/dummy-repo",
+        detail: "github:dummy-org/dummy-repo",
         payload: JSON.stringify({ subscribedBy: "root" }),
       });
 
@@ -2927,7 +2918,7 @@ describe("ActorMesh", () => {
       expect(events[3]).toMatchObject({
         kind: "event_source_unsubscribed",
         actorId,
-        detail: "github_repo:dummy-org/dummy-repo",
+        detail: "github:dummy-org/dummy-repo",
         body: "at=2026-01-01T12:00:00Z",
       });
     });
@@ -2971,12 +2962,12 @@ describe("ActorMesh", () => {
         expect.arrayContaining([
           expect.objectContaining({
             actorId: parent,
-            resource: { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+            resource: "github:dummy-org/dummy-repo",
             subscribedBy: "root",
           }),
           expect.objectContaining({
             actorId: child,
-            resource: { kind: "github_pr", repo: "dummy-org/dummy-repo", number: 616 },
+            resource: "github:dummy-org/dummy-repo/pulls/616",
             subscribedBy: parent,
           }),
         ])
@@ -3036,7 +3027,7 @@ describe("ActorMesh", () => {
       const subs = mesh.listSubscriptions();
       expect(subs.find((s) => s.actorId === parent)?.unsubscribedAt).toBe("2026-01-01T00:00:00Z");
       expect(subs.find((s) => s.actorId === child)).toMatchObject({
-        resource: pr,
+        resource: "github:dummy-org/dummy-repo/pulls/616",
         subscribedBy: parent,
         unsubscribedAt: undefined,
       });
@@ -3064,7 +3055,9 @@ describe("ActorMesh", () => {
       expect(
         mesh
           .listSubscriptions()
-          .find((s) => s.actorId === sibling && s.resource.kind === "github_pr")?.subscribedBy
+          .find(
+            (s) => s.actorId === sibling && s.resource === "github:dummy-org/dummy-repo/pulls/616"
+          )?.subscribedBy
       ).toBe(parent);
     });
 
@@ -3084,7 +3077,9 @@ describe("ActorMesh", () => {
       expect(
         mesh
           .listSubscriptions()
-          .find((s) => s.actorId === parent && s.resource.kind === "github_pr")?.subscribedBy
+          .find(
+            (s) => s.actorId === parent && s.resource === "github:dummy-org/dummy-repo/pulls/616"
+          )?.subscribedBy
       ).toBe(child);
     });
 
@@ -3204,13 +3199,18 @@ describe("ActorMesh", () => {
       expect(fake(parent).calls).toHaveLength(1);
       expect(fake(parent).calls[0]?.prompt).toContain("Work from your inbox");
       expect(
-        mesh.listSubscriptions().find((s) => s.actorId === child && s.resource.kind === "github_pr")
-          ?.unsubscribedAt
+        mesh
+          .listSubscriptions()
+          .find(
+            (s) => s.actorId === child && s.resource === "github:dummy-org/dummy-repo/pulls/616"
+          )?.unsubscribedAt
       ).toBe("2026-01-01T00:00:00Z");
       expect(
         mesh
           .listSubscriptions()
-          .find((s) => s.actorId === parent && s.resource.kind === "github_pr")?.subscribedBy
+          .find(
+            (s) => s.actorId === parent && s.resource === "github:dummy-org/dummy-repo/pulls/616"
+          )?.subscribedBy
       ).toBe(parent);
     });
 
@@ -3438,7 +3438,7 @@ describe("ActorMesh", () => {
       expect(appended).toEqual([
         {
           actorId,
-          source: "github_issue:dummy-org/dummy-repo#903",
+          source: "github:dummy-org/dummy-repo/issues/903",
           payload: { type: "issue_comment.created", commentId: 4959289232 },
         },
       ]);
