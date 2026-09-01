@@ -695,7 +695,10 @@ void main() {
               created: 't1',
               provider: 'claude',
               model: 'gemini-3.7-flash-high',
+              effort: 'medium',
               desiredModel: 'claude-opus-4-8',
+              desiredEffort: null,
+              effortChangePending: true,
             ),
           ];
         final store = DashboardStore(api: api, stream: FakeStream());
@@ -709,6 +712,7 @@ void main() {
           find.text('gemini-3.7-flash-high → claude-opus-4-8'),
           findsOneWidget,
         );
+        expect(find.text('effort medium → default'), findsOneWidget);
 
         await tester.tap(find.text('a-handle'));
         await tester.pump(const Duration(milliseconds: 50));
@@ -723,6 +727,13 @@ void main() {
         expect(
           find.textContaining(
             'gemini-3.7-flash-high → claude-opus-4-8 (applies after next run)',
+            findRichText: true,
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.textContaining(
+            'medium → default (applies after next run)',
             findRichText: true,
           ),
           findsOneWidget,

@@ -51,7 +51,8 @@ export interface FailureSinkDeps {
 export function formatProviderLabel(provider: CodingProvider, runModel?: string): string {
   const name = provider.providerName ?? provider.name;
   const model = runModel ?? provider.model;
-  return model ? `${name}/${model}` : name;
+  const selection = model ? `${name}/${model}` : name;
+  return provider.effort ? `${selection} @ ${provider.effort}` : selection;
 }
 
 function isGitRepoDirtyOrAhead(dir: string): boolean {
@@ -148,9 +149,9 @@ function findDirtyOrAheadRepoPath(workerDir: string): string | null {
  * parent is the one who judges what quota exhaustion means (wait, respawn on
  * another provider/tier, or re-scope) — so an exhaustion classification leads
  * the notice with a named condition, ahead of the usual exit-code/tail
- * summary. `providerLabel` (typically `<provider>/<model>`, via
- * {@link formatProviderLabel}) names what was exhausted; a non-exhaustion
- * failure is unaffected and keeps today's format.
+ * summary. `providerLabel` (typically `<provider>/<model> @ <effort>`, via
+ * {@link formatProviderLabel}) attributes both exhaustion and native selection
+ * rejection to the exact requested provider selection.
  */
 export async function routeRunFailure(
   deps: FailureSinkDeps,
@@ -174,6 +175,9 @@ export async function routeRunFailure(
     }
   }
 
+  if (!leadLine && providerLabel) {
+    leadLine = `provider selection ${providerLabel} failed.`;
+  }
   const body = leadLine ? `${leadLine}\n\n${summary}` : summary;
   routeMechanicalFailureNotice(deps, actorId, "run failed", body, result.exitCode, result);
 }

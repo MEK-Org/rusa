@@ -214,6 +214,12 @@ export function createAgentExecMcpServer(
           .describe(
             "Model/tier id for the child's harness (e.g. 'Gemini 3.7 Flash (High)'). Required."
           ),
+        effort: z
+          .string()
+          .optional()
+          .describe(
+            "Optional provider-native reasoning level (for example 'high' or 'xhigh'). Omit to preserve the provider/model default."
+          ),
         max_runs: z
           .number()
           .int()
@@ -240,7 +246,16 @@ export function createAgentExecMcpServer(
           ),
       },
     },
-    async ({ charter, provider, model, max_runs, conversation_id, title, context_mode }) => {
+    async ({
+      charter,
+      provider,
+      model,
+      effort,
+      max_runs,
+      conversation_id,
+      title,
+      context_mode,
+    }) => {
       try {
         const trimmedProvider = provider?.trim();
         if (!trimmedProvider) throw new Error("provider is required");
@@ -254,6 +269,7 @@ export function createAgentExecMcpServer(
                   charter,
                   provider: trimmedProvider,
                   model: trimmedModel,
+                  effort,
                   maxRuns: max_runs,
                   conversationId: conversation_id,
                   title,
@@ -266,6 +282,7 @@ export function createAgentExecMcpServer(
                 parentId: selfId,
                 provider: trimmedProvider,
                 model: trimmedModel,
+                effort,
                 budget: max_runs ? { maxRuns: max_runs } : undefined,
                 conversationId: conversation_id,
                 title,
@@ -596,7 +613,7 @@ export function createAgentExecMcpServer(
     {
       title: "Update an actor's model in-place",
       description:
-        "Update an existing actor's model/tier in-place in the thread registry without service restart . " +
+        "Update an existing actor's model and/or provider-native reasoning effort in-place in the thread registry without service restart . " +
         "Allowed for the actor's parent, or root for any actor including itself. Takes effect at the end of the actor's current or next run. " +
         "Optionally moves portable (ledger/tail) actors across providers. " +
         "Preserves the actor's accumulated context and session history.",
@@ -604,7 +621,15 @@ export function createAgentExecMcpServer(
         actor_id: z.string().describe("The actor's id to update."),
         model: z
           .string()
-          .describe("The new model/tier slug (e.g. 'claude-opus-4-8', 'gemini-3.1-pro')."),
+          .optional()
+          .describe("The new model/tier slug. Omit to update effort independently."),
+        effort: z
+          .string()
+          .nullable()
+          .optional()
+          .describe(
+            "Provider-native reasoning level. Omit to leave unchanged; pass null to restore the provider/model default."
+          ),
         provider: z
           .string()
           .optional()
@@ -614,14 +639,15 @@ export function createAgentExecMcpServer(
           ),
       },
     },
-    async ({ actor_id, model, provider }) => {
+    async ({ actor_id, model, effort, provider }) => {
       try {
-        mesh.setActorModel(actor_id, model, selfId, provider);
-        return toolOk(
-          provider
-            ? `set model for ${actor_id} to ${model} (provider: ${provider})`
-            : `set model for ${actor_id} to ${model}`
-        );
+        mesh.setActorModel(actor_id, model, selfId, provider, effort);
+        const changes = [
+          model ? `model ${model}` : null,
+          effort === null ? "provider-default effort" : effort ? `effort ${effort}` : null,
+          provider ? `provider ${provider}` : null,
+        ].filter(Boolean);
+        return toolOk(`staged ${changes.join(", ")} for ${actor_id}`);
       } catch (err) {
         return toolError(err);
       }

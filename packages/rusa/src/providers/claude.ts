@@ -23,6 +23,8 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 export interface ClaudeArgsOptions {
   prompt: string;
   model?: string;
+  /** First-class Claude Code effort level. Omit to preserve the CLI default. */
+  effort?: string;
   /** Session to attach: `resume` an existing id (`--resume`), or create with a chosen id (`--session-id`). */
   session?: { id: string; resume: boolean };
   /** When set, adds `--mcp-config <path> --strict-mcp-config`. */
@@ -56,6 +58,7 @@ export function buildClaudeArgs(o: ClaudeArgsOptions): string[] {
     // Claude CLI uses dashes instead of periods in model names.
     args.push("--model", o.model.replace(/\./g, "-"));
   }
+  if (o.effort) args.push("--effort", o.effort);
   return args;
 }
 
@@ -78,7 +81,8 @@ export class ClaudeProvider implements CodingProvider {
   constructor(
     public readonly name: string,
     private readonly config: ProviderConfig,
-    public readonly model?: string
+    public readonly model?: string,
+    public readonly effort?: string
   ) {}
 
   async run(opts: RunOptions): Promise<RunResult> {
@@ -136,6 +140,7 @@ export class ClaudeProvider implements CodingProvider {
     const args = buildClaudeArgs({
       prompt: opts.prompt,
       model: this.model,
+      effort: this.effort,
       session: sessionArg,
       mcpConfigPath: mcpConfigArg,
       addDirs: opts.addDirs,

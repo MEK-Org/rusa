@@ -155,6 +155,22 @@ describe("CodexProvider", () => {
         model: "gpt-5.5",
         reasoningEffort: "high",
       });
+      expect(parseCodexModel("gpt-5.6-sol extra-high")).toEqual({
+        model: "gpt-5.6-sol",
+        reasoningEffort: "extra-high",
+      });
+      expect(parseCodexModel("gpt-5.6-sol ultra")).toEqual({
+        model: "gpt-5.6-sol",
+        reasoningEffort: "ultra",
+      });
+      expect(parseCodexModel("gpt-5.6-sol unexpected high")).toEqual({
+        model: "gpt-5.6-sol",
+        reasoningEffort: undefined,
+      });
+      expect(parseCodexModel("gpt-5.6-sol high unexpected")).toEqual({
+        model: "gpt-5.6-sol",
+        reasoningEffort: undefined,
+      });
     });
 
     it("parses model slug with parenthesized reasoning effort", () => {
@@ -198,6 +214,27 @@ describe("CodexProvider", () => {
         "gpt-5.6-sol",
         "--config",
         'model_reasoning_effort="medium"',
+        "do it",
+      ]);
+    });
+
+    it("passes a first-class effort without embedding it in the model", () => {
+      expect(
+        buildCodexArgs({
+          prompt: "do it",
+          model: "gpt-5.6-sol",
+          effort: "xhigh",
+          cwd: "/wt",
+        })
+      ).toEqual([
+        "exec",
+        "--yolo",
+        "--cd",
+        "/wt",
+        "--model",
+        "gpt-5.6-sol",
+        "--config",
+        'model_reasoning_effort="xhigh"',
         "do it",
       ]);
     });
@@ -303,6 +340,13 @@ describe("CodexProvider", () => {
         'mcp_servers.tracker.url="http://127.0.0.1:5555/mcp/tracker-token"',
       ]);
     });
+
+    it("uses the first-class effort in root invocation overrides", () => {
+      expect(buildCodexConfigOverrides([], "gpt-5.6-sol", "max")).toEqual([
+        'model="gpt-5.6-sol"',
+        'model_reasoning_effort="max"',
+      ]);
+    });
   });
 
   describe("overrideTomlModel ", () => {
@@ -328,6 +372,12 @@ trust_level = "trusted"
       expect(out).not.toContain('"gpt-5.5"');
       expect(out).toContain('model_reasoning_effort = "high"');
       expect(out).toContain("trust_level");
+    });
+
+    it("overwrites reasoning effort from a first-class setting", () => {
+      const out = overrideTomlModel(base, "gpt-5.6-sol", "xhigh");
+      expect(out).toContain('model = "gpt-5.6-sol"');
+      expect(out).toContain('model_reasoning_effort = "xhigh"');
     });
 
     it("leaves the config untouched when no model was requested", () => {

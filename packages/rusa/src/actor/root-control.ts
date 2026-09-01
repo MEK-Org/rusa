@@ -6,6 +6,7 @@ export interface RootChildRequest {
   charter: string;
   provider: string;
   model: string;
+  effort?: string;
   context?: ContextConfig;
   maxRuns?: number;
   conversationId?: string;
@@ -18,6 +19,7 @@ export interface RootControlMesh {
     parentId: string;
     provider: string;
     model: string;
+    effort?: string;
     context?: ContextConfig;
     budget?: { maxRuns: number };
     conversationId?: string;
@@ -83,11 +85,16 @@ export class RootControlService {
     ) {
       throw new Error("maxRuns must be a positive integer");
     }
+    const effort = request.effort?.trim();
+    if (request.effort !== undefined && !effort) {
+      throw new Error("effort must be a non-empty string when set");
+    }
     const id = this.options.mesh.spawn({
       charter,
       parentId: this.rootId,
       provider,
       model,
+      ...(effort ? { effort } : {}),
       context: normalizeContext(request.context),
       budget: request.maxRuns ? { maxRuns: request.maxRuns } : undefined,
       conversationId: optionalTrimmed(request.conversationId),
@@ -96,6 +103,7 @@ export class RootControlService {
     this.record(principal, "spawn_child", id, {
       provider,
       model,
+      ...(effort ? { effort } : {}),
       context: normalizeContext(request.context),
     });
     return id;

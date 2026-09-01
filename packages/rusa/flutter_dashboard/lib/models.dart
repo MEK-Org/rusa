@@ -33,7 +33,10 @@ class ThreadDto {
     required this.status,
     required this.provider,
     required this.model,
+    this.effort,
     this.desiredModel,
+    this.desiredEffort,
+    this.effortChangePending = false,
     this.desiredProvider,
     required this.charterPreview,
     this.title = '',
@@ -56,8 +59,18 @@ class ThreadDto {
   /// The single authoritative model for this actor, as the server reports it.
   final String? model;
 
+  /// Explicit provider-native reasoning level, or null for provider default.
+  final String? effort;
+
   /// Pending desired model staged for next run boundary, or null if none.
   final String? desiredModel;
+
+  /// Target effort for a pending change; null means restore provider default.
+  final String? desiredEffort;
+
+  /// Whether [desiredEffort] is present in the API response. This preserves the
+  /// distinction between no staged change and an explicit null target.
+  final bool effortChangePending;
 
   /// Pending desired provider staged for next run boundary, or null if none.
   final String? desiredProvider;
@@ -93,7 +106,10 @@ class ThreadDto {
     String? status,
     String? provider,
     String? model,
+    Object? effort = _keepThreadField,
     Object? desiredModel = _keepThreadField,
+    Object? desiredEffort = _keepThreadField,
+    bool? effortChangePending,
     Object? desiredProvider = _keepThreadField,
     String? charterPreview,
     String? title,
@@ -112,9 +128,16 @@ class ThreadDto {
     status: status ?? this.status,
     provider: provider ?? this.provider,
     model: model ?? this.model,
+    effort: identical(effort, _keepThreadField)
+        ? this.effort
+        : effort as String?,
     desiredModel: identical(desiredModel, _keepThreadField)
         ? this.desiredModel
         : desiredModel as String?,
+    desiredEffort: identical(desiredEffort, _keepThreadField)
+        ? this.desiredEffort
+        : desiredEffort as String?,
+    effortChangePending: effortChangePending ?? this.effortChangePending,
     desiredProvider: identical(desiredProvider, _keepThreadField)
         ? this.desiredProvider
         : desiredProvider as String?,
@@ -139,7 +162,10 @@ class ThreadDto {
     status: j['status'] as String,
     provider: j['provider'] as String?,
     model: j['model'] as String?,
+    effort: j['effort'] as String?,
     desiredModel: j['desiredModel'] as String?,
+    desiredEffort: j['desiredEffort'] as String?,
+    effortChangePending: j.containsKey('desiredEffort'),
     desiredProvider: j['desiredProvider'] as String?,
     charterPreview: j['charterPreview'] as String? ?? '',
     title: j['title'] as String? ?? '',

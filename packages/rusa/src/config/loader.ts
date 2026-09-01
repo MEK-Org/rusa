@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { assertSpawnContextSupported, resolveContextConfig } from "../actor/context-selection.js";
+import { validateProviderSelection } from "../providers/registry.js";
 import {
   GEMINI_API_KEY_SECRET_FILENAME,
   MISTRAL_API_KEY_SECRET_FILENAME,
@@ -232,6 +233,19 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
         `config.yaml: rootActor.context: ${err instanceof Error ? err.message : String(err)}`
       );
     }
+  }
+  if (parsed.rootActor) {
+    const provider = parsed.rootActor.provider?.trim();
+    if (!provider) throw new Error("config.yaml: rootActor.provider must be a non-empty string");
+    const selection = validateProviderSelection(
+      parsed,
+      provider,
+      parsed.rootActor.model,
+      parsed.rootActor.effort
+    );
+    parsed.rootActor.provider = provider;
+    parsed.rootActor.model = selection.model;
+    parsed.rootActor.effort = selection.effort;
   }
   if (parsed.understanding?.rootNodeId !== undefined) {
     if (

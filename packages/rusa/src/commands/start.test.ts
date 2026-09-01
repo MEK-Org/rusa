@@ -2998,16 +2998,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     }).toThrow(/unconfigured-provider/);
 
-    // Assert that the actor record in the registry is retired/errored
+    // The central spawn validator rejects before allocating an actor identity
+    // or durable record.
     const list1 = activeMesh.registry.list();
     const failedWorker = list1.find((r) => r.charter === "unresolvable provider worker");
-    expect(failedWorker).toBeDefined();
-    expect(failedWorker?.status).toBe("retired");
-
-    if (!failedWorker) throw new Error("failedWorker should be defined");
-
-    // Assert that the failed worker is NOT live
-    expect(activeMesh.get(failedWorker.id)).toBeUndefined();
+    expect(failedWorker).toBeUndefined();
 
     // 2. Positive test: explicit empty model slug -> spawn throws loudly
     expect(() => {
