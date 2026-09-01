@@ -26,6 +26,7 @@ import {
   type EventResource,
   FileEventSubscriptionStore,
   isSubResourceOf,
+  missingAuditedEventSubscriptions,
   normalizeEventResource,
   reconcileEventSources,
   resourceKey,
@@ -787,6 +788,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     return runId;
   };
 
+  // Capture the disposable audit projection while this startup unquestionably
+  // owns an open DB handle. Some boot paths cross asynchronous probes before
+  // the subscription store is constructed; tests and multi-instance shutdowns
+  // may close the shared handle during that gap.
+  const eventSubscriptionAudit = getRepositories().meshEvents.listByKinds(
+    ["event_source_subscribed", "event_source_unsubscribed"],
+    { bodyKinds: [] }
+  );
+  const configuredRoots = configuredRootEventSources(config);
+
   // #1645 ready-head attention. Attached here, immediately after initDb, rather
   // than beside the mesh: `getRepositories()` throws once the database is
   // closed, and in a process that runs more than one instance (the tests, the
@@ -1224,6 +1235,18 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     join(mcHome, "event-subscriptions.json"),
     rootId
   );
+  const missingAuditedSubscriptions = missingAuditedEventSubscriptions(
+    persistentEventSubscriptions,
+    eventSubscriptionAudit
+  ).filter(({ resource }) =>
+    configuredRoots.some((configuredRoot) => isSubResourceOf(resource, configuredRoot))
+  );
+  if (missingAuditedSubscriptions.length > 0) {
+    console.warn(
+      `[mesh] event subscription consistency: ${missingAuditedSubscriptions.length} ` +
+        "audit-confirmed active subscription(s) absent from the durable store"
+    );
+  }
   // Host-plane host-jobs capability : durable per-actor job records, keyed
   // the same way capabilityGrants/eventSubscriptions are.
   const hostJobStore = new FileHostJobStore(join(mcHome, "host-jobs.json"));
@@ -1232,7 +1255,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     workersDir,
     handleForId: (id) => (id === rootId ? rootHandle : generateHandle(id)),
   });
-  const configuredRoots = configuredRootEventSources(config);
   const rootSourceSync = reconcileEventSources(
     persistentEventSubscriptions,
     configuredRoots,

@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -9,6 +9,7 @@ import {
   InMemoryEventSubscriptionStore,
   isStrictSubResourceOf,
   isSubResourceOf,
+  missingAuditedEventSubscriptions,
   normalizeEventResource,
   parentOf,
   reconcileEventSources,
@@ -174,24 +175,73 @@ describe("FileEventSubscriptionStore", () => {
     expect(store.list()).toEqual([]);
   });
 
-  it("starts empty (no crash) when the file is corrupt JSON", () => {
+  it("fails loudly instead of accepting an empty store when the file is corrupt JSON", () => {
     writeFileSync(file, "{ this is not valid json ]");
-    const store = new FileEventSubscriptionStore(file, rootId);
-    expect(store.list()).toEqual([]);
-    // …and remains usable.
-    store.subscribe(sub());
-    expect(store.activeForResource(REPO)).toHaveLength(1);
+    expect(() => new FileEventSubscriptionStore(file, rootId)).toThrow(
+      /invalid event subscription file/
+    );
+    expect(readFileSync(file, "utf8")).toBe("{ this is not valid json ]");
   });
 
-  it("keeps in-memory state authoritative when the disk write fails", () => {
-    // Point the store at a path whose parent is a *file*, not a directory, so
-    // every writeFileSync throws (ENOTDIR) — the flush is swallowed best-effort.
-    const blocker = join(dir, "blocker");
-    writeFileSync(blocker, "x");
-    const store = new FileEventSubscriptionStore(join(blocker, "event-subscriptions.json"), rootId);
-    expect(() => store.subscribe(sub())).not.toThrow();
-    // In-memory copy is authoritative for the process despite the failed write.
-    expect(store.activeForResource(REPO).map((s) => s.actorId)).toEqual([ACTOR_A]);
+  it("surfaces an atomic replace failure and does not publish the mutation in memory", () => {
+    const store = new FileEventSubscriptionStore(file, rootId);
+    mkdirSync(file);
+
+    expect(() => store.subscribe(sub())).toThrow();
+    expect(store.list()).toEqual([]);
+    expect(readdirSync(dir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("writes snapshots through a same-directory temporary file without leftovers", () => {
+    const store = new FileEventSubscriptionStore(file, rootId);
+    store.subscribe(sub());
+
+    expect(JSON.parse(readFileSync(file, "utf8"))).toMatchObject({
+      version: 3,
+      subscriptions: [expect.objectContaining({ actorId: ACTOR_A })],
+    });
+    expect(readdirSync(dir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("isolates malformed and conflicting rows while retaining later valid rows", () => {
+    writeFileSync(
+      file,
+      JSON.stringify({
+        version: 3,
+        subscriptions: [
+          sub({ actorId: ACTOR_A }),
+          { ...sub({ resource: "github_repo:dummy-org/dummy-repo", actorId: ACTOR_B }) },
+          { ...sub({ resource: OTHER, actorId: "" }) },
+          sub({ resource: OTHER, actorId: ACTOR_B }),
+        ],
+      })
+    );
+    const warnings: string[] = [];
+    const store = new FileEventSubscriptionStore(file, rootId, (message) => warnings.push(message));
+
+    expect(store.activeForResource(REPO).map((row) => row.actorId)).toEqual([ACTOR_A]);
+    expect(store.activeForResource(OTHER).map((row) => row.actorId)).toEqual([ACTOR_B]);
+    expect(warnings).toHaveLength(2);
+  });
+
+  it("loads an inactive row without tripping over an earlier active holder", () => {
+    writeFileSync(
+      file,
+      JSON.stringify({
+        version: 3,
+        subscriptions: [
+          sub({ actorId: ACTOR_A }),
+          sub({
+            actorId: ACTOR_B,
+            unsubscribedAt: "2026-06-28T00:00:00Z",
+          }),
+        ],
+      })
+    );
+    const store = new FileEventSubscriptionStore(file, rootId);
+
+    expect(store.list()).toHaveLength(2);
+    expect(store.activeForResource(REPO).map((row) => row.actorId)).toEqual([ACTOR_A]);
   });
 
   it("the conflict guard throws before mutating (File store)", () => {
@@ -202,6 +252,31 @@ describe("FileEventSubscriptionStore", () => {
     // A reload sees only the first subscriber.
     const reloaded = new FileEventSubscriptionStore(file, rootId);
     expect(reloaded.activeForResource(REPO).map((s) => s.actorId)).toEqual([ACTOR_A]);
+  });
+});
+
+describe("missingAuditedEventSubscriptions", () => {
+  it("reports only audit-confirmed active rows missing from the durable store", () => {
+    const store = new InMemoryEventSubscriptionStore();
+    store.subscribe(sub({ resource: OTHER, actorId: ACTOR_B }));
+
+    expect(
+      missingAuditedEventSubscriptions(store, [
+        { kind: "event_source_subscribed", actorId: ACTOR_A, detail: REPO },
+        { kind: "event_source_subscribed", actorId: ACTOR_B, detail: OTHER },
+      ])
+    ).toEqual([{ resource: REPO, actorId: ACTOR_A }]);
+  });
+
+  it("treats a later unsubscribe as settled and an empty audit stream as unknown", () => {
+    const store = new InMemoryEventSubscriptionStore();
+    expect(
+      missingAuditedEventSubscriptions(store, [
+        { kind: "event_source_subscribed", actorId: ACTOR_A, detail: REPO },
+        { kind: "event_source_unsubscribed", actorId: ACTOR_A, detail: REPO },
+      ])
+    ).toEqual([]);
+    expect(missingAuditedEventSubscriptions(store, [])).toEqual([]);
   });
 });
 
@@ -464,7 +539,7 @@ describe("UnionEventSubscriptionStore and implied persistence", () => {
     ]);
   });
 
-  it("drops an invalid legacy resource instead of rewriting it as canonical v3", () => {
+  it("loads valid legacy rows but leaves the source file untouched when another row is rejected", () => {
     const file = join(tmpdir(), `event-subs-test-invalid-${Date.now()}.json`);
     const rootId = "root";
     writeFileSync(
@@ -488,12 +563,10 @@ describe("UnionEventSubscriptionStore and implied persistence", () => {
       })
     );
 
-    const store = new FileEventSubscriptionStore(file, rootId);
+    const original = readFileSync(file, "utf8");
+    const store = new FileEventSubscriptionStore(file, rootId, () => undefined);
     expect(store.list().map((subscription) => subscription.actorId)).toEqual(["valid-worker"]);
-    expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({
-      version: 3,
-      subscriptions: [expect.objectContaining({ resource: REPO, actorId: "valid-worker" })],
-    });
+    expect(readFileSync(file, "utf8")).toBe(original);
   });
 
   it("locks the existing same-key inactive-collision behavior", () => {
