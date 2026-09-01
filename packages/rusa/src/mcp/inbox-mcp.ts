@@ -1,5 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import type { ResolvedInboxFocus } from "../actor/inbox-focus.js";
 import { attachInboxHints, type SelectedInboxEntry } from "../actor/inbox-hints.js";
 import type { InboxEntry, InboxStore } from "../actor/inbox-store.js";
 import { toolError, toolOk } from "./result.js";
@@ -10,7 +11,10 @@ export type { SelectedInboxEntry };
 export const INBOX_MCP_NAME = "inbox";
 
 export interface InboxMcpRunScope {
-  select: (entryIds: string[]) => unknown;
+  select: (
+    entryIds: string[],
+    obligationId?: string
+  ) => InboxEntry[] | { entries: InboxEntry[]; focus: ResolvedInboxFocus };
   selected: () => readonly string[];
   onHandled?: () => void;
   isFenced?: () => boolean;
@@ -70,21 +74,31 @@ export function createInboxMcpServer(
     {
       title: "Select inbox work for this run",
       description:
-        "Select the bounded set of unhandled entries this run will address. Selection is required before mark_handled and defines run-scoped causality. Selected entries may include source-specific handling hints (e.g. reply expectations or threading conventions).",
+        "Select the bounded set of unhandled entries this run will address. Selection is required before mark_handled and durably resolves the run's primary obligation when possible. During the observe-first rollout, ambiguous or unrelated work is reported in focus diagnostics rather than rejected. Selected entries retain source-specific handling hints.",
       inputSchema: {
         entry_ids: z.array(z.string().min(1)).min(1).max(100),
+        obligation_id: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Explicit primary obligation for this run. Omit when every selected entry resolves to one obligation chain."
+          ),
       },
     },
-    async ({ entry_ids }) => {
+    async ({ entry_ids, obligation_id }) => {
       try {
         if (new Set(entry_ids).size !== entry_ids.length) {
           throw new Error("entry_ids must be unique");
         }
-        const selected = scope.select(entry_ids);
-        const entries = Array.isArray(selected)
-          ? attachInboxHints(selected as InboxEntry[])
-          : selected;
-        return toolOk({ entries });
+        const selected = scope.select(entry_ids, obligation_id);
+        if (Array.isArray(selected)) {
+          return toolOk({ entries: attachInboxHints(selected) });
+        }
+        return toolOk({
+          entries: attachInboxHints(selected.entries),
+          focus: selected.focus,
+        });
       } catch (err) {
         return toolError(err);
       }

@@ -803,8 +803,16 @@ export class ActorMesh {
     return entries;
   }
 
-  /** Establish the run-scoped subset that may be marked handled. */
-  selectInboxEntries(actorId: string, entryIds: string[]): InboxEntry[] {
+  /**
+   * Establish the run-scoped subset that may be marked handled. When supplied,
+   * `beforeCommit` must durably record the selection; the in-memory guard is
+   * installed only after that callback succeeds.
+   */
+  selectInboxEntries(
+    actorId: string,
+    entryIds: string[],
+    beforeCommit?: (entries: InboxEntry[]) => void
+  ): InboxEntry[] {
     actorId = this.resolveThreadId(actorId);
     const inboxStore = this.inboxStore;
     if (!inboxStore) throw new Error("Inbox is not configured");
@@ -818,6 +826,7 @@ export class ActorMesh {
       if (entry.handledAt) throw new Error(`Inbox entry already handled: ${id}`);
       return entry;
     });
+    beforeCommit?.(entries);
     this.selectedInboxEntryIds.set(actorId, unique);
     return entries;
   }

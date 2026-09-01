@@ -170,4 +170,46 @@ describe("inbox MCP server", () => {
     const ownEntry = data.entries.find((e) => e.id === "own");
     expect(ownEntry?.hint).toBeUndefined();
   });
+
+  it("passes an explicit obligation to the run scope and returns resolved focus", async () => {
+    let selectedObligation: string | undefined;
+    const client = await connect(
+      createInboxMcpServer(store, "actor-a", {
+        select: (entryIds, obligationId) => {
+          selectedObligation = obligationId;
+          return {
+            entries: entryIds.map((id) => {
+              const entry = store.read("actor-a", id);
+              if (!entry) throw new Error("missing test entry");
+              return entry;
+            }),
+            focus: {
+              primaryObligationId: obligationId ?? null,
+              resolution: "explicit",
+              related: true,
+              diagnostics: [],
+              context: null,
+            },
+          };
+        },
+        selected: () => ["own"],
+      })
+    );
+
+    const result = (await client.callTool({
+      name: "select",
+      arguments: { entry_ids: ["own"], obligation_id: "ob-1" },
+    })) as CallToolResult;
+
+    expect(result.isError).not.toBe(true);
+    expect(selectedObligation).toBe("ob-1");
+    expect(dataOf(result)).toMatchObject({
+      entries: [{ id: "own" }],
+      focus: {
+        primaryObligationId: "ob-1",
+        resolution: "explicit",
+        related: true,
+      },
+    });
+  });
 });

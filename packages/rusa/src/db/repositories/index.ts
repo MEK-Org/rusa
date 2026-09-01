@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { ActorRunRepository } from "./actor-run-repository.js";
+import { InboxFocusRepository } from "./inbox-focus-repository.js";
 import { InboxRepository } from "./inbox-repository.js";
 import { MaintenanceRepository } from "./maintenance-repository.js";
 import { MeshChatRepository } from "./mesh-chat-repository.js";
@@ -23,6 +24,7 @@ export class Repositories {
   readonly rawInputs: RawInputRepository;
   readonly maintenance: MaintenanceRepository;
   readonly inbox: InboxRepository;
+  readonly inboxFocus: InboxFocusRepository;
   readonly meshChat: MeshChatRepository;
   readonly quotaScrapes: QuotaScrapeRepository;
   readonly modelScrapes: ModelScrapeRepository;
@@ -34,6 +36,7 @@ export class Repositories {
     this.rawInputs = new RawInputRepository(db);
     this.maintenance = new MaintenanceRepository(db);
     this.inbox = new InboxRepository(db);
+    this.inboxFocus = new InboxFocusRepository(db);
     this.meshChat = new MeshChatRepository(db);
     this.quotaScrapes = new QuotaScrapeRepository(db);
     this.modelScrapes = new ModelScrapeRepository(db);
@@ -60,6 +63,8 @@ export type {
   PortableLedgerSourceKind,
 } from "./actor-run-repository.js";
 export { ActorRunRepository } from "./actor-run-repository.js";
+export type { InboxFocusResolution, RunInboxFocus } from "./inbox-focus-repository.js";
+export { InboxFocusRepository } from "./inbox-focus-repository.js";
 export { InboxRepository } from "./inbox-repository.js";
 export { MaintenanceRepository } from "./maintenance-repository.js";
 export type { MeshChat } from "./mesh-chat-repository.js";

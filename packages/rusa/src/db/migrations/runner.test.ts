@@ -86,6 +86,7 @@ describe("Database Migration System", () => {
       "0028_obligation_artifacts",
       "0029_reference_grammar",
       "0030_actor_runs",
+      "0031_inbox_run_focus",
     ]);
 
     const meshEventsColumns = (

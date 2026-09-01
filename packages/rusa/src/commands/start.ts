@@ -50,6 +50,7 @@ import {
 import { handleHostJobExit } from "../actor/host-job-exit.js";
 import { ensureWakeOnExitScript } from "../actor/host-job-runner.js";
 import { FileHostJobStore } from "../actor/host-job-store.js";
+import { InboxFocusResolver, type ResolvedInboxFocus } from "../actor/inbox-focus.js";
 import type { InboxEntry, InboxStore } from "../actor/inbox-store.js";
 import {
   type MeshEventSink,
@@ -786,6 +787,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   }
 
   const activeRunIds = new Map<string, string>();
+  const inboxFocusResolver = new InboxFocusResolver(
+    getRepositories().inboxFocus,
+    getRepositories().obligations,
+    getRepositories().meshChat
+  );
   const beginActorRun = (actorId: string, providerName: string): string => {
     if (activeRunIds.has(actorId)) {
       throw new Error(`actor already has an active durable run: ${actorId}`);
@@ -1657,7 +1663,24 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         );
         const inboxUrl = mcpHttp.addServer(`${id}:${INBOX_MCP_NAME}`, () =>
           createInboxMcpServer(inboxStore, id, {
-            select: (entryIds) => mesh.selectInboxEntries(id, entryIds),
+            select: (entryIds, obligationId) => {
+              const runId = activeRunIds.get(id);
+              if (!runId) throw new Error(`actor has no active durable run: ${id}`);
+              let focus: ResolvedInboxFocus | undefined;
+              const entries = mesh.selectInboxEntries(id, entryIds, (selectedEntries) => {
+                focus = inboxFocusResolver.select({
+                  runId,
+                  actorId: id,
+                  entries: selectedEntries,
+                  explicitObligationId: obligationId,
+                });
+              });
+              if (!focus) throw new Error(`run focus was not resolved for actor: ${id}`);
+              return {
+                entries,
+                focus,
+              };
+            },
             selected: () => mesh.selectedInboxEntries(id),
             onHandled: () => mesh.inboxHandled(id),
             isFenced,
@@ -2072,7 +2095,24 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   );
   const rootInboxUrl = mcpHttp.addServer(`${rootId}:${INBOX_MCP_NAME}`, () =>
     createInboxMcpServer(inboxStore, rootId, {
-      select: (entryIds) => mesh.selectInboxEntries(rootId, entryIds),
+      select: (entryIds, obligationId) => {
+        const runId = activeRunIds.get(rootId);
+        if (!runId) throw new Error(`actor has no active durable run: ${rootId}`);
+        let focus: ResolvedInboxFocus | undefined;
+        const entries = mesh.selectInboxEntries(rootId, entryIds, (selectedEntries) => {
+          focus = inboxFocusResolver.select({
+            runId,
+            actorId: rootId,
+            entries: selectedEntries,
+            explicitObligationId: obligationId,
+          });
+        });
+        if (!focus) throw new Error(`run focus was not resolved for actor: ${rootId}`);
+        return {
+          entries,
+          focus,
+        };
+      },
       selected: () => mesh.selectedInboxEntries(rootId),
       onHandled: () => mesh.inboxHandled(rootId),
     })
