@@ -672,21 +672,13 @@ describe("tracker MCP server", () => {
       name: "create_issue",
       arguments: { repo: "owner/repo", title: "T", body: "B" },
     });
-    expect(onResourceCreated).toHaveBeenCalledWith({
-      kind: "github_issue",
-      repo: "owner/repo",
-      number: 123,
-    });
+    expect(onResourceCreated).toHaveBeenCalledWith("github:owner/repo/issues/123");
 
     await client.callTool({
       name: "create_pull_request",
       arguments: { repo: "owner/repo", head: "feature", title: "T", body: "B" },
     });
-    expect(onResourceCreated).toHaveBeenCalledWith({
-      kind: "github_pr",
-      repo: "owner/repo",
-      number: 1,
-    });
+    expect(onResourceCreated).toHaveBeenCalledWith("github:owner/repo/pulls/1");
   });
 
   it("does not fail create_issue if onResourceCreated throws", async () => {

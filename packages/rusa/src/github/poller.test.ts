@@ -125,10 +125,9 @@ describe("GitHubEventPoller", () => {
       },
     ]);
     expect(events[0].payload).not.toHaveProperty("ref");
-    expect(deriveGitHubInboxNotification("push", events[0].payload)?.resource).toEqual({
-      kind: "github_repo",
-      repo: "example-org/service-repo",
-    });
+    expect(deriveGitHubInboxNotification("push", events[0].payload)?.resource).toBe(
+      "github:example-org/service-repo"
+    );
   });
 
   it("maps a polled mesh:deliver issue comment to webhook-shaped payload", async () => {
