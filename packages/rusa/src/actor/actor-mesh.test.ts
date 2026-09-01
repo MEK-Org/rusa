@@ -2686,6 +2686,56 @@ describe("ActorMesh", () => {
     expect(registry.get(child)?.model).toBe("claude-opus-4-8");
   });
 
+  it("lets only the root set its own portable model at its run boundary", () => {
+    const events: MeshEventInput[] = [];
+    const modelSets: Array<{ actorId: string; newModel: string; record: ThreadRecord }> = [];
+    const { mesh, registry } = setup({
+      events: (event) => events.push(event),
+      onModelSet: (actorId, newModel, record) => modelSets.push({ actorId, newModel, record }),
+    });
+    registry.patch("root", {
+      provider: "claude",
+      model: "claude-opus-4-8",
+      context: { type: "portable", mode: "ledger" },
+    });
+    const child = mesh.spawn({ charter: "child", parentId: "root" });
+
+    mesh.setActorModel("root", "gpt-5.6-sol", "root", "codex");
+
+    expect(registry.get("root")).toMatchObject({
+      provider: "claude",
+      model: "claude-opus-4-8",
+      desiredProvider: "codex",
+      desiredModel: "gpt-5.6-sol",
+    });
+    expect(() => mesh.setActorModel(child, "claude-opus-4-8", child)).toThrow(
+      /cannot set its own model/
+    );
+
+    mesh.finishInboxRun("root");
+
+    expect(registry.get("root")).toMatchObject({
+      provider: "codex",
+      model: "gpt-5.6-sol",
+    });
+    expect(registry.get("root")?.desiredProvider).toBeUndefined();
+    expect(registry.get("root")?.desiredModel).toBeUndefined();
+    expect(modelSets).toEqual([
+      {
+        actorId: "root",
+        newModel: "gpt-5.6-sol",
+        record: expect.objectContaining({ provider: "codex", model: "gpt-5.6-sol" }),
+      },
+    ]);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "actor_model_set",
+        actorId: "root",
+        detail: "claude:claude-opus-4-8 -> codex:gpt-5.6-sol",
+      })
+    );
+  });
+
   it("setActorModel supports cross-provider moves for portable actors and rejects them for native actors", async () => {
     const events: MeshEventInput[] = [];
     const validations: Array<{ recordId: string; newModel: string; newProvider?: string }> = [];

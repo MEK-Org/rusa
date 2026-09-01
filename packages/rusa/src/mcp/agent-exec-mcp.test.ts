@@ -1380,6 +1380,29 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     expect(registry.get(childId)?.desiredModel).toBe("claude-opus-4-8");
   });
 
+  it("set_actor_model lets the root stage its own portable provider and model", async () => {
+    const { mesh, registry } = setup();
+    registry.patch("root", {
+      provider: "claude",
+      model: "claude-opus-4-8",
+      context: { type: "portable", mode: "ledger" },
+    });
+
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+    const res = (await client.callTool({
+      name: "set_actor_model",
+      arguments: { actor_id: "root", model: "gpt-5.6-sol", provider: "codex" },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    expect(registry.get("root")).toMatchObject({
+      provider: "claude",
+      model: "claude-opus-4-8",
+      desiredProvider: "codex",
+      desiredModel: "gpt-5.6-sol",
+    });
+  });
+
   it("set_thread_model fails when an actor tries to raise its own tier", async () => {
     const { mesh } = setup();
     const childId = mesh.spawn({

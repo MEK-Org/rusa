@@ -597,7 +597,7 @@ export function createAgentExecMcpServer(
       title: "Update an actor's model in-place",
       description:
         "Update an existing actor's model/tier in-place in the thread registry without service restart . " +
-        "Allowed for the actor's parent or root. Takes effect on the actor's next run. " +
+        "Allowed for the actor's parent, or root for any actor including itself. Takes effect at the end of the actor's current or next run. " +
         "Optionally moves portable (ledger/tail) actors across providers. " +
         "Preserves the actor's accumulated context and session history.",
       inputSchema: {
