@@ -29,10 +29,11 @@ export function normalizeReasoningEffort(effort: string): string {
 export function normalizeModelEffortSelection(
   provider: string,
   rawModel?: string,
-  rawEffort?: string
+  rawEffort?: string | null
 ): ModelEffortSelection {
   const model = rawModel?.trim() || undefined;
-  const explicitEffort = rawEffort === undefined ? undefined : normalizeReasoningEffort(rawEffort);
+  const explicitEffort =
+    rawEffort === undefined || rawEffort === null ? undefined : normalizeReasoningEffort(rawEffort);
   if (provider !== "codex" || !model) {
     return { model, effort: explicitEffort };
   }
@@ -44,6 +45,11 @@ export function normalizeModelEffortSelection(
   if (parsed.model !== model && legacyEffort === undefined) {
     throw new Error(
       `unrecognized legacy Codex model qualifier in "${model}"; pass the model slug and effort as separate settings`
+    );
+  }
+  if (rawEffort === null && legacyEffort) {
+    throw new Error(
+      `conflicting reasoning efforts for provider "codex": model pin carries "${legacyEffort}" but effort explicitly restores the provider default`
     );
   }
   if (explicitEffort && legacyEffort && explicitEffort !== legacyEffort) {

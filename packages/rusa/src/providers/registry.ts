@@ -1,7 +1,7 @@
 import type { ProviderConfig, RusaConfig } from "../config/types.js";
 import { AntigravityProvider } from "./antigravity.js";
 import { ClaudeProvider } from "./claude.js";
-import { CodexProvider } from "./codex.js";
+import { CODEX_REASONING_EFFORTS, CodexProvider } from "./codex.js";
 import { CopilotProvider } from "./copilot.js";
 import { FakeProvider } from "./fake-provider.js";
 import { KimiProvider } from "./kimi.js";
@@ -26,7 +26,7 @@ const providerAdapters: Readonly<Record<string, ProviderAdapter>> = {
   },
   codex: {
     create: (name, config, model, effort) => new CodexProvider(name, config, model, effort),
-    efforts: ["none", "low", "medium", "high", "xhigh", "max", "ultra"],
+    efforts: CODEX_REASONING_EFFORTS,
   },
   agy: {
     create: (name, config, model, effort) =>
@@ -63,7 +63,7 @@ export function validateProviderSelection(
   config: RusaConfig,
   providerName: string,
   model?: string,
-  effort?: string
+  effort?: string | null
 ): ModelEffortSelection {
   const providerConfig = getEffectiveProviderConfig(providerName, config);
   if (!providerConfig) {

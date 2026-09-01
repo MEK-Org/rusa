@@ -21,6 +21,19 @@ describe("reasoning effort", () => {
     expect(() => normalizeModelEffortSelection("codex", "gpt-5.6-sol unexpected")).toThrow(
       /unrecognized legacy Codex model qualifier/
     );
+    expect(() => normalizeModelEffortSelection("codex", "gpt-5.6-sol unexpected high")).toThrow(
+      /unrecognized legacy Codex model qualifier/
+    );
+    expect(() => normalizeModelEffortSelection("codex", "gpt-5.6-sol high unexpected")).toThrow(
+      /unrecognized legacy Codex model qualifier/
+    );
+    expect(normalizeModelEffortSelection("codex", "gpt-5.6-sol ultra")).toEqual({
+      model: "gpt-5.6-sol",
+      effort: "ultra",
+    });
+    expect(() => normalizeModelEffortSelection("codex", "gpt-5.6-sol high", null)).toThrow(
+      /conflicting reasoning efforts/
+    );
   });
 
   it("leaves non-Codex model vocabulary intact", () => {

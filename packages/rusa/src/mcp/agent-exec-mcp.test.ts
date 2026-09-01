@@ -1432,6 +1432,28 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     expect(registry.get(childId)?.desiredEffort).toBeNull();
   });
 
+  it("set_actor_model rejects a default-effort clear that conflicts with a legacy model pin", async () => {
+    const { mesh, registry } = setup();
+    const childId = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      effort: "medium",
+    });
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+    const res = (await client.callTool({
+      name: "set_actor_model",
+      arguments: { actor_id: childId, model: "gpt-5.6-sol high", effort: null },
+    })) as CallToolResult;
+
+    expect(res.isError).toBe(true);
+    expect((res.content[0] as { text: string }).text).toMatch(/conflicting reasoning efforts/);
+    expect(registry.get(childId)?.desiredModel).toBeUndefined();
+    expect(registry.get(childId)?.desiredEffort).toBeUndefined();
+  });
+
   it("set_thread_model fails when an actor tries to raise its own tier", async () => {
     const { mesh } = setup();
     const childId = mesh.spawn({

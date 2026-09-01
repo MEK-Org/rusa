@@ -261,7 +261,7 @@ export interface ActorMeshOptions {
     record: ThreadRecord,
     newModel: string | undefined,
     newProvider?: string,
-    newEffort?: string
+    newEffort?: string | null
   ) => ModelEffortSelection | undefined;
   /** Cross-actor concurrency cap for non-responsive runs (default 4). */
   maxConcurrent?: number;
@@ -425,7 +425,7 @@ export class ActorMesh {
     record: ThreadRecord,
     newModel: string | undefined,
     newProvider?: string,
-    newEffort?: string
+    newEffort?: string | null
   ) => ModelEffortSelection | undefined;
   private readonly limiter: ConcurrencyLimiter;
   private readonly providerGate: NonNullable<ActorMeshOptions["providerGate"]>;
@@ -2450,12 +2450,12 @@ export class ActorMesh {
     const initialSelection = normalizeModelEffortSelection(
       effectiveProvider,
       requestedModel,
-      typeof effort === "string" ? effort : undefined
+      effort
     );
     const nextModel = initialSelection.model ?? record.model;
     const requestedEffort =
       effort === null
-        ? undefined
+        ? null
         : effort !== undefined || initialSelection.effort !== undefined
           ? initialSelection.effort
           : record.effort;

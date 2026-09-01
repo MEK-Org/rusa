@@ -159,6 +159,18 @@ describe("CodexProvider", () => {
         model: "gpt-5.6-sol",
         reasoningEffort: "extra-high",
       });
+      expect(parseCodexModel("gpt-5.6-sol ultra")).toEqual({
+        model: "gpt-5.6-sol",
+        reasoningEffort: "ultra",
+      });
+      expect(parseCodexModel("gpt-5.6-sol unexpected high")).toEqual({
+        model: "gpt-5.6-sol",
+        reasoningEffort: undefined,
+      });
+      expect(parseCodexModel("gpt-5.6-sol high unexpected")).toEqual({
+        model: "gpt-5.6-sol",
+        reasoningEffort: undefined,
+      });
     });
 
     it("parses model slug with parenthesized reasoning effort", () => {

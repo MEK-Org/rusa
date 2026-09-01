@@ -2746,12 +2746,12 @@ describe("ActorMesh", () => {
 
   it("persists, updates, and clears effort independently at run boundaries", async () => {
     const events: MeshEventInput[] = [];
-    const validations: Array<{ model?: string; effort?: string }> = [];
+    const validations: Array<{ model?: string; effort?: string | null }> = [];
     const { mesh, registry, tick } = setup({
       events: (event) => events.push(event),
       validateModel: (_record, model, _provider, effort) => {
         validations.push({ model, effort });
-        return { model, effort };
+        return { model, effort: effort ?? undefined };
       },
     });
     const child = mesh.spawn({
@@ -2790,11 +2790,11 @@ describe("ActorMesh", () => {
   });
 
   it("supports an effort-only update when the root uses its provider's default model", () => {
-    const validations: Array<{ model?: string; effort?: string }> = [];
+    const validations: Array<{ model?: string; effort?: string | null }> = [];
     const { mesh, registry } = setup({
       validateModel: (_record, model, _provider, effort) => {
         validations.push({ model, effort });
-        return { model, effort };
+        return { model, effort: effort ?? undefined };
       },
     });
     registry.patch("root", { provider: "claude", model: undefined });
