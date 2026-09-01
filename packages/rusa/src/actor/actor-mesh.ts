@@ -1478,7 +1478,7 @@ export class ActorMesh {
     }
 
     // A verified `system:*` stamp marks a persistence-only write performed by
-    // mesh infrastructure (e.g. tracker-hygiene) rather than a peer actor — it
+    // mesh infrastructure rather than a peer actor — it
     // withholds delivery to EVERY destination, not just an author-match. Only a
     // verified stamp may trigger this (opts.stampedAuthor only exists when
     // resolveStampedAuthor's HMAC + freshness checks passed in start.ts); an

@@ -413,16 +413,13 @@ export function resolveStampedAuthor(opts: {
 export const HUMAN_OPERATOR = "human:operator";
 export const MESH_SYSTEM = "system:mesh";
 
-/** Actor id used to stamp tracker-hygiene's own GitHub writes . */
-export const SYSTEM_TRACKER_HYGIENE = "system:tracker-hygiene";
-
 export function isHumanOperator(actorId: string): boolean {
   return actorId.startsWith("human:");
 }
 
 /**
  * A `system:*` actor id marks a persistence-only write performed by mesh
- * infrastructure itself (e.g. tracker-hygiene) rather than by a peer actor.
+ * infrastructure itself (e.g. system background tasks) rather than by a peer actor.
  * Used by ActorMesh.deliverEvent to withhold such events from every
  * destination, not just the actor that would match on author identity — see
  * the mesh-wide suppression rule there. Only a VERIFIED stamp may rely on

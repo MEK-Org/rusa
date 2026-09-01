@@ -658,7 +658,7 @@ describe("ObligationRepository", () => {
 
   it("accepts any id in the mesh's one id space and rejects a blank one", () => {
     // Actor UUID, root, human:*, system:* — all the same space, no `kind`.
-    for (const creator of ["actor-a", "root", "human:operator", "system:tracker-hygiene"]) {
+    for (const creator of ["actor-a", "root", "human:operator", "system:service"]) {
       const o = repository.create({
         title: `by-${creator}`,
         id: `by-${creator}`,
@@ -744,7 +744,7 @@ describe("ObligationRepository", () => {
       repository.create({
         title: "system-owned",
         id: "system-owned",
-        ownerId: "system:tracker-hygiene",
+        ownerId: "system:service",
       })
     ).not.toThrow();
   });

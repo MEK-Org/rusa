@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import type { IssueClient } from "../gitops/issue-client.js";
-import { resolveStampedAuthor, SYSTEM_TRACKER_HYGIENE } from "../mcp/stamp.js";
+import { MESH_SYSTEM, resolveStampedAuthor } from "../mcp/stamp.js";
 import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
@@ -4061,9 +4061,9 @@ describe("ActorMesh", () => {
 
         mesh.deliverEvent(
           { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 1048 },
-          "hygiene comment echo",
+          "system comment echo",
           {
-            stampedAuthor: { actorId: SYSTEM_TRACKER_HYGIENE, instanceId: "staging-instance" },
+            stampedAuthor: { actorId: MESH_SYSTEM, instanceId: "staging-instance" },
             instanceId: "staging-instance",
           }
         );
@@ -4077,7 +4077,7 @@ describe("ActorMesh", () => {
         expect(
           logs.some((l) =>
             l.includes(
-              `system-event suppressed by author stamp: actor=${SYSTEM_TRACKER_HYGIENE} instance=staging-instance`
+              `system-event suppressed by author stamp: actor=${MESH_SYSTEM} instance=staging-instance`
             )
           )
         ).toBe(true);
@@ -4113,7 +4113,7 @@ describe("ActorMesh", () => {
           { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 1048 },
           "cross-instance system stamp",
           {
-            stampedAuthor: { actorId: SYSTEM_TRACKER_HYGIENE, instanceId: "prod-instance" },
+            stampedAuthor: { actorId: MESH_SYSTEM, instanceId: "prod-instance" },
             instanceId: "staging-instance",
             inboxPayload: payload("issue_comment.created"),
           }

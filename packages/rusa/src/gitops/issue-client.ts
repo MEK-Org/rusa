@@ -172,23 +172,6 @@ interface ReportedCiRun {
 
 const GREEN_CI_CONCLUSIONS = new Set(["success", "skipped", "neutral"]);
 
-/**
- * Reads an issue number out of a branch name, for the `issueNumber` hint on
- * {@link OpenPullRequest}. Matches an `issue-<n>` segment anywhere in the ref, or
- * a `steward/<n>-<slug>` pattern, so `mc/issue-42`, `steward/120-author-scoped-pr-list`,
- * `mc/fix/issue-42-slug` and `bot/issue-42-slug` all resolve.
- *
- * Both boundaries are deliberate: `reissue-42` is not issue 42, and `issue-42x`
- * is not a number worth trusting. Hyphenated suffixes (`issue-42-slug`, `120-slug`)
- * are supported via non-alphanumeric trailing lookahead. A ref this cannot read
- * yields `null`, which callers must treat as "no issue named" rather than as grounds
- * to drop the PR.
- */
-export function parseIssueNumberFromBranch(branchName: string): number | null {
-  const match = branchName.match(/(?:^|[^a-z0-9])(?:issue-|steward\/)(\d+)(?![a-z0-9])/i);
-  return match ? Number.parseInt(match[1], 10) : null;
-}
-
 export interface OpenPullRequest {
   number: number;
   title: string;
@@ -199,7 +182,6 @@ export interface OpenPullRequest {
   author: string;
   labels: string[];
   updatedAt: string;
-  issueNumber: number | null;
 }
 
 export interface OpenIssue {
@@ -310,11 +292,7 @@ export interface IssueClient {
    * existing PR.
    */
   createPullRequest(opts: CreatePROptions): Promise<CreatedPullRequest>;
-  /**
-   * Query open pull requests created by a specific author. Returns every open
-   * PR by that author; `issueNumber` is a best-effort read of the branch name
-   * and is null when the branch names no issue.
-   */
+  /** Query every open pull request created by a specific author. */
   getOpenPullRequestsByAuthor(repo: string, author: string): Promise<OpenPullRequest[]>;
   /**
    * Query all open pull requests, on the same terms as the author-scoped call
@@ -1324,7 +1302,6 @@ export class GitHubIssueClient implements IssueClient {
           .map((label) => (typeof label === "string" ? label : (label.name ?? "")))
           .filter((label) => label.length > 0),
         updatedAt: pr.updated_at,
-        issueNumber: parseIssueNumberFromBranch(pr.head.ref),
       };
     });
   }

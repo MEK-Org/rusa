@@ -13,7 +13,7 @@ export type ObligationStatus = "ready" | "waiting" | "done" | "cancelled";
  * or `system:*`.
  *
  * Deliberately an id alone, not an id plus a `kind`. `mcp/stamp.ts` already
- * mints `human:operator` / `system:mesh` / `system:tracker-hygiene` into the
+ * mints `human:operator` / `system:mesh` into the
  * same space actor ids live in, and `isHumanOperator(actorId)` reads the
  * category off the prefix — so a stored kind would restate what the id already
  * says, and could drift from it.

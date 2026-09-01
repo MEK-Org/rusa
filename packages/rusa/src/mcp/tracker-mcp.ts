@@ -138,7 +138,7 @@ export function createTrackerMcpServer(
     {
       title: "List open pull requests",
       description:
-        "List open pull requests, optionally scoped to one author. Every open PR is returned either way; `issueNumber` is parsed from the branch name and is null when the branch names no issue.",
+        "List open pull requests, optionally scoped to one author. Every open PR is returned either way.",
       inputSchema: {
         repo: z.string(),
         author: z

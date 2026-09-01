@@ -325,34 +325,6 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       ...configuredQuotaProviders,
     };
   }
-  const trackerHygiene = parsed.observability?.trackerHygiene;
-  if (trackerHygiene) {
-    if (trackerHygiene.closeAction === undefined) {
-      trackerHygiene.closeAction = "log";
-    } else if (trackerHygiene.closeAction !== "log" && trackerHygiene.closeAction !== "close") {
-      throw new Error(
-        'config.yaml: observability.trackerHygiene.closeAction must be "log" or "close"'
-      );
-    }
-    for (const [key, value] of Object.entries({
-      intervalSeconds: trackerHygiene.intervalSeconds,
-      staleAfterHours: trackerHygiene.staleAfterHours,
-      closeAfterHours: trackerHygiene.closeAfterHours,
-    })) {
-      if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
-        throw new Error(`config.yaml: observability.trackerHygiene.${key} must be positive`);
-      }
-    }
-    if (
-      trackerHygiene.pingBackoffHours !== undefined &&
-      (!Array.isArray(trackerHygiene.pingBackoffHours) ||
-        trackerHygiene.pingBackoffHours.some((value) => !Number.isFinite(value) || value < 0))
-    ) {
-      throw new Error(
-        "config.yaml: observability.trackerHygiene.pingBackoffHours must contain non-negative numbers"
-      );
-    }
-  }
   const diskAlert = parsed.observability?.diskAlert;
   if (diskAlert) {
     if (
