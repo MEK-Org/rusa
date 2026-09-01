@@ -444,7 +444,12 @@ export class FileEventSubscriptionStore implements EventSubscriptionStore {
     const isUnversioned = document.version === undefined;
     const rows = (document.subscriptions ?? []) as unknown[];
     let rejected = 0;
-    const parsedRows: Array<{ index: number; subscription: EventSubscription }> = [];
+    type ParsedRow = {
+      index: number;
+      subscription: EventSubscription;
+      stateChangedAt: number;
+    };
+    const parsedRows: ParsedRow[] = [];
     for (const [index, row] of rows.entries()) {
       try {
         const subscription = parsePersistedSubscription(row);
@@ -455,7 +460,11 @@ export class FileEventSubscriptionStore implements EventSubscriptionStore {
         ) {
           continue;
         }
-        parsedRows.push({ index, subscription });
+        parsedRows.push({
+          index,
+          subscription,
+          stateChangedAt: Date.parse(subscription.unsubscribedAt ?? subscription.subscribedAt),
+        });
       } catch (error) {
         rejected += 1;
         this.warn(
@@ -464,38 +473,69 @@ export class FileEventSubscriptionStore implements EventSubscriptionStore {
       }
     }
 
-    // Tombstones cannot contend for live ownership, so materialize them first.
-    // For conflicting active rows, prefer the most recent subscription rather
-    // than making JSON array order (normally oldest-first) the routing rule.
-    for (const { subscription } of parsedRows.filter(
+    const reject = (row: ParsedRow, reason: string): void => {
+      rejected += 1;
+      this.warn(`[mesh] skipped event subscription row ${row.index + 1}: ${reason}`);
+    };
+
+    // Legacy spellings can normalize multiple rows onto one (resource, actor)
+    // key. Resolve that actor's latest state before comparing active owners.
+    const pairRows = new Map<string, ParsedRow[]>();
+    for (const row of parsedRows) {
+      const key = `${row.subscription.resource}\0${row.subscription.actorId}`;
+      const group = pairRows.get(key) ?? [];
+      group.push(row);
+      pairRows.set(key, group);
+    }
+    const resolvedRows: ParsedRow[] = [];
+    for (const group of pairRows.values()) {
+      const latestAt = Math.max(...group.map((row) => row.stateChangedAt));
+      const latest = group.filter((row) => row.stateChangedAt === latestAt);
+      // At an exact transition tie, retain an inactive state. Otherwise choose
+      // by normalized row content so reversing the file cannot change behavior.
+      const [winner] = [...latest].sort((a, b) => {
+        const inactive =
+          Number(Boolean(b.subscription.unsubscribedAt)) -
+          Number(Boolean(a.subscription.unsubscribedAt));
+        if (inactive !== 0) return inactive;
+        return persistedRowTieKey(a.subscription).localeCompare(persistedRowTieKey(b.subscription));
+      });
+      if (!winner) continue;
+      resolvedRows.push(winner);
+      for (const row of group) {
+        if (row !== winner) {
+          reject(row, `a later state already exists for ${row.subscription.resource}`);
+        }
+      }
+    }
+
+    // Tombstones cannot contend for live ownership. Among active actors, an
+    // unambiguous newest subscribe wins. Equal instants are rejected as an
+    // authority conflict instead of assigning ownership from JSON file order.
+    for (const { subscription } of resolvedRows.filter(
       ({ subscription }) => subscription.unsubscribedAt
     )) {
       this.mem.restore(subscription);
     }
-    const activeRows = parsedRows.filter(({ subscription }) => !subscription.unsubscribedAt);
-    const activeWinners = new Map<string, (typeof activeRows)[number]>();
-    for (const row of activeRows) {
-      const prior = activeWinners.get(row.subscription.resource);
-      if (
-        !prior ||
-        row.subscription.subscribedAt > prior.subscription.subscribedAt ||
-        (row.subscription.subscribedAt === prior.subscription.subscribedAt &&
-          row.index > prior.index)
-      ) {
-        activeWinners.set(row.subscription.resource, row);
-      }
+    const activeByResource = new Map<string, ParsedRow[]>();
+    for (const row of resolvedRows.filter(({ subscription }) => !subscription.unsubscribedAt)) {
+      const group = activeByResource.get(row.subscription.resource) ?? [];
+      group.push(row);
+      activeByResource.set(row.subscription.resource, group);
     }
-    for (const row of activeRows) {
-      const { index, subscription } = row;
-      if (activeWinners.get(subscription.resource) !== row) {
-        rejected += 1;
-        this.warn(
-          `[mesh] skipped event subscription row ${index + 1}: ` +
-            `a newer active subscriber already owns ${subscription.resource}`
-        );
+    for (const [resource, group] of activeByResource) {
+      const newestAt = Math.max(...group.map((row) => Date.parse(row.subscription.subscribedAt)));
+      const newest = group.filter((row) => Date.parse(row.subscription.subscribedAt) === newestAt);
+      if (newest.length !== 1) {
+        for (const row of group) reject(row, `ambiguous active subscribers for ${resource}`);
         continue;
       }
-      this.mem.restore(subscription);
+      const [winner] = newest;
+      if (!winner) continue;
+      for (const row of group) {
+        if (row !== winner) reject(row, `a newer active subscriber already owns ${resource}`);
+      }
+      this.mem.restore(winner.subscription);
     }
 
     if (rejected > 0) {
@@ -585,13 +625,13 @@ function parsePersistedSubscription(value: unknown): EventSubscription {
   const row = value as Record<string, unknown>;
   const actorId = requiredString(row, "actorId");
   const subscribedBy = requiredString(row, "subscribedBy");
-  const subscribedAt = requiredString(row, "subscribedAt");
-  const unsubscribedAt = row.unsubscribedAt;
-  if (
-    unsubscribedAt !== undefined &&
-    (typeof unsubscribedAt !== "string" || unsubscribedAt.length === 0)
-  ) {
-    throw new Error("unsubscribedAt must be a non-empty string when present");
+  const subscribedAt = requiredTimestamp(row, "subscribedAt");
+  let unsubscribedAt: string | undefined;
+  if (row.unsubscribedAt !== undefined) {
+    unsubscribedAt = requiredTimestamp(row, "unsubscribedAt");
+    if (Date.parse(unsubscribedAt) < Date.parse(subscribedAt)) {
+      throw new Error("unsubscribedAt must not precede subscribedAt");
+    }
   }
   return {
     resource: normalizeEventResource(row.resource as EventResource | LegacyEventResourceInput),
@@ -600,6 +640,24 @@ function parsePersistedSubscription(value: unknown): EventSubscription {
     subscribedAt,
     ...(unsubscribedAt ? { unsubscribedAt } : {}),
   };
+}
+
+function persistedRowTieKey(subscription: EventSubscription): string {
+  return [
+    subscription.resource,
+    subscription.actorId,
+    subscription.subscribedBy,
+    subscription.subscribedAt,
+    subscription.unsubscribedAt ?? "",
+  ].join("\0");
+}
+
+function requiredTimestamp(row: Record<string, unknown>, field: string): string {
+  const value = requiredString(row, field);
+  if (!Number.isFinite(Date.parse(value))) {
+    throw new Error(`${field} must be a valid timestamp`);
+  }
+  return value;
 }
 
 function requiredString(row: Record<string, unknown>, field: string): string {

@@ -218,7 +218,13 @@ describe("FileEventSubscriptionStore", () => {
         version: 3,
         subscriptions: [
           sub({ actorId: ACTOR_A }),
-          { ...sub({ resource: "github_repo:dummy-org/dummy-repo", actorId: ACTOR_B }) },
+          {
+            ...sub({
+              resource: "github_repo:dummy-org/dummy-repo",
+              actorId: ACTOR_B,
+              subscribedAt: "2026-06-29T00:00:00Z",
+            }),
+          },
           { ...sub({ resource: OTHER, actorId: "" }) },
           sub({ resource: OTHER, actorId: ACTOR_B }),
         ],
@@ -266,6 +272,63 @@ describe("FileEventSubscriptionStore", () => {
       writeFileSync(file, JSON.stringify({ version: 3, subscriptions }));
       const store = new FileEventSubscriptionStore(file, rootId, () => {});
       expect(store.activeForResource(REPO).map((row) => row.actorId)).toEqual([ACTOR_B]);
+    }
+  });
+
+  it("rejects invalid timestamps instead of letting them outrank valid rows", () => {
+    writeFileSync(
+      file,
+      JSON.stringify({
+        version: 3,
+        subscriptions: [
+          sub({ actorId: ACTOR_A, subscribedAt: "zzz" }),
+          sub({ actorId: ACTOR_B, subscribedAt: "2026-06-29T00:00:00Z" }),
+        ],
+      })
+    );
+    const warnings: string[] = [];
+    const store = new FileEventSubscriptionStore(file, rootId, (message) => warnings.push(message));
+
+    expect(store.activeForResource(REPO).map((row) => row.actorId)).toEqual([ACTOR_B]);
+    expect(warnings.some((message) => message.includes("valid timestamp"))).toBe(true);
+  });
+
+  it("rejects tied active owners independently of file order", () => {
+    const utc = sub({ actorId: ACTOR_A, subscribedAt: "2026-06-27T00:00:00Z" });
+    const offset = sub({ actorId: ACTOR_B, subscribedAt: "2026-06-26T20:00:00-04:00" });
+
+    for (const subscriptions of [
+      [utc, offset],
+      [offset, utc],
+    ]) {
+      writeFileSync(file, JSON.stringify({ version: 3, subscriptions }));
+      const store = new FileEventSubscriptionStore(file, rootId, () => {});
+      expect(store.activeForResource(REPO)).toEqual([]);
+    }
+  });
+
+  it("resolves a normalized active/tombstone pair by its latest transition", () => {
+    const active = sub({
+      resource: "github_repo:dummy-org/dummy-repo",
+      actorId: ACTOR_A,
+      subscribedAt: "2026-06-27T00:00:00Z",
+    });
+    const tombstone = sub({
+      actorId: ACTOR_A,
+      subscribedAt: "2026-06-27T00:00:00Z",
+      unsubscribedAt: "2026-06-28T00:00:00Z",
+    });
+
+    for (const subscriptions of [
+      [active, tombstone],
+      [tombstone, active],
+    ]) {
+      writeFileSync(file, JSON.stringify({ version: 3, subscriptions }));
+      const store = new FileEventSubscriptionStore(file, rootId, () => {});
+      expect(store.activeForResource(REPO)).toEqual([]);
+      expect(store.list()).toEqual([
+        expect.objectContaining({ unsubscribedAt: "2026-06-28T00:00:00Z" }),
+      ]);
     }
   });
 
