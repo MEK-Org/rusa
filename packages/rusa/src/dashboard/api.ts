@@ -150,6 +150,10 @@ interface ThreadDto {
   provider: string | null;
   /** The single authoritative model for this actor, as configured in the registry. */
   model: string | null;
+  /** Pending desired model staged for next run boundary, or null if none. */
+  desiredModel?: string | null;
+  /** Pending desired provider staged for next run boundary, or null if none. */
+  desiredProvider?: string | null;
   /**
    * The leading `CHARTER_PREVIEW_CHARS` characters of the charter, ellipsised
    * when clipped. The full text is detail data: `GET
@@ -1180,6 +1184,8 @@ export function handleMeshApiRequest(
         status: r.status,
         provider: r.provider ?? null,
         model: r.model ?? null,
+        desiredModel: r.desiredModel ?? null,
+        desiredProvider: r.desiredProvider ?? null,
         charterPreview: charterPreview(r.charter),
         title: r.title ?? summarizeCharter(r.charter),
         createdAt: r.createdAt,

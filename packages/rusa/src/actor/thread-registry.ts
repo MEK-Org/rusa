@@ -91,6 +91,16 @@ export interface ThreadRecord {
    * run-scoped and lives on the `run_end` event ({@link RunEndPayload}).
    */
   model?: string;
+  /**
+   * Pending model change staged via `set_actor_model` to apply at the end of the
+   * next run boundary.
+   */
+  desiredModel?: string;
+  /**
+   * Pending provider change staged via `set_actor_model` to apply at the end of
+   * the next run boundary.
+   */
+  desiredProvider?: string;
   /** Provider session/conversation id = the working-memory handle (B.2); set after first run. */
   sessionId?: string;
   /**

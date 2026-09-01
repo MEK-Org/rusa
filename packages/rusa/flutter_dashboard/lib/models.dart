@@ -31,6 +31,8 @@ class ThreadDto {
     required this.status,
     required this.provider,
     required this.model,
+    this.desiredModel,
+    this.desiredProvider,
     required this.charterPreview,
     this.title = '',
     required this.createdAt,
@@ -51,6 +53,13 @@ class ThreadDto {
 
   /// The single authoritative model for this actor, as the server reports it.
   final String? model;
+
+  /// Pending desired model staged for next run boundary, or null if none.
+  final String? desiredModel;
+
+  /// Pending desired provider staged for next run boundary, or null if none.
+  final String? desiredProvider;
+
   /// The leading slice of the charter the server sends with the list — enough
   /// for the two-line excerpt in the overview, never the whole text. The full
   /// charter is fetched per actor when the detail panel opens one.
@@ -82,6 +91,8 @@ class ThreadDto {
     String? status,
     String? provider,
     String? model,
+    String? desiredModel,
+    String? desiredProvider,
     String? charterPreview,
     String? title,
     String? createdAt,
@@ -99,6 +110,8 @@ class ThreadDto {
     status: status ?? this.status,
     provider: provider ?? this.provider,
     model: model ?? this.model,
+    desiredModel: desiredModel ?? this.desiredModel,
+    desiredProvider: desiredProvider ?? this.desiredProvider,
     charterPreview: charterPreview ?? this.charterPreview,
     title: title ?? this.title,
     createdAt: createdAt ?? this.createdAt,
@@ -120,6 +133,8 @@ class ThreadDto {
     status: j['status'] as String,
     provider: j['provider'] as String?,
     model: j['model'] as String?,
+    desiredModel: j['desiredModel'] as String?,
+    desiredProvider: j['desiredProvider'] as String?,
     charterPreview: j['charterPreview'] as String? ?? '',
     title: j['title'] as String? ?? '',
     createdAt: j['createdAt'] as String? ?? '',
@@ -168,6 +183,8 @@ class ActorViewState {
   bool get isRetired => thread.isRetired;
   String? get provider => thread.provider;
   String? get model => thread.model;
+  String? get desiredModel => thread.desiredModel;
+  String? get desiredProvider => thread.desiredProvider;
   String get charterPreview => thread.charterPreview;
   String get title => thread.title;
   String get createdAt => thread.createdAt;

@@ -523,6 +523,25 @@ describe("handleMeshApiRequest", () => {
     expect(actor.boundModel).toBeUndefined();
   });
 
+  it("GET /api/mesh/threads surfaces pending desiredModel and desiredProvider when staged", () => {
+    registry.upsert({
+      ...rec(UUID_A, "root", "active"),
+      provider: "claude",
+      model: "claude-sonnet-5",
+      desiredModel: "claude-opus-4-8",
+      desiredProvider: "codex",
+    });
+
+    const { res } = call(deps, "GET", "/api/mesh/threads");
+    expect(res.statusCode).toBe(200);
+    const { threads } = JSON.parse(res.body);
+    const actor = threads.find((t: { id: string }) => t.id === UUID_A);
+    expect(actor.provider).toBe("claude");
+    expect(actor.model).toBe("claude-sonnet-5");
+    expect(actor.desiredModel).toBe("claude-opus-4-8");
+    expect(actor.desiredProvider).toBe("codex");
+  });
+
   it("GET /api/mesh/threads shows the default root handle when no identity is configured", () => {
     registry.upsert({ ...rec("root", null, "active"), isRoot: true });
     const { res } = call(deps, "GET", "/api/mesh/threads");

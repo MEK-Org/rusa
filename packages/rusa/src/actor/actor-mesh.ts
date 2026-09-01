@@ -2339,10 +2339,6 @@ export class ActorMesh {
         );
       }
     }
-    const liveActor = this.live.get(id);
-    if (liveActor && (liveActor.isRunning || liveActor.isQueued)) {
-      throw new Error(`Cannot change model or provider while actor ${id} is running or queued`);
-    }
     const trimmedModel = model.trim();
     if (!trimmedModel) {
       throw new Error(`Cannot set an empty model on thread: ${id}`);
@@ -2358,9 +2354,23 @@ export class ActorMesh {
     if (this.validateModel) {
       this.validateModel(record, trimmedModel, trimmedProvider);
     }
+    const liveActor = this.live.get(id);
+    const isBusy = Boolean(liveActor && (liveActor.isRunning || liveActor.isQueued));
+    if (isBusy) {
+      const patch: Partial<ThreadRecord> = {
+        desiredModel: trimmedModel,
+        desiredProvider: trimmedProvider,
+      };
+      this.registry.patch(id, patch);
+      return;
+    }
     const oldModel = record.model;
     const oldProvider = record.provider;
-    const patch: Partial<ThreadRecord> = { model: trimmedModel };
+    const patch: Partial<ThreadRecord> = {
+      model: trimmedModel,
+      desiredModel: undefined,
+      desiredProvider: undefined,
+    };
     if (trimmedProvider !== undefined) {
       patch.provider = trimmedProvider;
     }
@@ -2381,6 +2391,51 @@ export class ActorMesh {
       kind: "actor_model_set",
       actorId: id,
 
+      detail,
+    });
+  }
+
+  /**
+   * Apply any pending model/provider change that was deferred while the actor
+   * was running or queued. Invoked at the end of the run boundary.
+   */
+  private applyPendingModel(id: string): void {
+    const record = this.registry.get(id);
+    if (!record || !record.desiredModel) return;
+
+    const trimmedModel = record.desiredModel;
+    const trimmedProvider = record.desiredProvider;
+    const oldModel = record.model;
+    const oldProvider = record.provider;
+
+    const patch: Partial<ThreadRecord> = {
+      model: trimmedModel,
+      desiredModel: undefined,
+      desiredProvider: undefined,
+    };
+    if (trimmedProvider !== undefined) {
+      patch.provider = trimmedProvider;
+    }
+    this.registry.patch(id, patch);
+
+    const verified = this.registry.get(id);
+    if (
+      verified?.model !== trimmedModel ||
+      (trimmedProvider !== undefined && verified?.provider !== trimmedProvider)
+    ) {
+      throw new Error(`Failed to verify deferred model update for thread: ${id}`);
+    }
+
+    this.onModelSet?.(id, trimmedModel, verified);
+
+    const detail =
+      trimmedProvider && trimmedProvider !== oldProvider
+        ? `${oldProvider ?? "default"}:${oldModel ?? "default"} -> ${trimmedProvider}:${trimmedModel}`
+        : `${oldModel ?? "default"} -> ${trimmedModel}`;
+
+    this.recordEvent({
+      kind: "actor_model_set",
+      actorId: id,
       detail,
     });
   }
@@ -2625,6 +2680,7 @@ export class ActorMesh {
       onRunEnd: (result) => {
         this.finishInboxRun(record.id);
         this.accountRun(record.id, result);
+        this.applyPendingModel(record.id);
       },
     };
   }

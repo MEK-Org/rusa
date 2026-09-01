@@ -705,8 +705,22 @@ class _InfoViewState extends State<_InfoView> {
             runSpacing: 12,
             children: [
               _meta('Parent', parentHandle),
-              if (actor.provider != null) _meta('Provider', actor.provider!),
-              if (actor.model != null) _meta('Model', actor.model!),
+              if (actor.provider != null || actor.desiredProvider != null)
+                _meta(
+                  'Provider',
+                  actor.desiredProvider != null &&
+                          actor.desiredProvider != actor.provider
+                      ? '${actor.provider ?? "default"} → ${actor.desiredProvider} (applies after next run)'
+                      : (actor.provider ?? "default"),
+                ),
+              if (actor.model != null || actor.desiredModel != null)
+                _meta(
+                  'Model',
+                  actor.desiredModel != null &&
+                          actor.desiredModel != actor.model
+                      ? '${actor.model ?? "default"} → ${actor.desiredModel} (applies after next run)'
+                      : (actor.model ?? "default"),
+                ),
               if (actor.commitmentKind != null)
                 _meta('Work state', actor.commitmentKind!),
               if (actor.waitingOn != null)

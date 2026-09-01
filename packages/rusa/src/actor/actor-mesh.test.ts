@@ -30,7 +30,7 @@ import type {
   InboxStore,
 } from "./inbox-store.js";
 import type { MeshEventInput, MeshEventSink } from "./mesh-events.js";
-import { InMemoryThreadRegistry } from "./thread-registry.js";
+import { InMemoryThreadRegistry, type ThreadRecord } from "./thread-registry.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
 const DEBOUNCE = 10;
@@ -2770,21 +2770,107 @@ describe("ActorMesh", () => {
     expect(registry.get(nativeChild)?.provider).toBe("claude");
     expect(registry.get(nativeChild)?.model).toBe("claude-opus-4-8");
 
-    // 7. Refuses model/provider changes while actor is running or queued
-    const busyChild = mesh.spawn({
+    // 7. Defers model/provider changes while actor is running or queued and applies at run end
+    const { provider: deferredRunProvider, releaseAll: releaseDeferred } = deferredProvider();
+    const modelSetCalls: Array<{ actorId: string; newModel: string; record: ThreadRecord }> = [];
+    const busyMeshSetup = setup({
+      sharedProvider: deferredRunProvider,
+      events: (event) => events.push(event),
+      onModelSet: (actorId, newModel, record) => modelSetCalls.push({ actorId, newModel, record }),
+    });
+
+    const busyChild = busyMeshSetup.mesh.spawn({
       charter: "busy child",
       parentId: "root",
       provider: "claude",
       model: "claude-opus-4-8",
       context: { type: "portable", mode: "ledger" },
     });
-    const liveBusyActor = mesh.get(busyChild);
-    if (liveBusyActor) {
-      Object.defineProperty(liveBusyActor, "isRunning", { value: true, configurable: true });
-    }
-    expect(() =>
-      mesh.setActorModel(busyChild, "gemini-3.7-flash-high", "root", "antigravity")
-    ).toThrow(/Cannot change model or provider while actor .* is running or queued/);
+
+    // Start a run so the actor is running
+    busyMeshSetup.mesh.sendMessage(busyChild, "run 1", "root");
+    await busyMeshSetup.tick();
+    expect(busyMeshSetup.mesh.activeRunState(busyChild)?.phase).toBe("running");
+
+    // setActorModel does NOT reject when running; persists desiredModel/desiredProvider
+    busyMeshSetup.mesh.setActorModel(busyChild, "gemini-3.7-flash-high", "root", "antigravity");
+    expect(busyMeshSetup.registry.get(busyChild)?.model).toBe("claude-opus-4-8");
+    expect(busyMeshSetup.registry.get(busyChild)?.provider).toBe("claude");
+    expect(busyMeshSetup.registry.get(busyChild)?.desiredModel).toBe("gemini-3.7-flash-high");
+    expect(busyMeshSetup.registry.get(busyChild)?.desiredProvider).toBe("antigravity");
+    expect(modelSetCalls).toHaveLength(0);
+
+    // Overwrite test (last-write-wins before boundary)
+    busyMeshSetup.mesh.setActorModel(busyChild, "gpt-5.6-sol", "root", "codex");
+    expect(busyMeshSetup.registry.get(busyChild)?.desiredModel).toBe("gpt-5.6-sol");
+    expect(busyMeshSetup.registry.get(busyChild)?.desiredProvider).toBe("codex");
+
+    // Complete the in-flight run; deferred model is applied at the run end boundary
+    releaseDeferred();
+    await busyMeshSetup.tick();
+    expect(busyMeshSetup.registry.get(busyChild)?.model).toBe("gpt-5.6-sol");
+    expect(busyMeshSetup.registry.get(busyChild)?.provider).toBe("codex");
+    expect(busyMeshSetup.registry.get(busyChild)?.desiredModel).toBeUndefined();
+    expect(busyMeshSetup.registry.get(busyChild)?.desiredProvider).toBeUndefined();
+    expect(modelSetCalls).toContainEqual(
+      expect.objectContaining({
+        actorId: busyChild,
+        newModel: "gpt-5.6-sol",
+        record: expect.objectContaining({ model: "gpt-5.6-sol", provider: "codex" }),
+      })
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "actor_model_set",
+        actorId: busyChild,
+        detail: "claude:claude-opus-4-8 -> codex:gpt-5.6-sol",
+      })
+    );
+
+    // Queued run boundary test: occupy the one concurrency slot so this actor is
+    // genuinely waiting in the mesh gate (rather than merely dirty while running).
+    const queuedDeferred = deferredProvider();
+    const queuedMeshSetup = setup({
+      maxConcurrent: 1,
+      sharedProvider: queuedDeferred.provider,
+      events: (event) => events.push(event),
+      onModelSet: (actorId, newModel, record) => modelSetCalls.push({ actorId, newModel, record }),
+    });
+    const blocker = queuedMeshSetup.mesh.spawn({
+      charter: "blocker",
+      parentId: "root",
+    });
+    const queuedChild = queuedMeshSetup.mesh.spawn({
+      charter: "queued child",
+      parentId: "root",
+      provider: "claude",
+      model: "claude-sonnet-5",
+      context: { type: "portable", mode: "ledger" },
+    });
+    queuedMeshSetup.mesh.sendMessage(blocker, "hold the slot", "root");
+    await queuedMeshSetup.tick();
+    expect(queuedMeshSetup.mesh.activeRunState(blocker)?.phase).toBe("running");
+
+    queuedMeshSetup.mesh.sendMessage(queuedChild, "queued run", "root");
+    await queuedMeshSetup.tick();
+    expect(queuedMeshSetup.mesh.activeRunState(queuedChild)?.phase).toBe("queued");
+
+    queuedMeshSetup.mesh.setActorModel(queuedChild, "claude-opus-4-8", "root");
+    expect(queuedMeshSetup.registry.get(queuedChild)?.model).toBe("claude-sonnet-5");
+    expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModel).toBe("claude-opus-4-8");
+
+    // Releasing the blocker admits the queued run, which still uses the old
+    // model. The pending value must survive until that run itself completes.
+    queuedDeferred.releaseAll();
+    await queuedMeshSetup.tick();
+    expect(queuedMeshSetup.mesh.activeRunState(queuedChild)?.phase).toBe("running");
+    expect(queuedMeshSetup.registry.get(queuedChild)?.model).toBe("claude-sonnet-5");
+    expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModel).toBe("claude-opus-4-8");
+
+    queuedDeferred.releaseAll();
+    await queuedMeshSetup.tick();
+    expect(queuedMeshSetup.registry.get(queuedChild)?.model).toBe("claude-opus-4-8");
+    expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModel).toBeUndefined();
 
     // 8. Dynamic provider halt check: moved actor obeys new provider's halt state on wake
     let providerBExecuted = false;
