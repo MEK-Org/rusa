@@ -136,7 +136,9 @@ export function applyBrandingToHtml(html: string, branding: DashboardBranding): 
  * browser picking the closest declared size would otherwise still install the
  * generic mark. The root image is declared `sizes: "any"` because an uploaded
  * file has no size we can promise (generated ones are 512×512, uploads are
- * whatever the operator picked), and "any" is what the spec has for exactly that.
+ * whatever the operator picked), and "any" is what the spec has for exactly
+ * that. Declaring both icon purposes lets Android apply its native adaptive
+ * mask instead of letterboxing a custom root image as an unmaskable icon.
  *
  * A manifest we cannot parse is passed through untouched.
  */
@@ -158,7 +160,12 @@ export function applyBrandingToManifest(manifestJson: string, branding: Dashboar
   }
   if (branding.iconUrl !== null) {
     manifest.icons = [
-      { src: branding.iconUrl, sizes: "any", type: branding.iconType ?? "image/png" },
+      {
+        src: branding.iconUrl,
+        sizes: "any",
+        type: branding.iconType ?? "image/png",
+        purpose: "any maskable",
+      },
     ];
   }
 
