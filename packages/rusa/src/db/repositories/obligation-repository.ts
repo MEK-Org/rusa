@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
+import type { OsScheduler } from "../../actor/os-scheduler.js";
 import {
   assertObligationStatus,
   type EntityId,
@@ -35,6 +36,10 @@ interface ObligationRow {
   terminal_note: string | null;
   title: string | null;
   resolution_ref: string | null;
+  recurrence_policy: "completion_interval" | "cron" | null;
+  recurrence_cron: string | null;
+  recurrence_interval_seconds: number | null;
+  next_ready_at: string | null;
 }
 
 interface ObligationArtifactRow {
@@ -63,6 +68,10 @@ export interface CreateObligationInput {
    * than inferring one from `owner`.
    */
   creatorId?: EntityId | null;
+  recurrence?:
+    | { policy: "cron"; cronExpr: string }
+    | { policy: "completion_interval"; intervalSeconds: number }
+    | null;
 }
 
 export type PriorityScope = "subtree" | "self";
@@ -229,6 +238,10 @@ function toObligation(row: ObligationRow): Obligation {
     terminalNote: row.terminal_note,
     title: row.title,
     resolutionRef: row.resolution_ref,
+    recurrencePolicy: row.recurrence_policy,
+    recurrenceCron: row.recurrence_cron,
+    recurrenceIntervalSeconds: row.recurrence_interval_seconds,
+    nextReadyAt: row.next_ready_at,
   };
 }
 
@@ -250,6 +263,12 @@ export class ObligationRepository {
     private actorExists?: (actorId: string) => boolean,
     private readonly now: () => number = Date.now
   ) {}
+
+  private osScheduler?: OsScheduler;
+
+  setOsScheduler(scheduler: OsScheduler): void {
+    this.osScheduler = scheduler;
+  }
 
   /**
    * Notified when an ACTOR owner gains a ready head it did not have before.
@@ -477,10 +496,8 @@ export class ObligationRepository {
       try {
         this.db
           .prepare(
-            `INSERT INTO obligations
-               (id, parent_id, owner_id, title, intent, external_ref, status, priority,
-                created_at, updated_at, creator_id)
-             VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?)`
+            `INSERT INTO obligations (id, parent_id, owner_id, title, intent, external_ref, status, priority,
+                created_at, updated_at, creator_id, recurrence_policy, recurrence_cron, recurrence_interval_seconds) VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?)`
           )
           .run(
             id,
@@ -492,8 +509,19 @@ export class ObligationRepository {
             priority,
             stampedAt,
             stampedAt,
-            creatorId
+            creatorId,
+            input.recurrence?.policy ?? null,
+            input.recurrence?.policy === "cron" ? input.recurrence.cronExpr : null,
+            input.recurrence?.policy === "completion_interval"
+              ? input.recurrence.intervalSeconds
+              : null
           );
+        if (input.recurrence?.policy === "cron") {
+          this.osScheduler?.scheduleObligationActivation(id, {
+            kind: "cron",
+            cronExpr: input.recurrence.cronExpr,
+          });
+        }
       } catch (error) {
         if (
           error instanceof Error &&
@@ -1018,13 +1046,69 @@ export class ObligationRepository {
           )
           .run(randomUUID(), id, resolution, this.stamp());
       }
-      this.db
-        .prepare(
-          `UPDATE obligations
-           SET status = ?, terminal_note = ?, resolution_ref = ?, updated_at = ?
+
+      if (status === "done" && obligation.recurrencePolicy !== null) {
+        const seqRow = this.db
+          .prepare(
+            `SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM obligation_completions WHERE obligation_id = ?`
+          )
+          .get(id) as { seq: number };
+        const seq = seqRow.seq;
+        const completionId = randomUUID();
+
+        let nextReadyAt = null;
+        if (
+          obligation.recurrencePolicy === "completion_interval" &&
+          obligation.recurrenceIntervalSeconds != null
+        ) {
+          nextReadyAt = new Date(
+            this.now() + obligation.recurrenceIntervalSeconds * 1000
+          ).toISOString();
+        }
+
+        this.db
+          .prepare(
+            `INSERT INTO obligation_completions (id, obligation_id, sequence, completed_at, note, resolution_ref, next_ready_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            completionId,
+            id,
+            seq,
+            this.stamp(),
+            normalizeTerminalNote(note),
+            resolution,
+            nextReadyAt
+          );
+
+        this.db
+          .prepare(
+            `UPDATE obligations
+           SET status = 'scheduled', next_ready_at = ?, updated_at = ?
            WHERE id = ?`
-        )
-        .run(status, normalizeTerminalNote(note), resolution, this.stamp(), id);
+          )
+          .run(nextReadyAt, this.stamp(), id);
+
+        if (obligation.recurrencePolicy === "completion_interval" && nextReadyAt) {
+          this.osScheduler?.scheduleObligationActivation(id, {
+            kind: "at",
+            date: new Date(nextReadyAt),
+          });
+        }
+      } else {
+        this.db
+          .prepare(
+            `UPDATE obligations
+             SET status = ?, terminal_note = ?, resolution_ref = ?, updated_at = ?, next_ready_at = NULL
+             WHERE id = ?`
+          )
+          .run(status, normalizeTerminalNote(note), resolution, this.stamp(), id);
+
+        if (status === "cancelled" || (status === "done" && obligation.recurrencePolicy === null)) {
+          this.osScheduler?.cancelObligationActivation(id);
+        }
+      }
+
       if (obligation.parentId !== null) this.reReadyParentIfUnblocked(obligation.parentId);
       return this.require(id);
     });
@@ -1035,6 +1119,110 @@ export class ObligationRepository {
    * priority inherits from the new ancestry. Transactionally updates both old
    * and new parents' waiting/ready states and rejects cycles and self-parenting.
    */
+
+  setRecurrence(
+    id: string,
+    recurrence:
+      | { policy: "cron"; cronExpr: string }
+      | { policy: "completion_interval"; intervalSeconds: number }
+      | null
+  ): Obligation {
+    return this.mutate(() => {
+      const obligation = this.require(id);
+      if (isTerminalObligationStatus(obligation.status)) {
+        throw new ObligationValidationError("terminal obligations cannot be recurring");
+      }
+
+      let nextReadyAt = obligation.nextReadyAt;
+
+      if (recurrence === null) {
+        this.db
+          .prepare(
+            `UPDATE obligations SET recurrence_policy = NULL, recurrence_cron = NULL, recurrence_interval_seconds = NULL, updated_at = ? WHERE id = ?`
+          )
+          .run(this.stamp(), id);
+
+        if (obligation.status === "scheduled") {
+          this.db
+            .prepare(
+              `UPDATE obligations SET status = 'done', next_ready_at = NULL, updated_at = ? WHERE id = ?`
+            )
+            .run(this.stamp(), id);
+          if (obligation.parentId !== null) this.reReadyParentIfUnblocked(obligation.parentId);
+        } else {
+          this.db
+            .prepare(`UPDATE obligations SET next_ready_at = NULL, updated_at = ? WHERE id = ?`)
+            .run(this.stamp(), id);
+        }
+        this.osScheduler?.cancelObligationActivation(id);
+      } else if (recurrence.policy === "cron") {
+        this.db
+          .prepare(
+            `UPDATE obligations SET recurrence_policy = 'cron', recurrence_cron = ?, recurrence_interval_seconds = NULL, updated_at = ? WHERE id = ?`
+          )
+          .run(recurrence.cronExpr, this.stamp(), id);
+        this.osScheduler?.scheduleObligationActivation(id, {
+          kind: "cron",
+          cronExpr: recurrence.cronExpr,
+        });
+      } else if (recurrence.policy === "completion_interval") {
+        if (obligation.status === "scheduled") {
+          const lastCompletion = this.db
+            .prepare(
+              `SELECT completed_at FROM obligation_completions WHERE obligation_id = ? ORDER BY sequence DESC LIMIT 1`
+            )
+            .get(id) as { completed_at: string } | undefined;
+
+          if (lastCompletion) {
+            const completedTime = Date.parse(lastCompletion.completed_at);
+            const readyTime = completedTime + recurrence.intervalSeconds * 1000;
+            if (readyTime <= this.now()) {
+              this.db
+                .prepare(
+                  `UPDATE obligations SET status = 'ready', next_ready_at = NULL, recurrence_policy = 'completion_interval', recurrence_cron = NULL, recurrence_interval_seconds = ?, updated_at = ? WHERE id = ?`
+                )
+                .run(recurrence.intervalSeconds, this.stamp(), id);
+              this.osScheduler?.cancelObligationActivation(id);
+            } else {
+              nextReadyAt = new Date(readyTime).toISOString();
+              this.db
+                .prepare(
+                  `UPDATE obligations SET next_ready_at = ?, recurrence_policy = 'completion_interval', recurrence_cron = NULL, recurrence_interval_seconds = ?, updated_at = ? WHERE id = ?`
+                )
+                .run(nextReadyAt, recurrence.intervalSeconds, this.stamp(), id);
+              this.osScheduler?.scheduleObligationActivation(id, {
+                kind: "at",
+                date: new Date(readyTime),
+              });
+            }
+          }
+        } else {
+          this.db
+            .prepare(
+              `UPDATE obligations SET recurrence_policy = 'completion_interval', recurrence_cron = NULL, recurrence_interval_seconds = ?, updated_at = ? WHERE id = ?`
+            )
+            .run(recurrence.intervalSeconds, this.stamp(), id);
+        }
+      }
+      return this.require(id);
+    });
+  }
+
+  activateScheduled(id: string): Obligation | null {
+    return this.mutate(() => {
+      const obligation = this.get(id);
+      if (!obligation) return null;
+      if (obligation.status !== "scheduled") return obligation;
+      this.db
+        .prepare(
+          `UPDATE obligations SET status = 'ready', next_ready_at = NULL, updated_at = ? WHERE id = ?`
+        )
+        .run(this.stamp(), id);
+
+      return this.require(id);
+    });
+  }
+
   reparent(id: string, newParentId: string | null): Obligation {
     return this.mutate(() => {
       const obligation = this.require(id);

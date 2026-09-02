@@ -28,6 +28,16 @@ export interface McpHttpServerOptions {
  * loopback endpoint with a bearer token; the handler authenticates and delivers a
  * mechanical wake. Stateless — cron owns timing + durability.
  */
+export interface WakeObligationHandler {
+  token: string;
+  deliver: (id: string) => void;
+}
+
+export interface WakeMessageHandler {
+  token: string;
+  deliver: (id: string) => void;
+}
+
 export interface WakeHandler {
   /** The bearer token the cron job must present (minted at install, chmod-600 file). */
   token: string;
@@ -143,6 +153,8 @@ export class McpHttpServer {
   private readonly tokenToName = new Map<string, string>();
   /** Cron-driven wake endpoint backend; null until {@link setWakeHandler} wires it. */
   private wake: WakeHandler | null;
+  private wakeObligation?: WakeObligationHandler | null;
+  private wakeMessage?: WakeMessageHandler | null;
   /** Host-jobs exit endpoint backend; null until {@link setHostJobExitHandler} wires it. */
   private hostJobExit: HostJobExitHandler | null;
 
@@ -170,6 +182,12 @@ export class McpHttpServer {
    */
   setWakeHandler(wake: WakeHandler): void {
     this.wake = wake;
+  }
+  setWakeObligationHandler(wake: WakeObligationHandler): void {
+    this.wakeObligation = wake;
+  }
+  setWakeMessageHandler(wake: WakeMessageHandler): void {
+    this.wakeMessage = wake;
   }
 
   /**

@@ -6,7 +6,7 @@ import {
   type Reference,
 } from "../references/reference.js";
 
-export type ObligationStatus = "ready" | "waiting" | "done" | "cancelled";
+export type ObligationStatus = "ready" | "waiting" | "done" | "cancelled" | "scheduled";
 
 /**
  * One entity in the mesh's single id space: an actor UUID, `root`, `human:*`,
@@ -90,6 +90,20 @@ export interface Obligation {
    * obligations citing the same message.
    */
   resolutionRef: string | null;
+  recurrencePolicy: "completion_interval" | "cron" | null;
+  recurrenceCron: string | null;
+  recurrenceIntervalSeconds: number | null;
+  nextReadyAt: string | null;
+}
+
+export interface ObligationCompletion {
+  id: string;
+  obligationId: string;
+  sequence: number;
+  completedAt: string;
+  note: string | null;
+  resolutionRef: string | null;
+  nextReadyAt: string | null;
 }
 
 /** One artifact cited by an obligation. */
@@ -119,7 +133,7 @@ export class ObligationValidationError extends Error {
   }
 }
 
-const STATUSES = new Set<ObligationStatus>(["ready", "waiting", "done", "cancelled"]);
+const STATUSES = new Set<ObligationStatus>(["ready", "waiting", "done", "cancelled", "scheduled"]);
 
 export function isTerminalObligationStatus(status: ObligationStatus): boolean {
   return status === "done" || status === "cancelled";

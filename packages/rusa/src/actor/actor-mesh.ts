@@ -34,6 +34,7 @@ import {
   NOOP_MESH_EVENT_SINK,
   RUN_TERMINAL_EVENT_KINDS,
 } from "./mesh-events.js";
+import type { OsScheduler } from "./os-scheduler.js";
 import type {
   ActorBudget,
   ActorHandle,
@@ -479,7 +480,13 @@ export class ActorMesh {
     string,
     { record: ThreadRecord; cleanups: RetireCleanup[] }
   >();
-  private readonly pendingDeliveryTimers = new Map<string, NodeJS.Timeout>();
+  private pendingDeliveryTimers = new Map<string, NodeJS.Timeout>();
+  private osScheduler?: OsScheduler;
+
+  setOsScheduler(osScheduler: OsScheduler): void {
+    this.osScheduler = osScheduler;
+  }
+
   private readonly selectedInboxEntryIds = new Map<string, string[]>();
   /** Actors currently inside a run, for the ready-head window below. */
   private readonly actorsInRun = new Set<string>();
@@ -2230,6 +2237,7 @@ export class ActorMesh {
         const timer = this.pendingDeliveryTimers.get(msg.id);
         if (timer) clearTimeout(timer);
         this.pendingDeliveryTimers.delete(msg.id);
+        if (this.osScheduler) this.osScheduler.cancelMessageDelivery(msg.id);
       }
       this.registry.patch(id, { pendingDeliveries: [] });
     }
@@ -2857,9 +2865,13 @@ export class ActorMesh {
   }
 
   private armPendingDelivery(toId: string, msg: PendingMessageDelivery): void {
-    const delay = Math.max(0, new Date(msg.deliverAt).getTime() - Date.now());
-    const timer = setTimeout(() => this.firePendingDelivery(toId, msg.id), delay);
-    this.pendingDeliveryTimers.set(msg.id, timer);
+    if (this.osScheduler) {
+      this.osScheduler.scheduleMessageDelivery(msg.id, new Date(msg.deliverAt));
+    } else {
+      const delay = Math.max(0, new Date(msg.deliverAt).getTime() - Date.now());
+      const timer = setTimeout(() => this.firePendingDelivery(toId, msg.id), delay);
+      this.pendingDeliveryTimers.set(msg.id, timer);
+    }
   }
 
   /**
@@ -2909,6 +2921,18 @@ export class ActorMesh {
     }
   }
 
+  deliverScheduledMessage(messageId: string): void {
+    let foundToId: string | undefined;
+    for (const rec of this.registry.list()) {
+      if (rec.pendingDeliveries?.some((m) => m.id === messageId)) {
+        foundToId = rec.id;
+        break;
+      }
+    }
+    if (!foundToId) return;
+    this.firePendingDelivery(foundToId, messageId);
+  }
+
   private firePendingDelivery(toId: string, messageId: string): void {
     const rec = this.registry.get(toId);
     if (!rec) return;
@@ -2916,6 +2940,7 @@ export class ActorMesh {
     if (!scheduled) return;
 
     this.pendingDeliveryTimers.delete(messageId);
+    if (this.osScheduler) this.osScheduler.cancelMessageDelivery(messageId);
 
     try {
       if (rec.status !== "active") {

@@ -57,6 +57,7 @@ import {
   type RunAbandonedPayload,
   runEndPayload,
 } from "../actor/mesh-events.js";
+import { DefaultOsScheduler, execAtIo } from "../actor/os-scheduler.js";
 import {
   assemblePortableContext,
   assemblePortableContextV2,
@@ -2060,9 +2061,40 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // cron line (which reads it via `$(cat …)`) survives restarts.
   const wakeToken = ensureWakeToken(mcHome);
   writeWakePort(mcHome, mcpHttp.boundPort);
+
+  const osScheduler = new DefaultOsScheduler(execCrontabIo(), execAtIo(), {
+    tokenFile: wakeTokenPath(mcHome),
+    portFile: wakePortPath(mcHome),
+  });
+  getRepositories().setOsScheduler(osScheduler);
+  mesh.setOsScheduler(osScheduler);
+
   mcpHttp.setWakeHandler({
     token: wakeToken,
     deliver: (actorId, reason, priority) => mesh.deliverWake(actorId, reason, priority),
+  });
+
+  mcpHttp.setWakeObligationHandler({
+    token: wakeToken,
+    deliver: (id: string) => {
+      const ob = getRepositories().obligations.activateScheduled(id);
+      if (
+        ob &&
+        ob.status === "ready" &&
+        ob.parentId === null &&
+        !ob.ownerId.startsWith("human:") &&
+        !ob.ownerId.startsWith("system:")
+      ) {
+        mesh.deliverWake(ob.ownerId, "obligation_ready");
+      }
+    },
+  });
+
+  mcpHttp.setWakeMessageHandler({
+    token: wakeToken,
+    deliver: (id: string) => {
+      mesh.deliverScheduledMessage(id);
+    },
   });
 
   // ── Host-jobs exit endpoint  ──

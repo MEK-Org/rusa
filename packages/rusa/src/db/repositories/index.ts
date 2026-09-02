@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import type { OsScheduler } from "../../actor/os-scheduler.js";
 import { ActorRunRepository } from "./actor-run-repository.js";
 import { InboxFocusRepository } from "./inbox-focus-repository.js";
 import { InboxRepository } from "./inbox-repository.js";
@@ -56,6 +57,10 @@ export class Repositories {
    */
   setActorExists(probe: (actorId: string) => boolean): void {
     this.obligations.setActorExists(probe);
+  }
+
+  setOsScheduler(scheduler: OsScheduler): void {
+    this.obligations.setOsScheduler(scheduler);
   }
 }
 

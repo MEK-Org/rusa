@@ -22,6 +22,7 @@ type ObligationServerRepository = Pick<
   | "movePriorityInternal"
   | "reassign"
   | "reparent"
+  | "setRecurrence"
 >;
 
 export interface ObligationsMcpOptions {
@@ -243,9 +244,19 @@ export function createObligationsMcpServer(
         intent: z.string().nullable().optional(),
         external_ref: z.string().trim().min(1).nullable().optional(),
         priority: z.number().finite().nullable().optional(),
+        recurrence: z
+          .union([
+            z.object({ policy: z.literal("cron"), cronExpr: z.string().trim().min(1) }),
+            z.object({
+              policy: z.literal("completion_interval"),
+              intervalSeconds: z.number().int().min(1),
+            }),
+          ])
+          .nullable()
+          .optional(),
       },
     },
-    async ({ owner_id, title, parent_id, intent, external_ref, priority }) => {
+    async ({ owner_id, title, parent_id, intent, external_ref, priority, recurrence }) => {
       try {
         const owner = options?.resolveOwner?.(owner_id) ?? { ok: true as const, ownerId: owner_id };
         if (!owner.ok) return toolError(new Error(owner.error));
@@ -256,6 +267,7 @@ export function createObligationsMcpServer(
           intent: intent ?? null,
           externalRef: external_ref ?? null,
           priority: priority ?? null,
+          recurrence: recurrence ?? null,
           // Bound by the server from this server's actor identity, exactly like
           // `owner` on list_owned. There is deliberately no `created_by` field
           // in inputSchema: #1671's trust boundary requires that attribution is
@@ -266,6 +278,35 @@ export function createObligationsMcpServer(
         return toolOk({ obligation });
       } catch (err) {
         return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "set_obligation_recurrence",
+    {
+      title: "Set recurrence for an obligation",
+      description:
+        "Enables, changes, or disables recurrence for an obligation, and reconciles its OS job.",
+      inputSchema: {
+        id: z.string().trim().min(1),
+        recurrence: z
+          .union([
+            z.object({ policy: z.literal("cron"), cronExpr: z.string().trim().min(1) }),
+            z.object({
+              policy: z.literal("completion_interval"),
+              intervalSeconds: z.number().int().min(1),
+            }),
+          ])
+          .nullable(),
+      },
+    },
+    async ({ id, recurrence }) => {
+      try {
+        const obligation = repository.setRecurrence(id, recurrence);
+        return toolOk({ obligation });
+      } catch (error) {
+        return toolError(error);
       }
     }
   );
