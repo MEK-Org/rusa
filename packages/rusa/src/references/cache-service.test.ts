@@ -13,7 +13,8 @@ describe("ReferenceCacheService", () => {
       delete: vi.fn(),
     } as unknown as ReferenceCacheRepository;
 
-    const svc = new ReferenceCacheService({ repo });
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
     const deps = {
       meshChat: { getById: vi.fn().mockReturnValue(null) },
     };
@@ -37,11 +38,16 @@ describe("ReferenceCacheService", () => {
       delete: vi.fn(),
     } as unknown as ReferenceCacheRepository;
 
-    const svc = new ReferenceCacheService({ repo });
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
     const res = await svc.get("github:a/b/issues/1", {});
 
     expect(res.cacheState).toBe("fresh");
     expect(res.entity).toEqual({ type: "github_issue", title: "T", description: "D" });
+    expect(logger.info).toHaveBeenCalledWith(
+      "reference_cache_hit",
+      expect.objectContaining({ type: "github_issue" })
+    );
   });
 
   it("handles stale external hit", async () => {
@@ -63,7 +69,8 @@ describe("ReferenceCacheService", () => {
         getIssue: vi.fn().mockResolvedValue({ title: "T2", body: "D2" }),
       },
     };
-    const svc = new ReferenceCacheService({ repo });
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
     const res = await svc.get("github:a/b/issues/1", deps);
 
     expect(res.cacheState).toBe("stale");
@@ -87,12 +94,17 @@ describe("ReferenceCacheService", () => {
         getIssue: vi.fn().mockResolvedValue({ title: "T", body: "D" }),
       },
     };
-    const svc = new ReferenceCacheService({ repo });
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
     const res = await svc.get("github:a/b/issues/1", deps);
 
     expect(res.cacheState).toBe("fresh");
     expect(res.entity).toEqual({ type: "github_issue", title: "T", description: "D" });
     expect(repo.set).toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalledWith(
+      "reference_cache_miss",
+      expect.objectContaining({ type: "github_issue" })
+    );
   });
 
   it("handles cold miss with timeout", async () => {
@@ -107,13 +119,18 @@ describe("ReferenceCacheService", () => {
         getIssue: vi.fn().mockImplementation(() => new Promise((r) => setTimeout(r, 500))),
       },
     };
-    const svc = new ReferenceCacheService({ repo, deadlineMs: 50 });
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, deadlineMs: 50, logger });
     const res = await svc.get("github:a/b/issues/1", deps);
 
     expect(res.cacheState).toBe("pending");
     expect(res.unavailable).toBe("loading context");
     expect(res.entity).toBeUndefined();
     expect(repo.set).not.toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalledWith(
+      "reference_cache_deadline",
+      expect.objectContaining({ type: "github_issue" })
+    );
   });
 
   it("handles unavailable result", async () => {
@@ -128,7 +145,8 @@ describe("ReferenceCacheService", () => {
         getIssue: vi.fn().mockResolvedValue(null),
       },
     };
-    const svc = new ReferenceCacheService({ repo });
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
     const res = await svc.get("github:a/b/issues/1", deps);
 
     expect(res.cacheState).toBe("unavailable");
@@ -155,7 +173,8 @@ describe("ReferenceCacheService", () => {
         getIssue: vi.fn().mockRejectedValue(new Error("failed")),
       },
     };
-    const svc = new ReferenceCacheService({ repo });
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
     const res = await svc.get("github:a/b/issues/1", deps);
 
     expect(res.cacheState).toBe("stale");
@@ -185,7 +204,8 @@ describe("ReferenceCacheService", () => {
         }),
       },
     };
-    const svc = new ReferenceCacheService({ repo });
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
     const res = await svc.get("github:a/b/pulls/2", deps);
 
     expect(res.cacheState).toBe("fresh");
@@ -216,9 +236,11 @@ describe("ReferenceCacheService", () => {
           displayName: "My Space Name",
           raw_internal_id: "secret_123",
         }),
+        getMessage: vi.fn(),
       },
     };
-    const svc = new ReferenceCacheService({ repo });
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
     const res = await svc.get("gchat:spaces/abc", deps);
 
     expect(res.cacheState).toBe("fresh");
@@ -240,9 +262,11 @@ describe("ReferenceCacheService", () => {
         getSpace: vi.fn().mockResolvedValue({
           name: "spaces/def",
         }),
+        getMessage: vi.fn(),
       },
     };
-    const svc = new ReferenceCacheService({ repo });
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
     const res = await svc.get("gchat:spaces/def", deps);
 
     expect(res.cacheState).toBe("fresh");
@@ -263,9 +287,11 @@ describe("ReferenceCacheService", () => {
           text: "Full text content",
           internal_auth_token: "secret",
         }),
+        getSpace: vi.fn(),
       },
     };
-    const svc = new ReferenceCacheService({ repo });
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
     const res = await svc.get("gchat:spaces/abc/messages/123", deps);
 
     expect(res.cacheState).toBe("fresh");
@@ -287,9 +313,11 @@ describe("ReferenceCacheService", () => {
         getMessage: vi
           .fn()
           .mockRejectedValue(new Error("Permission denied: user does not have access")),
+        getSpace: vi.fn(),
       },
     };
-    const svc = new ReferenceCacheService({ repo });
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
     const res = await svc.get("gchat:spaces/abc/messages/403", deps);
 
     expect(res.cacheState).toBe("unavailable");
@@ -317,7 +345,8 @@ describe("ReferenceCacheService", () => {
         getIssue: vi.fn().mockResolvedValue(null), // cold miss will fail
       },
     };
-    const svc = new ReferenceCacheService({ repo });
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
     const res = await svc.get("github:a/b/issues/1", deps);
 
     expect(res.cacheState).toBe("unavailable");
@@ -344,7 +373,8 @@ describe("ReferenceCacheService", () => {
         getIssue: vi.fn().mockResolvedValue(null), // cold miss will fail
       },
     };
-    const svc = new ReferenceCacheService({ repo });
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
     const res = await svc.get("github:a/b/issues/1", deps);
 
     expect(res.cacheState).toBe("unavailable");

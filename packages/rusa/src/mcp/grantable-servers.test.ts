@@ -261,6 +261,7 @@ describe("grantable capabilities allow-list ", () => {
       listSpaces: async () => ({ spaces: [] }),
       listMessages: async () => ({ messages: [] }),
       getMessage: async () => ({ name: "spaces/A/messages/M1" }),
+      getSpace: async () => ({ name: "spaces/A" }),
       getAttachment: async () => ({ name: "spaces/A/attachments/ATT1" }),
       downloadAttachment: async () => Buffer.alloc(0),
       uploadAttachment: async () => ({ attachmentDataRef: { resourceName: "ref" } }),

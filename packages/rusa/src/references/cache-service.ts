@@ -61,19 +61,30 @@ export class ReferenceCacheService {
         const base = resolveReferenceSync(key, deps);
         if (now < refreshAfter) {
           // Fresh external hit
-          this.logger?.info("reference_cache_hit", { state: "fresh", scheme: reference.scheme });
+          this.logger?.info("reference_cache_hit", {
+            state: "fresh",
+            scheme: reference.scheme,
+            type: getResourceShape(reference),
+          });
           return { ...base, entity, unavailable: null, cacheState: "fresh" };
         }
 
         // Stale external hit
-        this.logger?.info("reference_cache_hit", { state: "stale", scheme: reference.scheme });
+        this.logger?.info("reference_cache_hit", {
+          state: "stale",
+          scheme: reference.scheme,
+          type: getResourceShape(reference),
+        });
         this.triggerRefresh(key, deps).catch(() => {}); // Fire and forget
         return { ...base, entity, unavailable: null, cacheState: "stale" };
       }
     }
 
     // Cold miss
-    this.logger?.info("reference_cache_miss", { scheme: reference.scheme });
+    this.logger?.info("reference_cache_miss", {
+      scheme: reference.scheme,
+      type: getResourceShape(reference),
+    });
     const readPromise = this.performProviderRead(key, deps);
     const deadlinePromise = new Promise<"deadline">((resolve) =>
       setTimeout(() => resolve("deadline"), this.deadlineMs)
@@ -83,7 +94,10 @@ export class ReferenceCacheService {
 
     if (result === "deadline") {
       // Background the read
-      this.logger?.info("reference_cache_deadline", { scheme: reference.scheme });
+      this.logger?.info("reference_cache_deadline", {
+        scheme: reference.scheme,
+        type: getResourceShape(reference),
+      });
       readPromise.catch(() => {});
       const base = resolveReferenceSync(key, deps);
       return { ...base, unavailable: "loading context", cacheState: "pending" };
@@ -100,7 +114,10 @@ export class ReferenceCacheService {
     }
 
     // Unavailable result
-    this.logger?.info("reference_cache_unavailable", { scheme: reference.scheme });
+    this.logger?.info("reference_cache_unavailable", {
+      scheme: reference.scheme,
+      type: getResourceShape(reference),
+    });
     const base = resolveReferenceSync(key, deps);
     return { ...base, unavailable: "could not load context", cacheState: "unavailable" };
   }
@@ -216,5 +233,22 @@ function decodeV1Entity(raw: unknown): ReferenceEntity | undefined {
     }
   }
 
+  return undefined;
+}
+
+function getResourceShape(reference: ReturnType<typeof parseReference>): string | undefined {
+  if (reference.scheme === "github") {
+    const issue = asGitHubIssue(reference);
+    if (issue) {
+      return issue.collection === "pulls" ? "github_pull_request" : "github_issue";
+    }
+  } else if (reference.scheme === "gchat") {
+    if (reference.segments.length === 2 && reference.segments[0] === "spaces") {
+      return "gchat_space";
+    }
+    if (reference.segments.length >= 4 && reference.segments[2] === "messages") {
+      return "gchat_message";
+    }
+  }
   return undefined;
 }
