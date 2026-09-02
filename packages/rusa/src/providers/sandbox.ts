@@ -713,7 +713,7 @@ function providerWritableStateDirs(authMode: SandboxAuthMode | undefined): strin
  * omits fnm's toolchain dir. Writes are scoped to exactly four places: the
  * actor's own dir, the shared pnpm CAS, the provider's state dir, and `/tmp`.
  */
-function buildMeshActorBwrapArgs(o: {
+export function buildMeshActorBwrapArgs(o: {
   actorDir: string;
   authMode?: SandboxAuthMode;
   mcpConfigPath?: string;
@@ -730,6 +730,7 @@ function buildMeshActorBwrapArgs(o: {
     "--unshare-all",
     "--share-net",
     "--die-with-parent",
+    ...(o.isE2eRoot ? [] : ["--new-session"]),
     // Read everything (incl. other actors' repos), with narrow tmpfs shadows for
     // host-plane-only stores below; the real home stays visible so tools resolve
     // ~/.gitconfig, ~/.ssh, ~/.config/gh without any remapping.
