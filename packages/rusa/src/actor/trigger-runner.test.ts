@@ -9,7 +9,17 @@ describe("TriggerRunner", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  it("coalesces pre-run nudges without retaining content", async () => {
+  it("starts promptly without debounce by default", async () => {
+    const runs: unknown[] = [];
+    const runner = new TriggerRunner({
+      run: async (nudge) => void runs.push(nudge),
+    });
+    runner.requestRun();
+    await flush();
+    expect(runs).toHaveLength(1);
+  });
+
+  it("coalesces pre-run nudges when explicitly debounced", async () => {
     const runs: unknown[] = [];
     const runner = new TriggerRunner({
       debounceMs: 10,
