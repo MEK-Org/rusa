@@ -27,39 +27,57 @@ class OwnerSelector extends StatelessWidget {
             .where((a) => !a.isRetired)
             .map((a) => OwnerOption(kind: 'actor', id: a.id, handle: a.handle));
         final humans = [
-          OwnerOption(kind: 'human', id: 'human:operator', handle: 'human operator'),
+          OwnerOption(
+            kind: 'human',
+            id: 'human:operator',
+            handle: 'human operator',
+          ),
         ];
         final all = [...humans, ...actors];
         if (text.isEmpty) return all;
-        return all.where((opt) => opt.handle.toLowerCase().contains(text) || opt.id.toLowerCase().contains(text));
-      },
-      fieldViewBuilder: (context, textEditingController, focusNode, onFieldSubmitted) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (ownerIdCtrl.text != textEditingController.text) {
-            ownerIdCtrl.text = textEditingController.text;
-          }
-        });
-        textEditingController.addListener(() {
-          ownerIdCtrl.text = textEditingController.text;
-        });
-        
-        return TextFormField(
-          controller: textEditingController,
-          focusNode: focusNode,
-          style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13, fontFamily: kMonoFontFamily),
-          decoration: decoration.copyWith(
-            suffixIcon: IconButton(
-              icon: const Icon(Icons.arrow_drop_down, color: MeshColors.textSecondary),
-              onPressed: () {
-                textEditingController.clear();
-                focusNode.requestFocus();
-              },
-            ),
-          ),
-          validator: (value) => (value == null || value.trim().isEmpty) ? 'Owner ID is required' : null,
-          onFieldSubmitted: (_) => onFieldSubmitted(),
+        return all.where(
+          (opt) =>
+              opt.handle.toLowerCase().contains(text) ||
+              opt.id.toLowerCase().contains(text),
         );
       },
+      fieldViewBuilder:
+          (context, textEditingController, focusNode, onFieldSubmitted) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (ownerIdCtrl.text != textEditingController.text) {
+                ownerIdCtrl.text = textEditingController.text;
+              }
+            });
+            textEditingController.addListener(() {
+              ownerIdCtrl.text = textEditingController.text;
+            });
+
+            return TextFormField(
+              controller: textEditingController,
+              focusNode: focusNode,
+              style: const TextStyle(
+                color: MeshColors.textPrimary,
+                fontSize: 13,
+                fontFamily: kMonoFontFamily,
+              ),
+              decoration: decoration.copyWith(
+                suffixIcon: IconButton(
+                  icon: const Icon(
+                    Icons.arrow_drop_down,
+                    color: MeshColors.textSecondary,
+                  ),
+                  onPressed: () {
+                    textEditingController.clear();
+                    focusNode.requestFocus();
+                  },
+                ),
+              ),
+              validator: (value) => (value == null || value.trim().isEmpty)
+                  ? 'Owner ID is required'
+                  : null,
+              onFieldSubmitted: (_) => onFieldSubmitted(),
+            );
+          },
       optionsViewBuilder: (context, onSelected, options) {
         return Align(
           alignment: Alignment.topLeft,
@@ -81,9 +99,16 @@ class OwnerSelector extends StatelessWidget {
                   return ListTile(
                     dense: true,
                     leading: option.kind == 'human'
-                        ? const Icon(Icons.person, color: MeshColors.textSecondary, size: 24)
+                        ? const Icon(
+                            Icons.person,
+                            color: MeshColors.textSecondary,
+                            size: 24,
+                          )
                         : ActorAvatar(id: option.id, size: 24, store: store),
-                    title: Text(option.handle, style: const TextStyle(color: MeshColors.textPrimary)),
+                    title: Text(
+                      option.handle,
+                      style: const TextStyle(color: MeshColors.textPrimary),
+                    ),
                     onTap: () => onSelected(option),
                   );
                 },

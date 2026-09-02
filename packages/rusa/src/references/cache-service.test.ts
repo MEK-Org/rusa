@@ -107,16 +107,21 @@ describe("ReferenceCacheService", () => {
     );
   });
 
-  it("handles cold miss with timeout", async () => {
+  it("handles cold miss with timeout and resolves background write", async () => {
     const repo = {
       get: vi.fn().mockReturnValue(null),
       set: vi.fn(),
       delete: vi.fn(),
     } as unknown as ReferenceCacheRepository;
 
+    let resolvePromise: (value: unknown) => void;
+    const providerPromise = new Promise((resolve) => {
+      resolvePromise = resolve;
+    });
+
     const deps = {
       issueClient: {
-        getIssue: vi.fn().mockImplementation(() => new Promise((r) => setTimeout(r, 500))),
+        getIssue: vi.fn().mockReturnValue(providerPromise),
       },
     };
     const logger = { info: vi.fn(), error: vi.fn() };
@@ -127,10 +132,13 @@ describe("ReferenceCacheService", () => {
     expect(res.unavailable).toBe("loading context");
     expect(res.entity).toBeUndefined();
     expect(repo.set).not.toHaveBeenCalled();
-    expect(logger.info).toHaveBeenCalledWith(
-      "reference_cache_deadline",
-      expect.objectContaining({ type: "github_issue" })
-    );
+
+    // Resolve the background promise
+    resolvePromise?.({ title: "T", body: "D" });
+    await new Promise((r) => setTimeout(r, 0)); // tick
+    await new Promise((r) => setTimeout(r, 0)); // tick
+
+    expect(repo.set).toHaveBeenCalled();
   });
 
   it("handles unavailable result", async () => {
@@ -380,5 +388,54 @@ describe("ReferenceCacheService", () => {
     expect(res.cacheState).toBe("unavailable");
     expect(res.unavailable).toBe("could not load context");
     expect(res.entity).toBeUndefined();
+  });
+
+  it("isolates repository read faults", async () => {
+    const repo = {
+      get: vi.fn().mockImplementation(() => {
+        throw new Error("db fault");
+      }),
+      set: vi.fn(),
+      delete: vi.fn(),
+    } as unknown as ReferenceCacheRepository;
+
+    const deps = {
+      issueClient: {
+        getIssue: vi.fn().mockResolvedValue({ title: "T", body: "D" }),
+      },
+    };
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
+    const res = await svc.get("github:a/b/issues/1", deps);
+
+    expect(res.cacheState).toBe("fresh"); // Because it misses cache, does a provider read, and succeeds
+    expect(res.entity).toEqual({ type: "github_issue", title: "T", description: "D" });
+  });
+
+  it("rejects cached row with incorrect discriminator", async () => {
+    const row: ReferenceCacheRow = {
+      ref: "github:a/b/issues/1",
+      document_version: 1,
+      entity_json: JSON.stringify({ type: "gchat_message", contents: "wrong shape" }),
+      fetched_at: new Date().toISOString(),
+      refresh_after: new Date(Date.now() + 100000).toISOString(),
+    };
+    const repo = {
+      get: vi.fn().mockReturnValue(row),
+      set: vi.fn(),
+      delete: vi.fn(),
+    } as unknown as ReferenceCacheRepository;
+
+    const deps = {
+      issueClient: {
+        getIssue: vi.fn().mockResolvedValue(null),
+      },
+    };
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
+    const res = await svc.get("github:a/b/issues/1", deps);
+
+    // It should ignore the bad cache row, miss the provider (mocked to null), and return unavailable
+    expect(res.cacheState).toBe("unavailable");
   });
 });

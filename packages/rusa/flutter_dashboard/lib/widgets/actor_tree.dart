@@ -73,9 +73,16 @@ class ActorTree extends StatelessWidget {
                   itemCount: visible.length,
                   itemBuilder: (_, i) {
                     final t = visible[i];
-                    final hasVisibleChildren = store.actorStates.value.actors.values.any(
-                      (c) => c.thread.parentId == t.id && store.isThreadVisible(c.thread),
-                    );
+                    final hasVisibleChildren = store
+                        .actorStates
+                        .value
+                        .actors
+                        .values
+                        .any(
+                          (c) =>
+                              c.thread.parentId == t.id &&
+                              store.isThreadVisible(c.thread),
+                        );
                     final isCollapsed = store.collapsed.value.contains(t.id);
                     return _ActorRow(
                       thread: t,
@@ -413,10 +420,7 @@ class _ActorRowState extends State<_ActorRow> {
     );
   }
 
-  Widget _buildContent(
-    BuildContext context, {
-    bool isHoveredTarget = false,
-  }) {
+  Widget _buildContent(BuildContext context, {bool isHoveredTarget = false}) {
     final thread = widget.thread;
     final dot = widget.dot;
     final isRunning = !thread.isRetired && dot == DotState.active;
@@ -715,9 +719,7 @@ class _WorkStateBadge extends StatelessWidget {
       decoration: BoxDecoration(
         color: MeshColors.accent.withValues(alpha: 0.14),
         borderRadius: BorderRadius.circular(4),
-        border: Border.all(
-          color: MeshColors.accent.withValues(alpha: 0.65),
-        ),
+        border: Border.all(color: MeshColors.accent.withValues(alpha: 0.65)),
       ),
       child: Text(
         kind.toUpperCase(),

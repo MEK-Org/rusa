@@ -484,10 +484,7 @@ String? _resetLine(QuotaWindowDto window) {
 /// to match reset timestamps. Carries relative age when [now] is provided so
 /// stale readings are visibly distinct. Null when the state behind this window
 /// never reached a probe, or the stamp can't be parsed.
-String? _asOfLine(
-  String? scrapedAtIso, {
-  DateTime? now,
-}) {
+String? _asOfLine(String? scrapedAtIso, {DateTime? now}) {
   if (scrapedAtIso == null) return null;
   final scraped = DateTime.tryParse(scrapedAtIso);
   if (scraped == null) return null;

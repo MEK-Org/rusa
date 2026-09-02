@@ -39,7 +39,10 @@ class ConversationTab extends StatelessWidget {
           );
         }
 
-        final handles = {for (final a in actorStates.actors.values) a.thread.id: a.thread.handle};
+        final handles = {
+          for (final a in actorStates.actors.values)
+            a.thread.id: a.thread.handle,
+        };
 
         if (view.chat.isEmpty && !view.loading) {
           return const Center(

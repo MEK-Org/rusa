@@ -29,7 +29,10 @@ class WebTreePreferencesCache implements TreePreferencesCache {
   @override
   void saveCollapsed(Set<String> collapsed) {
     try {
-      web.window.localStorage.setItem(_collapsedKey, jsonEncode(collapsed.toList()));
+      web.window.localStorage.setItem(
+        _collapsedKey,
+        jsonEncode(collapsed.toList()),
+      );
     } catch (_) {
       // Best-effort: failed write is swallowed.
     }
@@ -65,8 +68,9 @@ class WebTreePreferencesCache implements TreePreferencesCache {
       final result = <String, List<String>>{};
       for (final entry in decoded.entries) {
         if (entry.value is List) {
-          result[entry.key.toString()] =
-              (entry.value as List).map((e) => e.toString()).toList();
+          result[entry.key.toString()] = (entry.value as List)
+              .map((e) => e.toString())
+              .toList();
         }
       }
       return result;

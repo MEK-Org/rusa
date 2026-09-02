@@ -1718,6 +1718,59 @@ describe("handleMeshApiRequest", () => {
         expect(data.blockingChildren.map((c: { id: string }) => c.id)).toEqual(["sub-2"]);
       });
 
+      it("returns obligation with referenceCache embeddings and isolates faults", async () => {
+        obligations.create({
+          title: "with-cache",
+          id: "with-cache",
+          ownerId: "actor-1",
+        });
+        obligations.attachArtifact("with-cache", "github:MEK-Org/rusa/issues/1");
+        obligations.attachArtifact("with-cache", "github:MEK-Org/rusa/issues/2");
+
+        const depsWithCache = {
+          ...deps,
+          referenceCache: {
+            get: async (ref: string) => {
+              if (ref.includes("issues/1")) {
+                return {
+                  ref,
+                  scheme: "github",
+                  title: "Issue 1",
+                  body: "The body",
+                  cacheState: "fresh",
+                  entity: { type: "github_issue", title: "Issue 1", description: "The body" },
+                  unavailable: null,
+                };
+              }
+              throw new Error("cache fault on issue 2");
+            },
+          } as unknown as ReferenceCacheService,
+        };
+
+        const { res } = await call(depsWithCache, "GET", "/api/mesh/obligations/with-cache");
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(res.statusCode).toBe(200);
+
+        const artifacts = JSON.parse(res.body).artifacts as Array<{
+          artifact: { ref: string };
+          reference: { cacheState: string; entity?: unknown; unavailable?: string } | null;
+        }>;
+
+        expect(artifacts).toHaveLength(2);
+        const success = artifacts.find((a) => a.artifact.ref.includes("issues/1"));
+        expect(success?.reference?.cacheState).toBe("fresh");
+        expect(success?.reference?.entity).toEqual({
+          type: "github_issue",
+          title: "Issue 1",
+          description: "The body",
+        });
+
+        const failure = artifacts.find((a) => a.artifact.ref.includes("issues/2"));
+        // Since cacheService threw, Promise.all would reject in api.ts if we don't catch it!
+        expect(failure?.reference?.cacheState).toBe("unavailable");
+        expect(failure?.reference?.unavailable).toBe("could not load context");
+      });
+
       it("404s when obligation not found", async () => {
         const { res } = await call(deps, "GET", "/api/mesh/obligations/missing-task");
         expect(res.statusCode).toBe(404);

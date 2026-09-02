@@ -954,9 +954,9 @@ class ReferenceDto {
   bool get isResolved => unavailable == null;
 
   factory ReferenceDto.fromJson(Map<String, dynamic> j) => ReferenceDto(
-    ref: j['ref'] as String,
-    scheme: j['scheme'] as String,
-    title: j['title'] as String,
+    ref: j['ref'] as String? ?? '',
+    scheme: j['scheme'] as String? ?? '',
+    title: j['title'] as String? ?? '',
     body: j['body'] as String?,
     author: j['author'] as String?,
     timestamp: j['timestamp'] as String?,

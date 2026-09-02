@@ -40,7 +40,12 @@ export class ReferenceCacheService {
       return { ...resolved, cacheState: "local" };
     }
 
-    const cached = this.repo.get(key);
+    let cached: ReturnType<ReferenceCacheRepository["get"]> | undefined;
+    try {
+      cached = this.repo.get(key);
+    } catch {
+      cached = null;
+    }
     const now = new Date();
 
     if (cached) {
@@ -51,7 +56,8 @@ export class ReferenceCacheService {
         try {
           const parsed = JSON.parse(cached.entity_json);
           entity = decodeV1Entity(parsed);
-          valid = entity !== undefined;
+          const expectedShape = getResourceShape(reference);
+          valid = entity !== undefined && (!expectedShape || entity.type === expectedShape);
         } catch {
           // Ignore parse error, treat as unavailable
         }
@@ -188,9 +194,11 @@ export class ReferenceCacheService {
           }
         } else if (segments.length >= 4 && segments[2] === "messages") {
           const found = await deps.chatClient.getMessage(resourceName);
-          const text = found.text ?? found.formattedText ?? null;
-          if (text) {
-            entity = { type: "gchat_message", contents: text };
+          if (found) {
+            const text = found.text ?? found.formattedText ?? null;
+            if (text) {
+              entity = { type: "gchat_message", contents: text };
+            }
           }
         }
       } catch {
@@ -201,13 +209,17 @@ export class ReferenceCacheService {
     if (entity) {
       const now = new Date();
       const refreshAfter = new Date(now.getTime() + this.ttlMs);
-      this.repo.set({
-        ref: reference.key,
-        document_version: 1,
-        entity_json: JSON.stringify(entity),
-        fetched_at: now.toISOString(),
-        refresh_after: refreshAfter.toISOString(),
-      });
+      try {
+        this.repo.set({
+          ref: reference.key,
+          document_version: 1,
+          entity_json: JSON.stringify(entity),
+          fetched_at: now.toISOString(),
+          refresh_after: refreshAfter.toISOString(),
+        });
+      } catch {
+        // ignore cache write faults
+      }
       return entity;
     }
 

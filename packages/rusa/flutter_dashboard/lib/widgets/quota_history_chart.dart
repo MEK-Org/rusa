@@ -296,9 +296,7 @@ class QuotaPaceErrorChartPainter extends CustomPainter {
         Offset(plot.right, y),
         percent == 0 ? zeroPaint : gridPaint,
       );
-      final labelText = percent > 0
-          ? '+$percent%'
-          : '$percent%';
+      final labelText = percent > 0 ? '+$percent%' : '$percent%';
       _paintLabel(
         canvas,
         labelText,
@@ -314,11 +312,7 @@ class QuotaPaceErrorChartPainter extends CustomPainter {
     }
 
     final span = end.difference(start);
-    _paintLabel(
-      canvas,
-      _agoLabel(span),
-      Offset(plot.left, plot.bottom + 7),
-    );
+    _paintLabel(canvas, _agoLabel(span), Offset(plot.left, plot.bottom + 7));
     _paintLabel(
       canvas,
       _agoLabel(Duration(milliseconds: span.inMilliseconds ~/ 2)),
@@ -365,7 +359,8 @@ class QuotaPaceErrorChartPainter extends CustomPainter {
           }
         }
 
-        final x = plot.left +
+        final x =
+            plot.left +
             ((observedAt.millisecondsSinceEpoch -
                             start.millisecondsSinceEpoch) /
                         spanMs)
@@ -577,11 +572,7 @@ class QuotaThrottleIntervalChartPainter extends CustomPainter {
     }
 
     final span = end.difference(start);
-    _paintLabel(
-      canvas,
-      _agoLabel(span),
-      Offset(plot.left, plot.bottom + 7),
-    );
+    _paintLabel(canvas, _agoLabel(span), Offset(plot.left, plot.bottom + 7));
     _paintLabel(
       canvas,
       _agoLabel(Duration(milliseconds: span.inMilliseconds ~/ 2)),
@@ -629,7 +620,8 @@ class QuotaThrottleIntervalChartPainter extends CustomPainter {
           }
         }
 
-        final x = plot.left +
+        final x =
+            plot.left +
             ((observedAt.millisecondsSinceEpoch -
                             start.millisecondsSinceEpoch) /
                         spanMs)

@@ -381,9 +381,9 @@ async function resolveInboxPage(page: InboxPage, deps: DashboardDataDeps): Promi
       // through the same widget as an obligation's cited artifacts. Only mesh
       // chat resolves in v1 — every other payload keeps its raw JSON, which is
       // the honest rendering until those sources have resolvers.
-      const reference = deps.referenceCache
-        ? await deps.referenceCache.get(`mesh:messages/${messageId}`, deps)
-        : resolveReferenceSync(`mesh:messages/${messageId}`, { meshChat: deps.meshChat });
+      const reference = resolveReferenceSync(`mesh:messages/${messageId}`, {
+        meshChat: deps.meshChat,
+      });
       return {
         ...entry,
         payload: reference.body !== null ? { ...payload, content: reference.body } : payload,
@@ -1364,7 +1364,11 @@ export async function handleMeshApiRequest(
       deps.obligations.listArtifacts(id).map(async (artifact) => ({
         artifact,
         reference: deps.referenceCache
-          ? await deps.referenceCache.get(artifact.ref, deps)
+          ? await deps.referenceCache.get(artifact.ref, deps).catch(() => ({
+              ...resolveReferenceSync(artifact.ref, { meshChat: deps.meshChat }),
+              unavailable: "could not load context",
+              cacheState: "unavailable",
+            }))
           : resolveReferenceSync(artifact.ref, { meshChat: deps.meshChat }),
       }))
     );

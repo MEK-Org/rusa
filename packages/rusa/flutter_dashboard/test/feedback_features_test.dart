@@ -10,9 +10,7 @@ import 'package:rusa_dashboard/widgets/status_dot.dart';
 
 import 'fakes.dart';
 
-Widget _harness(Widget child) => MaterialApp(
-  home: Scaffold(body: child),
-);
+Widget _harness(Widget child) => MaterialApp(home: Scaffold(body: child));
 
 class _InboxTestApi extends FakeApi {
   @override
@@ -47,10 +45,7 @@ class _InboxTestApi extends FakeApi {
             'deliveredAt': '2026-08-19T09:00:00Z',
             'handledAt': '2026-08-19T09:05:00Z',
             'handledNote': 'Resolved successfully',
-            'payload': {
-              'type': 'human.message',
-              'content': 'Resolved signal',
-            },
+            'payload': {'type': 'human.message', 'content': 'Resolved signal'},
           },
         ],
       };
@@ -61,36 +56,45 @@ class _InboxTestApi extends FakeApi {
 
 void main() {
   group('Actor detail pane status indicator and quick actions', () {
-    testWidgets('shows status dot indicator on avatar and Run Now for idle actor', (tester) async {
+    testWidgets(
+      'shows status dot indicator on avatar and Run Now for idle actor',
+      (tester) async {
+        await tester.runAsync(() async {
+          final thread = makeThread('actor-1', status: 'active');
+          final api = FakeApi()..threadsResult = [thread];
+          final store = DashboardStore(api: api, stream: FakeStream());
+          await store.init();
+          store.clickActor('actor-1');
+
+          await tester.pumpWidget(_harness(DetailPanel(store: store)));
+          await tester.pump(const Duration(milliseconds: 50));
+
+          // StatusDot on top of avatar
+          expect(find.byType(StatusDot), findsWidgets);
+
+          // Run now button for idle actor
+          final runNowBtn = find.byTooltip('Run now');
+          expect(runNowBtn, findsOneWidget);
+
+          await tester.tap(runNowBtn);
+          await tester.pump(const Duration(milliseconds: 50));
+
+          expect(api.runNowCalls, contains('actor-1'));
+
+          await store.dispose();
+        });
+      },
+    );
+
+    testWidgets('shows Interrupt button for active/running actor', (
+      tester,
+    ) async {
       await tester.runAsync(() async {
-        final thread = makeThread('actor-1', status: 'active');
-        final api = FakeApi()..threadsResult = [thread];
-        final store = DashboardStore(api: api, stream: FakeStream());
-        await store.init();
-        store.clickActor('actor-1');
-
-        await tester.pumpWidget(_harness(DetailPanel(store: store)));
-        await tester.pump(const Duration(milliseconds: 50));
-
-        // StatusDot on top of avatar
-        expect(find.byType(StatusDot), findsWidgets);
-
-        // Run now button for idle actor
-        final runNowBtn = find.byTooltip('Run now');
-        expect(runNowBtn, findsOneWidget);
-
-        await tester.tap(runNowBtn);
-        await tester.pump(const Duration(milliseconds: 50));
-
-        expect(api.runNowCalls, contains('actor-1'));
-
-        await store.dispose();
-      });
-    });
-
-    testWidgets('shows Interrupt button for active/running actor', (tester) async {
-      await tester.runAsync(() async {
-        final thread = makeThread('actor-2', status: 'active', runState: RunState.running);
+        final thread = makeThread(
+          'actor-2',
+          status: 'active',
+          runState: RunState.running,
+        );
         final api = FakeApi()..threadsResult = [thread];
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
@@ -111,9 +115,15 @@ void main() {
       });
     });
 
-    testWidgets('shows Run now and Cancel queued run for queued actor', (tester) async {
+    testWidgets('shows Run now and Cancel queued run for queued actor', (
+      tester,
+    ) async {
       await tester.runAsync(() async {
-        final thread = makeThread('actor-3', status: 'active', runState: RunState.queued);
+        final thread = makeThread(
+          'actor-3',
+          status: 'active',
+          runState: RunState.queued,
+        );
         final api = FakeApi()..threadsResult = [thread];
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
@@ -138,17 +148,21 @@ void main() {
   group('Inbox view arrived and handled timestamps', () {
     testWidgets('renders Arrived and Handled timestamps', (tester) async {
       await tester.runAsync(() async {
-        final api = _InboxTestApi()
-          ..threadsResult = [makeThread('root')];
+        final api = _InboxTestApi()..threadsResult = [makeThread('root')];
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
 
-        await tester.pumpWidget(_harness(InboxTab(store: store, actorId: 'root')));
+        await tester.pumpWidget(
+          _harness(InboxTab(store: store, actorId: 'root')),
+        );
         await tester.pump(const Duration(milliseconds: 50));
 
         expect(find.textContaining('Arrived:'), findsNWidgets(2));
         expect(find.textContaining('Handled:'), findsOneWidget);
-        expect(find.textContaining('Resolved successfully', findRichText: true), findsOneWidget);
+        expect(
+          find.textContaining('Resolved successfully', findRichText: true),
+          findsOneWidget,
+        );
 
         await store.dispose();
       });
@@ -156,51 +170,56 @@ void main() {
   });
 
   group('Chat UI multiline textbox and keyboard shortcuts', () {
-    testWidgets('configures multiline text input and handles Enter vs Shift+Enter', (tester) async {
-      await tester.runAsync(() async {
-        final api = FakeApi()
-          ..threadsResult = [makeThread('actor-1')]
-          ..chatPages = [const ChatPage(chat: [], nextCursor: null)];
-        final store = DashboardStore(api: api, stream: FakeStream());
-        await store.init();
-        store.clickActor('actor-1');
+    testWidgets(
+      'configures multiline text input and handles Enter vs Shift+Enter',
+      (tester) async {
+        await tester.runAsync(() async {
+          final api = FakeApi()
+            ..threadsResult = [makeThread('actor-1')]
+            ..chatPages = [const ChatPage(chat: [], nextCursor: null)];
+          final store = DashboardStore(api: api, stream: FakeStream());
+          await store.init();
+          store.clickActor('actor-1');
 
-        await tester.pumpWidget(_harness(ChatTab(store: store)));
-        await tester.pump(const Duration(milliseconds: 50));
+          await tester.pumpWidget(_harness(ChatTab(store: store)));
+          await tester.pump(const Duration(milliseconds: 50));
 
-        final textFieldFinder = find.byType(TextField);
-        expect(textFieldFinder, findsOneWidget);
+          final textFieldFinder = find.byType(TextField);
+          expect(textFieldFinder, findsOneWidget);
 
-        final TextField textField = tester.widget(textFieldFinder);
-        expect(textField.minLines, 1);
-        expect(textField.maxLines, 5);
-        expect(textField.keyboardType, TextInputType.multiline);
-        expect(textField.textInputAction, TextInputAction.newline);
+          final TextField textField = tester.widget(textFieldFinder);
+          expect(textField.minLines, 1);
+          expect(textField.maxLines, 5);
+          expect(textField.keyboardType, TextInputType.multiline);
+          expect(textField.textInputAction, TextInputAction.newline);
 
-        // Enter text
-        await tester.enterText(textFieldFinder, 'Hello world');
-        await tester.pump();
+          // Enter text
+          await tester.enterText(textFieldFinder, 'Hello world');
+          await tester.pump();
 
-        // Shift + Enter should NOT send
-        await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
-        await tester.sendKeyEvent(LogicalKeyboardKey.enter);
-        await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
-        await tester.pump(const Duration(milliseconds: 50));
+          // Shift + Enter should NOT send
+          await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+          await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+          await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+          await tester.pump(const Duration(milliseconds: 50));
 
-        // Still contains text
-        final fieldStateAfterShift = tester.widget<TextField>(textFieldFinder);
-        expect(fieldStateAfterShift.controller!.text, 'Hello world');
+          // Still contains text
+          final fieldStateAfterShift = tester.widget<TextField>(
+            textFieldFinder,
+          );
+          expect(fieldStateAfterShift.controller!.text, 'Hello world');
 
-        // Plain Enter should send
-        await tester.sendKeyEvent(LogicalKeyboardKey.enter);
-        await tester.pump(const Duration(milliseconds: 50));
+          // Plain Enter should send
+          await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+          await tester.pump(const Duration(milliseconds: 50));
 
-        // Field cleared after send
-        final fieldStateAfterSend = tester.widget<TextField>(textFieldFinder);
-        expect(fieldStateAfterSend.controller!.text, '');
+          // Field cleared after send
+          final fieldStateAfterSend = tester.widget<TextField>(textFieldFinder);
+          expect(fieldStateAfterSend.controller!.text, '');
 
-        await store.dispose();
-      });
-    });
+          await store.dispose();
+        });
+      },
+    );
   });
 }

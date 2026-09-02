@@ -12,8 +12,7 @@ export const referenceCache: Migration = {
         fetched_at       TEXT NOT NULL,
         refresh_after    TEXT NOT NULL
       );
-      CREATE INDEX idx_reference_cache_refresh
-        ON reference_cache(refresh_after);
+
     `);
   },
 };

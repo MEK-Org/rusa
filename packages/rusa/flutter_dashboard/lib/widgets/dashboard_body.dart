@@ -70,7 +70,7 @@ class _DashboardBodyState extends State<DashboardBody> {
       focusedObligationId: widget.store.focusedObligationId.valueOrNull,
       focusedActorId: widget.store.primary.valueOrNull,
     );
-    
+
     _focusSub = widget.store.focusedObligationId.listen((id) {
       if (mounted) {
         writeDashboardViewToUrl(
@@ -298,7 +298,9 @@ class _ActorsBody extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             ActorTree(store: store),
-            Expanded(child: DetailPanel(store: store, onSelectView: onSelectView)),
+            Expanded(
+              child: DetailPanel(store: store, onSelectView: onSelectView),
+            ),
           ],
         );
       },
@@ -359,7 +361,13 @@ class _NarrowBody extends StatelessWidget {
                 _BackBar(store: store),
                 if (!isFullScreenWalkie)
                   const Divider(height: 1, color: MeshColors.border),
-                Expanded(child: DetailPanel(store: store, narrow: true, onSelectView: onSelectView)),
+                Expanded(
+                  child: DetailPanel(
+                    store: store,
+                    narrow: true,
+                    onSelectView: onSelectView,
+                  ),
+                ),
               ],
             );
           },

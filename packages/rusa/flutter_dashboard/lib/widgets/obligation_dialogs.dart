@@ -15,7 +15,13 @@ Future<void> showCreateObligationDialog(
   final formKey = GlobalKey<FormState>();
   final titleCtrl = TextEditingController();
   final intentCtrl = TextEditingController();
-  final ownerIdCtrl = TextEditingController(text: (defaultOwnerId == 'human:operator' ? 'human operator' : defaultOwnerId) ?? '');
+  final ownerIdCtrl = TextEditingController(
+    text:
+        (defaultOwnerId == 'human:operator'
+            ? 'human operator'
+            : defaultOwnerId) ??
+        '',
+  );
   final parentIdCtrl = TextEditingController(text: defaultParentId ?? '');
   final externalRefCtrl = TextEditingController();
   final priorityCtrl = TextEditingController();
@@ -32,8 +38,14 @@ Future<void> showCreateObligationDialog(
             side: const BorderSide(color: MeshColors.border),
           ),
           title: Text(
-            defaultParentId == null ? 'Create Root Obligation' : 'Create Child Obligation',
-            style: const TextStyle(color: MeshColors.textPrimary, fontSize: 16, fontWeight: FontWeight.bold),
+            defaultParentId == null
+                ? 'Create Root Obligation'
+                : 'Create Child Obligation',
+            style: const TextStyle(
+              color: MeshColors.textPrimary,
+              fontSize: 16,
+              fontWeight: FontWeight.bold,
+            ),
           ),
           content: SingleChildScrollView(
             child: SizedBox(
@@ -55,7 +67,13 @@ Future<void> showCreateObligationDialog(
                         ),
                         child: Row(
                           children: [
-                            const Text('Parent ID: ', style: TextStyle(color: MeshColors.textSecondary, fontSize: 12)),
+                            const Text(
+                              'Parent ID: ',
+                              style: TextStyle(
+                                color: MeshColors.textSecondary,
+                                fontSize: 12,
+                              ),
+                            ),
                             Expanded(
                               child: Text(
                                 defaultParentId,
@@ -71,102 +89,214 @@ Future<void> showCreateObligationDialog(
                         ),
                       ),
                     ],
-                    const Text('Title *', style: TextStyle(color: MeshColors.textSecondary, fontSize: 12)),
+                    const Text(
+                      'Title *',
+                      style: TextStyle(
+                        color: MeshColors.textSecondary,
+                        fontSize: 12,
+                      ),
+                    ),
                     const SizedBox(height: 4),
                     TextFormField(
                       controller: titleCtrl,
                       maxLength: kObligationTitleMax,
-                      style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13),
+                      style: const TextStyle(
+                        color: MeshColors.textPrimary,
+                        fontSize: 13,
+                      ),
                       decoration: const InputDecoration(
                         hintText: 'e.g. Game Type',
-                        hintStyle: TextStyle(color: MeshColors.textMuted, fontSize: 12),
+                        hintStyle: TextStyle(
+                          color: MeshColors.textMuted,
+                          fontSize: 12,
+                        ),
                         filled: true,
                         fillColor: MeshColors.bgPrimary,
-                        border: OutlineInputBorder(borderSide: BorderSide(color: MeshColors.border)),
-                        contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                        counterStyle: TextStyle(color: MeshColors.textMuted, fontSize: 10),
+                        border: OutlineInputBorder(
+                          borderSide: BorderSide(color: MeshColors.border),
+                        ),
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
+                        counterStyle: TextStyle(
+                          color: MeshColors.textMuted,
+                          fontSize: 10,
+                        ),
                       ),
-                      validator: (val) => (val == null || val.trim().isEmpty) ? 'Title is required' : null,
+                      validator: (val) => (val == null || val.trim().isEmpty)
+                          ? 'Title is required'
+                          : null,
                     ),
                     const SizedBox(height: 12),
-                    const Text('Intent / Description', style: TextStyle(color: MeshColors.textSecondary, fontSize: 12)),
+                    const Text(
+                      'Intent / Description',
+                      style: TextStyle(
+                        color: MeshColors.textSecondary,
+                        fontSize: 12,
+                      ),
+                    ),
                     const SizedBox(height: 4),
                     TextFormField(
                       controller: intentCtrl,
                       maxLines: 4,
                       minLines: 2,
-                      style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13),
+                      style: const TextStyle(
+                        color: MeshColors.textPrimary,
+                        fontSize: 13,
+                      ),
                       decoration: const InputDecoration(
-                        hintText: 'What should become true, in words that still read months from now.',
-                        hintStyle: TextStyle(color: MeshColors.textMuted, fontSize: 12),
+                        hintText:
+                            'What should become true, in words that still read months from now.',
+                        hintStyle: TextStyle(
+                          color: MeshColors.textMuted,
+                          fontSize: 12,
+                        ),
                         filled: true,
                         fillColor: MeshColors.bgPrimary,
-                        border: OutlineInputBorder(borderSide: BorderSide(color: MeshColors.border)),
-                        contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        border: OutlineInputBorder(
+                          borderSide: BorderSide(color: MeshColors.border),
+                        ),
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
                       ),
                     ),
                     const SizedBox(height: 12),
                     const SizedBox(height: 12),
-                    const Text('Owner ID or Handle *', style: TextStyle(color: MeshColors.textSecondary, fontSize: 12)),
+                    const Text(
+                      'Owner ID or Handle *',
+                      style: TextStyle(
+                        color: MeshColors.textSecondary,
+                        fontSize: 12,
+                      ),
+                    ),
                     const SizedBox(height: 4),
                     OwnerSelector(
                       store: store,
                       ownerIdCtrl: ownerIdCtrl,
                       decoration: const InputDecoration(
                         hintText: 'e.g. root, cloudy-porpoise',
-                        hintStyle: TextStyle(color: MeshColors.textMuted, fontSize: 12),
+                        hintStyle: TextStyle(
+                          color: MeshColors.textMuted,
+                          fontSize: 12,
+                        ),
                         filled: true,
                         fillColor: MeshColors.bgPrimary,
-                        border: OutlineInputBorder(borderSide: BorderSide(color: MeshColors.border)),
-                        contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        border: OutlineInputBorder(
+                          borderSide: BorderSide(color: MeshColors.border),
+                        ),
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
                       ),
                     ),
                     if (defaultParentId == null) ...[
                       const SizedBox(height: 12),
-                      const Text('Parent ID (optional)', style: TextStyle(color: MeshColors.textSecondary, fontSize: 12)),
+                      const Text(
+                        'Parent ID (optional)',
+                        style: TextStyle(
+                          color: MeshColors.textSecondary,
+                          fontSize: 12,
+                        ),
+                      ),
                       const SizedBox(height: 4),
                       TextFormField(
                         controller: parentIdCtrl,
-                        style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13, fontFamily: kMonoFontFamily),
+                        style: const TextStyle(
+                          color: MeshColors.textPrimary,
+                          fontSize: 13,
+                          fontFamily: kMonoFontFamily,
+                        ),
                         decoration: const InputDecoration(
                           hintText: 'Leave blank for root obligation',
-                          hintStyle: TextStyle(color: MeshColors.textMuted, fontSize: 12),
+                          hintStyle: TextStyle(
+                            color: MeshColors.textMuted,
+                            fontSize: 12,
+                          ),
                           filled: true,
                           fillColor: MeshColors.bgPrimary,
-                          border: OutlineInputBorder(borderSide: BorderSide(color: MeshColors.border)),
-                          contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                          border: OutlineInputBorder(
+                            borderSide: BorderSide(color: MeshColors.border),
+                          ),
+                          contentPadding: EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
                         ),
                       ),
                     ],
                     const SizedBox(height: 12),
-                    const Text('External Reference (optional)', style: TextStyle(color: MeshColors.textSecondary, fontSize: 12)),
+                    const Text(
+                      'External Reference (optional)',
+                      style: TextStyle(
+                        color: MeshColors.textSecondary,
+                        fontSize: 12,
+                      ),
+                    ),
                     const SizedBox(height: 4),
                     TextFormField(
                       controller: externalRefCtrl,
-                      style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13, fontFamily: kMonoFontFamily),
+                      style: const TextStyle(
+                        color: MeshColors.textPrimary,
+                        fontSize: 13,
+                        fontFamily: kMonoFontFamily,
+                      ),
                       decoration: const InputDecoration(
-                        hintText: 'e.g. github:MEK-Org/rusa/issues/33, or github:MEK-Org/rusa',
-                        hintStyle: TextStyle(color: MeshColors.textMuted, fontSize: 12),
+                        hintText:
+                            'e.g. github:MEK-Org/rusa/issues/33, or github:MEK-Org/rusa',
+                        hintStyle: TextStyle(
+                          color: MeshColors.textMuted,
+                          fontSize: 12,
+                        ),
                         filled: true,
                         fillColor: MeshColors.bgPrimary,
-                        border: OutlineInputBorder(borderSide: BorderSide(color: MeshColors.border)),
-                        contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        border: OutlineInputBorder(
+                          borderSide: BorderSide(color: MeshColors.border),
+                        ),
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
                       ),
                     ),
                     const SizedBox(height: 12),
-                    const Text('Explicit Priority Override (optional)', style: TextStyle(color: MeshColors.textSecondary, fontSize: 12)),
+                    const Text(
+                      'Explicit Priority Override (optional)',
+                      style: TextStyle(
+                        color: MeshColors.textSecondary,
+                        fontSize: 12,
+                      ),
+                    ),
                     const SizedBox(height: 4),
                     TextFormField(
                       controller: priorityCtrl,
-                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                      style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13, fontFamily: kMonoFontFamily),
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
+                      style: const TextStyle(
+                        color: MeshColors.textPrimary,
+                        fontSize: 13,
+                        fontFamily: kMonoFontFamily,
+                      ),
                       decoration: const InputDecoration(
-                        hintText: 'e.g. 100.0 (defaults to parent or timestamp)',
-                        hintStyle: TextStyle(color: MeshColors.textMuted, fontSize: 12),
+                        hintText:
+                            'e.g. 100.0 (defaults to parent or timestamp)',
+                        hintStyle: TextStyle(
+                          color: MeshColors.textMuted,
+                          fontSize: 12,
+                        ),
                         filled: true,
                         fillColor: MeshColors.bgPrimary,
-                        border: OutlineInputBorder(borderSide: BorderSide(color: MeshColors.border)),
-                        contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        border: OutlineInputBorder(
+                          borderSide: BorderSide(color: MeshColors.border),
+                        ),
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
                       ),
                     ),
                   ],
@@ -176,8 +306,13 @@ Future<void> showCreateObligationDialog(
           ),
           actions: [
             TextButton(
-              onPressed: isSubmitting ? null : () => Navigator.of(dialogContext).pop(),
-              child: const Text('Cancel', style: TextStyle(color: MeshColors.textSecondary)),
+              onPressed: isSubmitting
+                  ? null
+                  : () => Navigator.of(dialogContext).pop(),
+              child: const Text(
+                'Cancel',
+                style: TextStyle(color: MeshColors.textSecondary),
+              ),
             ),
             ElevatedButton(
               onPressed: isSubmitting
@@ -186,22 +321,32 @@ Future<void> showCreateObligationDialog(
                       if (!formKey.currentState!.validate()) return;
                       setState(() => isSubmitting = true);
                       try {
-                        final rawParent = defaultParentId ?? parentIdCtrl.text.trim();
+                        final rawParent =
+                            defaultParentId ?? parentIdCtrl.text.trim();
                         final parentId = rawParent.isEmpty ? null : rawParent;
                         final rawExt = externalRefCtrl.text.trim();
                         final externalRef = rawExt.isEmpty ? null : rawExt;
                         final rawPrio = priorityCtrl.text.trim();
-                        final priority = rawPrio.isEmpty ? null : double.tryParse(rawPrio);
+                        final priority = rawPrio.isEmpty
+                            ? null
+                            : double.tryParse(rawPrio);
 
                         final typedText = ownerIdCtrl.text.trim();
                         String resolvedId;
-                        if (typedText == 'operator' || typedText == 'human:operator' || typedText == 'human operator') {
+                        if (typedText == 'operator' ||
+                            typedText == 'human:operator' ||
+                            typedText == 'human operator') {
                           resolvedId = 'human:operator';
                         } else {
                           final matches = store.actorStates.value.actors.values
-                              .where((a) => a.handle == typedText || a.id == typedText)
+                              .where(
+                                (a) =>
+                                    a.handle == typedText || a.id == typedText,
+                              )
                               .map((a) => a.id);
-                          resolvedId = matches.isNotEmpty ? matches.first : typedText;
+                          resolvedId = matches.isNotEmpty
+                              ? matches.first
+                              : typedText;
                         }
 
                         final bodyText = intentCtrl.text.trim();
@@ -217,7 +362,9 @@ Future<void> showCreateObligationDialog(
                         if (context.mounted) {
                           Navigator.of(dialogContext).pop();
                           ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('Obligation created successfully')),
+                            const SnackBar(
+                              content: Text('Obligation created successfully'),
+                            ),
                           );
                           onCreated?.call();
                         }
@@ -225,7 +372,12 @@ Future<void> showCreateObligationDialog(
                         setState(() => isSubmitting = false);
                         if (context.mounted) {
                           ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(content: Text('Failed to create obligation: $err'), backgroundColor: MeshColors.statusHalted),
+                            SnackBar(
+                              content: Text(
+                                'Failed to create obligation: $err',
+                              ),
+                              backgroundColor: MeshColors.statusHalted,
+                            ),
                           );
                         }
                       }
@@ -235,7 +387,11 @@ Future<void> showCreateObligationDialog(
                 foregroundColor: MeshColors.bgPrimary,
               ),
               child: isSubmitting
-                  ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
                   : const Text('Create'),
             ),
           ],
@@ -268,7 +424,11 @@ Future<void> showReparentObligationDialog(
           ),
           title: const Text(
             'Reparent Obligation',
-            style: TextStyle(color: MeshColors.textPrimary, fontSize: 16, fontWeight: FontWeight.bold),
+            style: TextStyle(
+              color: MeshColors.textPrimary,
+              fontSize: 16,
+              fontWeight: FontWeight.bold,
+            ),
           ),
           content: SizedBox(
             width: 420,
@@ -280,12 +440,20 @@ Future<void> showReparentObligationDialog(
                 children: [
                   Text(
                     'Target: ${obligation.heading}',
-                    style: const TextStyle(color: MeshColors.textPrimary, fontWeight: FontWeight.w600, fontSize: 13),
+                    style: const TextStyle(
+                      color: MeshColors.textPrimary,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 13,
+                    ),
                   ),
                   const SizedBox(height: 4),
                   Text(
                     'Current Parent: ${obligation.parentId ?? 'None (Root)'}',
-                    style: const TextStyle(color: MeshColors.textMuted, fontSize: 12, fontFamily: kMonoFontFamily),
+                    style: const TextStyle(
+                      color: MeshColors.textMuted,
+                      fontSize: 12,
+                      fontFamily: kMonoFontFamily,
+                    ),
                   ),
                   const SizedBox(height: 16),
                   Row(
@@ -294,13 +462,22 @@ Future<void> showReparentObligationDialog(
                         child: OutlinedButton(
                           onPressed: () => setState(() => makeRoot = true),
                           style: OutlinedButton.styleFrom(
-                            backgroundColor: makeRoot ? MeshColors.bgSelected : MeshColors.bgPrimary,
-                            foregroundColor: makeRoot ? MeshColors.accent : MeshColors.textSecondary,
+                            backgroundColor: makeRoot
+                                ? MeshColors.bgSelected
+                                : MeshColors.bgPrimary,
+                            foregroundColor: makeRoot
+                                ? MeshColors.accent
+                                : MeshColors.textSecondary,
                             side: BorderSide(
-                              color: makeRoot ? MeshColors.accent : MeshColors.border,
+                              color: makeRoot
+                                  ? MeshColors.accent
+                                  : MeshColors.border,
                             ),
                           ),
-                          child: const Text('Make Root', style: TextStyle(fontSize: 12)),
+                          child: const Text(
+                            'Make Root',
+                            style: TextStyle(fontSize: 12),
+                          ),
                         ),
                       ),
                       const SizedBox(width: 8),
@@ -308,13 +485,22 @@ Future<void> showReparentObligationDialog(
                         child: OutlinedButton(
                           onPressed: () => setState(() => makeRoot = false),
                           style: OutlinedButton.styleFrom(
-                            backgroundColor: !makeRoot ? MeshColors.bgSelected : MeshColors.bgPrimary,
-                            foregroundColor: !makeRoot ? MeshColors.accent : MeshColors.textSecondary,
+                            backgroundColor: !makeRoot
+                                ? MeshColors.bgSelected
+                                : MeshColors.bgPrimary,
+                            foregroundColor: !makeRoot
+                                ? MeshColors.accent
+                                : MeshColors.textSecondary,
                             side: BorderSide(
-                              color: !makeRoot ? MeshColors.accent : MeshColors.border,
+                              color: !makeRoot
+                                  ? MeshColors.accent
+                                  : MeshColors.border,
                             ),
                           ),
-                          child: const Text('Attach to Parent', style: TextStyle(fontSize: 12)),
+                          child: const Text(
+                            'Attach to Parent',
+                            style: TextStyle(fontSize: 12),
+                          ),
                         ),
                       ),
                     ],
@@ -323,16 +509,31 @@ Future<void> showReparentObligationDialog(
                     const SizedBox(height: 8),
                     TextFormField(
                       controller: parentIdCtrl,
-                      style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13, fontFamily: kMonoFontFamily),
+                      style: const TextStyle(
+                        color: MeshColors.textPrimary,
+                        fontSize: 13,
+                        fontFamily: kMonoFontFamily,
+                      ),
                       decoration: const InputDecoration(
                         labelText: 'New Parent ID *',
-                        labelStyle: TextStyle(color: MeshColors.textSecondary, fontSize: 12),
+                        labelStyle: TextStyle(
+                          color: MeshColors.textSecondary,
+                          fontSize: 12,
+                        ),
                         hintText: 'Enter parent obligation ID',
-                        hintStyle: TextStyle(color: MeshColors.textMuted, fontSize: 12),
+                        hintStyle: TextStyle(
+                          color: MeshColors.textMuted,
+                          fontSize: 12,
+                        ),
                         filled: true,
                         fillColor: MeshColors.bgPrimary,
-                        border: OutlineInputBorder(borderSide: BorderSide(color: MeshColors.border)),
-                        contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                        border: OutlineInputBorder(
+                          borderSide: BorderSide(color: MeshColors.border),
+                        ),
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
                       ),
                       validator: (val) {
                         if (!makeRoot && (val == null || val.trim().isEmpty)) {
@@ -351,8 +552,13 @@ Future<void> showReparentObligationDialog(
           ),
           actions: [
             TextButton(
-              onPressed: isSubmitting ? null : () => Navigator.of(dialogContext).pop(),
-              child: const Text('Cancel', style: TextStyle(color: MeshColors.textSecondary)),
+              onPressed: isSubmitting
+                  ? null
+                  : () => Navigator.of(dialogContext).pop(),
+              child: const Text(
+                'Cancel',
+                style: TextStyle(color: MeshColors.textSecondary),
+              ),
             ),
             ElevatedButton(
               onPressed: isSubmitting
@@ -361,13 +567,22 @@ Future<void> showReparentObligationDialog(
                       if (!formKey.currentState!.validate()) return;
                       setState(() => isSubmitting = true);
                       try {
-                        final targetParentId = makeRoot ? null : parentIdCtrl.text.trim();
-                        await store.api.reparentObligation(obligation.id, parentId: targetParentId);
+                        final targetParentId = makeRoot
+                            ? null
+                            : parentIdCtrl.text.trim();
+                        await store.api.reparentObligation(
+                          obligation.id,
+                          parentId: targetParentId,
+                        );
 
                         if (context.mounted) {
                           Navigator.of(dialogContext).pop();
                           ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('Obligation reparented successfully')),
+                            const SnackBar(
+                              content: Text(
+                                'Obligation reparented successfully',
+                              ),
+                            ),
                           );
                           onReparented?.call();
                         }
@@ -375,7 +590,10 @@ Future<void> showReparentObligationDialog(
                         setState(() => isSubmitting = false);
                         if (context.mounted) {
                           ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(content: Text('Failed to reparent: $err'), backgroundColor: MeshColors.statusHalted),
+                            SnackBar(
+                              content: Text('Failed to reparent: $err'),
+                              backgroundColor: MeshColors.statusHalted,
+                            ),
                           );
                         }
                       }
@@ -385,7 +603,11 @@ Future<void> showReparentObligationDialog(
                 foregroundColor: MeshColors.bgPrimary,
               ),
               child: isSubmitting
-                  ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
                   : const Text('Reparent'),
             ),
           ],
@@ -412,7 +634,11 @@ Future<void> showReassignObligationDialog(
         backgroundColor: MeshColors.bgSecondary,
         title: const Text(
           'Reassign Obligation',
-          style: TextStyle(color: MeshColors.textPrimary, fontSize: 16, fontWeight: FontWeight.bold),
+          style: TextStyle(
+            color: MeshColors.textPrimary,
+            fontSize: 16,
+            fontWeight: FontWeight.bold,
+          ),
         ),
         content: SizedBox(
           width: 420,
@@ -423,7 +649,10 @@ Future<void> showReassignObligationDialog(
               children: [
                 Text(
                   'Current owner: ${store.actor(obligation.ownerId)?.handle ?? obligation.ownerId}',
-                  style: const TextStyle(color: MeshColors.textMuted, fontFamily: kMonoFontFamily),
+                  style: const TextStyle(
+                    color: MeshColors.textMuted,
+                    fontFamily: kMonoFontFamily,
+                  ),
                 ),
                 const SizedBox(height: 16),
                 OwnerSelector(
@@ -434,8 +663,13 @@ Future<void> showReassignObligationDialog(
                     hintText: 'e.g. cloudy-porpoise, operator, or UUID',
                     filled: true,
                     fillColor: MeshColors.bgPrimary,
-                    border: OutlineInputBorder(borderSide: BorderSide(color: MeshColors.border)),
-                    contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                    border: OutlineInputBorder(
+                      borderSide: BorderSide(color: MeshColors.border),
+                    ),
+                    contentPadding: EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 10,
+                    ),
                   ),
                 ),
               ],
@@ -444,7 +678,9 @@ Future<void> showReassignObligationDialog(
         ),
         actions: [
           TextButton(
-            onPressed: isSubmitting ? null : () => Navigator.of(dialogContext).pop(),
+            onPressed: isSubmitting
+                ? null
+                : () => Navigator.of(dialogContext).pop(),
             child: const Text('Cancel'),
           ),
           ElevatedButton(
@@ -456,13 +692,19 @@ Future<void> showReassignObligationDialog(
                     try {
                       final typedText = ownerIdCtrl.text.trim();
                       String resolvedId;
-                      if (typedText == 'operator' || typedText == 'human:operator' || typedText == 'human operator') {
+                      if (typedText == 'operator' ||
+                          typedText == 'human:operator' ||
+                          typedText == 'human operator') {
                         resolvedId = 'human:operator';
                       } else {
                         final matches = store.actorStates.value.actors.values
-                            .where((a) => a.handle == typedText || a.id == typedText)
+                            .where(
+                              (a) => a.handle == typedText || a.id == typedText,
+                            )
                             .map((a) => a.id);
-                        resolvedId = matches.isNotEmpty ? matches.first : typedText;
+                        resolvedId = matches.isNotEmpty
+                            ? matches.first
+                            : typedText;
                       }
 
                       await store.api.reassignObligation(
@@ -472,7 +714,9 @@ Future<void> showReassignObligationDialog(
                       if (context.mounted) {
                         Navigator.of(dialogContext).pop();
                         ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('Obligation reassigned successfully')),
+                          const SnackBar(
+                            content: Text('Obligation reassigned successfully'),
+                          ),
                         );
                         onReassigned?.call();
                       }
@@ -486,7 +730,11 @@ Future<void> showReassignObligationDialog(
                     }
                   },
             child: isSubmitting
-                ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                ? const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
                 : const Text('Reassign'),
           ),
         ],
@@ -521,7 +769,11 @@ Future<void> showEditExternalRefDialog(
         ),
         title: const Text(
           'External Reference',
-          style: TextStyle(color: MeshColors.textPrimary, fontSize: 16, fontWeight: FontWeight.bold),
+          style: TextStyle(
+            color: MeshColors.textPrimary,
+            fontSize: 16,
+            fontWeight: FontWeight.bold,
+          ),
         ),
         content: SingleChildScrollView(
           child: SizedBox(
@@ -532,7 +784,10 @@ Future<void> showEditExternalRefDialog(
               children: [
                 const Text(
                   'The object this obligation IS. Leave blank to unlink.',
-                  style: TextStyle(color: MeshColors.textSecondary, fontSize: 12.5),
+                  style: TextStyle(
+                    color: MeshColors.textSecondary,
+                    fontSize: 12.5,
+                  ),
                 ),
                 const SizedBox(height: 10),
                 TextField(
@@ -545,11 +800,19 @@ Future<void> showEditExternalRefDialog(
                   ),
                   decoration: const InputDecoration(
                     hintText: 'github:MEK-Org/rusa/issues/33',
-                    hintStyle: TextStyle(color: MeshColors.textMuted, fontSize: 12),
+                    hintStyle: TextStyle(
+                      color: MeshColors.textMuted,
+                      fontSize: 12,
+                    ),
                     filled: true,
                     fillColor: MeshColors.bgPrimary,
-                    border: OutlineInputBorder(borderSide: BorderSide(color: MeshColors.border)),
-                    contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                    border: OutlineInputBorder(
+                      borderSide: BorderSide(color: MeshColors.border),
+                    ),
+                    contentPadding: EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 10,
+                    ),
                   ),
                 ),
                 const SizedBox(height: 8),
@@ -567,7 +830,10 @@ Future<void> showEditExternalRefDialog(
                   const SizedBox(height: 10),
                   Text(
                     error!,
-                    style: const TextStyle(color: MeshColors.statusHalted, fontSize: 12),
+                    style: const TextStyle(
+                      color: MeshColors.statusHalted,
+                      fontSize: 12,
+                    ),
                   ),
                 ],
               ],
@@ -576,8 +842,13 @@ Future<void> showEditExternalRefDialog(
         ),
         actions: [
           TextButton(
-            onPressed: submitting ? null : () => Navigator.of(dialogContext).pop(),
-            child: const Text('Cancel', style: TextStyle(color: MeshColors.textSecondary)),
+            onPressed: submitting
+                ? null
+                : () => Navigator.of(dialogContext).pop(),
+            child: const Text(
+              'Cancel',
+              style: TextStyle(color: MeshColors.textSecondary),
+            ),
           ),
           ElevatedButton(
             style: ElevatedButton.styleFrom(
@@ -592,8 +863,12 @@ Future<void> showEditExternalRefDialog(
                       error = null;
                     });
                     try {
-                      await store.api.setObligationExternalRef(obligation.id, controller.text);
-                      if (dialogContext.mounted) Navigator.of(dialogContext).pop();
+                      await store.api.setObligationExternalRef(
+                        obligation.id,
+                        controller.text,
+                      );
+                      if (dialogContext.mounted) {
+                        Navigator.of(dialogContext).pop(); }
                       onUpdated?.call();
                     } catch (e) {
                       // The server owns the grammar, so its complaint is the
@@ -640,7 +915,11 @@ Future<void> confirmAndSetObligationStatus(
       ),
       title: Text(
         '$label Obligation?',
-        style: const TextStyle(color: MeshColors.textPrimary, fontSize: 16, fontWeight: FontWeight.bold),
+        style: const TextStyle(
+          color: MeshColors.textPrimary,
+          fontSize: 16,
+          fontWeight: FontWeight.bold,
+        ),
       ),
       // SizedBox inside a scroll view, matching the create/reparent dialogs:
       // AlertDialog wraps content in IntrinsicWidth, and a TextField has no
@@ -654,23 +933,37 @@ Future<void> confirmAndSetObligationStatus(
             children: [
               Text(
                 'Are you sure you want to transition "${obligation.heading}" to status "$status"?',
-                style: const TextStyle(color: MeshColors.textSecondary, fontSize: 13),
+                style: const TextStyle(
+                  color: MeshColors.textSecondary,
+                  fontSize: 13,
+                ),
               ),
               const SizedBox(height: 14),
               Text(
-                status == 'done' ? 'Why is this done? (optional)' : 'Why cancel? (optional)',
-                style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12),
+                status == 'done'
+                    ? 'Why is this done? (optional)'
+                    : 'Why cancel? (optional)',
+                style: const TextStyle(
+                  color: MeshColors.textSecondary,
+                  fontSize: 12,
+                ),
               ),
               const SizedBox(height: 4),
               TextField(
                 onChanged: (value) => note = value,
                 maxLines: 3,
-                style: const TextStyle(color: MeshColors.textPrimary, fontSize: 13),
+                style: const TextStyle(
+                  color: MeshColors.textPrimary,
+                  fontSize: 13,
+                ),
                 decoration: InputDecoration(
                   hintText: status == 'done'
                       ? 'What became true, or the answer if this was a question.'
                       : 'Why this intent is no longer current.',
-                  hintStyle: const TextStyle(color: MeshColors.textMuted, fontSize: 12),
+                  hintStyle: const TextStyle(
+                    color: MeshColors.textMuted,
+                    fontSize: 12,
+                  ),
                 ),
               ),
             ],
@@ -680,12 +973,17 @@ Future<void> confirmAndSetObligationStatus(
       actions: [
         TextButton(
           onPressed: () => Navigator.of(dialogContext).pop(false),
-          child: const Text('Cancel', style: TextStyle(color: MeshColors.textSecondary)),
+          child: const Text(
+            'Cancel',
+            style: TextStyle(color: MeshColors.textSecondary),
+          ),
         ),
         ElevatedButton(
           onPressed: () => Navigator.of(dialogContext).pop(true),
           style: ElevatedButton.styleFrom(
-            backgroundColor: status == 'done' ? MeshColors.statusActive : MeshColors.statusHalted,
+            backgroundColor: status == 'done'
+                ? MeshColors.statusActive
+                : MeshColors.statusHalted,
             foregroundColor: MeshColors.textPrimary,
           ),
           child: Text(label),
@@ -714,7 +1012,10 @@ Future<void> confirmAndSetObligationStatus(
   } catch (err) {
     if (context.mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to update status: $err'), backgroundColor: MeshColors.statusHalted),
+        SnackBar(
+          content: Text('Failed to update status: $err'),
+          backgroundColor: MeshColors.statusHalted,
+        ),
       );
     }
   }

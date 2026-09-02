@@ -155,7 +155,11 @@ class _DetailPanelState extends State<DetailPanel>
                           parentHandle: parentHandle,
                           store: widget.store,
                         ),
-                        InboxTab(actorId: actor.id, store: widget.store, onSelectView: widget.onSelectView),
+                        InboxTab(
+                          actorId: actor.id,
+                          store: widget.store,
+                          onSelectView: widget.onSelectView,
+                        ),
                       ]
                     : [
                         ChatTab(
@@ -169,7 +173,11 @@ class _DetailPanelState extends State<DetailPanel>
                           parentHandle: parentHandle,
                           store: widget.store,
                         ),
-                        InboxTab(actorId: actor.id, store: widget.store, onSelectView: widget.onSelectView),
+                        InboxTab(
+                          actorId: actor.id,
+                          store: widget.store,
+                          onSelectView: widget.onSelectView,
+                        ),
                       ],
               ),
             ),
@@ -471,14 +479,15 @@ class _DetailPanelState extends State<DetailPanel>
     final state = widget.store.actorStates.value.actors[a.id];
     final retired = a.isRetired;
     final runState = state?.runState ?? RunState.unknown;
-    
+
     String text;
     Color color;
 
     if (retired) {
       text = 'RETIRED';
       color = MeshColors.statusRetired;
-    } else if (runState == RunState.running || runState == RunState.windingDown) {
+    } else if (runState == RunState.running ||
+        runState == RunState.windingDown) {
       text = 'RUNNING';
       color = MeshColors.statusActive;
     } else if (runState == RunState.queued) {
@@ -680,7 +689,11 @@ class _InfoViewState extends State<_InfoView> {
       children: [
         TextSpan(
           text: '$label: ',
-          style: const TextStyle(color: MeshColors.textMuted, fontSize: 13, fontWeight: FontWeight.w600),
+          style: const TextStyle(
+            color: MeshColors.textMuted,
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+          ),
         ),
         TextSpan(
           text: value,
@@ -734,7 +747,10 @@ class _InfoViewState extends State<_InfoView> {
               if (actor.waitingOn != null)
                 _meta('Waiting on', actor.waitingOn!),
               if (actor.ownerExpectsRetirement != null)
-                _meta('Retire expected', actor.ownerExpectsRetirement!.toString()),
+                _meta(
+                  'Retire expected',
+                  actor.ownerExpectsRetirement!.toString(),
+                ),
             ],
           ),
           const SizedBox(height: 24),

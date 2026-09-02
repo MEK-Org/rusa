@@ -190,27 +190,27 @@ class _AvatarLightboxState extends State<AvatarLightbox> {
                     Flexible(
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(8.0),
-                      child: StreamBuilder<int>(
-                        stream: widget.store?.avatarEpoch,
-                        initialData: 0,
-                        builder: (context, snapshot) {
-                          final epoch = snapshot.data ?? 0;
-                          final url = Uri.base
-                              .resolve(
-                                '/api/mesh/avatar/${widget.id}.png${epoch > 0 ? '?v=$epoch' : ''}',
-                              )
-                              .toString();
-                          return Image.network(
-                            url,
-                            fit: BoxFit.contain,
-                            gaplessPlayback: true,
-                            loadingBuilder: (_, child, progress) =>
-                                progress == null ? child : _placeholder(),
-                            errorBuilder: (_, _, _) => _placeholder(),
-                          );
-                        },
+                        child: StreamBuilder<int>(
+                          stream: widget.store?.avatarEpoch,
+                          initialData: 0,
+                          builder: (context, snapshot) {
+                            final epoch = snapshot.data ?? 0;
+                            final url = Uri.base
+                                .resolve(
+                                  '/api/mesh/avatar/${widget.id}.png${epoch > 0 ? '?v=$epoch' : ''}',
+                                )
+                                .toString();
+                            return Image.network(
+                              url,
+                              fit: BoxFit.contain,
+                              gaplessPlayback: true,
+                              loadingBuilder: (_, child, progress) =>
+                                  progress == null ? child : _placeholder(),
+                              errorBuilder: (_, _, _) => _placeholder(),
+                            );
+                          },
+                        ),
                       ),
-                    ),
                     ),
                     if (_canEditAvatar) ...[
                       const SizedBox(height: 16),
@@ -218,12 +218,16 @@ class _AvatarLightboxState extends State<AvatarLightbox> {
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           TextButton.icon(
-                            onPressed: (_uploading || _generating) ? null : _upload,
+                            onPressed: (_uploading || _generating)
+                                ? null
+                                : _upload,
                             icon: _uploading
                                 ? const SizedBox(
                                     width: 16,
                                     height: 16,
-                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
                                   )
                                 : const Icon(Icons.upload, size: 18),
                             label: Text(
@@ -236,12 +240,16 @@ class _AvatarLightboxState extends State<AvatarLightbox> {
                           ),
                           const SizedBox(width: 8),
                           TextButton.icon(
-                            onPressed: (_uploading || _generating) ? null : _generate,
+                            onPressed: (_uploading || _generating)
+                                ? null
+                                : _generate,
                             icon: _generating
                                 ? const SizedBox(
                                     width: 16,
                                     height: 16,
-                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
                                   )
                                 : const Icon(Icons.auto_awesome, size: 18),
                             label: Text(

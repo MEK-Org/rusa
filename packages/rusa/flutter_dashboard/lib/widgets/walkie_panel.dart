@@ -103,8 +103,11 @@ class WalkiePanel extends StatelessWidget {
         final lastError = controller.lastError.valueOrNull;
         final entries = controller.transcript.valueOrNull ?? const [];
 
-        final actor = store?.actorStates.valueOrNull?.actors[controller.actorId]?.thread;
-        final dot = actor != null && store != null ? store!.dotFor(actor) : null;
+        final actor =
+            store?.actorStates.valueOrNull?.actors[controller.actorId]?.thread;
+        final dot = actor != null && store != null
+            ? store!.dotFor(actor)
+            : null;
 
         return Container(
           key: const ValueKey('walkie-panel'),
@@ -121,10 +124,7 @@ class WalkiePanel extends StatelessWidget {
               if (lastError != null) _errorBanner(lastError),
               if (expanded)
                 Expanded(
-                  child: _transcriptView(
-                    entries,
-                    nowPlaying: nowPlaying,
-                  ),
+                  child: _transcriptView(entries, nowPlaying: nowPlaying),
                 )
               else
                 _transcriptView(
@@ -184,10 +184,7 @@ class WalkiePanel extends StatelessWidget {
           const SizedBox(width: 12),
           StatusDot(state: dot, size: 8),
           const SizedBox(width: 6),
-          Text(
-            dotLabel,
-            style: TextStyle(color: dotColor, fontSize: 12),
-          ),
+          Text(dotLabel, style: TextStyle(color: dotColor, fontSize: 12)),
         ],
         const SizedBox(width: 12),
         if (queueDepth > 0)
@@ -256,10 +253,7 @@ class WalkiePanel extends StatelessWidget {
     );
   }
 
-  Widget _controlsRow(
-    RecordStatus record,
-    VoiceAnnouncement? nowPlaying,
-  ) {
+  Widget _controlsRow(RecordStatus record, VoiceAnnouncement? nowPlaying) {
     final lastPlayed = controller.lastPlayed.valueOrNull;
     final isRecording =
         record.phase == RecordPhase.recording ||
@@ -388,8 +382,10 @@ class _WalkieTranscriptViewState extends State<_WalkieTranscriptView> {
   @override
   void didUpdateWidget(_WalkieTranscriptView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    final oldCount = oldWidget.entries.length + (oldWidget.nowPlaying != null ? 1 : 0);
-    final newCount = widget.entries.length + (widget.nowPlaying != null ? 1 : 0);
+    final oldCount =
+        oldWidget.entries.length + (oldWidget.nowPlaying != null ? 1 : 0);
+    final newCount =
+        widget.entries.length + (widget.nowPlaying != null ? 1 : 0);
     if (newCount <= oldCount) return;
     // Capture "was at bottom" synchronously, while _scroll.position still
     // reflects the pre-update extent (before the new entry is laid out).
@@ -397,7 +393,8 @@ class _WalkieTranscriptViewState extends State<_WalkieTranscriptView> {
     // position alone — a new memo/reply should NOT yank them to the bottom.
     // hasClients==false → first entries ever, treat as at-bottom so they scroll.
     // Content shorter than viewport → maxScrollExtent==0, pixels==0 ≥ -40 → true.
-    final wasAtBottom = !_scroll.hasClients ||
+    final wasAtBottom =
+        !_scroll.hasClients ||
         _scroll.position.pixels >= _scroll.position.maxScrollExtent - 40;
     if (!wasAtBottom) return;
     SchedulerBinding.instance.addPostFrameCallback((_) {
@@ -410,8 +407,6 @@ class _WalkieTranscriptViewState extends State<_WalkieTranscriptView> {
       }
     });
   }
-
-
 
   @override
   void dispose() {
@@ -527,9 +522,7 @@ class _WalkieTranscriptEntry extends StatelessWidget {
                   : MeshColors.bgTertiary,
               borderRadius: BorderRadius.circular(8),
               border: isMemo
-                  ? Border.all(
-                      color: MeshColors.accent.withValues(alpha: 0.25),
-                    )
+                  ? Border.all(color: MeshColors.accent.withValues(alpha: 0.25))
                   : null,
             ),
             child: Text(

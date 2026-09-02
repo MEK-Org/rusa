@@ -149,7 +149,10 @@ void main() {
       findsOneWidget,
     );
     expect(find.byKey(const Key('quota-pace-error-chart')), findsNothing);
-    expect(find.byKey(const Key('quota-throttle-interval-chart')), findsNothing);
+    expect(
+      find.byKey(const Key('quota-throttle-interval-chart')),
+      findsNothing,
+    );
   });
 
   testWidgets(
@@ -271,15 +274,18 @@ void main() {
       expect(lowStep, greaterThan(highStep * 10));
     });
 
-    test('keeps a full decade for a flat series and pins sub-second readings', () {
-      final axis = ThrottleLogAxis.forSeries([
-        seriesWith([0.0, 0.25, null]),
-      ]);
-      expect(axis.minExponent, 0);
-      expect(axis.maxExponent, 1);
-      expect(axis.fractionOf(0), 0.0);
-      expect(axis.fractionOf(0.25), 0.0);
-    });
+    test(
+      'keeps a full decade for a flat series and pins sub-second readings',
+      () {
+        final axis = ThrottleLogAxis.forSeries([
+          seriesWith([0.0, 0.25, null]),
+        ]);
+        expect(axis.minExponent, 0);
+        expect(axis.maxExponent, 1);
+        expect(axis.fractionOf(0), 0.0);
+        expect(axis.fractionOf(0.25), 0.0);
+      },
+    );
 
     test('falls back to a default decade when no interval was recorded', () {
       final axis = ThrottleLogAxis.forSeries([

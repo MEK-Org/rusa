@@ -46,7 +46,8 @@ class _ReferencePreviewState extends State<ReferencePreview> {
     }
 
     final hasBody = displayBody.isNotEmpty;
-    final isLarge = displayBody.length > 300 || '\n'.allMatches(displayBody).length > 4;
+    final isLarge =
+        displayBody.length > 300 || '\n'.allMatches(displayBody).length > 4;
 
     return Container(
       width: double.infinity,
@@ -64,7 +65,8 @@ class _ReferencePreviewState extends State<ReferencePreview> {
           Row(
             children: [
               _SchemeChip(widget.reference.scheme),
-              if (widget.reference.cacheState != null && widget.reference.cacheState != 'local') ...[
+              if (widget.reference.cacheState != null &&
+                  widget.reference.cacheState != 'local') ...[
                 const SizedBox(width: 8),
                 _StateChip(widget.reference.cacheState!),
               ],
@@ -105,7 +107,8 @@ class _ReferencePreviewState extends State<ReferencePreview> {
               ),
             ),
           ],
-          if (widget.reference.author != null && widget.reference.author!.trim().isNotEmpty) ...[
+          if (widget.reference.author != null &&
+              widget.reference.author!.trim().isNotEmpty) ...[
             const SizedBox(height: 6),
             Text(
               'by ${widget.reference.author}',
@@ -181,12 +184,16 @@ class _ReferencePreviewState extends State<ReferencePreview> {
                 const SizedBox(width: 8),
                 Text(
                   'cited by ${widget.attachedBy}',
-                  style: const TextStyle(color: MeshColors.textMuted, fontSize: 10.5),
+                  style: const TextStyle(
+                    color: MeshColors.textMuted,
+                    fontSize: 10.5,
+                  ),
                 ),
               ],
             ],
           ),
-          if (widget.reference.url != null && widget.reference.url!.trim().isNotEmpty) ...[
+          if (widget.reference.url != null &&
+              widget.reference.url!.trim().isNotEmpty) ...[
             const SizedBox(height: 6),
             SelectableText(
               widget.reference.url!,
