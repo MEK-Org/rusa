@@ -1178,6 +1178,86 @@ describe("ActorMesh", () => {
     expect(fake("root").calls).toHaveLength(1);
   });
 
+  it("preempts an active run for durable responsive inbox work and runs the replacement", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let resolveFirst!: (result: Partial<RunResult>) => void;
+    let firstSignal: AbortSignal | undefined;
+    let runIndex = 0;
+    const provider = new FakeProvider((opts) => {
+      if (runIndex++ === 0) {
+        firstSignal = opts.signal;
+        return new Promise<Partial<RunResult>>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return { success: true, exitCode: 0, output: "responsive work handled" };
+    });
+    const { mesh, fake, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.notifyInboxChanged(worker);
+    await tick();
+    expect(fake(worker).calls).toHaveLength(1);
+    expect(firstSignal?.aborted).toBe(false);
+
+    const [responsive] = inboxStore.append([
+      {
+        actorId: worker,
+        source: "system:events",
+        payload: { type: "system.disk", priority: "responsive" },
+      },
+    ]);
+    mesh.notifyInboxChanged(worker, { priority: "responsive" });
+
+    expect(firstSignal?.aborted).toBe(true);
+    expect(firstSignal?.reason).toBe("interrupt:responsive-notification");
+    expect(responsive?.handledAt).toBeNull();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "run_preempted",
+        actorId: worker,
+        detail: "running",
+        payload: JSON.stringify({ reason: "responsive_notification" }),
+      })
+    );
+
+    resolveFirst({
+      success: false,
+      exitCode: 143,
+      cancelled: true,
+      interrupted: true,
+      output: "[Task interrupted by responsive-notification]",
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake(worker).calls).toHaveLength(2);
+  });
+
+  it("delivers responsive inbox work to an idle actor without a preemption event", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    const { mesh, fake, tick } = setup({ inboxStore, events: (event) => events.push(event) });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([
+      {
+        actorId: worker,
+        source: "system:events",
+        payload: { type: "system.disk", priority: "responsive" },
+      },
+    ]);
+    mesh.notifyInboxChanged(worker, { priority: "responsive" });
+    await tick();
+
+    expect(fake(worker).calls).toHaveLength(1);
+    expect(events.some((event) => event.kind === "run_preempted")).toBe(false);
+  });
+
   it("mechanically notifies the parent when a parent-triggered run yields", async () => {
     const chat: { senderId: string; recipientId: string; body: string; sessionId?: string }[] = [];
     const inboxStore = createMemoryInboxStore();

@@ -160,6 +160,10 @@ export async function routeRunFailure(
   providerLabel?: string
 ): Promise<void> {
   if (result.success) return;
+  if (isResponsivePreemption(result)) {
+    deps.log(`suppressing expected responsive preemption notice for ${actorId}`);
+    return;
+  }
   const tail = sanitizeFailureText(result.output ?? "")
     .slice(-TAIL_LEN)
     .trim();
@@ -180,6 +184,15 @@ export async function routeRunFailure(
   }
   const body = leadLine ? `${leadLine}\n\n${summary}` : summary;
   routeMechanicalFailureNotice(deps, actorId, "run failed", body, result.exitCode, result);
+}
+
+/** Responsive inbox preemption is intentional scheduling, not a supervisor failure. */
+export function isResponsivePreemption(result: RunResult): boolean {
+  return Boolean(
+    result.cancelled &&
+      result.interrupted &&
+      result.output?.includes("[Task interrupted by responsive-notification]")
+  );
 }
 
 export function sanitizeFailureText(text: string): string {

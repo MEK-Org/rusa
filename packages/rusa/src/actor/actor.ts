@@ -24,6 +24,7 @@ import {
 export const WATCHDOG_STALL_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
 export const WATCHDOG_CEILING_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes
 export const DEFAULT_YIELD_GRACE_MS = 10 * 1000; // 10 seconds
+export const RESPONSIVE_PREEMPTION_SOURCE = "responsive-notification";
 const YIELD_ELICITATION_MAX = 1;
 
 /**
@@ -430,6 +431,44 @@ export class Actor {
     this.cancelledQueuedRun = false;
     this.requestRun();
     return true;
+  }
+
+  /**
+   * Replace the current execution opportunity with newly delivered responsive work.
+   *
+   * Unlike a manual {@link interrupt}, this deliberately sets no inbox watermark:
+   * the replacement run must see both the responsive entry and any earlier work the
+   * interrupted run had not committed as handled. A queued start is cancelled
+   * without retaining the halt/resume dirty flag because the caller immediately
+   * requests its responsive replacement.
+   */
+  preemptForResponsive(): {
+    preempted: boolean;
+    phase?: "running" | "winding_down" | "queued";
+  } {
+    const phase = this.executing
+      ? this.yielded
+        ? "winding_down"
+        : "running"
+      : this.pendingStart || this.queued || this.runner.isBusy
+        ? "queued"
+        : undefined;
+    if (!phase) return { preempted: false };
+
+    // Drop any previously coalesced follow-up. The responsive inbox delivery that
+    // caused this call is the one replacement opportunity we want to retain.
+    this.runner.cancelPending();
+
+    if (this.executing && this.coalesceAbortController) {
+      if (this.coalesceAbortController.signal.aborted) return { preempted: false };
+      this.coalesceAbortController.abort(createInterruptAbortReason(RESPONSIVE_PREEMPTION_SOURCE));
+      return { preempted: true, phase };
+    }
+
+    this.pendingStart?.cancel?.();
+    this.queued = false;
+    this.publishRuntimeStateIfChanged();
+    return { preempted: true, phase: "queued" };
   }
 
   /**

@@ -99,6 +99,11 @@ export type MeshEventKind =
   // paths, which made them invisible in the timeline and — worse — left the
   // mesh's in-flight accounting permanently short one decrement .
   | "run_abandoned"
+  // A durable responsive inbox delivery displaced the actor's current queued or
+  // running opportunity. `actorId` = the recipient; `detail` = the displaced
+  // phase; payload = { reason: "responsive_notification" }. The displaced
+  // opportunity still closes normally through run_end or run_abandoned.
+  | "run_preempted"
   // A portable-context v2 ledger folded one or more inbound messages. `actorId`
   // is the remembered actor; detail/body carry generation/count metadata only.
   | "portable_context_compacted"

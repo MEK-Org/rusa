@@ -296,6 +296,39 @@ describe("Actor", () => {
     expect(provider.calls[0]?.prompt).toBe("PROMPT: inbox work");
   });
 
+  it("replaces a queued normal run with one responsive opportunity", async () => {
+    const limiter = new ConcurrencyLimiter(1);
+    let releaseBlocker!: () => void;
+    void limiter.run(() => new Promise<void>((resolve) => (releaseBlocker = resolve)));
+    await flush();
+    let actor!: Actor;
+    const provider = new FakeProvider(() => {
+      actor.declareYield();
+      return {};
+    });
+    actor = makeActor(
+      {
+        gate: (fn) => limiter.enqueue(fn),
+      },
+      provider
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(actor.isQueued).toBe(true);
+
+    expect(actor.preemptForResponsive()).toEqual({ preempted: true, phase: "queued" });
+    actor.requestRun({ priority: "responsive" });
+    await flush();
+    expect(provider.calls).toHaveLength(0);
+
+    releaseBlocker();
+    await flush();
+    expect(provider.calls).toHaveLength(1);
+    expect(provider.calls[0]?.prompt).toBe("PROMPT: inbox work");
+    expect(actor.resumeCancelledRun()).toBe(false);
+  });
+
   describe("every queued opportunity reports exactly one terminal signal ", () => {
     it("reports a completed run through onRunEnd and never as abandoned", async () => {
       // The counter-assertion for the cells below: if onRunAbandoned fired on the

@@ -43,7 +43,7 @@ import type {
   ThreadRegistry,
   ThreadStatus,
 } from "./thread-registry.js";
-import type { ActorRunMode, RunNudge } from "./trigger-runner.js";
+import { type ActorRunMode, isResponsiveNudge, type RunNudge } from "./trigger-runner.js";
 
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
 export const SCHEDULER_SENDER_ID = "scheduler";
@@ -71,6 +71,10 @@ export interface MeshActor {
   readonly isYielded?: boolean;
   cancelQueuedRun?(): boolean;
   resumeCancelledRun?(): boolean;
+  preemptForResponsive?(): {
+    preempted: boolean;
+    phase?: "running" | "winding_down" | "queued";
+  };
   interrupt?(by?: string): { interrupted: boolean; runStartTime?: Date; wasQueued?: boolean };
   getInterruptedWatermark?(): Date | null;
   clearInterruptWatermark?(): void;
@@ -773,6 +777,17 @@ export class ActorMesh {
     if (!target) {
       this.log(`inbox_changed for ${actorId} not nudged — no live actor`);
       return false;
+    }
+    if (isResponsiveNudge(nudge)) {
+      const preemption = target.preemptForResponsive?.();
+      if (preemption?.preempted) {
+        this.recordEvent({
+          kind: "run_preempted",
+          actorId,
+          detail: preemption.phase,
+          payload: JSON.stringify({ reason: "responsive_notification" }),
+        });
+      }
     }
     if (target.isQueued) {
       this.markInboxSeen(actorId);

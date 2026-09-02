@@ -365,6 +365,27 @@ describe("routeRunFailure", () => {
   });
 
   describe("human operator cancellation / error chat suppression ", () => {
+    it("suppresses expected responsive preemption notices for roots and workers", async () => {
+      const { deps, toParent, toChat, logs } = makeDeps({
+        root: { id: "root", parentId: null },
+        w1: { id: "w1", parentId: "root" },
+      });
+      const preempted: RunResult = {
+        success: false,
+        exitCode: 143,
+        cancelled: true,
+        interrupted: true,
+        output: "[Task interrupted by responsive-notification]",
+      };
+
+      await routeRunFailure(deps, "root", preempted);
+      await routeRunFailure(deps, "w1", preempted);
+
+      expect(toChat).toHaveLength(0);
+      expect(toParent).toHaveLength(0);
+      expect(logs.filter((line) => line.includes("responsive preemption"))).toHaveLength(2);
+    });
+
     it("suppresses error chat when root is interrupted by human:operator", async () => {
       const { deps, toParent, toChat, logs } = makeDeps({
         root: { id: "root", parentId: null },
