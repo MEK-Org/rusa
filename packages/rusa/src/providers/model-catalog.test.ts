@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { extractGeminiText, getGeminiClient } from "../understanding/gemini-utils.js";
+import { buildAntigravityArgs } from "./antigravity.js";
 import {
   clearProviderModelCatalog,
   extractKimiModelsFromToml,
@@ -274,6 +275,17 @@ describe("populateModelCatalogsFromDb", () => {
         efforts: ["high"],
       },
     ]);
+
+    const args = buildAntigravityArgs({
+      prompt: "hi",
+      model: "Gemini 3.5 Flash",
+      effort: "high",
+      timeoutMs: 60_000,
+    });
+    const iModel = args.indexOf("--model");
+    const iEffort = args.indexOf("--effort");
+    expect(args.slice(iModel, iModel + 2)).toEqual(["--model", "gemini-3.5-flash"]);
+    expect(args.slice(iEffort, iEffort + 2)).toEqual(["--effort", "high"]);
   });
 });
 

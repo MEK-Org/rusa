@@ -259,6 +259,21 @@ describe("buildAntigravityArgs", () => {
     ).toThrowError('invalid model selection: effort "high" is not supported by model "Test Model"');
   });
 
+  it("rejects when the model requires an effort but none was provided", () => {
+    setProviderModelCatalog("agy", [
+      { identifier: "test-model-high", displayLabel: "Test Model (High)", passable: true },
+    ]);
+    expect(() =>
+      buildAntigravityArgs({
+        prompt: "hi",
+        model: "Test Model",
+        timeoutMs: 60_000,
+      })
+    ).toThrowError(
+      'invalid model selection: model "Test Model" requires an effort but none was provided'
+    );
+  });
+
   it("canonicalizes exact display label and slug into base slug + effort argv through the catalog", () => {
     // Normalizing entries will populate base model "gemini-3.7-flash" with efforts ["high"]
     setProviderModelCatalog("agy", [
