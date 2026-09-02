@@ -3099,7 +3099,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("claude");
     expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
     expect(activeMesh.registry.get(portableWorkerId)?.desiredProvider).toBe("antigravity");
-    expect(activeMesh.registry.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash (High)");
+    expect(activeMesh.registry.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash");
+    expect(activeMesh.registry.get(portableWorkerId)?.desiredEffort).toBe("high");
 
     // Invalid model for target provider fails validation
     expect(() => {
@@ -3111,7 +3112,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
       );
     }).toThrow(/model pin validation failed/);
     expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
-    expect(activeMesh.registry.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash (High)");
+    expect(activeMesh.registry.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash");
+    expect(activeMesh.registry.get(portableWorkerId)?.desiredEffort).toBe("high");
     expect(activeMesh.registry.get(portableWorkerId)?.desiredProvider).toBe("antigravity");
   });
 

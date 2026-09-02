@@ -1189,6 +1189,7 @@ export function createQuotaMcpServer(
             displayLabel: entry.displayLabel,
             identifier: entry.identifier,
             passable: entry.passable !== false,
+            ...(entry.efforts ? { efforts: entry.efforts } : {}),
           }));
 
         if (provider) {
