@@ -286,6 +286,14 @@ export class McpHttpServer {
       await this.handleWake(req, res);
       return;
     }
+    if ((req.url ?? "").split("?")[0] === "/wake-obligation") {
+      await this.handleWakeObligationRequest(req, res);
+      return;
+    }
+    if ((req.url ?? "").split("?")[0] === "/wake-message") {
+      await this.handleWakeMessageRequest(req, res);
+      return;
+    }
     if ((req.url ?? "").split("?")[0] === "/host-jobs/exit") {
       await this.handleHostJobExit(req, res);
       return;
@@ -424,6 +432,89 @@ export class McpHttpServer {
    * the required fields present; the actor-liveness branching `/wake` does lives
    * inside `onExit` (via `deliverWake`), not this endpoint.
    */
+  private async handleWakeObligationRequest(
+    req: IncomingMessage,
+    res: ServerResponse
+  ): Promise<void> {
+    const send = (code: number, payload: Record<string, unknown>) => {
+      res.writeHead(code, { "content-type": "application/json" });
+      res.end(JSON.stringify(payload));
+    };
+    try {
+      if (!this.wakeObligation) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("not found");
+        return;
+      }
+      if (req.method !== "POST") {
+        send(405, { error: "method not allowed" });
+        return;
+      }
+      const auth = (req.headers.authorization as string | undefined) ?? "";
+      if (!safeEqual(auth, `Bearer ${this.wakeObligation.token}`)) {
+        send(401, { error: "unauthorized" });
+        return;
+      }
+      let raw: string;
+      try {
+        raw = await readTextBody(req);
+      } catch {
+        send(413, { error: "body too large" });
+        return;
+      }
+      const params = new URLSearchParams(raw);
+      const id = params.get("id");
+      if (!id) {
+        send(400, { error: "id required" });
+        return;
+      }
+      this.wakeObligation.deliver(id);
+      send(200, { ok: true });
+    } catch {
+      if (!res.headersSent) send(500, { error: "internal error" });
+    }
+  }
+
+  private async handleWakeMessageRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const send = (code: number, payload: Record<string, unknown>) => {
+      res.writeHead(code, { "content-type": "application/json" });
+      res.end(JSON.stringify(payload));
+    };
+    try {
+      if (!this.wakeMessage) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("not found");
+        return;
+      }
+      if (req.method !== "POST") {
+        send(405, { error: "method not allowed" });
+        return;
+      }
+      const auth = (req.headers.authorization as string | undefined) ?? "";
+      if (!safeEqual(auth, `Bearer ${this.wakeMessage.token}`)) {
+        send(401, { error: "unauthorized" });
+        return;
+      }
+      let raw: string;
+      try {
+        raw = await readTextBody(req);
+      } catch {
+        send(413, { error: "body too large" });
+        return;
+      }
+      const params = new URLSearchParams(raw);
+      const id = params.get("id");
+      if (!id) {
+        send(400, { error: "id required" });
+        return;
+      }
+      this.wakeMessage.deliver(id);
+      send(200, { ok: true });
+    } catch {
+      if (!res.headersSent) send(500, { error: "internal error" });
+    }
+  }
+
   private async handleHostJobExit(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const send = (code: number, payload: Record<string, unknown>) => {
       res.writeHead(code, { "content-type": "application/json" });

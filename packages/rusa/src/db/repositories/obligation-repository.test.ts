@@ -8,6 +8,7 @@ import { obligationTimestamps } from "../migrations/0025_obligation_timestamps.j
 import { obligationTerminalNote } from "../migrations/0026_obligation_terminal_note.js";
 import { obligationTitle } from "../migrations/0027_obligation_title.js";
 import { obligationArtifacts } from "../migrations/0028_obligation_artifacts.js";
+import { recurringObligations } from "../migrations/0033_recurring_obligations.js";
 import { ObligationRepository } from "./obligation-repository.js";
 
 describe("ObligationRepository", () => {
@@ -24,6 +25,7 @@ describe("ObligationRepository", () => {
     obligationTerminalNote.up(db);
     obligationTitle.up(db);
     obligationArtifacts.up(db);
+    recurringObligations.up(db);
     now = 1_000;
     repository = new ObligationRepository(
       db,
@@ -1201,6 +1203,37 @@ describe("ObligationRepository", () => {
     ).toThrow("cannot add a child to a terminal obligation");
   });
 
+  it("does not treat a scheduled child as blocking a parent's completion or reparenting", () => {
+    const parent = repository.create({ ownerId: "actor-a", title: "parent" });
+    const child = repository.create({ ownerId: "actor-a", title: "child", parentId: parent.id });
+
+    // change child to scheduled
+    db.prepare("UPDATE obligations SET status = 'scheduled' WHERE id = ?").run(child.id);
+
+    // parent should not be blocked from completion
+    const completed = repository.setTerminalStatus(parent.id, "done");
+    expect(completed.status).toBe("done");
+
+    // test reparenting a scheduled child
+    const newParent = repository.create({ ownerId: "actor-a", title: "new parent" });
+    repository.reparent(child.id, newParent.id);
+
+    // new parent should not be blocked
+    const newParentAfter = repository.get(newParent.id);
+    expect(newParentAfter?.status).toBe("ready");
+  });
+
+  it("includes scheduled identities in findLiveObligationByExternalRef and internal inheritance", () => {
+    const externalRef = "github://owner/repo/issue/1";
+    const ob = repository.create({ ownerId: "actor-a", title: "ob", externalRef });
+
+    db.prepare("UPDATE obligations SET status = 'scheduled' WHERE id = ?").run(ob.id);
+
+    // should find scheduled identity
+    const found = repository.findLiveObligationByExternalRef(externalRef);
+    expect(found?.ownerId).toBe("actor-a");
+  });
+
   it("returns a complete tree that names the live child explaining waiting", () => {
     repository.create({
       title: "root",
@@ -1309,6 +1342,7 @@ describe("ObligationRepository", () => {
     expect(repository.inheritRetiringActorObligationsInternal("actor-a", "actor-b")).toEqual({
       ready: 2,
       waiting: 1,
+      scheduled: 0,
     });
     expect(
       repository
@@ -1339,10 +1373,12 @@ describe("ObligationRepository", () => {
     expect(repository.inheritRetiringActorObligationsInternal("actor-a", "actor-b")).toEqual({
       ready: 1,
       waiting: 0,
+      scheduled: 0,
     });
     expect(repository.inheritRetiringActorObligationsInternal("actor-b", "actor-c")).toEqual({
       ready: 1,
       waiting: 0,
+      scheduled: 0,
     });
     expect(
       repository

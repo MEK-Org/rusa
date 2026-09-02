@@ -1298,7 +1298,7 @@ export async function handleMeshApiRequest(
     const limit = clampLimit(url);
     const offset = parsePositiveInt(url, "offset") ?? 0;
 
-    if (status && !["ready", "waiting", "done", "cancelled"].includes(status)) {
+    if (status && !["ready", "waiting", "done", "cancelled", "scheduled"].includes(status)) {
       sendJson(res, 400, { error: "invalid status" });
       return true;
     }

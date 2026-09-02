@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { OsScheduler } from "../../actor/os-scheduler.js";
+import { isValidCronExpr } from "../../actor/wake-cron.js";
 import {
   assertObligationStatus,
   type EntityId,
+  isBlockingObligationStatus,
   isTerminalObligationStatus,
   type Obligation,
   type ObligationArtifact,
@@ -137,6 +139,7 @@ export interface ObligationPage {
 export interface RetirementInheritanceResult {
   ready: number;
   waiting: number;
+  scheduled: number;
 }
 
 const EFFECTIVE_PRIORITY_CTE = `
@@ -268,6 +271,53 @@ export class ObligationRepository {
 
   setOsScheduler(scheduler: OsScheduler): void {
     this.osScheduler = scheduler;
+  }
+
+  reconcileScheduledObligations(): void {
+    if (!this.osScheduler) return;
+    const validIds = new Set<string>();
+
+    // Any obligation that needs an OS job (scheduled status OR a cron policy in ready/waiting/terminal etc?
+    // Wait, let's read the issue: "Fixed-schedule recurrence remains represented by one tagged cron entry. Completion moves the obligation to scheduled; the next cron callback changes it to ready."
+    // So cron entries are always active, even if ready/waiting. What if it's cancelled? "Cancelling permanently stops recurrence ... and removes the tagged OS job."
+    // What if it's done? If cron recurrence is disabled, it becomes done, and OS job removed.
+    // What if it's completion_interval? The OS job is only scheduled when status is 'scheduled' with next_ready_at.
+    const stmt = this.db.prepare(
+      `SELECT id, status, recurrence_policy, recurrence_cron, next_ready_at FROM obligations WHERE recurrence_policy = 'cron' OR status = 'scheduled'`
+    );
+
+    for (const row of stmt.all() as {
+      id: string;
+      status: string;
+      recurrence_policy: string | null;
+      recurrence_cron: string | null;
+      next_ready_at: string | null;
+    }[]) {
+      if (
+        row.recurrence_policy === "cron" &&
+        row.recurrence_cron &&
+        row.status !== "cancelled" &&
+        row.status !== "done"
+      ) {
+        validIds.add(row.id);
+        this.osScheduler.scheduleObligationActivation(row.id, {
+          kind: "cron",
+          cronExpr: row.recurrence_cron,
+        });
+      } else if (row.status === "scheduled" && row.next_ready_at) {
+        validIds.add(row.id);
+        this.osScheduler.scheduleObligationActivation(row.id, {
+          kind: "at",
+          date: new Date(row.next_ready_at),
+        });
+      }
+    }
+
+    for (const id of this.osScheduler.listObligationActivations()) {
+      if (!validIds.has(id)) {
+        this.osScheduler.cancelObligationActivation(id);
+      }
+    }
   }
 
   /**
@@ -857,6 +907,7 @@ export class ObligationRepository {
       return {
         ready: this.transferOwnedStatus(retiringOwner, parentOwner, "ready"),
         waiting: this.transferOwnedStatus(retiringOwner, parentOwner, "waiting"),
+        scheduled: this.transferOwnedStatus(retiringOwner, parentOwner, "scheduled"),
       };
     });
   }
@@ -989,7 +1040,7 @@ export class ObligationRepository {
         `SELECT id, owner_id
          FROM obligations
          WHERE external_ref = ? COLLATE NOCASE
-           AND status IN ('ready', 'waiting')
+           AND status IN ('ready', 'waiting', 'scheduled')
          LIMIT 1`
       )
       .get(ref) as { id: string; owner_id: EntityId } | undefined;
@@ -997,6 +1048,60 @@ export class ObligationRepository {
   }
 
   /** Every artifact cited by an obligation, oldest first. */
+  listCompletionsPage(
+    id: string,
+    options: ObligationPageOptions
+  ): {
+    completions: {
+      id: string;
+      obligationId: string;
+      sequence: number;
+      completedAt: string;
+      note: string | null;
+      resolutionRef: string | null;
+      nextReadyAt: string | null;
+    }[];
+    total: number;
+    hasMore: boolean;
+  } {
+    const { limit, offset } = validatePage(options);
+    const countRow = this.db
+      .prepare(`SELECT COUNT(*) as count FROM obligation_completions WHERE obligation_id = ?`)
+      .get(id) as { count: number };
+    const total = countRow.count;
+
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM obligation_completions WHERE obligation_id = ? ORDER BY sequence DESC LIMIT ? OFFSET ?`
+      )
+      .all(id, limit + 1, offset) as {
+      id: string;
+      obligation_id: string;
+      sequence: number;
+      completed_at: string;
+      note: string | null;
+      resolution_ref: string | null;
+      next_ready_at: string | null;
+    }[];
+
+    const hasMore = rows.length > limit;
+    if (hasMore) rows.pop();
+
+    return {
+      total,
+      hasMore,
+      completions: rows.map((row) => ({
+        id: row.id,
+        obligationId: row.obligation_id,
+        sequence: row.sequence,
+        completedAt: row.completed_at,
+        note: row.note ?? null,
+        resolutionRef: row.resolution_ref ?? null,
+        nextReadyAt: row.next_ready_at ?? null,
+      })),
+    };
+  }
+
   listArtifacts(obligationId: string): ObligationArtifact[] {
     const rows = this.db
       .prepare(
@@ -1025,8 +1130,8 @@ export class ObligationRepository {
       if (isTerminalObligationStatus(obligation.status)) {
         throw new ObligationValidationError("terminal obligations cannot be reopened or changed");
       }
-      const liveChild = this.listChildren(id).find(
-        (child) => !isTerminalObligationStatus(child.status)
+      const liveChild = this.listChildren(id).find((child) =>
+        isBlockingObligationStatus(child.status)
       );
       if (liveChild) {
         throw new ObligationValidationError(
@@ -1127,6 +1232,15 @@ export class ObligationRepository {
       | { policy: "completion_interval"; intervalSeconds: number }
       | null
   ): Obligation {
+    if (recurrence?.policy === "cron" && !isValidCronExpr(recurrence.cronExpr)) {
+      throw new ObligationValidationError("invalid cron expression");
+    }
+    if (
+      recurrence?.policy === "completion_interval" &&
+      (!Number.isInteger(recurrence.intervalSeconds) || recurrence.intervalSeconds <= 0)
+    ) {
+      throw new ObligationValidationError("recurrence interval must be a positive integer");
+    }
     return this.mutate(() => {
       const obligation = this.require(id);
       if (isTerminalObligationStatus(obligation.status)) {
@@ -1158,7 +1272,7 @@ export class ObligationRepository {
       } else if (recurrence.policy === "cron") {
         this.db
           .prepare(
-            `UPDATE obligations SET recurrence_policy = 'cron', recurrence_cron = ?, recurrence_interval_seconds = NULL, updated_at = ? WHERE id = ?`
+            `UPDATE obligations SET next_ready_at = NULL, recurrence_policy = 'cron', recurrence_cron = ?, recurrence_interval_seconds = NULL, updated_at = ? WHERE id = ?`
           )
           .run(recurrence.cronExpr, this.stamp(), id);
         this.osScheduler?.scheduleObligationActivation(id, {
@@ -1202,6 +1316,7 @@ export class ObligationRepository {
               `UPDATE obligations SET recurrence_policy = 'completion_interval', recurrence_cron = NULL, recurrence_interval_seconds = ?, updated_at = ? WHERE id = ?`
             )
             .run(recurrence.intervalSeconds, this.stamp(), id);
+          this.osScheduler?.cancelObligationActivation(id);
         }
       }
       return this.require(id);
@@ -1276,7 +1391,7 @@ export class ObligationRepository {
           .run(newParentId, this.stamp(), id);
       }
 
-      if (newParentId !== null) {
+      if (newParentId !== null && isBlockingObligationStatus(obligation.status)) {
         this.db
           .prepare(
             "UPDATE obligations SET status = 'waiting', updated_at = ? WHERE id = ? AND status = 'ready'"
@@ -1344,7 +1459,7 @@ export class ObligationRepository {
   private transferOwnedStatus(
     retiringActorId: string,
     parentActorId: string,
-    status: "ready" | "waiting"
+    status: "ready" | "waiting" | "scheduled"
   ): number {
     const source = this.db
       .prepare(

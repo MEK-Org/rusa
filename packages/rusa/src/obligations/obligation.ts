@@ -135,6 +135,10 @@ export class ObligationValidationError extends Error {
 
 const STATUSES = new Set<ObligationStatus>(["ready", "waiting", "done", "cancelled", "scheduled"]);
 
+export function isBlockingObligationStatus(status: ObligationStatus): boolean {
+  return status === "ready" || status === "waiting";
+}
+
 export function isTerminalObligationStatus(status: ObligationStatus): boolean {
   return status === "done" || status === "cancelled";
 }

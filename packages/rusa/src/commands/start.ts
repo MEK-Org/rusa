@@ -2549,6 +2549,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   mesh.rehydrateAll();
   mesh.reconcilePendingDeliveries();
   mesh.reconcileInbox();
+  getRepositories().obligations.reconcileScheduledObligations();
   try {
     mesh.reconcileReadyHeads(getRepositories().obligations);
   } catch (_err) {

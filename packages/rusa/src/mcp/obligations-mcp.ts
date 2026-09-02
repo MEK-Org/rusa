@@ -23,6 +23,8 @@ type ObligationServerRepository = Pick<
   | "reassign"
   | "reparent"
   | "setRecurrence"
+  | "listCompletionsPage"
+  | "require"
 >;
 
 export interface ObligationsMcpOptions {
@@ -50,7 +52,7 @@ const DEFAULT_PAGE_LIMIT = 50;
 type PageCursor =
   | {
       v: 1;
-      scope: "children" | "blocking-children";
+      scope: "children" | "blocking-children" | "completions";
       obligationId: string;
       offset: number;
     }
@@ -85,7 +87,7 @@ function decodeCursor(cursor: string): PageCursor {
 
 function childOffset(
   cursor: string | undefined,
-  scope: "children" | "blocking-children",
+  scope: "children" | "blocking-children" | "completions",
   obligationId: string
 ): number {
   if (!cursor) return 0;
@@ -143,9 +145,10 @@ export function createObligationsMcpServer(
         limit: z.number().int().min(1).max(100).optional().default(DEFAULT_PAGE_LIMIT),
         children_cursor: z.string().max(1_024).optional(),
         blocking_children_cursor: z.string().max(1_024).optional(),
+        completions_cursor: z.string().max(1_024).optional(),
       },
     },
-    async ({ id, limit, children_cursor, blocking_children_cursor }) => {
+    async ({ id, limit, children_cursor, blocking_children_cursor, completions_cursor }) => {
       try {
         const obligation = repository.get(id);
         if (!obligation) throw new Error("obligation not found");
@@ -156,6 +159,11 @@ export function createObligationsMcpServer(
           limit,
           offset: blockingOffset,
           blockingOnly: true,
+        });
+        const completionsOffset = childOffset(completions_cursor, "completions", id);
+        const completionsPage = repository.listCompletionsPage(id, {
+          limit,
+          offset: completionsOffset,
         });
         return toolOk({
           obligation,
@@ -187,6 +195,19 @@ export function createObligationsMcpServer(
                 })
               : null,
           },
+          completions: {
+            items: completionsPage.completions,
+            total: completionsPage.total,
+            truncated: completionsOffset > 0 || completionsPage.hasMore,
+            nextCursor: completionsPage.hasMore
+              ? encodeCursor({
+                  v: 1,
+                  scope: "completions",
+                  obligationId: id,
+                  offset: completionsOffset + limit,
+                })
+              : null,
+          },
         });
       } catch (err) {
         return toolError(err);
@@ -201,7 +222,7 @@ export function createObligationsMcpServer(
       description:
         "List a bounded page of obligations owned by this actor in ready-before-waiting queue order. Actor identity is bound by the server.",
       inputSchema: {
-        status: z.enum(["ready", "waiting", "done", "cancelled"]).optional(),
+        status: z.enum(["ready", "waiting", "done", "cancelled", "scheduled"]).optional(),
         limit: z.number().int().min(1).max(100).optional().default(DEFAULT_PAGE_LIMIT),
         cursor: z.string().max(1_024).optional(),
       },
@@ -303,6 +324,8 @@ export function createObligationsMcpServer(
     },
     async ({ id, recurrence }) => {
       try {
+        const existing = repository.require(id);
+        if (!canManage(existing)) throw new Error("not authorized to manage this obligation");
         const obligation = repository.setRecurrence(id, recurrence);
         return toolOk({ obligation });
       } catch (error) {

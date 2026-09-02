@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import type { CrontabIo } from "./wake-cron.js";
+import { type CrontabIo, isValidCronExpr } from "./wake-cron.js";
 
 /**
  * One internal scheduling service with a deliberately small vocabulary:
@@ -12,9 +12,11 @@ export interface OsScheduler {
     time: { kind: "cron"; cronExpr: string } | { kind: "at"; date: Date }
   ): void;
   cancelObligationActivation(id: string): void;
+  listObligationActivations(): string[];
 
   scheduleMessageDelivery(id: string, date: Date): void;
   cancelMessageDelivery(id: string): void;
+  listMessageDeliveries(): string[];
 }
 
 export interface OsSchedulerOptions {
@@ -102,8 +104,11 @@ export class DefaultOsScheduler implements OsScheduler {
     const out: string[] = [];
     for (let i = 0; i < lines.length; i++) {
       if (lines[i].trim() === tag) {
-        const next = lines[i + 1];
-        if (next !== undefined && next.trim() !== "" && !next.trimStart().startsWith("#")) {
+        while (i + 1 < lines.length) {
+          const next = lines[i + 1];
+          if (next === undefined || next.trim() === "" || next.trimStart().startsWith("#")) {
+            break;
+          }
           i++;
         }
         continue;
@@ -145,7 +150,9 @@ export class DefaultOsScheduler implements OsScheduler {
     const curlLine = this.buildCurlLine("wake-obligation", { id });
 
     if (time.kind === "cron") {
-      this.updateCron(tag, `${time.cronExpr} ${curlLine}`);
+      if (!isValidCronExpr(time.cronExpr))
+        throw new Error(`invalid cron expression: ${time.cronExpr}`);
+      this.updateCron(tag, `CRON_TZ=UTC\n${time.cronExpr} ${curlLine}`);
     } else {
       const script = `${tag}\n${curlLine}\n`;
       this.atIo.schedule(script, time.date);
@@ -156,6 +163,20 @@ export class DefaultOsScheduler implements OsScheduler {
     const tag = `# mc-obligation-activation:${id}`;
     this.updateCron(tag, null);
     this.removeAtByTag(tag);
+  }
+
+  listObligationActivations(): string[] {
+    const ids = new Set<string>();
+    const current = this.crontabIo.read();
+    for (const line of current.split("\n")) {
+      const m = line.match(/^# mc-obligation-activation:(.+)$/);
+      if (m) ids.add(m[1].trim());
+    }
+    for (const job of this.atIo.list()) {
+      const m = job.script.match(/# mc-obligation-activation:(.+)/);
+      if (m) ids.add(m[1].trim());
+    }
+    return Array.from(ids);
   }
 
   scheduleMessageDelivery(id: string, date: Date): void {
@@ -169,5 +190,14 @@ export class DefaultOsScheduler implements OsScheduler {
   cancelMessageDelivery(id: string): void {
     const tag = `# mc-message-delivery:${id}`;
     this.removeAtByTag(tag);
+  }
+
+  listMessageDeliveries(): string[] {
+    const ids = new Set<string>();
+    for (const job of this.atIo.list()) {
+      const m = job.script.match(/# mc-message-delivery:(.+)/);
+      if (m) ids.add(m[1].trim());
+    }
+    return Array.from(ids);
   }
 }

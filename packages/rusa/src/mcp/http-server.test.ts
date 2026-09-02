@@ -500,6 +500,70 @@ describe("McpHttpServer", () => {
     });
   });
 
+  describe("POST /wake-obligation", () => {
+    const TOKEN = "secret-wake-token";
+    const wakeUrl = () => `${http.urls()[0].url.replace(/\/mcp\/[^/]+$/, "")}/wake-obligation`;
+    const post = (init: RequestInit) => fetch(wakeUrl(), { method: "POST", ...init });
+
+    it("404s when no wake handler is wired (no info leak)", async () => {
+      const resp = await post({ body: "id=123", headers: { authorization: `Bearer ${TOKEN}` } });
+      expect(resp.status).toBe(404);
+    });
+
+    it("delivers a wake and passes id through", async () => {
+      let deliveredId = "";
+      http.setWakeObligationHandler({
+        token: TOKEN,
+        deliver: (id) => {
+          deliveredId = id;
+        },
+      });
+
+      const resp = await post({ body: "id=123", headers: { authorization: `Bearer ${TOKEN}` } });
+      expect(resp.status).toBe(200);
+      expect(await resp.json()).toEqual({ ok: true });
+      expect(deliveredId).toBe("123");
+    });
+
+    it("401s on bad token", async () => {
+      http.setWakeObligationHandler({ token: TOKEN, deliver: () => {} });
+      const resp = await post({ body: "id=123", headers: { authorization: "Bearer bad" } });
+      expect(resp.status).toBe(401);
+    });
+  });
+
+  describe("POST /wake-message", () => {
+    const TOKEN = "secret-wake-token";
+    const wakeUrl = () => `${http.urls()[0].url.replace(/\/mcp\/[^/]+$/, "")}/wake-message`;
+    const post = (init: RequestInit) => fetch(wakeUrl(), { method: "POST", ...init });
+
+    it("404s when no wake handler is wired (no info leak)", async () => {
+      const resp = await post({ body: "id=123", headers: { authorization: `Bearer ${TOKEN}` } });
+      expect(resp.status).toBe(404);
+    });
+
+    it("delivers a wake and passes id through", async () => {
+      let deliveredId = "";
+      http.setWakeMessageHandler({
+        token: TOKEN,
+        deliver: (id) => {
+          deliveredId = id;
+        },
+      });
+
+      const resp = await post({ body: "id=123", headers: { authorization: `Bearer ${TOKEN}` } });
+      expect(resp.status).toBe(200);
+      expect(await resp.json()).toEqual({ ok: true });
+      expect(deliveredId).toBe("123");
+    });
+
+    it("401s on bad token", async () => {
+      http.setWakeMessageHandler({ token: TOKEN, deliver: () => {} });
+      const resp = await post({ body: "id=123", headers: { authorization: "Bearer bad" } });
+      expect(resp.status).toBe(401);
+    });
+  });
+
   describe("POST /host-jobs/exit", () => {
     const TOKEN = "secret-wake-token";
     const exitUrl = () => `${http.urls()[0].url.replace(/\/mcp\/[^/]+$/, "")}/host-jobs/exit`;

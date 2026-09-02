@@ -668,12 +668,23 @@ export class ActorMesh {
 
   /** Boot recovery: re-arm timers for scheduled messages, and fire overdue ones immediately. */
   reconcilePendingDeliveries(): void {
+    const validIds = new Set<string>();
     for (const record of this.registry.list()) {
       if (record.status !== "active") continue;
       if (!record.pendingDeliveries?.length) continue;
       for (const msg of record.pendingDeliveries) {
+        validIds.add(msg.id);
         this.armPendingDelivery(record.id, msg);
         this.log(`re-armed scheduled message ${msg.id} for ${record.id} at ${msg.deliverAt}`);
+      }
+    }
+
+    if (this.osScheduler) {
+      for (const id of this.osScheduler.listMessageDeliveries()) {
+        if (!validIds.has(id)) {
+          this.osScheduler.cancelMessageDelivery(id);
+          this.log(`cancelled orphaned scheduled message ${id}`);
+        }
       }
     }
   }
@@ -2866,7 +2877,11 @@ export class ActorMesh {
 
   private armPendingDelivery(toId: string, msg: PendingMessageDelivery): void {
     if (this.osScheduler) {
-      this.osScheduler.scheduleMessageDelivery(msg.id, new Date(msg.deliverAt));
+      if (new Date(msg.deliverAt).getTime() <= Date.now()) {
+        this.firePendingDelivery(toId, msg.id);
+      } else {
+        this.osScheduler.scheduleMessageDelivery(msg.id, new Date(msg.deliverAt));
+      }
     } else {
       const delay = Math.max(0, new Date(msg.deliverAt).getTime() - Date.now());
       const timer = setTimeout(() => this.firePendingDelivery(toId, msg.id), delay);
