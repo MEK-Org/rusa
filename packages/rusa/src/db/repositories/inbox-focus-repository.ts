@@ -82,26 +82,21 @@ export class InboxFocusRepository {
 
       this.db
         .prepare(
-          `INSERT INTO actor_run_focus
-             (run_id, actor_id, primary_obligation_id, resolution, selected_at,
-              entry_ids_json, diagnostics_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(run_id) DO UPDATE SET
-             actor_id = excluded.actor_id,
-             primary_obligation_id = excluded.primary_obligation_id,
-             resolution = excluded.resolution,
-             selected_at = excluded.selected_at,
-             entry_ids_json = excluded.entry_ids_json,
-             diagnostics_json = excluded.diagnostics_json`
+          `UPDATE actor_runs SET
+             focus_primary_obligation_id = ?,
+             focus_resolution = ?,
+             focus_selected_at = ?,
+             focus_entry_ids_json = ?,
+             focus_diagnostics_json = ?
+           WHERE id = ?`
         )
         .run(
-          input.runId,
-          input.actorId,
           input.primaryObligationId,
           input.resolution,
           selectedAt.toISOString(),
           JSON.stringify(entryIds),
-          JSON.stringify(diagnostics)
+          JSON.stringify(diagnostics),
+          input.runId
         );
 
       const insertAssociation = this.db.prepare(
@@ -132,9 +127,20 @@ export class InboxFocusRepository {
   }
 
   getByRunId(runId: string): RunInboxFocus | null {
-    const row = this.db.prepare("SELECT * FROM actor_run_focus WHERE run_id = ?").get(runId) as
-      | FocusRow
-      | undefined;
+    const row = this.db
+      .prepare(`
+      SELECT
+        id as run_id,
+        actor_id,
+        focus_primary_obligation_id as primary_obligation_id,
+        focus_resolution as resolution,
+        focus_selected_at as selected_at,
+        focus_entry_ids_json as entry_ids_json,
+        focus_diagnostics_json as diagnostics_json
+      FROM actor_runs
+      WHERE id = ? AND focus_resolution IS NOT NULL
+    `)
+      .get(runId) as FocusRow | undefined;
     if (!row) return null;
     return {
       runId: row.run_id,
