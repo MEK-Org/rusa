@@ -206,7 +206,7 @@ describe("Actor", () => {
 
     // Actor is awaiting beforeRun
     const preemption = actor.preemptForResponsive();
-    expect(preemption.preempted).toBe(true);
+    if (preemption.preempted === false) throw new Error("Expected preemption");
     expect(preemption.phase).toBe("queued"); // TriggerRunner is busy but not executing yet
 
     // Queue the replacement that preempted it
@@ -269,7 +269,7 @@ describe("Actor", () => {
     // This perfectly simulates the cancel() === false window.
 
     const preemption = actor.preemptForResponsive();
-    expect(preemption.preempted).toBe(true);
+    if (preemption.preempted === false) throw new Error("Expected preemption");
     expect(preemption.phase).toBe("queued");
     // Ensure we are testing the gap before executing
     expect(actor.isRunning).toBe(false);
@@ -1772,7 +1772,7 @@ describe("Actor", () => {
 
       // Preempt
       const preemption = actor.preemptForResponsive();
-      expect(preemption.preempted).toBe(true);
+      if (preemption.preempted === false) throw new Error("Expected preemption");
       expect(preemption.phase).toBe("running");
       expect(call.signal?.aborted).toBe(true);
       expect(call.signal?.reason).toBe("interrupt:responsive-notification");
