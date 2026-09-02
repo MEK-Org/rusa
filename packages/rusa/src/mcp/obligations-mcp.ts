@@ -75,7 +75,7 @@ function decodeCursor(cursor: string): PageCursor {
       parsed.v !== 1 ||
       !Number.isSafeInteger(parsed.offset) ||
       parsed.offset < 0 ||
-      !["children", "blocking-children", "owned"].includes(parsed.scope)
+      !["children", "blocking-children", "owned", "completions"].includes(parsed.scope)
     ) {
       throw new Error("invalid cursor fields");
     }

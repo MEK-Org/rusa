@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
+import '../util.dart';
 import 'header.dart';
 import 'obligation_dialogs.dart';
 
@@ -213,6 +214,20 @@ class ObligationRow extends StatelessWidget {
                 ],
               ),
             ],
+            if (obligation.isScheduled && obligation.nextReadyAt != null) ...[
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  const Icon(Icons.schedule, size: 13, color: MeshColors.textMuted),
+                  const SizedBox(width: 4),
+                  Text(
+                    'Returns ${formatReturnsIn(obligation.nextReadyAt!)} '
+                    '(${formatTs(obligation.nextReadyAt!)})',
+                    style: const TextStyle(color: MeshColors.textMuted, fontSize: 11.5),
+                  ),
+                ],
+              ),
+            ],
             if (hasTerminalNote) ...[
               const SizedBox(height: 12),
               Container(
@@ -322,6 +337,10 @@ class _StatusChip extends StatelessWidget {
       case 'cancelled':
         bg = const Color(0xFFF87171).withValues(alpha: 0.1);
         fg = const Color(0xFFF87171);
+        break;
+      case 'scheduled':
+        bg = const Color(0xFF312E81);
+        fg = const Color(0xFFA5B4FC);
         break;
       default:
         bg = MeshColors.bgTertiary;

@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { OsScheduler } from "../../actor/os-scheduler.js";
 import type { Obligation } from "../../obligations/obligation.js";
 import { asGitHubIssue } from "../../references/reference.js";
 import { obligations } from "../migrations/0016_obligations.js";
@@ -10,6 +11,30 @@ import { obligationTitle } from "../migrations/0027_obligation_title.js";
 import { obligationArtifacts } from "../migrations/0028_obligation_artifacts.js";
 import { recurringObligations } from "../migrations/0034_recurring_obligations.js";
 import { ObligationRepository } from "./obligation-repository.js";
+
+/** Records every scheduler call instead of touching the OS, for assertions. */
+class FakeOsScheduler implements OsScheduler {
+  activations = new Map<string, { kind: "cron"; cronExpr: string } | { kind: "at"; date: Date }>();
+  cancelled: string[] = [];
+  scheduleObligationActivation(
+    id: string,
+    time: { kind: "cron"; cronExpr: string } | { kind: "at"; date: Date }
+  ): void {
+    this.activations.set(id, time);
+  }
+  cancelObligationActivation(id: string): void {
+    this.cancelled.push(id);
+    this.activations.delete(id);
+  }
+  listObligationActivations(): string[] {
+    return Array.from(this.activations.keys());
+  }
+  scheduleMessageDelivery(): void {}
+  cancelMessageDelivery(): void {}
+  listMessageDeliveries(): string[] {
+    return [];
+  }
+}
 
 describe("ObligationRepository", () => {
   let db: Database.Database;
@@ -1646,6 +1671,276 @@ describe("ObligationRepository", () => {
       // Reparent to same parent (no-op)
       const same = repository.reparent("child-a", "root-a");
       expect(same.parentId).toBe("root-a");
+    });
+  });
+
+  describe("recurrence, scheduling, and the completion ledger", () => {
+    let scheduler: FakeOsScheduler;
+
+    beforeEach(() => {
+      scheduler = new FakeOsScheduler();
+      repository.setOsScheduler(scheduler);
+      repository.create({ title: "rec", id: "rec-1", ownerId: "actor-a", intent: "recur" });
+    });
+
+    it("rejects an invalid cron expression or non-positive interval without mutating", () => {
+      expect(() => repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "bad" })).toThrow(
+        "invalid cron expression"
+      );
+      expect(() =>
+        repository.setRecurrence("rec-1", { policy: "completion_interval", intervalSeconds: 0 })
+      ).toThrow("recurrence interval must be a positive integer");
+      expect(() =>
+        repository.setRecurrence("rec-1", {
+          policy: "completion_interval",
+          intervalSeconds: 1.5,
+        })
+      ).toThrow("recurrence interval must be a positive integer");
+      expect(repository.require("rec-1").recurrencePolicy).toBeNull();
+      expect(scheduler.activations.size).toBe(0);
+    });
+
+    it("rejects setting or disabling recurrence on a terminal obligation", () => {
+      repository.setTerminalStatus("rec-1", "done");
+      expect(() =>
+        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" })
+      ).toThrow("terminal obligations cannot be recurring");
+      expect(() => repository.setRecurrence("rec-1", null)).toThrow(
+        "terminal obligations cannot be recurring"
+      );
+    });
+
+    it("sets a cron policy on a ready obligation without touching next_ready_at, and arms the OS entry", () => {
+      const updated = repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
+      expect(updated.status).toBe("ready");
+      expect(updated.recurrencePolicy).toBe("cron");
+      expect(updated.recurrenceCron).toBe("0 * * * *");
+      expect(updated.nextReadyAt).toBeNull();
+      expect(scheduler.activations.get("rec-1")).toEqual({ kind: "cron", cronExpr: "0 * * * *" });
+    });
+
+    it("completing a cron-recurring obligation moves it to scheduled, ledgers the completion, and leaves the cron entry armed", () => {
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "30 4 * * *" });
+      const done = repository.setTerminalStatus("rec-1", "done", "cycle one");
+      expect(done.status).toBe("scheduled");
+      expect(done.recurrencePolicy).toBe("cron");
+      expect(done.nextReadyAt).not.toBeNull();
+
+      const page = repository.listCompletionsPage("rec-1", { limit: 10, offset: 0 });
+      expect(page.total).toBe(1);
+      expect(page.completions[0]).toMatchObject({
+        obligationId: "rec-1",
+        sequence: 1,
+        note: "cycle one",
+        nextReadyAt: done.nextReadyAt,
+      });
+      // The cron entry stays armed across the cycle — no extra OS job needed.
+      expect(scheduler.activations.get("rec-1")).toEqual({
+        kind: "cron",
+        cronExpr: "30 4 * * *",
+      });
+    });
+
+    it("rejects completing a scheduled obligation as done until it returns to ready", () => {
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "30 4 * * *" });
+      repository.setTerminalStatus("rec-1", "done");
+      expect(() => repository.setTerminalStatus("rec-1", "done")).toThrow(
+        "scheduled obligations cannot be completed until they are ready"
+      );
+    });
+
+    it("cancelling a scheduled recurring obligation clears recurrence columns and cancels the OS entry", () => {
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "30 4 * * *" });
+      repository.setTerminalStatus("rec-1", "done");
+      const cancelled = repository.setTerminalStatus("rec-1", "cancelled");
+      expect(cancelled.status).toBe("cancelled");
+      expect(cancelled.recurrencePolicy).toBeNull();
+      expect(cancelled.recurrenceCron).toBeNull();
+      expect(cancelled.nextReadyAt).toBeNull();
+      expect(scheduler.cancelled).toContain("rec-1");
+      expect(scheduler.activations.has("rec-1")).toBe(false);
+    });
+
+    it("completing a completion_interval obligation schedules a one-off `at` activation at completedAt + interval", () => {
+      repository.setRecurrence("rec-1", { policy: "completion_interval", intervalSeconds: 60 });
+      const done = repository.setTerminalStatus("rec-1", "done");
+      expect(done.status).toBe("scheduled");
+      expect(done.nextReadyAt).toBe(
+        new Date(Date.parse(done.updatedAt as string) + 60_000).toISOString()
+      );
+      const armed = scheduler.activations.get("rec-1");
+      expect(armed?.kind).toBe("at");
+      expect((armed as { kind: "at"; date: Date }).date.toISOString()).toBe(done.nextReadyAt);
+    });
+
+    it("disabling recurrence on a non-scheduled obligation clears columns without changing status", () => {
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
+      const updated = repository.setRecurrence("rec-1", null);
+      expect(updated.status).toBe("ready");
+      expect(updated.recurrencePolicy).toBeNull();
+      expect(scheduler.cancelled).toContain("rec-1");
+    });
+
+    it("disabling recurrence on a scheduled obligation forfeits the pending cycle and finalizes as done", () => {
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
+      repository.setTerminalStatus("rec-1", "done");
+      const disabled = repository.setRecurrence("rec-1", null);
+      expect(disabled.status).toBe("done");
+      expect(disabled.recurrencePolicy).toBeNull();
+      expect(disabled.nextReadyAt).toBeNull();
+      expect(scheduler.cancelled).toContain("rec-1");
+    });
+
+    it("switching a scheduled obligation's policy to cron computes a fresh next_ready_at in the same statement", () => {
+      repository.setRecurrence("rec-1", { policy: "completion_interval", intervalSeconds: 60 });
+      repository.setTerminalStatus("rec-1", "done");
+      expect(repository.require("rec-1").status).toBe("scheduled");
+
+      // The CHECK constraint requires a non-null next_ready_at throughout —
+      // this must not throw a SQLITE_CONSTRAINT error.
+      const switched = repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
+      expect(switched.status).toBe("scheduled");
+      expect(switched.recurrencePolicy).toBe("cron");
+      expect(switched.nextReadyAt).not.toBeNull();
+      expect(scheduler.activations.get("rec-1")).toMatchObject({ kind: "cron" });
+    });
+
+    it("switching a scheduled obligation to completion_interval with an overdue interval returns it to ready immediately", () => {
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
+      repository.setTerminalStatus("rec-1", "done");
+      // Back-date the completion so any positive interval is already overdue,
+      // independent of the fixture clock's own small increasing values.
+      db.prepare(`UPDATE obligation_completions SET completed_at = ? WHERE obligation_id = ?`).run(
+        "1960-01-01T00:00:00.000Z",
+        "rec-1"
+      );
+
+      const switched = repository.setRecurrence("rec-1", {
+        policy: "completion_interval",
+        intervalSeconds: 1,
+      });
+      expect(switched.status).toBe("ready");
+      expect(switched.nextReadyAt).toBeNull();
+      expect(switched.recurrencePolicy).toBe("completion_interval");
+      expect(scheduler.cancelled).toContain("rec-1");
+    });
+
+    it("switching a scheduled obligation to completion_interval with a future interval stays scheduled and re-arms an `at` job", () => {
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
+      repository.setTerminalStatus("rec-1", "done");
+
+      const switched = repository.setRecurrence("rec-1", {
+        policy: "completion_interval",
+        intervalSeconds: 999_999_999,
+      });
+      expect(switched.status).toBe("scheduled");
+      expect(switched.nextReadyAt).not.toBeNull();
+      const armed = scheduler.activations.get("rec-1");
+      expect(armed?.kind).toBe("at");
+      expect((armed as { kind: "at"; date: Date }).date.toISOString()).toBe(switched.nextReadyAt);
+    });
+
+    it("switching recurrence policy while not scheduled has no lastCompletion to react to, and is a plain column update", () => {
+      const updated = repository.setRecurrence("rec-1", {
+        policy: "completion_interval",
+        intervalSeconds: 30,
+      });
+      expect(updated.status).toBe("ready");
+      expect(updated.recurrenceIntervalSeconds).toBe(30);
+      expect(updated.nextReadyAt).toBeNull();
+      expect(scheduler.cancelled).toContain("rec-1");
+    });
+
+    it("activateScheduled returns a scheduled obligation to ready and clears next_ready_at", () => {
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
+      repository.setTerminalStatus("rec-1", "done");
+      expect(repository.require("rec-1").status).toBe("scheduled");
+
+      const activated = repository.activateScheduled("rec-1");
+      expect(activated?.status).toBe("ready");
+      expect(activated?.nextReadyAt).toBeNull();
+    });
+
+    it("activateScheduled is a no-op for a non-scheduled obligation and null for a missing one", () => {
+      const unchanged = repository.activateScheduled("rec-1");
+      expect(unchanged?.status).toBe("ready");
+      expect(repository.activateScheduled("does-not-exist")).toBeNull();
+    });
+
+    it("paginates the completion ledger newest-sequence-first with hasMore/total", () => {
+      repository.setRecurrence("rec-1", {
+        policy: "completion_interval",
+        intervalSeconds: 999_999_999,
+      });
+      for (let i = 0; i < 3; i++) {
+        repository.setTerminalStatus("rec-1", "done", `cycle ${i}`);
+        repository.activateScheduled("rec-1");
+      }
+
+      const page1 = repository.listCompletionsPage("rec-1", { limit: 2, offset: 0 });
+      expect(page1.total).toBe(3);
+      expect(page1.hasMore).toBe(true);
+      expect(page1.completions.map((c) => c.sequence)).toEqual([3, 2]);
+
+      const page2 = repository.listCompletionsPage("rec-1", { limit: 2, offset: 2 });
+      expect(page2.hasMore).toBe(false);
+      expect(page2.completions.map((c) => c.sequence)).toEqual([1]);
+    });
+
+    describe("reconcileScheduledObligations (boot reconciliation)", () => {
+      it("re-arms a cron entry regardless of the obligation's current status", () => {
+        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
+        scheduler.activations.clear(); // simulate a restart: nothing armed yet
+        repository.reconcileScheduledObligations();
+        expect(scheduler.activations.get("rec-1")).toEqual({ kind: "cron", cronExpr: "0 * * * *" });
+      });
+
+      it("activates an overdue scheduled obligation immediately instead of arming a past OS job", () => {
+        repository.setRecurrence("rec-1", { policy: "completion_interval", intervalSeconds: 1 });
+        repository.setTerminalStatus("rec-1", "done");
+        db.prepare(`UPDATE obligations SET next_ready_at = ? WHERE id = ?`).run(
+          "1960-01-01T00:00:00.000Z",
+          "rec-1"
+        );
+        scheduler.activations.clear();
+
+        repository.reconcileScheduledObligations();
+        expect(repository.require("rec-1").status).toBe("ready");
+        expect(scheduler.activations.has("rec-1")).toBe(false);
+      });
+
+      it("arms a future `at` job for a scheduled obligation that has not yet come due", () => {
+        repository.setRecurrence("rec-1", { policy: "completion_interval", intervalSeconds: 1 });
+        repository.setTerminalStatus("rec-1", "done");
+        db.prepare(`UPDATE obligations SET next_ready_at = ? WHERE id = ?`).run(
+          "2999-01-01T00:00:00.000Z",
+          "rec-1"
+        );
+        scheduler.activations.clear();
+
+        repository.reconcileScheduledObligations();
+        expect(repository.require("rec-1").status).toBe("scheduled");
+        expect(scheduler.activations.get("rec-1")).toEqual({
+          kind: "at",
+          date: new Date("2999-01-01T00:00:00.000Z"),
+        });
+      });
+
+      it("cancels an orphaned OS activation for an obligation that no longer needs one", () => {
+        scheduler.activations.set("ghost-id", { kind: "cron", cronExpr: "0 * * * *" });
+        repository.reconcileScheduledObligations();
+        expect(scheduler.cancelled).toContain("ghost-id");
+        expect(scheduler.activations.has("ghost-id")).toBe(false);
+      });
+
+      it("is a no-op when no OS scheduler is attached", () => {
+        const bare = new ObligationRepository(
+          db,
+          (id) => ["actor-a"].includes(id),
+          () => now++
+        );
+        expect(() => bare.reconcileScheduledObligations()).not.toThrow();
+      });
     });
   });
 });

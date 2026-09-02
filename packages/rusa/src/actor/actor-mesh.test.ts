@@ -32,6 +32,7 @@ import type {
   InboxStore,
 } from "./inbox-store.js";
 import type { MeshEventInput, MeshEventSink } from "./mesh-events.js";
+import type { OsScheduler } from "./os-scheduler.js";
 import { InMemoryThreadRegistry, type ThreadRecord } from "./thread-registry.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
@@ -299,6 +300,31 @@ function setup(
   const tick = () => vi.advanceTimersByTimeAsync(DEBOUNCE + 1);
   const fake = (id: string) => providers.get(id) as FakeProvider;
   return { registry, mesh: testMesh, rawSpawn, providers, root, logs, tick, fake };
+}
+
+class FakeOsScheduler implements OsScheduler {
+  messageDeliveries = new Map<string, Date>();
+  scheduleMessageDeliveryImpl?: (id: string, date: Date) => void;
+
+  scheduleObligationActivation(): void {}
+  cancelObligationActivation(): void {}
+  listObligationActivations(): string[] {
+    return [];
+  }
+
+  scheduleMessageDelivery(id: string, date: Date): void {
+    if (this.scheduleMessageDeliveryImpl) {
+      this.scheduleMessageDeliveryImpl(id, date);
+      return;
+    }
+    this.messageDeliveries.set(id, date);
+  }
+  cancelMessageDelivery(id: string): void {
+    this.messageDeliveries.delete(id);
+  }
+  listMessageDeliveries(): string[] {
+    return Array.from(this.messageDeliveries.keys());
+  }
 }
 
 const payload = (type: string, merged?: boolean): InboxPayload =>
@@ -4365,6 +4391,63 @@ describe("ActorMesh", () => {
       expect(() => mesh.sendMessage(t1, "11th msg", t2, undefined, future)).toThrow(
         /cap of 10 pending deliveries/
       );
+    });
+
+    it("rolls back the pending-delivery record when arming the OS job fails", () => {
+      const { mesh, registry } = setup();
+      const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
+      const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
+
+      const osScheduler = new FakeOsScheduler();
+      osScheduler.scheduleMessageDeliveryImpl = () => {
+        throw new Error("OS scheduler rejected the job");
+      };
+      mesh.setOsScheduler(osScheduler);
+
+      const deliverAt = new Date(Date.now() + 100000).toISOString();
+      expect(() => mesh.sendMessage(t1, "scheduled message", t2, undefined, deliverAt)).toThrow(
+        /OS scheduler rejected the job/
+      );
+
+      // The durable record must not outlive the failed OS job — no orphan left behind.
+      expect(registry.get(t1)?.pendingDeliveries ?? []).toHaveLength(0);
+    });
+
+    it("does not let one failed re-arm on boot abort reconciliation for the rest", () => {
+      const { mesh, registry, logs } = setup();
+      const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
+      const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
+      const t3 = mesh.spawn({ charter: "t3", parentId: "root" });
+
+      const osScheduler = new FakeOsScheduler();
+      mesh.setOsScheduler(osScheduler);
+
+      const deliverAt = new Date(Date.now() + 100000).toISOString();
+      mesh.sendMessage(t1, "will fail to re-arm", t2, undefined, deliverAt);
+      mesh.sendMessage(t2, "should still re-arm", t3, undefined, deliverAt);
+
+      const failingMsgId = registry.get(t1)?.pendingDeliveries?.[0]?.id;
+
+      // Simulate a fresh restart: the OS scheduler's own state is queried
+      // anew, and it rejects one stale job on re-arm while still accepting
+      // everything else.
+      osScheduler.messageDeliveries.clear();
+      osScheduler.scheduleMessageDeliveryImpl = (id, date) => {
+        if (id === failingMsgId) throw new Error("stale job rejected by OS scheduler");
+        osScheduler.messageDeliveries.set(id, date);
+      };
+
+      expect(() => mesh.reconcilePendingDeliveries()).not.toThrow();
+
+      // Both records remain durable — reconciliation doesn't remove them, it
+      // only (re-)arms the underlying OS job — but only the healthy one
+      // actually got armed.
+      expect(registry.get(t1)?.pendingDeliveries).toHaveLength(1);
+      expect(registry.get(t2)?.pendingDeliveries).toHaveLength(1);
+      expect(osScheduler.listMessageDeliveries()).not.toContain(failingMsgId);
+      expect(
+        logs.some((l) => l.includes("failed to re-arm") && l.includes("stale job rejected"))
+      ).toBe(true);
     });
 
     it("survives mesh restart and fires exactly-once (re-arms timers)", async () => {

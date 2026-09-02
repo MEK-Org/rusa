@@ -1040,7 +1040,7 @@ class ObligationDto {
   final String? updatedAt;
   final String? intent;
   final String? externalRef;
-  final String status; // "ready" | "waiting" | "done" | "cancelled"
+  final String status; // "ready" | "waiting" | "done" | "cancelled" | "scheduled"
   final double? priority;
   final double effectivePriority;
   final String? prioritySourceId;
@@ -1053,6 +1053,24 @@ class ObligationDto {
   /// principal's own words. Null while live, and null for a terminal
   /// obligation whose reason was never stated or predates the column.
   final String? terminalNote;
+
+  /// `"cron"` | `"completion_interval"` | null. Null means this obligation
+  /// never recurs — the three recurrence fields below are only meaningful
+  /// together.
+  final String? recurrencePolicy;
+
+  /// The 5-field cron expression driving a `"cron"`-policy obligation. Null
+  /// for `"completion_interval"` policy and for non-recurring obligations.
+  final String? recurrenceCron;
+
+  /// Seconds after completion before a `"completion_interval"`-policy
+  /// obligation returns to ready. Null for `"cron"` policy and for
+  /// non-recurring obligations.
+  final int? recurrenceIntervalSeconds;
+
+  /// When a `scheduled` obligation returns to ready. Null unless [status] is
+  /// `scheduled`.
+  final String? nextReadyAt;
 
   /// What to show as the heading. Prefers [title]; falls back to [intent] so a
   /// row written before the split still reads, rather than rendering blank.
@@ -1078,7 +1096,9 @@ class ObligationDto {
   bool get isWaiting => status == 'waiting';
   bool get isDone => status == 'done';
   bool get isCancelled => status == 'cancelled';
+  bool get isScheduled => status == 'scheduled';
   bool get isTerminal => status == 'done' || status == 'cancelled';
+  bool get isRecurring => recurrencePolicy != null;
 
   factory ObligationDto.fromJson(Map<String, dynamic> j) {
     // The server sends a parsed reference object; older rows and some fixtures

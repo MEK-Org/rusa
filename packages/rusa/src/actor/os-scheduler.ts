@@ -57,16 +57,23 @@ export interface AtIo {
   remove(id: string): void;
 }
 
+/** `atrm`/`atq`/`at -c` on a job id that no longer exists — already fired, or already removed. */
+const AT_JOB_GONE = /cannot find|no such|does not exist|not found/i;
+
 export function execAtIo(): AtIo {
   return {
     schedule(script: string, date: Date): string {
+      // `at -t` takes seconds precision (`[[CC]YY]MMDDhhmm[.ss]`); the interval
+      // contract is seconds-based, so truncating to the minute could fire a
+      // completion_interval activation up to 59s early.
       const pad = (n: number, w: number) => n.toString().padStart(w, "0");
       const yyyy = pad(date.getUTCFullYear(), 4);
       const mm = pad(date.getUTCMonth() + 1, 2);
       const dd = pad(date.getUTCDate(), 2);
       const hh = pad(date.getUTCHours(), 2);
       const min = pad(date.getUTCMinutes(), 2);
-      const timeStr = `${yyyy}${mm}${dd}${hh}${min}`;
+      const ss = pad(date.getUTCSeconds(), 2);
+      const timeStr = `${yyyy}${mm}${dd}${hh}${min}.${ss}`;
 
       const res = spawnSync("at", ["-t", timeStr], {
         input: script,
@@ -86,7 +93,13 @@ export function execAtIo(): AtIo {
         if ((res.error as NodeJS.ErrnoException).code === "ENOENT") return [];
         throw res.error;
       }
-      if (res.status !== 0) return [];
+      // An empty queue exits 0 with empty stdout; a nonzero exit means atq
+      // itself failed (atd down, permission denied, ...), which must surface
+      // rather than read as "nothing scheduled" — that would make the
+      // reconciler quietly cancel every OS-scheduled job it thinks is an orphan.
+      if (res.status !== 0) {
+        throw new Error(`atq failed: ${res.stderr || res.stdout}`);
+      }
 
       const out: { id: string; script: string }[] = [];
       for (const line of res.stdout.trim().split("\n")) {
@@ -97,12 +110,24 @@ export function execAtIo(): AtIo {
         const scriptRes = spawnSync("at", ["-c", id], { encoding: "utf-8" });
         if (scriptRes.status === 0) {
           out.push({ id, script: scriptRes.stdout });
+        } else if (!AT_JOB_GONE.test(`${scriptRes.stderr}${scriptRes.stdout}`)) {
+          // A job atq just listed but `at -c` can't read is a real IO failure
+          // (not the race of it firing between the two calls, which reads as
+          // "gone" and is fine to drop silently).
+          throw new Error(`at -c ${id} failed: ${scriptRes.stderr || scriptRes.stdout}`);
         }
       }
       return out;
     },
     remove(id: string): void {
-      spawnSync("atrm", [id], { encoding: "utf-8" });
+      const res = spawnSync("atrm", [id], { encoding: "utf-8" });
+      if (res.error) throw res.error;
+      // Cancellation must be idempotent for a job that already fired or was
+      // already removed — atrm exits nonzero either way, and only the message
+      // tells them apart from a genuine IO failure.
+      if (res.status !== 0 && !AT_JOB_GONE.test(`${res.stderr}${res.stdout}`)) {
+        throw new Error(`atrm ${id} failed: ${res.stderr || res.stdout}`);
+      }
     },
   };
 }
@@ -162,6 +187,14 @@ export class DefaultOsScheduler implements OsScheduler {
     }
   }
 
+  /** The last `CRON_TZ=...` assignment still in effect at the end of `lines`, if any. */
+  private lastCronTzLine(lines: string[]): string | null {
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].trim().startsWith("CRON_TZ=")) return lines[i];
+    }
+    return null;
+  }
+
   private removeAtByTag(tag: string): void {
     const jobs = this.atIo.list();
     for (const job of jobs) {
@@ -176,16 +209,25 @@ export class DefaultOsScheduler implements OsScheduler {
     time: { kind: "cron"; cronExpr: string } | { kind: "at"; date: Date }
   ): void {
     const tag = `# mc-obligation-activation:${id}`;
-    this.updateCron(tag, null);
-    this.removeAtByTag(tag);
-
     const curlLine = this.buildCurlLine("wake-obligation", { id });
 
     if (time.kind === "cron") {
       if (!isValidCronExpr(time.cronExpr))
         throw new Error(`invalid cron expression: ${time.cronExpr}`);
-      this.updateCron(tag, `CRON_TZ=UTC\n${time.cronExpr} ${curlLine}\nCRON_TZ=""`);
+      this.removeAtByTag(tag);
+      // CRON_TZ persists for every later line in the crontab, not just ours,
+      // so the block must put back whatever was in effect before it rather
+      // than clearing it — otherwise a job appended after this one silently
+      // loses a timezone some other entry depends on.
+      const current = this.crontabIo.read();
+      const lines = current === "" ? [] : current.replace(/\n$/, "").split("\n");
+      const kept = this.stripCronBlock(lines, tag);
+      const priorTz = this.lastCronTzLine(kept);
+      kept.push(tag, "CRON_TZ=UTC", `${time.cronExpr} ${curlLine}`, priorTz ?? "CRON_TZ=");
+      this.crontabIo.write(`${kept.join("\n")}\n`);
     } else {
+      this.updateCron(tag, null);
+      this.removeAtByTag(tag);
       const script = `${tag}\n${curlLine}\n`;
       this.atIo.schedule(script, time.date);
     }

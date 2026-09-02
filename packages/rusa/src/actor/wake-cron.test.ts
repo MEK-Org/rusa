@@ -7,6 +7,7 @@ import {
   CrontabWakeCron,
   isValidActorId,
   isValidCronExpr,
+  nextCronOccurrence,
   preflightCron,
   writeWakePort,
 } from "./wake-cron.js";
@@ -169,6 +170,64 @@ describe("writeWakePort", () => {
     writeWakePort(dir, 54321);
     expect(readFileSync(join(dir, "wake-port"), "utf-8")).toBe("54321");
     expect(existsSync(join(dir, "wake-port.tmp"))).toBe(false); // renamed, not left as temp
+  });
+});
+
+describe("nextCronOccurrence", () => {
+  const at = (iso: string) => new Date(iso);
+
+  it("finds the next minute match, strictly after the given time", () => {
+    const next = nextCronOccurrence("30 4 * * *", at("2026-09-02T04:30:00.000Z"));
+    // Exactly on the mark still advances a full day — "next" excludes "now".
+    expect(next.toISOString()).toBe("2026-09-03T04:30:00.000Z");
+  });
+
+  it("finds the same-day occurrence when still ahead", () => {
+    const next = nextCronOccurrence("30 4 * * *", at("2026-09-02T00:00:00.000Z"));
+    expect(next.toISOString()).toBe("2026-09-02T04:30:00.000Z");
+  });
+
+  it("expands comma lists", () => {
+    const next = nextCronOccurrence("0 6,18 * * *", at("2026-09-02T07:00:00.000Z"));
+    expect(next.toISOString()).toBe("2026-09-02T18:00:00.000Z");
+  });
+
+  it("expands a-b ranges", () => {
+    const next = nextCronOccurrence("0 9-17 * * *", at("2026-09-02T08:00:00.000Z"));
+    expect(next.toISOString()).toBe("2026-09-02T09:00:00.000Z");
+  });
+
+  it("expands */step strides", () => {
+    const next = nextCronOccurrence("*/15 * * * *", at("2026-09-02T00:01:00.000Z"));
+    expect(next.toISOString()).toBe("2026-09-02T00:15:00.000Z");
+  });
+
+  it("expands a ranged step (a-b/n)", () => {
+    const next = nextCronOccurrence("0 9-17/4 * * *", at("2026-09-02T09:30:00.000Z"));
+    expect(next.toISOString()).toBe("2026-09-02T13:00:00.000Z");
+  });
+
+  it("treats day-of-month and day-of-week as OR when both are restricted", () => {
+    // The 1st of the month OR any Friday — standard cron semantics.
+    const next = nextCronOccurrence("0 0 1 * 5", at("2026-09-02T00:00:00.000Z"));
+    // 2026-09-04 is a Friday, before the 1st of October.
+    expect(next.toISOString()).toBe("2026-09-04T00:00:00.000Z");
+  });
+
+  it("treats day-of-month alone as AND with month when day-of-week is unrestricted", () => {
+    const next = nextCronOccurrence("0 0 15 * *", at("2026-09-02T00:00:00.000Z"));
+    expect(next.toISOString()).toBe("2026-09-15T00:00:00.000Z");
+  });
+
+  it("crosses a leap-year February 29th", () => {
+    const next = nextCronOccurrence("0 0 29 2 *", at("2027-01-01T00:00:00.000Z"));
+    expect(next.toISOString()).toBe("2028-02-29T00:00:00.000Z");
+  });
+
+  it("throws for an invalid cron expression", () => {
+    expect(() => nextCronOccurrence("bad expr", at("2026-09-02T00:00:00.000Z"))).toThrow(
+      /invalid cron/
+    );
   });
 });
 

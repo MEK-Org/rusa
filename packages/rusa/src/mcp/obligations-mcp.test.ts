@@ -599,6 +599,68 @@ describe("obligations MCP", () => {
     });
   });
 
+  it("pages the completion ledger independently and rejects a mismatched cursor", async () => {
+    repository.create({
+      title: "recurring",
+      id: "recurring",
+      ownerId: "actor-a",
+    });
+    repository.setRecurrence("recurring", {
+      policy: "completion_interval",
+      intervalSeconds: 999_999_999,
+    });
+    for (let i = 0; i < 2; i++) {
+      repository.setTerminalStatus("recurring", "done", `cycle ${i}`);
+      repository.activateScheduled("recurring");
+    }
+
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const first = (await client.callTool({
+      name: "get_obligation",
+      arguments: { id: "recurring", limit: 1 },
+    })) as CallToolResult;
+    const firstData = dataOf(first) as {
+      completions: {
+        items: Array<{ sequence: number; note: string | null }>;
+        total: number;
+        truncated: boolean;
+        nextCursor: string;
+      };
+    };
+    expect(firstData.completions).toMatchObject({
+      items: [{ sequence: 2, note: "cycle 1" }],
+      total: 2,
+      truncated: true,
+    });
+    expect(firstData.completions.nextCursor).toBeTypeOf("string");
+
+    const second = (await client.callTool({
+      name: "get_obligation",
+      arguments: {
+        id: "recurring",
+        limit: 1,
+        completions_cursor: firstData.completions.nextCursor,
+      },
+    })) as CallToolResult;
+    expect(dataOf(second)).toMatchObject({
+      completions: {
+        items: [{ sequence: 1, note: "cycle 0" }],
+        total: 2,
+        truncated: true,
+        nextCursor: null,
+      },
+    });
+
+    // The cursor is scoped to the obligation it paged — a different id must
+    // not silently reuse someone else's offset.
+    repository.create({ title: "other", id: "other", ownerId: "actor-a" });
+    const mismatched = (await client.callTool({
+      name: "get_obligation",
+      arguments: { id: "other", completions_cursor: firstData.completions.nextCursor },
+    })) as CallToolResult;
+    expect(mismatched.isError).toBe(true);
+  });
+
   it("returns an error for a missing obligation", async () => {
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
     const result = (await client.callTool({

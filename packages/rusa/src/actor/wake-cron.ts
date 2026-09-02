@@ -69,6 +69,89 @@ export function isValidCronExpr(expr: string): boolean {
   return fields.every((f) => /^[0-9*/,-]+$/.test(f));
 }
 
+/** One cron field's matching values, expanded from `*`, `a-b`, `a,b`, a `step` stride, or a single number. */
+function parseCronField(field: string, min: number, max: number): Set<number> {
+  const values = new Set<number>();
+  for (const part of field.split(",")) {
+    const stepMatch = part.match(/^([^/]+)\/(\d+)$/);
+    const range = stepMatch ? stepMatch[1] : part;
+    const step = stepMatch ? Number(stepMatch[2]) : 1;
+    let lo = min;
+    let hi = max;
+    if (range !== "*") {
+      const rangeMatch = range.match(/^(\d+)-(\d+)$/);
+      if (rangeMatch) {
+        lo = Number(rangeMatch[1]);
+        hi = Number(rangeMatch[2]);
+      } else if (/^\d+$/.test(range)) {
+        lo = hi = Number(range);
+      } else {
+        throw new Error(`unsupported cron field segment: "${part}"`);
+      }
+    }
+    if (step <= 0 || lo > hi) throw new Error(`unsupported cron field segment: "${part}"`);
+    for (let v = lo; v <= hi; v += step) values.add(v);
+  }
+  return values;
+}
+
+/** Four years of one-minute steps — far past any realistic recurrence, small enough to bound the search. */
+const NEXT_CRON_OCCURRENCE_SEARCH_MINUTES = 4 * 366 * 24 * 60;
+
+/**
+ * The next UTC moment a validated 5-field cron expression fires strictly
+ * after `after`. Matches `DefaultOsScheduler`'s `CRON_TZ=UTC` obligation
+ * jobs, so a computed `next_ready_at` lines up with when the tagged crontab
+ * entry will actually call back.
+ *
+ * Brute-force minute stepping rather than a full crontab parser: the
+ * validated grammar (digits, `*`, `/`, `,`, `-`) is narrow enough that
+ * scanning candidate minutes is simpler to get right than the general case,
+ * and cheap enough at this bound.
+ *
+ * Standard cron day semantics: when both day-of-month and day-of-week are
+ * restricted (neither is `*`), a day matches if EITHER is satisfied; when
+ * only one is restricted, that one alone decides.
+ */
+export function nextCronOccurrence(cronExpr: string, after: Date): Date {
+  if (!isValidCronExpr(cronExpr)) throw new Error(`invalid cron expression: ${cronExpr}`);
+  const [minuteField, hourField, domField, monthField, dowField] = cronExpr.trim().split(/\s+/);
+  const minutes = parseCronField(minuteField, 0, 59);
+  const hours = parseCronField(hourField, 0, 23);
+  const doms = parseCronField(domField, 1, 31);
+  const months = parseCronField(monthField, 1, 12);
+  const dows = parseCronField(dowField, 0, 6);
+  const domRestricted = domField !== "*";
+  const dowRestricted = dowField !== "*";
+
+  const candidate = new Date(after.getTime());
+  candidate.setUTCSeconds(0, 0);
+  candidate.setUTCMinutes(candidate.getUTCMinutes() + 1);
+
+  for (let i = 0; i < NEXT_CRON_OCCURRENCE_SEARCH_MINUTES; i++) {
+    const dayMatches =
+      domRestricted && dowRestricted
+        ? doms.has(candidate.getUTCDate()) || dows.has(candidate.getUTCDay())
+        : domRestricted
+          ? doms.has(candidate.getUTCDate())
+          : dowRestricted
+            ? dows.has(candidate.getUTCDay())
+            : true;
+    if (
+      minutes.has(candidate.getUTCMinutes()) &&
+      hours.has(candidate.getUTCHours()) &&
+      months.has(candidate.getUTCMonth() + 1) &&
+      dayMatches
+    ) {
+      return candidate;
+    }
+    candidate.setUTCMinutes(candidate.getUTCMinutes() + 1);
+  }
+  throw new Error(
+    `no cron occurrence found for "${cronExpr}" within ${NEXT_CRON_OCCURRENCE_SEARCH_MINUTES} minutes of ${after.toISOString()}`
+  );
+}
+
 /** Thread ids and suffixed wake slots only — keeps the tag/job lines free of whitespace or shell metachars. */
 export function isValidActorId(actorId: string): boolean {
   return /^[A-Za-z0-9._-]+(:[A-Za-z0-9._-]+)*$/.test(actorId);

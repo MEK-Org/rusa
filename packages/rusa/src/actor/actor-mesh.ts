@@ -674,8 +674,17 @@ export class ActorMesh {
       if (!record.pendingDeliveries?.length) continue;
       for (const msg of record.pendingDeliveries) {
         validIds.add(msg.id);
-        this.armPendingDelivery(record.id, msg);
-        this.log(`re-armed scheduled message ${msg.id} for ${record.id} at ${msg.deliverAt}`);
+        try {
+          this.armPendingDelivery(record.id, msg);
+          this.log(`re-armed scheduled message ${msg.id} for ${record.id} at ${msg.deliverAt}`);
+        } catch (err) {
+          // One actor's failed re-arm (e.g. the OS scheduler rejecting a
+          // stale date) must not abort reconciliation for every other actor
+          // queued behind it on boot.
+          this.log(
+            `failed to re-arm scheduled message ${msg.id} for ${record.id}: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
       }
     }
 
@@ -1709,7 +1718,20 @@ export class ActorMesh {
       this.registry.patch(toId, {
         pendingDeliveries: [...(rec.pendingDeliveries ?? []), pending],
       });
-      this.armPendingDelivery(toId, pending);
+      try {
+        this.armPendingDelivery(toId, pending);
+      } catch (err) {
+        // The durable record must not outlive the OS job that was supposed to
+        // fire it — an orphaned pendingDelivery with no timer and no `at` job
+        // behind it would sit forever, never delivered and never visible as
+        // failed. Roll the patch back so the caller's thrown error reflects
+        // the true post-failure state.
+        const latest = this.registry.get(toId);
+        this.registry.patch(toId, {
+          pendingDeliveries: (latest?.pendingDeliveries ?? []).filter((p) => p.id !== pending.id),
+        });
+        throw err;
+      }
       // Record event at fire time, not here, per #4.
       return { delivered: true };
     }

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { OsScheduler } from "../../actor/os-scheduler.js";
-import { isValidCronExpr } from "../../actor/wake-cron.js";
+import { isValidCronExpr, nextCronOccurrence } from "../../actor/wake-cron.js";
 import {
   assertObligationStatus,
   type EntityId,
@@ -277,11 +277,14 @@ export class ObligationRepository {
     if (!this.osScheduler) return;
     const validIds = new Set<string>();
 
-    // Any obligation that needs an OS job (scheduled status OR a cron policy in ready/waiting/terminal etc?
-    // Wait, let's read the issue: "Fixed-schedule recurrence remains represented by one tagged cron entry. Completion moves the obligation to scheduled; the next cron callback changes it to ready."
-    // So cron entries are always active, even if ready/waiting. What if it's cancelled? "Cancelling permanently stops recurrence ... and removes the tagged OS job."
-    // What if it's done? If cron recurrence is disabled, it becomes done, and OS job removed.
-    // What if it's completion_interval? The OS job is only scheduled when status is 'scheduled' with next_ready_at.
+    // A cron policy keeps one tagged crontab entry alive across every status
+    // except cancelled/done — ready/waiting callbacks are a no-op activation
+    // (`activateScheduled` only acts on `scheduled`), so the job stays armed
+    // rather than being torn down and reinstalled each cycle. A
+    // completion_interval obligation instead gets a one-off `at` job, and only
+    // while `scheduled` with a `next_ready_at` to fire at; an occurrence that
+    // is already overdue (e.g. the process was down) activates immediately
+    // rather than being handed back to the OS scheduler in the past.
     const stmt = this.db.prepare(
       `SELECT id, status, recurrence_policy, recurrence_cron, next_ready_at FROM obligations WHERE recurrence_policy = 'cron' OR status = 'scheduled'`
     );
@@ -1147,9 +1150,9 @@ export class ObligationRepository {
       if (isTerminalObligationStatus(obligation.status)) {
         throw new ObligationValidationError("terminal obligations cannot be reopened or changed");
       }
-      if (obligation.status === "scheduled") {
+      if (obligation.status === "scheduled" && status === "done") {
         throw new ObligationValidationError(
-          "scheduled obligations cannot be completed or cancelled until they are ready"
+          "scheduled obligations cannot be completed until they are ready"
         );
       }
       const liveChild = this.listChildren(id).find((child) =>
@@ -1184,13 +1187,18 @@ export class ObligationRepository {
         const seq = seqRow.seq;
         const completionId = randomUUID();
 
-        let nextReadyAt = null;
+        let nextReadyAt: string | null = null;
         if (
           obligation.recurrencePolicy === "completion_interval" &&
           obligation.recurrenceIntervalSeconds != null
         ) {
           nextReadyAt = new Date(
             new Date(completedAt).getTime() + obligation.recurrenceIntervalSeconds * 1000
+          ).toISOString();
+        } else if (obligation.recurrencePolicy === "cron" && obligation.recurrenceCron != null) {
+          nextReadyAt = nextCronOccurrence(
+            obligation.recurrenceCron,
+            new Date(completedAt)
           ).toISOString();
         }
 
@@ -1224,17 +1232,21 @@ export class ObligationRepository {
           });
         }
       } else {
+        // Reached for `cancelled` (any recurrence) or `done` with no
+        // recurrence — both permanently stop recurrence, so the recurrence
+        // columns are cleared alongside the status in the same statement
+        // rather than left to describe a cycle that will never resume.
         this.db
           .prepare(
             `UPDATE obligations
-             SET status = ?, terminal_note = ?, resolution_ref = ?, updated_at = ?, next_ready_at = NULL
+             SET status = ?, terminal_note = ?, resolution_ref = ?, updated_at = ?,
+                 next_ready_at = NULL, recurrence_policy = NULL, recurrence_cron = NULL,
+                 recurrence_interval_seconds = NULL
              WHERE id = ?`
           )
           .run(status, normalizeTerminalNote(note), resolution, completedAt, id);
 
-        if (status === "cancelled" || (status === "done" && obligation.recurrencePolicy === null)) {
-          this.osScheduler?.cancelObligationActivation(id);
-        }
+        this.osScheduler?.cancelObligationActivation(id);
       }
 
       if (obligation.parentId !== null) this.reReadyParentIfUnblocked(obligation.parentId);
@@ -1270,34 +1282,48 @@ export class ObligationRepository {
         throw new ObligationValidationError("terminal obligations cannot be recurring");
       }
 
-      let nextReadyAt = obligation.nextReadyAt;
-
       if (recurrence === null) {
-        this.db
-          .prepare(
-            `UPDATE obligations SET recurrence_policy = NULL, recurrence_cron = NULL, recurrence_interval_seconds = NULL, updated_at = ? WHERE id = ?`
-          )
-          .run(this.stamp(), id);
-
+        // Every state this row can be in — including `scheduled`, where the
+        // CHECK constraint demands a non-null recurrence_policy and
+        // next_ready_at as long as status stays `scheduled` — is resolved in
+        // one UPDATE so no intermediate write is ever checked against a
+        // combination that never actually holds. Disabling recurrence while
+        // scheduled forfeits the pending cycle: the row finalizes as done.
         if (obligation.status === "scheduled") {
           this.db
             .prepare(
-              `UPDATE obligations SET status = 'done', next_ready_at = NULL, updated_at = ? WHERE id = ?`
+              `UPDATE obligations
+               SET status = 'done', recurrence_policy = NULL, recurrence_cron = NULL,
+                   recurrence_interval_seconds = NULL, next_ready_at = NULL, updated_at = ?
+               WHERE id = ?`
             )
             .run(this.stamp(), id);
           if (obligation.parentId !== null) this.reReadyParentIfUnblocked(obligation.parentId);
         } else {
           this.db
-            .prepare(`UPDATE obligations SET next_ready_at = NULL, updated_at = ? WHERE id = ?`)
+            .prepare(
+              `UPDATE obligations
+               SET recurrence_policy = NULL, recurrence_cron = NULL,
+                   recurrence_interval_seconds = NULL, next_ready_at = NULL, updated_at = ?
+               WHERE id = ?`
+            )
             .run(this.stamp(), id);
         }
         this.osScheduler?.cancelObligationActivation(id);
       } else if (recurrence.policy === "cron") {
+        // A currently-scheduled row must keep a non-null next_ready_at in the
+        // very statement that changes its policy, or the CHECK constraint
+        // rejects the write outright; a ready/waiting row has no such
+        // requirement, so next_ready_at stays null until it actually completes.
+        const nextReadyAt =
+          obligation.status === "scheduled"
+            ? nextCronOccurrence(recurrence.cronExpr, new Date(this.now())).toISOString()
+            : null;
         this.db
           .prepare(
-            `UPDATE obligations SET next_ready_at = NULL, recurrence_policy = 'cron', recurrence_cron = ?, recurrence_interval_seconds = NULL, updated_at = ? WHERE id = ?`
+            `UPDATE obligations SET next_ready_at = ?, recurrence_policy = 'cron', recurrence_cron = ?, recurrence_interval_seconds = NULL, updated_at = ? WHERE id = ?`
           )
-          .run(recurrence.cronExpr, this.stamp(), id);
+          .run(nextReadyAt, recurrence.cronExpr, this.stamp(), id);
         this.osScheduler?.scheduleObligationActivation(id, {
           kind: "cron",
           cronExpr: recurrence.cronExpr,
@@ -1321,7 +1347,7 @@ export class ObligationRepository {
                 .run(recurrence.intervalSeconds, this.stamp(), id);
               this.osScheduler?.cancelObligationActivation(id);
             } else {
-              nextReadyAt = new Date(readyTime).toISOString();
+              const nextReadyAt = new Date(readyTime).toISOString();
               this.db
                 .prepare(
                   `UPDATE obligations SET next_ready_at = ?, recurrence_policy = 'completion_interval', recurrence_cron = NULL, recurrence_interval_seconds = ?, updated_at = ? WHERE id = ?`

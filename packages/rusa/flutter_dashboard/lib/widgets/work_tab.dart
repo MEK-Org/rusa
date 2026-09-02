@@ -384,6 +384,9 @@ class _WorkTabState extends State<WorkTab> {
       case 'cancelled':
         color = MeshColors.statusHalted;
         break;
+      case 'scheduled':
+        color = MeshColors.accent;
+        break;
     }
     return Container(
       width: 8,

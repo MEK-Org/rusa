@@ -62,6 +62,53 @@ void main() {
       expect(dto.id, 'ob-789');
       expect(dto.externalRef, null);
     });
+
+    test('deserializes recurrence fields and derives isScheduled/isRecurring', () {
+      final json = {
+        'id': 'ob-cron',
+        'parentId': null,
+        'ownerId': 'test-actor',
+        'intent': 'Nightly sweep',
+        'externalRef': null,
+        'status': 'scheduled',
+        'priority': 50.0,
+        'effectivePriority': 50.0,
+        'prioritySourceId': 'ob-cron',
+        'recurrencePolicy': 'cron',
+        'recurrenceCron': '0 3 * * *',
+        'recurrenceIntervalSeconds': null,
+        'nextReadyAt': '2026-09-03T03:00:00.000Z',
+      };
+
+      final dto = ObligationDto.fromJson(json);
+      expect(dto.recurrencePolicy, 'cron');
+      expect(dto.recurrenceCron, '0 3 * * *');
+      expect(dto.recurrenceIntervalSeconds, null);
+      expect(dto.nextReadyAt, '2026-09-03T03:00:00.000Z');
+      expect(dto.isScheduled, true);
+      expect(dto.isRecurring, true);
+      expect(dto.isTerminal, false);
+    });
+
+    test('a non-recurring ready obligation reports isScheduled/isRecurring false', () {
+      final json = {
+        'id': 'ob-plain',
+        'parentId': null,
+        'ownerId': 'test-actor',
+        'intent': 'One-off task',
+        'externalRef': null,
+        'status': 'ready',
+        'priority': 50.0,
+        'effectivePriority': 50.0,
+        'prioritySourceId': 'ob-plain',
+      };
+
+      final dto = ObligationDto.fromJson(json);
+      expect(dto.recurrencePolicy, null);
+      expect(dto.nextReadyAt, null);
+      expect(dto.isScheduled, false);
+      expect(dto.isRecurring, false);
+    });
   });
 
   group('ActorViewState', () {
