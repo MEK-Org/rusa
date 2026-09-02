@@ -233,9 +233,7 @@ describe("populateModelCatalogsFromDb", () => {
         ]),
     };
 
-    populateModelCatalogsFromDb(
-      mockRepo as unknown as import("./model-catalog.js").ModelScrapeStore
-    );
+    populateModelCatalogsFromDb(mockRepo);
 
     expect(getProviderModelCatalog("codex")).toEqual([
       { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol" },
@@ -266,9 +264,7 @@ describe("populateModelCatalogsFromDb", () => {
           ],
         ]),
     };
-    populateModelCatalogsFromDb(
-      mockRepo as unknown as import("./model-catalog.js").ModelScrapeStore
-    );
+    populateModelCatalogsFromDb(mockRepo);
     const catalog = getProviderModelCatalog("agy");
     expect(catalog).toEqual([
       {
