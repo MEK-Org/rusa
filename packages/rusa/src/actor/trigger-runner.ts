@@ -123,16 +123,11 @@ export class TriggerRunner {
       this.log("nudge — coalesced into pending debounce window");
       return;
     }
-    if (this.debounceMs > 0) {
-      this.log(`nudge — run scheduled in ${this.debounceMs / 1000}s`);
-      this.debounceTimer = setTimeout(() => {
-        this.debounceTimer = null;
-        void this.startRun();
-      }, this.debounceMs);
-    } else {
-      this.log("nudge — quick-start");
+    this.log(`nudge — run scheduled in ${this.debounceMs / 1000}s`);
+    this.debounceTimer = setTimeout(() => {
+      this.debounceTimer = null;
       void this.startRun();
-    }
+    }, this.debounceMs);
   }
 
   /** True while a run is active or a debounce is pending. */
