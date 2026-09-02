@@ -1,4 +1,4 @@
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +8,7 @@ import { runSubprocess } from "./subprocess-execution.js";
 
 function probeBwrapCapable(): boolean {
   try {
-    execSync("bwrap --unshare-user --uid 1000 --gid 1000 -- true", { stdio: "ignore" });
+    execFileSync("bwrap", ["--ro-bind", "/", "/", "--", "/bin/true"], { stdio: "ignore" });
     return true;
   } catch {
     return false;
@@ -161,3 +161,15 @@ describe.skipIf(!BWRAP_CAPABLE)(
     });
   }
 );
+
+describe("Sandbox provider args generation (always executed)", () => {
+  it("includes exactly one --new-session for actor isolation (issue #164)", () => {
+    const result = buildActorBwrapArgs("/tmp/fake", undefined, undefined, false);
+    expect(result.args.filter((a) => a === "--new-session")).toHaveLength(1);
+  });
+
+  it("omits --new-session for e2e-root", () => {
+    const result = buildActorBwrapArgs("/tmp/fake", undefined, undefined, true);
+    expect(result.args.filter((a) => a === "--new-session")).toHaveLength(0);
+  });
+});
