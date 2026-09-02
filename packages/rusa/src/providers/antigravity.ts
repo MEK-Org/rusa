@@ -14,6 +14,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ProviderConfig } from "../config/types.js";
+import { getProviderModelCatalog } from "./model-catalog.js";
 import { buildActorBwrapArgs, buildActorBwrapCommand, teardownFlutterOverlay } from "./sandbox.js";
 import { runSubprocess } from "./subprocess-execution.js";
 import {
@@ -52,11 +53,33 @@ export function buildAntigravityArgs(o: AntigravityArgsOptions): string[] {
   for (const dir of o.addDirs ?? []) {
     args.push("--add-dir", dir);
   }
-  if (o.model) args.push("--model", o.model);
-  // agy 1.1.10+ resolves --effort against the model selected by --model. The
-  // explicit flag therefore owns the effective reasoning level even when an
-  // older passable display label still contains a parenthesized level.
-  if (o.effort) args.push("--effort", o.effort);
+
+  let finalModel = o.model;
+  if (o.model) {
+    if (o.effort) {
+      if (/\s*\((low|medium|high|xhigh|max)\)$/i.test(o.model)) {
+        throw new Error(
+          `invalid model selection (--model "${o.model}" --effort "${o.effort}"): --effort is not supported for model "${o.model}"`
+        );
+      }
+
+      const catalog = getProviderModelCatalog("agy");
+      if (catalog) {
+        const baseMatch = catalog.find(
+          (e) => e.displayLabel === o.model || e.identifier === o.model
+        );
+        if (baseMatch) {
+          finalModel = baseMatch.identifier;
+        }
+      }
+    }
+    args.push("--model", finalModel);
+  }
+
+  if (o.effort) {
+    args.push("--effort", o.effort);
+  }
+
   // agy's --print-timeout is a wall-clock execution ceiling (verified empirically).
   // Set it to match the full invocation budget (o.timeoutMs) so active streaming tasks are not cut short.
   const printTimeoutMin = Math.max(1, Math.ceil(o.timeoutMs / 60_000));

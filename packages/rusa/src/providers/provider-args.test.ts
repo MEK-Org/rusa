@@ -10,6 +10,7 @@ import {
   parseConversationId,
 } from "./antigravity.js";
 import { buildClaudeArgs, buildClaudeMcpConfig } from "./claude.js";
+import { setProviderModelCatalog } from "./model-catalog.js";
 
 describe("buildClaudeArgs", () => {
   it("builds the base print/stream args", () => {
@@ -129,33 +130,59 @@ describe("buildAntigravityArgs", () => {
     expect(args[args.indexOf("--model") + 1]).toBe("Gemini 3.1 Pro (High)");
   });
 
-  it("passes an explicit effort independently from model", () => {
+  it("passes an explicit effort independently from model when model is a base slug", () => {
     const args = buildAntigravityArgs({
       prompt: "hi",
       model: "gemini-3.7-flash",
       effort: "high",
       timeoutMs: 60_000,
     });
+    expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2)).toEqual([
+      "--model",
+      "gemini-3.7-flash",
+    ]);
     expect(args.slice(args.indexOf("--effort"), args.indexOf("--effort") + 2)).toEqual([
       "--effort",
       "high",
     ]);
   });
 
-  it("lets explicit effort override the level in a legacy passable display label", () => {
+  it("rejects an explicit effort combined with a legacy passable display label containing a tier", () => {
+    expect(() =>
+      buildAntigravityArgs({
+        prompt: "hi",
+        model: "Gemini 3.1 Pro (High)",
+        effort: "low",
+        timeoutMs: 60_000,
+      })
+    ).toThrowError(
+      'invalid model selection (--model "Gemini 3.1 Pro (High)" --effort "low"): --effort is not supported for model "Gemini 3.1 Pro (High)"'
+    );
+  });
+
+  it("resolves a canonical base display label to its identifier to emit a valid selector with --effort", () => {
+    // Populate the mock catalog for this test so the lookup succeeds.
+
+    setProviderModelCatalog("agy", [
+      {
+        identifier: "gemini-3.7-flash-high",
+        displayLabel: "Gemini 3.7 Flash (High)",
+        passable: true,
+      },
+    ]);
     const args = buildAntigravityArgs({
       prompt: "hi",
-      model: "Gemini 3.1 Pro (High)",
-      effort: "low",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
       timeoutMs: 60_000,
     });
     expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2)).toEqual([
       "--model",
-      "Gemini 3.1 Pro (High)",
+      "gemini-3.7-flash",
     ]);
     expect(args.slice(args.indexOf("--effort"), args.indexOf("--effort") + 2)).toEqual([
       "--effort",
-      "low",
+      "high",
     ]);
   });
 
