@@ -124,6 +124,9 @@ describe("buildAntigravityArgs", () => {
   });
 
   it("resumes a conversation by id and passes the model", () => {
+    setProviderModelCatalog("agy", [
+      { identifier: "gemini-3.1-pro-high", displayLabel: "Gemini 3.1 Pro (High)", passable: true },
+    ]);
     const args = buildAntigravityArgs({
       prompt: "hi",
       conversationId: "conv-123",
@@ -131,11 +134,18 @@ describe("buildAntigravityArgs", () => {
       timeoutMs: 60_000,
     });
     expect(args[args.indexOf("--conversation") + 1]).toBe("conv-123");
-    expect(args[args.indexOf("--model") + 1]).toBe("Gemini 3.1 Pro");
+    expect(args[args.indexOf("--model") + 1]).toBe("gemini-3.1-pro");
     expect(args[args.indexOf("--effort") + 1]).toBe("high");
   });
 
   it("passes an explicit effort independently from model when model is a base slug", () => {
+    setProviderModelCatalog("agy", [
+      {
+        identifier: "gemini-3.7-flash-high",
+        displayLabel: "Gemini 3.7 Flash (High)",
+        passable: true,
+      },
+    ]);
     const args = buildAntigravityArgs({
       prompt: "hi",
       model: "gemini-3.7-flash",
@@ -284,82 +294,6 @@ describe("buildAntigravityArgs", () => {
       argsDisplay.slice(argsDisplay.indexOf("--effort"), argsDisplay.indexOf("--effort") + 2)
     ).toEqual(["--effort", "high"]);
   });
-});
-
-it("preserves provider-default effort when no model is explicitly passed", () => {
-  const args = buildAntigravityArgs({
-    prompt: "hi",
-    effort: "high",
-    timeoutMs: 60_000,
-  });
-  expect(args).not.toContain("--model");
-  expect(args.slice(args.indexOf("--effort"), args.indexOf("--effort") + 2)).toEqual([
-    "--effort",
-    "high",
-  ]);
-});
-
-it("rejects when the model is not found in the catalog", () => {
-  setProviderModelCatalog("agy", [
-    { identifier: "other-model", displayLabel: "Other", passable: true },
-  ]);
-  expect(() =>
-    buildAntigravityArgs({
-      prompt: "hi",
-      model: "missing-model",
-      timeoutMs: 60_000,
-    })
-  ).toThrowError('invalid model selection: model "missing-model" not found in catalog');
-});
-
-it("rejects when the effort is not supported by the catalog model", () => {
-  setProviderModelCatalog("agy", [
-    { identifier: "test-model", displayLabel: "Test Model", passable: true, efforts: ["low"] },
-  ]);
-  expect(() =>
-    buildAntigravityArgs({
-      prompt: "hi",
-      model: "test-model",
-      effort: "high",
-      timeoutMs: 60_000,
-    })
-  ).toThrowError('invalid model selection: effort "high" is not supported by model "Test Model"');
-});
-
-it("canonicalizes exact display label and slug into base slug + effort argv through the catalog", () => {
-  // Normalizing entries will populate base model "gemini-3.7-flash" with efforts ["high"]
-  setProviderModelCatalog("agy", [
-    {
-      identifier: "gemini-3.7-flash-high",
-      displayLabel: "Gemini 3.7 Flash (High)",
-      passable: true,
-    },
-  ]);
-  const argsSlug = buildAntigravityArgs({
-    prompt: "hi",
-    model: "gemini-3.7-flash-high",
-    timeoutMs: 60_000,
-  });
-  expect(argsSlug.slice(argsSlug.indexOf("--model"), argsSlug.indexOf("--model") + 2)).toEqual([
-    "--model",
-    "gemini-3.7-flash",
-  ]);
-  expect(argsSlug.slice(argsSlug.indexOf("--effort"), argsSlug.indexOf("--effort") + 2)).toEqual([
-    "--effort",
-    "high",
-  ]);
-
-  const argsDisplay = buildAntigravityArgs({
-    prompt: "hi",
-    model: "Gemini 3.7 Flash (High)",
-    timeoutMs: 60_000,
-  });
-  expect(
-    argsDisplay.slice(argsDisplay.indexOf("--model"), argsDisplay.indexOf("--model") + 2)
-  ).toEqual(["--model", "gemini-3.7-flash"]);
-  expect(
-    argsDisplay.slice(argsDisplay.indexOf("--effort"), argsDisplay.indexOf("--effort") + 2)
-  ).toEqual(["--effort", "high"]);
 });
 
 describe("parseConversationId", () => {

@@ -93,23 +93,38 @@ export function buildAntigravityArgs(o: AntigravityArgsOptions): string[] {
     finalModel = baseModel;
 
     const catalog = getProviderModelCatalog("agy");
-    if (catalog && catalog.length > 0) {
-      const baseMatch = catalog.find(
-        (e) => e.displayLabel === baseModel || e.identifier === baseModel
+    if (!catalog || catalog.length === 0) {
+      throw new Error(
+        `invalid model selection: model "${o.model}" provided but agy catalog is empty or missing`
       );
-      if (!baseMatch) {
-        throw new Error(`invalid model selection: model "${o.model}" not found in catalog`);
+    }
+
+    const baseMatch = catalog.find(
+      (e) => e.displayLabel === baseModel || e.identifier === baseModel
+    );
+    if (!baseMatch) {
+      throw new Error(`invalid model selection: model "${o.model}" not found in catalog`);
+    }
+    if (baseMatch.passable === false) {
+      throw new Error(`invalid model selection: model "${o.model}" is marked impassable`);
+    }
+    if (baseMatch.efforts && baseMatch.efforts.length > 0) {
+      if (!finalEffort) {
+        throw new Error(
+          `invalid model selection: model "${o.model}" requires an effort but none was provided`
+        );
       }
-      if (
-        finalEffort &&
-        (!baseMatch.efforts || !baseMatch.efforts.includes(finalEffort.toLowerCase()))
-      ) {
+      if (!baseMatch.efforts.includes(finalEffort.toLowerCase())) {
         throw new Error(
           `invalid model selection: effort "${finalEffort}" is not supported by model "${baseMatch.displayLabel}"`
         );
       }
-      finalModel = baseMatch.identifier;
+    } else if (finalEffort) {
+      throw new Error(
+        `invalid model selection: effort "${finalEffort}" is not supported by model "${baseMatch.displayLabel}"`
+      );
     }
+    finalModel = baseMatch.identifier;
     args.push("--model", finalModel);
   }
 

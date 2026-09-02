@@ -3,9 +3,10 @@ import EventEmitter from "node:events";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProviderConfig } from "../config/types.js";
 import { AntigravityProvider, formatAgyToolInvocation } from "./antigravity.js";
+import { clearProviderModelCatalog, setProviderModelCatalog } from "./model-catalog.js";
 import {
   RUN_CEILING_ABORT_REASON,
   STALL_WATCHDOG_ABORT_REASON,
@@ -51,7 +52,24 @@ function mockChildProcess() {
 }
 
 describe("AntigravityProvider", () => {
+  beforeEach(() => {
+    setProviderModelCatalog("agy", [
+      { identifier: "gemini-3.1-pro-high", displayLabel: "Gemini 3.1 Pro (High)", passable: true },
+      { identifier: "gemini-3.1-pro-low", displayLabel: "Gemini 3.1 Pro (Low)", passable: true },
+      {
+        identifier: "gemini-3.5-flash-high",
+        displayLabel: "Gemini 3.5 Flash (High)",
+        passable: true,
+      },
+      {
+        identifier: "gemini-3.5-flash-low",
+        displayLabel: "Gemini 3.5 Flash (Low)",
+        passable: true,
+      },
+    ]);
+  });
   afterEach(() => {
+    clearProviderModelCatalog("agy");
     vi.clearAllMocks();
   });
 
@@ -74,7 +92,9 @@ describe("AntigravityProvider", () => {
         "test prompt",
         "--dangerously-skip-permissions",
         "--model",
-        "Gemini 3.1 Pro (High)",
+        "gemini-3.1-pro",
+        "--effort",
+        "high",
       ]),
       expect.objectContaining({ cwd: "/tmp" })
     );

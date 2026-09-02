@@ -233,7 +233,9 @@ describe("populateModelCatalogsFromDb", () => {
         ]),
     };
 
-    populateModelCatalogsFromDb(mockRepo);
+    populateModelCatalogsFromDb(
+      mockRepo as unknown as import("./model-catalog.js").ModelScrapeStore
+    );
 
     expect(getProviderModelCatalog("codex")).toEqual([
       { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol" },
@@ -246,6 +248,36 @@ describe("populateModelCatalogsFromDb", () => {
 
     expect(validateModelPin("codex", "gpt-5.6-sol")).toEqual({ status: "accepted" });
     expect(() => validateModelPin("codex", "bad-model")).toThrow();
+  });
+
+  it("restores a raw tiered agy entry and correctly processes canonical pair to emit exact base slug + effort", () => {
+    const mockRepo = {
+      listLatestForEachProvider: () =>
+        new Map([
+          [
+            "agy",
+            [
+              {
+                displayLabel: "Gemini 3.5 Flash (High)",
+                identifier: "gemini-3.5-flash-high",
+                passable: true,
+              },
+            ],
+          ],
+        ]),
+    };
+    populateModelCatalogsFromDb(
+      mockRepo as unknown as import("./model-catalog.js").ModelScrapeStore
+    );
+    const catalog = getProviderModelCatalog("agy");
+    expect(catalog).toEqual([
+      {
+        displayLabel: "Gemini 3.5 Flash",
+        identifier: "gemini-3.5-flash",
+        passable: true,
+        efforts: ["high"],
+      },
+    ]);
   });
 });
 
