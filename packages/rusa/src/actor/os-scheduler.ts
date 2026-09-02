@@ -57,6 +57,43 @@ export interface AtIo {
   remove(id: string): void;
 }
 
+/**
+ * Thrown by {@link unavailableAtIo} for the one operation that actually needs
+ * a one-off job — scheduling a completion-interval activation or a scheduled
+ * message delivery — when `at`/`atd` was confirmed absent at boot (not when a
+ * live `atq` call merely fails, which stays a plain IO error).
+ */
+export class AtUnavailableError extends Error {
+  constructor(issues: string[]) {
+    super(`\`at\` scheduling is unavailable: ${issues.join("; ")}`);
+    this.name = "AtUnavailableError";
+  }
+}
+
+/**
+ * Stand-in `AtIo` for a host where {@link preflightAt} found `at`/`atd`
+ * missing. Boot must survive that (cron-only recurrences keep working) and
+ * reconciliation must not mistake "we chose not to call a missing binary"
+ * for "the binary said the queue is empty" — so `list()` reports no jobs
+ * (nothing could have been armed without `at` ever being available) and
+ * `schedule()`/`remove()` raise the named prerequisite error the first time
+ * something actually needs a one-off job, instead of letting `spawnSync`
+ * reject with a raw ENOENT.
+ */
+export function unavailableAtIo(issues: string[]): AtIo {
+  return {
+    schedule(): string {
+      throw new AtUnavailableError(issues);
+    },
+    list(): { id: string; script: string }[] {
+      return [];
+    },
+    remove(): void {
+      throw new AtUnavailableError(issues);
+    },
+  };
+}
+
 /** `atrm`/`atq`/`at -c` on a job id that no longer exists — already fired, or already removed. */
 const AT_JOB_GONE = /cannot find|no such|does not exist|not found/i;
 

@@ -1934,6 +1934,48 @@ describe("ObligationRepository", () => {
       expect(page2.completions.map((c) => c.sequence)).toEqual([1]);
     });
 
+    it("commits the policy change even when the OS scheduler call fails, instead of rolling it back", () => {
+      scheduler.scheduleObligationActivation = () => {
+        throw new Error("crontab write failed");
+      };
+
+      expect(() =>
+        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" })
+      ).toThrow("crontab write failed");
+
+      // The database write is not an OS side effect and must not roll back
+      // with it — the caller sees the scheduler failure, but the row it
+      // failed on reflects the policy that failure was actually about.
+      const row = repository.require("rec-1");
+      expect(row.recurrencePolicy).toBe("cron");
+      expect(row.recurrenceCron).toBe("0 * * * *");
+    });
+
+    it("replaces a switched-away completion_interval `at` job with the new cron job outside the transaction", () => {
+      const scheduleCalls: string[] = [];
+      const originalCancel = scheduler.cancelObligationActivation.bind(scheduler);
+      const originalSchedule = scheduler.scheduleObligationActivation.bind(scheduler);
+      scheduler.cancelObligationActivation = (id) => {
+        scheduleCalls.push(`cancel:${id}`);
+        originalCancel(id);
+      };
+      scheduler.scheduleObligationActivation = (id, time) => {
+        scheduleCalls.push(`schedule:${id}:${time.kind}`);
+        originalSchedule(id, time);
+      };
+
+      repository.setRecurrence("rec-1", { policy: "completion_interval", intervalSeconds: 60 });
+      repository.setTerminalStatus("rec-1", "done");
+      scheduleCalls.length = 0;
+
+      const switched = repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
+      expect(switched.recurrencePolicy).toBe("cron");
+      // Exactly one reconciliation call for the id, derived from the row the
+      // transaction actually committed — not a remove-then-install pair that
+      // could be interrupted mid-way while still inside the transaction.
+      expect(scheduleCalls).toEqual(["schedule:rec-1:cron"]);
+    });
+
     describe("reconcileScheduledObligations (boot reconciliation)", () => {
       it("re-arms a cron entry regardless of the obligation's current status", () => {
         repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
@@ -1978,6 +2020,30 @@ describe("ObligationRepository", () => {
         repository.reconcileScheduledObligations();
         expect(scheduler.cancelled).toContain("ghost-id");
         expect(scheduler.activations.has("ghost-id")).toBe(false);
+      });
+
+      it("keeps reconciling other rows when one row's OS scheduler call fails (e.g. `at` confirmed unavailable)", () => {
+        repository.create({ title: "iv", id: "rec-2", ownerId: "actor-a", intent: "recur" });
+        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
+        repository.setRecurrence("rec-2", { policy: "completion_interval", intervalSeconds: 1 });
+        repository.setTerminalStatus("rec-2", "done");
+        db.prepare(`UPDATE obligations SET next_ready_at = ? WHERE id = ?`).run(
+          "2999-01-01T00:00:00.000Z",
+          "rec-2"
+        );
+        scheduler.activations.clear();
+        const original = scheduler.scheduleObligationActivation.bind(scheduler);
+        scheduler.scheduleObligationActivation = (id, time) => {
+          if (time.kind === "at") throw new Error("`at` scheduling is unavailable: at missing");
+          original(id, time);
+        };
+
+        expect(() => repository.reconcileScheduledObligations()).not.toThrow();
+        // rec-2's `at`-kind reconciliation failed and was logged, but rec-1's
+        // cron reconciliation still ran — one row's OS failure must not abort
+        // the sweep for every other row queued behind it.
+        expect(scheduler.activations.get("rec-1")).toEqual({ kind: "cron", cronExpr: "0 * * * *" });
+        expect(scheduler.activations.has("rec-2")).toBe(false);
       });
 
       it("is a no-op when no OS scheduler is attached", () => {

@@ -12,11 +12,7 @@ import 'obligation_dialogs.dart';
 import 'reference_preview.dart';
 
 class WorkTab extends StatefulWidget {
-  const WorkTab({
-    super.key,
-    required this.store,
-    required this.onSelectView,
-  });
+  const WorkTab({super.key, required this.store, required this.onSelectView});
 
   final DashboardStore store;
   final ValueChanged<DashboardView> onSelectView;
@@ -117,7 +113,9 @@ class _WorkTabState extends State<WorkTab> {
           ? node.children.isNotEmpty
           : node.children.any((c) => !c.obligation.isTerminal);
       final isCollapsed = !_expandedIds.contains(id);
-      result.add(_FlatNode(node.obligation, depth, hasVisibleChildren, isCollapsed));
+      result.add(
+        _FlatNode(node.obligation, depth, hasVisibleChildren, isCollapsed),
+      );
       if (hasVisibleChildren && !isCollapsed) {
         result.addAll(_flattenTree(node.children, depth + 1));
       }
@@ -146,10 +144,7 @@ class _WorkTabState extends State<WorkTab> {
                 style: const TextStyle(color: MeshColors.textSecondary),
               ),
               const SizedBox(height: 12),
-              ElevatedButton(
-                onPressed: _loadRoots,
-                child: const Text('Retry'),
-              ),
+              ElevatedButton(onPressed: _loadRoots, child: const Text('Retry')),
             ],
           ),
         ),
@@ -201,7 +196,10 @@ class _WorkTabState extends State<WorkTab> {
                     : const Center(
                         child: Text(
                           'Select an obligation from the tree.',
-                          style: TextStyle(color: MeshColors.textMuted, fontSize: 14),
+                          style: TextStyle(
+                            color: MeshColors.textMuted,
+                            fontSize: 14,
+                          ),
                         ),
                       ),
               ),
@@ -213,162 +211,175 @@ class _WorkTabState extends State<WorkTab> {
   }
 
   Widget _narrowBackBar() => Container(
-        height: 48,
-        padding: const EdgeInsets.symmetric(horizontal: 12),
-        color: MeshColors.bgSecondary,
-        child: Row(
-          children: [
-            IconButton(
-              icon: const Icon(Icons.arrow_back, color: MeshColors.textSecondary, size: 20),
-              onPressed: () => setState(() => _selectedObligationId = null),
-            ),
-            const SizedBox(width: 8),
-            const Text(
-              'Back to List',
-              style: TextStyle(
-                color: MeshColors.textPrimary,
-                fontWeight: FontWeight.w600,
-                fontSize: 14,
-              ),
-            ),
-          ],
+    height: 48,
+    padding: const EdgeInsets.symmetric(horizontal: 12),
+    color: MeshColors.bgSecondary,
+    child: Row(
+      children: [
+        IconButton(
+          icon: const Icon(
+            Icons.arrow_back,
+            color: MeshColors.textSecondary,
+            size: 20,
+          ),
+          onPressed: () => setState(() => _selectedObligationId = null),
         ),
-      );
+        const SizedBox(width: 8),
+        const Text(
+          'Back to List',
+          style: TextStyle(
+            color: MeshColors.textPrimary,
+            fontWeight: FontWeight.w600,
+            fontSize: 14,
+          ),
+        ),
+      ],
+    ),
+  );
 
   Widget _sidebar(List<_FlatNode> nodes) => Container(
-        decoration: const BoxDecoration(
-          color: MeshColors.bgSecondary,
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 16, 12, 12),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+    decoration: const BoxDecoration(color: MeshColors.bgSecondary),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 16, 12, 12),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text(
+                'WORK QUEUE',
+                style: TextStyle(
+                  color: MeshColors.textSecondary,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 0.8,
+                ),
+              ),
+              Row(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Text(
-                    'WORK QUEUE',
-                    style: TextStyle(
-                      color: MeshColors.textSecondary,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600,
-                      letterSpacing: 0.8,
+                  IconButton(
+                    icon: Icon(
+                      _showDone ? Icons.visibility : Icons.visibility_off,
+                      size: 18,
                     ),
+                    onPressed: () => setState(() => _showDone = !_showDone),
+                    tooltip: _showDone ? 'Hide Done' : 'Show Done',
                   ),
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      IconButton(
-                        icon: Icon(_showDone ? Icons.visibility : Icons.visibility_off, size: 18),
-                        onPressed: () => setState(() => _showDone = !_showDone),
-                        tooltip: _showDone ? 'Hide Done' : 'Show Done',
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.add, size: 18),
-                        onPressed: () => showCreateObligationDialog(
-                          context,
-                          widget.store,
-                          onCreated: _loadRoots,
-                        ),
-                        tooltip: 'New Root Obligation',
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.refresh, size: 18),
-                        onPressed: _loadRoots,
-                        tooltip: 'Refresh Queue',
-                      ),
-                    ],
+                  IconButton(
+                    icon: const Icon(Icons.add, size: 18),
+                    onPressed: () => showCreateObligationDialog(
+                      context,
+                      widget.store,
+                      onCreated: _loadRoots,
+                    ),
+                    tooltip: 'New Root Obligation',
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.refresh, size: 18),
+                    onPressed: _loadRoots,
+                    tooltip: 'Refresh Queue',
                   ),
                 ],
               ),
-            ),
-            const Divider(height: 1, color: MeshColors.border),
-            Expanded(
-              child: nodes.isEmpty
-                  ? const Center(
-                      child: Text(
-                        'No obligations found',
-                        style: TextStyle(color: MeshColors.textMuted),
-                      ),
-                    )
-                  : ListView.builder(
-                      padding: const EdgeInsets.symmetric(vertical: 8),
-                      itemCount: nodes.length,
-                      itemBuilder: (context, index) {
-                        final node = nodes[index];
-                        final isSelected = node.obligation.id == _selectedObligationId;
-
-                        return InkWell(
-                          onTap: () => widget.store.setFocusedObligationId(node.obligation.id),
-                          child: Container(
-                            color: isSelected ? MeshColors.bgSelected : null,
-                            padding: EdgeInsets.only(
-                              left: 12.0 + (node.depth * 16.0),
-                              right: 12.0,
-                              top: 8.0,
-                              bottom: 8.0,
-                            ),
-                            child: Row(
-                              children: [
-                                SizedBox(
-                                  width: 24,
-                                  height: 24,
-                                  child: node.hasChildren
-                                      ? IconButton(
-                                          padding: EdgeInsets.zero,
-                                          icon: Icon(
-                                            node.isCollapsed
-                                                ? Icons.chevron_right
-                                                : Icons.keyboard_arrow_down,
-                                            size: 18,
-                                            color: MeshColors.textMuted,
-                                          ),
-                                          onPressed: () {
-                                            setState(() {
-                                              if (node.isCollapsed) {
-                                                _expandedIds.add(node.obligation.id);
-                                              } else {
-                                                _expandedIds.remove(node.obligation.id);
-                                              }
-                                            });
-                                          },
-                                        )
-                                      : null,
-                                ),
-                                const SizedBox(width: 4),
-                                _statusDot(node.obligation.status),
-                                const SizedBox(width: 8),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        node.obligation.heading,
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          color: isSelected
-                                              ? MeshColors.textPrimary
-                                              : MeshColors.textSecondary,
-                                          fontSize: 13,
-                                          fontWeight:
-                                              isSelected ? FontWeight.bold : FontWeight.normal,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        );
-                      },
-                    ),
-            ),
-          ],
+            ],
+          ),
         ),
-      );
+        const Divider(height: 1, color: MeshColors.border),
+        Expanded(
+          child: nodes.isEmpty
+              ? const Center(
+                  child: Text(
+                    'No obligations found',
+                    style: TextStyle(color: MeshColors.textMuted),
+                  ),
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  itemCount: nodes.length,
+                  itemBuilder: (context, index) {
+                    final node = nodes[index];
+                    final isSelected =
+                        node.obligation.id == _selectedObligationId;
+
+                    return InkWell(
+                      onTap: () => widget.store.setFocusedObligationId(
+                        node.obligation.id,
+                      ),
+                      child: Container(
+                        color: isSelected ? MeshColors.bgSelected : null,
+                        padding: EdgeInsets.only(
+                          left: 12.0 + (node.depth * 16.0),
+                          right: 12.0,
+                          top: 8.0,
+                          bottom: 8.0,
+                        ),
+                        child: Row(
+                          children: [
+                            SizedBox(
+                              width: 24,
+                              height: 24,
+                              child: node.hasChildren
+                                  ? IconButton(
+                                      padding: EdgeInsets.zero,
+                                      icon: Icon(
+                                        node.isCollapsed
+                                            ? Icons.chevron_right
+                                            : Icons.keyboard_arrow_down,
+                                        size: 18,
+                                        color: MeshColors.textMuted,
+                                      ),
+                                      onPressed: () {
+                                        setState(() {
+                                          if (node.isCollapsed) {
+                                            _expandedIds.add(
+                                              node.obligation.id,
+                                            );
+                                          } else {
+                                            _expandedIds.remove(
+                                              node.obligation.id,
+                                            );
+                                          }
+                                        });
+                                      },
+                                    )
+                                  : null,
+                            ),
+                            const SizedBox(width: 4),
+                            _statusDot(node.obligation.status),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    node.obligation.heading,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      color: isSelected
+                                          ? MeshColors.textPrimary
+                                          : MeshColors.textSecondary,
+                                      fontSize: 13,
+                                      fontWeight: isSelected
+                                          ? FontWeight.bold
+                                          : FontWeight.normal,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
+    ),
+  );
 
   Widget _statusDot(String status) {
     Color color = MeshColors.statusIdle;
@@ -392,10 +403,7 @@ class _WorkTabState extends State<WorkTab> {
     return Container(
       width: 8,
       height: 8,
-      decoration: BoxDecoration(
-        color: color,
-        shape: BoxShape.circle,
-      ),
+      decoration: BoxDecoration(color: color, shape: BoxShape.circle),
     );
   }
 }
@@ -426,7 +434,12 @@ class _DetailView extends StatefulWidget {
 }
 
 class _DetailViewState extends State<_DetailView> {
-  int _completionsOffset = 0;
+  // Completion history accumulates across "Load earlier completions" clicks
+  // instead of being replaced by each new page, so an earlier page stays on
+  // screen (extending the history, not losing access to it).
+  List<ObligationCompletionDto> _completions = const [];
+  int _completionsTotal = 0;
+  bool _completionsHasMore = false;
   late Future<ObligationDetailSnapshot> _future;
 
   DashboardStore get store => widget.store;
@@ -443,23 +456,34 @@ class _DetailViewState extends State<_DetailView> {
   void didUpdateWidget(covariant _DetailView oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.obligationId != widget.obligationId) {
-      _completionsOffset = 0;
+      _completions = const [];
+      _completionsTotal = 0;
+      _completionsHasMore = false;
       _fetch();
     }
   }
 
   void _fetch() {
-    _future = store.api.fetchObligationDetail(
+    final offset = _completions.length;
+    final future = store.api.fetchObligationDetail(
       widget.obligationId,
-      completionsOffset: _completionsOffset,
+      completionsOffset: offset,
     );
+    _future = future;
+    future.then((data) {
+      if (!mounted) return;
+      setState(() {
+        _completions = offset == 0
+            ? data.completions
+            : [..._completions, ...data.completions];
+        _completionsTotal = data.completionsTotal;
+        _completionsHasMore = data.completionsHasMore;
+      });
+    });
   }
 
-  void _loadMoreCompletions(int loadedCount) {
-    setState(() {
-      _completionsOffset += loadedCount;
-      _fetch();
-    });
+  void _loadMoreCompletions() {
+    setState(_fetch);
   }
 
   @override
@@ -526,7 +550,8 @@ class _DetailViewState extends State<_DetailView> {
               _SectionHeader('CITED ARTIFACTS'),
               for (final artifact in data.artifacts)
                 ReferencePreview(
-                  reference: artifact.reference ??
+                  reference:
+                      artifact.reference ??
                       // Unresolvable in v1 (anything but mesh chat). Still shown:
                       // the citation exists and is worth seeing even when we
                       // cannot expand it.
@@ -534,7 +559,8 @@ class _DetailViewState extends State<_DetailView> {
                         ref: artifact.ref,
                         scheme: artifact.ref.split(':').first,
                         title: artifact.ref,
-                        unavailable: 'Not resolvable yet — only mesh chat is read back so far.',
+                        unavailable:
+                            'Not resolvable yet — only mesh chat is read back so far.',
                       ),
                   label: artifact.label,
                   attachedBy: artifact.attachedBy,
@@ -557,7 +583,7 @@ class _DetailViewState extends State<_DetailView> {
             ],
             if (o.isRecurring) ...[
               _SectionHeader('COMPLETION HISTORY'),
-              _completionsPanel(data),
+              _completionsPanel(),
               const SizedBox(height: 24),
             ],
             _SectionHeader('CHILDREN'),
@@ -587,10 +613,10 @@ class _DetailViewState extends State<_DetailView> {
     final ownerSubtitle = displayId != ownerId
         ? ownerId
         : isHuman
-            ? 'Operator'
-            : isSystem
-                ? 'System component'
-                : 'Actor — not in this mesh view';
+        ? 'Operator'
+        : isSystem
+        ? 'System component'
+        : 'Actor — not in this mesh view';
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -607,7 +633,11 @@ class _DetailViewState extends State<_DetailView> {
             const CircleAvatar(
               radius: 14,
               backgroundColor: Color(0xFF1E293B),
-              child: Icon(Icons.person, size: 16, color: MeshColors.textSecondary),
+              child: Icon(
+                Icons.person,
+                size: 16,
+                color: MeshColors.textSecondary,
+              ),
             ),
           const SizedBox(width: 12),
           Expanded(
@@ -625,7 +655,10 @@ class _DetailViewState extends State<_DetailView> {
                 const SizedBox(height: 2),
                 Text(
                   ownerSubtitle,
-                  style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),
+                  style: const TextStyle(
+                    color: MeshColors.textMuted,
+                    fontSize: 11,
+                  ),
                 ),
               ],
             ),
@@ -637,14 +670,20 @@ class _DetailViewState extends State<_DetailView> {
                 store.setDetailPanelIndex(4); // Select Inbox tab
                 onSelectView(DashboardView.actors);
               },
-              child: const Text('View Owner Inbox →', style: TextStyle(color: MeshColors.accent)),
+              child: const Text(
+                'View Owner Inbox →',
+                style: TextStyle(color: MeshColors.accent),
+              ),
             )
           else if (isHuman)
             TextButton(
               onPressed: () {
                 onSelectView(DashboardView.overview);
               },
-              child: const Text('View Owner Queue →', style: TextStyle(color: MeshColors.accent)),
+              child: const Text(
+                'View Owner Queue →',
+                style: TextStyle(color: MeshColors.accent),
+              ),
             ),
         ],
       ),
@@ -655,8 +694,8 @@ class _DetailViewState extends State<_DetailView> {
     final policyLabel = o.recurrencePolicy == 'cron'
         ? 'Cron: ${o.recurrenceCron}'
         : o.recurrencePolicy == 'completion_interval'
-            ? 'Every ${o.recurrenceIntervalSeconds}s after completion'
-            : 'One-time';
+        ? 'Every ${o.recurrenceIntervalSeconds}s after completion'
+        : 'One-time';
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -686,7 +725,10 @@ class _DetailViewState extends State<_DetailView> {
             const SizedBox(height: 8),
             Text(
               'Returns ${formatReturnsIn(o.nextReadyAt!)} (${formatTs(o.nextReadyAt!)})',
-              style: const TextStyle(color: MeshColors.textMuted, fontSize: 11.5),
+              style: const TextStyle(
+                color: MeshColors.textMuted,
+                fontSize: 11.5,
+              ),
             ),
           ],
         ],
@@ -694,8 +736,8 @@ class _DetailViewState extends State<_DetailView> {
     );
   }
 
-  Widget _completionsPanel(ObligationDetailSnapshot data) {
-    final completions = data.completions;
+  Widget _completionsPanel() {
+    final completions = _completions;
 
     if (completions.isEmpty) {
       return Container(
@@ -712,7 +754,7 @@ class _DetailViewState extends State<_DetailView> {
       );
     }
 
-    final remaining = data.completionsTotal - (_completionsOffset + completions.length);
+    final remaining = _completionsTotal - completions.length;
 
     return Container(
       decoration: BoxDecoration(
@@ -737,11 +779,27 @@ class _DetailViewState extends State<_DetailView> {
                       fontWeight: FontWeight.w600,
                     ),
                   ),
-                  if (completion.note != null && completion.note!.trim().isNotEmpty) ...[
+                  if (completion.note != null &&
+                      completion.note!.trim().isNotEmpty) ...[
                     const SizedBox(height: 4),
                     Text(
                       completion.note!,
-                      style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12),
+                      style: const TextStyle(
+                        color: MeshColors.textSecondary,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                  if (completion.resolutionRef != null &&
+                      completion.resolutionRef!.trim().isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      completion.resolutionRef!,
+                      style: const TextStyle(
+                        color: MeshColors.accent,
+                        fontSize: 11.5,
+                        fontFamily: kMonoFontFamily,
+                      ),
                     ),
                   ],
                 ],
@@ -749,11 +807,11 @@ class _DetailViewState extends State<_DetailView> {
             ),
             const Divider(height: 1, color: MeshColors.border),
           ],
-          if (data.completionsHasMore)
+          if (_completionsHasMore)
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               child: TextButton(
-                onPressed: () => _loadMoreCompletions(completions.length),
+                onPressed: _loadMoreCompletions,
                 child: Text('Load earlier completions ($remaining remaining)'),
               ),
             ),
@@ -767,11 +825,22 @@ class _DetailViewState extends State<_DetailView> {
     final edit = o.isTerminal
         ? null
         : IconButton(
-            icon: const Icon(Icons.edit_outlined, size: 16, color: MeshColors.textSecondary),
-            tooltip: ref.isEmpty ? 'Link an issue, PR or repo' : 'Change or unlink',
+            icon: const Icon(
+              Icons.edit_outlined,
+              size: 16,
+              color: MeshColors.textSecondary,
+            ),
+            tooltip: ref.isEmpty
+                ? 'Link an issue, PR or repo'
+                : 'Change or unlink',
             padding: EdgeInsets.zero,
             constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
-            onPressed: () => showEditExternalRefDialog(context, store, o, onUpdated: onMutated),
+            onPressed: () => showEditExternalRefDialog(
+              context,
+              store,
+              o,
+              onUpdated: onMutated,
+            ),
           );
     if (ref.isEmpty) {
       return Container(
@@ -855,7 +924,10 @@ class _DetailViewState extends State<_DetailView> {
                 icon: const Icon(Icons.add, size: 14),
                 label: const Text('Add Child', style: TextStyle(fontSize: 11)),
                 style: TextButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
                   minimumSize: Size.zero,
                   tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                   foregroundColor: MeshColors.accent,
@@ -875,7 +947,6 @@ class _DetailViewState extends State<_DetailView> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-
           for (var i = 0; i < list.length; i++) ...[
             Builder(
               builder: (innerContext) {
@@ -884,45 +955,61 @@ class _DetailViewState extends State<_DetailView> {
                   obligation: c,
                   store: store,
                   showOwner: true,
-                  showActions: false, // In the original, the work_tab children row didn't have actions menu.
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  showActions:
+                      false, // In the original, the work_tab children row didn't have actions menu.
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 12,
+                  ),
                   showReorder: list.length > 1,
-                  onMoveUp: i > 0 ? () async {
-                    final previousId = i - 2 >= 0 ? list[i - 2].id : null;
-                    final nextId = list[i - 1].id;
-                    try {
-                      await store.api.reorderObligation(
-                        c.id,
-                        previousId: previousId,
-                        nextId: nextId,
-                      );
-                      onMutated?.call();
-                    } catch (err) {
-                      if (innerContext.mounted) {
-                        ScaffoldMessenger.of(innerContext).showSnackBar(
-                          SnackBar(content: Text('Failed to reorder: $err'), backgroundColor: MeshColors.statusHalted),
-                        );
-                      }
-                    }
-                  } : null,
-                  onMoveDown: i < list.length - 1 ? () async {
-                    final previousId = list[i + 1].id;
-                    final nextId = i + 2 < list.length ? list[i + 2].id : null;
-                    try {
-                      await store.api.reorderObligation(
-                        c.id,
-                        previousId: previousId,
-                        nextId: nextId,
-                      );
-                      onMutated?.call();
-                    } catch (err) {
-                      if (innerContext.mounted) {
-                        ScaffoldMessenger.of(innerContext).showSnackBar(
-                          SnackBar(content: Text('Failed to reorder: $err'), backgroundColor: MeshColors.statusHalted),
-                        );
-                      }
-                    }
-                  } : null,
+                  onMoveUp: i > 0
+                      ? () async {
+                          final previousId = i - 2 >= 0 ? list[i - 2].id : null;
+                          final nextId = list[i - 1].id;
+                          try {
+                            await store.api.reorderObligation(
+                              c.id,
+                              previousId: previousId,
+                              nextId: nextId,
+                            );
+                            onMutated?.call();
+                          } catch (err) {
+                            if (innerContext.mounted) {
+                              ScaffoldMessenger.of(innerContext).showSnackBar(
+                                SnackBar(
+                                  content: Text('Failed to reorder: $err'),
+                                  backgroundColor: MeshColors.statusHalted,
+                                ),
+                              );
+                            }
+                          }
+                        }
+                      : null,
+                  onMoveDown: i < list.length - 1
+                      ? () async {
+                          final previousId = list[i + 1].id;
+                          final nextId = i + 2 < list.length
+                              ? list[i + 2].id
+                              : null;
+                          try {
+                            await store.api.reorderObligation(
+                              c.id,
+                              previousId: previousId,
+                              nextId: nextId,
+                            );
+                            onMutated?.call();
+                          } catch (err) {
+                            if (innerContext.mounted) {
+                              ScaffoldMessenger.of(innerContext).showSnackBar(
+                                SnackBar(
+                                  content: Text('Failed to reorder: $err'),
+                                  backgroundColor: MeshColors.statusHalted,
+                                ),
+                              );
+                            }
+                          }
+                        }
+                      : null,
                 );
               },
             ),
@@ -951,7 +1038,9 @@ class _DetailViewState extends State<_DetailView> {
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
               decoration: BoxDecoration(
-                color: o.isDone ? const Color(0xFF064E3B) : const Color(0xFF450A0A),
+                color: o.isDone
+                    ? const Color(0xFF064E3B)
+                    : const Color(0xFF450A0A),
                 borderRadius: BorderRadius.circular(6),
               ),
               child: Row(
@@ -960,13 +1049,17 @@ class _DetailViewState extends State<_DetailView> {
                   Icon(
                     o.isDone ? Icons.check_circle : Icons.cancel,
                     size: 16,
-                    color: o.isDone ? const Color(0xFF34D399) : const Color(0xFFF87171),
+                    color: o.isDone
+                        ? const Color(0xFF34D399)
+                        : const Color(0xFFF87171),
                   ),
                   const SizedBox(width: 8),
                   Text(
                     'This obligation is in terminal status (${o.status.toUpperCase()}).',
                     style: TextStyle(
-                      color: o.isDone ? const Color(0xFF34D399) : const Color(0xFFF87171),
+                      color: o.isDone
+                          ? const Color(0xFF34D399)
+                          : const Color(0xFFF87171),
                       fontSize: 12,
                       fontWeight: FontWeight.w600,
                     ),

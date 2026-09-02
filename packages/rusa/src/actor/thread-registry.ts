@@ -36,6 +36,12 @@ export interface PendingMessageDelivery {
   body: string;
   deliverAt: string;
   sessionId?: string;
+  /**
+   * Set once `recordChat` has minted a durable message id for this delivery.
+   * A retry after a later failure (e.g. inbox append) reuses it instead of
+   * recording the chat/events a second time.
+   */
+  deliveredMessageId?: string;
 }
 
 /**

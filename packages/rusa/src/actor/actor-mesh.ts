@@ -692,11 +692,20 @@ export class ActorMesh {
     }
 
     if (this.osScheduler) {
-      for (const id of this.osScheduler.listMessageDeliveries()) {
-        if (!validIds.has(id)) {
-          this.osScheduler.cancelMessageDelivery(id);
-          this.log(`cancelled orphaned scheduled message ${id}`);
+      try {
+        for (const id of this.osScheduler.listMessageDeliveries()) {
+          if (!validIds.has(id)) {
+            this.osScheduler.cancelMessageDelivery(id);
+            this.log(`cancelled orphaned scheduled message ${id}`);
+          }
         }
+      } catch (err) {
+        // A real OS-scheduler IO failure here must not abort the rest of
+        // boot reconciliation — every message above is already re-armed (or
+        // its own failure already logged); only the orphan sweep is skipped.
+        this.log(
+          `failed to reconcile orphaned scheduled messages: ${err instanceof Error ? err.message : String(err)}`
+        );
       }
     }
   }
@@ -2980,7 +2989,16 @@ export class ActorMesh {
     if (!scheduled) return;
 
     this.pendingDeliveryTimers.delete(messageId);
-    if (this.osScheduler) this.osScheduler.cancelMessageDelivery(messageId);
+    try {
+      this.osScheduler?.cancelMessageDelivery(messageId);
+    } catch (err) {
+      // The one-shot job already fired and called back into us; failing to
+      // clear its own OS-side record must not abort delivery/recovery below —
+      // an already-consumed job has nothing left to re-fire spuriously.
+      this.log(
+        `cancelMessageDelivery failed for ${messageId}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
 
     try {
       if (rec.status !== "active") {
@@ -2994,13 +3012,28 @@ export class ActorMesh {
 
       const target = this.live.get(toId);
 
-      const durableMessageId = this.recordMessageEmitted({
-        fromId: scheduled.fromId,
-        toId,
-        body: scheduled.body,
-        sessionId: scheduled.sessionId,
-        isDrop: false,
-      });
+      // Exact-once at the durable boundary: once recordChat has minted a real
+      // message id, a retry (triggered by a later failure, e.g. inboxStore
+      // append) must reuse it rather than recording the chat/events a second
+      // time. Persist it onto the pending record before the next fallible
+      // step so a retry after that step's failure still sees it.
+      let durableMessageId = scheduled.deliveredMessageId;
+      if (!durableMessageId) {
+        durableMessageId = this.recordMessageEmitted({
+          fromId: scheduled.fromId,
+          toId,
+          body: scheduled.body,
+          sessionId: scheduled.sessionId,
+          isDrop: false,
+        });
+        if (durableMessageId) {
+          this.registry.patch(toId, {
+            pendingDeliveries: rec.pendingDeliveries?.map((m) =>
+              m.id === messageId ? { ...m, deliveredMessageId: durableMessageId } : m
+            ),
+          });
+        }
+      }
 
       if (target && this.inboxStore) {
         if (!durableMessageId) {

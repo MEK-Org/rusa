@@ -57,7 +57,12 @@ import {
   type RunAbandonedPayload,
   runEndPayload,
 } from "../actor/mesh-events.js";
-import { DefaultOsScheduler, execAtIo } from "../actor/os-scheduler.js";
+import {
+  DefaultOsScheduler,
+  execAtIo,
+  preflightAt,
+  unavailableAtIo,
+} from "../actor/os-scheduler.js";
 import {
   assemblePortableContext,
   assemblePortableContextV2,
@@ -2062,10 +2067,28 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const wakeToken = ensureWakeToken(mcHome);
   writeWakePort(mcHome, mcpHttp.boundPort);
 
-  const osScheduler = new DefaultOsScheduler(execCrontabIo(), execAtIo(), {
-    tokenFile: wakeTokenPath(mcHome),
-    portFile: wakePortPath(mcHome),
-  });
+  // `at`/atd is an optional one-shot facility: cron-only recurrences must
+  // keep working even when it's missing, so boot never refuses to start over
+  // it — only warns loudly. `execAtIo()` stays fail-visible for a live atq
+  // that actually errors; `unavailableAtIo()` instead avoids ever calling the
+  // confirmed-missing binary, so the first attempt to schedule a completion-
+  // interval activation or a scheduled message fails with the named
+  // prerequisite error, and boot-time reconciliation (which tolerates a
+  // per-item OS scheduler failure) simply finds no `at` jobs to re-derive.
+  const atPreflight = preflightAt();
+  if (!atPreflight.ok) {
+    console.warn(
+      `[start] \`at\` scheduling unavailable — cron-only recurrences still work, but completion-interval obligations and scheduled messages will fail until this is fixed: ${atPreflight.issues.join("; ")}`
+    );
+  }
+  const osScheduler = new DefaultOsScheduler(
+    execCrontabIo(),
+    atPreflight.ok ? execAtIo() : unavailableAtIo(atPreflight.issues),
+    {
+      tokenFile: wakeTokenPath(mcHome),
+      portFile: wakePortPath(mcHome),
+    }
+  );
   getRepositories().setOsScheduler(osScheduler);
   mesh.setOsScheduler(osScheduler);
 

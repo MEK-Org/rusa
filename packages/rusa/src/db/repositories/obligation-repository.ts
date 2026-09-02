@@ -269,6 +269,58 @@ export class ObligationRepository {
 
   private osScheduler?: OsScheduler;
 
+  /**
+   * Obligation ids whose OS scheduler job needs re-deriving once the current
+   * `mutate()` transaction commits. `spawnSync`-backed cron/`at` writes are
+   * not transactional — calling them from inside `db.transaction()` risks a
+   * committed job for a policy the database then rolls back, or a torn-down
+   * job for a policy the database keeps. Recording the id and reconciling it
+   * against the *committed* row afterward keeps the OS job derived from
+   * durable truth instead of racing it.
+   */
+  private dirtyScheduleIds = new Set<string>();
+
+  private markScheduleDirty(id: string): void {
+    if (this.osScheduler) this.dirtyScheduleIds.add(id);
+  }
+
+  /** Re-derive `id`'s OS scheduler job from its committed row. */
+  private reconcileObligationSchedule(id: string): void {
+    if (!this.osScheduler) return;
+    const row = this.db
+      .prepare(
+        `SELECT status, recurrence_policy, recurrence_cron, next_ready_at FROM obligations WHERE id = ?`
+      )
+      .get(id) as
+      | {
+          status: string;
+          recurrence_policy: string | null;
+          recurrence_cron: string | null;
+          next_ready_at: string | null;
+        }
+      | undefined;
+
+    if (
+      row &&
+      row.recurrence_policy === "cron" &&
+      row.recurrence_cron &&
+      row.status !== "cancelled" &&
+      row.status !== "done"
+    ) {
+      this.osScheduler.scheduleObligationActivation(id, {
+        kind: "cron",
+        cronExpr: row.recurrence_cron,
+      });
+    } else if (row && row.status === "scheduled" && row.next_ready_at) {
+      this.osScheduler.scheduleObligationActivation(id, {
+        kind: "at",
+        date: new Date(row.next_ready_at),
+      });
+    } else {
+      this.osScheduler.cancelObligationActivation(id);
+    }
+  }
+
   setOsScheduler(scheduler: OsScheduler): void {
     this.osScheduler = scheduler;
   }
@@ -296,35 +348,54 @@ export class ObligationRepository {
       recurrence_cron: string | null;
       next_ready_at: string | null;
     }[]) {
-      if (
-        row.recurrence_policy === "cron" &&
-        row.recurrence_cron &&
-        row.status !== "cancelled" &&
-        row.status !== "done"
-      ) {
-        validIds.add(row.id);
-        this.osScheduler.scheduleObligationActivation(row.id, {
-          kind: "cron",
-          cronExpr: row.recurrence_cron,
-        });
-      } else if (row.status === "scheduled" && row.next_ready_at) {
-        const nextDate = new Date(row.next_ready_at);
-        if (nextDate.getTime() <= this.now()) {
-          this.activateScheduled(row.id);
-        } else {
+      try {
+        if (
+          row.recurrence_policy === "cron" &&
+          row.recurrence_cron &&
+          row.status !== "cancelled" &&
+          row.status !== "done"
+        ) {
           validIds.add(row.id);
           this.osScheduler.scheduleObligationActivation(row.id, {
-            kind: "at",
-            date: nextDate,
+            kind: "cron",
+            cronExpr: row.recurrence_cron,
           });
+        } else if (row.status === "scheduled" && row.next_ready_at) {
+          const nextDate = new Date(row.next_ready_at);
+          if (nextDate.getTime() <= this.now()) {
+            this.activateScheduled(row.id);
+          } else {
+            validIds.add(row.id);
+            this.osScheduler.scheduleObligationActivation(row.id, {
+              kind: "at",
+              date: nextDate,
+            });
+          }
         }
+      } catch (err) {
+        // One row's OS scheduler failure — e.g. `at` confirmed unavailable at
+        // boot (AtUnavailableError) — must not abort reconciliation for every
+        // other row, cron-backed or not, queued behind it.
+        console.warn(
+          `[obligations] failed to reconcile scheduled activation for ${row.id}: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
       }
     }
 
-    for (const id of this.osScheduler.listObligationActivations()) {
-      if (!validIds.has(id)) {
-        this.osScheduler.cancelObligationActivation(id);
+    try {
+      for (const id of this.osScheduler.listObligationActivations()) {
+        if (!validIds.has(id)) {
+          this.osScheduler.cancelObligationActivation(id);
+        }
       }
+    } catch (err) {
+      console.warn(
+        `[obligations] failed to reconcile orphaned OS-scheduled activations: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
     }
   }
 
@@ -428,6 +499,7 @@ export class ObligationRepository {
    */
   private mutate<T>(work: () => T): T {
     const changes: ReadyHeadChange[] = [];
+    this.dirtyScheduleIds.clear();
     const result = this.db.transaction(() => {
       const before = this.readyHeads();
       const res = work();
@@ -501,6 +573,15 @@ export class ObligationRepository {
           );
         }
       }
+    }
+
+    // OS scheduler side effects run only now, against the state the
+    // transaction actually committed — never inside it, where a later
+    // rollback couldn't take them back with it.
+    const toReconcile = Array.from(this.dirtyScheduleIds);
+    this.dirtyScheduleIds.clear();
+    for (const id of toReconcile) {
+      this.reconcileObligationSchedule(id);
     }
 
     return result;
@@ -587,10 +668,7 @@ export class ObligationRepository {
               : null
           );
         if (input.recurrence?.policy === "cron") {
-          this.osScheduler?.scheduleObligationActivation(id, {
-            kind: "cron",
-            cronExpr: input.recurrence.cronExpr,
-          });
+          this.markScheduleDirty(id);
         }
       } catch (error) {
         if (
@@ -1226,10 +1304,7 @@ export class ObligationRepository {
           .run(nextReadyAt, completedAt, id);
 
         if (obligation.recurrencePolicy === "completion_interval" && nextReadyAt) {
-          this.osScheduler?.scheduleObligationActivation(id, {
-            kind: "at",
-            date: new Date(nextReadyAt),
-          });
+          this.markScheduleDirty(id);
         }
       } else {
         // Reached for `cancelled` (any recurrence) or `done` with no
@@ -1246,7 +1321,7 @@ export class ObligationRepository {
           )
           .run(status, normalizeTerminalNote(note), resolution, completedAt, id);
 
-        this.osScheduler?.cancelObligationActivation(id);
+        this.markScheduleDirty(id);
       }
 
       if (obligation.parentId !== null) this.reReadyParentIfUnblocked(obligation.parentId);
@@ -1309,7 +1384,6 @@ export class ObligationRepository {
             )
             .run(this.stamp(), id);
         }
-        this.osScheduler?.cancelObligationActivation(id);
       } else if (recurrence.policy === "cron") {
         // A currently-scheduled row must keep a non-null next_ready_at in the
         // very statement that changes its policy, or the CHECK constraint
@@ -1324,10 +1398,6 @@ export class ObligationRepository {
             `UPDATE obligations SET next_ready_at = ?, recurrence_policy = 'cron', recurrence_cron = ?, recurrence_interval_seconds = NULL, updated_at = ? WHERE id = ?`
           )
           .run(nextReadyAt, recurrence.cronExpr, this.stamp(), id);
-        this.osScheduler?.scheduleObligationActivation(id, {
-          kind: "cron",
-          cronExpr: recurrence.cronExpr,
-        });
       } else if (recurrence.policy === "completion_interval") {
         if (obligation.status === "scheduled") {
           const lastCompletion = this.db
@@ -1345,7 +1415,6 @@ export class ObligationRepository {
                   `UPDATE obligations SET status = 'ready', next_ready_at = NULL, recurrence_policy = 'completion_interval', recurrence_cron = NULL, recurrence_interval_seconds = ?, updated_at = ? WHERE id = ?`
                 )
                 .run(recurrence.intervalSeconds, this.stamp(), id);
-              this.osScheduler?.cancelObligationActivation(id);
             } else {
               const nextReadyAt = new Date(readyTime).toISOString();
               this.db
@@ -1353,10 +1422,6 @@ export class ObligationRepository {
                   `UPDATE obligations SET next_ready_at = ?, recurrence_policy = 'completion_interval', recurrence_cron = NULL, recurrence_interval_seconds = ?, updated_at = ? WHERE id = ?`
                 )
                 .run(nextReadyAt, recurrence.intervalSeconds, this.stamp(), id);
-              this.osScheduler?.scheduleObligationActivation(id, {
-                kind: "at",
-                date: new Date(readyTime),
-              });
             }
           }
         } else {
@@ -1365,9 +1430,9 @@ export class ObligationRepository {
               `UPDATE obligations SET recurrence_policy = 'completion_interval', recurrence_cron = NULL, recurrence_interval_seconds = ?, updated_at = ? WHERE id = ?`
             )
             .run(recurrence.intervalSeconds, this.stamp(), id);
-          this.osScheduler?.cancelObligationActivation(id);
         }
       }
+      this.markScheduleDirty(id);
       return this.require(id);
     });
   }

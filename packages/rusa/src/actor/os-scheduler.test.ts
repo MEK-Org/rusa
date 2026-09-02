@@ -1,6 +1,12 @@
 import { spawnSync } from "node:child_process";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { type AtIo, DefaultOsScheduler, execAtIo } from "./os-scheduler.js";
+import {
+  type AtIo,
+  AtUnavailableError,
+  DefaultOsScheduler,
+  execAtIo,
+  unavailableAtIo,
+} from "./os-scheduler.js";
 import type { CrontabIo } from "./wake-cron.js";
 
 vi.mock("node:child_process", () => {
@@ -172,5 +178,58 @@ describe("execAtIo", () => {
   it("remove() surfaces a real atrm IO failure", () => {
     mockedSpawnSync.mockReturnValue(result({ status: 1, stderr: "permission denied\n" }));
     expect(() => execAtIo().remove("5")).toThrow(/atrm 5 failed/);
+  });
+});
+
+describe("unavailableAtIo", () => {
+  it("list() reports no jobs instead of ever calling a confirmed-missing binary", () => {
+    expect(unavailableAtIo(["`at` CLI not found — install at"]).list()).toEqual([]);
+  });
+
+  it("schedule() raises the named prerequisite error instead of a raw spawnSync ENOENT", () => {
+    const io = unavailableAtIo(["`at` CLI not found — install at"]);
+    expect(() => io.schedule("script", new Date())).toThrow(AtUnavailableError);
+    expect(() => io.schedule("script", new Date())).toThrow(/at` CLI not found/);
+  });
+
+  it("remove() also raises the named prerequisite error", () => {
+    const io = unavailableAtIo(["atd daemon not detected"]);
+    expect(() => io.remove("5")).toThrow(AtUnavailableError);
+  });
+});
+
+describe("DefaultOsScheduler with an unavailable `at` facility", () => {
+  it("keeps cron scheduling working — a pure cron activation never touches `at`", () => {
+    let cronData = "";
+    const cron: CrontabIo = {
+      read: () => cronData,
+      write: (data) => {
+        cronData = data;
+      },
+    };
+    const scheduler = new DefaultOsScheduler(cron, unavailableAtIo(["at missing"]), {
+      tokenFile: "/token",
+      portFile: "/port",
+    });
+
+    expect(() =>
+      scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" })
+    ).not.toThrow();
+    expect(cronData).toContain("# mc-obligation-activation:ob-1");
+
+    expect(() => scheduler.cancelObligationActivation("ob-1")).not.toThrow();
+    expect(cronData).not.toContain("# mc-obligation-activation:ob-1");
+  });
+
+  it("fails a completion-interval (at-kind) activation with the named prerequisite error", () => {
+    const cron: CrontabIo = { read: () => "", write: () => {} };
+    const scheduler = new DefaultOsScheduler(cron, unavailableAtIo(["at missing"]), {
+      tokenFile: "/token",
+      portFile: "/port",
+    });
+
+    expect(() =>
+      scheduler.scheduleObligationActivation("ob-1", { kind: "at", date: new Date() })
+    ).toThrow(AtUnavailableError);
   });
 });
