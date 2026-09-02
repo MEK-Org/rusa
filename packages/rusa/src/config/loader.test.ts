@@ -1079,3 +1079,16 @@ describe("loadConfig chat.excludedSpaces ", () => {
     );
   });
 });
+
+describe("loadConfig antigravity effort", () => {
+  it("fails when antigravity model pin is missing effort", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          providers: { antigravity: { cliCommand: "agy" } },
+          rootActor: { provider: "antigravity", model: "gemini-3.7-flash" },
+        })
+      )
+    ).toThrow(/provider "agy" requires an explicit reasoning effort/);
+  });
+});

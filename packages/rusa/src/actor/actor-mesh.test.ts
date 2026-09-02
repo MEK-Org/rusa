@@ -8,6 +8,7 @@ import type { IssueClient } from "../gitops/issue-client.js";
 import { MESH_SYSTEM, resolveStampedAuthor } from "../mcp/stamp.js";
 import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
 import { FakeProvider } from "../providers/fake-provider.js";
+import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { Actor } from "./actor.js";
 import type {
@@ -738,10 +739,11 @@ describe("ActorMesh", () => {
     });
     const record = registry.get(id);
     expect(record?.provider).toBe("antigravity");
-    expect(record?.model).toBe("Gemini 3.7 Flash (High)");
+    expect(record?.model).toBe("Gemini 3.7 Flash");
+    expect(record?.effort).toBe("high");
     const spawnEvent = events.find((e) => e.kind === "actor_spawned" && e.actorId === id);
     expect(spawnEvent).toBeDefined();
-    expect(spawnEvent?.body).toBe("provider=antigravity model=Gemini 3.7 Flash (High)");
+    expect(spawnEvent?.body).toBe("provider=antigravity model=Gemini 3.7 Flash effort=high");
   });
 
   it("revokes parent handle and marks record retired when createActor throws on spawn", () => {
@@ -2965,12 +2967,17 @@ describe("ActorMesh", () => {
     const validations: Array<{ recordId: string; newModel?: string; newProvider?: string }> = [];
     const { mesh, registry, tick } = setup({
       events: (event) => events.push(event),
-      validateModel: (record, newModel, newProvider) => {
+      validateModel: (record, newModel, newProvider, newEffort) => {
         validations.push({ recordId: record.id, newModel, newProvider });
         if (newProvider === "antigravity" && newModel === "invalid-model") {
           throw new Error("invalid model for antigravity");
         }
-        return { model: newModel };
+        const sel = normalizeModelEffortSelection(
+          (newProvider ?? record.provider) as string,
+          newModel,
+          newEffort
+        );
+        return { model: sel.model, effort: sel.effort };
       },
     });
 
@@ -2986,22 +2993,24 @@ describe("ActorMesh", () => {
     expect(registry.get(ledgerChild)?.provider).toBe("claude");
     expect(registry.get(ledgerChild)?.model).toBe("claude-opus-4-8");
     expect(registry.get(ledgerChild)?.desiredProvider).toBe("antigravity");
-    expect(registry.get(ledgerChild)?.desiredModel).toBe("gemini-3.7-flash-high");
+    expect(registry.get(ledgerChild)?.desiredModel).toBe("gemini-3.7-flash");
+    expect(registry.get(ledgerChild)?.desiredEffort).toBe("high");
     mesh.sendMessage(ledgerChild, "apply staged provider", "root");
     await tick();
     expect(registry.get(ledgerChild)?.provider).toBe("antigravity");
-    expect(registry.get(ledgerChild)?.model).toBe("gemini-3.7-flash-high");
+    expect(registry.get(ledgerChild)?.model).toBe("gemini-3.7-flash");
+    expect(registry.get(ledgerChild)?.effort).toBe("high");
     expect(registry.get(ledgerChild)?.desiredModel).toBeUndefined();
     expect(validations).toContainEqual({
       recordId: ledgerChild,
-      newModel: "gemini-3.7-flash-high",
+      newModel: "gemini-3.7-flash",
       newProvider: "antigravity",
     });
     expect(events).toContainEqual(
       expect.objectContaining({
         kind: "actor_model_set",
         actorId: ledgerChild,
-        detail: "claude:claude-opus-4-8 -> antigravity:gemini-3.7-flash-high",
+        detail: "claude:claude-opus-4-8 -> antigravity:gemini-3.7-flash @ high",
       })
     );
 
@@ -5201,5 +5210,69 @@ describe("ActorMesh", () => {
 
       expect(woken).toEqual([steward]);
     });
+  });
+
+  it("canonicalizes antigravity effort on spawn, update, and restart", async () => {
+    const { registry, mesh } = setup();
+
+    // 1. Spawn
+    // Tier match
+    const workerMatch = mesh.spawn({
+      charter: "match test",
+      parentId: "root",
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash (High)",
+    });
+    const registryMatch = registry.get(workerMatch);
+    expect(registryMatch?.model).toBe("Gemini 3.7 Flash");
+    expect(registryMatch?.effort).toBe("high");
+
+    // Tier/effort conflict
+    expect(() => {
+      mesh.spawn({
+        charter: "conflict test",
+        parentId: "root",
+        provider: "antigravity",
+        model: "Gemini 3.7 Flash (High)",
+        effort: "low",
+      });
+    }).toThrow(/conflicting reasoning efforts/);
+
+    // 2. Update (setActorModel)
+    const updateWorker = mesh.spawn({
+      charter: "update test",
+      parentId: "root",
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "low",
+    });
+
+    // Changing model with inline effort
+    mesh.setActorModel(updateWorker, "Gemini 3.7 Flash (High)", "root");
+    const registryUpdate = registry.get(updateWorker);
+    expect(registryUpdate?.desiredModel).toBe("Gemini 3.7 Flash");
+    expect(registryUpdate?.desiredEffort).toBe("high");
+
+    // Conflicting effort in update
+    expect(() => {
+      mesh.setActorModel(updateWorker, "Gemini 3.7 Flash (High)", "root", undefined, "low");
+    }).toThrow(/conflicting reasoning efforts/);
+
+    // 3. Restart / Rehydrate
+    const restartWorker = mesh.spawn({
+      charter: "restart test",
+      parentId: "root",
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash (High)",
+    });
+
+    mesh.shutdownAll();
+
+    const { mesh: mesh2 } = setup();
+    Object.assign(mesh2, { registry });
+    mesh2.rehydrateAll();
+    const registryRestart = registry.get(restartWorker);
+    expect(registryRestart?.model).toBe("Gemini 3.7 Flash");
+    expect(registryRestart?.effort).toBe("high");
   });
 });

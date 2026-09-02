@@ -17,11 +17,12 @@ function configWith(rootActor?: RusaConfig["rootActor"]): RusaConfig {
 }
 
 describe("resolveRootProvider", () => {
-  it("defaults to agy (antigravity) with no model when rootActor is unset", () => {
+  it("defaults to agy (antigravity) with explicit effort when rootActor is unset", () => {
     const provider = resolveRootProvider(configWith());
     expect(provider.providerName).toBe(DEFAULT_ROOT_PROVIDER);
     expect(provider.providerName).toBe("antigravity");
     expect(provider.model).toBeUndefined();
+    expect(provider.effort).toBe("high");
   });
 
   it("honors an explicit provider and model", () => {
@@ -46,6 +47,7 @@ describe("resolveRootProvider", () => {
     const provider = resolveRootProvider(configWith({ provider: "claude" }));
     expect(provider.providerName).toBe("claude");
     expect(provider.model).toBeUndefined();
+    expect(provider.effort).toBeUndefined();
     expect(provider.name).toBe("claude");
   });
 
@@ -64,6 +66,7 @@ describe("resolveProvider", () => {
   it("resolves with the provider's default model when none is requested", () => {
     const provider = resolveProvider(configWith(), "claude");
     expect(provider.model).toBeUndefined();
+    expect(provider.effort).toBeUndefined();
   });
 
   it("hard-errors on an empty requested model instead of silently using the provider default ", () => {

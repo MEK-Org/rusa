@@ -35,7 +35,7 @@ export function normalizeModelEffortSelection(
   const explicitEffort =
     rawEffort === undefined || rawEffort === null ? undefined : normalizeReasoningEffort(rawEffort);
 
-  if (provider !== "codex" && provider !== "agy") {
+  if (provider !== "codex" && provider !== "agy" && provider !== "antigravity") {
     return { model, effort: explicitEffort };
   }
   if (!model) {
@@ -68,7 +68,7 @@ export function normalizeModelEffortSelection(
     };
   }
 
-  // provider === "agy"
+  // provider === "agy" || provider === "antigravity"
   const AGY_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
   let parsedBase = model;
   let parsedEffort: string | undefined;
@@ -116,7 +116,7 @@ export function validateReasoningEffort(
   effort: string | undefined,
   supportedEfforts: readonly string[] | undefined
 ): void {
-  if (provider === "agy" && effort === undefined) {
+  if ((provider === "agy" || provider === "antigravity") && effort === undefined) {
     throw new Error(
       `provider "agy" requires an explicit reasoning effort, either in the model pin or as a separate effort selection`
     );

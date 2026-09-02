@@ -48,6 +48,7 @@ function getEffectiveProviderConfig(
 
 /** Default root provider when `config.rootActor` is unset — `agy` (Antigravity). */
 export const DEFAULT_ROOT_PROVIDER = "antigravity";
+export const DEFAULT_ROOT_EFFORT = "high";
 
 /** The native CLI capability family behind a logical provider config key. */
 export function providerCapabilityName(providerName: string, config: RusaConfig): string {
@@ -91,7 +92,7 @@ export function validateProviderSelection(
       allowedEfforts = validation.efforts;
     }
   }
-  validateReasoningEffort(providerName, selection.model, selection.effort, allowedEfforts);
+  validateReasoningEffort(capabilityName, selection.model, selection.effort, allowedEfforts);
   return selection;
 }
 
@@ -104,11 +105,12 @@ export function validateProviderSelection(
  */
 export function resolveRootProvider(config: RusaConfig): CodingProvider {
   const providerName = config.rootActor?.provider?.trim() || DEFAULT_ROOT_PROVIDER;
+  const isDefaultRoot = !config.rootActor?.provider?.trim();
   const selection = validateProviderSelection(
     config,
     providerName,
     config.rootActor?.model,
-    config.rootActor?.effort
+    config.rootActor?.effort ?? (isDefaultRoot ? DEFAULT_ROOT_EFFORT : undefined)
   );
   return instantiateProvider(providerName, selection.model, selection.effort, config);
 }

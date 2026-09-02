@@ -1498,6 +1498,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         actor_id: portableChild,
         model: "gemini-3.7-flash-high",
         provider: "antigravity",
+        effort: "high",
       },
     })) as CallToolResult;
     expect(res1.isError).toBeFalsy();
@@ -1516,6 +1517,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         actor_id: nativeChild,
         model: "gemini-3.7-flash-high",
         provider: "antigravity",
+        effort: "high",
       },
     })) as CallToolResult;
     expect(res2.isError).toBe(true);
