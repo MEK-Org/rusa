@@ -100,6 +100,26 @@ describe("AntigravityProvider", () => {
     );
   });
 
+  it("rejects a required-effort model before launching agy when effort is missing", async () => {
+    setProviderModelCatalog("agy", [
+      {
+        identifier: "gemini-3.5-flash-high",
+        displayLabel: "Gemini 3.5 Flash (High)",
+        passable: true,
+      },
+    ]);
+    const provider = new AntigravityProvider(
+      "antigravity",
+      { cliCommand: "agy" },
+      "Gemini 3.5 Flash"
+    );
+
+    await expect(provider.run({ prompt: "test prompt", cwd: "/tmp" })).rejects.toThrowError(
+      'invalid model selection: model "Gemini 3.5 Flash" requires an effort but none was provided'
+    );
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it("runs agy inside bwrap when sandbox options are provided", async () => {
     const config: ProviderConfig = { cliCommand: "agy" };
     const provider = new AntigravityProvider("antigravity", config, "Gemini 3.5 Flash (Low)");
