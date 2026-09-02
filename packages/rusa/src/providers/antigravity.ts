@@ -54,8 +54,8 @@ export function buildAntigravityArgs(o: AntigravityArgsOptions): string[] {
     args.push("--add-dir", dir);
   }
 
-  let finalModel = o.model;
   if (o.model) {
+    let finalModel = o.model;
     if (o.effort) {
       if (/\s*\((low|medium|high|xhigh|max)\)$/i.test(o.model)) {
         throw new Error(
