@@ -78,18 +78,20 @@ export function validateProviderSelection(
       `empty model slug requested for provider "${providerName}" — refusing to fall back to the provider's default model `
     );
   }
+  let allowedEfforts = providerAdapters[capabilityName]?.efforts;
   if (selection.model) {
     const validation = validateModelPin(capabilityName, selection.model);
     if (validation.status === "unknown") {
       console.warn(`[model-catalog] ${validation.warning}`);
+    } else if (
+      validation.status === "accepted" &&
+      validation.efforts &&
+      validation.efforts.length > 0
+    ) {
+      allowedEfforts = validation.efforts;
     }
   }
-  validateReasoningEffort(
-    providerName,
-    selection.model,
-    selection.effort,
-    providerAdapters[capabilityName]?.efforts
-  );
+  validateReasoningEffort(providerName, selection.model, selection.effort, allowedEfforts);
   return selection;
 }
 

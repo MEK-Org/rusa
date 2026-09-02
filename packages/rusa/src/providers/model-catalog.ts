@@ -20,6 +20,11 @@ export interface ModelEntry {
    * (e.g. agy's "Gemini Flash" / "Gemini Pro"). Defaults to true when omitted.
    */
   passable?: boolean;
+  /**
+   * Allowed reasoning efforts for this specific model, if it exposes a discrete
+   * set of supported effort levels.
+   */
+  efforts?: string[];
 }
 
 export type ModelCommandLineField = keyof ModelEntry;
@@ -297,6 +302,48 @@ export function normalizeModelEntries(
     }
     return normalized;
   }
+  if (provider === "agy" || provider === "antigravity") {
+    const AGY_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+    const baseModels = new Map<string, ModelEntry>();
+
+    for (const entry of entries) {
+      let parsedBase = entry.identifier;
+      let parsedEffort: string | undefined;
+
+      const slugRe = new RegExp(`-(${AGY_EFFORTS.join("|")})$`, "i");
+      const match = entry.identifier.match(slugRe);
+      if (match) {
+        parsedBase = entry.identifier.replace(slugRe, "").trim();
+        parsedEffort = match[1].toLowerCase();
+      }
+
+      let parsedDisplay = entry.displayLabel;
+      const displayRe = new RegExp(`\\s*\\((${AGY_EFFORTS.join("|")})\\)$`, "i");
+      const displayMatch = entry.displayLabel.match(displayRe);
+      if (displayMatch) {
+        parsedDisplay = entry.displayLabel.replace(displayRe, "").trim();
+        if (!parsedEffort) parsedEffort = displayMatch[1].toLowerCase();
+      }
+
+      let existing = baseModels.get(parsedBase);
+      if (!existing) {
+        existing = {
+          identifier: parsedBase,
+          displayLabel: parsedDisplay,
+          ...(entry.passable !== undefined ? { passable: entry.passable } : {}),
+          efforts: [],
+        };
+        baseModels.set(parsedBase, existing);
+      } else {
+        if (entry.passable !== undefined) existing.passable = entry.passable;
+      }
+
+      if (parsedEffort && existing.efforts && !existing.efforts.includes(parsedEffort)) {
+        existing.efforts.push(parsedEffort);
+      }
+    }
+    return Array.from(baseModels.values());
+  }
   return [...entries];
 }
 
@@ -343,7 +390,9 @@ export function populateModelCatalogsFromDb(repo: {
   }
 }
 
-export type ModelPinValidation = { status: "accepted" } | { status: "unknown"; warning: string };
+export type ModelPinValidation =
+  | { status: "accepted"; efforts?: string[] }
+  | { status: "unknown"; warning: string };
 
 /**
  * Validate locally before constructing a provider. Absent and empty catalogs
@@ -361,19 +410,22 @@ export function validateModelPin(provider: string, pin: string): ModelPinValidat
   }
 
   const passableEntries = entries.filter((entry) => entry.passable !== false);
-  let isMatch = passableEntries.some(
+  let matchedEntry = passableEntries.find(
     (entry) => entry.identifier === pin || entry.displayLabel === pin
   );
+  let isMatch = !!matchedEntry;
+
   if (!isMatch && provider === "codex") {
     const { model: pinModel } = parseCodexModel(pin);
     if (pinModel) {
-      isMatch = passableEntries.some(
+      matchedEntry = passableEntries.find(
         (entry) =>
           entry.identifier === pinModel ||
           entry.displayLabel === pinModel ||
           parseCodexModel(entry.identifier).model === pinModel ||
           parseCodexModel(entry.displayLabel).model === pinModel
       );
+      isMatch = !!matchedEntry;
     }
   }
   if (!isMatch) {
@@ -386,7 +438,7 @@ export function validateModelPin(provider: string, pin: string): ModelPinValidat
       `model pin validation failed for provider "${provider}": rejected "${pin}"; acceptable values: ${acceptable.length > 0 ? acceptable.map((value) => `"${value}"`).join(", ") : "(none)"}`
     );
   }
-  return { status: "accepted" };
+  return { status: "accepted", efforts: matchedEntry?.efforts };
 }
 
 /**

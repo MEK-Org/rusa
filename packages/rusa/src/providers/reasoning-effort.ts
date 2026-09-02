@@ -34,32 +34,73 @@ export function normalizeModelEffortSelection(
   const model = rawModel?.trim() || undefined;
   const explicitEffort =
     rawEffort === undefined || rawEffort === null ? undefined : normalizeReasoningEffort(rawEffort);
-  if (provider !== "codex" || !model) {
+
+  if (provider !== "codex" && provider !== "agy") {
+    return { model, effort: explicitEffort };
+  }
+  if (!model) {
     return { model, effort: explicitEffort };
   }
 
-  const parsed = parseCodexModel(model);
-  const legacyEffort = parsed.reasoningEffort
-    ? normalizeReasoningEffort(parsed.reasoningEffort)
-    : undefined;
-  if (parsed.model !== model && legacyEffort === undefined) {
+  if (provider === "codex") {
+    const parsed = parseCodexModel(model);
+    const legacyEffort = parsed.reasoningEffort
+      ? normalizeReasoningEffort(parsed.reasoningEffort)
+      : undefined;
+    if (parsed.model !== model && legacyEffort === undefined) {
+      throw new Error(
+        `unrecognized legacy Codex model qualifier in "${model}"; pass the model slug and effort as separate settings`
+      );
+    }
+    if (rawEffort === null && legacyEffort) {
+      throw new Error(
+        `conflicting reasoning efforts for provider "codex": model pin carries "${legacyEffort}" but effort explicitly restores the provider default`
+      );
+    }
+    if (explicitEffort && legacyEffort && explicitEffort !== legacyEffort) {
+      throw new Error(
+        `conflicting reasoning efforts for provider "codex": model pin carries "${legacyEffort}" but effort is "${explicitEffort}"`
+      );
+    }
+    return {
+      model: parsed.model,
+      effort: explicitEffort ?? legacyEffort,
+    };
+  }
+
+  // provider === "agy"
+  const AGY_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+  let parsedBase = model;
+  let parsedEffort: string | undefined;
+
+  const effortRe = new RegExp(`\\s*\\((${AGY_EFFORTS.join("|")})\\)$`, "i");
+  let match = model.match(effortRe);
+  if (match) {
+    parsedBase = model.replace(effortRe, "").trim();
+    parsedEffort = normalizeReasoningEffort(match[1]);
+  } else {
+    const slugRe = new RegExp(`-(${AGY_EFFORTS.join("|")})$`, "i");
+    match = model.match(slugRe);
+    if (match) {
+      parsedBase = model.replace(slugRe, "").trim();
+      parsedEffort = normalizeReasoningEffort(match[1]);
+    }
+  }
+
+  if (rawEffort === null && parsedEffort) {
     throw new Error(
-      `unrecognized legacy Codex model qualifier in "${model}"; pass the model slug and effort as separate settings`
+      `conflicting reasoning efforts for provider "agy": model pin carries "${parsedEffort}" but effort explicitly restores the provider default`
     );
   }
-  if (rawEffort === null && legacyEffort) {
+  if (explicitEffort && parsedEffort && explicitEffort !== parsedEffort) {
     throw new Error(
-      `conflicting reasoning efforts for provider "codex": model pin carries "${legacyEffort}" but effort explicitly restores the provider default`
+      `conflicting reasoning efforts for provider "agy": model pin carries "${parsedEffort}" but effort is "${explicitEffort}"`
     );
   }
-  if (explicitEffort && legacyEffort && explicitEffort !== legacyEffort) {
-    throw new Error(
-      `conflicting reasoning efforts for provider "codex": model pin carries "${legacyEffort}" but effort is "${explicitEffort}"`
-    );
-  }
+
   return {
-    model: parsed.model,
-    effort: explicitEffort ?? legacyEffort,
+    model: parsedBase,
+    effort: explicitEffort ?? parsedEffort,
   };
 }
 
@@ -75,6 +116,11 @@ export function validateReasoningEffort(
   effort: string | undefined,
   supportedEfforts: readonly string[] | undefined
 ): void {
+  if (provider === "agy" && effort === undefined) {
+    throw new Error(
+      `provider "agy" requires an explicit reasoning effort, either in the model pin or as a separate effort selection`
+    );
+  }
   if (effort === undefined) return;
   const normalized = normalizeReasoningEffort(effort);
   if (!supportedEfforts) {
