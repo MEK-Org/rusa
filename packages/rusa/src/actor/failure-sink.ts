@@ -189,9 +189,7 @@ export async function routeRunFailure(
 /** Responsive inbox preemption is intentional scheduling, not a supervisor failure. */
 export function isResponsivePreemption(result: RunResult): boolean {
   return Boolean(
-    result.cancelled &&
-      result.interrupted &&
-      result.output?.includes("[Task interrupted by responsive-notification]")
+    result.cancelled && result.interrupted && result.interruptSource === "responsive-notification"
   );
 }
 
@@ -239,14 +237,11 @@ function scrubJson(value: unknown): unknown {
  * Top-level error chat reporting suppresses notices for operator-initiated interrupts.
  */
 export function isHumanOperatorCancelled(result: RunResult): boolean {
-  if (result.output) {
-    const interruptMatch = result.output.match(/\[Task (?:interrupted|cancelled) by ([^\]]+)\]/i);
-    if (interruptMatch) {
-      const by = interruptMatch[1].trim().toLowerCase();
-      return (
-        by === "human:operator" || by === "operator" || by === "human" || by.startsWith("human:")
-      );
-    }
+  if (result.interruptSource) {
+    const by = result.interruptSource.toLowerCase();
+    return (
+      by === "human:operator" || by === "operator" || by === "human" || by.startsWith("human:")
+    );
   }
   if (result.interrupted) {
     return true;
