@@ -91,58 +91,59 @@ void main() {
     },
   );
 
-  testWidgets('renders the mobile (~390px) master-detail list + detail ', (
-    tester,
-  ) async {
-    await tester.runAsync(() async {
-      final ids = _seedIds();
-      HttpOverrides.global = _FakeImageHttpOverrides(await _portraits(ids));
-      addTearDown(() => HttpOverrides.global = null);
+  testWidgets(
+    'renders the mobile (~390px) master-detail list + detail ',
+    (tester) async {
+      await tester.runAsync(() async {
+        final ids = _seedIds();
+        HttpOverrides.global = _FakeImageHttpOverrides(await _portraits(ids));
+        addTearDown(() => HttpOverrides.global = null);
 
-      final api = FakeApi()
-        ..threadsResult = _seedThreads()
-        ..eventPages = [EventPage(events: _seedEvents(), nextCursor: null)];
-      final store = DashboardStore(api: api, stream: FakeStream());
-      await store.init();
+        final api = FakeApi()
+          ..threadsResult = _seedThreads()
+          ..eventPages = [EventPage(events: _seedEvents(), nextCursor: null)];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
 
-      // A typical tall phone viewport (~390 logical px wide → narrow layout).
-      await tester.binding.setSurfaceSize(const Size(390, 844));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
+        // A typical tall phone viewport (~390 logical px wide → narrow layout).
+        await tester.binding.setSurfaceSize(const Size(390, 844));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
 
-      final key = GlobalKey();
-      await tester.pumpWidget(_mobileApp(store, key));
-      // Overview is the default landing view now; switch to Actors for the
-      // master-detail navigation captures below. At this width the header
-      // nav is horizontally scrollable and "Actors" starts off-screen
-      // (~x=389) — scroll it into view before tapping, else the tap
-      // silently misses and both shots below would capture Overview while
-      // still passing (ISSUE_NUM review).
-      await tester.ensureVisible(find.text('Actors'));
-      await tester.pump();
-      await tester.tap(find.text('Actors'));
-      await tester.pump();
-      await _settleImages(tester, _portraitUrls(ids));
+        final key = GlobalKey();
+        await tester.pumpWidget(_mobileApp(store, key));
+        // Overview is the default landing view now; switch to Actors for the
+        // master-detail navigation captures below. At this width the header
+        // nav is horizontally scrollable and "Actors" starts off-screen
+        // (~x=389) — scroll it into view before tapping, else the tap
+        // silently misses and both shots below would capture Overview while
+        // still passing (ISSUE_NUM review).
+        await tester.ensureVisible(find.text('Actors'));
+        await tester.pump();
+        await tester.tap(find.text('Actors'));
+        await tester.pump();
+        await _settleImages(tester, _portraitUrls(ids));
 
-      // 1) The full-width actor list (no actor selected → master view).
-      // Assert the actor tree actually rendered — not still Overview — so
-      // a missed nav tap fails loudly instead of silently capturing the
-      // wrong screen.
-      expect(find.byType(OverviewTab), findsNothing);
-      expect(find.byType(ActorTree), findsOneWidget);
-      await _capture(key, '$_outDir/mobile_list.png');
+        // 1) The full-width actor list (no actor selected → master view).
+        // Assert the actor tree actually rendered — not still Overview — so
+        // a missed nav tap fails loudly instead of silently capturing the
+        // wrong screen.
+        expect(find.byType(OverviewTab), findsNothing);
+        expect(find.byType(ActorTree), findsOneWidget);
+        await _capture(key, '$_outDir/mobile_list.png');
 
-      // 2) Tap an actor → full-width detail view with the back bar.
-      store.clickActor('11111111-1111-4111-8111-111111111111');
-      await _settleImages(tester, _portraitUrls(ids));
-      // Assert the actor detail panel — identified by the selected actor's
-      // handle in its header — is what's rendered before capturing.
-      expect(find.byType(DetailPanel), findsOneWidget);
-      expect(find.text('cloudy-porpoise'), findsWidgets);
-      await _capture(key, '$_outDir/mobile_detail.png');
+        // 2) Tap an actor → full-width detail view with the back bar.
+        store.clickActor('11111111-1111-4111-8111-111111111111');
+        await _settleImages(tester, _portraitUrls(ids));
+        // Assert the actor detail panel — identified by the selected actor's
+        // handle in its header — is what's rendered before capturing.
+        expect(find.byType(DetailPanel), findsOneWidget);
+        expect(find.text('cloudy-porpoise'), findsWidgets);
+        await _capture(key, '$_outDir/mobile_detail.png');
 
-      await store.dispose();
-    });
-  });
+        await store.dispose();
+      });
+    },
+  );
 
   testWidgets('renders the avatar circle/size strip (26 / 52 / 91 px)', (
     tester,

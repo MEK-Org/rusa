@@ -114,7 +114,7 @@ describe("ReferenceCacheService", () => {
       delete: vi.fn(),
     } as unknown as ReferenceCacheRepository;
 
-    let resolvePromise: (value: unknown) => void;
+    let resolvePromise!: (value: unknown) => void;
     const providerPromise = new Promise((resolve) => {
       resolvePromise = resolve;
     });

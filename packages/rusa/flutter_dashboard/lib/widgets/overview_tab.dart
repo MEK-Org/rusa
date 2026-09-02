@@ -15,7 +15,11 @@ import 'status_dot.dart';
 
 /// Overview tab: displays quota history, my obligations queue, live workers, queued actors, and yields.
 class OverviewTab extends StatefulWidget {
-  const OverviewTab({super.key, required this.store, this.onSelectView});
+  const OverviewTab({
+    super.key,
+    required this.store,
+    this.onSelectView,
+  });
 
   final DashboardStore store;
   final ValueChanged<DashboardView>? onSelectView;
@@ -23,7 +27,6 @@ class OverviewTab extends StatefulWidget {
   @override
   State<OverviewTab> createState() => _OverviewTabState();
 }
-
 class _OverviewTabState extends State<OverviewTab> {
   final TextEditingController _searchController = TextEditingController();
   String _searchQuery = '';
@@ -32,7 +35,9 @@ class _OverviewTabState extends State<OverviewTab> {
 
   Future<Map<String, dynamic>> _loadHumanQueue() async {
     final api = widget.store.api;
-    final page = await api.fetchObligations(ownerId: 'human:operator');
+    final page = await api.fetchObligations(
+      ownerId: 'human:operator',
+    );
     final ready = page.obligations.where((o) => o.isReady).toList();
     final waiting = page.obligations.where((o) => o.isWaiting).toList();
     final blockers = await Future.wait(
@@ -42,7 +47,11 @@ class _OverviewTabState extends State<OverviewTab> {
       for (var i = 0; i < waiting.length; i++)
         waiting[i].id: blockers[i].blockingChildren,
     };
-    return {'ready': ready, 'waiting': waiting, 'blockerMap': blockerMap};
+    return {
+      'ready': ready,
+      'waiting': waiting,
+      'blockerMap': blockerMap,
+    };
   }
 
   void _refreshHumanQueue() {
@@ -94,12 +103,7 @@ class _OverviewTabState extends State<OverviewTab> {
   /// Section title row: icon + title (ellipsizes first) + optional trailing
   /// counter, so long titles don't push a fixed-width counter off-screen at
   /// narrow widths.
-  Widget _sectionHeader(
-    IconData icon,
-    Color iconColor,
-    String title, {
-    Widget? trailing,
-  }) {
+  Widget _sectionHeader(IconData icon, Color iconColor, String title, {Widget? trailing}) {
     return Row(
       children: [
         Icon(icon, size: 18, color: iconColor),
@@ -174,11 +178,8 @@ class _OverviewTabState extends State<OverviewTab> {
       future: _humanQueueFuture,
       builder: (context, snap) {
         final ready = snap.data?['ready'] as List<ObligationDto>? ?? const [];
-        final waiting =
-            snap.data?['waiting'] as List<ObligationDto>? ?? const [];
-        final blockerMap =
-            snap.data?['blockerMap'] as Map<String, List<ObligationDto>>? ??
-            const {};
+        final waiting = snap.data?['waiting'] as List<ObligationDto>? ?? const [];
+        final blockerMap = snap.data?['blockerMap'] as Map<String, List<ObligationDto>>? ?? const {};
         final totalCount = ready.length + waiting.length;
 
         return LayoutBuilder(
@@ -205,15 +206,9 @@ class _OverviewTabState extends State<OverviewTab> {
                       onCreated: _refreshHumanQueue,
                     ),
                     icon: const Icon(Icons.add, size: 14),
-                    label: const Text(
-                      'New Obligation',
-                      style: TextStyle(fontSize: 11),
-                    ),
+                    label: const Text('New Obligation', style: TextStyle(fontSize: 11)),
                     style: TextButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 4,
-                      ),
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                       minimumSize: Size.zero,
                       tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                       foregroundColor: MeshColors.accent,
@@ -221,16 +216,9 @@ class _OverviewTabState extends State<OverviewTab> {
                   )
                 else
                   IconButton(
-                    icon: const Icon(
-                      Icons.add,
-                      size: 16,
-                      color: MeshColors.accent,
-                    ),
+                    icon: const Icon(Icons.add, size: 16, color: MeshColors.accent),
                     padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(
-                      minWidth: 28,
-                      minHeight: 28,
-                    ),
+                    constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
                     tooltip: 'New Obligation',
                     onPressed: () => showCreateObligationDialog(
                       context,
@@ -240,16 +228,9 @@ class _OverviewTabState extends State<OverviewTab> {
                     ),
                   ),
                 IconButton(
-                  icon: const Icon(
-                    Icons.refresh,
-                    size: 16,
-                    color: MeshColors.textSecondary,
-                  ),
+                  icon: const Icon(Icons.refresh, size: 16, color: MeshColors.textSecondary),
                   padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(
-                    minWidth: 28,
-                    minHeight: 28,
-                  ),
+                  constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
                   tooltip: 'Refresh Queue',
                   onPressed: _refreshHumanQueue,
                 ),
@@ -279,8 +260,7 @@ class _OverviewTabState extends State<OverviewTab> {
                     style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
                   ),
                   const SizedBox(height: 14),
-                  if (snap.connectionState != ConnectionState.done &&
-                      snap.data == null)
+                  if (snap.connectionState != ConnectionState.done && snap.data == null)
                     const Padding(
                       padding: EdgeInsets.symmetric(vertical: 20),
                       child: Center(child: CircularProgressIndicator()),
@@ -294,10 +274,7 @@ class _OverviewTabState extends State<OverviewTab> {
                               children: [
                                 Text(
                                   'Queue unavailable: ${snap.error}',
-                                  style: const TextStyle(
-                                    color: MeshColors.textMuted,
-                                    fontSize: 13,
-                                  ),
+                                  style: const TextStyle(color: MeshColors.textMuted, fontSize: 13),
                                 ),
                                 const SizedBox(height: 8),
                                 TextButton(
@@ -311,10 +288,7 @@ class _OverviewTabState extends State<OverviewTab> {
                                 Expanded(
                                   child: Text(
                                     'Queue unavailable: ${snap.error}',
-                                    style: const TextStyle(
-                                      color: MeshColors.textMuted,
-                                      fontSize: 13,
-                                    ),
+                                    style: const TextStyle(color: MeshColors.textMuted, fontSize: 13),
                                   ),
                                 ),
                                 TextButton(
@@ -333,10 +307,7 @@ class _OverviewTabState extends State<OverviewTab> {
                               children: [
                                 const Text(
                                   'No obligations in your queue.',
-                                  style: TextStyle(
-                                    color: MeshColors.textMuted,
-                                    fontSize: 13,
-                                  ),
+                                  style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
                                 ),
                                 const SizedBox(height: 10),
                                 ElevatedButton.icon(
@@ -347,20 +318,13 @@ class _OverviewTabState extends State<OverviewTab> {
                                     onCreated: _refreshHumanQueue,
                                   ),
                                   icon: const Icon(Icons.add, size: 14),
-                                  label: const Text(
-                                    'Create Obligation',
-                                    style: TextStyle(fontSize: 12),
-                                  ),
+                                  label: const Text('Create Obligation', style: TextStyle(fontSize: 12)),
                                   style: ElevatedButton.styleFrom(
                                     backgroundColor: MeshColors.accent,
                                     foregroundColor: MeshColors.bgPrimary,
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 12,
-                                      vertical: 8,
-                                    ),
+                                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                                     minimumSize: Size.zero,
-                                    tapTargetSize:
-                                        MaterialTapTargetSize.shrinkWrap,
+                                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                                   ),
                                 ),
                               ],
@@ -370,10 +334,7 @@ class _OverviewTabState extends State<OverviewTab> {
                               children: [
                                 const Text(
                                   'No obligations in your queue.',
-                                  style: TextStyle(
-                                    color: MeshColors.textMuted,
-                                    fontSize: 13,
-                                  ),
+                                  style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
                                 ),
                                 ElevatedButton.icon(
                                   onPressed: () => showCreateObligationDialog(
@@ -383,20 +344,13 @@ class _OverviewTabState extends State<OverviewTab> {
                                     onCreated: _refreshHumanQueue,
                                   ),
                                   icon: const Icon(Icons.add, size: 14),
-                                  label: const Text(
-                                    'Create Obligation',
-                                    style: TextStyle(fontSize: 12),
-                                  ),
+                                  label: const Text('Create Obligation', style: TextStyle(fontSize: 12)),
                                   style: ElevatedButton.styleFrom(
                                     backgroundColor: MeshColors.accent,
                                     foregroundColor: MeshColors.bgPrimary,
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 12,
-                                      vertical: 8,
-                                    ),
+                                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                                     minimumSize: Size.zero,
-                                    tapTargetSize:
-                                        MaterialTapTargetSize.shrinkWrap,
+                                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                                   ),
                                 ),
                               ],
@@ -416,10 +370,7 @@ class _OverviewTabState extends State<OverviewTab> {
                           ),
                           const SizedBox(width: 8),
                           Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 6,
-                              vertical: 1,
-                            ),
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
                             decoration: BoxDecoration(
                               color: const Color(0xFF064E3B),
                               borderRadius: BorderRadius.circular(4),
@@ -452,10 +403,7 @@ class _OverviewTabState extends State<OverviewTab> {
                           ),
                           const SizedBox(width: 8),
                           Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 6,
-                              vertical: 1,
-                            ),
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
                             decoration: BoxDecoration(
                               color: const Color(0xFF78350F),
                               borderRadius: BorderRadius.circular(4),
@@ -511,9 +459,7 @@ class _OverviewTabState extends State<OverviewTab> {
         ],
       ),
     );
-  }
-
-  Widget _buildQueueItemCard(
+  }  Widget _buildQueueItemCard(
     ObligationDto o,
     List<ObligationDto>? blockers, {
     required List<ObligationDto> items,
@@ -528,54 +474,42 @@ class _OverviewTabState extends State<OverviewTab> {
       onMutated: _refreshHumanQueue,
       contentPadding: const EdgeInsets.all(12),
       showReorder: isReadyList && items.length > 1,
-      onMoveUp: index > 0
-          ? () async {
-              final previousId = index - 2 >= 0 ? items[index - 2].id : null;
-              final nextId = items[index - 1].id;
-              try {
-                await widget.store.api.reorderObligation(
-                  o.id,
-                  previousId: previousId,
-                  nextId: nextId,
-                );
-                _refreshHumanQueue();
-              } catch (err) {
-                if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text('Failed to reorder: $err'),
-                      backgroundColor: MeshColors.statusHalted,
-                    ),
-                  );
-                }
-              }
-            }
-          : null,
-      onMoveDown: index < items.length - 1
-          ? () async {
-              final previousId = items[index + 1].id;
-              final nextId = index + 2 < items.length
-                  ? items[index + 2].id
-                  : null;
-              try {
-                await widget.store.api.reorderObligation(
-                  o.id,
-                  previousId: previousId,
-                  nextId: nextId,
-                );
-                _refreshHumanQueue();
-              } catch (err) {
-                if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text('Failed to reorder: $err'),
-                      backgroundColor: MeshColors.statusHalted,
-                    ),
-                  );
-                }
-              }
-            }
-          : null,
+      onMoveUp: index > 0 ? () async {
+        final previousId = index - 2 >= 0 ? items[index - 2].id : null;
+        final nextId = items[index - 1].id;
+        try {
+          await widget.store.api.reorderObligation(
+            o.id,
+            previousId: previousId,
+            nextId: nextId,
+          );
+          _refreshHumanQueue();
+        } catch (err) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('Failed to reorder: $err'), backgroundColor: MeshColors.statusHalted),
+            );
+          }
+        }
+      } : null,
+      onMoveDown: index < items.length - 1 ? () async {
+        final previousId = items[index + 1].id;
+        final nextId = index + 2 < items.length ? items[index + 2].id : null;
+        try {
+          await widget.store.api.reorderObligation(
+            o.id,
+            previousId: previousId,
+            nextId: nextId,
+          );
+          _refreshHumanQueue();
+        } catch (err) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('Failed to reorder: $err'), backgroundColor: MeshColors.statusHalted),
+            );
+          }
+        }
+      } : null,
     );
   }
 
@@ -722,10 +656,7 @@ class _OverviewTabState extends State<OverviewTab> {
                 'Queued Actors',
                 trailing: Text(
                   '${queued.length} queued',
-                  style: kMonoStyle.copyWith(
-                    color: MeshColors.statusIdle,
-                    fontSize: 12,
-                  ),
+                  style: kMonoStyle.copyWith(color: MeshColors.statusIdle, fontSize: 12),
                 ),
               ),
               const SizedBox(height: 4),
@@ -765,8 +696,7 @@ class _OverviewTabState extends State<OverviewTab> {
                             child: Text(
                               actor.nextProviderAvailableAt != null
                                   ? 'Provider slot opens ${formatTs(actor.nextProviderAvailableAt!)}'
-                                  : actor.waitingOn ??
-                                        'Queued behind another provider request.',
+                                  : actor.waitingOn ?? 'Queued behind another provider request.',
                               textAlign: TextAlign.right,
                               style: kMonoStyle.copyWith(
                                 color: MeshColors.textSecondary,
@@ -788,18 +718,15 @@ class _OverviewTabState extends State<OverviewTab> {
   /// Tail of recent actor yield events section (Core feature).
   Widget _buildYieldEventsSection() {
     return StreamBuilder<List<Object?>>(
-      stream:
-          Rx.combineLatest2<List<MeshEvent>, ActorStateSnapshot, List<Object?>>(
-            widget.store.yieldEvents,
-            widget.store.actorStates,
-            (yields, actorStates) => [yields, actorStates],
-          ),
+      stream: Rx.combineLatest2<List<MeshEvent>, ActorStateSnapshot, List<Object?>>(
+        widget.store.yieldEvents,
+        widget.store.actorStates,
+        (yields, actorStates) => [yields, actorStates],
+      ),
       builder: (context, snap) {
         final yields = widget.store.yieldEvents.value;
         final actorStates = widget.store.actorStates.value.actors.values;
-        final handles = {
-          for (final a in actorStates) a.thread.id: a.thread.handle,
-        };
+        final handles = {for (final a in actorStates) a.thread.id: a.thread.handle};
 
         // Filter by search query & status filter
         final filtered = yields.where((e) {
@@ -807,8 +734,7 @@ class _OverviewTabState extends State<OverviewTab> {
             if (e.detail != _statusFilter) return false;
           }
           if (_searchQuery.isNotEmpty) {
-            final handle = (handles[e.actorId] ?? e.actorId ?? '')
-                .toLowerCase();
+            final handle = (handles[e.actorId] ?? e.actorId ?? '').toLowerCase();
             final body = (e.body ?? e.detail ?? '').toLowerCase();
             final q = _searchQuery.toLowerCase();
             if (!handle.contains(q) && !body.contains(q)) return false;
@@ -853,10 +779,7 @@ class _OverviewTabState extends State<OverviewTab> {
                   child: Center(
                     child: Text(
                       'No yield events recorded.',
-                      style: TextStyle(
-                        color: MeshColors.textMuted,
-                        fontSize: 13,
-                      ),
+                      style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
                     ),
                   ),
                 )
@@ -865,8 +788,7 @@ class _OverviewTabState extends State<OverviewTab> {
                   shrinkWrap: true,
                   physics: const NeverScrollableScrollPhysics(),
                   itemCount: filtered.length,
-                  separatorBuilder: (_, _) =>
-                      const Divider(height: 1, color: MeshColors.border),
+                  separatorBuilder: (_, _) => const Divider(height: 1, color: MeshColors.border),
                   itemBuilder: (context, i) {
                     return _buildYieldRow(filtered[i]);
                   },
@@ -884,21 +806,12 @@ class _OverviewTabState extends State<OverviewTab> {
         Expanded(
           child: TextField(
             controller: _searchController,
-            style: kMonoStyle.copyWith(
-              color: MeshColors.textPrimary,
-              fontSize: 12,
-            ),
+            style: kMonoStyle.copyWith(color: MeshColors.textPrimary, fontSize: 12),
             decoration: InputDecoration(
               hintText: 'Search handle or message...',
-              hintStyle: kMonoStyle.copyWith(
-                color: MeshColors.textMuted,
-                fontSize: 12,
-              ),
+              hintStyle: kMonoStyle.copyWith(color: MeshColors.textMuted, fontSize: 12),
               isDense: true,
-              contentPadding: const EdgeInsets.symmetric(
-                horizontal: 10,
-                vertical: 8,
-              ),
+              contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
               filled: true,
               fillColor: MeshColors.bgTertiary,
               border: OutlineInputBorder(

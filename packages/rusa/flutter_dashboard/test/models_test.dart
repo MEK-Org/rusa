@@ -3,32 +3,29 @@ import 'package:rusa_dashboard/models.dart';
 
 void main() {
   group('ObligationDto.fromJson', () {
-    test(
-      'deserializes externalRef when it is a nested map (server format)',
-      () {
-        final json = {
-          'id': 'ob-123',
-          'parentId': null,
-          'ownerId': 'test-actor',
-          'intent': 'Test intent',
-          'externalRef': {
-            'kind': 'github_issue',
-            'owner': 'MEK-Org',
-            'repo': 'rusa',
-            'number': 1589,
-            'key': 'github_issue:dummy-org/dummy-repoISSUE_NUM',
-          },
-          'status': 'ready',
-          'priority': 50.0,
-          'effectivePriority': 50.0,
-          'prioritySourceId': 'ob-123',
-        };
+    test('deserializes externalRef when it is a nested map (server format)', () {
+      final json = {
+        'id': 'ob-123',
+        'parentId': null,
+        'ownerId': 'test-actor',
+        'intent': 'Test intent',
+        'externalRef': {
+          'kind': 'github_issue',
+          'owner': 'MEK-Org',
+          'repo': 'rusa',
+          'number': 1589,
+          'key': 'github_issue:dummy-org/dummy-repoISSUE_NUM'
+        },
+        'status': 'ready',
+        'priority': 50.0,
+        'effectivePriority': 50.0,
+        'prioritySourceId': 'ob-123',
+      };
 
-        final dto = ObligationDto.fromJson(json);
-        expect(dto.id, 'ob-123');
-        expect(dto.externalRef, 'github_issue:dummy-org/dummy-repoISSUE_NUM');
-      },
-    );
+      final dto = ObligationDto.fromJson(json);
+      expect(dto.id, 'ob-123');
+      expect(dto.externalRef, 'github_issue:dummy-org/dummy-repoISSUE_NUM');
+    });
 
     test('deserializes externalRef when it is a string', () {
       final json = {
@@ -98,10 +95,7 @@ void main() {
 
     test('dotState reflects runState and retired override', () {
       expect(
-        const ActorViewState(
-          thread: thread,
-          runState: RunState.queued,
-        ).dotState,
+        const ActorViewState(thread: thread, runState: RunState.queued).dotState,
         DotState.queued,
       );
       expect(
@@ -109,26 +103,17 @@ void main() {
         DotState.idle,
       );
       expect(
-        const ActorViewState(
-          thread: thread,
-          runState: RunState.unknown,
-        ).dotState,
+        const ActorViewState(thread: thread, runState: RunState.unknown).dotState,
         DotState.idle,
       );
       expect(
-        const ActorViewState(
-          thread: thread,
-          runState: RunState.windingDown,
-        ).dotState,
+        const ActorViewState(thread: thread, runState: RunState.windingDown).dotState,
         DotState.active,
       );
 
       final retiredThread = thread.copyWith(status: 'retired');
       expect(
-        ActorViewState(
-          thread: retiredThread,
-          runState: RunState.running,
-        ).dotState,
+        ActorViewState(thread: retiredThread, runState: RunState.running).dotState,
         DotState.retired,
       );
     });

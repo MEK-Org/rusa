@@ -53,11 +53,7 @@ class _ChatTabState extends State<ChatTab> {
               Set<String>,
               ActorStateSnapshot,
               (Set<String>, ActorStateSnapshot)
-            >(
-              widget.store.selection,
-              widget.store.actorStates,
-              (s, t) => (s, t),
-            )
+            >(widget.store.selection, widget.store.actorStates, (s, t) => (s, t))
             .listen((data) {
               final selection = data.$1;
               final actorStates = data.$2;
@@ -143,9 +139,7 @@ class _ChatTabState extends State<ChatTab> {
           );
         }
 
-        final handles = {
-          for (final a in actorStates) a.thread.id: a.thread.handle,
-        };
+        final handles = {for (final a in actorStates) a.thread.id: a.thread.handle};
 
         final height = MediaQuery.of(context).size.height;
         final walkieActive = widget.store.walkieActive.valueOrNull ?? false;

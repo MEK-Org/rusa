@@ -32,7 +32,10 @@ final class UserMemoEntry extends WalkieEntry {
 
 /// One actor reply that has finished playing.
 final class ActorReplyEntry extends WalkieEntry {
-  const ActorReplyEntry({required super.timestamp, required this.announcement});
+  const ActorReplyEntry({
+    required super.timestamp,
+    required this.announcement,
+  });
 
   final VoiceAnnouncement announcement;
 }
@@ -297,7 +300,10 @@ class WalkieController {
         _lastPlayed.add(item.frame);
         // Record the played reply in the session transcript .
         _appendTranscript(
-          ActorReplyEntry(timestamp: DateTime.now(), announcement: item.frame),
+          ActorReplyEntry(
+            timestamp: DateTime.now(),
+            announcement: item.frame,
+          ),
         );
         // Turned off mid-play: leave it unacked so it replays next mode entry.
         if (!_enabled.value) break;

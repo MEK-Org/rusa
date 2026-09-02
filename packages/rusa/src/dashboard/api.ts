@@ -369,28 +369,26 @@ function clampLimit(url: URL): number {
  * presentation boundary, so resolve a mesh-message pointer here and never leak
  * its opaque id into the UI payload.
  */
-async function resolveInboxPage(page: InboxPage, deps: DashboardDataDeps): Promise<InboxPage> {
-  const entries = await Promise.all(
-    page.entries.map(async (entry) => {
-      const { messageId, ...payload } = entry.payload as InboxPayload & {
-        messageId?: unknown;
-      };
-      if (typeof messageId !== "string") return entry;
-      // `content` is kept as-is so nothing that reads it today regresses;
-      // `reference` is the addition, so the dashboard can render an inbox item
-      // through the same widget as an obligation's cited artifacts. Only mesh
-      // chat resolves in v1 — every other payload keeps its raw JSON, which is
-      // the honest rendering until those sources have resolvers.
-      const reference = resolveReferenceSync(`mesh:messages/${messageId}`, {
-        meshChat: deps.meshChat,
-      });
-      return {
-        ...entry,
-        payload: reference.body !== null ? { ...payload, content: reference.body } : payload,
-        reference,
-      };
-    })
-  );
+function resolveInboxPage(page: InboxPage, deps: DashboardDataDeps): InboxPage {
+  const entries = page.entries.map((entry) => {
+    const { messageId, ...payload } = entry.payload as InboxPayload & {
+      messageId?: unknown;
+    };
+    if (typeof messageId !== "string") return entry;
+    // `content` is kept as-is so nothing that reads it today regresses;
+    // `reference` is the addition, so the dashboard can render an inbox item
+    // through the same widget as an obligation's cited artifacts. Only mesh
+    // chat resolves in v1 — every other payload keeps its raw JSON, which is
+    // the honest rendering until those sources have resolvers.
+    const reference = resolveReferenceSync(`mesh:messages/${messageId}`, {
+      meshChat: deps.meshChat,
+    });
+    return {
+      ...entry,
+      payload: reference.body !== null ? { ...payload, content: reference.body } : payload,
+      reference,
+    };
+  });
   return { ...page, entries };
 }
 
@@ -1275,7 +1273,7 @@ export async function handleMeshApiRequest(
     sendJson(
       res,
       200,
-      await resolveInboxPage(
+      resolveInboxPage(
         deps.inbox.list(actorId, {
           status: status as "unhandled" | "handled" | "all" | undefined,
           limit: clampLimit(url),

@@ -22,9 +22,7 @@ class WebAvatarFilePicker implements AvatarFilePicker {
       'change',
       (web.Event _) {
         final files = input.files;
-        final file = (files == null || files.length == 0)
-            ? null
-            : files.item(0);
+        final file = (files == null || files.length == 0) ? null : files.item(0);
         if (file == null) {
           if (!completer.isCompleted) completer.complete(null);
           return;
