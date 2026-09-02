@@ -1198,6 +1198,39 @@ class ObligationListPage {
       );
 }
 
+/// One completed cycle of a recurring obligation, as returned in the
+/// `completions` page of `GET /api/mesh/obligations/:id`.
+class ObligationCompletionDto {
+  const ObligationCompletionDto({
+    required this.id,
+    required this.obligationId,
+    required this.sequence,
+    required this.completedAt,
+    this.note,
+    this.resolutionRef,
+    this.nextReadyAt,
+  });
+
+  final String id;
+  final String obligationId;
+  final int sequence;
+  final String completedAt;
+  final String? note;
+  final String? resolutionRef;
+  final String? nextReadyAt;
+
+  factory ObligationCompletionDto.fromJson(Map<String, dynamic> j) =>
+      ObligationCompletionDto(
+        id: j['id'] as String? ?? '',
+        obligationId: j['obligationId'] as String? ?? '',
+        sequence: j['sequence'] as int? ?? 0,
+        completedAt: j['completedAt'] as String? ?? '',
+        note: j['note'] as String?,
+        resolutionRef: j['resolutionRef'] as String?,
+        nextReadyAt: j['nextReadyAt'] as String?,
+      );
+}
+
 class ObligationDetailSnapshot {
   const ObligationDetailSnapshot({
     required this.obligation,
@@ -1205,6 +1238,9 @@ class ObligationDetailSnapshot {
     required this.children,
     required this.blockingChildren,
     this.artifacts = const [],
+    this.completions = const [],
+    this.completionsTotal = 0,
+    this.completionsHasMore = false,
   });
 
   final ObligationDto obligation;
@@ -1212,6 +1248,9 @@ class ObligationDetailSnapshot {
   final List<ObligationDto> children;
   final List<ObligationDto> blockingChildren;
   final List<ObligationArtifactDto> artifacts;
+  final List<ObligationCompletionDto> completions;
+  final int completionsTotal;
+  final bool completionsHasMore;
 
   factory ObligationDetailSnapshot.fromJson(
     Map<String, dynamic> j,
@@ -1248,5 +1287,10 @@ class ObligationDetailSnapshot {
               )
               .toList()
         : const <ObligationArtifactDto>[],
+    completions: (j['completions'] as List<dynamic>? ?? const [])
+        .map((e) => ObligationCompletionDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    completionsTotal: j['completionsTotal'] as int? ?? 0,
+    completionsHasMore: j['completionsHasMore'] as bool? ?? false,
   );
 }

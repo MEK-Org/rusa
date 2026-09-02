@@ -310,6 +310,40 @@ describe("obligations MCP", () => {
     expect(res.isError).toBe(true);
   });
 
+  it("sets recurrence for the owner via set_obligation_recurrence", async () => {
+    repository.create({ title: "recurring", id: "rec-owned", ownerId: "actor-a" });
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+
+    const res = (await client.callTool({
+      name: "set_obligation_recurrence",
+      arguments: { id: "rec-owned", recurrence: { policy: "cron", cronExpr: "0 * * * *" } },
+    })) as CallToolResult;
+    expect(res.isError).toBeFalsy();
+    expect(repository.require("rec-owned").recurrencePolicy).toBe("cron");
+  });
+
+  it("rejects set_obligation_recurrence for a non-owner, and honors the owner-ancestor policy", async () => {
+    repository.create({ title: "foreign recurring", id: "rec-foreign", ownerId: "actor-b" });
+
+    const denied = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const deniedResult = (await denied.callTool({
+      name: "set_obligation_recurrence",
+      arguments: { id: "rec-foreign", recurrence: { policy: "cron", cronExpr: "0 * * * *" } },
+    })) as CallToolResult;
+    expect(deniedResult.isError).toBe(true);
+    expect(repository.require("rec-foreign").recurrencePolicy).toBeNull();
+
+    const ancestor = await connect(
+      createObligationsMcpServer(repository, "actor-a", { canManage: () => true })
+    );
+    const ancestorResult = (await ancestor.callTool({
+      name: "set_obligation_recurrence",
+      arguments: { id: "rec-foreign", recurrence: { policy: "cron", cronExpr: "0 * * * *" } },
+    })) as CallToolResult;
+    expect(ancestorResult.isError).toBeFalsy();
+    expect(repository.require("rec-foreign").recurrencePolicy).toBe("cron");
+  });
+
   it("reorders obligations via reorder_obligation", async () => {
     repository.create({
       title: "first",

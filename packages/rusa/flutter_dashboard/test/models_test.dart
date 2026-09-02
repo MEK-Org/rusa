@@ -111,6 +111,67 @@ void main() {
     });
   });
 
+  group('ObligationDetailSnapshot.fromJson', () {
+    test('deserializes completion history and pagination fields', () {
+      final json = {
+        'obligation': {
+          'id': 'ob-cron',
+          'ownerId': 'test-actor',
+          'status': 'scheduled',
+          'effectivePriority': 50.0,
+          'recurrencePolicy': 'cron',
+          'recurrenceCron': '0 3 * * *',
+          'nextReadyAt': '2026-09-03T03:00:00.000Z',
+        },
+        'parent': null,
+        'children': [],
+        'blockingChildren': [],
+        'artifacts': [],
+        'completions': [
+          {
+            'id': 'c-2',
+            'obligationId': 'ob-cron',
+            'sequence': 2,
+            'completedAt': '2026-09-02T03:00:00.000Z',
+            'note': 'cycle two',
+            'resolutionRef': null,
+            'nextReadyAt': '2026-09-03T03:00:00.000Z',
+          },
+        ],
+        'completionsTotal': 2,
+        'completionsHasMore': true,
+      };
+
+      final snapshot = ObligationDetailSnapshot.fromJson(json);
+      expect(snapshot.completions, hasLength(1));
+      expect(snapshot.completions.first.id, 'c-2');
+      expect(snapshot.completions.first.sequence, 2);
+      expect(snapshot.completions.first.note, 'cycle two');
+      expect(snapshot.completionsTotal, 2);
+      expect(snapshot.completionsHasMore, true);
+    });
+
+    test('defaults completion fields when absent (non-recurring obligations)', () {
+      final json = {
+        'obligation': {
+          'id': 'ob-plain',
+          'ownerId': 'test-actor',
+          'status': 'ready',
+          'effectivePriority': 50.0,
+        },
+        'parent': null,
+        'children': [],
+        'blockingChildren': [],
+        'artifacts': [],
+      };
+
+      final snapshot = ObligationDetailSnapshot.fromJson(json);
+      expect(snapshot.completions, isEmpty);
+      expect(snapshot.completionsTotal, 0);
+      expect(snapshot.completionsHasMore, false);
+    });
+  });
+
   group('ActorViewState', () {
     const thread = ThreadDto(
       id: 'a1',

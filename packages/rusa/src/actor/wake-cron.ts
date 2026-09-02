@@ -58,15 +58,36 @@ export function writeWakePort(mcHome: string, port: number): void {
   renameSync(tmp, path);
 }
 
+/** Inclusive min/max for each of the 5 standard cron fields, in order. */
+const CRON_FIELD_BOUNDS: readonly [number, number][] = [
+  [0, 59], // minute
+  [0, 23], // hour
+  [1, 31], // day of month
+  [1, 12], // month
+  [0, 6], // day of week
+];
+
 /**
  * A standard 5-field cron expression with numeric/`* / , -` fields only (no named
  * months/days for v1 — keeps the validator strict so a bad expr can't slip a line
- * that makes `crontab -` reject the entire file). Returns true if safe to write.
+ * that makes `crontab -` reject the entire file). Validates each field's actual
+ * range/step semantics (not just its character set), so out-of-range values like
+ * `99` in a minute field or a zero-valued step stride are rejected rather than
+ * silently accepted and only failing later inside `nextCronOccurrence`. Returns
+ * true if safe to write.
  */
 export function isValidCronExpr(expr: string): boolean {
   const fields = expr.trim().split(/\s+/);
   if (fields.length !== 5) return false;
-  return fields.every((f) => /^[0-9*/,-]+$/.test(f));
+  if (!fields.every((f) => /^[0-9*/,-]+$/.test(f))) return false;
+  try {
+    fields.forEach((f, i) => {
+      parseCronField(f, CRON_FIELD_BOUNDS[i][0], CRON_FIELD_BOUNDS[i][1]);
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** One cron field's matching values, expanded from `*`, `a-b`, `a,b`, a `step` stride, or a single number. */
@@ -89,7 +110,9 @@ function parseCronField(field: string, min: number, max: number): Set<number> {
         throw new Error(`unsupported cron field segment: "${part}"`);
       }
     }
-    if (step <= 0 || lo > hi) throw new Error(`unsupported cron field segment: "${part}"`);
+    if (step <= 0 || lo > hi || lo < min || hi > max) {
+      throw new Error(`unsupported cron field segment: "${part}"`);
+    }
     for (let v = lo; v <= hi; v += step) values.add(v);
   }
   return values;

@@ -1351,11 +1351,16 @@ export async function handleMeshApiRequest(
     }
     const limit = clampLimit(url);
     const offset = parsePositiveInt(url, "offset") ?? 0;
+    const completionsOffset = parsePositiveInt(url, "completions_offset") ?? 0;
     const children = deps.obligations.listChildrenPage(id, { limit, offset });
     const blockingChildren = deps.obligations.listChildrenPage(id, {
       limit,
       offset: 0,
       blockingOnly: true,
+    });
+    const completions = deps.obligations.listCompletionsPage(id, {
+      limit,
+      offset: completionsOffset,
     });
     const parent = obligation.parentId ? deps.obligations.get(obligation.parentId) : null;
     const artifacts = await Promise.all(
@@ -1375,6 +1380,9 @@ export async function handleMeshApiRequest(
       parent,
       children: children.obligations,
       blockingChildren: blockingChildren.obligations,
+      completions: completions.completions,
+      completionsTotal: completions.total,
+      completionsHasMore: completions.hasMore,
       artifacts,
     });
     return true;

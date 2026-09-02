@@ -4450,6 +4450,47 @@ describe("ActorMesh", () => {
       ).toBe(true);
     });
 
+    it("re-arms a scheduled delivery whose durable write failed, instead of stranding it unscheduled", () => {
+      const memoryStore = createMemoryInboxStore();
+      let shouldFail = true;
+      const inboxStore: InboxStore = {
+        ...memoryStore,
+        append: (inputs) => {
+          if (shouldFail) {
+            shouldFail = false;
+            throw new Error("disk full");
+          }
+          return memoryStore.append(inputs);
+        },
+      };
+      const { mesh, registry, logs } = setup({ inboxStore });
+      const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
+      const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
+
+      const osScheduler = new FakeOsScheduler();
+      mesh.setOsScheduler(osScheduler);
+
+      const deliverAt = new Date(Date.now() + 100000).toISOString();
+      mesh.sendMessage(t2, "will fail once", t1, undefined, deliverAt);
+      const messageId = registry.get(t2)?.pendingDeliveries?.[0]?.id ?? "";
+      expect(messageId).toBeTruthy();
+      expect(osScheduler.messageDeliveries.has(messageId)).toBe(true);
+
+      // Simulate the one-shot `at` job firing and calling back into the mesh.
+      mesh.deliverScheduledMessage(messageId);
+
+      // The durable write failed, but the record must not be stranded: it's
+      // still pending, and a fresh OS job has been armed to retry it.
+      expect(registry.get(t2)?.pendingDeliveries).toHaveLength(1);
+      expect(osScheduler.messageDeliveries.has(messageId)).toBe(true);
+      expect(logs.some((l) => l.includes("firePendingDelivery failed"))).toBe(true);
+
+      // The retry succeeds.
+      mesh.deliverScheduledMessage(messageId);
+      expect(registry.get(t2)?.pendingDeliveries ?? []).toHaveLength(0);
+      expect(memoryStore.entries.some((e) => e.actorId === t2)).toBe(true);
+    });
+
     it("survives mesh restart and fires exactly-once (re-arms timers)", async () => {
       // Required test: Schedule a send, restart the mesh, assert it still fires.
       const { registry, mesh: mesh1 } = setup();

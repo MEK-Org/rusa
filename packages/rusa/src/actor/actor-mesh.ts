@@ -49,6 +49,9 @@ import { type ActorRunMode, isResponsiveNudge, type RunNudge } from "./trigger-r
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
 export const SCHEDULER_SENDER_ID = "scheduler";
 
+/** Retry delay for a scheduled-message delivery whose durable write failed after its one-shot job fired. */
+const FIRE_PENDING_DELIVERY_RETRY_MS = 30_000;
+
 /** Map only the issue-shaped event resources obligations may govern. */
 function eventResourceObligationKey(resource: EventResource): string | undefined {
   const key = resourceKey(resource);
@@ -3034,6 +3037,26 @@ export class ActorMesh {
       this.log(
         `firePendingDelivery failed for ${messageId} to ${toId}: ${err instanceof Error ? err.message : String(err)}`
       );
+      // The one-shot OS job (or timer) that triggered this call has already
+      // fired and consumed itself. If the durable write above failed before
+      // the record was cleared, it's still pending but now unscheduled —
+      // re-arm it a short delay out so it gets retried without depending on
+      // the next process restart's reconcilePendingDeliveries() sweep.
+      const stillPending = this.registry
+        .get(toId)
+        ?.pendingDeliveries?.some((m) => m.id === messageId);
+      if (stillPending) {
+        try {
+          this.armPendingDelivery(toId, {
+            ...scheduled,
+            deliverAt: new Date(Date.now() + FIRE_PENDING_DELIVERY_RETRY_MS).toISOString(),
+          });
+        } catch (rearmErr) {
+          this.log(
+            `failed to re-arm scheduled message ${messageId} after delivery failure: ${rearmErr instanceof Error ? rearmErr.message : String(rearmErr)}`
+          );
+        }
+      }
     }
   }
 }

@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
+import '../util.dart';
 import 'avatar.dart';
 import 'header.dart';
 import 'obligation_card.dart';
@@ -407,7 +408,7 @@ class _FlatNode {
   final bool isCollapsed;
 }
 
-class _DetailView extends StatelessWidget {
+class _DetailView extends StatefulWidget {
   const _DetailView({
     required this.obligationId,
     required this.store,
@@ -421,9 +422,50 @@ class _DetailView extends StatelessWidget {
   final VoidCallback? onMutated;
 
   @override
+  State<_DetailView> createState() => _DetailViewState();
+}
+
+class _DetailViewState extends State<_DetailView> {
+  int _completionsOffset = 0;
+  late Future<ObligationDetailSnapshot> _future;
+
+  DashboardStore get store => widget.store;
+  ValueChanged<DashboardView> get onSelectView => widget.onSelectView;
+  VoidCallback? get onMutated => widget.onMutated;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetch();
+  }
+
+  @override
+  void didUpdateWidget(covariant _DetailView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.obligationId != widget.obligationId) {
+      _completionsOffset = 0;
+      _fetch();
+    }
+  }
+
+  void _fetch() {
+    _future = store.api.fetchObligationDetail(
+      widget.obligationId,
+      completionsOffset: _completionsOffset,
+    );
+  }
+
+  void _loadMoreCompletions(int loadedCount) {
+    setState(() {
+      _completionsOffset += loadedCount;
+      _fetch();
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
     return FutureBuilder<ObligationDetailSnapshot>(
-      future: store.api.fetchObligationDetail(obligationId),
+      future: _future,
       builder: (context, snapshot) {
         if (snapshot.hasError && !snapshot.hasData) {
           return Center(
@@ -508,6 +550,16 @@ class _DetailView extends StatelessWidget {
             _SectionHeader('EXTERNAL LINK'),
             _externalRefPanel(context, o),
             const SizedBox(height: 24),
+            if (o.isScheduled) ...[
+              _SectionHeader('SCHEDULE'),
+              _schedulePanel(o),
+              const SizedBox(height: 24),
+            ],
+            if (o.isRecurring) ...[
+              _SectionHeader('COMPLETION HISTORY'),
+              _completionsPanel(data),
+              const SizedBox(height: 24),
+            ],
             _SectionHeader('CHILDREN'),
             _childrenPanel(context, data),
             const SizedBox(height: 28),
@@ -593,6 +645,117 @@ class _DetailView extends StatelessWidget {
                 onSelectView(DashboardView.overview);
               },
               child: const Text('View Owner Queue →', style: TextStyle(color: MeshColors.accent)),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _schedulePanel(ObligationDto o) {
+    final policyLabel = o.recurrencePolicy == 'cron'
+        ? 'Cron: ${o.recurrenceCron}'
+        : o.recurrencePolicy == 'completion_interval'
+            ? 'Every ${o.recurrenceIntervalSeconds}s after completion'
+            : 'One-time';
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: MeshColors.bgSecondary,
+        border: Border.all(color: MeshColors.border),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.schedule, size: 16, color: MeshColors.accent),
+              const SizedBox(width: 8),
+              Text(
+                policyLabel,
+                style: const TextStyle(
+                  color: MeshColors.textPrimary,
+                  fontSize: 13,
+                  fontFamily: kMonoFontFamily,
+                ),
+              ),
+            ],
+          ),
+          if (o.nextReadyAt != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Returns ${formatReturnsIn(o.nextReadyAt!)} (${formatTs(o.nextReadyAt!)})',
+              style: const TextStyle(color: MeshColors.textMuted, fontSize: 11.5),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _completionsPanel(ObligationDetailSnapshot data) {
+    final completions = data.completions;
+
+    if (completions.isEmpty) {
+      return Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: MeshColors.bgSecondary,
+          border: Border.all(color: MeshColors.border),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: const Text(
+          'No completed cycles yet.',
+          style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
+        ),
+      );
+    }
+
+    final remaining = data.completionsTotal - (_completionsOffset + completions.length);
+
+    return Container(
+      decoration: BoxDecoration(
+        color: MeshColors.bgSecondary,
+        border: Border.all(color: MeshColors.border),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          for (final completion in completions) ...[
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Cycle ${completion.sequence} — ${formatTs(completion.completedAt)}',
+                    style: const TextStyle(
+                      color: MeshColors.textPrimary,
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  if (completion.note != null && completion.note!.trim().isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      completion.note!,
+                      style: const TextStyle(color: MeshColors.textSecondary, fontSize: 12),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            const Divider(height: 1, color: MeshColors.border),
+          ],
+          if (data.completionsHasMore)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              child: TextButton(
+                onPressed: () => _loadMoreCompletions(completions.length),
+                child: Text('Load earlier completions ($remaining remaining)'),
+              ),
             ),
         ],
       ),

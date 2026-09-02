@@ -32,8 +32,8 @@ export const recurringObligations: Migration = {
           CHECK (external_ref IS NULL OR length(trim(external_ref)) > 0),
           CHECK (
             (recurrence_policy IS NULL AND recurrence_cron IS NULL AND recurrence_interval_seconds IS NULL AND (status <> 'scheduled' OR next_ready_at IS NULL)) OR
-            (recurrence_policy = 'cron' AND recurrence_cron IS NOT NULL AND recurrence_interval_seconds IS NULL) OR
-            (recurrence_policy = 'completion_interval' AND recurrence_cron IS NULL AND recurrence_interval_seconds IS NOT NULL AND recurrence_interval_seconds > 0)
+            (recurrence_policy = 'cron' AND recurrence_cron IS NOT NULL AND length(trim(recurrence_cron)) > 0 AND recurrence_interval_seconds IS NULL) OR
+            (recurrence_policy = 'completion_interval' AND recurrence_cron IS NULL AND recurrence_interval_seconds IS NOT NULL AND typeof(recurrence_interval_seconds) = 'integer' AND recurrence_interval_seconds > 0)
           ),
           CHECK (status <> 'scheduled' OR (recurrence_policy IS NOT NULL AND next_ready_at IS NOT NULL))
         );

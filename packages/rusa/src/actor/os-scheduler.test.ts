@@ -57,6 +57,22 @@ describe("DefaultOsScheduler", () => {
     expect(cronData).toBe("1 * * * * user-job-1\n2 * * * * user-job-2\n");
   });
 
+  it("does not delete an adjacent unmanaged job whose command merely mentions wake-obligation/wake-message", () => {
+    cronData =
+      '1 * * * * user-job-1\n# mc-obligation-activation:ob-1\nCRON_TZ=UTC\n*/5 * * * * curl wake-obligation\nCRON_TZ=""\n3 * * * * /usr/bin/wake-message-backup --dry-run\n2 * * * * user-job-2\n';
+    scheduler.cancelObligationActivation("ob-1");
+    expect(cronData).toBe(
+      "1 * * * * user-job-1\n3 * * * * /usr/bin/wake-message-backup --dry-run\n2 * * * * user-job-2\n"
+    );
+  });
+
+  it("does not delete an adjacent unmanaged CRON_TZ= line beyond the block's own restore line", () => {
+    cronData =
+      "# mc-obligation-activation:ob-1\nCRON_TZ=UTC\n*/5 * * * * curl wake-obligation\nCRON_TZ=\nCRON_TZ=Europe/Paris\n4 * * * * user-job\n";
+    scheduler.cancelObligationActivation("ob-1");
+    expect(cronData).toBe("CRON_TZ=Europe/Paris\n4 * * * * user-job\n");
+  });
+
   it('restores CRON_TZ= (not CRON_TZ="") when no prior CRON_TZ was in effect', () => {
     scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" });
     const lines = cronData.trimEnd().split("\n");
@@ -116,14 +132,17 @@ describe("execAtIo", () => {
     expect(() => execAtIo().schedule("script", new Date())).toThrow(/at failed/);
   });
 
-  it("list() returns [] when the `at` CLI is missing entirely", () => {
+  it("list() throws when the `at` CLI is missing entirely, rather than reading as an empty queue", () => {
     mockedSpawnSync.mockReturnValue(
       result({
         status: null,
         error: Object.assign(new Error("spawn atq ENOENT"), { code: "ENOENT" }),
       })
     );
-    expect(execAtIo().list()).toEqual([]);
+    // A missing `atq` binary is a deployment problem, not "nothing scheduled" —
+    // reading it as empty would let boot reconciliation treat every still-pending
+    // OS job as an orphan and cancel it out from under live obligations/messages.
+    expect(() => execAtIo().list()).toThrow(/ENOENT/);
   });
 
   it("list() throws when atq itself fails, rather than reading as an empty queue", () => {

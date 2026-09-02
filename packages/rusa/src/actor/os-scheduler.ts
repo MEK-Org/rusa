@@ -89,10 +89,11 @@ export function execAtIo(): AtIo {
     },
     list(): { id: string; script: string }[] {
       const res = spawnSync("atq", { encoding: "utf-8" });
-      if (res.error) {
-        if ((res.error as NodeJS.ErrnoException).code === "ENOENT") return [];
-        throw res.error;
-      }
+      // A missing `atq` binary is a deployment/preflight problem, not an
+      // empty authoritative queue — reading it as "nothing scheduled" would
+      // let the reconciler treat every OS-scheduled job as an orphan and
+      // cancel it out from under still-pending obligations/messages.
+      if (res.error) throw res.error;
       // An empty queue exits 0 with empty stdout; a nonzero exit means atq
       // itself failed (atd down, permission denied, ...), which must surface
       // rather than read as "nothing scheduled" — that would make the
@@ -150,27 +151,27 @@ export class DefaultOsScheduler implements OsScheduler {
     return `${curl} -fsS -H ${auth} ${url} ${args}`;
   }
 
+  /**
+   * Drop exactly the block this class writes for `tag`: the tag line, an
+   * optional `CRON_TZ=UTC` line, the single generated job line, and an
+   * optional `CRON_TZ=...` restore line — by fixed position, not by content
+   * matching. A prior content-heuristic version consumed every following
+   * `CRON_TZ=` line and every line merely *containing* "wake-obligation" or
+   * "wake-message", which deleted unrelated adjacent user entries (e.g. a
+   * command literally named `wake-message-backup`).
+   */
   private stripCronBlock(lines: string[], tag: string): string[] {
     const out: string[] = [];
     for (let i = 0; i < lines.length; i++) {
-      if (lines[i].trim() === tag) {
-        while (i + 1 < lines.length) {
-          const next = lines[i + 1];
-          if (next === undefined) break;
-          const trimmed = next.trim();
-          if (
-            trimmed.startsWith("CRON_TZ=") ||
-            trimmed.includes("wake-obligation") ||
-            trimmed.includes("wake-message")
-          ) {
-            i++;
-          } else {
-            break;
-          }
-        }
+      if (lines[i].trim() !== tag) {
+        out.push(lines[i]);
         continue;
       }
-      out.push(lines[i]);
+      let j = i + 1;
+      if (lines[j]?.trim() === "CRON_TZ=UTC") j++;
+      if (j < lines.length) j++; // the single generated job line, whatever it contains
+      if (lines[j]?.trim().startsWith("CRON_TZ=")) j++;
+      i = j - 1;
     }
     return out;
   }

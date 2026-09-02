@@ -45,6 +45,8 @@ class _InboxTabState extends State<InboxTab> {
 
     final readyObligations = obligationPage.obligations.where((o) => o.isReady).toList();
     final waitingObligations = obligationPage.obligations.where((o) => o.isWaiting).toList();
+    final scheduledObligations = obligationPage.obligations.where((o) => o.isScheduled).toList()
+      ..sort((a, b) => (a.nextReadyAt ?? '').compareTo(b.nextReadyAt ?? ''));
 
     // Fetch blockers for waiting obligations
     final blockers = await Future.wait(
@@ -61,6 +63,7 @@ class _InboxTabState extends State<InboxTab> {
       'resolved': resolved,
       'readyObligations': readyObligations,
       'waitingObligations': waitingObligations,
+      'scheduledObligations': scheduledObligations,
       'blockerMap': blockerMap,
     };
   }
@@ -107,11 +110,15 @@ class _InboxTabState extends State<InboxTab> {
               snapshot.data?['readyObligations'] as List<ObligationDto>? ?? const [];
           final waitingObligations =
               snapshot.data?['waitingObligations'] as List<ObligationDto>? ?? const [];
+          final scheduledObligations =
+              snapshot.data?['scheduledObligations'] as List<ObligationDto>? ?? const [];
           final blockerMap =
               snapshot.data?['blockerMap'] as Map<String, List<ObligationDto>>? ?? const {};
 
           final hasInbox = pending.isNotEmpty || resolved.isNotEmpty;
-          final hasObligations = readyObligations.isNotEmpty || waitingObligations.isNotEmpty;
+          final hasObligations = readyObligations.isNotEmpty ||
+              waitingObligations.isNotEmpty ||
+              scheduledObligations.isNotEmpty;
 
           if (!hasInbox && !hasObligations) {
             return Center(
@@ -172,6 +179,11 @@ class _InboxTabState extends State<InboxTab> {
               if (waitingObligations.isNotEmpty) ...[
                 _SectionTitle('Waiting Obligations', '${waitingObligations.length} waiting'),
                 _obligationsPanel(waitingObligations, blockerMap),
+                const SizedBox(height: 24),
+              ],
+              if (scheduledObligations.isNotEmpty) ...[
+                _SectionTitle('Scheduled', '${scheduledObligations.length} scheduled'),
+                _obligationsPanel(scheduledObligations, blockerMap),
                 const SizedBox(height: 24),
               ],
               if (pending.isNotEmpty) ...[

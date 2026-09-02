@@ -45,6 +45,25 @@ describe("cron expression + actor-id validation", () => {
     expect(isValidCronExpr("0 3 * * * curl evil")).toBe(false); // trailing command
     expect(isValidCronExpr("0 3 * * *\ncurl evil")).toBe(false); // newline injection
   });
+  it("rejects field values outside each field's valid range", () => {
+    expect(isValidCronExpr("99 99 99 99 99")).toBe(false); // every field out of range
+    expect(isValidCronExpr("60 0 * * *")).toBe(false); // minute max is 59
+    expect(isValidCronExpr("0 24 * * *")).toBe(false); // hour max is 23
+    expect(isValidCronExpr("0 0 32 * *")).toBe(false); // day-of-month max is 31
+    expect(isValidCronExpr("0 0 0 * *")).toBe(false); // day-of-month min is 1
+    expect(isValidCronExpr("0 0 * 13 *")).toBe(false); // month max is 12
+    expect(isValidCronExpr("0 0 * 0 *")).toBe(false); // month min is 1
+    expect(isValidCronExpr("0 0 * * 7")).toBe(false); // day-of-week max is 6
+    expect(isValidCronExpr("59 23 31 12 6")).toBe(true); // every field at its max
+    expect(isValidCronExpr("0 0 1 1 0")).toBe(true); // every field at its min
+  });
+  it("rejects a zero-valued step stride", () => {
+    expect(isValidCronExpr("*/0 * * * *")).toBe(false);
+    expect(isValidCronExpr("0 0 1-10/0 * *")).toBe(false);
+  });
+  it("rejects an inverted range", () => {
+    expect(isValidCronExpr("0 0 10-1 * *")).toBe(false);
+  });
   it("validates actor ids to safe characters, including suffixed wake slots", () => {
     expect(isValidActorId("73e0b00f-8810-4315")).toBe(true);
     expect(isValidActorId("root:daily-bless-cut")).toBe(true);

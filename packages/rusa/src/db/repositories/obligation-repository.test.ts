@@ -1387,6 +1387,30 @@ describe("ObligationRepository", () => {
     }
   });
 
+  it("inherits a scheduled recurring obligation's ownership, keeping its recurrence and next_ready_at intact", () => {
+    repository.create({
+      title: "recurring-work",
+      id: "retiring-recurring",
+      ownerId: "actor-a",
+    });
+    repository.setRecurrence("retiring-recurring", { policy: "cron", cronExpr: "0 * * * *" });
+    const scheduled = repository.setTerminalStatus("retiring-recurring", "done", "cycle one");
+    expect(scheduled.status).toBe("scheduled");
+
+    expect(repository.inheritRetiringActorObligationsInternal("actor-a", "actor-b")).toEqual({
+      ready: 0,
+      waiting: 0,
+      scheduled: 1,
+    });
+
+    const inherited = repository.require("retiring-recurring");
+    expect(inherited.ownerId).toBe("actor-b");
+    expect(inherited.status).toBe("scheduled");
+    expect(inherited.recurrencePolicy).toBe("cron");
+    expect(inherited.recurrenceCron).toBe("0 * * * *");
+    expect(inherited.nextReadyAt).toBe(scheduled.nextReadyAt);
+  });
+
   it("supports child-first inheritance moving upward again when the parent retires", () => {
     repository.create({
       title: "grandparent-existing",
@@ -1444,6 +1468,29 @@ describe("ObligationRepository", () => {
     );
     expect(() => insert.run("ownerless", null, " ", "ready")).toThrow("CHECK constraint failed");
     expect(() => insert.run("self", "self", "actor-a", "ready")).toThrow("CHECK constraint failed");
+  });
+
+  it("enforces recurrence invariants at the migration's CHECK constraint, not just repository validation", () => {
+    const insertCron = db.prepare(
+      `INSERT INTO obligations
+         (id, parent_id, owner_id, status, priority, recurrence_policy, recurrence_cron, recurrence_interval_seconds)
+       VALUES (?, NULL, 'actor-a', 'ready', 0, 'cron', ?, NULL)`
+    );
+    // An empty (or whitespace-only) cron string must be rejected at the DB layer too.
+    expect(() => insertCron.run("empty-cron", "")).toThrow("CHECK constraint failed");
+    expect(() => insertCron.run("blank-cron", "   ")).toThrow("CHECK constraint failed");
+    expect(() => insertCron.run("ok-cron", "0 * * * *")).not.toThrow();
+
+    const insertInterval = db.prepare(
+      `INSERT INTO obligations
+         (id, parent_id, owner_id, status, priority, recurrence_policy, recurrence_cron, recurrence_interval_seconds)
+       VALUES (?, NULL, 'actor-a', 'ready', 0, 'completion_interval', NULL, ?)`
+    );
+    // SQLite's dynamic typing would otherwise let a REAL slip past a bare `> 0` check.
+    expect(() => insertInterval.run("fractional-interval", 1.5)).toThrow("CHECK constraint failed");
+    expect(() => insertInterval.run("zero-interval", 0)).toThrow("CHECK constraint failed");
+    expect(() => insertInterval.run("negative-interval", -60)).toThrow("CHECK constraint failed");
+    expect(() => insertInterval.run("ok-interval", 60)).not.toThrow();
   });
 
   describe("list and listPage", () => {
