@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   FileThreadRegistry,
   InMemoryThreadRegistry,
+  migrateLegacyModelEffort,
   resolveRootThreadId,
   type ThreadRecord,
   type ThreadRegistry,
@@ -139,6 +140,77 @@ function suite(name: string, make: () => ThreadRegistry) {
 }
 
 suite("InMemoryThreadRegistry", () => new InMemoryThreadRegistry());
+
+describe("migrateLegacyModelEffort", () => {
+  it("migrates active tiered slug to canonical form", () => {
+    const record = {
+      id: "test-id",
+      status: "active",
+      provider: "antigravity",
+      model: "gemini-3.7-flash-high",
+      effort: undefined,
+    };
+    const migrated = migrateLegacyModelEffort(record as unknown as ThreadRecord, (p: string) =>
+      p === "antigravity" ? "agy" : p
+    );
+    expect(migrated.model).toBe("gemini-3.7-flash");
+    expect(migrated.effort).toBe("high");
+  });
+
+  it("migrates active display-name form with omitted effort to canonical form", () => {
+    const record1 = {
+      id: "test-id-1",
+      status: "active",
+      provider: "antigravity",
+      model: "Gemini 3.6 Flash (High)",
+      effort: undefined,
+    };
+    const migrated1 = migrateLegacyModelEffort(record1 as unknown as ThreadRecord, (p: string) =>
+      p === "antigravity" ? "agy" : p
+    );
+    expect(migrated1.model).toBe("Gemini 3.6 Flash");
+    expect(migrated1.effort).toBe("high");
+
+    const record2 = {
+      id: "test-id-2",
+      status: "active",
+      provider: "antigravity",
+      model: "Gemini 3.1 Pro (Medium)",
+      effort: undefined,
+    };
+    const migrated2 = migrateLegacyModelEffort(record2 as unknown as ThreadRecord, (p: string) =>
+      p === "antigravity" ? "agy" : p
+    );
+    expect(migrated2.model).toBe("Gemini 3.1 Pro");
+    expect(migrated2.effort).toBe("medium");
+  });
+
+  it("skips retired records with null model or aliased provider", () => {
+    const record1 = {
+      id: "test-id-3",
+      status: "retired",
+      provider: "antigravity",
+      model: null,
+      effort: undefined,
+    };
+    const migrated1 = migrateLegacyModelEffort(record1 as unknown as ThreadRecord, (p: string) =>
+      p === "antigravity" ? "agy" : p
+    );
+    expect(migrated1).toBe(record1); // exact same object returned
+
+    const record2 = {
+      id: "test-id-4",
+      status: "retired",
+      provider: "old-alias",
+      model: "some-model",
+      effort: undefined,
+    };
+    const migrated2 = migrateLegacyModelEffort(record2 as unknown as ThreadRecord, (p: string) =>
+      p === "old-alias" ? "agy" : p
+    );
+    expect(migrated2).toBe(record2);
+  });
+});
 
 describe("FileThreadRegistry", () => {
   const dirs: string[] = [];

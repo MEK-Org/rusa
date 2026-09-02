@@ -146,8 +146,9 @@ rootActor:
 
   provider                 Required. Provider key (in providers) the root actor runs on.
   model                    Optional. Model id passed to the provider CLI's --model. Provider default if omitted.
-  effort                   Optional. Provider-native reasoning level, stored independently from model. Omit to
-                           preserve the provider/model default.
+  effort                   Required for antigravity (agy); optional otherwise. Provider-native reasoning
+                           level (e.g. "low", "high"), stored independently from model. Omit for other providers
+                           to preserve the provider/model default.
   fallbackModel            Optional string or list. Model(s) the root actor falls back to when the primary
                            model is overloaded or unavailable, tried in order via a freshly resolved
                            provider (root-only — ISSUE_NUM; providers.<name>.fallbackModel is rejected).

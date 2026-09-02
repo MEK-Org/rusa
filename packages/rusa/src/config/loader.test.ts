@@ -1081,14 +1081,21 @@ describe("loadConfig chat.excludedSpaces ", () => {
 });
 
 describe("loadConfig antigravity effort", () => {
-  it("fails when antigravity model pin is missing effort", () => {
-    expect(() =>
-      loadConfig(
-        writeConfig({
-          providers: { antigravity: { cliCommand: "agy" } },
-          rootActor: { provider: "antigravity", model: "gemini-3.7-flash" },
-        })
+  it("migrates a legacy antigravity config with no effort to high with a warning log", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const config = loadConfig(
+      writeConfig({
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity", model: "gemini-3.7-flash" },
+      })
+    );
+    expect(config.rootActor?.provider).toBe("antigravity");
+    expect(config.rootActor?.effort).toBe("high");
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining(
+        '[migration] defaulting omitted config rootActor effort to "high" for antigravity model "gemini-3.7-flash"'
       )
-    ).toThrow(/provider "agy" requires an explicit reasoning effort/);
+    );
+    warnSpy.mockRestore();
   });
 });

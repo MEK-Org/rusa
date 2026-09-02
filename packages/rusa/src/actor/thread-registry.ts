@@ -304,7 +304,15 @@ export function migrateLegacyModelEffort(
   providerCapabilityName: (providerName: string) => string = (providerName) => providerName
 ): ThreadRecord {
   const provider = providerCapabilityName(rec.provider ?? "");
-  const current = normalizeModelEffortSelection(provider, rec.model, rec.effort);
+
+  if (rec.status === "retired") {
+    if (rec.model === null || provider !== (rec.provider ?? "")) {
+      return rec;
+    }
+  }
+
+  const effort = rec.effort;
+  const current = normalizeModelEffortSelection(provider, rec.model, effort);
   const desiredProvider = providerCapabilityName(rec.desiredProvider ?? rec.provider ?? "");
   const desired = rec.desiredModel
     ? normalizeModelEffortSelection(
