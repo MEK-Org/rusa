@@ -29,8 +29,24 @@ class ReferencePreview extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final body = reference.body?.trim() ?? '';
-    final hasBody = body.isNotEmpty;
+    var displayTitle = reference.title;
+    var displayBody = reference.body?.trim() ?? '';
+
+    if (reference.entity != null) {
+      final e = reference.entity!;
+      final type = e['type'] as String?;
+      if (type == 'github_issue' || type == 'github_pull_request') {
+        displayTitle = e['title'] as String? ?? displayTitle;
+        displayBody = (e['description'] as String?)?.trim() ?? '';
+      } else if (type == 'gchat_space') {
+        displayTitle = e['name'] as String? ?? displayTitle;
+        displayBody = '';
+      } else if (type == 'gchat_message') {
+        displayBody = (e['contents'] as String?)?.trim() ?? displayBody;
+      }
+    }
+
+    final hasBody = displayBody.isNotEmpty;
 
     return Container(
       width: double.infinity,
@@ -48,10 +64,14 @@ class ReferencePreview extends StatelessWidget {
           Row(
             children: [
               _SchemeChip(reference.scheme),
+              if (reference.cacheState != null && reference.cacheState != 'local') ...[
+                const SizedBox(width: 8),
+                _StateChip(reference.cacheState!),
+              ],
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  reference.title,
+                  displayTitle,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
@@ -102,7 +122,7 @@ class ReferencePreview extends StatelessWidget {
             // citation rendered eight lines tall. The card is meant to be as
             // tall as what it is quoting.
             SelectableText(
-              body,
+              displayBody,
               style: const TextStyle(
                 color: Color(0xFFCBD5E1),
                 fontSize: 12,
@@ -180,4 +200,49 @@ class _SchemeChip extends StatelessWidget {
       ),
     ),
   );
+}
+
+class _StateChip extends StatelessWidget {
+  const _StateChip(this.state);
+  final String state;
+
+  @override
+  Widget build(BuildContext context) {
+    Color color;
+    switch (state) {
+      case 'fresh':
+        color = const Color(0xFF10B981);
+        break;
+      case 'stale':
+        color = const Color(0xFFF59E0B);
+        break;
+      case 'pending':
+        color = const Color(0xFF3B82F6);
+        break;
+      case 'unavailable':
+        color = const Color(0xFFEF4444);
+        break;
+      default:
+        color = MeshColors.textMuted;
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: color.withOpacity(0.3)),
+      ),
+      child: Text(
+        state.toUpperCase(),
+        style: TextStyle(
+          color: color,
+          fontSize: 8.5,
+          fontWeight: FontWeight.bold,
+          letterSpacing: 0.5,
+          fontFamily: kMonoFontFamily,
+        ),
+      ),
+    );
+  }
 }

@@ -68,6 +68,12 @@ export class FakeChatClient implements ChatClient {
     resourceName: string;
   }> = [];
 
+  async getSpace(spaceName: string): Promise<ChatSpace> {
+    const space = this.spaces.find((s) => s.name === spaceName);
+    if (!space) throw new Error(`space not found: ${spaceName}`);
+    return space;
+  }
+
   async getMessage(messageName: string): Promise<ChatReadMessage> {
     const message = this.messages.find((candidate) => candidate.name === messageName);
     if (!message) throw new Error(`message not found: ${messageName}`);

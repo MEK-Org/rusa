@@ -76,6 +76,9 @@ export interface DashboardDataDeps {
    * 400s with a message telling the operator to configure it.
    */
   geminiApiKey?: string;
+  referenceCache?: import("../references/cache-service.js").ReferenceCacheService;
+  chatClient?: import("../chat/types.js").ChatClient;
+  issueClient?: { getIssue?: (owner: string, repo: string, number: number) => Promise<unknown> };
 }
 
 /** Route prefix for the per-actor avatar endpoint . */
@@ -366,10 +369,9 @@ function clampLimit(url: URL): number {
  * presentation boundary, so resolve a mesh-message pointer here and never leak
  * its opaque id into the UI payload.
  */
-function resolveInboxPage(page: InboxPage, meshChat: MeshChatRepository): InboxPage {
-  return {
-    ...page,
-    entries: page.entries.map((entry) => {
+async function resolveInboxPage(page: InboxPage, deps: DashboardDataDeps): Promise<InboxPage> {
+  const entries = await Promise.all(
+    page.entries.map(async (entry) => {
       const { messageId, ...payload } = entry.payload as InboxPayload & {
         messageId?: unknown;
       };
@@ -379,14 +381,17 @@ function resolveInboxPage(page: InboxPage, meshChat: MeshChatRepository): InboxP
       // through the same widget as an obligation's cited artifacts. Only mesh
       // chat resolves in v1 — every other payload keeps its raw JSON, which is
       // the honest rendering until those sources have resolvers.
-      const reference = resolveReferenceSync(`mesh:messages/${messageId}`, { meshChat });
+      const reference = deps.referenceCache
+        ? await deps.referenceCache.get(`mesh:messages/${messageId}`, deps)
+        : resolveReferenceSync(`mesh:messages/${messageId}`, { meshChat: deps.meshChat });
       return {
         ...entry,
         payload: reference.body !== null ? { ...payload, content: reference.body } : payload,
         reference,
       };
-    }),
-  };
+    })
+  );
+  return { ...page, entries };
 }
 
 function parseKinds(url: URL): string[] | undefined {
@@ -405,12 +410,12 @@ function parseKinds(url: URL): string[] | undefined {
  * through to static asset serving. When `deps` is null (e.g. the e2e UI-only
  * server) every mesh route 503s — the static UI is unaffected.
  */
-export function handleMeshApiRequest(
+export async function handleMeshApiRequest(
   req: IncomingMessage,
   res: ServerResponse,
   url: URL,
   deps: DashboardDataDeps | null
-): boolean {
+): Promise<boolean> {
   const { pathname } = url;
   if (!pathname.startsWith("/api/mesh/")) return false;
 
@@ -1270,12 +1275,12 @@ export function handleMeshApiRequest(
     sendJson(
       res,
       200,
-      resolveInboxPage(
+      await resolveInboxPage(
         deps.inbox.list(actorId, {
           status: status as "unhandled" | "handled" | "all" | undefined,
           limit: clampLimit(url),
         }),
-        deps.meshChat
+        deps
       )
     );
     return true;
@@ -1355,13 +1360,14 @@ export function handleMeshApiRequest(
       blockingOnly: true,
     });
     const parent = obligation.parentId ? deps.obligations.get(obligation.parentId) : null;
-    const artifacts = deps.obligations.listArtifacts(id).map((artifact) => ({
-      artifact,
-      // v1 resolves mesh chat only; anything else comes back with `unavailable`
-      // set, which the dashboard renders as a citation it cannot yet expand
-      // rather than as an empty one.
-      reference: resolveReferenceSync(artifact.ref, { meshChat: deps.meshChat }),
-    }));
+    const artifacts = await Promise.all(
+      deps.obligations.listArtifacts(id).map(async (artifact) => ({
+        artifact,
+        reference: deps.referenceCache
+          ? await deps.referenceCache.get(artifact.ref, deps)
+          : resolveReferenceSync(artifact.ref, { meshChat: deps.meshChat }),
+      }))
+    );
     sendJson(res, 200, {
       obligation,
       parent,

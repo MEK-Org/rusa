@@ -187,6 +187,7 @@ import {
 import { assertBwrapAvailable, teardownFlutterOverlay } from "../providers/sandbox.js";
 import type { McpServerSpec, RunResult } from "../providers/types.js";
 import { resolveQuotaDatabasePath, SharedQuotaStore } from "../quota/shared-store.js";
+import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
 import { createCommitmentPolarityEvaluator } from "../understanding/commitment-polarity.js";
 import {
@@ -2729,6 +2730,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           meshChat: getRepositories().meshChat,
           obligations: getRepositories().obligations,
           inbox: getRepositories().inbox,
+          referenceCache: new ReferenceCacheService(getRepositories().referenceCache),
+          chatClient: chatClient ?? undefined,
+          issueClient: issueClient,
           emitter: meshEmitter,
           // Read-only exposures: the emergency-brake state and a snapshot of
           // which actors are executing a run right now — for the header HALTED

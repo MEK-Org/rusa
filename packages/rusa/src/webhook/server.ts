@@ -141,6 +141,9 @@ export interface DashboardMeshRefs {
   rootIdentity?: DashboardDataDeps["rootIdentity"];
   /** Gemini API key, for on-demand avatar generation ; see `DashboardDataDeps`. */
   geminiApiKey?: DashboardDataDeps["geminiApiKey"];
+  referenceCache?: DashboardDataDeps["referenceCache"];
+  chatClient?: DashboardDataDeps["chatClient"];
+  issueClient?: DashboardDataDeps["issueClient"];
 }
 
 export interface DashboardServerOptions {
@@ -298,7 +301,7 @@ export function createDashboardRequestHandler(
 
     // Live mesh Data API + SSE. Owns every `/api/mesh/*` path (503s if no mesh
     // is bound); returns false otherwise so we fall through to static serving.
-    if (handleMeshApiRequest(req, res, requestUrl, dataDeps)) return;
+    if (await handleMeshApiRequest(req, res, requestUrl, dataDeps)) return;
 
     if (serveUi && req.method === "GET" && !pathname.startsWith("/api/")) {
       // This instance's own name and face (#48), from the configured root
@@ -464,6 +467,9 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           providerQueueHeads: options.mesh.providerQueueHeads,
           rootIdentity: options.mesh.rootIdentity,
           geminiApiKey: options.mesh.geminiApiKey,
+          referenceCache: options.mesh.referenceCache,
+          chatClient: options.mesh.chatClient,
+          issueClient: options.mesh.issueClient,
         }
       : null;
   // Walkie-talkie deps : routes need the registry/mesh/hub either way so

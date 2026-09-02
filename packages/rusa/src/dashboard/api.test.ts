@@ -60,7 +60,7 @@ class MockRes extends EventEmitter {
   }
 }
 
-function call(
+async function call(
   deps: DashboardDataDeps | null,
   method: string,
   path: string,
@@ -75,18 +75,25 @@ function call(
   // adding a second path into sendJson that only tests would use.
   if (acceptEncoding !== undefined) res.req.headers = { "accept-encoding": acceptEncoding };
   const url = new URL(path, "http://localhost");
-  const handled = handleMeshApiRequest(
+
+  let handled = false;
+  const p = handleMeshApiRequest(
     req as unknown as IncomingMessage,
     res as unknown as ServerResponse,
     url,
     deps
-  );
+  ).then((h) => {
+    handled = h;
+  });
+
   if (body !== undefined) {
     process.nextTick(() => {
       req.emit("data", Buffer.from(body));
       req.emit("end");
     });
   }
+
+  await p;
   return { handled, res, req };
 }
 
@@ -147,35 +154,35 @@ describe("handleMeshApiRequest", () => {
     };
   });
 
-  it("ignores non-/api/mesh paths (returns false)", () => {
-    const { handled } = call(deps, "GET", "/dashboard");
+  it("ignores non-/api/mesh paths (returns false)", async () => {
+    const { handled } = await call(deps, "GET", "/dashboard");
     expect(handled).toBe(false);
   });
 
-  it("503s every mesh route when no mesh is bound", () => {
-    const { handled, res } = call(null, "GET", "/api/mesh/threads");
+  it("503s every mesh route when no mesh is bound", async () => {
+    const { handled, res } = await call(null, "GET", "/api/mesh/threads");
     expect(handled).toBe(true);
     expect(res.statusCode).toBe(503);
   });
 
-  it("405s a non-GET mesh request", () => {
-    const { res } = call(deps, "POST", "/api/mesh/threads");
+  it("405s a non-GET mesh request", async () => {
+    const { res } = await call(deps, "POST", "/api/mesh/threads");
     expect(res.statusCode).toBe(405);
   });
 
-  it("404s an unknown mesh endpoint", () => {
-    const { res } = call(deps, "GET", "/api/mesh/nope");
+  it("404s an unknown mesh endpoint", async () => {
+    const { res } = await call(deps, "GET", "/api/mesh/nope");
     expect(res.statusCode).toBe(404);
   });
 
-  it("GET /api/mesh/control/options lists configured providers", () => {
-    const { res } = call(deps, "GET", "/api/mesh/control/options");
+  it("GET /api/mesh/control/options lists configured providers", async () => {
+    const { res } = await call(deps, "GET", "/api/mesh/control/options");
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ providers: ["agy", "codex"] });
   });
 
   it("POST /api/mesh/actors delegates a root child spawn to the human principal", async () => {
-    const { res } = call(
+    const { res } = await call(
       deps,
       "POST",
       "/api/mesh/actors",
@@ -207,7 +214,7 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("POST /api/mesh/actors forwards a portable context selection ", async () => {
-    const { res } = call(
+    const { res } = await call(
       deps,
       "POST",
       "/api/mesh/actors",
@@ -232,7 +239,7 @@ describe("handleMeshApiRequest", () => {
   it("POST /api/mesh/actors 400s an unknown context selection instead of spawning native", async () => {
     // Silently falling back to native is the failure mode that matters here: the
     // operator would get an ordinary actor and believe it was portable.
-    const { res } = call(
+    const { res } = await call(
       deps,
       "POST",
       "/api/mesh/actors",
@@ -254,7 +261,7 @@ describe("handleMeshApiRequest", () => {
         throw new Error("charter is required");
       },
     } as unknown as RootControlService;
-    const { res } = call(deps, "POST", "/api/mesh/actors", JSON.stringify({ charter: "" }));
+    const { res } = await call(deps, "POST", "/api/mesh/actors", JSON.stringify({ charter: "" }));
     await new Promise((resolve) => process.nextTick(resolve));
     await new Promise((resolve) => process.nextTick(resolve));
     expect(res.statusCode).toBe(400);
@@ -273,26 +280,26 @@ describe("handleMeshApiRequest", () => {
       },
     } as unknown as RootControlService;
 
-    const res1 = call(
+    const { res: res1 } = await call(
       deps,
       "POST",
       "/api/mesh/actors",
       JSON.stringify({ charter: "work", model: "claude-sonnet-4-6" })
-    ).res;
+    );
     await new Promise((resolve) => process.nextTick(resolve));
     await new Promise((resolve) => process.nextTick(resolve));
-    expect(res1.statusCode).toBe(400);
+    expect(res1?.statusCode).toBe(400);
     expect(JSON.parse(res1.body)).toEqual({ error: "provider is required" });
 
-    const res2 = call(
+    const { res: res2 } = await call(
       deps,
       "POST",
       "/api/mesh/actors",
       JSON.stringify({ charter: "work", provider: "claude" })
-    ).res;
+    );
     await new Promise((resolve) => process.nextTick(resolve));
     await new Promise((resolve) => process.nextTick(resolve));
-    expect(res2.statusCode).toBe(400);
+    expect(res2?.statusCode).toBe(400);
     expect(JSON.parse(res2.body)).toEqual({ error: "model is required" });
 
     deps.rootControl = control;
@@ -329,7 +336,7 @@ describe("handleMeshApiRequest", () => {
 
     it("compresses a large body with brotli, preferring it over gzip", async () => {
       seedBulk();
-      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "gzip, deflate, br");
+      const { res } = await call(deps, "GET", "/api/mesh/threads", undefined, "gzip, deflate, br");
       await settled(res);
 
       expect(res.statusCode).toBe(200);
@@ -343,7 +350,7 @@ describe("handleMeshApiRequest", () => {
 
     it("falls back to gzip for a client that does not speak brotli", async () => {
       seedBulk();
-      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "gzip, deflate");
+      const { res } = await call(deps, "GET", "/api/mesh/threads", undefined, "gzip, deflate");
       await settled(res);
 
       expect(res.headers["Content-Encoding"]).toBe("gzip");
@@ -353,7 +360,7 @@ describe("handleMeshApiRequest", () => {
 
     it("sends a large body uncompressed when the client accepts nothing", async () => {
       seedBulk();
-      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "identity");
+      const { res } = await call(deps, "GET", "/api/mesh/threads", undefined, "identity");
       await settled(res);
 
       expect(res.headers["Content-Encoding"]).toBeUndefined();
@@ -362,7 +369,7 @@ describe("handleMeshApiRequest", () => {
 
     it("leaves a small body alone even when the client would take brotli", async () => {
       registry.upsert(rec("root", null, "active"));
-      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "br");
+      const { res } = await call(deps, "GET", "/api/mesh/threads", undefined, "br");
       await settled(res);
 
       // Below the threshold a round trip through the threadpool buys nothing.
@@ -372,7 +379,7 @@ describe("handleMeshApiRequest", () => {
 
     it("always varies on Accept-Encoding, including when it did not compress", async () => {
       registry.upsert(rec("root", null, "active"));
-      const { res } = call(deps, "GET", "/api/mesh/threads");
+      const { res } = await call(deps, "GET", "/api/mesh/threads");
       await settled(res);
 
       // A cache that missed this header could hand a br body to a client that
@@ -385,7 +392,7 @@ describe("handleMeshApiRequest", () => {
       // The case a substring test gets exactly backwards: this header offers
       // gzip and *forbids* brotli, and reading it as "mentions br" ships a
       // body the client said it cannot accept.
-      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "br;q=0, gzip");
+      const { res } = await call(deps, "GET", "/api/mesh/threads", undefined, "br;q=0, gzip");
       await settled(res);
 
       expect(res.headers["Content-Encoding"]).toBe("gzip");
@@ -395,7 +402,7 @@ describe("handleMeshApiRequest", () => {
 
     it("sends identity when every codec it can produce is refused", async () => {
       seedBulk();
-      const { res } = call(
+      const { res } = await call(
         deps,
         "GET",
         "/api/mesh/threads",
@@ -411,7 +418,7 @@ describe("handleMeshApiRequest", () => {
     it("does not read a codec name out of a longer token", async () => {
       seedBulk();
       // `xbr` and `gzipped` are not offers of `br` and `gzip`.
-      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "xbr, gzipped");
+      const { res } = await call(deps, "GET", "/api/mesh/threads", undefined, "xbr, gzipped");
       await settled(res);
 
       expect(res.headers["Content-Encoding"]).toBeUndefined();
@@ -420,7 +427,7 @@ describe("handleMeshApiRequest", () => {
 
     it("takes the wildcard as permission for a codec the client did not name", async () => {
       seedBulk();
-      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "*");
+      const { res } = await call(deps, "GET", "/api/mesh/threads", undefined, "*");
       await settled(res);
 
       expect(res.headers["Content-Encoding"]).toBe("br");
@@ -431,7 +438,7 @@ describe("handleMeshApiRequest", () => {
     it("lets an explicit refusal beat a permissive wildcard", async () => {
       seedBulk();
       // `*` allows everything unnamed; `br;q=0` names brotli to refuse it.
-      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "*, br;q=0");
+      const { res } = await call(deps, "GET", "/api/mesh/threads", undefined, "*, br;q=0");
       await settled(res);
 
       expect(res.headers["Content-Encoding"]).toBe("gzip");
@@ -444,7 +451,7 @@ describe("handleMeshApiRequest", () => {
       // Only an explicit zero disqualifies. A low q is still a yes, and a
       // malformed one falls back to the spec's default of 1 rather than
       // silently costing the client its compression.
-      const { res } = call(
+      const { res } = await call(
         deps,
         "GET",
         "/api/mesh/threads",
@@ -460,7 +467,7 @@ describe("handleMeshApiRequest", () => {
 
     it("reads tokens through whitespace and case the way clients send them", async () => {
       seedBulk();
-      const { res } = call(deps, "GET", "/api/mesh/threads", undefined, "  GZIP ;  Q=1.0 ");
+      const { res } = await call(deps, "GET", "/api/mesh/threads", undefined, "  GZIP ;  Q=1.0 ");
       await settled(res);
 
       expect(res.headers["Content-Encoding"]).toBe("gzip");
@@ -473,7 +480,7 @@ describe("handleMeshApiRequest", () => {
       // MockRes's default `req` carries no headers at all — the shape an
       // embedder's double can have. Negotiation must read that as "no
       // encoding offered" rather than throwing.
-      const { res } = call(deps, "GET", "/api/mesh/threads");
+      const { res } = await call(deps, "GET", "/api/mesh/threads");
       await settled(res);
 
       expect(res.statusCode).toBe(200);
@@ -482,12 +489,12 @@ describe("handleMeshApiRequest", () => {
     });
   });
 
-  it("GET /api/mesh/threads lists threads with deterministic handles", () => {
+  it("GET /api/mesh/threads lists threads with deterministic handles", async () => {
     registry.upsert(rec("root", null, "active"));
     registry.upsert(rec(UUID_A, "root", "active"));
     registry.upsert(rec(UUID_B, "root", "retired"));
 
-    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
     expect(res.statusCode).toBe(200);
     const { threads } = JSON.parse(res.body);
     expect(threads).toHaveLength(3);
@@ -496,7 +503,7 @@ describe("handleMeshApiRequest", () => {
     expect(threads.find((t: { id: string }) => t.id === UUID_B).status).toBe("retired");
   });
 
-  it("GET /api/mesh/threads surfaces one model and does not leak a stale bound-model readback", () => {
+  it("GET /api/mesh/threads surfaces one model and does not leak a stale bound-model readback", async () => {
     // A registry record that still carries the removed `boundModel` key. The cast is the
     // point, not a workaround: the field is gone from `ThreadRecord`, but the registry is
     // a JSON file loaded with a cast and rewritten whole, so every record written before
@@ -513,7 +520,7 @@ describe("handleMeshApiRequest", () => {
       boundModel: "gpt-5.5",
     } as ThreadRecord);
 
-    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
     expect(res.statusCode).toBe(200);
     const { threads } = JSON.parse(res.body);
     const actor = threads.find((t: { id: string }) => t.id === UUID_A);
@@ -523,7 +530,7 @@ describe("handleMeshApiRequest", () => {
     expect(actor.boundModel).toBeUndefined();
   });
 
-  it("GET /api/mesh/threads surfaces pending desiredModel and desiredProvider when staged", () => {
+  it("GET /api/mesh/threads surfaces pending desiredModel and desiredProvider when staged", async () => {
     registry.upsert({
       ...rec(UUID_A, "root", "active"),
       provider: "claude",
@@ -534,7 +541,7 @@ describe("handleMeshApiRequest", () => {
       desiredProvider: "codex",
     });
 
-    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
     expect(res.statusCode).toBe(200);
     const { threads } = JSON.parse(res.body);
     const actor = threads.find((t: { id: string }) => t.id === UUID_A);
@@ -547,7 +554,7 @@ describe("handleMeshApiRequest", () => {
     expect(actor.desiredProvider).toBe("codex");
   });
 
-  it("GET /api/mesh/threads distinguishes a pending effort clear from no pending change", () => {
+  it("GET /api/mesh/threads distinguishes a pending effort clear from no pending change", async () => {
     registry.upsert({
       ...rec(UUID_A, "root", "active"),
       provider: "codex",
@@ -562,7 +569,7 @@ describe("handleMeshApiRequest", () => {
       effort: "high",
     });
 
-    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
     const { threads } = JSON.parse(res.body);
     const clearing = threads.find((t: { id: string }) => t.id === UUID_A);
     const unchanged = threads.find((t: { id: string }) => t.id === UUID_B);
@@ -571,14 +578,14 @@ describe("handleMeshApiRequest", () => {
     expect(Object.hasOwn(unchanged, "desiredEffort")).toBe(false);
   });
 
-  it("GET /api/mesh/threads shows the default root handle when no identity is configured", () => {
+  it("GET /api/mesh/threads shows the default root handle when no identity is configured", async () => {
     registry.upsert({ ...rec("root", null, "active"), isRoot: true });
-    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
     const { threads } = JSON.parse(res.body);
     expect(threads.find((t: { id: string }) => t.id === "root").handle).toBe("root-actor");
   });
 
-  it("GET /api/mesh/threads shows the configured root handle, leaving worker handles alone ", () => {
+  it("GET /api/mesh/threads shows the configured root handle, leaving worker handles alone ", async () => {
     registry.upsert({ ...rec("root", null, "active"), isRoot: true });
     registry.upsert(rec(UUID_A, "root", "active"));
     const configuredDeps: DashboardDataDeps = {
@@ -586,7 +593,7 @@ describe("handleMeshApiRequest", () => {
       rootIdentity: { id: "root", handle: "ember-familiar" },
     };
 
-    const { res } = call(configuredDeps, "GET", "/api/mesh/threads");
+    const { res } = await call(configuredDeps, "GET", "/api/mesh/threads");
     const { threads } = JSON.parse(res.body);
     expect(threads.find((t: { id: string }) => t.id === "root").handle).toBe("ember-familiar");
     expect(threads.find((t: { id: string }) => t.id === UUID_A).handle).toBe(
@@ -594,19 +601,19 @@ describe("handleMeshApiRequest", () => {
     );
   });
 
-  it("GET /api/mesh/threads identifies a generated-id root from isRoot", () => {
+  it("GET /api/mesh/threads identifies a generated-id root from isRoot", async () => {
     registry.upsert({ ...rec(UUID_A, null, "active"), isRoot: true });
     const configuredDeps: DashboardDataDeps = {
       ...deps,
       rootIdentity: { id: UUID_A, handle: "ember-familiar" },
     };
 
-    const { res } = call(configuredDeps, "GET", "/api/mesh/threads");
+    const { res } = await call(configuredDeps, "GET", "/api/mesh/threads");
     const { threads } = JSON.parse(res.body);
     expect(threads.find((t: { id: string }) => t.id === UUID_A).handle).toBe("ember-familiar");
   });
 
-  it("GET /api/mesh/threads maps title and falls back on summarizeCharter", () => {
+  it("GET /api/mesh/threads maps title and falls back on summarizeCharter", async () => {
     registry.upsert({
       id: "root",
       charter: "root charter\nline 2",
@@ -623,7 +630,7 @@ describe("handleMeshApiRequest", () => {
       createdAt: "2026-06-21T00:00:00.000Z",
     });
 
-    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
     expect(res.statusCode).toBe(200);
     const { threads } = JSON.parse(res.body);
     const root = threads.find((t: { id: string }) => t.id === "root");
@@ -633,7 +640,7 @@ describe("handleMeshApiRequest", () => {
     expect(child.title).toBe("Custom Title");
   });
 
-  it("GET /api/mesh/threads sends a clipped charter preview, not the whole charter", () => {
+  it("GET /api/mesh/threads sends a clipped charter preview, not the whole charter", async () => {
     // A charter well past the preview budget, with a distinctive tail so the
     // assertion is about the bytes on the wire rather than about a length.
     const long = `${"pursue the objective. ".repeat(60)}TAIL-MARKER`;
@@ -645,7 +652,7 @@ describe("handleMeshApiRequest", () => {
       createdAt: "2026-06-21T00:00:00.000Z",
     });
 
-    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
     const { threads } = JSON.parse(res.body);
     const dto = threads.find((t: { id: string }) => t.id === UUID_A);
 
@@ -657,7 +664,7 @@ describe("handleMeshApiRequest", () => {
     expect(res.body.includes("TAIL-MARKER")).toBe(false);
   });
 
-  it("GET /api/mesh/threads leaves a charter inside the budget exactly as it is", () => {
+  it("GET /api/mesh/threads leaves a charter inside the budget exactly as it is", async () => {
     registry.upsert({
       id: UUID_A,
       charter: "short charter\nline 2",
@@ -666,7 +673,7 @@ describe("handleMeshApiRequest", () => {
       createdAt: "2026-06-21T00:00:00.000Z",
     });
 
-    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
     const { threads } = JSON.parse(res.body);
     const dto = threads.find((t: { id: string }) => t.id === UUID_A);
 
@@ -675,7 +682,7 @@ describe("handleMeshApiRequest", () => {
     expect(dto.charterPreview).toBe("short charter\nline 2");
   });
 
-  it("GET /api/mesh/threads clips a charter on a character, not a code unit", () => {
+  it("GET /api/mesh/threads clips a charter on a character, not a code unit", async () => {
     // Emoji are two UTF-16 code units each, so a code-unit slice at 280 lands
     // inside the 140th one and ends the excerpt on half a character.
     registry.upsert({
@@ -686,7 +693,7 @@ describe("handleMeshApiRequest", () => {
       createdAt: "2026-06-21T00:00:00.000Z",
     });
 
-    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
     const { threads } = JSON.parse(res.body);
     const dto = threads.find((t: { id: string }) => t.id === UUID_A);
 
@@ -697,7 +704,7 @@ describe("handleMeshApiRequest", () => {
     expect(Buffer.from(dto.charterPreview, "utf8").toString("utf8")).toBe(dto.charterPreview);
   });
 
-  it("GET /api/mesh/threads/charter serves the one actor's full charter", () => {
+  it("GET /api/mesh/threads/charter serves the one actor's full charter", async () => {
     const long = `${"pursue the objective. ".repeat(60)}TAIL-MARKER`;
     registry.upsert({
       id: UUID_A,
@@ -707,34 +714,34 @@ describe("handleMeshApiRequest", () => {
       createdAt: "2026-06-21T00:00:00.000Z",
     });
 
-    const { res } = call(deps, "GET", `/api/mesh/threads/charter?id=${UUID_A}`);
+    const { res } = await call(deps, "GET", `/api/mesh/threads/charter?id=${UUID_A}`);
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ id: UUID_A, charter: long });
   });
 
-  it("GET /api/mesh/threads/charter 404s for an unknown or missing id", () => {
+  it("GET /api/mesh/threads/charter 404s for an unknown or missing id", async () => {
     registry.upsert(rec(UUID_A, null, "active"));
 
-    const unknown = call(deps, "GET", "/api/mesh/threads/charter?id=nope").res;
+    const unknown = (await call(deps, "GET", "/api/mesh/threads/charter?id=nope")).res;
     expect(unknown.statusCode).toBe(404);
     expect(JSON.parse(unknown.body)).toEqual({ error: "thread not found" });
 
     // No `id` at all must not fall through to the list route below it.
-    const missing = call(deps, "GET", "/api/mesh/threads/charter").res;
+    const missing = (await call(deps, "GET", "/api/mesh/threads/charter")).res;
     expect(missing.statusCode).toBe(404);
   });
 
-  it("GET /api/mesh/threads reports halted:false and every thread idle by default", () => {
+  it("GET /api/mesh/threads reports halted:false and every thread idle by default", async () => {
     registry.upsert(rec("root", null, "active"));
     registry.upsert(rec(UUID_A, "root", "active"));
 
-    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
     const body = JSON.parse(res.body);
     expect(body.halted).toBe(false);
     expect(body.threads.every((t: { runState: string }) => t.runState === "idle")).toBe(true);
   });
 
-  it("GET /api/mesh/threads returns cursor and run states from one runtime capture", () => {
+  it("GET /api/mesh/threads returns cursor and run states from one runtime capture", async () => {
     registry.upsert(rec("root", null, "active"));
     registry.upsert(rec(UUID_A, "root", "active"));
     const snapshot = {
@@ -752,7 +759,7 @@ describe("handleMeshApiRequest", () => {
       runningThreadIds: () => new Set([UUID_A]),
     };
 
-    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
     const body = JSON.parse(res.body);
     expect(runtimeStateSnapshot).toHaveBeenCalledTimes(1);
     expect(body.runtimeCursor).toEqual({ streamId: "epoch-a", revision: 17 });
@@ -761,7 +768,7 @@ describe("handleMeshApiRequest", () => {
     );
   });
 
-  it("GET /api/mesh/threads surfaces halt, queued, and running snapshots", () => {
+  it("GET /api/mesh/threads surfaces halt, queued, and running snapshots", async () => {
     registry.upsert(rec("root", null, "active"));
     registry.upsert(rec(UUID_A, "root", "active"));
     registry.upsert(rec(UUID_B, "root", "active"));
@@ -772,7 +779,7 @@ describe("handleMeshApiRequest", () => {
       queuedThreadIds: () => new Set([UUID_B]),
     };
 
-    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
     const body = JSON.parse(res.body);
     expect(body.halted).toBe(true);
     const byId = (id: string) => body.threads.find((t: { id: string }) => t.id === id);
@@ -781,7 +788,7 @@ describe("handleMeshApiRequest", () => {
     expect(byId("root").runState).toBe("idle");
   });
 
-  it("GET /api/mesh/threads surfaces winding_down when a running actor is yielded", () => {
+  it("GET /api/mesh/threads surfaces winding_down when a running actor is yielded", async () => {
     registry.upsert(rec("root", null, "active"));
     registry.upsert(rec(UUID_A, "root", "active"));
     deps = {
@@ -790,13 +797,13 @@ describe("handleMeshApiRequest", () => {
       isYielded: (id) => id === UUID_A,
     };
 
-    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
     const body = JSON.parse(res.body);
     const byId = (id: string) => body.threads.find((t: { id: string }) => t.id === id);
     expect(byId(UUID_A).runState).toBe("winding_down");
   });
 
-  it("GET /api/mesh/threads exposes lastActiveAt from mesh_events", () => {
+  it("GET /api/mesh/threads exposes lastActiveAt from mesh_events", async () => {
     registry.upsert(rec("root", null, "active"));
     registry.upsert(rec(UUID_A, "root", "active"));
     registry.upsert(rec(UUID_B, "root", "retired"));
@@ -809,7 +816,7 @@ describe("handleMeshApiRequest", () => {
       ts: "2026-06-22T00:00:00.000Z",
     });
 
-    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
     const body = JSON.parse(res.body);
     const byId = (id: string) => body.threads.find((t: { id: string }) => t.id === id);
     expect(byId(UUID_A).lastActiveAt).toBe("2026-06-22T00:00:00.000Z");
@@ -817,17 +824,17 @@ describe("handleMeshApiRequest", () => {
     expect(byId("root").lastActiveAt).toBeNull();
   });
 
-  it("GET /api/mesh/events merges actors newest-first and paginates by rowid", () => {
+  it("GET /api/mesh/events merges actors newest-first and paginates by rowid", async () => {
     meshEvents.record({ kind: "run_start", actorId: UUID_A, detail: "1" });
     meshEvents.record({ kind: "run_start", actorId: UUID_B, detail: "2" });
     meshEvents.record({ kind: "run_end", actorId: UUID_A, success: true, detail: "3" });
 
-    const first = call(deps, "GET", `/api/mesh/events?actors=${UUID_A},${UUID_B}&limit=2`);
+    const first = await call(deps, "GET", `/api/mesh/events?actors=${UUID_A},${UUID_B}&limit=2`);
     const page1 = JSON.parse(first.res.body);
     expect(page1.events.map((e: { detail: string }) => e.detail)).toEqual(["3", "2"]);
     expect(page1.nextCursor).not.toBeNull();
 
-    const second = call(
+    const second = await call(
       deps,
       "GET",
       `/api/mesh/events?actors=${UUID_A},${UUID_B}&limit=2&before=${page1.nextCursor}`
@@ -837,7 +844,7 @@ describe("handleMeshApiRequest", () => {
     ]);
   });
 
-  it("GET /api/mesh/events?since= returns ALL actors, oldest-first, forward (distiller read)", () => {
+  it("GET /api/mesh/events?since= returns ALL actors, oldest-first, forward (distiller read)", async () => {
     meshEvents.record({
       kind: "run_start",
       actorId: UUID_A,
@@ -851,13 +858,13 @@ describe("handleMeshApiRequest", () => {
       ts: "2026-06-18T00:00:00.000Z",
     });
 
-    const { res } = call(deps, "GET", "/api/mesh/events?since=2026-06-17T00:00:00.000Z");
+    const { res } = await call(deps, "GET", "/api/mesh/events?since=2026-06-17T00:00:00.000Z");
     const body = JSON.parse(res.body);
     expect(body.events.map((e: { detail: string }) => e.detail)).toEqual(["in"]); // all actors, since-floored
     expect(body.hasMore).toBe(false);
   });
 
-  it("GET /api/mesh/events?since=&until= bounds the window (half-open)", () => {
+  it("GET /api/mesh/events?since=&until= bounds the window (half-open)", async () => {
     meshEvents.record({
       kind: "run_start",
       actorId: UUID_A,
@@ -871,7 +878,7 @@ describe("handleMeshApiRequest", () => {
       ts: "2026-06-20T00:00:00.000Z",
     });
 
-    const { res } = call(
+    const { res } = await call(
       deps,
       "GET",
       "/api/mesh/events?since=2026-06-17T00:00:00.000Z&until=2026-06-20T00:00:00.000Z"
@@ -879,7 +886,7 @@ describe("handleMeshApiRequest", () => {
     expect(JSON.parse(res.body).events.map((e: { detail: string }) => e.detail)).toEqual(["in"]);
   });
 
-  it("GET /api/mesh/events?since=&kinds= filters events by kind", () => {
+  it("GET /api/mesh/events?since=&kinds= filters events by kind", async () => {
     meshEvents.record({
       kind: "run_start",
       actorId: UUID_A,
@@ -893,7 +900,7 @@ describe("handleMeshApiRequest", () => {
       ts: "2026-06-18T00:00:01.000Z",
     });
 
-    const { res } = call(
+    const { res } = await call(
       deps,
       "GET",
       "/api/mesh/events?since=2026-06-17T00:00:00.000Z&kinds=run_yielded"
@@ -902,7 +909,7 @@ describe("handleMeshApiRequest", () => {
     expect(body.events.map((e: { detail: string }) => e.detail)).toEqual(["yielded"]);
   });
 
-  it("GET /api/mesh/events?since=&order= respects ordering parameter", () => {
+  it("GET /api/mesh/events?since=&order= respects ordering parameter", async () => {
     meshEvents.record({
       kind: "run_start",
       actorId: UUID_A,
@@ -916,7 +923,7 @@ describe("handleMeshApiRequest", () => {
       ts: "2026-06-18T00:00:01.000Z",
     });
 
-    const { res: resAsc } = call(
+    const { res: resAsc } = await call(
       deps,
       "GET",
       "/api/mesh/events?since=2026-06-17T00:00:00.000Z&order=asc"
@@ -926,7 +933,7 @@ describe("handleMeshApiRequest", () => {
       "newest",
     ]);
 
-    const { res: resDesc } = call(
+    const { res: resDesc } = await call(
       deps,
       "GET",
       "/api/mesh/events?since=2026-06-17T00:00:00.000Z&order=desc"
@@ -937,13 +944,13 @@ describe("handleMeshApiRequest", () => {
     ]);
   });
 
-  it("GET /api/mesh/events with no actors returns an empty page (never all events)", () => {
+  it("GET /api/mesh/events with no actors returns an empty page (never all events)", async () => {
     meshEvents.record({ kind: "run_start", actorId: UUID_A });
-    const { res } = call(deps, "GET", "/api/mesh/events");
+    const { res } = await call(deps, "GET", "/api/mesh/events");
     expect(JSON.parse(res.body)).toEqual({ events: [], nextCursor: null });
   });
 
-  it("GET /api/mesh/inbox resolves a mesh message body into the payload, not its id", () => {
+  it("GET /api/mesh/inbox resolves a mesh message body into the payload, not its id", async () => {
     const messageId = meshChat.record({
       id: "message-for-inbox",
       senderId: "root",
@@ -959,7 +966,7 @@ describe("handleMeshApiRequest", () => {
       },
     ]);
 
-    const { res } = call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
+    const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
     expect(res.statusCode).toBe(200);
     const entry = JSON.parse(res.body).entries[0];
     expect(entry.payload).toEqual({
@@ -981,7 +988,7 @@ describe("handleMeshApiRequest", () => {
     });
   });
 
-  it("GET /api/mesh/inbox preserves a dangling mesh citation and its failure reason", () => {
+  it("GET /api/mesh/inbox preserves a dangling mesh citation and its failure reason", async () => {
     inbox.append([
       {
         id: "dangling-inbox-entry",
@@ -991,7 +998,7 @@ describe("handleMeshApiRequest", () => {
       },
     ]);
 
-    const { res } = call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
+    const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
     const entry = JSON.parse(res.body).entries[0];
     expect(entry.reference).toMatchObject({
       ref: "mesh:messages/missing-message",
@@ -1002,7 +1009,7 @@ describe("handleMeshApiRequest", () => {
 
   describe("POST /api/mesh/actors/:id/inbox/handled", () => {
     const post = async (actorId: string, body: unknown) => {
-      const { res } = call(
+      const { res } = await call(
         deps,
         "POST",
         `/api/mesh/actors/${actorId}/inbox/handled`,
@@ -1089,15 +1096,15 @@ describe("handleMeshApiRequest", () => {
     });
   });
 
-  it("GET /api/mesh/events filters by kind", () => {
+  it("GET /api/mesh/events filters by kind", async () => {
     meshEvents.record({ kind: "run_start", actorId: UUID_A, detail: "s" });
     meshEvents.record({ kind: "message_sent", actorId: UUID_A, detail: "m" });
-    const { res } = call(deps, "GET", `/api/mesh/events?actors=${UUID_A}&kinds=message_sent`);
+    const { res } = await call(deps, "GET", `/api/mesh/events?actors=${UUID_A}&kinds=message_sent`);
     const page = JSON.parse(res.body);
     expect(page.events.map((e: { kind: string }) => e.kind)).toEqual(["message_sent"]);
   });
 
-  it("GET /api/mesh/events restricts to actor-pair when conversation=true", () => {
+  it("GET /api/mesh/events restricts to actor-pair when conversation=true", async () => {
     const insertMsg = (id: string, sender: string, recipient: string, detail: string) => {
       db.prepare(
         `INSERT INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id) VALUES (?, 0, ?, ?, ?, 's1')`
@@ -1114,7 +1121,7 @@ describe("handleMeshApiRequest", () => {
     insertMsg("m3", "UUID_C", UUID_A, "C to A");
     insertMsg("m4", UUID_B, "UUID_D", "B to D");
 
-    const { res } = call(
+    const { res } = await call(
       deps,
       "GET",
       `/api/mesh/events?actors=${UUID_A},${UUID_B}&kinds=message_sent&conversation=true`
@@ -1128,42 +1135,42 @@ describe("handleMeshApiRequest", () => {
     expect(page.events.length).toBe(2);
   });
 
-  it("GET /api/mesh/stream opens an SSE connection", () => {
-    const { res } = call(deps, "GET", `/api/mesh/stream?actors=${UUID_A}`);
+  it("GET /api/mesh/stream opens an SSE connection", async () => {
+    const { res } = await call(deps, "GET", `/api/mesh/stream?actors=${UUID_A}`);
     expect(res.statusCode).toBe(200);
     expect(res.headers["Content-Type"]).toContain("text/event-stream");
     expect(deps.sseHub.connectionCount).toBe(1);
   });
 
-  it("GET /api/mesh/avatar/root.jpg serves the bundled root image", () => {
-    const { res } = call(deps, "GET", "/api/mesh/avatar/root.jpg");
+  it("GET /api/mesh/avatar/root.jpg serves the bundled root image", async () => {
+    const { res } = await call(deps, "GET", "/api/mesh/avatar/root.jpg");
     expect(res.statusCode).toBe(200);
     expect(res.headers["Content-Type"]).toBe("image/png");
   });
 
-  it("GET /api/mesh/avatar/<id>.png 404s when nothing is cached yet", () => {
-    const { res } = call(deps, "GET", `/api/mesh/avatar/${UUID_A}.png`);
+  it("GET /api/mesh/avatar/<id>.png 404s when nothing is cached yet", async () => {
+    const { res } = await call(deps, "GET", `/api/mesh/avatar/${UUID_A}.png`);
     expect(res.statusCode).toBe(404);
     expect(res.headers["Cache-Control"]).toBe("no-store");
   });
 
-  it("serves avatars even with no mesh bound (filesystem-backed, deps=null)", () => {
-    const { handled, res } = call(null, "GET", "/api/mesh/avatar/root.jpg");
+  it("serves avatars even with no mesh bound (filesystem-backed, deps=null)", async () => {
+    const { handled, res } = await call(null, "GET", "/api/mesh/avatar/root.jpg");
     expect(handled).toBe(true);
     expect(res.statusCode).toBe(200);
   });
 
-  it("rejects avatar keys that try to traverse the filesystem", () => {
-    const { res } = call(deps, "GET", "/api/mesh/avatar/..%2f..%2fetc%2fpasswd.png");
+  it("rejects avatar keys that try to traverse the filesystem", async () => {
+    const { res } = await call(deps, "GET", "/api/mesh/avatar/..%2f..%2fetc%2fpasswd.png");
     expect(res.statusCode).toBe(404);
   });
 
-  it("GET /api/mesh/avatar/<configured-handle> still serves the root image ", () => {
+  it("GET /api/mesh/avatar/<configured-handle> still serves the root image ", async () => {
     const configuredDeps: DashboardDataDeps = {
       ...deps,
       rootIdentity: { handle: "ember-familiar" },
     };
-    const { res } = call(configuredDeps, "GET", "/api/mesh/avatar/ember-familiar.jpg");
+    const { res } = await call(configuredDeps, "GET", "/api/mesh/avatar/ember-familiar.jpg");
     expect(res.statusCode).toBe(200);
     expect(res.headers["Content-Type"]).toBe("image/png");
   });
@@ -1175,7 +1182,7 @@ describe("handleMeshApiRequest", () => {
     });
 
     it("sends human message, returns 200, and records human:operator event", async () => {
-      const { res } = call(
+      const { res } = await call(
         deps,
         "POST",
         `/api/mesh/actors/${UUID_A}/chat`,
@@ -1196,8 +1203,8 @@ describe("handleMeshApiRequest", () => {
       expect(page.events[0].body).toBe("hello actor");
     });
 
-    it("404s if actor is not found", () => {
-      const { res } = call(
+    it("404s if actor is not found", async () => {
+      const { res } = await call(
         deps,
         "POST",
         "/api/mesh/actors/does-not-exist/chat",
@@ -1206,8 +1213,8 @@ describe("handleMeshApiRequest", () => {
       expect(res.statusCode).toBe(404);
     });
 
-    it("400s if actor is retired and marks chatDisabled: true", () => {
-      const { res } = call(
+    it("400s if actor is retired and marks chatDisabled: true", async () => {
+      const { res } = await call(
         deps,
         "POST",
         `/api/mesh/actors/${UUID_B}/chat`,
@@ -1217,8 +1224,8 @@ describe("handleMeshApiRequest", () => {
       expect(JSON.parse(res.body)).toEqual({ error: "actor is retired", chatDisabled: true });
     });
 
-    it("surfaces chatDisabled state on GET /api/mesh/threads", () => {
-      const { res } = call(deps, "GET", "/api/mesh/threads");
+    it("surfaces chatDisabled state on GET /api/mesh/threads", async () => {
+      const { res } = await call(deps, "GET", "/api/mesh/threads");
       expect(res.statusCode).toBe(200);
       const data = JSON.parse(res.body);
       const threadA = data.threads.find((t: { id: string }) => t.id === UUID_A);
@@ -1251,7 +1258,7 @@ describe("handleMeshApiRequest", () => {
     const pngBase64 = pngBytes.toString("base64");
 
     it("uploads and caches a valid image, servable via GET afterward", async () => {
-      const { res } = call(
+      const { res } = await call(
         deps,
         "POST",
         `/api/mesh/avatar/${UUID_A}`,
@@ -1263,7 +1270,7 @@ describe("handleMeshApiRequest", () => {
       expect(res.statusCode).toBe(200);
       expect(readAvatar(UUID_A)?.body.equals(pngBytes)).toBe(true);
 
-      const getRes = call(deps, "GET", `/api/mesh/avatar/${UUID_A}.png`);
+      const getRes = await call(deps, "GET", `/api/mesh/avatar/${UUID_A}.png`);
       expect(getRes.res.statusCode).toBe(200);
     });
 
@@ -1279,7 +1286,7 @@ describe("handleMeshApiRequest", () => {
 
       const secondBytes = Buffer.concat([PNG_SIG, Buffer.from("second-upload")]);
       const secondBase64 = secondBytes.toString("base64");
-      const { res } = call(
+      const { res } = await call(
         deps,
         "POST",
         `/api/mesh/avatar/${UUID_A}`,
@@ -1293,7 +1300,7 @@ describe("handleMeshApiRequest", () => {
     });
 
     it("rejects an unsupported content-type", async () => {
-      const { res } = call(
+      const { res } = await call(
         deps,
         "POST",
         `/api/mesh/avatar/${UUID_A}`,
@@ -1306,7 +1313,7 @@ describe("handleMeshApiRequest", () => {
     });
 
     it("rejects image/jpeg — the cache and serve paths are PNG-only", async () => {
-      const { res } = call(
+      const { res } = await call(
         deps,
         "POST",
         `/api/mesh/avatar/${UUID_A}`,
@@ -1320,7 +1327,7 @@ describe("handleMeshApiRequest", () => {
 
     it("rejects imageBase64 that decodes to bytes without a PNG signature, even with contentType: image/png", async () => {
       const notPng = Buffer.from("definitely-not-a-png").toString("base64");
-      const { res } = call(
+      const { res } = await call(
         deps,
         "POST",
         `/api/mesh/avatar/${UUID_A}`,
@@ -1335,7 +1342,7 @@ describe("handleMeshApiRequest", () => {
 
     it("rejects an oversized image", async () => {
       const oversized = Buffer.alloc(5 * 1024 * 1024 + 1, 1).toString("base64");
-      const { res } = call(
+      const { res } = await call(
         deps,
         "POST",
         `/api/mesh/avatar/${UUID_A}`,
@@ -1348,7 +1355,7 @@ describe("handleMeshApiRequest", () => {
     });
 
     it("allows uploading an avatar for the root actor", async () => {
-      const { res } = call(
+      const { res } = await call(
         deps,
         "POST",
         "/api/mesh/avatar/root",
@@ -1365,7 +1372,7 @@ describe("handleMeshApiRequest", () => {
         ...deps,
         rootIdentity: { id: UUID_B, handle: "ember-familiar" },
       };
-      const { res } = call(
+      const { res } = await call(
         generatedRootDeps,
         "POST",
         `/api/mesh/avatar/${UUID_B}`,
@@ -1376,14 +1383,14 @@ describe("handleMeshApiRequest", () => {
 
       expect(res.statusCode).toBe(200);
       expect(readAvatar(UUID_B, generatedRootDeps.rootIdentity)?.body.equals(pngBytes)).toBe(true);
-      expect(call(generatedRootDeps, "GET", `/api/mesh/avatar/${UUID_B}.png`).res.statusCode).toBe(
-        200
-      );
+      expect(
+        (await call(generatedRootDeps, "GET", `/api/mesh/avatar/${UUID_B}.png`)).res.statusCode
+      ).toBe(200);
     });
 
-    it("503s an upload when rootControl is unavailable", () => {
+    it("503s an upload when rootControl is unavailable", async () => {
       const noRootControl = { ...deps, rootControl: undefined };
-      const { res } = call(
+      const { res } = await call(
         noRootControl,
         "POST",
         `/api/mesh/avatar/${UUID_A}`,
@@ -1392,8 +1399,8 @@ describe("handleMeshApiRequest", () => {
       expect(res.statusCode).toBe(503);
     });
 
-    it("503s an upload when deps itself is entirely absent (fail-closed, not just a missing field)", () => {
-      const { res } = call(
+    it("503s an upload when deps itself is entirely absent (fail-closed, not just a missing field)", async () => {
+      const { res } = await call(
         null,
         "POST",
         `/api/mesh/avatar/${UUID_A}`,
@@ -1421,7 +1428,7 @@ describe("handleMeshApiRequest", () => {
 
       try {
         const generateDeps: DashboardDataDeps = { ...deps, geminiApiKey: "key" };
-        const { res } = call(generateDeps, "POST", `/api/mesh/avatar/${UUID_A}/generate`);
+        const { res } = await call(generateDeps, "POST", `/api/mesh/avatar/${UUID_A}/generate`);
         await new Promise((resolve) => process.nextTick(resolve));
         await new Promise((resolve) => process.nextTick(resolve));
 
@@ -1443,7 +1450,7 @@ describe("handleMeshApiRequest", () => {
 
       try {
         const generateDeps: DashboardDataDeps = { ...deps, geminiApiKey: "key" };
-        const { res } = call(generateDeps, "POST", `/api/mesh/avatar/${UUID_A}/generate`);
+        const { res } = await call(generateDeps, "POST", `/api/mesh/avatar/${UUID_A}/generate`);
         await new Promise((resolve) => process.nextTick(resolve));
         await new Promise((resolve) => process.nextTick(resolve));
 
@@ -1476,7 +1483,7 @@ describe("handleMeshApiRequest", () => {
 
       try {
         const generateDeps: DashboardDataDeps = { ...deps, geminiApiKey: "key" };
-        const { res } = call(generateDeps, "POST", `/api/mesh/avatar/${UUID_A}/generate`);
+        const { res } = await call(generateDeps, "POST", `/api/mesh/avatar/${UUID_A}/generate`);
         await new Promise((resolve) => process.nextTick(resolve));
         await new Promise((resolve) => process.nextTick(resolve));
 
@@ -1496,8 +1503,8 @@ describe("handleMeshApiRequest", () => {
       }
     });
 
-    it("400s generate with a clear error when geminiApiKey is not configured", () => {
-      const { res } = call(deps, "POST", `/api/mesh/avatar/${UUID_A}/generate`);
+    it("400s generate with a clear error when geminiApiKey is not configured", async () => {
+      const { res } = await call(deps, "POST", `/api/mesh/avatar/${UUID_A}/generate`);
       expect(res.statusCode).toBe(400);
       expect(JSON.parse(res.body).error).toMatch(/geminiApiKey/);
     });
@@ -1519,7 +1526,7 @@ describe("handleMeshApiRequest", () => {
 
       try {
         const generateDeps: DashboardDataDeps = { ...deps, geminiApiKey: "key" };
-        const { res } = call(generateDeps, "POST", "/api/mesh/avatar/root/generate");
+        const { res } = await call(generateDeps, "POST", "/api/mesh/avatar/root/generate");
         await new Promise((resolve) => process.nextTick(resolve));
         await new Promise((resolve) => process.nextTick(resolve));
         expect(res.statusCode).toBe(200);
@@ -1529,14 +1536,14 @@ describe("handleMeshApiRequest", () => {
       }
     });
 
-    it("503s generate when rootControl is unavailable", () => {
+    it("503s generate when rootControl is unavailable", async () => {
       const noRootControl = { ...deps, rootControl: undefined, geminiApiKey: "key" };
-      const { res } = call(noRootControl, "POST", `/api/mesh/avatar/${UUID_A}/generate`);
+      const { res } = await call(noRootControl, "POST", `/api/mesh/avatar/${UUID_A}/generate`);
       expect(res.statusCode).toBe(503);
     });
 
-    it("503s generate when deps itself is entirely absent (fail-closed, not just a missing field)", () => {
-      const { res } = call(null, "POST", `/api/mesh/avatar/${UUID_A}/generate`);
+    it("503s generate when deps itself is entirely absent (fail-closed, not just a missing field)", async () => {
+      const { res } = await call(null, "POST", `/api/mesh/avatar/${UUID_A}/generate`);
       expect(res.statusCode).toBe(503);
       expect(JSON.parse(res.body).error).toBe("root control unavailable");
     });
@@ -1551,7 +1558,7 @@ describe("handleMeshApiRequest", () => {
         mesh: { interrupt: interruptMock } as unknown as ActorMesh,
       };
 
-      const { res, req } = call(meshDeps, "POST", `/api/mesh/actors/${UUID_A}/interrupt`);
+      const { res, req } = await call(meshDeps, "POST", `/api/mesh/actors/${UUID_A}/interrupt`);
       req.emit("data", Buffer.from(JSON.stringify({ by: "human:operator" })));
       req.emit("end");
       await new Promise((resolve) => process.nextTick(resolve));
@@ -1566,7 +1573,7 @@ describe("handleMeshApiRequest", () => {
         ...deps,
         mesh: { interrupt: vi.fn() } as unknown as ActorMesh,
       };
-      const { res } = call(meshDeps, "POST", "/api/mesh/actors/unknown-actor/interrupt");
+      const { res } = await call(meshDeps, "POST", "/api/mesh/actors/unknown-actor/interrupt");
       expect(res.statusCode).toBe(404);
     });
 
@@ -1576,12 +1583,12 @@ describe("handleMeshApiRequest", () => {
         ...deps,
         mesh: { interrupt: vi.fn() } as unknown as ActorMesh,
       };
-      const { res } = call(meshDeps, "POST", `/api/mesh/actors/${UUID_RETIRED}/interrupt`);
+      const { res } = await call(meshDeps, "POST", `/api/mesh/actors/${UUID_RETIRED}/interrupt`);
       expect(res.statusCode).toBe(400);
     });
 
     it("503s when live mesh is unavailable", async () => {
-      const { res } = call(null, "POST", `/api/mesh/actors/${UUID_A}/interrupt`);
+      const { res } = await call(null, "POST", `/api/mesh/actors/${UUID_A}/interrupt`);
       expect(res.statusCode).toBe(503);
     });
   });
@@ -1595,7 +1602,7 @@ describe("handleMeshApiRequest", () => {
         mesh: { runNow: runNowMock } as unknown as ActorMesh,
       };
 
-      const { res } = call(meshDeps, "POST", `/api/mesh/actors/${UUID_A}/run-now`);
+      const { res } = await call(meshDeps, "POST", `/api/mesh/actors/${UUID_A}/run-now`);
       expect(res.statusCode).toBe(200);
       expect(JSON.parse(res.body)).toEqual({ ok: true, queued: true });
       expect(runNowMock).toHaveBeenCalledWith(UUID_A, "human:operator");
@@ -1606,7 +1613,7 @@ describe("handleMeshApiRequest", () => {
         ...deps,
         mesh: { runNow: vi.fn() } as unknown as ActorMesh,
       };
-      const { res } = call(meshDeps, "POST", "/api/mesh/actors/unknown-actor/run-now");
+      const { res } = await call(meshDeps, "POST", "/api/mesh/actors/unknown-actor/run-now");
       expect(res.statusCode).toBe(404);
     });
 
@@ -1616,12 +1623,12 @@ describe("handleMeshApiRequest", () => {
         ...deps,
         mesh: { runNow: vi.fn() } as unknown as ActorMesh,
       };
-      const { res } = call(meshDeps, "POST", `/api/mesh/actors/${UUID_RETIRED}/run-now`);
+      const { res } = await call(meshDeps, "POST", `/api/mesh/actors/${UUID_RETIRED}/run-now`);
       expect(res.statusCode).toBe(400);
     });
 
     it("503s when live mesh is unavailable", async () => {
-      const { res } = call(null, "POST", `/api/mesh/actors/${UUID_A}/run-now`);
+      const { res } = await call(null, "POST", `/api/mesh/actors/${UUID_A}/run-now`);
       expect(res.statusCode).toBe(503);
     });
   });
@@ -1646,7 +1653,7 @@ describe("handleMeshApiRequest", () => {
           ownerId: "actor-1",
         });
 
-        const { res } = call(deps, "GET", "/api/mesh/obligations");
+        const { res } = await call(deps, "GET", "/api/mesh/obligations");
         expect(res.statusCode).toBe(200);
         const data = JSON.parse(res.body);
         expect(data.obligations.map((o: { id: string }) => o.id).sort()).toEqual(
@@ -1654,7 +1661,7 @@ describe("handleMeshApiRequest", () => {
         );
         expect(data.total).toBe(3);
 
-        const { res: filtered } = call(
+        const { res: filtered } = await call(
           deps,
           "GET",
           "/api/mesh/obligations?ownerId=actor-1&rootsOnly=true"
@@ -1665,16 +1672,16 @@ describe("handleMeshApiRequest", () => {
       });
 
       it("400s on invalid status", async () => {
-        const { res: badKind } = call(deps, "GET", "/api/mesh/obligations?status=invalid");
+        const { res: badKind } = await call(deps, "GET", "/api/mesh/obligations?status=invalid");
         expect(badKind.statusCode).toBe(400);
 
-        const { res: badStatus } = call(deps, "GET", "/api/mesh/obligations?status=invalid");
+        const { res: badStatus } = await call(deps, "GET", "/api/mesh/obligations?status=invalid");
         expect(badStatus.statusCode).toBe(400);
       });
 
       it("503s when obligations data is unavailable", async () => {
         const noObligationsDeps = { ...deps, obligations: undefined };
-        const { res } = call(noObligationsDeps, "GET", "/api/mesh/obligations");
+        const { res } = await call(noObligationsDeps, "GET", "/api/mesh/obligations");
         expect(res.statusCode).toBe(503);
       });
     });
@@ -1700,7 +1707,7 @@ describe("handleMeshApiRequest", () => {
         });
         obligations.setTerminalStatus("sub-1", "done");
 
-        const { res } = call(deps, "GET", "/api/mesh/obligations/root-task");
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/root-task");
         expect(res.statusCode).toBe(200);
         const data = JSON.parse(res.body);
         expect(data.obligation.id).toBe("root-task");
@@ -1712,7 +1719,7 @@ describe("handleMeshApiRequest", () => {
       });
 
       it("404s when obligation not found", async () => {
-        const { res } = call(deps, "GET", "/api/mesh/obligations/missing-task");
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/missing-task");
         expect(res.statusCode).toBe(404);
       });
     });
@@ -1731,7 +1738,7 @@ describe("handleMeshApiRequest", () => {
           ownerId: "actor-2",
         });
 
-        const { res } = call(deps, "GET", "/api/mesh/obligations/root-task/tree");
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/root-task/tree");
         expect(res.statusCode).toBe(200);
         const data = JSON.parse(res.body);
         expect(data.obligation.id).toBe("root-task");
@@ -1740,7 +1747,7 @@ describe("handleMeshApiRequest", () => {
       });
 
       it("404s when root not found", async () => {
-        const { res } = call(deps, "GET", "/api/mesh/obligations/missing-tree/tree");
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/missing-tree/tree");
         expect(res.statusCode).toBe(404);
       });
     });
@@ -1753,7 +1760,7 @@ describe("handleMeshApiRequest", () => {
           title: "Build feature",
           intent: "build feature",
         });
-        const { res } = call(deps, "POST", "/api/mesh/obligations", body);
+        const { res } = await call(deps, "POST", "/api/mesh/obligations", body);
         await new Promise((resolve) => process.nextTick(resolve));
         expect(res.statusCode).toBe(201);
         const data = JSON.parse(res.body);
@@ -1766,7 +1773,7 @@ describe("handleMeshApiRequest", () => {
       });
 
       it("binds the operator as creator without accepting one from the body", async () => {
-        const { res } = call(
+        const { res } = await call(
           deps,
           "POST",
           "/api/mesh/obligations",
@@ -1795,7 +1802,7 @@ describe("handleMeshApiRequest", () => {
         });
         obligations.attachArtifact("cited", "github:MEK-Org/rusa/issues/33");
 
-        const { res } = call(deps, "GET", "/api/mesh/obligations/cited");
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/cited");
         await new Promise((resolve) => process.nextTick(resolve));
         const artifacts = JSON.parse(res.body).artifacts as Array<{
           artifact: { ref: string; label: string | null };
@@ -1822,7 +1829,7 @@ describe("handleMeshApiRequest", () => {
           JSON.stringify({ ownerId: UUID_A, intent: "no heading" }),
           JSON.stringify({ ownerId: UUID_A, title: "   ", intent: "blank heading" }),
         ]) {
-          const { res } = call(deps, "POST", "/api/mesh/obligations", body);
+          const { res } = await call(deps, "POST", "/api/mesh/obligations", body);
           await new Promise((resolve) => process.nextTick(resolve));
           // A node with no heading cannot appear in a call-list, which is the
           // one thing the human-decision contract needs it for.
@@ -1833,7 +1840,7 @@ describe("handleMeshApiRequest", () => {
       it("rejects an owner that is neither a live actor nor the operator", async () => {
         registry.upsert(rec(UUID_RETIRED, "root", "retired"));
         for (const ownerId of ["actor-1", UUID_RETIRED, "system:mesh"]) {
-          const { res } = call(
+          const { res } = await call(
             deps,
             "POST",
             "/api/mesh/obligations",
@@ -1848,7 +1855,7 @@ describe("handleMeshApiRequest", () => {
       });
 
       it("400s on invalid payload", async () => {
-        const { res } = call(
+        const { res } = await call(
           deps,
           "POST",
           "/api/mesh/obligations",
@@ -1867,7 +1874,7 @@ describe("handleMeshApiRequest", () => {
           ownerId: "actor-1",
         });
 
-        const { res } = call(
+        const { res } = await call(
           deps,
           "POST",
           "/api/mesh/obligations/task-1/status",
@@ -1881,7 +1888,7 @@ describe("handleMeshApiRequest", () => {
       });
 
       it("404s when obligation not found", async () => {
-        const { res } = call(
+        const { res } = await call(
           deps,
           "POST",
           "/api/mesh/obligations/missing-task/status",
@@ -1898,7 +1905,7 @@ describe("handleMeshApiRequest", () => {
           ownerId: HUMAN_OPERATOR,
         });
 
-        const { res } = call(
+        const { res } = await call(
           deps,
           "POST",
           "/api/mesh/obligations/decide-stack/status",
@@ -1918,7 +1925,7 @@ describe("handleMeshApiRequest", () => {
           ownerId: "actor-1",
         });
 
-        const { res } = call(
+        const { res } = await call(
           deps,
           "POST",
           "/api/mesh/obligations/coerce-me/status",
@@ -1936,7 +1943,7 @@ describe("handleMeshApiRequest", () => {
         registry.upsert(rec(UUID_A, "root", "active"));
         obligations.create({ id: "linkable", ownerId: UUID_A, title: "Ship it" });
 
-        const link = call(
+        const link = await call(
           deps,
           "POST",
           "/api/mesh/obligations/linkable/external-ref",
@@ -1950,7 +1957,7 @@ describe("handleMeshApiRequest", () => {
 
         // A blank string unlinks, so the UI can clear the field without a
         // separate control.
-        const clear = call(
+        const clear = await call(
           deps,
           "POST",
           "/api/mesh/obligations/linkable/external-ref",
@@ -1964,7 +1971,7 @@ describe("handleMeshApiRequest", () => {
         registry.upsert(rec(UUID_A, "root", "active"));
         obligations.create({ id: "repo-level", ownerId: UUID_A, title: "Keep rusa releasable" });
 
-        const ok = call(
+        const ok = await call(
           deps,
           "POST",
           "/api/mesh/obligations/repo-level/external-ref",
@@ -1973,7 +1980,7 @@ describe("handleMeshApiRequest", () => {
         await new Promise((resolve) => process.nextTick(resolve));
         expect(ok.res.statusCode).toBe(200);
 
-        const bad = call(
+        const bad = await call(
           deps,
           "POST",
           "/api/mesh/obligations/repo-level/external-ref",
@@ -1994,7 +2001,7 @@ describe("handleMeshApiRequest", () => {
           externalRef: "github:MEK-Org/rusa/issues/33",
         });
 
-        const unlink = call(
+        const unlink = await call(
           deps,
           "POST",
           "/api/mesh/obligations/explicit-unlink/external-ref",
@@ -2018,7 +2025,7 @@ describe("handleMeshApiRequest", () => {
           externalRef: "github:MEK-Org/rusa",
         });
 
-        const missing = call(
+        const missing = await call(
           deps,
           "POST",
           "/api/mesh/obligations/keep-link/external-ref",
@@ -2032,7 +2039,7 @@ describe("handleMeshApiRequest", () => {
       });
 
       it("404s for an unknown obligation", async () => {
-        const { res } = call(
+        const { res } = await call(
           deps,
           "POST",
           "/api/mesh/obligations/missing/external-ref",
@@ -2056,7 +2063,7 @@ describe("handleMeshApiRequest", () => {
           ownerId: "actor-1",
         });
 
-        const { res } = call(
+        const { res } = await call(
           deps,
           "POST",
           "/api/mesh/obligations/second/reorder",
@@ -2091,7 +2098,7 @@ describe("handleMeshApiRequest", () => {
           ownerId: "actor-1",
         });
 
-        const { res } = call(
+        const { res } = await call(
           deps,
           "POST",
           "/api/mesh/obligations/c1/reparent",
@@ -2111,7 +2118,7 @@ describe("handleMeshApiRequest", () => {
           ownerId: "actor-1",
         });
 
-        const { res } = call(
+        const { res } = await call(
           deps,
           "POST",
           "/api/mesh/obligations/task-self/reparent",
@@ -2129,7 +2136,7 @@ describe("handleMeshApiRequest", () => {
           id: "task-owner",
           ownerId: "actor-1",
         });
-        const { res } = call(
+        const { res } = await call(
           deps,
           "POST",
           "/api/mesh/obligations/task-owner/reassign",
@@ -2148,7 +2155,7 @@ describe("handleMeshApiRequest", () => {
         });
         // With owner_kind gone the only malformed owner is a blank id; the
         // route must still reject it rather than write an empty owner.
-        const invalid = call(
+        const invalid = await call(
           deps,
           "POST",
           "/api/mesh/obligations/task-owner/reassign",
@@ -2157,7 +2164,7 @@ describe("handleMeshApiRequest", () => {
         await new Promise((resolve) => process.nextTick(resolve));
         expect(invalid.res.statusCode).toBe(400);
 
-        const missing = call(
+        const missing = await call(
           deps,
           "POST",
           "/api/mesh/obligations/missing/reassign",
@@ -2166,7 +2173,7 @@ describe("handleMeshApiRequest", () => {
         await new Promise((resolve) => process.nextTick(resolve));
         expect(missing.res.statusCode).toBe(404);
 
-        const unknownOwner = call(
+        const unknownOwner = await call(
           deps,
           "POST",
           "/api/mesh/obligations/task-owner/reassign",

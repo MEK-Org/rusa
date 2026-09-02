@@ -10,6 +10,12 @@ import {
   referenceUrl,
 } from "./reference.js";
 
+export type ReferenceEntity =
+  | { type: "github_issue"; title: string; description: string }
+  | { type: "github_pull_request"; title: string; description: string }
+  | { type: "gchat_message"; contents: string }
+  | { type: "gchat_space"; name: string };
+
 /**
  * A reference rendered down to what any surface needs to show it: what it is,
  * who said it, when, the text itself, and where to go look.
@@ -39,11 +45,18 @@ export interface ResolvedReference {
   unavailable: string | null;
 }
 
+export type ReferenceCacheState = "local" | "fresh" | "stale" | "pending" | "unavailable";
+
+export type ResolvedReferenceWithEntity = ResolvedReference & {
+  entity?: ReferenceEntity;
+  cacheState?: ReferenceCacheState;
+};
+
 export interface ReferenceResolverDeps {
   meshChat?: Pick<MeshChatRepository, "getById">;
   inbox?: Pick<InboxStore, "read">;
   /** Reads a Google Chat message; absent when the chat edge is not configured. */
-  chatClient?: Pick<ChatClient, "getMessage">;
+  chatClient?: Pick<ChatClient, "getMessage" | "getSpace">;
   /** Reads issues and pull requests; absent when no tracker is wired. */
   issueClient?: {
     getIssue?: (owner: string, repo: string, number: number) => Promise<unknown>;
