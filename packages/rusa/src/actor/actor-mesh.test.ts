@@ -20,6 +20,7 @@ import type {
 import { ActorMesh } from "./actor-mesh.js";
 import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
 import type { EventResource } from "./event-subscriptions.js";
+import { ExternalRootDriver } from "./external-root-driver.js";
 import { routeRunFailure } from "./failure-sink.js";
 import type {
   InboxActorWork,
@@ -154,6 +155,7 @@ function setup(
     }) => string;
     idgen?: () => string;
     onYield?: (actorId: string, ctx: { notifyingParent: boolean }) => string | null | undefined;
+    recordRunYield?: ActorMeshOptions["recordRunYield"];
     inboxStore?: InboxStore;
     onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
     grantableCapabilities?: ReadonlySet<string>;
@@ -188,6 +190,7 @@ function setup(
     grantableCapabilities: opts.grantableCapabilities,
     idgen: opts.idgen ?? (() => `t${++seq}`),
     onYield: opts.onYield,
+    recordRunYield: opts.recordRunYield,
     now: () => "2026-01-01T00:00:00Z",
     onRetire: opts.onRetire,
     onSpawn: opts.onSpawn,
@@ -241,6 +244,7 @@ function setup(
         beforeRun: ctx.beforeRun,
         onQueued: ctx.onQueued,
         onRunEnd: ctx.onRunEnd,
+        onRuntimeStateChanged: ctx.onRuntimeStateChanged,
         debounceMs: DEBOUNCE,
       });
       return actor;
@@ -265,6 +269,7 @@ function setup(
     buildPrompt: () => ({ prompt: "Work from your inbox." }),
     onQueued: (context) => mesh.actorQueued(rootId, context),
     onRunEnd: () => mesh.finishInboxRun(rootId),
+    onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
     debounceMs: DEBOUNCE,
   });
   mesh.adopt(
@@ -301,6 +306,55 @@ const payload = (type: string, merged?: boolean): InboxPayload =>
 describe("ActorMesh", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
+
+  it("sequences real actor and external-root transitions on one contiguous revision", async () => {
+    const { mesh, root, tick } = setup();
+    const externalId = "external";
+    const external = new ExternalRootDriver(
+      externalId,
+      () => "2026-01-01T00:00:00Z",
+      (state) => mesh.actorRuntimeStateChanged(externalId, state)
+    );
+    mesh.adopt(
+      {
+        id: externalId,
+        charter: "external root",
+        parentId: "root",
+        isRoot: false,
+        status: "active",
+        createdAt: "2026-01-01T00:00:00Z",
+      },
+      external
+    );
+    const before = mesh.runtimeStateSnapshot();
+    const deltas: Array<{ actorId: string; revision: number; runState: string }> = [];
+    mesh.onRuntimeStateDelta((delta) => deltas.push(delta));
+
+    external.requestRun();
+    external.requestRun({ priority: "responsive" });
+    root.requestRun();
+    await tick();
+    const [wake] = external.listWakes();
+    if (!wake) throw new Error("external wake not queued");
+    external.acknowledge([wake.id]);
+
+    expect(deltas.map(({ revision }) => revision)).toEqual(
+      deltas.map((_, index) => before.revision + index + 1)
+    );
+    expect(
+      deltas.filter(({ actorId, runState }) => actorId === externalId && runState === "queued")
+    ).toHaveLength(1);
+    expect(deltas).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ actorId: "root", runState: "queued" }),
+        expect.objectContaining({ actorId: "root", runState: "running" }),
+        expect.objectContaining({ actorId: externalId, runState: "idle" }),
+      ])
+    );
+    const after = mesh.runtimeStateSnapshot();
+    expect(after.states.get("root")).toBe("idle");
+    expect(after.states.get(externalId)).toBe("idle");
+  });
 
   it("passes the provider through the shared rate gate", async () => {
     const registry = new InMemoryThreadRegistry();
@@ -1127,6 +1181,7 @@ describe("ActorMesh", () => {
   it("mechanically notifies the parent when a parent-triggered run yields", async () => {
     const chat: { senderId: string; recipientId: string; body: string; sessionId?: string }[] = [];
     const inboxStore = createMemoryInboxStore();
+    const recordRunYield = vi.fn(() => "durable-run-1");
     let mesh!: ReturnType<typeof setup>["mesh"];
     let id!: string;
     const provider = new FakeProvider(() => {
@@ -1140,6 +1195,7 @@ describe("ActorMesh", () => {
         return "msg";
       },
       inboxStore,
+      recordRunYield,
     });
     mesh = env.mesh;
     id = mesh.spawn({ charter: "do work", parentId: "root" });
@@ -1153,11 +1209,12 @@ describe("ActorMesh", () => {
     expect(inboxStore.entries.find((entry) => entry.actorId === "root")?.payload).toMatchObject({
       type: "mesh.mechanical_note",
       note: `[yield/complete] ${id}: done`,
-      runId: id,
+      runId: "durable-run-1",
       actorId: id,
       status: "complete",
       fromId: id,
     });
+    expect(recordRunYield).toHaveBeenCalledWith(id, "complete", "done");
     expect(env.fake("root").calls.at(-1)?.prompt).toContain("Work from your inbox");
   });
 
@@ -2546,6 +2603,24 @@ describe("ActorMesh", () => {
     expect(retirement.registry.get(generatedRootId)?.status).toBe("retired");
   });
 
+  it("installs the handled-entry guard only after durable selection succeeds", () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh } = setup({ inboxStore });
+    const [entry] = inboxStore.append([
+      { actorId: "root", source: "mesh:parent", payload: payload("mesh.message") },
+    ]);
+
+    expect(() =>
+      mesh.selectInboxEntries("root", [entry.id], () => {
+        throw new Error("durable focus rejected");
+      })
+    ).toThrow("durable focus rejected");
+    expect(mesh.selectedInboxEntries("root")).toEqual([]);
+
+    expect(mesh.selectInboxEntries("root", [entry.id], () => {})).toEqual([entry]);
+    expect(mesh.selectedInboxEntries("root")).toEqual([entry.id]);
+  });
+
   it("reviveThread flips retired -> active, recreates the actor, keeps sessionId, and runs onRevive", async () => {
     const revived: string[] = [];
     const { mesh, registry, tick } = setup({
@@ -2632,6 +2707,7 @@ describe("ActorMesh", () => {
       onModelSet: (actorId, newModel) => modelSets.push({ actorId, newModel }),
       validateModel: (_record, newModel) => {
         if (newModel === "forbidden-model") throw new Error("forbidden model");
+        return { model: newModel };
       },
     });
     const parent = mesh.spawn({ charter: "parent", parentId: "root", model: "claude-sonnet-5" });
@@ -2686,6 +2762,68 @@ describe("ActorMesh", () => {
     expect(registry.get(child)?.model).toBe("claude-opus-4-8");
   });
 
+  it("persists, updates, and clears effort independently at run boundaries", async () => {
+    const events: MeshEventInput[] = [];
+    const validations: Array<{ model?: string; effort?: string | null }> = [];
+    const { mesh, registry, tick } = setup({
+      events: (event) => events.push(event),
+      validateModel: (_record, model, _provider, effort) => {
+        validations.push({ model, effort });
+        return { model, effort: effort ?? undefined };
+      },
+    });
+    const child = mesh.spawn({
+      charter: "codex child",
+      parentId: "root",
+      provider: "codex",
+      model: "gpt-5.6-sol high",
+    });
+    expect(registry.get(child)).toMatchObject({
+      model: "gpt-5.6-sol",
+      effort: "high",
+    });
+
+    mesh.setActorModel(child, undefined, "root", undefined, "xhigh");
+    expect(registry.get(child)?.effort).toBe("high");
+    expect(registry.get(child)?.desiredEffort).toBe("xhigh");
+    mesh.sendMessage(child, "apply effort", "root");
+    await tick();
+    expect(registry.get(child)?.effort).toBe("xhigh");
+    expect(registry.get(child)?.desiredEffort).toBeUndefined();
+    expect(validations).toContainEqual({ model: "gpt-5.6-sol", effort: "xhigh" });
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "actor_model_set",
+        actorId: child,
+        detail: "gpt-5.6-sol @ high -> gpt-5.6-sol @ xhigh",
+      })
+    );
+
+    mesh.setActorModel(child, undefined, "root", undefined, null);
+    expect(registry.get(child)?.desiredEffort).toBeNull();
+    mesh.sendMessage(child, "restore provider default", "root");
+    await tick();
+    expect(registry.get(child)?.effort).toBeUndefined();
+    expect(registry.get(child)?.desiredEffort).toBeUndefined();
+  });
+
+  it("supports an effort-only update when the root uses its provider's default model", () => {
+    const validations: Array<{ model?: string; effort?: string | null }> = [];
+    const { mesh, registry } = setup({
+      validateModel: (_record, model, _provider, effort) => {
+        validations.push({ model, effort });
+        return { model, effort: effort ?? undefined };
+      },
+    });
+    registry.patch("root", { provider: "claude", model: undefined });
+
+    mesh.setActorModel("root", undefined, "root", undefined, "high");
+
+    expect(validations).toEqual([{ model: undefined, effort: "high" }]);
+    expect(registry.get("root")).toMatchObject({ desiredEffort: "high" });
+    expect(registry.get("root")?.desiredModel).toBeUndefined();
+  });
+
   it("lets only the root set its own portable model at its run boundary", () => {
     const events: MeshEventInput[] = [];
     const modelSets: Array<{ actorId: string; newModel: string; record: ThreadRecord }> = [];
@@ -2738,7 +2876,7 @@ describe("ActorMesh", () => {
 
   it("setActorModel supports cross-provider moves for portable actors and rejects them for native actors", async () => {
     const events: MeshEventInput[] = [];
-    const validations: Array<{ recordId: string; newModel: string; newProvider?: string }> = [];
+    const validations: Array<{ recordId: string; newModel?: string; newProvider?: string }> = [];
     const { mesh, registry, tick } = setup({
       events: (event) => events.push(event),
       validateModel: (record, newModel, newProvider) => {
@@ -2746,6 +2884,7 @@ describe("ActorMesh", () => {
         if (newProvider === "antigravity" && newModel === "invalid-model") {
           throw new Error("invalid model for antigravity");
         }
+        return { model: newModel };
       },
     });
 

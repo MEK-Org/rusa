@@ -243,7 +243,12 @@ describe("applyBrandingToManifest", () => {
     // Left alongside the bundled entries, a browser matching on declared size
     // would still install the generic mark.
     expect(manifest.icons).toEqual([
-      { src: "/api/mesh/avatar/root.png?v=7-16", sizes: "any", type: "image/png" },
+      {
+        src: "/api/mesh/avatar/root.png?v=7-16",
+        sizes: "any",
+        type: "image/png",
+        purpose: "any maskable",
+      },
     ]);
     expect(manifest.name).toBe("Rusa");
   });

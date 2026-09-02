@@ -150,8 +150,12 @@ interface ThreadDto {
   provider: string | null;
   /** The single authoritative model for this actor, as configured in the registry. */
   model: string | null;
+  /** Explicit provider-native reasoning level, or null for provider default. */
+  effort: string | null;
   /** Pending desired model staged for next run boundary, or null if none. */
   desiredModel?: string | null;
+  /** Pending effort pin; null is also the provider-default state. */
+  desiredEffort?: string | null;
   /** Pending desired provider staged for next run boundary, or null if none. */
   desiredProvider?: string | null;
   /**
@@ -442,6 +446,7 @@ export function handleMeshApiRequest(
                 charter: typeof body.charter === "string" ? body.charter : "",
                 provider: typeof body.provider === "string" ? body.provider : "",
                 model: typeof body.model === "string" ? body.model : "",
+                effort: typeof body.effort === "string" ? body.effort : undefined,
                 maxRuns: typeof body.maxRuns === "number" ? body.maxRuns : undefined,
                 title: typeof body.title === "string" ? body.title : undefined,
                 context,
@@ -1156,6 +1161,10 @@ export function handleMeshApiRequest(
 
   // GET /api/mesh/threads — every thread (active + retired), handle up front.
   if (pathname === "/api/mesh/threads") {
+    const runtime =
+      typeof deps.mesh?.runtimeStateSnapshot === "function"
+        ? deps.mesh.runtimeStateSnapshot()
+        : null;
     // One synchronous snapshot of the running set, classified against every
     // thread in a single pass — no await between reads, so the view can't tear.
     const running = deps.runningThreadIds?.() ?? new Set<string>();
@@ -1170,8 +1179,8 @@ export function handleMeshApiRequest(
 
     const threads: ThreadDto[] = registry.list().map((r) => {
       let runState: "running" | "queued" | "winding_down" | "idle" = "idle";
-      if (typeof deps.mesh?.activeRunState === "function") {
-        runState = deps.mesh.activeRunState(r.id)?.phase ?? "idle";
+      if (runtime) {
+        runState = runtime.states.get(r.id) ?? "idle";
       } else if (running.has(r.id)) {
         runState = deps.isYielded?.(r.id) ? "winding_down" : "running";
       } else if (queued.has(r.id)) {
@@ -1184,7 +1193,9 @@ export function handleMeshApiRequest(
         status: r.status,
         provider: r.provider ?? null,
         model: r.model ?? null,
+        effort: r.effort ?? null,
         desiredModel: r.desiredModel ?? null,
+        ...(r.desiredEffort !== undefined ? { desiredEffort: r.desiredEffort } : {}),
         desiredProvider: r.desiredProvider ?? null,
         charterPreview: charterPreview(r.charter),
         title: r.title ?? summarizeCharter(r.charter),
@@ -1195,7 +1206,11 @@ export function handleMeshApiRequest(
         nextProviderAvailableAt: providerQueueHeads.get(r.id) ?? null,
       };
     });
-    sendJson(res, 200, { halted: deps.isHalted?.() ?? false, threads });
+    sendJson(res, 200, {
+      halted: deps.isHalted?.() ?? false,
+      runtimeCursor: runtime ? { streamId: runtime.streamId, revision: runtime.revision } : null,
+      threads,
+    });
     return true;
   }
 

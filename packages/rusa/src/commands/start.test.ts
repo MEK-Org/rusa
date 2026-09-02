@@ -5,12 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
 import { Actor, type RunAbandon } from "../actor/actor.js";
 import type { ActorMesh } from "../actor/actor-mesh.js";
+import { InMemoryEventSubscriptionStore } from "../actor/event-subscriptions.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
-import { closeDb, getRepositories } from "../db/index.js";
+import { closeDb, getDb, getRepositories } from "../db/index.js";
 import type { GitHubPollingIssueClient, IssueClient } from "../gitops/issue-client.js";
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { stampAuthor } from "../mcp/stamp.js";
@@ -132,6 +133,7 @@ import {
   runStart,
   shouldBindDashboardServer,
   shouldBindWebhookServer,
+  warnMissingConfiguredEventSubscriptionsAtBoot,
 } from "./start.js";
 
 class MockIssueClient implements Partial<IssueClient & GitHubPollingIssueClient> {
@@ -250,6 +252,66 @@ describe("start command tests", () => {
         "github:other-org/repo/issues/72 to worker skipped: not anchored in config"
       )
     );
+  });
+
+  it("warns at boot with bounded identities only for configured missing subscriptions", () => {
+    const store = new InMemoryEventSubscriptionStore();
+    store.subscribe({
+      resource: "github:configured-org/repo/issues/2",
+      actorId: "durable-actor",
+      subscribedBy: "root",
+      subscribedAt: "2026-07-26T00:00:00Z",
+    });
+    const warn = vi.fn();
+    const missing = warnMissingConfiguredEventSubscriptionsAtBoot(
+      store,
+      [
+        {
+          kind: "event_source_subscribed",
+          actorId: "missing-actor",
+          detail: "github:configured-org/repo/issues/1",
+        },
+        {
+          kind: "event_source_subscribed",
+          actorId: "durable-actor",
+          detail: "github:configured-org/repo/issues/2",
+        },
+        {
+          kind: "event_source_subscribed",
+          actorId: "unanchored-actor",
+          detail: "github:other-org/repo/issues/3",
+        },
+      ],
+      ["github:configured-org"],
+      warn
+    );
+
+    expect(missing).toEqual([
+      { resource: "github:configured-org/repo/issues/1", actorId: "missing-actor" },
+    ]);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("github:configured-org/repo/issues/1 -> missing-actor")
+    );
+    expect(warn.mock.calls[0]?.[0]).not.toContain("unanchored-actor");
+  });
+
+  it("bounds boot consistency identities and reports the remainder", () => {
+    const warn = vi.fn();
+    const missing = warnMissingConfiguredEventSubscriptionsAtBoot(
+      new InMemoryEventSubscriptionStore(),
+      Array.from({ length: 12 }, (_, index) => ({
+        kind: "event_source_subscribed",
+        actorId: `actor-${index}`,
+        detail: `github:configured-org/repo/issues/${index + 1}`,
+      })),
+      ["github:configured-org"],
+      warn
+    );
+
+    expect(missing).toHaveLength(12);
+    expect(warn.mock.calls[0]?.[0]).toContain("issues/10 -> actor-9");
+    expect(warn.mock.calls[0]?.[0]).not.toContain("issues/11 -> actor-10");
+    expect(warn.mock.calls[0]?.[0]).toContain("(+2 more)");
   });
 
   it("binds the webhook server only in webhook ingestion mode outside e2e", () => {
@@ -1681,6 +1743,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
           loadSessionId: () => string | undefined;
           saveSessionId: (id: string) => void;
           buildPrompt: () => { prompt: string; injectRecord?: { runCount: number } };
+          onRunStart?: (responsive: boolean) => void;
+          onRunEnd?: (result: {
+            success: boolean;
+            output: string;
+            exitCode: number;
+          }) => Promise<void>;
         };
       }
     ).opts;
@@ -1695,11 +1763,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
       sessionId: "stale-native",
     });
 
-    mesh.recordEvent({
-      kind: "run_end",
-      actorId: "root",
+    actorOpts.onRunStart?.(false);
+    await actorOpts.onRunEnd?.({
       success: true,
-      body: "PORTABLE_ROOT_CONTEXT_MARKER",
+      output: "PORTABLE_ROOT_CONTEXT_MARKER",
+      exitCode: 0,
     });
     const built = actorOpts.buildPrompt();
     expect(built.prompt).toContain("PORTABLE_ROOT_CONTEXT_MARKER");
@@ -1742,7 +1810,25 @@ describe("runStart webhook event routing (Phase 4)", () => {
           ...state,
           generation: state.generation + 1,
           updatedAt: now,
-          lastFoldedMessageEventId: messages.at(-1)?.id ?? null,
+          lastFoldedSourceId: messages.at(-1)?.id ?? null,
+          items: [
+            {
+              id: "mem-root-instruction",
+              kind: "decision" as const,
+              priority: "must" as const,
+              status: "active" as const,
+              statement: "The root instruction remains durable.",
+              evidence: [
+                {
+                  eventId: messages[0]?.id ?? "missing-source",
+                  sender: "operator",
+                  ts: messages[0]?.ts ?? now,
+                  quote: "Remember this root instruction.",
+                },
+              ],
+              updatedAt: now,
+            },
+          ],
         },
         quarantined: [],
         operations: 0,
@@ -1774,17 +1860,18 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
 
     if (!mesh) throw new Error("mesh not ready");
-    mesh.recordEvent({
-      kind: "message_received",
-      actorId: "root",
+    getRepositories().meshChat.record({
+      senderId: "operator",
+      recipientId: "root",
       body: "Remember this root instruction.",
-      payload: JSON.stringify({ from: "operator" }),
     });
     const rootActor = mesh.get("root");
     if (!rootActor) throw new Error("root actor not ready");
-    const onRunEnd = (
+    const actorOpts = (
       rootActor as unknown as {
         opts: {
+          buildPrompt: () => { prompt: string };
+          onRunStart?: (responsive: boolean) => void;
           onRunEnd?: (result: {
             success: boolean;
             output: string;
@@ -1792,21 +1879,47 @@ describe("runStart webhook event routing (Phase 4)", () => {
           }) => Promise<void>;
         };
       }
-    ).opts.onRunEnd;
-    await onRunEnd?.({ success: true, output: "root completed", exitCode: 0 });
+    ).opts;
+    actorOpts.onRunStart?.(false);
+    await actorOpts.onRunEnd?.({ success: true, output: "root completed", exitCode: 0 });
 
     expect(compactSpy).toHaveBeenCalledOnce();
     const state = JSON.parse(
       readFileSync(join(homeDir, "portable-context", "root.json"), "utf8")
-    ) as { generation: number; lastFoldedMessageEventId: string | null };
+    ) as { generation: number; lastFoldedSourceId: string | null };
     expect(state.generation).toBe(1);
-    expect(state.lastFoldedMessageEventId).toBeTruthy();
+    expect(state.lastFoldedSourceId).toBeTruthy();
     const compacted = getRepositories().meshEvents.listEventsByActors(["root"], {
       kinds: ["portable_context_compacted"],
       limit: 10,
     }).events;
     expect(compacted).toHaveLength(1);
     expect(compacted[0]?.detail).toContain("generation 1");
+
+    // mesh_events is an analytics stream, so pruning it must not remove live
+    // prompt state. Recent output comes from actor_runs, recent messages from
+    // mesh_chat, and compacted memory from the portable-context file.
+    getDb().exec("DELETE FROM mesh_events");
+    const built = actorOpts.buildPrompt();
+    expect(built.prompt).toContain("root completed");
+    expect(built.prompt).toContain("Remember this root instruction.");
+    expect(built.prompt).toContain("The root instruction remains durable.");
+
+    // The durable cursor must also advance after truncation, not merely render
+    // the already-materialized state.
+    getRepositories().meshChat.record({
+      senderId: "operator",
+      recipientId: "root",
+      body: "Fold this after truncation.",
+    });
+    actorOpts.onRunStart?.(false);
+    await actorOpts.onRunEnd?.({ success: true, output: "second run", exitCode: 0 });
+    expect(compactSpy).toHaveBeenCalledTimes(2);
+    const advancedState = JSON.parse(
+      readFileSync(join(homeDir, "portable-context", "root.json"), "utf8")
+    ) as { generation: number; lastFoldedSourceId: string | null };
+    expect(advancedState.generation).toBe(2);
+    expect(advancedState.lastFoldedSourceId).not.toBe(state.lastFoldedSourceId);
     compactSpy.mockRestore();
   });
 
@@ -2885,16 +2998,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     }).toThrow(/unconfigured-provider/);
 
-    // Assert that the actor record in the registry is retired/errored
+    // The central spawn validator rejects before allocating an actor identity
+    // or durable record.
     const list1 = activeMesh.registry.list();
     const failedWorker = list1.find((r) => r.charter === "unresolvable provider worker");
-    expect(failedWorker).toBeDefined();
-    expect(failedWorker?.status).toBe("retired");
-
-    if (!failedWorker) throw new Error("failedWorker should be defined");
-
-    // Assert that the failed worker is NOT live
-    expect(activeMesh.get(failedWorker.id)).toBeUndefined();
+    expect(failedWorker).toBeUndefined();
 
     // 2. Positive test: explicit empty model slug -> spawn throws loudly
     expect(() => {

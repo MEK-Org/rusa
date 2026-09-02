@@ -178,6 +178,8 @@ export interface ActorOptions {
    * failure result would put a run that never ran into failure accounting.
    */
   onRunAbandoned?: (abandon: RunAbandon) => void;
+  /** Publish the actor's derived runtime state after each real flag mutation cluster. */
+  onRuntimeStateChanged?: (state: "queued" | "running" | "winding_down" | "idle") => void;
 }
 
 /** What ended without a result, and which brackets it closes. */
@@ -271,6 +273,7 @@ export class Actor {
   private yielded = false;
   /** Status ('complete' | 'blocked') set when the actor calls its yield tool. */
   private yieldStatus?: string;
+  private yieldNote?: string;
   /** True when the last wake was gated off by {@link ActorOptions.beforeRun} (nothing ran). */
   private lastRunSkipped = false;
   /** True when the last run ended in a failure result (non-zero / threw). */
@@ -298,6 +301,7 @@ export class Actor {
   private readonly yieldGraceMs: number;
   private currentRunStartTime: Date | null = null;
   private interruptedWatermark: Date | null = null;
+  private lastPublishedRuntimeState: "queued" | "running" | "winding_down" | "idle" = "idle";
 
   constructor(private readonly opts: ActorOptions) {
     this.id = opts.id;
@@ -340,9 +344,11 @@ export class Actor {
    * period timer to forcefully kill the process if it does not exit promptly.
    * Stops the corrective run path; the actor next runs on a real external trigger.
    */
-  declareYield(status?: string): void {
+  declareYield(status?: string, note?: string): void {
     this.yielded = true;
     this.yieldStatus = status ?? "complete";
+    this.yieldNote = note;
+    this.publishRuntimeStateIfChanged();
     if (this.executing && !this.yieldGraceTimer) {
       this.yieldGraceTimer = setTimeout(() => {
         this.yieldGraceTimer = undefined;
@@ -450,6 +456,7 @@ export class Actor {
         this.cancelQueuedRun();
       }
       this.queued = false;
+      this.publishRuntimeStateIfChanged();
       return { interrupted: true, runStartTime: now, wasQueued: true };
     }
     return { interrupted: false };
@@ -498,11 +505,13 @@ export class Actor {
     // A yield only counts for the run it was declared in; clear any prior flag.
     this.yielded = false;
     this.yieldStatus = undefined;
+    this.yieldNote = undefined;
     this.runEndReported = false;
     this.runStartReported = false;
     this.currentRunStartTime = new Date();
     // The run is queued until invoke() is selected by both gates.
     this.queued = true;
+    this.publishRuntimeStateIfChanged();
     try {
       try {
         this.opts.onQueued?.({
@@ -524,6 +533,7 @@ export class Actor {
       this.currentRunStartTime = null;
       this.queued = false;
       this.executing = false;
+      this.publishRuntimeStateIfChanged();
       // Close the opportunity this `finally` just opened flags for. It lives here,
       // beside the flag clears, for the same reason they do: `executeTurn` has
       // terminal paths that return early, and a signal emitted at each of them is
@@ -667,6 +677,7 @@ export class Actor {
         throw new RunStartCancelledError();
       }
       this.executing = true;
+      this.publishRuntimeStateIfChanged();
       if (
         this.interruptedWatermark &&
         this.currentRunStartTime &&
@@ -751,6 +762,7 @@ export class Actor {
 
     if (this.yielded) {
       result.yieldStatus = this.yieldStatus ?? "complete";
+      result.yieldNote = this.yieldNote;
       if (wasGraceKilled) {
         // Fix ISSUE_NUM: when the supervisor's grace-kill follows a successful yield
         // in the same run, the run-end record must KEEP the yield's status
@@ -782,6 +794,24 @@ export class Actor {
     // reported abandoned — one opportunity, one terminal signal.
     this.runEndReported = true;
     await this.opts.onRunEnd?.(result);
+  }
+
+  /**
+   * Derive the narrow public runtime state from the actor's own flags. Keeping
+   * this beside the mutations prevents audit-hook ordering from becoming a
+   * second, fallible state machine.
+   */
+  private publishRuntimeStateIfChanged(): void {
+    const state = this.executing
+      ? this.yielded
+        ? "winding_down"
+        : "running"
+      : this.queued
+        ? "queued"
+        : "idle";
+    if (state === this.lastPublishedRuntimeState) return;
+    this.lastPublishedRuntimeState = state;
+    this.opts.onRuntimeStateChanged?.(state);
   }
 
   private async runWithFallback(

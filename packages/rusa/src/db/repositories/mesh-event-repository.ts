@@ -51,40 +51,12 @@ export interface EventPage {
 export interface RunStartPayload {
   provider: string;
   responsive: boolean;
+  /** Durable actor_runs identity for this execution. */
+  runId?: string;
 }
 
 export interface RunStartEvent extends MeshEvent<RunStartPayload> {
   kind: "run_start";
-}
-
-/**
- * The event kinds portable context  folds into an actor's durable ledger,
- * each tagged with who authored it. One table, so the SQL filter and the
- * provenance rule can never drift apart.
- *
- * `run_yielded` is the actor's own end-of-run self-summary — the "structured
- * end-of-run self-summary carried in the yield/report contract" the design note
- * prescribes, already durable in the log. It is deliberately NOT `run_end`:
- * a run_end body is the whole narration stream (measured across the live log:
- * 9,546 events, ~11.9KB average, clamped at {@link MAX_BODY_CHARS}), i.e. the
- * provider-transcript-shaped input v1 is supposed to stay away from, whereas a
- * yield note is the distilled outcome (8,491 events, ~536B average) and carries
- * a complete/blocked `detail` the compactor can discriminate on. The ~11% of
- * runs that end without yielding contribute nothing, which is correct: a run
- * that died mid-flight has no trustworthy self-summary.
- */
-const PORTABLE_CONTEXT_SOURCE_KINDS: Record<string, "inbound" | "self"> = {
-  message_received: "inbound",
-  run_yielded: "self",
-};
-
-/**
- * True when the actor itself authored events of this kind, so evidence drawn
- * from one must be attributed to the actor rather than left as "unknown" —
- * see the sender rule in `portable-context-compactor.ts`.
- */
-export function isSelfAuthoredLedgerSource(kind: string): boolean {
-  return PORTABLE_CONTEXT_SOURCE_KINDS[kind] === "self";
 }
 
 /** Largest body we persist per event; longer text is tail-truncated. */
@@ -361,53 +333,6 @@ export class MeshEventRepository {
     const page = hasMore ? rows.slice(0, limit) : rows;
     const nextCursor = hasMore ? page[page.length - 1].rowid : null;
     return { events: page.map(toMeshEvent), nextCursor };
-  }
-
-  /**
-   * The actor's ledger source journal after a durable event-id watermark, oldest
-   * first: inbound messages *and* the actor's own yield notes (see
-   * {@link PORTABLE_CONTEXT_SOURCE_KINDS}). Portable-context v2 folds from here;
-   * `mesh_events` remains authoritative while the actor's JSON ledger is only a
-   * materialized cache.
-   *
-   * The two kinds share ONE rowid watermark, which is why they are read in a
-   * single interleaved query rather than two: chronological order across both is
-   * what lets a later yield note update or resolve an item an earlier message
-   * created.
-   */
-  listLedgerSourcesAfter(
-    actorId: string,
-    afterEventId: string | null,
-    limit = 50
-  ): { events: MeshEvent[]; hasMore: boolean } {
-    if (limit <= 0) return { events: [], hasMore: false };
-    let afterRowid = 0;
-    if (afterEventId) {
-      const watermark = this.db
-        .prepare("SELECT rowid FROM mesh_events WHERE id = ?")
-        .get(afterEventId) as { rowid: number } | undefined;
-      if (!watermark) {
-        throw new Error(`portable-context watermark event not found: ${afterEventId}`);
-      }
-      afterRowid = watermark.rowid;
-    }
-    const kinds = Object.keys(PORTABLE_CONTEXT_SOURCE_KINDS);
-    const rows = this.db
-      .prepare(
-        `SELECT e.*, c.body AS chat_body
-         FROM mesh_events e
-         LEFT JOIN mesh_chat c ON json_extract(e.payload, '$.messageId') = c.id
-         WHERE e.rowid > ? AND e.kind IN (${kinds.map(() => "?").join(", ")}) AND e.actor_id = ?
-         ORDER BY e.rowid ASC
-         LIMIT ?`
-      )
-      .all(afterRowid, ...kinds, actorId, limit + 1) as (MeshEventRow & {
-      chat_body?: string | null;
-    })[];
-    return {
-      events: rows.slice(0, limit).map(toMeshEvent),
-      hasMore: rows.length > limit,
-    };
   }
 
   /**

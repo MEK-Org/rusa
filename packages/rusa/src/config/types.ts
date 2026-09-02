@@ -283,6 +283,11 @@ export interface RootActorConfig {
    */
   model?: string;
   /**
+   * Optional provider-native reasoning level, independent of `model`.
+   * Omit to preserve the provider/model default.
+   */
+  effort?: string;
+  /**
    * Optional fallback model(s) the root tries, in order, when the primary
    * `model` is overloaded or unavailable. Keeps a strong root responsive under
    * transient throttling by degrading that turn to a weaker model instead of

@@ -1,6 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
 import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../mcp/stamp.js";
+import {
+  type ModelEffortSelection,
+  normalizeModelEffortSelection,
+} from "../providers/reasoning-effort.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
 import {
@@ -59,7 +63,7 @@ function eventResourceObligationKey(resource: EventResource): string | undefined
 export interface MeshActor {
   readonly id: string;
   requestRun(nudge?: RunNudge): void;
-  declareYield(status?: string): void;
+  declareYield(status?: string, note?: string): void;
   markUnkillable(): void;
   close(): void;
   readonly isRunning: boolean;
@@ -74,6 +78,21 @@ export interface MeshActor {
   getProvider?(): CodingProvider;
 }
 
+export type ActorRuntimeState = "queued" | "running" | "winding_down" | "idle";
+
+export interface ActorRuntimeStateDelta {
+  streamId: string;
+  revision: number;
+  actorId: string;
+  runState: ActorRuntimeState;
+}
+
+export interface ActorRuntimeStateSnapshot {
+  streamId: string;
+  revision: number;
+  states: ReadonlyMap<string, ActorRuntimeState>;
+}
+
 export interface SpawnRequest {
   /** What the new actor owns — authored by the spawning message (B.5). */
   charter: string;
@@ -83,6 +102,8 @@ export interface SpawnRequest {
   provider: string;
   /** Model/tier id for the child's provider. Required . */
   model: string;
+  /** Provider-native reasoning level. Omit to preserve the provider/model default. */
+  effort?: string;
   /** Working-memory ownership and portable-context policy. Missing means native. */
   context?: ContextConfig;
   /** Peers to seed the child's address book with (introductions at birth). */
@@ -108,10 +129,10 @@ export type MessageDeliveryResult =
 /**
  * One thread's in-flight run.
  *
- * A run has no identity of its own in this mesh — everywhere a `runId` is carried it
- * holds the ACTOR's id (see the mechanical inbox forensics and the failure sink). So
- * the thread id plus its phase is the most specific name a run has here, and it is what
- * the retire refusal reports.
+ * Scheduling remains keyed by actor: the host-owned run journal carries the
+ * execution's durable identity, while this state only answers whether the one
+ * actor is queued, running, or winding down. The retire refusal therefore names
+ * the thread whose execution prevents retirement.
  */
 export interface ActiveRunState {
   actorId: string;
@@ -171,6 +192,8 @@ export interface ActorFactoryContext {
   onQueued: (context: { responsive: boolean; mode: ActorRunMode }) => void;
   /** Post-run accounting (budget) + completion-review hook. */
   onRunEnd: (result: RunResult) => void;
+  /** Forward the actor-owned runtime state to the mesh-wide sequencer. */
+  onRuntimeStateChanged: (state: ActorRuntimeState) => void;
 }
 
 export type ActorFactory = (ctx: ActorFactoryContext) => MeshActor;
@@ -232,9 +255,14 @@ export interface ActorMeshOptions {
   /** Builds a live Actor for a thread record (resolves provider/cwd/mcp/session). */
   createActor: ActorFactory;
   /** Synchronous gate run before a spawn id or durable record is created. */
-  validateSpawn?: (req: SpawnRequest) => void;
+  validateSpawn?: (req: SpawnRequest) => ModelEffortSelection | undefined;
   /** Synchronous validator before setting an actor's model in-place . */
-  validateModel?: (record: ThreadRecord, newModel: string, newProvider?: string) => void;
+  validateModel?: (
+    record: ThreadRecord,
+    newModel: string | undefined,
+    newProvider?: string,
+    newEffort?: string | null
+  ) => ModelEffortSelection | undefined;
   /** Cross-actor concurrency cap for non-responsive runs (default 4). */
   maxConcurrent?: number;
   /**
@@ -291,6 +319,8 @@ export interface ActorMeshOptions {
    * later, unrelated parent notification. Returns optional text to append.
    */
   onYield?: (actorId: string, ctx: { notifyingParent: boolean }) => string | null | undefined;
+  /** Persist the active run's yield fact and return its durable run id. */
+  recordRunYield?: (actorId: string, status: string, note?: string) => string | null;
   /**
    * Called once per actor at genuine birth — inside {@link spawn}, after the live
    * actor is registered — for out-of-band side effects the mesh doesn't own (e.g.
@@ -390,12 +420,13 @@ export interface ActorMeshOptions {
 export class ActorMesh {
   readonly registry: ThreadRegistry;
   private readonly createActor: ActorFactory;
-  private readonly validateSpawn?: (req: SpawnRequest) => void;
+  private readonly validateSpawn?: (req: SpawnRequest) => ModelEffortSelection | undefined;
   private readonly validateModel?: (
     record: ThreadRecord,
-    newModel: string,
-    newProvider?: string
-  ) => void;
+    newModel: string | undefined,
+    newProvider?: string,
+    newEffort?: string | null
+  ) => ModelEffortSelection | undefined;
   private readonly limiter: ConcurrencyLimiter;
   private readonly providerGate: NonNullable<ActorMeshOptions["providerGate"]>;
   private readonly isHalted: (provider?: string) => boolean;
@@ -409,6 +440,7 @@ export class ActorMesh {
     actorId: string,
     ctx: { notifyingParent: boolean }
   ) => string | null | undefined;
+  private readonly recordRunYield?: ActorMeshOptions["recordRunYield"];
   private readonly onSpawn?: (record: ThreadRecord) => void;
   private readonly onRevive?: (record: ThreadRecord) => void;
   private readonly onCapabilityGranted?: (actorId: string, capability: string) => void;
@@ -436,6 +468,9 @@ export class ActorMesh {
   private readonly grantable: ReadonlySet<string>;
   private readonly log: (msg: string) => void;
   private readonly live = new Map<string, MeshActor>();
+  private readonly runtimeStreamId = randomUUID();
+  private runtimeRevision = 0;
+  private readonly runtimeStateListeners = new Set<(delta: ActorRuntimeStateDelta) => void>();
   private readonly activeRunCounts = new Map<string, number>();
   private readonly deferredRetireCleanups = new Map<
     string,
@@ -501,6 +536,7 @@ export class ActorMesh {
     this.handleForId = opts.handleForId ?? generateHandle;
     this.onRetire = opts.onRetire;
     this.onYield = opts.onYield;
+    this.recordRunYield = opts.recordRunYield;
     this.onSpawn = opts.onSpawn;
     this.onRevive = opts.onRevive;
     this.onCapabilityGranted = opts.onCapabilityGranted;
@@ -583,6 +619,7 @@ export class ActorMesh {
     const existing = this.registry.get(record.id);
     this.registry.upsert(existing ? { ...existing, ...record } : record);
     this.live.set(record.id, actor);
+    this.actorRuntimeStateChanged(record.id, this.runtimeStateOf(actor));
   }
 
   /**
@@ -601,6 +638,7 @@ export class ActorMesh {
     try {
       const actor = this.createActor(this.factoryContext(record));
       this.live.set(record.id, actor);
+      this.actorRuntimeStateChanged(record.id, this.runtimeStateOf(actor));
       this.log(`rehydrated ${record.id} (parent ${record.parentId})`);
     } catch (err) {
       this.log(
@@ -777,8 +815,16 @@ export class ActorMesh {
     return entries;
   }
 
-  /** Establish the run-scoped subset that may be marked handled. */
-  selectInboxEntries(actorId: string, entryIds: string[]): InboxEntry[] {
+  /**
+   * Establish the run-scoped subset that may be marked handled. When supplied,
+   * `beforeCommit` must durably record the selection; the in-memory guard is
+   * installed only after that callback succeeds.
+   */
+  selectInboxEntries(
+    actorId: string,
+    entryIds: string[],
+    beforeCommit?: (entries: InboxEntry[]) => void
+  ): InboxEntry[] {
     actorId = this.resolveThreadId(actorId);
     const inboxStore = this.inboxStore;
     if (!inboxStore) throw new Error("Inbox is not configured");
@@ -792,6 +838,7 @@ export class ActorMesh {
       if (entry.handledAt) throw new Error(`Inbox entry already handled: ${id}`);
       return entry;
     });
+    beforeCommit?.(entries);
     this.selectedInboxEntryIds.set(actorId, unique);
     return entries;
   }
@@ -926,9 +973,17 @@ export class ActorMesh {
     if (!charter) throw new Error("charter is required");
     const provider = req.provider?.trim();
     if (!provider) throw new Error("provider is required");
-    const model = req.model?.trim();
+    const initialSelection = normalizeModelEffortSelection(provider, req.model, req.effort);
+    const selection =
+      this.validateSpawn?.({
+        ...req,
+        provider,
+        model: initialSelection.model ?? "",
+        effort: initialSelection.effort,
+      }) ?? initialSelection;
+    const model = selection.model?.trim();
     if (!model) throw new Error("model is required");
-    this.validateSpawn?.(req);
+    const effort = selection.effort;
     const id = this.idgen();
     const parentId = this.resolveThreadId(req.parentId);
     const record: ThreadRecord = {
@@ -937,6 +992,7 @@ export class ActorMesh {
       parentId,
       provider,
       model,
+      effort,
       context: req.context,
       handles: req.handles ? [...req.handles] : undefined,
       // Seed the session so the actor's first run resumes this conversation
@@ -961,6 +1017,7 @@ export class ActorMesh {
       throw err;
     }
     this.live.set(id, actor);
+    this.actorRuntimeStateChanged(id, this.runtimeStateOf(actor));
     // Genuine-birth side-effect hook (out-of-band, fire-and-forget) — e.g. kick
     // off avatar generation . Guarded like onRetire so a hook throw can
     // never break spawning, and only here (not createActor, which rehydrate
@@ -977,7 +1034,7 @@ export class ActorMesh {
       kind: "actor_spawned",
       actorId: id,
       detail: charter,
-      body: `provider=${provider} model=${model}`,
+      body: `provider=${provider} model=${model}${effort ? ` effort=${effort}` : ""}`,
       // TODO: Consider extracting the human or controller principal and storing it in payload.requestedBy
       payload: JSON.stringify({ parentId }),
     });
@@ -1834,6 +1891,7 @@ export class ActorMesh {
   declareYield(id: string, status: string, note?: string): void {
     id = this.resolveThreadId(id);
     const actor = this.live.get(id);
+    const runId = actor ? (this.recordRunYield?.(id, status, note) ?? null) : null;
     this.recordEvent({
       kind: "run_yielded",
       actorId: id,
@@ -1844,7 +1902,7 @@ export class ActorMesh {
       this.log(`yield from ${id} dropped — no live actor`);
       return;
     }
-    actor.declareYield(status);
+    actor.declareYield(status, note);
     const parentId = this.registry.get(id)?.parentId;
     const inboxStore = this.inboxStore;
     const notifyingParent = !!(
@@ -1862,7 +1920,7 @@ export class ActorMesh {
         ? `[yield/${status}] ${id}${summary}\n\n${appendix}`
         : `[yield/${status}] ${id}${summary}`;
       this.deliverMechanicalInboxNotice(parentId, body, id, {
-        runId: id,
+        runId: runId ?? id,
         actorId: id,
         status,
       });
@@ -2049,6 +2107,47 @@ export class ActorMesh {
     }
     if (actor.isQueued) return { actorId, phase: "queued" };
     return null;
+  }
+
+  /** One synchronous capture used to populate both the REST cursor and thread states. */
+  runtimeStateSnapshot(): ActorRuntimeStateSnapshot {
+    return {
+      streamId: this.runtimeStreamId,
+      revision: this.runtimeRevision,
+      states: new Map(
+        [...this.live].map(([actorId, actor]) => [actorId, this.runtimeStateOf(actor)])
+      ),
+    };
+  }
+
+  /** Subscribe to already-sequenced runtime deltas. */
+  onRuntimeStateDelta(listener: (delta: ActorRuntimeStateDelta) => void): () => void {
+    this.runtimeStateListeners.add(listener);
+    return () => this.runtimeStateListeners.delete(listener);
+  }
+
+  /** The sole revision authority for actor-published runtime transitions. */
+  actorRuntimeStateChanged(actorId: string, runState: ActorRuntimeState): void {
+    const delta: ActorRuntimeStateDelta = {
+      streamId: this.runtimeStreamId,
+      revision: ++this.runtimeRevision,
+      actorId,
+      runState,
+    };
+    for (const listener of this.runtimeStateListeners) {
+      try {
+        listener(delta);
+      } catch (err) {
+        this.log(
+          `runtime state listener failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+  }
+
+  private runtimeStateOf(actor: MeshActor): ActorRuntimeState {
+    if (actor.isRunning) return actor.isYielded ? "winding_down" : "running";
+    return actor.isQueued ? "queued" : "idle";
   }
 
   /** True only if the actor is live and declared yield during its active run. */
@@ -2317,7 +2416,13 @@ export class ActorMesh {
    * Optionally moves portable (ledger/tail) actors across providers.
    * Takes effect at the end of the actor's next run.
    */
-  setActorModel(id: string, model: string, requestedBy: string, provider?: string): void {
+  setActorModel(
+    id: string,
+    model: string | undefined,
+    requestedBy: string,
+    provider?: string,
+    effort?: string | null
+  ): void {
     id = this.resolveThreadId(id);
     requestedBy = this.resolveThreadId(requestedBy);
     const record = this.registry.get(id);
@@ -2335,11 +2440,14 @@ export class ActorMesh {
         );
       }
     }
-    const trimmedModel = model.trim();
-    if (!trimmedModel) {
+    const requestedModel = model?.trim();
+    if (model !== undefined && !requestedModel) {
       throw new Error(`Cannot set an empty model on thread: ${id}`);
     }
     const trimmedProvider = provider?.trim() || undefined;
+    if (model === undefined && effort === undefined && trimmedProvider === undefined) {
+      throw new Error(`Cannot set actor model: model, provider, or effort is required`);
+    }
     if (trimmedProvider !== undefined && trimmedProvider !== record.provider) {
       if (record.context?.type !== "portable") {
         throw new Error(
@@ -2347,16 +2455,35 @@ export class ActorMesh {
         );
       }
     }
-    if (this.validateModel) {
-      this.validateModel(record, trimmedModel, trimmedProvider);
-    }
+    const effectiveProvider = trimmedProvider ?? record.provider ?? "";
+    const initialSelection = normalizeModelEffortSelection(
+      effectiveProvider,
+      requestedModel,
+      effort
+    );
+    const nextModel = initialSelection.model ?? record.model;
+    const requestedEffort =
+      effort === null
+        ? null
+        : effort !== undefined || initialSelection.effort !== undefined
+          ? initialSelection.effort
+          : record.effort;
+    const selection =
+      this.validateModel?.(record, nextModel, trimmedProvider, requestedEffort) ??
+      normalizeModelEffortSelection(effectiveProvider, nextModel, requestedEffort);
+    const validatedModel = selection.model ?? nextModel;
+    const validatedEffort = selection.effort;
     // One boundary contract for every run state: the in-flight run, or the next
     // dispatched run when idle/queued, completes on the current model. The
     // desired value is applied only when that run ends.
-    const patch: Partial<ThreadRecord> = {
-      desiredModel: trimmedModel,
-      desiredProvider: trimmedProvider,
-    };
+    const patch: Partial<ThreadRecord> = { desiredProvider: trimmedProvider };
+    if (model !== undefined) patch.desiredModel = validatedModel;
+    if (effort !== undefined || validatedEffort !== record.effort) {
+      if (effort === null) patch.desiredEffort = null;
+      else if (validatedEffort !== undefined) {
+        patch.desiredEffort = validatedEffort;
+      }
+    }
     this.registry.patch(id, patch);
   }
 
@@ -2365,16 +2492,27 @@ export class ActorMesh {
    */
   private applyPendingModel(id: string): void {
     const record = this.registry.get(id);
-    if (!record || !record.desiredModel) return;
+    if (
+      !record ||
+      (record.desiredModel === undefined &&
+        record.desiredProvider === undefined &&
+        record.desiredEffort === undefined)
+    )
+      return;
 
-    const trimmedModel = record.desiredModel;
+    const trimmedModel = record.desiredModel ?? record.model;
     const trimmedProvider = record.desiredProvider;
     const oldModel = record.model;
     const oldProvider = record.provider;
+    const oldEffort = record.effort;
+    const nextEffort =
+      record.desiredEffort === null ? undefined : (record.desiredEffort ?? record.effort);
 
     const patch: Partial<ThreadRecord> = {
-      model: trimmedModel,
+      ...(record.desiredModel !== undefined ? { model: trimmedModel } : {}),
+      effort: nextEffort,
       desiredModel: undefined,
+      desiredEffort: undefined,
       desiredProvider: undefined,
     };
     if (trimmedProvider !== undefined) {
@@ -2385,17 +2523,21 @@ export class ActorMesh {
     const verified = this.registry.get(id);
     if (
       verified?.model !== trimmedModel ||
+      verified?.effort !== nextEffort ||
       (trimmedProvider !== undefined && verified?.provider !== trimmedProvider)
     ) {
       throw new Error(`Failed to verify deferred model update for thread: ${id}`);
     }
+    if (!verified) throw new Error(`Failed to reload thread after model update: ${id}`);
 
-    this.onModelSet?.(id, trimmedModel, verified);
+    this.onModelSet?.(id, trimmedModel ?? "", verified);
 
+    const oldSelection = `${oldModel ?? "default"}${oldEffort ? ` @ ${oldEffort}` : ""}`;
+    const newSelection = `${trimmedModel ?? "default"}${nextEffort ? ` @ ${nextEffort}` : ""}`;
     const detail =
       trimmedProvider && trimmedProvider !== oldProvider
-        ? `${oldProvider ?? "default"}:${oldModel ?? "default"} -> ${trimmedProvider}:${trimmedModel}`
-        : `${oldModel ?? "default"} -> ${trimmedModel}`;
+        ? `${oldProvider ?? "default"}:${oldSelection} -> ${trimmedProvider}:${newSelection}`
+        : `${oldSelection} -> ${newSelection}`;
 
     this.recordEvent({
       kind: "actor_model_set",
@@ -2489,6 +2631,7 @@ export class ActorMesh {
       this.onRevive?.(updatedRecord);
       const actor = this.createActor(this.factoryContext(updatedRecord));
       this.live.set(id, actor);
+      this.actorRuntimeStateChanged(id, this.runtimeStateOf(actor));
     } catch (err) {
       this.live.delete(id);
       this.registry.patch(id, { status: "retired" });
@@ -2645,6 +2788,7 @@ export class ActorMesh {
         this.finishInboxRun(record.id);
         this.accountRun(record.id, result);
       },
+      onRuntimeStateChanged: (state) => this.actorRuntimeStateChanged(record.id, state),
     };
   }
 

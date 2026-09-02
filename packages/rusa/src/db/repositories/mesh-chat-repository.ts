@@ -15,6 +15,10 @@ export interface MeshChatListOptions {
   limit?: number;
 }
 
+export interface MeshChatReceivedListOptions {
+  limit?: number;
+}
+
 interface MeshChatRow {
   id: string;
   ts: string;
@@ -85,6 +89,23 @@ export class MeshChatRepository {
          LIMIT ?`
       )
       .all(...params) as MeshChatRow[];
+    return rows.map(toMeshChat);
+  }
+
+  /** Recent inbound messages for one actor, newest first. */
+  listReceivedForActor(actorId: string, opts: MeshChatReceivedListOptions = {}): MeshChat[] {
+    const limit = opts.limit ?? 50;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error("mesh chat limit must be between 1 and 100");
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM mesh_chat
+         WHERE recipient_id = ?
+         ORDER BY ts DESC, id DESC
+         LIMIT ?`
+      )
+      .all(actorId, limit) as MeshChatRow[];
     return rows.map(toMeshChat);
   }
 

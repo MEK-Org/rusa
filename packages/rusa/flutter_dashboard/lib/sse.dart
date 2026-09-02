@@ -19,6 +19,8 @@ class WebEventSourceStream implements MeshStreamSource {
   final _mesh = StreamController<MeshEvent>.broadcast();
   final _live = StreamController<LiveOutputChunk>.broadcast();
   final _elided = StreamController<void>.broadcast();
+  final _runtimeHello = StreamController<RuntimeHello>.broadcast();
+  final _runtimeStates = StreamController<ActorRuntimeStateDelta>.broadcast();
   web.EventSource? _es;
 
   @override
@@ -27,6 +29,10 @@ class WebEventSourceStream implements MeshStreamSource {
   Stream<LiveOutputChunk> get liveOutput => _live.stream;
   @override
   Stream<void> get elided => _elided.stream;
+  @override
+  Stream<RuntimeHello> get runtimeHello => _runtimeHello.stream;
+  @override
+  Stream<ActorRuntimeStateDelta> get runtimeStates => _runtimeStates.stream;
 
   @override
   void connect(List<String> actors) {
@@ -50,6 +56,24 @@ class WebEventSourceStream implements MeshStreamSource {
       }),
     );
     es.addEventListener('elided', _listener((_) => _elided.add(null)));
+    es.addEventListener(
+      'hello',
+      _listener((data) {
+        _runtimeHello.add(
+          RuntimeHello.fromJson(jsonDecode(data) as Map<String, dynamic>),
+        );
+      }),
+    );
+    es.addEventListener(
+      'actor_runtime_state',
+      _listener((data) {
+        _runtimeStates.add(
+          ActorRuntimeStateDelta.fromJson(
+            jsonDecode(data) as Map<String, dynamic>,
+          ),
+        );
+      }),
+    );
     _es = es;
   }
 
@@ -74,5 +98,7 @@ class WebEventSourceStream implements MeshStreamSource {
     _mesh.close();
     _live.close();
     _elided.close();
+    _runtimeHello.close();
+    _runtimeStates.close();
   }
 }

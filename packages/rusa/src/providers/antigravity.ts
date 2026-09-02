@@ -32,6 +32,8 @@ const CONVERSATION_FILE_SUFFIXES = [".db-wal", ".db", ".db-shm"] as const;
 export interface AntigravityArgsOptions {
   prompt: string;
   model?: string;
+  /** First-class agy reasoning level. Omit to preserve the CLI default. */
+  effort?: string;
   /** Resumes an existing conversation by id (`--conversation`); omit to start fresh. */
   conversationId?: string;
   /** Extra directories to grant via repeatable `--add-dir`. */
@@ -51,6 +53,10 @@ export function buildAntigravityArgs(o: AntigravityArgsOptions): string[] {
     args.push("--add-dir", dir);
   }
   if (o.model) args.push("--model", o.model);
+  // agy 1.1.10+ resolves --effort against the model selected by --model. The
+  // explicit flag therefore owns the effective reasoning level even when an
+  // older passable display label still contains a parenthesized level.
+  if (o.effort) args.push("--effort", o.effort);
   // agy's --print-timeout is a wall-clock execution ceiling (verified empirically).
   // Set it to match the full invocation budget (o.timeoutMs) so active streaming tasks are not cut short.
   const printTimeoutMin = Math.max(1, Math.ceil(o.timeoutMs / 60_000));
@@ -354,7 +360,8 @@ export class AntigravityProvider implements CodingProvider {
     public readonly name: string,
     private readonly config: ProviderConfig,
     public readonly model?: string,
-    private readonly conversationsDir = antigravityConversationsDir()
+    private readonly conversationsDir = antigravityConversationsDir(),
+    public readonly effort?: string
   ) {}
 
   async run(opts: RunOptions): Promise<RunResult> {
@@ -421,6 +428,7 @@ export class AntigravityProvider implements CodingProvider {
     const args = buildAntigravityArgs({
       prompt: opts.prompt,
       model: this.model,
+      effort: this.effort,
       conversationId: opts.session?.id,
       addDirs: opts.addDirs,
       logFile,

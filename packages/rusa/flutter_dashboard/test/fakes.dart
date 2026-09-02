@@ -19,7 +19,10 @@ ThreadDto makeThread(
   String? title,
   String? provider,
   String? model,
+  String? effort,
   String? desiredModel,
+  String? desiredEffort,
+  bool? effortChangePending,
   String? desiredProvider,
   String? charterPreview,
 }) => ThreadDto(
@@ -29,7 +32,10 @@ ThreadDto makeThread(
   status: status,
   provider: provider,
   model: model,
+  effort: effort,
   desiredModel: desiredModel,
+  desiredEffort: desiredEffort,
+  effortChangePending: effortChangePending ?? desiredEffort != null,
   desiredProvider: desiredProvider,
   charterPreview: charterPreview ?? 'charter $id',
   title: title ?? 'charter $id',
@@ -53,7 +59,11 @@ MeshEvent makeEvent(
   actorId: actor,
   detail: detail,
   body: body,
-  payload: payload ?? (peer != null ? "{\"parentId\": \"$peer\", \"to\": \"$peer\", \"from\": \"$peer\"}" : null),
+  payload:
+      payload ??
+      (peer != null
+          ? "{\"parentId\": \"$peer\", \"to\": \"$peer\", \"from\": \"$peer\"}"
+          : null),
   success: null,
 );
 
@@ -84,23 +94,22 @@ ObligationDto makeObligation(
   String? terminalNote,
   String? title,
   String? resolutionRef,
-}) =>
-    ObligationDto(
-      id: id,
-      parentId: parentId,
-      ownerId: ownerId,
-      intent: intent ?? 'intent $id',
-      externalRef: externalRef,
-      status: status,
-      priority: priority,
-      effectivePriority: effectivePriority,
-      prioritySourceId: prioritySourceId,
-      terminalNote: terminalNote,
-      // Defaults to the intent's heading so existing fixtures keep rendering
-      // the label their assertions look for.
-      title: title ?? intent ?? 'intent $id',
-      resolutionRef: resolutionRef,
-    );
+}) => ObligationDto(
+  id: id,
+  parentId: parentId,
+  ownerId: ownerId,
+  intent: intent ?? 'intent $id',
+  externalRef: externalRef,
+  status: status,
+  priority: priority,
+  effectivePriority: effectivePriority,
+  prioritySourceId: prioritySourceId,
+  terminalNote: terminalNote,
+  // Defaults to the intent's heading so existing fixtures keep rendering
+  // the label their assertions look for.
+  title: title ?? intent ?? 'intent $id',
+  resolutionRef: resolutionRef,
+);
 
 /// Fake REST API with canned responses; records the actor lists it was queried
 /// with so tests can assert what the store requested.
@@ -113,6 +122,10 @@ class FakeApi extends DashboardApi {
   Object? quotaHistoryError;
   DashboardConfigDto? dashboardConfigResult;
   bool halted = false;
+  RuntimeCursor? runtimeCursor;
+  int threadsCallCount = 0;
+  final threadSnapshotGates = <Completer<ThreadsSnapshot>>[];
+  Object? threadsError;
   List<EventPage> eventPages = [];
   List<ChatPage> chatPages = [];
   int chatCall = 0;
@@ -146,8 +159,19 @@ class FakeApi extends DashboardApi {
   Completer<EventPage>? eventsGate;
 
   @override
-  Future<ThreadsSnapshot> fetchThreads() async =>
-      ThreadsSnapshot(halted: halted, threads: threadsResult);
+  Future<ThreadsSnapshot> fetchThreads() async {
+    threadsCallCount++;
+    final error = threadsError;
+    if (error != null) throw error;
+    if (threadSnapshotGates.isNotEmpty) {
+      return threadSnapshotGates.removeAt(0).future;
+    }
+    return ThreadsSnapshot(
+      halted: halted,
+      threads: threadsResult,
+      runtimeCursor: runtimeCursor,
+    );
+  }
 
   @override
   Future<List<String>> fetchRootControlProviders() async =>
@@ -379,7 +403,11 @@ class FakeApi extends DashboardApi {
     String imageBase64,
     String contentType,
   ) async {
-    uploadCalls.add((id: id, imageBase64: imageBase64, contentType: contentType));
+    uploadCalls.add((
+      id: id,
+      imageBase64: imageBase64,
+      contentType: contentType,
+    ));
     final err = uploadError;
     if (err != null) throw err;
   }
@@ -420,8 +448,11 @@ class FakeApi extends DashboardApi {
     String entryId, {
     String? reason,
   }) async {
-    markInboxHandledCalls
-        .add((actorId: actorId, entryId: entryId, reason: reason));
+    markInboxHandledCalls.add((
+      actorId: actorId,
+      entryId: entryId,
+      reason: reason,
+    ));
     final err = markInboxHandledError;
     if (err != null) throw err;
   }
@@ -430,9 +461,21 @@ class FakeApi extends DashboardApi {
   List<ObligationDto> obligationsResult = [];
   Map<String, ObligationDetailSnapshot> obligationDetails = {};
   Map<String, ObligationTreeDto> obligationTrees = {};
-  final createObligationCalls = <({String ownerId, String title, String? parentId, String? intent, String? externalRef, double? priority})>[];
-  final statusCalls = <({String id, String status, String? note, String? resolutionRef})>[];
-  final reorderCalls = <({String id, String? previousId, String? nextId, String scope})>[];
+  final createObligationCalls =
+      <
+        ({
+          String ownerId,
+          String title,
+          String? parentId,
+          String? intent,
+          String? externalRef,
+          double? priority,
+        })
+      >[];
+  final statusCalls =
+      <({String id, String status, String? note, String? resolutionRef})>[];
+  final reorderCalls =
+      <({String id, String? previousId, String? nextId, String scope})>[];
   final reparentCalls = <({String id, String? parentId})>[];
   final reassignCalls = <({String id, String ownerId})>[];
 
@@ -454,7 +497,11 @@ class FakeApi extends DashboardApi {
     if (rootsOnly == true) {
       list = list.where((o) => o.parentId == null).toList();
     }
-    return ObligationPage(obligations: list, total: list.length, hasMore: false);
+    return ObligationPage(
+      obligations: list,
+      total: list.length,
+      hasMore: false,
+    );
   }
 
   @override
@@ -475,7 +522,14 @@ class FakeApi extends DashboardApi {
       obligation: ob,
       parent: ob.parentId == null ? null : makeObligation(ob.parentId!),
       children: obligationsResult.where((o) => o.parentId == id).toList(),
-      blockingChildren: obligationsResult.where((o) => o.parentId == id && o.status != 'done' && o.status != 'cancelled').toList(),
+      blockingChildren: obligationsResult
+          .where(
+            (o) =>
+                o.parentId == id &&
+                o.status != 'done' &&
+                o.status != 'cancelled',
+          )
+          .toList(),
     );
   }
 
@@ -488,11 +542,25 @@ class FakeApi extends DashboardApi {
       (o) => o.id == id,
       orElse: () => makeObligation(id),
     );
-    final children = obligationsResult.where((o) => o.parentId == id).map((c) => ObligationTreeDto(
-      obligation: c,
-      children: obligationsResult.where((gc) => gc.parentId == c.id).map((gc) => ObligationTreeDto(obligation: gc, children: [], blockingChildren: [])).toList(),
-      blockingChildren: [],
-    )).toList();
+    final children = obligationsResult
+        .where((o) => o.parentId == id)
+        .map(
+          (c) => ObligationTreeDto(
+            obligation: c,
+            children: obligationsResult
+                .where((gc) => gc.parentId == c.id)
+                .map(
+                  (gc) => ObligationTreeDto(
+                    obligation: gc,
+                    children: [],
+                    blockingChildren: [],
+                  ),
+                )
+                .toList(),
+            blockingChildren: [],
+          ),
+        )
+        .toList();
     return ObligationTreeDto(
       obligation: ob,
       children: children,
@@ -537,7 +605,12 @@ class FakeApi extends DashboardApi {
     String? note,
     String? resolutionRef,
   }) async {
-    statusCalls.add((id: id, status: status, note: note, resolutionRef: resolutionRef));
+    statusCalls.add((
+      id: id,
+      status: status,
+      note: note,
+      resolutionRef: resolutionRef,
+    ));
     final index = obligationsResult.indexWhere((o) => o.id == id);
     if (index >= 0) {
       final old = obligationsResult[index];
@@ -598,13 +671,24 @@ class FakeApi extends DashboardApi {
     String? nextId,
     String scope = 'subtree',
   }) async {
-    reorderCalls.add((id: id, previousId: previousId, nextId: nextId, scope: scope));
-    final ob = obligationsResult.firstWhere((o) => o.id == id, orElse: () => makeObligation(id));
+    reorderCalls.add((
+      id: id,
+      previousId: previousId,
+      nextId: nextId,
+      scope: scope,
+    ));
+    final ob = obligationsResult.firstWhere(
+      (o) => o.id == id,
+      orElse: () => makeObligation(id),
+    );
     return ob;
   }
 
   @override
-  Future<ObligationDto> reparentObligation(String id, {String? parentId}) async {
+  Future<ObligationDto> reparentObligation(
+    String id, {
+    String? parentId,
+  }) async {
     reparentCalls.add((id: id, parentId: parentId));
     final index = obligationsResult.indexWhere((o) => o.id == id);
     if (index >= 0) {
@@ -731,13 +815,12 @@ class FakeTreePreferencesCache implements TreePreferencesCache {
   }
 
   @override
-  Map<String, List<String>>? loadActorOrder() =>
-      storedActorOrder == null
-          ? null
-          : {
-            for (final entry in storedActorOrder!.entries)
-              entry.key: List<String>.from(entry.value),
-          };
+  Map<String, List<String>>? loadActorOrder() => storedActorOrder == null
+      ? null
+      : {
+          for (final entry in storedActorOrder!.entries)
+            entry.key: List<String>.from(entry.value),
+        };
 
   @override
   void saveActorOrder(Map<String, List<String>> order) {
@@ -915,6 +998,9 @@ class FakeStream implements MeshStreamSource {
   final meshCtrl = StreamController<MeshEvent>.broadcast();
   final liveCtrl = StreamController<LiveOutputChunk>.broadcast();
   final elidedCtrl = StreamController<void>.broadcast();
+  final runtimeHelloCtrl = StreamController<RuntimeHello>.broadcast();
+  final runtimeStatesCtrl =
+      StreamController<ActorRuntimeStateDelta>.broadcast();
   final connectCalls = <List<String>>[];
 
   @override
@@ -923,6 +1009,10 @@ class FakeStream implements MeshStreamSource {
   Stream<LiveOutputChunk> get liveOutput => liveCtrl.stream;
   @override
   Stream<void> get elided => elidedCtrl.stream;
+  @override
+  Stream<RuntimeHello> get runtimeHello => runtimeHelloCtrl.stream;
+  @override
+  Stream<ActorRuntimeStateDelta> get runtimeStates => runtimeStatesCtrl.stream;
   @override
   void connect(List<String> actors) => connectCalls.add(actors);
   @override

@@ -25,6 +25,9 @@ import { obligationTerminalNote } from "./0026_obligation_terminal_note.js";
 import { obligationTitle } from "./0027_obligation_title.js";
 import { obligationArtifacts } from "./0028_obligation_artifacts.js";
 import { referenceGrammar } from "./0029_reference_grammar.js";
+import { actorRuns } from "./0030_actor_runs.js";
+import { inboxRunFocus } from "./0031_inbox_run_focus.js";
+import { actorRunsFocusFold } from "./0032_actor_runs_focus_fold.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -62,4 +65,7 @@ export const migrations: Migration[] = [
   obligationTitle,
   obligationArtifacts,
   referenceGrammar,
+  actorRuns,
+  inboxRunFocus,
+  actorRunsFocusFold,
 ];

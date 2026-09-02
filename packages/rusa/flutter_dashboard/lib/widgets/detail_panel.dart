@@ -721,6 +721,14 @@ class _InfoViewState extends State<_InfoView> {
                       ? '${actor.model ?? "default"} → ${actor.desiredModel} (applies after next run)'
                       : (actor.model ?? "default"),
                 ),
+              if (actor.effort != null || actor.effortChangePending)
+                _meta(
+                  'Effort',
+                  actor.effortChangePending &&
+                          actor.desiredEffort != actor.effort
+                      ? '${actor.effort ?? "default"} → ${actor.desiredEffort ?? "default"} (applies after next run)'
+                      : (actor.effort ?? "default"),
+                ),
               if (actor.commitmentKind != null)
                 _meta('Work state', actor.commitmentKind!),
               if (actor.waitingOn != null)

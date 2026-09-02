@@ -3,8 +3,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { compactPortableContext } from "../commands/start.js";
 import * as dbIdx from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
-import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
-import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
+import {
+  ActorRunRepository,
+  type PortableLedgerSource,
+} from "../db/repositories/actor-run-repository.js";
+import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import * as geminiUtils from "../understanding/gemini-utils.js";
 import {
   applyCompactionOperations,
@@ -40,7 +43,11 @@ const retiredItem = (
   updatedAt: "2026-07-01T00:00:00.000Z",
 });
 
-const message = (id: string, body: string, ts = "2026-07-21T00:00:00.000Z"): MeshEvent => ({
+const message = (
+  id: string,
+  body: string,
+  ts = "2026-07-21T00:00:00.000Z"
+): PortableLedgerSource => ({
   id,
   ts,
   kind: "message_received",
@@ -57,7 +64,7 @@ const yieldNote = (
   body: string,
   detail: "complete" | "blocked",
   ts = "2026-07-21T00:00:00.000Z"
-): MeshEvent => ({
+): PortableLedgerSource => ({
   ...message(id, body, ts),
   kind: "run_yielded",
   payload: null,
@@ -110,7 +117,7 @@ describe("applyCompactionOperations", () => {
     });
 
     expect(result.state.generation).toBe(1);
-    expect(result.state.lastFoldedMessageEventId).toBe("m1");
+    expect(result.state.lastFoldedSourceId).toBe("m1");
     expect(result.state.items[0]).toMatchObject({
       kind: "constraint",
       priority: "must",
@@ -201,7 +208,7 @@ describe("applyCompactionOperations", () => {
     expect(result.quarantined).toHaveLength(1);
     expect(result.quarantined[0].sourceEventId).toBe("m1");
     expect(result.quarantined[0].reason).toContain("not verbatim");
-    expect(result.state.lastFoldedMessageEventId).toBe("m1");
+    expect(result.state.lastFoldedSourceId).toBe("m1");
     // The denominator for the quarantine count: 1-of-2, not a bare 1 .
     expect(result.operations).toBe(2);
   });
@@ -248,7 +255,10 @@ describe("applyCompactionOperations", () => {
     // genuinely unrecoverable origin gets — the two must not collapse together,
     // because the self/inbound split is how provenance laundering stays visible.
     const note = yieldNote("y1", "All 4,466 tests passed.", "complete");
-    const anonymous: MeshEvent = { ...message("m1", "All 4,466 tests passed."), payload: null };
+    const anonymous: PortableLedgerSource = {
+      ...message("m1", "All 4,466 tests passed."),
+      payload: null,
+    };
     const add = (sourceEventId: string) => ({
       action: "add" as const,
       itemId: "",
@@ -1486,26 +1496,40 @@ vi.mock("../understanding/gemini-utils.js", async (importActual) => {
 
 describe("compactPortableContext integration (spec 6b)", () => {
   let db: Database.Database;
-  let repo: MeshEventRepository;
+  let actorRuns: ActorRunRepository;
+  let meshChat: MeshChatRepository;
+  let sequence: number;
+
+  const nextTimestamp = (): string =>
+    new Date(Date.UTC(2026, 6, 21, 0, 0, sequence++)).toISOString();
+  const recordInbound = (body: string): string =>
+    meshChat.record({
+      ts: nextTimestamp(),
+      senderId: "root",
+      recipientId: "actor-a",
+      body,
+    });
+  const recordYield = (body: string, status: "complete" | "blocked"): string => {
+    const ts = nextTimestamp();
+    const id = actorRuns.start({ actorId: "actor-a", startedAt: ts });
+    actorRuns.recordYield(id, status, body, ts);
+    actorRuns.complete(id, { endedAt: ts, success: true, exitCode: 0, output: body });
+    return id;
+  };
 
   beforeEach(() => {
     db = new Database(":memory:");
     runMigrations(db);
-    repo = new MeshEventRepository(db);
+    actorRuns = new ActorRunRepository(db);
+    meshChat = new MeshChatRepository(db);
+    sequence = 0;
     // biome-ignore lint/suspicious/noExplicitAny: partial test mock
-    vi.mocked(dbIdx.getRepositories).mockReturnValue({ meshEvents: repo } as any);
+    vi.mocked(dbIdx.getRepositories).mockReturnValue({ actorRuns } as any);
   });
 
   it("folds message and advances watermark even when quarantined, preventing re-fetch", async () => {
-    repo.record({
-      kind: "message_received",
-      actorId: "actor-a",
-      detail: null,
-      body: "bad body",
-      payload: JSON.stringify({ from: "root" }),
-      success: null,
-    });
-    const events = repo.listLedgerSourcesAfter("actor-a", null).events;
+    recordInbound("bad body");
+    const events = actorRuns.listLedgerSourcesAfter("actor-a", null).sources;
 
     // Mock the Gemini API to always return an operation with a bad quote
     const mockClient = {
@@ -1540,7 +1564,7 @@ describe("compactPortableContext integration (spec 6b)", () => {
     expect(result1?.items).toBe(0); // nothing added
 
     const state1 = store.load("actor-a");
-    expect(state1.lastFoldedMessageEventId).toBe(events[0].id);
+    expect(state1.lastFoldedSourceId).toBe(events[0].id);
 
     // Call it again
     const result2 = await compactPortableContext({ actorId: "actor-a", store, compactor });
@@ -1550,15 +1574,7 @@ describe("compactPortableContext integration (spec 6b)", () => {
   });
 
   it("distinguishes a degraded fold from an empty one in a single event ", async () => {
-    const record = (body: string) =>
-      repo.record({
-        kind: "message_received",
-        actorId: "actor-a",
-        detail: null,
-        body,
-        payload: JSON.stringify({ from: "root" }),
-        success: null,
-      });
+    const record = (body: string) => recordInbound(body);
 
     const operation = (statement: string, sourceEventId: string, quote: string) => ({
       action: "add",
@@ -1578,7 +1594,7 @@ describe("compactPortableContext integration (spec 6b)", () => {
 
     // Fold 1 — DEGRADED: one operation lands, one quarantines.
     record("Good info and other stuff");
-    const m1 = repo.listLedgerSourcesAfter("actor-a", null).events[0];
+    const m1 = actorRuns.listLedgerSourcesAfter("actor-a", null).sources[0];
     mockClient.models.generateContent.mockResolvedValueOnce({
       text: () =>
         JSON.stringify({
@@ -1592,7 +1608,7 @@ describe("compactPortableContext integration (spec 6b)", () => {
 
     // Fold 2 — EMPTY: the only operation quarantines, so the ledger does not grow.
     record("More info");
-    const m2 = repo.listLedgerSourcesAfter("actor-a", m1.id).events[0];
+    const m2 = actorRuns.listLedgerSourcesAfter("actor-a", m1.id).sources[0];
     mockClient.models.generateContent.mockResolvedValueOnce({
       text: () =>
         JSON.stringify({ operations: [operation("Another bad item", m2.id, "absent from body")] }),
@@ -1652,15 +1668,8 @@ describe("compactPortableContext integration (spec 6b)", () => {
       "Still holding: PR ISSUE_NUM is not yet merged to staging, and the bless window " +
       "remains frozen. mc/34ab82d4/obligation-ui remains stacked on ISSUE_NUM.";
 
-    const note = (body: string, detail: "complete" | "blocked") =>
-      repo.record({ kind: "run_yielded", actorId: "actor-a", detail, body });
-    const inbound = (body: string) =>
-      repo.record({
-        kind: "message_received",
-        actorId: "actor-a",
-        body,
-        payload: JSON.stringify({ from: "root" }),
-      });
+    const note = (body: string, detail: "complete" | "blocked") => recordYield(body, detail);
+    const inbound = (body: string) => recordInbound(body);
 
     const mockClient = { models: { generateContent: vi.fn() } };
     // biome-ignore lint/suspicious/noExplicitAny: partial test mock
@@ -1671,7 +1680,7 @@ describe("compactPortableContext integration (spec 6b)", () => {
     inbound("Ship the read-side obligations UI behind a branch, no schema changes.");
     note(COMPLETED, "complete");
     note(BLOCKED, "blocked");
-    const batch1 = repo.listLedgerSourcesAfter("actor-a", null).events;
+    const batch1 = actorRuns.listLedgerSourcesAfter("actor-a", null).sources;
     expect(batch1.map((e) => e.kind)).toEqual(["message_received", "run_yielded", "run_yielded"]);
 
     mockClient.models.generateContent.mockResolvedValueOnce({
@@ -1757,7 +1766,7 @@ describe("compactPortableContext integration (spec 6b)", () => {
     // A LATER yield note updates the item an earlier one created.
     const blockedItemId = afterFirst[2].id;
     note(STILL_BLOCKED, "blocked");
-    const batch2 = repo.listLedgerSourcesAfter("actor-a", batch1[2].id).events;
+    const batch2 = actorRuns.listLedgerSourcesAfter("actor-a", batch1[2].id).sources;
     expect(batch2).toHaveLength(1);
     mockClient.models.generateContent.mockResolvedValueOnce({
       text: () =>
@@ -1795,12 +1804,7 @@ describe("compactPortableContext integration (spec 6b)", () => {
     // crosses 256KB, so the loop stops with a third page still unread.
     const body = "x".repeat(5_000);
     for (let i = 0; i < 150; i++) {
-      repo.record({
-        kind: "message_received",
-        actorId: "actor-a",
-        body,
-        payload: JSON.stringify({ from: "root" }),
-      });
+      recordInbound(body);
     }
     const mockClient = {
       models: {
@@ -1830,7 +1834,7 @@ describe("compactPortableContext integration (spec 6b)", () => {
     // Bodies too small to ever reach the byte cap, so this exercises the other
     // ceiling: 1,050 sources = 21 pages, and the loop must stop at 20.
     for (let i = 0; i < 1_050; i++) {
-      repo.record({ kind: "run_yielded", actorId: "actor-a", detail: "complete", body: "ok" });
+      recordYield("ok", "complete");
     }
     const mockClient = {
       models: {

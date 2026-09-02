@@ -505,7 +505,11 @@ class _ActorRowState extends State<_ActorRow> {
                     color: MeshColors.textMuted,
                   ),
                 ),
-                if (thread.model != null || thread.desiredModel != null || thread.commitmentKind != null) ...[
+                if (thread.model != null ||
+                    thread.desiredModel != null ||
+                    thread.effort != null ||
+                    thread.effortChangePending ||
+                    thread.commitmentKind != null) ...[
                   const SizedBox(height: 4),
                   Row(
                     children: [
@@ -524,8 +528,31 @@ class _ActorRowState extends State<_ActorRow> {
                             ),
                           ),
                         ),
+                      if (thread.effort != null ||
+                          thread.effortChangePending) ...[
+                        if (thread.model != null || thread.desiredModel != null)
+                          const SizedBox(width: 6),
+                        Flexible(
+                          child: Text(
+                            thread.effortChangePending &&
+                                    thread.desiredEffort != thread.effort
+                                ? 'effort ${thread.effort ?? "default"} → ${thread.desiredEffort ?? "default"}'
+                                : 'effort ${thread.effort ?? "default"}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: kMonoStyle.copyWith(
+                              fontSize: 11,
+                              color: MeshColors.textSecondary,
+                            ),
+                          ),
+                        ),
+                      ],
                       if (thread.commitmentKind != null) ...[
-                        if (thread.model != null || thread.desiredModel != null) const SizedBox(width: 6),
+                        if (thread.model != null ||
+                            thread.desiredModel != null ||
+                            thread.effort != null ||
+                            thread.effortChangePending)
+                          const SizedBox(width: 6),
                         _WorkStateBadge(
                           kind: thread.commitmentKind!,
                           compact: true,

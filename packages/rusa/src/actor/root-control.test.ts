@@ -54,6 +54,27 @@ describe("RootControlService", () => {
     });
   });
 
+  it("forwards and audits an independent effort setting", () => {
+    const { mesh, events, service } = setup();
+    service.spawnChild(
+      {
+        charter: "review",
+        provider: "claude",
+        model: "claude-opus-4-8",
+        effort: "max",
+      },
+      "root-llm"
+    );
+
+    expect(mesh.spawn).toHaveBeenCalledWith(
+      expect.objectContaining({ model: "claude-opus-4-8", effort: "max" })
+    );
+    expect(JSON.parse(events[0].payload ?? "{}")).toMatchObject({
+      model: "claude-opus-4-8",
+      effort: "max",
+    });
+  });
+
   it("sends as root while retaining controller provenance in the audit event", () => {
     const { mesh, events, service } = setup();
     service.sendMessage("child-1", "  begin now  ", "e2e-controller");

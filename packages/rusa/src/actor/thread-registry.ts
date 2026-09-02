@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
+import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import { generateHandle } from "./handle-generator.js";
 
 /**
@@ -91,11 +92,18 @@ export interface ThreadRecord {
    * run-scoped and lives on the `run_end` event ({@link RunEndPayload}).
    */
   model?: string;
+  /** Explicit provider-native reasoning level; absent means provider default. */
+  effort?: string;
   /**
    * Pending model change staged via `set_actor_model` to apply at the end of the
    * next run boundary.
    */
   desiredModel?: string;
+  /**
+   * Pending reasoning-level change. `null` explicitly clears a pin back to the
+   * provider default; `undefined` means no effort change is staged.
+   */
+  desiredEffort?: string | null;
   /**
    * Pending provider change staged via `set_actor_model` to apply at the end of
    * the next run boundary.
@@ -230,10 +238,26 @@ export class InMemoryThreadRegistry implements ThreadRegistry {
 export class FileThreadRegistry implements ThreadRegistry {
   private readonly mem = new InMemoryThreadRegistry();
 
-  constructor(private readonly file: string) {
+  constructor(
+    private readonly file: string,
+    providerCapabilityName: (providerName: string) => string = (providerName) => providerName
+  ) {
+    let migrated = false;
     try {
       const parsed = JSON.parse(readFileSync(file, "utf-8")) as { threads?: ThreadRecord[] };
-      for (const rec of parsed.threads ?? []) this.mem.upsert(rec);
+      for (const rec of parsed.threads ?? []) {
+        try {
+          const normalized = migrateLegacyModelEffort(rec, providerCapabilityName);
+          migrated ||= normalized !== rec;
+          this.mem.upsert(normalized);
+        } catch {
+          // A conflicting hand-edited record must not make one actor erase the
+          // entire registry on boot. Preserve it verbatim so rehydration can
+          // fail that actor explicitly while every other thread remains intact.
+          this.mem.upsert(rec);
+        }
+      }
+      if (migrated) this.flush();
     } catch {
       /* missing / empty / invalid → start empty */
     }
@@ -272,4 +296,44 @@ export class FileThreadRegistry implements ThreadRegistry {
     this.mem.patch(id, changes);
     this.flush();
   }
+}
+
+/** Split recognized legacy model qualifiers while loading durable JSON records. */
+export function migrateLegacyModelEffort(
+  rec: ThreadRecord,
+  providerCapabilityName: (providerName: string) => string = (providerName) => providerName
+): ThreadRecord {
+  const provider = providerCapabilityName(rec.provider ?? "");
+  const current = normalizeModelEffortSelection(provider, rec.model, rec.effort);
+  const desiredProvider = providerCapabilityName(rec.desiredProvider ?? rec.provider ?? "");
+  const desired = rec.desiredModel
+    ? normalizeModelEffortSelection(
+        desiredProvider,
+        rec.desiredModel,
+        typeof rec.desiredEffort === "string" ? rec.desiredEffort : undefined
+      )
+    : undefined;
+  const desiredEffort = desired
+    ? rec.desiredEffort === null
+      ? null
+      : desired.effort
+    : rec.desiredEffort;
+  if (
+    current.model === rec.model &&
+    current.effort === rec.effort &&
+    (!desired || (desired.model === rec.desiredModel && desiredEffort === rec.desiredEffort))
+  ) {
+    return rec;
+  }
+  return {
+    ...rec,
+    model: current.model,
+    effort: current.effort,
+    ...(desired
+      ? {
+          desiredModel: desired.model,
+          desiredEffort,
+        }
+      : {}),
+  };
 }

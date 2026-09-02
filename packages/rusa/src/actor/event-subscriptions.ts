@@ -1,4 +1,5 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import {
   asGitHubBranch,
   githubBranchReference,
@@ -80,6 +81,50 @@ export interface EventSubscriptionStore {
   list(): EventSubscription[];
   /** The subscriptions currently active for a resource (≤1 by the invariant). */
   activeForResource(resource: EventResource): EventSubscription[];
+}
+
+export interface EventSubscriptionAuditEvent {
+  kind: "event_source_subscribed" | "event_source_unsubscribed" | string;
+  actorId: string | null;
+  detail: string | null;
+}
+
+/**
+ * Find audit-confirmed active subscriptions absent from the behavioral store.
+ *
+ * Events must be oldest-first. This is deliberately one-way: an empty or
+ * truncated analytics stream proves nothing about the durable file, so file-only
+ * rows are never reported and audit data is never used to mutate behavior.
+ */
+export function missingAuditedEventSubscriptions(
+  store: EventSubscriptionStore,
+  events: readonly EventSubscriptionAuditEvent[]
+): Array<{ resource: EventResource; actorId: string }> {
+  const auditedActive = new Map<string, { resource: EventResource; actorId: string }>();
+  for (const event of events) {
+    if (!event.actorId || !event.detail) continue;
+    let resource: EventResource;
+    try {
+      resource = resourceKey(event.detail);
+    } catch {
+      continue;
+    }
+    const key = `${resource}\0${event.actorId}`;
+    if (event.kind === "event_source_subscribed") {
+      auditedActive.set(key, { resource, actorId: event.actorId });
+    } else if (event.kind === "event_source_unsubscribed") {
+      auditedActive.delete(key);
+    }
+  }
+  const durableActive = new Set(
+    store
+      .list()
+      .filter((subscription) => !subscription.unsubscribedAt)
+      .map((subscription) => `${subscription.resource}\0${subscription.actorId}`)
+  );
+  return [...auditedActive.entries()]
+    .filter(([key]) => !durableActive.has(key))
+    .map(([, subscription]) => subscription);
 }
 
 /** Normalize a boundary input into one validated canonical reference string. */
@@ -260,24 +305,27 @@ export class InMemoryEventSubscriptionStore implements EventSubscriptionStore {
   private readonly subs = new Map<string, EventSubscription>();
 
   subscribe(subscription: Omit<EventSubscription, "resource"> & { resource: EventResource }): void {
-    const key = resourceKey(subscription.resource);
+    this.restore({ ...subscription, unsubscribedAt: undefined });
+  }
+
+  /** Hydrate one already-durable row without reactivating a tombstone. */
+  restore(subscription: EventSubscription): void {
+    const resource = resourceKey(subscription.resource);
     const normalized: EventSubscription = {
       ...subscription,
-      resource: key,
+      resource,
     };
     // One active subscriber per resource: a *different* active actor blocks.
-    const holder = this.activeForResource(key).find((s) => s.actorId !== subscription.actorId);
-    if (holder) {
+    const holder = normalized.unsubscribedAt
+      ? undefined
+      : this.activeForResource(resource).find((s) => s.actorId !== subscription.actorId);
+    if (holder && !normalized.unsubscribedAt) {
       throw new Error(
-        `event source ${key} already has an active subscriber ` +
+        `event source ${resource} already has an active subscriber ` +
           `(actor ${holder.actorId}); unsubscribe it before subscribing actor ${subscription.actorId}`
       );
     }
-    // Re-subscribing reactivates: drop any prior unsubscription, refresh metadata.
-    this.subs.set(`${key}:${subscription.actorId}`, {
-      ...normalized,
-      unsubscribedAt: undefined,
-    });
+    this.subs.set(`${resource}:${subscription.actorId}`, normalized);
   }
 
   unsubscribe(resource: EventResource, actorId: string, at: string): void {
@@ -347,77 +395,213 @@ export class UnionEventSubscriptionStore implements EventSubscriptionStore {
 /**
  * JSON-file-backed subscription store — the durable store, mirroring
  * {@link FileCapabilityGrantStore}: loads once on construction, rewrites the
- * whole file on every mutation, and keeps an authoritative in-memory copy so the
- * mesh keeps working even if the disk is momentarily unwritable.
+ * whole file atomically on every mutation. A mutation becomes visible in memory
+ * only after its snapshot has been replaced, so callers never receive a false
+ * success for a failed write or rename.
  */
 export class FileEventSubscriptionStore implements EventSubscriptionStore {
-  private readonly mem = new InMemoryEventSubscriptionStore();
+  private mem = new InMemoryEventSubscriptionStore();
 
   constructor(
     private readonly file: string,
-    rootId: string
+    rootId: string,
+    private readonly warn: (message: string) => void = console.warn,
+    private readonly replaceFile: typeof renameSync = renameSync
   ) {
-    let isUnversioned = false;
-    let didLoadSubscriptions = false;
-    let needsMigrationFlush = false;
+    let raw: string;
     try {
-      const parsed = JSON.parse(readFileSync(file, "utf-8")) as {
-        version?: number;
-        subscriptions?: Array<Omit<EventSubscription, "resource"> & { resource: unknown }>;
-      };
-      isUnversioned = !parsed.version;
-      if (isUnversioned || (parsed.version && parsed.version < 3)) {
-        needsMigrationFlush = true;
-      }
-      for (const s of parsed.subscriptions ?? []) {
-        didLoadSubscriptions = true;
-        let normalizedResource: EventResource;
-        try {
-          normalizedResource = normalizeEventResource(
-            s.resource as EventResource | LegacyEventResourceInput
-          );
-        } catch {
-          // Invalid legacy rows cannot participate in reference routing. Drop
-          // them explicitly and rewrite the file without blessing them as v3.
-          needsMigrationFlush = true;
-          continue;
-        }
-        if (isUnversioned && s.actorId === rootId && s.subscribedBy === rootId) {
-          continue;
-        }
-        this.mem.subscribe({
-          ...s,
-          resource: normalizedResource,
-        });
-        if (s.unsubscribedAt) this.mem.unsubscribe(normalizedResource, s.actorId, s.unsubscribedAt);
-      }
-    } catch {
-      /* missing / empty / invalid → start empty */
+      raw = readFileSync(file, "utf-8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
     }
-    if ((isUnversioned && didLoadSubscriptions) || (needsMigrationFlush && didLoadSubscriptions)) {
-      this.flush();
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      // Fail closed instead of silently booting with an empty routing authority.
+      // The source file remains untouched for manual repair.
+      throw new Error(`invalid event subscription file: ${file}`, { cause: error });
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`invalid event subscription file root: ${file}`);
+    }
+    const document = parsed as { version?: unknown; subscriptions?: unknown };
+    if (
+      document.version !== undefined &&
+      (!Number.isInteger(document.version) || (document.version as number) < 1)
+    ) {
+      throw new Error(`invalid event subscription file version: ${String(document.version)}`);
+    }
+    if (typeof document.version === "number" && document.version > 3) {
+      throw new Error(`unsupported event subscription file version: ${document.version}`);
+    }
+    if (document.subscriptions !== undefined && !Array.isArray(document.subscriptions)) {
+      throw new Error(`invalid event subscription rows: ${file}`);
+    }
+
+    const isUnversioned = document.version === undefined;
+    const rows = (document.subscriptions ?? []) as unknown[];
+    let rejected = 0;
+    type ParsedRow = {
+      index: number;
+      subscription: EventSubscription;
+      stateChangedAt: number;
+    };
+    const parsedRows: ParsedRow[] = [];
+    for (const [index, row] of rows.entries()) {
+      try {
+        const subscription = parsePersistedSubscription(row);
+        if (
+          isUnversioned &&
+          subscription.actorId === rootId &&
+          subscription.subscribedBy === rootId
+        ) {
+          continue;
+        }
+        parsedRows.push({
+          index,
+          subscription,
+          stateChangedAt: Date.parse(subscription.unsubscribedAt ?? subscription.subscribedAt),
+        });
+      } catch (error) {
+        rejected += 1;
+        this.warn(
+          `[mesh] skipped event subscription row ${index + 1}: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+
+    const reject = (row: ParsedRow, reason: string): void => {
+      rejected += 1;
+      this.warn(`[mesh] skipped event subscription row ${row.index + 1}: ${reason}`);
+    };
+
+    // Legacy spellings can normalize multiple rows onto one (resource, actor)
+    // key. Resolve that actor's latest state before comparing active owners.
+    const pairRows = new Map<string, ParsedRow[]>();
+    for (const row of parsedRows) {
+      const key = `${row.subscription.resource}\0${row.subscription.actorId}`;
+      const group = pairRows.get(key) ?? [];
+      group.push(row);
+      pairRows.set(key, group);
+    }
+    const resolvedRows: ParsedRow[] = [];
+    for (const group of pairRows.values()) {
+      const latestAt = Math.max(...group.map((row) => row.stateChangedAt));
+      const latest = group.filter((row) => row.stateChangedAt === latestAt);
+      // At an exact transition tie, retain an inactive state. Otherwise choose
+      // by normalized row content so reversing the file cannot change behavior.
+      const [winner] = [...latest].sort((a, b) => {
+        const inactive =
+          Number(Boolean(b.subscription.unsubscribedAt)) -
+          Number(Boolean(a.subscription.unsubscribedAt));
+        if (inactive !== 0) return inactive;
+        return persistedRowTieKey(a.subscription).localeCompare(persistedRowTieKey(b.subscription));
+      });
+      if (!winner) continue;
+      resolvedRows.push(winner);
+      for (const row of group) {
+        if (row !== winner) {
+          reject(row, `a later state already exists for ${row.subscription.resource}`);
+        }
+      }
+    }
+
+    // Tombstones cannot contend for live ownership. Among active actors, an
+    // unambiguous newest subscribe wins. Equal instants are rejected as an
+    // authority conflict instead of assigning ownership from JSON file order.
+    for (const { subscription } of resolvedRows.filter(
+      ({ subscription }) => subscription.unsubscribedAt
+    )) {
+      this.mem.restore(subscription);
+    }
+    const activeByResource = new Map<string, ParsedRow[]>();
+    for (const row of resolvedRows.filter(({ subscription }) => !subscription.unsubscribedAt)) {
+      const group = activeByResource.get(row.subscription.resource) ?? [];
+      group.push(row);
+      activeByResource.set(row.subscription.resource, group);
+    }
+    for (const [resource, group] of activeByResource) {
+      const newestAt = Math.max(...group.map((row) => Date.parse(row.subscription.subscribedAt)));
+      const newest = group.filter((row) => Date.parse(row.subscription.subscribedAt) === newestAt);
+      if (newest.length !== 1) {
+        for (const row of group) reject(row, `ambiguous active subscribers for ${resource}`);
+        continue;
+      }
+      const [winner] = newest;
+      if (!winner) continue;
+      for (const row of group) {
+        if (row !== winner) reject(row, `a newer active subscriber already owns ${resource}`);
+      }
+      this.mem.restore(winner.subscription);
+    }
+
+    if (rejected > 0) {
+      const recoveryFile = rejectedSnapshotPath(this.file, raw);
+      try {
+        writeFileSync(recoveryFile, raw, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      } catch (error) {
+        if (
+          (error as NodeJS.ErrnoException).code !== "EEXIST" ||
+          readFileSync(recoveryFile, "utf8") !== raw
+        ) {
+          throw new Error(`could not preserve rejected event subscription rows: ${recoveryFile}`, {
+            cause: error,
+          });
+        }
+      }
+      this.warn(
+        `[mesh] preserved ${rejected} rejected event subscription row(s) in ${recoveryFile}`
+      );
+    }
+
+    const needsMigrationFlush = isUnversioned || (document.version as number | undefined) !== 3;
+    if (needsMigrationFlush && rows.length > 0 && rejected === 0) {
+      this.flush(this.mem.list());
+    } else if (needsMigrationFlush && rejected > 0) {
+      this.warn(
+        `[mesh] event subscription migration left the source file unchanged after ${rejected} rejected row(s)`
+      );
     }
   }
 
-  private flush(): void {
+  private flush(subscriptions: EventSubscription[]): void {
+    // A same-directory temporary plus rename prevents a process interruption
+    // from exposing a partial JSON document. This is atomic replacement, not an
+    // fsync-based guarantee against host/power loss.
+    const temporary = `${this.file}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      writeFileSync(
-        this.file,
-        JSON.stringify({ version: 3, subscriptions: this.mem.list() }, null, 2)
-      );
-    } catch {
-      /* best effort — in-memory copy remains authoritative for this process */
+      writeFileSync(temporary, JSON.stringify({ version: 3, subscriptions }, null, 2), {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      this.replaceFile(temporary, this.file);
+    } catch (error) {
+      try {
+        unlinkSync(temporary);
+      } catch {
+        // The temporary file may not have been created. Preserve the write error.
+      }
+      throw error;
     }
+  }
+
+  private commit(mutate: (candidate: InMemoryEventSubscriptionStore) => void): void {
+    const candidate = new InMemoryEventSubscriptionStore();
+    for (const subscription of this.mem.list()) candidate.restore(subscription);
+    mutate(candidate);
+    this.flush(candidate.list());
+    this.mem = candidate;
   }
 
   subscribe(subscription: Omit<EventSubscription, "resource"> & { resource: EventResource }): void {
-    this.mem.subscribe(subscription); // throws on a conflicting active subscriber — before any flush
-    this.flush();
+    this.commit((candidate) => candidate.subscribe(subscription));
   }
 
   unsubscribe(resource: EventResource, actorId: string, at: string): void {
-    this.mem.unsubscribe(resource, actorId, at);
-    this.flush();
+    this.commit((candidate) => candidate.unsubscribe(resource, actorId, at));
   }
 
   list(): EventSubscription[] {
@@ -427,4 +611,59 @@ export class FileEventSubscriptionStore implements EventSubscriptionStore {
   activeForResource(resource: EventResource): EventSubscription[] {
     return this.mem.activeForResource(resource);
   }
+}
+
+function rejectedSnapshotPath(file: string, raw: string): string {
+  const digest = createHash("sha256").update(raw).digest("hex");
+  return `${file}.rejected-${digest}.json`;
+}
+
+function parsePersistedSubscription(value: unknown): EventSubscription {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("row is not an object");
+  }
+  const row = value as Record<string, unknown>;
+  const actorId = requiredString(row, "actorId");
+  const subscribedBy = requiredString(row, "subscribedBy");
+  const subscribedAt = requiredTimestamp(row, "subscribedAt");
+  let unsubscribedAt: string | undefined;
+  if (row.unsubscribedAt !== undefined) {
+    unsubscribedAt = requiredTimestamp(row, "unsubscribedAt");
+    if (Date.parse(unsubscribedAt) < Date.parse(subscribedAt)) {
+      throw new Error("unsubscribedAt must not precede subscribedAt");
+    }
+  }
+  return {
+    resource: normalizeEventResource(row.resource as EventResource | LegacyEventResourceInput),
+    actorId,
+    subscribedBy,
+    subscribedAt,
+    ...(unsubscribedAt ? { unsubscribedAt } : {}),
+  };
+}
+
+function persistedRowTieKey(subscription: EventSubscription): string {
+  return [
+    subscription.resource,
+    subscription.actorId,
+    subscription.subscribedBy,
+    subscription.subscribedAt,
+    subscription.unsubscribedAt ?? "",
+  ].join("\0");
+}
+
+function requiredTimestamp(row: Record<string, unknown>, field: string): string {
+  const value = requiredString(row, field);
+  if (!Number.isFinite(Date.parse(value))) {
+    throw new Error(`${field} must be a valid timestamp`);
+  }
+  return value;
+}
+
+function requiredString(row: Record<string, unknown>, field: string): string {
+  const value = row[field];
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${field} must be a non-empty string`);
+  }
+  return value;
 }

@@ -23,6 +23,28 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 /** A session/conversation UUID as it appears in codex rollout filenames + `session_meta.payload.id`. */
 const SESSION_UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
+/** Canonical reasoning levels accepted by the native Codex CLI. */
+export const CODEX_REASONING_EFFORTS = [
+  "none",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+] as const;
+
+const CODEX_LEGACY_EFFORT_ALIASES = ["extra-high"] as const;
+const CODEX_LEGACY_EFFORTS: readonly string[] = [
+  ...CODEX_REASONING_EFFORTS,
+  ...CODEX_LEGACY_EFFORT_ALIASES,
+];
+
+function recognizedLegacyCodexEffort(value: string): string | undefined {
+  const normalized = value.trim().toLowerCase();
+  return CODEX_LEGACY_EFFORTS.includes(normalized) ? normalized : undefined;
+}
+
 /**
  * Parse a Codex model string into its base model identifier and optional reasoning effort qualifier.
  * Codex models are slugs like 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.5', 'gpt-5.4-mini'.
@@ -41,9 +63,17 @@ export function parseCodexModel(rawModel?: string): {
   const baseMatch = trimmed.match(/^([^\s(]+)/);
   const baseModel = baseMatch ? baseMatch[1] : trimmed;
 
-  const effortRemainder = trimmed.slice(baseModel.length);
-  const effortMatch = effortRemainder.match(/\b(low|medium|high|extra-high|none)\b/i);
-  const reasoningEffort = effortMatch ? effortMatch[1].toLowerCase() : undefined;
+  const effortRemainder = trimmed.slice(baseModel.length).trim();
+  let reasoningEffort = recognizedLegacyCodexEffort(effortRemainder);
+  const parenthesized = effortRemainder.match(/^\((.*)\)$/);
+  if (!reasoningEffort && parenthesized) {
+    const detail = parenthesized[1].trim();
+    reasoningEffort = recognizedLegacyCodexEffort(detail);
+    const displayDetail = detail.match(/^reasoning\s+([^,]+),\s*summaries\s+[^,]+$/i);
+    if (!reasoningEffort && displayDetail) {
+      reasoningEffort = recognizedLegacyCodexEffort(displayDetail[1]);
+    }
+  }
 
   return {
     model: baseModel,
@@ -54,6 +84,8 @@ export function parseCodexModel(rawModel?: string): {
 export interface CodexArgsOptions {
   prompt: string;
   model?: string;
+  /** First-class reasoning level. Omit to preserve the Codex default. */
+  effort?: string;
   /** Per-invocation Codex config overrides, passed as repeatable `--config` flags. */
   configOverrides?: string[];
   /** Working root for a FRESH run (`--cd`). Ignored on resume — codex reloads the session's recorded cwd. */
@@ -87,7 +119,9 @@ export function buildCodexArgs(o: CodexArgsOptions): string[] {
       "codex: requested model slug is empty — refusing to fall through to the config-default model "
     );
   }
-  const { model, reasoningEffort } = parseCodexModel(rawModel);
+  const parsedModel = parseCodexModel(rawModel);
+  const model = parsedModel.model;
+  const reasoningEffort = o.effort ?? parsedModel.reasoningEffort;
   const configOverrides = [...(o.configOverrides ?? [])];
   if (reasoningEffort && !configOverrides.some((c) => c.startsWith("model_reasoning_effort="))) {
     configOverrides.push(`model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
@@ -291,13 +325,19 @@ export function stripMcpServersFromToml(toml: string): string {
  * Forcing the key makes the flag and the config agree, so a resolution hiccup
  * can never quietly downgrade the run to a different model.
  */
-export function overrideTomlModel(toml: string, rawModel: string | undefined): string {
-  if (!rawModel) return toml;
-  const { model, reasoningEffort } = parseCodexModel(rawModel);
-  if (!model) return toml;
+export function overrideTomlModel(
+  toml: string,
+  rawModel: string | undefined,
+  effort?: string
+): string {
+  if (!rawModel && !effort) return toml;
+  const parsedModel = parseCodexModel(rawModel);
+  const model = parsedModel.model;
+  const reasoningEffort = effort ?? parsedModel.reasoningEffort;
+  if (!model && !reasoningEffort) return toml;
   try {
     const parsed = parse(toml) as Record<string, unknown>;
-    parsed.model = model;
+    if (model) parsed.model = model;
     if (reasoningEffort) {
       parsed.model_reasoning_effort = reasoningEffort;
     }
@@ -305,7 +345,8 @@ export function overrideTomlModel(toml: string, rawModel: string | undefined): s
   } catch {
     // Unparseable base config: a config carrying only the requested model still
     // beats one carrying a wrong default.
-    const fallback: Record<string, unknown> = { model };
+    const fallback: Record<string, unknown> = {};
+    if (model) fallback.model = model;
     if (reasoningEffort) {
       fallback.model_reasoning_effort = reasoningEffort;
     }
@@ -327,9 +368,15 @@ export function buildCodexMcpConfig(servers: McpServerSpec[]): string {
  * Root runs cannot consume the sandbox-only config.toml bind, so pass the same
  * model pin and MCP server map through Codex's repeatable `--config` option.
  */
-export function buildCodexConfigOverrides(servers: McpServerSpec[], rawModel?: string): string[] {
+export function buildCodexConfigOverrides(
+  servers: McpServerSpec[],
+  rawModel?: string,
+  effort?: string
+): string[] {
   const overrides: string[] = [];
-  const { model, reasoningEffort } = parseCodexModel(rawModel);
+  const parsedModel = parseCodexModel(rawModel);
+  const model = parsedModel.model;
+  const reasoningEffort = effort ?? parsedModel.reasoningEffort;
   if (model) overrides.push(`model=${JSON.stringify(model)}`);
   if (reasoningEffort) overrides.push(`model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
   for (const server of servers) {
@@ -348,7 +395,8 @@ export class CodexProvider implements CodingProvider {
   constructor(
     public readonly name: string,
     private readonly config: ProviderConfig,
-    public readonly model?: string
+    public readonly model?: string,
+    public readonly effort?: string
   ) {}
 
   async run(opts: RunOptions): Promise<RunResult> {
@@ -403,7 +451,7 @@ export class CodexProvider implements CodingProvider {
     const codexCwd = opts.sandbox ? opts.sandbox.worktreePath : opts.cwd;
     const configOverrides = opts.sandbox
       ? undefined
-      : buildCodexConfigOverrides(opts.mcpServers ?? [], this.model);
+      : buildCodexConfigOverrides(opts.mcpServers ?? [], this.model, this.effort);
 
     // Build the bwrap wrapper ONCE (sandbox setup + per-actor sessions-store bind +
     // shared host auth bind). Reused across a resume→fresh retry so the second spawn
@@ -514,7 +562,7 @@ export class CodexProvider implements CodingProvider {
       // Mirror the claude layout: the SOURCE always goes to host /tmp (tmpdir)
       // and for a sandboxed run is --ro-bind-ed to ~/.codex/config.toml.
       const hasMcpServers = opts.mcpServers && opts.mcpServers.length > 0;
-      if (opts.sandbox && (hasMcpServers || this.model)) {
+      if (opts.sandbox && (hasMcpServers || this.model || this.effort)) {
         mcpConfigSource = join("/tmp", `rusa-mcp-codex-${randomUUID()}.toml`);
         let baseConfig = "";
         const hostHome = process.env.HOME ?? "/root";
@@ -528,7 +576,11 @@ export class CodexProvider implements CodingProvider {
         }
         // Pin the requested model into the merged config so the inherited host
         // default can never shadow the `--model` flag .
-        const stripped = overrideTomlModel(stripMcpServersFromToml(baseConfig), this.model);
+        const stripped = overrideTomlModel(
+          stripMcpServersFromToml(baseConfig),
+          this.model,
+          this.effort
+        );
         const merged =
           stripped +
           (opts.mcpServers && opts.mcpServers.length > 0
@@ -569,6 +621,7 @@ export class CodexProvider implements CodingProvider {
           buildCodexArgs({
             prompt: opts.prompt,
             model: this.model,
+            effort: this.effort,
             cwd: codexCwd,
             resumeSessionId,
             configOverrides,
@@ -590,6 +643,7 @@ export class CodexProvider implements CodingProvider {
         buildCodexArgs({
           prompt: opts.prompt,
           model: this.model,
+          effort: this.effort,
           cwd: codexCwd,
           configOverrides,
         })

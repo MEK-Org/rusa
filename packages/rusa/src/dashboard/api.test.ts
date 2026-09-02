@@ -528,7 +528,9 @@ describe("handleMeshApiRequest", () => {
       ...rec(UUID_A, "root", "active"),
       provider: "claude",
       model: "claude-sonnet-5",
+      effort: "medium",
       desiredModel: "claude-opus-4-8",
+      desiredEffort: "max",
       desiredProvider: "codex",
     });
 
@@ -538,8 +540,35 @@ describe("handleMeshApiRequest", () => {
     const actor = threads.find((t: { id: string }) => t.id === UUID_A);
     expect(actor.provider).toBe("claude");
     expect(actor.model).toBe("claude-sonnet-5");
+    expect(actor.effort).toBe("medium");
     expect(actor.desiredModel).toBe("claude-opus-4-8");
+    expect(actor.desiredEffort).toBe("max");
+    expect(Object.hasOwn(actor, "desiredEffort")).toBe(true);
     expect(actor.desiredProvider).toBe("codex");
+  });
+
+  it("GET /api/mesh/threads distinguishes a pending effort clear from no pending change", () => {
+    registry.upsert({
+      ...rec(UUID_A, "root", "active"),
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      effort: "high",
+      desiredEffort: null,
+    });
+    registry.upsert({
+      ...rec(UUID_B, "root", "active"),
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      effort: "high",
+    });
+
+    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const { threads } = JSON.parse(res.body);
+    const clearing = threads.find((t: { id: string }) => t.id === UUID_A);
+    const unchanged = threads.find((t: { id: string }) => t.id === UUID_B);
+    expect(Object.hasOwn(clearing, "desiredEffort")).toBe(true);
+    expect(clearing.desiredEffort).toBeNull();
+    expect(Object.hasOwn(unchanged, "desiredEffort")).toBe(false);
   });
 
   it("GET /api/mesh/threads shows the default root handle when no identity is configured", () => {
@@ -703,6 +732,33 @@ describe("handleMeshApiRequest", () => {
     const body = JSON.parse(res.body);
     expect(body.halted).toBe(false);
     expect(body.threads.every((t: { runState: string }) => t.runState === "idle")).toBe(true);
+  });
+
+  it("GET /api/mesh/threads returns cursor and run states from one runtime capture", () => {
+    registry.upsert(rec("root", null, "active"));
+    registry.upsert(rec(UUID_A, "root", "active"));
+    const snapshot = {
+      streamId: "epoch-a",
+      revision: 17,
+      states: new Map([
+        ["root", "idle" as const],
+        [UUID_A, "winding_down" as const],
+      ]),
+    };
+    const runtimeStateSnapshot = vi.fn(() => snapshot);
+    deps = {
+      ...deps,
+      mesh: { runtimeStateSnapshot } as unknown as ActorMesh,
+      runningThreadIds: () => new Set([UUID_A]),
+    };
+
+    const { res } = call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    expect(runtimeStateSnapshot).toHaveBeenCalledTimes(1);
+    expect(body.runtimeCursor).toEqual({ streamId: "epoch-a", revision: 17 });
+    expect(body.threads.find((thread: { id: string }) => thread.id === UUID_A).runState).toBe(
+      "winding_down"
+    );
   });
 
   it("GET /api/mesh/threads surfaces halt, queued, and running snapshots", () => {

@@ -52,16 +52,6 @@ function chunk(type, data) {
   return Buffer.concat([length, typeBuffer, data, crc]);
 }
 
-function roundedRectCoverage(x, y, size, radius) {
-  const insideRect =
-    (x >= radius && x <= size - radius && y >= 0 && y <= size) ||
-    (y >= radius && y <= size - radius && x >= 0 && x <= size);
-  if (insideRect) return 1;
-  const cx = x < radius ? radius : size - radius;
-  const cy = y < radius ? radius : size - radius;
-  return (x - cx) ** 2 + (y - cy) ** 2 <= radius ** 2 ? 1 : 0;
-}
-
 function distanceToSegment(px, py, ax, ay, bx, by) {
   const dx = bx - ax;
   const dy = by - ay;
@@ -93,13 +83,10 @@ function sampleMark(x, y, variant, maskable) {
   const offset = (1 - scale) / 2;
   const u = (x - offset) / scale;
   const v = (y - offset) / scale;
-  let color = transparent;
-
-  if (maskable) {
-    color = background;
-  } else if (u >= 0 && u <= 1 && v >= 0 && v <= 1) {
-    color = blend(color, background, roundedRectCoverage(u, v, 1, 7 / 32));
-  }
+  // Both icon classes need an opaque edge-to-edge canvas. Standard launchers
+  // apply their own corner treatment; only the dedicated maskable artwork
+  // insets the mark into the adaptive-icon safe zone.
+  let color = background;
 
   if (u >= 0 && u <= 1 && v >= 0 && v <= 1) {
     const lines = [
@@ -156,7 +143,7 @@ function makePng(size, variant, maskable) {
       raw[i] = color[0];
       raw[i + 1] = color[1];
       raw[i + 2] = color[2];
-      raw[i + 3] = maskable ? 255 : color[3];
+      raw[i + 3] = 255;
     }
   }
 

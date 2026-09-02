@@ -1,10 +1,7 @@
 import { createHash } from "node:crypto";
 import { Type } from "@google/genai";
 import { z } from "zod";
-import {
-  isSelfAuthoredLedgerSource,
-  type MeshEvent,
-} from "../db/repositories/mesh-event-repository.js";
+import type { PortableLedgerSource } from "../db/repositories/actor-run-repository.js";
 import {
   extractGeminiText,
   getGeminiClient,
@@ -120,7 +117,7 @@ export interface QuarantinedOperation {
    * failed.
    */
   rejectedQuoteBytes?: number;
-  /** Byte length of the source event body, so a reader can size the miss without re-querying `mesh_events`. */
+  /** Byte length of the source body, so a reader can size the miss without re-querying it. */
   sourceBodyBytes?: number;
   /**
    * Whether the body would contain the quote if every run of ASCII whitespace
@@ -221,7 +218,7 @@ export interface PortableContextCompactor {
   compact(input: {
     actorId: string;
     state: PortableContextState;
-    messages: MeshEvent[];
+    messages: PortableLedgerSource[];
     now: string;
   }): Promise<CompactionResult>;
 }
@@ -234,7 +231,7 @@ function stableItemId(actorId: string, op: CompactionOperation): string {
 }
 
 /**
- * Who authored a source event, for evidence provenance.
+ * Who authored a durable ledger source, for evidence provenance.
  *
  * An inbound message carries its sender in `payload.from`. A self-authored source (a
  * yield note) has no counterparty, so without this rule it would be stamped
@@ -245,7 +242,11 @@ function stableItemId(actorId: string, op: CompactionOperation): string {
  * indefinitely. v1 watches for that rather than preventing it; watching is only
  * possible if self-authored evidence is labelled as such.
  */
-function senderOf(event: MeshEvent, actorId: string): string {
+function isSelfAuthoredLedgerSource(kind: string): boolean {
+  return kind === "run_yielded";
+}
+
+function senderOf(event: PortableLedgerSource, actorId: string): string {
   if (event.payload) {
     try {
       const parsed = JSON.parse(event.payload) as { from?: unknown };
@@ -299,7 +300,7 @@ function matchesIgnoringWhitespace(body: string, quote: string): boolean {
 
 function evidenceFor(
   op: CompactionOperation,
-  event: MeshEvent,
+  event: PortableLedgerSource,
   actorId: string
 ): PortableMemoryEvidence | QuarantineRejection {
   const body = event.body ?? "";
@@ -324,7 +325,7 @@ function evidenceFor(
 export function applyCompactionOperations(input: {
   actorId: string;
   state: PortableContextState;
-  messages: MeshEvent[];
+  messages: PortableLedgerSource[];
   operations: CompactionOperation[];
   now: string;
   model: string;
@@ -510,7 +511,7 @@ export function applyCompactionOperations(input: {
       ...input.state,
       generation: input.state.generation + 1,
       updatedAt: input.now,
-      lastFoldedMessageEventId: input.messages.at(-1)?.id ?? input.state.lastFoldedMessageEventId,
+      lastFoldedSourceId: input.messages.at(-1)?.id ?? input.state.lastFoldedSourceId,
       compactor: { provider: "gemini", model: input.model },
       items,
     },
@@ -521,7 +522,7 @@ export function applyCompactionOperations(input: {
 
 function compactorPrompt(
   state: PortableContextState,
-  messages: MeshEvent[],
+  messages: PortableLedgerSource[],
   actorId: string
 ): string {
   const active = state.items
@@ -559,7 +560,7 @@ export class GeminiPortableContextCompactor implements PortableContextCompactor 
   async compact(input: {
     actorId: string;
     state: PortableContextState;
-    messages: MeshEvent[];
+    messages: PortableLedgerSource[];
     now: string;
   }): Promise<CompactionResult> {
     if (input.messages.length === 0) return { state: input.state, quarantined: [], operations: 0 };

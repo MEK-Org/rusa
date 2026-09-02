@@ -58,11 +58,9 @@ const NORMALIZED_MECHANICAL_KIND = "mechanical_note";
  *      2-actor predicate requires a matching chat row);
  *   3. re-label the paired `message_sent`/`message_received` events to
  *      {@link NORMALIZED_MECHANICAL_KIND}. We re-label rather than DELETE on
- *      purpose: the portable-context fold watermark is a persisted **event id**
- *      (`FilePortableContextStore` → `listLedgerSourcesAfter`, which resolves
- *      `WHERE id = ?` and throws if the id is gone). Deleting an event that some
- *      actor's on-disk watermark points at would strand that actor's compactor.
- *      Re-labelling preserves the id/rowid (watermark still resolves) while
+ *      purpose: at this migration's point in the upgrade chain, portable-context
+ *      v2 still carried an event-id watermark. Re-labelling preserves that
+ *      historical cursor until 0030 maps it onto durable chat/run sources, while
  *      dropping the row out of every `kind = 'message_received'` reader.
  *
  * Idempotent: after a run the inbox payloads no longer carry `messageId`, so a
