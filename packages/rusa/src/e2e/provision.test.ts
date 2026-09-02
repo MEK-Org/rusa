@@ -66,16 +66,18 @@ describe("buildE2EConfig", () => {
     const am = buildE2EConfig({
       scratchPath: "/some/scratch",
       baseConfig: null,
-      rootActor: { provider: "antigravity" },
+      rootActor: { provider: "antigravity", effort: "high" },
       chat: { projectId: "e2e", subscription: "e2e", pubsubKeyPath: "/dev/null" },
     });
     expect(am.rootActor?.provider).toBe("antigravity");
+    expect(am.rootActor?.effort).toBe("high");
     expect(am.chat?.projectId).toBe("e2e");
 
     // Still schema-valid with the actor-mesh edges present.
     writeFileSync(join(home, "config.yaml"), toYaml(am), "utf8");
     const loaded = loadConfig(home);
     expect(loaded.rootActor?.provider).toBe("antigravity");
+    expect(loaded.rootActor?.effort).toBe("high");
     expect(loaded.chat?.subscription).toBe("e2e");
   });
 

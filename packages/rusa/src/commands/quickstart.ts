@@ -365,7 +365,11 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
     providers: Object.fromEntries(
       providers.map((provider) => [provider, { cliCommand: PROVIDER_CLI_COMMANDS[provider] }])
     ),
-    rootActor: { provider: providers[0], handle: rootHandle },
+    rootActor: {
+      provider: providers[0],
+      handle: rootHandle,
+      ...(providers[0] === "antigravity" ? { effort: "high" } : {}),
+    },
     webhook: {
       port: QUICKSTART_WEBHOOK_PORT,
       secret: randomBytes(32).toString("hex"),

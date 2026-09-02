@@ -48,6 +48,7 @@ function getEffectiveProviderConfig(
 
 /** Default root provider when `config.rootActor` is unset — `agy` (Antigravity). */
 export const DEFAULT_ROOT_PROVIDER = "antigravity";
+export const DEFAULT_ROOT_EFFORT = "high";
 
 /** The native CLI capability family behind a logical provider config key. */
 export function providerCapabilityName(providerName: string, config: RusaConfig): string {
@@ -78,18 +79,20 @@ export function validateProviderSelection(
       `empty model slug requested for provider "${providerName}" — refusing to fall back to the provider's default model `
     );
   }
+  let allowedEfforts = providerAdapters[capabilityName]?.efforts;
   if (selection.model) {
     const validation = validateModelPin(capabilityName, selection.model);
     if (validation.status === "unknown") {
       console.warn(`[model-catalog] ${validation.warning}`);
+    } else if (
+      validation.status === "accepted" &&
+      validation.efforts &&
+      validation.efforts.length > 0
+    ) {
+      allowedEfforts = validation.efforts;
     }
   }
-  validateReasoningEffort(
-    providerName,
-    selection.model,
-    selection.effort,
-    providerAdapters[capabilityName]?.efforts
-  );
+  validateReasoningEffort(capabilityName, selection.model, selection.effort, allowedEfforts);
   return selection;
 }
 
@@ -102,11 +105,12 @@ export function validateProviderSelection(
  */
 export function resolveRootProvider(config: RusaConfig): CodingProvider {
   const providerName = config.rootActor?.provider?.trim() || DEFAULT_ROOT_PROVIDER;
+  const isDefaultRoot = !config.rootActor?.provider?.trim();
   const selection = validateProviderSelection(
     config,
     providerName,
     config.rootActor?.model,
-    config.rootActor?.effort
+    config.rootActor?.effort ?? (isDefaultRoot ? DEFAULT_ROOT_EFFORT : undefined)
   );
   return instantiateProvider(providerName, selection.model, selection.effort, config);
 }

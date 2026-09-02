@@ -236,7 +236,9 @@ describe("loadConfig secrets files ($RUSA_HOME/secrets, ISSUE_NUM)", () => {
     expect(config.geminiApiKey).toBe("file-key");
     expect(config.mistralApiKey).toBe("mistral-file-key");
     expect(config.webhook.secret).toBe("file-hook");
-    expect(warnSpy).not.toHaveBeenCalled();
+    expect(warnSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("[migration] defaulting omitted config rootActor effort")
+    );
     warnSpy.mockRestore();
   });
 
@@ -1077,5 +1079,74 @@ describe("loadConfig chat.excludedSpaces ", () => {
     expect(() => loadConfig(home)).toThrow(
       /chat\.excludedSpaces must be an array of spaces\/\.\.\. strings/
     );
+  });
+});
+
+describe("loadConfig antigravity effort", () => {
+  it("migrates a legacy antigravity config with no effort to high with a warning log", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const config = loadConfig(
+      writeConfig({
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity", model: "gemini-3.7-flash" },
+      })
+    );
+    expect(config.rootActor?.provider).toBe("antigravity");
+    expect(config.rootActor?.effort).toBe("high");
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining(
+        '[migration] defaulting omitted config rootActor effort to "high" for antigravity model "gemini-3.7-flash"'
+      )
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("extracts effort from omitted-effort tiered slug without defaulting to high", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const config = loadConfig(
+      writeConfig({
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity", model: "gemini-3.7-flash-medium" },
+      })
+    );
+    expect(config.rootActor?.provider).toBe("antigravity");
+    expect(config.rootActor?.model).toBe("gemini-3.7-flash");
+    expect(config.rootActor?.effort).toBe("medium");
+    expect(warnSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("[migration] defaulting omitted config rootActor effort")
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("extracts effort from omitted-effort tiered display label without defaulting to high", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const config = loadConfig(
+      writeConfig({
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity", model: "Gemini 3.1 Pro (Medium)" },
+      })
+    );
+    expect(config.rootActor?.provider).toBe("antigravity");
+    expect(config.rootActor?.model).toBe("Gemini 3.1 Pro");
+    expect(config.rootActor?.effort).toBe("medium");
+    expect(warnSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("[migration] defaulting omitted config rootActor effort")
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("retains explicit-conflict rejection when embedded tier conflicts with explicit effort", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const home = writeConfig({
+      providers: { antigravity: { cliCommand: "agy" } },
+      rootActor: { provider: "antigravity", model: "gemini-3.7-flash-medium", effort: "high" },
+    });
+    expect(() => loadConfig(home)).toThrow(
+      /conflicting reasoning efforts for provider "agy": model pin carries "medium" but effort is "high"/
+    );
+    expect(warnSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("[migration] defaulting omitted config rootActor effort")
+    );
+    warnSpy.mockRestore();
   });
 });

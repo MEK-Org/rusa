@@ -1312,11 +1312,17 @@ describe("quota MCP server", () => {
       expect(allParsed).toEqual({
         codex: [{ displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol", passable: true }],
         agy: [
-          { displayLabel: "Gemini Flash", identifier: "gemini-flash", passable: false },
           {
-            displayLabel: "Gemini 3.7 Flash (High)",
+            displayLabel: "Gemini Flash",
+            identifier: "gemini-flash",
+            passable: false,
+            efforts: [],
+          },
+          {
+            displayLabel: "Gemini 3.7 Flash",
             identifier: "gemini-3.7-flash",
             passable: true,
+            efforts: ["high"],
           },
         ],
       });
@@ -1330,11 +1336,17 @@ describe("quota MCP server", () => {
 
       expect(agyParsed).toEqual({
         agy: [
-          { displayLabel: "Gemini Flash", identifier: "gemini-flash", passable: false },
           {
-            displayLabel: "Gemini 3.7 Flash (High)",
+            displayLabel: "Gemini Flash",
+            identifier: "gemini-flash",
+            passable: false,
+            efforts: [],
+          },
+          {
+            displayLabel: "Gemini 3.7 Flash",
             identifier: "gemini-3.7-flash",
             passable: true,
+            efforts: ["high"],
           },
         ],
       });
@@ -1348,11 +1360,17 @@ describe("quota MCP server", () => {
 
       expect(antigravityParsed).toEqual({
         antigravity: [
-          { displayLabel: "Gemini Flash", identifier: "gemini-flash", passable: false },
           {
-            displayLabel: "Gemini 3.7 Flash (High)",
+            displayLabel: "Gemini Flash",
+            identifier: "gemini-flash",
+            passable: false,
+            efforts: [],
+          },
+          {
+            displayLabel: "Gemini 3.7 Flash",
             identifier: "gemini-3.7-flash",
             passable: true,
+            efforts: ["high"],
           },
         ],
       });

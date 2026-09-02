@@ -36,9 +36,30 @@ describe("reasoning effort", () => {
     );
   });
 
-  it("leaves non-Codex model vocabulary intact", () => {
-    expect(normalizeModelEffortSelection("antigravity", "Gemini 3.7 Flash (High)")).toEqual({
-      model: "Gemini 3.7 Flash (High)",
+  it("normalizes Antigravity tier labels", () => {
+    expect(normalizeModelEffortSelection("agy", "Gemini 3.7 Flash (High)")).toEqual({
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+    expect(normalizeModelEffortSelection("agy", "Gemini 3.7 Flash", "high")).toEqual({
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+    expect(() => normalizeModelEffortSelection("agy", "Gemini 3.7 Flash (Medium)", "high")).toThrow(
+      /conflicting reasoning efforts/
+    );
+    expect(normalizeModelEffortSelection("agy", "Gemini 3.7 Flash-Medium")).toEqual({
+      model: "Gemini 3.7 Flash",
+      effort: "medium",
+    });
+    expect(() => normalizeModelEffortSelection("agy", "Gemini 3.7 Flash (High)", null)).toThrow(
+      /conflicting reasoning efforts/
+    );
+  });
+
+  it("leaves other non-Codex model vocabulary intact", () => {
+    expect(normalizeModelEffortSelection("kimi", "Kimi 3.7 Flash (High)")).toEqual({
+      model: "Kimi 3.7 Flash (High)",
       effort: undefined,
     });
   });

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parse as parseYaml } from "yaml";
+import { loadConfig } from "../config/loader";
 import type { RusaConfig } from "../config/types.js";
 
 const spawnSyncMock = vi.hoisted(() => vi.fn());
@@ -151,6 +152,19 @@ describe("quickstart command", () => {
     expect(config.rootActor?.handle).toBe("my-root-entity");
     expect(config.dashboard?.port).toBe(8080);
     expect(config.providers).toEqual({ codex: { cliCommand: "codex" } });
+  });
+
+  it("generates a valid config for antigravity that loadConfig accepts", async () => {
+    promptMocks.state.inputs = ["antigravity", "/work/example-repo", "my-root-entity"];
+    promptMocks.state.passwords = ["test-gemini-key"];
+    await runQuickstartConfigure({
+      home,
+      executeProviderCommand: () => 0,
+    });
+
+    const loadedConfig = loadConfig(home);
+    expect(loadedConfig.rootActor?.provider).toBe("antigravity");
+    expect(loadedConfig.rootActor?.effort).toBe("high");
   });
 
   it("keeps the generated root handle when the handle prompt is blank", async () => {
