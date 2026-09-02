@@ -1,4 +1,5 @@
 import type { Database } from "better-sqlite3";
+import { parseReference } from "../../references/reference.js";
 
 export interface ReferenceCacheRow {
   ref: string;
@@ -12,6 +13,8 @@ export class ReferenceCacheRepository {
   constructor(private readonly db: Database) {}
 
   get(ref: string): ReferenceCacheRow | null {
+    if (parseReference(ref).key !== ref)
+      throw new Error("ReferenceCacheRepository requires canonical refs");
     const row = this.db
       .prepare(
         `SELECT ref, document_version, entity_json, fetched_at, refresh_after
@@ -23,6 +26,8 @@ export class ReferenceCacheRepository {
   }
 
   set(row: ReferenceCacheRow): void {
+    if (parseReference(row.ref).key !== row.ref)
+      throw new Error("ReferenceCacheRepository requires canonical refs");
     this.db
       .prepare(
         `INSERT INTO reference_cache (ref, document_version, entity_json, fetched_at, refresh_after)
@@ -37,6 +42,8 @@ export class ReferenceCacheRepository {
   }
 
   delete(ref: string): void {
+    if (parseReference(ref).key !== ref)
+      throw new Error("ReferenceCacheRepository requires canonical refs");
     this.db.prepare(`DELETE FROM reference_cache WHERE ref = ?`).run(ref);
   }
 }

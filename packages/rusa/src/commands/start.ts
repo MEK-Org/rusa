@@ -2732,7 +2732,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           inbox: getRepositories().inbox,
           referenceCache: new ReferenceCacheService({
             repo: getRepositories().referenceCache,
-            logger: log,
+            logger: {
+              info: (event, data) =>
+                console.log(`[reference-cache] ${event}`, data ? JSON.stringify(data) : ""),
+              error: (event, data) =>
+                console.warn(`[reference-cache] error: ${event}`, data ? JSON.stringify(data) : ""),
+            },
           }),
           chatClient: chatClient ?? undefined,
           issueClient: issueClient,

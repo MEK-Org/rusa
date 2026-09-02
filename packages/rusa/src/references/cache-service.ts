@@ -49,8 +49,9 @@ export class ReferenceCacheService {
       let valid = false;
       if (cached.document_version === 1) {
         try {
-          entity = JSON.parse(cached.entity_json) as ReferenceEntity;
-          valid = true;
+          const parsed = JSON.parse(cached.entity_json);
+          entity = decodeV1Entity(parsed);
+          valid = entity !== undefined;
         } catch {
           // Ignore parse error, treat as unavailable
         }
@@ -165,8 +166,8 @@ export class ReferenceCacheService {
       try {
         if (segments.length === 2 && segments[0] === "spaces") {
           const found = await deps.chatClient.getSpace(resourceName);
-          if (found?.displayName) {
-            entity = { type: "gchat_space", name: found.displayName };
+          if (found) {
+            entity = { type: "gchat_space", name: found.displayName ?? found.name };
           }
         } else if (segments.length >= 4 && segments[2] === "messages") {
           const found = await deps.chatClient.getMessage(resourceName);
@@ -195,4 +196,25 @@ export class ReferenceCacheService {
 
     return null;
   }
+}
+
+function decodeV1Entity(raw: unknown): ReferenceEntity | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const obj = raw as Record<string, unknown>;
+
+  if (obj.type === "github_issue" || obj.type === "github_pull_request") {
+    if (typeof obj.title === "string" && typeof obj.description === "string") {
+      return { type: obj.type, title: obj.title, description: obj.description };
+    }
+  } else if (obj.type === "gchat_message") {
+    if (typeof obj.contents === "string") {
+      return { type: obj.type, contents: obj.contents };
+    }
+  } else if (obj.type === "gchat_space") {
+    if (typeof obj.name === "string") {
+      return { type: obj.type, name: obj.name };
+    }
+  }
+
+  return undefined;
 }

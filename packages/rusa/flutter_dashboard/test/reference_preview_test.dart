@@ -4,7 +4,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/widgets/reference_preview.dart';
 
-Widget _host(Widget child) => MaterialApp(home: Scaffold(body: SingleChildScrollView(child: child)));
+Widget _host(Widget child) => MaterialApp(
+  home: Scaffold(body: SingleChildScrollView(child: child)),
+);
 
 void main() {
   group('ReferenceDto', () {
@@ -72,18 +74,22 @@ void main() {
 
   group('ReferencePreview', () {
     testWidgets('shows the cited text and its provenance', (tester) async {
-      await tester.pumpWidget(_host(const ReferencePreview(
-        reference: ReferenceDto(
-          ref: 'mesh:messages/abc',
-          scheme: 'mesh',
-          title: 'human:operator → root',
-          body: 'A monster-catching JRPG in a cave.',
-          author: 'human:operator',
-          url: 'https://example.test/citation',
+      await tester.pumpWidget(
+        _host(
+          const ReferencePreview(
+            reference: ReferenceDto(
+              ref: 'mesh:messages/abc',
+              scheme: 'mesh',
+              title: 'human:operator → root',
+              body: 'A monster-catching JRPG in a cave.',
+              author: 'human:operator',
+              url: 'https://example.test/citation',
+            ),
+            label: "Operator's answer",
+            attachedBy: 'root',
+          ),
         ),
-        label: "Operator's answer",
-        attachedBy: 'root',
-      )));
+      );
 
       expect(find.text('MESH'), findsOneWidget);
       expect(find.text('human:operator → root'), findsOneWidget);
@@ -103,20 +109,24 @@ void main() {
       addTearDown(tester.view.reset);
 
       Future<double> heightOf(String body) async {
-        await tester.pumpWidget(MaterialApp(
-          home: Scaffold(
-            body: ListView(children: [
-              ReferencePreview(
-                reference: ReferenceDto(
-                  ref: 'mesh:messages/abc',
-                  scheme: 'mesh',
-                  title: 'human:operator → root',
-                  body: body,
-                ),
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: ListView(
+                children: [
+                  ReferencePreview(
+                    reference: ReferenceDto(
+                      ref: 'mesh:messages/abc',
+                      scheme: 'mesh',
+                      title: 'human:operator → root',
+                      body: body,
+                    ),
+                  ),
+                ],
               ),
-            ]),
+            ),
           ),
-        ));
+        );
         await tester.pumpAndSettle();
         return tester.getSize(find.byType(SelectableText).first).height;
       }
@@ -131,90 +141,129 @@ void main() {
       expect(fourLines, greaterThan(oneLine * 3));
     });
 
-    testWidgets('displays cache state chips correctly', (tester) async { 
-      for (final state in ['fresh', 'stale', 'pending', 'unavailable']) { 
-        await tester.pumpWidget(_host(ReferencePreview( 
-          reference: ReferenceDto( 
-            ref: 'github:foo/bar/issues/1', 
-            scheme: 'github', 
-            title: 'issue', 
-            cacheState: state, 
-          ), 
-        ))); 
-        expect(find.text(state.toUpperCase()), findsOneWidget); 
-      } 
-    }); 
- 
-    testWidgets('truncates long text and allows expanding', (tester) async { 
-      final longBody = List.filled(10, 'Long line of text').join('\n'); 
-      await tester.pumpWidget(_host(ReferencePreview( 
-        reference: ReferenceDto( 
-          ref: 'mesh:123', 
-          scheme: 'mesh', 
-          title: 'title', 
-          body: longBody, 
-        ), 
-      ))); 
-       
-      expect(find.text('Show more'), findsOneWidget); 
-      await tester.tap(find.text('Show more')); 
-      await tester.pumpAndSettle(); 
-      expect(find.text('Show less'), findsOneWidget); 
-    }); 
- 
-    testWidgets('displays different entity types properly', (tester) async { 
-      await tester.pumpWidget(_host(const ReferencePreview( 
-        reference: ReferenceDto( 
-          ref: 'github:foo/bar/issues/1', 
-          scheme: 'github', 
-          title: 'Issue 1', 
-          entity: {'type': 'github_issue', 'title': 'My Issue', 'description': 'The desc'}, 
-        ), 
-      ))); 
-      expect(find.text('My Issue'), findsOneWidget); 
-      expect(find.text('The desc'), findsOneWidget); 
- 
-      await tester.pumpWidget(_host(const ReferencePreview( 
-        reference: ReferenceDto( 
-          ref: 'github:foo/bar/pulls/2', 
-          scheme: 'github', 
-          title: 'PR 2', 
-          entity: {'type': 'github_pull_request', 'title': 'My PR', 'description': 'The PR desc'}, 
-        ), 
-      ))); 
-      expect(find.text('My PR'), findsOneWidget); 
-      expect(find.text('The PR desc'), findsOneWidget); 
- 
-      await tester.pumpWidget(_host(const ReferencePreview( 
-        reference: ReferenceDto( 
-          ref: 'gchat:spaces/abc', 
-          scheme: 'gchat', 
-          title: 'Space', 
-          entity: {'type': 'gchat_space', 'name': 'My Space'}, 
-        ), 
-      ))); 
-      expect(find.text('My Space'), findsOneWidget); 
- 
-      await tester.pumpWidget(_host(const ReferencePreview( 
-        reference: ReferenceDto( 
-          ref: 'gchat:spaces/abc/messages/123', 
-          scheme: 'gchat', 
-          title: 'Message', 
-          entity: {'type': 'gchat_message', 'contents': 'Msg content'}, 
-        ), 
-      ))); 
-      expect(find.text('Msg content'), findsOneWidget); 
+    testWidgets('displays cache state chips correctly', (tester) async {
+      for (final state in ['fresh', 'stale', 'pending', 'unavailable']) {
+        await tester.pumpWidget(
+          _host(
+            ReferencePreview(
+              reference: ReferenceDto(
+                ref: 'github:foo/bar/issues/1',
+                scheme: 'github',
+                title: 'issue',
+                cacheState: state,
+              ),
+            ),
+          ),
+        );
+        expect(find.text(state.toUpperCase()), findsOneWidget);
+      }
     });
 
-    testWidgets('says why it could not expand, rather than showing nothing', (tester) async {
-      await tester.pumpWidget(_host(const ReferencePreview(
-        reference: ReferenceDto(
-          ref: 'github:MEK-Org/rusa/issues/33',
-          scheme: 'github',
-          title: 'github:MEK-Org/rusa/issues/33',
-          unavailable: 'Not resolvable yet — only mesh chat is read back so far.',
+    testWidgets('truncates long text and allows expanding', (tester) async {
+      final longBody = List.filled(10, 'Long line of text').join('\n');
+      await tester.pumpWidget(
+        _host(
+          ReferencePreview(
+            reference: ReferenceDto(
+              ref: 'mesh:123',
+              scheme: 'mesh',
+              title: 'title',
+              body: longBody,
+            ),
+          ),
         ),
-      )));
+      );
+
+      expect(find.text('Show more'), findsOneWidget);
+      await tester.tap(find.text('Show more'));
+      await tester.pumpAndSettle();
+      expect(find.text('Show less'), findsOneWidget);
+    });
+
+    testWidgets('displays different entity types properly', (tester) async {
+      await tester.pumpWidget(
+        _host(
+          const ReferencePreview(
+            reference: ReferenceDto(
+              ref: 'github:foo/bar/issues/1',
+              scheme: 'github',
+              title: 'Issue 1',
+              entity: {
+                'type': 'github_issue',
+                'title': 'My Issue',
+                'description': 'The desc',
+              },
+            ),
+          ),
+        ),
+      );
+      expect(find.text('My Issue'), findsOneWidget);
+      expect(find.text('The desc'), findsOneWidget);
+
+      await tester.pumpWidget(
+        _host(
+          const ReferencePreview(
+            reference: ReferenceDto(
+              ref: 'github:foo/bar/pulls/2',
+              scheme: 'github',
+              title: 'PR 2',
+              entity: {
+                'type': 'github_pull_request',
+                'title': 'My PR',
+                'description': 'The PR desc',
+              },
+            ),
+          ),
+        ),
+      );
+      expect(find.text('My PR'), findsOneWidget);
+      expect(find.text('The PR desc'), findsOneWidget);
+
+      await tester.pumpWidget(
+        _host(
+          const ReferencePreview(
+            reference: ReferenceDto(
+              ref: 'gchat:spaces/abc',
+              scheme: 'gchat',
+              title: 'Space',
+              entity: {'type': 'gchat_space', 'name': 'My Space'},
+            ),
+          ),
+        ),
+      );
+      expect(find.text('My Space'), findsOneWidget);
+
+      await tester.pumpWidget(
+        _host(
+          const ReferencePreview(
+            reference: ReferenceDto(
+              ref: 'gchat:spaces/abc/messages/123',
+              scheme: 'gchat',
+              title: 'Message',
+              entity: {'type': 'gchat_message', 'contents': 'Msg content'},
+            ),
+          ),
+        ),
+      );
+      expect(find.text('Msg content'), findsOneWidget);
+    });
+
+    testWidgets('says why it could not expand, rather than showing nothing', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _host(
+          const ReferencePreview(
+            reference: ReferenceDto(
+              ref: 'github:MEK-Org/rusa/issues/33',
+              scheme: 'github',
+              title: 'github:MEK-Org/rusa/issues/33',
+              unavailable:
+                  'Not resolvable yet — only mesh chat is read back so far.',
+            ),
+          ),
+        ),
+      );
 
       expect(find.text('GITHUB'), findsOneWidget);
       expect(

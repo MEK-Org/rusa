@@ -64,4 +64,26 @@ describe("ReferenceCacheRepository", () => {
     const found = repo.get(row.ref);
     expect(found).toEqual(row2);
   });
+
+  it("enforces canonical refs", () => {
+    const db = setupDb();
+    const repo = new ReferenceCacheRepository(db);
+
+    const nonCanonicalRef = "  github:MEK-Org/rusa/issues/155  ";
+    const row = {
+      ref: nonCanonicalRef,
+      document_version: 1,
+      entity_json: "{}",
+      fetched_at: "2026-09-02T14:00:00Z",
+      refresh_after: "2026-09-02T15:00:00Z",
+    };
+
+    expect(() => repo.set(row)).toThrowError("ReferenceCacheRepository requires canonical refs");
+    expect(() => repo.get(nonCanonicalRef)).toThrowError(
+      "ReferenceCacheRepository requires canonical refs"
+    );
+    expect(() => repo.delete(nonCanonicalRef)).toThrowError(
+      "ReferenceCacheRepository requires canonical refs"
+    );
+  });
 });
