@@ -730,6 +730,7 @@ function buildMeshActorBwrapArgs(o: {
     "--unshare-all",
     "--share-net",
     "--die-with-parent",
+    ...(o.isE2eRoot ? [] : ["--new-session"]),
     // Read everything (incl. other actors' repos), with narrow tmpfs shadows for
     // host-plane-only stores below; the real home stays visible so tools resolve
     // ~/.gitconfig, ~/.ssh, ~/.config/gh without any remapping.
