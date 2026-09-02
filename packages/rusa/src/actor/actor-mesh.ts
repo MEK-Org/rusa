@@ -71,10 +71,9 @@ export interface MeshActor {
   readonly isYielded?: boolean;
   cancelQueuedRun?(): boolean;
   resumeCancelledRun?(): boolean;
-  preemptForResponsive(): {
-    preempted: boolean;
-    phase?: "running" | "winding_down" | "queued";
-  };
+  preemptForResponsive():
+    | { preempted: false }
+    | { preempted: true; phase: "running" | "winding_down" | "queued" };
   interrupt?(by?: string): { interrupted: boolean; runStartTime?: Date; wasQueued?: boolean };
   getInterruptedWatermark?(): Date | null;
   clearInterruptWatermark?(): void;
@@ -780,7 +779,7 @@ export class ActorMesh {
     }
     if (isResponsiveNudge(nudge)) {
       const preemption = target.preemptForResponsive();
-      if (preemption?.preempted) {
+      if (preemption.preempted) {
         this.recordEvent({
           kind: "run_preempted",
           actorId,

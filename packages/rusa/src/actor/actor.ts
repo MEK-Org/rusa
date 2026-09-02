@@ -2,6 +2,7 @@ import type { ExhaustionClassifier } from "../providers/exhaustion-classifier.js
 import { teardownFlutterOverlay } from "../providers/sandbox.js";
 import {
   createInterruptAbortReason,
+  formatSigtermResult,
   RUN_CEILING_ABORT_REASON,
   STALL_WATCHDOG_ABORT_REASON,
   YIELD_GRACE_ABORT_REASON,
@@ -285,6 +286,7 @@ export class Actor {
   private queued = false;
   /** Actor-level dirty state retained when /halt cancels a queued provider start. */
   private cancelledQueuedRun = false;
+  private preemptedQueuedRun = false;
   /**
    * Set within a run at the moment it commits to reporting its result through
    * `onRunEnd`. Read by the terminal hook in `runOnce`'s `finally` to decide
@@ -442,10 +444,9 @@ export class Actor {
    * without retaining the halt/resume dirty flag because the caller immediately
    * requests its responsive replacement.
    */
-  preemptForResponsive(): {
-    preempted: boolean;
-    phase?: "running" | "winding_down" | "queued";
-  } {
+  preemptForResponsive():
+    | { preempted: false }
+    | { preempted: true; phase: "running" | "winding_down" | "queued" } {
     this.admissionEpoch++;
     const phase = this.executing
       ? this.yielded
@@ -465,21 +466,16 @@ export class Actor {
       this.coalesceAbortController.abort(createInterruptAbortReason(RESPONSIVE_PREEMPTION_SOURCE));
       return { preempted: true, phase };
     }
+    this.queued = false;
+    this.publishRuntimeStateIfChanged();
 
     if (this.pendingStart) {
       if (this.pendingStart.cancel && !this.pendingStart.cancel()) {
-        if (this.coalesceAbortController && !this.coalesceAbortController.signal.aborted) {
-          this.coalesceAbortController.abort(
-            createInterruptAbortReason(RESPONSIVE_PREEMPTION_SOURCE)
-          );
-          return { preempted: true, phase: "running" };
-        }
-        return { preempted: false };
+        this.preemptedQueuedRun = true;
+        return { preempted: true, phase: "queued" };
       }
     }
 
-    this.queued = false;
-    this.publishRuntimeStateIfChanged();
     return { preempted: true, phase: "queued" };
   }
 
@@ -733,7 +729,8 @@ export class Actor {
       // wake obeys per-actor serialization; v1 never cancels a live provider.
       this.pendingStart = undefined;
       this.queued = false;
-      if (this.closed) {
+      if (this.closed || this.preemptedQueuedRun) {
+        this.preemptedQueuedRun = false;
         throw new RunStartCancelledError();
       }
       this.executing = true;
@@ -810,6 +807,10 @@ export class Actor {
 
     if (this.coalesceAborted) return;
     this.coalesceAbortController = undefined;
+
+    if (abortController.signal.aborted && !result.cancelled) {
+      Object.assign(result, formatSigtermResult(result.output, abortController.signal));
+    }
 
     if (result.sessionId && result.sessionId !== sessionId) {
       this.opts.saveSessionId(result.sessionId);
