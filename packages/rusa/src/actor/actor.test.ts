@@ -184,6 +184,34 @@ describe("Actor", () => {
     expect(provider.calls).toHaveLength(0);
   });
 
+  it("skips the run when preempted during async beforeRun (admission epoch)", async () => {
+    const provider = new FakeProvider();
+    let resolveBeforeRun!: (val: boolean) => void;
+    const actor = makeActor(
+      {
+        beforeRun: () =>
+          new Promise((resolve) => {
+            resolveBeforeRun = resolve;
+          }),
+      },
+      provider
+    );
+    actor.requestRun();
+    await flush();
+
+    // Actor is awaiting beforeRun
+    const preemption = actor.preemptForResponsive();
+    expect(preemption.preempted).toBe(true);
+    expect(preemption.phase).toBe("queued"); // TriggerRunner is busy but not executing yet
+
+    // Resolve beforeRun
+    resolveBeforeRun(true);
+    await flush();
+
+    // The ordinary run should be skipped due to admission epoch change
+    expect(provider.calls).toHaveLength(0);
+  });
+
   it("routes the run through the gate and calls onRun", async () => {
     let actor!: Actor;
     const provider = new FakeProvider(() => {
@@ -1643,6 +1671,40 @@ describe("Actor", () => {
       expect(actor.isRunning).toBe(false);
       const res = actor.interrupt("human:operator");
       expect(res.interrupted).toBe(false);
+    });
+
+    it("preemptForResponsive bypasses markUnkillable and voice max-age", async () => {
+      let resolveRun!: (res: RunResult) => void;
+      const provider = new FakeProvider(() => {
+        return new Promise<RunResult>((resolve) => {
+          resolveRun = resolve;
+        });
+      });
+      const actor = makeActor({ debounceMs: 30000, voiceCoalesceMaxAgeMs: 5000 }, provider);
+
+      const now = Date.now();
+      actor.requestRun({ priority: "responsive", voiceTimestamp: now });
+      await flush();
+      expect(provider.calls).toHaveLength(1);
+
+      // Advance past max-age
+      await vi.advanceTimersByTimeAsync(6000);
+
+      // Mark unkillable
+      actor.markUnkillable();
+
+      const call = provider.calls[0] as RunOptions;
+      expect(call.signal?.aborted).toBe(false);
+
+      // Preempt
+      const preemption = actor.preemptForResponsive();
+      expect(preemption.preempted).toBe(true);
+      expect(preemption.phase).toBe("running");
+      expect(call.signal?.aborted).toBe(true);
+      expect(call.signal?.reason).toBe("interrupt:responsive-notification");
+
+      resolveRun({ success: false, exitCode: 1, output: "aborted" });
+      await flush();
     });
   });
 

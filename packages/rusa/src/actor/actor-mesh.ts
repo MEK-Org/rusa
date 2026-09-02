@@ -71,7 +71,7 @@ export interface MeshActor {
   readonly isYielded?: boolean;
   cancelQueuedRun?(): boolean;
   resumeCancelledRun?(): boolean;
-  preemptForResponsive?(): {
+  preemptForResponsive(): {
     preempted: boolean;
     phase?: "running" | "winding_down" | "queued";
   };

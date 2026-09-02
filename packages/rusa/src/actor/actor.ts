@@ -446,6 +446,7 @@ export class Actor {
     preempted: boolean;
     phase?: "running" | "winding_down" | "queued";
   } {
+    this.admissionEpoch++;
     const phase = this.executing
       ? this.yielded
         ? "winding_down"
@@ -465,7 +466,18 @@ export class Actor {
       return { preempted: true, phase };
     }
 
-    this.pendingStart?.cancel?.();
+    if (this.pendingStart) {
+      if (this.pendingStart.cancel && !this.pendingStart.cancel()) {
+        if (this.coalesceAbortController && !this.coalesceAbortController.signal.aborted) {
+          this.coalesceAbortController.abort(
+            createInterruptAbortReason(RESPONSIVE_PREEMPTION_SOURCE)
+          );
+          return { preempted: true, phase: "running" };
+        }
+        return { preempted: false };
+      }
+    }
+
     this.queued = false;
     this.publishRuntimeStateIfChanged();
     return { preempted: true, phase: "queued" };
@@ -481,6 +493,7 @@ export class Actor {
     runStartTime?: Date;
     wasQueued?: boolean;
   } {
+    this.admissionEpoch++;
     const now = new Date();
     this.runner.cancelPending();
     if (this.executing && this.coalesceAbortController) {
@@ -531,12 +544,20 @@ export class Actor {
     }
   }
 
+  private admissionEpoch = 0;
+
   private async runOnce(nudge: RunNudge): Promise<void> {
     if (this.closed) {
       this.lastRunSkipped = true;
       return;
     }
+    const epoch = this.admissionEpoch;
     if (this.opts.beforeRun && !(await this.opts.beforeRun({ mode: nudge.mode ?? "ordinary" }))) {
+      this.lastRunSkipped = true;
+      return;
+    }
+    if (this.admissionEpoch !== epoch) {
+      // Preempted or interrupted during async beforeRun
       this.lastRunSkipped = true;
       return;
     }

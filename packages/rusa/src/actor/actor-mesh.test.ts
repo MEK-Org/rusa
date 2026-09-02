@@ -1236,6 +1236,8 @@ describe("ActorMesh", () => {
     });
     await vi.advanceTimersByTimeAsync(0);
     expect(fake(worker).calls).toHaveLength(2);
+    expect(fake(worker).calls[1].prompt).toContain("mesh.message");
+    expect(fake(worker).calls[1].prompt).toContain("system.disk");
   });
 
   it("delivers responsive inbox work to an idle actor without a preemption event", async () => {

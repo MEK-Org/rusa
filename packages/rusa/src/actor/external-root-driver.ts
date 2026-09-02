@@ -66,4 +66,8 @@ export class ExternalRootDriver implements MeshActor {
   close(): void {
     this.closed = true;
   }
+
+  preemptForResponsive(): { preempted: boolean; phase?: "running" | "winding_down" | "queued" } {
+    return { preempted: false };
+  }
 }
