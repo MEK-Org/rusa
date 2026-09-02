@@ -809,6 +809,7 @@ export class Actor {
     this.coalesceAbortController = undefined;
 
     if (abortController.signal.aborted && !result.cancelled) {
+      result.success = false;
       Object.assign(result, formatSigtermResult(result.output, abortController.signal));
     }
 

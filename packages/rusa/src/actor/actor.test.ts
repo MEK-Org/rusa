@@ -1738,6 +1738,40 @@ describe("Actor", () => {
       });
     });
 
+    it("forces success=false for non-grace aborts even if provider returns success=true", async () => {
+      let resolveRun!: (res: RunResult) => void;
+      const provider = new FakeProvider(() => {
+        return new Promise<RunResult>((resolve) => {
+          resolveRun = resolve;
+        });
+      });
+      const onRunEnd = vi.fn();
+      const actor = makeActor({ onRunEnd }, provider);
+
+      actor.requestRun({ priority: "responsive" });
+      await flush();
+
+      actor.interrupt("root");
+
+      // Provider incorrectly thinks it succeeded despite the abort
+      resolveRun({
+        success: true,
+        exitCode: 0,
+        output: "i am done",
+      });
+      await flush();
+
+      expect(onRunEnd).toHaveBeenCalledTimes(1);
+      expect(onRunEnd.mock.calls[0][0]).toMatchObject({
+        success: false,
+        exitCode: 143,
+        cancelled: true,
+        interrupted: true,
+        interruptSource: "root",
+        output: expect.stringContaining("i am done\n[Task interrupted by root]"),
+      });
+    });
+
     it("returns interrupted: false when actor is idle", async () => {
       const provider = new FakeProvider();
       const actor = makeActor({}, provider);
