@@ -20,7 +20,7 @@ export function isResponsiveNudge(nudge: RunNudge): boolean {
 export interface TriggerRunnerOptions {
   /** Run once for the current dirty state; no work content crosses this seam. */
   run: (nudge: RunNudge) => Promise<void>;
-  /** Debounce window for coalescing event bursts while idle (default 30s). */
+  /** Debounce window for coalescing event bursts while idle (default 0). */
   debounceMs?: number;
   /**
    * Consulted after a run completes when no new external nudge is pending.
@@ -32,8 +32,6 @@ export interface TriggerRunnerOptions {
   voiceCoalesceMaxAgeMs?: number;
   log?: (msg: string) => void;
 }
-
-const DEFAULT_DEBOUNCE_MS = 30 * 1000;
 
 /**
  * Single-flight debounce + dirty-bit primitive.
@@ -55,7 +53,7 @@ export class TriggerRunner {
 
   constructor(private readonly opts: TriggerRunnerOptions) {
     this.run = opts.run;
-    this.debounceMs = opts.debounceMs ?? DEFAULT_DEBOUNCE_MS;
+    this.debounceMs = opts.debounceMs ?? 0;
     this.onIdle = opts.onIdle;
     this.log = opts.log ?? (() => {});
   }
