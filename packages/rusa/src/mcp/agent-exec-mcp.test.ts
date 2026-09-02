@@ -1503,12 +1503,12 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     })) as CallToolResult;
     expect(res1.isError).toBeFalsy();
     expect((res1.content[0] as { text: string }).text).toContain(
-      `staged model gemini-3.7-flash-high, provider antigravity for ${portableChild}`
+      `staged model gemini-3.7-flash-high, effort high, provider antigravity for ${portableChild}`
     );
     expect(registry.get(portableChild)?.provider).toBe("claude");
     expect(registry.get(portableChild)?.model).toBe("claude-opus-4-8");
     expect(registry.get(portableChild)?.desiredProvider).toBe("antigravity");
-    expect(registry.get(portableChild)?.desiredModel).toBe("gemini-3.7-flash-high");
+    expect(registry.get(portableChild)?.desiredModel).toBe("gemini-3.7-flash");
 
     // 2. Refuse move on native actor
     const res2 = (await client.callTool({

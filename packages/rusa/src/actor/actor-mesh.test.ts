@@ -3034,7 +3034,7 @@ describe("ActorMesh", () => {
     expect(() => mesh.setActorModel(ledgerChild, "invalid-model", "root", "antigravity")).toThrow(
       /invalid model for antigravity/
     );
-    expect(registry.get(ledgerChild)?.model).toBe("gemini-3.7-flash-high");
+    expect(registry.get(ledgerChild)?.model).toBe("gemini-3.7-flash");
 
     // 4. Non-portable (native context) actor rejects provider move
     const nativeChild = mesh.spawn({
@@ -3095,7 +3095,7 @@ describe("ActorMesh", () => {
     busyMeshSetup.mesh.setActorModel(busyChild, "gemini-3.7-flash-high", "root", "antigravity");
     expect(busyMeshSetup.registry.get(busyChild)?.model).toBe("claude-opus-4-8");
     expect(busyMeshSetup.registry.get(busyChild)?.provider).toBe("claude");
-    expect(busyMeshSetup.registry.get(busyChild)?.desiredModel).toBe("gemini-3.7-flash-high");
+    expect(busyMeshSetup.registry.get(busyChild)?.desiredModel).toBe("gemini-3.7-flash");
     expect(busyMeshSetup.registry.get(busyChild)?.desiredProvider).toBe("antigravity");
     expect(modelSetCalls).toHaveLength(0);
 
@@ -3122,7 +3122,7 @@ describe("ActorMesh", () => {
       expect.objectContaining({
         kind: "actor_model_set",
         actorId: busyChild,
-        detail: "claude:claude-opus-4-8 -> codex:gpt-5.6-sol",
+        detail: "claude:claude-opus-4-8 -> codex:gpt-5.6-sol @ high",
       })
     );
 
