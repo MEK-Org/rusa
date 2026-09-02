@@ -10,6 +10,7 @@ import { obligationTimestamps } from "../db/migrations/0025_obligation_timestamp
 import { obligationTerminalNote } from "../db/migrations/0026_obligation_terminal_note.js";
 import { obligationTitle } from "../db/migrations/0027_obligation_title.js";
 import { obligationArtifacts } from "../db/migrations/0028_obligation_artifacts.js";
+import { recurringObligations } from "../db/migrations/0034_recurring_obligations.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { createObligationsMcpServer } from "./obligations-mcp.js";
@@ -40,10 +41,11 @@ describe("obligations MCP", () => {
     obligationTerminalNote.up(db);
     obligationTitle.up(db);
     obligationArtifacts.up(db);
+    recurringObligations.up(db);
     repository = new ObligationRepository(db);
   });
 
-  it("exposes all 9 obligation tools", async () => {
+  it("exposes all 10 obligation tools", async () => {
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
     const { tools } = await client.listTools();
     expect(tools.map((tool) => tool.name).sort()).toEqual([
@@ -55,6 +57,7 @@ describe("obligations MCP", () => {
       "reorder_obligation",
       "reparent_obligation",
       "set_external_ref",
+      "set_obligation_recurrence",
       "set_obligation_status",
     ]);
   });

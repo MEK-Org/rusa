@@ -305,11 +305,16 @@ export class ObligationRepository {
           cronExpr: row.recurrence_cron,
         });
       } else if (row.status === "scheduled" && row.next_ready_at) {
-        validIds.add(row.id);
-        this.osScheduler.scheduleObligationActivation(row.id, {
-          kind: "at",
-          date: new Date(row.next_ready_at),
-        });
+        const nextDate = new Date(row.next_ready_at);
+        if (nextDate.getTime() <= this.now()) {
+          this.activateScheduled(row.id);
+        } else {
+          validIds.add(row.id);
+          this.osScheduler.scheduleObligationActivation(row.id, {
+            kind: "at",
+            date: nextDate,
+          });
+        }
       }
     }
 
@@ -523,6 +528,18 @@ export class ObligationRepository {
       if (isActorEntityId(ownerId) && this.actorExists && !this.actorExists(ownerId)) {
         throw new ObligationValidationError(`actor owner does not exist: ${ownerId}`);
       }
+
+      const recurrence = input.recurrence;
+      if (recurrence?.policy === "cron" && !isValidCronExpr(recurrence.cronExpr)) {
+        throw new ObligationValidationError("invalid cron expression");
+      }
+      if (
+        recurrence?.policy === "completion_interval" &&
+        (!Number.isInteger(recurrence.intervalSeconds) || recurrence.intervalSeconds <= 0)
+      ) {
+        throw new ObligationValidationError("recurrence interval must be a positive integer");
+      }
+
       // PROVISIONAL ISSUE_NUM Q72: human IDs are opaque nonempty handles; no registry exists yet.
       const externalRef =
         input.externalRef == null ? null : parseExternalRef(input.externalRef).key;
@@ -781,8 +798,8 @@ export class ObligationRepository {
       return {
         obligation,
         children,
-        blockingChildren: childObligations.filter(
-          (child) => !isTerminalObligationStatus(child.status)
+        blockingChildren: childObligations.filter((child) =>
+          isBlockingObligationStatus(child.status)
         ),
       };
     };
@@ -1130,6 +1147,11 @@ export class ObligationRepository {
       if (isTerminalObligationStatus(obligation.status)) {
         throw new ObligationValidationError("terminal obligations cannot be reopened or changed");
       }
+      if (obligation.status === "scheduled") {
+        throw new ObligationValidationError(
+          "scheduled obligations cannot be completed or cancelled until they are ready"
+        );
+      }
       const liveChild = this.listChildren(id).find((child) =>
         isBlockingObligationStatus(child.status)
       );
@@ -1139,6 +1161,7 @@ export class ObligationRepository {
         );
       }
 
+      const completedAt = this.stamp();
       const resolution = resolutionRef == null ? null : parseObligationReference(resolutionRef).key;
       if (resolution !== null) {
         // Same transaction as the transition: evidence that arrives only if a
@@ -1149,7 +1172,7 @@ export class ObligationRepository {
              VALUES (?, ?, ?, NULL, NULL, ?)
              ON CONFLICT(obligation_id, ref) DO NOTHING`
           )
-          .run(randomUUID(), id, resolution, this.stamp());
+          .run(randomUUID(), id, resolution, completedAt);
       }
 
       if (status === "done" && obligation.recurrencePolicy !== null) {
@@ -1167,7 +1190,7 @@ export class ObligationRepository {
           obligation.recurrenceIntervalSeconds != null
         ) {
           nextReadyAt = new Date(
-            this.now() + obligation.recurrenceIntervalSeconds * 1000
+            new Date(completedAt).getTime() + obligation.recurrenceIntervalSeconds * 1000
           ).toISOString();
         }
 
@@ -1180,7 +1203,7 @@ export class ObligationRepository {
             completionId,
             id,
             seq,
-            this.stamp(),
+            completedAt,
             normalizeTerminalNote(note),
             resolution,
             nextReadyAt
@@ -1192,7 +1215,7 @@ export class ObligationRepository {
            SET status = 'scheduled', next_ready_at = ?, updated_at = ?
            WHERE id = ?`
           )
-          .run(nextReadyAt, this.stamp(), id);
+          .run(nextReadyAt, completedAt, id);
 
         if (obligation.recurrencePolicy === "completion_interval" && nextReadyAt) {
           this.osScheduler?.scheduleObligationActivation(id, {
@@ -1207,7 +1230,7 @@ export class ObligationRepository {
              SET status = ?, terminal_note = ?, resolution_ref = ?, updated_at = ?, next_ready_at = NULL
              WHERE id = ?`
           )
-          .run(status, normalizeTerminalNote(note), resolution, this.stamp(), id);
+          .run(status, normalizeTerminalNote(note), resolution, completedAt, id);
 
         if (status === "cancelled" || (status === "done" && obligation.recurrencePolicy === null)) {
           this.osScheduler?.cancelObligationActivation(id);

@@ -8,7 +8,7 @@ import { obligationTimestamps } from "../migrations/0025_obligation_timestamps.j
 import { obligationTerminalNote } from "../migrations/0026_obligation_terminal_note.js";
 import { obligationTitle } from "../migrations/0027_obligation_title.js";
 import { obligationArtifacts } from "../migrations/0028_obligation_artifacts.js";
-import { recurringObligations } from "../migrations/0033_recurring_obligations.js";
+import { recurringObligations } from "../migrations/0034_recurring_obligations.js";
 import { ObligationRepository } from "./obligation-repository.js";
 
 describe("ObligationRepository", () => {
@@ -1208,7 +1208,9 @@ describe("ObligationRepository", () => {
     const child = repository.create({ ownerId: "actor-a", title: "child", parentId: parent.id });
 
     // change child to scheduled
-    db.prepare("UPDATE obligations SET status = 'scheduled' WHERE id = ?").run(child.id);
+    db.prepare(
+      "UPDATE obligations SET status = 'scheduled', recurrence_policy = 'cron', recurrence_cron = '* * * * *', next_ready_at = '2026-08-01T00:00:00.000Z' WHERE id = ?"
+    ).run(child.id);
 
     // parent should not be blocked from completion
     const completed = repository.setTerminalStatus(parent.id, "done");
@@ -1224,10 +1226,12 @@ describe("ObligationRepository", () => {
   });
 
   it("includes scheduled identities in findLiveObligationByExternalRef and internal inheritance", () => {
-    const externalRef = "github://owner/repo/issue/1";
+    const externalRef = "github:owner/repo/issues/1";
     const ob = repository.create({ ownerId: "actor-a", title: "ob", externalRef });
 
-    db.prepare("UPDATE obligations SET status = 'scheduled' WHERE id = ?").run(ob.id);
+    db.prepare(
+      "UPDATE obligations SET status = 'scheduled', recurrence_policy = 'cron', recurrence_cron = '* * * * *', next_ready_at = '2026-08-01T00:00:00.000Z' WHERE id = ?"
+    ).run(ob.id);
 
     // should find scheduled identity
     const found = repository.findLiveObligationByExternalRef(externalRef);

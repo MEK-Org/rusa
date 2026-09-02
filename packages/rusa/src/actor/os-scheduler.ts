@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { type CrontabIo, isValidCronExpr } from "./wake-cron.js";
 
 /**
@@ -24,6 +24,31 @@ export interface OsSchedulerOptions {
   portFile: string;
   host?: string;
   curlPath?: string;
+}
+
+export function preflightAt(
+  probe: { hasAt: () => boolean; isAtdRunning: () => boolean } = defaultAtProbe()
+): { ok: boolean; issues: string[] } {
+  const issues: string[] = [];
+  if (!probe.hasAt()) issues.push("`at` CLI not found — install at");
+  else if (!probe.isAtdRunning())
+    issues.push("atd daemon not detected — scheduled obligations won't fire");
+  return { ok: issues.length === 0, issues };
+}
+
+function defaultAtProbe(): { hasAt: () => boolean; isAtdRunning: () => boolean } {
+  const can = (cmd: string, args: string[]): boolean => {
+    try {
+      execFileSync(cmd, args, { stdio: "ignore" });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  return {
+    hasAt: () => can("which", ["at"]),
+    isAtdRunning: () => can("pgrep", ["-x", "atd"]),
+  };
 }
 
 export interface AtIo {
@@ -106,10 +131,17 @@ export class DefaultOsScheduler implements OsScheduler {
       if (lines[i].trim() === tag) {
         while (i + 1 < lines.length) {
           const next = lines[i + 1];
-          if (next === undefined || next.trim() === "" || next.trimStart().startsWith("#")) {
+          if (next === undefined) break;
+          const trimmed = next.trim();
+          if (
+            trimmed.startsWith("CRON_TZ=") ||
+            trimmed.includes("wake-obligation") ||
+            trimmed.includes("wake-message")
+          ) {
+            i++;
+          } else {
             break;
           }
-          i++;
         }
         continue;
       }
@@ -152,7 +184,7 @@ export class DefaultOsScheduler implements OsScheduler {
     if (time.kind === "cron") {
       if (!isValidCronExpr(time.cronExpr))
         throw new Error(`invalid cron expression: ${time.cronExpr}`);
-      this.updateCron(tag, `CRON_TZ=UTC\n${time.cronExpr} ${curlLine}`);
+      this.updateCron(tag, `CRON_TZ=UTC\n${time.cronExpr} ${curlLine}\nCRON_TZ=""`);
     } else {
       const script = `${tag}\n${curlLine}\n`;
       this.atIo.schedule(script, time.date);

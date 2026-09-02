@@ -2077,16 +2077,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   mcpHttp.setWakeObligationHandler({
     token: wakeToken,
     deliver: (id: string) => {
-      const ob = getRepositories().obligations.activateScheduled(id);
-      if (
-        ob &&
-        ob.status === "ready" &&
-        ob.parentId === null &&
-        !ob.ownerId.startsWith("human:") &&
-        !ob.ownerId.startsWith("system:")
-      ) {
-        mesh.deliverWake(ob.ownerId, "obligation_ready");
-      }
+      getRepositories().obligations.activateScheduled(id);
     },
   });
 

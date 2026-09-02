@@ -43,4 +43,11 @@ describe("DefaultOsScheduler", () => {
     scheduler.scheduleObligationActivation("ob-2", { kind: "at", date: new Date() });
     expect(at.schedule).toHaveBeenCalled();
   });
+
+  it("strips cron blocks without disturbing adjacent user jobs", () => {
+    cronData =
+      '1 * * * * user-job-1\n# mc-obligation-activation:ob-1\nCRON_TZ=UTC\n*/5 * * * * curl wake-obligation\nCRON_TZ=""\n2 * * * * user-job-2\n';
+    scheduler.cancelObligationActivation("ob-1");
+    expect(cronData).toBe("1 * * * * user-job-1\n2 * * * * user-job-2\n");
+  });
 });

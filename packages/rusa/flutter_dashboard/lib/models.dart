@@ -1015,6 +1015,10 @@ class ObligationDto {
     this.prioritySourceId,
     this.terminalNote,
     this.resolutionRef,
+    this.recurrencePolicy,
+    this.recurrenceCron,
+    this.recurrenceIntervalSeconds,
+    this.nextReadyAt,
   });
 
   final String id;
@@ -1100,6 +1104,10 @@ class ObligationDto {
       prioritySourceId: j['prioritySourceId'] as String?,
       terminalNote: j['terminalNote'] as String?,
       resolutionRef: j['resolutionRef'] as String?,
+      recurrencePolicy: j['recurrencePolicy'] as String?,
+      recurrenceCron: j['recurrenceCron'] as String?,
+      recurrenceIntervalSeconds: j['recurrenceIntervalSeconds'] as int?,
+      nextReadyAt: j['nextReadyAt'] as String?,
     );
   }
 }
