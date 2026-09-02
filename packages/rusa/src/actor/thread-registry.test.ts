@@ -175,14 +175,14 @@ describe("migrateLegacyModelEffort", () => {
       id: "test-id-2",
       status: "active",
       provider: "antigravity",
-      model: "Gemini 3.1 Pro (Medium)",
+      model: "Gemini 3.1 Pro (High)",
       effort: undefined,
     };
     const migrated2 = migrateLegacyModelEffort(record2 as unknown as ThreadRecord, (p: string) =>
       p === "antigravity" ? "agy" : p
     );
     expect(migrated2.model).toBe("Gemini 3.1 Pro");
-    expect(migrated2.effort).toBe("medium");
+    expect(migrated2.effort).toBe("high");
   });
 
   it("skips retired records with null model or aliased provider", () => {

@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { assertSpawnContextSupported, resolveContextConfig } from "../actor/context-selection.js";
+import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import { providerCapabilityName, validateProviderSelection } from "../providers/registry.js";
 import {
   GEMINI_API_KEY_SECRET_FILENAME,
@@ -239,10 +240,17 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     if (!provider) throw new Error("config.yaml: rootActor.provider must be a non-empty string");
     const capabilityName = providerCapabilityName(provider, parsed);
     if (capabilityName === "agy" && parsed.rootActor.effort === undefined) {
-      console.warn(
-        `[migration] defaulting omitted config rootActor effort to "high" for antigravity model "${parsed.rootActor.model || "default"}"`
+      const { effort: parsedEffort } = normalizeModelEffortSelection(
+        capabilityName,
+        parsed.rootActor.model,
+        undefined
       );
-      parsed.rootActor.effort = "high";
+      if (parsedEffort === undefined) {
+        console.warn(
+          `[migration] defaulting omitted config rootActor effort to "high" for antigravity model "${parsed.rootActor.model || "default"}"`
+        );
+        parsed.rootActor.effort = "high";
+      }
     }
     const selection = validateProviderSelection(
       parsed,
