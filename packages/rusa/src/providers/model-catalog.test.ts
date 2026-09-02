@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { extractGeminiText, getGeminiClient } from "../understanding/gemini-utils.js";
+import { buildAntigravityArgs, resolveAntigravitySelection } from "./antigravity.js";
 import {
   clearProviderModelCatalog,
   extractKimiModelsFromToml,
@@ -246,6 +247,50 @@ describe("populateModelCatalogsFromDb", () => {
 
     expect(validateModelPin("codex", "gpt-5.6-sol")).toEqual({ status: "accepted" });
     expect(() => validateModelPin("codex", "bad-model")).toThrow();
+  });
+
+  it("restores a raw tiered agy entry and emits the exact canonical argv selector pair", () => {
+    const mockRepo = {
+      listLatestForEachProvider: () =>
+        new Map([
+          [
+            "agy",
+            [
+              {
+                displayLabel: "Gemini 3.5 Flash (High)",
+                identifier: "gemini-3.5-flash-high",
+                passable: true,
+              },
+            ],
+          ],
+        ]),
+    };
+    populateModelCatalogsFromDb(mockRepo);
+    const catalog = getProviderModelCatalog("agy");
+    expect(catalog).toEqual([
+      {
+        displayLabel: "Gemini 3.5 Flash",
+        identifier: "gemini-3.5-flash",
+        passable: true,
+        efforts: ["high"],
+      },
+    ]);
+
+    const selection = resolveAntigravitySelection("Gemini 3.5 Flash", "high");
+    const args = buildAntigravityArgs({
+      prompt: "hi",
+      model: selection.model,
+      effort: selection.effort,
+      timeoutMs: 60_000,
+    });
+    const iModel = args.indexOf("--model");
+    const iEffort = args.indexOf("--effort");
+    expect(args.slice(iModel, iEffort + 2)).toEqual([
+      "--model",
+      "gemini-3.5-flash",
+      "--effort",
+      "high",
+    ]);
   });
 });
 

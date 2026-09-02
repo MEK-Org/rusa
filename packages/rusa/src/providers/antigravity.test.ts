@@ -3,9 +3,10 @@ import EventEmitter from "node:events";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProviderConfig } from "../config/types.js";
 import { AntigravityProvider, formatAgyToolInvocation } from "./antigravity.js";
+import { clearProviderModelCatalog, setProviderModelCatalog } from "./model-catalog.js";
 import {
   RUN_CEILING_ABORT_REASON,
   STALL_WATCHDOG_ABORT_REASON,
@@ -51,7 +52,24 @@ function mockChildProcess() {
 }
 
 describe("AntigravityProvider", () => {
+  beforeEach(() => {
+    setProviderModelCatalog("agy", [
+      { identifier: "gemini-3.1-pro-high", displayLabel: "Gemini 3.1 Pro (High)", passable: true },
+      { identifier: "gemini-3.1-pro-low", displayLabel: "Gemini 3.1 Pro (Low)", passable: true },
+      {
+        identifier: "gemini-3.5-flash-high",
+        displayLabel: "Gemini 3.5 Flash (High)",
+        passable: true,
+      },
+      {
+        identifier: "gemini-3.5-flash-low",
+        displayLabel: "Gemini 3.5 Flash (Low)",
+        passable: true,
+      },
+    ]);
+  });
   afterEach(() => {
+    clearProviderModelCatalog("agy");
     vi.clearAllMocks();
   });
 
@@ -74,10 +92,142 @@ describe("AntigravityProvider", () => {
         "test prompt",
         "--dangerously-skip-permissions",
         "--model",
-        "Gemini 3.1 Pro (High)",
+        "gemini-3.1-pro",
+        "--effort",
+        "high",
       ]),
       expect.objectContaining({ cwd: "/tmp" })
     );
+  });
+
+  it("rejects a required-effort model before launching agy when effort is missing", async () => {
+    setProviderModelCatalog("agy", [
+      {
+        identifier: "gemini-3.5-flash-high",
+        displayLabel: "Gemini 3.5 Flash (High)",
+        passable: true,
+      },
+    ]);
+    const provider = new AntigravityProvider(
+      "antigravity",
+      { cliCommand: "agy" },
+      "Gemini 3.5 Flash"
+    );
+
+    await expect(provider.run({ prompt: "test prompt", cwd: "/tmp" })).rejects.toThrowError(
+      'invalid model selection: model "Gemini 3.5 Flash" requires an effort but none was provided'
+    );
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "Gemini 3.5 Flash (High)",
+    "gemini-3.5-flash-high",
+  ])("canonicalizes matching tiered selector %s and mixed-case effort before launching agy", async (model) => {
+    const provider = new AntigravityProvider(
+      "antigravity",
+      { cliCommand: "agy" },
+      model,
+      undefined,
+      "HIGH"
+    );
+    const child = mockChildProcess();
+    vi.mocked(spawn).mockReturnValue(child as ChildProcessWithoutNullStreams);
+
+    const runPromise = provider.run({ prompt: "test prompt", cwd: "/tmp" });
+    setTimeout(() => child.emit("close", 0), 10);
+    await runPromise;
+
+    const args = vi.mocked(spawn).mock.calls[0][1];
+    expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2)).toEqual([
+      "--model",
+      "gemini-3.5-flash",
+    ]);
+    expect(args.slice(args.indexOf("--effort"), args.indexOf("--effort") + 2)).toEqual([
+      "--effort",
+      "high",
+    ]);
+  });
+
+  it("rejects mismatched tiered display and explicit effort before launching agy", async () => {
+    const provider = new AntigravityProvider(
+      "antigravity",
+      { cliCommand: "agy" },
+      "Gemini 3.5 Flash (High)",
+      undefined,
+      "low"
+    );
+
+    await expect(provider.run({ prompt: "test prompt", cwd: "/tmp" })).rejects.toThrowError(
+      'conflicting reasoning efforts for provider "agy": model pin carries "high" but effort is "low"'
+    );
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("prefers a catalog-exact suffix-like base display label before legacy parsing", async () => {
+    setProviderModelCatalog("agy", [
+      {
+        identifier: "future-model-v1",
+        displayLabel: "Future Model-high",
+        passable: true,
+      },
+    ]);
+    const provider = new AntigravityProvider(
+      "antigravity",
+      { cliCommand: "agy" },
+      "Future Model-high"
+    );
+    const child = mockChildProcess();
+    vi.mocked(spawn).mockReturnValue(child as ChildProcessWithoutNullStreams);
+
+    const runPromise = provider.run({ prompt: "test prompt", cwd: "/tmp" });
+    setTimeout(() => child.emit("close", 0), 10);
+    await runPromise;
+
+    const args = vi.mocked(spawn).mock.calls[0][1];
+    expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2)).toEqual([
+      "--model",
+      "future-model-v1",
+    ]);
+    expect(args).not.toContain("--effort");
+  });
+
+  it("rejects a pinned model with an empty catalog before launching agy", async () => {
+    clearProviderModelCatalog("agy");
+    const provider = new AntigravityProvider(
+      "antigravity",
+      { cliCommand: "agy" },
+      "Gemini 3.5 Flash"
+    );
+
+    await expect(provider.run({ prompt: "test prompt", cwd: "/tmp" })).rejects.toThrowError(
+      'invalid model selection: model "Gemini 3.5 Flash" provided but agy catalog is empty or missing'
+    );
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("launches without a pinned model and normalizes an explicit effort alias", async () => {
+    clearProviderModelCatalog("agy");
+    const provider = new AntigravityProvider(
+      "antigravity",
+      { cliCommand: "agy" },
+      undefined,
+      undefined,
+      "Extra-High"
+    );
+    const child = mockChildProcess();
+    vi.mocked(spawn).mockReturnValue(child as ChildProcessWithoutNullStreams);
+
+    const runPromise = provider.run({ prompt: "test prompt", cwd: "/tmp" });
+    setTimeout(() => child.emit("close", 0), 10);
+    await runPromise;
+
+    const args = vi.mocked(spawn).mock.calls[0][1];
+    expect(args).not.toContain("--model");
+    expect(args.slice(args.indexOf("--effort"), args.indexOf("--effort") + 2)).toEqual([
+      "--effort",
+      "xhigh",
+    ]);
   });
 
   it("runs agy inside bwrap when sandbox options are provided", async () => {
