@@ -129,7 +129,7 @@ describe("legacy to WAL conversion", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-instance-db-wal-race-"));
     roots.push(root);
     mkdirSync(join(root, "data"), { recursive: true });
-    const path = join(root, "data", "rusa.db");
+    const path = join(root, "data", "mesh.db");
     // No marker table here, unlike the shared database above: the migration
     // runner reads "any table already exists" as "this database predates the
     // migration system" and skips the initial schema, so a marker would fail

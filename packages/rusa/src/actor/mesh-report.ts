@@ -23,7 +23,7 @@ export function generateMeshReport(opts: { home: string; out?: string }): {
   outPath: string;
   counts: { actors: number; events: number; messages: number; runs: number };
 } {
-  const dbPath = join(opts.home, "data", "rusa.db");
+  const dbPath = join(opts.home, "data", "mesh.db");
   if (!existsSync(dbPath)) {
     throw new Error(`No rusa DB found at ${dbPath} (is --home the instance home?)`);
   }

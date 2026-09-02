@@ -52,7 +52,7 @@ export async function runDev(opts: {
   process.env.RUSA_HOME = DEV_HOME;
   setDevPorts();
 
-  const dbPath = join(DEV_HOME, "data", "rusa.db");
+  const dbPath = join(DEV_HOME, "data", "mesh.db");
   const walPath = `${dbPath}-wal`;
   const shmPath = `${dbPath}-shm`;
 
