@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { extractGeminiText, getGeminiClient } from "../understanding/gemini-utils.js";
-import { buildAntigravityArgs } from "./antigravity.js";
+import { buildAntigravityArgs, resolveAntigravitySelection } from "./antigravity.js";
 import {
   clearProviderModelCatalog,
   extractKimiModelsFromToml,
@@ -249,7 +249,7 @@ describe("populateModelCatalogsFromDb", () => {
     expect(() => validateModelPin("codex", "bad-model")).toThrow();
   });
 
-  it("restores a raw tiered agy entry and correctly processes canonical pair to emit exact base slug + effort", () => {
+  it("restores a raw tiered agy entry and emits the exact canonical argv selector pair", () => {
     const mockRepo = {
       listLatestForEachProvider: () =>
         new Map([
@@ -276,16 +276,21 @@ describe("populateModelCatalogsFromDb", () => {
       },
     ]);
 
+    const selection = resolveAntigravitySelection("Gemini 3.5 Flash", "high");
     const args = buildAntigravityArgs({
       prompt: "hi",
-      model: "Gemini 3.5 Flash",
-      effort: "high",
+      model: selection.model,
+      effort: selection.effort,
       timeoutMs: 60_000,
     });
     const iModel = args.indexOf("--model");
     const iEffort = args.indexOf("--effort");
-    expect(args.slice(iModel, iModel + 2)).toEqual(["--model", "gemini-3.5-flash"]);
-    expect(args.slice(iEffort, iEffort + 2)).toEqual(["--effort", "high"]);
+    expect(args.slice(iModel, iEffort + 2)).toEqual([
+      "--model",
+      "gemini-3.5-flash",
+      "--effort",
+      "high",
+    ]);
   });
 });
 

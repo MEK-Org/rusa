@@ -15,6 +15,11 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ProviderConfig } from "../config/types.js";
 import { getProviderModelCatalog } from "./model-catalog.js";
+import {
+  type ModelEffortSelection,
+  normalizeModelEffortSelection,
+  normalizeReasoningEffort,
+} from "./reasoning-effort.js";
 import { buildActorBwrapArgs, buildActorBwrapCommand, teardownFlutterOverlay } from "./sandbox.js";
 import { runSubprocess } from "./subprocess-execution.js";
 import {
@@ -54,89 +59,77 @@ export function buildAntigravityArgs(o: AntigravityArgsOptions): string[] {
     args.push("--add-dir", dir);
   }
 
-  let finalModel = o.model;
-  let finalEffort = o.effort;
-
-  if (o.model) {
-    const AGY_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
-    let baseModel = o.model;
-    let parsedEffort: string | undefined;
-
-    const slugRe = new RegExp(`-(${AGY_EFFORTS.join("|")})$`, "i");
-    const slugMatch = o.model.match(slugRe);
-    if (slugMatch) {
-      baseModel = o.model.replace(slugRe, "").trim();
-      parsedEffort = slugMatch[1].toLowerCase();
-    }
-
-    const displayRe = new RegExp(`\\s*\\((${AGY_EFFORTS.join("|")})\\)$`, "i");
-    const displayMatch = o.model.match(displayRe);
-    if (displayMatch) {
-      baseModel = o.model.replace(displayRe, "").trim();
-      if (!parsedEffort) parsedEffort = displayMatch[1].toLowerCase();
-    }
-
-    if (o.effort) {
-      if (displayMatch) {
-        throw new Error(
-          `invalid model selection (--model "${o.model}" --effort "${o.effort}"): --effort is not supported for model "${o.model}"`
-        );
-      }
-      if (parsedEffort && o.effort.toLowerCase() !== parsedEffort) {
-        throw new Error(
-          `invalid model selection (--model "${o.model}" --effort "${o.effort}"): effort mismatch`
-        );
-      }
-    }
-
-    finalEffort = o.effort || parsedEffort;
-    finalModel = baseModel;
-
-    const catalog = getProviderModelCatalog("agy");
-    if (!catalog || catalog.length === 0) {
-      throw new Error(
-        `invalid model selection: model "${o.model}" provided but agy catalog is empty or missing`
-      );
-    }
-
-    const baseMatch = catalog.find(
-      (e) => e.displayLabel === baseModel || e.identifier === baseModel
-    );
-    if (!baseMatch) {
-      throw new Error(`invalid model selection: model "${o.model}" not found in catalog`);
-    }
-    if (baseMatch.passable === false) {
-      throw new Error(`invalid model selection: model "${o.model}" is marked impassable`);
-    }
-    if (baseMatch.efforts && baseMatch.efforts.length > 0) {
-      if (!finalEffort) {
-        throw new Error(
-          `invalid model selection: model "${o.model}" requires an effort but none was provided`
-        );
-      }
-      if (!baseMatch.efforts.includes(finalEffort.toLowerCase())) {
-        throw new Error(
-          `invalid model selection: effort "${finalEffort}" is not supported by model "${baseMatch.displayLabel}"`
-        );
-      }
-    } else if (finalEffort) {
-      throw new Error(
-        `invalid model selection: effort "${finalEffort}" is not supported by model "${baseMatch.displayLabel}"`
-      );
-    }
-    finalModel = baseMatch.identifier;
-    args.push("--model", finalModel);
-  }
-
-  if (finalEffort) {
-    args.push("--effort", finalEffort);
-  }
+  if (o.model) args.push("--model", o.model);
+  if (o.effort) args.push("--effort", o.effort);
 
   // agy's --print-timeout is a wall-clock execution ceiling (verified empirically).
   // Set it to match the full invocation budget (o.timeoutMs) so active streaming tasks are not cut short.
   const printTimeoutMin = Math.max(1, Math.ceil(o.timeoutMs / 60_000));
   args.push("--print-timeout", `${printTimeoutMin}m0s`);
   return args;
+}
+
+/** Resolve a requested agy selector against the invocation-time model catalog. */
+export function resolveAntigravitySelection(
+  rawModel?: string,
+  rawEffort?: string
+): ModelEffortSelection {
+  const model = rawModel?.trim() || undefined;
+
+  // Provider-default selection does not depend on catalog availability, but an
+  // explicit effort still goes through the shared lowercase/alias normalizer.
+  if (!model) return normalizeModelEffortSelection("agy", undefined, rawEffort);
+
+  const catalog = getProviderModelCatalog("agy");
+  if (!catalog || catalog.length === 0) {
+    throw new Error(
+      `invalid model selection: model "${rawModel}" provided but agy catalog is empty or missing`
+    );
+  }
+
+  // A catalog-exact base name wins before legacy suffix parsing. This keeps a
+  // legitimate future base identifier/display label ending in "-high" intact.
+  const exactMatch = catalog.find(
+    (entry) => entry.identifier === model || entry.displayLabel === model
+  );
+  const selection = exactMatch
+    ? {
+        model,
+        effort: normalizeModelEffortSelection("agy", undefined, rawEffort).effort,
+      }
+    : normalizeModelEffortSelection("agy", model, rawEffort);
+
+  const catalogMatch =
+    exactMatch ??
+    catalog.find(
+      (entry) => entry.identifier === selection.model || entry.displayLabel === selection.model
+    );
+  if (!catalogMatch) {
+    throw new Error(`invalid model selection: model "${rawModel}" not found in catalog`);
+  }
+  if (catalogMatch.passable === false) {
+    throw new Error(`invalid model selection: model "${rawModel}" is marked impassable`);
+  }
+
+  const supportedEfforts = (catalogMatch.efforts ?? []).map(normalizeReasoningEffort);
+  if (supportedEfforts.length > 0) {
+    if (!selection.effort) {
+      throw new Error(
+        `invalid model selection: model "${rawModel}" requires an effort but none was provided`
+      );
+    }
+    if (!supportedEfforts.includes(selection.effort)) {
+      throw new Error(
+        `invalid model selection: effort "${selection.effort}" is not supported by model "${catalogMatch.displayLabel}"`
+      );
+    }
+  } else if (selection.effort) {
+    throw new Error(
+      `invalid model selection: effort "${selection.effort}" is not supported by model "${catalogMatch.displayLabel}"`
+    );
+  }
+
+  return { model: catalogMatch.identifier, effort: selection.effort };
 }
 
 /**
@@ -442,6 +435,7 @@ export class AntigravityProvider implements CodingProvider {
   async run(opts: RunOptions): Promise<RunResult> {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const command = this.config.cliCommand ?? "agy";
+    const selection = resolveAntigravitySelection(this.model, this.effort);
     const incomingDbPath = opts.session?.id
       ? join(this.conversationsDir, `${opts.session.id}.db`)
       : undefined;
@@ -502,8 +496,8 @@ export class AntigravityProvider implements CodingProvider {
 
     const args = buildAntigravityArgs({
       prompt: opts.prompt,
-      model: this.model,
-      effort: this.effort,
+      model: selection.model,
+      effort: selection.effort,
       conversationId: opts.session?.id,
       addDirs: opts.addDirs,
       logFile,
