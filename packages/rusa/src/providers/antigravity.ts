@@ -632,7 +632,14 @@ export class AntigravityProvider implements CodingProvider {
         }
       },
       cleanup,
-      buildKilledResult: ({ output, exitCode, cancelled, interrupted, graceKilled }) => {
+      buildKilledResult: ({
+        output,
+        exitCode,
+        cancelled,
+        interrupted,
+        interruptSource,
+        graceKilled,
+      }) => {
         if (buffer) {
           processLine(buffer);
           buffer = "";
@@ -643,11 +650,19 @@ export class AntigravityProvider implements CodingProvider {
           exitCode,
           cancelled,
           interrupted,
+          interruptSource,
           graceKilled,
           sessionId: opts.session?.id,
         });
       },
-      buildSignalResult: ({ output, exitCode, cancelled, interrupted, graceKilled }) => {
+      buildSignalResult: ({
+        output,
+        exitCode,
+        cancelled,
+        interrupted,
+        interruptSource,
+        graceKilled,
+      }) => {
         if (buffer) {
           processLine(buffer);
           buffer = "";
@@ -658,6 +673,7 @@ export class AntigravityProvider implements CodingProvider {
           exitCode,
           cancelled,
           interrupted,
+          interruptSource,
           graceKilled,
           sessionId: captureSessionFromLog(),
         });

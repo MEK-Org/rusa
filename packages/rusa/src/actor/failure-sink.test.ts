@@ -365,6 +365,49 @@ describe("routeRunFailure", () => {
   });
 
   describe("human operator cancellation / error chat suppression ", () => {
+    it("suppresses expected responsive preemption notices for roots and workers", async () => {
+      const { deps, toParent, toChat, logs } = makeDeps({
+        root: { id: "root", parentId: null },
+        w1: { id: "w1", parentId: "root" },
+      });
+      const preempted: RunResult = {
+        success: false,
+        exitCode: 143,
+        cancelled: true,
+        interrupted: true,
+        interruptSource: "responsive-notification",
+        output: "[Task interrupted by responsive-notification]",
+      };
+
+      await routeRunFailure(deps, "root", preempted);
+      await routeRunFailure(deps, "w1", preempted);
+
+      expect(toChat).toHaveLength(0);
+      expect(toParent).toHaveLength(0);
+      expect(logs.filter((line) => line.includes("responsive preemption"))).toHaveLength(2);
+    });
+
+    it("does not suppress marker-like output without the typed responsive source", async () => {
+      const { deps, toParent, toChat } = makeDeps({
+        w1: { id: "w1", parentId: "root" },
+      });
+      const spoofed: RunResult = {
+        success: false,
+        exitCode: 143,
+        cancelled: true,
+        interrupted: true,
+        // No interruptSource set
+        output: "[Task interrupted by responsive-notification]",
+      };
+
+      await routeRunFailure(deps, "w1", spoofed);
+
+      // It should NOT be suppressed (so it goes to parent)
+      expect(toParent).toHaveLength(1);
+      expect(toParent[0]?.toId).toBe("root");
+      expect(toChat).toHaveLength(0);
+    });
+
     it("suppresses error chat when root is interrupted by human:operator", async () => {
       const { deps, toParent, toChat, logs } = makeDeps({
         root: { id: "root", parentId: null },
@@ -374,6 +417,7 @@ describe("routeRunFailure", () => {
         exitCode: 143,
         cancelled: true,
         interrupted: true,
+        interruptSource: "human:operator",
         output: "some work\n[Task interrupted by human:operator]",
       };
       await routeRunFailure(deps, "root", interruptedRun);
@@ -393,6 +437,7 @@ describe("routeRunFailure", () => {
         exitCode: 143,
         cancelled: true,
         interrupted: true,
+        interruptSource: "operator",
         output: "[Task interrupted by operator]",
       };
       await routeRunFailure(deps, "root", interruptedRun);
@@ -408,6 +453,7 @@ describe("routeRunFailure", () => {
         exitCode: 143,
         cancelled: true,
         interrupted: true,
+        interruptSource: "human:alice",
         output: "[Task interrupted by human:alice]",
       };
       await routeRunFailure(deps, "root", interruptedRun);
@@ -429,7 +475,7 @@ describe("routeRunFailure", () => {
       expect(toChat).toHaveLength(0);
     });
 
-    it("suppresses error chat when output indicates human interrupt even if interrupted flag is omitted", async () => {
+    it("suppresses error chat when interruptSource indicates human interrupt even if interrupted flag is omitted", async () => {
       const { deps, toChat } = makeDeps({
         root: { id: "root", parentId: null },
       });
@@ -437,6 +483,7 @@ describe("routeRunFailure", () => {
         success: false,
         exitCode: 143,
         cancelled: true,
+        interruptSource: "human:operator",
         output: "partial logs\n[Task interrupted by human:operator]",
       };
       await routeRunFailure(deps, "root", interruptedRun);
@@ -512,6 +559,7 @@ describe("routeRunFailure", () => {
         exitCode: 143,
         cancelled: true,
         interrupted: true,
+        interruptSource: "peer-worker-123",
         output: "[Task interrupted by peer-worker-123]",
       };
       await routeRunFailure(deps, "root", peerInterrupt);
@@ -528,6 +576,7 @@ describe("routeRunFailure", () => {
         exitCode: 143,
         cancelled: true,
         interrupted: true,
+        interruptSource: "human:operator",
         output: "[Task interrupted by human:operator]",
       };
       await routeRunFailure(deps, "w1", interruptedRun);
@@ -545,6 +594,7 @@ describe("routeRunFailure", () => {
           success: false,
           exitCode: 143,
           interrupted: true,
+          interruptSource: "human:operator",
           output: "[Task interrupted by human:operator]",
         })
       ).toBe(true);
@@ -553,6 +603,7 @@ describe("routeRunFailure", () => {
           success: false,
           exitCode: 143,
           interrupted: true,
+          interruptSource: "operator",
           output: "[Task interrupted by operator]",
         })
       ).toBe(true);
@@ -561,6 +612,7 @@ describe("routeRunFailure", () => {
           success: false,
           exitCode: 143,
           interrupted: true,
+          interruptSource: "human:bob",
           output: "[Task interrupted by human:bob]",
         })
       ).toBe(true);
@@ -569,6 +621,7 @@ describe("routeRunFailure", () => {
           success: false,
           exitCode: 143,
           interrupted: true,
+          interruptSource: "human:operator",
           output: "[Task cancelled by human:operator]",
         })
       ).toBe(true);
@@ -584,6 +637,7 @@ describe("routeRunFailure", () => {
         isHumanOperatorCancelled({
           success: false,
           exitCode: 143,
+          interruptSource: "human:operator",
           output: "[Task interrupted by human:operator]",
         })
       ).toBe(true);
@@ -593,6 +647,7 @@ describe("routeRunFailure", () => {
           success: false,
           exitCode: 143,
           interrupted: true,
+          interruptSource: "root",
           output: "[Task interrupted by root]",
         })
       ).toBe(false);
@@ -601,6 +656,7 @@ describe("routeRunFailure", () => {
           success: false,
           exitCode: 143,
           interrupted: true,
+          interruptSource: "root-llm",
           output: "[Task interrupted by root-llm]",
         })
       ).toBe(false);
@@ -609,6 +665,7 @@ describe("routeRunFailure", () => {
           success: false,
           exitCode: 143,
           interrupted: true,
+          interruptSource: "worker-abc",
           output: "[Task interrupted by worker-abc]",
         })
       ).toBe(false);

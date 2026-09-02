@@ -13,6 +13,7 @@ const inertActor = (id: string): MeshActor => ({
   markUnkillable: () => {},
   close: () => {},
   isRunning: false,
+  preemptForResponsive: () => ({ preempted: false }),
 });
 
 describe("mesh restart persistence ", () => {

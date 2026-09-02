@@ -160,6 +160,10 @@ export async function routeRunFailure(
   providerLabel?: string
 ): Promise<void> {
   if (result.success) return;
+  if (isResponsivePreemption(result)) {
+    deps.log(`suppressing expected responsive preemption notice for ${actorId}`);
+    return;
+  }
   const tail = sanitizeFailureText(result.output ?? "")
     .slice(-TAIL_LEN)
     .trim();
@@ -180,6 +184,13 @@ export async function routeRunFailure(
   }
   const body = leadLine ? `${leadLine}\n\n${summary}` : summary;
   routeMechanicalFailureNotice(deps, actorId, "run failed", body, result.exitCode, result);
+}
+
+/** Responsive inbox preemption is intentional scheduling, not a supervisor failure. */
+export function isResponsivePreemption(result: RunResult): boolean {
+  return Boolean(
+    result.cancelled && result.interrupted && result.interruptSource === "responsive-notification"
+  );
 }
 
 export function sanitizeFailureText(text: string): string {
@@ -226,14 +237,11 @@ function scrubJson(value: unknown): unknown {
  * Top-level error chat reporting suppresses notices for operator-initiated interrupts.
  */
 export function isHumanOperatorCancelled(result: RunResult): boolean {
-  if (result.output) {
-    const interruptMatch = result.output.match(/\[Task (?:interrupted|cancelled) by ([^\]]+)\]/i);
-    if (interruptMatch) {
-      const by = interruptMatch[1].trim().toLowerCase();
-      return (
-        by === "human:operator" || by === "operator" || by === "human" || by.startsWith("human:")
-      );
-    }
+  if (result.interruptSource) {
+    const by = result.interruptSource.toLowerCase();
+    return (
+      by === "human:operator" || by === "operator" || by === "human" || by.startsWith("human:")
+    );
   }
   if (result.interrupted) {
     return true;
