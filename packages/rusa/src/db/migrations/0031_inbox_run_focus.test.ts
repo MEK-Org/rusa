@@ -1,12 +1,34 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { runMigrations } from "./runner.js";
+import { migrations } from "./index.js";
 
 describe("0031_inbox_run_focus", () => {
   it("creates durable run focus and many-to-many association tables", () => {
     const db = new Database(":memory:");
     db.pragma("foreign_keys = ON");
-    runMigrations(db);
+
+    // Run migrations up to 0031_inbox_run_focus to verify its point-in-time effect
+    // without requiring a production runner seam.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS _migrations (
+        id TEXT PRIMARY KEY,
+        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+
+    for (const migration of migrations) {
+      if (migration.noTransaction) {
+        migration.up(db);
+      } else {
+        db.transaction(() => {
+          migration.up(db);
+        })();
+      }
+      db.prepare("INSERT INTO _migrations (id) VALUES (?)").run(migration.id);
+      if (migration.id === "0031_inbox_run_focus") {
+        break;
+      }
+    }
 
     const tables = new Set(
       (
