@@ -11,7 +11,7 @@ describe("Database Migration System", () => {
 
   beforeEach(() => {
     testDbDir = mkdtempSync(join(tmpdir(), "migration-test-"));
-    dbPath = join(testDbDir, "rusa.db");
+    dbPath = join(testDbDir, "mesh.db");
   });
 
   afterEach(() => {

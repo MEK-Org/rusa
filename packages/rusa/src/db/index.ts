@@ -34,7 +34,7 @@ export interface TaskRow {
 }
 
 /**
- * Open (and migrate) the SQLite database under `<mcHome>/data/rusa.db`.
+ * Open (and migrate) the SQLite database under `<mcHome>/data/mesh.db`.
  * Idempotent: returns the existing handle if already open.
  */
 export function initDb(mcHome: string): Database.Database {
@@ -43,7 +43,7 @@ export function initDb(mcHome: string): Database.Database {
   const dataDir = join(mcHome, "data");
   mkdirSync(dataDir, { recursive: true });
 
-  const dbPath = join(dataDir, "rusa.db");
+  const dbPath = join(dataDir, "mesh.db");
   db = new Database(dbPath);
 
   // WAL for better concurrent read performance; enforce relational constraints.
