@@ -94,6 +94,9 @@ describe("0032_actor_runs_focus_fold", () => {
     const row = db.prepare("SELECT * FROM actor_runs WHERE id = 'run-123'").get() as {
       focus_primary_obligation_id: string;
       focus_resolution: string;
+      focus_selected_at: string;
+      focus_entry_ids_json: string;
+      focus_diagnostics_json: string;
     };
     expect(row.focus_primary_obligation_id).toBe("obl-789");
     expect(row.focus_resolution).toBe("explicit");
