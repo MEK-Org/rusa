@@ -152,6 +152,9 @@ class RigHolderActor implements MeshActor {
   requestRun(): void {}
   declareYield(): void {}
   markUnkillable(): void {}
+  preemptForResponsive() {
+    return { preempted: false };
+  }
   close(): void {}
 }
 

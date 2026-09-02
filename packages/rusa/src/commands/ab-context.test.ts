@@ -15,6 +15,7 @@ const stubActor = (id: string): MeshActor => ({
   requestRun: () => {},
   declareYield: () => {},
   markUnkillable: () => {},
+  preemptForResponsive: () => ({ preempted: false }),
   close: () => {},
 });
 

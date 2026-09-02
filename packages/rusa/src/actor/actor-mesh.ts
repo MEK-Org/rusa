@@ -779,7 +779,7 @@ export class ActorMesh {
       return false;
     }
     if (isResponsiveNudge(nudge)) {
-      const preemption = target.preemptForResponsive?.();
+      const preemption = target.preemptForResponsive();
       if (preemption?.preempted) {
         this.recordEvent({
           kind: "run_preempted",

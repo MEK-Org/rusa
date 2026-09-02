@@ -187,17 +187,22 @@ describe("Actor", () => {
   it("skips the run when preempted during async beforeRun (admission epoch)", async () => {
     const provider = new FakeProvider();
     let resolveBeforeRun!: (val: boolean) => void;
+    let beforeRunEntered!: () => void;
+    const beforeRunPromise = new Promise<void>((r) => (beforeRunEntered = r));
     const actor = makeActor(
       {
-        beforeRun: () =>
-          new Promise((resolve) => {
+        beforeRun: () => {
+          beforeRunEntered();
+          return new Promise((resolve) => {
             resolveBeforeRun = resolve;
-          }),
+          });
+        },
       },
       provider
     );
     actor.requestRun();
-    await flush();
+    await vi.advanceTimersByTimeAsync(50);
+    await beforeRunPromise;
 
     // Actor is awaiting beforeRun
     const preemption = actor.preemptForResponsive();
