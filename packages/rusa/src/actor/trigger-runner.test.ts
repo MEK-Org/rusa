@@ -15,6 +15,8 @@ describe("TriggerRunner", () => {
       run: async (nudge) => void runs.push(nudge),
     });
     runner.requestRun();
+    expect(runs).toHaveLength(0);
+    runner.requestRun();
     await vi.advanceTimersByTimeAsync(0);
     await flush();
     expect(runs).toHaveLength(1);
