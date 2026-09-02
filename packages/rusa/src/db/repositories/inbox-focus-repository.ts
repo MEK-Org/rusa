@@ -30,7 +30,11 @@ function parseStringArray(json: string, description: string): string[] {
   return value;
 }
 
-/** Durable persistence for run focus and inbox-entry obligation associations. */
+/**
+ * Durable persistence for run focus and inbox-entry obligation associations.
+ * The `focus_resolution` column is the canonical focus-present sentinel,
+ * and all focus fields are written atomically to the run record.
+ */
 export class InboxFocusRepository {
   constructor(
     private readonly db: Database.Database,
@@ -80,7 +84,7 @@ export class InboxFocusRepository {
         .all(input.actorId, ...entryIds) as Array<{ id: string }>;
       if (owned.length !== entryIds.length) throw new Error("inbox entry not found");
 
-      this.db
+      const result = this.db
         .prepare(
           `UPDATE actor_runs SET
              focus_primary_obligation_id = ?,
@@ -98,6 +102,9 @@ export class InboxFocusRepository {
           JSON.stringify(diagnostics),
           input.runId
         );
+      if (result.changes !== 1) {
+        throw new Error("failed to persist run focus");
+      }
 
       const insertAssociation = this.db.prepare(
         `INSERT INTO inbox_entry_obligations
