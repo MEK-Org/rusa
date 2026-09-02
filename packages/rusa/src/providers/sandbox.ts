@@ -713,7 +713,7 @@ function providerWritableStateDirs(authMode: SandboxAuthMode | undefined): strin
  * omits fnm's toolchain dir. Writes are scoped to exactly four places: the
  * actor's own dir, the shared pnpm CAS, the provider's state dir, and `/tmp`.
  */
-export function buildMeshActorBwrapArgs(o: {
+function buildMeshActorBwrapArgs(o: {
   actorDir: string;
   authMode?: SandboxAuthMode;
   mcpConfigPath?: string;

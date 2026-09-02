@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildMeshActorBwrapArgs } from "./sandbox.js";
+import { buildActorBwrapArgs } from "./sandbox.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -23,14 +23,43 @@ function getHostPidByCmd(cmdMarker: string): number | null {
   return null;
 }
 
+function getHostPgid(pid: number): number | null {
+  try {
+    const output = execSync(`ps -o pgid= -p ${pid}`, { encoding: "utf8" }).trim();
+    if (output) {
+      const pgid = parseInt(output, 10);
+      if (!Number.isNaN(pgid)) return pgid;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 describe("Sandbox — transitive process-group kill inside bwrap (Issue #164 leg 1)", () => {
   const temps: string[] = [];
+  const pidsToKill: number[] = [];
+  const groupsToKill: number[] = [];
 
   afterEach(() => {
+    for (const pid of pidsToKill) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
+    }
+    pidsToKill.length = 0;
+
+    for (const pgid of groupsToKill) {
+      try {
+        process.kill(-pgid, "SIGKILL");
+      } catch {}
+    }
+    groupsToKill.length = 0;
+
     for (const d of temps) {
       try {
         rmSync(d, { recursive: true, force: true });
@@ -57,6 +86,12 @@ describe("Sandbox — transitive process-group kill inside bwrap (Issue #164 leg
         "#!/bin/bash",
         "set -euo pipefail",
         "",
+        "MY_PGID=$(ps -o pgid= $$ | tr -d ' ')",
+        'if [ "$MY_PGID" -eq 0 ]; then',
+        "  echo 'PGID is 0! --new-session is missing.' >&2",
+        "  exit 1",
+        "fi",
+        "",
         // 1. Spawn a child in a new process group (using monitor mode)
         "set -m",
         "( exec sleep 300 ) &",
@@ -79,21 +114,25 @@ describe("Sandbox — transitive process-group kill inside bwrap (Issue #164 leg
         `echo alive > ${cliPidFile}`,
         "",
         // 5. Spawn a later long-lived descendant for outside-in abort
-        // Uses exec -a to set argv[0] so the outer test can pgrep it uniquely on the host
-        `exec -a ${uniqueMarker} sleep 300`,
+        // Uses setsid so it escapes bwrap's host process group
+        `setsid bash -c "exec -a ${uniqueMarker} sleep 300" &`,
+        "sleep 300",
       ].join("\n")
     );
     chmodSync(script, 0o755);
 
-    const bwrapArgs = buildMeshActorBwrapArgs({
-      actorDir: tmp,
-      isE2eRoot: false, // Ensures --new-session is applied
-    });
+    const bwrapArgs = buildActorBwrapArgs(
+      tmp,
+      undefined, // authMode
+      undefined, // mcpConfigPath
+      false // isE2eRoot: false ensures --new-session is applied
+    );
 
     const child = spawn("bwrap", [...bwrapArgs.args, script], {
       detached: true, // For outside-in reap
       stdio: "ignore",
     });
+    if (child.pid) groupsToKill.push(child.pid);
 
     let exitCode: number | null = null;
     child.on("exit", (code, signal) => {
@@ -108,6 +147,7 @@ describe("Sandbox — transitive process-group kill inside bwrap (Issue #164 leg
         survived = true;
         break;
       }
+      if (exitCode !== null) break;
       await new Promise((r) => setTimeout(r, 50));
     }
 
@@ -125,11 +165,20 @@ describe("Sandbox — transitive process-group kill inside bwrap (Issue #164 leg
 
     expect(descendantHostPid).not.toBeNull();
     const pidToKill = descendantHostPid as number;
+    pidsToKill.push(pidToKill);
+
     // Sanity check: prove it's alive on the host before abort
     expect(() => process.kill(pidToKill, 0)).not.toThrow();
 
+    // Assert its PGID differs from bwrap child.pid (i.e., escaped bwrap's host group)
+    const descendantPgid = getHostPgid(pidToKill);
+    const bwrapPgid = child.pid ? getHostPgid(child.pid) : null;
+    expect(descendantPgid).not.toBeNull();
+    expect(bwrapPgid).not.toBeNull();
+    expect(descendantPgid).not.toBe(bwrapPgid);
+
     // Now test outside-in reap (abort)
-    // Kill the bwrap process group (child.pid)
+    // Kill only bwrap's group
     if (child.pid) {
       process.kill(-child.pid, "SIGKILL");
     }
