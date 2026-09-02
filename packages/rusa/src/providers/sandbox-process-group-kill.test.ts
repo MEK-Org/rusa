@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 
 import { tmpdir } from "node:os";
@@ -10,11 +10,24 @@ import { buildMeshActorBwrapArgs } from "./sandbox.js";
 // Helpers
 // ---------------------------------------------------------------------------
 
+function getHostPidByCmd(cmdMarker: string): number | null {
+  try {
+    const output = execSync(`pgrep -f "^${cmdMarker} 300$"`, { encoding: "utf8" }).trim();
+    if (output) {
+      const pid = parseInt(output.split("\n")[0], 10);
+      if (!Number.isNaN(pid)) return pid;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-describe("Sandbox — transitive process-group kill inside bwrap (ISSUE_NUM leg 1)", () => {
+describe("Sandbox — transitive process-group kill inside bwrap (Issue #164 leg 1)", () => {
   const temps: string[] = [];
 
   afterEach(() => {
@@ -32,40 +45,51 @@ describe("Sandbox — transitive process-group kill inside bwrap (ISSUE_NUM leg 
     const tmp = mkdtempSync(join(tmpdir(), "mc-sandbox-pgkill-"));
     temps.push(tmp);
 
-    const grandchildPidFile = join(tmp, "grandchild.pid");
     const cliPidFile = join(tmp, "cli.pid");
     const script = join(tmp, "fake-cli.sh");
+    // Generate a unique marker for the descendant to identify it safely from the host
+    const uniqueMarker = `rusa-descendant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     // A fake "provider CLI" running inside bwrap.
-    // It spawns a long-lived grandchild, records both PIDs.
-    // Then it tries to kill its child's process group, just like the real CLI killing a timed-out tool.
-    // If it shares the process group (no --new-session), getpgid() returns 0, and killpg(0) kills the CLI itself.
     writeFileSync(
       script,
       [
         "#!/bin/bash",
-        // Record our own PID so the test knows the CLI's host PID (bwrap child)
-        // Wait, inside bwrap the PID namespace is unshared, so BASHPID is 2.
-        // We can't use the inside PID to check liveness from the outside test.
-        // But we can check if bwrap itself exits 137.
-        // Let's spawn the child:
-        `( echo $BASHPID > ${grandchildPidFile}; exec sleep 300 ) &`,
+        "set -euo pipefail",
+        "",
+        // 1. Spawn a child in a new process group (using monitor mode)
+        "set -m",
+        "( exec sleep 300 ) &",
         "CHILD=$!",
+        "set +m",
         "sleep 0.15",
         "PGID=$(ps -o pgid= $CHILD | tr -d ' ')",
+        "",
+        // 2. Kill the child's process group, as the real CLI does on tool timeout
         "kill -KILL -- -$PGID",
+        "",
+        // 3. Prove its target dies (inner kill success is observable/asserted)
+        "wait $CHILD 2>/dev/null || true",
+        "if kill -0 $CHILD 2>/dev/null; then",
+        "  echo 'Target did not die!' >&2",
+        "  exit 1",
+        "fi",
+        "",
+        // 4. Fake CLI survives its own group kill (if --new-session wasn't used, the CLI would share the PGID and die here)
         `echo alive > ${cliPidFile}`,
-        "exec sleep 300",
+        "",
+        // 5. Spawn a later long-lived descendant for outside-in abort
+        // Uses exec -a to set argv[0] so the outer test can pgrep it uniquely on the host
+        `exec -a ${uniqueMarker} sleep 300`,
       ].join("\n")
     );
     chmodSync(script, 0o755);
 
     const bwrapArgs = buildMeshActorBwrapArgs({
       actorDir: tmp,
-      isE2eRoot: false,
+      isE2eRoot: false, // Ensures --new-session is applied
     });
 
-    // Run the fake CLI inside the sandbox
     const child = spawn("bwrap", [...bwrapArgs.args, script], {
       detached: true, // For outside-in reap
       stdio: "ignore",
@@ -73,7 +97,6 @@ describe("Sandbox — transitive process-group kill inside bwrap (ISSUE_NUM leg 
 
     let exitCode: number | null = null;
     child.on("exit", (code, signal) => {
-      // signal is null if it exited, code is 137 if it was SIGKILLed
       exitCode = signal ? (signal === "SIGKILL" ? 137 : 143) : code;
     });
 
@@ -91,18 +114,39 @@ describe("Sandbox — transitive process-group kill inside bwrap (ISSUE_NUM leg 
     expect(survived).toBe(true);
     expect(exitCode).toBeNull(); // Still running
 
+    // Find the host PID of the long-lived descendant
+    let descendantHostPid: number | null = null;
+    const findDeadline = Date.now() + 5000;
+    while (Date.now() < findDeadline) {
+      descendantHostPid = getHostPidByCmd(uniqueMarker);
+      if (descendantHostPid) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    expect(descendantHostPid).not.toBeNull();
+    const pidToKill = descendantHostPid as number;
+    // Sanity check: prove it's alive on the host before abort
+    expect(() => process.kill(pidToKill, 0)).not.toThrow();
+
     // Now test outside-in reap (abort)
     // Kill the bwrap process group (child.pid)
     if (child.pid) {
       process.kill(-child.pid, "SIGKILL");
     }
 
-    // Wait for exit
+    // Wait for bwrap to exit
     await new Promise((r) => {
       if (exitCode !== null) r(null);
       else child.on("exit", () => r(null));
     });
 
     expect(exitCode).toBe(137);
+
+    // Give OS a moment to reap the descendant process tree
+    await new Promise((r) => setTimeout(r, 150));
+
+    // THE ARBITER ASSERTION:
+    // Prove outside-in abort leaves the later long-lived descendant dead
+    expect(() => process.kill(pidToKill, 0)).toThrow(); // Should throw ESRCH
   });
 });
