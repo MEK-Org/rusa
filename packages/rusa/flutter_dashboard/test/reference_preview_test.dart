@@ -131,6 +131,81 @@ void main() {
       expect(fourLines, greaterThan(oneLine * 3));
     });
 
+    testWidgets('displays cache state chips correctly', (tester) async { 
+      for (final state in ['fresh', 'stale', 'pending', 'unavailable']) { 
+        await tester.pumpWidget(_host(ReferencePreview( 
+          reference: ReferenceDto( 
+            ref: 'github:foo/bar/issues/1', 
+            scheme: 'github', 
+            title: 'issue', 
+            cacheState: state, 
+          ), 
+        ))); 
+        expect(find.text(state.toUpperCase()), findsOneWidget); 
+      } 
+    }); 
+ 
+    testWidgets('truncates long text and allows expanding', (tester) async { 
+      final longBody = List.filled(10, 'Long line of text').join('\n'); 
+      await tester.pumpWidget(_host(ReferencePreview( 
+        reference: ReferenceDto( 
+          ref: 'mesh:123', 
+          scheme: 'mesh', 
+          title: 'title', 
+          body: longBody, 
+        ), 
+      ))); 
+       
+      expect(find.text('Show more'), findsOneWidget); 
+      await tester.tap(find.text('Show more')); 
+      await tester.pumpAndSettle(); 
+      expect(find.text('Show less'), findsOneWidget); 
+    }); 
+ 
+    testWidgets('displays different entity types properly', (tester) async { 
+      await tester.pumpWidget(_host(const ReferencePreview( 
+        reference: ReferenceDto( 
+          ref: 'github:foo/bar/issues/1', 
+          scheme: 'github', 
+          title: 'Issue 1', 
+          entity: {'type': 'github_issue', 'title': 'My Issue', 'description': 'The desc'}, 
+        ), 
+      ))); 
+      expect(find.text('My Issue'), findsOneWidget); 
+      expect(find.text('The desc'), findsOneWidget); 
+ 
+      await tester.pumpWidget(_host(const ReferencePreview( 
+        reference: ReferenceDto( 
+          ref: 'github:foo/bar/pulls/2', 
+          scheme: 'github', 
+          title: 'PR 2', 
+          entity: {'type': 'github_pull_request', 'title': 'My PR', 'description': 'The PR desc'}, 
+        ), 
+      ))); 
+      expect(find.text('My PR'), findsOneWidget); 
+      expect(find.text('The PR desc'), findsOneWidget); 
+ 
+      await tester.pumpWidget(_host(const ReferencePreview( 
+        reference: ReferenceDto( 
+          ref: 'gchat:spaces/abc', 
+          scheme: 'gchat', 
+          title: 'Space', 
+          entity: {'type': 'gchat_space', 'name': 'My Space'}, 
+        ), 
+      ))); 
+      expect(find.text('My Space'), findsOneWidget); 
+ 
+      await tester.pumpWidget(_host(const ReferencePreview( 
+        reference: ReferenceDto( 
+          ref: 'gchat:spaces/abc/messages/123', 
+          scheme: 'gchat', 
+          title: 'Message', 
+          entity: {'type': 'gchat_message', 'contents': 'Msg content'}, 
+        ), 
+      ))); 
+      expect(find.text('Msg content'), findsOneWidget); 
+    });
+
     testWidgets('says why it could not expand, rather than showing nothing', (tester) async {
       await tester.pumpWidget(_host(const ReferencePreview(
         reference: ReferenceDto(

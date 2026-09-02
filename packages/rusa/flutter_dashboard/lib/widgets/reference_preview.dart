@@ -5,15 +5,7 @@ import '../theme.dart';
 import '../util.dart';
 
 /// One rendering for any resolved reference.
-///
-/// Shared by the obligation and inbox call sites so source metadata is presented
-/// consistently without two copies of the same card.
-///
-/// In v1 only mesh chat resolves to real text. Everything else arrives with
-/// [ReferenceDto.unavailable] set and renders as a citation we can name but not
-/// yet expand — which is the honest state, and visibly different from a
-/// citation with nothing behind it.
-class ReferencePreview extends StatelessWidget {
+class ReferencePreview extends StatefulWidget {
   const ReferencePreview({
     super.key,
     required this.reference,
@@ -28,12 +20,19 @@ class ReferencePreview extends StatelessWidget {
   final String? attachedBy;
 
   @override
-  Widget build(BuildContext context) {
-    var displayTitle = reference.title;
-    var displayBody = reference.body?.trim() ?? '';
+  State<ReferencePreview> createState() => _ReferencePreviewState();
+}
 
-    if (reference.entity != null) {
-      final e = reference.entity!;
+class _ReferencePreviewState extends State<ReferencePreview> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    var displayTitle = widget.reference.title;
+    var displayBody = widget.reference.body?.trim() ?? '';
+
+    if (widget.reference.entity != null) {
+      final e = widget.reference.entity!;
       final type = e['type'] as String?;
       if (type == 'github_issue' || type == 'github_pull_request') {
         displayTitle = e['title'] as String? ?? displayTitle;
@@ -47,6 +46,7 @@ class ReferencePreview extends StatelessWidget {
     }
 
     final hasBody = displayBody.isNotEmpty;
+    final isLarge = displayBody.length > 300 || '\n'.allMatches(displayBody).length > 4;
 
     return Container(
       width: double.infinity,
@@ -63,10 +63,10 @@ class ReferencePreview extends StatelessWidget {
         children: [
           Row(
             children: [
-              _SchemeChip(reference.scheme),
-              if (reference.cacheState != null && reference.cacheState != 'local') ...[
+              _SchemeChip(widget.reference.scheme),
+              if (widget.reference.cacheState != null && widget.reference.cacheState != 'local') ...[
                 const SizedBox(width: 8),
-                _StateChip(reference.cacheState!),
+                _StateChip(widget.reference.cacheState!),
               ],
               const SizedBox(width: 8),
               Expanded(
@@ -81,10 +81,10 @@ class ReferencePreview extends StatelessWidget {
                   ),
                 ),
               ),
-              if (reference.timestamp != null) ...[
+              if (widget.reference.timestamp != null) ...[
                 const SizedBox(width: 8),
                 Text(
-                  formatTs(reference.timestamp!),
+                  formatTs(widget.reference.timestamp!),
                   style: const TextStyle(
                     color: MeshColors.textMuted,
                     fontSize: 10.5,
@@ -94,10 +94,10 @@ class ReferencePreview extends StatelessWidget {
               ],
             ],
           ),
-          if (label != null && label!.trim().isNotEmpty) ...[
+          if (widget.label != null && widget.label!.trim().isNotEmpty) ...[
             const SizedBox(height: 6),
             Text(
-              label!,
+              widget.label!,
               style: const TextStyle(
                 color: MeshColors.accent,
                 fontSize: 11.5,
@@ -105,10 +105,10 @@ class ReferencePreview extends StatelessWidget {
               ),
             ),
           ],
-          if (reference.author != null && reference.author!.trim().isNotEmpty) ...[
+          if (widget.reference.author != null && widget.reference.author!.trim().isNotEmpty) ...[
             const SizedBox(height: 6),
             Text(
-              'by ${reference.author}',
+              'by ${widget.reference.author}',
               style: const TextStyle(
                 color: MeshColors.textMuted,
                 fontSize: 10.5,
@@ -117,21 +117,47 @@ class ReferencePreview extends StatelessWidget {
           ],
           const SizedBox(height: 8),
           if (hasBody)
-            // No `maxLines`: SelectableText wraps an EditableText, which sizes
-            // itself to `maxLines` rather than to its content, so a one-line
-            // citation rendered eight lines tall. The card is meant to be as
-            // tall as what it is quoting.
-            SelectableText(
-              displayBody,
-              style: const TextStyle(
-                color: Color(0xFFCBD5E1),
-                fontSize: 12,
-                height: 1.45,
-              ),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _expanded || !isLarge
+                    ? SelectableText(
+                        displayBody,
+                        style: const TextStyle(
+                          color: Color(0xFFCBD5E1),
+                          fontSize: 12,
+                          height: 1.45,
+                        ),
+                      )
+                    : Text(
+                        displayBody,
+                        maxLines: 5,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Color(0xFFCBD5E1),
+                          fontSize: 12,
+                          height: 1.45,
+                        ),
+                      ),
+                if (isLarge) ...[
+                  const SizedBox(height: 6),
+                  InkWell(
+                    onTap: () => setState(() => _expanded = !_expanded),
+                    child: Text(
+                      _expanded ? 'Show less' : 'Show more',
+                      style: const TextStyle(
+                        color: MeshColors.accent,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                ],
+              ],
             )
           else
             Text(
-              reference.unavailable ?? 'No content.',
+              widget.reference.unavailable ?? 'No content.',
               style: const TextStyle(
                 color: MeshColors.textMuted,
                 fontSize: 11.5,
@@ -143,7 +169,7 @@ class ReferencePreview extends StatelessWidget {
             children: [
               Expanded(
                 child: SelectableText(
-                  reference.ref,
+                  widget.reference.ref,
                   style: const TextStyle(
                     color: MeshColors.textMuted,
                     fontSize: 10.5,
@@ -151,19 +177,19 @@ class ReferencePreview extends StatelessWidget {
                   ),
                 ),
               ),
-              if (attachedBy != null) ...[
+              if (widget.attachedBy != null) ...[
                 const SizedBox(width: 8),
                 Text(
-                  'cited by $attachedBy',
+                  'cited by ${widget.attachedBy}',
                   style: const TextStyle(color: MeshColors.textMuted, fontSize: 10.5),
                 ),
               ],
             ],
           ),
-          if (reference.url != null && reference.url!.trim().isNotEmpty) ...[
+          if (widget.reference.url != null && widget.reference.url!.trim().isNotEmpty) ...[
             const SizedBox(height: 6),
             SelectableText(
-              reference.url!,
+              widget.reference.url!,
               style: const TextStyle(
                 color: MeshColors.accent,
                 fontSize: 10.5,

@@ -7,71 +7,122 @@ import {
   resolveReferenceSync,
 } from "./resolve.js";
 
-const DEFAULT_TTL_MS = 1000 * 60 * 60; // 1 hour
-const DEADLINE_MS = 250; // 250ms for UI deadline
+export interface ReferenceCacheServiceOptions {
+  repo: ReferenceCacheRepository;
+  ttlMs?: number;
+  deadlineMs?: number;
+  logger?: {
+    info: (event: string, data?: Record<string, unknown>) => void;
+    error: (event: string, data?: Record<string, unknown>) => void;
+  };
+}
 
 export class ReferenceCacheService {
-  constructor(private readonly repo: ReferenceCacheRepository) {}
+  private readonly repo: ReferenceCacheRepository;
+  private readonly ttlMs: number;
+  private readonly deadlineMs: number;
+  private readonly logger?: ReferenceCacheServiceOptions["logger"];
+
+  constructor(options: ReferenceCacheServiceOptions) {
+    this.repo = options.repo;
+    this.ttlMs = options.ttlMs ?? 1000 * 60 * 60; // 1 hour
+    this.deadlineMs = options.deadlineMs ?? 250; // 250ms for UI deadline
+    this.logger = options.logger;
+  }
 
   async get(ref: string, deps: ReferenceResolverDeps): Promise<ResolvedReferenceWithEntity> {
     const reference = parseReference(ref);
+    const key = reference.key;
+
     if (reference.scheme === "mesh" || reference.scheme === "system") {
       // Local reference
-      const resolved = resolveReferenceSync(ref, deps);
+      const resolved = resolveReferenceSync(key, deps);
       return { ...resolved, cacheState: "local" };
     }
 
-    const cached = this.repo.get(ref);
+    const cached = this.repo.get(key);
     const now = new Date();
 
     if (cached) {
       const refreshAfter = new Date(cached.refresh_after);
       let entity: ReferenceEntity | undefined;
-      try {
-        entity = JSON.parse(cached.entity_json) as ReferenceEntity;
-      } catch {
-        // Ignore parse error, treat as unavailable
+      let valid = false;
+      if (cached.document_version === 1) {
+        try {
+          entity = JSON.parse(cached.entity_json) as ReferenceEntity;
+          valid = true;
+        } catch {
+          // Ignore parse error, treat as unavailable
+        }
       }
 
-      const base = resolveReferenceSync(ref, deps);
-      if (now < refreshAfter) {
-        // Fresh external hit
-        return { ...base, entity, unavailable: null, cacheState: "fresh" };
-      }
+      if (valid) {
+        const base = resolveReferenceSync(key, deps);
+        if (now < refreshAfter) {
+          // Fresh external hit
+          this.logger?.info("reference_cache_hit", { state: "fresh", scheme: reference.scheme });
+          return { ...base, entity, unavailable: null, cacheState: "fresh" };
+        }
 
-      // Stale external hit
-      this.triggerRefresh(ref, deps).catch(() => {}); // Fire and forget
-      return { ...base, entity, unavailable: null, cacheState: "stale" };
+        // Stale external hit
+        this.logger?.info("reference_cache_hit", { state: "stale", scheme: reference.scheme });
+        this.triggerRefresh(key, deps).catch(() => {}); // Fire and forget
+        return { ...base, entity, unavailable: null, cacheState: "stale" };
+      }
     }
 
     // Cold miss
-    const readPromise = this.performProviderRead(ref, deps);
+    this.logger?.info("reference_cache_miss", { scheme: reference.scheme });
+    const readPromise = this.performProviderRead(key, deps);
     const deadlinePromise = new Promise<"deadline">((resolve) =>
-      setTimeout(() => resolve("deadline"), DEADLINE_MS)
+      setTimeout(() => resolve("deadline"), this.deadlineMs)
     );
 
     const result = await Promise.race([readPromise, deadlinePromise]);
 
     if (result === "deadline") {
       // Background the read
+      this.logger?.info("reference_cache_deadline", { scheme: reference.scheme });
       readPromise.catch(() => {});
-      const base = resolveReferenceSync(ref, deps);
-      return { ...base, cacheState: "pending" };
+      const base = resolveReferenceSync(key, deps);
+      return { ...base, unavailable: "loading context", cacheState: "pending" };
     }
 
     if (result) {
       // Success
-      const base = resolveReferenceSync(ref, deps);
+      this.logger?.info("reference_cache_resolved", {
+        scheme: reference.scheme,
+        type: result.type,
+      });
+      const base = resolveReferenceSync(key, deps);
       return { ...base, entity: result, unavailable: null, cacheState: "fresh" };
     }
 
     // Unavailable result
-    const base = resolveReferenceSync(ref, deps);
-    return { ...base, cacheState: "unavailable" };
+    this.logger?.info("reference_cache_unavailable", { scheme: reference.scheme });
+    const base = resolveReferenceSync(key, deps);
+    return { ...base, unavailable: "could not load context", cacheState: "unavailable" };
   }
 
   private async triggerRefresh(ref: string, deps: ReferenceResolverDeps): Promise<void> {
-    await this.performProviderRead(ref, deps);
+    const reference = parseReference(ref);
+    try {
+      const result = await this.performProviderRead(ref, deps);
+      if (result) {
+        this.logger?.info("reference_cache_refresh", {
+          scheme: reference.scheme,
+          type: result.type,
+          outcome: "success",
+        });
+      } else {
+        this.logger?.info("reference_cache_refresh", {
+          scheme: reference.scheme,
+          outcome: "unavailable",
+        });
+      }
+    } catch (_e) {
+      this.logger?.error("reference_cache_refresh", { scheme: reference.scheme, outcome: "error" });
+    }
   }
 
   private async performProviderRead(
@@ -131,9 +182,9 @@ export class ReferenceCacheService {
 
     if (entity) {
       const now = new Date();
-      const refreshAfter = new Date(now.getTime() + DEFAULT_TTL_MS);
+      const refreshAfter = new Date(now.getTime() + this.ttlMs);
       this.repo.set({
-        ref,
+        ref: reference.key,
         document_version: 1,
         entity_json: JSON.stringify(entity),
         fetched_at: now.toISOString(),

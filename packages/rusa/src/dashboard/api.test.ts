@@ -66,7 +66,7 @@ async function call(
   path: string,
   body?: string,
   acceptEncoding?: string
-): { handled: boolean; res: MockRes; req: MockReq } {
+): Promise<{ handled: boolean; res: MockRes; req: MockReq }> {
   const req = new MockReq();
   req.method = method;
   req.url = path;

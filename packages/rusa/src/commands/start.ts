@@ -2730,7 +2730,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           meshChat: getRepositories().meshChat,
           obligations: getRepositories().obligations,
           inbox: getRepositories().inbox,
-          referenceCache: new ReferenceCacheService(getRepositories().referenceCache),
+          referenceCache: new ReferenceCacheService({
+            repo: getRepositories().referenceCache,
+            logger: log,
+          }),
           chatClient: chatClient ?? undefined,
           issueClient: issueClient,
           emitter: meshEmitter,
