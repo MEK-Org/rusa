@@ -86,22 +86,21 @@ export class ReferenceCacheService {
       if (issue) {
         try {
           const found = (await deps.issueClient.getIssue(
-            issue.owner,
-            issue.repo,
+            `${issue.owner}/${issue.repo}`,
             issue.number
           )) as unknown as Record<string, unknown>;
           if (found) {
             if (issue.collection === "pulls") {
               entity = {
                 type: "github_pull_request",
-                title: found.title ?? "",
-                description: found.body ?? "",
+                title: (found.title as string | undefined) ?? "",
+                description: (found.body as string | undefined) ?? "",
               };
             } else {
               entity = {
                 type: "github_issue",
-                title: found.title ?? "",
-                description: found.body ?? "",
+                title: (found.title as string | undefined) ?? "",
+                description: (found.body as string | undefined) ?? "",
               };
             }
           }

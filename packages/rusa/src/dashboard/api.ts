@@ -78,7 +78,7 @@ export interface DashboardDataDeps {
   geminiApiKey?: string;
   referenceCache?: import("../references/cache-service.js").ReferenceCacheService;
   chatClient?: import("../chat/types.js").ChatClient;
-  issueClient?: { getIssue?: (owner: string, repo: string, number: number) => Promise<unknown> };
+  issueClient?: { getIssue?: (repo: string, number: number) => Promise<unknown> };
 }
 
 /** Route prefix for the per-actor avatar endpoint . */

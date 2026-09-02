@@ -59,7 +59,7 @@ export interface ReferenceResolverDeps {
   chatClient?: Pick<ChatClient, "getMessage" | "getSpace">;
   /** Reads issues and pull requests; absent when no tracker is wired. */
   issueClient?: {
-    getIssue?: (owner: string, repo: string, number: number) => Promise<unknown>;
+    getIssue?: (repo: string, number: number) => Promise<unknown>;
   };
 }
 
@@ -229,7 +229,7 @@ async function resolveGitHub(
   if (!deps.issueClient?.getIssue) {
     return { ...unresolved(reference, reference.key, "tracker not configured"), url };
   }
-  const found = (await deps.issueClient.getIssue(issue.owner, issue.repo, issue.number)) as {
+  const found = (await deps.issueClient.getIssue(`${issue.owner}/${issue.repo}`, issue.number)) as {
     title?: string;
     body?: string;
     user?: { login?: string };
