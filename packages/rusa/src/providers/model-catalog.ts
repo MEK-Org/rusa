@@ -446,7 +446,7 @@ export function validateModelPin(provider: string, pin: string): ModelPinValidat
  * Reads the `[models."..."]` tables and emits each config key as the only
  * accepted identifier. The Kimi CLI's `-m/--model` takes the config key
  * ("LLM model alias to use for this invocation"), never the underlying
- * `model` slug, so the bare slug is not advertised (ISSUE_NUM).
+ * `model` slug, so the bare slug is not advertised.
  */
 export function extractKimiModelsFromToml(tomlContent: string): ModelEntry[] {
   try {
