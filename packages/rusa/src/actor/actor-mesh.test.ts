@@ -3279,6 +3279,52 @@ describe("ActorMesh", () => {
     expect(() => mesh.reparentThread(b, dead)).toThrow(/non-active/);
   });
 
+  it("setActorModel queues a run if the actor is idle and has unhandled inbox entries", async () => {
+    let shouldFail = false;
+    let runCount = 0;
+    const { mesh, tick } = setup({
+      sharedProvider: {
+        name: "test-provider",
+        providerName: "test-provider",
+        run: async () => {
+          runCount++;
+          if (shouldFail) return { success: false, exitCode: 1, output: "failed" };
+          return { success: true, exitCode: 0, output: "ok" };
+        },
+      },
+    });
+
+    const worker = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      provider: "test-provider",
+      model: "model-a",
+      context: { type: "portable", mode: "ledger" },
+    });
+
+    mesh.setActorModel(worker, "model-b", "root");
+    await tick();
+    expect(runCount).toBe(0);
+
+    // Queue a run that fails.
+    shouldFail = true;
+    mesh.sendMessage(worker, "work", "root");
+    await tick();
+    expect(runCount).toBe(1);
+
+    expect(mesh.activeRunState(worker)).toBeNull(); // idle
+
+    // Re-pin should queue it now.
+    mesh.setActorModel(worker, "model-c", "root");
+
+    // Tick to let the new run execute.
+    shouldFail = false;
+    await tick();
+
+    expect(runCount).toBe(2);
+    expect(mesh.registry.get(worker)?.model).toBe("model-c");
+  });
+
   it("reviveThread rolls back to retired if re-instantiation fails, staying re-tryable ", async () => {
     let failRevive = true;
     const { mesh, registry, tick } = setup({

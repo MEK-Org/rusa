@@ -2567,6 +2567,13 @@ export class ActorMesh {
       }
     }
     this.registry.patch(id, patch);
+
+    if (this.inboxStore && this.live.has(id) && this.activeRunState(id) === null) {
+      const unhandled = this.inboxStore.list(id, { status: "unhandled" }).entries;
+      if (unhandled.length > 0) {
+        this.notifyInboxChanged(id);
+      }
+    }
   }
 
   /**
