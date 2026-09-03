@@ -2963,7 +2963,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // runner occasionally exceeds the 5s default and reds the bless PR. Give it
   }, 15000);
 
-  it("requires provider and model on spawn and refuses unresolvable configurations loudly (ISSUE_NUM, ISSUE_NUM)", async () => {
+  it("requires provider and model on spawn and refuses unresolvable configurations loudly", async () => {
     let mesh: ActorMesh | undefined;
     const config = {
       github: {
@@ -3063,9 +3063,23 @@ describe("runStart webhook event routing (Phase 4)", () => {
         charter: "invalid model pin worker",
         parentId: "root",
         provider: "antigravity",
-        model: "bad-unsupported-model",
+        model: "gemini-bad-unsupported-model",
       });
     }).toThrow(/model pin validation failed/);
+
+    expect(() => {
+      activeMesh.spawn({
+        charter: "non-Gemini Antigravity worker",
+        parentId: "root",
+        provider: "antigravity",
+        model: "claude-sonnet-4-6",
+      });
+    }).toThrow(/Antigravity supports Gemini models only/);
+    expect(
+      activeMesh.registry
+        .list()
+        .find((record) => record.charter === "non-Gemini Antigravity worker")
+    ).toBeUndefined();
 
     // 5. Positive test: explicit-and-VALID provider/model -> succeeds
     const validWorkerId = activeMesh.spawn({
@@ -3092,6 +3106,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("claude");
     expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
 
+    expect(() => {
+      activeMesh.setActorModel(portableWorkerId, "gpt-oss-120b-medium", "root", "antigravity");
+    }).toThrow(/Antigravity supports Gemini models only/);
+    expect(activeMesh.registry.get(portableWorkerId)?.desiredProvider).toBeUndefined();
+    expect(activeMesh.registry.get(portableWorkerId)?.desiredModel).toBeUndefined();
+
     // Unconfigured target provider is rejected before state change, record untouched
     expect(() => {
       activeMesh.setActorModel(
@@ -3116,7 +3136,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(() => {
       activeMesh.setActorModel(
         portableWorkerId,
-        "bad-model-for-antigravity",
+        "gemini-bad-model-for-antigravity",
         "root",
         "antigravity"
       );

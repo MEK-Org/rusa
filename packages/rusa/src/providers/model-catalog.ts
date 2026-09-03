@@ -29,6 +29,11 @@ export interface ModelEntry {
 
 export type ModelCommandLineField = keyof ModelEntry;
 
+/** Antigravity accepts only Gemini-family model pins in this mesh. */
+export function isAntigravityGeminiModel(model: string): boolean {
+  return /^gemini(?:[\s._-]|$)/i.test(model.trim());
+}
+
 export interface ProviderModelDescriptor {
   provider: string;
   /** The ModelEntry field this provider's CLI accepts for `--model`. */
@@ -307,6 +312,9 @@ export function normalizeModelEntries(
     const baseModels = new Map<string, ModelEntry>();
 
     for (const entry of entries) {
+      if (!isAntigravityGeminiModel(entry.identifier)) {
+        continue;
+      }
       let parsedBase = entry.identifier;
       let parsedEffort: string | undefined;
 
@@ -504,7 +512,7 @@ export function parseAgyModelsOutput(raw: string): ModelEntry[] {
       identifier = match[1].trim();
       displayLabel = match[2].trim();
     }
-    if (identifier && displayLabel) {
+    if (identifier && displayLabel && isAntigravityGeminiModel(identifier)) {
       entries.push({ identifier, displayLabel, passable: true });
     }
   }
