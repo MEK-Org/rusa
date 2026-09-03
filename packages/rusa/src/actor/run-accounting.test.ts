@@ -3,9 +3,25 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import type { RunResult } from "../providers/types.js";
-import { createRunAccounting, type RunAccounting } from "./run-accounting.js";
+import {
+  type ActorRunLaunchConfig,
+  createRunAccounting,
+  type RunAccounting,
+} from "./run-accounting.js";
 
 const RESULT: RunResult = { success: true, output: "done", exitCode: 0 };
+const CODEX_LAUNCH = {
+  provider: "codex",
+  model: "gpt-5.6-sol",
+  effortApplicable: true,
+  effort: "high",
+} satisfies ActorRunLaunchConfig;
+const CLAUDE_LAUNCH = {
+  provider: "claude",
+  model: "claude-sonnet-5",
+  effortApplicable: true,
+  effort: "medium",
+} satisfies ActorRunLaunchConfig;
 
 describe("createRunAccounting", () => {
   let db: Database.Database;
@@ -20,17 +36,26 @@ describe("createRunAccounting", () => {
   });
 
   it("opens and closes one run per actor", () => {
-    const runId = accounting.begin("actor-a", "codex");
+    const runId = accounting.begin("actor-a", CODEX_LAUNCH);
     expect(accounting.activeRunId("actor-a")).toBe(runId);
 
     expect(accounting.complete("actor-a", RESULT)).toBe(runId);
     expect(accounting.activeRunId("actor-a")).toBeUndefined();
-    expect(runs.getById(runId)).toMatchObject({ outcome: "completed", success: true });
+    expect(runs.getById(runId)).toMatchObject({
+      outcome: "completed",
+      success: true,
+      provider: CODEX_LAUNCH.provider,
+      model: CODEX_LAUNCH.model,
+      effort: CODEX_LAUNCH.effort,
+      effortIsApplicable: true,
+    });
   });
 
   it("refuses to open a second run for an actor that already has one", () => {
-    accounting.begin("actor-a", "codex");
-    expect(() => accounting.begin("actor-a", "codex")).toThrow(/already has an active durable run/);
+    accounting.begin("actor-a", CODEX_LAUNCH);
+    expect(() => accounting.begin("actor-a", CODEX_LAUNCH)).toThrow(
+      /already has an active durable run/
+    );
   });
 
   it("refuses to close a run that was never opened", () => {
@@ -38,7 +63,7 @@ describe("createRunAccounting", () => {
   });
 
   it("closes a run once — a second completion finds nothing to close", () => {
-    accounting.begin("actor-a", "codex");
+    accounting.begin("actor-a", CODEX_LAUNCH);
     accounting.complete("actor-a", RESULT);
     expect(() => accounting.complete("actor-a", RESULT)).toThrow(/no active durable run/);
   });
@@ -63,7 +88,7 @@ describe("createRunAccounting", () => {
     } as unknown as ActorRunRepository;
     const flaky = createRunAccounting(() => flakyRuns);
 
-    const runId = flaky.begin("actor-a", "codex");
+    const runId = flaky.begin("actor-a", CODEX_LAUNCH);
     failWrite = true;
     expect(() => flaky.complete("actor-a", RESULT)).toThrow(/database is locked/);
 
@@ -72,7 +97,7 @@ describe("createRunAccounting", () => {
     // close it, and would let a second run start over the top of it.
     expect(runs.getById(runId)).toMatchObject({ outcome: null });
     expect(flaky.activeRunId("actor-a")).toBe(runId);
-    expect(() => flaky.begin("actor-a", "codex")).toThrow(/already has an active durable run/);
+    expect(() => flaky.begin("actor-a", CODEX_LAUNCH)).toThrow(/already has an active durable run/);
 
     failWrite = false;
     expect(flaky.complete("actor-a", RESULT)).toBe(runId);
@@ -90,7 +115,7 @@ describe("createRunAccounting", () => {
     } as unknown as ActorRunRepository;
     const flaky = createRunAccounting(() => flakyRuns);
 
-    const runId = flaky.begin("actor-a", "codex");
+    const runId = flaky.begin("actor-a", CODEX_LAUNCH);
     failWrite = true;
     expect(() => flaky.abandon("actor-a", "coalesced")).toThrow(/database is locked/);
     expect(flaky.activeRunId("actor-a")).toBe(runId);
@@ -101,15 +126,15 @@ describe("createRunAccounting", () => {
   });
 
   it("abandons an open run and reports none when there is nothing open", () => {
-    const runId = accounting.begin("actor-a", "codex");
+    const runId = accounting.begin("actor-a", CODEX_LAUNCH);
     expect(accounting.abandon("actor-a", "coalesced")).toBe(runId);
     expect(runs.getById(runId)).toMatchObject({ outcome: "abandoned", abandonReason: "coalesced" });
     expect(accounting.abandon("actor-a", "coalesced")).toBeNull();
   });
 
   it("keeps each actor's run separate", () => {
-    const a = accounting.begin("actor-a", "codex");
-    const b = accounting.begin("actor-b", "claude");
+    const a = accounting.begin("actor-a", CODEX_LAUNCH);
+    const b = accounting.begin("actor-b", CLAUDE_LAUNCH);
     expect(a).not.toBe(b);
 
     accounting.complete("actor-a", RESULT);

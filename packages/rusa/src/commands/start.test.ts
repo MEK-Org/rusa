@@ -3487,6 +3487,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const payload = JSON.parse(runStartEvents[0]?.payload ?? "{}") as {
       model?: string;
       effort?: string;
+      runId?: string;
     };
     // Gap #1 (#199 amend, extended to pools): this run's own run_start
     // payload must record the now-live model — the entry this very run
@@ -3494,6 +3495,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // variable at root construction.
     expect(payload.model).toBe("Gemini 4.1 Ultra");
     expect(payload.model).not.toBe(originalModel);
+    expect(payload.runId).toBeTruthy();
+    expect(getRepositories().actorRuns.getById(payload.runId ?? "")).toMatchObject({
+      provider: "agy",
+      model: "Gemini 4.1 Ultra",
+      effort: "high",
+      effortIsApplicable: true,
+    });
   });
 
   it("root's beforeRun halt-gate checks the entry that will actually launch, not the frozen boot-time provider (#199 amend gap 2, extended to pools)", async () => {

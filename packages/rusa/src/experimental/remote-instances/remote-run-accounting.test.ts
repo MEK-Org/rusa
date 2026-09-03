@@ -76,8 +76,17 @@ describe("remote actor run accounting", () => {
 
     const actorOptions = {
       modelConfig: [{ provider: "codex", model: "gpt-5.5" }],
-      onRunStart: (_responsive: boolean, _inject: unknown, selected: { provider: string }) => {
-        accounting.begin(ACTOR_ID, selected.provider);
+      onRunStart: (
+        _responsive: boolean,
+        _inject: unknown,
+        selected: { provider: string; model: string; effort?: string }
+      ) => {
+        accounting.begin(ACTOR_ID, {
+          provider: selected.provider,
+          model: selected.model,
+          effortApplicable: true,
+          effort: selected.effort ?? null,
+        });
       },
       log: (chunk: string) => {
         if (chunk.includes("run accounting failed")) accountingErrors.push(chunk);

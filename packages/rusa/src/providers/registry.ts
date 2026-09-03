@@ -18,6 +18,7 @@ export {
   DEFAULT_ROOT_EFFORT,
   DEFAULT_ROOT_PROVIDER,
   providerCapabilityName,
+  providerSupportsEffort,
   validateProviderSelection,
 } from "./provider-selection.js";
 

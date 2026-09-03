@@ -97,6 +97,7 @@ describe("Database Migration System", () => {
       "0038_event_sources",
       "0040_host_jobs",
       "0041_model_classes",
+      "0042_actor_run_launch_config",
     ]);
 
     const meshEventsColumns = (

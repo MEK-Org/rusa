@@ -87,7 +87,7 @@ import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-thro
 import { resolveRootActorId } from "../actor/root-actor-id.js";
 import { RootControlService } from "../actor/root-control.js";
 import { buildRootPrompt } from "../actor/root-prompt.js";
-import { createRunAccounting } from "../actor/run-accounting.js";
+import { createRunAccounting, projectActorRunLaunchConfig } from "../actor/run-accounting.js";
 import {
   ensureWakeToken,
   wakePortPath,
@@ -203,6 +203,7 @@ import {
   DEFAULT_ROOT_PROVIDER,
   normalizeFallbackModel,
   providerCapabilityName,
+  providerSupportsEffort,
   providerThrottleKey,
   resolveProvider,
   resolveRootProvider,
@@ -2209,12 +2210,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             // The run actually launched: the queued reservation this
             // describes no longer exists to cancel or report on.
             mesh.clearSelection(id);
-            const providerName = providerThrottleKey(selected.provider, config);
-            const runId = beginActorRun(id, providerName);
+            const launchConfig = projectActorRunLaunchConfig(
+              selected,
+              providerThrottleKey(selected.provider, config),
+              providerSupportsEffort(providerCapabilityName(selected.provider, config))
+            );
+            const runId = beginActorRun(id, launchConfig);
             runLogger(id, runId).info("run_start", {
-              provider: providerName,
-              model: selected.model,
-              effort: selected.effort,
+              provider: launchConfig.provider,
+              model: launchConfig.model,
+              effort: launchConfig.effort,
               responsive,
             });
             mesh.recordEvent({
@@ -2225,9 +2230,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                 : undefined,
               body: injectRecord ? JSON.stringify(injectRecord) : undefined,
               payload: JSON.stringify({
-                provider: providerName,
-                model: selected.model,
-                effort: selected.effort,
+                provider: launchConfig.provider,
+                model: launchConfig.model,
+                effort: launchConfig.effort,
                 responsive,
                 runId,
               }),
@@ -2805,12 +2810,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // The run actually launched: the queued reservation this describes
         // no longer exists to cancel or report on.
         mesh.clearSelection(rootId);
-        const providerName = providerThrottleKey(selected.provider, config);
-        const runId = beginActorRun(rootId, providerName);
+        const launchConfig = projectActorRunLaunchConfig(
+          selected,
+          providerThrottleKey(selected.provider, config),
+          providerSupportsEffort(providerCapabilityName(selected.provider, config))
+        );
+        const runId = beginActorRun(rootId, launchConfig);
         runLogger(rootId, runId).info("run_start", {
-          provider: providerName,
-          model: selected.model,
-          effort: selected.effort,
+          provider: launchConfig.provider,
+          model: launchConfig.model,
+          effort: launchConfig.effort,
           responsive,
         });
         mesh.recordEvent({
@@ -2821,9 +2830,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             : undefined,
           body: injectRecord ? JSON.stringify(injectRecord) : undefined,
           payload: JSON.stringify({
-            provider: providerName,
-            model: selected.model,
-            effort: selected.effort,
+            provider: launchConfig.provider,
+            model: launchConfig.model,
+            effort: launchConfig.effort,
             responsive,
             runId,
           }),
