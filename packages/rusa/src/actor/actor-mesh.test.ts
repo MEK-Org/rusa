@@ -2932,8 +2932,9 @@ describe("ActorMesh", () => {
     const child = mesh.spawn({ charter: "child", parentId: parent, model: "claude-sonnet-5" });
     const sibling = mesh.spawn({ charter: "sibling", parentId: "root" });
 
-    // Parent can stage a child's model. Even while idle, the child keeps its
-    // current model through the next dispatched run and applies at run end.
+    // Parent can stage a child's model. The child is idle, so the staged
+    // model stays pending until its next dispatch (triggered below by
+    // sendMessage), where it applies before that run's run_start.
     mesh.setActorModel(child, "claude-opus-4-8", parent);
     expect(registry.get(child)?.model).toBe("claude-sonnet-5");
     expect(registry.get(child)?.desiredModel).toBe("claude-opus-4-8");
@@ -3199,7 +3200,7 @@ describe("ActorMesh", () => {
     expect(registry.get(nativeChild)?.provider).toBe("claude");
     expect(registry.get(nativeChild)?.model).toBe("claude-opus-4-8");
 
-    // 7. Defers model/provider changes while actor is running or queued and applies at run end
+    // 7. Defers model/provider changes while actor is running; applies at run end
     const { provider: deferredRunProvider, releaseAll: releaseDeferred } = deferredProvider();
     const modelSetCalls: Array<{ actorId: string; newModel: string; record: ThreadRecord }> = [];
     const busyMeshSetup = setup({

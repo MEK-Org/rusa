@@ -2499,7 +2499,9 @@ export class ActorMesh {
    * a non-root parent may only set the model for its own descendants (and never
    * raise its own tier).
    * Optionally moves portable (ledger/tail) actors across providers.
-   * Takes effect at the end of the actor's next run.
+   * Takes effect at the end of the actor's current run if one is in flight;
+   * otherwise applies at the actor's next dispatch, before that run's
+   * run_start and launch.
    */
   setActorModel(
     id: string,
@@ -2558,9 +2560,10 @@ export class ActorMesh {
       normalizeModelEffortSelection(effectiveProvider, nextModel, requestedEffort);
     const validatedModel = selection.model ?? nextModel;
     const validatedEffort = selection.effort;
-    // One boundary contract for every run state: the in-flight run, or the next
-    // dispatched run when idle/queued, completes on the current model. The
-    // desired value is applied only when that run ends.
+    // Boundary contract: an in-flight run completes on its already-launched
+    // model, and the desired value applies at that run's end. An idle or
+    // queued actor has no launched run yet, so the desired value applies at
+    // its next dispatch, before run_start is recorded and before launch.
     const patch: Partial<ThreadRecord> = { desiredProvider: trimmedProvider };
     if (model !== undefined) patch.desiredModel = validatedModel;
     if (effort !== undefined || validatedEffort !== record.effort) {

@@ -3215,6 +3215,72 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(payload.model).not.toBe(originalModel);
   });
 
+  it("root's beforeRun halt-gate checks the tuple that will actually launch, not the frozen boot-time provider (#199 amend gap 2)", async () => {
+    clearProviderModelCatalog("antigravity");
+    clearProviderModelCatalog("claude");
+    const config = {
+      github: { account: "mock-bot" },
+      providers: {
+        antigravity: { cliCommand: "agy" },
+        claude: { cliCommand: "claude" },
+      },
+      rootActor: {
+        provider: "antigravity",
+        effort: "high",
+        context: { type: "portable", mode: "ledger" },
+      },
+      geminiApiKey: "fake-gemini-key",
+    };
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
+
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+    const activeMesh = mesh;
+    const rootActor = activeMesh.get("root");
+    if (!rootActor) throw new Error("root actor not ready");
+
+    // Directly invoke the production beforeRun closure — same technique used
+    // above for onRunStart — to exercise root's real halt-gate wiring without
+    // driving a full provider/gate/queue cycle. `mode: "yield-elicitation"`
+    // short-circuits past the unrelated inbox-watermark check so only the
+    // halt-gate logic under test is exercised.
+    const actorOpts = (
+      rootActor as unknown as { opts: { beforeRun?: (arg: { mode: string }) => boolean } }
+    ).opts;
+
+    // Stage a move to claude while root is idle on antigravity.
+    activeMesh.setActorModel("root", "claude-sonnet-5", "root", "claude");
+    expect(activeMesh.registry.get("root")?.provider).toBe("antigravity");
+    expect(activeMesh.registry.get("root")?.desiredProvider).toBe("claude");
+
+    const halt = new HaltSwitch(join(homeDir, "HALT"));
+
+    // Halt the NEW provider (claude) — the one root will actually launch on.
+    // Gap #2: beforeRun must consult the live launch tuple (claude), not the
+    // rootProviderName ("antigravity") frozen at root construction — so a
+    // halt scoped to claude must still block dispatch.
+    halt.halt("halt claude", { providers: ["claude"] });
+    expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(false);
+    halt.resume();
+
+    // Halt the OLD provider (antigravity) instead — root is no longer
+    // launching on antigravity, so this halt must not wrongly block it.
+    halt.halt("halt antigravity", { providers: ["antigravity"] });
+    expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(true);
+    halt.resume();
+  });
+
   it("routes delegated chat spaces to the delegatee while others bubble to root", async () => {
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();

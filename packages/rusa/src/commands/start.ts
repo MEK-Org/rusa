@@ -2427,7 +2427,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // Responsive human wakes bypass normal pacing/concurrency; background root
       // wakes use the same normal scheduling path as workers.
       beforeRun: ({ mode }): boolean => {
-        if (isProviderHalted(rootProviderName) || gracefulShutdown.isShuttingDown()) {
+        const rootRecord = registry.get(rootId);
+        const launchProviderName =
+          rootRecord?.desiredProvider ?? rootRecord?.provider ?? rootProviderName;
+        if (isProviderHalted(launchProviderName) || gracefulShutdown.isShuttingDown()) {
           return false;
         }
         if (mode === "yield-elicitation") return true;
