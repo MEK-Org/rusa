@@ -73,93 +73,239 @@ void main() {
   });
 
   group('ReferencePreview', () {
-    testWidgets('shows the cited text and its provenance', (tester) async {
+    testWidgets(
+      'renders a compact header — scheme, link button, label, then the '
+      'resolved cited-by handle — with no footer, raw ref, url, or cache '
+      'status anywhere',
+      (tester) async {
+        await tester.pumpWidget(
+          _host(
+            ReferencePreview(
+              reference: const ReferenceDto(
+                ref: 'github:MEK-Org/rusa/issues/204',
+                scheme: 'github',
+                title: 'github:MEK-Org/rusa/issues/204',
+                entity: {
+                  'type': 'github_issue',
+                  'title': 'Polish obligation artifact previews',
+                  'description': 'Some description body.',
+                },
+                url: 'https://github.com/MEK-Org/rusa/issues/204',
+                cacheState: 'fresh',
+              ),
+              attachedBy: 'raw-actor-id',
+              resolveActorHandle: (id) =>
+                  id == 'raw-actor-id' ? 'operator-handle' : id,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        // The four header elements are present...
+        expect(find.text('GITHUB'), findsOneWidget);
+        expect(find.byIcon(Icons.open_in_new), findsOneWidget);
+        expect(
+          find.text('Polish obligation artifact previews'),
+          findsOneWidget,
+        );
+        expect(find.text('cited by operator-handle'), findsOneWidget);
+
+        // ...and appear left to right in that order.
+        final schemeX = tester.getCenter(find.text('GITHUB')).dx;
+        final linkX = tester.getCenter(find.byIcon(Icons.open_in_new)).dx;
+        final labelX = tester
+            .getCenter(find.text('Polish obligation artifact previews'))
+            .dx;
+        final citedByX = tester
+            .getCenter(find.text('cited by operator-handle'))
+            .dx;
+        expect(schemeX, lessThan(linkX));
+        expect(linkX, lessThan(labelX));
+        expect(labelX, lessThan(citedByX));
+
+        // No cache-state badge, no raw ref/url text, no raw attachedBy id,
+        // and no footer row of any kind.
+        expect(find.text('FRESH'), findsNothing);
+        expect(find.text('github:MEK-Org/rusa/issues/204'), findsNothing);
+        expect(
+          find.text('https://github.com/MEK-Org/rusa/issues/204'),
+          findsNothing,
+        );
+        expect(find.text('raw-actor-id'), findsNothing);
+        expect(find.text('cited by raw-actor-id'), findsNothing);
+      },
+    );
+
+    testWidgets(
+      "the citer's own label wins the header slot over the resolved title",
+      (tester) async {
+        await tester.pumpWidget(
+          _host(
+            const ReferencePreview(
+              reference: ReferenceDto(
+                ref: 'github:foo/bar/issues/1',
+                scheme: 'github',
+                title: 'fallback title',
+                entity: {
+                  'type': 'github_issue',
+                  'title': 'Resolved Issue Title',
+                  'description': 'desc',
+                },
+              ),
+              label: "Operator's own gloss",
+            ),
+          ),
+        );
+
+        expect(find.text("Operator's own gloss"), findsOneWidget);
+        expect(find.text('Resolved Issue Title'), findsNothing);
+      },
+    );
+
+    testWidgets('omits the link button when the reference has no url', (
+      tester,
+    ) async {
       await tester.pumpWidget(
         _host(
           const ReferencePreview(
             reference: ReferenceDto(
               ref: 'mesh:messages/abc',
               scheme: 'mesh',
-              title: 'human:operator → root',
-              body: 'A monster-catching JRPG in a cave.',
-              author: 'human:operator',
-              url: 'https://example.test/citation',
+              title: 'title',
+              body: 'body',
             ),
-            label: "Operator's answer",
-            attachedBy: 'root',
           ),
         ),
       );
 
-      expect(find.text('MESH'), findsOneWidget);
-      expect(find.text('human:operator → root'), findsOneWidget);
-      expect(find.text('A monster-catching JRPG in a cave.'), findsOneWidget);
-      expect(find.text('by human:operator'), findsOneWidget);
-      expect(find.text('https://example.test/citation'), findsOneWidget);
-      expect(find.text("Operator's answer"), findsOneWidget);
-      expect(find.text('cited by root'), findsOneWidget);
-      // The ref itself stays visible and selectable — a citation you cannot
-      // copy is a citation you cannot chase.
-      expect(find.text('mesh:messages/abc'), findsOneWidget);
+      expect(find.byIcon(Icons.open_in_new), findsNothing);
     });
 
-    testWidgets('is only as tall as the text it quotes', (tester) async {
-      tester.view.physicalSize = const Size(1200, 900);
-      tester.view.devicePixelRatio = 1.0;
-      addTearDown(tester.view.reset);
-
-      Future<double> heightOf(String body) async {
-        await tester.pumpWidget(
-          MaterialApp(
-            home: Scaffold(
-              body: ListView(
-                children: [
-                  ReferencePreview(
-                    reference: ReferenceDto(
-                      ref: 'mesh:messages/abc',
-                      scheme: 'mesh',
-                      title: 'human:operator → root',
-                      body: body,
-                    ),
-                  ),
-                ],
-              ),
+    testWidgets('the link button is tappable and does not crash the VM test', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _host(
+          const ReferencePreview(
+            reference: ReferenceDto(
+              ref: 'github:foo/bar/issues/1',
+              scheme: 'github',
+              title: 'Issue 1',
+              url: 'https://example.test/issue/1',
             ),
           ),
-        );
-        await tester.pumpAndSettle();
-        return tester.getSize(find.byType(SelectableText).first).height;
-      }
+        ),
+      );
 
-      final oneLine = await heightOf('Can you help me plan it out?');
-      final fourLines = await heightOf(List.filled(4, 'line').join('\n'));
-
-      // Regression guard. SelectableText wraps an EditableText, which sizes to
-      // `maxLines` rather than to its content — passing one made a single-line
-      // citation render eight lines tall. Height must track the text.
-      expect(oneLine, lessThan(30));
-      expect(fourLines, greaterThan(oneLine * 3));
+      await tester.tap(find.byIcon(Icons.open_in_new));
+      await tester.pump();
+      // Nothing to assert beyond "no exception" — the VM build has no real
+      // browser, so opening a tab is a no-op seam; see link_opener_stub.dart.
     });
 
-    testWidgets('displays cache state chips correctly', (tester) async {
-      for (final state in ['fresh', 'stale', 'pending', 'unavailable']) {
+    testWidgets(
+      'resolves a mesh message sender to a handle with no "by" prefix, and '
+      'never shows the raw sender id',
+      (tester) async {
         await tester.pumpWidget(
           _host(
             ReferencePreview(
-              reference: ReferenceDto(
-                ref: 'github:foo/bar/issues/1',
-                scheme: 'github',
-                title: 'issue',
-                cacheState: state,
+              reference: const ReferenceDto(
+                ref: 'mesh:messages/abc',
+                scheme: 'mesh',
+                title: 'human:operator → root',
+                body: 'A monster-catching JRPG in a cave.',
+                entity: {
+                  'type': 'mesh_message',
+                  'senderId': 'human:operator',
+                  'recipientId': 'root',
+                },
+              ),
+              resolveActorHandle: (id) =>
+                  id == 'human:operator' ? 'operator' : id,
+            ),
+          ),
+        );
+
+        expect(find.text('operator'), findsOneWidget);
+        expect(find.text('by operator'), findsNothing);
+        expect(find.text('human:operator'), findsNothing);
+      },
+    );
+
+    testWidgets('shows a github author with the "by" prefix, unresolved', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _host(
+          const ReferencePreview(
+            reference: ReferenceDto(
+              ref: 'github:foo/bar/issues/1',
+              scheme: 'github',
+              title: 'Issue 1',
+              author: 'octocat',
+            ),
+          ),
+        ),
+      );
+
+      expect(find.text('by octocat'), findsOneWidget);
+    });
+
+    testWidgets(
+      'shows "Show more" only when the body genuinely overflows five lines '
+      'at the rendered width, not from a character-count heuristic',
+      (tester) async {
+        // Long enough to run past five lines when wrapped narrow, but short
+        // enough to fit within five lines at a wide layout — proving the
+        // toggle tracks actual layout, not body length.
+        const body =
+            'The quick brown fox jumps over the lazy dog near the riverbank '
+            'while the sun sets slowly behind the distant hills.';
+
+        await tester.pumpWidget(
+          _host(
+            SizedBox(
+              width: 220,
+              child: ReferencePreview(
+                reference: const ReferenceDto(
+                  ref: 'mesh:messages/narrow',
+                  scheme: 'mesh',
+                  title: 'title',
+                  body: body,
+                ),
               ),
             ),
           ),
         );
-        expect(find.text(state.toUpperCase()), findsOneWidget);
-      }
-    });
+        await tester.pump();
+        await tester.pump();
 
-    testWidgets('truncates long text and allows expanding', (tester) async {
+        expect(find.text('Show more'), findsOneWidget);
+
+        await tester.pumpWidget(
+          _host(
+            SizedBox(
+              width: 900,
+              child: ReferencePreview(
+                reference: const ReferenceDto(
+                  ref: 'mesh:messages/wide',
+                  scheme: 'mesh',
+                  title: 'title',
+                  body: body,
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('Show more'), findsNothing);
+      },
+    );
+
+    testWidgets('expanding "Show more" reveals the full text', (tester) async {
       final longBody = List.filled(10, 'Long line of text').join('\n');
       await tester.pumpWidget(
         _host(
@@ -173,6 +319,8 @@ void main() {
           ),
         ),
       );
+      await tester.pump();
+      await tester.pump();
 
       expect(find.text('Show more'), findsOneWidget);
       await tester.tap(find.text('Show more'));
@@ -218,6 +366,38 @@ void main() {
       );
       expect(find.text('My PR'), findsOneWidget);
       expect(find.text('The PR desc'), findsOneWidget);
+
+      await tester.pumpWidget(
+        _host(
+          const ReferencePreview(
+            reference: ReferenceDto(
+              ref: 'github:foo/bar/issues/1/comments/9',
+              scheme: 'github',
+              title: 'Comment',
+              entity: {'type': 'github_comment', 'body': 'A comment body'},
+            ),
+          ),
+        ),
+      );
+      expect(find.text('A comment body'), findsOneWidget);
+
+      await tester.pumpWidget(
+        _host(
+          const ReferencePreview(
+            reference: ReferenceDto(
+              ref: 'github:foo/bar/pulls/2/reviews/7',
+              scheme: 'github',
+              title: 'Review',
+              entity: {
+                'type': 'github_review',
+                'body': 'Ship it.',
+                'state': 'APPROVED',
+              },
+            ),
+          ),
+        ),
+      );
+      expect(find.text('Ship it.'), findsOneWidget);
 
       await tester.pumpWidget(
         _host(

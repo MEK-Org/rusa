@@ -135,6 +135,10 @@ void main() {
         );
         expect(find.textContaining('Cycle 1'), findsNothing);
 
+        await tester.ensureVisible(
+          find.textContaining('Load earlier completions'),
+        );
+        await tester.pumpAndSettle();
         await tester.tap(find.textContaining('Load earlier completions'));
         await tester.pump();
         await tester.pump();

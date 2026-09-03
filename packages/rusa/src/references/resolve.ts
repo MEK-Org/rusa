@@ -1,6 +1,7 @@
 import type { InboxStore } from "../actor/inbox-store.js";
 import type { ChatClient } from "../chat/types.js";
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
+import type { IssueClient } from "../gitops/issue-client.js";
 import {
   asGitHubBranch,
   asGitHubIssue,
@@ -13,8 +14,11 @@ import {
 export type ReferenceEntity =
   | { type: "github_issue"; title: string; description: string }
   | { type: "github_pull_request"; title: string; description: string }
+  | { type: "github_comment"; body: string }
+  | { type: "github_review"; body: string; state: string }
   | { type: "gchat_message"; contents: string }
-  | { type: "gchat_space"; name: string };
+  | { type: "gchat_space"; name: string }
+  | { type: "mesh_message"; senderId: string; recipientId: string };
 
 /**
  * A reference rendered down to what any surface needs to show it: what it is,
@@ -58,9 +62,12 @@ export interface ReferenceResolverDeps {
   /** Reads a Google Chat message; absent when the chat edge is not configured. */
   chatClient?: Pick<ChatClient, "getMessage" | "getSpace">;
   /** Reads issues and pull requests; absent when no tracker is wired. */
-  issueClient?: {
-    getIssue?: (repo: string, number: number) => Promise<unknown>;
-  };
+  issueClient?: Partial<
+    Pick<
+      IssueClient,
+      "getIssue" | "listIssueComments" | "getPrReviewComments" | "getPullRequestReview"
+    >
+  >;
 }
 
 function unresolved(reference: Reference, title: string, reason: string): ResolvedReference {
@@ -85,7 +92,10 @@ function pairs(reference: Reference, rootSegments: number): Array<[string, strin
   return out;
 }
 
-function resolveMesh(reference: Reference, deps: ReferenceResolverDeps): ResolvedReference {
+function resolveMesh(
+  reference: Reference,
+  deps: ReferenceResolverDeps
+): ResolvedReferenceWithEntity {
   const [first, second] = pairs(reference, 0);
 
   if (first?.[0] === "messages") {
@@ -100,6 +110,14 @@ function resolveMesh(reference: Reference, deps: ReferenceResolverDeps): Resolve
       timestamp: message.ts,
       url: null,
       unavailable: null,
+      // Raw mesh actor ids — the dashboard resolves these to handles through
+      // its actor projection rather than rendering them, so the widget needs
+      // both ids separately instead of reparsing them back out of `title`.
+      entity: {
+        type: "mesh_message",
+        senderId: message.senderId,
+        recipientId: message.recipientId,
+      },
     };
   }
 
@@ -135,7 +153,7 @@ function resolveMesh(reference: Reference, deps: ReferenceResolverDeps): Resolve
 export function resolveReferenceSync(
   ref: string,
   deps: Pick<ReferenceResolverDeps, "meshChat" | "inbox">
-): ResolvedReference {
+): ResolvedReferenceWithEntity {
   let reference: Reference;
   try {
     reference = parseReference(ref);
@@ -212,6 +230,100 @@ async function resolveGchat(
   };
 }
 
+const POSITIVE_INT = /^[1-9]\d*$/;
+
+/** Fetch and normalize one comment (an issue conversation comment, or a PR review comment). */
+async function resolveGitHubComment(
+  reference: Reference,
+  deps: ReferenceResolverDeps,
+  repo: string,
+  number: number,
+  commentId: number,
+  collection: "issues" | "pulls",
+  label: string,
+  url: string | null
+): Promise<ResolvedReferenceWithEntity> {
+  let comment: { body: string; author?: string; createdAt?: string } | undefined;
+  if (collection === "issues") {
+    if (!deps.issueClient?.listIssueComments) {
+      return {
+        ...unresolved(reference, `${label} — comment ${commentId}`, "tracker not configured"),
+        url,
+      };
+    }
+    comment = (await deps.issueClient.listIssueComments(repo, number)).find(
+      (c) => c.id === commentId
+    );
+  } else {
+    if (!deps.issueClient?.getPrReviewComments) {
+      return {
+        ...unresolved(reference, `${label} — comment ${commentId}`, "tracker not configured"),
+        url,
+      };
+    }
+    comment = (await deps.issueClient.getPrReviewComments(repo, number)).find(
+      (c) => c.id === commentId
+    );
+  }
+  if (!comment) {
+    return {
+      ...unresolved(
+        reference,
+        `${label} — comment ${commentId}`,
+        "comment not found on the tracker"
+      ),
+      url,
+    };
+  }
+  return {
+    ref: reference.key,
+    scheme: reference.scheme,
+    title: `${label} — comment`,
+    body: comment.body,
+    author: comment.author ?? null,
+    timestamp: comment.createdAt ?? null,
+    url,
+    unavailable: null,
+    entity: { type: "github_comment", body: comment.body },
+  };
+}
+
+/** Fetch and normalize a pull request review's own summary (verdict and body). */
+async function resolveGitHubReview(
+  reference: Reference,
+  deps: ReferenceResolverDeps,
+  repo: string,
+  prNumber: number,
+  reviewId: number,
+  label: string,
+  url: string | null
+): Promise<ResolvedReferenceWithEntity> {
+  if (!deps.issueClient?.getPullRequestReview) {
+    return {
+      ...unresolved(reference, `${label} — review ${reviewId}`, "tracker not configured"),
+      url,
+    };
+  }
+  const review = await deps.issueClient.getPullRequestReview(repo, prNumber, reviewId);
+  if (!review) {
+    return {
+      ...unresolved(reference, `${label} — review ${reviewId}`, "review not found on the tracker"),
+      url,
+    };
+  }
+  return {
+    ref: reference.key,
+    scheme: reference.scheme,
+    title: `${label} — review`,
+    body: review.body || null,
+    author: review.author || null,
+    timestamp: null,
+    url,
+    unavailable: review.body ? null : "no body on the review",
+    entity: { type: "github_review", body: review.body, state: review.state },
+  };
+}
+
 async function resolveGitHub(
   reference: Reference,
   deps: ReferenceResolverDeps
@@ -235,16 +347,32 @@ async function resolveGitHub(
     // A sub-resource — a comment or a review. Unlike the previous grammar, the
     // reference names its parent, so there is always something useful to say
     // and somewhere to go, even before the tracker can fetch the body.
-    const [owner, repo, collection, number, subCollection, subId] = reference.segments;
-    if (subCollection && subId) {
-      return {
-        ...unresolved(
+    const [owner, repo, collection, rawNumber, subCollection, subId] = reference.segments;
+    if (
+      (collection === "issues" || collection === "pulls") &&
+      subCollection &&
+      subId &&
+      POSITIVE_INT.test(rawNumber ?? "") &&
+      POSITIVE_INT.test(subId)
+    ) {
+      const number = Number(rawNumber);
+      const repoName = `${owner}/${repo}`;
+      const label = `${repoName} ${collection}/${number}`;
+      if (subCollection === "comments") {
+        return resolveGitHubComment(
           reference,
-          `${owner}/${repo} ${collection}/${number} — ${subCollection} ${subId}`,
-          "sub-resource bodies are not fetched yet"
-        ),
-        url,
-      };
+          deps,
+          repoName,
+          number,
+          Number(subId),
+          collection,
+          label,
+          url
+        );
+      }
+      if (subCollection === "reviews" && collection === "pulls") {
+        return resolveGitHubReview(reference, deps, repoName, number, Number(subId), label, url);
+      }
     }
     return { ...unresolved(reference, reference.key, "unrecognised GitHub resource"), url };
   }
@@ -252,27 +380,24 @@ async function resolveGitHub(
   if (!deps.issueClient?.getIssue) {
     return { ...unresolved(reference, reference.key, "tracker not configured"), url };
   }
-  const found = (await deps.issueClient.getIssue(`${issue.owner}/${issue.repo}`, issue.number)) as {
-    title?: string;
-    body?: string;
-    user?: { login?: string };
-    createdAt?: string;
-  } | null;
+  const found = await deps.issueClient.getIssue(`${issue.owner}/${issue.repo}`, issue.number);
   if (!found) {
     return { ...unresolved(reference, reference.key, "not found on the tracker"), url };
   }
   const label = `${issue.owner}/${issue.repo}#${issue.number}`;
   const entity: ReferenceEntity =
     issue.collection === "pulls"
-      ? { type: "github_pull_request", title: found.title ?? "", description: found.body ?? "" }
-      : { type: "github_issue", title: found.title ?? "", description: found.body ?? "" };
+      ? { type: "github_pull_request", title: found.title, description: found.body }
+      : { type: "github_issue", title: found.title, description: found.body };
   return {
     ref: reference.key,
     scheme: reference.scheme,
     title: found.title ? `${label} — ${found.title}` : label,
-    body: found.body ?? null,
-    author: found.user?.login ?? null,
-    timestamp: found.createdAt ?? null,
+    body: found.body || null,
+    author: found.author || null,
+    // IssueDetails carries no created-date field — stay honest rather than
+    // guess, instead of the old code's always-undefined `.createdAt` read.
+    timestamp: null,
     url,
     unavailable: found.body ? null : "no body on the issue",
     entity,

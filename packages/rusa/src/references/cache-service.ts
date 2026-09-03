@@ -190,6 +190,14 @@ function decodeV1Entity(raw: unknown): ReferenceEntity | undefined {
     if (typeof obj.title === "string" && typeof obj.description === "string") {
       return { type: obj.type, title: obj.title, description: obj.description };
     }
+  } else if (obj.type === "github_comment") {
+    if (typeof obj.body === "string") {
+      return { type: obj.type, body: obj.body };
+    }
+  } else if (obj.type === "github_review") {
+    if (typeof obj.body === "string" && typeof obj.state === "string") {
+      return { type: obj.type, body: obj.body, state: obj.state };
+    }
   } else if (obj.type === "gchat_message") {
     if (typeof obj.contents === "string") {
       return { type: obj.type, contents: obj.contents };
@@ -208,6 +216,16 @@ function getResourceShape(reference: ReturnType<typeof parseReference>): string 
     const issue = asGitHubIssue(reference);
     if (issue) {
       return issue.collection === "pulls" ? "github_pull_request" : "github_issue";
+    }
+    const [, , collection, rawNumber, subCollection, subId] = reference.segments;
+    if (
+      (collection === "issues" || collection === "pulls") &&
+      subCollection &&
+      subId &&
+      /^[1-9]\d*$/.test(rawNumber ?? "")
+    ) {
+      if (subCollection === "comments") return "github_comment";
+      if (subCollection === "reviews" && collection === "pulls") return "github_review";
     }
   } else if (reference.scheme === "gchat") {
     if (reference.segments.length === 2 && reference.segments[0] === "spaces") {

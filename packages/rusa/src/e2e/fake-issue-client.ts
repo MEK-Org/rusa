@@ -20,6 +20,7 @@ import {
   type PullRequestChecksStatus,
   PullRequestChecksUnreadableError,
   type PullRequestDetails,
+  type PullRequestReviewDetails,
   type ReactionContent,
 } from "../gitops/issue-client.js";
 import type { LocalTracker, ReviewState } from "./local-tracker.js";
@@ -336,6 +337,16 @@ export class FakeIssueClient implements IssueClient {
       createdAt: c.createdAt,
       inReplyToId: c.inReplyToId ?? null,
     }));
+  }
+
+  async getPullRequestReview(
+    _repo: string,
+    prNumber: number,
+    reviewId: number
+  ): Promise<PullRequestReviewDetails | null> {
+    const review = this.tracker.listReviews(prNumber).find((r) => r.id === reviewId);
+    if (!review) return null;
+    return { id: review.id, state: review.state, body: review.body, author: review.author };
   }
 
   async getParentIssueNumber(_repo: string, issueNumber: number): Promise<number | null> {
