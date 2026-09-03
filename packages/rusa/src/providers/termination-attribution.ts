@@ -32,6 +32,7 @@ export interface TerminationAttribution {
   exitCode: number;
   cancelled: boolean;
   interrupted?: boolean;
+  interruptSource?: string;
   graceKilled?: boolean;
 }
 
@@ -52,6 +53,7 @@ export function formatSigtermResult(
       exitCode: 143, // 128 + SIGTERM (15)
       cancelled: true,
       interrupted: true,
+      interruptSource: by,
     };
   }
 

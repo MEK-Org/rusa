@@ -145,7 +145,7 @@ gemini-3.1-pro-high       Gemini 3.1 Pro (High)
     expect(res.status).toBe("unknown");
     expect(mockStore.recordParseError).toHaveBeenCalledWith("scrape-agy-empty", expect.any(Error));
     expect(getProviderModelCatalog("agy")).toEqual([
-      { displayLabel: "old-model", identifier: "old-model", passable: true },
+      { displayLabel: "old-model", identifier: "old-model", passable: true, efforts: [] },
     ]);
   });
 

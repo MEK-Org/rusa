@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { extractGeminiText, getGeminiClient } from "../understanding/gemini-utils.js";
+import { buildAntigravityArgs, resolveAntigravitySelection } from "./antigravity.js";
 import {
   clearProviderModelCatalog,
   extractKimiModelsFromToml,
@@ -247,6 +248,50 @@ describe("populateModelCatalogsFromDb", () => {
     expect(validateModelPin("codex", "gpt-5.6-sol")).toEqual({ status: "accepted" });
     expect(() => validateModelPin("codex", "bad-model")).toThrow();
   });
+
+  it("restores a raw tiered agy entry and emits the exact canonical argv selector pair", () => {
+    const mockRepo = {
+      listLatestForEachProvider: () =>
+        new Map([
+          [
+            "agy",
+            [
+              {
+                displayLabel: "Gemini 3.5 Flash (High)",
+                identifier: "gemini-3.5-flash-high",
+                passable: true,
+              },
+            ],
+          ],
+        ]),
+    };
+    populateModelCatalogsFromDb(mockRepo);
+    const catalog = getProviderModelCatalog("agy");
+    expect(catalog).toEqual([
+      {
+        displayLabel: "Gemini 3.5 Flash",
+        identifier: "gemini-3.5-flash",
+        passable: true,
+        efforts: ["high"],
+      },
+    ]);
+
+    const selection = resolveAntigravitySelection("Gemini 3.5 Flash", "high");
+    const args = buildAntigravityArgs({
+      prompt: "hi",
+      model: selection.model,
+      effort: selection.effort,
+      timeoutMs: 60_000,
+    });
+    const iModel = args.indexOf("--model");
+    const iEffort = args.indexOf("--effort");
+    expect(args.slice(iModel, iEffort + 2)).toEqual([
+      "--model",
+      "gemini-3.5-flash",
+      "--effort",
+      "high",
+    ]);
+  });
 });
 
 describe("banked fixtures", () => {
@@ -302,66 +347,67 @@ describe("validateModelPin", () => {
 
   it("accepts both agy display labels and slug identifiers ", () => {
     setProviderModelCatalog("antigravity", [
-      { displayLabel: "Gemini 3.1 Pro (High)", identifier: "gemini-3.1-pro" },
+      { identifier: "gemini-3.1-pro-high", displayLabel: "Gemini 3.1 Pro (High)" },
     ]);
-    expect(validateModelPin("antigravity", "Gemini 3.1 Pro (High)")).toEqual({
-      status: "accepted",
-    });
-    expect(validateModelPin("antigravity", "gemini-3.1-pro")).toEqual({
-      status: "accepted",
-    });
-    expect(() => validateModelPin("antigravity", "bad-pin")).toThrow(
-      'acceptable values: "Gemini 3.1 Pro (High)", "gemini-3.1-pro"'
+    expect(validateModelPin("antigravity", "Gemini 3.1 Pro").status).toBe("accepted");
+    expect(validateModelPin("antigravity", "gemini-3.1-pro").status).toBe("accepted");
+    expect(() => validateModelPin("antigravity", "Gemini 3.1 Pro (High)")).toThrow(
+      'model pin validation failed for provider "antigravity": rejected "Gemini 3.1 Pro (High)"; acceptable values: "Gemini 3.1 Pro", "gemini-3.1-pro"'
     );
   });
 
   it("resolves catalog aliases between agy and antigravity ", () => {
-    clearProviderModelCatalog();
     setProviderModelCatalog("antigravity", [
-      { displayLabel: "Gemini 3.1 Pro (High)", identifier: "gemini-3.1-pro-high", passable: true },
+      { identifier: "gemini-3.1-pro-high", displayLabel: "Gemini 3.1 Pro (High)", passable: true },
     ]);
 
     // getProviderModelCatalog resolves agy from antigravity
     expect(getProviderModelCatalog("agy")).toEqual([
-      { displayLabel: "Gemini 3.1 Pro (High)", identifier: "gemini-3.1-pro-high", passable: true },
+      {
+        displayLabel: "Gemini 3.1 Pro",
+        identifier: "gemini-3.1-pro",
+        passable: true,
+        efforts: ["high"],
+      },
     ]);
-    // validateModelPin works across aliases
-    expect(validateModelPin("agy", "gemini-3.1-pro-high")).toEqual({ status: "accepted" });
-    expect(validateModelPin("agy", "Gemini 3.1 Pro (High)")).toEqual({ status: "accepted" });
-
-    // clearProviderModelCatalog clears both
+    // clear resolves the reverse
     clearProviderModelCatalog("agy");
     expect(getProviderModelCatalog("antigravity")).toBeUndefined();
   });
 
   it("does not hard-block an explicitly populated empty catalog", () => {
-    setProviderModelCatalog("claude", []);
-    expect(validateModelPin("claude", "claude-opus-4-8").status).toBe("unknown");
+    setProviderModelCatalog("agy", []);
+    const result = validateModelPin("agy", "Gemini 3.7 Flash");
+    expect(result.status).toBe("unknown");
+    if (result.status === "unknown") {
+      expect(result.warning).toContain('model catalog for provider "agy" is unknown');
+    }
   });
 
   it("rejects non-passable agy quota group labels while accepting concrete models", () => {
     setProviderModelCatalog("agy", [
-      { displayLabel: "Gemini Flash", identifier: "gemini-flash", passable: false },
-      { displayLabel: "Gemini 3.7 Flash (High)", identifier: "gemini-3.7-flash", passable: true },
-      { displayLabel: "Gemini Pro", identifier: "gemini-pro", passable: false },
-      { displayLabel: "Gemini 3.1 Pro (High)", identifier: "gemini-3.1-pro", passable: true },
+      {
+        identifier: "gemini-3.7-flash-high",
+        displayLabel: "Gemini 3.7 Flash (High)",
+        passable: true,
+      },
+      { identifier: "gemini-3.1-pro-high", displayLabel: "Gemini 3.1 Pro (High)", passable: true },
+      { identifier: "gemini-flash", displayLabel: "Gemini Flash", passable: false },
     ]);
-
-    // Concrete models validate successfully (both display label and slug identifier)
-    expect(validateModelPin("agy", "Gemini 3.7 Flash (High)")).toEqual({ status: "accepted" });
-    expect(validateModelPin("agy", "gemini-3.7-flash")).toEqual({ status: "accepted" });
-    expect(validateModelPin("agy", "Gemini 3.1 Pro (High)")).toEqual({ status: "accepted" });
-    expect(validateModelPin("agy", "gemini-3.1-pro")).toEqual({ status: "accepted" });
+    expect(validateModelPin("agy", "Gemini 3.7 Flash").status).toBe("accepted");
+    expect(validateModelPin("agy", "gemini-3.7-flash").status).toBe("accepted");
+    expect(validateModelPin("agy", "Gemini 3.1 Pro").status).toBe("accepted");
+    expect(validateModelPin("agy", "gemini-3.1-pro").status).toBe("accepted");
 
     // Quota group labels are rejected
     expect(() => validateModelPin("agy", "Gemini Flash")).toThrow(
-      'model pin validation failed for provider "agy": rejected "Gemini Flash"; acceptable values: "Gemini 3.7 Flash (High)", "gemini-3.7-flash", "Gemini 3.1 Pro (High)", "gemini-3.1-pro"'
+      'model pin validation failed for provider "agy": rejected "Gemini Flash"; acceptable values: "Gemini 3.7 Flash", "gemini-3.7-flash", "Gemini 3.1 Pro", "gemini-3.1-pro"'
     );
     expect(() => validateModelPin("agy", "gemini-flash")).toThrow(
-      'model pin validation failed for provider "agy": rejected "gemini-flash"; acceptable values: "Gemini 3.7 Flash (High)", "gemini-3.7-flash", "Gemini 3.1 Pro (High)", "gemini-3.1-pro"'
+      'model pin validation failed for provider "agy": rejected "gemini-flash"; acceptable values: "Gemini 3.7 Flash", "gemini-3.7-flash", "Gemini 3.1 Pro", "gemini-3.1-pro"'
     );
     expect(() => validateModelPin("agy", "Gemini Pro")).toThrow(
-      'model pin validation failed for provider "agy": rejected "Gemini Pro"; acceptable values: "Gemini 3.7 Flash (High)", "gemini-3.7-flash", "Gemini 3.1 Pro (High)", "gemini-3.1-pro"'
+      'model pin validation failed for provider "agy": rejected "Gemini Pro"; acceptable values: "Gemini 3.7 Flash", "gemini-3.7-flash", "Gemini 3.1 Pro", "gemini-3.1-pro"'
     );
   });
 });

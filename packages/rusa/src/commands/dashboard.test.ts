@@ -26,9 +26,17 @@ const mockWebhookServerModule = vi.hoisted(() => ({
   startDashboardServer: vi.fn(() => Promise.resolve(mockDashboardServer)),
 }));
 
+const mockReferenceCacheRepo = vi.hoisted(() => ({ get: vi.fn(), set: vi.fn(), delete: vi.fn() }));
+
 const mockDbModule = vi.hoisted(() => ({
   initDb: vi.fn(),
-  getRepositories: vi.fn(() => ({ meshEvents: {} })),
+  getRepositories: vi.fn(() => ({ meshEvents: {}, referenceCache: mockReferenceCacheRepo })),
+}));
+
+const mockReferenceCacheModule = vi.hoisted(() => ({
+  ReferenceCacheService: vi.fn(function (this: { options: unknown }, options: unknown) {
+    this.options = options;
+  }),
 }));
 
 const mockThreadRegistryModule = vi.hoisted(() => ({
@@ -43,6 +51,7 @@ vi.mock("open", () => openMock);
 vi.mock("../webhook/server.js", () => mockWebhookServerModule);
 vi.mock("../config/index.js", () => mockConfigLoader);
 vi.mock("../db/index.js", () => mockDbModule);
+vi.mock("../references/cache-service.js", () => mockReferenceCacheModule);
 vi.mock("../actor/thread-registry.js", () => mockThreadRegistryModule);
 
 import { runDashboard } from "./dashboard.js";
@@ -73,6 +82,20 @@ describe("runDashboard", () => {
       })
     );
     expect(openMock.default).toHaveBeenCalledWith("http://localhost:8080");
+  });
+
+  it("wires a repository-backed reference cache so standalone dashboard can serve persisted rows", async () => {
+    await runDashboard();
+
+    expect(mockReferenceCacheModule.ReferenceCacheService).toHaveBeenCalledWith(
+      expect.objectContaining({ repo: mockReferenceCacheRepo })
+    );
+    const serviceInstance = mockReferenceCacheModule.ReferenceCacheService.mock.instances[0];
+    expect(mockWebhookServerModule.startDashboardServer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mesh: expect.objectContaining({ referenceCache: serviceInstance }),
+      })
+    );
   });
 
   it("prefers the tailscale hostname for the opened URL when configured", async () => {

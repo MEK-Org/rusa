@@ -49,7 +49,7 @@ function createSandbox(sourceHome: string): Sandbox {
   const sandboxHome = mkdtempSync(join(tmpdir(), "rusa-eval-"));
   mkdirSync(join(sandboxHome, "data"), { recursive: true });
 
-  const files = ["rusa.db", "rusa.db-shm", "rusa.db-wal"];
+  const files = ["mesh.db", "mesh.db-shm", "mesh.db-wal"];
   for (const file of files) {
     const src = join(sourceHome, "data", file);
     if (existsSync(src)) {
@@ -525,7 +525,7 @@ export async function runUnderstandingEvalReplay(opts: {
   browser?: boolean;
 }): Promise<void> {
   const sourceHome = resolveHome();
-  const sourceDbPath = join(sourceHome, "data", "rusa.db");
+  const sourceDbPath = join(sourceHome, "data", "mesh.db");
   const outputPath = join(process.cwd(), "replay.json");
   const opsOutputPath = join(process.cwd(), "ops.json");
   const hierarchyOutputPath = join(process.cwd(), "hierarchy.txt");

@@ -177,6 +177,8 @@ export interface ChatUploadAttachmentResult {
 
 /** Chat actions performed as the authenticated user. */
 export interface ChatClient {
+  /** Read one space by its full Google Chat resource name. */
+  getSpace(spaceName: string): Promise<ChatSpace>;
   /** Read one message by its full Google Chat resource name. */
   getMessage(messageName: string): Promise<ChatReadMessage>;
   /** List one page of messages in a space, optionally narrowed to a thread. */

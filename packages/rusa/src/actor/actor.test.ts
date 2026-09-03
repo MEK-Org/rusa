@@ -184,6 +184,108 @@ describe("Actor", () => {
     expect(provider.calls).toHaveLength(0);
   });
 
+  it("skips the run when preempted during async beforeRun (admission epoch)", async () => {
+    const provider = new FakeProvider();
+    let resolveBeforeRun!: (val: boolean) => void;
+    let beforeRunEntered!: () => void;
+    const beforeRunPromise = new Promise<void>((r) => (beforeRunEntered = r));
+    const actor = makeActor(
+      {
+        beforeRun: () => {
+          beforeRunEntered();
+          return new Promise((resolve) => {
+            resolveBeforeRun = resolve;
+          });
+        },
+      },
+      provider
+    );
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(50);
+    await beforeRunPromise;
+
+    // Actor is awaiting beforeRun
+    const preemption = actor.preemptForResponsive();
+    if (preemption.preempted === false) throw new Error("Expected preemption");
+    expect(preemption.phase).toBe("queued"); // TriggerRunner is busy but not executing yet
+
+    // Queue the replacement that preempted it
+    actor.requestRun({ priority: "responsive" });
+
+    // Resolve beforeRun for the stale run
+    resolveBeforeRun(true);
+    await flush();
+
+    // The responsive replacement starts and hits beforeRun. Resolve it too.
+    resolveBeforeRun(true);
+    await flush();
+
+    // The ordinary run is skipped due to admission epoch change, and exactly one
+    // run (the responsive replacement) is executed.
+    expect(provider.calls).toHaveLength(1);
+  });
+
+  it("skips the run when preempted in the gap after scheduler pops but before invoke", async () => {
+    let resolveInvoke!: () => void;
+    let invokeCalled = false;
+    const provider = new FakeProvider(() => {
+      actor.declareYield("complete");
+      return {
+        success: true,
+        output: "simulated output",
+        exitCode: 0,
+        sessionId: "s1",
+      };
+    });
+    const actor = makeActor(
+      {
+        gate: (invoke) => {
+          if (invokeCalled) {
+            return invoke();
+          }
+          return {
+            started: false,
+            cancel: () => false, // simulate scheduler popping the callback
+            promote: () => {},
+            result: new Promise((resolve) => {
+              // Defer invoke() to capture the exact gap
+              resolveInvoke = () => {
+                invokeCalled = true;
+                try {
+                  resolve(invoke());
+                } catch (e) {
+                  resolve(Promise.reject(e));
+                }
+              };
+            }),
+          };
+        },
+      },
+      provider
+    );
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(50);
+    // Gate has returned the start handle, but invoke() hasn't run yet.
+    // This perfectly simulates the cancel() === false window.
+
+    const preemption = actor.preemptForResponsive();
+    if (preemption.preempted === false) throw new Error("Expected preemption");
+    expect(preemption.phase).toBe("queued");
+    // Ensure we are testing the gap before executing
+    expect(actor.isRunning).toBe(false);
+
+    // Enqueue the replacement
+    actor.requestRun({ priority: "responsive" });
+
+    // Now let invoke() run; it should throw RunStartCancelledError due to preemption flag
+    resolveInvoke();
+    await flush();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(invokeCalled).toBe(true);
+    // Only the responsive replacement ran
+    expect(provider.calls).toHaveLength(1);
+  });
+
   it("routes the run through the gate and calls onRun", async () => {
     let actor!: Actor;
     const provider = new FakeProvider(() => {
@@ -294,6 +396,39 @@ describe("Actor", () => {
     await vi.advanceTimersByTimeAsync(10);
     await flush();
     expect(provider.calls[0]?.prompt).toBe("PROMPT: inbox work");
+  });
+
+  it("replaces a queued normal run with one responsive opportunity", async () => {
+    const limiter = new ConcurrencyLimiter(1);
+    let releaseBlocker!: () => void;
+    void limiter.run(() => new Promise<void>((resolve) => (releaseBlocker = resolve)));
+    await flush();
+    let actor!: Actor;
+    const provider = new FakeProvider(() => {
+      actor.declareYield();
+      return {};
+    });
+    actor = makeActor(
+      {
+        gate: (fn) => limiter.enqueue(fn),
+      },
+      provider
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(actor.isQueued).toBe(true);
+
+    expect(actor.preemptForResponsive()).toEqual({ preempted: true, phase: "queued" });
+    actor.requestRun({ priority: "responsive" });
+    await flush();
+    expect(provider.calls).toHaveLength(0);
+
+    releaseBlocker();
+    await flush();
+    expect(provider.calls).toHaveLength(1);
+    expect(provider.calls[0]?.prompt).toBe("PROMPT: inbox work");
+    expect(actor.resumeCancelledRun()).toBe(false);
   });
 
   describe("every queued opportunity reports exactly one terminal signal ", () => {
@@ -1603,6 +1738,40 @@ describe("Actor", () => {
       });
     });
 
+    it("forces success=false for non-grace aborts even if provider returns success=true", async () => {
+      let resolveRun!: (res: RunResult) => void;
+      const provider = new FakeProvider(() => {
+        return new Promise<RunResult>((resolve) => {
+          resolveRun = resolve;
+        });
+      });
+      const onRunEnd = vi.fn();
+      const actor = makeActor({ onRunEnd }, provider);
+
+      actor.requestRun({ priority: "responsive" });
+      await flush();
+
+      actor.interrupt("root");
+
+      // Provider incorrectly thinks it succeeded despite the abort
+      resolveRun({
+        success: true,
+        exitCode: 0,
+        output: "i am done",
+      });
+      await flush();
+
+      expect(onRunEnd).toHaveBeenCalledTimes(1);
+      expect(onRunEnd.mock.calls[0][0]).toMatchObject({
+        success: false,
+        exitCode: 143,
+        cancelled: true,
+        interrupted: true,
+        interruptSource: "root",
+        output: expect.stringContaining("i am done\n[Task interrupted by root]"),
+      });
+    });
+
     it("returns interrupted: false when actor is idle", async () => {
       const provider = new FakeProvider();
       const actor = makeActor({}, provider);
@@ -1610,6 +1779,76 @@ describe("Actor", () => {
       expect(actor.isRunning).toBe(false);
       const res = actor.interrupt("human:operator");
       expect(res.interrupted).toBe(false);
+    });
+
+    it("preemptForResponsive bypasses markUnkillable and voice max-age", async () => {
+      let resolveRun!: (res: RunResult) => void;
+      const provider = new FakeProvider(() => {
+        return new Promise<RunResult>((resolve) => {
+          resolveRun = resolve;
+        });
+      });
+      const actor = makeActor({ debounceMs: 30000, voiceCoalesceMaxAgeMs: 5000 }, provider);
+
+      const now = Date.now();
+      actor.requestRun({ priority: "responsive", voiceTimestamp: now });
+      await flush();
+      expect(provider.calls).toHaveLength(1);
+
+      // Advance past max-age
+      await vi.advanceTimersByTimeAsync(6000);
+
+      // Mark unkillable
+      actor.markUnkillable();
+
+      const call = provider.calls[0] as RunOptions;
+      expect(call.signal?.aborted).toBe(false);
+
+      // Preempt
+      const preemption = actor.preemptForResponsive();
+      if (preemption.preempted === false) throw new Error("Expected preemption");
+      expect(preemption.phase).toBe("running");
+      expect(call.signal?.aborted).toBe(true);
+      expect(call.signal?.reason).toBe("interrupt:responsive-notification");
+
+      resolveRun({ success: false, exitCode: 1, output: "aborted" });
+      await flush();
+    });
+
+    it("source-to-RunResult responsive attribution via termination-builder path", async () => {
+      let resolveRun!: (res: RunResult) => void;
+      const seen: RunResult[] = [];
+      const provider = new FakeProvider(() => {
+        return new Promise<RunResult>((resolve) => {
+          resolveRun = resolve;
+        });
+      });
+      const actor = makeActor(
+        {
+          onRunEnd: async (r) => {
+            seen.push(r);
+          },
+        },
+        provider
+      );
+
+      actor.requestRun();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(actor.isRunning).toBe(true);
+
+      // Preempt the executing run with a responsive wake
+      const preemption = actor.preemptForResponsive();
+      expect(preemption.preempted).toBe(true);
+
+      // Resolve the provider without any manual attribution (it didn't use subprocess-execution)
+      resolveRun({ success: false, output: "simulated output", exitCode: 1 });
+      await flush();
+
+      expect(seen).toHaveLength(1);
+      const res = seen[0] as RunResult;
+      expect(res.interrupted).toBe(true);
+      expect(res.interruptSource).toBe("responsive-notification");
+      expect(res.output).toContain("[Task interrupted by responsive-notification]");
     });
   });
 

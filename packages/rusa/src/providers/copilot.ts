@@ -73,20 +73,36 @@ export class CopilotProvider implements CodingProvider {
       signal: opts.signal,
       onChunk: opts.onChunk,
       cleanup: cleanupTempPaths,
-      buildKilledResult: ({ output, exitCode, cancelled, interrupted, graceKilled }) => ({
+      buildKilledResult: ({
+        output,
+        exitCode,
+        cancelled,
+        interrupted,
+        interruptSource,
+        graceKilled,
+      }) => ({
         success: false,
         output,
         exitCode,
         cancelled,
         interrupted,
+        interruptSource,
         graceKilled,
       }),
-      buildSignalResult: ({ output, exitCode, cancelled, interrupted, graceKilled }) => ({
+      buildSignalResult: ({
+        output,
+        exitCode,
+        cancelled,
+        interrupted,
+        interruptSource,
+        graceKilled,
+      }) => ({
         success: false,
         output,
         exitCode,
         cancelled,
         interrupted,
+        interruptSource,
         graceKilled,
       }),
       buildExitResult: (output, exitCode) => ({

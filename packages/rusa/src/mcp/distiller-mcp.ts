@@ -27,7 +27,7 @@ export interface DistillerSeedSource {
 
 /**
  * The host-side distiller boundary. This is intentionally narrower than raw
- * rusa.db or repository access: it can touch only cursor state, count
+ * mesh.db or repository access: it can touch only cursor state, count
  * substantive activity for the gate, and derive the one-shot seed source.
  */
 export interface DistillerMcpStore extends DistillerStore {

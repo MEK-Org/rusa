@@ -280,22 +280,38 @@ export class ClaudeProvider implements CodingProvider {
           teardownFlutterOverlay(opts.sandbox.worktreePath);
         }
       },
-      buildKilledResult: ({ output, exitCode, cancelled, interrupted, graceKilled }) => ({
+      buildKilledResult: ({
+        output,
+        exitCode,
+        cancelled,
+        interrupted,
+        interruptSource,
+        graceKilled,
+      }) => ({
         success: false,
         output,
         exitCode,
         cancelled,
         interrupted,
+        interruptSource,
         graceKilled,
         sessionId,
         tokenUsage: captureTokenUsage(),
       }),
-      buildSignalResult: ({ output, exitCode, cancelled, interrupted, graceKilled }) => ({
+      buildSignalResult: ({
+        output,
+        exitCode,
+        cancelled,
+        interrupted,
+        interruptSource,
+        graceKilled,
+      }) => ({
         success: false,
         output,
         exitCode,
         cancelled,
         interrupted,
+        interruptSource,
         graceKilled,
         sessionId,
         tokenUsage: captureTokenUsage(),

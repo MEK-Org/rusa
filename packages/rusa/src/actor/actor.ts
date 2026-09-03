@@ -2,6 +2,7 @@ import type { ExhaustionClassifier } from "../providers/exhaustion-classifier.js
 import { teardownFlutterOverlay } from "../providers/sandbox.js";
 import {
   createInterruptAbortReason,
+  formatSigtermResult,
   RUN_CEILING_ABORT_REASON,
   STALL_WATCHDOG_ABORT_REASON,
   YIELD_GRACE_ABORT_REASON,
@@ -24,6 +25,7 @@ import {
 export const WATCHDOG_STALL_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
 export const WATCHDOG_CEILING_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes
 export const DEFAULT_YIELD_GRACE_MS = 10 * 1000; // 10 seconds
+export const RESPONSIVE_PREEMPTION_SOURCE = "responsive-notification";
 const YIELD_ELICITATION_MAX = 1;
 
 /**
@@ -284,6 +286,7 @@ export class Actor {
   private queued = false;
   /** Actor-level dirty state retained when /halt cancels a queued provider start. */
   private cancelledQueuedRun = false;
+  private preemptedQueuedRun = false;
   /**
    * Set within a run at the moment it commits to reporting its result through
    * `onRunEnd`. Read by the terminal hook in `runOnce`'s `finally` to decide
@@ -433,6 +436,50 @@ export class Actor {
   }
 
   /**
+   * Replace the current execution opportunity with newly delivered responsive work.
+   *
+   * Unlike a manual {@link interrupt}, this deliberately sets no inbox watermark:
+   * the replacement run must see both the responsive entry and any earlier work the
+   * interrupted run had not committed as handled. A queued start is cancelled
+   * without retaining the halt/resume dirty flag because the caller immediately
+   * requests its responsive replacement.
+   */
+  preemptForResponsive():
+    | { preempted: false }
+    | { preempted: true; phase: "running" | "winding_down" | "queued" } {
+    this.admissionEpoch++;
+    const phase = this.executing
+      ? this.yielded
+        ? "winding_down"
+        : "running"
+      : this.pendingStart || this.queued || this.runner.isBusy
+        ? "queued"
+        : undefined;
+    if (!phase) return { preempted: false };
+
+    // Drop any previously coalesced follow-up. The responsive inbox delivery that
+    // caused this call is the one replacement opportunity we want to retain.
+    this.runner.cancelPending();
+
+    if (this.executing && this.coalesceAbortController) {
+      if (this.coalesceAbortController.signal.aborted) return { preempted: false };
+      this.coalesceAbortController.abort(createInterruptAbortReason(RESPONSIVE_PREEMPTION_SOURCE));
+      return { preempted: true, phase };
+    }
+    this.queued = false;
+    this.publishRuntimeStateIfChanged();
+
+    if (this.pendingStart) {
+      if (this.pendingStart.cancel && !this.pendingStart.cancel()) {
+        this.preemptedQueuedRun = true;
+        return { preempted: true, phase: "queued" };
+      }
+    }
+
+    return { preempted: true, phase: "queued" };
+  }
+
+  /**
    * Interrupt this actor if it has an in-flight run (executing or queued).
    * Sets the interrupted watermark to the run's start time so older inbox items
    * do not immediately re-schedule the actor.
@@ -442,6 +489,7 @@ export class Actor {
     runStartTime?: Date;
     wasQueued?: boolean;
   } {
+    this.admissionEpoch++;
     const now = new Date();
     this.runner.cancelPending();
     if (this.executing && this.coalesceAbortController) {
@@ -492,12 +540,20 @@ export class Actor {
     }
   }
 
+  private admissionEpoch = 0;
+
   private async runOnce(nudge: RunNudge): Promise<void> {
     if (this.closed) {
       this.lastRunSkipped = true;
       return;
     }
+    const epoch = this.admissionEpoch;
     if (this.opts.beforeRun && !(await this.opts.beforeRun({ mode: nudge.mode ?? "ordinary" }))) {
+      this.lastRunSkipped = true;
+      return;
+    }
+    if (this.admissionEpoch !== epoch) {
+      // Preempted or interrupted during async beforeRun
       this.lastRunSkipped = true;
       return;
     }
@@ -673,7 +729,8 @@ export class Actor {
       // wake obeys per-actor serialization; v1 never cancels a live provider.
       this.pendingStart = undefined;
       this.queued = false;
-      if (this.closed) {
+      if (this.closed || this.preemptedQueuedRun) {
+        this.preemptedQueuedRun = false;
         throw new RunStartCancelledError();
       }
       this.executing = true;
@@ -750,6 +807,11 @@ export class Actor {
 
     if (this.coalesceAborted) return;
     this.coalesceAbortController = undefined;
+
+    if (abortController.signal.aborted && !result.cancelled) {
+      result.success = false;
+      Object.assign(result, formatSigtermResult(result.output, abortController.signal));
+    }
 
     if (result.sessionId && result.sessionId !== sessionId) {
       this.opts.saveSessionId(result.sessionId);

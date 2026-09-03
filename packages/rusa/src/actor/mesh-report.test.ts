@@ -22,7 +22,7 @@ describe("generateMeshReport", () => {
 
   function seed(records: ThreadRecord[], record: (repo: MeshEventRepository) => void): void {
     writeFileSync(join(home, "threads.json"), JSON.stringify({ threads: records }, null, 2));
-    const db = new Database(join(home, "data", "rusa.db"));
+    const db = new Database(join(home, "data", "mesh.db"));
     runMigrations(db);
     record(new MeshEventRepository(db));
     db.close();

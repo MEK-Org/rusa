@@ -936,6 +936,8 @@ class ReferenceDto {
     this.timestamp,
     this.url,
     this.unavailable,
+    this.entity,
+    this.cacheState,
   });
 
   final String ref;
@@ -945,22 +947,23 @@ class ReferenceDto {
   final String? author;
   final String? timestamp;
   final String? url;
-
-  /// Why [body] is absent, when it is. Distinguishes "no text" from "could not
-  /// read it" from "no such thing".
   final String? unavailable;
+  final Map<String, dynamic>? entity;
+  final String? cacheState;
 
-  bool get isResolved => body != null && body!.trim().isNotEmpty;
+  bool get isResolved => unavailable == null;
 
   factory ReferenceDto.fromJson(Map<String, dynamic> j) => ReferenceDto(
     ref: j['ref'] as String? ?? '',
-    scheme: j['scheme'] as String? ?? 'mesh',
-    title: j['title'] as String? ?? j['ref'] as String? ?? '',
+    scheme: j['scheme'] as String? ?? '',
+    title: j['title'] as String? ?? '',
     body: j['body'] as String?,
     author: j['author'] as String?,
     timestamp: j['timestamp'] as String?,
     url: j['url'] as String?,
     unavailable: j['unavailable'] as String?,
+    entity: j['entity'] as Map<String, dynamic>?,
+    cacheState: j['cacheState'] as String?,
   );
 }
 

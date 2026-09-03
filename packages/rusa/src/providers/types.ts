@@ -79,6 +79,8 @@ export interface RunResult {
   exitCode: number;
   cancelled?: boolean;
   interrupted?: boolean;
+  /** The typed source of the interrupt, if applicable (e.g. 'human:operator', 'responsive-notification'). */
+  interruptSource?: string;
   /** True when the run was grace-killed by the supervisor after exceeding the yield grace period. */
   graceKilled?: boolean;
   /** The declared yield status ('complete' | 'blocked') if the run yielded. */

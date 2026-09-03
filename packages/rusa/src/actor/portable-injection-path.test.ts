@@ -29,7 +29,7 @@ describe("portable injection path at a late step (ISSUE_NUM Concern 2)", () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "portable-inject-"));
     mkdirSync(join(home, "data"), { recursive: true });
-    db = new Database(join(home, "data", "rusa.db"));
+    db = new Database(join(home, "data", "mesh.db"));
     runMigrations(db);
     repo = new MeshEventRepository(db);
   });

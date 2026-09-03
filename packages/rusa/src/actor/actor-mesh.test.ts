@@ -8,6 +8,7 @@ import type { IssueClient } from "../gitops/issue-client.js";
 import { MESH_SYSTEM, resolveStampedAuthor } from "../mcp/stamp.js";
 import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
 import { FakeProvider } from "../providers/fake-provider.js";
+import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { Actor } from "./actor.js";
 import type {
@@ -375,6 +376,7 @@ describe("ActorMesh", () => {
           declareYield: () => {},
           markUnkillable: () => {},
           close: () => {},
+          preemptForResponsive: () => ({ preempted: false }),
           isRunning: false,
         };
       },
@@ -737,10 +739,11 @@ describe("ActorMesh", () => {
     });
     const record = registry.get(id);
     expect(record?.provider).toBe("antigravity");
-    expect(record?.model).toBe("Gemini 3.7 Flash (High)");
+    expect(record?.model).toBe("Gemini 3.7 Flash");
+    expect(record?.effort).toBe("high");
     const spawnEvent = events.find((e) => e.kind === "actor_spawned" && e.actorId === id);
     expect(spawnEvent).toBeDefined();
-    expect(spawnEvent?.body).toBe("provider=antigravity model=Gemini 3.7 Flash (High)");
+    expect(spawnEvent?.body).toBe("provider=antigravity model=Gemini 3.7 Flash effort=high");
   });
 
   it("revokes parent handle and marks record retired when createActor throws on spawn", () => {
@@ -1176,6 +1179,91 @@ describe("ActorMesh", () => {
       }),
     ]);
     expect(fake("root").calls).toHaveLength(1);
+  });
+
+  it("preempts an active run for durable responsive inbox work and runs the replacement", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    let resolveFirst!: (result: Partial<RunResult>) => void;
+    let firstSignal: AbortSignal | undefined;
+    let runIndex = 0;
+    const provider = new FakeProvider((opts) => {
+      if (runIndex++ === 0) {
+        firstSignal = opts.signal;
+        return new Promise<Partial<RunResult>>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return { success: true, exitCode: 0, output: "responsive work handled" };
+    });
+    const { mesh, fake, tick } = setup({
+      inboxStore,
+      events: (event) => events.push(event),
+      sharedProvider: provider,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([{ actorId: worker, source: "mesh:root", payload: payload("mesh.message") }]);
+    mesh.notifyInboxChanged(worker);
+    await tick();
+    expect(fake(worker).calls).toHaveLength(1);
+    expect(firstSignal?.aborted).toBe(false);
+
+    const [responsive] = inboxStore.append([
+      {
+        actorId: worker,
+        source: "system:events",
+        payload: { type: "system.disk", priority: "responsive" },
+      },
+    ]);
+    mesh.notifyInboxChanged(worker, { priority: "responsive" });
+
+    expect(firstSignal?.aborted).toBe(true);
+    expect(firstSignal?.reason).toBe("interrupt:responsive-notification");
+    expect(responsive?.handledAt).toBeNull();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "run_preempted",
+        actorId: worker,
+        detail: "running",
+        payload: JSON.stringify({ reason: "responsive_notification" }),
+      })
+    );
+
+    resolveFirst({
+      success: false,
+      exitCode: 143,
+      cancelled: true,
+      interrupted: true,
+      output: "[Task interrupted by responsive-notification]",
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake(worker).calls).toHaveLength(2);
+
+    // Assert the inbox seam preserves both the old unhandled and new responsive entries
+    const unhandled = inboxStore.entries.filter((e) => e.actorId === worker && !e.handledAt);
+    expect(unhandled).toHaveLength(2);
+    expect(unhandled.map((e) => e.payload.type)).toEqual(["mesh.message", "system.disk"]);
+  });
+
+  it("delivers responsive inbox work to an idle actor without a preemption event", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const events: MeshEventInput[] = [];
+    const { mesh, fake, tick } = setup({ inboxStore, events: (event) => events.push(event) });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    inboxStore.append([
+      {
+        actorId: worker,
+        source: "system:events",
+        payload: { type: "system.disk", priority: "responsive" },
+      },
+    ]);
+    mesh.notifyInboxChanged(worker, { priority: "responsive" });
+    await tick();
+
+    expect(fake(worker).calls).toHaveLength(1);
+    expect(events.some((event) => event.kind === "run_preempted")).toBe(false);
   });
 
   it("mechanically notifies the parent when a parent-triggered run yields", async () => {
@@ -2879,12 +2967,17 @@ describe("ActorMesh", () => {
     const validations: Array<{ recordId: string; newModel?: string; newProvider?: string }> = [];
     const { mesh, registry, tick } = setup({
       events: (event) => events.push(event),
-      validateModel: (record, newModel, newProvider) => {
+      validateModel: (record, newModel, newProvider, newEffort) => {
         validations.push({ recordId: record.id, newModel, newProvider });
         if (newProvider === "antigravity" && newModel === "invalid-model") {
           throw new Error("invalid model for antigravity");
         }
-        return { model: newModel };
+        const sel = normalizeModelEffortSelection(
+          (newProvider ?? record.provider) as string,
+          newModel,
+          newEffort
+        );
+        return { model: sel.model, effort: sel.effort };
       },
     });
 
@@ -2900,22 +2993,24 @@ describe("ActorMesh", () => {
     expect(registry.get(ledgerChild)?.provider).toBe("claude");
     expect(registry.get(ledgerChild)?.model).toBe("claude-opus-4-8");
     expect(registry.get(ledgerChild)?.desiredProvider).toBe("antigravity");
-    expect(registry.get(ledgerChild)?.desiredModel).toBe("gemini-3.7-flash-high");
+    expect(registry.get(ledgerChild)?.desiredModel).toBe("gemini-3.7-flash");
+    expect(registry.get(ledgerChild)?.desiredEffort).toBe("high");
     mesh.sendMessage(ledgerChild, "apply staged provider", "root");
     await tick();
     expect(registry.get(ledgerChild)?.provider).toBe("antigravity");
-    expect(registry.get(ledgerChild)?.model).toBe("gemini-3.7-flash-high");
+    expect(registry.get(ledgerChild)?.model).toBe("gemini-3.7-flash");
+    expect(registry.get(ledgerChild)?.effort).toBe("high");
     expect(registry.get(ledgerChild)?.desiredModel).toBeUndefined();
     expect(validations).toContainEqual({
       recordId: ledgerChild,
-      newModel: "gemini-3.7-flash-high",
+      newModel: "gemini-3.7-flash",
       newProvider: "antigravity",
     });
     expect(events).toContainEqual(
       expect.objectContaining({
         kind: "actor_model_set",
         actorId: ledgerChild,
-        detail: "claude:claude-opus-4-8 -> antigravity:gemini-3.7-flash-high",
+        detail: "claude:claude-opus-4-8 -> antigravity:gemini-3.7-flash @ high",
       })
     );
 
@@ -2939,7 +3034,7 @@ describe("ActorMesh", () => {
     expect(() => mesh.setActorModel(ledgerChild, "invalid-model", "root", "antigravity")).toThrow(
       /invalid model for antigravity/
     );
-    expect(registry.get(ledgerChild)?.model).toBe("gemini-3.7-flash-high");
+    expect(registry.get(ledgerChild)?.model).toBe("gemini-3.7-flash");
 
     // 4. Non-portable (native context) actor rejects provider move
     const nativeChild = mesh.spawn({
@@ -3000,7 +3095,7 @@ describe("ActorMesh", () => {
     busyMeshSetup.mesh.setActorModel(busyChild, "gemini-3.7-flash-high", "root", "antigravity");
     expect(busyMeshSetup.registry.get(busyChild)?.model).toBe("claude-opus-4-8");
     expect(busyMeshSetup.registry.get(busyChild)?.provider).toBe("claude");
-    expect(busyMeshSetup.registry.get(busyChild)?.desiredModel).toBe("gemini-3.7-flash-high");
+    expect(busyMeshSetup.registry.get(busyChild)?.desiredModel).toBe("gemini-3.7-flash");
     expect(busyMeshSetup.registry.get(busyChild)?.desiredProvider).toBe("antigravity");
     expect(modelSetCalls).toHaveLength(0);
 
@@ -3027,7 +3122,7 @@ describe("ActorMesh", () => {
       expect.objectContaining({
         kind: "actor_model_set",
         actorId: busyChild,
-        detail: "claude:claude-opus-4-8 -> codex:gpt-5.6-sol",
+        detail: "claude:claude-opus-4-8 -> codex:gpt-5.6-sol @ high",
       })
     );
 
@@ -5115,5 +5210,69 @@ describe("ActorMesh", () => {
 
       expect(woken).toEqual([steward]);
     });
+  });
+
+  it("canonicalizes antigravity effort on spawn, update, and restart", async () => {
+    const { registry, mesh } = setup();
+
+    // 1. Spawn
+    // Tier match
+    const workerMatch = mesh.spawn({
+      charter: "match test",
+      parentId: "root",
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash (High)",
+    });
+    const registryMatch = registry.get(workerMatch);
+    expect(registryMatch?.model).toBe("Gemini 3.7 Flash");
+    expect(registryMatch?.effort).toBe("high");
+
+    // Tier/effort conflict
+    expect(() => {
+      mesh.spawn({
+        charter: "conflict test",
+        parentId: "root",
+        provider: "antigravity",
+        model: "Gemini 3.7 Flash (High)",
+        effort: "low",
+      });
+    }).toThrow(/conflicting reasoning efforts/);
+
+    // 2. Update (setActorModel)
+    const updateWorker = mesh.spawn({
+      charter: "update test",
+      parentId: "root",
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "low",
+    });
+
+    // Changing model with inline effort
+    mesh.setActorModel(updateWorker, "Gemini 3.7 Flash (High)", "root");
+    const registryUpdate = registry.get(updateWorker);
+    expect(registryUpdate?.desiredModel).toBe("Gemini 3.7 Flash");
+    expect(registryUpdate?.desiredEffort).toBe("high");
+
+    // Conflicting effort in update
+    expect(() => {
+      mesh.setActorModel(updateWorker, "Gemini 3.7 Flash (High)", "root", undefined, "low");
+    }).toThrow(/conflicting reasoning efforts/);
+
+    // 3. Restart / Rehydrate
+    const restartWorker = mesh.spawn({
+      charter: "restart test",
+      parentId: "root",
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash (High)",
+    });
+
+    mesh.shutdownAll();
+
+    const { mesh: mesh2 } = setup();
+    Object.assign(mesh2, { registry });
+    mesh2.rehydrateAll();
+    const registryRestart = registry.get(restartWorker);
+    expect(registryRestart?.model).toBe("Gemini 3.7 Flash");
+    expect(registryRestart?.effort).toBe("high");
   });
 });

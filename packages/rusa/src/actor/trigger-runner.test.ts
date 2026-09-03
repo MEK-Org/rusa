@@ -9,7 +9,20 @@ describe("TriggerRunner", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  it("coalesces pre-run nudges without retaining content", async () => {
+  it("starts promptly without debounce by default", async () => {
+    const runs: unknown[] = [];
+    const runner = new TriggerRunner({
+      run: async (nudge) => void runs.push(nudge),
+    });
+    runner.requestRun();
+    expect(runs).toHaveLength(0);
+    runner.requestRun();
+    await vi.advanceTimersByTimeAsync(0);
+    await flush();
+    expect(runs).toHaveLength(1);
+  });
+
+  it("coalesces pre-run nudges when explicitly debounced", async () => {
     const runs: unknown[] = [];
     const runner = new TriggerRunner({
       debounceMs: 10,
@@ -40,6 +53,42 @@ describe("TriggerRunner", () => {
     release();
     await flush();
     await vi.advanceTimersByTimeAsync(10);
+    expect(runs).toHaveLength(2);
+  });
+
+  it("retains one dirty follow-up for production default while a run is active", async () => {
+    let release!: () => void;
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    const runs: unknown[] = [];
+    const runner = new TriggerRunner({
+      run: async (nudge) => {
+        concurrent++;
+        if (concurrent > maxConcurrent) maxConcurrent = concurrent;
+        runs.push(nudge);
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        concurrent--;
+      },
+    });
+
+    runner.requestRun();
+    await vi.advanceTimersByTimeAsync(0);
+    await flush();
+
+    runner.requestRun();
+    runner.requestRun();
+    runner.requestRun();
+
+    release();
+    await flush();
+    await vi.advanceTimersByTimeAsync(0);
+
+    release();
+    await flush();
+
+    expect(maxConcurrent).toBe(1);
     expect(runs).toHaveLength(2);
   });
 

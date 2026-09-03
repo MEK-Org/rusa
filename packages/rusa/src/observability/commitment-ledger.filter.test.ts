@@ -50,6 +50,7 @@ const ALL_MESH_EVENT_KINDS = Object.keys({
   run_first_chunk: 0,
   run_end: 0,
   run_abandoned: 0,
+  run_preempted: 0,
   portable_context_compacted: 0,
   run_coalesced: 0,
   run_continued: 0,

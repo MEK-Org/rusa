@@ -67,6 +67,10 @@ export class GchatClient implements ChatClient {
     await this.call("POST", `${messageName}/reactions`, undefined, { emoji: { unicode: emoji } });
   }
 
+  async getSpace(spaceName: string): Promise<ChatSpace> {
+    return (await this.call("GET", spaceName)) as ChatSpace;
+  }
+
   async getMessage(messageName: string): Promise<ChatReadMessage> {
     return (await this.call("GET", messageName)) as ChatReadMessage;
   }
