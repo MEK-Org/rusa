@@ -165,6 +165,7 @@ function setup(
     validateSpawn?: ActorMeshOptions["validateSpawn"];
     validateModel?: ActorMeshOptions["validateModel"];
     onModelSet?: ActorMeshOptions["onModelSet"];
+    onQueued?: ActorMeshOptions["onQueued"];
     createActor?: ActorMeshOptions["createActor"];
     rootId?: string;
     obligations?: ActorMeshOptions["obligations"];
@@ -182,6 +183,7 @@ function setup(
     validateSpawn: opts.validateSpawn,
     validateModel: opts.validateModel,
     onModelSet: opts.onModelSet,
+    onQueued: opts.onQueued,
     maxConcurrent: opts.maxConcurrent ?? 4,
     isHalted: opts.isHalted,
     isShuttingDown: opts.isShuttingDown,
@@ -3277,6 +3279,184 @@ describe("ActorMesh", () => {
     const dead = mesh.spawn({ charter: "dead", parentId: "root" });
     registry.patch(dead, { status: "retired" });
     expect(() => mesh.reparentThread(b, dead)).toThrow(/non-active/);
+  });
+
+  it("setActorModel queues a run if the actor is idle and has unhandled inbox entries", async () => {
+    let shouldFail = false;
+    let runCount = 0;
+    const events: MeshEventInput[] = [];
+    const { mesh, tick } = setup({
+      events: (e) => events.push(e),
+      onQueued: (actorId, ctx) => {
+        mesh.recordEvent({ kind: "run_queued", actorId, detail: ctx.mode });
+      },
+      sharedProvider: {
+        name: "test-provider",
+        providerName: "test-provider",
+        run: async () => {
+          runCount++;
+          if (shouldFail) return { success: false, exitCode: 1, output: "failed" };
+          return { success: true, exitCode: 0, output: "ok" };
+        },
+      },
+    });
+
+    const worker = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      provider: "test-provider",
+      model: "model-a",
+      context: { type: "portable", mode: "ledger" },
+    });
+
+    // Queue a run that fails.
+    shouldFail = true;
+    mesh.sendMessage(worker, "work", "root");
+    await tick();
+    expect(runCount).toBe(1);
+
+    expect(mesh.activeRunState(worker)).toBeNull(); // idle
+    events.length = 0;
+
+    // Re-pin should queue it now.
+    mesh.setActorModel(worker, "model-c", "root");
+
+    // Tick to let the new run execute.
+    shouldFail = false;
+    await tick();
+
+    expect(runCount).toBe(2);
+    expect(mesh.registry.get(worker)?.model).toBe("model-c");
+    expect(events).toContainEqual(expect.objectContaining({ kind: "run_queued", actorId: worker }));
+  });
+
+  it("setActorModel does not queue an idle actor with an empty inbox", async () => {
+    let runCount = 0;
+    const { mesh, tick } = setup({
+      sharedProvider: {
+        name: "test-provider",
+        providerName: "test-provider",
+        run: async () => {
+          runCount++;
+          return { success: true, exitCode: 0, output: "ok" };
+        },
+      },
+    });
+
+    const worker = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      provider: "test-provider",
+      model: "model-a",
+      context: { type: "portable", mode: "ledger" },
+    });
+
+    expect(mesh.activeRunState(worker)).toBeNull();
+
+    mesh.setActorModel(worker, "model-b", "root");
+    await tick();
+
+    expect(runCount).toBe(0);
+    expect(mesh.activeRunState(worker)).toBeNull();
+    expect(mesh.registry.get(worker)?.desiredModel).toBe("model-b");
+    expect(mesh.registry.get(worker)?.model).toBe("model-a");
+  });
+
+  it("setActorModel does not duplicate a running run", async () => {
+    let runCount = 0;
+    const deferred = deferredProvider();
+    const { mesh, tick } = setup({
+      sharedProvider: {
+        name: "deferred",
+        providerName: "deferred",
+        run: async (opts) => {
+          runCount++;
+          return deferred.provider.run(opts);
+        },
+      },
+    });
+
+    const worker = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      provider: "deferred",
+      model: "model-a",
+      context: { type: "portable", mode: "ledger" },
+    });
+
+    mesh.sendMessage(worker, "work", "root");
+    await tick();
+    expect(mesh.activeRunState(worker)?.phase).toBe("running");
+    expect(runCount).toBe(1);
+
+    // Re-pin while the run is in-flight.
+    mesh.setActorModel(worker, "model-b", "root");
+
+    // Finish the in-flight run.
+    deferred.releaseAll();
+    await tick();
+
+    expect(mesh.activeRunState(worker)).toBeNull();
+    expect(runCount).toBe(1);
+    expect(mesh.registry.get(worker)?.model).toBe("model-b");
+  });
+
+  it("setActorModel does not duplicate a queued run", async () => {
+    let runCount = 0;
+    const deferred = deferredProvider();
+    const { mesh, tick } = setup({
+      maxConcurrent: 1,
+      sharedProvider: {
+        name: "deferred",
+        providerName: "deferred",
+        run: async (opts) => {
+          runCount++;
+          return deferred.provider.run(opts);
+        },
+      },
+    });
+
+    const blocker = mesh.spawn({
+      charter: "blocker",
+      parentId: "root",
+      provider: "deferred",
+    });
+
+    const worker = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      provider: "deferred",
+      model: "model-a",
+      context: { type: "portable", mode: "ledger" },
+    });
+
+    // Blocker occupies the concurrency slot.
+    mesh.sendMessage(blocker, "block", "root");
+    await tick();
+    expect(mesh.activeRunState(blocker)?.phase).toBe("running");
+
+    // Worker is queued behind the blocker.
+    mesh.sendMessage(worker, "work", "root");
+    await tick();
+    expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+    expect(runCount).toBe(1);
+
+    // Re-pin while the worker is queued.
+    mesh.setActorModel(worker, "model-b", "root");
+    expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+
+    // Release the blocker so the worker is admitted.
+    deferred.releaseAll();
+    await tick();
+    expect(mesh.activeRunState(worker)?.phase).toBe("running");
+    expect(runCount).toBe(2);
+
+    // Complete the worker's run.
+    deferred.releaseAll();
+    await tick();
+    expect(mesh.activeRunState(worker)).toBeNull();
+    expect(runCount).toBe(2);
+    expect(mesh.registry.get(worker)?.model).toBe("model-b");
   });
 
   it("reviveThread rolls back to retired if re-instantiation fails, staying re-tryable ", async () => {
