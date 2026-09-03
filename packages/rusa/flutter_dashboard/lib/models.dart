@@ -46,7 +46,8 @@ class ThreadDto {
     this.chatDisabled = false,
     this.commitmentKind,
     this.waitingOn,
-    this.nextProviderAvailableAt,
+    this.queuePosition,
+    this.estimatedStartAt,
     this.ownerExpectsRetirement,
   });
 
@@ -94,7 +95,14 @@ class ThreadDto {
 
   final String? commitmentKind;
   final String? waitingOn;
-  final String? nextProviderAvailableAt;
+
+  /// 0-based position within this actor's own provider lane; not comparable
+  /// across actors on different lanes. Null when not in a provider queue.
+  final int? queuePosition;
+
+  /// ISO-8601 estimate of this actor's provider run start, or null when the
+  /// scheduler can't honestly quote one yet (e.g. behind a staged run).
+  final String? estimatedStartAt;
   final bool? ownerExpectsRetirement;
 
   bool get isRetired => status == 'retired';
@@ -119,7 +127,8 @@ class ThreadDto {
     bool? chatDisabled,
     String? commitmentKind,
     String? waitingOn,
-    String? nextProviderAvailableAt,
+    int? queuePosition,
+    String? estimatedStartAt,
     bool? ownerExpectsRetirement,
   }) => ThreadDto(
     id: id ?? this.id,
@@ -149,8 +158,8 @@ class ThreadDto {
     chatDisabled: chatDisabled ?? this.chatDisabled,
     commitmentKind: commitmentKind ?? this.commitmentKind,
     waitingOn: waitingOn ?? this.waitingOn,
-    nextProviderAvailableAt:
-        nextProviderAvailableAt ?? this.nextProviderAvailableAt,
+    queuePosition: queuePosition ?? this.queuePosition,
+    estimatedStartAt: estimatedStartAt ?? this.estimatedStartAt,
     ownerExpectsRetirement:
         ownerExpectsRetirement ?? this.ownerExpectsRetirement,
   );
@@ -175,7 +184,8 @@ class ThreadDto {
     chatDisabled: j['chatDisabled'] as bool? ?? false,
     commitmentKind: j['commitmentKind'] as String?,
     waitingOn: j['waitingOn'] as String?,
-    nextProviderAvailableAt: j['nextProviderAvailableAt'] as String?,
+    queuePosition: j['queuePosition'] as int?,
+    estimatedStartAt: j['estimatedStartAt'] as String?,
     ownerExpectsRetirement: j['ownerExpectsRetirement'] as bool?,
   );
 }
@@ -282,7 +292,8 @@ class ActorViewState {
   bool get chatDisabled => thread.chatDisabled;
   String? get commitmentKind => thread.commitmentKind;
   String? get waitingOn => thread.waitingOn;
-  String? get nextProviderAvailableAt => thread.nextProviderAvailableAt;
+  int? get queuePosition => thread.queuePosition;
+  String? get estimatedStartAt => thread.estimatedStartAt;
   bool? get ownerExpectsRetirement => thread.ownerExpectsRetirement;
 
   bool get isRunning => runState == RunState.running;
@@ -326,6 +337,34 @@ class ActorViewState {
 /// Normalized snapshot of all actor states across the mesh.
 /// Serves as the single source of truth for the actor tree, detail panel,
 /// and overview tab.
+/// Orders queued actors by expected run order. Actors with a parseable
+/// `estimatedStartAt` sort ascending by that time; actors without one (an
+/// honest "unknown", not a fabricated instant) sort after all known times.
+/// Within either group, ties break by `queuePosition` then by `id`, so the
+/// result is fully deterministic and stable across rebuilds.
+int _compareQueuedActors(ActorViewState a, ActorViewState b) {
+  final aTime = a.estimatedStartAt == null
+      ? null
+      : DateTime.tryParse(a.estimatedStartAt!)?.millisecondsSinceEpoch;
+  final bTime = b.estimatedStartAt == null
+      ? null
+      : DateTime.tryParse(b.estimatedStartAt!)?.millisecondsSinceEpoch;
+
+  if (aTime != null && bTime != null && aTime != bTime) {
+    return aTime.compareTo(bTime);
+  }
+  if (aTime != null && bTime == null) return -1;
+  if (aTime == null && bTime != null) return 1;
+
+  final aPos = a.queuePosition;
+  final bPos = b.queuePosition;
+  if (aPos != null && bPos != null && aPos != bPos) return aPos.compareTo(bPos);
+  if (aPos != null && bPos == null) return -1;
+  if (aPos == null && bPos != null) return 1;
+
+  return a.id.compareTo(b.id);
+}
+
 class ActorStateSnapshot {
   const ActorStateSnapshot({
     this.revision = 0,
@@ -346,8 +385,12 @@ class ActorStateSnapshot {
   List<ActorViewState> get runningActors =>
       all.where((a) => a.isRunning || a.isWindingDown).toList();
 
+  /// Queued actors sorted by expected run order: known estimated start
+  /// times first (ascending), then actors with no honest estimate yet, each
+  /// group broken deterministically by lane position and finally by id so
+  /// ties never reorder between rebuilds.
   List<ActorViewState> get queuedActors =>
-      all.where((a) => a.isQueued).toList();
+      all.where((a) => a.isQueued).toList()..sort(_compareQueuedActors);
 
   DotState dotFor(String actorId) {
     return actors[actorId]?.dotState ?? DotState.idle;

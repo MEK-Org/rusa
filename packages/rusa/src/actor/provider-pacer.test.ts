@@ -99,7 +99,7 @@ describe("ProviderPacer", () => {
     expect(pacer.waiting).toBe(0);
   });
 
-  it("reports an eligible-start time only for the provider queue head", async () => {
+  it("reports FIFO positions and compounding ETAs for the queued lane", async () => {
     const base = Date.now();
     const mesh = new ConcurrencyLimiter(1);
     const pacer = new ProviderPacer(10_000, () => Date.now());
@@ -114,10 +114,13 @@ describe("ProviderPacer", () => {
       enqueueNormal: (fn) => mesh.enqueue(fn),
     });
 
-    expect(pacer.queueHead).toEqual({ threadId: "head-thread", availableAt: base + 10_000 });
+    expect(pacer.getQueueSnapshot()).toEqual([
+      { threadId: "head-thread", position: 0, estimatedStartAt: base + 10_000 },
+      { threadId: "following-thread", position: 1, estimatedStartAt: base + 20_000 },
+    ]);
   });
 
-  it("suppresses the eligible-start time while a request is staged on mesh concurrency", async () => {
+  it("reports a null ETA for the staged request and every entry behind it", async () => {
     const base = Date.now();
     const mesh = new ConcurrencyLimiter(1);
     let release!: () => void;
@@ -135,12 +138,17 @@ describe("ProviderPacer", () => {
     });
 
     // The staged request can't become eligible until it actually starts and
-    // recomputes nextAvailableAt, so the following request's ETA is unknown.
-    expect(pacer.queueHead).toBeNull();
+    // recomputes nextAvailableAt, so every entry's ETA is unknown.
+    expect(pacer.getQueueSnapshot()).toEqual([
+      { threadId: "staged-thread", position: 0, estimatedStartAt: null },
+      { threadId: "following-thread", position: 1, estimatedStartAt: null },
+    ]);
 
     release();
     await vi.advanceTimersByTimeAsync(0);
-    expect(pacer.queueHead).toEqual({ threadId: "following-thread", availableAt: base + 10_000 });
+    expect(pacer.getQueueSnapshot()).toEqual([
+      { threadId: "following-thread", position: 0, estimatedStartAt: base + 10_000 },
+    ]);
 
     await vi.advanceTimersByTimeAsync(10_000);
     await expect(following.result).resolves.toBe("following");
@@ -157,7 +165,9 @@ describe("ProviderPacer", () => {
       enqueueNormal: (fn) => mesh.enqueue(fn),
     });
 
-    expect(pacer.queueHead).toEqual({ threadId: "delayed-thread", availableAt: base + 5_000 });
+    expect(pacer.getQueueSnapshot()).toEqual([
+      { threadId: "delayed-thread", position: 0, estimatedStartAt: base + 5_000 },
+    ]);
     await vi.advanceTimersByTimeAsync(4_999);
     expect(run.started).toBe(false);
 

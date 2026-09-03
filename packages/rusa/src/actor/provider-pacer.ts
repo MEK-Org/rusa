@@ -50,19 +50,55 @@ export class ProviderPacer {
   }
 
   /**
-   * The only request for which the provider governor has a meaningful next
-   * eligible-start time. Once a request reaches mesh concurrency, that time is
-   * no longer an ETA, so deliberately do not report it for the staged
-   * request. While a request is staged, `nextAvailableAt` also can't be
-   * trusted for the request behind it: the queue can't advance until the
-   * staged request actually starts and recomputes `nextAvailableAt`, so the
-   * stale value could already be in the past.
+   * A read-only, side-effect-free snapshot of this lane's FIFO order, for
+   * dashboard display only — never persisted, and recomputed fresh on every
+   * call from current pacer state.
+   *
+   * Public contract:
+   * - `position` is 0-based within this lane, in FIFO start order. The
+   *   staged request (if any) occupies position 0; queued requests follow
+   *   in submission order.
+   * - `estimatedStartAt` is an epoch-ms projection: the head of the queue
+   *   (once the staged request, if any, is out of the way) is estimated at
+   *   `nextAvailableAt`, and each subsequent entry adds one `intervalMs`.
+   * - `estimatedStartAt` is `null` whenever the time can't be honestly
+   *   quoted: for the staged request itself (it has already cleared the
+   *   pacing gate and is only waiting on mesh concurrency, not on
+   *   `nextAvailableAt`) and for every entry behind it, since the lane
+   *   can't advance until the staged request actually starts and
+   *   recomputes `nextAvailableAt` — the current value could already be
+   *   stale. Callers must render `null` as "unknown", never fabricate a
+   *   time.
+   * - Requests submitted without a `threadId` are omitted from the
+   *   returned entries (nothing to key them by) but still consume a
+   *   `position`, so surviving entries keep their true FIFO position.
    */
-  get queueHead(): { threadId: string; availableAt: number } | null {
-    if (this.staged) return null;
-    const request = this.queue[0];
-    if (!request?.opts.threadId) return null;
-    return { threadId: request.opts.threadId, availableAt: this.nextAvailableAt };
+  getQueueSnapshot(): Array<{
+    threadId: string;
+    position: number;
+    estimatedStartAt: number | null;
+  }> {
+    const snapshot: Array<{ threadId: string; position: number; estimatedStartAt: number | null }> =
+      [];
+    let position = 0;
+    let eta: number | null = this.staged ? null : this.nextAvailableAt;
+
+    if (this.staged) {
+      if (this.staged.opts.threadId) {
+        snapshot.push({ threadId: this.staged.opts.threadId, position, estimatedStartAt: null });
+      }
+      position++;
+    }
+
+    for (const request of this.queue) {
+      if (request.opts.threadId) {
+        snapshot.push({ threadId: request.opts.threadId, position, estimatedStartAt: eta });
+      }
+      position++;
+      if (eta !== null) eta += this.intervalMs;
+    }
+
+    return snapshot;
   }
 
   setInterval(intervalMs: number): void {

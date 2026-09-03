@@ -104,6 +104,7 @@ function rec(id: string, parentId: string | null, status: "active" | "retired"):
 
 const UUID_A = "aaaaaaaa-0000-4000-8000-000000000001";
 const UUID_B = "bbbbbbbb-0000-4000-8000-000000000002";
+const UUID_C = "cccccccc-0000-4000-8000-000000000004";
 const UUID_RETIRED = "rrrrrrrr-0000-4000-8000-000000000003";
 
 describe("handleMeshApiRequest", () => {
@@ -845,6 +846,101 @@ describe("handleMeshApiRequest", () => {
     expect(byId(UUID_A).lastActiveAt).toBe("2026-06-22T00:00:00.000Z");
     expect(byId(UUID_B).lastActiveAt).toBeNull();
     expect(byId("root").lastActiveAt).toBeNull();
+  });
+
+  it("GET /api/mesh/threads exposes per-lane queue position and estimated start", async () => {
+    registry.upsert(rec("root", null, "active"));
+    registry.upsert(rec(UUID_A, "root", "active"));
+    registry.upsert(rec(UUID_B, "root", "active"));
+    deps = {
+      ...deps,
+      providerQueueSnapshots: () => [
+        { threadId: UUID_A, position: 0, estimatedStartAt: "2026-06-21T00:00:10.000Z" },
+        { threadId: UUID_B, position: 1, estimatedStartAt: "2026-06-21T00:00:20.000Z" },
+      ],
+    };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    const byId = (id: string) => body.threads.find((t: { id: string }) => t.id === id);
+    expect(byId(UUID_A).queuePosition).toBe(0);
+    expect(byId(UUID_A).estimatedStartAt).toBe("2026-06-21T00:00:10.000Z");
+    expect(byId(UUID_B).queuePosition).toBe(1);
+    expect(byId(UUID_B).estimatedStartAt).toBe("2026-06-21T00:00:20.000Z");
+    expect(byId("root").queuePosition).toBeNull();
+    expect(byId("root").estimatedStartAt).toBeNull();
+  });
+
+  it("GET /api/mesh/threads keeps each provider lane's queue position independent", async () => {
+    registry.upsert(rec("root", null, "active"));
+    registry.upsert(rec(UUID_A, "root", "active"));
+    registry.upsert(rec(UUID_B, "root", "active"));
+    // Two different provider lanes can each have a head at position 0 with
+    // its own ETA; positions are only meaningful within a lane.
+    deps = {
+      ...deps,
+      providerQueueSnapshots: () => [
+        { threadId: UUID_A, position: 0, estimatedStartAt: "2026-06-21T00:00:05.000Z" },
+        { threadId: UUID_B, position: 0, estimatedStartAt: "2026-06-21T00:01:00.000Z" },
+      ],
+    };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    const byId = (id: string) => body.threads.find((t: { id: string }) => t.id === id);
+    expect(byId(UUID_A).queuePosition).toBe(0);
+    expect(byId(UUID_B).queuePosition).toBe(0);
+    expect(byId(UUID_A).estimatedStartAt).not.toBe(byId(UUID_B).estimatedStartAt);
+  });
+
+  it("GET /api/mesh/threads reports null estimatedStartAt for an unknown ETA behind a staged run", async () => {
+    registry.upsert(rec("root", null, "active"));
+    registry.upsert(rec(UUID_A, "root", "active"));
+    registry.upsert(rec(UUID_B, "root", "active"));
+    registry.upsert(rec(UUID_C, "root", "active"));
+    deps = {
+      ...deps,
+      providerQueueSnapshots: () => [
+        { threadId: UUID_A, position: 0, estimatedStartAt: null },
+        { threadId: UUID_B, position: 1, estimatedStartAt: null },
+      ],
+    };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    const byId = (id: string) => body.threads.find((t: { id: string }) => t.id === id);
+    expect(byId(UUID_A).queuePosition).toBe(0);
+    expect(byId(UUID_A).estimatedStartAt).toBeNull();
+    expect(byId(UUID_B).queuePosition).toBe(1);
+    expect(byId(UUID_B).estimatedStartAt).toBeNull();
+    // Not in any pacer's snapshot at all — not merely an unknown ETA.
+    expect(byId(UUID_C).queuePosition).toBeNull();
+    expect(byId(UUID_C).estimatedStartAt).toBeNull();
+  });
+
+  it("GET /api/mesh/threads reflects dynamic pacing changes on the next request", async () => {
+    registry.upsert(rec("root", null, "active"));
+    registry.upsert(rec(UUID_A, "root", "active"));
+    let estimatedStartAt = "2026-06-21T00:00:10.000Z";
+    deps = {
+      ...deps,
+      providerQueueSnapshots: () => [{ threadId: UUID_A, position: 0, estimatedStartAt }],
+    };
+
+    const first = await call(deps, "GET", "/api/mesh/threads");
+    const firstBody = JSON.parse(first.res.body);
+    expect(firstBody.threads.find((t: { id: string }) => t.id === UUID_A).estimatedStartAt).toBe(
+      "2026-06-21T00:00:10.000Z"
+    );
+
+    // Interval widened (or the lane reset) between requests; the snapshot is
+    // recomputed fresh each call rather than cached from the first read.
+    estimatedStartAt = "2026-06-21T00:05:00.000Z";
+    const second = await call(deps, "GET", "/api/mesh/threads");
+    const secondBody = JSON.parse(second.res.body);
+    expect(secondBody.threads.find((t: { id: string }) => t.id === UUID_A).estimatedStartAt).toBe(
+      "2026-06-21T00:05:00.000Z"
+    );
   });
 
   it("GET /api/mesh/events merges actors newest-first and paginates by rowid", async () => {

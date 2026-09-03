@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
+import 'package:rusa_dashboard/util.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/overview_tab.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
@@ -401,7 +402,6 @@ void main() {
         final api = FakeApi()
           ..threadsResult = [makeThread('root')]
           ..obligationsResult = [scheduledOb];
-
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
 
@@ -422,7 +422,61 @@ void main() {
           ),
           isTrue,
         );
+        await store.dispose();
+      });
+    },
+  );
 
+  testWidgets(
+    'OverviewTab lists queued actors in estimated run order with estimate labels',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [
+            makeThread('root', runState: RunState.idle),
+            makeThread(
+              'late',
+              parent: 'root',
+              runState: RunState.queued,
+              estimatedStartAt: '2026-01-01T00:00:30.000Z',
+            ),
+            makeThread(
+              'early',
+              parent: 'root',
+              runState: RunState.queued,
+              estimatedStartAt: '2026-01-01T00:00:10.000Z',
+            ),
+            makeThread(
+              'unknown',
+              parent: 'root',
+              runState: RunState.queued,
+              queuePosition: 2,
+            ),
+          ];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('3 queued'), findsOneWidget);
+        expect(
+          find.text('Estimated start ${formatTs('2026-01-01T00:00:10.000Z')}'),
+          findsOneWidget,
+        );
+        expect(
+          find.text('Estimated start ${formatTs('2026-01-01T00:00:30.000Z')}'),
+          findsOneWidget,
+        );
+        expect(find.text('Lane position 3'), findsOneWidget);
+
+        // Rendered in estimated run order: early, then late, then unknown.
+        final earlyY = tester.getTopLeft(find.text('early-handle')).dy;
+        final lateY = tester.getTopLeft(find.text('late-handle')).dy;
+        final unknownY = tester.getTopLeft(find.text('unknown-handle')).dy;
+        expect(earlyY, lessThan(lateY));
+        expect(lateY, lessThan(unknownY));
         await store.dispose();
       });
     },
