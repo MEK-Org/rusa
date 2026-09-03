@@ -312,10 +312,7 @@ export function normalizeModelEntries(
     const baseModels = new Map<string, ModelEntry>();
 
     for (const entry of entries) {
-      if (
-        !isAntigravityGeminiModel(entry.identifier) ||
-        !isAntigravityGeminiModel(entry.displayLabel)
-      ) {
+      if (!isAntigravityGeminiModel(entry.identifier)) {
         continue;
       }
       let parsedBase = entry.identifier;
@@ -521,12 +518,7 @@ export function parseAgyModelsOutput(raw: string): ModelEntry[] {
       identifier = match[1].trim();
       displayLabel = match[2].trim();
     }
-    if (
-      identifier &&
-      displayLabel &&
-      isAntigravityGeminiModel(identifier) &&
-      isAntigravityGeminiModel(displayLabel)
-    ) {
+    if (identifier && displayLabel && isAntigravityGeminiModel(identifier)) {
       entries.push({ identifier, displayLabel, passable: true });
     }
   }

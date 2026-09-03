@@ -570,31 +570,18 @@ describe("quota MCP server", () => {
       expect(systemInstruction).not.toContain("refresh requested");
     });
 
-    it("ignores the CLAUDE AND GPT MODELS quota group", async () => {
+    it("relies on the LLM omitting non-GEMINI sections instead of filtering labels", async () => {
       mockGenerateContent.mockResolvedValue({
         text: () =>
           JSON.stringify({
-            status: "exhausted",
+            status: "available",
             windows: [
               {
-                label: "Weekly GEMINI MODELS",
+                label: "Weekly Limit",
                 kind: "weekly",
                 usedPercent: 20,
                 resetInIso: "PT70H13M",
                 scope: "provider",
-              },
-              {
-                label: "Weekly CLAUDE AND GPT MODELS",
-                kind: "weekly",
-                usedPercent: 100,
-                resetInIso: "PT20H",
-                scope: "provider",
-              },
-            ],
-            groups: [
-              {
-                model: "CLAUDE_GPT",
-                limits: [{ label: "Weekly", kind: "weekly", percentLeft: 50 }],
               },
             ],
           }),
@@ -602,20 +589,13 @@ describe("quota MCP server", () => {
 
       const parsed = await parseAgyQuota("agy usage output here", "test-key");
 
-      expect(parsed).not.toHaveProperty("groups");
       expect(parsed.status).toBe("available");
       expect(parsed.limits).toEqual([
-        expect.objectContaining({ label: "Weekly GEMINI MODELS", scope: "provider" }),
+        expect.objectContaining({ label: "Weekly Limit", scope: "provider" }),
       ]);
-      expect(JSON.stringify(parsed)).not.toMatch(/CLAUDE|GPT/);
 
       const systemInstruction = lastSystemInstruction();
       expect(systemInstruction).toContain("Omit every other section (e.g. CLAUDE AND GPT MODELS)");
-      expect(systemInstruction).not.toContain("CLAUDE_GPT");
-      const lastCallArgs = mockGenerateContent.mock.calls[0][0] as {
-        config: { responseSchema: { properties: Record<string, unknown> } };
-      };
-      expect(lastCallArgs.config.responseSchema.properties.groups).toBeUndefined();
     });
 
     it("scopes the Kimi LLM prompt to Kimi /usage and remaining-percent semantics", async () => {
@@ -757,7 +737,7 @@ describe("quota MCP server", () => {
           }),
       });
 
-      const parsed = await parseAgyQuota("CLAUDE AND GPT MODELS Weekly 3% remaining", "test-key");
+      const parsed = await parseAgyQuota("GEMINI MODELS Weekly 3% remaining", "test-key");
       const weekly = parsed.limits?.[0];
       expect(weekly?.percentLeft).toBe(3);
       expect(weekly?.scope).toBe("provider");

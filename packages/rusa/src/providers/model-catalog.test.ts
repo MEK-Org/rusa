@@ -410,6 +410,29 @@ describe("validateModelPin", () => {
       'model pin validation failed for provider "agy": rejected "Gemini Pro"; acceptable values: "Gemini 3.7 Flash", "gemini-3.7-flash", "Gemini 3.1 Pro", "gemini-3.1-pro"'
     );
   });
+
+  it("keeps a gemini-* identifier with a non-Gemini cosmetic label during normalization", () => {
+    setProviderModelCatalog("agy", [
+      {
+        identifier: "gemini-3.7-flash-high",
+        displayLabel: "Custom Flash 3.7 (High)",
+        passable: true,
+      },
+      {
+        identifier: "claude-sonnet",
+        displayLabel: "Claude Sonnet",
+        passable: true,
+      },
+    ]);
+    expect(getProviderModelCatalog("agy")).toEqual([
+      {
+        identifier: "gemini-3.7-flash",
+        displayLabel: "Custom Flash 3.7",
+        passable: true,
+        efforts: ["high"],
+      },
+    ]);
+  });
 });
 
 describe("parseAgyModelsOutput", () => {
@@ -435,6 +458,27 @@ gpt-oss-120b-medium       GPT-OSS 120B (Medium)
         passable: true,
       },
       { identifier: "gemini-3.1-pro-high", displayLabel: "Gemini 3.1 Pro (High)", passable: true },
+    ]);
+  });
+
+  it("keeps a gemini-* identifier with a non-Gemini cosmetic label while excluding non-Gemini identifiers", () => {
+    const raw = `
+gemini-3.7-flash-high     Custom Flash 3.7
+gemini-3.1-pro-high       Pro 3.1
+claude-sonnet-4-6         Claude Sonnet 4.6 (Thinking)
+`;
+    const entries = parseAgyModelsOutput(raw);
+    expect(entries).toEqual([
+      {
+        identifier: "gemini-3.7-flash-high",
+        displayLabel: "Custom Flash 3.7",
+        passable: true,
+      },
+      {
+        identifier: "gemini-3.1-pro-high",
+        displayLabel: "Pro 3.1",
+        passable: true,
+      },
     ]);
   });
 
