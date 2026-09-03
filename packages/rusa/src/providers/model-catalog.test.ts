@@ -419,6 +419,7 @@ describe("parseAgyModelsOutput", () => {
 gemini-3.7-flash-medium   Gemini 3.7 Flash (Medium)
 gemini-3.1-pro-high       Gemini 3.1 Pro (High)
 claude-sonnet-4-6         Claude Sonnet 4.6 (Thinking)
+claude-opus-4-6-thinking  Claude Opus 4.6 (Thinking)
 gpt-oss-120b-medium       GPT-OSS 120B (Medium)
 `;
     const entries = parseAgyModelsOutput(raw);
@@ -434,12 +435,6 @@ gpt-oss-120b-medium       GPT-OSS 120B (Medium)
         passable: true,
       },
       { identifier: "gemini-3.1-pro-high", displayLabel: "Gemini 3.1 Pro (High)", passable: true },
-      {
-        identifier: "claude-sonnet-4-6",
-        displayLabel: "Claude Sonnet 4.6 (Thinking)",
-        passable: true,
-      },
-      { identifier: "gpt-oss-120b-medium", displayLabel: "GPT-OSS 120B (Medium)", passable: true },
     ]);
   });
 
@@ -449,6 +444,7 @@ gpt-oss-120b-medium       GPT-OSS 120B (Medium)
 gemini-3.6-flash-high\tGemini 3.6 Flash (High)
 gemini-3.1-pro-high\tGemini 3.1 Pro (High)
 claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)
+claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)
 gpt-oss-120b-medium\tGPT-OSS 120B (Medium)`;
     const entries = parseAgyModelsOutput(raw);
     expect(entries).toEqual([
@@ -463,12 +459,6 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)`;
         passable: true,
       },
       { identifier: "gemini-3.1-pro-high", displayLabel: "Gemini 3.1 Pro (High)", passable: true },
-      {
-        identifier: "claude-sonnet-4-6",
-        displayLabel: "Claude Sonnet 4.6 (Thinking)",
-        passable: true,
-      },
-      { identifier: "gpt-oss-120b-medium", displayLabel: "GPT-OSS 120B (Medium)", passable: true },
     ]);
   });
 

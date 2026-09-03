@@ -570,22 +570,11 @@ describe("quota MCP server", () => {
       expect(systemInstruction).not.toContain("refresh requested");
     });
 
-    it("never surfaces a non-GEMINI (CLAUDE_GPT) group — guards the ISSUE_NUM regression", async () => {
-      // ISSUE_NUM (reverted here) re-added agy CLAUDE_GPT scraping that 64c6700d
-      // had deliberately removed: it rewrote the agy prompt to populate a
-      // `groups[]` array with a CLAUDE_GPT entry and mapped that onto the
-      // snapshot. Operator's ruling — agy is gemini-only; we do not dispatch to or
-      // scrape non-gemini models. This guards BOTH layers the regression
-      // touched: the prompt must still tell the LLM to OMIT the CLAUDE AND GPT
-      // MODELS section, and the mapping must drop any rogue CLAUDE_GPT payload
-      // on the floor rather than surface it. The guard lives at the producer
-      // (MCP/snapshot) layer — where ISSUE_NUM re-added the shape — not one layer
-      // above at the dashboard DTO, which is why the existing dashboard test
-      // never tripped.
+    it("ignores the CLAUDE AND GPT MODELS quota group", async () => {
       mockGenerateContent.mockResolvedValue({
         text: () =>
           JSON.stringify({
-            status: "available",
+            status: "exhausted",
             windows: [
               {
                 label: "Weekly GEMINI MODELS",
@@ -594,9 +583,14 @@ describe("quota MCP server", () => {
                 resetInIso: "PT70H13M",
                 scope: "provider",
               },
+              {
+                label: "Weekly CLAUDE AND GPT MODELS",
+                kind: "weekly",
+                usedPercent: 100,
+                resetInIso: "PT20H",
+                scope: "provider",
+              },
             ],
-            // A ISSUE_NUM-shaped rogue payload: even if a future LLM emits a
-            // CLAUDE_GPT group, the mapping must never let it reach the snapshot.
             groups: [
               {
                 model: "CLAUDE_GPT",
@@ -608,17 +602,13 @@ describe("quota MCP server", () => {
 
       const parsed = await parseAgyQuota("agy usage output here", "test-key");
 
-      // Mapping layer: the banned shape never reaches the snapshot, and only the
-      // GEMINI provider-scoped window survives — nothing CLAUDE_GPT.
       expect(parsed).not.toHaveProperty("groups");
+      expect(parsed.status).toBe("available");
       expect(parsed.limits).toEqual([
         expect.objectContaining({ label: "Weekly GEMINI MODELS", scope: "provider" }),
       ]);
-      expect(JSON.stringify(parsed)).not.toContain("CLAUDE_GPT");
+      expect(JSON.stringify(parsed)).not.toMatch(/CLAUDE|GPT/);
 
-      // Prompt layer: the guard clause ISSUE_NUM overwrote must still be present,
-      // the banned group vocabulary must be absent, and the output schema must
-      // not offer the LLM a `groups` field to fill.
       const systemInstruction = lastSystemInstruction();
       expect(systemInstruction).toContain("Omit every other section (e.g. CLAUDE AND GPT MODELS)");
       expect(systemInstruction).not.toContain("CLAUDE_GPT");
@@ -1294,6 +1284,21 @@ describe("quota MCP server", () => {
       setProviderModelCatalog("agy", [
         { displayLabel: "Gemini Flash", identifier: "gemini-flash", passable: false },
         { displayLabel: "Gemini 3.7 Flash (High)", identifier: "gemini-3.7-flash", passable: true },
+        {
+          displayLabel: "Claude Sonnet 4.6",
+          identifier: "claude-sonnet-4-6",
+          passable: true,
+        },
+        {
+          displayLabel: "Claude Opus 4.6 (Thinking)",
+          identifier: "claude-opus-4-6-thinking",
+          passable: true,
+        },
+        {
+          displayLabel: "GPT-OSS 120B (Medium)",
+          identifier: "gpt-oss-120b-medium",
+          passable: true,
+        },
       ]);
 
       const server = createQuotaMcpServer({

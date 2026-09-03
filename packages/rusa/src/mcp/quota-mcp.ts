@@ -451,15 +451,28 @@ async function parseQuotaWithLlm(
     const text = await extractGeminiText(response);
     const parsed = JSON.parse(text);
 
-    const result: Partial<ProviderQuotaSnapshot> = {
-      status: parsed.status,
-    };
-
-    const realWindows = Array.isArray(parsed.windows)
+    const parsedRealWindows = Array.isArray(parsed.windows)
       ? (parsed.windows as LlmQuotaWindow[]).filter(
           (w) => !w.placeholder && typeof w.usedPercent === "number"
         )
       : [];
+    const realWindows = isAgy
+      ? parsedRealWindows.filter((window) => !/\b(?:claude|gpt)\b/i.test(window.label ?? ""))
+      : parsedRealWindows;
+    const ignoredNonGeminiWindows = realWindows.length !== parsedRealWindows.length;
+    const status =
+      isAgy && ignoredNonGeminiWindows
+        ? realWindows.length === 0
+          ? "unknown"
+          : realWindows.some(
+                (window) =>
+                  normalizeQuotaWindowKind(window.kind) === "weekly" &&
+                  (window.usedPercent ?? 0) >= 100
+              )
+            ? "exhausted"
+            : "available"
+        : parsed.status;
+    const result: Partial<ProviderQuotaSnapshot> = { status };
 
     validateParsedWindowsCompleteness(output, provider, realWindows);
 
