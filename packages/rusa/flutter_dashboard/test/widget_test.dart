@@ -940,6 +940,37 @@ void main() {
     });
   });
 
+  testWidgets('header shows a scheduler warning badge when at is unavailable', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final api = FakeApi()
+        ..schedulerWarning = ['`atq` cannot be queried']
+        ..threadsResult = [makeThread('root', created: 't0')];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 1100,
+              child: MeshHeader(
+                store: store,
+                selected: DashboardView.actors,
+                onSelect: (_) {},
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(find.text('Scheduler'), findsOneWidget);
+      await store.dispose();
+    });
+  });
+
   testWidgets('header shows the active pulse in the brand cluster', (
     tester,
   ) async {

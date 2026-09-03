@@ -58,6 +58,12 @@ import {
   runEndPayload,
 } from "../actor/mesh-events.js";
 import {
+  DefaultOsScheduler,
+  execAtIo,
+  preflightAt,
+  unavailableAtIo,
+} from "../actor/os-scheduler.js";
+import {
   assemblePortableContext,
   assemblePortableContextV2,
   type InjectRecord,
@@ -90,9 +96,11 @@ import {
   type ThreadRecord,
 } from "../actor/thread-registry.js";
 import {
+  CrontabMutator,
   CrontabWakeCron,
   ensureWakeToken,
   execCrontabIo,
+  preflightCron,
   wakePortPath,
   wakeTokenPath,
   writeWakePort,
@@ -1387,7 +1395,23 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         }),
       }),
   });
-  const wakeCron = new CrontabWakeCron(execCrontabIo(), {
+  // Cron is the durability backbone for recurring obligations (#153), so an
+  // unusable `crontab` here is more severe than a missing `at` — but boot still
+  // never refuses to start over it (matches the `at` preflight below): a
+  // console warning plus the dashboard health projection below is how an
+  // operator finds out, and the shared mutator's `write()` stays fail-visible
+  // (throws) the moment something actually tries to use a broken crontab.
+  const cronPreflight = preflightCron();
+  if (!cronPreflight.ok) {
+    console.warn(
+      `[start] cron scheduling unavailable — schedule_wake and recurring obligations will fail until this is fixed: ${cronPreflight.issues.join("; ")}`
+    );
+  }
+  // ONE shared crontab mutator for every feature that edits this crontab
+  // (wake schedules here, plus obligation/message recurrence blocks below) —
+  // see CrontabMutator's doc comment for why a single instance matters.
+  const crontabMutator = new CrontabMutator(execCrontabIo());
+  const wakeCron = new CrontabWakeCron(crontabMutator, {
     tokenFile: wakeTokenPath(mcHome),
     portFile: wakePortPath(mcHome),
   });
@@ -2060,9 +2084,49 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // cron line (which reads it via `$(cat …)`) survives restarts.
   const wakeToken = ensureWakeToken(mcHome);
   writeWakePort(mcHome, mcpHttp.boundPort);
+
+  // `at`/atd is an optional one-shot facility: cron-only recurrences must
+  // keep working even when it's missing, so boot never refuses to start over
+  // it — only warns loudly. `execAtIo()` stays fail-visible for a live atq
+  // that actually errors; `unavailableAtIo()` instead avoids ever calling the
+  // confirmed-missing binary, so the first attempt to schedule a completion-
+  // interval activation or a scheduled message fails with the named
+  // prerequisite error, and boot-time reconciliation (which tolerates a
+  // per-item OS scheduler failure) simply finds no `at` jobs to re-derive.
+  const atPreflight = preflightAt();
+  if (!atPreflight.ok) {
+    console.warn(
+      `[start] \`at\` scheduling unavailable — cron-only recurrences still work, but completion-interval obligations and scheduled messages will fail until this is fixed: ${atPreflight.issues.join("; ")}`
+    );
+  }
+  const osScheduler = new DefaultOsScheduler(
+    crontabMutator,
+    atPreflight.ok ? execAtIo() : unavailableAtIo(atPreflight.issues),
+    {
+      tokenFile: wakeTokenPath(mcHome),
+      portFile: wakePortPath(mcHome),
+    }
+  );
+  getRepositories().setOsScheduler(osScheduler);
+  mesh.setOsScheduler(osScheduler);
+
   mcpHttp.setWakeHandler({
     token: wakeToken,
     deliver: (actorId, reason, priority) => mesh.deliverWake(actorId, reason, priority),
+  });
+
+  mcpHttp.setWakeObligationHandler({
+    token: wakeToken,
+    deliver: (id: string) => {
+      getRepositories().obligations.activateScheduled(id);
+    },
+  });
+
+  mcpHttp.setWakeMessageHandler({
+    token: wakeToken,
+    deliver: (id: string) => {
+      mesh.deliverScheduledMessage(id);
+    },
   });
 
   // ── Host-jobs exit endpoint  ──
@@ -2517,6 +2581,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   mesh.rehydrateAll();
   mesh.reconcilePendingDeliveries();
   mesh.reconcileInbox();
+  getRepositories().obligations.reconcileScheduledObligations();
   try {
     mesh.reconcileReadyHeads(getRepositories().obligations);
   } catch (_err) {
@@ -2746,6 +2811,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           // which actors are executing a run right now — for the header HALTED
           // indicator and per-thread run-state dots. No new mesh behavior.
           isHalted: () => haltSwitch.hasActiveHalt(),
+          // Surfaces the boot-time `at`/`atrm`/`atd`/`atq` AND `crontab`/crond/
+          // cron.allow-cron.deny preflights so a missing one-shot facility or an
+          // unusable crontab is dashboard/health-visible, not just a startup
+          // console.warn. Merged into one projection since either issue set
+          // means "some recurrence path is degraded" from an operator's view.
+          schedulerHealth: () => ({
+            ok: atPreflight.ok && cronPreflight.ok,
+            issues: [...cronPreflight.issues, ...atPreflight.issues],
+          }),
           runningThreadIds: () => mesh.runningThreadIds(),
           queuedThreadIds: () => mesh.queuedThreadIds(),
           providerQueueHeads: () =>

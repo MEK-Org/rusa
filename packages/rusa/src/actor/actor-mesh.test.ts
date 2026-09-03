@@ -32,6 +32,7 @@ import type {
   InboxStore,
 } from "./inbox-store.js";
 import type { MeshEventInput, MeshEventSink } from "./mesh-events.js";
+import type { OsScheduler } from "./os-scheduler.js";
 import { InMemoryThreadRegistry, type ThreadRecord } from "./thread-registry.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
@@ -149,6 +150,7 @@ function setup(
     isShuttingDown?: () => boolean;
     events?: MeshEventSink;
     recordChat?: (opts: {
+      id?: string;
       senderId: string;
       recipientId: string;
       body: string;
@@ -299,6 +301,31 @@ function setup(
   const tick = () => vi.advanceTimersByTimeAsync(DEBOUNCE + 1);
   const fake = (id: string) => providers.get(id) as FakeProvider;
   return { registry, mesh: testMesh, rawSpawn, providers, root, logs, tick, fake };
+}
+
+class FakeOsScheduler implements OsScheduler {
+  messageDeliveries = new Map<string, Date>();
+  scheduleMessageDeliveryImpl?: (id: string, date: Date) => void;
+
+  scheduleObligationActivation(): void {}
+  cancelObligationActivation(): void {}
+  listObligationActivations(): string[] {
+    return [];
+  }
+
+  scheduleMessageDelivery(id: string, date: Date): void {
+    if (this.scheduleMessageDeliveryImpl) {
+      this.scheduleMessageDeliveryImpl(id, date);
+      return;
+    }
+    this.messageDeliveries.set(id, date);
+  }
+  cancelMessageDelivery(id: string): void {
+    this.messageDeliveries.delete(id);
+  }
+  listMessageDeliveries(): string[] {
+    return Array.from(this.messageDeliveries.keys());
+  }
 }
 
 const payload = (type: string, merged?: boolean): InboxPayload =>
@@ -4365,6 +4392,258 @@ describe("ActorMesh", () => {
       expect(() => mesh.sendMessage(t1, "11th msg", t2, undefined, future)).toThrow(
         /cap of 10 pending deliveries/
       );
+    });
+
+    it("rolls back the pending-delivery record when arming the OS job fails", () => {
+      const { mesh, registry } = setup();
+      const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
+      const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
+
+      const osScheduler = new FakeOsScheduler();
+      osScheduler.scheduleMessageDeliveryImpl = () => {
+        throw new Error("OS scheduler rejected the job");
+      };
+      mesh.setOsScheduler(osScheduler);
+
+      const deliverAt = new Date(Date.now() + 100000).toISOString();
+      expect(() => mesh.sendMessage(t1, "scheduled message", t2, undefined, deliverAt)).toThrow(
+        /OS scheduler rejected the job/
+      );
+
+      // The durable record must not outlive the failed OS job — no orphan left behind.
+      expect(registry.get(t1)?.pendingDeliveries ?? []).toHaveLength(0);
+    });
+
+    it("does not let one failed re-arm on boot abort reconciliation for the rest", () => {
+      const { mesh, registry, logs } = setup();
+      const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
+      const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
+      const t3 = mesh.spawn({ charter: "t3", parentId: "root" });
+
+      const osScheduler = new FakeOsScheduler();
+      mesh.setOsScheduler(osScheduler);
+
+      const deliverAt = new Date(Date.now() + 100000).toISOString();
+      mesh.sendMessage(t1, "will fail to re-arm", t2, undefined, deliverAt);
+      mesh.sendMessage(t2, "should still re-arm", t3, undefined, deliverAt);
+
+      const failingMsgId = registry.get(t1)?.pendingDeliveries?.[0]?.id;
+
+      // Simulate a fresh restart: the OS scheduler's own state is queried
+      // anew, and it rejects one stale job on re-arm while still accepting
+      // everything else.
+      osScheduler.messageDeliveries.clear();
+      osScheduler.scheduleMessageDeliveryImpl = (id, date) => {
+        if (id === failingMsgId) throw new Error("stale job rejected by OS scheduler");
+        osScheduler.messageDeliveries.set(id, date);
+      };
+
+      expect(() => mesh.reconcilePendingDeliveries()).not.toThrow();
+
+      // Both records remain durable — reconciliation doesn't remove them, it
+      // only (re-)arms the underlying OS job — but only the healthy one
+      // actually got armed.
+      expect(registry.get(t1)?.pendingDeliveries).toHaveLength(1);
+      expect(registry.get(t2)?.pendingDeliveries).toHaveLength(1);
+      expect(osScheduler.listMessageDeliveries()).not.toContain(failingMsgId);
+      expect(
+        logs.some((l) => l.includes("failed to re-arm") && l.includes("stale job rejected"))
+      ).toBe(true);
+    });
+
+    it("re-arms a scheduled delivery whose durable write failed, instead of stranding it unscheduled", () => {
+      const memoryStore = createMemoryInboxStore();
+      let shouldFail = true;
+      const inboxStore: InboxStore = {
+        ...memoryStore,
+        append: (inputs) => {
+          if (shouldFail) {
+            shouldFail = false;
+            throw new Error("disk full");
+          }
+          return memoryStore.append(inputs);
+        },
+      };
+      const { mesh, registry, logs } = setup({ inboxStore });
+      const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
+      const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
+
+      const osScheduler = new FakeOsScheduler();
+      mesh.setOsScheduler(osScheduler);
+
+      const deliverAt = new Date(Date.now() + 100000).toISOString();
+      mesh.sendMessage(t2, "will fail once", t1, undefined, deliverAt);
+      const messageId = registry.get(t2)?.pendingDeliveries?.[0]?.id ?? "";
+      expect(messageId).toBeTruthy();
+      expect(osScheduler.messageDeliveries.has(messageId)).toBe(true);
+
+      // Simulate the one-shot `at` job firing and calling back into the mesh.
+      mesh.deliverScheduledMessage(messageId);
+
+      // The durable write failed, but the record must not be stranded: it's
+      // still pending, and a fresh OS job has been armed to retry it.
+      expect(registry.get(t2)?.pendingDeliveries).toHaveLength(1);
+      expect(osScheduler.messageDeliveries.has(messageId)).toBe(true);
+      expect(logs.some((l) => l.includes("firePendingDelivery failed"))).toBe(true);
+
+      // The retry succeeds.
+      mesh.deliverScheduledMessage(messageId);
+      expect(registry.get(t2)?.pendingDeliveries ?? []).toHaveLength(0);
+      expect(memoryStore.entries.some((e) => e.actorId === t2)).toBe(true);
+    });
+
+    it("does not record a duplicate chat row or events when a retry follows a recordChat success", () => {
+      const memoryStore = createMemoryInboxStore();
+      let shouldFail = true;
+      const inboxStore: InboxStore = {
+        ...memoryStore,
+        append: (inputs) => {
+          if (shouldFail) {
+            shouldFail = false;
+            throw new Error("disk full");
+          }
+          return memoryStore.append(inputs);
+        },
+      };
+      // These fakes mirror the real repositories' `INSERT OR IGNORE`
+      // semantics keyed on the caller-supplied id, rather than a separate
+      // best-effort marker: recordChat/events are called on every retry, but
+      // a retry using the same stable id must not add a second row.
+      let recordChatCalls = 0;
+      const chatRows = new Map<string, string>();
+      const eventIds = new Set<string>();
+      const sentEvents: string[] = [];
+      const { mesh, registry } = setup({
+        inboxStore,
+        recordChat: (opts) => {
+          recordChatCalls += 1;
+          const id = opts.id ?? `message-${recordChatCalls}`;
+          if (!chatRows.has(id)) chatRows.set(id, opts.body);
+          return id;
+        },
+        events: (event) => {
+          if (event.kind !== "message_sent" && event.kind !== "message_received") return;
+          if (event.id) {
+            if (eventIds.has(event.id)) return;
+            eventIds.add(event.id);
+          }
+          sentEvents.push(event.kind);
+        },
+      });
+      const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
+      const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
+
+      const osScheduler = new FakeOsScheduler();
+      mesh.setOsScheduler(osScheduler);
+
+      const deliverAt = new Date(Date.now() + 100000).toISOString();
+      mesh.sendMessage(t2, "will fail once", t1, undefined, deliverAt);
+      const messageId = registry.get(t2)?.pendingDeliveries?.[0]?.id ?? "";
+
+      // First attempt: recordChat succeeds and mints a durable row keyed on
+      // the pending delivery's own stable id, but the inbox append after it
+      // fails — the retry must not record a second chat row or events for
+      // the same delivery.
+      mesh.deliverScheduledMessage(messageId);
+      expect(chatRows.size).toBe(1);
+      expect(chatRows.has(messageId)).toBe(true);
+
+      mesh.deliverScheduledMessage(messageId);
+      expect(recordChatCalls).toBe(2);
+      expect(chatRows.size).toBe(1);
+      expect(registry.get(t2)?.pendingDeliveries ?? []).toHaveLength(0);
+      expect(memoryStore.entries.filter((e) => e.actorId === t2)).toHaveLength(1);
+      expect(sentEvents).toEqual(["message_sent", "message_received"]);
+    });
+
+    it("recovers exact-once delivery across a restart that loses the in-memory pending-delivery state after the chat write", () => {
+      // Simulates a crash between the durable chat write (recordChat, keyed
+      // on the pending delivery's stable id) and the rest of firePendingDelivery
+      // finishing: on "restart", reconcilePendingDeliveries re-fires the same
+      // pending delivery. Because the chat/event rows are keyed on that
+      // already-durable id, the retry must be a safe no-op at the chat/event
+      // layer and still complete the delivery exactly once.
+      const memoryStore = createMemoryInboxStore();
+      const chatRows = new Map<string, string>();
+      const eventIds = new Set<string>();
+      const sentEvents: string[] = [];
+      let crashAfterChatWrite = true;
+      const inboxStore: InboxStore = {
+        ...memoryStore,
+        append: (inputs) => {
+          if (crashAfterChatWrite) {
+            crashAfterChatWrite = false;
+            throw new Error("process crashed before inbox append");
+          }
+          return memoryStore.append(inputs);
+        },
+      };
+      const { mesh, registry } = setup({
+        inboxStore,
+        recordChat: (opts) => {
+          const id = opts.id ?? "unexpected-missing-id";
+          if (!chatRows.has(id)) chatRows.set(id, opts.body);
+          return id;
+        },
+        events: (event) => {
+          if (event.kind !== "message_sent" && event.kind !== "message_received") return;
+          if (event.id) {
+            if (eventIds.has(event.id)) return;
+            eventIds.add(event.id);
+          }
+          sentEvents.push(event.kind);
+        },
+      });
+      const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
+      const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
+
+      const osScheduler = new FakeOsScheduler();
+      mesh.setOsScheduler(osScheduler);
+
+      const deliverAt = new Date(Date.now() + 100000).toISOString();
+      mesh.sendMessage(t2, "restart-boundary message", t1, undefined, deliverAt);
+      const messageId = registry.get(t2)?.pendingDeliveries?.[0]?.id ?? "";
+      expect(messageId).toBeTruthy();
+
+      // "Crash" mid-delivery: the chat row lands durably, the inbox append
+      // does not, and — unlike a live retry — nothing in memory (not even a
+      // deliveredMessageId patch) survives the restart.
+      mesh.deliverScheduledMessage(messageId);
+      expect(chatRows.size).toBe(1);
+      expect(registry.get(t2)?.pendingDeliveries).toHaveLength(1);
+
+      // Boot-time reconciliation re-fires the still-pending delivery using
+      // only what was durably persisted at schedule time (the same messageId).
+      mesh.deliverScheduledMessage(messageId);
+
+      expect(chatRows.size).toBe(1);
+      expect(sentEvents).toEqual(["message_sent", "message_received"]);
+      expect(registry.get(t2)?.pendingDeliveries ?? []).toHaveLength(0);
+      expect(memoryStore.entries.filter((e) => e.actorId === t2)).toHaveLength(1);
+    });
+
+    it("keeps a delivery retryable when clearing its own OS job fails, instead of aborting delivery", () => {
+      const { mesh, registry, logs } = setup();
+      const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
+      const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
+
+      const osScheduler = new FakeOsScheduler();
+      osScheduler.cancelMessageDelivery = () => {
+        throw new Error("atrm failed");
+      };
+      mesh.setOsScheduler(osScheduler);
+
+      const deliverAt = new Date(Date.now() + 100000).toISOString();
+      mesh.sendMessage(t1, "hello", t2, undefined, deliverAt);
+      const messageId = registry.get(t1)?.pendingDeliveries?.[0]?.id ?? "";
+
+      // The one-shot OS job already fired and called back; failing to clear
+      // its own bookkeeping must not prevent the delivery it triggered.
+      expect(() => mesh.deliverScheduledMessage(messageId)).not.toThrow();
+      expect(registry.get(t1)?.pendingDeliveries ?? []).toHaveLength(0);
+      expect(
+        logs.some((l) => l.includes("cancelMessageDelivery failed") && l.includes("atrm failed"))
+      ).toBe(true);
     });
 
     it("survives mesh restart and fires exactly-once (re-arms timers)", async () => {

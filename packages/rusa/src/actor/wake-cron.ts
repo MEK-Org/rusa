@@ -58,15 +58,180 @@ export function writeWakePort(mcHome: string, port: number): void {
   renameSync(tmp, path);
 }
 
+/** Inclusive min/max for each of the 5 standard cron fields, in order. */
+const CRON_FIELD_BOUNDS: readonly [number, number][] = [
+  [0, 59], // minute
+  [0, 23], // hour
+  [1, 31], // day of month
+  [1, 12], // month
+  [0, 6], // day of week
+];
+
 /**
  * A standard 5-field cron expression with numeric/`* / , -` fields only (no named
  * months/days for v1 — keeps the validator strict so a bad expr can't slip a line
- * that makes `crontab -` reject the entire file). Returns true if safe to write.
+ * that makes `crontab -` reject the entire file). Validates each field's actual
+ * range/step semantics (not just its character set), so out-of-range values like
+ * `99` in a minute field or a zero-valued step stride are rejected rather than
+ * silently accepted and only failing later inside `nextCronOccurrence`. Returns
+ * true if safe to write.
  */
 export function isValidCronExpr(expr: string): boolean {
   const fields = expr.trim().split(/\s+/);
   if (fields.length !== 5) return false;
-  return fields.every((f) => /^[0-9*/,-]+$/.test(f));
+  if (!fields.every((f) => /^[0-9*/,-]+$/.test(f))) return false;
+  try {
+    fields.forEach((f, i) => {
+      parseCronField(f, CRON_FIELD_BOUNDS[i][0], CRON_FIELD_BOUNDS[i][1]);
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** A syntactically valid cron expression whose calendar constraints never match. */
+export class NonFiringCronExprError extends Error {
+  constructor(expr: string) {
+    super(`cron expression can never fire: ${expr}`);
+    this.name = "NonFiringCronExprError";
+  }
+}
+
+/**
+ * Whether a structurally valid cron expression has at least one UTC firing.
+ *
+ * Gregorian dates (including weekday alignment) repeat every 400 years.  Looking
+ * at each day in one such cycle is both complete and bounded; unlike the former
+ * four-year minute walk, it catches expressions such as "0 0 31 2 *" without
+ * declaring a rare-but-real century-boundary date impossible.
+ */
+export function cronExprEverFires(expr: string): boolean {
+  if (!isValidCronExpr(expr)) return false;
+  const [, , domField, monthField, dowField] = expr.trim().split(/\s+/);
+  const doms = parseCronField(domField, 1, 31);
+  const months = parseCronField(monthField, 1, 12);
+  const dows = parseCronField(dowField, 0, 6);
+  const domRestricted = domField !== "*";
+  const dowRestricted = dowField !== "*";
+
+  for (let year = 2000; year < 2400; year++) {
+    for (let month = 0; month < 12; month++) {
+      if (!months.has(month + 1)) continue;
+      const days = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+      for (let day = 1; day <= days; day++) {
+        const date = new Date(Date.UTC(year, month, day));
+        const dayMatches =
+          domRestricted && dowRestricted
+            ? doms.has(day) || dows.has(date.getUTCDay())
+            : domRestricted
+              ? doms.has(day)
+              : dowRestricted
+                ? dows.has(date.getUTCDay())
+                : true;
+        if (dayMatches) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Reject syntactic, range, and calendar-impossible expressions before persistence. */
+export function assertCronExprCanFire(expr: string): void {
+  if (!isValidCronExpr(expr)) throw new Error(`invalid cron expression: ${expr}`);
+  if (!cronExprEverFires(expr)) throw new NonFiringCronExprError(expr);
+}
+
+/** One cron field's matching values, expanded from `*`, `a-b`, `a,b`, a `step` stride, or a single number. */
+function parseCronField(field: string, min: number, max: number): Set<number> {
+  const values = new Set<number>();
+  for (const part of field.split(",")) {
+    const stepMatch = part.match(/^([^/]+)\/(\d+)$/);
+    const range = stepMatch ? stepMatch[1] : part;
+    const step = stepMatch ? Number(stepMatch[2]) : 1;
+    let lo = min;
+    let hi = max;
+    if (range !== "*") {
+      const rangeMatch = range.match(/^(\d+)-(\d+)$/);
+      if (rangeMatch) {
+        lo = Number(rangeMatch[1]);
+        hi = Number(rangeMatch[2]);
+      } else if (/^\d+$/.test(range)) {
+        lo = hi = Number(range);
+      } else {
+        throw new Error(`unsupported cron field segment: "${part}"`);
+      }
+    }
+    if (step <= 0 || lo > hi || lo < min || hi > max) {
+      throw new Error(`unsupported cron field segment: "${part}"`);
+    }
+    for (let v = lo; v <= hi; v += step) values.add(v);
+  }
+  return values;
+}
+
+/** A complete Gregorian weekday/calendar cycle. */
+const GREGORIAN_CYCLE_YEARS = 400;
+
+/**
+ * The next UTC moment a validated 5-field cron expression fires strictly
+ * after `after`. Matches `DefaultOsScheduler`'s `CRON_TZ=UTC` obligation
+ * jobs, so a computed `next_ready_at` lines up with when the tagged crontab
+ * entry will actually call back.
+ *
+ * Scans matching calendar days, then tests the (small) hour/minute Cartesian
+ * product. A complete 400-year Gregorian cycle bounds rare real expressions
+ * such as leap day beyond a century boundary without the former four-year
+ * per-minute cutoff.
+ *
+ * Standard cron day semantics: when both day-of-month and day-of-week are
+ * restricted (neither is `*`), a day matches if EITHER is satisfied; when
+ * only one is restricted, that one alone decides.
+ */
+export function nextCronOccurrence(cronExpr: string, after: Date): Date {
+  assertCronExprCanFire(cronExpr);
+  const [minuteField, hourField, domField, monthField, dowField] = cronExpr.trim().split(/\s+/);
+  const minutes = parseCronField(minuteField, 0, 59);
+  const hours = parseCronField(hourField, 0, 23);
+  const doms = parseCronField(domField, 1, 31);
+  const months = parseCronField(monthField, 1, 12);
+  const dows = parseCronField(dowField, 0, 6);
+  const domRestricted = domField !== "*";
+  const dowRestricted = dowField !== "*";
+
+  const candidate = new Date(
+    Date.UTC(after.getUTCFullYear(), after.getUTCMonth(), after.getUTCDate())
+  );
+  const endYear = candidate.getUTCFullYear() + GREGORIAN_CYCLE_YEARS;
+  while (candidate.getUTCFullYear() < endYear) {
+    const dayMatches =
+      domRestricted && dowRestricted
+        ? doms.has(candidate.getUTCDate()) || dows.has(candidate.getUTCDay())
+        : domRestricted
+          ? doms.has(candidate.getUTCDate())
+          : dowRestricted
+            ? dows.has(candidate.getUTCDay())
+            : true;
+    if (months.has(candidate.getUTCMonth() + 1) && dayMatches) {
+      for (const hour of [...hours].sort((a, b) => a - b)) {
+        for (const minute of [...minutes].sort((a, b) => a - b)) {
+          const occurrence = new Date(
+            Date.UTC(
+              candidate.getUTCFullYear(),
+              candidate.getUTCMonth(),
+              candidate.getUTCDate(),
+              hour,
+              minute
+            )
+          );
+          if (occurrence.getTime() > after.getTime()) return occurrence;
+        }
+      }
+    }
+    candidate.setUTCDate(candidate.getUTCDate() + 1);
+  }
+  // `assertCronExprCanFire` plus a full Gregorian cycle make this unreachable.
+  throw new NonFiringCronExprError(cronExpr);
 }
 
 /** Thread ids and suffixed wake slots only — keeps the tag/job lines free of whitespace or shell metachars. */
@@ -108,13 +273,20 @@ export interface CrontabIo {
 }
 
 /** Real crontab IO over the `crontab` CLI. */
-export function execCrontabIo(): CrontabIo {
+export function execCrontabIo(run: typeof execFileSync = execFileSync): CrontabIo {
   return {
     read(): string {
       try {
-        return execFileSync("crontab", ["-l"], { encoding: "utf-8" });
-      } catch {
-        return ""; // "no crontab for user" exits non-zero — treat as empty
+        return run("crontab", ["-l"], { encoding: "utf-8" }) as string;
+      } catch (error) {
+        // `crontab -l` uses a nonzero exit for a genuinely absent per-user
+        // crontab.  A missing binary, permission denial, daemon failure, or
+        // any other read error is *not* an empty crontab: treating it that way
+        // would make a later mutation overwrite jobs we failed to read.
+        const stderr = (error as { stderr?: string | Buffer }).stderr;
+        const detail = typeof stderr === "string" ? stderr : (stderr?.toString("utf-8") ?? "");
+        if (/no crontab for(?:\s+user)?\b/i.test(detail)) return "";
+        throw error;
       }
     },
     write(content: string): void {
@@ -124,28 +296,50 @@ export function execCrontabIo(): CrontabIo {
 }
 
 /**
- * Read/modify/write the familiar's crontab for `# mc-wake:<actorId>` blocks. All
- * mutations go through an in-process mutex and re-read the crontab immediately
- * before editing, so concurrent schedule/cancel calls can't clobber each other or
- * a human's unrelated lines.
+ * The ONE read-modify-write path onto the familiar's crontab, shared by every
+ * feature that edits it — wake schedules (`# mc-wake:`), obligation-activation
+ * recurrence blocks (`# mc-obligation-activation:`), and message-delivery blocks.
+ * Both wake and scheduler edits receive the same mutation boundary.  It preserves
+ * unrelated lines and fails closed: if the current crontab cannot be read, or a
+ * managed block cannot be verified, no replacement write is attempted.
+ */
+export class CrontabMutator {
+  constructor(private readonly io: CrontabIo) {}
+
+  /** Un-locked snapshot read — safe on its own since no write is being computed from it. */
+  read(): string {
+    return this.io.read();
+  }
+
+  /**
+   * Read the current crontab, hand its lines to `fn`, and write back whatever
+   * `fn` returns — UNLESS `fn` returns the identical array reference it was
+   * given, which signals "no change" and skips the write entirely. If `fn`
+   * throws (e.g. it can't verify a truncated block's boundary), the throw
+   * propagates and `write` is never reached — a failed mutation is always a
+   * no-write no-op, never a partial one.
+   */
+  mutate<T>(fn: (lines: string[]) => { lines: string[]; result: T }): T {
+    const current = this.io.read();
+    const lines = current === "" ? [] : current.replace(/\n$/, "").split("\n");
+    const { lines: nextLines, result } = fn(lines);
+    if (nextLines !== lines) {
+      this.io.write(nextLines.length ? `${nextLines.join("\n")}\n` : "");
+    }
+    return result;
+  }
+}
+
+/**
+ * Read/modify/write the familiar's crontab for `# mc-wake:<actorId>` blocks,
+ * through the shared {@link CrontabMutator}, which preserves the common
+ * fail-closed read/verify/write invariant for managed crontab edits.
  */
 export class CrontabWakeCron {
-  private lock: Promise<unknown> = Promise.resolve();
-
   constructor(
-    private readonly io: CrontabIo,
+    private readonly mutator: CrontabMutator,
     private readonly opts: CrontabWakeCronOptions
   ) {}
-
-  /** Serialize a read-modify-write so edits never interleave. */
-  private serialize<T>(fn: () => T): Promise<T> {
-    const run = this.lock.then(() => fn());
-    this.lock = run.then(
-      () => undefined,
-      () => undefined
-    );
-    return run;
-  }
 
   /** The full job line a cron entry runs to ping the wake endpoint. */
   buildJobLine(
@@ -204,50 +398,42 @@ export class CrontabWakeCron {
     priority?: "normal" | "responsive" | boolean
   ): Promise<void> {
     if (!isValidActorId(actorId)) throw new Error(`invalid actor id: ${actorId}`);
-    if (!isValidCronExpr(cronExpr)) throw new Error(`invalid cron expression: ${cronExpr}`);
-    return this.serialize(() => {
-      const current = this.io.read();
-      const lines = current === "" ? [] : current.replace(/\n$/, "").split("\n");
+    assertCronExprCanFire(cronExpr);
+    this.mutator.mutate((lines) => {
       const kept = this.stripBlock(lines, actorId);
       kept.push(TAG_PREFIX + actorId, this.buildJobLine(actorId, cronExpr, reason, priority));
-      this.io.write(`${kept.join("\n")}\n`);
+      return { lines: kept, result: undefined };
     });
   }
 
   async cancel(actorId: string): Promise<void> {
     if (!isValidActorId(actorId)) throw new Error(`invalid actor id: ${actorId}`);
-    return this.serialize(() => {
-      const current = this.io.read();
-      if (current === "") return;
-      const lines = current.replace(/\n$/, "").split("\n");
+    this.mutator.mutate((lines) => {
       const kept = this.stripBlock(lines, actorId);
-      if (kept.length === lines.length) return; // nothing to remove
-      this.io.write(kept.length ? `${kept.join("\n")}\n` : "");
+      return { lines: kept.length === lines.length ? lines : kept, result: undefined };
     });
   }
 
-  list(): Promise<WakeEntry[]> {
-    return this.serialize(() => {
-      const current = this.io.read();
-      if (current === "") return [];
-      const lines = current.replace(/\n$/, "").split("\n");
-      const entries: WakeEntry[] = [];
-      for (let i = 0; i < lines.length; i++) {
-        const trimmed = lines[i].trim();
-        if (!trimmed.startsWith(TAG_PREFIX)) continue;
-        const actorId = trimmed.slice(TAG_PREFIX.length);
-        const job = lines[i + 1] ?? "";
-        const reason = parseReason(job);
-        const priority = parsePriority(job);
-        entries.push({
-          actorId,
-          cronExpr: job.trim().split(/\s+/).slice(0, 5).join(" "),
-          reason,
-          ...(priority ? { priority } : {}),
-        });
-      }
-      return entries;
-    });
+  async list(): Promise<WakeEntry[]> {
+    const current = this.mutator.read();
+    if (current === "") return [];
+    const lines = current.replace(/\n$/, "").split("\n");
+    const entries: WakeEntry[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trim();
+      if (!trimmed.startsWith(TAG_PREFIX)) continue;
+      const actorId = trimmed.slice(TAG_PREFIX.length);
+      const job = lines[i + 1] ?? "";
+      const reason = parseReason(job);
+      const priority = parsePriority(job);
+      entries.push({
+        actorId,
+        cronExpr: job.trim().split(/\s+/).slice(0, 5).join(" "),
+        reason,
+        ...(priority ? { priority } : {}),
+      });
+    }
+    return entries;
   }
 }
 
@@ -267,21 +453,47 @@ function parsePriority(job: string): "responsive" | undefined {
 }
 
 /**
- * Preflight that the host can actually run cron, so `schedule_wake` doesn't
- * silently no-op. Best-effort + non-fatal: returns the issues for the caller to
- * warn about (IU is the only consumer and isn't scheduled until phase 2).
+ * Preflight that the host can actually run cron, so `schedule_wake` and
+ * recurring-obligation scheduling don't silently no-op. Covers all three ways
+ * this can be unavailable: the CLI missing, the daemon not running, and — the
+ * one a `which`/`pgrep` check can't see — this specific user being locked out
+ * by `/etc/cron.allow` / `/etc/cron.deny`, which fails every `crontab`
+ * invocation (including the shared `CrontabMutator`'s writes) with a permission
+ * error rather than the ordinary "no crontab for user" of a fresh account.
+ * `checkPermission` distinguishes the two by inspecting `crontab -l`'s stderr
+ * instead of just its exit code, and never writes — a read-only probe can't
+ * itself be the thing that clobbers a hand-edited crontab.
+ * Best-effort + non-fatal: returns the issues for the caller to warn about and
+ * project onto the dashboard's health surface; scheduling boot never refuses
+ * to start over this, matching `preflightAt`.
  */
 export function preflightCron(
-  probe: { hasCrontab: () => boolean; isCrondRunning: () => boolean } = defaultCronProbe()
+  probe: {
+    hasCrontab: () => boolean;
+    isCrondRunning: () => boolean;
+    checkPermission: () => { ok: boolean; detail?: string };
+  } = defaultCronProbe()
 ): { ok: boolean; issues: string[] } {
   const issues: string[] = [];
-  if (!probe.hasCrontab()) issues.push("`crontab` CLI not found — install cron");
-  else if (!probe.isCrondRunning())
-    issues.push("cron daemon not detected — scheduled wakes won't fire");
+  if (!probe.hasCrontab()) {
+    issues.push("`crontab` CLI not found — install cron");
+    return { ok: false, issues };
+  }
+  if (!probe.isCrondRunning()) issues.push("cron daemon not detected — scheduled wakes won't fire");
+  const permission = probe.checkPermission();
+  if (!permission.ok)
+    issues.push(
+      permission.detail ??
+        "this user is not permitted to use crontab — check /etc/cron.allow and /etc/cron.deny"
+    );
   return { ok: issues.length === 0, issues };
 }
 
-function defaultCronProbe(): { hasCrontab: () => boolean; isCrondRunning: () => boolean } {
+function defaultCronProbe(): {
+  hasCrontab: () => boolean;
+  isCrondRunning: () => boolean;
+  checkPermission: () => { ok: boolean; detail?: string };
+} {
   const can = (cmd: string, args: string[]): boolean => {
     try {
       execFileSync(cmd, args, { stdio: "ignore" });
@@ -293,5 +505,20 @@ function defaultCronProbe(): { hasCrontab: () => boolean; isCrondRunning: () => 
   return {
     hasCrontab: () => can("which", ["crontab"]),
     isCrondRunning: () => can("pgrep", ["-x", "cron"]) || can("pgrep", ["-x", "crond"]),
+    checkPermission: () => {
+      try {
+        execFileSync("crontab", ["-l"], { stdio: ["ignore", "ignore", "pipe"], encoding: "utf-8" });
+        return { ok: true };
+      } catch (err) {
+        const stderr =
+          err && typeof err === "object" && "stderr" in err
+            ? String((err as { stderr: unknown }).stderr)
+            : "";
+        // "no crontab for <user>" is the normal empty-crontab case, not a permission issue.
+        if (/not allowed/i.test(stderr))
+          return { ok: false, detail: `crontab denied for this user: ${stderr.trim()}` };
+        return { ok: true };
+      }
+    },
   };
 }

@@ -48,6 +48,16 @@ export interface DashboardDataDeps {
    */
   isHalted?: () => boolean;
   /**
+   * Read-only snapshot of the boot-time `at`/`atrm`/`atd`/`atq` preflight
+   * (see `preflightAt` in os-scheduler.ts), surfaced as the top-level
+   * `schedulerWarning` field on `/api/mesh/threads` — a missing one-shot
+   * facility only warns at boot (cron-only recurrences keep working), so the
+   * dashboard/health surface is this snapshot's one durable place to make
+   * that non-fatal condition visible to an operator instead of console-only.
+   * Optional; absent or an ok result reports `schedulerWarning: null`.
+   */
+  schedulerHealth?: () => { ok: boolean; issues: string[] };
+  /**
    * Read-only snapshot of the thread ids whose live actor is *genuinely
    * executing a run right now* (between run_start and run_end — i.e. the
    * TriggerRunner's running flag), used to derive each thread's `runState`.
@@ -1209,8 +1219,10 @@ export async function handleMeshApiRequest(
         nextProviderAvailableAt: providerQueueHeads.get(r.id) ?? null,
       };
     });
+    const schedulerHealth = deps.schedulerHealth?.();
     sendJson(res, 200, {
       halted: deps.isHalted?.() ?? false,
+      schedulerWarning: schedulerHealth && !schedulerHealth.ok ? schedulerHealth.issues : null,
       runtimeCursor: runtime ? { streamId: runtime.streamId, revision: runtime.revision } : null,
       threads,
     });
@@ -1298,7 +1310,7 @@ export async function handleMeshApiRequest(
     const limit = clampLimit(url);
     const offset = parsePositiveInt(url, "offset") ?? 0;
 
-    if (status && !["ready", "waiting", "done", "cancelled"].includes(status)) {
+    if (status && !["ready", "waiting", "done", "cancelled", "scheduled"].includes(status)) {
       sendJson(res, 400, { error: "invalid status" });
       return true;
     }
@@ -1351,11 +1363,16 @@ export async function handleMeshApiRequest(
     }
     const limit = clampLimit(url);
     const offset = parsePositiveInt(url, "offset") ?? 0;
+    const completionsOffset = parsePositiveInt(url, "completions_offset") ?? 0;
     const children = deps.obligations.listChildrenPage(id, { limit, offset });
     const blockingChildren = deps.obligations.listChildrenPage(id, {
       limit,
       offset: 0,
       blockingOnly: true,
+    });
+    const completions = deps.obligations.listCompletionsPage(id, {
+      limit,
+      offset: completionsOffset,
     });
     const parent = obligation.parentId ? deps.obligations.get(obligation.parentId) : null;
     const artifacts = await Promise.all(
@@ -1375,6 +1392,9 @@ export async function handleMeshApiRequest(
       parent,
       children: children.obligations,
       blockingChildren: blockingChildren.obligations,
+      completions: completions.completions,
+      completionsTotal: completions.total,
+      completionsHasMore: completions.hasMore,
       artifacts,
     });
     return true;

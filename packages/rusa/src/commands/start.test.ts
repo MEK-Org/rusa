@@ -1958,6 +1958,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(pollerMock.startGitHubEventPoller).not.toHaveBeenCalled();
 
       sigintListener?.("SIGINT");
+      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, "start did not exit");
     } finally {
       processOnSpy.mockRestore();
     }
@@ -2016,6 +2017,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       );
 
       sigintListener?.("SIGINT");
+      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, "start did not exit");
     } finally {
       processOnSpy.mockRestore();
       errorSpy.mockRestore();
@@ -2061,6 +2063,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       );
 
       sigintListener?.("SIGINT");
+      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, "start did not exit");
     } finally {
       processOnSpy.mockRestore();
       worktreeMock.getRemoteUrl.mockReturnValue("https://github.com/dummy-org/dummy-repo.git");
@@ -2109,6 +2112,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       );
 
       sigintListener?.("SIGINT");
+      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, "start did not exit");
     } finally {
       processOnSpy.mockRestore();
       errorSpy.mockRestore();

@@ -742,6 +742,28 @@ describe("handleMeshApiRequest", () => {
     expect(body.threads.every((t: { runState: string }) => t.runState === "idle")).toBe(true);
   });
 
+  it("GET /api/mesh/threads reports schedulerWarning:null when the at preflight is absent or ok", async () => {
+    registry.upsert(rec("root", null, "active"));
+
+    const absent = (await call(deps, "GET", "/api/mesh/threads")).res;
+    expect(JSON.parse(absent.body).schedulerWarning).toBeNull();
+
+    deps = { ...deps, schedulerHealth: () => ({ ok: true, issues: [] }) };
+    const ok = (await call(deps, "GET", "/api/mesh/threads")).res;
+    expect(JSON.parse(ok.body).schedulerWarning).toBeNull();
+  });
+
+  it("GET /api/mesh/threads surfaces the at preflight issues when unavailable, dashboard/health-visible rather than console-only", async () => {
+    registry.upsert(rec("root", null, "active"));
+    deps = {
+      ...deps,
+      schedulerHealth: () => ({ ok: false, issues: ["`at` CLI not found — install at"] }),
+    };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    expect(JSON.parse(res.body).schedulerWarning).toEqual(["`at` CLI not found — install at"]);
+  });
+
   it("GET /api/mesh/threads returns cursor and run states from one runtime capture", async () => {
     registry.upsert(rec("root", null, "active"));
     registry.upsert(rec(UUID_A, "root", "active"));
@@ -1775,6 +1797,38 @@ describe("handleMeshApiRequest", () => {
       it("404s when obligation not found", async () => {
         const { res } = await call(deps, "GET", "/api/mesh/obligations/missing-task");
         expect(res.statusCode).toBe(404);
+      });
+
+      it("returns paginated completion history for a recurring obligation", async () => {
+        obligations.create({
+          title: "recurring-task",
+          id: "recurring-task",
+          ownerId: "actor-1",
+        });
+        obligations.setRecurrence("recurring-task", { policy: "cron", cronExpr: "0 * * * *" });
+        obligations.setTerminalStatus("recurring-task", "done", "cycle one");
+        obligations.activateScheduled("recurring-task");
+        obligations.setTerminalStatus("recurring-task", "done", "cycle two");
+
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/recurring-task?limit=1");
+        expect(res.statusCode).toBe(200);
+        const data = JSON.parse(res.body);
+        expect(data.completions).toHaveLength(1);
+        expect(data.completions[0].note).toBe("cycle two");
+        expect(data.completionsTotal).toBe(2);
+        expect(data.completionsHasMore).toBe(true);
+        expect(data.obligation.hasCompletionHistory).toBe(true);
+        expect(data.obligation.completionsTotal).toBeUndefined();
+
+        const { res: page2 } = await call(
+          deps,
+          "GET",
+          "/api/mesh/obligations/recurring-task?limit=1&completions_offset=1"
+        );
+        const page2Data = JSON.parse(page2.body);
+        expect(page2Data.completions).toHaveLength(1);
+        expect(page2Data.completions[0].note).toBe("cycle one");
+        expect(page2Data.completionsHasMore).toBe(false);
       });
     });
 

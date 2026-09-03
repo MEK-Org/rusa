@@ -62,6 +62,128 @@ void main() {
       expect(dto.id, 'ob-789');
       expect(dto.externalRef, null);
     });
+
+    test('deserializes recurrence fields and derives isScheduled/isRecurring', () {
+      final json = {
+        'id': 'ob-cron',
+        'parentId': null,
+        'ownerId': 'test-actor',
+        'intent': 'Nightly sweep',
+        'externalRef': null,
+        'status': 'scheduled',
+        'priority': 50.0,
+        'effectivePriority': 50.0,
+        'prioritySourceId': 'ob-cron',
+        'recurrencePolicy': 'cron',
+        'recurrenceCron': '0 3 * * *',
+        'recurrenceIntervalSeconds': null,
+        'nextReadyAt': '2026-09-03T03:00:00.000Z',
+      };
+
+      final dto = ObligationDto.fromJson(json);
+      expect(dto.recurrencePolicy, 'cron');
+      expect(dto.recurrenceCron, '0 3 * * *');
+      expect(dto.recurrenceIntervalSeconds, null);
+      expect(dto.nextReadyAt, '2026-09-03T03:00:00.000Z');
+      expect(dto.isScheduled, true);
+      expect(dto.isRecurring, true);
+      expect(dto.isTerminal, false);
+    });
+
+    test('a non-recurring ready obligation reports isScheduled/isRecurring false', () {
+      final json = {
+        'id': 'ob-plain',
+        'parentId': null,
+        'ownerId': 'test-actor',
+        'intent': 'One-off task',
+        'externalRef': null,
+        'status': 'ready',
+        'priority': 50.0,
+        'effectivePriority': 50.0,
+        'prioritySourceId': 'ob-plain',
+      };
+
+      final dto = ObligationDto.fromJson(json);
+      expect(dto.recurrencePolicy, null);
+      expect(dto.nextReadyAt, null);
+      expect(dto.isScheduled, false);
+      expect(dto.isRecurring, false);
+      expect(dto.hasCompletionHistory, false);
+    });
+
+    test('deserializes retained completion-history existence without an exact count', () {
+      final dto = ObligationDto.fromJson({
+        'id': 'ob-formerly-recurring',
+        'ownerId': 'test-actor',
+        'status': 'done',
+        'effectivePriority': 50.0,
+        'hasCompletionHistory': true,
+      });
+
+      expect(dto.isRecurring, false);
+      expect(dto.hasCompletionHistory, true);
+    });
+  });
+
+  group('ObligationDetailSnapshot.fromJson', () {
+    test('deserializes completion history and pagination fields', () {
+      final json = {
+        'obligation': {
+          'id': 'ob-cron',
+          'ownerId': 'test-actor',
+          'status': 'scheduled',
+          'effectivePriority': 50.0,
+          'recurrencePolicy': 'cron',
+          'recurrenceCron': '0 3 * * *',
+          'nextReadyAt': '2026-09-03T03:00:00.000Z',
+        },
+        'parent': null,
+        'children': [],
+        'blockingChildren': [],
+        'artifacts': [],
+        'completions': [
+          {
+            'id': 'c-2',
+            'obligationId': 'ob-cron',
+            'sequence': 2,
+            'completedAt': '2026-09-02T03:00:00.000Z',
+            'note': 'cycle two',
+            'resolutionRef': null,
+            'nextReadyAt': '2026-09-03T03:00:00.000Z',
+          },
+        ],
+        'completionsTotal': 2,
+        'completionsHasMore': true,
+      };
+
+      final snapshot = ObligationDetailSnapshot.fromJson(json);
+      expect(snapshot.completions, hasLength(1));
+      expect(snapshot.completions.first.id, 'c-2');
+      expect(snapshot.completions.first.sequence, 2);
+      expect(snapshot.completions.first.note, 'cycle two');
+      expect(snapshot.completionsTotal, 2);
+      expect(snapshot.completionsHasMore, true);
+    });
+
+    test('defaults completion fields when absent (non-recurring obligations)', () {
+      final json = {
+        'obligation': {
+          'id': 'ob-plain',
+          'ownerId': 'test-actor',
+          'status': 'ready',
+          'effectivePriority': 50.0,
+        },
+        'parent': null,
+        'children': [],
+        'blockingChildren': [],
+        'artifacts': [],
+      };
+
+      final snapshot = ObligationDetailSnapshot.fromJson(json);
+      expect(snapshot.completions, isEmpty);
+      expect(snapshot.completionsTotal, 0);
+      expect(snapshot.completionsHasMore, false);
+    });
   });
 
   group('ActorViewState', () {

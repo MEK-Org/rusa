@@ -131,6 +131,8 @@ export interface DashboardMeshRefs {
   rootControl?: RootControlService;
   /** Read-only emergency-brake state (HALT sentinel) → top-level `halted` flag. */
   isHalted?: () => boolean;
+  /** Boot-time `at` preflight snapshot → top-level `schedulerWarning`; see `DashboardDataDeps`. */
+  schedulerHealth?: DashboardDataDeps["schedulerHealth"];
   /** Read-only snapshot of thread ids whose actor is executing a run right now. */
   runningThreadIds?: () => Set<string>;
   /** Read-only snapshot of thread ids waiting for their provider run to start. */
@@ -462,6 +464,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           mesh: options.mesh.mesh,
           rootControl: options.mesh.rootControl,
           isHalted: options.mesh.isHalted,
+          schedulerHealth: options.mesh.schedulerHealth,
           runningThreadIds: options.mesh.runningThreadIds,
           queuedThreadIds: options.mesh.queuedThreadIds,
           providerQueueHeads: options.mesh.providerQueueHeads,

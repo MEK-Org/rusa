@@ -815,6 +815,18 @@ void main() {
   );
 
   test(
+    'schedulerWarning: seeded from the threads payload and exposed as a stream',
+    () async {
+      final api = FakeApi()
+        ..schedulerWarning = ['atq cannot be queried']
+        ..threadsResult = [makeThread('a', parent: 'root')];
+      final store = await _booted(api, FakeStream());
+      expect(store.schedulerWarning.value, ['atq cannot be queried']);
+      await store.dispose();
+    },
+  );
+
+  test(
     'runtime deltas buffer through bootstrap, drain in order, and drop stale duplicates',
     () async {
       final bootstrap = Completer<ThreadsSnapshot>();

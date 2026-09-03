@@ -425,26 +425,32 @@ describe("assemblePortableContextV2", () => {
 describe("obligation projection (ISSUE_NUM, ratified in ISSUE_NUM comment 5369843998)", () => {
   const obligation = (
     id: string,
-    status: "ready" | "waiting",
+    status: "ready" | "waiting" | "scheduled",
     intent: string,
     priority = 1,
-    externalRef: Obligation["externalRef"] = null
+    externalRef: Obligation["externalRef"] = null,
+    nextReadyAt: string | null = null
   ): Obligation => ({
     id,
     parentId: null,
     ownerId: "actor-a",
+    title: intent,
     intent,
     externalRef,
     status,
     priority,
     effectivePriority: priority,
     prioritySourceId: id,
-    createdAt: "2026-08-29T00:00:00.000Z",
-    updatedAt: "2026-08-29T00:00:00.000Z",
+    createdAt: "2026-08-01T00:00:00.000Z",
+    updatedAt: "2026-08-01T00:00:00.000Z",
     creatorId: "actor-a",
     terminalNote: null,
-    title: intent,
     resolutionRef: null,
+    recurrencePolicy: status === "scheduled" ? "cron" : null,
+    recurrenceCron: status === "scheduled" ? "0 * * * *" : null,
+    recurrenceIntervalSeconds: null,
+    nextReadyAt: status === "scheduled" ? (nextReadyAt ?? "2026-08-02T00:00:00.000Z") : null,
+    hasCompletionHistory: false,
   });
 
   const OBLIGATIONS_HEADING = "### Your obligations (system of record)";
@@ -598,5 +604,64 @@ describe("obligation projection (ISSUE_NUM, ratified in ISSUE_NUM comment 536984
         obligations: [],
       })
     ).toBeNull();
+  });
+
+  describe("scheduled obligations", () => {
+    it("renders scheduled obligations after ready and waiting, with their next-ready time", () => {
+      const section = project([
+        obligation("ob-ready", "ready", "Active work", 1),
+        obligation("ob-waiting", "waiting", "Blocked work", 2),
+        obligation(
+          "ob-scheduled",
+          "scheduled",
+          "Recurring work",
+          3,
+          null,
+          "2026-09-05T12:00:00.000Z"
+        ),
+      ]);
+      expect(section.indexOf("ob-ready")).toBeLessThan(section.indexOf("ob-waiting"));
+      expect(section.indexOf("ob-waiting")).toBeLessThan(section.indexOf("ob-scheduled"));
+      expect(section).toContain("[SCHEDULED] ob-scheduled");
+      expect(section).toContain("returns at 2026-09-05T12:00:00.000Z");
+    });
+
+    it("never shows a scheduled obligation's intent — it must not look actionable", () => {
+      const section = project([
+        obligation("ob-scheduled", "scheduled", "Do not surface this as work", 1),
+      ]);
+      expect(section).toContain("[SCHEDULED] ob-scheduled");
+      expect(section).not.toContain("Do not surface this as work");
+    });
+
+    it("omits scheduled references entirely when any ready obligation was cut", () => {
+      const filler = "x".repeat(PORTABLE_CONTEXT_OBLIGATIONS_MAX_BYTES - 500);
+      const section = project([
+        obligation("ob-big", "ready", filler, 1),
+        obligation("ob-cut", "ready", "x".repeat(2_000), 2),
+        obligation("ob-scheduled", "scheduled", "Recurring", 3),
+      ]);
+      expect(section).toContain("ob-big");
+      expect(section).not.toContain("ob-cut");
+      expect(section).not.toContain("ob-scheduled");
+    });
+
+    it("includes scheduled references once every ready obligation fits", () => {
+      const section = project([
+        obligation("ob-1", "ready", "Small ready item", 1),
+        obligation("ob-scheduled", "scheduled", "Recurring", 2),
+      ]);
+      expect(section).toContain("[READY] ob-1");
+      expect(section).toContain("[SCHEDULED] ob-scheduled");
+    });
+
+    it("stays within its own byte ceiling with many scheduled references", () => {
+      const many = Array.from({ length: 200 }, (_, index) =>
+        obligation(`ob-${index}`, "scheduled", `Work item ${index} `.repeat(20), index + 1)
+      );
+      expect(obligationsSectionBytes(project(many))).toBeLessThanOrEqual(
+        PORTABLE_CONTEXT_OBLIGATIONS_MAX_BYTES
+      );
+    });
   });
 });

@@ -34,6 +34,7 @@ import {
   NOOP_MESH_EVENT_SINK,
   RUN_TERMINAL_EVENT_KINDS,
 } from "./mesh-events.js";
+import type { OsScheduler } from "./os-scheduler.js";
 import type {
   ActorBudget,
   ActorHandle,
@@ -47,6 +48,9 @@ import { type ActorRunMode, isResponsiveNudge, type RunNudge } from "./trigger-r
 
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
 export const SCHEDULER_SENDER_ID = "scheduler";
+
+/** Retry delay for a scheduled-message delivery whose durable write failed after its one-shot job fired. */
+const FIRE_PENDING_DELIVERY_RETRY_MS = 30_000;
 
 /** Map only the issue-shaped event resources obligations may govern. */
 function eventResourceObligationKey(resource: EventResource): string | undefined {
@@ -367,6 +371,7 @@ export interface ActorMeshOptions {
   events?: MeshEventSink;
   /** Durable record store for message content. */
   recordChat?: (opts: {
+    id?: string;
     senderId: string;
     recipientId: string;
     body: string;
@@ -455,6 +460,7 @@ export class ActorMesh {
   private readonly retireCleanups: RetireCleanup[];
   private readonly events: MeshEventSink;
   private readonly recordChat?: (opts: {
+    id?: string;
     senderId: string;
     recipientId: string;
     body: string;
@@ -479,7 +485,13 @@ export class ActorMesh {
     string,
     { record: ThreadRecord; cleanups: RetireCleanup[] }
   >();
-  private readonly pendingDeliveryTimers = new Map<string, NodeJS.Timeout>();
+  private pendingDeliveryTimers = new Map<string, NodeJS.Timeout>();
+  private osScheduler?: OsScheduler;
+
+  setOsScheduler(osScheduler: OsScheduler): void {
+    this.osScheduler = osScheduler;
+  }
+
   private readonly selectedInboxEntryIds = new Map<string, string[]>();
   /** Actors currently inside a run, for the ready-head window below. */
   private readonly actorsInRun = new Set<string>();
@@ -554,8 +566,18 @@ export class ActorMesh {
     this.log = opts.log ?? (() => {});
   }
 
-  /** Standardized message emission for the ISSUE_NUM spine. */
+  /**
+   * Standardized message emission for the ISSUE_NUM spine.
+   *
+   * `opts.id`, when supplied, is a stable idempotency key (e.g. a
+   * `PendingMessageDelivery.id` minted once at schedule time): the chat row
+   * and its events all derive their ids from it so a retry after a crash
+   * between the chat write and the caller's own durable bookkeeping re-runs
+   * this as a safe no-op (`INSERT OR IGNORE`) instead of duplicating the
+   * message.
+   */
   recordMessageEmitted(opts: {
+    id?: string;
     fromId: string;
     toId: string;
     body: string;
@@ -568,6 +590,7 @@ export class ActorMesh {
     if (this.recordChat) {
       try {
         msgId = this.recordChat({
+          id: opts.id,
           senderId: fromId,
           recipientId: toId,
           body: opts.body,
@@ -579,6 +602,7 @@ export class ActorMesh {
     }
 
     this.recordEvent({
+      id: opts.id ? `${opts.id}:sent` : undefined,
       kind: "message_sent",
       actorId: fromId,
       detail: opts.sessionId ?? (opts.isDrop ? DROPPED_MESSAGE_DETAIL : undefined),
@@ -587,6 +611,7 @@ export class ActorMesh {
 
     if (!opts.isDrop) {
       this.recordEvent({
+        id: opts.id ? `${opts.id}:received` : undefined,
         kind: "message_received",
         actorId: toId,
         detail: opts.sessionId,
@@ -661,12 +686,41 @@ export class ActorMesh {
 
   /** Boot recovery: re-arm timers for scheduled messages, and fire overdue ones immediately. */
   reconcilePendingDeliveries(): void {
+    const validIds = new Set<string>();
     for (const record of this.registry.list()) {
       if (record.status !== "active") continue;
       if (!record.pendingDeliveries?.length) continue;
       for (const msg of record.pendingDeliveries) {
-        this.armPendingDelivery(record.id, msg);
-        this.log(`re-armed scheduled message ${msg.id} for ${record.id} at ${msg.deliverAt}`);
+        validIds.add(msg.id);
+        try {
+          this.armPendingDelivery(record.id, msg);
+          this.log(`re-armed scheduled message ${msg.id} for ${record.id} at ${msg.deliverAt}`);
+        } catch (err) {
+          // One actor's failed re-arm (e.g. the OS scheduler rejecting a
+          // stale date) must not abort reconciliation for every other actor
+          // queued behind it on boot.
+          this.log(
+            `failed to re-arm scheduled message ${msg.id} for ${record.id}: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+      }
+    }
+
+    if (this.osScheduler) {
+      try {
+        for (const id of this.osScheduler.listMessageDeliveries()) {
+          if (!validIds.has(id)) {
+            this.osScheduler.cancelMessageDelivery(id);
+            this.log(`cancelled orphaned scheduled message ${id}`);
+          }
+        }
+      } catch (err) {
+        // A real OS-scheduler IO failure here must not abort the rest of
+        // boot reconciliation — every message above is already re-armed (or
+        // its own failure already logged); only the orphan sweep is skipped.
+        this.log(
+          `failed to reconcile orphaned scheduled messages: ${err instanceof Error ? err.message : String(err)}`
+        );
       }
     }
   }
@@ -1691,7 +1745,20 @@ export class ActorMesh {
       this.registry.patch(toId, {
         pendingDeliveries: [...(rec.pendingDeliveries ?? []), pending],
       });
-      this.armPendingDelivery(toId, pending);
+      try {
+        this.armPendingDelivery(toId, pending);
+      } catch (err) {
+        // The durable record must not outlive the OS job that was supposed to
+        // fire it — an orphaned pendingDelivery with no timer and no `at` job
+        // behind it would sit forever, never delivered and never visible as
+        // failed. Roll the patch back so the caller's thrown error reflects
+        // the true post-failure state.
+        const latest = this.registry.get(toId);
+        this.registry.patch(toId, {
+          pendingDeliveries: (latest?.pendingDeliveries ?? []).filter((p) => p.id !== pending.id),
+        });
+        throw err;
+      }
       // Record event at fire time, not here, per #4.
       return { delivered: true };
     }
@@ -2230,6 +2297,7 @@ export class ActorMesh {
         const timer = this.pendingDeliveryTimers.get(msg.id);
         if (timer) clearTimeout(timer);
         this.pendingDeliveryTimers.delete(msg.id);
+        if (this.osScheduler) this.osScheduler.cancelMessageDelivery(msg.id);
       }
       this.registry.patch(id, { pendingDeliveries: [] });
     }
@@ -2857,9 +2925,17 @@ export class ActorMesh {
   }
 
   private armPendingDelivery(toId: string, msg: PendingMessageDelivery): void {
-    const delay = Math.max(0, new Date(msg.deliverAt).getTime() - Date.now());
-    const timer = setTimeout(() => this.firePendingDelivery(toId, msg.id), delay);
-    this.pendingDeliveryTimers.set(msg.id, timer);
+    if (this.osScheduler) {
+      if (new Date(msg.deliverAt).getTime() <= Date.now()) {
+        this.firePendingDelivery(toId, msg.id);
+      } else {
+        this.osScheduler.scheduleMessageDelivery(msg.id, new Date(msg.deliverAt));
+      }
+    } else {
+      const delay = Math.max(0, new Date(msg.deliverAt).getTime() - Date.now());
+      const timer = setTimeout(() => this.firePendingDelivery(toId, msg.id), delay);
+      this.pendingDeliveryTimers.set(msg.id, timer);
+    }
   }
 
   /**
@@ -2909,6 +2985,18 @@ export class ActorMesh {
     }
   }
 
+  deliverScheduledMessage(messageId: string): void {
+    let foundToId: string | undefined;
+    for (const rec of this.registry.list()) {
+      if (rec.pendingDeliveries?.some((m) => m.id === messageId)) {
+        foundToId = rec.id;
+        break;
+      }
+    }
+    if (!foundToId) return;
+    this.firePendingDelivery(foundToId, messageId);
+  }
+
   private firePendingDelivery(toId: string, messageId: string): void {
     const rec = this.registry.get(toId);
     if (!rec) return;
@@ -2916,6 +3004,16 @@ export class ActorMesh {
     if (!scheduled) return;
 
     this.pendingDeliveryTimers.delete(messageId);
+    try {
+      this.osScheduler?.cancelMessageDelivery(messageId);
+    } catch (err) {
+      // The one-shot job already fired and called back into us; failing to
+      // clear its own OS-side record must not abort delivery/recovery below —
+      // an already-consumed job has nothing left to re-fire spuriously.
+      this.log(
+        `cancelMessageDelivery failed for ${messageId}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
 
     try {
       if (rec.status !== "active") {
@@ -2929,7 +3027,15 @@ export class ActorMesh {
 
       const target = this.live.get(toId);
 
+      // Exact-once at the durable boundary: `messageId` is the pending
+      // delivery's own stable id, minted once at schedule time and already
+      // durable (it identifies `scheduled` itself). Using it as the chat
+      // row's id makes this call idempotent (`INSERT OR IGNORE`) rather than
+      // relying on a separate best-effort marker: a retry after a crash
+      // between the chat write and any later step just re-runs this as a
+      // no-op and gets the same id back.
       const durableMessageId = this.recordMessageEmitted({
+        id: messageId,
         fromId: scheduled.fromId,
         toId,
         body: scheduled.body,
@@ -2943,6 +3049,7 @@ export class ActorMesh {
         }
         this.inboxStore.append([
           {
+            id: messageId,
             actorId: toId,
             source: `mesh:${scheduled.fromId}`,
             payload: {
@@ -2972,6 +3079,26 @@ export class ActorMesh {
       this.log(
         `firePendingDelivery failed for ${messageId} to ${toId}: ${err instanceof Error ? err.message : String(err)}`
       );
+      // The one-shot OS job (or timer) that triggered this call has already
+      // fired and consumed itself. If the durable write above failed before
+      // the record was cleared, it's still pending but now unscheduled —
+      // re-arm it a short delay out so it gets retried without depending on
+      // the next process restart's reconcilePendingDeliveries() sweep.
+      const stillPending = this.registry
+        .get(toId)
+        ?.pendingDeliveries?.some((m) => m.id === messageId);
+      if (stillPending) {
+        try {
+          this.armPendingDelivery(toId, {
+            ...scheduled,
+            deliverAt: new Date(Date.now() + FIRE_PENDING_DELIVERY_RETRY_MS).toISOString(),
+          });
+        } catch (rearmErr) {
+          this.log(
+            `failed to re-arm scheduled message ${messageId} after delivery failure: ${rearmErr instanceof Error ? rearmErr.message : String(rearmErr)}`
+          );
+        }
+      }
     }
   }
 }

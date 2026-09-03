@@ -94,6 +94,11 @@ ObligationDto makeObligation(
   String? terminalNote,
   String? title,
   String? resolutionRef,
+  String? recurrencePolicy,
+  String? recurrenceCron,
+  int? recurrenceIntervalSeconds,
+  String? nextReadyAt,
+  bool hasCompletionHistory = false,
 }) => ObligationDto(
   id: id,
   parentId: parentId,
@@ -109,6 +114,11 @@ ObligationDto makeObligation(
   // the label their assertions look for.
   title: title ?? intent ?? 'intent $id',
   resolutionRef: resolutionRef,
+  recurrencePolicy: recurrencePolicy,
+  recurrenceCron: recurrenceCron,
+  recurrenceIntervalSeconds: recurrenceIntervalSeconds,
+  nextReadyAt: nextReadyAt,
+  hasCompletionHistory: hasCompletionHistory,
 );
 
 /// Fake REST API with canned responses; records the actor lists it was queried
@@ -122,6 +132,7 @@ class FakeApi extends DashboardApi {
   Object? quotaHistoryError;
   DashboardConfigDto? dashboardConfigResult;
   bool halted = false;
+  List<String>? schedulerWarning;
   RuntimeCursor? runtimeCursor;
   int threadsCallCount = 0;
   final threadSnapshotGates = <Completer<ThreadsSnapshot>>[];
@@ -168,6 +179,7 @@ class FakeApi extends DashboardApi {
     }
     return ThreadsSnapshot(
       halted: halted,
+      schedulerWarning: schedulerWarning,
       threads: threadsResult,
       runtimeCursor: runtimeCursor,
     );
@@ -460,6 +472,12 @@ class FakeApi extends DashboardApi {
   // ── Obligations routes ──
   List<ObligationDto> obligationsResult = [];
   Map<String, ObligationDetailSnapshot> obligationDetails = {};
+
+  /// When set, computes the detail snapshot per call instead of the static
+  /// [obligationDetails] map — needed to fake a paginated completions field
+  /// that actually varies with `completionsOffset`.
+  ObligationDetailSnapshot Function(String id, int? completionsOffset)?
+  obligationDetailByOffset;
   Map<String, ObligationTreeDto> obligationTrees = {};
   final createObligationCalls =
       <
@@ -478,6 +496,8 @@ class FakeApi extends DashboardApi {
       <({String id, String? previousId, String? nextId, String scope})>[];
   final reparentCalls = <({String id, String? parentId})>[];
   final reassignCalls = <({String id, String ownerId})>[];
+  final fetchObligationsCalls =
+      <({String? ownerId, String? status, bool? rootsOnly})>[];
 
   @override
   Future<ObligationPage> fetchObligations({
@@ -487,6 +507,11 @@ class FakeApi extends DashboardApi {
     int? limit,
     int? offset,
   }) async {
+    fetchObligationsCalls.add((
+      ownerId: ownerId,
+      status: status,
+      rootsOnly: rootsOnly,
+    ));
     var list = obligationsResult;
     if (ownerId != null) {
       list = list.where((o) => o.ownerId == ownerId).toList();
@@ -509,8 +534,13 @@ class FakeApi extends DashboardApi {
     String id, {
     int? childrenOffset,
     int? blockingOffset,
+    int? completionsOffset,
     int? limit,
   }) async {
+    final byOffset = obligationDetailByOffset;
+    if (byOffset != null) {
+      return byOffset(id, completionsOffset);
+    }
     if (obligationDetails.containsKey(id)) {
       return obligationDetails[id]!;
     }

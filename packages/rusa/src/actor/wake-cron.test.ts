@@ -4,9 +4,13 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   type CrontabIo,
+  CrontabMutator,
   CrontabWakeCron,
+  cronExprEverFires,
+  execCrontabIo,
   isValidActorId,
   isValidCronExpr,
+  nextCronOccurrence,
   preflightCron,
   writeWakePort,
 } from "./wake-cron.js";
@@ -30,7 +34,7 @@ const OPTS = {
 };
 const make = (content = "") => {
   const io = new FakeCrontab(content);
-  return { io, cron: new CrontabWakeCron(io, OPTS) };
+  return { io, cron: new CrontabWakeCron(new CrontabMutator(io), OPTS) };
 };
 
 describe("cron expression + actor-id validation", () => {
@@ -44,6 +48,36 @@ describe("cron expression + actor-id validation", () => {
     expect(isValidCronExpr("0 3 * * * curl evil")).toBe(false); // trailing command
     expect(isValidCronExpr("0 3 * * *\ncurl evil")).toBe(false); // newline injection
   });
+  it("rejects field values outside each field's valid range", () => {
+    expect(isValidCronExpr("99 99 99 99 99")).toBe(false); // every field out of range
+    expect(isValidCronExpr("60 0 * * *")).toBe(false); // minute max is 59
+    expect(isValidCronExpr("0 24 * * *")).toBe(false); // hour max is 23
+    expect(isValidCronExpr("0 0 32 * *")).toBe(false); // day-of-month max is 31
+    expect(isValidCronExpr("0 0 0 * *")).toBe(false); // day-of-month min is 1
+    expect(isValidCronExpr("0 0 * 13 *")).toBe(false); // month max is 12
+    expect(isValidCronExpr("0 0 * 0 *")).toBe(false); // month min is 1
+    expect(isValidCronExpr("0 0 * * 7")).toBe(false); // day-of-week max is 6
+    expect(isValidCronExpr("59 23 31 12 6")).toBe(true); // every field at its max
+    expect(isValidCronExpr("0 0 1 1 0")).toBe(true); // every field at its min
+  });
+  it("rejects a zero-valued step stride", () => {
+    expect(isValidCronExpr("*/0 * * * *")).toBe(false);
+    expect(isValidCronExpr("0 0 1-10/0 * *")).toBe(false);
+  });
+  it("rejects an inverted range", () => {
+    expect(isValidCronExpr("0 0 10-1 * *")).toBe(false);
+  });
+  it("rejects syntactically valid calendars that can never fire", () => {
+    expect(cronExprEverFires("0 0 31 2 *")).toBe(false);
+  });
+  it("recognizes century-boundary leap dates across the complete Gregorian cycle", () => {
+    // 2100 is not a leap year but 2000 and 2400 are; a short bounded scan
+    // cannot establish this calendar-level fact.
+    expect(cronExprEverFires("0 0 29 2 *")).toBe(true);
+    expect(
+      nextCronOccurrence("0 0 29 2 *", new Date("2099-03-01T00:00:00.000Z")).toISOString()
+    ).toBe("2104-02-29T00:00:00.000Z");
+  });
   it("validates actor ids to safe characters, including suffixed wake slots", () => {
     expect(isValidActorId("73e0b00f-8810-4315")).toBe(true);
     expect(isValidActorId("root:daily-bless-cut")).toBe(true);
@@ -53,6 +87,28 @@ describe("cron expression + actor-id validation", () => {
     expect(isValidActorId(":slot")).toBe(false);
     expect(isValidActorId("root:")).toBe(false);
     expect(isValidActorId("root::slot")).toBe(false);
+  });
+});
+
+describe("execCrontabIo", () => {
+  it("treats only crontab's documented absent-user message as an empty crontab", () => {
+    const io = execCrontabIo((() => {
+      const error = Object.assign(new Error("exit 1"), {
+        stderr: Buffer.from("no crontab for user\n"),
+      });
+      throw error;
+    }) as typeof import("node:child_process").execFileSync);
+    expect(io.read()).toBe("");
+  });
+
+  it("fails closed when crontab -l fails for any other reason", () => {
+    const io = execCrontabIo((() => {
+      const error = Object.assign(new Error("permission denied"), {
+        stderr: Buffer.from("permission denied\n"),
+      });
+      throw error;
+    }) as typeof import("node:child_process").execFileSync);
+    expect(() => io.read()).toThrow("permission denied");
   });
 });
 
@@ -172,18 +228,110 @@ describe("writeWakePort", () => {
   });
 });
 
+describe("nextCronOccurrence", () => {
+  const at = (iso: string) => new Date(iso);
+
+  it("finds the next minute match, strictly after the given time", () => {
+    const next = nextCronOccurrence("30 4 * * *", at("2026-09-02T04:30:00.000Z"));
+    // Exactly on the mark still advances a full day — "next" excludes "now".
+    expect(next.toISOString()).toBe("2026-09-03T04:30:00.000Z");
+  });
+
+  it("finds the same-day occurrence when still ahead", () => {
+    const next = nextCronOccurrence("30 4 * * *", at("2026-09-02T00:00:00.000Z"));
+    expect(next.toISOString()).toBe("2026-09-02T04:30:00.000Z");
+  });
+
+  it("expands comma lists", () => {
+    const next = nextCronOccurrence("0 6,18 * * *", at("2026-09-02T07:00:00.000Z"));
+    expect(next.toISOString()).toBe("2026-09-02T18:00:00.000Z");
+  });
+
+  it("expands a-b ranges", () => {
+    const next = nextCronOccurrence("0 9-17 * * *", at("2026-09-02T08:00:00.000Z"));
+    expect(next.toISOString()).toBe("2026-09-02T09:00:00.000Z");
+  });
+
+  it("expands */step strides", () => {
+    const next = nextCronOccurrence("*/15 * * * *", at("2026-09-02T00:01:00.000Z"));
+    expect(next.toISOString()).toBe("2026-09-02T00:15:00.000Z");
+  });
+
+  it("expands a ranged step (a-b/n)", () => {
+    const next = nextCronOccurrence("0 9-17/4 * * *", at("2026-09-02T09:30:00.000Z"));
+    expect(next.toISOString()).toBe("2026-09-02T13:00:00.000Z");
+  });
+
+  it("treats day-of-month and day-of-week as OR when both are restricted", () => {
+    // The 1st of the month OR any Friday — standard cron semantics.
+    const next = nextCronOccurrence("0 0 1 * 5", at("2026-09-02T00:00:00.000Z"));
+    // 2026-09-04 is a Friday, before the 1st of October.
+    expect(next.toISOString()).toBe("2026-09-04T00:00:00.000Z");
+  });
+
+  it("treats day-of-month alone as AND with month when day-of-week is unrestricted", () => {
+    const next = nextCronOccurrence("0 0 15 * *", at("2026-09-02T00:00:00.000Z"));
+    expect(next.toISOString()).toBe("2026-09-15T00:00:00.000Z");
+  });
+
+  it("crosses a leap-year February 29th", () => {
+    const next = nextCronOccurrence("0 0 29 2 *", at("2027-01-01T00:00:00.000Z"));
+    expect(next.toISOString()).toBe("2028-02-29T00:00:00.000Z");
+  });
+
+  it("throws for an invalid cron expression", () => {
+    expect(() => nextCronOccurrence("bad expr", at("2026-09-02T00:00:00.000Z"))).toThrow(
+      /invalid cron/
+    );
+  });
+});
+
 describe("preflightCron", () => {
+  const okPermission = () => ({ ok: true });
+
   it("reports a missing crontab CLI", () => {
-    const r = preflightCron({ hasCrontab: () => false, isCrondRunning: () => true });
+    const r = preflightCron({
+      hasCrontab: () => false,
+      isCrondRunning: () => true,
+      checkPermission: okPermission,
+    });
     expect(r.ok).toBe(false);
     expect(r.issues[0]).toMatch(/crontab/);
   });
   it("reports a stopped cron daemon", () => {
-    const r = preflightCron({ hasCrontab: () => true, isCrondRunning: () => false });
+    const r = preflightCron({
+      hasCrontab: () => true,
+      isCrondRunning: () => false,
+      checkPermission: okPermission,
+    });
     expect(r.ok).toBe(false);
     expect(r.issues[0]).toMatch(/daemon/);
   });
-  it("is ok when both are present", () => {
-    expect(preflightCron({ hasCrontab: () => true, isCrondRunning: () => true }).ok).toBe(true);
+  it("reports a user locked out by cron.allow/cron.deny", () => {
+    const r = preflightCron({
+      hasCrontab: () => true,
+      isCrondRunning: () => true,
+      checkPermission: () => ({ ok: false, detail: "crontab denied for this user: not allowed" }),
+    });
+    expect(r.ok).toBe(false);
+    expect(r.issues[0]).toMatch(/not allowed/);
+  });
+  it("falls back to a generic permission message when the probe gives no detail", () => {
+    const r = preflightCron({
+      hasCrontab: () => true,
+      isCrondRunning: () => true,
+      checkPermission: () => ({ ok: false }),
+    });
+    expect(r.ok).toBe(false);
+    expect(r.issues[0]).toMatch(/cron\.allow/);
+  });
+  it("is ok when the CLI, daemon, and permission are all fine", () => {
+    expect(
+      preflightCron({
+        hasCrontab: () => true,
+        isCrondRunning: () => true,
+        checkPermission: okPermission,
+      }).ok
+    ).toBe(true);
   });
 });

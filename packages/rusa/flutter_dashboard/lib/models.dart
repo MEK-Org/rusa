@@ -188,11 +188,18 @@ class ThreadsSnapshot {
     required this.halted,
     required this.threads,
     this.runtimeCursor,
+    this.schedulerWarning,
   });
 
   final bool halted;
   final List<ThreadDto> threads;
   final RuntimeCursor? runtimeCursor;
+
+  /// Boot-time `at`/`atrm`/`atd`/`atq` preflight issues, when that facility is
+  /// unavailable — null when it's fine or the server doesn't report it. A
+  /// missing one-shot facility never fails boot (cron-only recurrences keep
+  /// working); this is the health-visible surface for that non-fatal state.
+  final List<String>? schedulerWarning;
 
   factory ThreadsSnapshot.fromJson(Map<String, dynamic> j) => ThreadsSnapshot(
     halted: j['halted'] as bool? ?? false,
@@ -201,6 +208,9 @@ class ThreadsSnapshot {
         : RuntimeCursor.fromJson(j['runtimeCursor'] as Map<String, dynamic>),
     threads: (j['threads'] as List<dynamic>? ?? const [])
         .map((e) => ThreadDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    schedulerWarning: (j['schedulerWarning'] as List<dynamic>?)
+        ?.map((e) => e as String)
         .toList(),
   );
 }
@@ -1015,6 +1025,11 @@ class ObligationDto {
     this.prioritySourceId,
     this.terminalNote,
     this.resolutionRef,
+    this.recurrencePolicy,
+    this.recurrenceCron,
+    this.recurrenceIntervalSeconds,
+    this.nextReadyAt,
+    this.hasCompletionHistory = false,
   });
 
   final String id;
@@ -1036,7 +1051,7 @@ class ObligationDto {
   final String? updatedAt;
   final String? intent;
   final String? externalRef;
-  final String status; // "ready" | "waiting" | "done" | "cancelled"
+  final String status; // "ready" | "waiting" | "done" | "cancelled" | "scheduled"
   final double? priority;
   final double effectivePriority;
   final String? prioritySourceId;
@@ -1049,6 +1064,29 @@ class ObligationDto {
   /// principal's own words. Null while live, and null for a terminal
   /// obligation whose reason was never stated or predates the column.
   final String? terminalNote;
+
+  /// `"cron"` | `"completion_interval"` | null. Null means this obligation
+  /// never recurs — the three recurrence fields below are only meaningful
+  /// together.
+  final String? recurrencePolicy;
+
+  /// The 5-field cron expression driving a `"cron"`-policy obligation. Null
+  /// for `"completion_interval"` policy and for non-recurring obligations.
+  final String? recurrenceCron;
+
+  /// Seconds after completion before a `"completion_interval"`-policy
+  /// obligation returns to ready. Null for `"cron"` policy and for
+  /// non-recurring obligations.
+  final int? recurrenceIntervalSeconds;
+
+  /// When a `scheduled` obligation returns to ready. Null unless [status] is
+  /// `scheduled`.
+  final String? nextReadyAt;
+
+  /// Whether the durable completion ledger contains at least one row, even if
+  /// recurrence was later disabled. Exact counts live on the detail snapshot's
+  /// completion-page metadata rather than every obligation projection.
+  final bool hasCompletionHistory;
 
   /// What to show as the heading. Prefers [title]; falls back to [intent] so a
   /// row written before the split still reads, rather than rendering blank.
@@ -1074,7 +1112,9 @@ class ObligationDto {
   bool get isWaiting => status == 'waiting';
   bool get isDone => status == 'done';
   bool get isCancelled => status == 'cancelled';
+  bool get isScheduled => status == 'scheduled';
   bool get isTerminal => status == 'done' || status == 'cancelled';
+  bool get isRecurring => recurrencePolicy != null;
 
   factory ObligationDto.fromJson(Map<String, dynamic> j) {
     // The server sends a parsed reference object; older rows and some fixtures
@@ -1100,6 +1140,11 @@ class ObligationDto {
       prioritySourceId: j['prioritySourceId'] as String?,
       terminalNote: j['terminalNote'] as String?,
       resolutionRef: j['resolutionRef'] as String?,
+      recurrencePolicy: j['recurrencePolicy'] as String?,
+      recurrenceCron: j['recurrenceCron'] as String?,
+      recurrenceIntervalSeconds: j['recurrenceIntervalSeconds'] as int?,
+      nextReadyAt: j['nextReadyAt'] as String?,
+      hasCompletionHistory: j['hasCompletionHistory'] as bool? ?? false,
     );
   }
 }
@@ -1170,6 +1215,39 @@ class ObligationListPage {
       );
 }
 
+/// One completed cycle of a recurring obligation, as returned in the
+/// `completions` page of `GET /api/mesh/obligations/:id`.
+class ObligationCompletionDto {
+  const ObligationCompletionDto({
+    required this.id,
+    required this.obligationId,
+    required this.sequence,
+    required this.completedAt,
+    this.note,
+    this.resolutionRef,
+    this.nextReadyAt,
+  });
+
+  final String id;
+  final String obligationId;
+  final int sequence;
+  final String completedAt;
+  final String? note;
+  final String? resolutionRef;
+  final String? nextReadyAt;
+
+  factory ObligationCompletionDto.fromJson(Map<String, dynamic> j) =>
+      ObligationCompletionDto(
+        id: j['id'] as String? ?? '',
+        obligationId: j['obligationId'] as String? ?? '',
+        sequence: j['sequence'] as int? ?? 0,
+        completedAt: j['completedAt'] as String? ?? '',
+        note: j['note'] as String?,
+        resolutionRef: j['resolutionRef'] as String?,
+        nextReadyAt: j['nextReadyAt'] as String?,
+      );
+}
+
 class ObligationDetailSnapshot {
   const ObligationDetailSnapshot({
     required this.obligation,
@@ -1177,6 +1255,9 @@ class ObligationDetailSnapshot {
     required this.children,
     required this.blockingChildren,
     this.artifacts = const [],
+    this.completions = const [],
+    this.completionsTotal = 0,
+    this.completionsHasMore = false,
   });
 
   final ObligationDto obligation;
@@ -1184,6 +1265,9 @@ class ObligationDetailSnapshot {
   final List<ObligationDto> children;
   final List<ObligationDto> blockingChildren;
   final List<ObligationArtifactDto> artifacts;
+  final List<ObligationCompletionDto> completions;
+  final int completionsTotal;
+  final bool completionsHasMore;
 
   factory ObligationDetailSnapshot.fromJson(
     Map<String, dynamic> j,
@@ -1220,5 +1304,10 @@ class ObligationDetailSnapshot {
               )
               .toList()
         : const <ObligationArtifactDto>[],
+    completions: (j['completions'] as List<dynamic>? ?? const [])
+        .map((e) => ObligationCompletionDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    completionsTotal: j['completionsTotal'] as int? ?? 0,
+    completionsHasMore: j['completionsHasMore'] as bool? ?? false,
   );
 }
