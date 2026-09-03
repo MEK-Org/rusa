@@ -47,6 +47,7 @@ interface ObligationRow {
   recurrence_cron: string | null;
   recurrence_interval_seconds: number | null;
   next_ready_at: string | null;
+  completions_total: number;
 }
 
 interface ObligationArtifactRow {
@@ -164,7 +165,9 @@ const EFFECTIVE_PRIORITY_CTE = `
 const PROJECTED_OBLIGATION = `
   SELECT obligation.*,
          effective_priority.effective_priority,
-         effective_priority.priority_source_id
+         effective_priority.priority_source_id,
+         (SELECT COUNT(*) FROM obligation_completions WHERE obligation_id = obligation.id)
+           AS completions_total
   FROM obligations obligation
   JOIN effective_priority ON effective_priority.id = obligation.id
 `;
@@ -250,6 +253,7 @@ function toObligation(row: ObligationRow): Obligation {
     recurrenceCron: row.recurrence_cron,
     recurrenceIntervalSeconds: row.recurrence_interval_seconds,
     nextReadyAt: row.next_ready_at,
+    completionsTotal: row.completions_total,
   };
 }
 

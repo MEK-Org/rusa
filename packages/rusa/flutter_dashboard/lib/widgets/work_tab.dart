@@ -107,11 +107,21 @@ class _WorkTabState extends State<WorkTab> {
   List<_FlatNode> _flattenTree(List<ObligationTreeDto> nodes, int depth) {
     final result = <_FlatNode>[];
     for (final node in nodes) {
-      if (!_showDone && node.obligation.isTerminal) continue;
+      // A terminal obligation still shows if it retains completion history —
+      // the same "recurring, or ledger rows survived recurrence being turned
+      // off" test the detail panel uses to decide whether to render the
+      // COMPLETION HISTORY section at all.
+      final visible =
+          _showDone ||
+          !node.obligation.isTerminal ||
+          node.obligation.hasCompletionHistory;
+      if (!visible) continue;
       final id = node.obligation.id;
       final hasVisibleChildren = _showDone
           ? node.children.isNotEmpty
-          : node.children.any((c) => !c.obligation.isTerminal);
+          : node.children.any(
+              (c) => !c.obligation.isTerminal || c.obligation.hasCompletionHistory,
+            );
       final isCollapsed = !_expandedIds.contains(id);
       result.add(
         _FlatNode(node.obligation, depth, hasVisibleChildren, isCollapsed),
