@@ -410,8 +410,13 @@ export function validateModelPin(provider: string, pin: string): ModelPinValidat
   }
 
   const passableEntries = entries.filter((entry) => entry.passable !== false);
-  let matchedEntry = passableEntries.find(
-    (entry) => entry.identifier === pin || entry.displayLabel === pin
+  // Kimi's CLI takes only the config key (identifier), never the friendly
+  // display_name, so a display-label match here would accept a pin that
+  // fails to launch. Every other provider keeps matching either field.
+  let matchedEntry = passableEntries.find((entry) =>
+    provider === "kimi"
+      ? entry.identifier === pin
+      : entry.identifier === pin || entry.displayLabel === pin
   );
   let isMatch = !!matchedEntry;
 

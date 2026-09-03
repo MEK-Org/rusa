@@ -613,6 +613,7 @@ display_name = "K3"
     ]);
     expect(validateModelPin("kimi", "kimi-code/k3")).toEqual({ status: "accepted" });
     expect(() => validateModelPin("kimi", "k3")).toThrow();
+    expect(() => validateModelPin("kimi", "K3")).toThrow();
     expect(() => validateModelPin("kimi", "unsupported-model")).toThrow();
   });
 });
