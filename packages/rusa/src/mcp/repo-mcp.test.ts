@@ -70,6 +70,7 @@ function recordingIssueClient(
     addReaction: async () => {},
     addCommentReaction: async () => {},
     getPrReviewComments: async () => [],
+    getPullRequestReview: async () => null,
     getParentIssueNumber: async () => null,
     getRootIssueNumber: async () => null,
     hasSubIssues: async () => false,
