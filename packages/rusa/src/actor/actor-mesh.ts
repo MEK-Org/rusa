@@ -2837,12 +2837,24 @@ export class ActorMesh {
     return new Set([...this.runningThreadIds(), ...this.queuedThreadIds()]);
   }
 
+  /**
+   * The provider a thread's next run will actually launch on: a staged
+   * `desiredProvider` has not been applied to `provider` yet (that happens in
+   * {@link applyPendingModel} at dispatch), so every halt-gate check must
+   * consult this instead of the record's current `provider` — otherwise a
+   * staged move to an already-halted provider slips through a still-open old
+   * provider's gate.
+   */
+  private launchProvider(id: string): string | undefined {
+    const rec = this.registry.get(id);
+    return rec?.desiredProvider ?? rec?.provider;
+  }
+
   /** Cancel queued starts selected by provider-aware halt state. */
   cancelHaltedQueuedRuns(): string[] {
     const cancelled: string[] = [];
     for (const [id, actor] of this.live) {
-      const provider = this.registry.get(id)?.provider;
-      if (this.isHalted(provider) && actor.cancelQueuedRun?.()) cancelled.push(id);
+      if (this.isHalted(this.launchProvider(id)) && actor.cancelQueuedRun?.()) cancelled.push(id);
     }
     return cancelled;
   }
@@ -2851,8 +2863,7 @@ export class ActorMesh {
   resumeCancelledRuns(): string[] {
     const resumed: string[] = [];
     for (const [id, actor] of this.live) {
-      const provider = this.registry.get(id)?.provider;
-      if (!this.isHalted(provider) && actor.resumeCancelledRun?.()) resumed.push(id);
+      if (!this.isHalted(this.launchProvider(id)) && actor.resumeCancelledRun?.()) resumed.push(id);
     }
     return resumed;
   }
@@ -2868,7 +2879,11 @@ export class ActorMesh {
         if (!rec || rec.status !== "active") {
           return false;
         }
-        if (this.isHalted(rec.provider) || this.isShuttingDown() || !this.checkLease(record.id)) {
+        if (
+          this.isHalted(this.launchProvider(record.id)) ||
+          this.isShuttingDown() ||
+          !this.checkLease(record.id)
+        ) {
           return false;
         }
         if (mode === "yield-elicitation") return true;

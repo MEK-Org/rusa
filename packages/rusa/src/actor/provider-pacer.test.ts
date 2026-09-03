@@ -180,4 +180,39 @@ describe("ProviderPacer", () => {
     expect(() => pacer.deferUntil(Number.NaN)).toThrow(/availableAtMs/);
     expect(() => pacer.deferUntil(-1)).toThrow(/availableAtMs/);
   });
+
+  it("does not strand the lane when revalidateProvider throws — the next queued request still starts", async () => {
+    const mesh = new ConcurrencyLimiter(1);
+    let release!: () => void;
+    void mesh.run(() => new Promise<void>((resolve) => (release = resolve)));
+    await Promise.resolve();
+
+    const pacer = new ProviderPacer(0);
+    let secondStarted = false;
+    const first = pacer.submit(async () => "first", {
+      enqueueNormal: (fn) => mesh.enqueue(fn),
+      revalidateProvider: () => {
+        throw new Error("registry read failed");
+      },
+    });
+    const second = pacer.submit(
+      async () => {
+        secondStarted = true;
+        return "second";
+      },
+      {
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+        revalidateProvider: () => true,
+      }
+    );
+
+    // Admits `first` into the mesh queue, where its revalidateProvider throws.
+    release();
+    await expect(first.result).rejects.toThrow(/registry read failed/);
+
+    // The throw must not strand `second`, still queued behind `first`.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(secondStarted).toBe(true);
+    await expect(second.result).resolves.toBe("second");
+  });
 });

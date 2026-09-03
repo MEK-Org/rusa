@@ -2271,6 +2271,99 @@ describe("ActorMesh", () => {
     await tick();
   });
 
+  it("a staged move to an already-halted provider never invokes it, and dispatches once the halt lifts (idle actor)", async () => {
+    const d = deferredProvider();
+    const halted = new Set<string>();
+    const { mesh, registry, tick } = setup({
+      sharedProvider: d.provider,
+      isHalted: (provider) => (provider ? halted.has(provider) : halted.size > 0),
+    });
+    const worker = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      provider: "provider-a",
+      model: "model-a",
+      context: { type: "portable", mode: "ledger" },
+    });
+
+    // Stage a move to provider-b, then halt provider-b, while worker is idle —
+    // the tuple has not launched yet, so beforeRun's halt gate must consult
+    // the provider this run will actually dispatch to, not the stale current one.
+    mesh.setActorModel(worker, "model-b", "root", "provider-b");
+    halted.add("provider-b");
+
+    mesh.sendMessage(worker, "go", "root");
+    await tick();
+
+    // Gated off before the provider ever launched.
+    expect(d.pending()).toBe(0);
+    expect(mesh.runningThreadIds()).toEqual(new Set());
+    expect(mesh.queuedThreadIds()).toEqual(new Set());
+    expect(registry.get(worker)?.provider).toBe("provider-a");
+
+    // Lifting the halt and reconciling unseen inbox work (the production
+    // halt-expiry/`/resume` path) replays the gated-off wake without a fresh
+    // external trigger.
+    halted.delete("provider-b");
+    mesh.resumeCancelledRuns();
+    mesh.reconcileUnseenInbox();
+    await tick();
+
+    expect(d.pending()).toBe(1);
+    expect(registry.get(worker)?.provider).toBe("provider-b");
+
+    d.releaseAll();
+    await tick();
+  });
+
+  it("a provider swap staged while genuinely queued is cancelled by a halt on the new provider, not the old one, and replays on resume", async () => {
+    const d = deferredProvider();
+    const halted = new Set<string>();
+    const { mesh, registry, tick } = setup({
+      maxConcurrent: 1,
+      sharedProvider: d.provider,
+      isHalted: (provider) => (provider ? halted.has(provider) : halted.size > 0),
+    });
+    const running = mesh.spawn({ charter: "running", parentId: "root", provider: "provider-a" });
+    const worker = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      provider: "provider-a",
+      model: "model-a",
+      context: { type: "portable", mode: "ledger" },
+    });
+    mesh.sendMessage(running, "go", "root");
+    mesh.sendMessage(worker, "go", "root");
+    await tick();
+    expect(mesh.queuedThreadIds()).toEqual(new Set([worker]));
+
+    // Stage the cross-provider swap while worker already sits queued behind
+    // mesh capacity, then halt the new provider — not the old one it's
+    // registered under.
+    mesh.setActorModel(worker, "model-b", "root", "provider-b");
+    expect(registry.get(worker)?.provider).toBe("provider-a");
+    halted.add("provider-b");
+
+    expect(mesh.cancelHaltedQueuedRuns()).toEqual([worker]);
+    await tick();
+    expect(mesh.queuedThreadIds()).toEqual(new Set());
+
+    halted.delete("provider-b");
+    expect(mesh.resumeCancelledRuns()).toEqual([worker]);
+    await tick();
+    expect(mesh.queuedThreadIds()).toEqual(new Set([worker]));
+
+    // Free the concurrency slot: worker is admitted here, after the swap.
+    d.releaseAll();
+    await tick();
+
+    expect(registry.get(worker)?.provider).toBe("provider-b");
+    expect(d.pending()).toBe(1);
+
+    d.releaseAll();
+    await tick();
+  });
+
   it("runningThreadIds excludes a halt/lease-gated wake (nothing actually executes)", async () => {
     const d = deferredProvider();
     // Halted: every wake is gated off in beforeRun before the run body, so the

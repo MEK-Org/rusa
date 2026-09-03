@@ -255,6 +255,13 @@ export class ProviderPacer {
         request.state = "settled";
         request.reject(error);
       }
+      // `staged` was already cleared at the top of this closure, before
+      // `revalidateProvider()` (a production callback that applies registry
+      // state and can throw) had a chance to run. A throw here skips every
+      // `schedule()` call this closure would otherwise reach, so without this
+      // call nothing re-triggers `stageNext()` and every request still
+      // waiting behind this one strands in the lane forever.
+      this.schedule();
     });
   }
 
