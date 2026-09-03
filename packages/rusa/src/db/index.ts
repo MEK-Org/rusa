@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { runMigrations } from "./migrations/runner.js";
@@ -44,6 +44,18 @@ export function initDb(mcHome: string): Database.Database {
   mkdirSync(dataDir, { recursive: true });
 
   const dbPath = join(dataDir, "mesh.db");
+  const legacyDbPath = join(dataDir, "rusa.db");
+
+  if (!existsSync(dbPath) && existsSync(legacyDbPath)) {
+    if (existsSync(legacyDbPath + "-wal")) {
+      renameSync(legacyDbPath + "-wal", dbPath + "-wal");
+    }
+    if (existsSync(legacyDbPath + "-shm")) {
+      renameSync(legacyDbPath + "-shm", dbPath + "-shm");
+    }
+    renameSync(legacyDbPath, dbPath);
+  }
+
   db = new Database(dbPath);
 
   // WAL for better concurrent read performance; enforce relational constraints.
