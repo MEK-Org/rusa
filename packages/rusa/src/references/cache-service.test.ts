@@ -261,10 +261,38 @@ describe("ReferenceCacheService", () => {
 
     expect(res.cacheState).toBe("fresh");
     expect(res.entity).toEqual({ type: "github_comment", body: "The actual comment" });
+    // The title is a safe, resolved label derived from the reference's own
+    // path — never the raw canonical ref (see the cache-boundary title test
+    // below for the case that would otherwise leak it).
+    expect(res.title).toBe("a/b issues/1 — comment");
+    expect(res.title).not.toBe("github:a/b/issues/1/comments/12345");
 
     const saved = (repo.set as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(saved.entity_json).not.toContain("SHOULD_NOT_BE_SAVED");
     expect(saved.entity_json).toContain("github_comment");
+  });
+
+  it("reconstructs a safe title for a comment served from a stored cache hit, not the canonical ref", async () => {
+    const row: ReferenceCacheRow = {
+      ref: "github:a/b/issues/1/comments/12345",
+      document_version: 1,
+      entity_json: JSON.stringify({ type: "github_comment", body: "The actual comment" }),
+      fetched_at: new Date().toISOString(),
+      refresh_after: new Date(Date.now() + 100000).toISOString(),
+    };
+    const repo = {
+      get: vi.fn().mockReturnValue(row),
+      set: vi.fn(),
+      delete: vi.fn(),
+    } as unknown as ReferenceCacheRepository;
+
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
+    const res = await svc.get("github:a/b/issues/1/comments/12345", {});
+
+    expect(res.cacheState).toBe("fresh");
+    expect(res.title).toBe("a/b issues/1 — comment");
+    expect(res.title).not.toBe("github:a/b/issues/1/comments/12345");
   });
 
   it("normalizes a GitHub PR review and omits raw provider fields", async () => {
@@ -291,10 +319,35 @@ describe("ReferenceCacheService", () => {
 
     expect(res.cacheState).toBe("fresh");
     expect(res.entity).toEqual({ type: "github_review", body: "Ship it.", state: "APPROVED" });
+    expect(res.title).toBe("a/b pulls/76 — review");
+    expect(res.title).not.toBe("github:a/b/pulls/76/reviews/9001");
 
     const saved = (repo.set as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(saved.entity_json).not.toContain("SHOULD_NOT_BE_SAVED");
     expect(saved.entity_json).toContain("github_review");
+  });
+
+  it("reconstructs a safe title for a review served from a stored cache hit, not the canonical ref", async () => {
+    const row: ReferenceCacheRow = {
+      ref: "github:a/b/pulls/76/reviews/9001",
+      document_version: 1,
+      entity_json: JSON.stringify({ type: "github_review", body: "Ship it.", state: "APPROVED" }),
+      fetched_at: new Date().toISOString(),
+      refresh_after: new Date(Date.now() + 100000).toISOString(),
+    };
+    const repo = {
+      get: vi.fn().mockReturnValue(row),
+      set: vi.fn(),
+      delete: vi.fn(),
+    } as unknown as ReferenceCacheRepository;
+
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
+    const res = await svc.get("github:a/b/pulls/76/reviews/9001", {});
+
+    expect(res.cacheState).toBe("fresh");
+    expect(res.title).toBe("a/b pulls/76 — review");
+    expect(res.title).not.toBe("github:a/b/pulls/76/reviews/9001");
   });
 
   it("normalizes Chat space", async () => {
@@ -320,6 +373,7 @@ describe("ReferenceCacheService", () => {
 
     expect(res.cacheState).toBe("fresh");
     expect(res.entity).toEqual({ type: "gchat_space", name: "My Space Name" });
+    expect(res.title).toBe("My Space Name");
 
     const saved = (repo.set as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(saved.entity_json).not.toContain("secret_123");
@@ -371,6 +425,7 @@ describe("ReferenceCacheService", () => {
 
     expect(res.cacheState).toBe("fresh");
     expect(res.entity).toEqual({ type: "gchat_message", contents: "Full text content" });
+    expect(res.title).not.toBe("gchat:spaces/abc/messages/123");
 
     const saved = (repo.set as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(saved.entity_json).not.toContain("secret");

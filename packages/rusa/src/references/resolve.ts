@@ -232,6 +232,45 @@ async function resolveGchat(
 
 const POSITIVE_INT = /^[1-9]\d*$/;
 
+/**
+ * Pure, network-free label for a GitHub comment/review sub-resource, derived
+ * only from the reference's own path segments — the same "owner/repo
+ * issues/N" shape {@link resolveGitHubComment}/{@link resolveGitHubReview}
+ * build their title from. A cache hit can reconstruct a safe display title
+ * from this without re-fetching, instead of falling back to the raw ref.
+ */
+export function githubSubResourceLabel(reference: Reference):
+  | {
+      repoName: string;
+      collection: "issues" | "pulls";
+      number: number;
+      subCollection: string;
+      subId: number;
+      label: string;
+    }
+  | undefined {
+  const [owner, repo, collection, rawNumber, subCollection, subId] = reference.segments;
+  if (
+    (collection === "issues" || collection === "pulls") &&
+    subCollection &&
+    subId &&
+    POSITIVE_INT.test(rawNumber ?? "") &&
+    POSITIVE_INT.test(subId)
+  ) {
+    const repoName = `${owner}/${repo}`;
+    const number = Number(rawNumber);
+    return {
+      repoName,
+      collection,
+      number,
+      subCollection,
+      subId: Number(subId),
+      label: `${repoName} ${collection}/${number}`,
+    };
+  }
+  return undefined;
+}
+
 /** Fetch and normalize one comment (an issue conversation comment, or a PR review comment). */
 async function resolveGitHubComment(
   reference: Reference,
@@ -350,31 +389,30 @@ async function resolveGitHub(
     // A sub-resource — a comment or a review. Unlike the previous grammar, the
     // reference names its parent, so there is always something useful to say
     // and somewhere to go, even before the tracker can fetch the body.
-    const [owner, repo, collection, rawNumber, subCollection, subId] = reference.segments;
-    if (
-      (collection === "issues" || collection === "pulls") &&
-      subCollection &&
-      subId &&
-      POSITIVE_INT.test(rawNumber ?? "") &&
-      POSITIVE_INT.test(subId)
-    ) {
-      const number = Number(rawNumber);
-      const repoName = `${owner}/${repo}`;
-      const label = `${repoName} ${collection}/${number}`;
-      if (subCollection === "comments") {
+    const sub = githubSubResourceLabel(reference);
+    if (sub) {
+      if (sub.subCollection === "comments") {
         return resolveGitHubComment(
           reference,
           deps,
-          repoName,
-          number,
-          Number(subId),
-          collection,
-          label,
+          sub.repoName,
+          sub.number,
+          sub.subId,
+          sub.collection,
+          sub.label,
           url
         );
       }
-      if (subCollection === "reviews" && collection === "pulls") {
-        return resolveGitHubReview(reference, deps, repoName, number, Number(subId), label, url);
+      if (sub.subCollection === "reviews" && sub.collection === "pulls") {
+        return resolveGitHubReview(
+          reference,
+          deps,
+          sub.repoName,
+          sub.number,
+          sub.subId,
+          sub.label,
+          url
+        );
       }
     }
     return { ...unresolved(reference, reference.key, "unrecognised GitHub resource"), url };

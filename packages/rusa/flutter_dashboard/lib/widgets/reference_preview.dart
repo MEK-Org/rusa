@@ -48,7 +48,7 @@ class _ReferencePreviewState extends State<ReferencePreview> {
     final entity = widget.reference.entity;
     final entityType = entity?['type'] as String?;
 
-    String? meshSenderHandle;
+    String? meshParticipants;
     if (entityType == 'github_issue' || entityType == 'github_pull_request') {
       displayTitle = entity?['title'] as String? ?? displayTitle;
       displayBody = (entity?['description'] as String?)?.trim() ?? '';
@@ -66,7 +66,25 @@ class _ReferencePreviewState extends State<ReferencePreview> {
       displayBody = (entity?['contents'] as String?)?.trim() ?? displayBody;
     } else if (entityType == 'mesh_message') {
       final senderId = entity?['senderId'] as String?;
-      if (senderId != null) meshSenderHandle = _handle(senderId);
+      final recipientId = entity?['recipientId'] as String?;
+      final senderHandle = senderId != null ? _handle(senderId) : null;
+      final recipientHandle = recipientId != null ? _handle(recipientId) : null;
+      meshParticipants = [
+        senderHandle,
+        recipientHandle,
+      ].whereType<String>().join(' → ');
+      if (meshParticipants.isEmpty) meshParticipants = null;
+      // The server's raw "senderId → recipientId" title is never rendered —
+      // both ids are resolved through the actor projection before display.
+      if (meshParticipants != null) displayTitle = meshParticipants;
+    }
+
+    // Defense in depth: whatever the entity-specific overrides above did,
+    // a title that still equals the raw canonical ref means nothing safe
+    // was resolved for it. Never render that ref — fall back to a
+    // scheme/type-derived generic label instead.
+    if (displayTitle == widget.reference.ref) {
+      displayTitle = _genericTitle(widget.reference.scheme, entityType);
     }
 
     final hasBody = displayBody.isNotEmpty;
@@ -80,7 +98,7 @@ class _ReferencePreviewState extends State<ReferencePreview> {
         ? _handle(widget.attachedBy!)
         : null;
     final authorHandle = widget.reference.scheme == 'mesh'
-        ? meshSenderHandle
+        ? meshParticipants
         : (widget.reference.author != null &&
                   widget.reference.author!.trim().isNotEmpty
               ? widget.reference.author
@@ -170,7 +188,9 @@ class _ReferencePreviewState extends State<ReferencePreview> {
                     final painter = TextPainter(
                       text: TextSpan(text: displayBody, style: style),
                       maxLines: 5,
-                      textDirection: TextDirection.ltr,
+                      textDirection: Directionality.of(context),
+                      textScaler: MediaQuery.textScalerOf(context),
+                      locale: Localizations.maybeLocaleOf(context),
                     )..layout(maxWidth: constraints.maxWidth);
                     final overflows = painter.didExceedMaxLines;
                     if (overflows != _overflows) {
@@ -219,6 +239,22 @@ class _ReferencePreviewState extends State<ReferencePreview> {
     );
   }
 }
+
+/// A human-safe, generic label for a reference whose title is otherwise the
+/// raw canonical ref — an unresolved or unrecognized source, or an entity
+/// type this widget has no specific title rule for. Never the ref itself.
+String _genericTitle(String scheme, String? entityType) => switch (entityType) {
+  'github_comment' => 'GitHub comment',
+  'github_review' => 'GitHub review',
+  'gchat_message' => 'Chat message',
+  'gchat_space' => 'Chat space',
+  _ => switch (scheme) {
+    'github' => 'GitHub reference',
+    'gchat' => 'Chat reference',
+    'mesh' => 'Mesh message',
+    _ => 'Reference unavailable',
+  },
+};
 
 /// An approval/rejection with no written comment still has content: the
 /// verdict itself. Returns null for an unrecognized or missing state, so the
