@@ -754,8 +754,10 @@ class _OverviewTabState extends State<OverviewTab> {
     );
   }
 
-  /// Queue entries are separate from idle actors. The provider queue head gets
-  /// its exact eligible-start time; every other queued actor has no ETA.
+  /// Queue entries are separate from idle actors, sorted by expected run
+  /// order (`ActorStateSnapshot.queuedActors`). Each entry shows the
+  /// scheduler's current estimate, or an honest "unknown" when pacing state
+  /// doesn't support one yet.
   Widget _buildQueuedActorsSection() {
     return StreamBuilder<ActorStateSnapshot>(
       stream: widget.store.actorStates,
@@ -786,8 +788,9 @@ class _OverviewTabState extends State<OverviewTab> {
               ),
               const SizedBox(height: 4),
               const Text(
-                'The actors waiting for a provider slot. The actor at the head '
-                'of each provider queue shows when its slot opens.',
+                'Actors waiting for a provider slot, sorted by expected run '
+                'order. Each shows the scheduler\'s current estimate, which '
+                'shifts as pacing changes.',
                 style: TextStyle(color: MeshColors.textMuted, fontSize: 11),
               ),
               const SizedBox(height: 14),
@@ -819,10 +822,12 @@ class _OverviewTabState extends State<OverviewTab> {
                           ),
                           Flexible(
                             child: Text(
-                              actor.nextProviderAvailableAt != null
-                                  ? 'Provider slot opens ${formatTs(actor.nextProviderAvailableAt!)}'
+                              actor.estimatedStartAt != null
+                                  ? 'Estimated start ${formatTs(actor.estimatedStartAt!)}'
                                   : actor.waitingOn ??
-                                        'Queued behind another provider request.',
+                                        (actor.queuePosition != null
+                                            ? 'Lane position ${actor.queuePosition! + 1}'
+                                            : 'Queued behind another provider request.'),
                               textAlign: TextAlign.right,
                               style: kMonoStyle.copyWith(
                                 color: MeshColors.textSecondary,

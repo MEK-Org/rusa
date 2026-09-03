@@ -137,8 +137,8 @@ export interface DashboardMeshRefs {
   runningThreadIds?: () => Set<string>;
   /** Read-only snapshot of thread ids waiting for their provider run to start. */
   queuedThreadIds?: () => Set<string>;
-  /** Provider-paced FIFO heads with their exact next eligible start time. */
-  providerQueueHeads?: DashboardDataDeps["providerQueueHeads"];
+  /** Per-lane provider queue snapshots; see `DashboardDataDeps`. */
+  providerQueueSnapshots?: DashboardDataDeps["providerQueueSnapshots"];
   /** This instance's configured root identity ; see `DashboardDataDeps`. */
   rootIdentity?: DashboardDataDeps["rootIdentity"];
   /** Gemini API key, for on-demand avatar generation ; see `DashboardDataDeps`. */
@@ -467,7 +467,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           schedulerHealth: options.mesh.schedulerHealth,
           runningThreadIds: options.mesh.runningThreadIds,
           queuedThreadIds: options.mesh.queuedThreadIds,
-          providerQueueHeads: options.mesh.providerQueueHeads,
+          providerQueueSnapshots: options.mesh.providerQueueSnapshots,
           rootIdentity: options.mesh.rootIdentity,
           geminiApiKey: options.mesh.geminiApiKey,
           referenceCache: options.mesh.referenceCache,

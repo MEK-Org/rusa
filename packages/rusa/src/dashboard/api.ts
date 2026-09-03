@@ -70,8 +70,18 @@ export interface DashboardDataDeps {
   queuedThreadIds?: () => Set<string>;
   /** Optional yield check for testing runState without full mesh instance. */
   isYielded?: (actorId: string) => boolean;
-  /** The provider-paced FIFO heads with their exact next eligible start time. */
-  providerQueueHeads?: () => Array<{ threadId: string; availableAt: string }>;
+  /**
+   * Read-only, per-lane FIFO snapshots from every live `ProviderPacer`,
+   * flattened across lanes. `position` is 0-based within its own provider
+   * lane (not globally comparable across lanes); `estimatedStartAt` is an
+   * ISO-8601 projection or `null` when it can't be honestly quoted yet —
+   * see `ProviderPacer.getQueueSnapshot` for the full contract this mirrors.
+   */
+  providerQueueSnapshots?: () => Array<{
+    threadId: string;
+    position: number;
+    estimatedStartAt: string | null;
+  }>;
   /**
    * This instance's configured root identity  — the resolved display
    * handle and avatar override, if `rootActor.handle`/`rootActor.avatar` are
@@ -188,8 +198,20 @@ interface ThreadDto {
   chatDisabled: boolean;
   /** ISO-8601 timestamp of the actor's most recent mesh event, or null if none. */
   lastActiveAt: string | null;
-  /** Exact provider-pacer release time, populated only for a provider queue head. */
-  nextProviderAvailableAt?: string | null;
+  /**
+   * 0-based position within this actor's provider lane, or `null` when the
+   * actor isn't in a provider queue right now. Not comparable across
+   * different provider lanes — only meaningful relative to other actors on
+   * the same lane.
+   */
+  queuePosition?: number | null;
+  /**
+   * ISO-8601 estimate of when this actor's provider run will start, or
+   * `null` when the estimate can't be honestly quoted yet (see
+   * `ProviderPacer.getQueueSnapshot`). Recomputed on every request from
+   * live pacer state — never persisted, and shifts as pacing changes.
+   */
+  estimatedStartAt?: string | null;
 }
 
 /**
@@ -1182,8 +1204,8 @@ export async function handleMeshApiRequest(
     // thread in a single pass — no await between reads, so the view can't tear.
     const running = deps.runningThreadIds?.() ?? new Set<string>();
     const queued = deps.queuedThreadIds?.() ?? new Set<string>();
-    const providerQueueHeads = new Map(
-      (deps.providerQueueHeads?.() ?? []).map((head) => [head.threadId, head.availableAt])
+    const providerQueueSnapshots = new Map(
+      (deps.providerQueueSnapshots?.() ?? []).map((entry) => [entry.threadId, entry])
     );
     const rootHandle = deps.rootIdentity?.handle ?? generateHandle("root");
     // Aggregate last activity once for all actors; the covering index on
@@ -1216,7 +1238,8 @@ export async function handleMeshApiRequest(
         runState,
         chatDisabled: r.status === "retired",
         lastActiveAt: lastActiveByActor.get(r.id) ?? null,
-        nextProviderAvailableAt: providerQueueHeads.get(r.id) ?? null,
+        queuePosition: providerQueueSnapshots.get(r.id)?.position ?? null,
+        estimatedStartAt: providerQueueSnapshots.get(r.id)?.estimatedStartAt ?? null,
       };
     });
     const schedulerHealth = deps.schedulerHealth?.();

@@ -2822,18 +2822,17 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           }),
           runningThreadIds: () => mesh.runningThreadIds(),
           queuedThreadIds: () => mesh.queuedThreadIds(),
-          providerQueueHeads: () =>
-            [...providerPacers.values()].flatMap((pacer) => {
-              const head = pacer.queueHead;
-              return head
-                ? [
-                    {
-                      threadId: head.threadId,
-                      availableAt: new Date(head.availableAt).toISOString(),
-                    },
-                  ]
-                : [];
-            }),
+          providerQueueSnapshots: () =>
+            [...providerPacers.values()].flatMap((pacer) =>
+              pacer.getQueueSnapshot().map((entry) => ({
+                threadId: entry.threadId,
+                position: entry.position,
+                estimatedStartAt:
+                  entry.estimatedStartAt === null
+                    ? null
+                    : new Date(entry.estimatedStartAt).toISOString(),
+              }))
+            ),
           rootControl,
           // The configured root identity  — display handle + avatar
           // override — so the dashboard shows this instance's own identity
