@@ -1134,6 +1134,54 @@ void main() {
   );
 
   test(
+    'events: live SSE prepend bounds the retained window (10 pages of 50) '
+    'while leaving trimmed-away history reachable through Load More',
+    () async {
+      final api = FakeApi()
+        ..threadsResult = [makeThread('a', parent: 'root', created: 't1')]
+        ..eventPages = [
+          EventPage(
+            events: [makeEvent('seed0', 'run_start', actor: 'a')],
+            nextCursor: 1,
+          ),
+          EventPage(
+            events: [makeEvent('seed0', 'run_start', actor: 'a')],
+            nextCursor: null,
+          ),
+        ];
+      final stream = FakeStream();
+      final store = await _booted(api, stream);
+
+      store.clickActor('a');
+      await pumpEventQueue();
+      expect(store.events.value.events.map((e) => e.id), ['seed0']);
+
+      // Flood well past the retention cap via live SSE (history: 1 row +
+      // live: 500 rows = 501, one more than the cap).
+      for (var i = 0; i < 500; i++) {
+        stream.meshCtrl.add(makeEvent('live$i', 'run_start', actor: 'a'));
+      }
+      await pumpEventQueue();
+
+      final retained = store.events.value.events;
+      expect(retained.length, 500); // capped, not 501
+      expect(retained.first.id, 'live499'); // newest-first preserved
+      expect(retained.map((e) => e.id), isNot(contains('seed0'))); // aged out
+
+      // The trimmed-away row is still reachable through Load More: its id
+      // was evicted from the live/history de-dupe set alongside the row
+      // itself, so the REST page that returns it again is not mistaken for
+      // a seam duplicate and gets re-admitted.
+      await store.loadMoreEvents();
+      await pumpEventQueue();
+      expect(store.events.value.events.last.id, 'seed0');
+      expect(store.events.value.hasMore, false);
+
+      await store.dispose();
+    },
+  );
+
+  test(
     'selection reconnects the SSE stream with the selected actors',
     () async {
       final api = FakeApi()
@@ -1243,6 +1291,42 @@ void main() {
       await store.dispose();
     },
   );
+
+  test('operatorChat: live SSE prepend bounds the retained window (10 pages '
+      'of 50) without disturbing selection/reset behavior', () async {
+    final api = FakeApi()
+      ..threadsResult = [makeThread('a', parent: 'root', created: 't1')];
+    final stream = FakeStream();
+    final store = await _booted(api, stream);
+
+    store.clickActor('a');
+    await pumpEventQueue();
+
+    for (var i = 0; i < 501; i++) {
+      stream.meshCtrl.add(
+        makeEvent(
+          'evt$i',
+          'message_sent',
+          actor: 'human:operator',
+          payload: '{"messageId":"m$i","to":"a"}',
+        ),
+      );
+    }
+    await pumpEventQueue();
+
+    final retained = store.operatorChat.value.chat;
+    expect(retained.length, 500); // capped
+    expect(retained.first.id, 'm500'); // newest-first preserved
+    expect(retained.map((e) => e.id), isNot(contains('m0'))); // aged out
+
+    // Selecting a different actor still resets the view + de-dupe state
+    // cleanly (the retention cap doesn't interfere with selection reset).
+    store.clickActor('b');
+    await pumpEventQueue();
+    expect(store.operatorChat.value.chat, isEmpty);
+
+    await store.dispose();
+  });
 
   test('refreshQuota keeps the last-known snapshot visible and flips '
       'quotaRefreshing while a background revalidation is in flight '
@@ -1597,6 +1681,42 @@ void main() {
     await store.dispose();
   });
 
+  test('conversation: live SSE prepend bounds the retained window (10 pages '
+      'of 50), newest-first', () async {
+    final api = FakeApi()
+      ..threadsResult = [
+        makeThread('a', parent: 'root', created: 't1'),
+        makeThread('b', parent: 'root', created: 't2'),
+      ]
+      ..eventPages = [const EventPage(events: [], nextCursor: null)]
+      ..chatPages = [const ChatPage(chat: [], nextCursor: null)];
+    final stream = FakeStream();
+    final store = await _booted(api, stream);
+
+    store.clickActor('a');
+    store.toggleActor('b');
+    await pumpEventQueue();
+
+    for (var i = 0; i < 501; i++) {
+      stream.meshCtrl.add(
+        makeEvent(
+          'evt$i',
+          'message_sent',
+          actor: 'a',
+          payload: '{"messageId":"m$i","to":"b"}',
+        ),
+      );
+    }
+    await pumpEventQueue();
+
+    final retained = store.conversation.value.chat;
+    expect(retained.length, 500); // capped
+    expect(retained.first.id, 'm500'); // newest-first preserved
+    expect(retained.map((e) => e.id), isNot(contains('m0'))); // aged out
+
+    await store.dispose();
+  });
+
   test(
     'overview: yieldEvents captures history and live run_yielded SSE events',
     () async {
@@ -1692,4 +1812,50 @@ void main() {
       await store.dispose();
     },
   );
+
+  test('overview: yieldEvents bounds the live-fed window to the newest 50, '
+      'matching the REST seed contract', () async {
+    final api = FakeApi()
+      ..threadsResult = [makeThread('worker-1', parent: 'root', created: 't1')]
+      ..eventPages = [
+        EventPage(
+          events: [
+            for (var i = 0; i < 5; i++)
+              makeEvent(
+                'seed$i',
+                'run_yielded',
+                actor: 'worker-1',
+                detail: 'complete',
+              ),
+          ],
+          nextCursor: null,
+        ),
+      ];
+    final stream = FakeStream();
+    final store = await _booted(api, stream);
+    await store.refreshYieldEvents();
+    await pumpEventQueue();
+    expect(store.yieldEvents.value.length, 5);
+
+    // Flood well past the newest-50 contract via live run_yielded events.
+    for (var i = 0; i < 60; i++) {
+      stream.meshCtrl.add(
+        makeEvent(
+          'live$i',
+          'run_yielded',
+          actor: 'worker-1',
+          detail: 'complete',
+        ),
+      );
+    }
+    await pumpEventQueue();
+
+    final retained = store.yieldEvents.value;
+    expect(retained.length, 50); // matches Overview's newest-50 contract
+    expect(retained.first.id, 'live59'); // newest-first preserved
+    expect(retained.map((e) => e.id), isNot(contains('seed0'))); // aged out
+    expect(retained.map((e) => e.id), isNot(contains('live0'))); // aged out
+
+    await store.dispose();
+  });
 }
