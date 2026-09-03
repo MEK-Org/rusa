@@ -102,8 +102,9 @@ export interface ThreadRecord {
   /** Explicit provider-native reasoning level; absent means provider default. */
   effort?: string;
   /**
-   * Pending model change staged via `set_actor_model` to apply at the end of the
-   * next run boundary.
+   * Pending model change staged via `set_actor_model`. Applies at the end of an
+   * in-flight run's run_end; applies at the next dispatch (before run_start and
+   * launch) for an idle or queued actor with no run currently in flight.
    */
   desiredModel?: string;
   /**
@@ -112,8 +113,9 @@ export interface ThreadRecord {
    */
   desiredEffort?: string | null;
   /**
-   * Pending provider change staged via `set_actor_model` to apply at the end of
-   * the next run boundary.
+   * Pending provider change staged via `set_actor_model`. Applies at the end of
+   * an in-flight run's run_end; applies at the next dispatch (before run_start
+   * and launch) for an idle or queued actor with no run currently in flight.
    */
   desiredProvider?: string;
   /** Provider session/conversation id = the working-memory handle (B.2); set after first run. */

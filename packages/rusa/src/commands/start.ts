@@ -1503,7 +1503,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   };
 
   // ── Actor mesh: the root plus any worker threads it spawns ──
-  const mesh = new ActorMesh({
+  const mesh: ActorMesh = new ActorMesh({
     registry,
     rootId,
     validateSpawn: (req) => {
@@ -1555,12 +1555,28 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // sandbox honors them instead (see injectSecretsMasking in sandbox.ts).
     grantableCapabilities: new Set([...grantableServers.keys(), ...PARENT_GRANTABLE_CAPABILITIES]),
     maxConcurrent: config.mesh?.maxConcurrent,
-    providerGate: (fn, providerName, request) =>
-      pacerFor(providerThrottleKey(providerName, config)).submit(fn, {
+    providerGate: (fn, providerName, request) => {
+      const key = providerThrottleKey(providerName, config);
+      return pacerFor(key).submit(fn, {
         responsive: request.responsive,
         threadId: request.threadId,
         enqueueNormal: request.enqueueNormal,
-      }),
+        // A staged provider change may land (via applyPendingModel) while this
+        // request sits in the mesh queue behind this lane's interval/capacity.
+        // Re-checking here, right before start, means a genuinely-queued swap
+        // is caught before it launches (and charges this lane's clock) under
+        // the wrong provider — see actor.ts's gate retry loop for the other
+        // half of this contract.
+        revalidateProvider: request.threadId
+          ? () => {
+              mesh.applyPendingModel(request.threadId as string);
+              const liveProvider = mesh.get(request.threadId as string)?.getProvider?.();
+              if (!liveProvider) return true;
+              return providerThrottleKey(liveProvider.providerName, config) === key;
+            }
+          : undefined,
+      });
+    },
     isHalted: isProviderHalted,
     isShuttingDown: () => gracefulShutdown.isShuttingDown(),
     handleForId: (id) => (id === rootId ? rootHandle : generateHandle(id)),
@@ -1934,6 +1950,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           },
           onRuntimeStateChanged: ctx.onRuntimeStateChanged,
           onRunStart: (responsive, injectRecord) => {
+            // Apply a tuple staged while this actor was queued/idle before its
+            // own run_start is recorded (#199), so this dispatch launches on the
+            // new provider/model/effort rather than the one it was queued on.
+            mesh.applyPendingModel(id);
             const providerName = providerThrottleKey(actor.getProvider().providerName, config);
             const runId = beginActorRun(id, providerName);
             mesh.recordEvent({
@@ -2407,7 +2427,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // Responsive human wakes bypass normal pacing/concurrency; background root
       // wakes use the same normal scheduling path as workers.
       beforeRun: ({ mode }): boolean => {
-        if (isProviderHalted(rootProviderName) || gracefulShutdown.isShuttingDown()) {
+        const rootRecord = registry.get(rootId);
+        const launchProviderName =
+          rootRecord?.desiredProvider ?? rootRecord?.provider ?? rootProviderName;
+        if (isProviderHalted(launchProviderName) || gracefulShutdown.isShuttingDown()) {
           return false;
         }
         if (mode === "yield-elicitation") return true;
@@ -2443,7 +2466,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       },
       onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
       onRunStart: (responsive, injectRecord) => {
-        const providerName = providerThrottleKey(provider.providerName, config);
+        // Same dispatch-time apply as the worker onRunStart above (#199): a
+        // tuple staged while the root was queued/idle must land before this
+        // run's run_start rather than at the end of the run after.
+        mesh.applyPendingModel(rootId);
+        // Read live, not the closure `provider`: applyPendingModel above may
+        // have just called root.setProvider(...) via onModelSet, and this
+        // run must record/launch that new tuple, not the one root was built
+        // with.
+        const liveProvider = root.getProvider?.() ?? provider;
+        const providerName = providerThrottleKey(liveProvider.providerName, config);
         const runId = beginActorRun(rootId, providerName);
         mesh.recordEvent({
           kind: "run_start",
@@ -2454,8 +2486,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           body: injectRecord ? JSON.stringify(injectRecord) : undefined,
           payload: JSON.stringify({
             provider: providerName,
-            model: provider.model,
-            effort: provider.effort,
+            model: liveProvider.model,
+            effort: liveProvider.effort,
             responsive,
             runId,
           }),

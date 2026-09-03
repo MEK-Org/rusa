@@ -921,8 +921,11 @@ export class ActorMesh {
     this.selectedInboxEntryIds.delete(actorId);
     this.flushRunHeadAttention(actorId);
     // Both factory-created workers and the externally-created root finish runs
-    // through this boundary. Applying here lets the root stage its own model
-    // without giving arbitrary actors self-set authority.
+    // through this boundary. Applying here covers a tuple staged mid-run: it
+    // stays on the launched tuple and only picks up the new one now, for the
+    // run after. A tuple staged while idle/queued is applied earlier, at that
+    // run's own dispatch (see the `onRunStart` wiring), so this call is then a
+    // no-op — {@link applyPendingModel} tolerates being called from both.
     this.applyPendingModel(actorId);
   }
 
@@ -2496,7 +2499,9 @@ export class ActorMesh {
    * a non-root parent may only set the model for its own descendants (and never
    * raise its own tier).
    * Optionally moves portable (ledger/tail) actors across providers.
-   * Takes effect at the end of the actor's next run.
+   * Takes effect at the end of the actor's current run if one is in flight;
+   * otherwise applies at the actor's next dispatch, before that run's
+   * run_start and launch.
    */
   setActorModel(
     id: string,
@@ -2555,9 +2560,10 @@ export class ActorMesh {
       normalizeModelEffortSelection(effectiveProvider, nextModel, requestedEffort);
     const validatedModel = selection.model ?? nextModel;
     const validatedEffort = selection.effort;
-    // One boundary contract for every run state: the in-flight run, or the next
-    // dispatched run when idle/queued, completes on the current model. The
-    // desired value is applied only when that run ends.
+    // Boundary contract: an in-flight run completes on its already-launched
+    // model, and the desired value applies at that run's end. An idle or
+    // queued actor has no launched run yet, so the desired value applies at
+    // its next dispatch, before run_start is recorded and before launch.
     const patch: Partial<ThreadRecord> = { desiredProvider: trimmedProvider };
     if (model !== undefined) patch.desiredModel = validatedModel;
     if (effort !== undefined || validatedEffort !== record.effort) {
@@ -2577,9 +2583,17 @@ export class ActorMesh {
   }
 
   /**
-   * Apply the pending model/provider change at the end of the next run boundary.
+   * Apply the pending model/provider change at whichever boundary the actor's
+   * current state puts it behind next: dispatch (queued/idle, called from the
+   * `onRunStart` wiring just before that run's `run_start` is recorded and its
+   * provider launches) or run end (mid-run, called from {@link finishInboxRun}).
+   * Public — like {@link finishInboxRun} and {@link actorQueued} — because the
+   * externally-constructed root actor wires its own `onRunStart`/`onRunEnd`
+   * outside the `createActor` factory and must call this directly.
+   * A no-op when nothing is staged, so calling it from both boundaries on the
+   * same run is safe: whichever fires first consumes the pending tuple.
    */
-  private applyPendingModel(id: string): void {
+  applyPendingModel(id: string): void {
     const record = this.registry.get(id);
     if (
       !record ||
@@ -2826,12 +2840,24 @@ export class ActorMesh {
     return new Set([...this.runningThreadIds(), ...this.queuedThreadIds()]);
   }
 
+  /**
+   * The provider a thread's next run will actually launch on: a staged
+   * `desiredProvider` has not been applied to `provider` yet (that happens in
+   * {@link applyPendingModel} at dispatch), so every halt-gate check must
+   * consult this instead of the record's current `provider` — otherwise a
+   * staged move to an already-halted provider slips through a still-open old
+   * provider's gate.
+   */
+  private launchProvider(id: string): string | undefined {
+    const rec = this.registry.get(id);
+    return rec?.desiredProvider ?? rec?.provider;
+  }
+
   /** Cancel queued starts selected by provider-aware halt state. */
   cancelHaltedQueuedRuns(): string[] {
     const cancelled: string[] = [];
     for (const [id, actor] of this.live) {
-      const provider = this.registry.get(id)?.provider;
-      if (this.isHalted(provider) && actor.cancelQueuedRun?.()) cancelled.push(id);
+      if (this.isHalted(this.launchProvider(id)) && actor.cancelQueuedRun?.()) cancelled.push(id);
     }
     return cancelled;
   }
@@ -2840,8 +2866,7 @@ export class ActorMesh {
   resumeCancelledRuns(): string[] {
     const resumed: string[] = [];
     for (const [id, actor] of this.live) {
-      const provider = this.registry.get(id)?.provider;
-      if (!this.isHalted(provider) && actor.resumeCancelledRun?.()) resumed.push(id);
+      if (!this.isHalted(this.launchProvider(id)) && actor.resumeCancelledRun?.()) resumed.push(id);
     }
     return resumed;
   }
@@ -2857,7 +2882,11 @@ export class ActorMesh {
         if (!rec || rec.status !== "active") {
           return false;
         }
-        if (this.isHalted(rec.provider) || this.isShuttingDown() || !this.checkLease(record.id)) {
+        if (
+          this.isHalted(this.launchProvider(record.id)) ||
+          this.isShuttingDown() ||
+          !this.checkLease(record.id)
+        ) {
           return false;
         }
         if (mode === "yield-elicitation") return true;

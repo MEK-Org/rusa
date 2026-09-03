@@ -1,4 +1,8 @@
-import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
+import {
+  RunStartCancelledError,
+  type RunStartHandle,
+  RunStartStaleProviderError,
+} from "./concurrency-limiter.js";
 
 export interface ProviderPacerSubmitOptions {
   responsive?: boolean;
@@ -8,6 +12,17 @@ export interface ProviderPacerSubmitOptions {
   enqueueNormal: <T>(fn: () => Promise<T>) => RunStartHandle<T>;
   /** Fires at the actual provider start, never when either queue is entered. */
   onStarted?: () => void;
+  /**
+   * Consulted at the same selection-time point as the adaptive interval
+   * revalidation, right before this request would actually start: applies any
+   * pending model/provider change and reports whether the actor's live
+   * provider still matches the lane this request was submitted under. A
+   * `false` return rejects the request with {@link RunStartStaleProviderError}
+   * instead of starting it, so the caller can re-gate under the new provider
+   * — a request that waited in this lane must not start (and charge this
+   * lane's interval clock) under a provider it no longer belongs to.
+   */
+  revalidateProvider?: () => boolean;
 }
 
 interface PacerRequest<T> {
@@ -213,6 +228,18 @@ export class ProviderPacer {
       if (this.staged === request) this.staged = null;
       request.meshRun = undefined;
 
+      // The actor's provider may have changed while this ticket waited in the
+      // mesh queue. Starting it here would charge this lane's interval clock
+      // for a run that is about to launch under a different provider. Reject
+      // so the caller re-gates under the now-live provider and picks the
+      // correct lane instead.
+      if (!request.responsive && request.opts.revalidateProvider?.() === false) {
+        request.state = "settled";
+        request.reject(new RunStartStaleProviderError());
+        this.schedule();
+        return;
+      }
+
       // The adaptive interval may have increased while this ticket waited in
       // the mesh queue. Revalidate at selection time rather than starting early.
       if (!request.responsive && this.now() < this.nextAvailableAt) {
@@ -228,6 +255,13 @@ export class ProviderPacer {
         request.state = "settled";
         request.reject(error);
       }
+      // `staged` was already cleared at the top of this closure, before
+      // `revalidateProvider()` (a production callback that applies registry
+      // state and can throw) had a chance to run. A throw here skips every
+      // `schedule()` call this closure would otherwise reach, so without this
+      // call nothing re-triggers `stageNext()` and every request still
+      // waiting behind this one strands in the lane forever.
+      this.schedule();
     });
   }
 
