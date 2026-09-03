@@ -45,6 +45,84 @@ void main() {
     });
   });
 
+  testWidgets('shows "Operator" for a human creator, never the raw human: id', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final ob = makeObligation(
+        'ob-human-creator',
+        ownerId: 'root',
+        creatorId: 'human:operator',
+        intent: 'Filed by the operator',
+      );
+      final api = FakeApi()
+        ..threadsResult = [makeThread('root')]
+        ..obligationsResult = [ob];
+
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: WorkTab(store: store, onSelectView: (_) {}),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+      await tester.tap(find.text('Filed by the operator'));
+      await tester.pump();
+      await tester.pump();
+
+      expect(find.text('CREATOR'), findsOneWidget);
+      expect(find.text('Operator'), findsOneWidget);
+      expect(find.text('human:operator'), findsNothing);
+
+      await store.dispose();
+    });
+  });
+
+  testWidgets(
+    'shows "Unknown actor" for a creator id no lookup can find, never the '
+    'raw id',
+    (tester) async {
+      await tester.runAsync(() async {
+        final ob = makeObligation(
+          'ob-retired-creator',
+          ownerId: 'root',
+          creatorId: 'retired-actor-999',
+          intent: 'Filed by someone gone from this mesh view',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [ob];
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.tap(
+          find.text('Filed by someone gone from this mesh view'),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('CREATOR'), findsOneWidget);
+        expect(find.text('Unknown actor'), findsOneWidget);
+        expect(find.text('retired-actor-999'), findsNothing);
+
+        await store.dispose();
+      });
+    },
+  );
+
   testWidgets('shows an honest unknown state for a legacy null creator', (
     tester,
   ) async {

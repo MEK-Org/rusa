@@ -557,8 +557,7 @@ class _InboxTabState extends State<InboxTab> {
             if (reference != null)
               ReferencePreview(
                 reference: reference,
-                resolveActorHandle: (id) =>
-                    widget.store.actor(id)?.handle ?? id,
+                lookupActorHandle: (id) => widget.store.actor(id)?.handle,
               )
             else
               Text(

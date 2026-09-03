@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../actor_display.dart';
 import '../link_opener.dart';
 import '../models.dart';
 import '../theme.dart';
@@ -11,7 +12,8 @@ class ReferencePreview extends StatefulWidget {
     required this.reference,
     this.label,
     this.attachedBy,
-    this.resolveActorHandle,
+    this.lookupActorHandle,
+    this.openLink = openInNewTab,
   });
 
   final ReferenceDto reference;
@@ -20,11 +22,14 @@ class ReferencePreview extends StatefulWidget {
   final String? label;
   final String? attachedBy;
 
-  /// Resolves a raw actor/thread id to its display handle. Defaults to the
-  /// identity function so callers without a store (e.g. plain widget tests)
-  /// still render — raw ids only belong under the handle in actor detail
-  /// view, never bare here.
-  final String Function(String id)? resolveActorHandle;
+  /// Looks up a raw actor/thread id's display handle, or null if unknown.
+  /// Fed through [actorDisplayLabel] so a raw id never renders bare — an
+  /// unresolved lookup still falls back to "Unknown actor", never the id.
+  final String? Function(String id)? lookupActorHandle;
+
+  /// Opens a reference's url. Injectable so tests can assert exactly what
+  /// gets opened without touching a real browser/platform channel.
+  final void Function(String url) openLink;
 
   @override
   State<ReferencePreview> createState() => _ReferencePreviewState();
@@ -34,7 +39,7 @@ class _ReferencePreviewState extends State<ReferencePreview> {
   bool _expanded = false;
   bool _overflows = false;
 
-  String _handle(String id) => widget.resolveActorHandle?.call(id) ?? id;
+  String _handle(String id) => actorDisplayLabel(id, widget.lookupActorHandle);
 
   @override
   Widget build(BuildContext context) {
@@ -47,9 +52,13 @@ class _ReferencePreviewState extends State<ReferencePreview> {
     if (entityType == 'github_issue' || entityType == 'github_pull_request') {
       displayTitle = entity?['title'] as String? ?? displayTitle;
       displayBody = (entity?['description'] as String?)?.trim() ?? '';
-    } else if (entityType == 'github_comment' ||
-        entityType == 'github_review') {
+    } else if (entityType == 'github_comment') {
       displayBody = (entity?['body'] as String?)?.trim() ?? displayBody;
+    } else if (entityType == 'github_review') {
+      final reviewBody = (entity?['body'] as String?)?.trim() ?? '';
+      displayBody = reviewBody.isNotEmpty
+          ? reviewBody
+          : _reviewVerdictText(entity?['state'] as String?) ?? displayBody;
     } else if (entityType == 'gchat_space') {
       displayTitle = entity?['name'] as String? ?? displayTitle;
       displayBody = '';
@@ -97,7 +106,7 @@ class _ReferencePreviewState extends State<ReferencePreview> {
                   widget.reference.url!.trim().isNotEmpty) ...[
                 const SizedBox(width: 4),
                 IconButton(
-                  onPressed: () => openInNewTab(widget.reference.url!),
+                  onPressed: () => widget.openLink(widget.reference.url!),
                   icon: const Icon(Icons.open_in_new, size: 14),
                   color: MeshColors.accent,
                   padding: EdgeInsets.zero,
@@ -210,6 +219,17 @@ class _ReferencePreviewState extends State<ReferencePreview> {
     );
   }
 }
+
+/// An approval/rejection with no written comment still has content: the
+/// verdict itself. Returns null for an unrecognized or missing state, so the
+/// caller's "no content" fallback still applies there.
+String? _reviewVerdictText(String? state) => switch (state) {
+  'APPROVED' => 'Approved.',
+  'CHANGES_REQUESTED' => 'Changes requested.',
+  'COMMENTED' => 'Commented, no summary.',
+  'DISMISSED' => 'Review dismissed.',
+  _ => null,
+};
 
 class _SchemeChip extends StatelessWidget {
   const _SchemeChip(this.scheme);

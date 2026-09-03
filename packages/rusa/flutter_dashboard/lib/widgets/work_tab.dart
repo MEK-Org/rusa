@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 
+import '../actor_display.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -578,7 +579,7 @@ class _DetailViewState extends State<_DetailView> {
                       ),
                   label: artifact.label,
                   attachedBy: artifact.attachedBy,
-                  resolveActorHandle: (id) => store.actor(id)?.handle ?? id,
+                  lookupActorHandle: (id) => store.actor(id)?.handle,
                 ),
               const SizedBox(height: 16),
             ],
@@ -694,21 +695,21 @@ class _DetailViewState extends State<_DetailView> {
 
   /// One id space: the category is read off the id's prefix, the same way
   /// `isHumanOperator` does server-side. A known actor renders as its handle;
-  /// anything else renders as the id itself. Shared by Owner (always present)
-  /// and Creator (rendered separately when null, above).
+  /// anything else falls back to "Unknown actor" — never the raw id. Shared
+  /// by Owner (always present) and Creator (rendered separately when null,
+  /// above).
   Widget _identityPanel(String id, {Widget? action}) {
     final isHuman = id.startsWith('human:');
     final isSystem = id.startsWith('system:');
     final isActor = !isHuman && !isSystem;
-    final displayId = store.actor(id)?.handle ?? id;
-    // The second line names the category rather than repeating the raw id —
-    // raw actor/thread ids only belong under the handle in actor detail
-    // view, never bare here.
-    final subtitle = isHuman
-        ? 'Operator'
-        : isSystem
-        ? 'System component'
-        : displayId != id
+    final displayId = actorDisplayLabel(id, (i) => store.actor(i)?.handle);
+    // The second line adds category context beyond the primary label — for
+    // human/system ids the primary label already says it, so there is
+    // nothing more to add. Raw actor/thread ids only belong under the handle
+    // in actor detail view, never bare here.
+    final subtitle = isHuman || isSystem
+        ? null
+        : displayId != 'Unknown actor'
         ? 'Actor'
         : 'Actor — not in this mesh view';
 
@@ -746,14 +747,16 @@ class _DetailViewState extends State<_DetailView> {
                     fontFamily: kMonoFontFamily,
                   ),
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  subtitle,
-                  style: const TextStyle(
-                    color: MeshColors.textMuted,
-                    fontSize: 11,
+                if (subtitle != null) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    subtitle,
+                    style: const TextStyle(
+                      color: MeshColors.textMuted,
+                      fontSize: 11,
+                    ),
                   ),
-                ),
+                ],
               ],
             ),
           ),

@@ -94,8 +94,8 @@ void main() {
                 cacheState: 'fresh',
               ),
               attachedBy: 'raw-actor-id',
-              resolveActorHandle: (id) =>
-                  id == 'raw-actor-id' ? 'operator-handle' : id,
+              lookupActorHandle: (id) =>
+                  id == 'raw-actor-id' ? 'operator-handle' : null,
             ),
           ),
         );
@@ -181,31 +181,61 @@ void main() {
       expect(find.byIcon(Icons.open_in_new), findsNothing);
     });
 
-    testWidgets('the link button is tappable and does not crash the VM test', (
-      tester,
-    ) async {
+    testWidgets(
+      'tapping the link button opens exactly the reference URL, via the '
+      'injected opener',
+      (tester) async {
+        final openedUrls = <String>[];
+        await tester.pumpWidget(
+          _host(
+            ReferencePreview(
+              reference: const ReferenceDto(
+                ref: 'github:foo/bar/issues/1',
+                scheme: 'github',
+                title: 'Issue 1',
+                url: 'https://example.test/issue/1',
+              ),
+              openLink: openedUrls.add,
+            ),
+          ),
+        );
+
+        await tester.tap(find.byIcon(Icons.open_in_new));
+        await tester.pump();
+
+        expect(openedUrls, ['https://example.test/issue/1']);
+      },
+    );
+
+    testWidgets('resolves a mesh message sender that is the human operator to '
+        '"Operator" with no "by" prefix, and never shows the raw sender id — '
+        'even with no lookup supplied', (tester) async {
       await tester.pumpWidget(
         _host(
           const ReferencePreview(
             reference: ReferenceDto(
-              ref: 'github:foo/bar/issues/1',
-              scheme: 'github',
-              title: 'Issue 1',
-              url: 'https://example.test/issue/1',
+              ref: 'mesh:messages/abc',
+              scheme: 'mesh',
+              title: 'human:operator → root',
+              body: 'A monster-catching JRPG in a cave.',
+              entity: {
+                'type': 'mesh_message',
+                'senderId': 'human:operator',
+                'recipientId': 'root',
+              },
             ),
           ),
         ),
       );
 
-      await tester.tap(find.byIcon(Icons.open_in_new));
-      await tester.pump();
-      // Nothing to assert beyond "no exception" — the VM build has no real
-      // browser, so opening a tab is a no-op seam; see link_opener_stub.dart.
+      expect(find.text('Operator'), findsOneWidget);
+      expect(find.text('by Operator'), findsNothing);
+      expect(find.text('human:operator'), findsNothing);
     });
 
     testWidgets(
-      'resolves a mesh message sender to a handle with no "by" prefix, and '
-      'never shows the raw sender id',
+      'resolves a mesh message sender that no lookup can find to "Unknown '
+      'actor", never the raw sender id',
       (tester) async {
         await tester.pumpWidget(
           _host(
@@ -213,23 +243,44 @@ void main() {
               reference: const ReferenceDto(
                 ref: 'mesh:messages/abc',
                 scheme: 'mesh',
-                title: 'human:operator → root',
-                body: 'A monster-catching JRPG in a cave.',
+                title: 'retired-actor-77 → root',
+                body: 'gone from this mesh view',
                 entity: {
                   'type': 'mesh_message',
-                  'senderId': 'human:operator',
+                  'senderId': 'retired-actor-77',
                   'recipientId': 'root',
                 },
               ),
-              resolveActorHandle: (id) =>
-                  id == 'human:operator' ? 'operator' : id,
+              lookupActorHandle: (id) => null,
             ),
           ),
         );
 
-        expect(find.text('operator'), findsOneWidget);
-        expect(find.text('by operator'), findsNothing);
-        expect(find.text('human:operator'), findsNothing);
+        expect(find.text('Unknown actor'), findsOneWidget);
+        expect(find.text('retired-actor-77'), findsNothing);
+      },
+    );
+
+    testWidgets(
+      'shows "cited by Unknown actor", never the raw id, when the citer '
+      'cannot be resolved',
+      (tester) async {
+        await tester.pumpWidget(
+          _host(
+            const ReferencePreview(
+              reference: ReferenceDto(
+                ref: 'github:foo/bar/issues/1',
+                scheme: 'github',
+                title: 'Issue 1',
+              ),
+              attachedBy: 'retired-actor-77',
+            ),
+          ),
+        );
+
+        expect(find.text('cited by Unknown actor'), findsOneWidget);
+        expect(find.text('cited by retired-actor-77'), findsNothing);
+        expect(find.text('retired-actor-77'), findsNothing);
       },
     );
 
@@ -427,6 +478,31 @@ void main() {
       );
       expect(find.text('Msg content'), findsOneWidget);
     });
+
+    testWidgets(
+      'an empty-body review shows its verdict as content, not "No content."',
+      (tester) async {
+        await tester.pumpWidget(
+          _host(
+            const ReferencePreview(
+              reference: ReferenceDto(
+                ref: 'github:foo/bar/pulls/2/reviews/9002',
+                scheme: 'github',
+                title: 'Review',
+                entity: {
+                  'type': 'github_review',
+                  'body': '',
+                  'state': 'APPROVED',
+                },
+              ),
+            ),
+          ),
+        );
+
+        expect(find.text('No content.'), findsNothing);
+        expect(find.text('Approved.'), findsOneWidget);
+      },
+    );
 
     testWidgets('says why it could not expand, rather than showing nothing', (
       tester,

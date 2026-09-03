@@ -126,6 +126,21 @@ describe("resolveReference — github", () => {
     expect(resolved.entity).toEqual({ type: "github_review", body: "Ship it.", state: "APPROVED" });
   });
 
+  it("resolves an empty-body review as available — an approval's verdict is content, not a blank card", async () => {
+    const getPullRequestReview = vi.fn<IssueClient["getPullRequestReview"]>().mockResolvedValue({
+      id: 9002,
+      state: "APPROVED",
+      body: "",
+      author: "octocat",
+    });
+    const resolved = await resolveReference("github:MEK-Org/rusa/pulls/76/reviews/9002", {
+      issueClient: { getPullRequestReview },
+    });
+
+    expect(resolved.unavailable).toBeNull();
+    expect(resolved.entity).toEqual({ type: "github_review", body: "", state: "APPROVED" });
+  });
+
   it("keeps an issue comment reference unavailable, not the whole request failing, when the tracker has no such comment", async () => {
     const listIssueComments = vi.fn<IssueClient["listIssueComments"]>().mockResolvedValue([]);
     const resolved = await resolveReference("github:MEK-Org/rusa/issues/33/comments/999", {

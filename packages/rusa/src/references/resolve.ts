@@ -319,7 +319,10 @@ async function resolveGitHubReview(
     author: review.author || null,
     timestamp: null,
     url,
-    unavailable: review.body ? null : "no body on the review",
+    // A review's verdict (state) is content in its own right — an APPROVED
+    // review with no comment is a common, honest outcome, not a blank card.
+    // Only the total absence of both is unavailable.
+    unavailable: review.body || review.state ? null : "no content on the review",
     entity: { type: "github_review", body: review.body, state: review.state },
   };
 }
