@@ -129,3 +129,16 @@ export class RunStartCancelledError extends Error {
     this.name = "RunStartCancelledError";
   }
 }
+
+/**
+ * Expected control-flow signal when a request's provider changed while it sat
+ * in a pacer/concurrency queue. The caller must re-gate under the now-live
+ * provider rather than start against the pacer lane it was originally
+ * submitted to.
+ */
+export class RunStartStaleProviderError extends Error {
+  constructor() {
+    super("queued run's provider changed before start");
+    this.name = "RunStartStaleProviderError";
+  }
+}

@@ -13,7 +13,11 @@ import type {
   RunResult,
   SandboxOptions,
 } from "../providers/types.js";
-import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
+import {
+  RunStartCancelledError,
+  type RunStartHandle,
+  RunStartStaleProviderError,
+} from "./concurrency-limiter.js";
 import type { InjectRecord } from "./portable-context.js";
 import {
   type ActorRunMode,
@@ -778,13 +782,27 @@ export class Actor {
     let result: RunResult;
     try {
       if (this.opts.gate) {
-        const gated = this.opts.gate(invoke, this.opts.provider.providerName, responsive);
-        const start: RunStartHandle<RunResult> =
-          gated instanceof Promise
-            ? { result: gated, started: false, promote: () => {}, cancel: () => false }
-            : gated;
-        this.pendingStart = start;
-        result = await start.result;
+        // A staged provider swap can land while this request is genuinely
+        // queued behind another provider's pacer/capacity. `gate` rejects
+        // with RunStartStaleProviderError in that case rather than starting
+        // under the wrong lane; re-reading `this.opts.provider` (now live,
+        // via the same applyPendingModel call that raised the rejection) and
+        // re-gating picks the correct lane instead of losing the run.
+        for (;;) {
+          const gated = this.opts.gate(invoke, this.opts.provider.providerName, responsive);
+          const start: RunStartHandle<RunResult> =
+            gated instanceof Promise
+              ? { result: gated, started: false, promote: () => {}, cancel: () => false }
+              : gated;
+          this.pendingStart = start;
+          try {
+            result = await start.result;
+            break;
+          } catch (err) {
+            if (err instanceof RunStartStaleProviderError) continue;
+            throw err;
+          }
+        }
       } else {
         result = await invoke();
       }

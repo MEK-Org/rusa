@@ -33,6 +33,7 @@ import type {
 } from "./inbox-store.js";
 import type { MeshEventInput, MeshEventSink } from "./mesh-events.js";
 import type { OsScheduler } from "./os-scheduler.js";
+import { ProviderPacer } from "./provider-pacer.js";
 import { InMemoryThreadRegistry, type ThreadRecord } from "./thread-registry.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
@@ -169,6 +170,7 @@ function setup(
     createActor?: ActorMeshOptions["createActor"];
     rootId?: string;
     obligations?: ActorMeshOptions["obligations"];
+    providerGate?: ActorMeshOptions["providerGate"];
   } = {}
 ) {
   const registry = new InMemoryThreadRegistry();
@@ -201,6 +203,7 @@ function setup(
     onSpawn: opts.onSpawn,
     onRevive: opts.onRevive,
     retireCleanups: opts.retireCleanups,
+    providerGate: opts.providerGate,
     log: (m) => logs.push(m),
     createActor: (ctx) => {
       if (opts.createActor) return opts.createActor(ctx);
@@ -3488,6 +3491,136 @@ describe("ActorMesh", () => {
       expect(runCount).toBe(2);
       expect(seenModelAtRunStart).toEqual(["model-a", "model-c"]);
       expect(registry.get(worker)?.model).toBe("model-c");
+    });
+  });
+
+  // #199 amend gap 2: `Actor.executeTurn` reads `this.opts.provider.providerName`
+  // once, before `gate()`, to pick a pacer lane. A provider staged while the
+  // request is genuinely queued behind mesh capacity must not launch (and
+  // charge the interval clock) under the stale lane it was submitted to.
+  describe("cross-provider swap while queued is gated under the new provider (#199 amend gap 2)", () => {
+    it("a provider swap staged while genuinely queued behind mesh capacity launches under the new provider, never the old one", async () => {
+      const providerARuns: string[] = [];
+      const providerBRuns: string[] = [];
+      const liveActors = new Map<string, Actor>();
+      const blockerDeferred = deferredProvider();
+      const pacers = new Map<string, ProviderPacer>();
+      const pacerFor = (name: string): ProviderPacer => {
+        let pacer = pacers.get(name);
+        if (!pacer) {
+          pacer = new ProviderPacer(0);
+          pacers.set(name, pacer);
+        }
+        return pacer;
+      };
+
+      const { mesh, registry, tick } = setup({
+        maxConcurrent: 1,
+        onModelSet: (actorId, _newModel, record) => {
+          const live = mesh.get(actorId);
+          if (live && record.provider === "provider-b") {
+            live.setProvider?.({
+              name: "provider-b",
+              providerName: "provider-b",
+              run: async (runOpts) => {
+                providerBRuns.push(runOpts.cwd);
+                liveActors.get(actorId)?.declareYield();
+                return { success: true, exitCode: 0, output: "b" };
+              },
+            });
+          }
+        },
+        // Mirrors the production providerGate wiring in start.ts: one
+        // ProviderPacer lane per provider, revalidated (via applyPendingModel)
+        // right before a queued request would actually start.
+        providerGate: (fn, providerName, request) =>
+          pacerFor(providerName).submit(fn, {
+            responsive: request.responsive,
+            threadId: request.threadId,
+            enqueueNormal: request.enqueueNormal,
+            revalidateProvider: request.threadId
+              ? () => {
+                  mesh.applyPendingModel(request.threadId as string);
+                  const live = mesh.get(request.threadId as string)?.getProvider?.();
+                  if (!live) return true;
+                  return live.providerName === providerName;
+                }
+              : undefined,
+          }),
+        createActor: (ctx) => {
+          let actor!: Actor;
+          const isBlocker = ctx.record.charter === "blocker";
+          const provider: CodingProvider = isBlocker
+            ? {
+                ...blockerDeferred.provider,
+                run: async (runOpts) => {
+                  const result = await blockerDeferred.provider.run(runOpts);
+                  if (result.success) actor.declareYield();
+                  return result;
+                },
+              }
+            : {
+                name: "provider-a",
+                providerName: "provider-a",
+                run: async (runOpts) => {
+                  providerARuns.push(runOpts.cwd);
+                  actor.declareYield();
+                  return { success: true, exitCode: 0, output: "a" };
+                },
+              };
+          actor = new Actor({
+            id: ctx.record.id,
+            cwd: `/tmp/${ctx.record.id}`,
+            provider,
+            mcpServers: [],
+            loadSessionId: () => ctx.getRecord()?.sessionId,
+            saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
+            buildPrompt: () => ({ prompt: "work" }),
+            gate: ctx.gate,
+            beforeRun: ctx.beforeRun,
+            onQueued: ctx.onQueued,
+            onRunStart: () => mesh.applyPendingModel(ctx.record.id),
+            onRunEnd: (result) => ctx.onRunEnd(result),
+            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+            debounceMs: DEBOUNCE,
+          });
+          liveActors.set(ctx.record.id, actor);
+          return actor;
+        },
+      });
+
+      const blocker = mesh.spawn({ charter: "blocker", parentId: "root" });
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        provider: "provider-a",
+        model: "model-a",
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      // Occupy the mesh's one concurrency slot.
+      mesh.sendMessage(blocker, "hold the slot", "root");
+      await tick();
+      expect(mesh.activeRunState(blocker)?.phase).toBe("running");
+
+      // Worker is genuinely queued behind mesh capacity, not merely staged.
+      mesh.sendMessage(worker, "work", "root");
+      await tick();
+      expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+
+      // Stage the cross-provider swap while the request already sits in the
+      // mesh queue — the exact race the retry/revalidation exists for.
+      mesh.setActorModel(worker, "model-b", "root", "provider-b");
+      expect(registry.get(worker)?.provider).toBe("provider-a");
+
+      // Free the slot: the queued worker request is admitted for the first
+      // time here, after the swap was staged.
+      blockerDeferred.releaseAll();
+      await tick();
+
+      expect(registry.get(worker)?.provider).toBe("provider-b");
+      expect(providerBRuns).toEqual([`/tmp/${worker}`]);
+      expect(providerARuns).toEqual([]);
     });
   });
 

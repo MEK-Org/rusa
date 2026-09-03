@@ -15,7 +15,7 @@ import { closeDb, getDb, getRepositories } from "../db/index.js";
 import type { GitHubPollingIssueClient, IssueClient } from "../gitops/issue-client.js";
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { stampAuthor } from "../mcp/stamp.js";
-import { setProviderModelCatalog } from "../providers/model-catalog.js";
+import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
 
 const worktreeMock = vi.hoisted(() => ({
@@ -3156,6 +3156,63 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(activeMesh.registry.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash");
     expect(activeMesh.registry.get(portableWorkerId)?.desiredEffort).toBe("high");
     expect(activeMesh.registry.get(portableWorkerId)?.desiredProvider).toBe("antigravity");
+  });
+
+  it("root's run_start records the live model after a tuple staged while idle, not the value frozen when root was built (#199 amend gap 1)", async () => {
+    // A prior test in this file registers a real "antigravity"/"agy" model
+    // catalog via setProviderModelCatalog and never clears it; that module-level
+    // state otherwise leaks into this test and rejects the pin below.
+    clearProviderModelCatalog("antigravity");
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+    const activeMesh = mesh;
+
+    const rootActor = activeMesh.get("root");
+    if (!rootActor) throw new Error("root actor not ready");
+    const originalModel = activeMesh.registry.get("root")?.model;
+
+    // Stage a new model on root while idle. Per #199, this must apply at
+    // root's very next dispatch, before that run's run_start is recorded —
+    // it must not merely sit staged past this run.
+    activeMesh.setActorModel("root", "Gemini 4.1 Ultra (High)", "root");
+    expect(activeMesh.registry.get("root")?.model).toBe(originalModel);
+    expect(activeMesh.registry.get("root")?.desiredModel).toBe("Gemini 4.1 Ultra");
+
+    // Directly invoke the production onRunStart closure — the same technique
+    // used elsewhere in this file to exercise root's real dispatch-time
+    // wiring without driving a full provider/gate/queue cycle.
+    const actorOpts = (
+      rootActor as unknown as { opts: { onRunStart?: (responsive: boolean) => void } }
+    ).opts;
+    actorOpts.onRunStart?.(false);
+
+    expect(activeMesh.registry.get("root")?.model).toBe("Gemini 4.1 Ultra");
+
+    const runStartEvents = getRepositories().meshEvents.listEventsByActors(["root"], {
+      kinds: ["run_start"],
+      limit: 10,
+    }).events;
+    expect(runStartEvents).toHaveLength(1);
+    const payload = JSON.parse(runStartEvents[0]?.payload ?? "{}") as {
+      model?: string;
+      effort?: string;
+    };
+    // Gap #1 (#199 amend): this run's own run_start payload must record the
+    // now-live model — the tuple this very run launches on — not the value
+    // frozen in start.ts's `provider` closure variable at root construction.
+    expect(payload.model).toBe("Gemini 4.1 Ultra");
+    expect(payload.model).not.toBe(originalModel);
   });
 
   it("routes delegated chat spaces to the delegatee while others bubble to root", async () => {
