@@ -66,6 +66,8 @@ describe("prompt assembly conduct policy injection ", () => {
 
   it("injects EXTERNAL_CONDUCT_POLICY into buildWorkerPrompt at assembly time", () => {
     const prompt = buildWorkerPrompt("custom worker task charter", dummyWorkerCtx);
+    expect(prompt).toContain("git clone --recurse-submodules");
+    expect(prompt).toContain("never `--single-branch` or `--depth`");
     expect(prompt).toContain("## Conduct on external systems");
     expect(prompt).toContain(EXTERNAL_CONDUCT_POLICY);
     expect(prompt.split("## Conduct on external systems").length - 1).toBe(1);
