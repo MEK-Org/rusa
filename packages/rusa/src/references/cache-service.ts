@@ -4,6 +4,7 @@ import {
   type ReferenceEntity,
   type ReferenceResolverDeps,
   type ResolvedReferenceWithEntity,
+  resolveReference,
   resolveReferenceSync,
 } from "./resolve.js";
 
@@ -149,81 +150,35 @@ export class ReferenceCacheService {
     }
   }
 
+  /**
+   * Reads through the shared async resolver seam rather than fetching and
+   * normalizing providers here, so authorization/error/shape behavior cannot
+   * drift between two implementations of the same GitHub/Google Chat reads.
+   * This service owns only cache policy: whether to persist, and for how long.
+   */
   private async performProviderRead(
     ref: string,
     deps: ReferenceResolverDeps
   ): Promise<ReferenceEntity | null> {
+    const resolved = await resolveReference(ref, deps);
+    const entity = resolved.entity ?? null;
+    if (!entity) return null;
+
     const reference = parseReference(ref);
-    let entity: ReferenceEntity | null = null;
-
-    if (reference.scheme === "github" && deps.issueClient?.getIssue) {
-      const issue = asGitHubIssue(reference);
-      if (issue) {
-        try {
-          const found = (await deps.issueClient.getIssue(
-            `${issue.owner}/${issue.repo}`,
-            issue.number
-          )) as unknown as Record<string, unknown>;
-          if (found) {
-            if (issue.collection === "pulls") {
-              entity = {
-                type: "github_pull_request",
-                title: (found.title as string | undefined) ?? "",
-                description: (found.body as string | undefined) ?? "",
-              };
-            } else {
-              entity = {
-                type: "github_issue",
-                title: (found.title as string | undefined) ?? "",
-                description: (found.body as string | undefined) ?? "",
-              };
-            }
-          }
-        } catch {
-          // ignore
-        }
-      }
-    } else if (reference.scheme === "gchat" && deps.chatClient) {
-      const segments = reference.segments;
-      const resourceName = segments.join("/");
-      try {
-        if (segments.length === 2 && segments[0] === "spaces") {
-          const found = await deps.chatClient.getSpace(resourceName);
-          if (found) {
-            entity = { type: "gchat_space", name: found.displayName ?? found.name };
-          }
-        } else if (segments.length >= 4 && segments[2] === "messages") {
-          const found = await deps.chatClient.getMessage(resourceName);
-          if (found) {
-            const text = found.text ?? found.formattedText ?? null;
-            if (text) {
-              entity = { type: "gchat_message", contents: text };
-            }
-          }
-        }
-      } catch {
-        // ignore
-      }
+    const now = new Date();
+    const refreshAfter = new Date(now.getTime() + this.ttlMs);
+    try {
+      this.repo.set({
+        ref: reference.key,
+        document_version: 1,
+        entity_json: JSON.stringify(entity),
+        fetched_at: now.toISOString(),
+        refresh_after: refreshAfter.toISOString(),
+      });
+    } catch {
+      // ignore cache write faults
     }
-
-    if (entity) {
-      const now = new Date();
-      const refreshAfter = new Date(now.getTime() + this.ttlMs);
-      try {
-        this.repo.set({
-          ref: reference.key,
-          document_version: 1,
-          entity_json: JSON.stringify(entity),
-          fetched_at: now.toISOString(),
-          refresh_after: refreshAfter.toISOString(),
-        });
-      } catch {
-        // ignore cache write faults
-      }
-      return entity;
-    }
-
-    return null;
+    return entity;
   }
 }
 

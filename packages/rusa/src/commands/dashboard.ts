@@ -7,6 +7,7 @@ import { loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { getRepositories, initDb } from "../db/index.js";
 import { providerCapabilityName } from "../providers/registry.js";
+import { ReferenceCacheService } from "../references/cache-service.js";
 import { startDashboardServer } from "../webhook/server.js";
 
 /**
@@ -39,6 +40,17 @@ ${"━".repeat(26)}
   const dashboardBindHost = config.dashboard?.bindHost ?? "127.0.0.1";
   // Open the persisted db + registry so the Data API serves real mesh data.
   initDb(mcHome);
+  // No provider clients run in this process, but the repository-backed cache
+  // still serves fresh/stale rows a live `rusa start` process persisted.
+  const referenceCache = new ReferenceCacheService({
+    repo: getRepositories().referenceCache,
+    logger: {
+      info: (event, data) =>
+        console.log(`[reference-cache] ${event}`, data ? JSON.stringify(data) : ""),
+      error: (event, data) =>
+        console.warn(`[reference-cache] error: ${event}`, data ? JSON.stringify(data) : ""),
+    },
+  });
   const registry = new FileThreadRegistry(join(mcHome, "threads.json"), (providerName) =>
     providerCapabilityName(providerName, config)
   );
@@ -54,6 +66,7 @@ ${"━".repeat(26)}
       meshEvents: getRepositories().meshEvents,
       meshChat: getRepositories().meshChat,
       obligations: getRepositories().obligations,
+      referenceCache,
       // No mesh runs here, so this emitter never fires live_output; it exists so
       // the SSE endpoint is available (it will carry events only if this process
       // recorded them, which it does not — viewing is via the JSON endpoints).
