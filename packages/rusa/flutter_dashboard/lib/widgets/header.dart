@@ -145,6 +145,23 @@ class MeshHeader extends StatelessWidget {
                                     ? _HaltedBadge(compact: compact)
                                     : _LivePulse(compact: compact),
                               ),
+                              StreamBuilder<List<String>?>(
+                                stream: store.schedulerWarning,
+                                initialData: store.schedulerWarning.valueOrNull,
+                                builder: (_, snap) {
+                                  final issues = snap.data;
+                                  if (issues == null || issues.isEmpty) {
+                                    return const SizedBox.shrink();
+                                  }
+                                  return Padding(
+                                    padding: const EdgeInsets.only(left: 6),
+                                    child: _SchedulerWarningBadge(
+                                      issues: issues,
+                                      compact: compact,
+                                    ),
+                                  );
+                                },
+                              ),
                               if (!compact) ...[const SizedBox(width: 6)],
                               if (onSelect != null)
                                 Expanded(
@@ -704,6 +721,53 @@ class _HaltedBadge extends StatelessWidget {
             ),
           ],
         ],
+      ),
+    );
+  }
+}
+
+/// Dashboard/health-visible surface for a non-fatal boot preflight problem
+/// (currently `at`/`atrm`/`atd`/`atq` unavailability): cron-only recurrences
+/// keep working, so this is a caution badge, not a halt — the full issue list
+/// is in the tooltip rather than the console.
+class _SchedulerWarningBadge extends StatelessWidget {
+  const _SchedulerWarningBadge({required this.issues, this.compact = false});
+
+  final List<String> issues;
+  final bool compact;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: 'Scheduler unavailable:\n${issues.join('\n')}',
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(
+          color: MeshColors.statusIdle.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(4),
+          border: Border.all(color: MeshColors.statusIdle.withValues(alpha: 0.5)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.warning_amber_rounded,
+              color: MeshColors.statusIdle,
+              size: 14,
+            ),
+            if (!compact) ...[
+              const SizedBox(width: 8),
+              Text(
+                'Scheduler',
+                style: kMonoStyle.copyWith(
+                  color: MeshColors.statusIdle,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }

@@ -742,6 +742,28 @@ describe("handleMeshApiRequest", () => {
     expect(body.threads.every((t: { runState: string }) => t.runState === "idle")).toBe(true);
   });
 
+  it("GET /api/mesh/threads reports schedulerWarning:null when the at preflight is absent or ok", async () => {
+    registry.upsert(rec("root", null, "active"));
+
+    const absent = (await call(deps, "GET", "/api/mesh/threads")).res;
+    expect(JSON.parse(absent.body).schedulerWarning).toBeNull();
+
+    deps = { ...deps, schedulerHealth: () => ({ ok: true, issues: [] }) };
+    const ok = (await call(deps, "GET", "/api/mesh/threads")).res;
+    expect(JSON.parse(ok.body).schedulerWarning).toBeNull();
+  });
+
+  it("GET /api/mesh/threads surfaces the at preflight issues when unavailable, dashboard/health-visible rather than console-only", async () => {
+    registry.upsert(rec("root", null, "active"));
+    deps = {
+      ...deps,
+      schedulerHealth: () => ({ ok: false, issues: ["`at` CLI not found — install at"] }),
+    };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    expect(JSON.parse(res.body).schedulerWarning).toEqual(["`at` CLI not found — install at"]);
+  });
+
   it("GET /api/mesh/threads returns cursor and run states from one runtime capture", async () => {
     registry.upsert(rec("root", null, "active"));
     registry.upsert(rec(UUID_A, "root", "active"));

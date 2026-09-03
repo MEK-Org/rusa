@@ -371,6 +371,7 @@ export interface ActorMeshOptions {
   events?: MeshEventSink;
   /** Durable record store for message content. */
   recordChat?: (opts: {
+    id?: string;
     senderId: string;
     recipientId: string;
     body: string;
@@ -459,6 +460,7 @@ export class ActorMesh {
   private readonly retireCleanups: RetireCleanup[];
   private readonly events: MeshEventSink;
   private readonly recordChat?: (opts: {
+    id?: string;
     senderId: string;
     recipientId: string;
     body: string;
@@ -564,8 +566,18 @@ export class ActorMesh {
     this.log = opts.log ?? (() => {});
   }
 
-  /** Standardized message emission for the ISSUE_NUM spine. */
+  /**
+   * Standardized message emission for the ISSUE_NUM spine.
+   *
+   * `opts.id`, when supplied, is a stable idempotency key (e.g. a
+   * `PendingMessageDelivery.id` minted once at schedule time): the chat row
+   * and its events all derive their ids from it so a retry after a crash
+   * between the chat write and the caller's own durable bookkeeping re-runs
+   * this as a safe no-op (`INSERT OR IGNORE`) instead of duplicating the
+   * message.
+   */
   recordMessageEmitted(opts: {
+    id?: string;
     fromId: string;
     toId: string;
     body: string;
@@ -578,6 +590,7 @@ export class ActorMesh {
     if (this.recordChat) {
       try {
         msgId = this.recordChat({
+          id: opts.id,
           senderId: fromId,
           recipientId: toId,
           body: opts.body,
@@ -589,6 +602,7 @@ export class ActorMesh {
     }
 
     this.recordEvent({
+      id: opts.id ? `${opts.id}:sent` : undefined,
       kind: "message_sent",
       actorId: fromId,
       detail: opts.sessionId ?? (opts.isDrop ? DROPPED_MESSAGE_DETAIL : undefined),
@@ -597,6 +611,7 @@ export class ActorMesh {
 
     if (!opts.isDrop) {
       this.recordEvent({
+        id: opts.id ? `${opts.id}:received` : undefined,
         kind: "message_received",
         actorId: toId,
         detail: opts.sessionId,
@@ -3012,28 +3027,21 @@ export class ActorMesh {
 
       const target = this.live.get(toId);
 
-      // Exact-once at the durable boundary: once recordChat has minted a real
-      // message id, a retry (triggered by a later failure, e.g. inboxStore
-      // append) must reuse it rather than recording the chat/events a second
-      // time. Persist it onto the pending record before the next fallible
-      // step so a retry after that step's failure still sees it.
-      let durableMessageId = scheduled.deliveredMessageId;
-      if (!durableMessageId) {
-        durableMessageId = this.recordMessageEmitted({
-          fromId: scheduled.fromId,
-          toId,
-          body: scheduled.body,
-          sessionId: scheduled.sessionId,
-          isDrop: false,
-        });
-        if (durableMessageId) {
-          this.registry.patch(toId, {
-            pendingDeliveries: rec.pendingDeliveries?.map((m) =>
-              m.id === messageId ? { ...m, deliveredMessageId: durableMessageId } : m
-            ),
-          });
-        }
-      }
+      // Exact-once at the durable boundary: `messageId` is the pending
+      // delivery's own stable id, minted once at schedule time and already
+      // durable (it identifies `scheduled` itself). Using it as the chat
+      // row's id makes this call idempotent (`INSERT OR IGNORE`) rather than
+      // relying on a separate best-effort marker: a retry after a crash
+      // between the chat write and any later step just re-runs this as a
+      // no-op and gets the same id back.
+      const durableMessageId = this.recordMessageEmitted({
+        id: messageId,
+        fromId: scheduled.fromId,
+        toId,
+        body: scheduled.body,
+        sessionId: scheduled.sessionId,
+        isDrop: false,
+      });
 
       if (target && this.inboxStore) {
         if (!durableMessageId) {
@@ -3041,6 +3049,7 @@ export class ActorMesh {
         }
         this.inboxStore.append([
           {
+            id: messageId,
             actorId: toId,
             source: `mesh:${scheduled.fromId}`,
             payload: {

@@ -26,17 +26,33 @@ export interface OsSchedulerOptions {
   curlPath?: string;
 }
 
-export function preflightAt(
-  probe: { hasAt: () => boolean; isAtdRunning: () => boolean } = defaultAtProbe()
-): { ok: boolean; issues: string[] } {
+export interface AtProbe {
+  hasAt: () => boolean;
+  hasAtrm: () => boolean;
+  isAtdRunning: () => boolean;
+  /**
+   * Actually invoke `atq` (not just check the binary is on PATH) and confirm
+   * it can be queried by this user — the specific call `execAtIo().list()`
+   * makes at runtime. `which at` succeeding says nothing about `atq` being
+   * installed, executable by this user, or able to reach a live `atd`.
+   */
+  canQueryAtq: () => boolean;
+}
+
+export function preflightAt(probe: AtProbe = defaultAtProbe()): { ok: boolean; issues: string[] } {
   const issues: string[] = [];
   if (!probe.hasAt()) issues.push("`at` CLI not found — install at");
-  else if (!probe.isAtdRunning())
+  if (!probe.hasAtrm()) issues.push("`atrm` CLI not found — install at");
+  if (probe.hasAt() && !probe.isAtdRunning())
     issues.push("atd daemon not detected — scheduled obligations won't fire");
+  if (!probe.canQueryAtq())
+    issues.push(
+      "`atq` cannot be queried — verify at/atd is installed and this user can access the queue"
+    );
   return { ok: issues.length === 0, issues };
 }
 
-function defaultAtProbe(): { hasAt: () => boolean; isAtdRunning: () => boolean } {
+function defaultAtProbe(): AtProbe {
   const can = (cmd: string, args: string[]): boolean => {
     try {
       execFileSync(cmd, args, { stdio: "ignore" });
@@ -47,7 +63,12 @@ function defaultAtProbe(): { hasAt: () => boolean; isAtdRunning: () => boolean }
   };
   return {
     hasAt: () => can("which", ["at"]),
+    hasAtrm: () => can("which", ["atrm"]),
     isAtdRunning: () => can("pgrep", ["-x", "atd"]),
+    canQueryAtq: () => {
+      const res = spawnSync("atq", { encoding: "utf-8" });
+      return !res.error && res.status === 0;
+    },
   };
 }
 
@@ -189,36 +210,46 @@ export class DefaultOsScheduler implements OsScheduler {
   }
 
   /**
-   * Drop exactly the block this class writes for `tag`: the tag line, an
-   * optional `CRON_TZ=UTC` line, the single generated job line, and an
-   * optional `CRON_TZ=...` restore line — by fixed position, not by content
-   * matching. A prior content-heuristic version consumed every following
-   * `CRON_TZ=` line and every line merely *containing* "wake-obligation" or
-   * "wake-message", which deleted unrelated adjacent user entries (e.g. a
-   * command literally named `wake-message-backup`).
+   * Drop exactly the block this class writes for `tag`: from the tag line
+   * through the matching `endTag` line, inclusive — an exact, verifiable
+   * boundary rather than a fixed line count or content heuristic. A prior
+   * position-counting version assumed the block was always intact and
+   * consumed whatever followed the tag by position, which deletes an
+   * adjacent user entry the moment the block is truncated or hand-edited
+   * (e.g. `# mc-obligation-activation:<id>` immediately followed by an
+   * unrelated job, with no job/restore lines of its own left before it).
+   * When `endTag` isn't found before either EOF or another start tag, the
+   * block is malformed/partial: only the orphaned start tag itself is
+   * dropped, and every other line — ours or not — is preserved untouched.
    */
-  private stripCronBlock(lines: string[], tag: string): string[] {
+  private stripCronBlock(lines: string[], tag: string, endTag: string): string[] {
     const out: string[] = [];
-    for (let i = 0; i < lines.length; i++) {
+    let i = 0;
+    while (i < lines.length) {
       if (lines[i].trim() !== tag) {
         out.push(lines[i]);
+        i++;
         continue;
       }
       let j = i + 1;
-      if (lines[j]?.trim() === "CRON_TZ=UTC") j++;
-      if (j < lines.length) j++; // the single generated job line, whatever it contains
-      if (lines[j]?.trim().startsWith("CRON_TZ=")) j++;
-      i = j - 1;
+      while (j < lines.length && lines[j].trim() !== endTag && lines[j].trim() !== tag) {
+        j++;
+      }
+      if (j < lines.length && lines[j].trim() === endTag) {
+        i = j + 1; // drop tag..endTag inclusive
+      } else {
+        i++; // malformed/truncated: drop only the orphaned start tag
+      }
     }
     return out;
   }
 
-  private updateCron(tag: string, jobLine: string | null): void {
+  private updateCron(tag: string, endTag: string, jobLine: string | null): void {
     const current = this.crontabIo.read();
     const lines = current === "" ? [] : current.replace(/\n$/, "").split("\n");
-    const kept = this.stripCronBlock(lines, tag);
+    const kept = this.stripCronBlock(lines, tag, endTag);
     if (jobLine) {
-      kept.push(tag, jobLine);
+      kept.push(tag, jobLine, endTag);
     }
     if (kept.length !== lines.length || jobLine) {
       this.crontabIo.write(kept.length ? `${kept.join("\n")}\n` : "");
@@ -242,11 +273,19 @@ export class DefaultOsScheduler implements OsScheduler {
     }
   }
 
+  /** The tag/end-tag pair bounding one obligation's managed cron block, exactly. */
+  private activationTags(id: string): { tag: string; endTag: string } {
+    return {
+      tag: `# mc-obligation-activation:${id}`,
+      endTag: `# mc-obligation-activation-end:${id}`,
+    };
+  }
+
   scheduleObligationActivation(
     id: string,
     time: { kind: "cron"; cronExpr: string } | { kind: "at"; date: Date }
   ): void {
-    const tag = `# mc-obligation-activation:${id}`;
+    const { tag, endTag } = this.activationTags(id);
     const curlLine = this.buildCurlLine("wake-obligation", { id });
 
     if (time.kind === "cron") {
@@ -259,12 +298,12 @@ export class DefaultOsScheduler implements OsScheduler {
       // loses a timezone some other entry depends on.
       const current = this.crontabIo.read();
       const lines = current === "" ? [] : current.replace(/\n$/, "").split("\n");
-      const kept = this.stripCronBlock(lines, tag);
+      const kept = this.stripCronBlock(lines, tag, endTag);
       const priorTz = this.lastCronTzLine(kept);
-      kept.push(tag, "CRON_TZ=UTC", `${time.cronExpr} ${curlLine}`, priorTz ?? "CRON_TZ=");
+      kept.push(tag, "CRON_TZ=UTC", `${time.cronExpr} ${curlLine}`, priorTz ?? "CRON_TZ=", endTag);
       this.crontabIo.write(`${kept.join("\n")}\n`);
     } else {
-      this.updateCron(tag, null);
+      this.updateCron(tag, endTag, null);
       this.removeAtByTag(tag);
       const script = `${tag}\n${curlLine}\n`;
       this.atIo.schedule(script, time.date);
@@ -272,8 +311,8 @@ export class DefaultOsScheduler implements OsScheduler {
   }
 
   cancelObligationActivation(id: string): void {
-    const tag = `# mc-obligation-activation:${id}`;
-    this.updateCron(tag, null);
+    const { tag, endTag } = this.activationTags(id);
+    this.updateCron(tag, endTag, null);
     this.removeAtByTag(tag);
   }
 

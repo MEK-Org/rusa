@@ -130,6 +130,7 @@ class FakeApi extends DashboardApi {
   Object? quotaHistoryError;
   DashboardConfigDto? dashboardConfigResult;
   bool halted = false;
+  List<String>? schedulerWarning;
   RuntimeCursor? runtimeCursor;
   int threadsCallCount = 0;
   final threadSnapshotGates = <Completer<ThreadsSnapshot>>[];
@@ -176,6 +177,7 @@ class FakeApi extends DashboardApi {
     }
     return ThreadsSnapshot(
       halted: halted,
+      schedulerWarning: schedulerWarning,
       threads: threadsResult,
       runtimeCursor: runtimeCursor,
     );

@@ -89,7 +89,7 @@ export class MeshEventRepository {
     const id = opts.id ?? randomUUID();
     this.db
       .prepare(
-        `INSERT INTO mesh_events (id, ts, kind, actor_id, detail, body, payload, success)
+        `INSERT OR IGNORE INTO mesh_events (id, ts, kind, actor_id, detail, body, payload, success)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(

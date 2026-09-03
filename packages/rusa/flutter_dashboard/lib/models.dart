@@ -188,11 +188,18 @@ class ThreadsSnapshot {
     required this.halted,
     required this.threads,
     this.runtimeCursor,
+    this.schedulerWarning,
   });
 
   final bool halted;
   final List<ThreadDto> threads;
   final RuntimeCursor? runtimeCursor;
+
+  /// Boot-time `at`/`atrm`/`atd`/`atq` preflight issues, when that facility is
+  /// unavailable — null when it's fine or the server doesn't report it. A
+  /// missing one-shot facility never fails boot (cron-only recurrences keep
+  /// working); this is the health-visible surface for that non-fatal state.
+  final List<String>? schedulerWarning;
 
   factory ThreadsSnapshot.fromJson(Map<String, dynamic> j) => ThreadsSnapshot(
     halted: j['halted'] as bool? ?? false,
@@ -201,6 +208,9 @@ class ThreadsSnapshot {
         : RuntimeCursor.fromJson(j['runtimeCursor'] as Map<String, dynamic>),
     threads: (j['threads'] as List<dynamic>? ?? const [])
         .map((e) => ThreadDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    schedulerWarning: (j['schedulerWarning'] as List<dynamic>?)
+        ?.map((e) => e as String)
         .toList(),
   );
 }

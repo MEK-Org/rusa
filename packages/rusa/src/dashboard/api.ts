@@ -48,6 +48,16 @@ export interface DashboardDataDeps {
    */
   isHalted?: () => boolean;
   /**
+   * Read-only snapshot of the boot-time `at`/`atrm`/`atd`/`atq` preflight
+   * (see `preflightAt` in os-scheduler.ts), surfaced as the top-level
+   * `schedulerWarning` field on `/api/mesh/threads` — a missing one-shot
+   * facility only warns at boot (cron-only recurrences keep working), so the
+   * dashboard/health surface is this snapshot's one durable place to make
+   * that non-fatal condition visible to an operator instead of console-only.
+   * Optional; absent or an ok result reports `schedulerWarning: null`.
+   */
+  schedulerHealth?: () => { ok: boolean; issues: string[] };
+  /**
    * Read-only snapshot of the thread ids whose live actor is *genuinely
    * executing a run right now* (between run_start and run_end — i.e. the
    * TriggerRunner's running flag), used to derive each thread's `runState`.
@@ -1209,8 +1219,10 @@ export async function handleMeshApiRequest(
         nextProviderAvailableAt: providerQueueHeads.get(r.id) ?? null,
       };
     });
+    const schedulerHealth = deps.schedulerHealth?.();
     sendJson(res, 200, {
       halted: deps.isHalted?.() ?? false,
+      schedulerWarning: schedulerHealth && !schedulerHealth.ok ? schedulerHealth.issues : null,
       runtimeCursor: runtime ? { streamId: runtime.streamId, revision: runtime.revision } : null,
       threads,
     });

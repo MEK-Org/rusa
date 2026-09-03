@@ -31,17 +31,18 @@ export interface PortableContextConfig {
 export type ContextConfig = NativeContextConfig | PortableContextConfig;
 
 export interface PendingMessageDelivery {
+  /**
+   * Minted once at schedule time and durable from that point on. Doubles as
+   * the idempotency key for the chat row/events this delivery eventually
+   * writes (see `recordMessageEmitted`), so a retry after a crash between
+   * that write and the rest of delivery is a safe no-op rather than a
+   * duplicate.
+   */
   id: string;
   fromId: string;
   body: string;
   deliverAt: string;
   sessionId?: string;
-  /**
-   * Set once `recordChat` has minted a durable message id for this delivery.
-   * A retry after a later failure (e.g. inbox append) reuses it instead of
-   * recording the chat/events a second time.
-   */
-  deliveredMessageId?: string;
 }
 
 /**

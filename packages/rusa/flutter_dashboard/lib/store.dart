@@ -186,6 +186,7 @@ class DashboardStore {
     const ActorStateSnapshot(),
   );
   final _halted = BehaviorSubject<bool>.seeded(false);
+  final _schedulerWarning = BehaviorSubject<List<String>?>.seeded(null);
   final _showRetired = BehaviorSubject<bool>.seeded(false);
   final _selection = BehaviorSubject<Set<String>>.seeded(const {});
   final _collapsed = BehaviorSubject<Set<String>>.seeded(const {});
@@ -244,6 +245,7 @@ class DashboardStore {
   // ── Exposed streams ──
   ValueStream<ActorStateSnapshot> get actorStates => _actorStates.stream;
   ValueStream<bool> get halted => _halted.stream;
+  ValueStream<List<String>?> get schedulerWarning => _schedulerWarning.stream;
   ValueStream<bool> get showRetired => _showRetired.stream;
   ValueStream<Set<String>> get selection => _selection.stream;
   ValueStream<Set<String>> get collapsed => _collapsed.stream;
@@ -1133,6 +1135,7 @@ class DashboardStore {
       _runtimeRetry = null;
       _runtimeRetryDelay = _kRuntimeRetryInitial;
       _halted.add(snap.halted);
+      _schedulerWarning.add(snap.schedulerWarning);
       _updateActorStatesFromThreads(snap.threads);
       _runtimeCursor = snap.runtimeCursor;
       _error.add(null);
@@ -1277,6 +1280,7 @@ class DashboardStore {
     await Future.wait([
       _actorStates.close(),
       _halted.close(),
+      _schedulerWarning.close(),
       _showRetired.close(),
       _selection.close(),
       _primary.close(),

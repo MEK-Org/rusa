@@ -150,6 +150,7 @@ function setup(
     isShuttingDown?: () => boolean;
     events?: MeshEventSink;
     recordChat?: (opts: {
+      id?: string;
       senderId: string;
       recipientId: string;
       body: string;
@@ -4504,18 +4505,29 @@ describe("ActorMesh", () => {
           return memoryStore.append(inputs);
         },
       };
+      // These fakes mirror the real repositories' `INSERT OR IGNORE`
+      // semantics keyed on the caller-supplied id, rather than a separate
+      // best-effort marker: recordChat/events are called on every retry, but
+      // a retry using the same stable id must not add a second row.
       let recordChatCalls = 0;
+      const chatRows = new Map<string, string>();
+      const eventIds = new Set<string>();
       const sentEvents: string[] = [];
       const { mesh, registry } = setup({
         inboxStore,
-        recordChat: () => {
+        recordChat: (opts) => {
           recordChatCalls += 1;
-          return `message-${recordChatCalls}`;
+          const id = opts.id ?? `message-${recordChatCalls}`;
+          if (!chatRows.has(id)) chatRows.set(id, opts.body);
+          return id;
         },
         events: (event) => {
-          if (event.kind === "message_sent" || event.kind === "message_received") {
-            sentEvents.push(event.kind);
+          if (event.kind !== "message_sent" && event.kind !== "message_received") return;
+          if (event.id) {
+            if (eventIds.has(event.id)) return;
+            eventIds.add(event.id);
           }
+          sentEvents.push(event.kind);
         },
       });
       const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
@@ -4528,18 +4540,86 @@ describe("ActorMesh", () => {
       mesh.sendMessage(t2, "will fail once", t1, undefined, deliverAt);
       const messageId = registry.get(t2)?.pendingDeliveries?.[0]?.id ?? "";
 
-      // First attempt: recordChat succeeds and mints a durable id, but the
-      // inbox append after it fails — the retry must not mint (or record) a
-      // second chat row for the same delivery.
+      // First attempt: recordChat succeeds and mints a durable row keyed on
+      // the pending delivery's own stable id, but the inbox append after it
+      // fails — the retry must not record a second chat row or events for
+      // the same delivery.
       mesh.deliverScheduledMessage(messageId);
-      expect(recordChatCalls).toBe(1);
-      expect(registry.get(t2)?.pendingDeliveries?.[0]?.deliveredMessageId).toBe("message-1");
+      expect(chatRows.size).toBe(1);
+      expect(chatRows.has(messageId)).toBe(true);
 
       mesh.deliverScheduledMessage(messageId);
-      expect(recordChatCalls).toBe(1);
+      expect(recordChatCalls).toBe(2);
+      expect(chatRows.size).toBe(1);
       expect(registry.get(t2)?.pendingDeliveries ?? []).toHaveLength(0);
       expect(memoryStore.entries.filter((e) => e.actorId === t2)).toHaveLength(1);
       expect(sentEvents).toEqual(["message_sent", "message_received"]);
+    });
+
+    it("recovers exact-once delivery across a restart that loses the in-memory pending-delivery state after the chat write", () => {
+      // Simulates a crash between the durable chat write (recordChat, keyed
+      // on the pending delivery's stable id) and the rest of firePendingDelivery
+      // finishing: on "restart", reconcilePendingDeliveries re-fires the same
+      // pending delivery. Because the chat/event rows are keyed on that
+      // already-durable id, the retry must be a safe no-op at the chat/event
+      // layer and still complete the delivery exactly once.
+      const memoryStore = createMemoryInboxStore();
+      const chatRows = new Map<string, string>();
+      const eventIds = new Set<string>();
+      const sentEvents: string[] = [];
+      let crashAfterChatWrite = true;
+      const inboxStore: InboxStore = {
+        ...memoryStore,
+        append: (inputs) => {
+          if (crashAfterChatWrite) {
+            crashAfterChatWrite = false;
+            throw new Error("process crashed before inbox append");
+          }
+          return memoryStore.append(inputs);
+        },
+      };
+      const { mesh, registry } = setup({
+        inboxStore,
+        recordChat: (opts) => {
+          const id = opts.id ?? "unexpected-missing-id";
+          if (!chatRows.has(id)) chatRows.set(id, opts.body);
+          return id;
+        },
+        events: (event) => {
+          if (event.kind !== "message_sent" && event.kind !== "message_received") return;
+          if (event.id) {
+            if (eventIds.has(event.id)) return;
+            eventIds.add(event.id);
+          }
+          sentEvents.push(event.kind);
+        },
+      });
+      const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
+      const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
+
+      const osScheduler = new FakeOsScheduler();
+      mesh.setOsScheduler(osScheduler);
+
+      const deliverAt = new Date(Date.now() + 100000).toISOString();
+      mesh.sendMessage(t2, "restart-boundary message", t1, undefined, deliverAt);
+      const messageId = registry.get(t2)?.pendingDeliveries?.[0]?.id ?? "";
+      expect(messageId).toBeTruthy();
+
+      // "Crash" mid-delivery: the chat row lands durably, the inbox append
+      // does not, and — unlike a live retry — nothing in memory (not even a
+      // deliveredMessageId patch) survives the restart.
+      mesh.deliverScheduledMessage(messageId);
+      expect(chatRows.size).toBe(1);
+      expect(registry.get(t2)?.pendingDeliveries).toHaveLength(1);
+
+      // Boot-time reconciliation re-fires the still-pending delivery using
+      // only what was durably persisted at schedule time (the same messageId).
+      mesh.deliverScheduledMessage(messageId);
+
+      expect(chatRows.size).toBe(1);
+      expect(sentEvents).toEqual(["message_sent", "message_received"]);
+      expect(registry.get(t2)?.pendingDeliveries ?? []).toHaveLength(0);
+      expect(memoryStore.entries.filter((e) => e.actorId === t2)).toHaveLength(1);
     });
 
     it("keeps a delivery retryable when clearing its own OS job fails, instead of aborting delivery", () => {

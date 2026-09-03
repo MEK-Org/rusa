@@ -1,10 +1,12 @@
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type AtIo,
+  type AtProbe,
   AtUnavailableError,
   DefaultOsScheduler,
   execAtIo,
+  preflightAt,
   unavailableAtIo,
 } from "./os-scheduler.js";
 import type { CrontabIo } from "./wake-cron.js";
@@ -58,14 +60,14 @@ describe("DefaultOsScheduler", () => {
 
   it("strips cron blocks without disturbing adjacent user jobs", () => {
     cronData =
-      '1 * * * * user-job-1\n# mc-obligation-activation:ob-1\nCRON_TZ=UTC\n*/5 * * * * curl wake-obligation\nCRON_TZ=""\n2 * * * * user-job-2\n';
+      '1 * * * * user-job-1\n# mc-obligation-activation:ob-1\nCRON_TZ=UTC\n*/5 * * * * curl wake-obligation\nCRON_TZ=""\n# mc-obligation-activation-end:ob-1\n2 * * * * user-job-2\n';
     scheduler.cancelObligationActivation("ob-1");
     expect(cronData).toBe("1 * * * * user-job-1\n2 * * * * user-job-2\n");
   });
 
   it("does not delete an adjacent unmanaged job whose command merely mentions wake-obligation/wake-message", () => {
     cronData =
-      '1 * * * * user-job-1\n# mc-obligation-activation:ob-1\nCRON_TZ=UTC\n*/5 * * * * curl wake-obligation\nCRON_TZ=""\n3 * * * * /usr/bin/wake-message-backup --dry-run\n2 * * * * user-job-2\n';
+      '1 * * * * user-job-1\n# mc-obligation-activation:ob-1\nCRON_TZ=UTC\n*/5 * * * * curl wake-obligation\nCRON_TZ=""\n# mc-obligation-activation-end:ob-1\n3 * * * * /usr/bin/wake-message-backup --dry-run\n2 * * * * user-job-2\n';
     scheduler.cancelObligationActivation("ob-1");
     expect(cronData).toBe(
       "1 * * * * user-job-1\n3 * * * * /usr/bin/wake-message-backup --dry-run\n2 * * * * user-job-2\n"
@@ -74,7 +76,7 @@ describe("DefaultOsScheduler", () => {
 
   it("does not delete an adjacent unmanaged CRON_TZ= line beyond the block's own restore line", () => {
     cronData =
-      "# mc-obligation-activation:ob-1\nCRON_TZ=UTC\n*/5 * * * * curl wake-obligation\nCRON_TZ=\nCRON_TZ=Europe/Paris\n4 * * * * user-job\n";
+      "# mc-obligation-activation:ob-1\nCRON_TZ=UTC\n*/5 * * * * curl wake-obligation\nCRON_TZ=\n# mc-obligation-activation-end:ob-1\nCRON_TZ=Europe/Paris\n4 * * * * user-job\n";
     scheduler.cancelObligationActivation("ob-1");
     expect(cronData).toBe("CRON_TZ=Europe/Paris\n4 * * * * user-job\n");
   });
@@ -82,14 +84,16 @@ describe("DefaultOsScheduler", () => {
   it('restores CRON_TZ= (not CRON_TZ="") when no prior CRON_TZ was in effect', () => {
     scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" });
     const lines = cronData.trimEnd().split("\n");
-    expect(lines[lines.length - 1]).toBe("CRON_TZ=");
+    expect(lines[lines.length - 1]).toBe("# mc-obligation-activation-end:ob-1");
+    expect(lines[lines.length - 2]).toBe("CRON_TZ=");
   });
 
   it("restores the exact prior CRON_TZ line rather than blindly clearing it", () => {
     cronData = "CRON_TZ=America/New_York\n1 * * * * user-job\n";
     scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" });
     const lines = cronData.trimEnd().split("\n");
-    expect(lines[lines.length - 1]).toBe("CRON_TZ=America/New_York");
+    expect(lines[lines.length - 1]).toBe("# mc-obligation-activation-end:ob-1");
+    expect(lines[lines.length - 2]).toBe("CRON_TZ=America/New_York");
     expect(cronData).toContain("1 * * * * user-job");
   });
 
@@ -98,11 +102,30 @@ describe("DefaultOsScheduler", () => {
     scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" });
     scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "0 6 * * *" });
     const lines = cronData.trimEnd().split("\n");
-    expect(lines[lines.length - 1]).toBe("CRON_TZ=America/New_York");
+    expect(lines[lines.length - 1]).toBe("# mc-obligation-activation-end:ob-1");
+    expect(lines[lines.length - 2]).toBe("CRON_TZ=America/New_York");
     expect(cronData).toContain("1 * * * * user-job");
     expect(cronData.match(/# mc-obligation-activation:ob-1/g)).toHaveLength(1);
+    expect(cronData.match(/# mc-obligation-activation-end:ob-1/g)).toHaveLength(1);
     expect(cronData).toContain("0 6 * * *");
     expect(cronData).not.toContain("*/5 * * * *");
+  });
+
+  it("cancelling a truncated/damaged block (no end marker) drops only the orphaned tag, preserving every adjacent line", () => {
+    // A block with no end marker — hand-edited or truncated — cannot be
+    // proven to still have the shape this class wrote, so only the one line
+    // we can attribute with certainty (the tag itself) is removed.
+    cronData = "1 * * * * user-job-1\n# mc-obligation-activation:ob-1\n2 * * * * user-job-2\n";
+    scheduler.cancelObligationActivation("ob-1");
+    expect(cronData).toBe("1 * * * * user-job-1\n2 * * * * user-job-2\n");
+  });
+
+  it("scheduling over a truncated/damaged block still lands a well-formed replacement", () => {
+    cronData = "# mc-obligation-activation:ob-1\n5 * * * * user-job\n";
+    scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" });
+    expect(cronData).toContain("5 * * * * user-job");
+    expect(cronData.match(/# mc-obligation-activation:ob-1/g)).toHaveLength(1);
+    expect(cronData).toContain("# mc-obligation-activation-end:ob-1");
   });
 });
 
@@ -231,5 +254,93 @@ describe("DefaultOsScheduler with an unavailable `at` facility", () => {
     expect(() =>
       scheduler.scheduleObligationActivation("ob-1", { kind: "at", date: new Date() })
     ).toThrow(AtUnavailableError);
+  });
+});
+
+describe("preflightAt", () => {
+  const okProbe: AtProbe = {
+    hasAt: () => true,
+    hasAtrm: () => true,
+    isAtdRunning: () => true,
+    canQueryAtq: () => true,
+  };
+
+  it("passes when at/atrm/atd/atq are all present and queryable", () => {
+    expect(preflightAt(okProbe)).toEqual({ ok: true, issues: [] });
+  });
+
+  it("fails when `at` itself is missing", () => {
+    const result = preflightAt({ ...okProbe, hasAt: () => false, canQueryAtq: () => false });
+    expect(result.ok).toBe(false);
+    expect(result.issues.join(" ")).toMatch(/`at` CLI not found/);
+  });
+
+  it("fails when `atrm` is missing even though `at`/atq/atd are fine", () => {
+    const result = preflightAt({ ...okProbe, hasAtrm: () => false });
+    expect(result.ok).toBe(false);
+    expect(result.issues.join(" ")).toMatch(/`atrm` CLI not found/);
+  });
+
+  it("fails when atd isn't running", () => {
+    const result = preflightAt({ ...okProbe, isAtdRunning: () => false });
+    expect(result.ok).toBe(false);
+    expect(result.issues.join(" ")).toMatch(/atd daemon not detected/);
+  });
+
+  it("fails when `at` is present but `atq` can't actually be queried — the exact host shape that reached raw spawnSync ENOENT in production", () => {
+    const result = preflightAt({ ...okProbe, canQueryAtq: () => false });
+    expect(result.ok).toBe(false);
+    expect(result.issues.join(" ")).toMatch(/`atq` cannot be queried/);
+  });
+
+  describe("with the default (host-probing) probe", () => {
+    const mockedExecFileSync = vi.mocked(execFileSync);
+    const mockedSpawnSync = vi.mocked(spawnSync);
+
+    beforeEach(() => {
+      mockedExecFileSync.mockReset();
+      mockedSpawnSync.mockReset();
+    });
+
+    const spawnResult = (overrides: Partial<ReturnType<typeof spawnSync>>) =>
+      ({
+        pid: 1,
+        output: [],
+        stdout: "",
+        stderr: "",
+        status: 0,
+        signal: null,
+        ...overrides,
+      }) as ReturnType<typeof spawnSync>;
+
+    it("reports ok when which/pgrep succeed and a live atq call succeeds", () => {
+      mockedExecFileSync.mockReturnValue(Buffer.from(""));
+      mockedSpawnSync.mockReturnValue(spawnResult({ stdout: "" }));
+      expect(preflightAt()).toEqual({ ok: true, issues: [] });
+    });
+
+    it("surfaces a missing `atq` binary (ENOENT from a live query) as unusable, not ok", () => {
+      mockedExecFileSync.mockReturnValue(Buffer.from(""));
+      mockedSpawnSync.mockReturnValue(
+        spawnResult({
+          status: null,
+          error: Object.assign(new Error("spawn atq ENOENT"), { code: "ENOENT" }),
+        })
+      );
+      const result = preflightAt();
+      expect(result.ok).toBe(false);
+      expect(result.issues.join(" ")).toMatch(/`atq` cannot be queried/);
+    });
+
+    it("surfaces `atrm` missing from PATH even when `at`/atq/atd are otherwise fine", () => {
+      mockedExecFileSync.mockImplementation((_cmd, args) => {
+        if (Array.isArray(args) && args[0] === "atrm") throw new Error("not found");
+        return Buffer.from("");
+      });
+      mockedSpawnSync.mockReturnValue(spawnResult({ stdout: "" }));
+      const result = preflightAt();
+      expect(result.ok).toBe(false);
+      expect(result.issues.join(" ")).toMatch(/`atrm` CLI not found/);
+    });
   });
 });
