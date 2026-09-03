@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   type CrontabIo,
+  CrontabMutator,
   CrontabWakeCron,
   isValidActorId,
   isValidCronExpr,
@@ -31,7 +32,7 @@ const OPTS = {
 };
 const make = (content = "") => {
   const io = new FakeCrontab(content);
-  return { io, cron: new CrontabWakeCron(io, OPTS) };
+  return { io, cron: new CrontabWakeCron(new CrontabMutator(io), OPTS) };
 };
 
 describe("cron expression + actor-id validation", () => {
@@ -251,17 +252,51 @@ describe("nextCronOccurrence", () => {
 });
 
 describe("preflightCron", () => {
+  const okPermission = () => ({ ok: true });
+
   it("reports a missing crontab CLI", () => {
-    const r = preflightCron({ hasCrontab: () => false, isCrondRunning: () => true });
+    const r = preflightCron({
+      hasCrontab: () => false,
+      isCrondRunning: () => true,
+      checkPermission: okPermission,
+    });
     expect(r.ok).toBe(false);
     expect(r.issues[0]).toMatch(/crontab/);
   });
   it("reports a stopped cron daemon", () => {
-    const r = preflightCron({ hasCrontab: () => true, isCrondRunning: () => false });
+    const r = preflightCron({
+      hasCrontab: () => true,
+      isCrondRunning: () => false,
+      checkPermission: okPermission,
+    });
     expect(r.ok).toBe(false);
     expect(r.issues[0]).toMatch(/daemon/);
   });
-  it("is ok when both are present", () => {
-    expect(preflightCron({ hasCrontab: () => true, isCrondRunning: () => true }).ok).toBe(true);
+  it("reports a user locked out by cron.allow/cron.deny", () => {
+    const r = preflightCron({
+      hasCrontab: () => true,
+      isCrondRunning: () => true,
+      checkPermission: () => ({ ok: false, detail: "crontab denied for this user: not allowed" }),
+    });
+    expect(r.ok).toBe(false);
+    expect(r.issues[0]).toMatch(/not allowed/);
+  });
+  it("falls back to a generic permission message when the probe gives no detail", () => {
+    const r = preflightCron({
+      hasCrontab: () => true,
+      isCrondRunning: () => true,
+      checkPermission: () => ({ ok: false }),
+    });
+    expect(r.ok).toBe(false);
+    expect(r.issues[0]).toMatch(/cron\.allow/);
+  });
+  it("is ok when the CLI, daemon, and permission are all fine", () => {
+    expect(
+      preflightCron({
+        hasCrontab: () => true,
+        isCrondRunning: () => true,
+        checkPermission: okPermission,
+      }).ok
+    ).toBe(true);
   });
 });

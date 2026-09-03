@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { type CrontabIo, isValidCronExpr } from "./wake-cron.js";
+import { type CrontabMutator, isValidCronExpr } from "./wake-cron.js";
 
 /**
  * One internal scheduling service with a deliberately small vocabulary:
@@ -191,9 +191,26 @@ export function execAtIo(): AtIo {
   };
 }
 
+/**
+ * Thrown when an owned recurrence/message cron block is found truncated or
+ * unterminated — a start tag with no matching end marker before EOF or
+ * another start tag. This can only mean the block was hand-edited or
+ * corrupted after this class wrote it: its exact boundary can no longer be
+ * verified, so the mutation fails closed with no write rather than guessing
+ * that an adjacent line belongs to (or doesn't belong to) the block.
+ */
+export class TruncatedCronBlockError extends Error {
+  constructor(tag: string) {
+    super(
+      `crontab block "${tag}" has no matching end marker — truncated or hand-edited; refusing to mutate without a verified boundary`
+    );
+    this.name = "TruncatedCronBlockError";
+  }
+}
+
 export class DefaultOsScheduler implements OsScheduler {
   constructor(
-    private readonly crontabIo: CrontabIo,
+    private readonly mutator: CrontabMutator,
     private readonly atIo: AtIo,
     private readonly opts: OsSchedulerOptions
   ) {}
@@ -219,8 +236,13 @@ export class DefaultOsScheduler implements OsScheduler {
    * (e.g. `# mc-obligation-activation:<id>` immediately followed by an
    * unrelated job, with no job/restore lines of its own left before it).
    * When `endTag` isn't found before either EOF or another start tag, the
-   * block is malformed/partial: only the orphaned start tag itself is
-   * dropped, and every other line — ours or not — is preserved untouched.
+   * block is malformed/partial — its boundary can no longer be verified, so
+   * this throws {@link TruncatedCronBlockError} instead of guessing which
+   * adjacent line belongs to it. The caller must perform no write in that
+   * case (never fall back to dropping just the orphaned tag): a block that
+   * looks truncated might just as easily be one where a foreign line was
+   * inserted BEFORE the real end marker, and only a human can tell those
+   * apart safely.
    */
   private stripCronBlock(lines: string[], tag: string, endTag: string): string[] {
     const out: string[] = [];
@@ -238,22 +260,27 @@ export class DefaultOsScheduler implements OsScheduler {
       if (j < lines.length && lines[j].trim() === endTag) {
         i = j + 1; // drop tag..endTag inclusive
       } else {
-        i++; // malformed/truncated: drop only the orphaned start tag
+        throw new TruncatedCronBlockError(tag);
       }
     }
     return out;
   }
 
+  /**
+   * Routed through the shared {@link CrontabMutator}: if `stripCronBlock`
+   * throws (truncated block), that throw propagates out of `mutate()` before
+   * it ever calls `write`, so a truncated block leaves the crontab
+   * byte-for-byte untouched.
+   */
   private updateCron(tag: string, endTag: string, jobLine: string | null): void {
-    const current = this.crontabIo.read();
-    const lines = current === "" ? [] : current.replace(/\n$/, "").split("\n");
-    const kept = this.stripCronBlock(lines, tag, endTag);
-    if (jobLine) {
-      kept.push(tag, jobLine, endTag);
-    }
-    if (kept.length !== lines.length || jobLine) {
-      this.crontabIo.write(kept.length ? `${kept.join("\n")}\n` : "");
-    }
+    this.mutator.mutate((lines) => {
+      const kept = this.stripCronBlock(lines, tag, endTag);
+      if (jobLine) {
+        kept.push(tag, jobLine, endTag);
+      }
+      const changed = kept.length !== lines.length || !!jobLine;
+      return { lines: changed ? kept : lines, result: undefined };
+    });
   }
 
   /** The last `CRON_TZ=...` assignment still in effect at the end of `lines`, if any. */
@@ -296,12 +323,18 @@ export class DefaultOsScheduler implements OsScheduler {
       // so the block must put back whatever was in effect before it rather
       // than clearing it — otherwise a job appended after this one silently
       // loses a timezone some other entry depends on.
-      const current = this.crontabIo.read();
-      const lines = current === "" ? [] : current.replace(/\n$/, "").split("\n");
-      const kept = this.stripCronBlock(lines, tag, endTag);
-      const priorTz = this.lastCronTzLine(kept);
-      kept.push(tag, "CRON_TZ=UTC", `${time.cronExpr} ${curlLine}`, priorTz ?? "CRON_TZ=", endTag);
-      this.crontabIo.write(`${kept.join("\n")}\n`);
+      this.mutator.mutate((lines) => {
+        const kept = this.stripCronBlock(lines, tag, endTag);
+        const priorTz = this.lastCronTzLine(kept);
+        kept.push(
+          tag,
+          "CRON_TZ=UTC",
+          `${time.cronExpr} ${curlLine}`,
+          priorTz ?? "CRON_TZ=",
+          endTag
+        );
+        return { lines: kept, result: undefined };
+      });
     } else {
       this.updateCron(tag, endTag, null);
       this.removeAtByTag(tag);
@@ -318,7 +351,7 @@ export class DefaultOsScheduler implements OsScheduler {
 
   listObligationActivations(): string[] {
     const ids = new Set<string>();
-    const current = this.crontabIo.read();
+    const current = this.mutator.read();
     for (const line of current.split("\n")) {
       const m = line.match(/^# mc-obligation-activation:(.+)$/);
       if (m) ids.add(m[1].trim());

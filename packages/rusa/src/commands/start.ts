@@ -96,9 +96,11 @@ import {
   type ThreadRecord,
 } from "../actor/thread-registry.js";
 import {
+  CrontabMutator,
   CrontabWakeCron,
   ensureWakeToken,
   execCrontabIo,
+  preflightCron,
   wakePortPath,
   wakeTokenPath,
   writeWakePort,
@@ -1393,7 +1395,23 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         }),
       }),
   });
-  const wakeCron = new CrontabWakeCron(execCrontabIo(), {
+  // Cron is the durability backbone for recurring obligations (#153), so an
+  // unusable `crontab` here is more severe than a missing `at` — but boot still
+  // never refuses to start over it (matches the `at` preflight below): a
+  // console warning plus the dashboard health projection below is how an
+  // operator finds out, and the shared mutator's `write()` stays fail-visible
+  // (throws) the moment something actually tries to use a broken crontab.
+  const cronPreflight = preflightCron();
+  if (!cronPreflight.ok) {
+    console.warn(
+      `[start] cron scheduling unavailable — schedule_wake and recurring obligations will fail until this is fixed: ${cronPreflight.issues.join("; ")}`
+    );
+  }
+  // ONE shared crontab mutator for every feature that edits this crontab
+  // (wake schedules here, plus obligation/message recurrence blocks below) —
+  // see CrontabMutator's doc comment for why a single instance matters.
+  const crontabMutator = new CrontabMutator(execCrontabIo());
+  const wakeCron = new CrontabWakeCron(crontabMutator, {
     tokenFile: wakeTokenPath(mcHome),
     portFile: wakePortPath(mcHome),
   });
@@ -2082,7 +2100,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     );
   }
   const osScheduler = new DefaultOsScheduler(
-    execCrontabIo(),
+    crontabMutator,
     atPreflight.ok ? execAtIo() : unavailableAtIo(atPreflight.issues),
     {
       tokenFile: wakeTokenPath(mcHome),
@@ -2793,10 +2811,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           // which actors are executing a run right now — for the header HALTED
           // indicator and per-thread run-state dots. No new mesh behavior.
           isHalted: () => haltSwitch.hasActiveHalt(),
-          // Surfaces the boot-time `at`/`atrm`/`atd`/`atq` preflight so a
-          // missing one-shot facility is dashboard/health-visible, not just a
-          // startup console.warn — cron-only recurrences keep working either way.
-          schedulerHealth: () => atPreflight,
+          // Surfaces the boot-time `at`/`atrm`/`atd`/`atq` AND `crontab`/crond/
+          // cron.allow-cron.deny preflights so a missing one-shot facility or an
+          // unusable crontab is dashboard/health-visible, not just a startup
+          // console.warn. Merged into one projection since either issue set
+          // means "some recurrence path is degraded" from an operator's view.
+          schedulerHealth: () => ({
+            ok: atPreflight.ok && cronPreflight.ok,
+            issues: [...cronPreflight.issues, ...atPreflight.issues],
+          }),
           runningThreadIds: () => mesh.runningThreadIds(),
           queuedThreadIds: () => mesh.queuedThreadIds(),
           providerQueueHeads: () =>

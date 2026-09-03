@@ -230,28 +230,55 @@ export function execCrontabIo(): CrontabIo {
 }
 
 /**
- * Read/modify/write the familiar's crontab for `# mc-wake:<actorId>` blocks. All
- * mutations go through an in-process mutex and re-read the crontab immediately
- * before editing, so concurrent schedule/cancel calls can't clobber each other or
- * a human's unrelated lines.
+ * The ONE read-modify-write path onto the familiar's crontab, shared by every
+ * feature that edits it — wake schedules (`# mc-wake:`), obligation-activation
+ * recurrence blocks (`# mc-obligation-activation:`), and message-delivery blocks.
+ * Before this class existed, `CrontabWakeCron` and `DefaultOsScheduler` each held
+ * their own separately constructed `CrontabIo` and did their own read-then-write,
+ * each implicitly assuming it was the crontab's only writer. All crontab IO here
+ * is synchronous (`crontab -l` / `crontab -` block the event loop for their
+ * duration), so a single instance's `mutate()` call is an uninterruptible critical
+ * section — construct exactly one `CrontabMutator` per process and hand the SAME
+ * instance to every writer so an interleaved wake-schedule edit and a recurrence
+ * edit can never observe each other's stale pre-image and silently drop one.
+ */
+export class CrontabMutator {
+  constructor(private readonly io: CrontabIo) {}
+
+  /** Un-locked snapshot read — safe on its own since no write is being computed from it. */
+  read(): string {
+    return this.io.read();
+  }
+
+  /**
+   * Read the current crontab, hand its lines to `fn`, and write back whatever
+   * `fn` returns — UNLESS `fn` returns the identical array reference it was
+   * given, which signals "no change" and skips the write entirely. If `fn`
+   * throws (e.g. it can't verify a truncated block's boundary), the throw
+   * propagates and `write` is never reached — a failed mutation is always a
+   * no-write no-op, never a partial one.
+   */
+  mutate<T>(fn: (lines: string[]) => { lines: string[]; result: T }): T {
+    const current = this.io.read();
+    const lines = current === "" ? [] : current.replace(/\n$/, "").split("\n");
+    const { lines: nextLines, result } = fn(lines);
+    if (nextLines !== lines) {
+      this.io.write(nextLines.length ? `${nextLines.join("\n")}\n` : "");
+    }
+    return result;
+  }
+}
+
+/**
+ * Read/modify/write the familiar's crontab for `# mc-wake:<actorId>` blocks,
+ * through the shared {@link CrontabMutator} so edits here can never interleave
+ * with — or silently lose — an edit from another crontab writer.
  */
 export class CrontabWakeCron {
-  private lock: Promise<unknown> = Promise.resolve();
-
   constructor(
-    private readonly io: CrontabIo,
+    private readonly mutator: CrontabMutator,
     private readonly opts: CrontabWakeCronOptions
   ) {}
-
-  /** Serialize a read-modify-write so edits never interleave. */
-  private serialize<T>(fn: () => T): Promise<T> {
-    const run = this.lock.then(() => fn());
-    this.lock = run.then(
-      () => undefined,
-      () => undefined
-    );
-    return run;
-  }
 
   /** The full job line a cron entry runs to ping the wake endpoint. */
   buildJobLine(
@@ -311,49 +338,41 @@ export class CrontabWakeCron {
   ): Promise<void> {
     if (!isValidActorId(actorId)) throw new Error(`invalid actor id: ${actorId}`);
     if (!isValidCronExpr(cronExpr)) throw new Error(`invalid cron expression: ${cronExpr}`);
-    return this.serialize(() => {
-      const current = this.io.read();
-      const lines = current === "" ? [] : current.replace(/\n$/, "").split("\n");
+    this.mutator.mutate((lines) => {
       const kept = this.stripBlock(lines, actorId);
       kept.push(TAG_PREFIX + actorId, this.buildJobLine(actorId, cronExpr, reason, priority));
-      this.io.write(`${kept.join("\n")}\n`);
+      return { lines: kept, result: undefined };
     });
   }
 
   async cancel(actorId: string): Promise<void> {
     if (!isValidActorId(actorId)) throw new Error(`invalid actor id: ${actorId}`);
-    return this.serialize(() => {
-      const current = this.io.read();
-      if (current === "") return;
-      const lines = current.replace(/\n$/, "").split("\n");
+    this.mutator.mutate((lines) => {
       const kept = this.stripBlock(lines, actorId);
-      if (kept.length === lines.length) return; // nothing to remove
-      this.io.write(kept.length ? `${kept.join("\n")}\n` : "");
+      return { lines: kept.length === lines.length ? lines : kept, result: undefined };
     });
   }
 
-  list(): Promise<WakeEntry[]> {
-    return this.serialize(() => {
-      const current = this.io.read();
-      if (current === "") return [];
-      const lines = current.replace(/\n$/, "").split("\n");
-      const entries: WakeEntry[] = [];
-      for (let i = 0; i < lines.length; i++) {
-        const trimmed = lines[i].trim();
-        if (!trimmed.startsWith(TAG_PREFIX)) continue;
-        const actorId = trimmed.slice(TAG_PREFIX.length);
-        const job = lines[i + 1] ?? "";
-        const reason = parseReason(job);
-        const priority = parsePriority(job);
-        entries.push({
-          actorId,
-          cronExpr: job.trim().split(/\s+/).slice(0, 5).join(" "),
-          reason,
-          ...(priority ? { priority } : {}),
-        });
-      }
-      return entries;
-    });
+  async list(): Promise<WakeEntry[]> {
+    const current = this.mutator.read();
+    if (current === "") return [];
+    const lines = current.replace(/\n$/, "").split("\n");
+    const entries: WakeEntry[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trim();
+      if (!trimmed.startsWith(TAG_PREFIX)) continue;
+      const actorId = trimmed.slice(TAG_PREFIX.length);
+      const job = lines[i + 1] ?? "";
+      const reason = parseReason(job);
+      const priority = parsePriority(job);
+      entries.push({
+        actorId,
+        cronExpr: job.trim().split(/\s+/).slice(0, 5).join(" "),
+        reason,
+        ...(priority ? { priority } : {}),
+      });
+    }
+    return entries;
   }
 }
 
@@ -373,21 +392,47 @@ function parsePriority(job: string): "responsive" | undefined {
 }
 
 /**
- * Preflight that the host can actually run cron, so `schedule_wake` doesn't
- * silently no-op. Best-effort + non-fatal: returns the issues for the caller to
- * warn about (IU is the only consumer and isn't scheduled until phase 2).
+ * Preflight that the host can actually run cron, so `schedule_wake` and
+ * recurring-obligation scheduling don't silently no-op. Covers all three ways
+ * this can be unavailable: the CLI missing, the daemon not running, and — the
+ * one a `which`/`pgrep` check can't see — this specific user being locked out
+ * by `/etc/cron.allow` / `/etc/cron.deny`, which fails every `crontab`
+ * invocation (including the shared `CrontabMutator`'s writes) with a permission
+ * error rather than the ordinary "no crontab for user" of a fresh account.
+ * `checkPermission` distinguishes the two by inspecting `crontab -l`'s stderr
+ * instead of just its exit code, and never writes — a read-only probe can't
+ * itself be the thing that clobbers a hand-edited crontab.
+ * Best-effort + non-fatal: returns the issues for the caller to warn about and
+ * project onto the dashboard's health surface; scheduling boot never refuses
+ * to start over this, matching `preflightAt`.
  */
 export function preflightCron(
-  probe: { hasCrontab: () => boolean; isCrondRunning: () => boolean } = defaultCronProbe()
+  probe: {
+    hasCrontab: () => boolean;
+    isCrondRunning: () => boolean;
+    checkPermission: () => { ok: boolean; detail?: string };
+  } = defaultCronProbe()
 ): { ok: boolean; issues: string[] } {
   const issues: string[] = [];
-  if (!probe.hasCrontab()) issues.push("`crontab` CLI not found — install cron");
-  else if (!probe.isCrondRunning())
-    issues.push("cron daemon not detected — scheduled wakes won't fire");
+  if (!probe.hasCrontab()) {
+    issues.push("`crontab` CLI not found — install cron");
+    return { ok: false, issues };
+  }
+  if (!probe.isCrondRunning()) issues.push("cron daemon not detected — scheduled wakes won't fire");
+  const permission = probe.checkPermission();
+  if (!permission.ok)
+    issues.push(
+      permission.detail ??
+        "this user is not permitted to use crontab — check /etc/cron.allow and /etc/cron.deny"
+    );
   return { ok: issues.length === 0, issues };
 }
 
-function defaultCronProbe(): { hasCrontab: () => boolean; isCrondRunning: () => boolean } {
+function defaultCronProbe(): {
+  hasCrontab: () => boolean;
+  isCrondRunning: () => boolean;
+  checkPermission: () => { ok: boolean; detail?: string };
+} {
   const can = (cmd: string, args: string[]): boolean => {
     try {
       execFileSync(cmd, args, { stdio: "ignore" });
@@ -399,5 +444,20 @@ function defaultCronProbe(): { hasCrontab: () => boolean; isCrondRunning: () => 
   return {
     hasCrontab: () => can("which", ["crontab"]),
     isCrondRunning: () => can("pgrep", ["-x", "cron"]) || can("pgrep", ["-x", "crond"]),
+    checkPermission: () => {
+      try {
+        execFileSync("crontab", ["-l"], { stdio: ["ignore", "ignore", "pipe"], encoding: "utf-8" });
+        return { ok: true };
+      } catch (err) {
+        const stderr =
+          err && typeof err === "object" && "stderr" in err
+            ? String((err as { stderr: unknown }).stderr)
+            : "";
+        // "no crontab for <user>" is the normal empty-crontab case, not a permission issue.
+        if (/not allowed/i.test(stderr))
+          return { ok: false, detail: `crontab denied for this user: ${stderr.trim()}` };
+        return { ok: true };
+      }
+    },
   };
 }

@@ -7,9 +7,10 @@ import {
   DefaultOsScheduler,
   execAtIo,
   preflightAt,
+  TruncatedCronBlockError,
   unavailableAtIo,
 } from "./os-scheduler.js";
-import type { CrontabIo } from "./wake-cron.js";
+import { type CrontabIo, CrontabMutator, CrontabWakeCron } from "./wake-cron.js";
 
 vi.mock("node:child_process", () => {
   const mocked = { spawnSync: vi.fn(), execFileSync: vi.fn() };
@@ -37,7 +38,7 @@ describe("DefaultOsScheduler", () => {
       remove: vi.fn(),
     };
 
-    scheduler = new DefaultOsScheduler(cron, at, {
+    scheduler = new DefaultOsScheduler(new CrontabMutator(cron), at, {
       tokenFile: "/token",
       portFile: "/port",
     });
@@ -111,21 +112,98 @@ describe("DefaultOsScheduler", () => {
     expect(cronData).not.toContain("*/5 * * * *");
   });
 
-  it("cancelling a truncated/damaged block (no end marker) drops only the orphaned tag, preserving every adjacent line", () => {
+  it("cancelling a truncated/damaged block (no end marker) fails closed with no write, leaving every line untouched", () => {
     // A block with no end marker — hand-edited or truncated — cannot be
-    // proven to still have the shape this class wrote, so only the one line
-    // we can attribute with certainty (the tag itself) is removed.
-    cronData = "1 * * * * user-job-1\n# mc-obligation-activation:ob-1\n2 * * * * user-job-2\n";
-    scheduler.cancelObligationActivation("ob-1");
-    expect(cronData).toBe("1 * * * * user-job-1\n2 * * * * user-job-2\n");
+    // proven to still have the shape this class wrote, so this must never
+    // guess which adjacent line belongs to it: fail with a named error and
+    // perform no write at all, rather than dropping just the orphaned tag.
+    const original =
+      "1 * * * * user-job-1\n# mc-obligation-activation:ob-1\n2 * * * * user-job-2\n";
+    cronData = original;
+    expect(() => scheduler.cancelObligationActivation("ob-1")).toThrow(TruncatedCronBlockError);
+    expect(cronData).toBe(original);
   });
 
-  it("scheduling over a truncated/damaged block still lands a well-formed replacement", () => {
-    cronData = "# mc-obligation-activation:ob-1\n5 * * * * user-job\n";
-    scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" });
-    expect(cronData).toContain("5 * * * * user-job");
-    expect(cronData.match(/# mc-obligation-activation:ob-1/g)).toHaveLength(1);
+  it("scheduling over a truncated/damaged block fails closed with no write rather than guessing the boundary", () => {
+    const original = "# mc-obligation-activation:ob-1\n5 * * * * user-job\n";
+    cronData = original;
+    expect(() =>
+      scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" })
+    ).toThrow(TruncatedCronBlockError);
+    expect(cronData).toBe(original);
+  });
+
+  it("switching a truncated cron block to an at-kind (interval) activation also fails closed with no write", () => {
+    const original = "# mc-obligation-activation:ob-1\n5 * * * * user-job\n";
+    cronData = original;
+    expect(() =>
+      scheduler.scheduleObligationActivation("ob-1", { kind: "at", date: new Date() })
+    ).toThrow(TruncatedCronBlockError);
+    expect(cronData).toBe(original);
+    expect(at.schedule).not.toHaveBeenCalled();
+  });
+});
+
+describe("CrontabMutator shared between CrontabWakeCron and DefaultOsScheduler", () => {
+  it("consolidates both writers behind one instance so an interleaved wake-schedule mutation and a recurrence mutation cannot lose either entry, and every foreign byte survives", async () => {
+    // Seed a crontab with a foreign (unrelated feature) `# mc-wake:` block
+    // and arbitrary untagged user lines, exactly as the addendum requires.
+    let cronData =
+      "0 2 * * * /usr/bin/backup.sh\n" +
+      "# mc-wake:other-actor\n" +
+      "0 3 * * * curl -fsS http://127.0.0.1:1/wake -d actorId=other-actor -d reason=nightly\n" +
+      "* * * * * /usr/bin/heartbeat\n";
+    const foreignLines = cronData.trim().split("\n");
+    const cron: CrontabIo = {
+      read: () => cronData,
+      write: (data) => {
+        cronData = data;
+      },
+    };
+    const at: AtIo = {
+      schedule: vi.fn().mockReturnValue("1"),
+      list: vi.fn().mockReturnValue([]),
+      remove: vi.fn(),
+    };
+
+    // ONE shared mutator instance, handed to both writers — this is the
+    // "single crontab writer" shape: neither class constructs its own IO.
+    const mutator = new CrontabMutator(cron);
+    const wakeCron = new CrontabWakeCron(mutator, { tokenFile: "/token", portFile: "/port" });
+    const osScheduler = new DefaultOsScheduler(mutator, at, {
+      tokenFile: "/token",
+      portFile: "/port",
+    });
+
+    // Order A: the recurrence (obligation) mutation lands first, then the
+    // unrelated wake-schedule mutation. Both are synchronous end-to-end (the
+    // underlying crontab IO blocks the event loop), so this is the only
+    // interleaving order this single-threaded process can actually produce —
+    // proving it doesn't lose either entry is the real regression coverage.
+    osScheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" });
+    await wakeCron.schedule("actor-a", "0 4 * * *", "daily digest");
+
+    expect(cronData).toContain("# mc-obligation-activation:ob-1");
     expect(cronData).toContain("# mc-obligation-activation-end:ob-1");
+    expect(cronData).toContain("# mc-wake:actor-a");
+    // Every foreign line — the unrelated backup job, the foreign mc-wake
+    // block, and the heartbeat job — is preserved byte-for-byte.
+    for (const line of foreignLines) {
+      expect(cronData).toContain(line);
+    }
+
+    // Order B: cancel the recurrence, then cancel the unrelated wake — each
+    // removes only its own block, leaving the other writer's entry and all
+    // foreign content intact until it too is cancelled.
+    osScheduler.cancelObligationActivation("ob-1");
+    expect(cronData).not.toContain("# mc-obligation-activation:ob-1");
+    expect(cronData).toContain("# mc-wake:actor-a");
+
+    await wakeCron.cancel("actor-a");
+    expect(cronData).not.toContain("# mc-wake:actor-a");
+    for (const line of foreignLines) {
+      expect(cronData).toContain(line);
+    }
   });
 });
 
@@ -230,10 +308,14 @@ describe("DefaultOsScheduler with an unavailable `at` facility", () => {
         cronData = data;
       },
     };
-    const scheduler = new DefaultOsScheduler(cron, unavailableAtIo(["at missing"]), {
-      tokenFile: "/token",
-      portFile: "/port",
-    });
+    const scheduler = new DefaultOsScheduler(
+      new CrontabMutator(cron),
+      unavailableAtIo(["at missing"]),
+      {
+        tokenFile: "/token",
+        portFile: "/port",
+      }
+    );
 
     expect(() =>
       scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" })
@@ -246,10 +328,14 @@ describe("DefaultOsScheduler with an unavailable `at` facility", () => {
 
   it("fails a completion-interval (at-kind) activation with the named prerequisite error", () => {
     const cron: CrontabIo = { read: () => "", write: () => {} };
-    const scheduler = new DefaultOsScheduler(cron, unavailableAtIo(["at missing"]), {
-      tokenFile: "/token",
-      portFile: "/port",
-    });
+    const scheduler = new DefaultOsScheduler(
+      new CrontabMutator(cron),
+      unavailableAtIo(["at missing"]),
+      {
+        tokenFile: "/token",
+        portFile: "/port",
+      }
+    );
 
     expect(() =>
       scheduler.scheduleObligationActivation("ob-1", { kind: "at", date: new Date() })
