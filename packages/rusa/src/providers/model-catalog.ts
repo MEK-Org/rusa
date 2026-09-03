@@ -410,8 +410,13 @@ export function validateModelPin(provider: string, pin: string): ModelPinValidat
   }
 
   const passableEntries = entries.filter((entry) => entry.passable !== false);
-  let matchedEntry = passableEntries.find(
-    (entry) => entry.identifier === pin || entry.displayLabel === pin
+  // Kimi's CLI takes only the config key (identifier), never the friendly
+  // display_name, so a display-label match here would accept a pin that
+  // fails to launch. Every other provider keeps matching either field.
+  let matchedEntry = passableEntries.find((entry) =>
+    provider === "kimi"
+      ? entry.identifier === pin
+      : entry.identifier === pin || entry.displayLabel === pin
   );
   let isMatch = !!matchedEntry;
 
@@ -443,8 +448,10 @@ export function validateModelPin(provider: string, pin: string): ModelPinValidat
 
 /**
  * Mechanically extract ModelEntry items from Kimi's config.toml content.
- * Reads the `[models."..."]` tables and extracts both the config key and
- * the underlying model slug as accepted identifiers.
+ * Reads the `[models."..."]` tables and emits each config key as the only
+ * accepted identifier. The Kimi CLI's `-m/--model` takes the config key
+ * ("LLM model alias to use for this invocation"), never the underlying
+ * `model` slug, so the bare slug is not advertised.
  */
 export function extractKimiModelsFromToml(tomlContent: string): ModelEntry[] {
   try {
@@ -454,7 +461,6 @@ export function extractKimiModelsFromToml(tomlContent: string): ModelEntry[] {
       return [];
     }
     const entries: ModelEntry[] = [];
-    const seenIdentifiers = new Set<string>();
 
     for (const [key, val] of Object.entries(modelsObj)) {
       if (typeof val !== "object" || val === null) continue;
@@ -464,19 +470,7 @@ export function extractKimiModelsFromToml(tomlContent: string): ModelEntry[] {
           ? modelVal.display_name.trim()
           : key;
 
-      if (!seenIdentifiers.has(key)) {
-        entries.push({ displayLabel, identifier: key });
-        seenIdentifiers.add(key);
-      }
-
-      if (
-        typeof modelVal.model === "string" &&
-        modelVal.model.trim() &&
-        !seenIdentifiers.has(modelVal.model.trim())
-      ) {
-        entries.push({ displayLabel, identifier: modelVal.model.trim() });
-        seenIdentifiers.add(modelVal.model.trim());
-      }
+      entries.push({ displayLabel, identifier: key, passable: true });
     }
     return entries;
   } catch {
