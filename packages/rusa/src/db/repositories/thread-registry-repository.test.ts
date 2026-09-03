@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { ThreadRecord } from "../../actor/thread-registry.js";
@@ -88,16 +91,56 @@ describe("DbThreadRegistry", () => {
     expect(registry.resolveHandle("same-name", distinguish)).toBeNull();
   });
 
-  it("enforces the relational ownership invariants", () => {
+  it("persists normalized records across a file-backed database reopen", () => {
+    const directory = mkdtempSync(join(tmpdir(), "rusa-thread-registry-"));
+    const file = join(directory, "mesh.db");
+    try {
+      const first = new Database(file);
+      first.pragma("foreign_keys = ON");
+      actorRuntimeState.up(first);
+      const firstRegistry = new DbThreadRegistry(first);
+      firstRegistry.upsert(root);
+      firstRegistry.upsert({
+        id: "worker",
+        charter: "Persist",
+        parentId: "root",
+        status: "active",
+        handles: [{ id: "root", role: "parent" }],
+        pendingDeliveries: [
+          { id: "d1", fromId: "root", body: "wake", deliverAt: "2026-09-03T14:00:00.000Z" },
+        ],
+        createdAt: "2026-09-03T13:01:00.000Z",
+      });
+      first.close();
+
+      const reopened = new Database(file);
+      reopened.pragma("foreign_keys = ON");
+      expect(new DbThreadRegistry(reopened).get("worker")).toMatchObject({
+        id: "worker",
+        handles: [{ id: "root", role: "parent" }],
+        pendingDeliveries: [{ id: "d1", fromId: "root", body: "wake" }],
+      });
+      reopened.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces the relational ownership invariants while preserving parentless drivers", () => {
     expect(() => registry.upsert({ ...root, parentId: "missing" })).toThrow();
     registry.upsert(root);
     expect(() => registry.upsert({ ...root, id: "second-root" })).toThrow();
+    expect(() => registry.upsert({ ...root, id: "root-with-parent", parentId: "root" })).toThrow();
     expect(() =>
-      db
-        .prepare(
-          "INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at) VALUES ('missing', 'x', 'root', 'now')"
-        )
-        .run()
+      registry.upsert({
+        ...root,
+        id: "driver",
+        parentId: null,
+        isRoot: false,
+      })
+    ).not.toThrow();
+    expect(() =>
+      db.prepare("INSERT INTO actor_handles (actor_id, target_id) VALUES ('missing', 'root')").run()
     ).toThrow();
   });
 });

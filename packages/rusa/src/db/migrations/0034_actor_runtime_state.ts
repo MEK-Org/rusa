@@ -31,7 +31,11 @@ export const actorRuntimeState: Migration = {
         budget_runs_used INTEGER,
         human_unlocked INTEGER NOT NULL DEFAULT 0 CHECK (human_unlocked IN (0, 1)),
         last_chat_session_id TEXT,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        -- is_root is the unique mesh-authority flag. A parentless non-root
+        -- is also a supported driver-owned shape, but an authority root never
+        -- has a parent.
+        CHECK (is_root = 0 OR parent_id IS NULL)
       );
       CREATE INDEX actor_threads_parent_id_idx ON actor_threads (parent_id);
       CREATE INDEX actor_threads_status_idx ON actor_threads (status);
@@ -51,49 +55,6 @@ export const actorRuntimeState: Migration = {
         deliver_at TEXT NOT NULL,
         session_id TEXT,
         PRIMARY KEY (actor_id, id)
-      );
-      CREATE TABLE capability_grants (
-        actor_id TEXT NOT NULL REFERENCES actor_threads(id),
-        capability TEXT NOT NULL,
-        granted_by TEXT NOT NULL,
-        granted_at TEXT NOT NULL,
-        revoked_at TEXT,
-        PRIMARY KEY (actor_id, capability)
-      );
-      CREATE TABLE event_subscriptions (
-        resource TEXT NOT NULL,
-        actor_id TEXT NOT NULL REFERENCES actor_threads(id),
-        subscribed_by TEXT NOT NULL,
-        subscribed_at TEXT NOT NULL,
-        unsubscribed_at TEXT,
-        PRIMARY KEY (resource, actor_id)
-      );
-      CREATE UNIQUE INDEX event_subscriptions_one_active_owner_idx
-        ON event_subscriptions (resource) WHERE unsubscribed_at IS NULL;
-      CREATE TABLE host_jobs (
-        id TEXT PRIMARY KEY,
-        actor_id TEXT NOT NULL REFERENCES actor_threads(id),
-        unit_name TEXT NOT NULL UNIQUE,
-        script_label TEXT NOT NULL,
-        manifest_json TEXT NOT NULL CHECK (json_valid(manifest_json)),
-        audit_artifact_path TEXT NOT NULL,
-        audit_artifact_sha256 TEXT NOT NULL,
-        runtime_max_sec INTEGER NOT NULL,
-        submitted_at TEXT NOT NULL,
-        stop_requested_at TEXT,
-        completed_at TEXT,
-        exit_status TEXT,
-        exit_code TEXT
-      );
-      CREATE INDEX host_jobs_actor_id_idx ON host_jobs (actor_id);
-      CREATE TABLE portable_contexts (
-        actor_id TEXT PRIMARY KEY REFERENCES actor_threads(id),
-        schema_version INTEGER NOT NULL,
-        generation INTEGER NOT NULL,
-        updated_at TEXT NOT NULL,
-        compactor_json TEXT,
-        items_json TEXT NOT NULL CHECK (json_valid(items_json)),
-        last_folded_source_id TEXT
       );
     `);
   },
