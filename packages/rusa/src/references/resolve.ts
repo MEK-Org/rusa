@@ -10,6 +10,12 @@ import {
   referenceUrl,
 } from "./reference.js";
 
+export type ReferenceEntity =
+  | { type: "github_issue"; title: string; description: string }
+  | { type: "github_pull_request"; title: string; description: string }
+  | { type: "gchat_message"; contents: string }
+  | { type: "gchat_space"; name: string };
+
 /**
  * A reference rendered down to what any surface needs to show it: what it is,
  * who said it, when, the text itself, and where to go look.
@@ -39,14 +45,21 @@ export interface ResolvedReference {
   unavailable: string | null;
 }
 
+export type ReferenceCacheState = "local" | "fresh" | "stale" | "pending" | "unavailable";
+
+export type ResolvedReferenceWithEntity = ResolvedReference & {
+  entity?: ReferenceEntity;
+  cacheState?: ReferenceCacheState;
+};
+
 export interface ReferenceResolverDeps {
   meshChat?: Pick<MeshChatRepository, "getById">;
   inbox?: Pick<InboxStore, "read">;
   /** Reads a Google Chat message; absent when the chat edge is not configured. */
-  chatClient?: Pick<ChatClient, "getMessage">;
+  chatClient?: Pick<ChatClient, "getMessage" | "getSpace">;
   /** Reads issues and pull requests; absent when no tracker is wired. */
   issueClient?: {
-    getIssue?: (owner: string, repo: string, number: number) => Promise<unknown>;
+    getIssue?: (repo: string, number: number) => Promise<unknown>;
   };
 }
 
@@ -151,9 +164,9 @@ export function resolveReferenceSync(
 async function resolveGchat(
   reference: Reference,
   deps: ReferenceResolverDeps
-): Promise<ResolvedReference> {
+): Promise<ResolvedReferenceWithEntity> {
   const [space, message] = pairs(reference, 0);
-  if (space?.[0] !== "spaces" || message?.[0] !== "messages") {
+  if (space?.[0] !== "spaces") {
     return unresolved(reference, reference.key, "unrecognised chat resource");
   }
   if (!deps.chatClient) return unresolved(reference, reference.key, "chat edge not configured");
@@ -161,6 +174,28 @@ async function resolveGchat(
   // Google's own resource name is exactly this path, so it round-trips with no
   // mapping — which is why the grammar carries chat paths verbatim.
   const resourceName = reference.segments.join("/");
+
+  if (!message) {
+    // A bare space, with no message beneath it.
+    const found = await deps.chatClient.getSpace(resourceName);
+    const name = found.displayName ?? found.name;
+    return {
+      ref: reference.key,
+      scheme: reference.scheme,
+      title: name,
+      body: null,
+      author: null,
+      timestamp: null,
+      url: null,
+      unavailable: null,
+      entity: { type: "gchat_space", name },
+    };
+  }
+
+  if (message[0] !== "messages") {
+    return unresolved(reference, reference.key, "unrecognised chat resource");
+  }
+
   const found = await deps.chatClient.getMessage(resourceName);
   const text = found.text ?? found.formattedText ?? null;
   const author = found.sender?.displayName ?? found.sender?.name ?? null;
@@ -173,13 +208,14 @@ async function resolveGchat(
     timestamp: found.createTime ?? null,
     url: null,
     unavailable: text ? null : "message has no text",
+    entity: text ? { type: "gchat_message", contents: text } : undefined,
   };
 }
 
 async function resolveGitHub(
   reference: Reference,
   deps: ReferenceResolverDeps
-): Promise<ResolvedReference> {
+): Promise<ResolvedReferenceWithEntity> {
   const branch = asGitHubBranch(reference);
   const issue = asGitHubIssue(reference);
   const url = referenceUrl(reference);
@@ -216,7 +252,7 @@ async function resolveGitHub(
   if (!deps.issueClient?.getIssue) {
     return { ...unresolved(reference, reference.key, "tracker not configured"), url };
   }
-  const found = (await deps.issueClient.getIssue(issue.owner, issue.repo, issue.number)) as {
+  const found = (await deps.issueClient.getIssue(`${issue.owner}/${issue.repo}`, issue.number)) as {
     title?: string;
     body?: string;
     user?: { login?: string };
@@ -226,6 +262,10 @@ async function resolveGitHub(
     return { ...unresolved(reference, reference.key, "not found on the tracker"), url };
   }
   const label = `${issue.owner}/${issue.repo}#${issue.number}`;
+  const entity: ReferenceEntity =
+    issue.collection === "pulls"
+      ? { type: "github_pull_request", title: found.title ?? "", description: found.body ?? "" }
+      : { type: "github_issue", title: found.title ?? "", description: found.body ?? "" };
   return {
     ref: reference.key,
     scheme: reference.scheme,
@@ -235,6 +275,7 @@ async function resolveGitHub(
     timestamp: found.createdAt ?? null,
     url,
     unavailable: found.body ? null : "no body on the issue",
+    entity,
   };
 }
 
@@ -248,7 +289,7 @@ async function resolveGitHub(
 export async function resolveReference(
   ref: string,
   deps: ReferenceResolverDeps
-): Promise<ResolvedReference> {
+): Promise<ResolvedReferenceWithEntity> {
   let reference: Reference;
   try {
     reference = parseReference(ref);
@@ -285,6 +326,6 @@ export async function resolveReference(
 export async function resolveReferences(
   refs: readonly string[],
   deps: ReferenceResolverDeps
-): Promise<ResolvedReference[]> {
+): Promise<ResolvedReferenceWithEntity[]> {
   return Promise.all(refs.map((ref) => resolveReference(ref, deps)));
 }
