@@ -1029,7 +1029,7 @@ class ObligationDto {
     this.recurrenceCron,
     this.recurrenceIntervalSeconds,
     this.nextReadyAt,
-    this.completionsTotal = 0,
+    this.hasCompletionHistory = false,
   });
 
   final String id;
@@ -1083,16 +1083,10 @@ class ObligationDto {
   /// `scheduled`.
   final String? nextReadyAt;
 
-  /// Rows in the completion ledger, regardless of whether recurrence is still
-  /// enabled — lets a terminal obligation whose recurrence was later disabled
-  /// stay reachable instead of vanishing behind the same filter that hides a
-  /// `done` obligation with no history worth surfacing.
-  final int completionsTotal;
-
-  /// Whether this obligation's completion history is worth surfacing: still
-  /// recurring, or terminal with retained ledger rows from before recurrence
-  /// was disabled.
-  bool get hasCompletionHistory => isRecurring || completionsTotal > 0;
+  /// Whether the durable completion ledger contains at least one row, even if
+  /// recurrence was later disabled. Exact counts live on the detail snapshot's
+  /// completion-page metadata rather than every obligation projection.
+  final bool hasCompletionHistory;
 
   /// What to show as the heading. Prefers [title]; falls back to [intent] so a
   /// row written before the split still reads, rather than rendering blank.
@@ -1150,7 +1144,7 @@ class ObligationDto {
       recurrenceCron: j['recurrenceCron'] as String?,
       recurrenceIntervalSeconds: j['recurrenceIntervalSeconds'] as int?,
       nextReadyAt: j['nextReadyAt'] as String?,
-      completionsTotal: j['completionsTotal'] as int? ?? 0,
+      hasCompletionHistory: j['hasCompletionHistory'] as bool? ?? false,
     );
   }
 }

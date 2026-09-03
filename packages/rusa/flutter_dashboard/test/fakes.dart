@@ -98,7 +98,7 @@ ObligationDto makeObligation(
   String? recurrenceCron,
   int? recurrenceIntervalSeconds,
   String? nextReadyAt,
-  int completionsTotal = 0,
+  bool hasCompletionHistory = false,
 }) => ObligationDto(
   id: id,
   parentId: parentId,
@@ -118,7 +118,7 @@ ObligationDto makeObligation(
   recurrenceCron: recurrenceCron,
   recurrenceIntervalSeconds: recurrenceIntervalSeconds,
   nextReadyAt: nextReadyAt,
-  completionsTotal: completionsTotal,
+  hasCompletionHistory: hasCompletionHistory,
 );
 
 /// Fake REST API with canned responses; records the actor lists it was queried

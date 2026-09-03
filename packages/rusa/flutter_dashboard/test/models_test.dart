@@ -108,6 +108,20 @@ void main() {
       expect(dto.nextReadyAt, null);
       expect(dto.isScheduled, false);
       expect(dto.isRecurring, false);
+      expect(dto.hasCompletionHistory, false);
+    });
+
+    test('deserializes retained completion-history existence without an exact count', () {
+      final dto = ObligationDto.fromJson({
+        'id': 'ob-formerly-recurring',
+        'ownerId': 'test-actor',
+        'status': 'done',
+        'effectivePriority': 50.0,
+        'hasCompletionHistory': true,
+      });
+
+      expect(dto.isRecurring, false);
+      expect(dto.hasCompletionHistory, true);
     });
   });
 

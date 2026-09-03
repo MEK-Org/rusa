@@ -1843,6 +1843,8 @@ describe("ObligationRepository", () => {
       expect(disabled.status).toBe("done");
       expect(disabled.recurrencePolicy).toBeNull();
       expect(disabled.nextReadyAt).toBeNull();
+      expect(disabled.hasCompletionHistory).toBe(true);
+      expect("completionsTotal" in disabled).toBe(false);
       expect(scheduler.cancelled).toContain("rec-1");
     });
 

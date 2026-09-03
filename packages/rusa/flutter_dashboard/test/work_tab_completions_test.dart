@@ -16,7 +16,7 @@ void main() {
           ownerId: 'root',
           intent: 'Formerly recurring work',
           status: 'done',
-          completionsTotal: 1,
+          hasCompletionHistory: true,
         );
         final api = FakeApi()
           ..threadsResult = [makeThread('root')]

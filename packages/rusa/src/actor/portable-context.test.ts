@@ -450,7 +450,7 @@ describe("obligation projection (ISSUE_NUM, ratified in ISSUE_NUM comment 536984
     recurrenceCron: status === "scheduled" ? "0 * * * *" : null,
     recurrenceIntervalSeconds: null,
     nextReadyAt: status === "scheduled" ? (nextReadyAt ?? "2026-08-02T00:00:00.000Z") : null,
-    completionsTotal: 0,
+    hasCompletionHistory: false,
   });
 
   const OBLIGATIONS_HEADING = "### Your obligations (system of record)";

@@ -1817,6 +1817,8 @@ describe("handleMeshApiRequest", () => {
         expect(data.completions[0].note).toBe("cycle two");
         expect(data.completionsTotal).toBe(2);
         expect(data.completionsHasMore).toBe(true);
+        expect(data.obligation.hasCompletionHistory).toBe(true);
+        expect(data.obligation.completionsTotal).toBeUndefined();
 
         const { res: page2 } = await call(
           deps,

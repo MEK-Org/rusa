@@ -95,14 +95,12 @@ export interface Obligation {
   recurrenceIntervalSeconds: number | null;
   nextReadyAt: string | null;
   /**
-   * Rows in the `obligation_completions` ledger, regardless of whether
-   * recurrence is still enabled. A terminal obligation whose recurrence was
-   * later disabled keeps this above zero, which is exactly what lets a
-   * consumer keep its completion history reachable instead of burying it
-   * behind the same "done" filter that hides obligations with no history
-   * worth surfacing.
+   * Whether the `obligation_completions` ledger contains any rows, regardless
+   * of whether recurrence is still enabled. This keeps a terminal obligation
+   * with retained history reachable without making every core obligation read
+   * count the whole ledger; exact counts belong to completion-page metadata.
    */
-  completionsTotal: number;
+  hasCompletionHistory: boolean;
 }
 
 export interface ObligationCompletion {

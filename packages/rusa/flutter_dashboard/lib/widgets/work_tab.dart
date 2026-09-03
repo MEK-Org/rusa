@@ -114,13 +114,17 @@ class _WorkTabState extends State<WorkTab> {
       final visible =
           _showDone ||
           !node.obligation.isTerminal ||
+          node.obligation.isRecurring ||
           node.obligation.hasCompletionHistory;
       if (!visible) continue;
       final id = node.obligation.id;
       final hasVisibleChildren = _showDone
           ? node.children.isNotEmpty
           : node.children.any(
-              (c) => !c.obligation.isTerminal || c.obligation.hasCompletionHistory,
+              (c) =>
+                  !c.obligation.isTerminal ||
+                  c.obligation.isRecurring ||
+                  c.obligation.hasCompletionHistory,
             );
       final isCollapsed = !_expandedIds.contains(id);
       result.add(
@@ -594,7 +598,7 @@ class _DetailViewState extends State<_DetailView> {
             // Disabling recurrence finalizes a scheduled row but deliberately
             // retains its ledger.  History belongs to the durable obligation,
             // not to its current recurrence setting.
-            if (o.isRecurring || data.completionsTotal > 0) ...[
+            if (o.isRecurring || o.hasCompletionHistory) ...[
               _SectionHeader('COMPLETION HISTORY'),
               _completionsPanel(),
               const SizedBox(height: 24),
