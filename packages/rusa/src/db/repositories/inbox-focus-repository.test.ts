@@ -36,7 +36,7 @@ describe("InboxFocusRepository", () => {
   });
 
   it("persists the selected set, primary obligation, diagnostics, and associations", () => {
-    runs.start({ id: "run-1", actorId: "actor-a" });
+    runs.start({ id: "run-1", actorId: "actor-a", model: "test-model" });
     const associations = new Map<string, readonly string[]>([
       ["entry-1", ["ob-1", "ob-2"]],
       ["entry-2", ["ob-2"]],
@@ -67,7 +67,7 @@ describe("InboxFocusRepository", () => {
   });
 
   it("replaces one run's selection without deleting durable entry associations", () => {
-    runs.start({ id: "run-1", actorId: "actor-a" });
+    runs.start({ id: "run-1", actorId: "actor-a", model: "test-model" });
     focus.recordSelection({
       runId: "run-1",
       actorId: "actor-a",
@@ -93,7 +93,7 @@ describe("InboxFocusRepository", () => {
   });
 
   it("rejects foreign inbox entries, mismatched runs, and completed runs", () => {
-    runs.start({ id: "run-a", actorId: "actor-a" });
+    runs.start({ id: "run-a", actorId: "actor-a", model: "test-model" });
     expect(() =>
       focus.recordSelection({
         runId: "run-a",

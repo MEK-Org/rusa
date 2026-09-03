@@ -95,7 +95,7 @@ describe("InboxFocusResolver", () => {
         payload: notification.payload,
       },
     ]);
-    runs.start({ id: "run-1", actorId: "actor-a" });
+    runs.start({ id: "run-1", actorId: "actor-a", model: "test-model" });
 
     const result = resolver.select({ runId: "run-1", actorId: "actor-a", entries });
 
@@ -132,7 +132,7 @@ describe("InboxFocusResolver", () => {
     const [entry] = append([
       { id: "general", source: "mesh:root", payload: { type: "mesh.message" } },
     ]);
-    runs.start({ id: "run-2", actorId: "actor-a" });
+    runs.start({ id: "run-2", actorId: "actor-a", model: "test-model" });
 
     expect(
       resolver.select({
@@ -148,7 +148,7 @@ describe("InboxFocusResolver", () => {
     });
     expect(focus.listEntryObligationIds("actor-a", "general")).toEqual(["issue-work"]);
 
-    runs.start({ id: "run-2b", actorId: "actor-a" });
+    runs.start({ id: "run-2b", actorId: "actor-a", model: "test-model" });
     const second = resolver.select({
       runId: "run-2b",
       actorId: "actor-a",
@@ -161,7 +161,7 @@ describe("InboxFocusResolver", () => {
       "sibling-work",
     ]);
 
-    runs.start({ id: "run-2c", actorId: "actor-a" });
+    runs.start({ id: "run-2c", actorId: "actor-a", model: "test-model" });
     const subsequent = resolver.select({
       runId: "run-2c",
       actorId: "actor-a",
@@ -180,7 +180,7 @@ describe("InboxFocusResolver", () => {
         payload: { type: "issues.edited" },
       },
     ]);
-    runs.start({ id: "run-inferred", actorId: "actor-a" });
+    runs.start({ id: "run-inferred", actorId: "actor-a", model: "test-model" });
 
     expect(resolver.select({ runId: "run-inferred", actorId: "actor-a", entries })).toMatchObject({
       primaryObligationId: "issue-work",
@@ -205,7 +205,7 @@ describe("InboxFocusResolver", () => {
         payload: { type: "issues.edited" },
       },
     ]);
-    runs.start({ id: "run-artifacts", actorId: "actor-a" });
+    runs.start({ id: "run-artifacts", actorId: "actor-a", model: "test-model" });
 
     const result = resolver.select({
       runId: "run-artifacts",
@@ -233,7 +233,7 @@ describe("InboxFocusResolver", () => {
         payload: { type: "issues.edited" },
       },
     ]);
-    runs.start({ id: "run-3", actorId: "actor-a" });
+    runs.start({ id: "run-3", actorId: "actor-a", model: "test-model" });
 
     const result = resolver.select({ runId: "run-3", actorId: "actor-a", entries });
 
@@ -254,7 +254,7 @@ describe("InboxFocusResolver", () => {
         payload: { type: "issues.edited" },
       },
     ]);
-    runs.start({ id: "run-4", actorId: "actor-a" });
+    runs.start({ id: "run-4", actorId: "actor-a", model: "test-model" });
 
     const result = resolver.select({
       runId: "run-4",
@@ -274,7 +274,7 @@ describe("InboxFocusResolver", () => {
     const [entry] = append([
       { id: "general", source: "mesh:root", payload: { type: "mesh.message" } },
     ]);
-    runs.start({ id: "run-5", actorId: "actor-a" });
+    runs.start({ id: "run-5", actorId: "actor-a", model: "test-model" });
 
     expect(() =>
       resolver.select({

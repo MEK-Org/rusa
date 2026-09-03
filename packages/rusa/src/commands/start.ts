@@ -176,6 +176,7 @@ import { antigravityScratchDir } from "../providers/antigravity.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
 import { refreshConfiguredProviderModelCatalogs } from "../providers/model-scrape.js";
+import { providerSupportsEffort } from "../providers/reasoning-effort.js";
 import {
   DEFAULT_ROOT_PROVIDER,
   normalizeFallbackModel,
@@ -791,11 +792,23 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     getRepositories().obligations,
     getRepositories().meshChat
   );
-  const beginActorRun = (actorId: string, providerName: string): string => {
+  const beginActorRun = (
+    actorId: string,
+    providerName: string,
+    model: string | null,
+    effortSupported: boolean,
+    effort: string | null
+  ): string => {
     if (activeRunIds.has(actorId)) {
       throw new Error(`actor already has an active durable run: ${actorId}`);
     }
-    const runId = getRepositories().actorRuns.start({ actorId, provider: providerName });
+    const runId = getRepositories().actorRuns.start({
+      actorId,
+      provider: providerName,
+      model,
+      effortSupported,
+      effort,
+    });
     activeRunIds.set(actorId, runId);
     return runId;
   };
@@ -808,7 +821,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       output: result.output,
       yieldStatus: result.yieldStatus,
       yieldNote: result.yieldNote,
-      model: result.model,
     });
     activeRunIds.delete(actorId);
     return runId;
@@ -1910,8 +1922,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           },
           onRuntimeStateChanged: ctx.onRuntimeStateChanged,
           onRunStart: (responsive, injectRecord) => {
-            const providerName = providerThrottleKey(actor.getProvider().providerName, config);
-            const runId = beginActorRun(id, providerName);
+            const workerProvider = actor.getProvider();
+            const providerName = providerThrottleKey(workerProvider.providerName, config);
+            const runId = beginActorRun(
+              id,
+              providerName,
+              workerProvider.model ?? null,
+              providerSupportsEffort(workerProvider.providerName),
+              workerProvider.effort ?? null
+            );
             mesh.recordEvent({
               kind: "run_start",
               actorId: id,
@@ -1921,8 +1940,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               body: injectRecord ? JSON.stringify(injectRecord) : undefined,
               payload: JSON.stringify({
                 provider: providerName,
-                model: actor.getProvider().model,
-                effort: actor.getProvider().effort,
+                model: workerProvider.model,
+                effort: workerProvider.effort,
                 responsive,
                 runId,
               }),
@@ -2380,7 +2399,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
       onRunStart: (responsive, injectRecord) => {
         const providerName = providerThrottleKey(provider.providerName, config);
-        const runId = beginActorRun(rootId, providerName);
+        const runId = beginActorRun(
+          rootId,
+          providerName,
+          provider.model ?? null,
+          providerSupportsEffort(provider.providerName),
+          provider.effort ?? null
+        );
         mesh.recordEvent({
           kind: "run_start",
           actorId: rootId,

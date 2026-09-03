@@ -17,6 +17,15 @@ export interface ActorRun {
   yieldedAt: string | null;
   provider: string | null;
   model: string | null;
+  /** Provider-native reasoning level actually passed at launch, when the provider supports one. */
+  effort: string | null;
+  /**
+   * Whether effort applicability was recorded at launch: `true` for an
+   * effort-capable provider, `false` as an explicit "not applicable" for a
+   * provider without effort control, `null` for a row that predates this
+   * column (a recording omission, not a recorded absence).
+   */
+  effortIsSet: boolean | null;
   abandonReason: string | null;
 }
 
@@ -34,6 +43,8 @@ interface ActorRunRow {
   yielded_at: string | null;
   provider: string | null;
   model: string | null;
+  effort: string | null;
+  effort_is_set: number | null;
   abandon_reason: string | null;
 }
 
@@ -82,19 +93,52 @@ export function captureRunOutput(output: string | null | undefined): string | nu
 export class ActorRunRepository {
   constructor(private readonly db: Database.Database) {}
 
+  /**
+   * Open a run and durably record its launch configuration up front, so a run
+   * that fails or gets interrupted before `complete()` still retains what was
+   * actually launched (design #184).
+   *
+   * `model` is required — pass the exact pin handed to the provider, or `null`
+   * when the provider was launched with no explicit pin (an operator-configured
+   * "use the provider's own default" — see `ProviderConfig.model`'s doc). An
+   * empty string is always a mistake (a caller that meant `null`), so it throws.
+   *
+   * `effortSupported` records whether the provider exposes a native effort
+   * control at all, independent of whether an override `effort` value was
+   * actually chosen for this run. Omit it only for a run that isn't a real
+   * provider launch (a test fixture); a real launch should always pass it so
+   * "no effort control" (false) stays distinguishable from a pre-migration row
+   * that never assessed it (the column reads null).
+   */
   start(opts: {
     id?: string;
     actorId: string;
     startedAt?: string;
     provider?: string | null;
+    model: string | null;
+    effortSupported?: boolean;
+    effort?: string | null;
   }): string {
+    if (opts.model !== null && !opts.model.trim()) {
+      throw new Error("actor run model must not be an empty string; pass null for no explicit pin");
+    }
     const id = opts.id ?? randomUUID();
+    const effortIsSet = opts.effortSupported === undefined ? null : opts.effortSupported ? 1 : 0;
+    const effort = opts.effortSupported ? (opts.effort ?? null) : null;
     this.db
       .prepare(
-        `INSERT INTO actor_runs (id, actor_id, started_at, provider)
-         VALUES (?, ?, ?, ?)`
+        `INSERT INTO actor_runs (id, actor_id, started_at, provider, model, effort, effort_is_set)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
       )
-      .run(id, opts.actorId, opts.startedAt ?? new Date().toISOString(), opts.provider ?? null);
+      .run(
+        id,
+        opts.actorId,
+        opts.startedAt ?? new Date().toISOString(),
+        opts.provider ?? null,
+        opts.model,
+        effort,
+        effortIsSet
+      );
     return id;
   }
 
@@ -109,6 +153,13 @@ export class ActorRunRepository {
     if (result.changes !== 1) throw new Error(`active actor run not found: ${id}`);
   }
 
+  /**
+   * `model`/`effort` are launch config, fixed by `start()` — `complete()` never
+   * touches them. A provider's post-hoc read-back of what it ran on
+   * (`RunResult.model`) is a narrower, best-effort-reported concept (see its
+   * doc in providers/types.ts) that belongs on the `run_end` mesh event, not
+   * here; conflating the two was design #184's bug.
+   */
   complete(
     id: string,
     opts: {
@@ -118,7 +169,6 @@ export class ActorRunRepository {
       output: string;
       yieldStatus?: string;
       yieldNote?: string;
-      model?: string | null;
     }
   ): void {
     const endedAt = opts.endedAt ?? new Date().toISOString();
@@ -132,8 +182,7 @@ export class ActorRunRepository {
              yielded_at = CASE
                WHEN COALESCE(?, yield_status) IS NOT NULL THEN COALESCE(yielded_at, ?)
                ELSE yielded_at
-             END,
-             model = ?
+             END
          WHERE id = ? AND outcome IS NULL`
       )
       .run(
@@ -145,7 +194,6 @@ export class ActorRunRepository {
         yieldNote,
         opts.yieldStatus ?? null,
         endedAt,
-        opts.model ?? null,
         id
       );
     if (result.changes !== 1) throw new Error(`active actor run not found: ${id}`);
@@ -303,6 +351,8 @@ function toActorRun(row: ActorRunRow): ActorRun {
     yieldedAt: row.yielded_at,
     provider: row.provider,
     model: row.model,
+    effort: row.effort,
+    effortIsSet: row.effort_is_set === null ? null : row.effort_is_set === 1,
     abandonReason: row.abandon_reason,
   };
 }

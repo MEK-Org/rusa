@@ -15,6 +15,20 @@ const EFFORT_ALIASES: Readonly<Record<string, string>> = {
   "extra-high": "xhigh",
 };
 
+/**
+ * Providers whose adapter exposes a native reasoning-effort control at all —
+ * kept in sync with the `efforts` vocabularies registered per adapter in
+ * providers/registry.ts. A provider outside this list (kimi, copilot) has no
+ * effort to omit, so its runs record that explicitly rather than leaving the
+ * actor_runs effort columns to read the same as a pre-#184 row.
+ */
+export const EFFORT_CAPABLE_PROVIDERS: readonly string[] = ["claude", "codex", "antigravity"];
+
+/** Whether `providerName`'s adapter (the `CodingProvider.providerName`, not the CLI command key) supports effort at all. */
+export function providerSupportsEffort(providerName: string): boolean {
+  return EFFORT_CAPABLE_PROVIDERS.includes(providerName);
+}
+
 export function normalizeReasoningEffort(effort: string): string {
   const normalized = effort.trim().toLowerCase();
   if (!normalized) throw new Error("reasoning effort must be a non-empty string");

@@ -1511,7 +1511,7 @@ describe("compactPortableContext integration (spec 6b)", () => {
     });
   const recordYield = (body: string, status: "complete" | "blocked"): string => {
     const ts = nextTimestamp();
-    const id = actorRuns.start({ actorId: "actor-a", startedAt: ts });
+    const id = actorRuns.start({ actorId: "actor-a", startedAt: ts, model: "test-model" });
     actorRuns.recordYield(id, status, body, ts);
     actorRuns.complete(id, { endedAt: ts, success: true, exitCode: 0, output: body });
     return id;

@@ -30,6 +30,7 @@ import { inboxRunFocus } from "./0031_inbox_run_focus.js";
 import { actorRunsFocusFold } from "./0032_actor_runs_focus_fold.js";
 import { referenceCache } from "./0033_reference_cache.js";
 import { actorRuntimeState } from "./0034_actor_runtime_state.js";
+import { actorRunLaunchConfig } from "./0035_actor_run_launch_config.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -72,4 +73,5 @@ export const migrations: Migration[] = [
   actorRunsFocusFold,
   referenceCache,
   actorRuntimeState,
+  actorRunLaunchConfig,
 ];
