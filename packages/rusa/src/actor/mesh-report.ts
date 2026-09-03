@@ -278,9 +278,12 @@ function renderTopology(records: ThreadRecord[], counts: Map<string, number>): s
   const renderNode = (r: ThreadRecord): string => {
     const meta = [
       chip(r.status, statusChipClass(r.status)),
-      r.provider ? chip(r.provider, "muted-chip") : "",
-      r.model ? chip(r.model, "muted-chip") : "",
-      r.effort ? chip(`effort ${r.effort}`, "muted-chip") : "",
+      ...(r.modelConfig ?? []).map((c) =>
+        chip(
+          `${c.provider}${c.model ? `:${c.model}` : ""}${c.effort ? ` @ ${c.effort}` : ""}`,
+          "muted-chip"
+        )
+      ),
       r.budget?.maxRuns != null
         ? chip(`runs ${r.budget.runsUsed ?? 0}/${r.budget.maxRuns}`, "muted-chip")
         : "",

@@ -1,4 +1,5 @@
 import type { ExhaustionClassifier } from "../providers/exhaustion-classifier.js";
+import type { ProviderModelConfig } from "../providers/model-config.js";
 import { teardownFlutterOverlay } from "../providers/sandbox.js";
 import {
   createInterruptAbortReason,
@@ -50,8 +51,13 @@ export interface ActorOptions {
   id: string;
   /** Working directory for this actor's agent runs (its own dir/worktree). */
   cwd: string;
-  /** The resolved coding provider this actor runs on. */
-  provider: CodingProvider;
+  /**
+   * The declared candidate pool this actor runs on (design MEK-Org/rusa#169).
+   * A single fixed-model actor still declares a one-element pool.
+   */
+  modelConfig: ProviderModelConfig[];
+  /** Resolve one declared candidate into the coding provider that will run it. */
+  resolveProvider: (config: ProviderModelConfig) => CodingProvider;
   /** MCP servers attached as this actor's tools. */
   mcpServers: McpServerSpec[];
   /**
@@ -114,8 +120,8 @@ export interface ActorOptions {
    * both queues; the returned handle can promote a queued normal run.
    */
   gate?: <T>(
-    fn: () => Promise<T>,
-    provider: string,
+    fn: (selected: ProviderModelConfig) => Promise<T>,
+    candidates: readonly ProviderModelConfig[],
     responsive: boolean
   ) => Promise<T> | RunStartHandle<T>;
   /**
@@ -146,7 +152,11 @@ export interface ActorOptions {
    * telling "the provider never answered" apart from a genuine mid-run stall
    * needs a first-chunk timestamp, which {@link onFirstChunk} carries.
    */
-  onRunStart?: (responsive: boolean, injectRecord?: InjectRecord) => void;
+  onRunStart?: (
+    responsive: boolean,
+    injectRecord: InjectRecord | undefined,
+    selected: ProviderModelConfig
+  ) => void;
   /**
    * Optional hook fired ONCE per run, on the first chunk the provider emits —
    * the moment it starts answering, as distinct from the moment we asked .
@@ -522,13 +532,13 @@ export class Actor {
     this.interruptedWatermark = null;
   }
 
-  /** Update the active coding provider in-place for subsequent runs . */
-  setProvider(provider: CodingProvider): void {
-    this.opts.provider = provider;
-  }
-
-  getProvider(): CodingProvider {
-    return this.opts.provider;
+  /**
+   * Adopt a staged modelConfig pool replacement (`set_actor_model`) on the live
+   * actor, so the very next run gates against the new declared pool instead of
+   * waiting for a full actor rebuild.
+   */
+  setModelConfig(modelConfig: ProviderModelConfig[]): void {
+    this.opts.modelConfig = modelConfig;
   }
 
   close(): void {
@@ -728,7 +738,7 @@ export class Actor {
           this.opts.log?.(chunk);
         },
       });
-    const invoke = (): Promise<RunResult> => {
+    const invoke = (selected: ProviderModelConfig): Promise<RunResult> => {
       // Both queues have selected this run. From this point a later responsive
       // wake obeys per-actor serialization; v1 never cancels a live provider.
       this.pendingStart = undefined;
@@ -758,7 +768,7 @@ export class Actor {
       // beside onQueued so a run queued behind the concurrency cap is
       // distinguishable from one that started and went quiet — same reason the
       // watchdog timers moved in here .
-      this.opts.onRunStart?.(responsive, built.injectRecord);
+      this.opts.onRunStart?.(responsive, built.injectRecord, selected);
       // AFTER the hook, not before: this flag means "a start was announced", so a
       // hook that threw before announcing must not leave a bracket a reader will
       // wait forever to see closed. (The mirror of `runEndReported`, which is set
@@ -766,7 +776,7 @@ export class Actor {
       // same run's outcome twice, here it is claiming a start nobody saw.)
       this.runStartReported = true;
       startWatchdogTimers();
-      return this.runWithFallback(runProvider);
+      return this.runWithFallback(this.opts.resolveProvider(selected), runProvider);
     };
 
     // The post-run hook is the single choke point for failure forwarding, so it
@@ -782,14 +792,15 @@ export class Actor {
     let result: RunResult;
     try {
       if (this.opts.gate) {
-        // A staged provider swap can land while this request is genuinely
-        // queued behind another provider's pacer/capacity. `gate` rejects
-        // with RunStartStaleProviderError in that case rather than starting
-        // under the wrong lane; re-reading `this.opts.provider` (now live,
-        // via the same applyPendingModel call that raised the rejection) and
-        // re-gating picks the correct lane instead of losing the run.
+        // A staged modelConfig swap can land while this request is genuinely
+        // queued behind a specific lane's pacer/capacity. `gate` rejects with
+        // RunStartStaleProviderError in that case rather than starting under
+        // a stale pool snapshot; re-reading `this.opts.modelConfig` (now
+        // live, via the same applyPendingModel call that raised the
+        // rejection) and re-gating re-selects the correct lane instead of
+        // losing the run.
         for (;;) {
-          const gated = this.opts.gate(invoke, this.opts.provider.providerName, responsive);
+          const gated = this.opts.gate(invoke, this.opts.modelConfig, responsive);
           const start: RunStartHandle<RunResult> =
             gated instanceof Promise
               ? { result: gated, started: false, promote: () => {}, cancel: () => false }
@@ -800,17 +811,18 @@ export class Actor {
             break;
           } catch (err) {
             if (err instanceof RunStartStaleProviderError) {
-              // The provider that just became live (via the same
-              // applyPendingModel call that raised this rejection) may be
-              // durably halted — the pacer only re-validated lane
-              // membership, not halt state, since halting is a separate
-              // concern from provider pacing. Re-run the same admission gate
-              // this run already passed once on its original provider; if
-              // the newly-live provider is halted, this is exactly a queued
-              // run cancelled out from under it, so retain the same replay
-              // flag `cancelQueuedRun` sets, letting `resumeCancelledRun`
-              // (already the production halt/resume replay path) relaunch it
-              // once the halt clears — no parallel lifecycle construct.
+              // The pool that just became live (via the same
+              // applyPendingModel call that raised this rejection) may have
+              // every candidate durably halted — the pacer only
+              // re-validated lane membership, not halt state, since halting
+              // is a separate concern from provider pacing. Re-run the same
+              // admission gate this run already passed once on its original
+              // pool; if the newly-live pool is fully halted, this is
+              // exactly a queued run cancelled out from under it, so retain
+              // the same replay flag `cancelQueuedRun` sets, letting
+              // `resumeCancelledRun` (already the production halt/resume
+              // replay path) relaunch it once the halt clears — no parallel
+              // lifecycle construct.
               if (
                 this.opts.beforeRun &&
                 !(await this.opts.beforeRun({ mode: nudge.mode ?? "ordinary" }))
@@ -825,7 +837,7 @@ export class Actor {
           }
         }
       } else {
-        result = await invoke();
+        result = await invoke(this.opts.modelConfig[0]);
       }
     } catch (err) {
       if (err instanceof RunStartCancelledError) {
@@ -916,9 +928,9 @@ export class Actor {
   }
 
   private async runWithFallback(
+    primary: CodingProvider,
     runProvider: (provider: CodingProvider) => Promise<RunResult>
   ): Promise<RunResult> {
-    const primary = this.opts.provider;
     const result = await runProvider(primary);
     const fallback = this.opts.fallback;
     if (result.success || !fallback || fallback.models.length === 0) return result;

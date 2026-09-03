@@ -352,9 +352,11 @@ export function startRootControlServer(opts: {
           const id = opts.handles.rootControl.spawnChild(
             {
               charter: typeof body.charter === "string" ? body.charter : "",
-              provider: typeof body.provider === "string" ? body.provider : "",
-              model: typeof body.model === "string" ? body.model : "",
-              effort: typeof body.effort === "string" ? body.effort : undefined,
+              modelConfig: {
+                provider: typeof body.provider === "string" ? body.provider : "",
+                model: typeof body.model === "string" ? body.model : "",
+                effort: typeof body.effort === "string" ? body.effort : undefined,
+              },
               maxRuns: typeof body.maxRuns === "number" ? body.maxRuns : undefined,
               title: typeof body.title === "string" ? body.title : undefined,
               context,

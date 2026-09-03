@@ -41,7 +41,7 @@ describe("generateMeshReport", () => {
         id: "worker-abcdef12",
         charter: "implement the feature",
         parentId: "root",
-        provider: "claude",
+        modelConfig: [{ provider: "claude" }],
         status: "active",
         createdAt: "t1",
       },

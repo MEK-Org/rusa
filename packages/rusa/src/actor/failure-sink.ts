@@ -48,7 +48,11 @@ export interface FailureSinkDeps {
  * no name. A gate asserting two runs used the same model may not fall back the same
  * way — see `harness/model-identity.ts`.
  */
-export function formatProviderLabel(provider: CodingProvider, runModel?: string): string {
+export function formatProviderLabel(
+  provider: Pick<CodingProvider, "providerName" | "model" | "effort"> &
+    Partial<Pick<CodingProvider, "name">>,
+  runModel?: string
+): string {
   const name = provider.providerName ?? provider.name;
   const model = runModel ?? provider.model;
   const selection = model ? `${name}/${model}` : name;

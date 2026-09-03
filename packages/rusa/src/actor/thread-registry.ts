@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
+import type { ProviderModelConfig } from "../providers/model-config.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import { generateHandle } from "./handle-generator.js";
 
@@ -86,38 +87,26 @@ export interface ThreadRecord {
    */
   handles?: ActorHandle[];
   /**
-   * Which coding harness this actor runs on — a key under `providers` (e.g.
-   * "claude", "antigravity"). Undefined means "use the default" (the root's
-   * provider). Lets a parent delegate to a different harness/tier than itself.
+   * The declared pool of acceptable provider/model/effort choices this actor
+   * runs on, in earliest-available order — a bounded, non-empty, validated
+   * array (see `validateModelConfigPool`), never a bare scalar. A pool longer
+   * than one entry requires a portable actor. Undefined means "use the
+   * default" (the root's provider, or the standing coder pool for a worker
+   * spawned without one). This is a spawn INPUT — `createActor`/the admission
+   * broker feed it to provider resolution on every wake — so nothing may
+   * overwrite it with a provider read-back: that would make one run's report
+   * the next run's request. Which candidate a run actually ran on is
+   * run-scoped and lives on the `run_end`/selection event, not here.
    */
-  provider?: string;
+  modelConfig?: ProviderModelConfig[];
   /**
-   * Optional model/tier id passed to the provider (e.g. a stronger model for review).
-   * This is a spawn INPUT — `createActor` feeds it to `resolveProvider` on every
-   * wake — so nothing may overwrite it with a provider read-back: that would make
-   * one run's report the next run's request. What a run actually ran on is
-   * run-scoped and lives on the `run_end` event ({@link RunEndPayload}).
+   * Pending modelConfig replacement staged via `set_actor_model`, applied
+   * atomically (the whole pool, never a per-field patch). Applies at the end
+   * of an in-flight run's run_end; applies at the next dispatch (before
+   * run_start and launch) for an idle or queued actor with no run currently
+   * in flight.
    */
-  model?: string;
-  /** Explicit provider-native reasoning level; absent means provider default. */
-  effort?: string;
-  /**
-   * Pending model change staged via `set_actor_model`. Applies at the end of an
-   * in-flight run's run_end; applies at the next dispatch (before run_start and
-   * launch) for an idle or queued actor with no run currently in flight.
-   */
-  desiredModel?: string;
-  /**
-   * Pending reasoning-level change. `null` explicitly clears a pin back to the
-   * provider default; `undefined` means no effort change is staged.
-   */
-  desiredEffort?: string | null;
-  /**
-   * Pending provider change staged via `set_actor_model`. Applies at the end of
-   * an in-flight run's run_end; applies at the next dispatch (before run_start
-   * and launch) for an idle or queued actor with no run currently in flight.
-   */
-  desiredProvider?: string;
+  desiredModelConfig?: ProviderModelConfig[];
   /** Provider session/conversation id = the working-memory handle (B.2); set after first run. */
   sessionId?: string;
   /**
@@ -256,7 +245,7 @@ export class FileThreadRegistry implements ThreadRegistry {
       const parsed = JSON.parse(readFileSync(file, "utf-8")) as { threads?: ThreadRecord[] };
       for (const rec of parsed.threads ?? []) {
         try {
-          const normalized = migrateLegacyModelEffort(rec, providerCapabilityName);
+          const normalized = migrateLegacyModelConfig(rec, providerCapabilityName);
           migrated ||= normalized !== rec;
           this.mem.upsert(normalized);
         } catch {
@@ -307,50 +296,80 @@ export class FileThreadRegistry implements ThreadRegistry {
   }
 }
 
-/** Split recognized legacy model qualifiers while loading durable JSON records. */
-export function migrateLegacyModelEffort(
-  rec: ThreadRecord,
+/**
+ * Legacy scalar shape (pre-modelConfig) a durable JSON record may still carry
+ * on disk — provider/model/effort singletons plus their `desired*` staging
+ * counterparts, as opposed to the current `modelConfig`/`desiredModelConfig`
+ * pools.
+ */
+interface LegacyScalarModelFields {
+  provider?: string;
+  model?: string | null;
+  effort?: string;
+  desiredModel?: string;
+  desiredEffort?: string | null;
+  desiredProvider?: string;
+}
+
+/**
+ * Fold a legacy scalar provider/model/effort singleton (and its `desired*`
+ * staging counterpart) into a one-entry `modelConfig`/`desiredModelConfig`
+ * pool, also splitting recognized legacy model qualifiers (e.g. Codex's
+ * `"gpt-5.6-sol high"`) while loading durable JSON records. A record that
+ * already carries `modelConfig` (or neither shape) passes through unchanged.
+ */
+export function migrateLegacyModelConfig(
+  rec: ThreadRecord & LegacyScalarModelFields,
   providerCapabilityName: (providerName: string) => string = (providerName) => providerName
 ): ThreadRecord {
+  const hasLegacyScalar =
+    rec.provider !== undefined ||
+    rec.model !== undefined ||
+    rec.effort !== undefined ||
+    rec.desiredModel !== undefined ||
+    rec.desiredEffort !== undefined ||
+    rec.desiredProvider !== undefined;
+  if (!hasLegacyScalar) return rec;
+
   const provider = providerCapabilityName(rec.provider ?? "");
-
-  if (rec.status === "retired") {
-    if (rec.model === null || provider !== (rec.provider ?? "")) {
-      return rec;
-    }
-  }
-
-  const effort = rec.effort;
-  const current = normalizeModelEffortSelection(provider, rec.model, effort);
-  const desiredProvider = providerCapabilityName(rec.desiredProvider ?? rec.provider ?? "");
-  const desired = rec.desiredModel
-    ? normalizeModelEffortSelection(
-        desiredProvider,
-        rec.desiredModel,
-        typeof rec.desiredEffort === "string" ? rec.desiredEffort : undefined
-      )
-    : undefined;
-  const desiredEffort = desired
-    ? rec.desiredEffort === null
-      ? null
-      : desired.effort
-    : rec.desiredEffort;
-  if (
-    current.model === rec.model &&
-    current.effort === rec.effort &&
-    (!desired || (desired.model === rec.desiredModel && desiredEffort === rec.desiredEffort))
-  ) {
+  if (rec.status === "retired" && (rec.model === null || provider !== (rec.provider ?? ""))) {
     return rec;
   }
+
+  const current = normalizeModelEffortSelection(provider, rec.model ?? undefined, rec.effort);
+  const modelConfig: ProviderModelConfig[] = [
+    { provider: rec.provider ?? provider, model: current.model, effort: current.effort },
+  ];
+
+  let desiredModelConfig: ProviderModelConfig[] | undefined;
+  if (rec.desiredModel !== undefined || rec.desiredProvider !== undefined) {
+    const desiredProviderName = providerCapabilityName(rec.desiredProvider ?? rec.provider ?? "");
+    const desired = normalizeModelEffortSelection(
+      desiredProviderName,
+      rec.desiredModel,
+      typeof rec.desiredEffort === "string" ? rec.desiredEffort : undefined
+    );
+    desiredModelConfig = [
+      {
+        provider: rec.desiredProvider ?? rec.provider ?? desiredProviderName,
+        model: desired.model,
+        effort: rec.desiredEffort === null ? undefined : desired.effort,
+      },
+    ];
+  }
+
+  const {
+    provider: _provider,
+    model: _model,
+    effort: _effort,
+    desiredModel: _desiredModel,
+    desiredEffort: _desiredEffort,
+    desiredProvider: _desiredProvider,
+    ...rest
+  } = rec;
   return {
-    ...rec,
-    model: current.model,
-    effort: current.effort,
-    ...(desired
-      ? {
-          desiredModel: desired.model,
-          desiredEffort,
-        }
-      : {}),
+    ...rest,
+    modelConfig,
+    ...(desiredModelConfig ? { desiredModelConfig } : {}),
   };
 }

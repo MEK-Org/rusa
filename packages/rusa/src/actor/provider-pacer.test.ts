@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConcurrencyLimiter } from "./concurrency-limiter.js";
-import { ProviderPacer } from "./provider-pacer.js";
+import { ProviderPacer, selectPoolLane } from "./provider-pacer.js";
 
 describe("ProviderPacer", () => {
   beforeEach(() => vi.useFakeTimers());
@@ -214,5 +214,72 @@ describe("ProviderPacer", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(secondStarted).toBe(true);
     await expect(second.result).resolves.toBe("second");
+  });
+
+  describe("quote", () => {
+    it("quotes an idle lane as immediately eligible", () => {
+      const pacer = new ProviderPacer(10_000, () => Date.now());
+      expect(pacer.quote(Date.now())).toBe(Date.now());
+    });
+
+    it("quotes a lane deferred by a past run at lastStartedAt + interval", async () => {
+      const base = Date.now();
+      const mesh = new ConcurrencyLimiter(1);
+      const pacer = new ProviderPacer(10_000, () => Date.now());
+      await pacer.submit(async () => "first", { enqueueNormal: (fn) => mesh.enqueue(fn) }).result;
+      expect(pacer.quote(base)).toBe(base + 10_000);
+    });
+
+    it("adds one interval per already-waiting request", async () => {
+      const base = Date.now();
+      const mesh = new ConcurrencyLimiter(1);
+      const pacer = new ProviderPacer(10_000, () => Date.now());
+      await pacer.submit(async () => "first", { enqueueNormal: (fn) => mesh.enqueue(fn) }).result;
+      pacer.submit(async () => "second", { enqueueNormal: (fn) => mesh.enqueue(fn) });
+      expect(pacer.waiting).toBe(1);
+      expect(pacer.quote(base)).toBe(base + 10_000 + 10_000);
+    });
+
+    it("honors an explicit deferUntil floor even with a zero interval", () => {
+      const base = Date.now();
+      const pacer = new ProviderPacer(0, () => Date.now());
+      pacer.deferUntil(base + 5_000);
+      expect(pacer.quote(base)).toBe(base + 5_000);
+    });
+  });
+
+  describe("selectPoolLane", () => {
+    it("selects the candidate with the earliest quote", () => {
+      const now = Date.now();
+      const soon = new ProviderPacer(0, () => now);
+      const later = new ProviderPacer(0, () => now);
+      later.deferUntil(now + 1_000);
+      const winner = selectPoolLane(
+        [
+          { config: "later", lane: "later", pacer: later },
+          { config: "soon", lane: "soon", pacer: soon },
+        ],
+        now
+      );
+      expect(winner?.config).toBe("soon");
+    });
+
+    it("breaks ties by declaration order", () => {
+      const now = Date.now();
+      const first = new ProviderPacer(0, () => now);
+      const second = new ProviderPacer(0, () => now);
+      const winner = selectPoolLane(
+        [
+          { config: "first", lane: "a", pacer: first },
+          { config: "second", lane: "b", pacer: second },
+        ],
+        now
+      );
+      expect(winner?.config).toBe("first");
+    });
+
+    it("returns undefined for an empty candidate list", () => {
+      expect(selectPoolLane([], Date.now())).toBeUndefined();
+    });
   });
 });

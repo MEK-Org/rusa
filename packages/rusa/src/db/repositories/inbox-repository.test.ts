@@ -192,7 +192,8 @@ describe("InboxRepository", () => {
     const actor = new Actor({
       id: "actor",
       cwd: "/tmp/actor-inbox-invariant",
-      provider: new FakeProvider(),
+      modelConfig: [{ provider: "fake" }],
+      resolveProvider: () => new FakeProvider(),
       mcpServers: [],
       loadSessionId: () => undefined,
       saveSessionId: () => {},

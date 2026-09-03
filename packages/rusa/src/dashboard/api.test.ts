@@ -206,10 +206,10 @@ describe("handleMeshApiRequest", () => {
         principal: "human:operator",
         request: {
           charter: "Investigate the flaky build",
-          provider: "agy",
-          model: "gemini-3.5-flash-medium",
+          modelConfig: { provider: "agy", model: "gemini-3.5-flash-medium", effort: undefined },
           maxRuns: 4,
           title: "Build investigator",
+          context: undefined,
         },
       },
     ]);
@@ -232,8 +232,7 @@ describe("handleMeshApiRequest", () => {
 
     expect(res.statusCode).toBe(201);
     expect(rootSpawns[0]?.request).toMatchObject({
-      provider: "agy",
-      model: "gemini-3.5-flash-medium",
+      modelConfig: { provider: "agy", model: "gemini-3.5-flash-medium" },
       context: { type: "portable", mode: "ledger" },
     });
   });
@@ -271,13 +270,13 @@ describe("handleMeshApiRequest", () => {
     deps.rootControl = control;
   });
 
-  it("POST /api/mesh/actors rejects missing provider or model ", async () => {
+  it("POST /api/mesh/actors rejects a missing provider", async () => {
     const control = deps.rootControl;
     deps.rootControl = {
       providers: [],
       spawnChild: (req: RootChildRequest) => {
-        if (!req.provider) throw new Error("provider is required");
-        if (!req.model) throw new Error("model is required");
+        const modelConfig = Array.isArray(req.modelConfig) ? req.modelConfig[0] : req.modelConfig;
+        if (!modelConfig?.provider) throw new Error("provider is required");
         return UUID_A;
       },
     } as unknown as RootControlService;
@@ -292,17 +291,6 @@ describe("handleMeshApiRequest", () => {
     await new Promise((resolve) => process.nextTick(resolve));
     expect(res1?.statusCode).toBe(400);
     expect(JSON.parse(res1.body)).toEqual({ error: "provider is required" });
-
-    const { res: res2 } = await call(
-      deps,
-      "POST",
-      "/api/mesh/actors",
-      JSON.stringify({ charter: "work", provider: "claude" })
-    );
-    await new Promise((resolve) => process.nextTick(resolve));
-    await new Promise((resolve) => process.nextTick(resolve));
-    expect(res2?.statusCode).toBe(400);
-    expect(JSON.parse(res2.body)).toEqual({ error: "model is required" });
 
     deps.rootControl = control;
   });
@@ -506,10 +494,11 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads surfaces one model and does not leak a stale bound-model readback", async () => {
-    // A registry record that still carries the removed `boundModel` key. The cast is the
-    // point, not a workaround: the field is gone from `ThreadRecord`, but the registry is
-    // a JSON file loaded with a cast and rewritten whole, so every record written before
-    // this change still carries the key on disk. This is that record.
+    // A registry record that still carries the removed `boundModel` key alongside a
+    // properly-shaped `modelConfig`. The cast is the point, not a workaround: the field
+    // is gone from `ThreadRecord`, but the registry is a JSON file loaded with a cast and
+    // rewritten whole, so a record written before this key was retired can still carry it
+    // on disk. This is that record.
     //
     // It is the shape that produced the old "MODEL DIVERGED" badge — an actor moved off
     // codex, its codex readback outliving the move because nothing ever cleared it. The
@@ -517,8 +506,7 @@ describe("handleMeshApiRequest", () => {
     // compare it against.
     registry.upsert({
       ...rec(UUID_A, "root", "active"),
-      provider: "codex",
-      model: "gpt-5-codex",
+      modelConfig: [{ provider: "codex", model: "gpt-5-codex" }],
       boundModel: "gpt-5.5",
     } as ThreadRecord);
 
@@ -535,12 +523,8 @@ describe("handleMeshApiRequest", () => {
   it("GET /api/mesh/threads surfaces pending desiredModel and desiredProvider when staged", async () => {
     registry.upsert({
       ...rec(UUID_A, "root", "active"),
-      provider: "claude",
-      model: "claude-sonnet-5",
-      effort: "medium",
-      desiredModel: "claude-opus-4-8",
-      desiredEffort: "max",
-      desiredProvider: "codex",
+      modelConfig: [{ provider: "claude", model: "claude-sonnet-5", effort: "medium" }],
+      desiredModelConfig: [{ provider: "codex", model: "claude-opus-4-8", effort: "max" }],
     });
 
     const { res } = await call(deps, "GET", "/api/mesh/threads");
@@ -559,16 +543,12 @@ describe("handleMeshApiRequest", () => {
   it("GET /api/mesh/threads distinguishes a pending effort clear from no pending change", async () => {
     registry.upsert({
       ...rec(UUID_A, "root", "active"),
-      provider: "codex",
-      model: "gpt-5.6-sol",
-      effort: "high",
-      desiredEffort: null,
+      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol", effort: "high" }],
+      desiredModelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
     });
     registry.upsert({
       ...rec(UUID_B, "root", "active"),
-      provider: "codex",
-      model: "gpt-5.6-sol",
-      effort: "high",
+      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol", effort: "high" }],
     });
 
     const { res } = await call(deps, "GET", "/api/mesh/threads");

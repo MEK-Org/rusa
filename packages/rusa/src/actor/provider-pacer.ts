@@ -116,6 +116,23 @@ export class ProviderPacer {
     return snapshot;
   }
 
+  /**
+   * A side-effect-free ETA for the next reservation on this lane: the later of
+   * `now` and the known next-available timestamp, plus one interval per
+   * request already queued or staged ahead of it. Lets a multi-lane pool
+   * compare candidates before committing to one via {@link submit}.
+   */
+  quote(now: number = this.now()): number {
+    return Math.max(now, this.nextAvailableAt) + this.waiting * this.intervalMs;
+  }
+
+  get queueHead(): { threadId: string; availableAt: number } | null {
+    if (this.staged) return null;
+    const request = this.queue[0];
+    if (!request?.opts.threadId) return null;
+    return { threadId: request.opts.threadId, availableAt: this.nextAvailableAt };
+  }
+
   setInterval(intervalMs: number): void {
     this.assertInterval(intervalMs);
     this.intervalMs = intervalMs;
@@ -287,4 +304,34 @@ export class ProviderPacer {
       throw new Error(`intervalMs must be >= 0, got ${intervalMs}`);
     }
   }
+}
+
+export interface PoolLaneCandidate<C> {
+  config: C;
+  lane: string;
+  pacer: ProviderPacer;
+}
+
+/**
+ * Pick the earliest-available declared candidate across canonical provider
+ * lanes, by comparing each lane's side-effect-free {@link ProviderPacer.quote}.
+ * Ties go to the earlier-declared candidate (strict `<` keeps the first seen).
+ * Callers must reserve the winning lane (via `submit`) synchronously, with no
+ * `await` between calling this and reserving — JS's single-threaded execution
+ * is what keeps concurrent wakes from double-booking the same slot.
+ */
+export function selectPoolLane<C>(
+  candidates: readonly PoolLaneCandidate<C>[],
+  now: number
+): PoolLaneCandidate<C> | undefined {
+  let best: PoolLaneCandidate<C> | undefined;
+  let bestQuote = Number.POSITIVE_INFINITY;
+  for (const candidate of candidates) {
+    const quote = candidate.pacer.quote(now);
+    if (quote < bestQuote) {
+      bestQuote = quote;
+      best = candidate;
+    }
+  }
+  return best;
 }

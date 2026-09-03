@@ -8,6 +8,7 @@ import type { IssueClient } from "../gitops/issue-client.js";
 import { MESH_SYSTEM, resolveStampedAuthor } from "../mcp/stamp.js";
 import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
 import { FakeProvider } from "../providers/fake-provider.js";
+import type { ProviderModelConfig } from "../providers/model-config.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { Actor } from "./actor.js";
@@ -233,7 +234,8 @@ function setup(
       actor = new Actor({
         id: ctx.record.id,
         cwd: `/tmp/${ctx.record.id}`,
-        provider,
+        modelConfig: [{ provider: provider.providerName }],
+        resolveProvider: () => provider,
         mcpServers: [],
         loadSessionId: () => ctx.getRecord()?.sessionId,
         saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
@@ -274,7 +276,8 @@ function setup(
   root = new Actor({
     id: rootId,
     cwd: `/tmp/${rootId}`,
-    provider: rootProvider,
+    modelConfig: [{ provider: rootProvider.providerName }],
+    resolveProvider: () => rootProvider,
     mcpServers: [],
     loadSessionId: () => registry.get(rootId)?.sessionId,
     saveSessionId: (id) => registry.patch(rootId, { sessionId: id }),
@@ -303,8 +306,7 @@ function setup(
   };
   testMesh.spawn = (req: Partial<SpawnRequest> & { charter: string; parentId: string }) =>
     rawSpawn({
-      provider: "claude",
-      model: "claude-sonnet-4-6",
+      modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
       ...req,
     } as SpawnRequest);
 
@@ -419,8 +421,12 @@ describe("ActorMesh", () => {
       },
     });
 
-    mesh.spawn({ charter: "worker", parentId: "root", provider: "codex", model: "gpt-5.6-sol" });
-    await expect(gate(async () => 42, "codex", false).result).resolves.toBe(42);
+    mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      modelConfig: { provider: "codex", model: "gpt-5.6-sol" },
+    });
+    await expect(gate(async () => 42, [{ provider: "codex" }], false).result).resolves.toBe(42);
 
     expect(selected).toEqual(["codex"]);
   });
@@ -586,10 +592,12 @@ describe("ActorMesh", () => {
         if (ctx.record.id === "t1") {
           throw new Error("unresolvable provider mock error");
         }
+        const provider = new FakeProvider();
         return new Actor({
           id: ctx.record.id,
           cwd: `/tmp/${ctx.record.id}`,
-          provider: new FakeProvider(),
+          modelConfig: [{ provider: provider.providerName }],
+          resolveProvider: () => provider,
           mcpServers: [],
           loadSessionId: () => undefined,
           saveSessionId: () => {},
@@ -721,49 +729,26 @@ describe("ActorMesh", () => {
     });
 
     expect(() =>
-      mesh.spawn({ charter: "must not spawn", parentId: "root", provider: "codex", model: "bad" })
+      mesh.spawn({
+        charter: "must not spawn",
+        parentId: "root",
+        modelConfig: { provider: "codex", model: "bad" },
+      })
     ).toThrow("locally rejected model pin");
     expect(idAllocations).toBe(0);
     expect(registry.list().map((record) => record.id)).toEqual(["root"]);
   });
 
-  it("refuses spawn when provider is missing or whitespace ", () => {
-    const { rawSpawn } = setup();
-    expect(() =>
-      rawSpawn({ charter: "child", parentId: "root", provider: "", model: "claude-sonnet-4-6" })
-    ).toThrow("provider is required");
-    expect(() =>
-      rawSpawn({ charter: "child", parentId: "root", provider: "   ", model: "claude-sonnet-4-6" })
-    ).toThrow("provider is required");
-    expect(() =>
-      rawSpawn({
-        charter: "child",
-        parentId: "root",
-        provider: undefined as unknown as string,
-        model: "claude-sonnet-4-6",
-      })
-    ).toThrow("provider is required");
-  });
+  // NOTE(MEK-Org/rusa#169): "refuses spawn when provider/model is missing or
+  // whitespace" used to live here, back when ActorMesh.spawn itself parsed
+  // scalar provider/model fields. That validation now lives in
+  // validateModelConfigPool ("rejects an entry missing a provider", in
+  // src/providers/model-config.test.ts) — ActorMesh no longer inspects
+  // modelConfig entries unless a validateSpawn hook is wired in, so there is
+  // nothing left here for those two tests to exercise. Removed rather than
+  // rewritten.
 
-  it("refuses spawn when model is missing or whitespace ", () => {
-    const { rawSpawn } = setup();
-    expect(() =>
-      rawSpawn({ charter: "child", parentId: "root", provider: "claude", model: "" })
-    ).toThrow("model is required");
-    expect(() =>
-      rawSpawn({ charter: "child", parentId: "root", provider: "claude", model: "   " })
-    ).toThrow("model is required");
-    expect(() =>
-      rawSpawn({
-        charter: "child",
-        parentId: "root",
-        provider: "claude",
-        model: undefined as unknown as string,
-      })
-    ).toThrow("model is required");
-  });
-
-  it("records trimmed provider and model on thread record and event ", () => {
+  it("records modelConfig pool on thread record and event", () => {
     const events: MeshEventInput[] = [];
     const { rawSpawn, registry } = setup({
       events: (e) => events.push(e),
@@ -771,16 +756,15 @@ describe("ActorMesh", () => {
     const id = rawSpawn({
       charter: "custom worker",
       parentId: "root",
-      provider: "  antigravity  ",
-      model: "  Gemini 3.7 Flash (High)  ",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
     });
     const record = registry.get(id);
-    expect(record?.provider).toBe("antigravity");
-    expect(record?.model).toBe("Gemini 3.7 Flash");
-    expect(record?.effort).toBe("high");
+    expect(record?.modelConfig).toEqual([
+      { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+    ]);
     const spawnEvent = events.find((e) => e.kind === "actor_spawned" && e.actorId === id);
     expect(spawnEvent).toBeDefined();
-    expect(spawnEvent?.body).toBe("provider=antigravity model=Gemini 3.7 Flash effort=high");
+    expect(spawnEvent?.body).toBe("modelConfig=antigravity:Gemini 3.7 Flash @ high");
   });
 
   it("revokes parent handle and marks record retired when createActor throws on spawn", () => {
@@ -2241,12 +2225,20 @@ describe("ActorMesh", () => {
       sharedProvider: d.provider,
       isHalted: (provider) => (provider ? halted.has(provider) : halted.size > 0),
     });
-    const running = mesh.spawn({ charter: "running", parentId: "root", provider: "claude" });
-    const blocked = mesh.spawn({ charter: "blocked", parentId: "root", provider: "codex" });
+    const running = mesh.spawn({
+      charter: "running",
+      parentId: "root",
+      modelConfig: { provider: "claude" },
+    });
+    const blocked = mesh.spawn({
+      charter: "blocked",
+      parentId: "root",
+      modelConfig: { provider: "codex" },
+    });
     const unaffected = mesh.spawn({
       charter: "unaffected",
       parentId: "root",
-      provider: "claude",
+      modelConfig: { provider: "claude" },
     });
     mesh.sendMessage(running, "go", "root");
     mesh.sendMessage(blocked, "go", "root");
@@ -2919,169 +2911,203 @@ describe("ActorMesh", () => {
 
   it("setActorModel updates the record model, emits event, and enforces authority", async () => {
     const events: MeshEventInput[] = [];
-    const modelSets: Array<{ actorId: string; newModel: string }> = [];
+    const modelSets: Array<{ actorId: string; newModel?: string }> = [];
     const { mesh, registry, tick } = setup({
       events: (event) => events.push(event),
-      onModelSet: (actorId, newModel) => modelSets.push({ actorId, newModel }),
-      validateModel: (_record, newModel) => {
-        if (newModel === "forbidden-model") throw new Error("forbidden model");
-        return { model: newModel };
+      onModelSet: (actorId, modelConfig) =>
+        modelSets.push({ actorId, newModel: modelConfig[0]?.model }),
+      validateModel: (_record, modelConfig) => {
+        const list = Array.isArray(modelConfig) ? modelConfig : [modelConfig];
+        const valid = list.filter((entry) => entry.model?.trim());
+        for (const entry of valid) {
+          if (entry.model === "forbidden-model") throw new Error("forbidden model");
+        }
+        return valid.map((entry) => ({
+          provider: entry.provider,
+          model: entry.model,
+          effort: entry.effort,
+        }));
       },
     });
-    const parent = mesh.spawn({ charter: "parent", parentId: "root", model: "claude-sonnet-5" });
-    const child = mesh.spawn({ charter: "child", parentId: parent, model: "claude-sonnet-5" });
+    const parent = mesh.spawn({
+      charter: "parent",
+      parentId: "root",
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+    });
+    const child = mesh.spawn({
+      charter: "child",
+      parentId: parent,
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+    });
     const sibling = mesh.spawn({ charter: "sibling", parentId: "root" });
 
     // Parent can stage a child's model. The child is idle, so the staged
-    // model stays pending until its next dispatch (triggered below by
+    // pool stays pending until its next dispatch (triggered below by
     // sendMessage), where it applies before that run's run_start.
-    mesh.setActorModel(child, "claude-opus-4-8", parent);
-    expect(registry.get(child)?.model).toBe("claude-sonnet-5");
-    expect(registry.get(child)?.desiredModel).toBe("claude-opus-4-8");
+    mesh.setActorModel(child, { provider: "claude", model: "claude-opus-4-8" }, parent);
+    expect(registry.get(child)?.modelConfig?.[0]?.model).toBe("claude-sonnet-5");
+    expect(registry.get(child)?.desiredModelConfig?.[0]?.model).toBe("claude-opus-4-8");
     expect(modelSets).toEqual([]);
     mesh.sendMessage(child, "apply staged model", parent);
     await tick();
-    expect(registry.get(child)?.model).toBe("claude-opus-4-8");
-    expect(registry.get(child)?.desiredModel).toBeUndefined();
+    expect(registry.get(child)?.modelConfig?.[0]?.model).toBe("claude-opus-4-8");
+    expect(registry.get(child)?.desiredModelConfig).toBeUndefined();
     expect(modelSets).toEqual([{ actorId: child, newModel: "claude-opus-4-8" }]);
     expect(events).toContainEqual(
       expect.objectContaining({
         kind: "actor_model_set",
         actorId: child,
 
-        detail: "claude-sonnet-5 -> claude-opus-4-8",
+        detail: "claude:claude-sonnet-5 -> claude:claude-opus-4-8",
       })
     );
 
     // Root can stage any child's model under the same boundary rule.
-    mesh.setActorModel(parent, "gemini-3.1-pro", "root");
-    expect(registry.get(parent)?.model).toBe("claude-sonnet-5");
+    mesh.setActorModel(parent, { provider: "claude", model: "gemini-3.1-pro" }, "root");
+    expect(registry.get(parent)?.modelConfig?.[0]?.model).toBe("claude-sonnet-5");
     mesh.sendMessage(parent, "apply staged model", "root");
     await tick();
-    expect(registry.get(parent)?.model).toBe("gemini-3.1-pro");
+    expect(registry.get(parent)?.modelConfig?.[0]?.model).toBe("gemini-3.1-pro");
 
     // An actor cannot set its own model (tier-raising guard)
-    expect(() => mesh.setActorModel(child, "claude-opus-4-8", child)).toThrow(
-      /cannot set its own model/
-    );
+    expect(() =>
+      mesh.setActorModel(child, { provider: "claude", model: "claude-opus-4-8" }, child)
+    ).toThrow(/cannot set its own model/);
 
     // Sibling cannot set model on another thread
-    expect(() => mesh.setActorModel(child, "claude-opus-4-8", sibling)).toThrow(/not an ancestor/);
+    expect(() =>
+      mesh.setActorModel(child, { provider: "claude", model: "claude-opus-4-8" }, sibling)
+    ).toThrow(/not an ancestor/);
 
-    // Refuses empty/whitespace model
-    expect(() => mesh.setActorModel(child, "   ", parent)).toThrow(/empty model/);
-
-    // Throws on unknown thread
-    expect(() => mesh.setActorModel("non-existent", "claude-opus-4-8", "root")).toThrow(
-      /unknown thread/
+    // Refuses an empty/whitespace modelConfig pool
+    expect(() => mesh.setActorModel(child, { provider: "claude", model: "   " }, parent)).toThrow(
+      /empty modelConfig/
     );
 
+    // Throws on unknown thread
+    expect(() =>
+      mesh.setActorModel("non-existent", { provider: "claude", model: "claude-opus-4-8" }, "root")
+    ).toThrow(/unknown thread/);
+
     // Validation hook failure aborts before patching registry
-    expect(() => mesh.setActorModel(child, "forbidden-model", parent)).toThrow(/forbidden model/);
-    expect(registry.get(child)?.model).toBe("claude-opus-4-8");
+    expect(() =>
+      mesh.setActorModel(child, { provider: "claude", model: "forbidden-model" }, parent)
+    ).toThrow(/forbidden model/);
+    expect(registry.get(child)?.modelConfig?.[0]?.model).toBe("claude-opus-4-8");
   });
 
   it("persists, updates, and clears effort independently at run boundaries", async () => {
     const events: MeshEventInput[] = [];
-    const validations: Array<{ model?: string; effort?: string | null }> = [];
+    const validations: Array<{ model?: string; effort?: string }> = [];
     const { mesh, registry, tick } = setup({
       events: (event) => events.push(event),
-      validateModel: (_record, model, _provider, effort) => {
-        validations.push({ model, effort });
-        return { model, effort: effort ?? undefined };
+      validateModel: (_record, modelConfig) => {
+        const list = Array.isArray(modelConfig) ? modelConfig : [modelConfig];
+        return list.map((entry) => {
+          validations.push({ model: entry.model, effort: entry.effort });
+          return { provider: entry.provider, model: entry.model, effort: entry.effort };
+        });
       },
     });
     const child = mesh.spawn({
       charter: "codex child",
       parentId: "root",
-      provider: "codex",
-      model: "gpt-5.6-sol high",
+      modelConfig: { provider: "codex", model: "gpt-5.6-sol", effort: "high" },
     });
-    expect(registry.get(child)).toMatchObject({
-      model: "gpt-5.6-sol",
-      effort: "high",
-    });
+    expect(registry.get(child)?.modelConfig).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol", effort: "high" },
+    ]);
 
-    mesh.setActorModel(child, undefined, "root", undefined, "xhigh");
-    expect(registry.get(child)?.effort).toBe("high");
-    expect(registry.get(child)?.desiredEffort).toBe("xhigh");
+    // A complete-object effort-only change: same provider/model, new effort.
+    mesh.setActorModel(child, { provider: "codex", model: "gpt-5.6-sol", effort: "xhigh" }, "root");
+    expect(registry.get(child)?.modelConfig?.[0]?.effort).toBe("high");
+    expect(registry.get(child)?.desiredModelConfig?.[0]?.effort).toBe("xhigh");
     mesh.sendMessage(child, "apply effort", "root");
     await tick();
-    expect(registry.get(child)?.effort).toBe("xhigh");
-    expect(registry.get(child)?.desiredEffort).toBeUndefined();
+    expect(registry.get(child)?.modelConfig?.[0]?.effort).toBe("xhigh");
+    expect(registry.get(child)?.desiredModelConfig).toBeUndefined();
     expect(validations).toContainEqual({ model: "gpt-5.6-sol", effort: "xhigh" });
     expect(events).toContainEqual(
       expect.objectContaining({
         kind: "actor_model_set",
         actorId: child,
-        detail: "gpt-5.6-sol @ high -> gpt-5.6-sol @ xhigh",
+        detail: "codex:gpt-5.6-sol @ high -> codex:gpt-5.6-sol @ xhigh",
       })
     );
 
-    mesh.setActorModel(child, undefined, "root", undefined, null);
-    expect(registry.get(child)?.desiredEffort).toBeNull();
+    // Omitting effort in the complete replacement restores the provider/model default.
+    mesh.setActorModel(child, { provider: "codex", model: "gpt-5.6-sol" }, "root");
+    expect(registry.get(child)?.desiredModelConfig?.[0]?.effort).toBeUndefined();
     mesh.sendMessage(child, "restore provider default", "root");
     await tick();
-    expect(registry.get(child)?.effort).toBeUndefined();
-    expect(registry.get(child)?.desiredEffort).toBeUndefined();
+    expect(registry.get(child)?.modelConfig?.[0]?.effort).toBeUndefined();
+    expect(registry.get(child)?.desiredModelConfig).toBeUndefined();
   });
 
   it("supports an effort-only update when the root uses its provider's default model", () => {
-    const validations: Array<{ model?: string; effort?: string | null }> = [];
+    const validations: Array<{ model?: string; effort?: string }> = [];
     const { mesh, registry } = setup({
-      validateModel: (_record, model, _provider, effort) => {
-        validations.push({ model, effort });
-        return { model, effort: effort ?? undefined };
+      validateModel: (_record, modelConfig) => {
+        const list = Array.isArray(modelConfig) ? modelConfig : [modelConfig];
+        return list.map((entry) => {
+          validations.push({ model: entry.model, effort: entry.effort });
+          return { provider: entry.provider, model: entry.model, effort: entry.effort };
+        });
       },
     });
-    registry.patch("root", { provider: "claude", model: undefined });
+    registry.patch("root", { modelConfig: [{ provider: "claude" }] });
 
-    mesh.setActorModel("root", undefined, "root", undefined, "high");
+    mesh.setActorModel("root", { provider: "claude", effort: "high" }, "root");
 
     expect(validations).toEqual([{ model: undefined, effort: "high" }]);
-    expect(registry.get("root")).toMatchObject({ desiredEffort: "high" });
-    expect(registry.get("root")?.desiredModel).toBeUndefined();
+    expect(registry.get("root")?.desiredModelConfig).toEqual([
+      { provider: "claude", effort: "high" },
+    ]);
   });
 
   it("lets only the root set its own portable model at its run boundary", () => {
     const events: MeshEventInput[] = [];
-    const modelSets: Array<{ actorId: string; newModel: string; record: ThreadRecord }> = [];
+    const modelSets: Array<{ actorId: string; newModel?: string; record: ThreadRecord }> = [];
     const { mesh, registry } = setup({
       events: (event) => events.push(event),
-      onModelSet: (actorId, newModel, record) => modelSets.push({ actorId, newModel, record }),
+      onModelSet: (actorId, modelConfig, record) =>
+        modelSets.push({ actorId, newModel: modelConfig[0]?.model, record }),
     });
     registry.patch("root", {
-      provider: "claude",
-      model: "claude-opus-4-8",
+      modelConfig: [{ provider: "claude", model: "claude-opus-4-8" }],
       context: { type: "portable", mode: "ledger" },
     });
-    const child = mesh.spawn({ charter: "child", parentId: "root" });
-
-    mesh.setActorModel("root", "gpt-5.6-sol", "root", "codex");
-
-    expect(registry.get("root")).toMatchObject({
-      provider: "claude",
-      model: "claude-opus-4-8",
-      desiredProvider: "codex",
-      desiredModel: "gpt-5.6-sol",
+    const child = mesh.spawn({
+      charter: "child",
+      parentId: "root",
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
     });
-    expect(() => mesh.setActorModel(child, "claude-opus-4-8", child)).toThrow(
-      /cannot set its own model/
-    );
+
+    mesh.setActorModel("root", { provider: "codex", model: "gpt-5.6-sol" }, "root");
+
+    expect(registry.get("root")?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8" },
+    ]);
+    expect(registry.get("root")?.desiredModelConfig).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol" },
+    ]);
+    expect(() =>
+      mesh.setActorModel(child, { provider: "claude", model: "claude-opus-4-8" }, child)
+    ).toThrow(/cannot set its own model/);
 
     mesh.finishInboxRun("root");
 
-    expect(registry.get("root")).toMatchObject({
-      provider: "codex",
-      model: "gpt-5.6-sol",
-    });
-    expect(registry.get("root")?.desiredProvider).toBeUndefined();
-    expect(registry.get("root")?.desiredModel).toBeUndefined();
+    expect(registry.get("root")?.modelConfig).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol" },
+    ]);
+    expect(registry.get("root")?.desiredModelConfig).toBeUndefined();
     expect(modelSets).toEqual([
       {
         actorId: "root",
         newModel: "gpt-5.6-sol",
-        record: expect.objectContaining({ provider: "codex", model: "gpt-5.6-sol" }),
+        record: expect.objectContaining({
+          modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
+        }),
       },
     ]);
     expect(events).toContainEqual(
@@ -3098,17 +3124,21 @@ describe("ActorMesh", () => {
     const validations: Array<{ recordId: string; newModel?: string; newProvider?: string }> = [];
     const { mesh, registry, tick } = setup({
       events: (event) => events.push(event),
-      validateModel: (record, newModel, newProvider, newEffort) => {
-        validations.push({ recordId: record.id, newModel, newProvider });
-        if (newProvider === "antigravity" && newModel === "invalid-model") {
-          throw new Error("invalid model for antigravity");
-        }
-        const sel = normalizeModelEffortSelection(
-          (newProvider ?? record.provider) as string,
-          newModel,
-          newEffort
-        );
-        return { model: sel.model, effort: sel.effort };
+      validateModel: (record, modelConfig) => {
+        const list = Array.isArray(modelConfig) ? modelConfig : [modelConfig];
+        return list.map((entry) => {
+          const provider = entry.provider ?? record.modelConfig?.[0]?.provider;
+          validations.push({
+            recordId: record.id,
+            newModel: entry.model,
+            newProvider: entry.provider,
+          });
+          if (provider === "antigravity" && entry.model === "invalid-model") {
+            throw new Error("invalid model for antigravity");
+          }
+          const sel = normalizeModelEffortSelection(provider as string, entry.model, entry.effort);
+          return { provider: provider as string, model: sel.model, effort: sel.effort };
+        });
       },
     });
 
@@ -3116,25 +3146,29 @@ describe("ActorMesh", () => {
     const ledgerChild = mesh.spawn({
       charter: "ledger child",
       parentId: "root",
-      provider: "claude",
-      model: "claude-opus-4-8",
+      modelConfig: { provider: "claude", model: "claude-opus-4-8" },
       context: { type: "portable", mode: "ledger" },
     });
-    mesh.setActorModel(ledgerChild, "gemini-3.7-flash-high", "root", "antigravity");
-    expect(registry.get(ledgerChild)?.provider).toBe("claude");
-    expect(registry.get(ledgerChild)?.model).toBe("claude-opus-4-8");
-    expect(registry.get(ledgerChild)?.desiredProvider).toBe("antigravity");
-    expect(registry.get(ledgerChild)?.desiredModel).toBe("gemini-3.7-flash");
-    expect(registry.get(ledgerChild)?.desiredEffort).toBe("high");
+    mesh.setActorModel(
+      ledgerChild,
+      { provider: "antigravity", model: "gemini-3.7-flash-high" },
+      "root"
+    );
+    expect(registry.get(ledgerChild)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8" },
+    ]);
+    expect(registry.get(ledgerChild)?.desiredModelConfig).toEqual([
+      { provider: "antigravity", model: "gemini-3.7-flash", effort: "high" },
+    ]);
     mesh.sendMessage(ledgerChild, "apply staged provider", "root");
     await tick();
-    expect(registry.get(ledgerChild)?.provider).toBe("antigravity");
-    expect(registry.get(ledgerChild)?.model).toBe("gemini-3.7-flash");
-    expect(registry.get(ledgerChild)?.effort).toBe("high");
-    expect(registry.get(ledgerChild)?.desiredModel).toBeUndefined();
+    expect(registry.get(ledgerChild)?.modelConfig).toEqual([
+      { provider: "antigravity", model: "gemini-3.7-flash", effort: "high" },
+    ]);
+    expect(registry.get(ledgerChild)?.desiredModelConfig).toBeUndefined();
     expect(validations).toContainEqual({
       recordId: ledgerChild,
-      newModel: "gemini-3.7-flash",
+      newModel: "gemini-3.7-flash-high",
       newProvider: "antigravity",
     });
     expect(events).toContainEqual(
@@ -3149,71 +3183,80 @@ describe("ActorMesh", () => {
     const tailChild = mesh.spawn({
       charter: "tail child",
       parentId: "root",
-      provider: "claude",
-      model: "claude-sonnet-5",
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
       context: { type: "portable", mode: "tail" },
     });
-    mesh.setActorModel(tailChild, "gpt-5.6-sol", "root", "codex");
-    expect(registry.get(tailChild)?.provider).toBe("claude");
-    expect(registry.get(tailChild)?.model).toBe("claude-sonnet-5");
+    mesh.setActorModel(tailChild, { provider: "codex", model: "gpt-5.6-sol" }, "root");
+    expect(registry.get(tailChild)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-sonnet-5" },
+    ]);
     mesh.sendMessage(tailChild, "apply staged provider", "root");
     await tick();
-    expect(registry.get(tailChild)?.provider).toBe("codex");
-    expect(registry.get(tailChild)?.model).toBe("gpt-5.6-sol");
+    expect(registry.get(tailChild)?.modelConfig).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol" },
+    ]);
 
     // 3. Validation failure aborts cross-provider move
-    expect(() => mesh.setActorModel(ledgerChild, "invalid-model", "root", "antigravity")).toThrow(
-      /invalid model for antigravity/
-    );
-    expect(registry.get(ledgerChild)?.model).toBe("gemini-3.7-flash");
+    expect(() =>
+      mesh.setActorModel(ledgerChild, { provider: "antigravity", model: "invalid-model" }, "root")
+    ).toThrow(/invalid model for antigravity/);
+    expect(registry.get(ledgerChild)?.modelConfig?.[0]?.model).toBe("gemini-3.7-flash");
 
     // 4. Non-portable (native context) actor rejects provider move
     const nativeChild = mesh.spawn({
       charter: "native child",
       parentId: "root",
-      provider: "claude",
-      model: "claude-sonnet-5",
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
       context: { type: "native" },
     });
     expect(() =>
-      mesh.setActorModel(nativeChild, "gemini-3.7-flash-high", "root", "antigravity")
+      mesh.setActorModel(
+        nativeChild,
+        { provider: "antigravity", model: "gemini-3.7-flash-high" },
+        "root"
+      )
     ).toThrow(/Cannot change provider on non-portable actor/);
-    expect(registry.get(nativeChild)?.provider).toBe("claude");
-    expect(registry.get(nativeChild)?.model).toBe("claude-sonnet-5");
+    expect(registry.get(nativeChild)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-sonnet-5" },
+    ]);
 
     // 5. Default context (implicit native) rejects provider move
     const defaultContextChild = mesh.spawn({
       charter: "default child",
       parentId: "root",
-      provider: "claude",
-      model: "claude-sonnet-5",
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
     });
     expect(() =>
-      mesh.setActorModel(defaultContextChild, "gemini-3.7-flash-high", "root", "antigravity")
+      mesh.setActorModel(
+        defaultContextChild,
+        { provider: "antigravity", model: "gemini-3.7-flash-high" },
+        "root"
+      )
     ).toThrow(/Cannot change provider on non-portable actor/);
 
     // 6. Native actor accepts model update when explicit provider equals existing provider
-    mesh.setActorModel(nativeChild, "claude-opus-4-8", "root", "claude");
-    expect(registry.get(nativeChild)?.model).toBe("claude-sonnet-5");
+    mesh.setActorModel(nativeChild, { provider: "claude", model: "claude-opus-4-8" }, "root");
+    expect(registry.get(nativeChild)?.modelConfig?.[0]?.model).toBe("claude-sonnet-5");
     mesh.sendMessage(nativeChild, "apply staged model", "root");
     await tick();
-    expect(registry.get(nativeChild)?.provider).toBe("claude");
-    expect(registry.get(nativeChild)?.model).toBe("claude-opus-4-8");
+    expect(registry.get(nativeChild)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8" },
+    ]);
 
     // 7. Defers model/provider changes while actor is running; applies at run end
     const { provider: deferredRunProvider, releaseAll: releaseDeferred } = deferredProvider();
-    const modelSetCalls: Array<{ actorId: string; newModel: string; record: ThreadRecord }> = [];
+    const modelSetCalls: Array<{ actorId: string; newModel?: string; record: ThreadRecord }> = [];
     const busyMeshSetup = setup({
       sharedProvider: deferredRunProvider,
       events: (event) => events.push(event),
-      onModelSet: (actorId, newModel, record) => modelSetCalls.push({ actorId, newModel, record }),
+      onModelSet: (actorId, modelConfig, record) =>
+        modelSetCalls.push({ actorId, newModel: modelConfig[0]?.model, record }),
     });
 
     const busyChild = busyMeshSetup.mesh.spawn({
       charter: "busy child",
       parentId: "root",
-      provider: "claude",
-      model: "claude-opus-4-8",
+      modelConfig: { provider: "claude", model: "claude-opus-4-8" },
       context: { type: "portable", mode: "ledger" },
     });
 
@@ -3222,38 +3265,51 @@ describe("ActorMesh", () => {
     await busyMeshSetup.tick();
     expect(busyMeshSetup.mesh.activeRunState(busyChild)?.phase).toBe("running");
 
-    // setActorModel does NOT reject when running; persists desiredModel/desiredProvider
-    busyMeshSetup.mesh.setActorModel(busyChild, "gemini-3.7-flash-high", "root", "antigravity");
-    expect(busyMeshSetup.registry.get(busyChild)?.model).toBe("claude-opus-4-8");
-    expect(busyMeshSetup.registry.get(busyChild)?.provider).toBe("claude");
-    expect(busyMeshSetup.registry.get(busyChild)?.desiredModel).toBe("gemini-3.7-flash");
-    expect(busyMeshSetup.registry.get(busyChild)?.desiredProvider).toBe("antigravity");
+    // setActorModel does NOT reject when running; persists desiredModelConfig
+    busyMeshSetup.mesh.setActorModel(
+      busyChild,
+      { provider: "antigravity", model: "gemini-3.7-flash", effort: "high" },
+      "root"
+    );
+    expect(busyMeshSetup.registry.get(busyChild)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8" },
+    ]);
+    expect(busyMeshSetup.registry.get(busyChild)?.desiredModelConfig).toEqual([
+      { provider: "antigravity", model: "gemini-3.7-flash", effort: "high" },
+    ]);
     expect(modelSetCalls).toHaveLength(0);
 
     // Overwrite test (last-write-wins before boundary)
-    busyMeshSetup.mesh.setActorModel(busyChild, "gpt-5.6-sol", "root", "codex");
-    expect(busyMeshSetup.registry.get(busyChild)?.desiredModel).toBe("gpt-5.6-sol");
-    expect(busyMeshSetup.registry.get(busyChild)?.desiredProvider).toBe("codex");
+    busyMeshSetup.mesh.setActorModel(
+      busyChild,
+      { provider: "codex", model: "gpt-5.6-sol" },
+      "root"
+    );
+    expect(busyMeshSetup.registry.get(busyChild)?.desiredModelConfig).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol" },
+    ]);
 
     // Complete the in-flight run; deferred model is applied at the run end boundary
     releaseDeferred();
     await busyMeshSetup.tick();
-    expect(busyMeshSetup.registry.get(busyChild)?.model).toBe("gpt-5.6-sol");
-    expect(busyMeshSetup.registry.get(busyChild)?.provider).toBe("codex");
-    expect(busyMeshSetup.registry.get(busyChild)?.desiredModel).toBeUndefined();
-    expect(busyMeshSetup.registry.get(busyChild)?.desiredProvider).toBeUndefined();
+    expect(busyMeshSetup.registry.get(busyChild)?.modelConfig).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol" },
+    ]);
+    expect(busyMeshSetup.registry.get(busyChild)?.desiredModelConfig).toBeUndefined();
     expect(modelSetCalls).toContainEqual(
       expect.objectContaining({
         actorId: busyChild,
         newModel: "gpt-5.6-sol",
-        record: expect.objectContaining({ model: "gpt-5.6-sol", provider: "codex" }),
+        record: expect.objectContaining({
+          modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
+        }),
       })
     );
     expect(events).toContainEqual(
       expect.objectContaining({
         kind: "actor_model_set",
         actorId: busyChild,
-        detail: "claude:claude-opus-4-8 -> codex:gpt-5.6-sol @ high",
+        detail: "claude:claude-opus-4-8 -> codex:gpt-5.6-sol",
       })
     );
 
@@ -3264,17 +3320,18 @@ describe("ActorMesh", () => {
       maxConcurrent: 1,
       sharedProvider: queuedDeferred.provider,
       events: (event) => events.push(event),
-      onModelSet: (actorId, newModel, record) => modelSetCalls.push({ actorId, newModel, record }),
+      onModelSet: (actorId, modelConfig, record) =>
+        modelSetCalls.push({ actorId, newModel: modelConfig[0]?.model, record }),
     });
     const blocker = queuedMeshSetup.mesh.spawn({
       charter: "blocker",
       parentId: "root",
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
     });
     const queuedChild = queuedMeshSetup.mesh.spawn({
       charter: "queued child",
       parentId: "root",
-      provider: "claude",
-      model: "claude-sonnet-5",
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
       context: { type: "portable", mode: "ledger" },
     });
     queuedMeshSetup.mesh.sendMessage(blocker, "hold the slot", "root");
@@ -3285,9 +3342,17 @@ describe("ActorMesh", () => {
     await queuedMeshSetup.tick();
     expect(queuedMeshSetup.mesh.activeRunState(queuedChild)?.phase).toBe("queued");
 
-    queuedMeshSetup.mesh.setActorModel(queuedChild, "claude-opus-4-8", "root");
-    expect(queuedMeshSetup.registry.get(queuedChild)?.model).toBe("claude-sonnet-5");
-    expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModel).toBe("claude-opus-4-8");
+    queuedMeshSetup.mesh.setActorModel(
+      queuedChild,
+      { provider: "claude", model: "claude-opus-4-8" },
+      "root"
+    );
+    expect(queuedMeshSetup.registry.get(queuedChild)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-sonnet-5" },
+    ]);
+    expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8" },
+    ]);
 
     // Releasing the blocker admits the queued run. Per #199, a tuple staged
     // while queued is applied at THIS dispatch — before the queued run's own
@@ -3295,13 +3360,15 @@ describe("ActorMesh", () => {
     queuedDeferred.releaseAll();
     await queuedMeshSetup.tick();
     expect(queuedMeshSetup.mesh.activeRunState(queuedChild)?.phase).toBe("running");
-    expect(queuedMeshSetup.registry.get(queuedChild)?.model).toBe("claude-opus-4-8");
-    expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModel).toBeUndefined();
+    expect(queuedMeshSetup.registry.get(queuedChild)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8" },
+    ]);
+    expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModelConfig).toBeUndefined();
     expect(events).toContainEqual(
       expect.objectContaining({
         kind: "actor_model_set",
         actorId: queuedChild,
-        detail: "claude-sonnet-5 -> claude-opus-4-8",
+        detail: "claude:claude-sonnet-5 -> claude:claude-opus-4-8",
       })
     );
 
@@ -3309,8 +3376,10 @@ describe("ActorMesh", () => {
     // with; nothing further is staged, so this release is a plain run end.
     queuedDeferred.releaseAll();
     await queuedMeshSetup.tick();
-    expect(queuedMeshSetup.registry.get(queuedChild)?.model).toBe("claude-opus-4-8");
-    expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModel).toBeUndefined();
+    expect(queuedMeshSetup.registry.get(queuedChild)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8" },
+    ]);
+    expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModelConfig).toBeUndefined();
 
     // 8. Dynamic provider halt check: moved actor obeys new provider's halt state on wake
     let providerBExecuted = false;
@@ -3328,30 +3397,72 @@ describe("ActorMesh", () => {
         return { success: true, exitCode: 0, output: "b" };
       },
     };
+    const providerByName = new Map<string, CodingProvider>([["provider-a", mockProviderA]]);
+    let dynamicMesh!: ActorMesh;
     const dynamicMeshSetup = setup({
-      sharedProvider: mockProviderA,
       isHalted: (p) => p === haltedProvider,
-      onModelSet: (actorId, _newModel, record) => {
-        const live = dynamicMeshSetup.mesh.get(actorId);
-        if (live && record.provider === "provider-b") {
-          live.setProvider?.(mockProviderB);
+      onModelSet: (actorId, modelConfig) => {
+        if (modelConfig[0]?.provider === "provider-b") {
+          providerByName.set("provider-b", mockProviderB);
         }
+        // Production onModelSet wiring adopts the staged pool on the live actor;
+        // ActorMesh itself never calls setModelConfig (see Actor.setModelConfig doc).
+        dynamicMesh.get(actorId)?.setModelConfig?.(modelConfig);
+      },
+      createActor: (ctx) => {
+        let actor!: Actor;
+        actor = new Actor({
+          id: ctx.record.id,
+          cwd: `/tmp/${ctx.record.id}`,
+          modelConfig: ctx.record.modelConfig ?? [{ provider: "provider-a" }],
+          resolveProvider: (config) => {
+            const base = providerByName.get(config.provider);
+            if (!base) throw new Error(`no provider registered for ${config.provider}`);
+            return {
+              ...base,
+              run: async (runOpts) => {
+                const result = await base.run(runOpts);
+                if (result.success) actor.declareYield();
+                return result;
+              },
+            };
+          },
+          mcpServers: [],
+          loadSessionId: () => ctx.getRecord()?.sessionId,
+          saveSessionId: (id) => ctx.mesh.registry.patch(ctx.record.id, { sessionId: id }),
+          buildPrompt: () => ({ prompt: "Work from your inbox." }),
+          gate: ctx.gate,
+          beforeRun: ctx.beforeRun,
+          onQueued: ctx.onQueued,
+          onRunEnd: ctx.onRunEnd,
+          onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+          debounceMs: DEBOUNCE,
+        });
+        return actor;
       },
     });
+    dynamicMesh = dynamicMeshSetup.mesh;
     const movingWorker = dynamicMeshSetup.mesh.spawn({
       charter: "moving worker",
       parentId: "root",
-      provider: "provider-a",
-      model: "model-a",
+      modelConfig: { provider: "provider-a", model: "model-a" },
       context: { type: "portable", mode: "ledger" },
     });
     // Move to provider-b
-    dynamicMeshSetup.mesh.setActorModel(movingWorker, "model-b", "root", "provider-b");
-    expect(dynamicMeshSetup.registry.get(movingWorker)?.provider).toBe("provider-a");
+    dynamicMeshSetup.mesh.setActorModel(
+      movingWorker,
+      { provider: "provider-b", model: "model-b" },
+      "root"
+    );
+    expect(dynamicMeshSetup.registry.get(movingWorker)?.modelConfig?.[0]?.provider).toBe(
+      "provider-a"
+    );
     dynamicMeshSetup.mesh.sendMessage(movingWorker, "apply staged provider", "root");
     await dynamicMeshSetup.tick();
-    expect(dynamicMeshSetup.registry.get(movingWorker)?.provider).toBe("provider-b");
-    // Per #199, the staged provider applies at THIS dispatch (movingWorker was
+    expect(dynamicMeshSetup.registry.get(movingWorker)?.modelConfig?.[0]?.provider).toBe(
+      "provider-b"
+    );
+    // Per #199, the staged pool applies at THIS dispatch (movingWorker was
     // idle when staged), so this very run already launched on provider-b.
     expect(providerBExecuted).toBe(true);
     providerBExecuted = false;
@@ -3372,8 +3483,8 @@ describe("ActorMesh", () => {
   // #199: a tuple staged while an actor is queued/idle must apply at that
   // actor's next dispatch (before run_start / provider launch), not at the
   // end of the run it happens to land in.
-  describe("setActorModel dispatch-time boundary (#199)", () => {
-    it("applies a tuple staged while idle to the very next run, before that run's provider launch", async () => {
+  describe("setActorModel dispatch-time boundary (#199, extended to pools)", () => {
+    it("applies a pool staged while idle to the very next run, before that run's provider launch", async () => {
       const events: MeshEventInput[] = [];
       const seenModelAtRunStart: string[] = [];
       const { mesh, registry, tick } = setup({
@@ -3382,7 +3493,7 @@ describe("ActorMesh", () => {
           name: "test-provider",
           providerName: "test-provider",
           run: async () => {
-            seenModelAtRunStart.push(registry.get(worker)?.model ?? "");
+            seenModelAtRunStart.push(registry.get(worker)?.modelConfig?.[0]?.model ?? "");
             return { success: true, exitCode: 0, output: "ok" };
           },
         },
@@ -3391,31 +3502,30 @@ describe("ActorMesh", () => {
       const worker = mesh.spawn({
         charter: "worker",
         parentId: "root",
-        provider: "test-provider",
-        model: "model-a",
+        modelConfig: { provider: "test-provider", model: "model-a" },
         context: { type: "portable", mode: "ledger" },
       });
 
       // Idle, no unhandled inbox: staging must not itself dispatch anything.
-      mesh.setActorModel(worker, "model-b", "root");
+      mesh.setActorModel(worker, { provider: "test-provider", model: "model-b" }, "root");
       expect(mesh.activeRunState(worker)).toBeNull();
-      expect(registry.get(worker)?.model).toBe("model-a");
-      expect(registry.get(worker)?.desiredModel).toBe("model-b");
+      expect(registry.get(worker)?.modelConfig?.[0]?.model).toBe("model-a");
+      expect(registry.get(worker)?.desiredModelConfig?.[0]?.model).toBe("model-b");
 
       // The next dispatch (a fresh message) must already run on the staged
-      // model — the run body itself observes "model-b", not "model-a".
+      // pool — the run body itself observes "model-b", not "model-a".
       mesh.sendMessage(worker, "work", "root");
       await tick();
 
       expect(seenModelAtRunStart).toEqual(["model-b"]);
-      expect(registry.get(worker)?.model).toBe("model-b");
-      expect(registry.get(worker)?.desiredModel).toBeUndefined();
+      expect(registry.get(worker)?.modelConfig?.[0]?.model).toBe("model-b");
+      expect(registry.get(worker)?.desiredModelConfig).toBeUndefined();
       expect(events).toContainEqual(
         expect.objectContaining({ kind: "actor_model_set", actorId: worker })
       );
     });
 
-    it("applies a tuple staged while queued to that same queued run, before it launches", async () => {
+    it("applies a pool staged while queued to that same queued run, before it launches", async () => {
       const seenModelAtRunStart: string[] = [];
       const deferred = deferredProvider();
       const { mesh, registry, tick } = setup({
@@ -3425,7 +3535,7 @@ describe("ActorMesh", () => {
           providerName: "deferred",
           run: async (opts) => {
             if (opts.cwd === `/tmp/${worker}`) {
-              seenModelAtRunStart.push(registry.get(worker)?.model ?? "");
+              seenModelAtRunStart.push(registry.get(worker)?.modelConfig?.[0]?.model ?? "");
             }
             return deferred.provider.run(opts);
           },
@@ -3436,8 +3546,7 @@ describe("ActorMesh", () => {
       const worker = mesh.spawn({
         charter: "worker",
         parentId: "root",
-        provider: "deferred",
-        model: "model-a",
+        modelConfig: { provider: "deferred", model: "model-a" },
         context: { type: "portable", mode: "ledger" },
       });
 
@@ -3450,23 +3559,23 @@ describe("ActorMesh", () => {
       expect(mesh.activeRunState(worker)?.phase).toBe("queued");
 
       // Re-pin while queued, still behind the blocker.
-      mesh.setActorModel(worker, "model-b", "root");
-      expect(registry.get(worker)?.model).toBe("model-a");
-      expect(registry.get(worker)?.desiredModel).toBe("model-b");
+      mesh.setActorModel(worker, { provider: "deferred", model: "model-b" }, "root");
+      expect(registry.get(worker)?.modelConfig?.[0]?.model).toBe("model-a");
+      expect(registry.get(worker)?.desiredModelConfig?.[0]?.model).toBe("model-b");
 
       // Admit the queued run: its own body must already see "model-b".
       deferred.releaseAll();
       await tick();
       expect(mesh.activeRunState(worker)?.phase).toBe("running");
       expect(seenModelAtRunStart).toEqual(["model-b"]);
-      expect(registry.get(worker)?.model).toBe("model-b");
-      expect(registry.get(worker)?.desiredModel).toBeUndefined();
+      expect(registry.get(worker)?.modelConfig?.[0]?.model).toBe("model-b");
+      expect(registry.get(worker)?.desiredModelConfig).toBeUndefined();
 
       deferred.releaseAll();
       await tick();
     });
 
-    it("keeps an in-flight run on its already-launched tuple; only the following run picks up the staged one", async () => {
+    it("keeps an in-flight run on its already-launched pool; only the following run picks up the staged one", async () => {
       const seenModelAtRunStart: string[] = [];
       const deferred = deferredProvider();
       const { mesh, registry, tick } = setup({
@@ -3474,7 +3583,7 @@ describe("ActorMesh", () => {
           name: "deferred",
           providerName: "deferred",
           run: async (opts) => {
-            seenModelAtRunStart.push(registry.get(worker)?.model ?? "");
+            seenModelAtRunStart.push(registry.get(worker)?.modelConfig?.[0]?.model ?? "");
             return deferred.provider.run(opts);
           },
         },
@@ -3483,8 +3592,7 @@ describe("ActorMesh", () => {
       const worker = mesh.spawn({
         charter: "worker",
         parentId: "root",
-        provider: "deferred",
-        model: "model-a",
+        modelConfig: { provider: "deferred", model: "model-a" },
         context: { type: "portable", mode: "ledger" },
       });
 
@@ -3494,14 +3602,14 @@ describe("ActorMesh", () => {
       expect(seenModelAtRunStart).toEqual(["model-a"]);
 
       // Staged mid-flight: must not disturb the run already underway.
-      mesh.setActorModel(worker, "model-b", "root");
-      expect(registry.get(worker)?.model).toBe("model-a");
+      mesh.setActorModel(worker, { provider: "deferred", model: "model-b" }, "root");
+      expect(registry.get(worker)?.modelConfig?.[0]?.model).toBe("model-a");
 
       deferred.releaseAll();
       await tick();
       expect(mesh.activeRunState(worker)).toBeNull();
-      expect(registry.get(worker)?.model).toBe("model-b");
-      expect(registry.get(worker)?.desiredModel).toBeUndefined();
+      expect(registry.get(worker)?.modelConfig?.[0]?.model).toBe("model-b");
+      expect(registry.get(worker)?.desiredModelConfig).toBeUndefined();
 
       // The following run is the first to actually execute on "model-b".
       mesh.sendMessage(worker, "run 2", "root");
@@ -3512,7 +3620,7 @@ describe("ActorMesh", () => {
       await tick();
     });
 
-    it("emits actor_model_set at the applying dispatch, not when the tuple is merely staged", async () => {
+    it("emits actor_model_set at the applying dispatch, not when the pool is merely staged", async () => {
       const trace: string[] = [];
       const { mesh, tick } = setup({
         events: (event) => {
@@ -3531,12 +3639,11 @@ describe("ActorMesh", () => {
       const worker = mesh.spawn({
         charter: "worker",
         parentId: "root",
-        provider: "test-provider",
-        model: "model-a",
+        modelConfig: { provider: "test-provider", model: "model-a" },
         context: { type: "portable", mode: "ledger" },
       });
 
-      mesh.setActorModel(worker, "model-b", "root");
+      mesh.setActorModel(worker, { provider: "test-provider", model: "model-b" }, "root");
       expect(trace).toEqual([]); // no event yet: nothing has been applied
 
       mesh.sendMessage(worker, "work", "root");
@@ -3546,7 +3653,7 @@ describe("ActorMesh", () => {
       expect(trace).toEqual([`event:${worker}`, "run-body"]);
     });
 
-    it("re-pinning an idle actor with unhandled inbox dispatches exactly one run, already on the new tuple", async () => {
+    it("re-pinning an idle actor with unhandled inbox dispatches exactly one run, already on the new pool", async () => {
       let runCount = 0;
       const seenModelAtRunStart: string[] = [];
       const { mesh, registry, tick } = setup({
@@ -3557,7 +3664,7 @@ describe("ActorMesh", () => {
           providerName: "test-provider",
           run: async () => {
             runCount++;
-            seenModelAtRunStart.push(registry.get(worker)?.model ?? "");
+            seenModelAtRunStart.push(registry.get(worker)?.modelConfig?.[0]?.model ?? "");
             if (runCount === 1) return { success: false, exitCode: 1, output: "failed" };
             return { success: true, exitCode: 0, output: "ok" };
           },
@@ -3567,8 +3674,7 @@ describe("ActorMesh", () => {
       const worker = mesh.spawn({
         charter: "worker",
         parentId: "root",
-        provider: "test-provider",
-        model: "model-a",
+        modelConfig: { provider: "test-provider", model: "model-a" },
         context: { type: "portable", mode: "ledger" },
       });
 
@@ -3578,26 +3684,40 @@ describe("ActorMesh", () => {
       expect(mesh.activeRunState(worker)).toBeNull(); // idle again, failed run left inbox unhandled
 
       // Re-pin: this is the #202 path (idle + unhandled inbox => immediate dispatch).
-      mesh.setActorModel(worker, "model-c", "root");
+      mesh.setActorModel(worker, { provider: "test-provider", model: "model-c" }, "root");
       await tick();
 
       // Exactly one new run — the re-pin dispatch itself, not a duplicate.
       expect(runCount).toBe(2);
       expect(seenModelAtRunStart).toEqual(["model-a", "model-c"]);
-      expect(registry.get(worker)?.model).toBe("model-c");
+      expect(registry.get(worker)?.modelConfig?.[0]?.model).toBe("model-c");
     });
   });
 
-  // #199 amend gap 2: `Actor.executeTurn` reads `this.opts.provider.providerName`
-  // once, before `gate()`, to pick a pacer lane. A provider staged while the
-  // request is genuinely queued behind mesh capacity must not launch (and
-  // charge the interval clock) under the stale lane it was submitted to.
-  describe("cross-provider swap while queued is gated under the new provider (#199 amend gap 2)", () => {
+  // #199 amend gap 2 (extended to pools): the gate reads `this.opts.modelConfig`
+  // once, before selecting a pacer lane. A pool staged while the request is
+  // genuinely queued behind mesh capacity must not launch (and charge the
+  // interval clock) under the stale lane it was submitted to.
+  describe("cross-provider swap while queued is gated under the new provider (#199 amend gap 2, extended to pools)", () => {
     it("a provider swap staged while genuinely queued behind mesh capacity launches under the new provider, never the old one", async () => {
       const providerARuns: string[] = [];
       const providerBRuns: string[] = [];
       const liveActors = new Map<string, Actor>();
       const blockerDeferred = deferredProvider();
+      const providerByName = new Map<string, CodingProvider>([
+        [
+          "provider-a",
+          {
+            name: "provider-a",
+            providerName: "provider-a",
+            run: async (runOpts) => {
+              providerARuns.push(runOpts.cwd);
+              liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
+              return { success: true, exitCode: 0, output: "a" };
+            },
+          },
+        ],
+      ]);
       const pacers = new Map<string, ProviderPacer>();
       const pacerFor = (name: string): ProviderPacer => {
         let pacer = pacers.get(name);
@@ -3610,10 +3730,9 @@ describe("ActorMesh", () => {
 
       const { mesh, registry, tick } = setup({
         maxConcurrent: 1,
-        onModelSet: (actorId, _newModel, record) => {
-          const live = mesh.get(actorId);
-          if (live && record.provider === "provider-b") {
-            live.setProvider?.({
+        onModelSet: (actorId, newModelConfig) => {
+          if (newModelConfig[0]?.provider === "provider-b" && !providerByName.has("provider-b")) {
+            providerByName.set("provider-b", {
               name: "provider-b",
               providerName: "provider-b",
               run: async (runOpts) => {
@@ -3623,49 +3742,50 @@ describe("ActorMesh", () => {
               },
             });
           }
+          mesh.get(actorId)?.setModelConfig?.(newModelConfig);
         },
         // Mirrors the production providerGate wiring in start.ts: one
         // ProviderPacer lane per provider, revalidated (via applyPendingModel)
         // right before a queued request would actually start.
-        providerGate: (fn, providerName, request) =>
-          pacerFor(providerName).submit(fn, {
+        providerGate: (fn, candidates, request) => {
+          const selected = candidates[0];
+          return pacerFor(selected.provider).submit(() => fn(selected), {
             responsive: request.responsive,
             threadId: request.threadId,
             enqueueNormal: request.enqueueNormal,
             revalidateProvider: request.threadId
               ? () => {
                   mesh.applyPendingModel(request.threadId as string);
-                  const live = mesh.get(request.threadId as string)?.getProvider?.();
+                  const live = registry.get(request.threadId as string)?.modelConfig?.[0];
                   if (!live) return true;
-                  return live.providerName === providerName;
+                  return live.provider === selected.provider;
                 }
               : undefined,
-          }),
+          });
+        },
         createActor: (ctx) => {
           let actor!: Actor;
           const isBlocker = ctx.record.charter === "blocker";
-          const provider: CodingProvider = isBlocker
-            ? {
-                ...blockerDeferred.provider,
-                run: async (runOpts) => {
-                  const result = await blockerDeferred.provider.run(runOpts);
-                  if (result.success) actor.declareYield();
-                  return result;
-                },
-              }
-            : {
-                name: "provider-a",
-                providerName: "provider-a",
-                run: async (runOpts) => {
-                  providerARuns.push(runOpts.cwd);
-                  actor.declareYield();
-                  return { success: true, exitCode: 0, output: "a" };
-                },
-              };
           actor = new Actor({
             id: ctx.record.id,
             cwd: `/tmp/${ctx.record.id}`,
-            provider,
+            modelConfig: isBlocker
+              ? [{ provider: "blocker" }]
+              : (ctx.record.modelConfig ?? [{ provider: "provider-a", model: "model-a" }]),
+            resolveProvider: isBlocker
+              ? () => ({
+                  ...blockerDeferred.provider,
+                  run: async (runOpts) => {
+                    const result = await blockerDeferred.provider.run(runOpts);
+                    if (result.success) actor.declareYield();
+                    return result;
+                  },
+                })
+              : (selected) => {
+                  const base = providerByName.get(selected.provider);
+                  if (!base) throw new Error(`no provider registered for ${selected.provider}`);
+                  return base;
+                },
             mcpServers: [],
             loadSessionId: () => ctx.getRecord()?.sessionId,
             saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
@@ -3673,7 +3793,6 @@ describe("ActorMesh", () => {
             gate: ctx.gate,
             beforeRun: ctx.beforeRun,
             onQueued: ctx.onQueued,
-            onRunStart: () => mesh.applyPendingModel(ctx.record.id),
             onRunEnd: (result) => ctx.onRunEnd(result),
             onRuntimeStateChanged: ctx.onRuntimeStateChanged,
             debounceMs: DEBOUNCE,
@@ -3687,8 +3806,7 @@ describe("ActorMesh", () => {
       const worker = mesh.spawn({
         charter: "worker",
         parentId: "root",
-        provider: "provider-a",
-        model: "model-a",
+        modelConfig: { provider: "provider-a", model: "model-a" },
         context: { type: "portable", mode: "ledger" },
       });
 
@@ -3704,15 +3822,15 @@ describe("ActorMesh", () => {
 
       // Stage the cross-provider swap while the request already sits in the
       // mesh queue — the exact race the retry/revalidation exists for.
-      mesh.setActorModel(worker, "model-b", "root", "provider-b");
-      expect(registry.get(worker)?.provider).toBe("provider-a");
+      mesh.setActorModel(worker, { provider: "provider-b", model: "model-b" }, "root");
+      expect(registry.get(worker)?.modelConfig?.[0]?.provider).toBe("provider-a");
 
       // Free the slot: the queued worker request is admitted for the first
       // time here, after the swap was staged.
       blockerDeferred.releaseAll();
       await tick();
 
-      expect(registry.get(worker)?.provider).toBe("provider-b");
+      expect(registry.get(worker)?.modelConfig?.[0]?.provider).toBe("provider-b");
       expect(providerBRuns).toEqual([`/tmp/${worker}`]);
       expect(providerARuns).toEqual([]);
     });
@@ -3725,13 +3843,27 @@ describe("ActorMesh", () => {
   // ticket — the only remaining choke point is the RunStartStaleProviderError
   // retry in `Actor.executeTurn`, which must re-check the halt gate (via
   // `beforeRun`) before resubmitting under the newly-live provider.
-  describe("cross-provider swap onto an already-halted provider while genuinely queued (#199 amend gap 3)", () => {
+  describe("cross-provider swap onto an already-halted provider while genuinely queued (#199 amend gap 3, extended to pools)", () => {
     it("never invokes the halted provider, leaves nothing active, and replays once on resume without a fresh external delivery", async () => {
       const providerARuns: string[] = [];
       const providerBRuns: string[] = [];
       const liveActors = new Map<string, Actor>();
       const blockerDeferred = deferredProvider();
       const halted = new Set<string>();
+      const providerByName = new Map<string, CodingProvider>([
+        [
+          "provider-a",
+          {
+            name: "provider-a",
+            providerName: "provider-a",
+            run: async (runOpts) => {
+              providerARuns.push(runOpts.cwd);
+              liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
+              return { success: true, exitCode: 0, output: "a" };
+            },
+          },
+        ],
+      ]);
       const pacers = new Map<string, ProviderPacer>();
       const pacerFor = (name: string): ProviderPacer => {
         let pacer = pacers.get(name);
@@ -3745,10 +3877,9 @@ describe("ActorMesh", () => {
       const { mesh, registry, tick } = setup({
         maxConcurrent: 1,
         isHalted: (provider) => (provider ? halted.has(provider) : false),
-        onModelSet: (actorId, _newModel, record) => {
-          const live = mesh.get(actorId);
-          if (live && record.provider === "provider-b") {
-            live.setProvider?.({
+        onModelSet: (actorId, newModelConfig) => {
+          if (newModelConfig[0]?.provider === "provider-b" && !providerByName.has("provider-b")) {
+            providerByName.set("provider-b", {
               name: "provider-b",
               providerName: "provider-b",
               run: async (runOpts) => {
@@ -3758,48 +3889,49 @@ describe("ActorMesh", () => {
               },
             });
           }
+          mesh.get(actorId)?.setModelConfig?.(newModelConfig);
         },
         // Mirrors the production providerGate wiring in start.ts (same as the
         // gap-2 describe block above).
-        providerGate: (fn, providerName, request) =>
-          pacerFor(providerName).submit(fn, {
+        providerGate: (fn, candidates, request) => {
+          const selected = candidates[0];
+          return pacerFor(selected.provider).submit(() => fn(selected), {
             responsive: request.responsive,
             threadId: request.threadId,
             enqueueNormal: request.enqueueNormal,
             revalidateProvider: request.threadId
               ? () => {
                   mesh.applyPendingModel(request.threadId as string);
-                  const live = mesh.get(request.threadId as string)?.getProvider?.();
+                  const live = registry.get(request.threadId as string)?.modelConfig?.[0];
                   if (!live) return true;
-                  return live.providerName === providerName;
+                  return live.provider === selected.provider;
                 }
               : undefined,
-          }),
+          });
+        },
         createActor: (ctx) => {
           let actor!: Actor;
           const isBlocker = ctx.record.charter === "blocker";
-          const provider: CodingProvider = isBlocker
-            ? {
-                ...blockerDeferred.provider,
-                run: async (runOpts) => {
-                  const result = await blockerDeferred.provider.run(runOpts);
-                  if (result.success) actor.declareYield();
-                  return result;
-                },
-              }
-            : {
-                name: "provider-a",
-                providerName: "provider-a",
-                run: async (runOpts) => {
-                  providerARuns.push(runOpts.cwd);
-                  actor.declareYield();
-                  return { success: true, exitCode: 0, output: "a" };
-                },
-              };
           actor = new Actor({
             id: ctx.record.id,
             cwd: `/tmp/${ctx.record.id}`,
-            provider,
+            modelConfig: isBlocker
+              ? [{ provider: "blocker" }]
+              : (ctx.record.modelConfig ?? [{ provider: "provider-a", model: "model-a" }]),
+            resolveProvider: isBlocker
+              ? () => ({
+                  ...blockerDeferred.provider,
+                  run: async (runOpts) => {
+                    const result = await blockerDeferred.provider.run(runOpts);
+                    if (result.success) actor.declareYield();
+                    return result;
+                  },
+                })
+              : (selected) => {
+                  const base = providerByName.get(selected.provider);
+                  if (!base) throw new Error(`no provider registered for ${selected.provider}`);
+                  return base;
+                },
             mcpServers: [],
             loadSessionId: () => ctx.getRecord()?.sessionId,
             saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
@@ -3807,7 +3939,6 @@ describe("ActorMesh", () => {
             gate: ctx.gate,
             beforeRun: ctx.beforeRun,
             onQueued: ctx.onQueued,
-            onRunStart: () => mesh.applyPendingModel(ctx.record.id),
             onRunEnd: (result) => ctx.onRunEnd(result),
             onRuntimeStateChanged: ctx.onRuntimeStateChanged,
             debounceMs: DEBOUNCE,
@@ -3824,8 +3955,7 @@ describe("ActorMesh", () => {
       const worker = mesh.spawn({
         charter: "worker",
         parentId: "root",
-        provider: "provider-a",
-        model: "model-a",
+        modelConfig: { provider: "provider-a", model: "model-a" },
         context: { type: "portable", mode: "ledger" },
       });
 
@@ -3843,8 +3973,8 @@ describe("ActorMesh", () => {
       // Stage the cross-provider swap onto the already-halted provider-b
       // while worker is genuinely queued. No halt command fires here, so
       // `cancelHaltedQueuedRuns` is never invoked for this ticket.
-      mesh.setActorModel(worker, "model-b", "root", "provider-b");
-      expect(registry.get(worker)?.provider).toBe("provider-a");
+      mesh.setActorModel(worker, { provider: "provider-b", model: "model-b" }, "root");
+      expect(registry.get(worker)?.modelConfig?.[0]?.provider).toBe("provider-a");
       expect(halted.has("provider-b")).toBe(true);
 
       // Free the slot: the queued ticket is naturally selected here, well
@@ -3923,8 +4053,7 @@ describe("ActorMesh", () => {
     const worker = mesh.spawn({
       charter: "worker",
       parentId: "root",
-      provider: "test-provider",
-      model: "model-a",
+      modelConfig: { provider: "test-provider", model: "model-a" },
       context: { type: "portable", mode: "ledger" },
     });
 
@@ -3938,14 +4067,14 @@ describe("ActorMesh", () => {
     events.length = 0;
 
     // Re-pin should queue it now.
-    mesh.setActorModel(worker, "model-c", "root");
+    mesh.setActorModel(worker, { provider: "test-provider", model: "model-c" }, "root");
 
     // Tick to let the new run execute.
     shouldFail = false;
     await tick();
 
     expect(runCount).toBe(2);
-    expect(mesh.registry.get(worker)?.model).toBe("model-c");
+    expect(mesh.registry.get(worker)?.modelConfig?.[0]?.model).toBe("model-c");
     expect(events).toContainEqual(expect.objectContaining({ kind: "run_queued", actorId: worker }));
   });
 
@@ -3965,20 +4094,19 @@ describe("ActorMesh", () => {
     const worker = mesh.spawn({
       charter: "worker",
       parentId: "root",
-      provider: "test-provider",
-      model: "model-a",
+      modelConfig: { provider: "test-provider", model: "model-a" },
       context: { type: "portable", mode: "ledger" },
     });
 
     expect(mesh.activeRunState(worker)).toBeNull();
 
-    mesh.setActorModel(worker, "model-b", "root");
+    mesh.setActorModel(worker, { provider: "test-provider", model: "model-b" }, "root");
     await tick();
 
     expect(runCount).toBe(0);
     expect(mesh.activeRunState(worker)).toBeNull();
-    expect(mesh.registry.get(worker)?.desiredModel).toBe("model-b");
-    expect(mesh.registry.get(worker)?.model).toBe("model-a");
+    expect(mesh.registry.get(worker)?.desiredModelConfig?.[0]?.model).toBe("model-b");
+    expect(mesh.registry.get(worker)?.modelConfig?.[0]?.model).toBe("model-a");
   });
 
   it("setActorModel does not duplicate a running run", async () => {
@@ -3998,8 +4126,7 @@ describe("ActorMesh", () => {
     const worker = mesh.spawn({
       charter: "worker",
       parentId: "root",
-      provider: "deferred",
-      model: "model-a",
+      modelConfig: { provider: "deferred", model: "model-a" },
       context: { type: "portable", mode: "ledger" },
     });
 
@@ -4009,7 +4136,7 @@ describe("ActorMesh", () => {
     expect(runCount).toBe(1);
 
     // Re-pin while the run is in-flight.
-    mesh.setActorModel(worker, "model-b", "root");
+    mesh.setActorModel(worker, { provider: "deferred", model: "model-b" }, "root");
 
     // Finish the in-flight run.
     deferred.releaseAll();
@@ -4017,7 +4144,7 @@ describe("ActorMesh", () => {
 
     expect(mesh.activeRunState(worker)).toBeNull();
     expect(runCount).toBe(1);
-    expect(mesh.registry.get(worker)?.model).toBe("model-b");
+    expect(mesh.registry.get(worker)?.modelConfig?.[0]?.model).toBe("model-b");
   });
 
   it("setActorModel does not duplicate a queued run", async () => {
@@ -4038,14 +4165,13 @@ describe("ActorMesh", () => {
     const blocker = mesh.spawn({
       charter: "blocker",
       parentId: "root",
-      provider: "deferred",
+      modelConfig: { provider: "deferred" },
     });
 
     const worker = mesh.spawn({
       charter: "worker",
       parentId: "root",
-      provider: "deferred",
-      model: "model-a",
+      modelConfig: { provider: "deferred", model: "model-a" },
       context: { type: "portable", mode: "ledger" },
     });
 
@@ -4061,7 +4187,7 @@ describe("ActorMesh", () => {
     expect(runCount).toBe(1);
 
     // Re-pin while the worker is queued.
-    mesh.setActorModel(worker, "model-b", "root");
+    mesh.setActorModel(worker, { provider: "deferred", model: "model-b" }, "root");
     expect(mesh.activeRunState(worker)?.phase).toBe("queued");
 
     // Release the blocker so the worker is admitted.
@@ -4075,7 +4201,7 @@ describe("ActorMesh", () => {
     await tick();
     expect(mesh.activeRunState(worker)).toBeNull();
     expect(runCount).toBe(2);
-    expect(mesh.registry.get(worker)?.model).toBe("model-b");
+    expect(mesh.registry.get(worker)?.modelConfig?.[0]?.model).toBe("model-b");
   });
 
   it("reviveThread rolls back to retired if re-instantiation fails, staying re-tryable ", async () => {
@@ -4569,8 +4695,16 @@ describe("ActorMesh", () => {
         isHalted: (provider) => claudeHalted && provider === "claude",
         onInboxEntriesSeen: (actorId) => queuedActors.push(actorId),
       });
-      const halted = mesh.spawn({ charter: "halted", parentId: "root", provider: "claude" });
-      const available = mesh.spawn({ charter: "available", parentId: "root", provider: "agy" });
+      const halted = mesh.spawn({
+        charter: "halted",
+        parentId: "root",
+        modelConfig: { provider: "claude" },
+      });
+      const available = mesh.spawn({
+        charter: "available",
+        parentId: "root",
+        modelConfig: { provider: "agy" },
+      });
       const haltedResource = "github:dummy-org/dummy-repo/issues/1288" as const;
       const availableResource = "github:dummy-org/dummy-repo/issues/1291" as const;
       mesh.subscribeEventSource(haltedResource, halted, "root");
@@ -5732,7 +5866,8 @@ describe("ActorMesh", () => {
           actor = new Actor({
             id: ctx.record.id,
             cwd: `/tmp/${ctx.record.id}`,
-            provider,
+            modelConfig: [{ provider: "test-provider" }],
+            resolveProvider: () => provider,
             mcpServers: [],
             loadSessionId: () => undefined,
             saveSessionId: () => {},
@@ -5792,12 +5927,17 @@ describe("ActorMesh", () => {
           actor = new Actor({
             id: ctx.record.id,
             cwd: `/tmp/${ctx.record.id}`,
-            provider,
+            modelConfig: [{ provider: "test-provider" }],
+            resolveProvider: () => provider,
             mcpServers: [],
             loadSessionId: () => undefined,
             saveSessionId: () => {},
             buildPrompt: () => ({ prompt: "prompt" }),
-            gate: <T>(fn: () => Promise<T>, prov: string, resp: boolean): RunStartHandle<T> => {
+            gate: <T>(
+              fn: (selected: ProviderModelConfig) => Promise<T>,
+              candidates: readonly ProviderModelConfig[],
+              resp: boolean
+            ): RunStartHandle<T> => {
               if (ctx.record.id === "t1") {
                 let resolve!: (val: unknown) => void;
                 let reject!: (err: unknown) => void;
@@ -5807,7 +5947,7 @@ describe("ActorMesh", () => {
                 });
                 runInvoke = async () => {
                   try {
-                    const res = await fn();
+                    const res = await fn(candidates[0] ?? { provider: "test-provider" });
                     resolve(res);
                     return res;
                   } catch (err) {
@@ -5822,7 +5962,7 @@ describe("ActorMesh", () => {
                   cancel: () => false,
                 };
               }
-              return ctx.gate(fn, prov, resp);
+              return ctx.gate(fn, candidates, resp);
             },
             beforeRun: ctx.beforeRun,
             onQueued: ctx.onQueued,
@@ -6290,67 +6430,16 @@ describe("ActorMesh", () => {
     });
   });
 
-  it("canonicalizes antigravity effort on spawn, update, and restart", async () => {
-    const { registry, mesh } = setup();
-
-    // 1. Spawn
-    // Tier match
-    const workerMatch = mesh.spawn({
-      charter: "match test",
-      parentId: "root",
-      provider: "antigravity",
-      model: "Gemini 3.7 Flash (High)",
-    });
-    const registryMatch = registry.get(workerMatch);
-    expect(registryMatch?.model).toBe("Gemini 3.7 Flash");
-    expect(registryMatch?.effort).toBe("high");
-
-    // Tier/effort conflict
-    expect(() => {
-      mesh.spawn({
-        charter: "conflict test",
-        parentId: "root",
-        provider: "antigravity",
-        model: "Gemini 3.7 Flash (High)",
-        effort: "low",
-      });
-    }).toThrow(/conflicting reasoning efforts/);
-
-    // 2. Update (setActorModel)
-    const updateWorker = mesh.spawn({
-      charter: "update test",
-      parentId: "root",
-      provider: "antigravity",
-      model: "Gemini 3.7 Flash",
-      effort: "low",
-    });
-
-    // Changing model with inline effort
-    mesh.setActorModel(updateWorker, "Gemini 3.7 Flash (High)", "root");
-    const registryUpdate = registry.get(updateWorker);
-    expect(registryUpdate?.desiredModel).toBe("Gemini 3.7 Flash");
-    expect(registryUpdate?.desiredEffort).toBe("high");
-
-    // Conflicting effort in update
-    expect(() => {
-      mesh.setActorModel(updateWorker, "Gemini 3.7 Flash (High)", "root", undefined, "low");
-    }).toThrow(/conflicting reasoning efforts/);
-
-    // 3. Restart / Rehydrate
-    const restartWorker = mesh.spawn({
-      charter: "restart test",
-      parentId: "root",
-      provider: "antigravity",
-      model: "Gemini 3.7 Flash (High)",
-    });
-
-    mesh.shutdownAll();
-
-    const { mesh: mesh2 } = setup();
-    Object.assign(mesh2, { registry });
-    mesh2.rehydrateAll();
-    const registryRestart = registry.get(restartWorker);
-    expect(registryRestart?.model).toBe("Gemini 3.7 Flash");
-    expect(registryRestart?.effort).toBe("high");
-  });
+  // NOTE(MEK-Org/rusa#169): "canonicalizes antigravity effort on spawn,
+  // update, and restart" used to live here, exercising ActorMesh's own
+  // parsing of legacy Codex/Antigravity model-pin syntax (e.g. "Gemini 3.7
+  // Flash (High)") through scalar provider/model/effort fields on spawn and
+  // setActorModel. ActorMesh no longer does that parsing itself — every
+  // modelConfig entry is opaque to it unless a validateSpawn/validateModel
+  // hook is wired in. The underlying canonicalization behavior
+  // (normalizeModelEffortSelection / parseCodexModel) is covered directly in
+  // src/providers/reasoning-effort.test.ts and src/providers/antigravity.test.ts,
+  // and persistence of a canonicalized modelConfig across a restart is
+  // covered in actor-mesh-restart-persistence.test.ts. Removed rather than
+  // rewritten.
 });

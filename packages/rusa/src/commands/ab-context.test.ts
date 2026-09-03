@@ -49,15 +49,13 @@ describe("A/B arm parenting ", () => {
     native: mesh.spawn({
       charter: "harness",
       parentId,
-      provider: "claude",
-      model: "claude-sonnet-4-6",
+      modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
       title: "ab-native",
     }),
     portable: mesh.spawn({
       charter: "harness",
       parentId,
-      provider: "claude",
-      model: "claude-sonnet-4-6",
+      modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
       title: "ab-portable",
     }),
   });
@@ -103,7 +101,7 @@ describe("A/B arm parenting ", () => {
     expect(rec?.parentId).toBeNull();
     expect(rec?.isRoot).toBe(false);
     expect(rec?.status).toBe("active");
-    expect(rec?.provider).toBeUndefined();
+    expect(rec?.modelConfig).toBeUndefined();
   });
 
   it("keeps the parentless holder as an immovable ownership boundary", () => {

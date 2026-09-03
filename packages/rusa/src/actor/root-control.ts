@@ -1,12 +1,11 @@
+import type { ModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
 import type { ActorHandle, ContextConfig, ThreadRecord } from "./thread-registry.js";
 
 export type RootControlPrincipal = "root-llm" | "human:operator" | "e2e-controller";
 
 export interface RootChildRequest {
   charter: string;
-  provider: string;
-  model: string;
-  effort?: string;
+  modelConfig: ModelConfigInput;
   context?: ContextConfig;
   maxRuns?: number;
   conversationId?: string;
@@ -17,9 +16,7 @@ export interface RootControlMesh {
   spawn(request: {
     charter: string;
     parentId: string;
-    provider: string;
-    model: string;
-    effort?: string;
+    modelConfig: ModelConfigInput;
     context?: ContextConfig;
     budget?: { maxRuns: number };
     conversationId?: string;
@@ -72,12 +69,16 @@ export class RootControlService {
   spawnChild(request: RootChildRequest, principal: RootControlPrincipal): string {
     const charter = request.charter?.trim();
     if (!charter) throw new Error("charter is required");
-    const provider = request.provider?.trim();
-    if (!provider) throw new Error("provider is required");
-    const model = request.model?.trim();
-    if (!model) throw new Error("model is required");
-    if (this.providers.length > 0 && !this.providers.includes(provider)) {
-      throw new Error(`unknown provider: ${provider}`);
+    const pool: readonly ProviderModelConfig[] = Array.isArray(request.modelConfig)
+      ? request.modelConfig
+      : [request.modelConfig];
+    if (pool.length === 0) throw new Error("modelConfig is required");
+    if (this.providers.length > 0) {
+      for (const { provider } of pool) {
+        if (!this.providers.includes(provider)) {
+          throw new Error(`unknown provider: ${provider}`);
+        }
+      }
     }
     if (
       request.maxRuns !== undefined &&
@@ -85,25 +86,17 @@ export class RootControlService {
     ) {
       throw new Error("maxRuns must be a positive integer");
     }
-    const effort = request.effort?.trim();
-    if (request.effort !== undefined && !effort) {
-      throw new Error("effort must be a non-empty string when set");
-    }
     const id = this.options.mesh.spawn({
       charter,
       parentId: this.rootId,
-      provider,
-      model,
-      ...(effort ? { effort } : {}),
+      modelConfig: request.modelConfig,
       context: normalizeContext(request.context),
       budget: request.maxRuns ? { maxRuns: request.maxRuns } : undefined,
       conversationId: optionalTrimmed(request.conversationId),
       title: optionalTrimmed(request.title),
     });
     this.record(principal, "spawn_child", id, {
-      provider,
-      model,
-      ...(effort ? { effort } : {}),
+      modelConfig: pool,
       context: normalizeContext(request.context),
     });
     return id;

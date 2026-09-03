@@ -21,6 +21,7 @@ import type { ObligationRepository } from "../db/repositories/obligation-reposit
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { ObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
+import type { ProviderModelConfig } from "../providers/model-config.js";
 import { resolveReferenceSync } from "../references/resolve.js";
 import type { SseHub } from "./sse.js";
 
@@ -170,6 +171,7 @@ interface ThreadDto {
   handle: string;
   parentId: string | null;
   status: string;
+  /** The declared candidate pool's first (or only) entry — compat view of {@link modelConfig}. */
   provider: string | null;
   /** The single authoritative model for this actor, as configured in the registry. */
   model: string | null;
@@ -181,6 +183,10 @@ interface ThreadDto {
   desiredEffort?: string | null;
   /** Pending desired provider staged for next run boundary, or null if none. */
   desiredProvider?: string | null;
+  /** The declared candidate pool, in earliest-available order. */
+  modelConfig: ProviderModelConfig[];
+  /** Pending full-pool replacement staged for the next run boundary, if any. */
+  desiredModelConfig?: ProviderModelConfig[];
   /**
    * The leading `CHARTER_PREVIEW_CHARS` characters of the charter, ellipsised
    * when clipped. The full text is detail data: `GET
@@ -479,9 +485,11 @@ export async function handleMeshApiRequest(
             const id = deps.rootControl?.spawnChild(
               {
                 charter: typeof body.charter === "string" ? body.charter : "",
-                provider: typeof body.provider === "string" ? body.provider : "",
-                model: typeof body.model === "string" ? body.model : "",
-                effort: typeof body.effort === "string" ? body.effort : undefined,
+                modelConfig: {
+                  provider: typeof body.provider === "string" ? body.provider : "",
+                  model: typeof body.model === "string" ? body.model : "",
+                  effort: typeof body.effort === "string" ? body.effort : undefined,
+                },
                 maxRuns: typeof body.maxRuns === "number" ? body.maxRuns : undefined,
                 title: typeof body.title === "string" ? body.title : undefined,
                 context,
@@ -1226,12 +1234,16 @@ export async function handleMeshApiRequest(
         handle: r.isRoot === true ? rootHandle : generateHandle(r.id),
         parentId: r.parentId,
         status: r.status,
-        provider: r.provider ?? null,
-        model: r.model ?? null,
-        effort: r.effort ?? null,
-        desiredModel: r.desiredModel ?? null,
-        ...(r.desiredEffort !== undefined ? { desiredEffort: r.desiredEffort } : {}),
-        desiredProvider: r.desiredProvider ?? null,
+        provider: r.modelConfig?.[0]?.provider ?? null,
+        model: r.modelConfig?.[0]?.model ?? null,
+        effort: r.modelConfig?.[0]?.effort ?? null,
+        desiredModel: r.desiredModelConfig?.[0]?.model ?? null,
+        ...(r.desiredModelConfig !== undefined
+          ? { desiredEffort: r.desiredModelConfig[0]?.effort ?? null }
+          : {}),
+        desiredProvider: r.desiredModelConfig?.[0]?.provider ?? null,
+        modelConfig: r.modelConfig ?? [],
+        ...(r.desiredModelConfig !== undefined ? { desiredModelConfig: r.desiredModelConfig } : {}),
         charterPreview: charterPreview(r.charter),
         title: r.title ?? summarizeCharter(r.charter),
         createdAt: r.createdAt,

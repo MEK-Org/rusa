@@ -4,11 +4,12 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { actorRuntimeState } from "../db/migrations/0034_actor_runtime_state.js";
+import { actorModelConfig } from "../db/migrations/0036_actor_model_config.js";
 import { DbThreadRegistry } from "../db/repositories/thread-registry-repository.js";
 import {
   FileThreadRegistry,
   InMemoryThreadRegistry,
-  migrateLegacyModelEffort,
+  migrateLegacyModelConfig,
   resolveRootThreadId,
   type ThreadRecord,
   type ThreadRegistry,
@@ -149,11 +150,12 @@ suite("DbThreadRegistry (behavior)", () => {
   const db = new Database(":memory:");
   db.pragma("foreign_keys = ON");
   actorRuntimeState.up(db);
+  actorModelConfig.up(db);
   return new DbThreadRegistry(db);
 });
 
-describe("migrateLegacyModelEffort", () => {
-  it("migrates active tiered slug to canonical form", () => {
+describe("migrateLegacyModelConfig", () => {
+  it("migrates active tiered slug to a canonical one-entry modelConfig pool", () => {
     const record = {
       id: "test-id",
       status: "active",
@@ -161,11 +163,14 @@ describe("migrateLegacyModelEffort", () => {
       model: "gemini-3.7-flash-high",
       effort: undefined,
     };
-    const migrated = migrateLegacyModelEffort(record as unknown as ThreadRecord, (p: string) =>
+    const migrated = migrateLegacyModelConfig(record as unknown as ThreadRecord, (p: string) =>
       p === "antigravity" ? "agy" : p
     );
-    expect(migrated.model).toBe("gemini-3.7-flash");
-    expect(migrated.effort).toBe("high");
+    expect(migrated.modelConfig).toEqual([
+      { provider: "antigravity", model: "gemini-3.7-flash", effort: "high" },
+    ]);
+    expect(migrated).not.toHaveProperty("model");
+    expect(migrated).not.toHaveProperty("effort");
   });
 
   it("migrates active display-name form with omitted effort to canonical form", () => {
@@ -176,11 +181,12 @@ describe("migrateLegacyModelEffort", () => {
       model: "Gemini 3.6 Flash (High)",
       effort: undefined,
     };
-    const migrated1 = migrateLegacyModelEffort(record1 as unknown as ThreadRecord, (p: string) =>
+    const migrated1 = migrateLegacyModelConfig(record1 as unknown as ThreadRecord, (p: string) =>
       p === "antigravity" ? "agy" : p
     );
-    expect(migrated1.model).toBe("Gemini 3.6 Flash");
-    expect(migrated1.effort).toBe("high");
+    expect(migrated1.modelConfig).toEqual([
+      { provider: "antigravity", model: "Gemini 3.6 Flash", effort: "high" },
+    ]);
 
     const record2 = {
       id: "test-id-2",
@@ -189,11 +195,12 @@ describe("migrateLegacyModelEffort", () => {
       model: "Gemini 3.1 Pro (High)",
       effort: undefined,
     };
-    const migrated2 = migrateLegacyModelEffort(record2 as unknown as ThreadRecord, (p: string) =>
+    const migrated2 = migrateLegacyModelConfig(record2 as unknown as ThreadRecord, (p: string) =>
       p === "antigravity" ? "agy" : p
     );
-    expect(migrated2.model).toBe("Gemini 3.1 Pro");
-    expect(migrated2.effort).toBe("high");
+    expect(migrated2.modelConfig).toEqual([
+      { provider: "antigravity", model: "Gemini 3.1 Pro", effort: "high" },
+    ]);
   });
 
   it("skips retired records with null model or aliased provider", () => {
@@ -204,7 +211,7 @@ describe("migrateLegacyModelEffort", () => {
       model: null,
       effort: undefined,
     };
-    const migrated1 = migrateLegacyModelEffort(record1 as unknown as ThreadRecord, (p: string) =>
+    const migrated1 = migrateLegacyModelConfig(record1 as unknown as ThreadRecord, (p: string) =>
       p === "antigravity" ? "agy" : p
     );
     expect(migrated1).toBe(record1); // exact same object returned
@@ -216,10 +223,45 @@ describe("migrateLegacyModelEffort", () => {
       model: "some-model",
       effort: undefined,
     };
-    const migrated2 = migrateLegacyModelEffort(record2 as unknown as ThreadRecord, (p: string) =>
+    const migrated2 = migrateLegacyModelConfig(record2 as unknown as ThreadRecord, (p: string) =>
       p === "old-alias" ? "agy" : p
     );
     expect(migrated2).toBe(record2);
+  });
+
+  it("passes through a record with neither legacy scalars nor modelConfig", () => {
+    const record = rec("plain");
+    expect(migrateLegacyModelConfig(record)).toBe(record);
+  });
+
+  it("passes through a record that already carries modelConfig", () => {
+    const record = rec("already-migrated", {
+      modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }],
+    });
+    expect(migrateLegacyModelConfig(record)).toBe(record);
+  });
+
+  it("folds a staged legacy desired* trio into desiredModelConfig", () => {
+    const record = {
+      id: "test-id-5",
+      status: "active",
+      provider: "codex",
+      model: "gpt-5.6-sol",
+      effort: "high",
+      desiredProvider: "claude",
+      desiredModel: "claude-opus-4-8",
+      desiredEffort: "max",
+    };
+    const migrated = migrateLegacyModelConfig(record as unknown as ThreadRecord);
+    expect(migrated.modelConfig).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol", effort: "high" },
+    ]);
+    expect(migrated.desiredModelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8", effort: "max" },
+    ]);
+    expect(migrated).not.toHaveProperty("desiredModel");
+    expect(migrated).not.toHaveProperty("desiredEffort");
+    expect(migrated).not.toHaveProperty("desiredProvider");
   });
 });
 
@@ -255,7 +297,7 @@ describe("FileThreadRegistry", () => {
     expect(r2.get("a")?.handles).toEqual([{ id: "b", role: "reviewer" }]);
   });
 
-  it("migrates recognized legacy Codex effort qualifiers on load", () => {
+  it("migrates recognized legacy Codex effort qualifiers on load, folding into modelConfig pools", () => {
     const file = makeFile();
     writeFileSync(
       file,
@@ -265,17 +307,15 @@ describe("FileThreadRegistry", () => {
             provider: "codex",
             model: "gpt-5.6-sol extra-high",
             desiredModel: "gpt-5.6-sol medium",
-          }),
+          } as never),
         ],
       })
     );
 
     const record = new FileThreadRegistry(file).get("codex-worker");
     expect(record).toMatchObject({
-      model: "gpt-5.6-sol",
-      effort: "xhigh",
-      desiredModel: "gpt-5.6-sol",
-      desiredEffort: "medium",
+      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol", effort: "xhigh" }],
+      desiredModelConfig: [{ provider: "codex", model: "gpt-5.6-sol", effort: "medium" }],
     });
   });
 
@@ -288,7 +328,7 @@ describe("FileThreadRegistry", () => {
           rec("aliased-worker", {
             provider: "strong",
             model: "gpt-5.6-sol extra-high",
-          }),
+          } as never),
         ],
       })
     );
@@ -297,16 +337,12 @@ describe("FileThreadRegistry", () => {
       provider === "strong" ? "codex" : provider
     );
     expect(registry.get("aliased-worker")).toMatchObject({
-      provider: "strong",
-      model: "gpt-5.6-sol",
-      effort: "xhigh",
+      modelConfig: [{ provider: "strong", model: "gpt-5.6-sol", effort: "xhigh" }],
     });
     expect(JSON.parse(readFileSync(file, "utf-8"))).toMatchObject({
       threads: [
         {
-          provider: "strong",
-          model: "gpt-5.6-sol",
-          effort: "xhigh",
+          modelConfig: [{ provider: "strong", model: "gpt-5.6-sol", effort: "xhigh" }],
         },
       ],
     });

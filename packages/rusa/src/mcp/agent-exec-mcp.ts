@@ -9,6 +9,7 @@ import {
 } from "../actor/event-subscriptions.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
+import { DEFAULT_CODER_POOL, type ModelConfigInput } from "../providers/model-config.js";
 import { githubBranchReference } from "../references/reference.js";
 import { toolError, toolOk } from "./result.js";
 import { HUMAN_OPERATOR, isHumanOperator } from "./stamp.js";
@@ -38,6 +39,31 @@ export interface WakeScheduler {
     }[]
   >;
 }
+
+const providerModelConfigSchema = z.object({
+  provider: z.string().describe("Coding harness, e.g. 'claude', 'antigravity', 'codex', 'kimi'."),
+  model: z
+    .string()
+    .optional()
+    .describe("Model/tier id for the harness. Omit to use the provider's default model."),
+  effort: z
+    .string()
+    .optional()
+    .describe(
+      "Optional provider-native reasoning level (for example 'high' or 'xhigh'). Omit to preserve the provider/model default."
+    ),
+});
+
+/**
+ * A single provider/model/effort choice, or an ordered pool of acceptable
+ * choices tried earliest-available first. A pool longer than one entry
+ * requires a portable (ledger/tail) actor — a native provider session can't
+ * move between candidates.
+ */
+const modelConfigSchema = z.union([
+  providerModelConfigSchema,
+  z.array(providerModelConfigSchema).min(1),
+]);
 
 /**
  * The agent-execution MCP server — the actor mesh's primitive (design B.4)
@@ -204,21 +230,10 @@ export function createAgentExecMcpServer(
           .describe(
             "What the new actor owns — its standing brief, authored by you. Include its full scope: the repo(s) to work in (it clones them itself), the deliverable, and whether it should open one PR or several."
           ),
-        provider: z
-          .string()
-          .describe(
-            "Coding harness for the child, e.g. 'claude' or 'antigravity'. Required. Pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review)."
-          ),
-        model: z
-          .string()
-          .describe(
-            "Model/tier id for the child's harness (e.g. 'Gemini 3.7 Flash (High)'). Required."
-          ),
-        effort: z
-          .string()
+        model_config: modelConfigSchema
           .optional()
           .describe(
-            "Optional provider-native reasoning level (for example 'high' or 'xhigh'). Omit to preserve the provider/model default."
+            "Provider/model/effort choice(s) for the child, in earliest-available order. A single object pins one choice; pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review). An array declares a pool of acceptable choices, tried whichever is earliest-available first — requires context_mode 'ledger' or 'tail', since a native provider session can't move between candidates. Omit to use the standing default coder pool."
           ),
         max_runs: z
           .number()
@@ -246,30 +261,16 @@ export function createAgentExecMcpServer(
           ),
       },
     },
-    async ({
-      charter,
-      provider,
-      model,
-      effort,
-      max_runs,
-      conversation_id,
-      title,
-      context_mode,
-    }) => {
+    async ({ charter, model_config, max_runs, conversation_id, title, context_mode }) => {
       try {
-        const trimmedProvider = provider?.trim();
-        if (!trimmedProvider) throw new Error("provider is required");
-        const trimmedModel = model?.trim();
-        if (!trimmedModel) throw new Error("model is required");
         const context = resolveContextSelection(context_mode);
+        const modelConfig: ModelConfigInput = model_config ?? [...DEFAULT_CODER_POOL];
         const id =
           selfId === rootId && options?.rootControl
             ? options.rootControl.spawnChild(
                 {
                   charter,
-                  provider: trimmedProvider,
-                  model: trimmedModel,
-                  effort,
+                  modelConfig,
                   maxRuns: max_runs,
                   conversationId: conversation_id,
                   title,
@@ -280,9 +281,7 @@ export function createAgentExecMcpServer(
             : mesh.spawn({
                 charter,
                 parentId: selfId,
-                provider: trimmedProvider,
-                model: trimmedModel,
-                effort,
+                modelConfig,
                 budget: max_runs ? { maxRuns: max_runs } : undefined,
                 conversationId: conversation_id,
                 title,
@@ -611,43 +610,24 @@ export function createAgentExecMcpServer(
   server.registerTool(
     "set_actor_model",
     {
-      title: "Update an actor's model in-place",
+      title: "Update an actor's declared model pool in-place",
       description:
-        "Update an existing actor's model and/or provider-native reasoning effort in-place in the thread registry without service restart . " +
+        "Replace an existing actor's declared provider/model/effort pool in-place in the thread registry without service restart — " +
+        "a full replacement of the pool, not a per-field patch. " +
         "Allowed for the actor's parent, or root for any actor including itself. Takes effect at the end of the actor's current run if one is in flight; otherwise applies at the actor's next dispatch, before that run starts and launches. " +
-        "Optionally moves portable (ledger/tail) actors across providers. " +
+        "A pool of more than one entry, or a change of provider, is only permitted for portable (ledger/tail) actors. " +
         "Preserves the actor's accumulated context and session history.",
       inputSchema: {
         actor_id: z.string().describe("The actor's id to update."),
-        model: z
-          .string()
-          .optional()
-          .describe("The new model/tier slug. Omit to update effort independently."),
-        effort: z
-          .string()
-          .nullable()
-          .optional()
-          .describe(
-            "Provider-native reasoning level. Omit to leave unchanged; pass null to restore the provider/model default."
-          ),
-        provider: z
-          .string()
-          .optional()
-          .describe(
-            "Optional target provider slug (e.g. 'antigravity', 'claude', 'codex', 'kimi'). " +
-              "Only permitted for portable (ledger/tail) actors."
-          ),
+        model_config: modelConfigSchema.describe(
+          "The full replacement provider/model/effort choice(s), in earliest-available order — replaces the entire current pool."
+        ),
       },
     },
-    async ({ actor_id, model, effort, provider }) => {
+    async ({ actor_id, model_config }) => {
       try {
-        mesh.setActorModel(actor_id, model, selfId, provider, effort);
-        const changes = [
-          model ? `model ${model}` : null,
-          effort === null ? "provider-default effort" : effort ? `effort ${effort}` : null,
-          provider ? `provider ${provider}` : null,
-        ].filter(Boolean);
-        return toolOk(`staged ${changes.join(", ")} for ${actor_id}`);
+        mesh.setActorModel(actor_id, model_config, selfId);
+        return toolOk(`staged modelConfig update for ${actor_id}`);
       } catch (err) {
         return toolError(err);
       }

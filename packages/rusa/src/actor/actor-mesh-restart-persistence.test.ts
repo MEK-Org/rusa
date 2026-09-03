@@ -74,23 +74,16 @@ describe("mesh restart persistence ", () => {
       id: "worker-1",
       charter: "worker",
       parentId: "root",
-      provider: "claude",
-      model: "claude-sonnet-5",
-      effort: "medium",
-      desiredModel: "claude-opus-4-8",
-      desiredEffort: "max",
-      desiredProvider: "claude",
+      modelConfig: [{ provider: "claude", model: "claude-sonnet-5", effort: "medium" }],
+      desiredModelConfig: [{ provider: "claude", model: "claude-opus-4-8", effort: "max" }],
       status: "active",
       createdAt: "2026-01-01T00:00:00Z",
     });
 
     const registry2 = new FileThreadRegistry(file);
     expect(registry2.get("worker-1")).toMatchObject({
-      model: "claude-sonnet-5",
-      effort: "medium",
-      desiredModel: "claude-opus-4-8",
-      desiredEffort: "max",
-      desiredProvider: "claude",
+      modelConfig: [{ provider: "claude", model: "claude-sonnet-5", effort: "medium" }],
+      desiredModelConfig: [{ provider: "claude", model: "claude-opus-4-8", effort: "max" }],
     });
 
     let runEndCallback: ActorFactoryContext["onRunEnd"] | undefined;
@@ -105,17 +98,18 @@ describe("mesh restart persistence ", () => {
     const rec1 = registry2.get("worker-1");
     if (!rec1) throw new Error("worker-1 missing");
     mesh.rehydrate(rec1);
-    expect(registry2.get("worker-1")?.model).toBe("claude-sonnet-5");
-    expect(registry2.get("worker-1")?.effort).toBe("medium");
-    expect(registry2.get("worker-1")?.desiredModel).toBe("claude-opus-4-8");
-    expect(registry2.get("worker-1")?.desiredEffort).toBe("max");
+    expect(registry2.get("worker-1")?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-sonnet-5", effort: "medium" },
+    ]);
+    expect(registry2.get("worker-1")?.desiredModelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8", effort: "max" },
+    ]);
 
     // Simulate run completing after restart
     runEndCallback?.({ success: true, exitCode: 0, output: "done" });
-    expect(registry2.get("worker-1")?.model).toBe("claude-opus-4-8");
-    expect(registry2.get("worker-1")?.effort).toBe("max");
-    expect(registry2.get("worker-1")?.desiredModel).toBeUndefined();
-    expect(registry2.get("worker-1")?.desiredEffort).toBeUndefined();
-    expect(registry2.get("worker-1")?.desiredProvider).toBeUndefined();
+    expect(registry2.get("worker-1")?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8", effort: "max" },
+    ]);
+    expect(registry2.get("worker-1")?.desiredModelConfig).toBeUndefined();
   });
 });

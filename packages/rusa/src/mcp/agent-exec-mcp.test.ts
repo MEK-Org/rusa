@@ -70,7 +70,8 @@ function setup(
       new Actor({
         id: ctx.record.id,
         cwd: `/tmp/${ctx.record.id}`,
-        provider: new FakeProvider(opts.childResponder),
+        modelConfig: ctx.record.modelConfig ?? [{ provider: "claude" }],
+        resolveProvider: () => new FakeProvider(opts.childResponder),
         mcpServers: [],
         loadSessionId: () => ctx.getRecord()?.sessionId,
         saveSessionId: (sid) => registry.patch(ctx.record.id, { sessionId: sid }),
@@ -85,7 +86,8 @@ function setup(
   const root = new Actor({
     id: "root",
     cwd: "/tmp/root",
-    provider: new FakeProvider(),
+    modelConfig: [{ provider: "claude" }],
+    resolveProvider: () => new FakeProvider(),
     mcpServers: [],
     loadSessionId: () => undefined,
     saveSessionId: () => {},
@@ -201,7 +203,10 @@ describe("agent-execution MCP server", () => {
     const rootSrv = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const spawn = await rootSrv.callTool({
       name: "spawn_thread",
-      arguments: { charter: "do a thing", provider: "claude", model: "claude-sonnet-4-6" },
+      arguments: {
+        charter: "do a thing",
+        model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+      },
     });
     const { thread_id } = dataOf(spawn as CallToolResult) as { thread_id: string };
     const childSrv = await connect(createAgentExecMcpServer(mesh, thread_id, "root"));
@@ -223,9 +228,7 @@ describe("agent-execution MCP server", () => {
       name: "spawn_thread",
       arguments: {
         charter: "implement X",
-        provider: "claude",
-        model: "claude-sonnet-4-6",
-        effort: "high",
+        model_config: { provider: "claude", model: "claude-sonnet-4-6", effort: "high" },
         max_runs: 5,
       },
     })) as CallToolResult;
@@ -234,9 +237,9 @@ describe("agent-execution MCP server", () => {
     const rec = registry.get("t1");
     expect(rec?.parentId).toBe("root");
     expect(rec?.charter).toBe("implement X");
-    expect(rec?.provider).toBe("claude");
-    expect(rec?.model).toBe("claude-sonnet-4-6");
-    expect(rec?.effort).toBe("high");
+    expect(rec?.modelConfig?.[0]?.provider).toBe("claude");
+    expect(rec?.modelConfig?.[0]?.model).toBe("claude-sonnet-4-6");
+    expect(rec?.modelConfig?.[0]?.effort).toBe("high");
     expect(rec?.budget?.maxRuns).toBe(5);
     // The caller got a handle to its new child.
     expect(registry.get("root")?.handles).toEqual([{ id: "t1" }]);
@@ -253,8 +256,7 @@ describe("agent-execution MCP server", () => {
       name: "spawn_thread",
       arguments: {
         charter: "review the patch",
-        provider: "agy",
-        model: "gemini-3.5-flash-medium",
+        model_config: { provider: "agy", model: "gemini-3.5-flash-medium" },
       },
     })) as CallToolResult;
 
@@ -262,8 +264,7 @@ describe("agent-execution MCP server", () => {
     expect(spawnChild).toHaveBeenCalledWith(
       expect.objectContaining({
         charter: "review the patch",
-        provider: "agy",
-        model: "gemini-3.5-flash-medium",
+        modelConfig: { provider: "agy", model: "gemini-3.5-flash-medium" },
       }),
       "root-llm"
     );
@@ -275,12 +276,15 @@ describe("agent-execution MCP server", () => {
     const { thread_id } = dataOf(
       (await client.callTool({
         name: "spawn_thread",
-        arguments: { charter: "review", provider: "claude", model: "claude-opus-4-8" },
+        arguments: {
+          charter: "review",
+          model_config: { provider: "claude", model: "claude-opus-4-8" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
     const rec = registry.get(thread_id);
-    expect(rec?.provider).toBe("claude");
-    expect(rec?.model).toBe("claude-opus-4-8");
+    expect(rec?.modelConfig?.[0]?.provider).toBe("claude");
+    expect(rec?.modelConfig?.[0]?.model).toBe("claude-opus-4-8");
   });
 
   it("spawn_thread passes the optional title to the record", async () => {
@@ -291,8 +295,7 @@ describe("agent-execution MCP server", () => {
         name: "spawn_thread",
         arguments: {
           charter: "do tasks",
-          provider: "claude",
-          model: "claude-sonnet-4-6",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
           title: "My custom actor title",
         },
       })) as CallToolResult
@@ -313,8 +316,7 @@ describe("agent-execution MCP server", () => {
         name: "spawn_thread",
         arguments: {
           charter: "own a small issue",
-          provider: "claude",
-          model: "claude-sonnet-4-6",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
           context_mode: "ledger",
         },
       })) as CallToolResult
@@ -330,7 +332,10 @@ describe("agent-execution MCP server", () => {
     const { thread_id } = dataOf(
       (await client.callTool({
         name: "spawn_thread",
-        arguments: { charter: "ordinary work", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "ordinary work",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
     expect(registry.get(thread_id)?.context).toBeUndefined();
@@ -347,8 +352,7 @@ describe("agent-execution MCP server", () => {
       name: "spawn_thread",
       arguments: {
         charter: "own a small issue",
-        provider: "claude",
-        model: "claude-sonnet-4-6",
+        model_config: { provider: "claude", model: "claude-sonnet-4-6" },
         context_mode: "tail",
       },
     });
@@ -358,32 +362,24 @@ describe("agent-execution MCP server", () => {
     );
   });
 
-  it("spawn_thread rejects calls with missing provider or model ", async () => {
+  it("spawn_thread rejects calls with a missing provider", async () => {
     const { mesh } = setup();
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const missingProvider = (await client.callTool({
       name: "spawn_thread",
-      arguments: { charter: "work", model: "claude-sonnet-4-6" },
+      arguments: { charter: "work", model_config: { model: "claude-sonnet-4-6" } },
     })) as CallToolResult;
     expect(missingProvider.isError).toBe(true);
+  });
 
-    const missingModel = (await client.callTool({
+  it("spawn_thread rejects an empty modelConfig pool", async () => {
+    const { mesh } = setup();
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+    const result = (await client.callTool({
       name: "spawn_thread",
-      arguments: { charter: "work", provider: "claude" },
+      arguments: { charter: "work", model_config: [] },
     })) as CallToolResult;
-    expect(missingModel.isError).toBe(true);
-
-    const emptyProvider = (await client.callTool({
-      name: "spawn_thread",
-      arguments: { charter: "work", provider: "   ", model: "claude-sonnet-4-6" },
-    })) as CallToolResult;
-    expect(emptyProvider.isError).toBe(true);
-
-    const emptyModel = (await client.callTool({
-      name: "spawn_thread",
-      arguments: { charter: "work", provider: "claude", model: "   " },
-    })) as CallToolResult;
-    expect(emptyModel.isError).toBe(true);
+    expect(result.isError).toBe(true);
   });
 
   it("introduce grants the holder a handle to the target (with optional role)", async () => {
@@ -392,13 +388,19 @@ describe("agent-execution MCP server", () => {
     const a = dataOf(
       (await client.callTool({
         name: "spawn_thread",
-        arguments: { charter: "coder", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "coder",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
     const b = dataOf(
       (await client.callTool({
         name: "spawn_thread",
-        arguments: { charter: "reviewer", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "reviewer",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
     await client.callTool({
@@ -413,11 +415,17 @@ describe("agent-execution MCP server", () => {
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     await client.callTool({
       name: "spawn_thread",
-      arguments: { charter: "first task\nmore", provider: "claude", model: "claude-sonnet-4-6" },
+      arguments: {
+        charter: "first task\nmore",
+        model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+      },
     });
     await client.callTool({
       name: "spawn_thread",
-      arguments: { charter: "second task", provider: "claude", model: "claude-sonnet-4-6" },
+      arguments: {
+        charter: "second task",
+        model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+      },
     });
     const list = dataOf(
       (await client.callTool({ name: "list_threads", arguments: {} })) as CallToolResult
@@ -433,7 +441,10 @@ describe("agent-execution MCP server", () => {
     const { thread_id } = dataOf(
       (await client.callTool({
         name: "spawn_thread",
-        arguments: { charter: "x", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "x",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
     await client.callTool({ name: "retire_thread", arguments: { thread_id } });
@@ -447,7 +458,10 @@ describe("agent-execution MCP server", () => {
     const { thread_id } = dataOf(
       (await client.callTool({
         name: "spawn_thread",
-        arguments: { charter: "build the arm", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "build the arm",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
     mesh.sendMessage(thread_id, "go", "root");
@@ -483,13 +497,19 @@ describe("agent-execution MCP server", () => {
     const w1 = dataOf(
       (await client.callTool({
         name: "spawn_thread",
-        arguments: { charter: "worker 1", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "worker 1",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
     const w2 = dataOf(
       (await client.callTool({
         name: "spawn_thread",
-        arguments: { charter: "worker 2", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "worker 2",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
 
@@ -529,13 +549,19 @@ describe("agent-execution MCP server", () => {
     const busy = dataOf(
       (await client.callTool({
         name: "spawn_thread",
-        arguments: { charter: "busy", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "busy",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
     const idle = dataOf(
       (await client.callTool({
         name: "spawn_thread",
-        arguments: { charter: "idle", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "idle",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
     mesh.sendMessage(busy.thread_id, "go", "root");
@@ -588,7 +614,10 @@ describe("agent-execution MCP server", () => {
     const { thread_id } = dataOf(
       (await client.callTool({
         name: "spawn_thread",
-        arguments: { charter: "worker", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "worker",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
 
@@ -613,7 +642,10 @@ describe("agent-execution MCP server", () => {
     const { thread_id } = dataOf(
       (await client.callTool({
         name: "spawn_thread",
-        arguments: { charter: "x", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "x",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
     const res = (await client.callTool({
@@ -630,7 +662,10 @@ describe("agent-execution MCP server", () => {
     const { thread_id } = dataOf(
       (await client.callTool({
         name: "spawn_thread",
-        arguments: { charter: "x", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "x",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
     mesh.retire(thread_id);
@@ -778,14 +813,20 @@ describe("agent-execution MCP server", () => {
     const { thread_id: parentId } = dataOf(
       (await rootSrv.callTool({
         name: "spawn_thread",
-        arguments: { charter: "parent", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "parent",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
     const parentSrv = await connect(createAgentExecMcpServer(mesh, parentId, "root"));
     const { thread_id: childId } = dataOf(
       (await parentSrv.callTool({
         name: "spawn_thread",
-        arguments: { charter: "child", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "child",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
 
@@ -819,7 +860,10 @@ describe("agent-execution MCP server", () => {
     const { thread_id: parentId } = dataOf(
       (await rootSrv.callTool({
         name: "spawn_thread",
-        arguments: { charter: "parent", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "parent",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
     const { thread_id: siblingId } = dataOf(
@@ -827,8 +871,7 @@ describe("agent-execution MCP server", () => {
         name: "spawn_thread",
         arguments: {
           charter: "sibling (root's child, not parent's)",
-          provider: "claude",
-          model: "claude-sonnet-4-6",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
         },
       })) as CallToolResult
     ) as { thread_id: string };
@@ -836,7 +879,10 @@ describe("agent-execution MCP server", () => {
     const { thread_id: childId } = dataOf(
       (await parentSrv.callTool({
         name: "spawn_thread",
-        arguments: { charter: "child", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "child",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
 
@@ -878,7 +924,10 @@ describe("agent-execution MCP server", () => {
     const { thread_id } = dataOf(
       (await client.callTool({
         name: "spawn_thread",
-        arguments: { charter: "x", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "x",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       })) as CallToolResult
     ) as { thread_id: string };
 
@@ -926,12 +975,18 @@ describe("agent-execution MCP server", () => {
 
       await rootClient.callTool({
         name: "spawn_thread",
-        arguments: { charter: "parent", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "parent",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       });
       const parentClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
       await parentClient.callTool({
         name: "spawn_thread",
-        arguments: { charter: "child", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "child",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       });
       mesh.subscribeEventSource("github:dummy-org", "root", "root");
       await rootClient.callTool({
@@ -999,12 +1054,18 @@ describe("agent-execution MCP server", () => {
 
       await rootClient.callTool({
         name: "spawn_thread",
-        arguments: { charter: "parent", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "parent",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       });
       const parentClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
       await parentClient.callTool({
         name: "spawn_thread",
-        arguments: { charter: "child", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "child",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       });
       const invalidRes = (await parentClient.callTool({
         name: "delegate_event_source",
@@ -1055,12 +1116,18 @@ describe("agent-execution MCP server", () => {
 
       await rootClient.callTool({
         name: "spawn_thread",
-        arguments: { charter: "parent", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "parent",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       });
       const parentClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
       await parentClient.callTool({
         name: "spawn_thread",
-        arguments: { charter: "child", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "child",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       });
       mesh.subscribeEventSource("github:dummy-org", "root", "root");
       await rootClient.callTool({
@@ -1135,7 +1202,10 @@ describe("agent-execution MCP server", () => {
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
       await rootClient.callTool({
         name: "spawn_thread",
-        arguments: { charter: "system owner", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "system owner",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       });
       mesh.subscribeEventSource("system:events", "root", "root");
 
@@ -1158,12 +1228,18 @@ describe("agent-execution MCP server", () => {
       const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
       await rootClient.callTool({
         name: "spawn_thread",
-        arguments: { charter: "parent", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "parent",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       });
       const parentClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
       await parentClient.callTool({
         name: "spawn_thread",
-        arguments: { charter: "child", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "child",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       });
 
       const res = (await parentClient.callTool({
@@ -1186,7 +1262,10 @@ describe("agent-execution MCP server", () => {
 
       await client.callTool({
         name: "spawn_thread",
-        arguments: { charter: "repo worker", provider: "claude", model: "claude-sonnet-4-6" },
+        arguments: {
+          charter: "repo worker",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
       });
 
       const delegateRes = (await client.callTool({
@@ -1362,131 +1441,124 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     expect((res.content[0] as { text: string }).text).toMatch(/invalid cron/);
   });
 
-  it("set_thread_model stages an actor's model via MCP tool", async () => {
+  it("set_actor_model stages a full modelConfig replacement via MCP tool", async () => {
     const { mesh, registry } = setup();
     const childId = mesh.spawn({
       charter: "worker",
       parentId: "root",
-      provider: "claude",
-      model: "claude-sonnet-5",
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
     });
 
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const res = (await client.callTool({
       name: "set_actor_model",
-      arguments: { actor_id: childId, model: "claude-opus-4-8" },
+      arguments: {
+        actor_id: childId,
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
     })) as CallToolResult;
 
     expect(res.isError).toBeFalsy();
-    expect(registry.get(childId)?.model).toBe("claude-sonnet-5");
-    expect(registry.get(childId)?.desiredModel).toBe("claude-opus-4-8");
+    expect(registry.get(childId)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-sonnet-5" },
+    ]);
+    expect(registry.get(childId)?.desiredModelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8" },
+    ]);
   });
 
   it("set_actor_model lets the root stage its own portable provider and model", async () => {
     const { mesh, registry } = setup();
     registry.patch("root", {
-      provider: "claude",
-      model: "claude-opus-4-8",
+      modelConfig: [{ provider: "claude", model: "claude-opus-4-8" }],
       context: { type: "portable", mode: "ledger" },
     });
 
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const res = (await client.callTool({
       name: "set_actor_model",
-      arguments: { actor_id: "root", model: "gpt-5.6-sol", provider: "codex" },
+      arguments: { actor_id: "root", model_config: { provider: "codex", model: "gpt-5.6-sol" } },
     })) as CallToolResult;
 
     expect(res.isError).toBeFalsy();
     expect(registry.get("root")).toMatchObject({
-      provider: "claude",
-      model: "claude-opus-4-8",
-      desiredProvider: "codex",
-      desiredModel: "gpt-5.6-sol",
+      modelConfig: [{ provider: "claude", model: "claude-opus-4-8" }],
+      desiredModelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
     });
   });
 
-  it("set_actor_model stages and clears effort without repeating model", async () => {
+  it("set_actor_model replaces the whole pool in one call, including effort", async () => {
     const { mesh, registry } = setup();
     const childId = mesh.spawn({
       charter: "worker",
       parentId: "root",
-      provider: "codex",
-      model: "gpt-5.6-sol",
-      effort: "medium",
-    });
-    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
-
-    const stage = (await client.callTool({
-      name: "set_actor_model",
-      arguments: { actor_id: childId, effort: "xhigh" },
-    })) as CallToolResult;
-    expect(stage.isError).toBeFalsy();
-    expect(registry.get(childId)?.desiredModel).toBeUndefined();
-    expect(registry.get(childId)?.desiredEffort).toBe("xhigh");
-
-    const clear = (await client.callTool({
-      name: "set_actor_model",
-      arguments: { actor_id: childId, effort: null },
-    })) as CallToolResult;
-    expect(clear.isError).toBeFalsy();
-    expect(registry.get(childId)?.desiredEffort).toBeNull();
-  });
-
-  it("set_actor_model rejects a default-effort clear that conflicts with a legacy model pin", async () => {
-    const { mesh, registry } = setup();
-    const childId = mesh.spawn({
-      charter: "worker",
-      parentId: "root",
-      provider: "codex",
-      model: "gpt-5.6-sol",
-      effort: "medium",
+      modelConfig: { provider: "codex", model: "gpt-5.6-sol", effort: "medium" },
     });
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
 
     const res = (await client.callTool({
       name: "set_actor_model",
-      arguments: { actor_id: childId, model: "gpt-5.6-sol high", effort: null },
+      arguments: {
+        actor_id: childId,
+        model_config: { provider: "codex", model: "gpt-5.6-sol", effort: "xhigh" },
+      },
     })) as CallToolResult;
-
-    expect(res.isError).toBe(true);
-    expect((res.content[0] as { text: string }).text).toMatch(/conflicting reasoning efforts/);
-    expect(registry.get(childId)?.desiredModel).toBeUndefined();
-    expect(registry.get(childId)?.desiredEffort).toBeUndefined();
+    expect(res.isError).toBeFalsy();
+    expect(registry.get(childId)?.desiredModelConfig).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol", effort: "xhigh" },
+    ]);
   });
 
-  it("set_thread_model fails when an actor tries to raise its own tier", async () => {
+  it("set_actor_model rejects an empty modelConfig pool", async () => {
     const { mesh } = setup();
     const childId = mesh.spawn({
       charter: "worker",
       parentId: "root",
-      provider: "claude",
-      model: "claude-sonnet-5",
+      modelConfig: { provider: "codex", model: "gpt-5.6-sol" },
+    });
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+    const res = (await client.callTool({
+      name: "set_actor_model",
+      arguments: { actor_id: childId, model_config: [] },
+    })) as CallToolResult;
+
+    expect(res.isError).toBe(true);
+  });
+
+  it("set_actor_model fails when an actor tries to set its own model", async () => {
+    const { mesh } = setup();
+    const childId = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
     });
 
     const client = await connect(createAgentExecMcpServer(mesh, childId, "root"));
     const res = (await client.callTool({
       name: "set_actor_model",
-      arguments: { actor_id: childId, model: "claude-opus-4-8" },
+      arguments: {
+        actor_id: childId,
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
     })) as CallToolResult;
 
     expect(res.isError).toBe(true);
     expect((res.content[0] as { text: string }).text).toMatch(/cannot set its own model/);
   });
 
-  it("set_actor_model moves portable actor across providers and refuses native actors", async () => {
+  it("set_actor_model moves a portable actor across providers and refuses native actors", async () => {
     const { mesh, registry } = setup();
     const portableChild = mesh.spawn({
       charter: "portable worker",
       parentId: "root",
-      provider: "claude",
-      model: "claude-opus-4-8",
+      modelConfig: { provider: "claude", model: "claude-opus-4-8" },
       context: { type: "portable", mode: "ledger" },
     });
     const nativeChild = mesh.spawn({
       charter: "native worker",
       parentId: "root",
-      provider: "claude",
-      model: "claude-sonnet-5",
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
     });
 
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
@@ -1496,34 +1568,31 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       name: "set_actor_model",
       arguments: {
         actor_id: portableChild,
-        model: "gemini-3.7-flash-high",
-        provider: "antigravity",
-        effort: "high",
+        model_config: { provider: "antigravity", model: "gemini-3.7-flash", effort: "high" },
       },
     })) as CallToolResult;
     expect(res1.isError).toBeFalsy();
-    expect((res1.content[0] as { text: string }).text).toContain(
-      `staged model gemini-3.7-flash-high, effort high, provider antigravity for ${portableChild}`
-    );
-    expect(registry.get(portableChild)?.provider).toBe("claude");
-    expect(registry.get(portableChild)?.model).toBe("claude-opus-4-8");
-    expect(registry.get(portableChild)?.desiredProvider).toBe("antigravity");
-    expect(registry.get(portableChild)?.desiredModel).toBe("gemini-3.7-flash");
+    expect(registry.get(portableChild)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8" },
+    ]);
+    expect(registry.get(portableChild)?.desiredModelConfig).toEqual([
+      { provider: "antigravity", model: "gemini-3.7-flash", effort: "high" },
+    ]);
 
     // 2. Refuse move on native actor
     const res2 = (await client.callTool({
       name: "set_actor_model",
       arguments: {
         actor_id: nativeChild,
-        model: "gemini-3.7-flash-high",
-        provider: "antigravity",
-        effort: "high",
+        model_config: { provider: "antigravity", model: "gemini-3.7-flash", effort: "high" },
       },
     })) as CallToolResult;
     expect(res2.isError).toBe(true);
     expect((res2.content[0] as { text: string }).text).toMatch(
       /Cannot change provider on non-portable actor/
     );
-    expect(registry.get(nativeChild)?.provider).toBe("claude");
+    expect(registry.get(nativeChild)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-sonnet-5" },
+    ]);
   });
 });

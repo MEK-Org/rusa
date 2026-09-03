@@ -5,18 +5,15 @@ import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { ThreadRecord } from "../../actor/thread-registry.js";
 import { actorRuntimeState } from "../migrations/0034_actor_runtime_state.js";
+import { actorModelConfig } from "../migrations/0036_actor_model_config.js";
 import { DbThreadRegistry } from "./thread-registry-repository.js";
 
 const root: ThreadRecord = {
   id: "root",
   charter: "Own the mesh",
   parentId: null,
-  provider: "codex",
-  model: "gpt-test",
-  effort: "high",
-  desiredProvider: "next-provider",
-  desiredModel: "next-model",
-  desiredEffort: null,
+  modelConfig: [{ provider: "codex", model: "gpt-test", effort: "high" }],
+  desiredModelConfig: [{ provider: "next-provider", model: "next-model" }],
   sessionId: "session-1",
   context: { type: "native" },
   title: "Root",
@@ -36,6 +33,7 @@ describe("DbThreadRegistry", () => {
     db = new Database(":memory:");
     db.pragma("foreign_keys = ON");
     actorRuntimeState.up(db);
+    actorModelConfig.up(db);
     registry = new DbThreadRegistry(db);
   });
 
@@ -98,6 +96,7 @@ describe("DbThreadRegistry", () => {
       const first = new Database(file);
       first.pragma("foreign_keys = ON");
       actorRuntimeState.up(first);
+      actorModelConfig.up(first);
       const firstRegistry = new DbThreadRegistry(first);
       firstRegistry.upsert(root);
       firstRegistry.upsert({
