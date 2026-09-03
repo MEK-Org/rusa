@@ -89,7 +89,7 @@ describe("Database Migration System", () => {
       "0031_inbox_run_focus",
       "0032_actor_runs_focus_fold",
       "0033_reference_cache",
-      "0034_recurring_obligations",
+      "0035_recurring_obligations",
     ]);
 
     const meshEventsColumns = (

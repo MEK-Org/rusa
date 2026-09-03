@@ -581,7 +581,10 @@ class _DetailViewState extends State<_DetailView> {
               _schedulePanel(o),
               const SizedBox(height: 24),
             ],
-            if (o.isRecurring) ...[
+            // Disabling recurrence finalizes a scheduled row but deliberately
+            // retains its ledger.  History belongs to the durable obligation,
+            // not to its current recurrence setting.
+            if (o.isRecurring || data.completionsTotal > 0) ...[
               _SectionHeader('COMPLETION HISTORY'),
               _completionsPanel(),
               const SizedBox(height: 24),

@@ -10,7 +10,7 @@ import { obligationTimestamps } from "../db/migrations/0025_obligation_timestamp
 import { obligationTerminalNote } from "../db/migrations/0026_obligation_terminal_note.js";
 import { obligationTitle } from "../db/migrations/0027_obligation_title.js";
 import { obligationArtifacts } from "../db/migrations/0028_obligation_artifacts.js";
-import { recurringObligations } from "../db/migrations/0034_recurring_obligations.js";
+import { recurringObligations } from "../db/migrations/0035_recurring_obligations.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { createObligationsMcpServer } from "./obligations-mcp.js";

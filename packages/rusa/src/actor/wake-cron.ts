@@ -90,6 +90,58 @@ export function isValidCronExpr(expr: string): boolean {
   }
 }
 
+/** A syntactically valid cron expression whose calendar constraints never match. */
+export class NonFiringCronExprError extends Error {
+  constructor(expr: string) {
+    super(`cron expression can never fire: ${expr}`);
+    this.name = "NonFiringCronExprError";
+  }
+}
+
+/**
+ * Whether a structurally valid cron expression has at least one UTC firing.
+ *
+ * Gregorian dates (including weekday alignment) repeat every 400 years.  Looking
+ * at each day in one such cycle is both complete and bounded; unlike the former
+ * four-year minute walk, it catches expressions such as "0 0 31 2 *" without
+ * declaring a rare-but-real century-boundary date impossible.
+ */
+export function cronExprEverFires(expr: string): boolean {
+  if (!isValidCronExpr(expr)) return false;
+  const [, , domField, monthField, dowField] = expr.trim().split(/\s+/);
+  const doms = parseCronField(domField, 1, 31);
+  const months = parseCronField(monthField, 1, 12);
+  const dows = parseCronField(dowField, 0, 6);
+  const domRestricted = domField !== "*";
+  const dowRestricted = dowField !== "*";
+
+  for (let year = 2000; year < 2400; year++) {
+    for (let month = 0; month < 12; month++) {
+      if (!months.has(month + 1)) continue;
+      const days = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+      for (let day = 1; day <= days; day++) {
+        const date = new Date(Date.UTC(year, month, day));
+        const dayMatches =
+          domRestricted && dowRestricted
+            ? doms.has(day) || dows.has(date.getUTCDay())
+            : domRestricted
+              ? doms.has(day)
+              : dowRestricted
+                ? dows.has(date.getUTCDay())
+                : true;
+        if (dayMatches) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Reject syntactic, range, and calendar-impossible expressions before persistence. */
+export function assertCronExprCanFire(expr: string): void {
+  if (!isValidCronExpr(expr)) throw new Error(`invalid cron expression: ${expr}`);
+  if (!cronExprEverFires(expr)) throw new NonFiringCronExprError(expr);
+}
+
 /** One cron field's matching values, expanded from `*`, `a-b`, `a,b`, a `step` stride, or a single number. */
 function parseCronField(field: string, min: number, max: number): Set<number> {
   const values = new Set<number>();
@@ -118,8 +170,8 @@ function parseCronField(field: string, min: number, max: number): Set<number> {
   return values;
 }
 
-/** Four years of one-minute steps — far past any realistic recurrence, small enough to bound the search. */
-const NEXT_CRON_OCCURRENCE_SEARCH_MINUTES = 4 * 366 * 24 * 60;
+/** A complete Gregorian weekday/calendar cycle. */
+const GREGORIAN_CYCLE_YEARS = 400;
 
 /**
  * The next UTC moment a validated 5-field cron expression fires strictly
@@ -127,17 +179,17 @@ const NEXT_CRON_OCCURRENCE_SEARCH_MINUTES = 4 * 366 * 24 * 60;
  * jobs, so a computed `next_ready_at` lines up with when the tagged crontab
  * entry will actually call back.
  *
- * Brute-force minute stepping rather than a full crontab parser: the
- * validated grammar (digits, `*`, `/`, `,`, `-`) is narrow enough that
- * scanning candidate minutes is simpler to get right than the general case,
- * and cheap enough at this bound.
+ * Scans matching calendar days, then tests the (small) hour/minute Cartesian
+ * product. A complete 400-year Gregorian cycle bounds rare real expressions
+ * such as leap day beyond a century boundary without the former four-year
+ * per-minute cutoff.
  *
  * Standard cron day semantics: when both day-of-month and day-of-week are
  * restricted (neither is `*`), a day matches if EITHER is satisfied; when
  * only one is restricted, that one alone decides.
  */
 export function nextCronOccurrence(cronExpr: string, after: Date): Date {
-  if (!isValidCronExpr(cronExpr)) throw new Error(`invalid cron expression: ${cronExpr}`);
+  assertCronExprCanFire(cronExpr);
   const [minuteField, hourField, domField, monthField, dowField] = cronExpr.trim().split(/\s+/);
   const minutes = parseCronField(minuteField, 0, 59);
   const hours = parseCronField(hourField, 0, 23);
@@ -147,11 +199,11 @@ export function nextCronOccurrence(cronExpr: string, after: Date): Date {
   const domRestricted = domField !== "*";
   const dowRestricted = dowField !== "*";
 
-  const candidate = new Date(after.getTime());
-  candidate.setUTCSeconds(0, 0);
-  candidate.setUTCMinutes(candidate.getUTCMinutes() + 1);
-
-  for (let i = 0; i < NEXT_CRON_OCCURRENCE_SEARCH_MINUTES; i++) {
+  const candidate = new Date(
+    Date.UTC(after.getUTCFullYear(), after.getUTCMonth(), after.getUTCDate())
+  );
+  const endYear = candidate.getUTCFullYear() + GREGORIAN_CYCLE_YEARS;
+  while (candidate.getUTCFullYear() < endYear) {
     const dayMatches =
       domRestricted && dowRestricted
         ? doms.has(candidate.getUTCDate()) || dows.has(candidate.getUTCDay())
@@ -160,19 +212,26 @@ export function nextCronOccurrence(cronExpr: string, after: Date): Date {
           : dowRestricted
             ? dows.has(candidate.getUTCDay())
             : true;
-    if (
-      minutes.has(candidate.getUTCMinutes()) &&
-      hours.has(candidate.getUTCHours()) &&
-      months.has(candidate.getUTCMonth() + 1) &&
-      dayMatches
-    ) {
-      return candidate;
+    if (months.has(candidate.getUTCMonth() + 1) && dayMatches) {
+      for (const hour of [...hours].sort((a, b) => a - b)) {
+        for (const minute of [...minutes].sort((a, b) => a - b)) {
+          const occurrence = new Date(
+            Date.UTC(
+              candidate.getUTCFullYear(),
+              candidate.getUTCMonth(),
+              candidate.getUTCDate(),
+              hour,
+              minute
+            )
+          );
+          if (occurrence.getTime() > after.getTime()) return occurrence;
+        }
+      }
     }
-    candidate.setUTCMinutes(candidate.getUTCMinutes() + 1);
+    candidate.setUTCDate(candidate.getUTCDate() + 1);
   }
-  throw new Error(
-    `no cron occurrence found for "${cronExpr}" within ${NEXT_CRON_OCCURRENCE_SEARCH_MINUTES} minutes of ${after.toISOString()}`
-  );
+  // `assertCronExprCanFire` plus a full Gregorian cycle make this unreachable.
+  throw new NonFiringCronExprError(cronExpr);
 }
 
 /** Thread ids and suffixed wake slots only — keeps the tag/job lines free of whitespace or shell metachars. */
@@ -214,13 +273,20 @@ export interface CrontabIo {
 }
 
 /** Real crontab IO over the `crontab` CLI. */
-export function execCrontabIo(): CrontabIo {
+export function execCrontabIo(run: typeof execFileSync = execFileSync): CrontabIo {
   return {
     read(): string {
       try {
-        return execFileSync("crontab", ["-l"], { encoding: "utf-8" });
-      } catch {
-        return ""; // "no crontab for user" exits non-zero — treat as empty
+        return run("crontab", ["-l"], { encoding: "utf-8" }) as string;
+      } catch (error) {
+        // `crontab -l` uses a nonzero exit for a genuinely absent per-user
+        // crontab.  A missing binary, permission denial, daemon failure, or
+        // any other read error is *not* an empty crontab: treating it that way
+        // would make a later mutation overwrite jobs we failed to read.
+        const stderr = (error as { stderr?: string | Buffer }).stderr;
+        const detail = typeof stderr === "string" ? stderr : (stderr?.toString("utf-8") ?? "");
+        if (/no crontab for(?:\s+user)?\b/i.test(detail)) return "";
+        throw error;
       }
     },
     write(content: string): void {
@@ -233,14 +299,9 @@ export function execCrontabIo(): CrontabIo {
  * The ONE read-modify-write path onto the familiar's crontab, shared by every
  * feature that edits it — wake schedules (`# mc-wake:`), obligation-activation
  * recurrence blocks (`# mc-obligation-activation:`), and message-delivery blocks.
- * Before this class existed, `CrontabWakeCron` and `DefaultOsScheduler` each held
- * their own separately constructed `CrontabIo` and did their own read-then-write,
- * each implicitly assuming it was the crontab's only writer. All crontab IO here
- * is synchronous (`crontab -l` / `crontab -` block the event loop for their
- * duration), so a single instance's `mutate()` call is an uninterruptible critical
- * section — construct exactly one `CrontabMutator` per process and hand the SAME
- * instance to every writer so an interleaved wake-schedule edit and a recurrence
- * edit can never observe each other's stale pre-image and silently drop one.
+ * Both wake and scheduler edits receive the same mutation boundary.  It preserves
+ * unrelated lines and fails closed: if the current crontab cannot be read, or a
+ * managed block cannot be verified, no replacement write is attempted.
  */
 export class CrontabMutator {
   constructor(private readonly io: CrontabIo) {}
@@ -271,8 +332,8 @@ export class CrontabMutator {
 
 /**
  * Read/modify/write the familiar's crontab for `# mc-wake:<actorId>` blocks,
- * through the shared {@link CrontabMutator} so edits here can never interleave
- * with — or silently lose — an edit from another crontab writer.
+ * through the shared {@link CrontabMutator}, which preserves the common
+ * fail-closed read/verify/write invariant for managed crontab edits.
  */
 export class CrontabWakeCron {
   constructor(
@@ -337,7 +398,7 @@ export class CrontabWakeCron {
     priority?: "normal" | "responsive" | boolean
   ): Promise<void> {
     if (!isValidActorId(actorId)) throw new Error(`invalid actor id: ${actorId}`);
-    if (!isValidCronExpr(cronExpr)) throw new Error(`invalid cron expression: ${cronExpr}`);
+    assertCronExprCanFire(cronExpr);
     this.mutator.mutate((lines) => {
       const kept = this.stripBlock(lines, actorId);
       kept.push(TAG_PREFIX + actorId, this.buildJobLine(actorId, cronExpr, reason, priority));

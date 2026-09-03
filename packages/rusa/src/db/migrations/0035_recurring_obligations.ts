@@ -3,7 +3,7 @@ import type { Migration } from "./types.js";
 
 /** Support recurring obligations as durable scheduled work. */
 export const recurringObligations: Migration = {
-  id: "0034_recurring_obligations",
+  id: "0035_recurring_obligations",
   noTransaction: true,
   up: (db: Database) => {
     db.exec("PRAGMA foreign_keys = OFF;");

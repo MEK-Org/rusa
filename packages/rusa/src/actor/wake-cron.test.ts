@@ -6,6 +6,8 @@ import {
   type CrontabIo,
   CrontabMutator,
   CrontabWakeCron,
+  cronExprEverFires,
+  execCrontabIo,
   isValidActorId,
   isValidCronExpr,
   nextCronOccurrence,
@@ -65,6 +67,17 @@ describe("cron expression + actor-id validation", () => {
   it("rejects an inverted range", () => {
     expect(isValidCronExpr("0 0 10-1 * *")).toBe(false);
   });
+  it("rejects syntactically valid calendars that can never fire", () => {
+    expect(cronExprEverFires("0 0 31 2 *")).toBe(false);
+  });
+  it("recognizes century-boundary leap dates across the complete Gregorian cycle", () => {
+    // 2100 is not a leap year but 2000 and 2400 are; a short bounded scan
+    // cannot establish this calendar-level fact.
+    expect(cronExprEverFires("0 0 29 2 *")).toBe(true);
+    expect(
+      nextCronOccurrence("0 0 29 2 *", new Date("2099-03-01T00:00:00.000Z")).toISOString()
+    ).toBe("2104-02-29T00:00:00.000Z");
+  });
   it("validates actor ids to safe characters, including suffixed wake slots", () => {
     expect(isValidActorId("73e0b00f-8810-4315")).toBe(true);
     expect(isValidActorId("root:daily-bless-cut")).toBe(true);
@@ -74,6 +87,28 @@ describe("cron expression + actor-id validation", () => {
     expect(isValidActorId(":slot")).toBe(false);
     expect(isValidActorId("root:")).toBe(false);
     expect(isValidActorId("root::slot")).toBe(false);
+  });
+});
+
+describe("execCrontabIo", () => {
+  it("treats only crontab's documented absent-user message as an empty crontab", () => {
+    const io = execCrontabIo((() => {
+      const error = Object.assign(new Error("exit 1"), {
+        stderr: Buffer.from("no crontab for user\n"),
+      });
+      throw error;
+    }) as typeof import("node:child_process").execFileSync);
+    expect(io.read()).toBe("");
+  });
+
+  it("fails closed when crontab -l fails for any other reason", () => {
+    const io = execCrontabIo((() => {
+      const error = Object.assign(new Error("permission denied"), {
+        stderr: Buffer.from("permission denied\n"),
+      });
+      throw error;
+    }) as typeof import("node:child_process").execFileSync);
+    expect(() => io.read()).toThrow("permission denied");
   });
 });
 

@@ -1,7 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { OsScheduler } from "../../actor/os-scheduler.js";
-import { isValidCronExpr, nextCronOccurrence } from "../../actor/wake-cron.js";
+import {
+  cronExprEverFires,
+  isValidCronExpr,
+  NonFiringCronExprError,
+  nextCronOccurrence,
+} from "../../actor/wake-cron.js";
 import {
   assertObligationStatus,
   type EntityId,
@@ -279,6 +284,27 @@ export class ObligationRepository {
    * durable truth instead of racing it.
    */
   private dirtyScheduleIds = new Set<string>();
+
+  /** A transient OS write failure gets two bounded post-commit re-derivations. */
+  private scheduleReconcileRetry(ids: readonly string[], attemptsRemaining = 2): void {
+    if (!this.osScheduler || attemptsRemaining <= 0 || ids.length === 0) return;
+    setTimeout(() => {
+      const failed: string[] = [];
+      for (const id of ids) {
+        try {
+          this.reconcileObligationSchedule(id);
+        } catch (err) {
+          failed.push(id);
+          console.warn(
+            `[obligations] retry failed to reconcile scheduled activation for ${id}: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+        }
+      }
+      this.scheduleReconcileRetry(failed, attemptsRemaining - 1);
+    }, 0);
+  }
 
   private markScheduleDirty(id: string): void {
     if (this.osScheduler) this.dirtyScheduleIds.add(id);
@@ -580,9 +606,20 @@ export class ObligationRepository {
     // rollback couldn't take them back with it.
     const toReconcile = Array.from(this.dirtyScheduleIds);
     this.dirtyScheduleIds.clear();
+    const failedReconciliations: string[] = [];
     for (const id of toReconcile) {
-      this.reconcileObligationSchedule(id);
+      try {
+        this.reconcileObligationSchedule(id);
+      } catch (err) {
+        failedReconciliations.push(id);
+        console.warn(
+          `[obligations] failed to reconcile scheduled activation for ${id}: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
     }
+    this.scheduleReconcileRetry(failedReconciliations);
 
     return result;
   }
@@ -597,6 +634,11 @@ export class ObligationRepository {
    */
   private stamp(): string {
     return new Date(this.now()).toISOString();
+  }
+
+  private assertFiringCronExpr(expr: string): void {
+    if (!isValidCronExpr(expr)) throw new ObligationValidationError("invalid cron expression");
+    if (!cronExprEverFires(expr)) throw new NonFiringCronExprError(expr);
   }
 
   create(input: CreateObligationInput): Obligation {
@@ -614,9 +656,7 @@ export class ObligationRepository {
       }
 
       const recurrence = input.recurrence;
-      if (recurrence?.policy === "cron" && !isValidCronExpr(recurrence.cronExpr)) {
-        throw new ObligationValidationError("invalid cron expression");
-      }
+      if (recurrence?.policy === "cron") this.assertFiringCronExpr(recurrence.cronExpr);
       if (
         recurrence?.policy === "completion_interval" &&
         (!Number.isInteger(recurrence.intervalSeconds) || recurrence.intervalSeconds <= 0)
@@ -1342,9 +1382,7 @@ export class ObligationRepository {
       | { policy: "completion_interval"; intervalSeconds: number }
       | null
   ): Obligation {
-    if (recurrence?.policy === "cron" && !isValidCronExpr(recurrence.cronExpr)) {
-      throw new ObligationValidationError("invalid cron expression");
-    }
+    if (recurrence?.policy === "cron") this.assertFiringCronExpr(recurrence.cronExpr);
     if (
       recurrence?.policy === "completion_interval" &&
       (!Number.isInteger(recurrence.intervalSeconds) || recurrence.intervalSeconds <= 0)

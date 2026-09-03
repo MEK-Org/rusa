@@ -142,6 +142,50 @@ describe("DefaultOsScheduler", () => {
     expect(cronData).toBe(original);
     expect(at.schedule).not.toHaveBeenCalled();
   });
+
+  it("keeps the existing cron block when installing its at replacement fails", () => {
+    scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" });
+    const original = cronData;
+    vi.mocked(at.schedule).mockImplementation(() => {
+      throw new Error("at unavailable");
+    });
+
+    expect(() =>
+      scheduler.scheduleObligationActivation("ob-1", { kind: "at", date: new Date() })
+    ).toThrow("at unavailable");
+    expect(cronData).toBe(original);
+  });
+
+  it("installs the replacement cron block before stale at cleanup, retaining it on cleanup failure", () => {
+    vi.mocked(at.list).mockReturnValue([
+      { id: "old-at", script: "# mc-obligation-activation:ob-1\nold" },
+    ]);
+    vi.mocked(at.remove).mockImplementation(() => {
+      throw new Error("atrm failed");
+    });
+
+    expect(() =>
+      scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" })
+    ).toThrow("atrm failed");
+    expect(cronData).toContain("# mc-obligation-activation:ob-1");
+  });
+
+  it("installs a replacement at job before removing stale at jobs", () => {
+    const calls: string[] = [];
+    const jobs = [{ id: "old-at", script: "# mc-obligation-activation:ob-1\nold" }];
+    vi.mocked(at.list).mockReturnValue(jobs);
+    vi.mocked(at.schedule).mockImplementation(() => {
+      calls.push("schedule");
+      return "new-at";
+    });
+    vi.mocked(at.remove).mockImplementation((id) => {
+      calls.push(`remove:${id}`);
+    });
+
+    scheduler.scheduleObligationActivation("ob-1", { kind: "at", date: new Date() });
+    expect(calls).toEqual(["schedule", "remove:old-at"]);
+    expect(at.remove).toHaveBeenCalledWith("old-at");
+  });
 });
 
 describe("CrontabMutator shared between CrontabWakeCron and DefaultOsScheduler", () => {

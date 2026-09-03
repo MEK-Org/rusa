@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { type CrontabMutator, isValidCronExpr } from "./wake-cron.js";
+import { assertCronExprCanFire, type CrontabMutator } from "./wake-cron.js";
 
 /**
  * One internal scheduling service with a deliberately small vocabulary:
@@ -283,6 +283,14 @@ export class DefaultOsScheduler implements OsScheduler {
     });
   }
 
+  /** Verify an existing managed block before touching a replacement scheduler. */
+  private verifyCronBlock(tag: string, endTag: string): void {
+    this.mutator.mutate((lines) => {
+      this.stripCronBlock(lines, tag, endTag);
+      return { lines, result: undefined };
+    });
+  }
+
   /** The last `CRON_TZ=...` assignment still in effect at the end of `lines`, if any. */
   private lastCronTzLine(lines: string[]): string | null {
     for (let i = lines.length - 1; i >= 0; i--) {
@@ -291,13 +299,15 @@ export class DefaultOsScheduler implements OsScheduler {
     return null;
   }
 
-  private removeAtByTag(tag: string): void {
-    const jobs = this.atIo.list();
-    for (const job of jobs) {
-      if (job.script.includes(tag)) {
-        this.atIo.remove(job.id);
-      }
-    }
+  private staleAtIds(tag: string): string[] {
+    return this.atIo
+      .list()
+      .filter((job) => job.script.includes(tag))
+      .map((job) => job.id);
+  }
+
+  private removeAtIds(ids: Iterable<string>): void {
+    for (const id of ids) this.atIo.remove(id);
   }
 
   /** The tag/end-tag pair bounding one obligation's managed cron block, exactly. */
@@ -316,9 +326,8 @@ export class DefaultOsScheduler implements OsScheduler {
     const curlLine = this.buildCurlLine("wake-obligation", { id });
 
     if (time.kind === "cron") {
-      if (!isValidCronExpr(time.cronExpr))
-        throw new Error(`invalid cron expression: ${time.cronExpr}`);
-      this.removeAtByTag(tag);
+      assertCronExprCanFire(time.cronExpr);
+      const staleAtIds = this.staleAtIds(tag);
       // CRON_TZ persists for every later line in the crontab, not just ours,
       // so the block must put back whatever was in effect before it rather
       // than clearing it — otherwise a job appended after this one silently
@@ -335,18 +344,30 @@ export class DefaultOsScheduler implements OsScheduler {
         );
         return { lines: kept, result: undefined };
       });
+      // The replacement cron block is now durable.  If removing an old at job
+      // fails, retain it for reconciliation rather than creating a scheduling
+      // gap by removing it before the replacement was installed.
+      this.removeAtIds(staleAtIds);
     } else {
-      this.updateCron(tag, endTag, null);
-      this.removeAtByTag(tag);
       const script = `${tag}\n${curlLine}\n`;
-      this.atIo.schedule(script, time.date);
+      // Validate the existing block before submitting `at`: corruption must
+      // still fail closed with no new job, while a normal replacement is
+      // installed before its old cron/at entries are removed.
+      this.verifyCronBlock(tag, endTag);
+      // Install first: a failed `at` submission leaves an existing cron block
+      // and prior at jobs armed.  Once it succeeds, remove only the stale jobs
+      // captured before installation (never the just-created replacement).
+      const staleAtIds = this.staleAtIds(tag);
+      const replacementId = this.atIo.schedule(script, time.date);
+      this.updateCron(tag, endTag, null);
+      this.removeAtIds(staleAtIds.filter((staleId) => staleId !== replacementId));
     }
   }
 
   cancelObligationActivation(id: string): void {
     const { tag, endTag } = this.activationTags(id);
     this.updateCron(tag, endTag, null);
-    this.removeAtByTag(tag);
+    this.removeAtIds(this.staleAtIds(tag));
   }
 
   listObligationActivations(): string[] {
@@ -365,15 +386,16 @@ export class DefaultOsScheduler implements OsScheduler {
 
   scheduleMessageDelivery(id: string, date: Date): void {
     const tag = `# mc-message-delivery:${id}`;
-    this.removeAtByTag(tag);
     const curlLine = this.buildCurlLine("wake-message", { id });
     const script = `${tag}\n${curlLine}\n`;
-    this.atIo.schedule(script, date);
+    const staleAtIds = this.staleAtIds(tag);
+    const replacementId = this.atIo.schedule(script, date);
+    this.removeAtIds(staleAtIds.filter((staleId) => staleId !== replacementId));
   }
 
   cancelMessageDelivery(id: string): void {
     const tag = `# mc-message-delivery:${id}`;
-    this.removeAtByTag(tag);
+    this.removeAtIds(this.staleAtIds(tag));
   }
 
   listMessageDeliveries(): string[] {

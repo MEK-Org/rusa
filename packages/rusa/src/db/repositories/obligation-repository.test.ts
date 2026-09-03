@@ -9,7 +9,7 @@ import { obligationTimestamps } from "../migrations/0025_obligation_timestamps.j
 import { obligationTerminalNote } from "../migrations/0026_obligation_terminal_note.js";
 import { obligationTitle } from "../migrations/0027_obligation_title.js";
 import { obligationArtifacts } from "../migrations/0028_obligation_artifacts.js";
-import { recurringObligations } from "../migrations/0034_recurring_obligations.js";
+import { recurringObligations } from "../migrations/0035_recurring_obligations.js";
 import { ObligationRepository } from "./obligation-repository.js";
 
 /** Records every scheduler call instead of touching the OS, for assertions. */
@@ -1747,6 +1747,14 @@ describe("ObligationRepository", () => {
       expect(scheduler.activations.size).toBe(0);
     });
 
+    it("rejects a calendar-impossible cron expression before persisting recurrence", () => {
+      expect(() =>
+        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 0 31 2 *" })
+      ).toThrow("cron expression can never fire");
+      expect(repository.require("rec-1").recurrencePolicy).toBeNull();
+      expect(scheduler.activations.size).toBe(0);
+    });
+
     it("rejects setting or disabling recurrence on a terminal obligation", () => {
       repository.setTerminalStatus("rec-1", "done");
       expect(() =>
@@ -1935,20 +1943,42 @@ describe("ObligationRepository", () => {
     });
 
     it("commits the policy change even when the OS scheduler call fails, instead of rolling it back", () => {
+      vi.useFakeTimers();
+      let attempts = 0;
       scheduler.scheduleObligationActivation = () => {
-        throw new Error("crontab write failed");
+        attempts++;
+        if (attempts === 1) throw new Error("crontab write failed");
       };
 
       expect(() =>
         repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" })
-      ).toThrow("crontab write failed");
+      ).not.toThrow();
+      expect(attempts).toBe(1);
+      vi.runAllTimers();
+      expect(attempts).toBe(2);
+      vi.useRealTimers();
 
       // The database write is not an OS side effect and must not roll back
-      // with it — the caller sees the scheduler failure, but the row it
-      // failed on reflects the policy that failure was actually about.
+      // with it; a bounded post-commit retry re-derives the scheduler job from
+      // the policy that actually committed.
       const row = repository.require("rec-1");
       expect(row.recurrencePolicy).toBe("cron");
       expect(row.recurrenceCron).toBe("0 * * * *");
+    });
+
+    it("bounds post-commit scheduler reconciliation retries", () => {
+      vi.useFakeTimers();
+      let attempts = 0;
+      scheduler.scheduleObligationActivation = () => {
+        attempts++;
+        throw new Error("persistent crontab failure");
+      };
+
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
+      vi.runAllTimers();
+      // One committed mutation plus the two explicitly bounded retries.
+      expect(attempts).toBe(3);
+      vi.useRealTimers();
     });
 
     it("replaces a switched-away completion_interval `at` job with the new cron job outside the transaction", () => {

@@ -8,6 +8,58 @@ import 'fakes.dart';
 
 void main() {
   testWidgets(
+    'shows retained completion history after recurrence has been disabled',
+    (tester) async {
+      await tester.runAsync(() async {
+        final completedOb = makeObligation(
+          'ob-retained-ledger',
+          ownerId: 'root',
+          intent: 'Formerly recurring work',
+          status: 'done',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [completedOb]
+          ..obligationDetailByOffset = (_, __) => ObligationDetailSnapshot(
+            obligation: completedOb,
+            children: const [],
+            blockingChildren: const [],
+            completions: [
+              ObligationCompletionDto(
+                id: 'c-retained',
+                obligationId: completedOb.id,
+                sequence: 1,
+                completedAt: '2026-09-01T03:00:00.000Z',
+                note: 'kept for audit',
+              ),
+            ],
+            completionsTotal: 1,
+            completionsHasMore: false,
+          );
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.tap(find.text('Formerly recurring work'));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('COMPLETION HISTORY'), findsOneWidget);
+        expect(find.textContaining('Cycle 1'), findsOneWidget);
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
     '"Load earlier completions" extends the visible history instead of replacing it, and renders resolutionRef',
     (tester) async {
       await tester.runAsync(() async {
