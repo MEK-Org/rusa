@@ -3718,6 +3718,160 @@ describe("ActorMesh", () => {
     });
   });
 
+  // #199 amend gap 3: a halt already in effect on provider B, from before the
+  // swap was even staged, must still block a queued-on-A ticket that lands on
+  // B only once it is naturally selected from the mesh queue. No `/halt`
+  // command fires after staging, so `cancelHaltedQueuedRuns` never scans this
+  // ticket — the only remaining choke point is the RunStartStaleProviderError
+  // retry in `Actor.executeTurn`, which must re-check the halt gate (via
+  // `beforeRun`) before resubmitting under the newly-live provider.
+  describe("cross-provider swap onto an already-halted provider while genuinely queued (#199 amend gap 3)", () => {
+    it("never invokes the halted provider, leaves nothing active, and replays once on resume without a fresh external delivery", async () => {
+      const providerARuns: string[] = [];
+      const providerBRuns: string[] = [];
+      const liveActors = new Map<string, Actor>();
+      const blockerDeferred = deferredProvider();
+      const halted = new Set<string>();
+      const pacers = new Map<string, ProviderPacer>();
+      const pacerFor = (name: string): ProviderPacer => {
+        let pacer = pacers.get(name);
+        if (!pacer) {
+          pacer = new ProviderPacer(0);
+          pacers.set(name, pacer);
+        }
+        return pacer;
+      };
+
+      const { mesh, registry, tick } = setup({
+        maxConcurrent: 1,
+        isHalted: (provider) => (provider ? halted.has(provider) : false),
+        onModelSet: (actorId, _newModel, record) => {
+          const live = mesh.get(actorId);
+          if (live && record.provider === "provider-b") {
+            live.setProvider?.({
+              name: "provider-b",
+              providerName: "provider-b",
+              run: async (runOpts) => {
+                providerBRuns.push(runOpts.cwd);
+                liveActors.get(actorId)?.declareYield();
+                return { success: true, exitCode: 0, output: "b" };
+              },
+            });
+          }
+        },
+        // Mirrors the production providerGate wiring in start.ts (same as the
+        // gap-2 describe block above).
+        providerGate: (fn, providerName, request) =>
+          pacerFor(providerName).submit(fn, {
+            responsive: request.responsive,
+            threadId: request.threadId,
+            enqueueNormal: request.enqueueNormal,
+            revalidateProvider: request.threadId
+              ? () => {
+                  mesh.applyPendingModel(request.threadId as string);
+                  const live = mesh.get(request.threadId as string)?.getProvider?.();
+                  if (!live) return true;
+                  return live.providerName === providerName;
+                }
+              : undefined,
+          }),
+        createActor: (ctx) => {
+          let actor!: Actor;
+          const isBlocker = ctx.record.charter === "blocker";
+          const provider: CodingProvider = isBlocker
+            ? {
+                ...blockerDeferred.provider,
+                run: async (runOpts) => {
+                  const result = await blockerDeferred.provider.run(runOpts);
+                  if (result.success) actor.declareYield();
+                  return result;
+                },
+              }
+            : {
+                name: "provider-a",
+                providerName: "provider-a",
+                run: async (runOpts) => {
+                  providerARuns.push(runOpts.cwd);
+                  actor.declareYield();
+                  return { success: true, exitCode: 0, output: "a" };
+                },
+              };
+          actor = new Actor({
+            id: ctx.record.id,
+            cwd: `/tmp/${ctx.record.id}`,
+            provider,
+            mcpServers: [],
+            loadSessionId: () => ctx.getRecord()?.sessionId,
+            saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
+            buildPrompt: () => ({ prompt: "work" }),
+            gate: ctx.gate,
+            beforeRun: ctx.beforeRun,
+            onQueued: ctx.onQueued,
+            onRunStart: () => mesh.applyPendingModel(ctx.record.id),
+            onRunEnd: (result) => ctx.onRunEnd(result),
+            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+            debounceMs: DEBOUNCE,
+          });
+          liveActors.set(ctx.record.id, actor);
+          return actor;
+        },
+      });
+
+      // Provider B is already halted, before anything is staged or queued.
+      halted.add("provider-b");
+
+      const blocker = mesh.spawn({ charter: "blocker", parentId: "root" });
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        provider: "provider-a",
+        model: "model-a",
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      // Occupy the mesh's one concurrency slot.
+      mesh.sendMessage(blocker, "hold the slot", "root");
+      await tick();
+      expect(mesh.activeRunState(blocker)?.phase).toBe("running");
+
+      // Worker's beforeRun passes on provider-a (not halted) and sits
+      // genuinely queued behind mesh capacity.
+      mesh.sendMessage(worker, "work", "root");
+      await tick();
+      expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+
+      // Stage the cross-provider swap onto the already-halted provider-b
+      // while worker is genuinely queued. No halt command fires here, so
+      // `cancelHaltedQueuedRuns` is never invoked for this ticket.
+      mesh.setActorModel(worker, "model-b", "root", "provider-b");
+      expect(registry.get(worker)?.provider).toBe("provider-a");
+      expect(halted.has("provider-b")).toBe(true);
+
+      // Free the slot: the queued ticket is naturally selected here, well
+      // after the swap was staged and B was halted.
+      blockerDeferred.releaseAll();
+      await tick();
+
+      // The halted provider must never actually be invoked, and the run must
+      // not be left dangling as active.
+      expect(providerBRuns).toEqual([]);
+      expect(providerARuns).toEqual([]);
+      expect(mesh.runningThreadIds()).toEqual(new Set());
+      expect(mesh.queuedThreadIds()).toEqual(new Set());
+
+      // Clear the halt and drive the production resume/reconcile path: the
+      // same unhandled work launches once on provider-b, with no fresh
+      // external delivery.
+      halted.delete("provider-b");
+      mesh.resumeCancelledRuns();
+      mesh.reconcileUnseenInbox();
+      await tick();
+
+      expect(providerBRuns).toEqual([`/tmp/${worker}`]);
+      expect(providerARuns).toEqual([]);
+    });
+  });
+
   it("reparentThread moves the actor to a new parent and hands the new parent a handle", async () => {
     const { mesh, registry } = setup();
     const steward = mesh.spawn({ charter: "steward", parentId: "root" });

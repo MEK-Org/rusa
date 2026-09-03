@@ -799,7 +799,28 @@ export class Actor {
             result = await start.result;
             break;
           } catch (err) {
-            if (err instanceof RunStartStaleProviderError) continue;
+            if (err instanceof RunStartStaleProviderError) {
+              // The provider that just became live (via the same
+              // applyPendingModel call that raised this rejection) may be
+              // durably halted — the pacer only re-validated lane
+              // membership, not halt state, since halting is a separate
+              // concern from provider pacing. Re-run the same admission gate
+              // this run already passed once on its original provider; if
+              // the newly-live provider is halted, this is exactly a queued
+              // run cancelled out from under it, so retain the same replay
+              // flag `cancelQueuedRun` sets, letting `resumeCancelledRun`
+              // (already the production halt/resume replay path) relaunch it
+              // once the halt clears — no parallel lifecycle construct.
+              if (
+                this.opts.beforeRun &&
+                !(await this.opts.beforeRun({ mode: nudge.mode ?? "ordinary" }))
+              ) {
+                this.cancelledQueuedRun = true;
+                this.lastRunSkipped = true;
+                return;
+              }
+              continue;
+            }
             throw err;
           }
         }
