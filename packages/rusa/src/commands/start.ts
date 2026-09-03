@@ -1934,6 +1934,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           },
           onRuntimeStateChanged: ctx.onRuntimeStateChanged,
           onRunStart: (responsive, injectRecord) => {
+            // Apply a tuple staged while this actor was queued/idle before its
+            // own run_start is recorded (#199), so this dispatch launches on the
+            // new provider/model/effort rather than the one it was queued on.
+            mesh.applyPendingModel(id);
             const providerName = providerThrottleKey(actor.getProvider().providerName, config);
             const runId = beginActorRun(id, providerName);
             mesh.recordEvent({
@@ -2443,6 +2447,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       },
       onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
       onRunStart: (responsive, injectRecord) => {
+        // Same dispatch-time apply as the worker onRunStart above (#199): a
+        // tuple staged while the root was queued/idle must land before this
+        // run's run_start rather than at the end of the run after.
+        mesh.applyPendingModel(rootId);
         const providerName = providerThrottleKey(provider.providerName, config);
         const runId = beginActorRun(rootId, providerName);
         mesh.recordEvent({

@@ -248,6 +248,10 @@ function setup(
         gate: ctx.gate,
         beforeRun: ctx.beforeRun,
         onQueued: ctx.onQueued,
+        // Mirrors the production onRunStart wiring in start.ts (#199): apply a
+        // pending model/provider/effort tuple before this run's own dispatch,
+        // the same way start.ts calls `mesh.applyPendingModel` there.
+        onRunStart: () => mesh.applyPendingModel(ctx.record.id),
         onRunEnd: ctx.onRunEnd,
         onRuntimeStateChanged: ctx.onRuntimeStateChanged,
         debounceMs: DEBOUNCE,
@@ -273,6 +277,7 @@ function setup(
     saveSessionId: (id) => registry.patch(rootId, { sessionId: id }),
     buildPrompt: () => ({ prompt: "Work from your inbox." }),
     onQueued: (context) => mesh.actorQueued(rootId, context),
+    onRunStart: () => mesh.applyPendingModel(rootId),
     onRunEnd: () => mesh.finishInboxRun(rootId),
     onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
     debounceMs: DEBOUNCE,
@@ -3187,14 +3192,24 @@ describe("ActorMesh", () => {
     expect(queuedMeshSetup.registry.get(queuedChild)?.model).toBe("claude-sonnet-5");
     expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModel).toBe("claude-opus-4-8");
 
-    // Releasing the blocker admits the queued run, which still uses the old
-    // model. The pending value must survive until that run itself completes.
+    // Releasing the blocker admits the queued run. Per #199, a tuple staged
+    // while queued is applied at THIS dispatch — before the queued run's own
+    // run_start — not deferred to the end of the run it was staged behind.
     queuedDeferred.releaseAll();
     await queuedMeshSetup.tick();
     expect(queuedMeshSetup.mesh.activeRunState(queuedChild)?.phase).toBe("running");
-    expect(queuedMeshSetup.registry.get(queuedChild)?.model).toBe("claude-sonnet-5");
-    expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModel).toBe("claude-opus-4-8");
+    expect(queuedMeshSetup.registry.get(queuedChild)?.model).toBe("claude-opus-4-8");
+    expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModel).toBeUndefined();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "actor_model_set",
+        actorId: queuedChild,
+        detail: "claude-sonnet-5 -> claude-opus-4-8",
+      })
+    );
 
+    // The now-launched run itself completes on the tuple it was admitted
+    // with; nothing further is staged, so this release is a plain run end.
     queuedDeferred.releaseAll();
     await queuedMeshSetup.tick();
     expect(queuedMeshSetup.registry.get(queuedChild)?.model).toBe("claude-opus-4-8");
@@ -3239,6 +3254,10 @@ describe("ActorMesh", () => {
     dynamicMeshSetup.mesh.sendMessage(movingWorker, "apply staged provider", "root");
     await dynamicMeshSetup.tick();
     expect(dynamicMeshSetup.registry.get(movingWorker)?.provider).toBe("provider-b");
+    // Per #199, the staged provider applies at THIS dispatch (movingWorker was
+    // idle when staged), so this very run already launched on provider-b.
+    expect(providerBExecuted).toBe(true);
+    providerBExecuted = false;
 
     // When provider-b is halted, wake is skipped (provider-a halt does not block it)
     haltedProvider = "provider-b";
@@ -3251,6 +3270,225 @@ describe("ActorMesh", () => {
     dynamicMeshSetup.mesh.sendMessage(movingWorker, "do work", "root");
     await dynamicMeshSetup.tick();
     expect(providerBExecuted).toBe(true);
+  });
+
+  // #199: a tuple staged while an actor is queued/idle must apply at that
+  // actor's next dispatch (before run_start / provider launch), not at the
+  // end of the run it happens to land in.
+  describe("setActorModel dispatch-time boundary (#199)", () => {
+    it("applies a tuple staged while idle to the very next run, before that run's provider launch", async () => {
+      const events: MeshEventInput[] = [];
+      const seenModelAtRunStart: string[] = [];
+      const { mesh, registry, tick } = setup({
+        events: (event) => events.push(event),
+        sharedProvider: {
+          name: "test-provider",
+          providerName: "test-provider",
+          run: async () => {
+            seenModelAtRunStart.push(registry.get(worker)?.model ?? "");
+            return { success: true, exitCode: 0, output: "ok" };
+          },
+        },
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        provider: "test-provider",
+        model: "model-a",
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      // Idle, no unhandled inbox: staging must not itself dispatch anything.
+      mesh.setActorModel(worker, "model-b", "root");
+      expect(mesh.activeRunState(worker)).toBeNull();
+      expect(registry.get(worker)?.model).toBe("model-a");
+      expect(registry.get(worker)?.desiredModel).toBe("model-b");
+
+      // The next dispatch (a fresh message) must already run on the staged
+      // model — the run body itself observes "model-b", not "model-a".
+      mesh.sendMessage(worker, "work", "root");
+      await tick();
+
+      expect(seenModelAtRunStart).toEqual(["model-b"]);
+      expect(registry.get(worker)?.model).toBe("model-b");
+      expect(registry.get(worker)?.desiredModel).toBeUndefined();
+      expect(events).toContainEqual(
+        expect.objectContaining({ kind: "actor_model_set", actorId: worker })
+      );
+    });
+
+    it("applies a tuple staged while queued to that same queued run, before it launches", async () => {
+      const seenModelAtRunStart: string[] = [];
+      const deferred = deferredProvider();
+      const { mesh, registry, tick } = setup({
+        maxConcurrent: 1,
+        sharedProvider: {
+          name: "deferred",
+          providerName: "deferred",
+          run: async (opts) => {
+            if (opts.cwd === `/tmp/${worker}`) {
+              seenModelAtRunStart.push(registry.get(worker)?.model ?? "");
+            }
+            return deferred.provider.run(opts);
+          },
+        },
+      });
+
+      const blocker = mesh.spawn({ charter: "blocker", parentId: "root" });
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        provider: "deferred",
+        model: "model-a",
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      mesh.sendMessage(blocker, "hold the slot", "root");
+      await tick();
+      expect(mesh.activeRunState(blocker)?.phase).toBe("running");
+
+      mesh.sendMessage(worker, "work", "root");
+      await tick();
+      expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+
+      // Re-pin while queued, still behind the blocker.
+      mesh.setActorModel(worker, "model-b", "root");
+      expect(registry.get(worker)?.model).toBe("model-a");
+      expect(registry.get(worker)?.desiredModel).toBe("model-b");
+
+      // Admit the queued run: its own body must already see "model-b".
+      deferred.releaseAll();
+      await tick();
+      expect(mesh.activeRunState(worker)?.phase).toBe("running");
+      expect(seenModelAtRunStart).toEqual(["model-b"]);
+      expect(registry.get(worker)?.model).toBe("model-b");
+      expect(registry.get(worker)?.desiredModel).toBeUndefined();
+
+      deferred.releaseAll();
+      await tick();
+    });
+
+    it("keeps an in-flight run on its already-launched tuple; only the following run picks up the staged one", async () => {
+      const seenModelAtRunStart: string[] = [];
+      const deferred = deferredProvider();
+      const { mesh, registry, tick } = setup({
+        sharedProvider: {
+          name: "deferred",
+          providerName: "deferred",
+          run: async (opts) => {
+            seenModelAtRunStart.push(registry.get(worker)?.model ?? "");
+            return deferred.provider.run(opts);
+          },
+        },
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        provider: "deferred",
+        model: "model-a",
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      mesh.sendMessage(worker, "run 1", "root");
+      await tick();
+      expect(mesh.activeRunState(worker)?.phase).toBe("running");
+      expect(seenModelAtRunStart).toEqual(["model-a"]);
+
+      // Staged mid-flight: must not disturb the run already underway.
+      mesh.setActorModel(worker, "model-b", "root");
+      expect(registry.get(worker)?.model).toBe("model-a");
+
+      deferred.releaseAll();
+      await tick();
+      expect(mesh.activeRunState(worker)).toBeNull();
+      expect(registry.get(worker)?.model).toBe("model-b");
+      expect(registry.get(worker)?.desiredModel).toBeUndefined();
+
+      // The following run is the first to actually execute on "model-b".
+      mesh.sendMessage(worker, "run 2", "root");
+      await tick();
+      expect(seenModelAtRunStart).toEqual(["model-a", "model-b"]);
+
+      deferred.releaseAll();
+      await tick();
+    });
+
+    it("emits actor_model_set at the applying dispatch, not when the tuple is merely staged", async () => {
+      const trace: string[] = [];
+      const { mesh, tick } = setup({
+        events: (event) => {
+          if (event.kind === "actor_model_set") trace.push(`event:${event.actorId}`);
+        },
+        sharedProvider: {
+          name: "test-provider",
+          providerName: "test-provider",
+          run: async () => {
+            trace.push("run-body");
+            return { success: true, exitCode: 0, output: "ok" };
+          },
+        },
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        provider: "test-provider",
+        model: "model-a",
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      mesh.setActorModel(worker, "model-b", "root");
+      expect(trace).toEqual([]); // no event yet: nothing has been applied
+
+      mesh.sendMessage(worker, "work", "root");
+      await tick();
+
+      // The event fires at dispatch, ahead of the run body it applies to.
+      expect(trace).toEqual([`event:${worker}`, "run-body"]);
+    });
+
+    it("re-pinning an idle actor with unhandled inbox dispatches exactly one run, already on the new tuple", async () => {
+      let runCount = 0;
+      const seenModelAtRunStart: string[] = [];
+      const { mesh, registry, tick } = setup({
+        onQueued: (actorId, ctx) =>
+          mesh.recordEvent({ kind: "run_queued", actorId, detail: ctx.mode }),
+        sharedProvider: {
+          name: "test-provider",
+          providerName: "test-provider",
+          run: async () => {
+            runCount++;
+            seenModelAtRunStart.push(registry.get(worker)?.model ?? "");
+            if (runCount === 1) return { success: false, exitCode: 1, output: "failed" };
+            return { success: true, exitCode: 0, output: "ok" };
+          },
+        },
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        provider: "test-provider",
+        model: "model-a",
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      mesh.sendMessage(worker, "work", "root");
+      await tick();
+      expect(runCount).toBe(1);
+      expect(mesh.activeRunState(worker)).toBeNull(); // idle again, failed run left inbox unhandled
+
+      // Re-pin: this is the #202 path (idle + unhandled inbox => immediate dispatch).
+      mesh.setActorModel(worker, "model-c", "root");
+      await tick();
+
+      // Exactly one new run — the re-pin dispatch itself, not a duplicate.
+      expect(runCount).toBe(2);
+      expect(seenModelAtRunStart).toEqual(["model-a", "model-c"]);
+      expect(registry.get(worker)?.model).toBe("model-c");
+    });
   });
 
   it("reparentThread moves the actor to a new parent and hands the new parent a handle", async () => {

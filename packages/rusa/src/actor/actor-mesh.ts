@@ -921,8 +921,11 @@ export class ActorMesh {
     this.selectedInboxEntryIds.delete(actorId);
     this.flushRunHeadAttention(actorId);
     // Both factory-created workers and the externally-created root finish runs
-    // through this boundary. Applying here lets the root stage its own model
-    // without giving arbitrary actors self-set authority.
+    // through this boundary. Applying here covers a tuple staged mid-run: it
+    // stays on the launched tuple and only picks up the new one now, for the
+    // run after. A tuple staged while idle/queued is applied earlier, at that
+    // run's own dispatch (see the `onRunStart` wiring), so this call is then a
+    // no-op — {@link applyPendingModel} tolerates being called from both.
     this.applyPendingModel(actorId);
   }
 
@@ -2577,9 +2580,17 @@ export class ActorMesh {
   }
 
   /**
-   * Apply the pending model/provider change at the end of the next run boundary.
+   * Apply the pending model/provider change at whichever boundary the actor's
+   * current state puts it behind next: dispatch (queued/idle, called from the
+   * `onRunStart` wiring just before that run's `run_start` is recorded and its
+   * provider launches) or run end (mid-run, called from {@link finishInboxRun}).
+   * Public — like {@link finishInboxRun} and {@link actorQueued} — because the
+   * externally-constructed root actor wires its own `onRunStart`/`onRunEnd`
+   * outside the `createActor` factory and must call this directly.
+   * A no-op when nothing is staged, so calling it from both boundaries on the
+   * same run is safe: whichever fires first consumes the pending tuple.
    */
-  private applyPendingModel(id: string): void {
+  applyPendingModel(id: string): void {
     const record = this.registry.get(id);
     if (
       !record ||
