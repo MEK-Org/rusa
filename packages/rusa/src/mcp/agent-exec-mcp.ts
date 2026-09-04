@@ -7,6 +7,7 @@ import {
   normalizeEventResource,
   resourceKey,
 } from "../actor/event-subscriptions.js";
+import type { ActorWakeScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import { githubBranchReference } from "../references/reference.js";
@@ -15,29 +16,6 @@ import { HUMAN_OPERATOR, isHumanOperator } from "./stamp.js";
 import { createMcpServer } from "./strict-server.js";
 
 export const AGENT_EXEC_MCP_NAME = "mesh";
-
-/**
- * The crontab-backed wake scheduler (ISSUE_NUM, phase 1c) the root-only wake tools
- * drive. An interface (not the concrete CrontabWakeCron) so the MCP layer stays
- * decoupled from the crontab impl and is hermetically testable.
- */
-export interface WakeScheduler {
-  schedule(
-    actorId: string,
-    cronExpr: string,
-    reason: string,
-    priority?: "normal" | "responsive"
-  ): Promise<void>;
-  cancel(actorId: string): Promise<void>;
-  list(): Promise<
-    {
-      actorId: string;
-      cronExpr: string;
-      reason: string;
-      priority?: "normal" | "responsive";
-    }[]
-  >;
-}
 
 /**
  * The agent-execution MCP server — the actor mesh's primitive (design B.4)
@@ -54,7 +32,7 @@ export function createAgentExecMcpServer(
   mesh: ActorMesh,
   selfId: string,
   rootId: string,
-  wakeScheduler?: WakeScheduler,
+  wakeScheduler?: ActorWakeScheduler,
   options?: {
     onWrite?: () => void;
     rootControl?: RootControlService;
@@ -161,7 +139,7 @@ export function createAgentExecMcpServer(
     return `github:${repo}/${kind === "github_pr" ? "pulls" : "issues"}/${number}`;
   };
 
-  const rec = mesh.registry.get(selfId);
+  const rec = mesh.actors.get(selfId);
   if (rec?.humanUnlocked) {
     server.registerTool(
       "reply",
@@ -174,7 +152,7 @@ export function createAgentExecMcpServer(
       },
       async ({ message }) => {
         try {
-          const r = mesh.registry.get(selfId);
+          const r = mesh.actors.get(selfId);
           const sessionId = r?.lastChatSessionId ?? "default-session";
           mesh.recordMessageEmitted({
             fromId: selfId,
@@ -336,20 +314,12 @@ export function createAgentExecMcpServer(
     },
     async () => {
       try {
-        const pending = [];
-        for (const rec of mesh.registry.list()) {
-          if (!rec.pendingDeliveries) continue;
-          for (const msg of rec.pendingDeliveries) {
-            if (msg.fromId === selfId || rec.id === selfId) {
-              pending.push({
-                recipient: rec.id,
-                sender: msg.fromId,
-                deliver_at: msg.deliverAt,
-                body: msg.body.slice(0, 100) + (msg.body.length > 100 ? "..." : ""),
-              });
-            }
-          }
-        }
+        const pending = mesh.listPendingMessagesFor(selfId).map((message) => ({
+          recipient: message.recipient,
+          sender: message.sender,
+          deliver_at: message.deliverAt,
+          body: message.body.slice(0, 100) + (message.body.length > 100 ? "..." : ""),
+        }));
         return toolOk(pending);
       } catch (err) {
         return toolError(err);
@@ -404,10 +374,10 @@ export function createAgentExecMcpServer(
     },
     async ({ holder_thread_id, target_thread_id, role }) => {
       try {
-        if (!mesh.registry.get(holder_thread_id)) {
+        if (!mesh.actors.get(holder_thread_id)) {
           return toolError(new Error(`unknown thread id: ${holder_thread_id}`));
         }
-        if (!mesh.registry.get(target_thread_id)) {
+        if (!mesh.actors.get(target_thread_id)) {
           return toolError(new Error(`unknown thread id: ${target_thread_id}`));
         }
         mesh.grantHandle(holder_thread_id, { id: target_thread_id, role });
@@ -476,7 +446,7 @@ export function createAgentExecMcpServer(
     },
     async ({ thread_id, force }) => {
       try {
-        if (!mesh.registry.get(thread_id)) {
+        if (!mesh.actors.get(thread_id)) {
           return toolError(new Error(`unknown thread id: ${thread_id}`));
         }
         if (!mesh.isAncestorOf(selfId, thread_id) || thread_id === selfId) {
@@ -596,7 +566,7 @@ export function createAgentExecMcpServer(
     {
       title: "Update an actor's model in-place",
       description:
-        "Update an existing actor's model and/or provider-native reasoning effort in-place in the thread registry without service restart . " +
+        "Update an existing actor's model and/or provider-native reasoning effort in-place in the actor repository without service restart . " +
         "Allowed for the actor's parent, or root for any actor including itself. Takes effect at the end of the actor's current run if one is in flight; otherwise applies at the actor's next dispatch, before that run starts and launches. " +
         "Optionally moves portable (ledger/tail) actors across providers. " +
         "Preserves the actor's accumulated context and session history.",

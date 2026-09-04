@@ -3,17 +3,16 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
-  readFileSync,
   rmSync,
   statSync,
   unlinkSync,
-  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Actor } from "../actor/actor.js";
 import { ActorMesh, type MeshActor, type RetireCleanup } from "../actor/actor-mesh.js";
+import type { ActorRecord, PortableContextConfig } from "../actor/actor-record.js";
 import {
   CAPABILITY_GRANTS_FILENAME,
   FileCapabilityGrantStore,
@@ -58,7 +57,8 @@ import {
   runEndPayload,
 } from "../actor/mesh-events.js";
 import {
-  DefaultOsScheduler,
+  type ActorWakeScheduler,
+  DefaultCronSubsystem,
   execAtIo,
   preflightAt,
   unavailableAtIo,
@@ -87,17 +87,11 @@ import {
 } from "../actor/portable-context-state.js";
 import { ProviderPacer } from "../actor/provider-pacer.js";
 import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-throttle-status.js";
+import { resolveRootActorId } from "../actor/root-actor-id.js";
 import { RootControlService } from "../actor/root-control.js";
 import { buildRootPrompt } from "../actor/root-prompt.js";
 import {
-  FileThreadRegistry,
-  type PortableContextConfig,
-  resolveRootThreadId,
-  type ThreadRecord,
-} from "../actor/thread-registry.js";
-import {
   CrontabMutator,
-  CrontabWakeCron,
   ensureWakeToken,
   execCrontabIo,
   preflightCron,
@@ -125,6 +119,10 @@ import { DEFAULT_DEPLOY_BRANCH } from "../config/types.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import type { QuotaApiDeps } from "../dashboard/quota-api.js";
 import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
+import {
+  finishDeferredRootSessionImport,
+  importLegacyActorState,
+} from "../db/legacy-actor-import.js";
 import type { ReadyHeadChange } from "../db/repositories/obligation-repository.js";
 import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
@@ -419,7 +417,7 @@ export function postBackOnlinePing(opts: {
  */
 export function createStartRetireCleanups(
   workersDir: string,
-  wakeCron: Pick<CrontabWakeCron, "cancel">,
+  cronSubsystem: Pick<ActorWakeScheduler, "cancel">,
   e2eInstance?: Pick<E2EInstanceManager, "stopForActorRetirement">,
   scratch?: { dir: string; listActors: () => readonly ActorLiveness[] }
 ): RetireCleanup[] {
@@ -428,7 +426,7 @@ export function createStartRetireCleanups(
       ? [
           {
             name: "e2e instance",
-            run: (record: ThreadRecord) => e2eInstance.stopForActorRetirement(record.id),
+            run: (record: ActorRecord) => e2eInstance.stopForActorRetirement(record.id),
           },
         ]
       : []),
@@ -454,7 +452,7 @@ export function createStartRetireCleanups(
             // run ends.
             name: "provider scratch workdir",
             deferUntilRunEnd: true,
-            run: (record: ThreadRecord) => {
+            run: (record: ActorRecord) => {
               // Every spelling this actor's workspace may carry that no live
               // actor also answers to: the provider has named this directory
               // differently over time, and two of the three name an actor only
@@ -470,7 +468,7 @@ export function createStartRetireCleanups(
       : []),
     {
       name: "cron wake",
-      run: (record) => wakeCron.cancel(record.id),
+      run: (record) => cronSubsystem.cancel(record.id),
     },
   ];
 }
@@ -586,22 +584,6 @@ export function warnMissingConfiguredEventSubscriptionsAtBoot(
   return missing;
 }
 
-function loadRootSessionId(file: string): string | undefined {
-  try {
-    return (JSON.parse(readFileSync(file, "utf-8")) as { sessionId?: string }).sessionId;
-  } catch {
-    return undefined;
-  }
-}
-
-function saveRootSessionId(file: string, sessionId: string): void {
-  try {
-    writeFileSync(file, JSON.stringify({ sessionId }, null, 2));
-  } catch {
-    /* best effort */
-  }
-}
-
 /**
  * Assemble a portable-context (design ISSUE_NUM) actor's
  * stateless prefix from its own durable recent run outputs, plus the per-run inject
@@ -645,7 +627,7 @@ function assemblePortableInjection(
 }
 
 function assembleConfiguredPortableInjection(
-  record: ThreadRecord,
+  record: ActorRecord,
   apiKey: string | null,
   store: PortableContextStore
 ): { priorContext: string; injectRecord: InjectRecord } | undefined {
@@ -731,7 +713,7 @@ export async function compactPortableContext(input: {
  * tracker + chat + the agent-execution ("mesh") server that lets it delegate to
  * worker actors. Workers are the same {@link Actor} loop, get their own
  * per-actor agent-execution endpoint (identity baked in), report to their parent,
- * and are recorded in a durable {@link FileThreadRegistry} that survives restart.
+ * and are recorded in the durable SQLite actor repository that survives restart.
  * The v2 orchestrator pipeline is not wired (its implementation is retained but
  * unused).
  */
@@ -783,8 +765,46 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   }
 
   console.log("Initializing database...");
-  initDb(mcHome);
+  const database = initDb(mcHome);
   console.log("✓ Database ready");
+
+  // One host scheduling subsystem owns every cron/at mutation: recurring
+  // actor wakes, recurring or interval obligations, and one-shot messages.
+  const cronPreflight = preflightCron();
+  if (!cronPreflight.ok) {
+    console.warn(
+      `[start] cron scheduling unavailable — schedule_wake and recurring obligations will fail until this is fixed: ${cronPreflight.issues.join("; ")}`
+    );
+  }
+  const atPreflight = preflightAt();
+  if (!atPreflight.ok) {
+    console.warn(
+      `[start] \`at\` scheduling unavailable — cron-only recurrences still work, but completion-interval obligations and scheduled messages will fail until this is fixed: ${atPreflight.issues.join("; ")}`
+    );
+  }
+  const cronSubsystem = new DefaultCronSubsystem(
+    new CrontabMutator(execCrontabIo()),
+    atPreflight.ok ? execAtIo() : unavailableAtIo(atPreflight.issues),
+    {
+      tokenFile: wakeTokenPath(mcHome),
+      portFile: wakePortPath(mcHome),
+    }
+  );
+  const wakeToken = ensureWakeToken(mcHome);
+
+  const legacyActorImport = importLegacyActorState({
+    mcHome,
+    db: database,
+    repositories: getRepositories(),
+    providerCapabilityName: (providerName) => providerCapabilityName(providerName, config),
+    scheduledMessages: cronSubsystem,
+  });
+  if (legacyActorImport.importedActors > 0 || legacyActorImport.importedScheduledMessages > 0) {
+    console.log(
+      `[mesh] imported ${legacyActorImport.importedActors} actor(s) and ` +
+        `${legacyActorImport.importedScheduledMessages} scheduled message(s) into the host queue`
+    );
+  }
 
   const recoveredOpenRuns = getRepositories().actorRuns.abandonOpen(
     "service restarted before run completion"
@@ -958,14 +978,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     },
     unsyncedCount: () => getLocalUnderstandingUnsyncedCount(mcHome),
   };
-  const registry = new FileThreadRegistry(join(mcHome, "threads.json"), (providerName) =>
-    providerCapabilityName(providerName, config)
-  );
+  const actors = getRepositories().actors;
   // The obligation store's actor guard is only real once it can see the
-  // registry. Built from a Database alone, the container cannot do this itself,
+  // actors. Built from a Database alone, the container cannot do this itself,
   // and without this line every owner check in the repository is inert.
-  getRepositories().setActorExists((actorId) => registry.get(actorId)?.status === "active");
-  const rootId = resolveRootThreadId(registry);
+  getRepositories().setActorExists((actorId) => actors.get(actorId)?.status === "active");
+  const rootId = resolveRootActorId(actors);
   const inboxStore = getRepositories().inbox;
   const modelScrapesStore = getRepositories().modelScrapes;
   const workersDir = join(mcHome, "workers");
@@ -975,11 +993,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // restart that interrupted that, or a workspace from before the provider's own
   // scratch area was cleaned at all (#3). Skipped in the test runner alongside
   // the other boot sweeps.
-  // Who the registry knows and whether they still run, read fresh at every use:
+  // Who the actor repository knows and whether they still run, read fresh at every use:
   // both the boot sweep below and each retirement cleanup decide what to delete
   // from this, and it changes underneath them.
   const actorLiveness = (): ActorLiveness[] =>
-    registry.list().map((record) => ({ id: record.id, retired: record.status === "retired" }));
+    actors.list().map((record) => ({ id: record.id, retired: record.status === "retired" }));
   if (process.env.NODE_ENV !== "test") {
     const sweptWorkspaces = sweepOrphanedWorkspaces({
       workersDir,
@@ -1032,7 +1050,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       ),
     [STUCK_LOOP_DETECTOR_MCP_NAME]: () =>
       createStuckLoopDetectorMcpServer({
-        registry,
+        actors,
         meshEvents: getRepositories().meshEvents,
         rootHandle,
       }),
@@ -1056,7 +1074,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const sharedMcp = mcpHttp.urls();
   console.log(`[mcp] serving ${sharedMcp.map((u) => u.name).join(", ")} on loopback`);
 
-  // ── Provider + thread registry ──
+  // ── Provider + actor repository ──
   let provider: ReturnType<typeof resolveRootProvider>;
   try {
     provider = resolveRootProvider(config);
@@ -1395,26 +1413,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         }),
       }),
   });
-  // Cron is the durability backbone for recurring obligations (#153), so an
-  // unusable `crontab` here is more severe than a missing `at` — but boot still
-  // never refuses to start over it (matches the `at` preflight below): a
-  // console warning plus the dashboard health projection below is how an
-  // operator finds out, and the shared mutator's `write()` stays fail-visible
-  // (throws) the moment something actually tries to use a broken crontab.
-  const cronPreflight = preflightCron();
-  if (!cronPreflight.ok) {
-    console.warn(
-      `[start] cron scheduling unavailable — schedule_wake and recurring obligations will fail until this is fixed: ${cronPreflight.issues.join("; ")}`
-    );
-  }
-  // ONE shared crontab mutator for every feature that edits this crontab
-  // (wake schedules here, plus obligation/message recurrence blocks below) —
-  // see CrontabMutator's doc comment for why a single instance matters.
-  const crontabMutator = new CrontabMutator(execCrontabIo());
-  const wakeCron = new CrontabWakeCron(crontabMutator, {
-    tokenFile: wakeTokenPath(mcHome),
-    portFile: wakePortPath(mcHome),
-  });
   // Actor keeps this array by reference and hands its current contents to the
   // provider at run start. A live grant updates it synchronously, which is the
   // latest boundary every provider CLI can reliably consume MCP configuration.
@@ -1482,7 +1480,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const compactPortableActorAfterRun = async (
     actorId: string
   ): Promise<PortableContextCompactionSummary | null> => {
-    const current = registry.get(actorId);
+    const current = actors.get(actorId);
     const context = current?.context?.type === "portable" ? current.context : undefined;
     const compactor = context?.mode === "ledger" ? compactorFor(context) : null;
     if (context?.mode !== "ledger" || !compactor) return null;
@@ -1504,7 +1502,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
   // ── Actor mesh: the root plus any worker threads it spawns ──
   const mesh: ActorMesh = new ActorMesh({
-    registry,
+    actors,
     rootId,
     validateSpawn: (req) => {
       // Portable-context refusals  live here, at the mesh's single spawn
@@ -1528,6 +1526,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     },
     events: meshEvents,
     recordChat: (opts) => getRepositories().meshChat.record(opts),
+    scheduledMessages: cronSubsystem,
+    withTransaction: (fn) => getDb().transaction(fn)(),
     recordRunYield: (actorId, status, note) => {
       const runId = activeRunIds.get(actorId);
       if (!runId) return null;
@@ -1590,7 +1590,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       return notifyingParent ? deliverable : undefined;
     },
     log: (m) => console.log(`[mesh] ${m}`),
-    retireCleanups: createStartRetireCleanups(workersDir, wakeCron, e2eInstance, {
+    retireCleanups: createStartRetireCleanups(workersDir, cronSubsystem, e2eInstance, {
       dir: antigravityScratchDir(),
       listActors: actorLiveness,
     }),
@@ -1677,7 +1677,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           console.error(`[mesh] ${errorMsg}`);
 
           teardownActorMcp(id);
-          registry.patch(id, { status: "retired" });
+          actors.patch(id, { status: "retired" });
 
           mesh.recordEvent({
             kind: "run_end",
@@ -1735,7 +1735,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const obligationsUrl = mcpHttp.addServer(`${id}:${OBLIGATIONS_MCP_NAME}`, () =>
           createObligationsMcpServer(getRepositories().obligations, id, {
             isFenced,
-            resolveOwner: (raw) => resolveObligationOwner(registry, raw),
+            resolveOwner: (raw) => resolveObligationOwner(actors, raw),
             canManage: (callerId, obligation) => mesh.isAncestorOf(callerId, obligation.ownerId),
           })
         );
@@ -1784,7 +1784,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const stuckLoopUrl = mcpHttp.addServer(`${id}:${STUCK_LOOP_DETECTOR_MCP_NAME}`, () =>
           createStuckLoopDetectorMcpServer(
             {
-              registry,
+              actors,
               meshEvents: getRepositories().meshEvents,
               rootHandle,
             },
@@ -1846,7 +1846,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // Workers run untrusted code, so isolating them from the privileged plane is
         // mandatory: a fresh tmpfs /tmp stops one actor reading another's MCP-config
         // endpoint token from shared /tmp (identity harvest), and the read-only `/`
-        // bind stops tampering ~/.rusa (threads.json / capability-grants.json).
+        // bind stops tampering with ~/.rusa runtime state and capability-grants.json.
         // Root is NOT built here and stays unsandboxed — it is the trusted plane.
         // The Actor derives the sandbox (rooted at cwd, git+gh); each provider mounts
         // its own auth dir rw (see providerWritableStateDirs).
@@ -1884,17 +1884,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           // Portable-context actors (design ISSUE_NUM) are called STATELESS — never resume a
           // provider session — so the mesh, not the provider, owns their memory.
           loadSessionId: () =>
-            registry.get(id)?.context?.type === "portable"
-              ? undefined
-              : registry.get(id)?.sessionId,
+            actors.get(id)?.context?.type === "portable" ? undefined : actors.get(id)?.sessionId,
           saveSessionId: (sid) => {
-            if (registry.get(id)?.context?.type === "portable") return;
-            registry.patch(id, { sessionId: sid });
+            if (actors.get(id)?.context?.type === "portable") return;
+            actors.patch(id, { sessionId: sid });
           },
           buildPrompt: () => {
-            const r = registry.get(id);
+            const r = actors.get(id);
             if (!r) return { prompt: "No active thread record." };
-            const handles = resolveHandleLabels(r.handles, (hid) => registry.get(hid)?.charter);
+            const handles = resolveHandleLabels(r.handles, (hid) => actors.get(hid)?.charter);
             // Portable-context actors (design ISSUE_NUM) get their own recent run outputs
             // assembled into a stateless prefix; the per-run inject record rides on
             // this run's `run_start` event, not its own event kind.
@@ -2084,7 +2082,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     },
   });
   const failureSink: FailureSinkDeps = {
-    registry,
+    actors,
     sendToParent: (toId, body, fromId, forensics) =>
       mesh.deliverMechanicalInboxNotice(toId, body, fromId, forensics),
     postToErrorChat: errorNotifier ? (text) => errorNotifier.notify(text) : null,
@@ -2096,39 +2094,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     classify: classifyExhaustion,
   };
 
-  // ── Nightly wake trigger (cron-backed, ISSUE_NUM phase 1c) ──
-  // A cron job in the familiar account's OWN crontab pings the loopback /wake
-  // endpoint with a bearer token; the endpoint delivers a mechanical wake. Cron
-  // owns timing + durability (no in-process scheduler). The token lives in a
-  // chmod-600 file; the endpoint's ephemeral port is published to a file so the
-  // cron line (which reads it via `$(cat …)`) survives restarts.
-  const wakeToken = ensureWakeToken(mcHome);
+  // Publish the live callback port only after the shared MCP server is bound.
+  // Every cron/at job reads this file when it fires, so jobs survive restarts
+  // without capturing an ephemeral port.
   writeWakePort(mcHome, mcpHttp.boundPort);
-
-  // `at`/atd is an optional one-shot facility: cron-only recurrences must
-  // keep working even when it's missing, so boot never refuses to start over
-  // it — only warns loudly. `execAtIo()` stays fail-visible for a live atq
-  // that actually errors; `unavailableAtIo()` instead avoids ever calling the
-  // confirmed-missing binary, so the first attempt to schedule a completion-
-  // interval activation or a scheduled message fails with the named
-  // prerequisite error, and boot-time reconciliation (which tolerates a
-  // per-item OS scheduler failure) simply finds no `at` jobs to re-derive.
-  const atPreflight = preflightAt();
-  if (!atPreflight.ok) {
-    console.warn(
-      `[start] \`at\` scheduling unavailable — cron-only recurrences still work, but completion-interval obligations and scheduled messages will fail until this is fixed: ${atPreflight.issues.join("; ")}`
-    );
-  }
-  const osScheduler = new DefaultOsScheduler(
-    crontabMutator,
-    atPreflight.ok ? execAtIo() : unavailableAtIo(atPreflight.issues),
-    {
-      tokenFile: wakeTokenPath(mcHome),
-      portFile: wakePortPath(mcHome),
-    }
-  );
-  getRepositories().setOsScheduler(osScheduler);
-  mesh.setOsScheduler(osScheduler);
+  getRepositories().setCronSubsystem(cronSubsystem);
 
   mcpHttp.setWakeHandler({
     token: wakeToken,
@@ -2144,8 +2114,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
   mcpHttp.setWakeMessageHandler({
     token: wakeToken,
-    deliver: (id: string) => {
-      mesh.deliverScheduledMessage(id);
+    deliver: (message) => {
+      mesh.deliverScheduledMessage(message);
     },
   });
 
@@ -2176,9 +2146,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // ── Root actor ──
   const rootAgentDir = join(mcHome, "root-agent");
   mkdirSync(rootAgentDir, { recursive: true });
-  const sessionFile = join(rootAgentDir, "session.json");
   const rootMeshUrl = mcpHttp.addServer(rootId, () =>
-    createAgentExecMcpServer(mesh, rootId, rootId, wakeCron, {
+    createAgentExecMcpServer(mesh, rootId, rootId, cronSubsystem, {
       rootControl,
       onWrite: () => {
         mesh.markUnkillable(rootId);
@@ -2215,7 +2184,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const rootObligationsUrl = mcpHttp.addServer(`${rootId}:${OBLIGATIONS_MCP_NAME}`, () =>
     createObligationsMcpServer(getRepositories().obligations, rootId, {
       canManage: () => true,
-      resolveOwner: (raw) => resolveObligationOwner(registry, raw),
+      resolveOwner: (raw) => resolveObligationOwner(actors, raw),
     })
   );
   const rootPnpmInstallUrl = mcpHttp.addServer(`${rootId}:${PNPM_INSTALL_MCP_NAME}`, () =>
@@ -2364,7 +2333,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const pnpmHardlinksDeps: PnpmHardlinksToolDeps = {
     rootId: rootId,
     workersDir,
-    registry,
+    actors,
     runningThreadIds: () => mesh.activeRunThreadIds(),
   };
   const pnpmHardlinksUrl = mcpHttp.addServer(PNPM_HARDLINKS_MCP_NAME, () =>
@@ -2390,16 +2359,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       sandbox: Boolean(opts?.e2e),
       isE2eRoot: Boolean(opts?.e2e),
       loadSessionId: () =>
-        registry.get(rootId)?.context?.type === "portable"
+        actors.get(rootId)?.context?.type === "portable"
           ? undefined
-          : loadRootSessionId(sessionFile),
+          : (actors.get(rootId)?.sessionId ?? legacyActorImport.deferredRootSessionId),
       saveSessionId: (id) => {
-        if (registry.get(rootId)?.context?.type === "portable") return;
-        saveRootSessionId(sessionFile, id); // root session file stays authoritative for the root
-        registry.patch(rootId, { sessionId: id });
+        if (actors.get(rootId)?.context?.type === "portable") return;
+        actors.patch(rootId, { sessionId: id });
       },
       buildPrompt: () => {
-        const record = registry.get(rootId);
+        const record = actors.get(rootId);
         if (!record) return { prompt: "No active root thread record." };
         const injection = assembleConfiguredPortableInjection(
           record,
@@ -2427,7 +2395,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // Responsive human wakes bypass normal pacing/concurrency; background root
       // wakes use the same normal scheduling path as workers.
       beforeRun: ({ mode }): boolean => {
-        const rootRecord = registry.get(rootId);
+        const rootRecord = actors.get(rootId);
         const launchProviderName =
           rootRecord?.desiredProvider ?? rootRecord?.provider ?? rootProviderName;
         if (isProviderHalted(launchProviderName) || gracefulShutdown.isShuttingDown()) {
@@ -2545,7 +2513,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       },
       log: makeFirehose(rootId), // firehose → console + dashboard SSE
     });
-  const rootRecord: ThreadRecord = {
+  const rootRecord: ActorRecord = {
     id: rootId,
     charter: config.rootActor?.charter ?? DEFAULT_ROOT_CHARTER,
     parentId: null,
@@ -2555,11 +2523,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     effort: config.rootActor?.effort,
     context: config.rootActor?.context,
     sessionId:
-      config.rootActor?.context?.type === "portable" ? undefined : loadRootSessionId(sessionFile),
+      config.rootActor?.context?.type === "portable"
+        ? undefined
+        : (actors.get(rootId)?.sessionId ?? legacyActorImport.deferredRootSessionId),
     status: "active",
-    createdAt: new Date().toISOString(),
+    createdAt: actors.get(rootId)?.createdAt ?? new Date().toISOString(),
   };
   mesh.adopt(rootRecord, root);
+  if (legacyActorImport.deferredRootSessionId) finishDeferredRootSessionImport(mcHome);
   const scheduleHaltExpiry = (until?: string) => {
     if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
     haltExpiryTimer = null;
@@ -2597,13 +2568,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     const sessionDescription =
       rootContext?.type === "portable"
         ? `portable/${rootContext.mode} (stateless)`
-        : (loadRootSessionId(sessionFile) ?? "(new)");
+        : (actors.get(rootId)?.sessionId ?? "(new)");
     console.log(
       `[root] provider=${provider.name} session=${sessionDescription} tools=${rootMcp.map((u) => u.name).join(",")}`
     );
   }
 
-  // Restore live actors for threads the registry persisted across the last
+  // Restore live actors from records the actor repository persisted across the last
   // restart. Must run after the root is adopted (so a worker's parent is live
   // before the worker). Retired threads stay dead; rehydration never wakes an
   // actor by itself. Message-trigger reconciliation runs immediately after
@@ -2619,9 +2590,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   } catch (_err) {
     // Database may be closed during test shutdown/teardown races
   }
-  const restored = registry.list().filter((r) => r.status === "active" && r.id !== rootId);
+  const restored = actors.list().filter((r) => r.status === "active" && r.id !== rootId);
   if (restored.length > 0) {
-    console.log(`[mesh] rehydrated ${restored.length} active thread(s) from the registry`);
+    console.log(`[mesh] rehydrated ${restored.length} active actor(s) from the repository`);
   }
 
   // One-time avatar backfill : generate a cached avatar for every currently
@@ -2629,7 +2600,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // respawn. Strictly fire-and-forget — the root and already-cached handles are
   // no-ops inside the generator, and any failure is isolated to a log line.
   backfillAvatars(
-    registry
+    actors
       .list()
       .filter((r) => r.status === "active")
       .map((r) => r.id),
@@ -2823,7 +2794,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // Bind the live mesh so the dashboard Data API + SSE serve real data.
         mesh: {
           mesh,
-          registry,
+          actors,
           meshEvents: getRepositories().meshEvents,
           meshChat: getRepositories().meshChat,
           obligations: getRepositories().obligations,
@@ -3117,7 +3088,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     modelProbeAbort.abort();
     if (modelProbeInFlight) await modelProbeInFlight;
     if (haltExpiryTimer) clearTimeout(haltExpiryTimer);
-    mesh.shutdownAll(); // stops the root and any live workers (registry untouched)
+    mesh.shutdownAll(); // stops the root and any live workers (repository untouched)
     errorNotifier?.close(); // cancel any pending coalesced failure summary
     if (weSubscriber) {
       try {

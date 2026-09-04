@@ -29,8 +29,22 @@ const mockWebhookServerModule = vi.hoisted(() => ({
 const mockReferenceCacheRepo = vi.hoisted(() => ({ get: vi.fn(), set: vi.fn(), delete: vi.fn() }));
 
 const mockDbModule = vi.hoisted(() => ({
-  initDb: vi.fn(),
-  getRepositories: vi.fn(() => ({ meshEvents: {}, referenceCache: mockReferenceCacheRepo })),
+  initDb: vi.fn(() => ({})),
+  getRepositories: vi.fn(() => ({
+    actors: { list: vi.fn(() => []) },
+    meshEvents: {},
+    meshChat: {},
+    obligations: {},
+    referenceCache: mockReferenceCacheRepo,
+  })),
+}));
+
+const mockLegacyImport = vi.hoisted(() => ({
+  importLegacyActorState: vi.fn(() => ({
+    importedActors: 0,
+    importedScheduledMessages: 0,
+    backupFiles: [],
+  })),
 }));
 
 const mockReferenceCacheModule = vi.hoisted(() => ({
@@ -39,20 +53,12 @@ const mockReferenceCacheModule = vi.hoisted(() => ({
   }),
 }));
 
-const mockThreadRegistryModule = vi.hoisted(() => ({
-  FileThreadRegistry: class {
-    list() {
-      return [];
-    }
-  },
-}));
-
 vi.mock("open", () => openMock);
 vi.mock("../webhook/server.js", () => mockWebhookServerModule);
 vi.mock("../config/index.js", () => mockConfigLoader);
 vi.mock("../db/index.js", () => mockDbModule);
+vi.mock("../db/legacy-actor-import.js", () => mockLegacyImport);
 vi.mock("../references/cache-service.js", () => mockReferenceCacheModule);
-vi.mock("../actor/thread-registry.js", () => mockThreadRegistryModule);
 
 import { runDashboard } from "./dashboard.js";
 

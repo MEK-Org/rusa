@@ -1,5 +1,5 @@
+import type { ActorHandle } from "./actor-record.js";
 import { generateHandle } from "./handle-generator.js";
-import type { ActorHandle } from "./thread-registry.js";
 
 /** A handle resolved to its display label for the address book. */
 export interface ResolvedHandle {

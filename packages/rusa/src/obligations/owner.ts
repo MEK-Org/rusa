@@ -1,5 +1,5 @@
-import type { ThreadRegistry } from "../actor/thread-registry.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+import type { ActorRepository } from "../repositories/actor-repository.js";
 
 /**
  * Resolve a requested obligation owner to one this mesh can actually route to.
@@ -16,12 +16,12 @@ import { HUMAN_OPERATOR } from "../mcp/stamp.js";
  * that appears in no queue and wakes nobody.
  */
 export function resolveObligationOwner(
-  registry: Pick<ThreadRegistry, "get">,
+  actors: Pick<ActorRepository, "get">,
   rawOwnerId: string
 ): { ok: true; ownerId: string } | { ok: false; error: string } {
   const ownerId = rawOwnerId.trim();
   if (ownerId === HUMAN_OPERATOR) return { ok: true, ownerId };
-  const record = registry.get(ownerId);
+  const record = actors.get(ownerId);
   if (!record) return { ok: false, error: `unknown obligation owner: ${ownerId}` };
   if (record.status !== "active") {
     return { ok: false, error: `obligation owner is not active: ${ownerId}` };

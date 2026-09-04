@@ -1,25 +1,63 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { assertCronExprCanFire, type CrontabMutator } from "./wake-cron.js";
+import {
+  assertCronExprCanFire,
+  type CrontabMutator,
+  CrontabWakeCron,
+  type WakeEntry,
+} from "./wake-cron.js";
 
 /**
- * One internal scheduling service with a deliberately small vocabulary:
- * - register, replace, or cancel an obligation activation;
- * - register, replace, or cancel a scheduled-message delivery.
+ * The actor-facing recurring-wake slice of the host scheduler.
  */
-export interface OsScheduler {
+export interface ActorWakeScheduler {
+  schedule(
+    actorId: string,
+    cronExpr: string,
+    reason: string,
+    priority?: "normal" | "responsive"
+  ): Promise<void>;
+  cancel(actorId: string): Promise<void>;
+  list(): Promise<WakeEntry[]>;
+}
+
+/** The obligation-facing slice of the host scheduler. */
+export interface ObligationActivationScheduler {
   scheduleObligationActivation(
     id: string,
     time: { kind: "cron"; cronExpr: string } | { kind: "at"; date: Date }
   ): void;
   cancelObligationActivation(id: string): void;
   listObligationActivations(): string[];
-
-  scheduleMessageDelivery(id: string, date: Date): void;
-  cancelMessageDelivery(id: string): void;
-  listMessageDeliveries(): string[];
 }
 
-export interface OsSchedulerOptions {
+/** A complete one-shot message persisted inside its versioned `at` job. */
+export interface ScheduledMessage {
+  id: string;
+  toId: string;
+  fromId: string;
+  body: string;
+  deliverAt: string;
+  sessionId?: string;
+}
+
+/** The scheduled-message-facing slice of the host scheduler. */
+export interface ScheduledMessageScheduler {
+  scheduleMessageDelivery(message: ScheduledMessage): void;
+  cancelMessageDelivery(id: string): void;
+  listMessageDeliveries(): ScheduledMessage[];
+}
+
+/**
+ * The single host scheduling boundary. Cron owns recurring actor wakes and
+ * cron-policy obligations; `at` owns one-shot obligation activations and the
+ * complete payload of scheduled messages.
+ */
+export interface CronSubsystem
+  extends ActorWakeScheduler,
+    ObligationActivationScheduler,
+    ScheduledMessageScheduler {}
+
+export interface CronSubsystemOptions {
   tokenFile: string;
   portFile: string;
   host?: string;
@@ -44,7 +82,7 @@ export function preflightAt(probe: AtProbe = defaultAtProbe()): { ok: boolean; i
   if (!probe.hasAt()) issues.push("`at` CLI not found — install at");
   if (!probe.hasAtrm()) issues.push("`atrm` CLI not found — install at");
   if (probe.hasAt() && !probe.isAtdRunning())
-    issues.push("atd daemon not detected — scheduled obligations won't fire");
+    issues.push("atd daemon not detected — one-shot obligations and scheduled messages won't fire");
   if (!probe.canQueryAtq())
     issues.push(
       "`atq` cannot be queried — verify at/atd is installed and this user can access the queue"
@@ -208,22 +246,109 @@ export class TruncatedCronBlockError extends Error {
   }
 }
 
-export class DefaultOsScheduler implements OsScheduler {
+const SCHEDULED_MESSAGE_SCHEMA_VERSION = 1 as const;
+const MAX_SCHEDULED_MESSAGE_BODY_BYTES = 128 * 1024;
+
+export function encodeScheduledMessagePayload(message: ScheduledMessage): string {
+  return Buffer.from(
+    JSON.stringify({ schemaVersion: SCHEDULED_MESSAGE_SCHEMA_VERSION, ...message }),
+    "utf8"
+  ).toString("base64url");
+}
+
+export function decodeScheduledMessagePayload(payload: string): ScheduledMessage {
+  try {
+    const value = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Record<
+      string,
+      unknown
+    >;
+    if (
+      value.schemaVersion !== SCHEDULED_MESSAGE_SCHEMA_VERSION ||
+      typeof value.id !== "string" ||
+      value.id.length === 0 ||
+      typeof value.toId !== "string" ||
+      value.toId.length === 0 ||
+      typeof value.fromId !== "string" ||
+      value.fromId.length === 0 ||
+      typeof value.body !== "string" ||
+      Buffer.byteLength(value.body, "utf8") > MAX_SCHEDULED_MESSAGE_BODY_BYTES ||
+      typeof value.deliverAt !== "string" ||
+      (value.sessionId !== undefined && typeof value.sessionId !== "string") ||
+      Number.isNaN(Date.parse(value.deliverAt))
+    ) {
+      throw new Error("invalid scheduled-message payload");
+    }
+    return {
+      id: value.id,
+      toId: value.toId,
+      fromId: value.fromId,
+      body: value.body,
+      deliverAt: value.deliverAt,
+      ...(typeof value.sessionId === "string" ? { sessionId: value.sessionId } : {}),
+    };
+  } catch (cause) {
+    throw new Error("invalid scheduled-message payload", { cause });
+  }
+}
+
+function decodeScheduledMessage(script: string): ScheduledMessage {
+  const match = script.match(/-d 'payload=([A-Za-z0-9_-]+)'/);
+  if (!match) throw new Error("scheduled-message job has no payload");
+  return decodeScheduledMessagePayload(match[1]);
+}
+
+export class DefaultCronSubsystem implements CronSubsystem {
+  private readonly actorWakes: CrontabWakeCron;
+
   constructor(
     private readonly mutator: CrontabMutator,
     private readonly atIo: AtIo,
-    private readonly opts: OsSchedulerOptions
-  ) {}
+    private readonly opts: CronSubsystemOptions
+  ) {
+    this.actorWakes = new CrontabWakeCron(mutator, opts);
+  }
 
-  private buildCurlLine(endpoint: string, data: Record<string, string>): string {
+  schedule(
+    actorId: string,
+    cronExpr: string,
+    reason: string,
+    priority?: "normal" | "responsive"
+  ): Promise<void> {
+    return this.actorWakes.schedule(actorId, cronExpr, reason, priority);
+  }
+
+  cancel(actorId: string): Promise<void> {
+    return this.actorWakes.cancel(actorId);
+  }
+
+  list(): Promise<WakeEntry[]> {
+    return this.actorWakes.list();
+  }
+
+  private buildCurlLine(
+    endpoint: string,
+    data: Record<string, string>,
+    options?: { retryWhileServiceRestarts?: boolean }
+  ): string {
     const curl = this.opts.curlPath ?? "/usr/bin/curl";
     const host = this.opts.host ?? "127.0.0.1";
-    const url = `"http://${host}:$(cat ${this.opts.portFile})/${endpoint}"`;
     const auth = `"Authorization: Bearer $(cat ${this.opts.tokenFile})"`;
     const args = Object.entries(data)
       .map(([k, v]) => `-d '${k}=${v.replace(/'/g, "'\\''")}'`)
       .join(" ");
-    return `${curl} -fsS -H ${auth} ${url} ${args}`;
+    if (!options?.retryWhileServiceRestarts) {
+      const url = `"http://${host}:$(cat ${this.opts.portFile})/${endpoint}"`;
+      return `${curl} -fsS -H ${auth} ${url} ${args}`;
+    }
+
+    // The callback port is ephemeral and can change during a service restart.
+    // Curl's built-in retry expands $(cat portFile) only once, before curl
+    // starts, so use a bounded shell loop that re-reads both files on every
+    // attempt. This also covers an overdue legacy job firing during first boot,
+    // before the port file has been published.
+    const url = `"http://${host}:$rusa_callback_port/${endpoint}"`;
+    const call = `${curl} -fsS -H ${auth} ${url} ${args}`;
+    return `rusa_attempt=0; while [ "$rusa_attempt" -lt 120 ]; do rusa_callback_port=$(cat ${this.opts.portFile} 2>/dev/null) && ${call} && exit 0; rusa_attempt=$((rusa_attempt + 1)); sleep 5; done; exit 1`;
   }
 
   /**
@@ -302,7 +427,7 @@ export class DefaultOsScheduler implements OsScheduler {
   private staleAtIds(tag: string): string[] {
     return this.atIo
       .list()
-      .filter((job) => job.script.includes(tag))
+      .filter((job) => job.script.split("\n").some((line) => line.trim() === tag))
       .map((job) => job.id);
   }
 
@@ -384,26 +509,58 @@ export class DefaultOsScheduler implements OsScheduler {
     return Array.from(ids);
   }
 
-  scheduleMessageDelivery(id: string, date: Date): void {
-    const tag = `# mc-message-delivery:${id}`;
-    const curlLine = this.buildCurlLine("wake-message", { id });
+  scheduleMessageDelivery(message: ScheduledMessage): void {
+    if (Buffer.byteLength(message.body, "utf8") > MAX_SCHEDULED_MESSAGE_BODY_BYTES) {
+      throw new Error("Scheduled message body exceeds the 128 KiB host-job limit");
+    }
+    // Apply the same shape validation used by the callback boundary before a
+    // job reaches the host queue. This also rejects invalid deliverAt values
+    // supplied by importers or callers outside ActorMesh.
+    const payload = encodeScheduledMessagePayload(message);
+    decodeScheduledMessagePayload(payload);
+    const tag = this.messageTag(message.id);
+    const curlLine = this.buildCurlLine(
+      "wake-message",
+      { payload },
+      { retryWhileServiceRestarts: true }
+    );
     const script = `${tag}\n${curlLine}\n`;
     const staleAtIds = this.staleAtIds(tag);
-    const replacementId = this.atIo.schedule(script, date);
+    const replacementId = this.atIo.schedule(script, new Date(message.deliverAt));
     this.removeAtIds(staleAtIds.filter((staleId) => staleId !== replacementId));
   }
 
   cancelMessageDelivery(id: string): void {
-    const tag = `# mc-message-delivery:${id}`;
+    const tag = this.messageTag(id);
     this.removeAtIds(this.staleAtIds(tag));
   }
 
-  listMessageDeliveries(): string[] {
-    const ids = new Set<string>();
+  listMessageDeliveries(): ScheduledMessage[] {
+    const messages = new Map<string, ScheduledMessage>();
     for (const job of this.atIo.list()) {
-      const m = job.script.match(/# mc-message-delivery:(.+)/);
-      if (m) ids.add(m[1].trim());
+      const tagLines = job.script
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith("# mc-message-delivery:"));
+      if (tagLines.length === 0) continue;
+      let message: ScheduledMessage;
+      try {
+        message = decodeScheduledMessage(job.script);
+        if (tagLines.length !== 1 || tagLines[0] !== this.messageTag(message.id)) {
+          throw new Error("scheduled-message tag does not match its payload id");
+        }
+      } catch (cause) {
+        throw new Error(`Invalid scheduled-message host job ${job.id}`, { cause });
+      }
+      messages.set(message.id, message);
     }
-    return Array.from(ids);
+    return [...messages.values()].sort(
+      (left, right) =>
+        Date.parse(left.deliverAt) - Date.parse(right.deliverAt) || left.id.localeCompare(right.id)
+    );
+  }
+
+  private messageTag(id: string): string {
+    return `# mc-message-delivery:${Buffer.from(id, "utf8").toString("base64url")}`;
   }
 }

@@ -1076,7 +1076,7 @@ async function runProviderContextABBody(
   // different models is void no matter how clean everything else reads.
   const armProvenance = Object.fromEntries(
     variants.map(([variant, id]) => {
-      const rec = mesh.registry.get(id);
+      const rec = mesh.actors.get(id);
       const windows = stepWindows[variant];
       return [
         variant,

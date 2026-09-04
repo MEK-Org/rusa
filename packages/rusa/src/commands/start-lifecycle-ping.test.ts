@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ActorMesh } from "../actor/actor-mesh.js";
-import type { ThreadRecord } from "../actor/thread-registry.js";
-import { InMemoryThreadRegistry } from "../actor/thread-registry.js";
+import type { ActorRecord } from "../actor/actor-record.js";
+import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { createStartRetireCleanups, postBackOnlinePing } from "./start.js";
 
 describe("postBackOnlinePing", () => {
@@ -77,7 +77,7 @@ describe("createStartRetireCleanups", () => {
         },
       }
     );
-    const record: ThreadRecord = {
+    const record: ActorRecord = {
       id: actorId,
       charter: "worker",
       parentId: "root",
@@ -111,7 +111,7 @@ describe("createStartRetireCleanups", () => {
       dir: scratchDir,
       listActors: () => [{ id: actorId, retired: false }],
     });
-    const record: ThreadRecord = {
+    const record: ActorRecord = {
       id: actorId,
       charter: "worker",
       parentId: "root",
@@ -145,7 +145,7 @@ describe("createStartRetireCleanups", () => {
         { id: liveNeighbour, retired: false },
       ],
     });
-    const record: ThreadRecord = {
+    const record: ActorRecord = {
       id: actorId,
       charter: "worker",
       parentId: "root",
@@ -168,7 +168,7 @@ describe("createStartRetireCleanups", () => {
     const workdir = join(workersDir, actorId);
     mkdirSync(workdir, { recursive: true });
     const cancelled: string[] = [];
-    const registry = new InMemoryThreadRegistry();
+    const registry = new InMemoryActorRepository();
     registry.upsert({
       id: actorId,
       charter: "worker",
@@ -177,7 +177,7 @@ describe("createStartRetireCleanups", () => {
       createdAt: "2026-01-01T00:00:00Z",
     });
     const mesh = new ActorMesh({
-      registry,
+      actors: registry,
       createActor: () => {
         throw new Error("not used");
       },

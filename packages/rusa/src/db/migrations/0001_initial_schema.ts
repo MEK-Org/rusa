@@ -27,7 +27,7 @@ import type { Migration } from "./types.js";
  * set) schema untouched — the runner sees `0001_initial_schema` already recorded
  * and no-ops. To fully drop the orphaned v2 tables on a live instance, delete the
  * db file so it rebuilds from this schema (sanctioned data loss; the only state
- * the mesh owns is `mesh_events` history + the file-based thread registry).
+ * the mesh owns is its SQLite event history and actor repository).
  */
 export const initialSchema: Migration = {
   id: "0001_initial_schema",

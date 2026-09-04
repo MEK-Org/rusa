@@ -91,7 +91,7 @@ export interface RunResult {
   capped?: boolean;
   /**
    * The session/conversation id used or newly created this run. For a created
-   * session, persist it (e.g. in the thread registry) to resume the actor later.
+   * session, persist it in the actor repository to resume the actor later.
    */
   sessionId?: string;
   /**

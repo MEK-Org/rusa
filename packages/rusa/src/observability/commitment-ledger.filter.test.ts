@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ThreadRecord } from "../actor/thread-registry.js";
+import type { ActorRecord } from "../actor/actor-record.js";
 import type { MeshEvent, MeshEventKind } from "../db/repositories/mesh-event-repository.js";
 import {
   COMMITMENT_LEDGER_BODY_KINDS,
@@ -75,7 +75,7 @@ const IGNORED_KINDS = ALL_MESH_EVENT_KINDS.filter(
   (kind) => !COMMITMENT_LEDGER_KINDS.includes(kind)
 );
 
-function thread(id: string, parentId: string | null, extra: Partial<ThreadRecord> = {}) {
+function thread(id: string, parentId: string | null, extra: Partial<ActorRecord> = {}) {
   return {
     id,
     charter: `charter for ${id}`,
@@ -83,7 +83,7 @@ function thread(id: string, parentId: string | null, extra: Partial<ThreadRecord
     status: "active",
     createdAt: "2026-06-27T00:00:00.000Z",
     ...extra,
-  } satisfies ThreadRecord;
+  } satisfies ActorRecord;
 }
 
 function event(
@@ -112,7 +112,7 @@ function event(
  * negative half: they are the actors a *dropped* read would turn into a false
  * alarm, where the others are the ones it would silence.
  */
-const THREADS: ThreadRecord[] = [
+const THREADS: ActorRecord[] = [
   thread("root", null),
   thread("steward", "root"),
   thread("done-leaf", "steward"),

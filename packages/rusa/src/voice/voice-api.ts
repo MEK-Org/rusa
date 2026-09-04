@@ -17,13 +17,13 @@ import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ActorMesh } from "../actor/actor-mesh.js";
-import type { ThreadRegistry } from "../actor/thread-registry.js";
 import type { SseHub } from "../dashboard/sse.js";
+import type { ActorRepository } from "../repositories/actor-repository.js";
 import { toFrame, VOICE_MEMO_PREFIX, type VoiceService } from "./voice-service.js";
 
 /** Everything the voice routes need, injected by the server wiring. */
 export interface VoiceApiDeps {
-  registry: ThreadRegistry;
+  actors: ActorRepository;
   sseHub: SseHub;
   /** The live ActorMesh instance (memo delivery). */
   mesh?: ActorMesh;
@@ -120,7 +120,7 @@ export function handleVoiceApiRequest(
   const memoMatch = req.method === "POST" ? pathname.match(MEMO_ROUTE) : null;
   if (memoMatch) {
     const actorId = memoMatch[1];
-    const rec = deps.registry.get(actorId);
+    const rec = deps.actors.get(actorId);
     if (!rec) {
       sendJson(res, 404, { error: "actor not found" });
       return true;

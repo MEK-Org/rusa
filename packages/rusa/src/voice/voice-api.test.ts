@@ -6,11 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import type { ActorMesh } from "../actor/actor-mesh.js";
-import { InMemoryThreadRegistry, type ThreadRecord } from "../actor/thread-registry.js";
+import type { ActorRecord } from "../actor/actor-record.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { SseHub } from "../dashboard/sse.js";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import type { SpeechClient } from "./gemini-speech.js";
 import { handleVoiceApiRequest, type VoiceApiDeps } from "./voice-api.js";
 import { VOICE_MEMO_PREFIX, VoiceService } from "./voice-service.js";
@@ -87,7 +88,7 @@ async function settled(res: MockRes): Promise<void> {
   await vi.waitFor(() => expect(res.ended).toBe(true));
 }
 
-function rec(id: string, status: "active" | "retired"): ThreadRecord {
+function rec(id: string, status: "active" | "retired"): ActorRecord {
   return {
     id,
     charter: `charter ${id}`,
@@ -186,7 +187,7 @@ function findLatencyLog(calls: unknown[]): {
 
 describe("handleVoiceApiRequest", () => {
   let home: string;
-  let registry: InMemoryThreadRegistry;
+  let actors: InMemoryActorRepository;
   let service: VoiceService;
   let hub: SseHub;
   let emitter: MeshEventEmitter;
@@ -197,9 +198,9 @@ describe("handleVoiceApiRequest", () => {
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "voice-api-"));
-    registry = new InMemoryThreadRegistry();
-    registry.upsert(rec(UUID_A, "active"));
-    registry.upsert(rec(UUID_B, "retired"));
+    actors = new InMemoryActorRepository();
+    actors.upsert(rec(UUID_A, "active"));
+    actors.upsert(rec(UUID_B, "retired"));
     transcribe = vi.fn(async (_audio: Buffer, _mimeType: string) => "pick up milk on the way home");
     const speech: SpeechClient = {
       transcribe,
@@ -233,7 +234,7 @@ describe("handleVoiceApiRequest", () => {
     hub = new SseHub(emitter);
     sendHumanMessage = vi.fn(() => ({ delivered: true }));
     deps = {
-      registry,
+      actors: actors,
       sseHub: hub,
       mesh: { sendHumanMessage } as unknown as ActorMesh,
       service,
@@ -380,7 +381,7 @@ describe("handleVoiceApiRequest", () => {
     });
 
     it("does not deliver frames for actors outside the filter", async () => {
-      registry.upsert(rec("cccccccc-0000-4000-8000-000000000003", "active"));
+      actors.upsert(rec("cccccccc-0000-4000-8000-000000000003", "active"));
       const detach = attachVoiceOutbound(emitter, service, hub);
       const { res } = call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}`);
       service.presenceConnect(["cccccccc-0000-4000-8000-000000000003"]);
@@ -686,7 +687,7 @@ describe("handleVoiceApiRequest", () => {
       expect(res.writes[0].toString()).toBe("static-mp3-fallback");
     });
 
-    it("404s unknown announcement ids (registry lookup only, no paths)", () => {
+    it("404s unknown announcement ids (actors lookup only, no paths)", () => {
       const { res } = call(deps, "GET", "/api/mesh/voice/audio/not-an-id");
       expect(res.statusCode).toBe(404);
       const traversal = call(deps, "GET", "/api/mesh/voice/audio/..%2F..%2Fetc%2Fpasswd");

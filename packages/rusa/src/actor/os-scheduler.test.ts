@@ -4,23 +4,25 @@ import {
   type AtIo,
   type AtProbe,
   AtUnavailableError,
-  DefaultOsScheduler,
+  DefaultCronSubsystem,
+  decodeScheduledMessagePayload,
+  encodeScheduledMessagePayload,
   execAtIo,
   preflightAt,
   TruncatedCronBlockError,
   unavailableAtIo,
 } from "./os-scheduler.js";
-import { type CrontabIo, CrontabMutator, CrontabWakeCron } from "./wake-cron.js";
+import { type CrontabIo, CrontabMutator } from "./wake-cron.js";
 
 vi.mock("node:child_process", () => {
   const mocked = { spawnSync: vi.fn(), execFileSync: vi.fn() };
   return { ...mocked, default: mocked };
 });
 
-describe("DefaultOsScheduler", () => {
+describe("DefaultCronSubsystem", () => {
   let cron: CrontabIo;
   let at: AtIo;
-  let scheduler: DefaultOsScheduler;
+  let scheduler: DefaultCronSubsystem;
   let cronData: string;
 
   beforeEach(() => {
@@ -38,7 +40,7 @@ describe("DefaultOsScheduler", () => {
       remove: vi.fn(),
     };
 
-    scheduler = new DefaultOsScheduler(new CrontabMutator(cron), at, {
+    scheduler = new DefaultCronSubsystem(new CrontabMutator(cron), at, {
       tokenFile: "/token",
       portFile: "/port",
     });
@@ -57,6 +59,104 @@ describe("DefaultOsScheduler", () => {
   it("schedules an at activation", () => {
     scheduler.scheduleObligationActivation("ob-2", { kind: "at", date: new Date() });
     expect(at.schedule).toHaveBeenCalled();
+  });
+
+  it("round-trips a complete scheduled message through the at job", () => {
+    const message = {
+      id: "message-1",
+      toId: "recipient",
+      fromId: "sender",
+      body: "quotes: ' & form=data\nsecond line",
+      deliverAt: "2026-09-04T12:34:56.000Z",
+      sessionId: "session-1",
+    };
+
+    scheduler.scheduleMessageDelivery(message);
+
+    const [script, date] = vi.mocked(at.schedule).mock.calls[0];
+    expect(date).toEqual(new Date(message.deliverAt));
+    expect(script).toContain("# mc-message-delivery:");
+    expect(script).toContain("/wake-message");
+    expect(script).toContain('while [ "$rusa_attempt" -lt 120 ]');
+    expect(script).toContain("rusa_callback_port=$(cat /port");
+    expect(script).not.toContain(message.body);
+
+    vi.mocked(at.list).mockReturnValue([{ id: "123", script }]);
+    expect(scheduler.listMessageDeliveries()).toEqual([message]);
+  });
+
+  it("uses the versioned callback payload as the public encode/decode contract", () => {
+    const message = {
+      id: "message-2",
+      toId: "recipient",
+      fromId: "sender",
+      body: "hello",
+      deliverAt: "2026-09-04T12:34:56.000Z",
+    };
+    expect(decodeScheduledMessagePayload(encodeScheduledMessagePayload(message))).toEqual(message);
+    expect(() =>
+      decodeScheduledMessagePayload(
+        Buffer.from(JSON.stringify({ schemaVersion: 2, ...message })).toString("base64url")
+      )
+    ).toThrow(/invalid scheduled-message payload/);
+  });
+
+  it("fails visibly when an owned host job has a missing or corrupt payload", () => {
+    vi.mocked(at.list).mockReturnValue([
+      { id: "broken", script: "# mc-message-delivery:broken\ncurl /wake-message -d 'id=old'\n" },
+    ]);
+    expect(() => scheduler.listMessageDeliveries()).toThrow(
+      /Invalid scheduled-message host job broken/
+    );
+  });
+
+  it("matches message tags by exact line when replacing jobs", () => {
+    scheduler.scheduleMessageDelivery({
+      id: "a",
+      toId: "recipient",
+      fromId: "sender",
+      body: "first",
+      deliverAt: "2026-09-04T12:34:56.000Z",
+    });
+    const [firstScript] = vi.mocked(at.schedule).mock.calls[0];
+    scheduler.scheduleMessageDelivery({
+      id: "aa",
+      toId: "recipient",
+      fromId: "sender",
+      body: "second",
+      deliverAt: "2026-09-04T12:35:56.000Z",
+    });
+    const [secondScript] = vi.mocked(at.schedule).mock.calls[1];
+    vi.mocked(at.list).mockReturnValue([
+      { id: "first", script: firstScript },
+      { id: "second", script: secondScript },
+    ]);
+
+    scheduler.cancelMessageDelivery("a");
+
+    expect(at.remove).toHaveBeenCalledWith("first");
+    expect(at.remove).not.toHaveBeenCalledWith("second");
+  });
+
+  it("rejects invalid dates and message bodies too large for a host job", () => {
+    expect(() =>
+      scheduler.scheduleMessageDelivery({
+        id: "bad-date",
+        toId: "recipient",
+        fromId: "sender",
+        body: "hello",
+        deliverAt: "not-a-date",
+      })
+    ).toThrow(/invalid scheduled-message payload/);
+    expect(() =>
+      scheduler.scheduleMessageDelivery({
+        id: "too-large",
+        toId: "recipient",
+        fromId: "sender",
+        body: "x".repeat(128 * 1024 + 1),
+        deliverAt: "2026-09-04T12:34:56.000Z",
+      })
+    ).toThrow(/128 KiB/);
   });
 
   it("strips cron blocks without disturbing adjacent user jobs", () => {
@@ -188,7 +288,7 @@ describe("DefaultOsScheduler", () => {
   });
 });
 
-describe("CrontabMutator shared between CrontabWakeCron and DefaultOsScheduler", () => {
+describe("one cron subsystem for actor wakes and obligations", () => {
   it("consolidates both writers behind one instance so an interleaved wake-schedule mutation and a recurrence mutation cannot lose either entry, and every foreign byte survives", async () => {
     // Seed a crontab with a foreign (unrelated feature) `# mc-wake:` block
     // and arbitrary untagged user lines, exactly as the addendum requires.
@@ -210,11 +310,9 @@ describe("CrontabMutator shared between CrontabWakeCron and DefaultOsScheduler",
       remove: vi.fn(),
     };
 
-    // ONE shared mutator instance, handed to both writers — this is the
-    // "single crontab writer" shape: neither class constructs its own IO.
+    // One subsystem owns the sole mutator and both public scheduling slices.
     const mutator = new CrontabMutator(cron);
-    const wakeCron = new CrontabWakeCron(mutator, { tokenFile: "/token", portFile: "/port" });
-    const osScheduler = new DefaultOsScheduler(mutator, at, {
+    const scheduler = new DefaultCronSubsystem(mutator, at, {
       tokenFile: "/token",
       portFile: "/port",
     });
@@ -224,8 +322,8 @@ describe("CrontabMutator shared between CrontabWakeCron and DefaultOsScheduler",
     // underlying crontab IO blocks the event loop), so this is the only
     // interleaving order this single-threaded process can actually produce —
     // proving it doesn't lose either entry is the real regression coverage.
-    osScheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" });
-    await wakeCron.schedule("actor-a", "0 4 * * *", "daily digest");
+    scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" });
+    await scheduler.schedule("actor-a", "0 4 * * *", "daily digest");
 
     expect(cronData).toContain("# mc-obligation-activation:ob-1");
     expect(cronData).toContain("# mc-obligation-activation-end:ob-1");
@@ -239,11 +337,11 @@ describe("CrontabMutator shared between CrontabWakeCron and DefaultOsScheduler",
     // Order B: cancel the recurrence, then cancel the unrelated wake — each
     // removes only its own block, leaving the other writer's entry and all
     // foreign content intact until it too is cancelled.
-    osScheduler.cancelObligationActivation("ob-1");
+    scheduler.cancelObligationActivation("ob-1");
     expect(cronData).not.toContain("# mc-obligation-activation:ob-1");
     expect(cronData).toContain("# mc-wake:actor-a");
 
-    await wakeCron.cancel("actor-a");
+    await scheduler.cancel("actor-a");
     expect(cronData).not.toContain("# mc-wake:actor-a");
     for (const line of foreignLines) {
       expect(cronData).toContain(line);
@@ -343,7 +441,7 @@ describe("unavailableAtIo", () => {
   });
 });
 
-describe("DefaultOsScheduler with an unavailable `at` facility", () => {
+describe("DefaultCronSubsystem with an unavailable `at` facility", () => {
   it("keeps cron scheduling working — a pure cron activation never touches `at`", () => {
     let cronData = "";
     const cron: CrontabIo = {
@@ -352,7 +450,7 @@ describe("DefaultOsScheduler with an unavailable `at` facility", () => {
         cronData = data;
       },
     };
-    const scheduler = new DefaultOsScheduler(
+    const scheduler = new DefaultCronSubsystem(
       new CrontabMutator(cron),
       unavailableAtIo(["at missing"]),
       {
@@ -372,7 +470,7 @@ describe("DefaultOsScheduler with an unavailable `at` facility", () => {
 
   it("fails a completion-interval (at-kind) activation with the named prerequisite error", () => {
     const cron: CrontabIo = { read: () => "", write: () => {} };
-    const scheduler = new DefaultOsScheduler(
+    const scheduler = new DefaultCronSubsystem(
       new CrontabMutator(cron),
       unavailableAtIo(["at missing"]),
       {

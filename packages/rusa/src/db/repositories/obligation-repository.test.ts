@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { OsScheduler } from "../../actor/os-scheduler.js";
+import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js";
 import type { Obligation } from "../../obligations/obligation.js";
 import { asGitHubIssue } from "../../references/reference.js";
 import { obligations } from "../migrations/0016_obligations.js";
@@ -13,7 +13,7 @@ import { recurringObligations } from "../migrations/0035_recurring_obligations.j
 import { ObligationRepository } from "./obligation-repository.js";
 
 /** Records every scheduler call instead of touching the OS, for assertions. */
-class FakeOsScheduler implements OsScheduler {
+class FakeObligationScheduler implements ObligationActivationScheduler {
   activations = new Map<string, { kind: "cron"; cronExpr: string } | { kind: "at"; date: Date }>();
   cancelled: string[] = [];
   scheduleObligationActivation(
@@ -28,11 +28,6 @@ class FakeOsScheduler implements OsScheduler {
   }
   listObligationActivations(): string[] {
     return Array.from(this.activations.keys());
-  }
-  scheduleMessageDelivery(): void {}
-  cancelMessageDelivery(): void {}
-  listMessageDeliveries(): string[] {
-    return [];
   }
 }
 
@@ -765,7 +760,7 @@ describe("ObligationRepository", () => {
         ownerId: "   ",
       })
     ).toThrow("entity id is required");
-    // `human:*` and `system:*` are not in the thread registry, so they must NOT
+    // `human:*` and `system:*` are not in the actor repository, so they must NOT
     // be run through the actor-existence check that rejects "unknown".
     expect(() =>
       repository.create({
@@ -1722,11 +1717,11 @@ describe("ObligationRepository", () => {
   });
 
   describe("recurrence, scheduling, and the completion ledger", () => {
-    let scheduler: FakeOsScheduler;
+    let scheduler: FakeObligationScheduler;
 
     beforeEach(() => {
-      scheduler = new FakeOsScheduler();
-      repository.setOsScheduler(scheduler);
+      scheduler = new FakeObligationScheduler();
+      repository.setCronSubsystem(scheduler);
       repository.create({ title: "rec", id: "rec-1", ownerId: "actor-a", intent: "recur" });
     });
 

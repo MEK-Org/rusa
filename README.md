@@ -47,7 +47,7 @@ self-similarity is what makes the mesh easy to reason about: there is no special
 
    Shared, orthogonal to the tree:
      • tracker-MCP (gh) / chat-MCP (gchat)  — the facts, re-derived each wake
-     • thread registry (durable)            — the org chart of live actors
+     • actor repository (durable, SQLite)   — the org chart of live actors
      • firehose                             — every actor's raw streamed output
 ```
 
@@ -91,11 +91,11 @@ configuration:
 - They **report to their parent, not to humans.** Completion is the *parent's*
   judgment: a worker may *propose* it's done, but the parent owns retirement
   (and retiring a thread retires its whole subtree).
-Every actor is backed by a durable **thread registry record** (charter, parent,
+Every actor is backed by a durable **actor repository record** (charter, parent,
 session handle, status) — the one piece of state that *can't* be
 re-derived from the humans' tools, and what lets the root reconstitute "who's
 working on what" after a restart. See
-[`thread-registry.ts`](packages/rusa/src/actor/thread-registry.ts).
+[`actor-repository.ts`](packages/rusa/src/db/repositories/actor-repository.ts).
 
 ### Concurrency Limiter
 
@@ -107,6 +107,22 @@ FIFO gate that lets at most `N` provider runs execute at once and queues the
 rest, starting them as slots free. Each actor wraps its provider run in this
 shared gate, so the whole mesh respects one global concurrency cap regardless of
 how many threads are live.
+
+### Host Scheduling
+
+One host scheduling subsystem owns every cron and `at` mutation. Recurring
+actor wakes live directly in the user's crontab. Obligation recurrence policy
+remains durable in SQLite and is reconciled into cron jobs or one-shot `at`
+activations. Scheduled sends are different: the complete, versioned message
+payload lives in the `at` job, so `atq` is the pending-message authority and
+there is no application pending-message table or restart re-arming pass.
+
+Host callbacks use the loopback MCP HTTP server and a file-backed bearer token.
+Scheduled-message callbacks retry for up to ten minutes and re-read the current
+ephemeral port on every attempt. Cron-backed features require `crontab` plus a
+running cron daemon; one-shot obligations and scheduled sends additionally
+require `at`, `atq`, `atrm`, and a running `atd`. Startup and the dashboard
+surface degraded prerequisites without preventing cron-only work from running.
 
 ---
 
@@ -151,7 +167,7 @@ rusa/
 │       │   ├── actor.ts                # the Actor unit (inbox + session + tools)
 │       │   ├── actor-mesh.ts           # scheduler: spawn / sendMessage / retire
 │       │   ├── concurrency-limiter.ts  # cross-actor capacity gate
-│       │   ├── thread-registry.ts      # durable per-thread records
+│       │   ├── actor-record.ts         # actor record + repository contract
 │       │   ├── trigger-runner.ts       # per-actor debounce/single-flight loop
 │       │   ├── root-prompt.ts          # the default root charter + per-wake prompt
 │       │   └── worker-prompt.ts        # worker scaffold + delegation discipline
@@ -253,4 +269,4 @@ The system keeps three tiers of memory, deliberately separated:
 | **Facts** | tracker-MCP / chat-MCP (issues, PRs, chat) | not ours — re-derived each wake |
 
 Sessions are reconstructable; the only state rusa durably *owns* is its
-long-term library plus the thread registry (the org chart of live actors).
+long-term library plus the actor repository (the org chart of live actors).

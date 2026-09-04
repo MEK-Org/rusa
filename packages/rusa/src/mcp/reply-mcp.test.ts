@@ -5,7 +5,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it } from "vitest";
 import type { Actor } from "../actor/actor.js";
 import { ActorMesh } from "../actor/actor-mesh.js";
-import { InMemoryThreadRegistry } from "../actor/thread-registry.js";
+import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { createAgentExecMcpServer } from "./agent-exec-mcp.js";
 import { HUMAN_OPERATOR } from "./stamp.js";
 
@@ -18,7 +18,7 @@ async function connect(server: McpServer): Promise<Client> {
 }
 
 function setupTestMesh() {
-  const registry = new InMemoryThreadRegistry();
+  const registry = new InMemoryActorRepository();
   const recordedEvents: {
     kind: string;
     actorId?: string;
@@ -26,7 +26,7 @@ function setupTestMesh() {
     body?: string;
   }[] = [];
   const mesh = new ActorMesh({
-    registry,
+    actors: registry,
     events: (e) => recordedEvents.push(e),
     grantableCapabilities: new Set(),
     idgen: () => "id",

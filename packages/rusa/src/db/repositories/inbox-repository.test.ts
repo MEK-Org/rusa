@@ -2,8 +2,8 @@ import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Actor } from "../../actor/actor.js";
 import { ActorMesh } from "../../actor/actor-mesh.js";
-import { InMemoryThreadRegistry } from "../../actor/thread-registry.js";
 import { FakeProvider } from "../../providers/fake-provider.js";
+import { InMemoryActorRepository } from "../../repositories/in-memory-actor-repository.js";
 import { actorInbox } from "../migrations/0003_actor_inbox.js";
 import { actorInboxSeen } from "../migrations/0012_actor_inbox_seen.js";
 import { actorInboxHandledNote } from "../migrations/0015_actor_inbox_handled_note.js";
@@ -181,9 +181,9 @@ describe("InboxRepository", () => {
     store.list("actor", { status: "all" });
 
     // Exercise run start/end, yield, boot recovery, and retire/retention wiring.
-    const registry = new InMemoryThreadRegistry();
+    const registry = new InMemoryActorRepository();
     const mesh = new ActorMesh({
-      registry,
+      actors: registry,
       inboxStore: store,
       createActor: () => {
         throw new Error("not used");

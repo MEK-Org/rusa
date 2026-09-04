@@ -1,12 +1,13 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
+import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
+import type { ActorRecord } from "./actor-record.js";
 import { generateMeshReport } from "./mesh-report.js";
-import type { ThreadRecord } from "./thread-registry.js";
 
 describe("generateMeshReport", () => {
   let home: string;
@@ -20,20 +21,22 @@ describe("generateMeshReport", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  function seed(records: ThreadRecord[], record: (repo: MeshEventRepository) => void): void {
-    writeFileSync(join(home, "threads.json"), JSON.stringify({ threads: records }, null, 2));
+  function seed(records: ActorRecord[], record: (repo: MeshEventRepository) => void): void {
     const db = new Database(join(home, "data", "mesh.db"));
     runMigrations(db);
+    const actors = new SqliteActorRepository(db);
+    for (const actor of records) actors.upsert(actor);
     record(new MeshEventRepository(db));
     db.close();
   }
 
-  it("renders topology and a timeline from the registry + event log", () => {
-    const records: ThreadRecord[] = [
+  it("renders topology and a timeline from the actor repository + event log", () => {
+    const records: ActorRecord[] = [
       {
         id: "root",
         charter: "Root Orchestrator: Coordinates worker subagents",
         parentId: null,
+        isRoot: true,
         status: "active",
         createdAt: "t0",
       },
@@ -102,7 +105,16 @@ describe("generateMeshReport", () => {
 
   it("handles a home with no events yet", () => {
     seed(
-      [{ id: "root", charter: "root", parentId: null, status: "active", createdAt: "t0" }],
+      [
+        {
+          id: "root",
+          charter: "root",
+          parentId: null,
+          isRoot: true,
+          status: "active",
+          createdAt: "t0",
+        },
+      ],
       () => {}
     );
     const { counts } = generateMeshReport({ home });

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import type { OsScheduler } from "../../actor/os-scheduler.js";
+import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js";
 import {
   cronExprEverFires,
   isValidCronExpr,
@@ -279,7 +279,7 @@ export class ObligationRepository {
     private readonly now: () => number = Date.now
   ) {}
 
-  private osScheduler?: OsScheduler;
+  private scheduler?: ObligationActivationScheduler;
 
   /**
    * Obligation ids whose OS scheduler job needs re-deriving once the current
@@ -294,7 +294,7 @@ export class ObligationRepository {
 
   /** A transient OS write failure gets two bounded post-commit re-derivations. */
   private scheduleReconcileRetry(ids: readonly string[], attemptsRemaining = 2): void {
-    if (!this.osScheduler || attemptsRemaining <= 0 || ids.length === 0) return;
+    if (!this.scheduler || attemptsRemaining <= 0 || ids.length === 0) return;
     setTimeout(() => {
       const failed: string[] = [];
       for (const id of ids) {
@@ -314,12 +314,12 @@ export class ObligationRepository {
   }
 
   private markScheduleDirty(id: string): void {
-    if (this.osScheduler) this.dirtyScheduleIds.add(id);
+    if (this.scheduler) this.dirtyScheduleIds.add(id);
   }
 
   /** Re-derive `id`'s OS scheduler job from its committed row. */
   private reconcileObligationSchedule(id: string): void {
-    if (!this.osScheduler) return;
+    if (!this.scheduler) return;
     const row = this.db
       .prepare(
         `SELECT status, recurrence_policy, recurrence_cron, next_ready_at FROM obligations WHERE id = ?`
@@ -340,26 +340,26 @@ export class ObligationRepository {
       row.status !== "cancelled" &&
       row.status !== "done"
     ) {
-      this.osScheduler.scheduleObligationActivation(id, {
+      this.scheduler.scheduleObligationActivation(id, {
         kind: "cron",
         cronExpr: row.recurrence_cron,
       });
     } else if (row && row.status === "scheduled" && row.next_ready_at) {
-      this.osScheduler.scheduleObligationActivation(id, {
+      this.scheduler.scheduleObligationActivation(id, {
         kind: "at",
         date: new Date(row.next_ready_at),
       });
     } else {
-      this.osScheduler.cancelObligationActivation(id);
+      this.scheduler.cancelObligationActivation(id);
     }
   }
 
-  setOsScheduler(scheduler: OsScheduler): void {
-    this.osScheduler = scheduler;
+  setCronSubsystem(scheduler: ObligationActivationScheduler): void {
+    this.scheduler = scheduler;
   }
 
   reconcileScheduledObligations(): void {
-    if (!this.osScheduler) return;
+    if (!this.scheduler) return;
     const validIds = new Set<string>();
 
     // A cron policy keeps one tagged crontab entry alive across every status
@@ -389,7 +389,7 @@ export class ObligationRepository {
           row.status !== "done"
         ) {
           validIds.add(row.id);
-          this.osScheduler.scheduleObligationActivation(row.id, {
+          this.scheduler.scheduleObligationActivation(row.id, {
             kind: "cron",
             cronExpr: row.recurrence_cron,
           });
@@ -399,7 +399,7 @@ export class ObligationRepository {
             this.activateScheduled(row.id);
           } else {
             validIds.add(row.id);
-            this.osScheduler.scheduleObligationActivation(row.id, {
+            this.scheduler.scheduleObligationActivation(row.id, {
               kind: "at",
               date: nextDate,
             });
@@ -418,9 +418,9 @@ export class ObligationRepository {
     }
 
     try {
-      for (const id of this.osScheduler.listObligationActivations()) {
+      for (const id of this.scheduler.listObligationActivations()) {
         if (!validIds.has(id)) {
-          this.osScheduler.cancelObligationActivation(id);
+          this.scheduler.cancelObligationActivation(id);
         }
       }
     } catch (err) {
@@ -444,7 +444,7 @@ export class ObligationRepository {
    * Supply the actor-existence probe after construction.
    *
    * Needed because the production container is built from a `Database` alone,
-   * before the thread registry exists — which is why the constructor argument
+   * before the actor repository is wired — which is why the constructor argument
    * was never passed there, leaving the guard inert on every production path
    * while reading as if it applied.
    */

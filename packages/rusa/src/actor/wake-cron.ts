@@ -175,7 +175,7 @@ const GREGORIAN_CYCLE_YEARS = 400;
 
 /**
  * The next UTC moment a validated 5-field cron expression fires strictly
- * after `after`. Matches `DefaultOsScheduler`'s `CRON_TZ=UTC` obligation
+ * after `after`. Matches `DefaultCronSubsystem`'s `CRON_TZ=UTC` obligation
  * jobs, so a computed `next_ready_at` lines up with when the tagged crontab
  * entry will actually call back.
  *

@@ -10,13 +10,13 @@ import {
   WATCHDOG_CEILING_TIMEOUT_MS,
   WATCHDOG_STALL_TIMEOUT_MS,
 } from "./actor.js";
+import type { ActorRecord } from "./actor-record.js";
 import {
   ConcurrencyLimiter,
   RunStartCancelledError,
   type RunStartHandle,
 } from "./concurrency-limiter.js";
 import { routeContinuationCapped, routeRunFailure } from "./failure-sink.js";
-import type { ThreadRecord } from "./thread-registry.js";
 
 /** Let the timer-less corrective-run microtasks drain. */
 const flush = async () => {
@@ -1035,7 +1035,7 @@ describe("Actor", () => {
           if (!result.success) {
             routeRunFailure(
               {
-                registry: { get: () => ({ id: "a1", parentId: "root" }) as ThreadRecord },
+                actors: { get: () => ({ id: "a1", parentId: "root" }) as ActorRecord },
                 sendToParent: (_toId, body) => toParent.push(body),
                 postToErrorChat: null,
                 rootId: "root",
@@ -1061,7 +1061,7 @@ describe("Actor", () => {
     const toParent: string[] = [];
     const provider = new FakeProvider();
     const deps = {
-      registry: { get: () => ({ id: "a1", parentId: "root" }) as ThreadRecord },
+      actors: { get: () => ({ id: "a1", parentId: "root" }) as ActorRecord },
       sendToParent: (_toId: string, body: string) => toParent.push(body),
       postToErrorChat: null,
       rootId: "root",
@@ -1116,7 +1116,7 @@ describe("Actor", () => {
           if (!result.success) {
             routeRunFailure(
               {
-                registry: { get: () => ({ id: "a1", parentId: "root" }) as ThreadRecord },
+                actors: { get: () => ({ id: "a1", parentId: "root" }) as ActorRecord },
                 sendToParent: (_toId, body) => toParent.push(body),
                 postToErrorChat: null,
                 rootId: "root",
