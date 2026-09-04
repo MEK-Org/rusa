@@ -1728,6 +1728,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
             charter: "worker",
             parentId: "root",
             provider: "antigravity",
+            effort: "high",
             status: "active",
             createdAt: "2026-01-01T00:00:01.000Z",
           },
