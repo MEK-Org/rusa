@@ -5,8 +5,6 @@ import { resolveRootHandle } from "../actor/handle-generator.js";
 import { loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { getRepositories, initDb } from "../db/index.js";
-import { importLegacyActorState } from "../db/legacy-actor-import.js";
-import { providerCapabilityName } from "../providers/registry.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { startDashboardServer } from "../webhook/server.js";
 
@@ -39,13 +37,7 @@ ${"━".repeat(26)}
   const dashboardPort = config.dashboard?.port ?? 8080;
   const dashboardBindHost = config.dashboard?.bindHost ?? "127.0.0.1";
   // Open the persisted database so the Data API serves real mesh data.
-  const database = initDb(mcHome);
-  importLegacyActorState({
-    mcHome,
-    db: database,
-    repositories: getRepositories(),
-    providerCapabilityName: (providerName) => providerCapabilityName(providerName, config),
-  });
+  initDb(mcHome);
   // No provider clients run in this process, but the repository-backed cache
   // still serves fresh/stale rows a live `rusa start` process persisted.
   const referenceCache = new ReferenceCacheService({

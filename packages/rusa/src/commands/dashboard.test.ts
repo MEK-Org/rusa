@@ -90,6 +90,12 @@ describe("runDashboard", () => {
     expect(openMock.default).toHaveBeenCalledWith("http://localhost:8080");
   });
 
+  it("stays read-only: never invokes the mutating legacy actor state importer", async () => {
+    await runDashboard();
+
+    expect(mockLegacyImport.importLegacyActorState).not.toHaveBeenCalled();
+  });
+
   it("wires a repository-backed reference cache so standalone dashboard can serve persisted rows", async () => {
     await runDashboard();
 

@@ -167,7 +167,7 @@ rusa/
 │       │   ├── actor.ts                # the Actor unit (inbox + session + tools)
 │       │   ├── actor-mesh.ts           # scheduler: spawn / sendMessage / retire
 │       │   ├── concurrency-limiter.ts  # cross-actor capacity gate
-│       │   ├── actor-record.ts         # actor record + repository contract
+│       │   ├── actor-record.ts         # ActorRecord: the actor's persisted shape (charter, parent, status, …)
 │       │   ├── trigger-runner.ts       # per-actor debounce/single-flight loop
 │       │   ├── root-prompt.ts          # the default root charter + per-wake prompt
 │       │   └── worker-prompt.ts        # worker scaffold + delegation discipline
@@ -178,6 +178,7 @@ rusa/
 │       ├── chat/               # Google Chat client, OAuth, Pub/Sub + Workspace Events source
 │       ├── commands/           # CLI subcommands (start, init, dashboard, e2e, service, …)
 │       ├── config/             # config loading + docs
+│       ├── repositories/       # actor-repository.ts: the ActorRepository persistence contract
 │       ├── db/                 # SQLite schema, migrations, repositories
 │       ├── gitops/             # git + the IssueClient (gh) seam
 │       ├── providers/          # coding harnesses: claude, codex, antigravity, gemini, copilot, kimi
