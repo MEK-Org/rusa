@@ -2268,6 +2268,31 @@ describe("ObligationRepository", () => {
       ]);
     });
 
+    it("demotes an already-ready dependent to waiting when addPrerequisite names an already-cancelled prerequisite", () => {
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      repository.setTerminalStatus("prereq", "cancelled");
+      const dependent = repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+      });
+      expect(dependent.status).toBe("ready");
+
+      const delivered: Array<{
+        dependentId: string;
+        dependentOwnerId: string;
+        prerequisiteId: string;
+      }> = [];
+      repository.setCancellationAttentionListener((attention) => delivered.push(attention));
+
+      repository.addPrerequisite("dependent", "prereq");
+
+      expect(repository.require("dependent").status).toBe("waiting");
+      expect(delivered).toEqual([
+        { dependentId: "dependent", dependentOwnerId: "actor-a", prerequisiteId: "prereq" },
+      ]);
+    });
+
     it("repairs a cancellation-blocked dependent when its owner removes the edge", () => {
       repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
       repository.create({
@@ -2322,6 +2347,24 @@ describe("ObligationRepository", () => {
       repository.create({ title: "b", id: "b", ownerId: "actor-a" });
       repository.addPrerequisite("a", "b");
       expect(() => repository.addPrerequisite("b", "a")).toThrow(/cycle/);
+    });
+
+    it("rejects creating a child that names its own new parent as a prerequisite", () => {
+      // wouldCreateCycle(parentId, prerequisiteId) asks whether parentId is
+      // reachable *from* prerequisiteId — never reflexively true for
+      // prerequisiteId === parentId with no self-loop, so this exact case
+      // needs its own check rather than relying on the graph walk.
+      repository.create({ title: "p", id: "p", ownerId: "actor-a" });
+
+      expect(() =>
+        repository.create({
+          title: "c",
+          id: "c",
+          ownerId: "actor-a",
+          parentId: "p",
+          blockedBy: ["p"],
+        })
+      ).toThrow(/cycle/);
     });
 
     it("rejects a cycle formed by combining an explicit edge with the parent-child hierarchy", () => {
@@ -2435,6 +2478,29 @@ describe("ObligationRepository", () => {
         { dependentId: "dependent", dependentOwnerId: "actor-a", prerequisiteId: "prereq" },
       ]);
       expect(repository.require("dependent").ownerId).toBe("actor-a");
+    });
+
+    it("does not queue immediate cancellation attention for a dependent that already reached a terminal status", () => {
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+        blockedBy: ["prereq"],
+      });
+      repository.setTerminalStatus("dependent", "cancelled");
+
+      const delivered: Array<{
+        dependentId: string;
+        dependentOwnerId: string;
+        prerequisiteId: string;
+      }> = [];
+      repository.setCancellationAttentionListener((attention) => delivered.push(attention));
+
+      repository.setTerminalStatus("prereq", "cancelled");
+
+      expect(delivered).toEqual([]);
+      expect(repository.listPrerequisiteCancellationAttention()).toEqual([]);
     });
 
     it("includes a recurring dependent that is currently 'scheduled' in cancellation reconciliation", () => {

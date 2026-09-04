@@ -803,6 +803,18 @@ export class ObligationRepository {
         // parent-waits-for-child edge from `parentId`. Naming a prerequisite
         // that can already reach `parentId` would close that loop the moment
         // the insert below lands, so it is rejected before it can.
+        //
+        // `parentId === prerequisiteId` is the degenerate case of that same
+        // loop and needs its own check: {@link wouldCreateCycle} asks whether
+        // `parentId` is reachable *from* `prerequisiteId` by following edges
+        // out of it, which is never true of a node reaching itself unless a
+        // self-loop already exists — so naming the new parent as a
+        // prerequisite would otherwise slip through un-rejected.
+        if (parentId !== null && prerequisiteId === parentId) {
+          throw new ObligationValidationError(
+            `prerequisite would create a cycle in the wait-for graph: ${prerequisiteId}`
+          );
+        }
         if (parentId !== null && this.wouldCreateCycle(parentId, prerequisiteId)) {
           throw new ObligationValidationError(
             `prerequisite would create a cycle in the wait-for graph: ${prerequisiteId}`
@@ -1002,13 +1014,17 @@ export class ObligationRepository {
         )
         .run(dependentId, prerequisiteId, this.stamp());
 
+      // Attention-queuing and demotion are independent facts about the named
+      // prerequisite — a cancelled prerequisite is also a non-done one, so
+      // both must run for it, not just one arm of an if/else-if.
       if (prerequisite.status === "cancelled") {
         this.pendingCancellationAttention.push({
           dependentId,
           dependentOwnerId: dependent.ownerId,
           prerequisiteId,
         });
-      } else if (prerequisite.status !== "done" && dependent.status === "ready") {
+      }
+      if (prerequisite.status !== "done" && dependent.status === "ready") {
         this.db
           .prepare("UPDATE obligations SET status = 'waiting', updated_at = ? WHERE id = ?")
           .run(this.stamp(), dependentId);
@@ -1740,12 +1756,17 @@ export class ObligationRepository {
           // Cancelling never satisfies a dependent (#212) — it forfeits the
           // wait forever, so each dependent's owner needs durable attention
           // to remove or replace this edge rather than a silent release.
+          // Matches {@link listPrerequisiteCancellationAttention}'s live-dependent
+          // filter: a dependent that already reached done/cancelled on its own
+          // has nothing left to repair, so it should not receive a prompt just
+          // because the now-dangling edge still names it.
           const dependents = this.db
             .prepare(
               `SELECT op.dependent_id AS dependent_id, dependent.owner_id AS dependent_owner_id
                FROM obligation_prerequisites op
                JOIN obligations dependent ON dependent.id = op.dependent_id
-               WHERE op.prerequisite_id = ?`
+               WHERE op.prerequisite_id = ?
+                 AND dependent.status IN ('ready', 'waiting', 'scheduled')`
             )
             .all(id) as Array<{ dependent_id: string; dependent_owner_id: string }>;
           for (const dependent of dependents) {
