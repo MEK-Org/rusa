@@ -1890,6 +1890,76 @@ describe("handleMeshApiRequest", () => {
         expect(failure?.reference?.unavailable).toBe("could not load context");
       });
 
+      it("returns obligation with a PR comment and a PR review embedded, not just a plain issue", async () => {
+        obligations.create({
+          title: "with-comment-and-review",
+          id: "with-comment-and-review",
+          ownerId: "actor-1",
+        });
+        obligations.attachArtifact(
+          "with-comment-and-review",
+          "github:MEK-Org/rusa/pulls/76/comments/12345"
+        );
+        obligations.attachArtifact(
+          "with-comment-and-review",
+          "github:MEK-Org/rusa/pulls/76/reviews/9001"
+        );
+
+        const depsWithCache = {
+          ...deps,
+          referenceCache: {
+            get: async (ref: string) => {
+              if (ref.includes("comments")) {
+                return {
+                  ref,
+                  scheme: "github",
+                  title: "MEK-Org/rusa pulls/76 — comment",
+                  body: "nit: rename this",
+                  cacheState: "fresh",
+                  entity: { type: "github_comment", body: "nit: rename this" },
+                  unavailable: null,
+                };
+              }
+              return {
+                ref,
+                scheme: "github",
+                title: "MEK-Org/rusa pulls/76 — review",
+                body: null,
+                cacheState: "fresh",
+                entity: { type: "github_review", body: "", state: "APPROVED" },
+                unavailable: null,
+              };
+            },
+          } as unknown as ReferenceCacheService,
+        };
+
+        const { res } = await call(
+          depsWithCache,
+          "GET",
+          "/api/mesh/obligations/with-comment-and-review"
+        );
+        await new Promise((resolve) => process.nextTick(resolve));
+        expect(res.statusCode).toBe(200);
+
+        const artifacts = JSON.parse(res.body).artifacts as Array<{
+          artifact: { ref: string };
+          reference: { entity?: unknown } | null;
+        }>;
+
+        expect(artifacts).toHaveLength(2);
+        const comment = artifacts.find((a) => a.artifact.ref.includes("comments"));
+        expect(comment?.reference?.entity).toEqual({
+          type: "github_comment",
+          body: "nit: rename this",
+        });
+        const review = artifacts.find((a) => a.artifact.ref.includes("reviews"));
+        expect(review?.reference?.entity).toEqual({
+          type: "github_review",
+          body: "",
+          state: "APPROVED",
+        });
+      });
+
       it("404s when obligation not found", async () => {
         const { res } = await call(deps, "GET", "/api/mesh/obligations/missing-task");
         expect(res.statusCode).toBe(404);

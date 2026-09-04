@@ -492,12 +492,11 @@ void main() {
       await tester.tap(find.text('Operator Work'));
       await tester.pumpAndSettle();
       expect(find.text('OWNER'), findsOneWidget);
-      expect(find.text('human:operator'), findsOneWidget);
       expect(find.text('Operator'), findsOneWidget);
 
       await tester.tap(find.text('Ghost Work'));
       await tester.pumpAndSettle();
-      expect(find.text('actor-ghost'), findsOneWidget);
+      expect(find.text('Unknown actor'), findsOneWidget);
       expect(find.text('Actor — not in this mesh view'), findsOneWidget);
     });
 

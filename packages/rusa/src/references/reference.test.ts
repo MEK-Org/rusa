@@ -143,6 +143,15 @@ describe("reference grammar", () => {
     expect(referenceUrl(parseReference("github:MEK-Org/rusa/issues/33/comments/12345"))).toBe(
       "https://github.com/MEK-Org/rusa/issues/33#issuecomment-12345"
     );
+    // A review comment lives under `pulls/N/comments`, GitHub's own split
+    // between conversation and diff-anchored comments — it needs the
+    // `discussion_r` anchor, not `issuecomment`.
+    expect(referenceUrl(parseReference("github:MEK-Org/rusa/pulls/76/comments/12345"))).toBe(
+      "https://github.com/MEK-Org/rusa/pull/76#discussion_r12345"
+    );
+    expect(referenceUrl(parseReference("github:MEK-Org/rusa/pulls/76/reviews/9001"))).toBe(
+      "https://github.com/MEK-Org/rusa/pull/76#pullrequestreview-9001"
+    );
     expect(referenceUrl(parseReference("mesh:messages/1"))).toBeNull();
   });
 

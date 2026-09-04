@@ -217,6 +217,14 @@ export interface IssueComment {
   createdAt: string;
 }
 
+export interface PullRequestReviewDetails {
+  id: number;
+  /** GitHub's own casing, e.g. `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`. */
+  state: string;
+  body: string;
+  author: string;
+}
+
 export interface PollIssueOrPullRequest {
   number: number;
   title: string;
@@ -358,6 +366,12 @@ export interface IssueClient {
     prNumber: number,
     reviewId?: number
   ): Promise<PrReviewComment[]>;
+  /** Fetch one review's own summary (verdict and body), or null if it no longer exists. */
+  getPullRequestReview(
+    repo: string,
+    prNumber: number,
+    reviewId: number
+  ): Promise<PullRequestReviewDetails | null>;
   /**
    * Return the parent issue number if this issue is a sub-issue, or null if it
    * is a root issue (no parent).
@@ -698,6 +712,30 @@ export class GitHubIssueClient implements IssueClient {
       createdAt: c.created_at,
       inReplyToId: c.in_reply_to_id ?? null,
     }));
+  }
+
+  async getPullRequestReview(
+    repo: string,
+    prNumber: number,
+    reviewId: number
+  ): Promise<PullRequestReviewDetails | null> {
+    try {
+      const review = await this.api<{
+        id: number;
+        state: string;
+        body: string | null;
+        user: { login: string } | null;
+      }>("GET", `/repos/${repo}/pulls/${prNumber}/reviews/${reviewId}`);
+      return {
+        id: review.id,
+        state: review.state,
+        body: review.body ?? "",
+        author: review.user?.login ?? "",
+      };
+    } catch (err) {
+      if (err instanceof GitHubApiError && err.status === 404) return null;
+      throw err;
+    }
   }
 
   async getIssue(repo: string, issueNumber: number): Promise<IssueDetails> {
@@ -1414,6 +1452,14 @@ export class GitBridgeIssueClient implements IssueClient, GitHubPollingIssueClie
     reviewId?: number
   ): Promise<PrReviewComment[]> {
     return this.delegate.getPrReviewComments(repo, prNumber, reviewId);
+  }
+
+  getPullRequestReview(
+    repo: string,
+    prNumber: number,
+    reviewId: number
+  ): Promise<PullRequestReviewDetails | null> {
+    return this.delegate.getPullRequestReview(repo, prNumber, reviewId);
   }
 
   getParentIssueNumber(repo: string, issueNumber: number): Promise<number | null> {

@@ -3,7 +3,13 @@ import type {
   ReferenceCacheRepository,
   ReferenceCacheRow,
 } from "../db/repositories/reference-cache-repository.js";
+import type { IssueDetails } from "../gitops/issue-client.js";
 import { ReferenceCacheService } from "./cache-service.js";
+
+/** A production-shaped `IssueDetails`, as `GitHubIssueClient.getIssue` really returns. */
+function issueDetails(overrides: Partial<IssueDetails> = {}): IssueDetails {
+  return { number: 1, title: "T", body: "D", state: "open", author: "octocat", ...overrides };
+}
 
 describe("ReferenceCacheService", () => {
   it("bypasses local reference", async () => {
@@ -66,7 +72,7 @@ describe("ReferenceCacheService", () => {
 
     const deps = {
       issueClient: {
-        getIssue: vi.fn().mockResolvedValue({ title: "T2", body: "D2" }),
+        getIssue: vi.fn().mockResolvedValue(issueDetails({ title: "T2", body: "D2" })),
       },
     };
     const logger = { info: vi.fn(), error: vi.fn() };
@@ -91,7 +97,7 @@ describe("ReferenceCacheService", () => {
 
     const deps = {
       issueClient: {
-        getIssue: vi.fn().mockResolvedValue({ title: "T", body: "D" }),
+        getIssue: vi.fn().mockResolvedValue(issueDetails()),
       },
     };
     const logger = { info: vi.fn(), error: vi.fn() };
@@ -134,7 +140,7 @@ describe("ReferenceCacheService", () => {
     expect(repo.set).not.toHaveBeenCalled();
 
     // Resolve the background promise
-    resolvePromise?.({ title: "T", body: "D" });
+    resolvePromise?.(issueDetails());
     await new Promise((r) => setTimeout(r, 0)); // tick
     await new Promise((r) => setTimeout(r, 0)); // tick
 
@@ -205,8 +211,7 @@ describe("ReferenceCacheService", () => {
     const deps = {
       issueClient: {
         getIssue: vi.fn().mockResolvedValue({
-          title: "PR Title",
-          body: "PR Body with secrets",
+          ...issueDetails({ title: "PR Title", body: "PR Body with secrets" }),
           secret_field: "SHOULD_NOT_BE_SAVED",
           html_url: "https://example.com",
         }),
@@ -228,6 +233,121 @@ describe("ReferenceCacheService", () => {
     expect(saved.ref).toBe("github:a/b/pulls/2");
     expect(saved.entity_json).not.toContain("SHOULD_NOT_BE_SAVED");
     expect(saved.entity_json).toContain("github_pull_request");
+  });
+
+  it("normalizes a GitHub issue comment and omits raw provider fields", async () => {
+    const repo = {
+      get: vi.fn().mockReturnValue(null),
+      set: vi.fn(),
+      delete: vi.fn(),
+    } as unknown as ReferenceCacheRepository;
+
+    const deps = {
+      issueClient: {
+        listIssueComments: vi.fn().mockResolvedValue([
+          {
+            id: 12345,
+            author: "octocat",
+            body: "The actual comment",
+            createdAt: "2026-09-01T10:00:00Z",
+            node_id: "SHOULD_NOT_BE_SAVED",
+          },
+        ]),
+      },
+    };
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
+    const res = await svc.get("github:a/b/issues/1/comments/12345", deps);
+
+    expect(res.cacheState).toBe("fresh");
+    expect(res.entity).toEqual({ type: "github_comment", body: "The actual comment" });
+    // The title is a safe, resolved label derived from the reference's own
+    // path — never the raw canonical ref (see the cache-boundary title test
+    // below for the case that would otherwise leak it).
+    expect(res.title).toBe("a/b issues/1 — comment");
+    expect(res.title).not.toBe("github:a/b/issues/1/comments/12345");
+
+    const saved = (repo.set as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(saved.entity_json).not.toContain("SHOULD_NOT_BE_SAVED");
+    expect(saved.entity_json).toContain("github_comment");
+  });
+
+  it("reconstructs a safe title for a comment served from a stored cache hit, not the canonical ref", async () => {
+    const row: ReferenceCacheRow = {
+      ref: "github:a/b/issues/1/comments/12345",
+      document_version: 1,
+      entity_json: JSON.stringify({ type: "github_comment", body: "The actual comment" }),
+      fetched_at: new Date().toISOString(),
+      refresh_after: new Date(Date.now() + 100000).toISOString(),
+    };
+    const repo = {
+      get: vi.fn().mockReturnValue(row),
+      set: vi.fn(),
+      delete: vi.fn(),
+    } as unknown as ReferenceCacheRepository;
+
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
+    const res = await svc.get("github:a/b/issues/1/comments/12345", {});
+
+    expect(res.cacheState).toBe("fresh");
+    expect(res.title).toBe("a/b issues/1 — comment");
+    expect(res.title).not.toBe("github:a/b/issues/1/comments/12345");
+  });
+
+  it("normalizes a GitHub PR review and omits raw provider fields", async () => {
+    const repo = {
+      get: vi.fn().mockReturnValue(null),
+      set: vi.fn(),
+      delete: vi.fn(),
+    } as unknown as ReferenceCacheRepository;
+
+    const deps = {
+      issueClient: {
+        getPullRequestReview: vi.fn().mockResolvedValue({
+          id: 9001,
+          state: "APPROVED",
+          body: "Ship it.",
+          author: "octocat",
+          node_id: "SHOULD_NOT_BE_SAVED",
+        }),
+      },
+    };
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
+    const res = await svc.get("github:a/b/pulls/76/reviews/9001", deps);
+
+    expect(res.cacheState).toBe("fresh");
+    expect(res.entity).toEqual({ type: "github_review", body: "Ship it.", state: "APPROVED" });
+    expect(res.title).toBe("a/b pulls/76 — review");
+    expect(res.title).not.toBe("github:a/b/pulls/76/reviews/9001");
+
+    const saved = (repo.set as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(saved.entity_json).not.toContain("SHOULD_NOT_BE_SAVED");
+    expect(saved.entity_json).toContain("github_review");
+  });
+
+  it("reconstructs a safe title for a review served from a stored cache hit, not the canonical ref", async () => {
+    const row: ReferenceCacheRow = {
+      ref: "github:a/b/pulls/76/reviews/9001",
+      document_version: 1,
+      entity_json: JSON.stringify({ type: "github_review", body: "Ship it.", state: "APPROVED" }),
+      fetched_at: new Date().toISOString(),
+      refresh_after: new Date(Date.now() + 100000).toISOString(),
+    };
+    const repo = {
+      get: vi.fn().mockReturnValue(row),
+      set: vi.fn(),
+      delete: vi.fn(),
+    } as unknown as ReferenceCacheRepository;
+
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
+    const res = await svc.get("github:a/b/pulls/76/reviews/9001", {});
+
+    expect(res.cacheState).toBe("fresh");
+    expect(res.title).toBe("a/b pulls/76 — review");
+    expect(res.title).not.toBe("github:a/b/pulls/76/reviews/9001");
   });
 
   it("normalizes Chat space", async () => {
@@ -253,6 +373,7 @@ describe("ReferenceCacheService", () => {
 
     expect(res.cacheState).toBe("fresh");
     expect(res.entity).toEqual({ type: "gchat_space", name: "My Space Name" });
+    expect(res.title).toBe("My Space Name");
 
     const saved = (repo.set as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(saved.entity_json).not.toContain("secret_123");
@@ -304,6 +425,7 @@ describe("ReferenceCacheService", () => {
 
     expect(res.cacheState).toBe("fresh");
     expect(res.entity).toEqual({ type: "gchat_message", contents: "Full text content" });
+    expect(res.title).not.toBe("gchat:spaces/abc/messages/123");
 
     const saved = (repo.set as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(saved.entity_json).not.toContain("secret");
@@ -401,7 +523,7 @@ describe("ReferenceCacheService", () => {
 
     const deps = {
       issueClient: {
-        getIssue: vi.fn().mockResolvedValue({ title: "T", body: "D" }),
+        getIssue: vi.fn().mockResolvedValue(issueDetails()),
       },
     };
     const logger = { info: vi.fn(), error: vi.fn() };
@@ -410,6 +532,33 @@ describe("ReferenceCacheService", () => {
 
     expect(res.cacheState).toBe("fresh"); // Because it misses cache, does a provider read, and succeeds
     expect(res.entity).toEqual({ type: "github_issue", title: "T", description: "D" });
+  });
+
+  it("rejects a cached comment row served for a review reference", async () => {
+    const row: ReferenceCacheRow = {
+      ref: "github:a/b/pulls/76/reviews/9001",
+      document_version: 1,
+      entity_json: JSON.stringify({ type: "github_comment", body: "wrong shape" }),
+      fetched_at: new Date().toISOString(),
+      refresh_after: new Date(Date.now() + 100000).toISOString(),
+    };
+    const repo = {
+      get: vi.fn().mockReturnValue(row),
+      set: vi.fn(),
+      delete: vi.fn(),
+    } as unknown as ReferenceCacheRepository;
+
+    const deps = {
+      issueClient: {
+        getPullRequestReview: vi.fn().mockResolvedValue(null),
+      },
+    };
+    const logger = { info: vi.fn(), error: vi.fn() };
+    const svc = new ReferenceCacheService({ repo, logger });
+    const res = await svc.get("github:a/b/pulls/76/reviews/9001", deps);
+
+    // It should ignore the mismatched cache row, miss the provider (mocked to null), and return unavailable
+    expect(res.cacheState).toBe("unavailable");
   });
 
   it("rejects cached row with incorrect discriminator", async () => {

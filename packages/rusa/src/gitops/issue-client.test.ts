@@ -756,6 +756,24 @@ describe("GitHubIssueClient", () => {
     });
   });
 
+  it("reads a pull request review, defaulting nullable body/user to empty, and maps 404 to null", async () => {
+    installFetch({
+      [`GET /repos/${REPO}/pulls/76/reviews/9001`]: {
+        json: { id: 9001, state: "APPROVED", body: null, user: null },
+      },
+      [`GET /repos/${REPO}/pulls/76/reviews/404`]: { status: 404, json: { message: "Not Found" } },
+    });
+    const client = new GitHubIssueClient();
+
+    await expect(client.getPullRequestReview(REPO, 76, 9001)).resolves.toEqual({
+      id: 9001,
+      state: "APPROVED",
+      body: "",
+      author: "",
+    });
+    await expect(client.getPullRequestReview(REPO, 76, 404)).resolves.toBeNull();
+  });
+
   it("creates an inline PR review comment resolving headSha and defaulting side to RIGHT", async () => {
     const requests = installFetch({
       [`GET /repos/${REPO}/pulls/12`]: {

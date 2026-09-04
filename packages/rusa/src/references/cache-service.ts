@@ -1,12 +1,45 @@
 import type { ReferenceCacheRepository } from "../db/repositories/reference-cache-repository.js";
-import { asGitHubIssue, parseReference } from "./reference.js";
+import { asGitHubIssue, parseReference, type Reference } from "./reference.js";
 import {
+  githubSubResourceLabel,
   type ReferenceEntity,
   type ReferenceResolverDeps,
   type ResolvedReferenceWithEntity,
   resolveReference,
   resolveReferenceSync,
 } from "./resolve.js";
+
+/**
+ * A human-safe display title for a cached entity, derived only from the
+ * entity itself and the reference's own path segments — never a network
+ * call, so it's cheap to reconstruct on every cache hit. Without this, the
+ * cache boundary would fall back to `base.title`, which for every non-mesh
+ * scheme is the raw canonical ref (see `resolveReferenceSync`'s `unresolved`
+ * fallback) — exactly the id/ref leak the dashboard must never render.
+ */
+function deriveDisplayTitle(reference: Reference, entity: ReferenceEntity): string | undefined {
+  switch (entity.type) {
+    case "github_issue":
+    case "github_pull_request":
+      return entity.title;
+    case "github_comment": {
+      const sub = githubSubResourceLabel(reference);
+      return sub ? `${sub.label} — comment` : undefined;
+    }
+    case "github_review": {
+      const sub = githubSubResourceLabel(reference);
+      return sub ? `${sub.label} — review` : undefined;
+    }
+    case "gchat_space":
+      return entity.name;
+    case "gchat_message":
+      // The provider author is intentionally not preserved in the cached
+      // entity (only what the widget renders is), so this stays generic.
+      return "Chat message";
+    case "mesh_message":
+      return undefined; // mesh is resolved locally, never cached here.
+  }
+}
 
 export interface ReferenceCacheServiceOptions {
   repo: ReferenceCacheRepository;
@@ -64,8 +97,9 @@ export class ReferenceCacheService {
         }
       }
 
-      if (valid) {
+      if (valid && entity) {
         const base = resolveReferenceSync(key, deps);
+        const title = deriveDisplayTitle(reference, entity) ?? base.title;
         if (now < refreshAfter) {
           // Fresh external hit
           this.logger?.info("reference_cache_hit", {
@@ -73,7 +107,7 @@ export class ReferenceCacheService {
             scheme: reference.scheme,
             type: getResourceShape(reference),
           });
-          return { ...base, entity, unavailable: null, cacheState: "fresh" };
+          return { ...base, title, entity, unavailable: null, cacheState: "fresh" };
         }
 
         // Stale external hit
@@ -83,7 +117,7 @@ export class ReferenceCacheService {
           type: getResourceShape(reference),
         });
         this.triggerRefresh(key, deps).catch(() => {}); // Fire and forget
-        return { ...base, entity, unavailable: null, cacheState: "stale" };
+        return { ...base, title, entity, unavailable: null, cacheState: "stale" };
       }
     }
 
@@ -117,7 +151,8 @@ export class ReferenceCacheService {
         type: result.type,
       });
       const base = resolveReferenceSync(key, deps);
-      return { ...base, entity: result, unavailable: null, cacheState: "fresh" };
+      const title = deriveDisplayTitle(reference, result) ?? base.title;
+      return { ...base, title, entity: result, unavailable: null, cacheState: "fresh" };
     }
 
     // Unavailable result
@@ -190,6 +225,14 @@ function decodeV1Entity(raw: unknown): ReferenceEntity | undefined {
     if (typeof obj.title === "string" && typeof obj.description === "string") {
       return { type: obj.type, title: obj.title, description: obj.description };
     }
+  } else if (obj.type === "github_comment") {
+    if (typeof obj.body === "string") {
+      return { type: obj.type, body: obj.body };
+    }
+  } else if (obj.type === "github_review") {
+    if (typeof obj.body === "string" && typeof obj.state === "string") {
+      return { type: obj.type, body: obj.body, state: obj.state };
+    }
   } else if (obj.type === "gchat_message") {
     if (typeof obj.contents === "string") {
       return { type: obj.type, contents: obj.contents };
@@ -208,6 +251,16 @@ function getResourceShape(reference: ReturnType<typeof parseReference>): string 
     const issue = asGitHubIssue(reference);
     if (issue) {
       return issue.collection === "pulls" ? "github_pull_request" : "github_issue";
+    }
+    const [, , collection, rawNumber, subCollection, subId] = reference.segments;
+    if (
+      (collection === "issues" || collection === "pulls") &&
+      subCollection &&
+      subId &&
+      /^[1-9]\d*$/.test(rawNumber ?? "")
+    ) {
+      if (subCollection === "comments") return "github_comment";
+      if (subCollection === "reviews" && collection === "pulls") return "github_review";
     }
   } else if (reference.scheme === "gchat") {
     if (reference.segments.length === 2 && reference.segments[0] === "spaces") {

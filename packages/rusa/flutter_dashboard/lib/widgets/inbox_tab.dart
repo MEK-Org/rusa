@@ -555,7 +555,10 @@ class _InboxTabState extends State<InboxTab> {
             // for those sources yet, and inventing a prettier rendering would
             // hide that.
             if (reference != null)
-              ReferencePreview(reference: reference)
+              ReferencePreview(
+                reference: reference,
+                lookupActorHandle: (id) => widget.store.actor(id)?.handle,
+              )
             else
               Text(
                 content.isEmpty ? 'No attached contents.' : content,

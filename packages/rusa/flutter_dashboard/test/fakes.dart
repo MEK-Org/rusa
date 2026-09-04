@@ -89,6 +89,7 @@ ObligationDto makeObligation(
   String id, {
   String? parentId,
   String ownerId = 'root',
+  String? creatorId,
   String? intent,
   String? externalRef,
   String status = 'ready',
@@ -107,6 +108,7 @@ ObligationDto makeObligation(
   id: id,
   parentId: parentId,
   ownerId: ownerId,
+  creatorId: creatorId,
   intent: intent ?? 'intent $id',
   externalRef: externalRef,
   status: status,

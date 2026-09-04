@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 
+import '../actor_display.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -578,11 +579,15 @@ class _DetailViewState extends State<_DetailView> {
                       ),
                   label: artifact.label,
                   attachedBy: artifact.attachedBy,
+                  lookupActorHandle: (id) => store.actor(id)?.handle,
                 ),
               const SizedBox(height: 16),
             ],
             _SectionHeader('OWNER'),
             _ownerPanel(o.ownerId),
+            const SizedBox(height: 24),
+            _SectionHeader('CREATOR'),
+            _creatorPanel(o.creatorId),
             // Shown even when absent: linking an obligation to the issue it
             // turned into is a normal later step, and a section that only
             // appears once a ref exists gives no way to add the first one.
@@ -615,24 +620,97 @@ class _DetailViewState extends State<_DetailView> {
   }
 
   Widget _ownerPanel(String ownerId) {
-    // One id space: the category is read off the id's prefix, the same way
-    // `isHumanOperator` does server-side. A known actor renders as its handle;
-    // anything else renders as the id itself.
     final isHuman = ownerId.startsWith('human:');
     final isSystem = ownerId.startsWith('system:');
     final isActor = !isHuman && !isSystem;
-    final displayId = store.actor(ownerId)?.handle ?? ownerId;
-    // The second line exists to disambiguate the first. When the first line
-    // already IS the raw id — the operator, a system component, or an actor
-    // this dashboard has no record of — repeating it says nothing, so fall back
-    // to the category the prefix encodes. That is the cue the old `Kind: ACTOR`
-    // line carried before owner_kind was dropped.
-    final ownerSubtitle = displayId != ownerId
-        ? ownerId
-        : isHuman
-        ? 'Operator'
-        : isSystem
-        ? 'System component'
+
+    return _identityPanel(
+      ownerId,
+      action: isActor
+          ? TextButton(
+              onPressed: () {
+                store.clickActor(ownerId);
+                store.setDetailPanelIndex(4); // Select Inbox tab
+                onSelectView(DashboardView.actors);
+              },
+              child: const Text(
+                'View Owner Inbox →',
+                style: TextStyle(color: MeshColors.accent),
+              ),
+            )
+          : isHuman
+          ? TextButton(
+              onPressed: () {
+                onSelectView(DashboardView.overview);
+              },
+              child: const Text(
+                'View Owner Queue →',
+                style: TextStyle(color: MeshColors.accent),
+              ),
+            )
+          : null,
+    );
+  }
+
+  /// Who raised this obligation. Null is a real, honest state — a row that
+  /// predates creator attribution — not something to paper over by falling
+  /// back to the owner or guessing.
+  Widget _creatorPanel(String? creatorId) {
+    if (creatorId == null) {
+      return Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: MeshColors.bgSecondary,
+          border: Border.all(color: MeshColors.border),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          children: [
+            const CircleAvatar(
+              radius: 14,
+              backgroundColor: Color(0xFF1E293B),
+              child: Icon(
+                Icons.person_off_outlined,
+                size: 16,
+                color: MeshColors.textMuted,
+              ),
+            ),
+            const SizedBox(width: 12),
+            const Expanded(
+              child: Text(
+                'Unknown — predates creator attribution',
+                style: TextStyle(
+                  color: MeshColors.textMuted,
+                  fontSize: 12,
+                  fontStyle: FontStyle.italic,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+    return _identityPanel(creatorId);
+  }
+
+  /// One id space: the category is read off the id's prefix, the same way
+  /// `isHumanOperator` does server-side. A known actor renders as its handle;
+  /// anything else falls back to "Unknown actor" — never the raw id. Shared
+  /// by Owner (always present) and Creator (rendered separately when null,
+  /// above).
+  Widget _identityPanel(String id, {Widget? action}) {
+    final isHuman = id.startsWith('human:');
+    final isSystem = id.startsWith('system:');
+    final isActor = !isHuman && !isSystem;
+    final displayId = actorDisplayLabel(id, (i) => store.actor(i)?.handle);
+    // The second line adds category context beyond the primary label — for
+    // human/system ids the primary label already says it, so there is
+    // nothing more to add. Raw actor/thread ids only belong under the handle
+    // in actor detail view, never bare here.
+    final subtitle = isHuman || isSystem
+        ? null
+        : displayId != 'Unknown actor'
+        ? 'Actor'
         : 'Actor — not in this mesh view';
 
     return Container(
@@ -645,7 +723,7 @@ class _DetailViewState extends State<_DetailView> {
       child: Row(
         children: [
           if (isActor)
-            ActorAvatar(id: ownerId, size: 28)
+            ActorAvatar(id: id, size: 28)
           else
             const CircleAvatar(
               radius: 14,
@@ -669,39 +747,20 @@ class _DetailViewState extends State<_DetailView> {
                     fontFamily: kMonoFontFamily,
                   ),
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  ownerSubtitle,
-                  style: const TextStyle(
-                    color: MeshColors.textMuted,
-                    fontSize: 11,
+                if (subtitle != null) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    subtitle,
+                    style: const TextStyle(
+                      color: MeshColors.textMuted,
+                      fontSize: 11,
+                    ),
                   ),
-                ),
+                ],
               ],
             ),
           ),
-          if (isActor)
-            TextButton(
-              onPressed: () {
-                store.clickActor(ownerId);
-                store.setDetailPanelIndex(4); // Select Inbox tab
-                onSelectView(DashboardView.actors);
-              },
-              child: const Text(
-                'View Owner Inbox →',
-                style: TextStyle(color: MeshColors.accent),
-              ),
-            )
-          else if (isHuman)
-            TextButton(
-              onPressed: () {
-                onSelectView(DashboardView.overview);
-              },
-              child: const Text(
-                'View Owner Queue →',
-                style: TextStyle(color: MeshColors.accent),
-              ),
-            ),
+          ?action,
         ],
       ),
     );

@@ -62,6 +62,7 @@ function fakeIssueClient(): { client: IssueClient; labels: string[] } {
     addReaction: async () => {},
     addCommentReaction: async () => {},
     getPrReviewComments: async () => [],
+    getPullRequestReview: async () => null,
     getParentIssueNumber: async () => null,
     getRootIssueNumber: async () => null,
     hasSubIssues: async () => false,
