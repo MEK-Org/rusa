@@ -239,7 +239,7 @@ export function authorStampBodyForWebhookPayload(
  *
  * `localInstanceId`, when given, is this process's own instance handle. A v2/v3 stamp
  * whose `instanceId` doesn't match it came from another instance sharing the same bot
- * login (see ISSUE_NUM) — that is short-circuited to `foreign` before the HMAC is ever
+ * login (#201) — that is short-circuited to `foreign` before the HMAC is ever
  * computed or compared, since a foreign instance's HMAC can never match ours anyway and
  * the comparison would just relabel "not ours" as "invalid". Omitting it (legacy callers)
  * skips the check and verifies purely against this instance's own secret, as before.
@@ -344,8 +344,8 @@ function verifySignedStamp(opts: {
 
   if (hmacBuf.length !== expectedHmacBuf.length || !timingSafeEqual(hmacBuf, expectedHmacBuf)) {
     // Same instanceId as ours, yet the HMAC doesn't match: post-restart key rotation and an
-    // actual forged stamp are indistinguishable by this mechanism, so neither is claimed —
-    // see the ISSUE_NUM discriminator this status exists to add.
+    // actual forged stamp are indistinguishable by this mechanism, so neither is claimed
+    // (#201).
     return {
       status: "unverifiable",
       reason: `HMAC mismatch. Expected ${expectedHmac}, got ${hmac}. Context: ${context}`,
@@ -394,7 +394,7 @@ export interface StampAnomaly {
  *
  * `localInstanceId` (this process's own instance handle) is threaded through to
  * verifyAuthorStamp so a stamp from another instance sharing the same bot login is
- * recognized as `foreign` — never HMAC-compared, never called a forgery. See ISSUE_NUM.
+ * recognized as `foreign` — never HMAC-compared, never called a forgery (#201).
  */
 export function resolveStampedAuthor(opts: {
   event: string;
