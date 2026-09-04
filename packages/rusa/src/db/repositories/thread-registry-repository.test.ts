@@ -179,4 +179,56 @@ describe("DbThreadRegistry", () => {
       })
     ).toThrow();
   });
+
+  it("keeps a staged desiredModel/desiredProvider/desiredEffort change in the process-local overlay, not a durable column", () => {
+    registry.upsert(root);
+    registry.patch("root", {
+      desiredProvider: "claude",
+      desiredModel: "claude-opus",
+      desiredEffort: null,
+    });
+
+    expect(registry.get("root")).toMatchObject({
+      desiredProvider: "claude",
+      desiredModel: "claude-opus",
+      desiredEffort: null,
+    });
+    // Never a durable column: model_config only carries the applied tuple.
+    const row = db.prepare("SELECT model_config FROM actors WHERE id = 'root'").get() as {
+      model_config: string;
+    };
+    expect(JSON.parse(row.model_config)).toEqual({
+      provider: "codex",
+      model: "gpt-test",
+      effort: "high",
+    });
+  });
+
+  it("leaves a staged model change alone across an unrelated patch, and drops it on an explicit clear", () => {
+    registry.upsert(root);
+    registry.patch("root", { desiredModel: "claude-opus" });
+
+    registry.patch("root", { title: "Renamed" });
+    expect(registry.get("root")).toMatchObject({ desiredModel: "claude-opus", title: "Renamed" });
+
+    // The apply-boundary clear: present keys set to undefined, exactly as
+    // ActorMesh.applyPendingModel does once it has consumed the staged tuple.
+    registry.patch("root", {
+      desiredModel: undefined,
+      desiredProvider: undefined,
+      desiredEffort: undefined,
+    });
+    expect(registry.get("root")?.desiredModel).toBeUndefined();
+    expect(registry.get("root")?.desiredProvider).toBeUndefined();
+    expect(registry.get("root")?.desiredEffort).toBeUndefined();
+  });
+
+  it("loses staged model changes across a registry reopen, matching process-memory-only semantics", () => {
+    registry.upsert(root);
+    registry.patch("root", { desiredModel: "claude-opus" });
+    expect(registry.get("root")?.desiredModel).toBe("claude-opus");
+
+    const reopened = new DbThreadRegistry(db);
+    expect(reopened.get("root")?.desiredModel).toBeUndefined();
+  });
 });

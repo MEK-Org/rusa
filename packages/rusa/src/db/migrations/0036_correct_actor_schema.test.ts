@@ -59,17 +59,13 @@ describe("0036_correct_actor_schema", () => {
       ) VALUES (
         'worker', 'Implement a slice', 'root', NULL, NULL, NULL,
         NULL, NULL, NULL, 0,
-        NULL, 'portable', 'ledger', 'gemini-test',
+        'stale-session', 'portable', 'ledger', 'gemini-test',
         NULL, 0, 'retired', NULL, NULL,
         0, NULL, '2026-09-03T13:01:00.000Z'
       )`
     ).run();
     db.prepare(
       "INSERT INTO actor_handles (actor_id, target_id, role) VALUES ('worker', 'root', 'parent')"
-    ).run();
-    db.prepare(
-      `INSERT INTO actor_pending_deliveries (id, actor_id, from_id, body, deliver_at, session_id)
-       VALUES ('d1', 'worker', 'root', 'wake', '2026-09-03T14:00:00.000Z', 'chat-1')`
     ).run();
 
     apply0036(db);
@@ -100,8 +96,6 @@ describe("0036_correct_actor_schema", () => {
     expect(JSON.parse(root.context_config)).toEqual({
       type: "native",
       sessionId: "session-1",
-      mode: null,
-      compactionModel: null,
     });
     expect(root.retired_at).toBeNull();
 
@@ -111,9 +105,10 @@ describe("0036_correct_actor_schema", () => {
       retired_at: string | null;
     };
     expect(worker.model_config).toBeNull();
+    // worker's stale native session id (a legacy leftover from before it moved to
+    // portable context) must not be carried into the portable context_config.
     expect(JSON.parse(worker.context_config)).toEqual({
       type: "portable",
-      sessionId: null,
       mode: "ledger",
       compactionModel: "gemini-test",
     });
@@ -123,12 +118,38 @@ describe("0036_correct_actor_schema", () => {
       .prepare("SELECT actor_id, target_id, role FROM actor_handles WHERE actor_id = 'worker'")
       .get();
     expect(handle).toEqual({ actor_id: "worker", target_id: "root", role: "parent" });
+  });
 
-    expect(
-      db
-        .prepare("SELECT COUNT(*) as n FROM sqlite_master WHERE name = 'actor_pending_deliveries'")
-        .get()
-    ).toEqual({ n: 0 });
+  it("refuses to migrate while actor_pending_deliveries holds rows, rather than silently dropping them", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    applyThrough(db, "0035_recurring_obligations");
+    db.prepare(
+      `INSERT INTO actor_threads (id, charter, parent_id, is_root, status, created_at)
+       VALUES ('root', 'Own the mesh', NULL, 1, 'active', '2026-09-03T13:00:00.000Z')`
+    ).run();
+    db.prepare(
+      `INSERT INTO actor_pending_deliveries (id, actor_id, from_id, body, deliver_at, session_id)
+       VALUES ('d1', 'root', 'root', 'wake', '2026-09-03T14:00:00.000Z', NULL)`
+    ).run();
+
+    expect(() => apply0036(db)).toThrow(/actor_pending_deliveries holds 1 row/);
+
+    // The refusal must not have torn down anything: both source tables survive intact.
+    const tables = new Set(
+      (
+        db
+          .prepare(
+            `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`
+          )
+          .all() as Array<{ name: string }>
+      ).map((row) => row.name)
+    );
+    expect(tables.has("actor_threads")).toBe(true);
+    expect(tables.has("actor_pending_deliveries")).toBe(true);
+    expect(db.prepare("SELECT COUNT(*) as n FROM actor_pending_deliveries").get()).toEqual({
+      n: 1,
+    });
   });
 
   it("enforces at most one parentless row via the single-root partial index", () => {
@@ -199,6 +220,71 @@ describe("0036_correct_actor_schema", () => {
            VALUES ('valid', 'Own the mesh', NULL, '{"provider":"codex"}', '{"type":"native"}', '2026-09-03T13:00:00.000Z')`
         )
         .run()
+    ).not.toThrow();
+  });
+
+  it("enforces the context_config discriminated shape: a known type, and no sessionId on a portable one", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    applyThrough(db, "0036_correct_actor_schema");
+
+    // A real (parented) row, since the single-root partial index caps NULL parent_id to one
+    // row and this test only cares about context_config, not root topology.
+    db.prepare(
+      `INSERT INTO actors (id, charter, parent_id, created_at) VALUES ('root', 'Own the mesh', NULL, '2026-09-03T13:00:00.000Z')`
+    ).run();
+    const insertContext = (id: string, contextConfig: string) =>
+      db
+        .prepare(
+          `INSERT INTO actors (id, charter, parent_id, context_config, created_at)
+           VALUES (?, 'Own the mesh', 'root', ?, '2026-09-03T13:00:00.000Z')`
+        )
+        .run(id, contextConfig);
+
+    expect(() => insertContext("no-type", '{"sessionId":"s1"}')).toThrow(/CHECK constraint failed/);
+    expect(() => insertContext("bad-type", '{"type":"legacy"}')).toThrow(/CHECK constraint failed/);
+    expect(() =>
+      insertContext("portable-with-session", '{"type":"portable","mode":"tail","sessionId":"s1"}')
+    ).toThrow(/CHECK constraint failed/);
+
+    expect(() =>
+      insertContext("native-with-session", '{"type":"native","sessionId":"s1"}')
+    ).not.toThrow();
+    expect(() =>
+      insertContext("portable-no-session", '{"type":"portable","mode":"tail"}')
+    ).not.toThrow();
+  });
+
+  it("enforces the model_config discriminated shape: at least one known key, and text-typed when present", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    applyThrough(db, "0036_correct_actor_schema");
+
+    db.prepare(
+      `INSERT INTO actors (id, charter, parent_id, created_at) VALUES ('root', 'Own the mesh', NULL, '2026-09-03T13:00:00.000Z')`
+    ).run();
+    const insertModel = (id: string, modelConfig: string) =>
+      db
+        .prepare(
+          `INSERT INTO actors (id, charter, parent_id, model_config, created_at)
+           VALUES (?, 'Own the mesh', 'root', ?, '2026-09-03T13:00:00.000Z')`
+        )
+        .run(id, modelConfig);
+
+    // A generic object with none of the known keys must not slip in as a model_config.
+    expect(() => insertModel("generic", '{"foo":1}')).toThrow(/CHECK constraint failed/);
+    expect(() => insertModel("empty", "{}")).toThrow(/CHECK constraint failed/);
+    // Present known keys must be text, not some other JSON type.
+    expect(() => insertModel("bad-provider-type", '{"provider":123}')).toThrow(
+      /CHECK constraint failed/
+    );
+    expect(() => insertModel("bad-effort-type", '{"effort":true}')).toThrow(
+      /CHECK constraint failed/
+    );
+
+    expect(() => insertModel("provider-only", '{"provider":"codex"}')).not.toThrow();
+    expect(() =>
+      insertModel("full", '{"provider":"codex","model":"gpt-5","effort":"high"}')
     ).not.toThrow();
   });
 

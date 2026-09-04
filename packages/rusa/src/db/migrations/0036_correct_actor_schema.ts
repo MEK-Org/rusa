@@ -8,10 +8,18 @@ import type { Migration } from "./types.js";
  *
  * - `actor_threads` is renamed to `actors`.
  * - `provider`/`model`/`effort` collapse into one validated `model_config`
- *   JSON object; the `desired_*` staging columns are dropped entirely — an
- *   unapplied model change is process memory only, never a durable row.
+ *   JSON object: at least one of the three keys must be present, and each
+ *   present key must be text, so a generic object (e.g. `{}` or an unrelated
+ *   payload) cannot slip in as a config; the `desired_*` staging columns are
+ *   dropped entirely — an unapplied model change is process memory only,
+ *   never a durable row.
  * - `session_id` (the native provider session) and the portable-context
- *   columns collapse into one `context_config` JSON object.
+ *   columns collapse into one `context_config` JSON object, discriminated by
+ *   `type`. A legacy row with no `context_type` but a `session_id` normalizes
+ *   to `type: "native"` (that was always the implicit default); a `portable`
+ *   row never carries `sessionId` forward — a provider session is meaningless
+ *   once an actor is mesh-managed-context, so this migration drops it rather
+ *   than let it linger as dead state.
  * - `is_root` is dropped. Root topology is derived from `parent_id IS NULL`,
  *   enforced by a partial unique index capping the table to one parentless
  *   row. A database that already holds a parentless, non-root actor (the
@@ -28,10 +36,11 @@ import type { Migration } from "./types.js";
  *   operator-authored row addressed to the actor unlocks the reply channel,
  *   and its `session_id` is the last chat session), so the repository derives
  *   them at read time instead of duplicating that state in a column.
- * - `actor_pending_deliveries` is dropped. Pending scheduled deliveries stay
- *   in the legacy file-backed store until a dedicated scheduler migration
- *   owns their cutover; this table would otherwise be a second, unused
- *   authority for the same data.
+ * - `actor_pending_deliveries` is dropped, but only once it is empty. Pending
+ *   scheduled deliveries stay in the legacy file-backed store until a
+ *   dedicated scheduler migration (#209) owns their cutover, so this
+ *   migration must not silently discard populated rows — a populated table
+ *   makes it refuse (see the guard below) rather than drop data.
  */
 export const correctActorSchema: Migration = {
   id: "0036_correct_actor_schema",
@@ -49,6 +58,19 @@ export const correctActorSchema: Migration = {
       );
     }
 
+    const { n: pendingDeliveryCount } = db
+      .prepare("SELECT COUNT(*) AS n FROM actor_pending_deliveries")
+      .get() as { n: number };
+    if (pendingDeliveryCount > 0) {
+      throw new Error(
+        `0036_correct_actor_schema: refusing to migrate — actor_pending_deliveries holds ` +
+          `${pendingDeliveryCount} row(s). Pending scheduled deliveries stay in the legacy ` +
+          "file-backed store until a dedicated scheduler migration (#209) owns their cutover; " +
+          "dropping this table here would silently discard them. Drain them (let them deliver, " +
+          "or move them to the legacy store) before applying this migration."
+      );
+    }
+
     // No PRAGMA foreign_keys toggle: SQLite checks a FK constraint at the end
     // of the statement that touches it (immediate) or at COMMIT (deferred),
     // never mid-statement per row, so the self-referential rebuild below is
@@ -62,10 +84,37 @@ export const correctActorSchema: Migration = {
         charter TEXT NOT NULL,
         parent_id TEXT REFERENCES actors(id),
         model_config TEXT CHECK (
-          model_config IS NULL OR (json_valid(model_config) AND json_type(model_config) = 'object')
+          model_config IS NULL OR (
+            json_valid(model_config) AND json_type(model_config) = 'object' AND
+            (
+              json_extract(model_config, '$.provider') IS NOT NULL OR
+              json_extract(model_config, '$.model') IS NOT NULL OR
+              json_extract(model_config, '$.effort') IS NOT NULL
+            ) AND
+            (
+              json_extract(model_config, '$.provider') IS NULL OR
+              json_type(model_config, '$.provider') = 'text'
+            ) AND
+            (
+              json_extract(model_config, '$.model') IS NULL OR
+              json_type(model_config, '$.model') = 'text'
+            ) AND
+            (
+              json_extract(model_config, '$.effort') IS NULL OR
+              json_type(model_config, '$.effort') = 'text'
+            )
+          )
         ),
         context_config TEXT CHECK (
-          context_config IS NULL OR (json_valid(context_config) AND json_type(context_config) = 'object')
+          context_config IS NULL OR (
+            json_valid(context_config) AND json_type(context_config) = 'object' AND
+            json_extract(context_config, '$.type') IS NOT NULL AND
+            json_extract(context_config, '$.type') IN ('native', 'portable') AND
+            (
+              json_extract(context_config, '$.type') = 'native' OR
+              json_extract(context_config, '$.sessionId') IS NULL
+            )
+          )
         ),
         title TEXT,
         retired_at TEXT,
@@ -85,12 +134,12 @@ export const correctActorSchema: Migration = {
         END,
         CASE
           WHEN context_type IS NULL AND session_id IS NULL THEN NULL
-          ELSE json_object(
-            'type', context_type,
-            'sessionId', session_id,
+          WHEN context_type = 'portable' THEN json_object(
+            'type', 'portable',
             'mode', context_mode,
             'compactionModel', context_compaction_model
           )
+          ELSE json_object('type', 'native', 'sessionId', session_id)
         END,
         title,
         CASE WHEN status = 'retired' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE NULL END,

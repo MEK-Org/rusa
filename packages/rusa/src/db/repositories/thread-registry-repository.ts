@@ -50,22 +50,26 @@ function parseModelConfig(
 
 /**
  * Builds the `context_config` JSON object grouping the native provider session
- * with portable-context selection, or null when neither is set. `sessionId` is
- * carried independently of `type` — it predates a `context` value being set at
- * all for legacy-native records — mirroring the decoupled scalar columns this
- * replaces.
+ * with portable-context selection, or null when neither is set. A `portable`
+ * record never carries `sessionId` forward — a provider session is meaningless
+ * once an actor is mesh-managed-context — and a record with a session but no
+ * explicit `context` (the legacy default) normalizes to `type: "native"`,
+ * matching the CHECK the `actors` table enforces on this column.
  */
 function buildContextConfig(record: ThreadRecord): string | null {
-  const config: ContextConfigJson = {};
-  if (record.context?.type !== undefined) config.type = record.context.type;
-  if (record.sessionId !== undefined) config.sessionId = record.sessionId;
   if (record.context?.type === "portable") {
-    config.mode = record.context.mode;
+    const config: ContextConfigJson = { type: "portable", mode: record.context.mode };
     if (record.context.compactionModel !== undefined) {
       config.compactionModel = record.context.compactionModel;
     }
+    return JSON.stringify(config);
   }
-  return Object.keys(config).length ? JSON.stringify(config) : null;
+  if (record.context?.type === "native" || record.sessionId !== undefined) {
+    const config: ContextConfigJson = { type: "native" };
+    if (record.sessionId !== undefined) config.sessionId = record.sessionId;
+    return JSON.stringify(config);
+  }
+  return null;
 }
 
 function parseContextConfig(json: string | null): Pick<ThreadRecord, "context" | "sessionId"> {
@@ -85,14 +89,35 @@ function parseContextConfig(json: string | null): Pick<ThreadRecord, "context" |
   return out;
 }
 
+/** A staged, not-yet-applied model/provider/effort change. */
+type DesiredOverlayEntry = {
+  desiredProvider?: string;
+  desiredModel?: string;
+  desiredEffort?: string | null;
+};
+
 /**
  * SQLite implementation of the existing registry interface, storing the
  * operator-approved actor shape: `provider`/`model`/`effort` and native
  * session/portable-context selection each collapse into one validated JSON
  * object, root topology is derived from `parent_id IS NULL`, and retirement
  * is a nullable timestamp rather than a duplicate status enum.
+ *
+ * `desiredProvider`/`desiredModel`/`desiredEffort` are process memory, not a
+ * durable row (an unapplied model change is discardable), so they live in an
+ * instance-local overlay instead of a column: gone on reopen, present within
+ * the same process across `get`/`patch` calls. Every `upsert` fully replaces
+ * an id's overlay entry from whichever of the three keys are actually present
+ * on the incoming record — `patch` always builds that record by spreading
+ * `get(id)` (which already reads the current overlay back in) under the new
+ * `changes`, so "key present with value `undefined`" (an explicit clear, e.g.
+ * `desiredEffort: null` clearing to provider default, or `desiredModel:
+ * undefined` after applying it) and "key absent" (leave whatever is staged
+ * alone) stay distinguishable all the way through.
  */
 export class DbThreadRegistry implements ThreadRegistry {
+  private readonly desiredOverlay = new Map<string, DesiredOverlayEntry>();
+
   constructor(private readonly db: Database.Database) {}
 
   upsert(record: ThreadRecord): void {
@@ -110,6 +135,8 @@ export class DbThreadRegistry implements ThreadRegistry {
         `DbThreadRegistry: root actor '${record.id}' must have a null parentId (got '${record.parentId}')`
       );
     }
+
+    this.storeDesiredOverlay(record);
 
     this.db.transaction(() => {
       const retiredAt =
@@ -181,6 +208,26 @@ export class DbThreadRegistry implements ThreadRegistry {
     if (record) this.upsert({ ...record, ...changes, id });
   }
 
+  /**
+   * Replaces `record.id`'s overlay entry wholesale from whichever desired-*
+   * keys are present as own properties of `record` (`in`, not `!== undefined`
+   * — an explicit clear is a present key with value `undefined`). A record
+   * with none of the three keys (a fresh spawn, or a boot-time `adopt` merge
+   * that never touches them) clears the overlay entirely rather than leaving
+   * stale desired-* state for that id.
+   */
+  private storeDesiredOverlay(record: ThreadRecord): void {
+    const overlay: DesiredOverlayEntry = {};
+    if ("desiredProvider" in record) overlay.desiredProvider = record.desiredProvider;
+    if ("desiredModel" in record) overlay.desiredModel = record.desiredModel;
+    if ("desiredEffort" in record) overlay.desiredEffort = record.desiredEffort;
+    if (Object.keys(overlay).length) {
+      this.desiredOverlay.set(record.id, overlay);
+    } else {
+      this.desiredOverlay.delete(record.id);
+    }
+  }
+
   private fromRow(row: ActorRow): ThreadRecord {
     const handles = this.db
       .prepare("SELECT target_id, role FROM actor_handles WHERE actor_id = ? ORDER BY target_id")
@@ -210,6 +257,7 @@ export class DbThreadRegistry implements ThreadRegistry {
         : {}),
       ...(lastHumanMessage ? { humanUnlocked: true } : {}),
       ...(lastHumanMessage?.session_id ? { lastChatSessionId: lastHumanMessage.session_id } : {}),
+      ...this.desiredOverlay.get(row.id),
     };
   }
 }
