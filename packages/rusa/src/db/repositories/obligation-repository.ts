@@ -1869,11 +1869,17 @@ export class ObligationRepository {
             const completedTime = Date.parse(lastCompletion.completed_at);
             const readyTime = completedTime + recurrence.intervalSeconds * 1000;
             if (readyTime <= this.now()) {
+              // This is the same direct scheduled→ready transition
+              // `activateScheduled` performs, so it must apply the same
+              // prerequisite check — an occurrence can pick up an unmet
+              // prerequisite after it was first armed, and going overdue
+              // must not let it skip straight past that.
+              const nextStatus = this.prerequisitesSatisfied(id) ? "ready" : "waiting";
               this.db
                 .prepare(
-                  `UPDATE obligations SET status = 'ready', next_ready_at = NULL, recurrence_policy = 'completion_interval', recurrence_cron = NULL, recurrence_interval_seconds = ?, updated_at = ? WHERE id = ?`
+                  `UPDATE obligations SET status = ?, next_ready_at = NULL, recurrence_policy = 'completion_interval', recurrence_cron = NULL, recurrence_interval_seconds = ?, updated_at = ? WHERE id = ?`
                 )
-                .run(recurrence.intervalSeconds, this.stamp(), id);
+                .run(nextStatus, recurrence.intervalSeconds, this.stamp(), id);
             } else {
               const nextReadyAt = new Date(readyTime).toISOString();
               this.db

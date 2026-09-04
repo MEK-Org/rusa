@@ -1914,6 +1914,30 @@ describe("ObligationRepository", () => {
       expect(scheduler.cancelled).toContain("rec-1");
     });
 
+    it("switching an overdue scheduled obligation to completion_interval waits on an unmet prerequisite instead of going ready", () => {
+      repository.create({ title: "blocker", id: "blocker-1", ownerId: "actor-a", intent: "block" });
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
+      repository.setTerminalStatus("rec-1", "done");
+      // Back-date the completion so any positive interval is already overdue,
+      // matching the sibling test above.
+      db.prepare(`UPDATE obligation_completions SET completed_at = ? WHERE obligation_id = ?`).run(
+        "1960-01-01T00:00:00.000Z",
+        "rec-1"
+      );
+      // Named while `rec-1` is already `scheduled`, so this occurrence picks up
+      // an unmet prerequisite it didn't have when it first went scheduled —
+      // the same setup `activateScheduled`'s own regression test uses.
+      repository.addPrerequisite("rec-1", "blocker-1");
+
+      const switched = repository.setRecurrence("rec-1", {
+        policy: "completion_interval",
+        intervalSeconds: 1,
+      });
+      expect(switched.status).toBe("waiting");
+      expect(switched.nextReadyAt).toBeNull();
+      expect(switched.recurrencePolicy).toBe("completion_interval");
+    });
+
     it("switching a scheduled obligation to completion_interval with a future interval stays scheduled and re-arms an `at` job", () => {
       repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
       repository.setTerminalStatus("rec-1", "done");
