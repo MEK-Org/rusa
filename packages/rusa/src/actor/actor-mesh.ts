@@ -35,10 +35,14 @@ import {
   RUN_TERMINAL_EVENT_KINDS,
 } from "./mesh-events.js";
 import type { OsScheduler } from "./os-scheduler.js";
+import {
+  InMemoryScheduledDeliveryStore,
+  type ScheduledDelivery,
+  type ScheduledDeliveryStore,
+} from "./scheduled-delivery-store.js";
 import type {
   ActorHandle,
   ContextConfig,
-  PendingMessageDelivery,
   ThreadRecord,
   ThreadRegistry,
   ThreadStatus,
@@ -400,6 +404,19 @@ export interface ActorMeshOptions {
    * rejected, bounding what the primitive can ever hand out. Defaults to empty.
    */
   grantableCapabilities?: ReadonlySet<string>;
+  /**
+   * Durable store for scheduled (future-dated) actor-to-actor messages (#209).
+   * Defaults to an in-memory store; production wiring supplies a SQLite-backed
+   * one. Deliberately not coupled to `actors`/`ThreadRecord` — see
+   * {@link ScheduledDeliveryStore}.
+   */
+  scheduledDeliveries?: ScheduledDeliveryStore;
+  /**
+   * Wraps the durable accept-time write (insert + `message_sent` event) so it
+   * commits atomically. Defaults to a no-op passthrough (what every in-memory-store
+   * test uses); production wiring supplies a real DB transaction.
+   */
+  withTransaction?: (fn: () => void) => void;
   log?: (msg: string) => void;
 }
 
@@ -473,6 +490,8 @@ export class ActorMesh {
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
   private readonly grantable: ReadonlySet<string>;
   private readonly log: (msg: string) => void;
+  readonly scheduledDeliveries: ScheduledDeliveryStore;
+  private readonly withTransaction: (fn: () => void) => void;
   private readonly live = new Map<string, MeshActor>();
   private readonly runtimeStreamId = randomUUID();
   private runtimeRevision = 0;
@@ -561,6 +580,8 @@ export class ActorMesh {
     this.events = opts.events ?? NOOP_MESH_EVENT_SINK;
     this.recordChat = opts.recordChat;
     this.log = opts.log ?? (() => {});
+    this.scheduledDeliveries = opts.scheduledDeliveries ?? new InMemoryScheduledDeliveryStore();
+    this.withTransaction = opts.withTransaction ?? ((fn) => fn());
   }
 
   /**
@@ -583,20 +604,13 @@ export class ActorMesh {
   }): string | undefined {
     const fromId = this.resolveThreadId(opts.fromId);
     const toId = this.resolveThreadId(opts.toId);
-    let msgId: string | undefined;
-    if (this.recordChat) {
-      try {
-        msgId = this.recordChat({
-          id: opts.id,
-          senderId: fromId,
-          recipientId: toId,
-          body: opts.body,
-          sessionId: opts.sessionId,
-        });
-      } catch (err) {
-        this.log(`recordChat failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
+    const msgId = this.writeChatRow({
+      id: opts.id,
+      fromId,
+      toId,
+      body: opts.body,
+      sessionId: opts.sessionId,
+    });
 
     this.recordEvent({
       id: opts.id ? `${opts.id}:sent` : undefined,
@@ -616,6 +630,87 @@ export class ActorMesh {
       });
     }
     return msgId;
+  }
+
+  /** Shared `recordChat` write, best-effort — a failure never breaks routing. */
+  private writeChatRow(opts: {
+    id?: string;
+    fromId: string;
+    toId: string;
+    body: string;
+    sessionId?: string;
+  }): string | undefined {
+    if (!this.recordChat) return undefined;
+    try {
+      return this.recordChat({
+        id: opts.id,
+        senderId: opts.fromId,
+        recipientId: opts.toId,
+        body: opts.body,
+        sessionId: opts.sessionId,
+      });
+    } catch (err) {
+      this.log(`recordChat failed: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+  }
+
+  /**
+   * Durable "sent" half of a scheduled message (#209): the chat row plus the
+   * `message_sent` event, written once at scheduling-accept time under the
+   * stable `opts.id` so a crash-retry of the caller's transaction is a safe
+   * no-op. The `message_received` half is deferred to {@link recordMessageReceived},
+   * fired only at actual delivery.
+   */
+  recordMessageSent(opts: {
+    id: string;
+    fromId: string;
+    toId: string;
+    body: string;
+    sessionId?: string;
+  }): string | undefined {
+    const fromId = this.resolveThreadId(opts.fromId);
+    const toId = this.resolveThreadId(opts.toId);
+    const msgId = this.writeChatRow({
+      id: opts.id,
+      fromId,
+      toId,
+      body: opts.body,
+      sessionId: opts.sessionId,
+    });
+
+    this.recordEvent({
+      id: `${opts.id}:sent`,
+      kind: "message_sent",
+      actorId: fromId,
+      detail: opts.sessionId,
+      payload: msgId ? JSON.stringify({ messageId: msgId, to: toId }) : undefined,
+    });
+    return msgId;
+  }
+
+  /**
+   * Durable "received" half of a scheduled message (#209), fired only at
+   * actual delivery. Deliberately does not re-write the chat row — the
+   * accept-time {@link recordMessageSent} already owns it under the same
+   * stable `opts.id`, and a missing chat row on JOIN gracefully degrades to a
+   * null body (see `mesh-event-repository.ts`).
+   */
+  recordMessageReceived(opts: {
+    id: string;
+    fromId: string;
+    toId: string;
+    sessionId?: string;
+  }): void {
+    const fromId = this.resolveThreadId(opts.fromId);
+    const toId = this.resolveThreadId(opts.toId);
+    this.recordEvent({
+      id: `${opts.id}:received`,
+      kind: "message_received",
+      actorId: toId,
+      detail: opts.sessionId,
+      payload: JSON.stringify({ messageId: opts.id, from: fromId }),
+    });
   }
 
   /** Record a mesh event; the sink is best-effort and never breaks routing. */
@@ -684,22 +779,19 @@ export class ActorMesh {
   /** Boot recovery: re-arm timers for scheduled messages, and fire overdue ones immediately. */
   reconcilePendingDeliveries(): void {
     const validIds = new Set<string>();
-    for (const record of this.registry.list()) {
-      if (record.status !== "active") continue;
-      if (!record.pendingDeliveries?.length) continue;
-      for (const msg of record.pendingDeliveries) {
-        validIds.add(msg.id);
-        try {
-          this.armPendingDelivery(record.id, msg);
-          this.log(`re-armed scheduled message ${msg.id} for ${record.id} at ${msg.deliverAt}`);
-        } catch (err) {
-          // One actor's failed re-arm (e.g. the OS scheduler rejecting a
-          // stale date) must not abort reconciliation for every other actor
-          // queued behind it on boot.
-          this.log(
-            `failed to re-arm scheduled message ${msg.id} for ${record.id}: ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
+    for (const msg of this.scheduledDeliveries.listAll()) {
+      if (this.registry.get(msg.toId)?.status !== "active") continue;
+      validIds.add(msg.id);
+      try {
+        this.armPendingDelivery(msg.toId, msg);
+        this.log(`re-armed scheduled message ${msg.id} for ${msg.toId} at ${msg.deliverAt}`);
+      } catch (err) {
+        // One actor's failed re-arm (e.g. the OS scheduler rejecting a
+        // stale date) must not abort reconciliation for every other actor
+        // queued behind it on boot.
+        this.log(
+          `failed to re-arm scheduled message ${msg.id} for ${msg.toId}: ${err instanceof Error ? err.message : String(err)}`
+        );
       }
     }
 
@@ -1728,37 +1820,36 @@ export class ActorMesh {
       if (!rec || rec.status !== "active") {
         return { delivered: false, status: rec?.status };
       }
-      if ((rec.pendingDeliveries?.length ?? 0) >= 10) {
+      if (this.scheduledDeliveries.countForRecipient(toId) >= 10) {
         throw new Error(
           `Cannot schedule message: recipient ${toId} has reached the cap of 10 pending deliveries.`
         );
       }
 
-      const pending: PendingMessageDelivery = {
-        id: randomUUID(),
+      const id = randomUUID();
+      const pending: ScheduledDelivery = {
+        id,
+        toId,
         fromId,
         body,
         deliverAt,
         sessionId,
       };
-      this.registry.patch(toId, {
-        pendingDeliveries: [...(rec.pendingDeliveries ?? []), pending],
+      this.withTransaction(() => {
+        this.scheduledDeliveries.insert(pending);
+        this.recordMessageSent({ id, fromId, toId, body, sessionId });
+        try {
+          this.armPendingDelivery(toId, pending);
+        } catch (err) {
+          // The durable record must not outlive the OS job that was supposed to
+          // fire it — an orphaned scheduled delivery with no timer and no `at`
+          // job behind it would sit forever, never delivered and never visible
+          // as failed. Roll the insert back so the caller's thrown error
+          // reflects the true post-failure state.
+          this.scheduledDeliveries.remove(id);
+          throw err;
+        }
       });
-      try {
-        this.armPendingDelivery(toId, pending);
-      } catch (err) {
-        // The durable record must not outlive the OS job that was supposed to
-        // fire it — an orphaned pendingDelivery with no timer and no `at` job
-        // behind it would sit forever, never delivered and never visible as
-        // failed. Roll the patch back so the caller's thrown error reflects
-        // the true post-failure state.
-        const latest = this.registry.get(toId);
-        this.registry.patch(toId, {
-          pendingDeliveries: (latest?.pendingDeliveries ?? []).filter((p) => p.id !== pending.id),
-        });
-        throw err;
-      }
-      // Record event at fire time, not here, per #4.
       return { delivered: true };
     }
 
@@ -2290,15 +2381,13 @@ export class ActorMesh {
     actor?.close();
     this.live.delete(id);
     const record = this.registry.get(id);
-    if (record?.pendingDeliveries) {
-      for (const msg of record.pendingDeliveries) {
-        this.notifyScheduledDeliveryDropped(id, msg);
-        const timer = this.pendingDeliveryTimers.get(msg.id);
-        if (timer) clearTimeout(timer);
-        this.pendingDeliveryTimers.delete(msg.id);
-        if (this.osScheduler) this.osScheduler.cancelMessageDelivery(msg.id);
-      }
-      this.registry.patch(id, { pendingDeliveries: [] });
+    for (const msg of this.scheduledDeliveries.listForRecipient(id)) {
+      this.notifyScheduledDeliveryDropped(id, msg);
+      const timer = this.pendingDeliveryTimers.get(msg.id);
+      if (timer) clearTimeout(timer);
+      this.pendingDeliveryTimers.delete(msg.id);
+      if (this.osScheduler) this.osScheduler.cancelMessageDelivery(msg.id);
+      this.scheduledDeliveries.remove(msg.id);
     }
     if (record && this.onRetire) {
       try {
@@ -2933,7 +3022,7 @@ export class ActorMesh {
     }
   }
 
-  private armPendingDelivery(toId: string, msg: PendingMessageDelivery): void {
+  private armPendingDelivery(toId: string, msg: ScheduledDelivery): void {
     if (this.osScheduler) {
       if (new Date(msg.deliverAt).getTime() <= Date.now()) {
         this.firePendingDelivery(toId, msg.id);
@@ -2976,7 +3065,7 @@ export class ActorMesh {
     return null;
   }
 
-  private notifyScheduledDeliveryDropped(toId: string, scheduled: PendingMessageDelivery): void {
+  private notifyScheduledDeliveryDropped(toId: string, scheduled: ScheduledDelivery): void {
     const notifyTarget = this.resolveDropNotifyTarget(scheduled.fromId);
 
     if (notifyTarget) {
@@ -2995,22 +3084,15 @@ export class ActorMesh {
   }
 
   deliverScheduledMessage(messageId: string): void {
-    let foundToId: string | undefined;
-    for (const rec of this.registry.list()) {
-      if (rec.pendingDeliveries?.some((m) => m.id === messageId)) {
-        foundToId = rec.id;
-        break;
-      }
-    }
-    if (!foundToId) return;
-    this.firePendingDelivery(foundToId, messageId);
+    const scheduled = this.scheduledDeliveries.get(messageId);
+    if (!scheduled) return;
+    this.firePendingDelivery(scheduled.toId, messageId);
   }
 
   private firePendingDelivery(toId: string, messageId: string): void {
-    const rec = this.registry.get(toId);
-    if (!rec) return;
-    const scheduled = rec.pendingDeliveries?.find((m) => m.id === messageId);
+    const scheduled = this.scheduledDeliveries.get(messageId);
     if (!scheduled) return;
+    const rec = this.registry.get(toId);
 
     this.pendingDeliveryTimers.delete(messageId);
     try {
@@ -3025,37 +3107,27 @@ export class ActorMesh {
     }
 
     try {
-      if (rec.status !== "active") {
+      if (!rec || rec.status !== "active") {
         this.log(`pending delivery ${messageId} for ${toId} dropped — recipient retired`);
         this.notifyScheduledDeliveryDropped(toId, scheduled);
-        this.registry.patch(toId, {
-          pendingDeliveries: rec.pendingDeliveries?.filter((m) => m.id !== messageId),
-        });
+        this.scheduledDeliveries.remove(messageId);
         return;
       }
 
       const target = this.live.get(toId);
 
-      // Exact-once at the durable boundary: `messageId` is the pending
-      // delivery's own stable id, minted once at schedule time and already
-      // durable (it identifies `scheduled` itself). Using it as the chat
-      // row's id makes this call idempotent (`INSERT OR IGNORE`) rather than
-      // relying on a separate best-effort marker: a retry after a crash
-      // between the chat write and any later step just re-runs this as a
-      // no-op and gets the same id back.
-      const durableMessageId = this.recordMessageEmitted({
+      // Exact-once at the durable boundary: the chat row and `message_sent`
+      // event were already written at schedule-accept time under `messageId`
+      // (see `recordMessageSent`); only the `message_received` half is
+      // durable now, at actual delivery.
+      this.recordMessageReceived({
         id: messageId,
         fromId: scheduled.fromId,
         toId,
-        body: scheduled.body,
         sessionId: scheduled.sessionId,
-        isDrop: false,
       });
 
       if (target && this.inboxStore) {
-        if (!durableMessageId) {
-          throw new Error("Scheduled message delivery requires durable chat storage");
-        }
         this.inboxStore.append([
           {
             id: messageId,
@@ -3063,25 +3135,19 @@ export class ActorMesh {
             source: `mesh:${scheduled.fromId}`,
             payload: {
               type: "mesh.scheduled_message",
-              messageId: durableMessageId,
+              messageId,
               fromId: scheduled.fromId,
               sessionId: scheduled.sessionId,
             },
           },
         ]);
-        this.registry.patch(toId, {
-          pendingDeliveries: rec.pendingDeliveries?.filter((m) => m.id !== messageId) ?? [],
-        });
+        this.scheduledDeliveries.remove(messageId);
         this.notifyInboxChanged(toId);
       } else if (target && !this.inboxStore) {
-        this.registry.patch(toId, {
-          pendingDeliveries: rec.pendingDeliveries?.filter((m) => m.id !== messageId) ?? [],
-        });
+        this.scheduledDeliveries.remove(messageId);
         target.requestRun();
       } else {
-        this.registry.patch(toId, {
-          pendingDeliveries: rec.pendingDeliveries?.filter((m) => m.id !== messageId) ?? [],
-        });
+        this.scheduledDeliveries.remove(messageId);
         this.log(`message to ${toId} from ${scheduled.fromId} dropped — no durable inbox target`);
       }
     } catch (err) {
@@ -3093,9 +3159,7 @@ export class ActorMesh {
       // the record was cleared, it's still pending but now unscheduled —
       // re-arm it a short delay out so it gets retried without depending on
       // the next process restart's reconcilePendingDeliveries() sweep.
-      const stillPending = this.registry
-        .get(toId)
-        ?.pendingDeliveries?.some((m) => m.id === messageId);
+      const stillPending = this.scheduledDeliveries.get(messageId) != null;
       if (stillPending) {
         try {
           this.armPendingDelivery(toId, {
@@ -3109,6 +3173,47 @@ export class ActorMesh {
         }
       }
     }
+  }
+
+  /**
+   * Idempotent legacy cutover (#209): move every legacy `ThreadRecord.pendingDeliveries`
+   * entry into the durable {@link scheduledDeliveries} store, then clear the legacy
+   * field — but only after its inserts succeed, and only for that one record, so a
+   * crash mid-loop leaves every not-yet-processed record's legacy field intact for
+   * the next boot to retry. `insert` is itself `INSERT OR IGNORE` on the stable
+   * `id`, so re-running an already-migrated record's inserts is a safe no-op. Must
+   * run before {@link reconcilePendingDeliveries}.
+   */
+  importLegacyPendingDeliveries(): void {
+    for (const record of this.registry.list()) {
+      if (!record.pendingDeliveries?.length) continue;
+      for (const msg of record.pendingDeliveries) {
+        this.scheduledDeliveries.insert({
+          id: msg.id,
+          toId: record.id,
+          fromId: msg.fromId,
+          body: msg.body,
+          deliverAt: msg.deliverAt,
+          sessionId: msg.sessionId,
+        });
+      }
+      this.registry.patch(record.id, { pendingDeliveries: [] });
+    }
+  }
+
+  /** Every scheduled message sent or addressed to `actorId` — the `list_pending_messages` MCP tool. */
+  listPendingMessagesFor(
+    actorId: string
+  ): Array<{ recipient: string; sender: string; deliverAt: string; body: string }> {
+    return this.scheduledDeliveries
+      .listAll()
+      .filter((msg) => msg.fromId === actorId || msg.toId === actorId)
+      .map((msg) => ({
+        recipient: msg.toId,
+        sender: msg.fromId,
+        deliverAt: msg.deliverAt,
+        body: msg.body,
+      }));
   }
 }
 

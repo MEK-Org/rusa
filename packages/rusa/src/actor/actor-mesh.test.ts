@@ -34,7 +34,12 @@ import type {
 import type { MeshEventInput, MeshEventSink } from "./mesh-events.js";
 import type { OsScheduler } from "./os-scheduler.js";
 import { ProviderPacer } from "./provider-pacer.js";
-import { InMemoryThreadRegistry, type ThreadRecord } from "./thread-registry.js";
+import { InMemoryScheduledDeliveryStore } from "./scheduled-delivery-store.js";
+import {
+  InMemoryThreadRegistry,
+  type PendingMessageDelivery,
+  type ThreadRecord,
+} from "./thread-registry.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
 const DEBOUNCE = 10;
@@ -5179,7 +5184,7 @@ describe("ActorMesh", () => {
     });
 
     it("rolls back the pending-delivery record when arming the OS job fails", () => {
-      const { mesh, registry } = setup();
+      const { mesh } = setup();
       const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
       const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
 
@@ -5195,11 +5200,11 @@ describe("ActorMesh", () => {
       );
 
       // The durable record must not outlive the failed OS job — no orphan left behind.
-      expect(registry.get(t1)?.pendingDeliveries ?? []).toHaveLength(0);
+      expect(mesh.scheduledDeliveries.listForRecipient(t1)).toHaveLength(0);
     });
 
     it("does not let one failed re-arm on boot abort reconciliation for the rest", () => {
-      const { mesh, registry, logs } = setup();
+      const { mesh, logs } = setup();
       const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
       const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
       const t3 = mesh.spawn({ charter: "t3", parentId: "root" });
@@ -5211,7 +5216,7 @@ describe("ActorMesh", () => {
       mesh.sendMessage(t1, "will fail to re-arm", t2, undefined, deliverAt);
       mesh.sendMessage(t2, "should still re-arm", t3, undefined, deliverAt);
 
-      const failingMsgId = registry.get(t1)?.pendingDeliveries?.[0]?.id;
+      const failingMsgId = mesh.scheduledDeliveries.listForRecipient(t1)[0]?.id;
 
       // Simulate a fresh restart: the OS scheduler's own state is queried
       // anew, and it rejects one stale job on re-arm while still accepting
@@ -5227,8 +5232,8 @@ describe("ActorMesh", () => {
       // Both records remain durable — reconciliation doesn't remove them, it
       // only (re-)arms the underlying OS job — but only the healthy one
       // actually got armed.
-      expect(registry.get(t1)?.pendingDeliveries).toHaveLength(1);
-      expect(registry.get(t2)?.pendingDeliveries).toHaveLength(1);
+      expect(mesh.scheduledDeliveries.listForRecipient(t1)).toHaveLength(1);
+      expect(mesh.scheduledDeliveries.listForRecipient(t2)).toHaveLength(1);
       expect(osScheduler.listMessageDeliveries()).not.toContain(failingMsgId);
       expect(
         logs.some((l) => l.includes("failed to re-arm") && l.includes("stale job rejected"))
@@ -5248,7 +5253,7 @@ describe("ActorMesh", () => {
           return memoryStore.append(inputs);
         },
       };
-      const { mesh, registry, logs } = setup({ inboxStore });
+      const { mesh, logs } = setup({ inboxStore });
       const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
       const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
 
@@ -5257,7 +5262,7 @@ describe("ActorMesh", () => {
 
       const deliverAt = new Date(Date.now() + 100000).toISOString();
       mesh.sendMessage(t2, "will fail once", t1, undefined, deliverAt);
-      const messageId = registry.get(t2)?.pendingDeliveries?.[0]?.id ?? "";
+      const messageId = mesh.scheduledDeliveries.listForRecipient(t2)[0]?.id ?? "";
       expect(messageId).toBeTruthy();
       expect(osScheduler.messageDeliveries.has(messageId)).toBe(true);
 
@@ -5266,13 +5271,13 @@ describe("ActorMesh", () => {
 
       // The durable write failed, but the record must not be stranded: it's
       // still pending, and a fresh OS job has been armed to retry it.
-      expect(registry.get(t2)?.pendingDeliveries).toHaveLength(1);
+      expect(mesh.scheduledDeliveries.listForRecipient(t2)).toHaveLength(1);
       expect(osScheduler.messageDeliveries.has(messageId)).toBe(true);
       expect(logs.some((l) => l.includes("firePendingDelivery failed"))).toBe(true);
 
       // The retry succeeds.
       mesh.deliverScheduledMessage(messageId);
-      expect(registry.get(t2)?.pendingDeliveries ?? []).toHaveLength(0);
+      expect(mesh.scheduledDeliveries.listForRecipient(t2)).toHaveLength(0);
       expect(memoryStore.entries.some((e) => e.actorId === t2)).toBe(true);
     });
 
@@ -5290,14 +5295,15 @@ describe("ActorMesh", () => {
         },
       };
       // These fakes mirror the real repositories' `INSERT OR IGNORE`
-      // semantics keyed on the caller-supplied id, rather than a separate
-      // best-effort marker: recordChat/events are called on every retry, but
-      // a retry using the same stable id must not add a second row.
+      // semantics keyed on the caller-supplied id. `recordChat` is now called
+      // exactly once, at schedule-accept time (see `recordMessageSent`) — a
+      // retried delivery attempt no longer re-invokes it — while `events` are
+      // still recorded per attempt but deduped by their own stable id.
       let recordChatCalls = 0;
       const chatRows = new Map<string, string>();
       const eventIds = new Set<string>();
       const sentEvents: string[] = [];
-      const { mesh, registry } = setup({
+      const { mesh } = setup({
         inboxStore,
         recordChat: (opts) => {
           recordChatCalls += 1;
@@ -5322,20 +5328,22 @@ describe("ActorMesh", () => {
 
       const deliverAt = new Date(Date.now() + 100000).toISOString();
       mesh.sendMessage(t2, "will fail once", t1, undefined, deliverAt);
-      const messageId = registry.get(t2)?.pendingDeliveries?.[0]?.id ?? "";
+      const messageId = mesh.scheduledDeliveries.listForRecipient(t2)[0]?.id ?? "";
 
-      // First attempt: recordChat succeeds and mints a durable row keyed on
-      // the pending delivery's own stable id, but the inbox append after it
-      // fails — the retry must not record a second chat row or events for
-      // the same delivery.
-      mesh.deliverScheduledMessage(messageId);
-      expect(chatRows.size).toBe(1);
+      // recordChat already ran once, at accept time — the chat row is durable
+      // before either delivery attempt below.
+      expect(recordChatCalls).toBe(1);
       expect(chatRows.has(messageId)).toBe(true);
 
+      // First attempt: the inbox append fails — the retry must not record a
+      // second chat row or duplicate events for the same delivery.
       mesh.deliverScheduledMessage(messageId);
-      expect(recordChatCalls).toBe(2);
       expect(chatRows.size).toBe(1);
-      expect(registry.get(t2)?.pendingDeliveries ?? []).toHaveLength(0);
+
+      mesh.deliverScheduledMessage(messageId);
+      expect(recordChatCalls).toBe(1);
+      expect(chatRows.size).toBe(1);
+      expect(mesh.scheduledDeliveries.listForRecipient(t2)).toHaveLength(0);
       expect(memoryStore.entries.filter((e) => e.actorId === t2)).toHaveLength(1);
       expect(sentEvents).toEqual(["message_sent", "message_received"]);
     });
@@ -5362,7 +5370,7 @@ describe("ActorMesh", () => {
           return memoryStore.append(inputs);
         },
       };
-      const { mesh, registry } = setup({
+      const { mesh } = setup({
         inboxStore,
         recordChat: (opts) => {
           const id = opts.id ?? "unexpected-missing-id";
@@ -5386,7 +5394,7 @@ describe("ActorMesh", () => {
 
       const deliverAt = new Date(Date.now() + 100000).toISOString();
       mesh.sendMessage(t2, "restart-boundary message", t1, undefined, deliverAt);
-      const messageId = registry.get(t2)?.pendingDeliveries?.[0]?.id ?? "";
+      const messageId = mesh.scheduledDeliveries.listForRecipient(t2)[0]?.id ?? "";
       expect(messageId).toBeTruthy();
 
       // "Crash" mid-delivery: the chat row lands durably, the inbox append
@@ -5394,7 +5402,7 @@ describe("ActorMesh", () => {
       // deliveredMessageId patch) survives the restart.
       mesh.deliverScheduledMessage(messageId);
       expect(chatRows.size).toBe(1);
-      expect(registry.get(t2)?.pendingDeliveries).toHaveLength(1);
+      expect(mesh.scheduledDeliveries.listForRecipient(t2)).toHaveLength(1);
 
       // Boot-time reconciliation re-fires the still-pending delivery using
       // only what was durably persisted at schedule time (the same messageId).
@@ -5402,12 +5410,12 @@ describe("ActorMesh", () => {
 
       expect(chatRows.size).toBe(1);
       expect(sentEvents).toEqual(["message_sent", "message_received"]);
-      expect(registry.get(t2)?.pendingDeliveries ?? []).toHaveLength(0);
+      expect(mesh.scheduledDeliveries.listForRecipient(t2)).toHaveLength(0);
       expect(memoryStore.entries.filter((e) => e.actorId === t2)).toHaveLength(1);
     });
 
     it("keeps a delivery retryable when clearing its own OS job fails, instead of aborting delivery", () => {
-      const { mesh, registry, logs } = setup();
+      const { mesh, logs } = setup();
       const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
       const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
 
@@ -5419,12 +5427,12 @@ describe("ActorMesh", () => {
 
       const deliverAt = new Date(Date.now() + 100000).toISOString();
       mesh.sendMessage(t1, "hello", t2, undefined, deliverAt);
-      const messageId = registry.get(t1)?.pendingDeliveries?.[0]?.id ?? "";
+      const messageId = mesh.scheduledDeliveries.listForRecipient(t1)[0]?.id ?? "";
 
       // The one-shot OS job already fired and called back; failing to clear
       // its own bookkeeping must not prevent the delivery it triggered.
       expect(() => mesh.deliverScheduledMessage(messageId)).not.toThrow();
-      expect(registry.get(t1)?.pendingDeliveries ?? []).toHaveLength(0);
+      expect(mesh.scheduledDeliveries.listForRecipient(t1)).toHaveLength(0);
       expect(
         logs.some((l) => l.includes("cancelMessageDelivery failed") && l.includes("atrm failed"))
       ).toBe(true);
@@ -5439,29 +5447,30 @@ describe("ActorMesh", () => {
       const deliverAt = new Date(Date.now() + 100000).toISOString();
       mesh1.sendMessage(t1, "scheduled message", t2, undefined, deliverAt);
 
-      // It is pending in the registry
-      expect(registry.get(t1)?.pendingDeliveries).toHaveLength(1);
+      // It is pending in the store, shared across mesh instances since both
+      // point at the same in-memory `scheduledDeliveries` below.
+      expect(mesh1.scheduledDeliveries.listForRecipient(t1)).toHaveLength(1);
       expect(registry.get(t1)).not.toHaveProperty("messageClaims");
 
       // Restart the mesh (simulate restart by creating a new ActorMesh instance on the same registry)
       mesh1.shutdownAll();
 
       const { mesh: mesh2, fake } = setup();
-      // Point mesh2 to the same registry
-      Object.assign(mesh2, { registry });
+      // Point mesh2 to the same registry and scheduled-delivery store
+      Object.assign(mesh2, { registry, scheduledDeliveries: mesh1.scheduledDeliveries });
       // Run boot sequence
       mesh2.rehydrateAll();
       mesh2.reconcilePendingDeliveries();
       mesh2.reconcileInbox();
 
       // Still pending
-      expect(registry.get(t1)?.pendingDeliveries).toHaveLength(1);
+      expect(mesh2.scheduledDeliveries.listForRecipient(t1)).toHaveLength(1);
 
       // Fast-forward time so timer fires and runner executes
       await vi.advanceTimersByTimeAsync(100000 + 30000);
 
       // It should have fired and woken the actor.
-      expect(registry.get(t1)?.pendingDeliveries).toHaveLength(0);
+      expect(mesh2.scheduledDeliveries.listForRecipient(t1)).toHaveLength(0);
       expect(fake(t1).calls).toHaveLength(1);
       expect(fake(t1).calls[0]?.prompt).toContain("Work from your inbox");
     });
@@ -5481,7 +5490,7 @@ describe("ActorMesh", () => {
       await vi.advanceTimersByTimeAsync(150000);
 
       const { mesh: mesh2, fake } = setup();
-      Object.assign(mesh2, { registry });
+      Object.assign(mesh2, { registry, scheduledDeliveries: mesh1.scheduledDeliveries });
 
       // Boot
       mesh2.rehydrateAll();
@@ -5491,22 +5500,22 @@ describe("ActorMesh", () => {
       // Let setTimeout(0) and the runner execute
       await vi.advanceTimersByTimeAsync(30000);
 
-      expect(registry.get(t1)?.pendingDeliveries).toHaveLength(0);
+      expect(mesh2.scheduledDeliveries.listForRecipient(t1)).toHaveLength(0);
       expect(fake(t1).calls).toHaveLength(1);
       expect(fake(t1).calls[0]?.prompt).toContain("Work from your inbox");
     });
 
     it("notifies sender exactly once when recipient retires while holding pending deliveries", async () => {
       const inboxStore = createMemoryInboxStore();
-      const { mesh, registry, fake, tick } = setup({ inboxStore });
+      const { mesh, fake, tick } = setup({ inboxStore });
       const sender = mesh.spawn({ charter: "sender", parentId: "root" });
       const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
 
       const deliverAt = new Date(Date.now() + 100000).toISOString();
       mesh.sendMessage(recipient, "long wait", sender, undefined, deliverAt);
-      const pendingMessageId = registry.get(recipient)?.pendingDeliveries?.[0]?.id;
+      const pendingMessageId = mesh.scheduledDeliveries.listForRecipient(recipient)[0]?.id;
 
-      expect(registry.get(recipient)?.pendingDeliveries).toHaveLength(1);
+      expect(mesh.scheduledDeliveries.listForRecipient(recipient)).toHaveLength(1);
 
       // Retire the recipient before timers advance
       mesh.retire(recipient);
@@ -5533,7 +5542,7 @@ describe("ActorMesh", () => {
       ]);
 
       // Assert pendingDeliveries is empty on recipient
-      expect(registry.get(recipient)?.pendingDeliveries ?? []).toEqual([]);
+      expect(mesh.scheduledDeliveries.listForRecipient(recipient)).toEqual([]);
 
       // Advance past deliverAt and ensure NO duplicate notification is sent
       await vi.advanceTimersByTimeAsync(150000);
@@ -5605,6 +5614,74 @@ describe("ActorMesh", () => {
         }),
       });
     });
+
+    it("imports legacy pendingDeliveries into the durable store and clears the legacy field only once copied", () => {
+      const { mesh, registry } = setup();
+      const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
+      const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
+
+      // Seed the legacy shape directly, as if this record predates #209.
+      const legacy: PendingMessageDelivery = {
+        id: "legacy-1",
+        fromId: t1,
+        body: "pre-#209 message",
+        deliverAt: new Date(Date.now() + 100000).toISOString(),
+      };
+      registry.patch(t2, { pendingDeliveries: [legacy] });
+
+      mesh.importLegacyPendingDeliveries();
+
+      expect(mesh.scheduledDeliveries.get("legacy-1")).toMatchObject({
+        toId: t2,
+        fromId: t1,
+        body: "pre-#209 message",
+      });
+      expect(registry.get(t2)?.pendingDeliveries).toEqual([]);
+
+      // A second run (e.g. a re-triggered boot sequence) must be a no-op: the
+      // legacy field is already empty, and even if it weren't, insert is
+      // `INSERT OR IGNORE` on the stable id — no duplicate durable row.
+      mesh.importLegacyPendingDeliveries();
+      expect(mesh.scheduledDeliveries.listForRecipient(t2)).toHaveLength(1);
+    });
+
+    it("does not clear a record's legacy field if its durable copy throws partway through", () => {
+      const failingStore = new InMemoryScheduledDeliveryStore();
+      const realInsert = failingStore.insert.bind(failingStore);
+      let shouldFail = true;
+      failingStore.insert = (delivery) => {
+        if (shouldFail) {
+          shouldFail = false;
+          throw new Error("durable write failed");
+        }
+        realInsert(delivery);
+      };
+      const { mesh, registry } = setup();
+      Object.assign(mesh, { scheduledDeliveries: failingStore });
+      const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
+      const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
+
+      const legacy: PendingMessageDelivery = {
+        id: "legacy-2",
+        fromId: t1,
+        body: "will fail to copy",
+        deliverAt: new Date(Date.now() + 100000).toISOString(),
+      };
+      registry.patch(t2, { pendingDeliveries: [legacy] });
+
+      expect(() => mesh.importLegacyPendingDeliveries()).toThrow(/durable write failed/);
+
+      // The legacy field must survive an aborted copy — a later retry (e.g.
+      // the next boot) needs it intact to try again, rather than losing the
+      // message because the durable store rejected the write.
+      expect(registry.get(t2)?.pendingDeliveries).toEqual([legacy]);
+      expect(failingStore.get("legacy-2")).toBeUndefined();
+
+      // Retry succeeds and clears the legacy field.
+      mesh.importLegacyPendingDeliveries();
+      expect(failingStore.get("legacy-2")).toMatchObject({ toId: t2 });
+      expect(registry.get(t2)?.pendingDeliveries).toEqual([]);
+    });
   });
 
   describe("retire cancels pending wakes & late wakes no-op ", () => {
@@ -5618,14 +5695,14 @@ describe("ActorMesh", () => {
       const deliverAt = new Date(Date.now() + 100000).toISOString();
       const res = mesh.sendMessage(worker, "self follow-up wake", worker, undefined, deliverAt);
       expect(res.delivered).toBe(true);
-      expect(registry.get(worker)?.pendingDeliveries).toHaveLength(1);
+      expect(mesh.scheduledDeliveries.listForRecipient(worker)).toHaveLength(1);
 
       // Retire the worker
       mesh.retire(worker);
       await tick();
 
       // Pending deliveries on retired worker should be cleared
-      expect(registry.get(worker)?.pendingDeliveries ?? []).toEqual([]);
+      expect(mesh.scheduledDeliveries.listForRecipient(worker)).toEqual([]);
       expect(registry.get(worker)?.status).toBe("retired");
 
       // Advance time past the deliverAt timestamp
@@ -5672,13 +5749,13 @@ describe("ActorMesh", () => {
 
     it("late firePendingDelivery on retired actor drops cleanly without attempting execution", async () => {
       const inboxStore = createMemoryInboxStore();
-      const { mesh, registry, fake, tick } = setup({ inboxStore });
+      const { mesh, fake, tick } = setup({ inboxStore });
       const parent = mesh.spawn({ charter: "parent", parentId: "root" });
       const worker = mesh.spawn({ charter: "worker", parentId: parent });
 
       const deliverAt = new Date(Date.now() + 100000).toISOString();
       mesh.sendMessage(worker, "late message", parent, undefined, deliverAt);
-      const pendingId = registry.get(worker)?.pendingDeliveries?.[0]?.id ?? "";
+      const pendingId = mesh.scheduledDeliveries.listForRecipient(worker)[0]?.id ?? "";
       expect(pendingId).toBeTruthy();
 
       // Retire worker

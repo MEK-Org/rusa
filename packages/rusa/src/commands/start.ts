@@ -1528,6 +1528,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     },
     events: meshEvents,
     recordChat: (opts) => getRepositories().meshChat.record(opts),
+    scheduledDeliveries: getRepositories().scheduledMessages,
+    withTransaction: (fn) => getDb().transaction(fn)(),
     recordRunYield: (actorId, status, note) => {
       const runId = activeRunIds.get(actorId);
       if (!runId) return null;
@@ -2611,6 +2613,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // never completed (drain or hard kill). Cron wakes and GitHub events remain
   // outside this path by design.
   mesh.rehydrateAll();
+  mesh.importLegacyPendingDeliveries();
   mesh.reconcilePendingDeliveries();
   mesh.reconcileInbox();
   getRepositories().obligations.reconcileScheduledObligations();

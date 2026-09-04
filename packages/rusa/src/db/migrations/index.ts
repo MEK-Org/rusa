@@ -32,6 +32,7 @@ import { referenceCache } from "./0033_reference_cache.js";
 import { actorRuntimeState } from "./0034_actor_runtime_state.js";
 import { recurringObligations } from "./0035_recurring_obligations.js";
 import { correctActorSchema } from "./0036_correct_actor_schema.js";
+import { scheduledMessages } from "./0038_scheduled_messages.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -76,4 +77,7 @@ export const migrations: Migration[] = [
   actorRuntimeState,
   recurringObligations,
   correctActorSchema,
+  // 0037 is reserved by a concurrently open PR (capability grants); skipping it
+  // here rather than reusing it avoids a numbering collision on merge.
+  scheduledMessages,
 ];

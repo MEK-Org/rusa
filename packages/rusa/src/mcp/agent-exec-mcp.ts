@@ -336,20 +336,12 @@ export function createAgentExecMcpServer(
     },
     async () => {
       try {
-        const pending = [];
-        for (const rec of mesh.registry.list()) {
-          if (!rec.pendingDeliveries) continue;
-          for (const msg of rec.pendingDeliveries) {
-            if (msg.fromId === selfId || rec.id === selfId) {
-              pending.push({
-                recipient: rec.id,
-                sender: msg.fromId,
-                deliver_at: msg.deliverAt,
-                body: msg.body.slice(0, 100) + (msg.body.length > 100 ? "..." : ""),
-              });
-            }
-          }
-        }
+        const pending = mesh.listPendingMessagesFor(selfId).map((msg) => ({
+          recipient: msg.recipient,
+          sender: msg.sender,
+          deliver_at: msg.deliverAt,
+          body: msg.body.slice(0, 100) + (msg.body.length > 100 ? "..." : ""),
+        }));
         return toolOk(pending);
       } catch (err) {
         return toolError(err);

@@ -11,6 +11,7 @@ import { ObligationRepository } from "./obligation-repository.js";
 import { QuotaScrapeRepository } from "./quota-scrape-repository.js";
 import { RawInputRepository } from "./raw-input-repository.js";
 import { ReferenceCacheRepository } from "./reference-cache-repository.js";
+import { ScheduledMessageRepository } from "./scheduled-message-repository.js";
 
 /**
  * Aggregate of the entity repositories the actor mesh + the retained
@@ -32,6 +33,7 @@ export class Repositories {
   readonly modelScrapes: ModelScrapeRepository;
   readonly obligations: ObligationRepository;
   readonly referenceCache: ReferenceCacheRepository;
+  readonly scheduledMessages: ScheduledMessageRepository;
 
   constructor(db: Database.Database) {
     this.actorRuns = new ActorRunRepository(db);
@@ -45,6 +47,7 @@ export class Repositories {
     this.modelScrapes = new ModelScrapeRepository(db);
     this.obligations = new ObligationRepository(db);
     this.referenceCache = new ReferenceCacheRepository(db);
+    this.scheduledMessages = new ScheduledMessageRepository(db);
   }
 
   /**
@@ -90,3 +93,4 @@ export { QuotaScrapeRepository } from "./quota-scrape-repository.js";
 export type { RawInput } from "./raw-input-repository.js";
 export { RawInputRepository } from "./raw-input-repository.js";
 export { ReferenceCacheRepository } from "./reference-cache-repository.js";
+export { ScheduledMessageRepository } from "./scheduled-message-repository.js";

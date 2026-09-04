@@ -18,14 +18,14 @@ export interface PortableContextConfig {
 
 export type ContextConfig = NativeContextConfig | PortableContextConfig;
 
+/**
+ * Legacy (pre-#209) shape of a scheduled delivery, retained only so
+ * `ThreadRecord.pendingDeliveries` can still be read and imported once at
+ * boot by `ActorMesh.importLegacyPendingDeliveries()`. Live scheduled
+ * messages are owned by the durable `scheduled_messages` table via
+ * `ScheduledDeliveryStore`/`ScheduledDelivery` — see `scheduled-delivery-store.ts`.
+ */
 export interface PendingMessageDelivery {
-  /**
-   * Minted once at schedule time and durable from that point on. Doubles as
-   * the idempotency key for the chat row/events this delivery eventually
-   * writes (see `recordMessageEmitted`), so a retry after a crash between
-   * that write and the rest of delivery is a safe no-op rather than a
-   * duplicate.
-   */
   id: string;
   fromId: string;
   body: string;
@@ -123,7 +123,11 @@ export interface ThreadRecord {
    */
   isRoot?: boolean;
   status: ThreadStatus;
-  /** Pending scheduled deliveries for this actor. */
+  /**
+   * Legacy pending scheduled deliveries (pre-#209), imported once into the
+   * durable `scheduled_messages` table at boot and then only ever cleared —
+   * new scheduling never writes here.
+   */
   pendingDeliveries?: PendingMessageDelivery[];
   /** Whether the operator has ever messaged this actor, unlocking the reply channel. */
   humanUnlocked?: boolean;
