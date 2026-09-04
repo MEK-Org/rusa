@@ -1,4 +1,4 @@
-import type { ActorHandle, ContextConfig, ThreadRecord } from "./thread-registry.js";
+import type { ActorHandle, ActorRecord, ContextConfig } from "./actor-record.js";
 
 export type RootControlPrincipal = "root-llm" | "human:operator" | "e2e-controller";
 
@@ -44,7 +44,7 @@ export interface RootControlMesh {
     detail?: string;
     payload?: string;
   }): void;
-  list(): ThreadRecord[];
+  list(): ActorRecord[];
 }
 
 export interface RootControlOptions {
@@ -170,7 +170,7 @@ export class RootControlService {
     return result;
   }
 
-  listChildren(): ThreadRecord[] {
+  listChildren(): ActorRecord[] {
     return this.options.mesh.list().filter((record) => record.parentId === this.rootId);
   }
 

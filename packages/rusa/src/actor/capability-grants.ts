@@ -62,7 +62,7 @@ export interface CapabilityGrant {
 }
 
 /**
- * Persistence boundary for capability grants — mirrors {@link ThreadRegistry}:
+ * Persistence boundary for capability grants — mirrors {@link ActorRepository}:
  * a local JSON file in production ({@link FileCapabilityGrantStore}), in-memory
  * for tests. Keyed on (actorId, capability); one record per pair.
  */
@@ -111,7 +111,7 @@ export class InMemoryCapabilityGrantStore implements CapabilityGrantStore {
 
 /**
  * JSON-file-backed grant store — the durable store, mirroring
- * {@link FileThreadRegistry}: rewrites the whole file on every mutation, and
+ * the former JSON actor store: rewrites the whole file on every mutation, and
  * refreshes successful reads from disk so grants recorded by another process are
  * visible to the next actor construction without an orchestrator restart.
  */

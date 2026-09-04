@@ -3,14 +3,14 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
+import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { MechanicalInboxForensics } from "./actor-mesh.js";
-import type { ThreadRegistry } from "./thread-registry.js";
 
 /** How much of a failed run's output to include in the mechanical notice. */
 const TAIL_LEN = 800;
 
 export interface FailureSinkDeps {
-  registry: Pick<ThreadRegistry, "get">;
+  actors: Pick<ActorRepository, "get">;
   /** Deliver to the parent's durable ISSUE_NUM actor inbox. */
   sendToParent: (
     toId: string,
@@ -269,7 +269,7 @@ function routeMechanicalFailureNotice(
   exitCode?: number,
   result?: RunResult
 ): void {
-  const record = deps.registry.get(actorId);
+  const record = deps.actors.get(actorId);
 
   let extraMessage = "";
   if (exitCode === 143 && deps.workersDir) {

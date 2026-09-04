@@ -1,9 +1,9 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import type { ActorRecord } from "../actor/actor-record.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { RUN_TERMINAL_EVENT_KINDS } from "../actor/mesh-events.js";
-import type { ThreadRecord } from "../actor/thread-registry.js";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
 import {
   type CommitmentLedgerStoryboardSnapshot,
@@ -21,8 +21,8 @@ function thread(
   id: string,
   parentId: string | null = "root",
   createdAt = "2026-06-29T00:00:00.000Z",
-  extra: Partial<ThreadRecord> = {}
-): ThreadRecord {
+  extra: Partial<ActorRecord> = {}
+): ActorRecord {
   return {
     id,
     charter: id,

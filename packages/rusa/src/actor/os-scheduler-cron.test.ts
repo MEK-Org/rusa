@@ -2,18 +2,10 @@ import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import {
-  type CrontabIo,
-  CrontabMutator,
-  CrontabWakeCron,
-  cronExprEverFires,
-  execCrontabIo,
-  isValidActorId,
-  isValidCronExpr,
-  nextCronOccurrence,
-  preflightCron,
-  writeWakePort,
-} from "./wake-cron.js";
+import { cronExprEverFires, isValidCronExpr, nextCronOccurrence } from "./cron-expression.js";
+import { type CrontabIo, CrontabMutator, execCrontabIo, preflightCron } from "./crontab.js";
+import { DefaultOsScheduler, isValidActorId } from "./os-scheduler.js";
+import { writeWakePort } from "./wake-callback.js";
 
 /** In-memory crontab: serves a string, records each write. */
 class FakeCrontab implements CrontabIo {
@@ -34,7 +26,16 @@ const OPTS = {
 };
 const make = (content = "") => {
   const io = new FakeCrontab(content);
-  return { io, cron: new CrontabWakeCron(new CrontabMutator(io), OPTS) };
+  const scheduler = new DefaultOsScheduler(
+    new CrontabMutator(io),
+    {
+      schedule: () => "1",
+      list: () => [],
+      remove: () => undefined,
+    },
+    OPTS
+  );
+  return { io, scheduler };
 };
 
 describe("cron expression + actor-id validation", () => {
@@ -112,10 +113,10 @@ describe("execCrontabIo", () => {
   });
 });
 
-describe("CrontabWakeCron.buildJobLine", () => {
+describe("DefaultOsScheduler actor wake job lines", () => {
   it("emits cron-expr + absolute curl + token/port via command substitution", () => {
-    const { cron } = make();
-    const line = cron.buildJobLine("act1", "0 3 * * *", "nightly distill");
+    const { scheduler } = make();
+    const line = scheduler.buildWakeJobLine("act1", "0 3 * * *", "nightly distill");
     expect(line.startsWith("0 3 * * * /usr/bin/curl -fsS")).toBe(true);
     expect(line).toContain('-H "Authorization: Bearer $(cat /home/sf/.rusa/wake-token)"');
     expect(line).toContain('"http://127.0.0.1:$(cat /home/sf/.rusa/wake-port)/wake"');
@@ -123,27 +124,27 @@ describe("CrontabWakeCron.buildJobLine", () => {
     expect(line).toContain("-d 'reason=nightly distill'");
   });
   it("escapes % (cron newline) and single quotes in the reason", () => {
-    const { cron } = make();
-    const line = cron.buildJobLine("act1", "0 3 * * *", "100% done; it's ready");
+    const { scheduler } = make();
+    const line = scheduler.buildWakeJobLine("act1", "0 3 * * *", "100% done; it's ready");
     expect(line).toContain("\\%"); // % escaped
     expect(line).not.toMatch(/[^\\]%/); // no unescaped %
     expect(line).toContain("it'\\''s"); // single quote escaped
   });
   it("emits priority parameter when priority is responsive", () => {
-    const { cron } = make();
-    const lineString = cron.buildJobLine("act1", "0 3 * * *", "bless cut", "responsive");
+    const { scheduler } = make();
+    const lineString = scheduler.buildWakeJobLine("act1", "0 3 * * *", "bless cut", "responsive");
     expect(lineString).toContain("-d 'priority=responsive'");
-    const lineBool = cron.buildJobLine("act1", "0 3 * * *", "bless cut", true);
+    const lineBool = scheduler.buildWakeJobLine("act1", "0 3 * * *", "bless cut", true);
     expect(lineBool).toContain("-d 'priority=responsive'");
-    const lineNormal = cron.buildJobLine("act1", "0 3 * * *", "nightly", "normal");
+    const lineNormal = scheduler.buildWakeJobLine("act1", "0 3 * * *", "nightly", "normal");
     expect(lineNormal).not.toContain("priority=");
   });
 });
 
-describe("CrontabWakeCron schedule/cancel/list", () => {
+describe("DefaultOsScheduler actor wake schedule/cancel/list", () => {
   it("schedules into an empty crontab as a tag line above the job line", async () => {
-    const { io, cron } = make();
-    await cron.schedule("act1", "0 3 * * *", "nightly");
+    const { io, scheduler } = make();
+    await scheduler.schedule("act1", "0 3 * * *", "nightly");
     const lines = io.content.trimEnd().split("\n");
     expect(lines[0]).toBe("# mc-wake:act1");
     expect(lines[1].startsWith("0 3 * * * /usr/bin/curl")).toBe(true);
@@ -151,52 +152,52 @@ describe("CrontabWakeCron schedule/cancel/list", () => {
 
   it("preserves unrelated human lines and replaces (not duplicates) an existing block", async () => {
     const human = "# my own job\n0 9 * * 1 /usr/bin/backup.sh\n";
-    const { io, cron } = make(human);
-    await cron.schedule("act1", "0 3 * * *", "first");
-    await cron.schedule("act1", "30 4 * * *", "second"); // re-schedule same actor
+    const { io, scheduler } = make(human);
+    await scheduler.schedule("act1", "0 3 * * *", "first");
+    await scheduler.schedule("act1", "30 4 * * *", "second"); // re-schedule same actor
     expect(io.content).toContain("# my own job");
     expect(io.content).toContain("/usr/bin/backup.sh");
     expect(io.content.match(/# mc-wake:act1/g)).toHaveLength(1); // replaced, not duplicated
-    const entries = await cron.list();
+    const entries = await scheduler.list();
     expect(entries).toEqual([{ actorId: "act1", cronExpr: "30 4 * * *", reason: "second" }]);
   });
 
   it("manages multiple actors and suffixed slots independently", async () => {
-    const { cron } = make();
-    await cron.schedule("root", "0 3 * * *", "base root wake");
-    await cron.schedule("root:daily-bless-cut", "45 8 * * *", "daily bless cut", "responsive");
-    await cron.schedule("act2", "0 4 * * *", "two");
+    const { scheduler } = make();
+    await scheduler.schedule("root", "0 3 * * *", "base root wake");
+    await scheduler.schedule("root:daily-bless-cut", "45 8 * * *", "daily bless cut", "responsive");
+    await scheduler.schedule("act2", "0 4 * * *", "two");
 
-    const entries = await cron.list();
+    const entries = await scheduler.list();
     expect(entries.map((e) => e.actorId).sort()).toEqual(["act2", "root", "root:daily-bless-cut"]);
 
-    await cron.cancel("root:daily-bless-cut");
-    const afterCancel = await cron.list();
+    await scheduler.cancel("root:daily-bless-cut");
+    const afterCancel = await scheduler.list();
     expect(afterCancel.map((e) => e.actorId).sort()).toEqual(["act2", "root"]);
     expect(afterCancel.find((e) => e.actorId === "root")?.reason).toBe("base root wake");
   });
 
   it("cancel preserves unrelated lines and no-ops when the actor is absent", async () => {
-    const { io, cron } = make("# keep me\n0 1 * * * /bin/true\n");
-    await cron.cancel("ghost"); // absent
+    const { io, scheduler } = make("# keep me\n0 1 * * * /bin/true\n");
+    await scheduler.cancel("ghost"); // absent
     expect(io.writes).toHaveLength(0); // no write when nothing changed
-    await cron.schedule("act1", "0 3 * * *", "x");
-    await cron.cancel("act1");
+    await scheduler.schedule("act1", "0 3 * * *", "x");
+    await scheduler.cancel("act1");
     expect(io.content).toContain("# keep me");
     expect(io.content).not.toContain("mc-wake");
   });
 
   it("round-trips a reason containing % and quotes through schedule→list", async () => {
-    const { cron } = make();
-    await cron.schedule("act1", "0 3 * * *", "100% of it's done");
-    expect((await cron.list())[0].reason).toBe("100% of it's done");
+    const { scheduler } = make();
+    await scheduler.schedule("act1", "0 3 * * *", "100% of it's done");
+    expect((await scheduler.list())[0].reason).toBe("100% of it's done");
   });
 
   it("round-trips priority through schedule→list", async () => {
-    const { cron } = make();
-    await cron.schedule("act1", "0 3 * * *", "standing op", "responsive");
-    await cron.schedule("act2", "0 4 * * *", "normal op");
-    const entries = await cron.list();
+    const { scheduler } = make();
+    await scheduler.schedule("act1", "0 3 * * *", "standing op", "responsive");
+    await scheduler.schedule("act2", "0 4 * * *", "normal op");
+    const entries = await scheduler.list();
     expect(entries).toEqual([
       { actorId: "act1", cronExpr: "0 3 * * *", reason: "standing op", priority: "responsive" },
       { actorId: "act2", cronExpr: "0 4 * * *", reason: "normal op" },
@@ -204,18 +205,18 @@ describe("CrontabWakeCron schedule/cancel/list", () => {
   });
 
   it("rejects an invalid cron expression WITHOUT writing", async () => {
-    const { io, cron } = make();
-    await expect(cron.schedule("act1", "bad expr", "x")).rejects.toThrow(/invalid cron/);
+    const { io, scheduler } = make();
+    await expect(scheduler.schedule("act1", "bad expr", "x")).rejects.toThrow(/invalid cron/);
     expect(io.writes).toHaveLength(0);
   });
 
   it("serializes concurrent edits so both land (no lost update)", async () => {
-    const { cron } = make();
+    const { scheduler } = make();
     await Promise.all([
-      cron.schedule("act1", "0 3 * * *", "one"),
-      cron.schedule("act2", "0 4 * * *", "two"),
+      scheduler.schedule("act1", "0 3 * * *", "one"),
+      scheduler.schedule("act2", "0 4 * * *", "two"),
     ]);
-    expect((await cron.list()).map((e) => e.actorId).sort()).toEqual(["act1", "act2"]);
+    expect((await scheduler.list()).map((e) => e.actorId).sort()).toEqual(["act1", "act2"]);
   });
 });
 

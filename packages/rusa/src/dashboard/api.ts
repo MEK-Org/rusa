@@ -6,7 +6,6 @@ import { resolveContextSelection } from "../actor/context-selection.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import type { InboxPage, InboxPayload, InboxStore } from "../actor/inbox-store.js";
 import type { RootControlService } from "../actor/root-control.js";
-import type { ThreadRegistry } from "../actor/thread-registry.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import {
   generateAvatarForce,
@@ -22,11 +21,12 @@ import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { ObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { resolveReferenceSync } from "../references/resolve.js";
+import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { SseHub } from "./sse.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
 export interface DashboardDataDeps {
-  registry: ThreadRegistry;
+  actors: ActorRepository;
   meshEvents: MeshEventRepository;
   meshChat: MeshChatRepository;
   /** Durable obligation repository for task and dependency management. */
@@ -48,12 +48,10 @@ export interface DashboardDataDeps {
    */
   isHalted?: () => boolean;
   /**
-   * Read-only snapshot of the boot-time `at`/`atrm`/`atd`/`atq` preflight
-   * (see `preflightAt` in os-scheduler.ts), surfaced as the top-level
-   * `schedulerWarning` field on `/api/mesh/threads` — a missing one-shot
-   * facility only warns at boot (cron-only recurrences keep working), so the
-   * dashboard/health surface is this snapshot's one durable place to make
-   * that non-fatal condition visible to an operator instead of console-only.
+   * Read-only snapshot of both host-scheduler preflights: crontab/crond and
+   * `at`/`atrm`/`atd`/`atq`. Surfaced as the top-level `schedulerWarning`
+   * field on `/api/mesh/threads`; either facility may be degraded while the
+   * service and the unaffected scheduling paths continue to run.
    * Optional; absent or an ok result reports `schedulerWarning: null`.
    */
   schedulerHealth?: () => { ok: boolean; issues: string[] };
@@ -503,7 +501,7 @@ export async function handleMeshApiRequest(
         return true;
       }
       const actorId = match[1];
-      const rec = deps.registry.get(actorId);
+      const rec = deps.actors.get(actorId);
       if (!rec) {
         sendJson(res, 404, { error: "actor not found" });
         return true;
@@ -561,7 +559,7 @@ export async function handleMeshApiRequest(
         return true;
       }
       const actorId = decodeURIComponent(interruptMatch[1]);
-      const rec = deps.registry.get(actorId);
+      const rec = deps.actors.get(actorId);
       if (!rec) {
         sendJson(res, 404, { error: "actor not found" });
         return true;
@@ -610,7 +608,7 @@ export async function handleMeshApiRequest(
         return true;
       }
       const actorId = decodeURIComponent(runNowMatch[1]);
-      const rec = deps.registry.get(actorId);
+      const rec = deps.actors.get(actorId);
       if (!rec) {
         sendJson(res, 404, { error: "actor not found" });
         return true;
@@ -857,7 +855,7 @@ export async function handleMeshApiRequest(
           const priority =
             typeof rawPriority === "number" && Number.isFinite(rawPriority) ? rawPriority : null;
 
-          const owner = resolveObligationOwner(deps.registry, ownerId);
+          const owner = resolveObligationOwner(deps.actors, ownerId);
           if (!owner.ok) {
             sendJson(res, 400, { error: owner.error });
             return;
@@ -1112,7 +1110,7 @@ export async function handleMeshApiRequest(
             sendJson(res, 404, { error: "obligation not found" });
             return;
           }
-          const owner = resolveObligationOwner(deps.registry, ownerId);
+          const owner = resolveObligationOwner(deps.actors, ownerId);
           if (!owner.ok) {
             sendJson(res, 400, { error: owner.error });
             return;
@@ -1167,7 +1165,7 @@ export async function handleMeshApiRequest(
     return true;
   }
 
-  const { registry, meshEvents, sseHub } = deps;
+  const { actors, meshEvents, sseHub } = deps;
 
   if (pathname === "/api/mesh/control/options") {
     if (!deps.rootControl) {
@@ -1184,7 +1182,7 @@ export async function handleMeshApiRequest(
   // list route because the dispatcher matches on exact pathname.
   if (pathname === "/api/mesh/threads/charter") {
     const id = url.searchParams.get("id");
-    const thread = id ? registry.get(id) : undefined;
+    const thread = id ? actors.get(id) : undefined;
     if (!thread) {
       sendJson(res, 404, { error: "thread not found" });
       return true;
@@ -1211,7 +1209,7 @@ export async function handleMeshApiRequest(
     // mesh_events(actor_id, ts) makes this cheap .
     const lastActiveByActor = meshEvents.latestActivityByActor();
 
-    const threads: ThreadDto[] = registry.list().map((r) => {
+    const threads: ThreadDto[] = actors.list().map((r) => {
       let runState: "running" | "queued" | "winding_down" | "idle" = "idle";
       if (runtime) {
         runState = runtime.states.get(r.id) ?? "idle";

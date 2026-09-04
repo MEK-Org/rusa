@@ -7,6 +7,8 @@ import {
 } from "../providers/reasoning-effort.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
+import type { ActorRepository } from "../repositories/actor-repository.js";
+import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./actor-record.js";
 import {
   type CapabilityGrantStore,
   InMemoryCapabilityGrantStore,
@@ -34,22 +36,11 @@ import {
   NOOP_MESH_EVENT_SINK,
   RUN_TERMINAL_EVENT_KINDS,
 } from "./mesh-events.js";
-import type { OsScheduler } from "./os-scheduler.js";
-import type {
-  ActorHandle,
-  ContextConfig,
-  PendingMessageDelivery,
-  ThreadRecord,
-  ThreadRegistry,
-  ThreadStatus,
-} from "./thread-registry.js";
+import type { ScheduledMessage, ScheduledMessageScheduler } from "./os-scheduler.js";
 import { type ActorRunMode, isResponsiveNudge, type RunNudge } from "./trigger-runner.js";
 
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
 export const SCHEDULER_SENDER_ID = "scheduler";
-
-/** Retry delay for a scheduled-message delivery whose durable write failed after its one-shot job fired. */
-const FIRE_PENDING_DELIVERY_RETRY_MS = 30_000;
 
 /** Map only the issue-shaped event resources obligations may govern. */
 function eventResourceObligationKey(resource: EventResource): string | undefined {
@@ -128,7 +119,7 @@ export interface SpawnRequest {
 
 export type MessageDeliveryResult =
   | { delivered: true }
-  | { delivered: false; status?: ThreadStatus };
+  | { delivered: false; status?: ActorStatus };
 
 /**
  * One thread's in-flight run.
@@ -181,9 +172,9 @@ export interface MechanicalInboxForensics {
 /** What the mesh hands the factory to build a live {@link Actor} for a record. */
 export interface ActorFactoryContext {
   /** The record at spawn time. Use {@link getRecord} for the *current* state. */
-  record: ThreadRecord;
+  record: ActorRecord;
   /** Read the live record (charter + handles can change between wakes). */
-  getRecord: () => ThreadRecord | undefined;
+  getRecord: () => ActorRecord | undefined;
   mesh: ActorMesh;
   /**
    * Wrap the provider run in the shared cross-actor concurrency gate. The
@@ -249,11 +240,11 @@ export interface RetireCleanup {
    * actor's active run to emit its matching run_end.
    */
   deferUntilRunEnd?: boolean;
-  run: (record: ThreadRecord) => void | Promise<void>;
+  run: (record: ActorRecord) => void | Promise<void>;
 }
 
 export interface ActorMeshOptions {
-  registry: ThreadRegistry;
+  actors: ActorRepository;
   /** This account/subtree's root id. Also backs the grandfathered `"root"` address alias. */
   rootId?: string;
   /** Builds a live Actor for a thread record (resolves provider/cwd/mcp/session). */
@@ -262,7 +253,7 @@ export interface ActorMeshOptions {
   validateSpawn?: (req: SpawnRequest) => ModelEffortSelection | undefined;
   /** Synchronous validator before setting an actor's model in-place . */
   validateModel?: (
-    record: ThreadRecord,
+    record: ActorRecord,
     newModel: string | undefined,
     newProvider?: string,
     newEffort?: string | null
@@ -311,7 +302,7 @@ export interface ActorMeshOptions {
    * record is marked retired), for resource teardown the mesh doesn't own — e.g.
    * removing the actor's MCP endpoint and its working directory.
    */
-  onRetire?: (record: ThreadRecord) => void;
+  onRetire?: (record: ActorRecord) => void;
   /**
    * Called on every actor yield, for out-of-band handling the mesh doesn't own
    * (e.g. surfacing a git-bridge deliverable). `notifyingParent` is true only
@@ -335,13 +326,13 @@ export interface ActorMeshOptions {
    * The hook must not block — it kicks work off and returns immediately; spawn
    * stays synchronous and returns the id right away (B.5's non-blocking rule).
    */
-  onSpawn?: (record: ThreadRecord) => void;
+  onSpawn?: (record: ActorRecord) => void;
   /**
    * Called once per actor as it's revived (after its record is marked active,
    * before the live actor is re-instantiated), for out-of-band side effects the
    * mesh doesn't own — e.g. recreating the actor's working directory.
    */
-  onRevive?: (record: ThreadRecord) => void;
+  onRevive?: (record: ActorRecord) => void;
   /**
    * Called after a capability grant is durably recorded, for live resource
    * wiring the mesh does not own. The production wiring uses this to mount the
@@ -356,10 +347,10 @@ export interface ActorMeshOptions {
    */
   onCapabilityRevoked?: (actorId: string, capability: string) => Promise<void> | void;
   /**
-   * Called after a thread's model is durably updated in the registry ,
+   * Called after an actor's model is durably updated in the repository,
    * for live resource / provider updating on the active actor.
    */
-  onModelSet?: (actorId: string, newModel: string, record: ThreadRecord) => void;
+  onModelSet?: (actorId: string, newModel: string, record: ActorRecord) => void;
   /**
    * Per-actor durable-registration cleanup hooks run during retire. Each hook is
    * failure-isolated so one broken teardown cannot stop the rest of the cascade.
@@ -400,12 +391,16 @@ export interface ActorMeshOptions {
    * rejected, bounding what the primitive can ever hand out. Defaults to empty.
    */
   grantableCapabilities?: ReadonlySet<string>;
+  /** Host-owned one-shot messages. Production supplies the `at`-backed OS scheduler. */
+  scheduledMessages?: ScheduledMessageScheduler;
+  /** Atomic boundary for recording a scheduled message's chat/audit rows. */
+  withTransaction?: (fn: () => void) => void;
   log?: (msg: string) => void;
 }
 
 /**
  * The actor scheduler (design Part D — the v2 pump repurposed). It owns the
- * thread {@link ThreadRegistry} (durable records) and the set of *live* actors,
+ * {@link ActorRepository} (durable records) and the set of *live* actors,
  * and provides the mesh's primitives:
  *
  * - {@link spawn} — create a child actor (record + live instance) and return its
@@ -423,11 +418,11 @@ export interface ActorMeshOptions {
  * concurrency is bounded by a shared {@link ConcurrencyLimiter}.
  */
 export class ActorMesh {
-  readonly registry: ThreadRegistry;
+  readonly actors: ActorRepository;
   private readonly createActor: ActorFactory;
   private readonly validateSpawn?: (req: SpawnRequest) => ModelEffortSelection | undefined;
   private readonly validateModel?: (
-    record: ThreadRecord,
+    record: ActorRecord,
     newModel: string | undefined,
     newProvider?: string,
     newEffort?: string | null
@@ -440,20 +435,20 @@ export class ActorMesh {
   private readonly now: () => string;
   private readonly handleForId: (id: string) => string;
   private readonly rootId?: string;
-  private readonly onRetire?: (record: ThreadRecord) => void;
+  private readonly onRetire?: (record: ActorRecord) => void;
   private readonly onYield?: (
     actorId: string,
     ctx: { notifyingParent: boolean }
   ) => string | null | undefined;
   private readonly recordRunYield?: ActorMeshOptions["recordRunYield"];
-  private readonly onSpawn?: (record: ThreadRecord) => void;
-  private readonly onRevive?: (record: ThreadRecord) => void;
+  private readonly onSpawn?: (record: ActorRecord) => void;
+  private readonly onRevive?: (record: ActorRecord) => void;
   private readonly onCapabilityGranted?: (actorId: string, capability: string) => void;
   private readonly onCapabilityRevoked?: (
     actorId: string,
     capability: string
   ) => Promise<void> | void;
-  private readonly onModelSet?: (actorId: string, newModel: string, record: ThreadRecord) => void;
+  private readonly onModelSet?: (actorId: string, newModel: string, record: ActorRecord) => void;
   private readonly retireCleanups: RetireCleanup[];
   private readonly events: MeshEventSink;
   private readonly recordChat?: (opts: {
@@ -473,6 +468,8 @@ export class ActorMesh {
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
   private readonly grantable: ReadonlySet<string>;
   private readonly log: (msg: string) => void;
+  private scheduledMessages?: ScheduledMessageScheduler;
+  private readonly withTransaction: (fn: () => void) => void;
   private readonly live = new Map<string, MeshActor>();
   private readonly runtimeStreamId = randomUUID();
   private runtimeRevision = 0;
@@ -480,13 +477,10 @@ export class ActorMesh {
   private readonly activeRunCounts = new Map<string, number>();
   private readonly deferredRetireCleanups = new Map<
     string,
-    { record: ThreadRecord; cleanups: RetireCleanup[] }
+    { record: ActorRecord; cleanups: RetireCleanup[] }
   >();
-  private pendingDeliveryTimers = new Map<string, NodeJS.Timeout>();
-  private osScheduler?: OsScheduler;
-
-  setOsScheduler(osScheduler: OsScheduler): void {
-    this.osScheduler = osScheduler;
+  setScheduledMessageScheduler(scheduler: ScheduledMessageScheduler): void {
+    this.scheduledMessages = scheduler;
   }
 
   private readonly selectedInboxEntryIds = new Map<string, string[]>();
@@ -510,13 +504,13 @@ export class ActorMesh {
   /**
    * Ids whose {@link retire} is currently unwinding. A subtree retire recurses
    * into children *before* marking itself retired, so an ancestor mid-retire
-   * still reads `status: "active"` in the registry — see
+   * still reads `status: "active"` in the repository — see
    * {@link resolveDropNotifyTarget}, which must not hand a notification to one.
    */
   private readonly retiring = new Set<string>();
 
   constructor(opts: ActorMeshOptions) {
-    this.registry = opts.registry;
+    this.actors = opts.actors;
     this.rootId = opts.rootId;
     this.createActor = opts.createActor;
     this.validateSpawn = opts.validateSpawn;
@@ -561,13 +555,15 @@ export class ActorMesh {
     this.events = opts.events ?? NOOP_MESH_EVENT_SINK;
     this.recordChat = opts.recordChat;
     this.log = opts.log ?? (() => {});
+    this.scheduledMessages = opts.scheduledMessages;
+    this.withTransaction = opts.withTransaction ?? ((fn) => fn());
   }
 
   /**
    * Standardized message emission for the ISSUE_NUM spine.
    *
    * `opts.id`, when supplied, is a stable idempotency key (e.g. a
-   * `PendingMessageDelivery.id` minted once at schedule time): the chat row
+   * scheduled-delivery id minted once at schedule time): the chat row
    * and its events all derive their ids from it so a retry after a crash
    * between the chat write and the caller's own durable bookkeeping re-runs
    * this as a safe no-op (`INSERT OR IGNORE`) instead of duplicating the
@@ -583,20 +579,13 @@ export class ActorMesh {
   }): string | undefined {
     const fromId = this.resolveThreadId(opts.fromId);
     const toId = this.resolveThreadId(opts.toId);
-    let msgId: string | undefined;
-    if (this.recordChat) {
-      try {
-        msgId = this.recordChat({
-          id: opts.id,
-          senderId: fromId,
-          recipientId: toId,
-          body: opts.body,
-          sessionId: opts.sessionId,
-        });
-      } catch (err) {
-        this.log(`recordChat failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
+    const msgId = this.writeChatRow({
+      id: opts.id,
+      fromId,
+      toId,
+      body: opts.body,
+      sessionId: opts.sessionId,
+    });
 
     this.recordEvent({
       id: opts.id ? `${opts.id}:sent` : undefined,
@@ -618,6 +607,68 @@ export class ActorMesh {
     return msgId;
   }
 
+  private writeChatRow(opts: {
+    id?: string;
+    fromId: string;
+    toId: string;
+    body: string;
+    sessionId?: string;
+  }): string | undefined {
+    if (!this.recordChat) return undefined;
+    try {
+      return this.recordChat({
+        id: opts.id,
+        senderId: opts.fromId,
+        recipientId: opts.toId,
+        body: opts.body,
+        sessionId: opts.sessionId,
+      });
+    } catch (err) {
+      this.log(`recordChat failed: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+  }
+
+  /** Persist the chat row and sent event when a scheduled message is accepted. */
+  recordScheduledMessageSent(opts: ScheduledMessage): string | undefined {
+    const fromId = this.resolveThreadId(opts.fromId);
+    const toId = this.resolveThreadId(opts.toId);
+    if (!this.recordChat) {
+      throw new Error("Scheduled message acceptance requires durable chat storage");
+    }
+    const messageId = this.recordChat({
+      id: opts.id,
+      senderId: fromId,
+      recipientId: toId,
+      body: opts.body,
+      sessionId: opts.sessionId,
+    });
+    const event = {
+      id: `${opts.id}:sent`,
+      kind: "message_sent" as const,
+      actorId: fromId,
+      detail: opts.sessionId,
+      payload: JSON.stringify({ messageId, to: toId }),
+    };
+    // This is part of the acceptance transaction, so unlike ordinary
+    // best-effort observability, a persistence failure must reach the caller.
+    this.events(event);
+    this.updateActiveRunState(event);
+    return messageId;
+  }
+
+  private recordScheduledMessageReceived(delivery: ScheduledMessage): void {
+    const fromId = this.resolveThreadId(delivery.fromId);
+    const toId = this.resolveThreadId(delivery.toId);
+    this.recordEvent({
+      id: `${delivery.id}:received`,
+      kind: "message_received",
+      actorId: toId,
+      detail: delivery.sessionId,
+      payload: JSON.stringify({ messageId: delivery.id, from: fromId }),
+    });
+  }
+
   /** Record a mesh event; the sink is best-effort and never breaks routing. */
   recordEvent(...args: Parameters<MeshEventSink>): void {
     const [event] = args;
@@ -631,25 +682,23 @@ export class ActorMesh {
 
   /**
    * Register an externally-created actor (the root) so the mesh can route
-   * messages to it and the registry knows it exists. Idempotent on the record.
+   * messages to it and the repository knows it exists. Idempotent on the record.
    *
    * The wiring rebuilds `record` fresh on every boot : it carries the
-   * current config/session but not the durable fields the mesh itself owns —
-   * `pendingDeliveries`, etc. A blind
-   * `upsert` would silently wipe those out from underneath boot reconciliation
-   * on every restart. Merge onto any existing persisted record instead,
-   * so `record`'s fields win but everything else survives.
+   * current config/session while the repository retains durable identity fields.
+   * Merge onto any existing record so the freshly configured fields win without
+   * changing stable creation metadata.
    */
-  adopt(record: ThreadRecord, actor: MeshActor): void {
-    const existing = this.registry.get(record.id);
-    this.registry.upsert(existing ? { ...existing, ...record } : record);
+  adopt(record: ActorRecord, actor: MeshActor): void {
+    const existing = this.actors.get(record.id);
+    this.actors.upsert(existing ? { ...existing, ...record } : record);
     this.live.set(record.id, actor);
     this.actorRuntimeStateChanged(record.id, this.runtimeStateOf(actor));
   }
 
   /**
    * Recreate the live {@link Actor} for an existing record — boot restore for
-   * threads the registry persisted across a restart. Unlike {@link spawn} it
+   * actors the repository persisted across a restart. Unlike {@link spawn} it
    * mints no record, grants no handle, and does **not** wake the actor: waking it
    * with no reason would be a phantom run. No-op if it's already live or not
    * active (retired threads stay dead).
@@ -657,7 +706,7 @@ export class ActorMesh {
    * Rehydration alone does not wake: after all active actors are live, boot-time
    * inbox reconciliation nudges actors with durable work.
    */
-  rehydrate(record: ThreadRecord): void {
+  rehydrate(record: ActorRecord): void {
     if (this.live.has(record.id)) return; // already live (e.g. the adopted root)
     if (record.status !== "active") return; // don't revive retired threads
     try {
@@ -673,50 +722,31 @@ export class ActorMesh {
   }
 
   /**
-   * Rehydrate every active thread the registry knows about. Call once on boot
+   * Rehydrate every active actor the repository knows about. Call once on boot
    * *after* the root is adopted, so a worker's parent is live before the worker
    * is. Already-live (root) and retired records are skipped.
    */
   rehydrateAll(): void {
-    for (const record of this.registry.list()) this.rehydrate(record);
+    for (const record of this.actors.list()) this.rehydrate(record);
   }
 
-  /** Boot recovery: re-arm timers for scheduled messages, and fire overdue ones immediately. */
+  /**
+   * Boot reconciliation for the OS-owned pending-message queue. The `at` jobs
+   * are already armed and contain their own payloads; the mesh only removes
+   * jobs whose recipients can no longer receive them.
+   */
   reconcilePendingDeliveries(): void {
-    const validIds = new Set<string>();
-    for (const record of this.registry.list()) {
-      if (record.status !== "active") continue;
-      if (!record.pendingDeliveries?.length) continue;
-      for (const msg of record.pendingDeliveries) {
-        validIds.add(msg.id);
-        try {
-          this.armPendingDelivery(record.id, msg);
-          this.log(`re-armed scheduled message ${msg.id} for ${record.id} at ${msg.deliverAt}`);
-        } catch (err) {
-          // One actor's failed re-arm (e.g. the OS scheduler rejecting a
-          // stale date) must not abort reconciliation for every other actor
-          // queued behind it on boot.
-          this.log(
-            `failed to re-arm scheduled message ${msg.id} for ${record.id}: ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
-      }
-    }
-
-    if (this.osScheduler) {
+    if (!this.scheduledMessages) return;
+    for (const message of this.scheduledMessages.listMessageDeliveries()) {
+      const recipient = this.actors.get(message.toId);
+      if (recipient?.status === "active") continue;
       try {
-        for (const id of this.osScheduler.listMessageDeliveries()) {
-          if (!validIds.has(id)) {
-            this.osScheduler.cancelMessageDelivery(id);
-            this.log(`cancelled orphaned scheduled message ${id}`);
-          }
-        }
+        this.notifyScheduledDeliveryDropped(message.toId, message);
+        this.scheduledMessages.cancelMessageDelivery(message.id);
+        this.log(`cancelled scheduled message ${message.id} for inactive actor ${message.toId}`);
       } catch (err) {
-        // A real OS-scheduler IO failure here must not abort the rest of
-        // boot reconciliation — every message above is already re-armed (or
-        // its own failure already logged); only the orphan sweep is skipped.
         this.log(
-          `failed to reconcile orphaned scheduled messages: ${err instanceof Error ? err.message : String(err)}`
+          `failed to cancel scheduled message ${message.id} for inactive actor ${message.toId}: ${err instanceof Error ? err.message : String(err)}`
         );
       }
     }
@@ -727,7 +757,7 @@ export class ActorMesh {
     if (!this.inboxStore) return;
     try {
       for (const work of this.inboxStore.actorsWithUnhandled()) {
-        const record = this.registry.get(work.actorId);
+        const record = this.actors.get(work.actorId);
         if (record && record.status !== "active") continue;
         this.notifyInboxChanged(work.actorId, { priority: work.priority });
       }
@@ -744,7 +774,7 @@ export class ActorMesh {
     if (!this.inboxStore) return;
     try {
       for (const work of this.inboxStore.actorsWithUnseen()) {
-        const record = this.registry.get(work.actorId);
+        const record = this.actors.get(work.actorId);
         if (record && record.status !== "active") continue;
         this.notifyInboxChanged(work.actorId, { priority: work.priority });
       }
@@ -782,7 +812,7 @@ export class ActorMesh {
         } of obligations.readyHeadTransitions()) {
           if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) continue;
           const actorId = this.resolveThreadId(ownerId);
-          const record = this.registry.get(actorId);
+          const record = this.actors.get(actorId);
           if (!record || record.status !== "active") continue;
           const head = obligations.get(headId);
           if (!head) continue;
@@ -797,7 +827,7 @@ export class ActorMesh {
         for (const [ownerId, headId] of obligations.readyHeads()) {
           if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) continue;
           const actorId = this.resolveThreadId(ownerId);
-          const record = this.registry.get(actorId);
+          const record = this.actors.get(actorId);
           if (!record || record.status !== "active") continue;
           const head = obligations.get(headId);
           if (!head) continue;
@@ -818,7 +848,7 @@ export class ActorMesh {
    */
   notifyInboxChanged(actorId: string, nudge: RunNudge = {}): boolean {
     actorId = this.resolveThreadId(actorId);
-    const rec = this.registry.get(actorId);
+    const rec = this.actors.get(actorId);
     if (rec && rec.status !== "active") {
       this.log(`inbox_changed for ${actorId} not nudged — actor is retired`);
       return false;
@@ -993,7 +1023,7 @@ export class ActorMesh {
     sequence: number | null = null
   ): boolean {
     if (!this.inboxStore) return false;
-    const record = this.registry.get(actorId);
+    const record = this.actors.get(actorId);
     if (!record || record.status !== "active") return false;
     // Keying on transition + sequence ensures exact-once durable inbox delivery across restarts.
     // ON CONFLICT DO NOTHING suppresses duplicate inbox rows if the prior entry remains.
@@ -1054,7 +1084,7 @@ export class ActorMesh {
     const effort = selection.effort;
     const id = this.idgen();
     const parentId = this.resolveThreadId(req.parentId);
-    const record: ThreadRecord = {
+    const record: ActorRecord = {
       id,
       charter,
       parentId,
@@ -1070,7 +1100,7 @@ export class ActorMesh {
       status: "active",
       createdAt: this.now(),
     };
-    this.registry.upsert(record);
+    this.actors.upsert(record);
     // Spawning grants the parent a handle to the child, so it can message it.
     // No role — the parent authored the charter, so the child's charter is the
     // truthful label (resolved at prompt time).
@@ -1080,7 +1110,7 @@ export class ActorMesh {
       actor = this.createActor(this.factoryContext(record));
     } catch (err) {
       this.revokeHandle(parentId, id);
-      this.registry.patch(id, { status: "retired" });
+      this.actors.patch(id, { status: "retired" });
       throw err;
     }
     this.live.set(id, actor);
@@ -1117,7 +1147,7 @@ export class ActorMesh {
   grantHandle(toId: string, handle: ActorHandle): void {
     toId = this.resolveThreadId(toId);
     handle = { ...handle, id: this.resolveThreadId(handle.id) };
-    const rec = this.registry.get(toId);
+    const rec = this.actors.get(toId);
     if (!rec) return;
     if (handle.id === toId) return; // don't hand an actor its own handle
     const entry: ActorHandle = handle.role
@@ -1125,7 +1155,7 @@ export class ActorMesh {
       : { id: handle.id };
     const handles = (rec.handles ?? []).filter((h) => h.id !== handle.id);
     handles.push(entry);
-    this.registry.patch(toId, { handles });
+    this.actors.patch(toId, { handles });
     this.recordEvent({
       kind: "handle_granted",
       actorId: toId,
@@ -1143,12 +1173,12 @@ export class ActorMesh {
   revokeHandle(toId: string, targetId: string): void {
     toId = this.resolveThreadId(toId);
     targetId = this.resolveThreadId(targetId);
-    const rec = this.registry.get(toId);
+    const rec = this.actors.get(toId);
     if (!rec) return;
     const current = rec.handles ?? [];
     const handles = current.filter((h) => h.id !== targetId);
     if (handles.length === current.length) return;
-    this.registry.patch(toId, { handles });
+    this.actors.patch(toId, { handles });
   }
 
   /**
@@ -1156,7 +1186,7 @@ export class ActorMesh {
    * Decoupled from `parentId == null` (which represents top-level topology).
    */
   private isRootActor(actorId: string): boolean {
-    const record = this.registry.get(actorId);
+    const record = this.actors.get(actorId);
     return record?.isRoot === true;
   }
 
@@ -1169,7 +1199,7 @@ export class ActorMesh {
    * Grantor authorization for {@link grantCapability}/{@link revokeCapability}
    * . Root may grant/revoke anything grantable, as before. A non-root
    * grantor may only touch capabilities in {@link PARENT_GRANTABLE_CAPABILITIES}
-   * and only where the grantee is its DIRECT child (the registry's `parentId`
+   * and only where the grantee is its DIRECT child (the repository's `parentId`
    * edge). Enforced HERE — the mesh layer — not just at the tool layer, so the
    * invariant holds for any future caller. Fail-closed: an unknown grantor is
    * never root.
@@ -1180,7 +1210,7 @@ export class ActorMesh {
     capability: string,
     verb: "grant" | "revoke"
   ): void {
-    const grantee = this.registry.get(granteeId);
+    const grantee = this.actors.get(granteeId);
     if (!grantee) {
       throw new Error(`unknown thread id: ${granteeId}`);
     }
@@ -1453,7 +1483,7 @@ export class ActorMesh {
   delegateEventSource(resource: EventResource, childThreadId: string, delegatedBy: string): void {
     childThreadId = this.resolveThreadId(childThreadId);
     delegatedBy = this.resolveThreadId(delegatedBy);
-    const child = this.registry.get(childThreadId);
+    const child = this.actors.get(childThreadId);
     if (!child) {
       throw new Error(`cannot delegate to unknown thread: ${childThreadId}`);
     }
@@ -1715,6 +1745,7 @@ export class ActorMesh {
       const ms = new Date(deliverAt).getTime();
       if (Number.isNaN(ms)) throw new Error(`Invalid deliverAt timestamp: ${deliverAt}`);
       const delay = ms - Date.now();
+      if (delay < 0) throw new Error(`deliver_at must be in the future, got delay=${delay}ms`);
       if (fromId === toId && delay < 60000) {
         throw new Error(
           `Self-send requires a strictly-future deliver_at (minimum 60s delay), got delay=${delay}ms`
@@ -1724,45 +1755,47 @@ export class ActorMesh {
         // 24 days
         throw new Error(`deliver_at beyond max horizon (24 days), got delay=${delay}ms`);
       }
-      const rec = this.registry.get(toId);
+      const rec = this.actors.get(toId);
       if (!rec || rec.status !== "active") {
         return { delivered: false, status: rec?.status };
       }
-      if ((rec.pendingDeliveries?.length ?? 0) >= 10) {
+      if (!this.scheduledMessages) {
+        throw new Error("Scheduled-message OS scheduler is not configured");
+      }
+      if (
+        this.scheduledMessages.listMessageDeliveries().filter((message) => message.toId === toId)
+          .length >= 10
+      ) {
         throw new Error(
           `Cannot schedule message: recipient ${toId} has reached the cap of 10 pending deliveries.`
         );
       }
 
-      const pending: PendingMessageDelivery = {
+      const pending: ScheduledMessage = {
         id: randomUUID(),
+        toId,
         fromId,
         body,
         deliverAt,
         sessionId,
       };
-      this.registry.patch(toId, {
-        pendingDeliveries: [...(rec.pendingDeliveries ?? []), pending],
-      });
+      this.scheduledMessages.scheduleMessageDelivery(pending);
       try {
-        this.armPendingDelivery(toId, pending);
-      } catch (err) {
-        // The durable record must not outlive the OS job that was supposed to
-        // fire it — an orphaned pendingDelivery with no timer and no `at` job
-        // behind it would sit forever, never delivered and never visible as
-        // failed. Roll the patch back so the caller's thrown error reflects
-        // the true post-failure state.
-        const latest = this.registry.get(toId);
-        this.registry.patch(toId, {
-          pendingDeliveries: (latest?.pendingDeliveries ?? []).filter((p) => p.id !== pending.id),
-        });
-        throw err;
+        this.withTransaction(() => this.recordScheduledMessageSent(pending));
+      } catch (error) {
+        try {
+          this.scheduledMessages.cancelMessageDelivery(pending.id);
+        } catch (cancelError) {
+          this.log(
+            `failed to roll back scheduled message ${pending.id}: ${cancelError instanceof Error ? cancelError.message : String(cancelError)}`
+          );
+        }
+        throw error;
       }
-      // Record event at fire time, not here, per #4.
       return { delivered: true };
     }
 
-    const rec = this.registry.get(toId);
+    const rec = this.actors.get(toId);
     if (!rec || rec.status !== "active") {
       this.log(`message to ${toId} from ${fromId} dropped — recipient not active`);
       return { delivered: false, status: rec?.status };
@@ -1778,7 +1811,7 @@ export class ActorMesh {
     });
     if (!target) {
       this.log(`message to ${toId} from ${fromId} dropped — no live actor`);
-      return { delivered: false, status: this.registry.get(toId)?.status };
+      return { delivered: false, status: this.actors.get(toId)?.status };
     }
     if (this.inboxStore) {
       if (!messageId) throw new Error("Actor message delivery requires durable chat storage");
@@ -1798,12 +1831,13 @@ export class ActorMesh {
     toId: string,
     note: string,
     fromId: string,
-    forensics: MechanicalInboxForensics = {}
+    forensics: MechanicalInboxForensics = {},
+    id?: string
   ): MessageDeliveryResult {
     if (!this.inboxStore) throw new Error("Mechanical inbox delivery requires an inbox store");
     toId = this.resolveThreadId(toId);
     fromId = this.resolveThreadId(fromId);
-    const rec = this.registry.get(toId);
+    const rec = this.actors.get(toId);
     if (!rec || rec.status !== "active") {
       this.log(`mechanical inbox notice to ${toId} from ${fromId} dropped — no active actor`);
       return { delivered: false, status: rec?.status };
@@ -1817,8 +1851,9 @@ export class ActorMesh {
     // `run_yielded` with the note as its body); `forensics.runId` carries the
     // pointer back to that run item. Regressed 07-26  by minting the
     // note via recordChat; this restores the 2833bde29 inline-note form.
-    this.inboxStore.append([
+    const inserted = this.inboxStore.append([
       {
+        id,
         actorId: toId,
         source: `mesh:mechanical:${fromId}`,
         payload: {
@@ -1829,6 +1864,7 @@ export class ActorMesh {
         },
       },
     ]);
+    if (inserted.length === 0) return { delivered: true };
     this.notifyInboxChanged(toId);
     return { delivered: true };
   }
@@ -1845,12 +1881,12 @@ export class ActorMesh {
   ): MessageDeliveryResult {
     toId = this.resolveThreadId(toId);
     const fromId = HUMAN_OPERATOR;
-    const rec = this.registry.get(toId);
+    const rec = this.actors.get(toId);
     if (!rec || rec.status !== "active") {
       this.log(`message to ${toId} from ${fromId} dropped — recipient not active`);
       return { delivered: false, status: rec?.status };
     }
-    this.registry.patch(toId, {
+    this.actors.patch(toId, {
       humanUnlocked: true,
       lastChatSessionId: sessionId,
     });
@@ -1864,7 +1900,7 @@ export class ActorMesh {
     });
     if (!target) {
       this.log(`message to ${toId} from ${fromId} dropped — no live actor`);
-      return { delivered: false, status: this.registry.get(toId)?.status };
+      return { delivered: false, status: this.actors.get(toId)?.status };
     }
     const isVoice = opts?.voice || body.startsWith("🎙️ [voice memo");
     if (this.inboxStore) {
@@ -1904,7 +1940,7 @@ export class ActorMesh {
     const colonIdx = actorId.indexOf(":");
     const baseActorId = colonIdx >= 0 ? actorId.slice(0, colonIdx) : actorId;
     const resolvedId = this.resolveThreadId(baseActorId);
-    const rec = this.registry.get(resolvedId);
+    const rec = this.actors.get(resolvedId);
     const isLive = Boolean(rec && rec.status === "active" && this.live.has(resolvedId));
     const target = isLive ? this.live.get(resolvedId) : undefined;
     const isResponsive = priority === "responsive";
@@ -1983,7 +2019,7 @@ export class ActorMesh {
       return;
     }
     actor.declareYield(status, note);
-    const parentId = this.registry.get(id)?.parentId;
+    const parentId = this.actors.get(id)?.parentId;
     const inboxStore = this.inboxStore;
     const notifyingParent = !!(
       parentId &&
@@ -2061,7 +2097,7 @@ export class ActorMesh {
       }
     }
     // Marked before the child recursion: children retiring below us must be able
-    // to see that we are on our way out, since the registry won't say so until
+    // to see that we are on our way out, since the repository won't say so until
     // this call finishes. Cleared in the finally so a throwing cleanup can't
     // leave a live actor permanently marked as retiring.
     this.retiring.add(id);
@@ -2133,7 +2169,7 @@ export class ActorMesh {
    */
   runNow(targetId: string, source: string = "operator"): { queued: boolean } {
     targetId = this.resolveThreadId(targetId);
-    const record = this.registry.get(targetId);
+    const record = this.actors.get(targetId);
     if (!record) {
       throw new Error(`cannot run unknown actor ${targetId}`);
     }
@@ -2255,7 +2291,7 @@ export class ActorMesh {
       seen.add(cursor);
       const state = this.activeRunState(cursor);
       if (state) busy.push(state);
-      for (const child of this.registry.children(cursor)) {
+      for (const child of this.actors.children(cursor)) {
         if (child.status === "active") walk(child.id);
       }
     };
@@ -2274,14 +2310,14 @@ export class ActorMesh {
   ): Map<string, "running" | "queued" | "winding_down" | "idle"> {
     parentId = this.resolveThreadId(parentId);
     const states = new Map<string, "running" | "queued" | "winding_down" | "idle">();
-    for (const child of this.registry.children(parentId)) {
+    for (const child of this.actors.children(parentId)) {
       states.set(child.id, this.activeRunState(child.id)?.phase ?? "idle");
     }
     return states;
   }
 
   private retireInner(id: string): void {
-    for (const child of this.registry.children(id)) {
+    for (const child of this.actors.children(id)) {
       // `force`: the entry call already cleared this whole subtree, and re-checking
       // here would only re-answer the same question against a tree we're mid-teardown of.
       if (child.status === "active") this.retire(child.id, { force: true });
@@ -2289,16 +2325,12 @@ export class ActorMesh {
     const actor = this.live.get(id);
     actor?.close();
     this.live.delete(id);
-    const record = this.registry.get(id);
-    if (record?.pendingDeliveries) {
-      for (const msg of record.pendingDeliveries) {
-        this.notifyScheduledDeliveryDropped(id, msg);
-        const timer = this.pendingDeliveryTimers.get(msg.id);
-        if (timer) clearTimeout(timer);
-        this.pendingDeliveryTimers.delete(msg.id);
-        if (this.osScheduler) this.osScheduler.cancelMessageDelivery(msg.id);
-      }
-      this.registry.patch(id, { pendingDeliveries: [] });
+    const record = this.actors.get(id);
+    for (const message of this.scheduledMessages
+      ?.listMessageDeliveries()
+      .filter((entry) => entry.toId === id) ?? []) {
+      this.notifyScheduledDeliveryDropped(id, message);
+      this.scheduledMessages?.cancelMessageDelivery(message.id);
     }
     if (record && this.onRetire) {
       try {
@@ -2332,7 +2364,7 @@ export class ActorMesh {
 
     // Mark retired before physical teardown so routing/handle resolution stops
     // immediately even when a destructive cleanup is deferred until run_end.
-    this.registry.patch(id, { status: "retired" });
+    this.actors.patch(id, { status: "retired" });
     this.recordEvent({
       kind: "actor_retired",
       actorId: id,
@@ -2341,7 +2373,7 @@ export class ActorMesh {
     this.log(`retired ${id}`);
   }
 
-  private runRetireCleanups(record: ThreadRecord): void {
+  private runRetireCleanups(record: ActorRecord): void {
     const deferred: RetireCleanup[] = [];
     for (const cleanup of this.retireCleanups) {
       if (cleanup.deferUntilRunEnd && this.hasActiveRun(record.id)) {
@@ -2362,7 +2394,7 @@ export class ActorMesh {
     }
   }
 
-  private runRetireCleanup(cleanup: RetireCleanup, record: ThreadRecord): void {
+  private runRetireCleanup(cleanup: RetireCleanup, record: ActorRecord): void {
     try {
       const result = cleanup.run(record);
       if (result && typeof result === "object" && "then" in result) {
@@ -2419,7 +2451,7 @@ export class ActorMesh {
     );
   }
 
-  private retireEventSubscriptions(record: ThreadRecord): void {
+  private retireEventSubscriptions(record: ActorRecord): void {
     const at = this.now();
     for (const subscription of this.eventSubscriptions.list()) {
       if (subscription.actorId !== record.id || subscription.unsubscribedAt) continue;
@@ -2448,11 +2480,11 @@ export class ActorMesh {
    */
   setThreadTitle(id: string, title: string): void {
     id = this.resolveThreadId(id);
-    const record = this.registry.get(id);
+    const record = this.actors.get(id);
     if (!record) {
       throw new Error(`Cannot set title on unknown thread: ${id}`);
     }
-    this.registry.patch(id, { title });
+    this.actors.patch(id, { title });
   }
 
   /**
@@ -2468,7 +2500,7 @@ export class ActorMesh {
    */
   setThreadCharter(id: string, charter: string): void {
     id = this.resolveThreadId(id);
-    const record = this.registry.get(id);
+    const record = this.actors.get(id);
     if (!record) {
       throw new Error(`Cannot set charter on unknown thread: ${id}`);
     }
@@ -2477,7 +2509,7 @@ export class ActorMesh {
     if (!charter.trim()) {
       throw new Error(`Cannot set an empty charter on thread: ${id}`);
     }
-    this.registry.patch(id, { charter });
+    this.actors.patch(id, { charter });
     // Audit the durable re-scope on the timeline (detail = a charter excerpt, per
     // MeshEventInput) — promotions and other re-charters should be inspectable
     // alongside reparent/grant/retire.
@@ -2489,7 +2521,7 @@ export class ActorMesh {
   }
 
   /**
-   * Update an existing actor's model in-place in the thread registry .
+   * Update an existing actor's model in-place in the actor repository.
    * Root or parent-gated: root may set the model for any thread in its subtree;
    * root may also set its own model;
    * a non-root parent may only set the model for its own descendants (and never
@@ -2508,7 +2540,7 @@ export class ActorMesh {
   ): void {
     id = this.resolveThreadId(id);
     requestedBy = this.resolveThreadId(requestedBy);
-    const record = this.registry.get(id);
+    const record = this.actors.get(id);
     if (!record) {
       throw new Error(`Cannot set model on unknown thread: ${id}`);
     }
@@ -2560,7 +2592,7 @@ export class ActorMesh {
     // model, and the desired value applies at that run's end. An idle or
     // queued actor has no launched run yet, so the desired value applies at
     // its next dispatch, before run_start is recorded and before launch.
-    const patch: Partial<ThreadRecord> = { desiredProvider: trimmedProvider };
+    const patch: Partial<ActorRecord> = { desiredProvider: trimmedProvider };
     if (model !== undefined) patch.desiredModel = validatedModel;
     if (effort !== undefined || validatedEffort !== record.effort) {
       if (effort === null) patch.desiredEffort = null;
@@ -2568,7 +2600,7 @@ export class ActorMesh {
         patch.desiredEffort = validatedEffort;
       }
     }
-    this.registry.patch(id, patch);
+    this.actors.patch(id, patch);
 
     if (this.inboxStore && this.live.has(id) && this.activeRunState(id) === null) {
       const unhandled = this.inboxStore.list(id, { status: "unhandled" }).entries;
@@ -2590,7 +2622,7 @@ export class ActorMesh {
    * same run is safe: whichever fires first consumes the pending tuple.
    */
   applyPendingModel(id: string): void {
-    const record = this.registry.get(id);
+    const record = this.actors.get(id);
     if (
       !record ||
       (record.desiredModel === undefined &&
@@ -2607,7 +2639,7 @@ export class ActorMesh {
     const nextEffort =
       record.desiredEffort === null ? undefined : (record.desiredEffort ?? record.effort);
 
-    const patch: Partial<ThreadRecord> = {
+    const patch: Partial<ActorRecord> = {
       ...(record.desiredModel !== undefined ? { model: trimmedModel } : {}),
       effort: nextEffort,
       desiredModel: undefined,
@@ -2617,9 +2649,9 @@ export class ActorMesh {
     if (trimmedProvider !== undefined) {
       patch.provider = trimmedProvider;
     }
-    this.registry.patch(id, patch);
+    this.actors.patch(id, patch);
 
-    const verified = this.registry.get(id);
+    const verified = this.actors.get(id);
     if (
       verified?.model !== trimmedModel ||
       verified?.effort !== nextEffort ||
@@ -2660,7 +2692,7 @@ export class ActorMesh {
   reparentThread(id: string, newParentId: string): void {
     id = this.resolveThreadId(id);
     newParentId = this.resolveThreadId(newParentId);
-    const record = this.registry.get(id);
+    const record = this.actors.get(id);
     if (!record) {
       throw new Error(`Cannot reparent unknown thread: ${id}`);
     }
@@ -2673,7 +2705,7 @@ export class ActorMesh {
     if (id === newParentId) {
       throw new Error(`Cannot reparent ${id} to itself`);
     }
-    const newParent = this.registry.get(newParentId);
+    const newParent = this.actors.get(newParentId);
     if (!newParent) {
       throw new Error(`Cannot reparent ${id} to unknown parent: ${newParentId}`);
     }
@@ -2691,14 +2723,14 @@ export class ActorMesh {
     for (
       let cursor: string | null | undefined = newParentId;
       cursor != null && !seen.has(cursor);
-      cursor = this.registry.get(cursor)?.parentId
+      cursor = this.actors.get(cursor)?.parentId
     ) {
       if (cursor === id) {
         throw new Error(`Cannot reparent ${id} under its own descendant ${newParentId} (cycle)`);
       }
       seen.add(cursor);
     }
-    this.registry.patch(id, { parentId: newParentId });
+    this.actors.patch(id, { parentId: newParentId });
     this.grantHandle(newParentId, { id }); // the new parent can now message the actor
     this.recordEvent({
       kind: "actor_reparented",
@@ -2709,7 +2741,7 @@ export class ActorMesh {
 
   reviveThread(id: string): void {
     id = this.resolveThreadId(id);
-    const record = this.registry.get(id);
+    const record = this.actors.get(id);
     if (!record) {
       throw new Error(`Cannot revive unknown thread: ${id}`);
     }
@@ -2717,8 +2749,8 @@ export class ActorMesh {
       throw new Error(`Cannot revive thread ${id}: status is ${record.status} (expected retired)`);
     }
 
-    this.registry.patch(id, { status: "active" });
-    const updatedRecord = this.registry.get(id);
+    this.actors.patch(id, { status: "active" });
+    const updatedRecord = this.actors.get(id);
     if (!updatedRecord) {
       throw new Error(`Failed to retrieve record for revived thread: ${id}`);
     }
@@ -2733,7 +2765,7 @@ export class ActorMesh {
       this.actorRuntimeStateChanged(id, this.runtimeStateOf(actor));
     } catch (err) {
       this.live.delete(id);
-      this.registry.patch(id, { status: "retired" });
+      this.actors.patch(id, { status: "retired" });
       this.log(
         `reviveThread(${id}) failed, rolled back to retired: ${err instanceof Error ? err.message : String(err)}`
       );
@@ -2764,25 +2796,23 @@ export class ActorMesh {
     while (cursor && !seen.has(cursor)) {
       if (cursor === ancestorId) return true;
       seen.add(cursor);
-      cursor = this.registry.get(cursor)?.parentId ?? null;
+      cursor = this.actors.get(cursor)?.parentId ?? null;
     }
     return false;
   }
 
   /**
    * Stop all live actors' timers without retiring them (graceful shutdown). The
-   * registry is untouched, so active threads can be rehydrated on the next boot.
+   * repository is untouched, so active actors can be rehydrated on the next boot.
    */
   shutdownAll(): void {
     for (const actor of this.live.values()) actor.close();
     this.live.clear();
-    for (const timer of this.pendingDeliveryTimers.values()) clearTimeout(timer);
-    this.pendingDeliveryTimers.clear();
   }
 
   /** All thread records (active and retired). */
-  list(): ThreadRecord[] {
-    return this.registry.list();
+  list(): ActorRecord[] {
+    return this.actors.list();
   }
 
   /** Slots currently running (for diagnostics/tests). */
@@ -2810,7 +2840,7 @@ export class ActorMesh {
    * are deliberately excluded. Built in one synchronous
    * pass over the live map (no awaits), so the dashboard can classify every
    * thread against a single non-torn view. Live actors only (the root included,
-   * since it's adopted into `live`); the threads handler joins the registry, so
+   * since it's adopted into `live`); the threads handler joins the repository, so
    * an active-but-not-running thread reads idle and a retired one reads retired.
    * Read-only: observes existing state, never schedules, wakes, or mutates.
    */
@@ -2845,7 +2875,7 @@ export class ActorMesh {
    * provider's gate.
    */
   private launchProvider(id: string): string | undefined {
-    const rec = this.registry.get(id);
+    const rec = this.actors.get(id);
     return rec?.desiredProvider ?? rec?.provider;
   }
 
@@ -2867,14 +2897,14 @@ export class ActorMesh {
     return resumed;
   }
 
-  private factoryContext(record: ThreadRecord): ActorFactoryContext {
+  private factoryContext(record: ActorRecord): ActorFactoryContext {
     return {
       record,
-      getRecord: () => this.registry.get(record.id),
+      getRecord: () => this.actors.get(record.id),
       mesh: this,
       gate: (fn, provider, responsive) => this.gateRun(fn, provider, responsive, record.id),
       beforeRun: ({ mode }) => {
-        const rec = this.registry.get(record.id);
+        const rec = this.actors.get(record.id);
         if (!rec || rec.status !== "active") {
           return false;
         }
@@ -2933,20 +2963,6 @@ export class ActorMesh {
     }
   }
 
-  private armPendingDelivery(toId: string, msg: PendingMessageDelivery): void {
-    if (this.osScheduler) {
-      if (new Date(msg.deliverAt).getTime() <= Date.now()) {
-        this.firePendingDelivery(toId, msg.id);
-      } else {
-        this.osScheduler.scheduleMessageDelivery(msg.id, new Date(msg.deliverAt));
-      }
-    } else {
-      const delay = Math.max(0, new Date(msg.deliverAt).getTime() - Date.now());
-      const timer = setTimeout(() => this.firePendingDelivery(toId, msg.id), delay);
-      this.pendingDeliveryTimers.set(msg.id, timer);
-    }
-  }
-
   /**
    * Who should hear that a scheduled message will never arrive: the sender if
    * it's genuinely live, else its nearest live ancestor.
@@ -2963,20 +2979,20 @@ export class ActorMesh {
    */
   private resolveDropNotifyTarget(fromId: string): string | null {
     const isLive = (id: string): boolean =>
-      this.registry.get(id)?.status === "active" && !this.retiring.has(id);
+      this.actors.get(id)?.status === "active" && !this.retiring.has(id);
     if (isLive(fromId)) return fromId;
 
     const seen = new Set<string>([fromId]);
-    let next = this.registry.get(fromId)?.parentId;
+    let next = this.actors.get(fromId)?.parentId;
     while (next && !seen.has(next)) {
       if (isLive(next)) return next;
       seen.add(next);
-      next = this.registry.get(next)?.parentId;
+      next = this.actors.get(next)?.parentId;
     }
     return null;
   }
 
-  private notifyScheduledDeliveryDropped(toId: string, scheduled: PendingMessageDelivery): void {
+  private notifyScheduledDeliveryDropped(toId: string, scheduled: ScheduledMessage): void {
     const notifyTarget = this.resolveDropNotifyTarget(scheduled.fromId);
 
     if (notifyTarget) {
@@ -2989,126 +3005,67 @@ export class ActorMesh {
           actorId: toId,
           originalFromId: scheduled.fromId,
           pendingMessageId: scheduled.id,
-        }
+        },
+        `${scheduled.id}:dropped`
       );
     }
   }
 
-  deliverScheduledMessage(messageId: string): void {
-    let foundToId: string | undefined;
-    for (const rec of this.registry.list()) {
-      if (rec.pendingDeliveries?.some((m) => m.id === messageId)) {
-        foundToId = rec.id;
-        break;
-      }
-    }
-    if (!foundToId) return;
-    this.firePendingDelivery(foundToId, messageId);
-  }
-
-  private firePendingDelivery(toId: string, messageId: string): void {
-    const rec = this.registry.get(toId);
-    if (!rec) return;
-    const scheduled = rec.pendingDeliveries?.find((m) => m.id === messageId);
-    if (!scheduled) return;
-
-    this.pendingDeliveryTimers.delete(messageId);
-    try {
-      this.osScheduler?.cancelMessageDelivery(messageId);
-    } catch (err) {
-      // The one-shot job already fired and called back into us; failing to
-      // clear its own OS-side record must not abort delivery/recovery below —
-      // an already-consumed job has nothing left to re-fire spuriously.
-      this.log(
-        `cancelMessageDelivery failed for ${messageId}: ${err instanceof Error ? err.message : String(err)}`
-      );
+  deliverScheduledMessage(scheduled: ScheduledMessage): void {
+    const { id: messageId, toId } = scheduled;
+    // Heal the only cross-system crash window: the host job is installed
+    // before acceptance history is committed so a failed DB transaction can
+    // still be rolled back by cancelling the job. If the process dies between
+    // those steps, the complete payload in `at` can recreate the stable-id chat
+    // and sent-event rows before delivery. Normal callbacks simply hit the
+    // repositories' INSERT-OR-IGNORE path.
+    this.withTransaction(() => this.recordScheduledMessageSent(scheduled));
+    const rec = this.actors.get(toId);
+    if (!rec || rec.status !== "active") {
+      this.log(`scheduled delivery ${messageId} for ${toId} dropped — recipient retired`);
+      this.notifyScheduledDeliveryDropped(toId, scheduled);
+      return;
     }
 
-    try {
-      if (rec.status !== "active") {
-        this.log(`pending delivery ${messageId} for ${toId} dropped — recipient retired`);
-        this.notifyScheduledDeliveryDropped(toId, scheduled);
-        this.registry.patch(toId, {
-          pendingDeliveries: rec.pendingDeliveries?.filter((m) => m.id !== messageId),
-        });
-        return;
-      }
-
-      const target = this.live.get(toId);
-
-      // Exact-once at the durable boundary: `messageId` is the pending
-      // delivery's own stable id, minted once at schedule time and already
-      // durable (it identifies `scheduled` itself). Using it as the chat
-      // row's id makes this call idempotent (`INSERT OR IGNORE`) rather than
-      // relying on a separate best-effort marker: a retry after a crash
-      // between the chat write and any later step just re-runs this as a
-      // no-op and gets the same id back.
-      const durableMessageId = this.recordMessageEmitted({
-        id: messageId,
-        fromId: scheduled.fromId,
-        toId,
-        body: scheduled.body,
-        sessionId: scheduled.sessionId,
-        isDrop: false,
-      });
-
-      if (target && this.inboxStore) {
-        if (!durableMessageId) {
-          throw new Error("Scheduled message delivery requires durable chat storage");
-        }
-        this.inboxStore.append([
-          {
-            id: messageId,
-            actorId: toId,
-            source: `mesh:${scheduled.fromId}`,
-            payload: {
-              type: "mesh.scheduled_message",
-              messageId: durableMessageId,
-              fromId: scheduled.fromId,
-              sessionId: scheduled.sessionId,
-            },
+    // The endpoint may be retried by curl. Both the inbox entry and event use
+    // the message's stable id, so repeated callbacks converge without a local
+    // pending-message row.
+    this.recordScheduledMessageReceived(scheduled);
+    if (this.inboxStore) {
+      this.inboxStore.append([
+        {
+          id: messageId,
+          actorId: toId,
+          source: `mesh:${scheduled.fromId}`,
+          payload: {
+            type: "mesh.scheduled_message",
+            messageId,
+            fromId: scheduled.fromId,
+            sessionId: scheduled.sessionId,
           },
-        ]);
-        this.registry.patch(toId, {
-          pendingDeliveries: rec.pendingDeliveries?.filter((m) => m.id !== messageId) ?? [],
-        });
-        this.notifyInboxChanged(toId);
-      } else if (target && !this.inboxStore) {
-        this.registry.patch(toId, {
-          pendingDeliveries: rec.pendingDeliveries?.filter((m) => m.id !== messageId) ?? [],
-        });
-        target.requestRun();
-      } else {
-        this.registry.patch(toId, {
-          pendingDeliveries: rec.pendingDeliveries?.filter((m) => m.id !== messageId) ?? [],
-        });
-        this.log(`message to ${toId} from ${scheduled.fromId} dropped — no durable inbox target`);
-      }
-    } catch (err) {
-      this.log(
-        `firePendingDelivery failed for ${messageId} to ${toId}: ${err instanceof Error ? err.message : String(err)}`
-      );
-      // The one-shot OS job (or timer) that triggered this call has already
-      // fired and consumed itself. If the durable write above failed before
-      // the record was cleared, it's still pending but now unscheduled —
-      // re-arm it a short delay out so it gets retried without depending on
-      // the next process restart's reconcilePendingDeliveries() sweep.
-      const stillPending = this.registry
-        .get(toId)
-        ?.pendingDeliveries?.some((m) => m.id === messageId);
-      if (stillPending) {
-        try {
-          this.armPendingDelivery(toId, {
-            ...scheduled,
-            deliverAt: new Date(Date.now() + FIRE_PENDING_DELIVERY_RETRY_MS).toISOString(),
-          });
-        } catch (rearmErr) {
-          this.log(
-            `failed to re-arm scheduled message ${messageId} after delivery failure: ${rearmErr instanceof Error ? rearmErr.message : String(rearmErr)}`
-          );
-        }
-      }
+        },
+      ]);
+      this.notifyInboxChanged(toId);
+      return;
     }
+
+    const target = this.live.get(toId);
+    if (!target) throw new Error(`scheduled delivery target ${toId} is not available`);
+    target.requestRun();
+  }
+
+  /** Scheduled messages visible to an actor, used by the MCP projection. */
+  listPendingMessagesFor(
+    actorId: string
+  ): Array<{ recipient: string; sender: string; deliverAt: string; body: string }> {
+    return (this.scheduledMessages?.listMessageDeliveries() ?? [])
+      .filter((message) => message.fromId === actorId || message.toId === actorId)
+      .map((message) => ({
+        recipient: message.toId,
+        sender: message.fromId,
+        deliverAt: message.deliverAt,
+        body: message.body,
+      }));
   }
 }
 

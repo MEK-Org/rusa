@@ -6,9 +6,9 @@ import { describe, expect, it, vi } from "vitest";
 import { Actor } from "../actor/actor.js";
 import { ActorMesh } from "../actor/actor-mesh.js";
 import type { RootControlService } from "../actor/root-control.js";
-import { InMemoryThreadRegistry } from "../actor/thread-registry.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import type { RunResult } from "../providers/types.js";
+import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { createAgentExecMcpServer } from "./agent-exec-mcp.js";
 
 async function connect(server: McpServer): Promise<Client> {
@@ -46,7 +46,7 @@ const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve,
 function setup(
   opts: { childResponder?: () => Promise<Partial<RunResult>>; maxConcurrent?: number } = {}
 ) {
-  const registry = new InMemoryThreadRegistry();
+  const registry = new InMemoryActorRepository();
   const events: {
     kind: string;
     actorId?: string;
@@ -56,7 +56,7 @@ function setup(
   }[] = [];
   let seq = 0;
   const mesh = new ActorMesh({
-    registry,
+    actors: registry,
     maxConcurrent: opts.maxConcurrent,
     events: (e) => events.push(e),
     grantableCapabilities: new Set([

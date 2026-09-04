@@ -1,4 +1,12 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -422,7 +430,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     };
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
     // Most startup tests exercise the upgrade/restart path used by current prod.
-    // Fresh-install UUID selection is covered directly by resolveRootThreadId.
+    // Fresh-install UUID selection is covered directly by resolveRootActorId.
     writeFileSync(
       join(homeDir, "threads.json"),
       JSON.stringify({
@@ -492,8 +500,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
             {
               id: "test-kimi-worker",
               charter: "test",
+              parentId: "root",
               provider: "kimi",
               status: "active",
+              createdAt: "2026-01-01T00:00:01.000Z",
             },
           ],
         }),
@@ -536,13 +546,22 @@ describe("runStart webhook event routing (Phase 4)", () => {
         join(homeDir, "threads.json"),
         JSON.stringify({
           threads: [
-            { id: "root", charter: "root", parentId: null, isRoot: true, status: "active" },
+            {
+              id: "root",
+              charter: "root",
+              parentId: null,
+              isRoot: true,
+              status: "active",
+              createdAt: "2026-01-01T00:00:00.000Z",
+            },
             {
               id: "live-worker",
               charter: "worker",
               parentId: "root",
-              provider: "kimi",
+              provider: "antigravity",
+              effort: "high",
               status: "active",
+              createdAt: "2026-01-01T00:00:01.000Z",
             },
             {
               id: "retired-worker",
@@ -550,6 +569,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
               parentId: "root",
               provider: "kimi",
               status: "retired",
+              createdAt: "2026-01-01T00:00:02.000Z",
             },
           ],
         }),
@@ -567,12 +587,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         });
       });
 
-      // Read the live id back out of the registry boot actually loaded, rather
-      // than assuming the file we wrote survived `resolveRootThreadId`.
-      const threads = JSON.parse(readFileSync(join(homeDir, "threads.json"), "utf8")) as {
-        threads: Array<{ id: string; status: string }>;
-      };
-      const liveId = threads.threads.find((t) => t.status === "active")?.id;
+      const liveId = getRepositories().actors.get("live-worker")?.id;
       expect(liveId).toBeDefined();
 
       const obligations = getRepositories().obligations;
@@ -1736,7 +1751,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
 
     if (!mesh) throw new Error("mesh not ready");
-    expect(mesh.registry.get("root")?.context).toEqual({ type: "portable", mode: "tail" });
+    expect(mesh.actors.get("root")?.context).toEqual({ type: "portable", mode: "tail" });
     const rootActor = mesh.get("root");
     if (!rootActor) throw new Error("root actor not ready");
     const actorOpts = (
@@ -1757,13 +1772,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     expect(actorOpts.loadSessionId()).toBeUndefined();
     actorOpts.saveSessionId("must-not-persist");
-    expect(mesh.registry.get("root")?.sessionId).toBeUndefined();
+    expect(mesh.actors.get("root")?.sessionId).toBeUndefined();
     expect(logSpy).toHaveBeenCalledWith(
       expect.stringContaining("session=portable/tail (stateless)")
     );
-    expect(JSON.parse(readFileSync(join(rootAgentDir, "session.json"), "utf8"))).toEqual({
-      sessionId: "stale-native",
-    });
+    expect(existsSync(join(rootAgentDir, "session.json"))).toBe(false);
+    expect(
+      readdirSync(rootAgentDir).some((name) => name.startsWith("session.json.imported-"))
+    ).toBe(true);
 
     actorOpts.onRunStart?.(false);
     await actorOpts.onRunEnd?.({
@@ -3010,7 +3026,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     // The central spawn validator rejects before allocating an actor identity
     // or durable record.
-    const list1 = activeMesh.registry.list();
+    const list1 = activeMesh.actors.list();
     const failedWorker = list1.find((r) => r.charter === "unresolvable provider worker");
     expect(failedWorker).toBeUndefined();
 
@@ -3076,9 +3092,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       });
     }).toThrow(/Antigravity supports Gemini models only/);
     expect(
-      activeMesh.registry
-        .list()
-        .find((record) => record.charter === "non-Gemini Antigravity worker")
+      activeMesh.actors.list().find((record) => record.charter === "non-Gemini Antigravity worker")
     ).toBeUndefined();
 
     // 5. Positive test: explicit-and-VALID provider/model -> succeeds
@@ -3089,11 +3103,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
       model: "Gemini 3.7 Flash (High)",
     });
     expect(activeMesh.get(validWorkerId)).toBeDefined();
-    const validWorkerRecord = activeMesh.registry.get(validWorkerId);
+    const validWorkerRecord = activeMesh.actors.get(validWorkerId);
     expect(validWorkerRecord?.status).toBe("active");
-    expect(activeMesh.registry.get("root")?.handles?.some((h) => h.id === validWorkerId)).toBe(
-      true
-    );
+    expect(activeMesh.actors.get("root")?.handles?.some((h) => h.id === validWorkerId)).toBe(true);
 
     // 6. Cross-provider move validates against TARGET provider's catalog and resolves target provider
     const portableWorkerId = activeMesh.spawn({
@@ -3103,14 +3115,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
       model: "Claude 3.5 Sonnet",
       context: { type: "portable", mode: "ledger" },
     });
-    expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("claude");
-    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
+    expect(activeMesh.actors.get(portableWorkerId)?.provider).toBe("claude");
+    expect(activeMesh.actors.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
 
     expect(() => {
       activeMesh.setActorModel(portableWorkerId, "gpt-oss-120b-medium", "root", "antigravity");
     }).toThrow(/Antigravity supports Gemini models only/);
-    expect(activeMesh.registry.get(portableWorkerId)?.desiredProvider).toBeUndefined();
-    expect(activeMesh.registry.get(portableWorkerId)?.desiredModel).toBeUndefined();
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredProvider).toBeUndefined();
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredModel).toBeUndefined();
 
     // Unconfigured target provider is rejected before state change, record untouched
     expect(() => {
@@ -3121,16 +3133,16 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "unconfigured-provider"
       );
     }).toThrow(/unconfigured-provider/);
-    expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("claude");
-    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
+    expect(activeMesh.actors.get(portableWorkerId)?.provider).toBe("claude");
+    expect(activeMesh.actors.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
 
     // Valid target provider + model stages for the next run boundary.
     activeMesh.setActorModel(portableWorkerId, "Gemini 3.7 Flash (High)", "root", "antigravity");
-    expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("claude");
-    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
-    expect(activeMesh.registry.get(portableWorkerId)?.desiredProvider).toBe("antigravity");
-    expect(activeMesh.registry.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash");
-    expect(activeMesh.registry.get(portableWorkerId)?.desiredEffort).toBe("high");
+    expect(activeMesh.actors.get(portableWorkerId)?.provider).toBe("claude");
+    expect(activeMesh.actors.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredProvider).toBe("antigravity");
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash");
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredEffort).toBe("high");
 
     // Invalid model for target provider fails validation
     expect(() => {
@@ -3152,10 +3164,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "low"
       );
     }).toThrow(/conflicting reasoning efforts/);
-    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
-    expect(activeMesh.registry.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash");
-    expect(activeMesh.registry.get(portableWorkerId)?.desiredEffort).toBe("high");
-    expect(activeMesh.registry.get(portableWorkerId)?.desiredProvider).toBe("antigravity");
+    expect(activeMesh.actors.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash");
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredEffort).toBe("high");
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredProvider).toBe("antigravity");
   });
 
   it("root's run_start records the live model after a tuple staged while idle, not the value frozen when root was built (#199 amend gap 1)", async () => {
@@ -3180,14 +3192,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     const rootActor = activeMesh.get("root");
     if (!rootActor) throw new Error("root actor not ready");
-    const originalModel = activeMesh.registry.get("root")?.model;
+    const originalModel = activeMesh.actors.get("root")?.model;
 
     // Stage a new model on root while idle. Per #199, this must apply at
     // root's very next dispatch, before that run's run_start is recorded —
     // it must not merely sit staged past this run.
     activeMesh.setActorModel("root", "Gemini 4.1 Ultra (High)", "root");
-    expect(activeMesh.registry.get("root")?.model).toBe(originalModel);
-    expect(activeMesh.registry.get("root")?.desiredModel).toBe("Gemini 4.1 Ultra");
+    expect(activeMesh.actors.get("root")?.model).toBe(originalModel);
+    expect(activeMesh.actors.get("root")?.desiredModel).toBe("Gemini 4.1 Ultra");
 
     // Directly invoke the production onRunStart closure — the same technique
     // used elsewhere in this file to exercise root's real dispatch-time
@@ -3197,7 +3209,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     ).opts;
     actorOpts.onRunStart?.(false);
 
-    expect(activeMesh.registry.get("root")?.model).toBe("Gemini 4.1 Ultra");
+    expect(activeMesh.actors.get("root")?.model).toBe("Gemini 4.1 Ultra");
 
     const runStartEvents = getRepositories().meshEvents.listEventsByActors(["root"], {
       kinds: ["run_start"],
@@ -3261,8 +3273,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     // Stage a move to claude while root is idle on antigravity.
     activeMesh.setActorModel("root", "claude-sonnet-5", "root", "claude");
-    expect(activeMesh.registry.get("root")?.provider).toBe("antigravity");
-    expect(activeMesh.registry.get("root")?.desiredProvider).toBe("claude");
+    expect(activeMesh.actors.get("root")?.provider).toBe("antigravity");
+    expect(activeMesh.actors.get("root")?.desiredProvider).toBe("claude");
 
     const halt = new HaltSwitch(join(homeDir, "HALT"));
 
@@ -3640,7 +3652,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
   });
 
   it("rehydrates active workers on boot and retires unresolvable ones without blocking others", async () => {
-    // Write threads.json directly in homeDir to simulate persisted registry on boot
+    // Write the legacy file directly to simulate the one-time upgrade path on boot.
     const threads = {
       threads: [
         legacyRootThread,
@@ -3685,13 +3697,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     // Assert that bad rehydrate worker (t1) is NOT live, and registry marked it retired
     expect(mesh.get("t1")).toBeUndefined();
-    const t1Record = mesh.registry.get("t1");
+    const t1Record = mesh.actors.get("t1");
     expect(t1Record).toBeDefined();
     expect(t1Record?.status).toBe("retired");
 
     // Assert that good rehydrate worker (t2) IS live, and registry left it active
     expect(mesh.get("t2")).toBeDefined();
-    const t2Record = mesh.registry.get("t2");
+    const t2Record = mesh.actors.get("t2");
     expect(t2Record).toBeDefined();
     expect(t2Record?.status).toBe("active");
   });

@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { decodeScheduledMessagePayload, type ScheduledMessage } from "../actor/os-scheduler.js";
 import type { McpServerSpec } from "../providers/types.js";
 
 export interface McpHttpServerOptions {
@@ -35,7 +36,7 @@ export interface WakeObligationHandler {
 
 export interface WakeMessageHandler {
   token: string;
-  deliver: (id: string) => void;
+  deliver: (message: ScheduledMessage) => void;
 }
 
 export interface WakeHandler {
@@ -75,6 +76,7 @@ function safeEqual(a: string, b: string): boolean {
 
 /** Wake bodies are tiny (actorId + reason); cap to bound a runaway/malicious body. */
 const MAX_WAKE_BODY_BYTES = 8 * 1024;
+const MAX_SCHEDULED_MESSAGE_BODY_BYTES = 256 * 1024;
 
 function readTextBody(req: IncomingMessage, maxBytes = MAX_WAKE_BODY_BYTES): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -497,18 +499,25 @@ export class McpHttpServer {
       }
       let raw: string;
       try {
-        raw = await readTextBody(req);
+        raw = await readTextBody(req, MAX_SCHEDULED_MESSAGE_BODY_BYTES);
       } catch {
         send(413, { error: "body too large" });
         return;
       }
       const params = new URLSearchParams(raw);
-      const id = params.get("id");
-      if (!id) {
-        send(400, { error: "id required" });
+      const payload = params.get("payload");
+      if (!payload) {
+        send(400, { error: "payload required" });
         return;
       }
-      this.wakeMessage.deliver(id);
+      let message: ScheduledMessage;
+      try {
+        message = decodeScheduledMessagePayload(payload);
+      } catch {
+        send(400, { error: "invalid payload" });
+        return;
+      }
+      this.wakeMessage.deliver(message);
       send(200, { ok: true });
     } catch {
       if (!res.headersSent) send(500, { error: "internal error" });

@@ -2,7 +2,6 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { ThreadRegistry } from "../actor/thread-registry.js";
 import {
   checkPnpmHardlinks,
   ensurePnpmStoreDir,
@@ -10,6 +9,7 @@ import {
   relinkPnpmProject,
   resolvePnpmStoreDir,
 } from "../pnpm/hardlinks.js";
+import type { ActorRepository } from "../repositories/actor-repository.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 
@@ -18,7 +18,7 @@ export const PNPM_HARDLINKS_MCP_NAME = "pnpm-hardlinks";
 export interface PnpmHardlinksToolDeps {
   rootId: string;
   workersDir: string;
-  registry: ThreadRegistry;
+  actors: ActorRepository;
   runningThreadIds: () => Iterable<string>;
 }
 
@@ -72,7 +72,7 @@ export function runForceRelinkWorkers(
 ): WorkerRelinkSummary[] {
   const dryRun = opts?.dryRun ?? true;
   const activeIds = new Set(
-    deps.registry
+    deps.actors
       .list()
       .filter((record) => record.status === "active")
       .map((record) => record.id)

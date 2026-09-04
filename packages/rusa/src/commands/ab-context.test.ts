@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { MeshActor } from "../actor/actor-mesh.js";
 import { ActorMesh } from "../actor/actor-mesh.js";
-import { InMemoryThreadRegistry } from "../actor/thread-registry.js";
 import type { MeshEvent } from "../db/repositories/mesh-event-repository.js";
+import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { adoptRigHolder, armRunModels, RIG_HOLDER_ID } from "./ab-context.js";
 
 const ROOT_ID = "root";
@@ -20,10 +20,10 @@ const stubActor = (id: string): MeshActor => ({
 });
 
 function setup() {
-  const registry = new InMemoryThreadRegistry();
+  const registry = new InMemoryActorRepository();
   let seq = 0;
   const mesh = new ActorMesh({
-    registry,
+    actors: registry,
     idgen: () => `t${++seq}`,
     now: () => "2026-01-01T00:00:00Z",
     log: () => {},

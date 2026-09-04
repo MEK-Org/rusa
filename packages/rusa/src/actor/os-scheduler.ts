@@ -1,23 +1,60 @@
-import { execFileSync, spawnSync } from "node:child_process";
-import { assertCronExprCanFire, type CrontabMutator } from "./wake-cron.js";
+import type { AtIo } from "./at-queue.js";
+import { assertCronExprCanFire } from "./cron-expression.js";
+import type { CrontabMutator } from "./crontab.js";
+
+const DEFAULT_CURL = "/usr/bin/curl";
+const WAKE_TAG_PREFIX = "# mc-wake:";
 
 /**
- * One internal scheduling service with a deliberately small vocabulary:
- * - register, replace, or cancel an obligation activation;
- * - register, replace, or cancel a scheduled-message delivery.
+ * The actor-facing recurring-wake slice of the host scheduler.
  */
-export interface OsScheduler {
+export interface ActorWakeScheduler {
+  schedule(
+    actorId: string,
+    cronExpr: string,
+    reason: string,
+    priority?: "normal" | "responsive"
+  ): Promise<void>;
+  cancel(actorId: string): Promise<void>;
+  list(): Promise<WakeEntry[]>;
+}
+
+/** The obligation-facing slice of the host scheduler. */
+export interface ObligationActivationScheduler {
   scheduleObligationActivation(
     id: string,
     time: { kind: "cron"; cronExpr: string } | { kind: "at"; date: Date }
   ): void;
   cancelObligationActivation(id: string): void;
   listObligationActivations(): string[];
-
-  scheduleMessageDelivery(id: string, date: Date): void;
-  cancelMessageDelivery(id: string): void;
-  listMessageDeliveries(): string[];
 }
+
+/** A complete one-shot message persisted inside its versioned `at` job. */
+export interface ScheduledMessage {
+  id: string;
+  toId: string;
+  fromId: string;
+  body: string;
+  deliverAt: string;
+  sessionId?: string;
+}
+
+/** The scheduled-message-facing slice of the host scheduler. */
+export interface ScheduledMessageScheduler {
+  scheduleMessageDelivery(message: ScheduledMessage): void;
+  cancelMessageDelivery(id: string): void;
+  listMessageDeliveries(): ScheduledMessage[];
+}
+
+/**
+ * The single host scheduling boundary. Cron owns recurring actor wakes and
+ * cron-policy obligations; `at` owns one-shot obligation activations and the
+ * complete payload of scheduled messages.
+ */
+export interface OsScheduler
+  extends ActorWakeScheduler,
+    ObligationActivationScheduler,
+    ScheduledMessageScheduler {}
 
 export interface OsSchedulerOptions {
   tokenFile: string;
@@ -26,169 +63,36 @@ export interface OsSchedulerOptions {
   curlPath?: string;
 }
 
-export interface AtProbe {
-  hasAt: () => boolean;
-  hasAtrm: () => boolean;
-  isAtdRunning: () => boolean;
-  /**
-   * Actually invoke `atq` (not just check the binary is on PATH) and confirm
-   * it can be queried by this user — the specific call `execAtIo().list()`
-   * makes at runtime. `which at` succeeding says nothing about `atq` being
-   * installed, executable by this user, or able to reach a live `atd`.
-   */
-  canQueryAtq: () => boolean;
+export interface WakeEntry {
+  actorId: string;
+  cronExpr: string;
+  reason: string;
+  priority?: "normal" | "responsive";
 }
 
-export function preflightAt(probe: AtProbe = defaultAtProbe()): { ok: boolean; issues: string[] } {
-  const issues: string[] = [];
-  if (!probe.hasAt()) issues.push("`at` CLI not found — install at");
-  if (!probe.hasAtrm()) issues.push("`atrm` CLI not found — install at");
-  if (probe.hasAt() && !probe.isAtdRunning())
-    issues.push("atd daemon not detected — scheduled obligations won't fire");
-  if (!probe.canQueryAtq())
-    issues.push(
-      "`atq` cannot be queried — verify at/atd is installed and this user can access the queue"
-    );
-  return { ok: issues.length === 0, issues };
+/** Actor ids and suffixed wake slots accepted in managed crontab tags. */
+export function isValidActorId(actorId: string): boolean {
+  return /^[A-Za-z0-9._-]+(:[A-Za-z0-9._-]+)*$/.test(actorId);
 }
 
-function defaultAtProbe(): AtProbe {
-  const can = (cmd: string, args: string[]): boolean => {
-    try {
-      execFileSync(cmd, args, { stdio: "ignore" });
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  return {
-    hasAt: () => can("which", ["at"]),
-    hasAtrm: () => can("which", ["atrm"]),
-    isAtdRunning: () => can("pgrep", ["-x", "atd"]),
-    canQueryAtq: () => {
-      const res = spawnSync("atq", { encoding: "utf-8" });
-      return !res.error && res.status === 0;
-    },
-  };
+/** Single-quote a value for a cron command, then escape cron's `%` newline. */
+function quoteForCron(value: string): string {
+  const oneLine = value.replace(/[\r\n]+/g, " ");
+  const singleQuoted = `'${oneLine.replace(/'/g, "'\\''")}'`;
+  return singleQuoted.replace(/%/g, "\\%");
 }
 
-export interface AtIo {
-  schedule(script: string, date: Date): string;
-  list(): { id: string; script: string }[];
-  remove(id: string): void;
+function parseWakeReason(job: string): string {
+  const match = job.match(/-d '(?:reason=)((?:[^']|'\\'')*)'/);
+  if (!match) return "";
+  return match[1].replace(/'\\''/g, "'").replace(/\\%/g, "%");
 }
 
-/**
- * Thrown by {@link unavailableAtIo} for the one operation that actually needs
- * a one-off job — scheduling a completion-interval activation or a scheduled
- * message delivery — when `at`/`atd` was confirmed absent at boot (not when a
- * live `atq` call merely fails, which stays a plain IO error).
- */
-export class AtUnavailableError extends Error {
-  constructor(issues: string[]) {
-    super(`\`at\` scheduling is unavailable: ${issues.join("; ")}`);
-    this.name = "AtUnavailableError";
-  }
-}
-
-/**
- * Stand-in `AtIo` for a host where {@link preflightAt} found `at`/`atd`
- * missing. Boot must survive that (cron-only recurrences keep working) and
- * reconciliation must not mistake "we chose not to call a missing binary"
- * for "the binary said the queue is empty" — so `list()` reports no jobs
- * (nothing could have been armed without `at` ever being available) and
- * `schedule()`/`remove()` raise the named prerequisite error the first time
- * something actually needs a one-off job, instead of letting `spawnSync`
- * reject with a raw ENOENT.
- */
-export function unavailableAtIo(issues: string[]): AtIo {
-  return {
-    schedule(): string {
-      throw new AtUnavailableError(issues);
-    },
-    list(): { id: string; script: string }[] {
-      return [];
-    },
-    remove(): void {
-      throw new AtUnavailableError(issues);
-    },
-  };
-}
-
-/** `atrm`/`atq`/`at -c` on a job id that no longer exists — already fired, or already removed. */
-const AT_JOB_GONE = /cannot find|no such|does not exist|not found/i;
-
-export function execAtIo(): AtIo {
-  return {
-    schedule(script: string, date: Date): string {
-      // `at -t` takes seconds precision (`[[CC]YY]MMDDhhmm[.ss]`); the interval
-      // contract is seconds-based, so truncating to the minute could fire a
-      // completion_interval activation up to 59s early.
-      const pad = (n: number, w: number) => n.toString().padStart(w, "0");
-      const yyyy = pad(date.getUTCFullYear(), 4);
-      const mm = pad(date.getUTCMonth() + 1, 2);
-      const dd = pad(date.getUTCDate(), 2);
-      const hh = pad(date.getUTCHours(), 2);
-      const min = pad(date.getUTCMinutes(), 2);
-      const ss = pad(date.getUTCSeconds(), 2);
-      const timeStr = `${yyyy}${mm}${dd}${hh}${min}.${ss}`;
-
-      const res = spawnSync("at", ["-t", timeStr], {
-        input: script,
-        encoding: "utf-8",
-        env: { ...process.env, TZ: "UTC" },
-      });
-      if (res.error) throw res.error;
-      if (res.status !== 0) throw new Error(`at failed: ${res.stderr || res.stdout}`);
-
-      const m = res.stderr.match(/job\s+(\d+)\s+at/);
-      if (!m) throw new Error(`could not parse at output: ${res.stderr}`);
-      return m[1];
-    },
-    list(): { id: string; script: string }[] {
-      const res = spawnSync("atq", { encoding: "utf-8" });
-      // A missing `atq` binary is a deployment/preflight problem, not an
-      // empty authoritative queue — reading it as "nothing scheduled" would
-      // let the reconciler treat every OS-scheduled job as an orphan and
-      // cancel it out from under still-pending obligations/messages.
-      if (res.error) throw res.error;
-      // An empty queue exits 0 with empty stdout; a nonzero exit means atq
-      // itself failed (atd down, permission denied, ...), which must surface
-      // rather than read as "nothing scheduled" — that would make the
-      // reconciler quietly cancel every OS-scheduled job it thinks is an orphan.
-      if (res.status !== 0) {
-        throw new Error(`atq failed: ${res.stderr || res.stdout}`);
-      }
-
-      const out: { id: string; script: string }[] = [];
-      for (const line of res.stdout.trim().split("\n")) {
-        if (!line) continue;
-        const id = line.split(/\s+/)[0];
-        if (!id) continue;
-
-        const scriptRes = spawnSync("at", ["-c", id], { encoding: "utf-8" });
-        if (scriptRes.status === 0) {
-          out.push({ id, script: scriptRes.stdout });
-        } else if (!AT_JOB_GONE.test(`${scriptRes.stderr}${scriptRes.stdout}`)) {
-          // A job atq just listed but `at -c` can't read is a real IO failure
-          // (not the race of it firing between the two calls, which reads as
-          // "gone" and is fine to drop silently).
-          throw new Error(`at -c ${id} failed: ${scriptRes.stderr || scriptRes.stdout}`);
-        }
-      }
-      return out;
-    },
-    remove(id: string): void {
-      const res = spawnSync("atrm", [id], { encoding: "utf-8" });
-      if (res.error) throw res.error;
-      // Cancellation must be idempotent for a job that already fired or was
-      // already removed — atrm exits nonzero either way, and only the message
-      // tells them apart from a genuine IO failure.
-      if (res.status !== 0 && !AT_JOB_GONE.test(`${res.stderr}${res.stdout}`)) {
-        throw new Error(`atrm ${id} failed: ${res.stderr || res.stdout}`);
-      }
-    },
-  };
+function parseWakePriority(job: string): "responsive" | undefined {
+  const match = job.match(/-d '(?:priority=)((?:[^']|'\\'')*)'/);
+  if (!match) return undefined;
+  const value = match[1].replace(/'\\''/g, "'");
+  return value === "responsive" ? "responsive" : undefined;
 }
 
 /**
@@ -208,6 +112,57 @@ export class TruncatedCronBlockError extends Error {
   }
 }
 
+const SCHEDULED_MESSAGE_SCHEMA_VERSION = 1 as const;
+const MAX_SCHEDULED_MESSAGE_BODY_BYTES = 128 * 1024;
+
+export function encodeScheduledMessagePayload(message: ScheduledMessage): string {
+  return Buffer.from(
+    JSON.stringify({ schemaVersion: SCHEDULED_MESSAGE_SCHEMA_VERSION, ...message }),
+    "utf8"
+  ).toString("base64url");
+}
+
+export function decodeScheduledMessagePayload(payload: string): ScheduledMessage {
+  try {
+    const value = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Record<
+      string,
+      unknown
+    >;
+    if (
+      value.schemaVersion !== SCHEDULED_MESSAGE_SCHEMA_VERSION ||
+      typeof value.id !== "string" ||
+      value.id.length === 0 ||
+      typeof value.toId !== "string" ||
+      value.toId.length === 0 ||
+      typeof value.fromId !== "string" ||
+      value.fromId.length === 0 ||
+      typeof value.body !== "string" ||
+      Buffer.byteLength(value.body, "utf8") > MAX_SCHEDULED_MESSAGE_BODY_BYTES ||
+      typeof value.deliverAt !== "string" ||
+      (value.sessionId !== undefined && typeof value.sessionId !== "string") ||
+      Number.isNaN(Date.parse(value.deliverAt))
+    ) {
+      throw new Error("invalid scheduled-message payload");
+    }
+    return {
+      id: value.id,
+      toId: value.toId,
+      fromId: value.fromId,
+      body: value.body,
+      deliverAt: value.deliverAt,
+      ...(typeof value.sessionId === "string" ? { sessionId: value.sessionId } : {}),
+    };
+  } catch (cause) {
+    throw new Error("invalid scheduled-message payload", { cause });
+  }
+}
+
+function decodeScheduledMessage(script: string): ScheduledMessage {
+  const match = script.match(/-d 'payload=([A-Za-z0-9_-]+)'/);
+  if (!match) throw new Error("scheduled-message job has no payload");
+  return decodeScheduledMessagePayload(match[1]);
+}
+
 export class DefaultOsScheduler implements OsScheduler {
   constructor(
     private readonly mutator: CrontabMutator,
@@ -215,15 +170,112 @@ export class DefaultOsScheduler implements OsScheduler {
     private readonly opts: OsSchedulerOptions
   ) {}
 
-  private buildCurlLine(endpoint: string, data: Record<string, string>): string {
-    const curl = this.opts.curlPath ?? "/usr/bin/curl";
+  /** Build the complete cron line for an actor wake. */
+  buildWakeJobLine(
+    actorId: string,
+    cronExpr: string,
+    reason: string,
+    priority?: "normal" | "responsive" | boolean
+  ): string {
+    const curl = this.opts.curlPath ?? DEFAULT_CURL;
     const host = this.opts.host ?? "127.0.0.1";
-    const url = `"http://${host}:$(cat ${this.opts.portFile})/${endpoint}"`;
+    const url = `"http://${host}:$(cat ${this.opts.portFile})/wake"`;
+    const auth = `"Authorization: Bearer $(cat ${this.opts.tokenFile})"`;
+    const responsive = priority === "responsive" || priority === true;
+    const priorityArg = responsive ? ` -d ${quoteForCron("priority=responsive")}` : "";
+    return (
+      `${cronExpr.trim()} ${curl} -fsS -H ${auth} ${url} ` +
+      `-d ${quoteForCron(`actorId=${actorId}`)} -d ${quoteForCron(`reason=${reason}`)}${priorityArg}`
+    );
+  }
+
+  /** Remove the actor's owned two-line wake block while preserving all other entries. */
+  private stripWakeBlock(lines: string[], actorId: string): string[] {
+    const tag = WAKE_TAG_PREFIX + actorId;
+    const kept: string[] = [];
+    for (let index = 0; index < lines.length; index++) {
+      if (lines[index].trim() === tag) {
+        const next = lines[index + 1];
+        if (next !== undefined && next.trim() !== "" && !next.trimStart().startsWith("#")) {
+          index++;
+        }
+        continue;
+      }
+      kept.push(lines[index]);
+    }
+    return kept;
+  }
+
+  async schedule(
+    actorId: string,
+    cronExpr: string,
+    reason: string,
+    priority?: "normal" | "responsive"
+  ): Promise<void> {
+    if (!isValidActorId(actorId)) throw new Error(`invalid actor id: ${actorId}`);
+    assertCronExprCanFire(cronExpr);
+    this.mutator.mutate((lines) => {
+      const kept = this.stripWakeBlock(lines, actorId);
+      kept.push(
+        WAKE_TAG_PREFIX + actorId,
+        this.buildWakeJobLine(actorId, cronExpr, reason, priority)
+      );
+      return { lines: kept, result: undefined };
+    });
+  }
+
+  async cancel(actorId: string): Promise<void> {
+    if (!isValidActorId(actorId)) throw new Error(`invalid actor id: ${actorId}`);
+    this.mutator.mutate((lines) => {
+      const kept = this.stripWakeBlock(lines, actorId);
+      return { lines: kept.length === lines.length ? lines : kept, result: undefined };
+    });
+  }
+
+  async list(): Promise<WakeEntry[]> {
+    const current = this.mutator.read();
+    if (current === "") return [];
+    const lines = current.replace(/\n$/, "").split("\n");
+    const entries: WakeEntry[] = [];
+    for (let index = 0; index < lines.length; index++) {
+      const trimmed = lines[index].trim();
+      if (!trimmed.startsWith(WAKE_TAG_PREFIX)) continue;
+      const job = lines[index + 1] ?? "";
+      const priority = parseWakePriority(job);
+      entries.push({
+        actorId: trimmed.slice(WAKE_TAG_PREFIX.length),
+        cronExpr: job.trim().split(/\s+/).slice(0, 5).join(" "),
+        reason: parseWakeReason(job),
+        ...(priority ? { priority } : {}),
+      });
+    }
+    return entries;
+  }
+
+  private buildCurlLine(
+    endpoint: string,
+    data: Record<string, string>,
+    options?: { retryWhileServiceRestarts?: boolean }
+  ): string {
+    const curl = this.opts.curlPath ?? DEFAULT_CURL;
+    const host = this.opts.host ?? "127.0.0.1";
     const auth = `"Authorization: Bearer $(cat ${this.opts.tokenFile})"`;
     const args = Object.entries(data)
       .map(([k, v]) => `-d '${k}=${v.replace(/'/g, "'\\''")}'`)
       .join(" ");
-    return `${curl} -fsS -H ${auth} ${url} ${args}`;
+    if (!options?.retryWhileServiceRestarts) {
+      const url = `"http://${host}:$(cat ${this.opts.portFile})/${endpoint}"`;
+      return `${curl} -fsS -H ${auth} ${url} ${args}`;
+    }
+
+    // The callback port is ephemeral and can change during a service restart.
+    // Curl's built-in retry expands $(cat portFile) only once, before curl
+    // starts, so use a bounded shell loop that re-reads both files on every
+    // attempt. This also covers an overdue legacy job firing during first boot,
+    // before the port file has been published.
+    const url = `"http://${host}:$rusa_callback_port/${endpoint}"`;
+    const call = `${curl} -fsS -H ${auth} ${url} ${args}`;
+    return `rusa_attempt=0; while [ "$rusa_attempt" -lt 120 ]; do rusa_callback_port=$(cat ${this.opts.portFile} 2>/dev/null) && ${call} && exit 0; rusa_attempt=$((rusa_attempt + 1)); sleep 5; done; exit 1`;
   }
 
   /**
@@ -302,7 +354,7 @@ export class DefaultOsScheduler implements OsScheduler {
   private staleAtIds(tag: string): string[] {
     return this.atIo
       .list()
-      .filter((job) => job.script.includes(tag))
+      .filter((job) => job.script.split("\n").some((line) => line.trim() === tag))
       .map((job) => job.id);
   }
 
@@ -384,26 +436,58 @@ export class DefaultOsScheduler implements OsScheduler {
     return Array.from(ids);
   }
 
-  scheduleMessageDelivery(id: string, date: Date): void {
-    const tag = `# mc-message-delivery:${id}`;
-    const curlLine = this.buildCurlLine("wake-message", { id });
+  scheduleMessageDelivery(message: ScheduledMessage): void {
+    if (Buffer.byteLength(message.body, "utf8") > MAX_SCHEDULED_MESSAGE_BODY_BYTES) {
+      throw new Error("Scheduled message body exceeds the 128 KiB host-job limit");
+    }
+    // Apply the same shape validation used by the callback boundary before a
+    // job reaches the host queue. This also rejects invalid deliverAt values
+    // supplied by importers or callers outside ActorMesh.
+    const payload = encodeScheduledMessagePayload(message);
+    decodeScheduledMessagePayload(payload);
+    const tag = this.messageTag(message.id);
+    const curlLine = this.buildCurlLine(
+      "wake-message",
+      { payload },
+      { retryWhileServiceRestarts: true }
+    );
     const script = `${tag}\n${curlLine}\n`;
     const staleAtIds = this.staleAtIds(tag);
-    const replacementId = this.atIo.schedule(script, date);
+    const replacementId = this.atIo.schedule(script, new Date(message.deliverAt));
     this.removeAtIds(staleAtIds.filter((staleId) => staleId !== replacementId));
   }
 
   cancelMessageDelivery(id: string): void {
-    const tag = `# mc-message-delivery:${id}`;
+    const tag = this.messageTag(id);
     this.removeAtIds(this.staleAtIds(tag));
   }
 
-  listMessageDeliveries(): string[] {
-    const ids = new Set<string>();
+  listMessageDeliveries(): ScheduledMessage[] {
+    const messages = new Map<string, ScheduledMessage>();
     for (const job of this.atIo.list()) {
-      const m = job.script.match(/# mc-message-delivery:(.+)/);
-      if (m) ids.add(m[1].trim());
+      const tagLines = job.script
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith("# mc-message-delivery:"));
+      if (tagLines.length === 0) continue;
+      let message: ScheduledMessage;
+      try {
+        message = decodeScheduledMessage(job.script);
+        if (tagLines.length !== 1 || tagLines[0] !== this.messageTag(message.id)) {
+          throw new Error("scheduled-message tag does not match its payload id");
+        }
+      } catch (cause) {
+        throw new Error(`Invalid scheduled-message host job ${job.id}`, { cause });
+      }
+      messages.set(message.id, message);
     }
-    return Array.from(ids);
+    return [...messages.values()].sort(
+      (left, right) =>
+        Date.parse(left.deliverAt) - Date.parse(right.deliverAt) || left.id.localeCompare(right.id)
+    );
+  }
+
+  private messageTag(id: string): string {
+    return `# mc-message-delivery:${Buffer.from(id, "utf8").toString("base64url")}`;
   }
 }

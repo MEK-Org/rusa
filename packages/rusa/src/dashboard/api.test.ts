@@ -7,9 +7,9 @@ import { brotliDecompressSync, gunzipSync } from "node:zlib";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorMesh } from "../actor/actor-mesh.js";
+import type { ActorRecord } from "../actor/actor-record.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import type { RootChildRequest, RootControlService } from "../actor/root-control.js";
-import { InMemoryThreadRegistry, type ThreadRecord } from "../actor/thread-registry.js";
 import { readAvatar } from "../avatar/avatars.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { InboxRepository } from "../db/repositories/inbox-repository.js";
@@ -18,6 +18,7 @@ import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { ReferenceCacheService } from "../references/cache-service.js";
+import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { type DashboardDataDeps, handleMeshApiRequest } from "./api.js";
 import { MeshEventEmitter } from "./mesh-event-emitter.js";
 import { SseHub } from "./sse.js";
@@ -98,7 +99,7 @@ async function call(
   return { handled, res, req };
 }
 
-function rec(id: string, parentId: string | null, status: "active" | "retired"): ThreadRecord {
+function rec(id: string, parentId: string | null, status: "active" | "retired"): ActorRecord {
   return { id, charter: `charter ${id}`, parentId, status, createdAt: "2026-06-21T00:00:00.000Z" };
 }
 
@@ -113,7 +114,7 @@ describe("handleMeshApiRequest", () => {
   let meshChat: MeshChatRepository;
   let inbox: InboxRepository;
   let obligations: ObligationRepository;
-  let registry: InMemoryThreadRegistry;
+  let actors: InMemoryActorRepository;
   let deps: DashboardDataDeps;
   let rootSpawns: Array<{ request: unknown; principal: string }>;
 
@@ -124,7 +125,7 @@ describe("handleMeshApiRequest", () => {
     meshChat = new MeshChatRepository(db);
     inbox = new InboxRepository(db);
     obligations = new ObligationRepository(db);
-    registry = new InMemoryThreadRegistry();
+    actors = new InMemoryActorRepository();
     rootSpawns = [];
     const mockMesh = {
       sendHumanMessage: (toId: string, body: string, sessionId: string) => {
@@ -139,7 +140,7 @@ describe("handleMeshApiRequest", () => {
       },
     };
     deps = {
-      registry,
+      actors: actors,
       meshEvents,
       meshChat,
       inbox,
@@ -308,10 +309,10 @@ describe("handleMeshApiRequest", () => {
   describe("response compression", () => {
     /** Enough threads that the JSON clears MIN_COMPRESS_BYTES several times over. */
     const seedBulk = (): void => {
-      registry.upsert(rec("root", null, "active"));
+      actors.upsert(rec("root", null, "active"));
       for (let i = 0; i < 60; i++) {
         const id = `cccccccc-0000-4000-8000-${String(i).padStart(12, "0")}`;
-        registry.upsert({
+        actors.upsert({
           id,
           charter: `charter ${id} `.repeat(40),
           parentId: "root",
@@ -368,7 +369,7 @@ describe("handleMeshApiRequest", () => {
     });
 
     it("leaves a small body alone even when the client would take brotli", async () => {
-      registry.upsert(rec("root", null, "active"));
+      actors.upsert(rec("root", null, "active"));
       const { res } = await call(deps, "GET", "/api/mesh/threads", undefined, "br");
       await settled(res);
 
@@ -378,7 +379,7 @@ describe("handleMeshApiRequest", () => {
     });
 
     it("always varies on Accept-Encoding, including when it did not compress", async () => {
-      registry.upsert(rec("root", null, "active"));
+      actors.upsert(rec("root", null, "active"));
       const { res } = await call(deps, "GET", "/api/mesh/threads");
       await settled(res);
 
@@ -490,9 +491,9 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads lists threads with deterministic handles", async () => {
-    registry.upsert(rec("root", null, "active"));
-    registry.upsert(rec(UUID_A, "root", "active"));
-    registry.upsert(rec(UUID_B, "root", "retired"));
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+    actors.upsert(rec(UUID_B, "root", "retired"));
 
     const { res } = await call(deps, "GET", "/api/mesh/threads");
     expect(res.statusCode).toBe(200);
@@ -504,8 +505,8 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads surfaces one model and does not leak a stale bound-model readback", async () => {
-    // A registry record that still carries the removed `boundModel` key. The cast is the
-    // point, not a workaround: the field is gone from `ThreadRecord`, but the registry is
+    // A actors record that still carries the removed `boundModel` key. The cast is the
+    // point, not a workaround: the field is gone from `ActorRecord`, but the actors is
     // a JSON file loaded with a cast and rewritten whole, so every record written before
     // this change still carries the key on disk. This is that record.
     //
@@ -513,12 +514,12 @@ describe("handleMeshApiRequest", () => {
     // codex, its codex readback outliving the move because nothing ever cleared it. The
     // API must publish the configured model, prefer nothing to it, and expose nothing to
     // compare it against.
-    registry.upsert({
+    actors.upsert({
       ...rec(UUID_A, "root", "active"),
       provider: "codex",
       model: "gpt-5-codex",
       boundModel: "gpt-5.5",
-    } as ThreadRecord);
+    } as ActorRecord);
 
     const { res } = await call(deps, "GET", "/api/mesh/threads");
     expect(res.statusCode).toBe(200);
@@ -531,7 +532,7 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads surfaces pending desiredModel and desiredProvider when staged", async () => {
-    registry.upsert({
+    actors.upsert({
       ...rec(UUID_A, "root", "active"),
       provider: "claude",
       model: "claude-sonnet-5",
@@ -555,14 +556,14 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads distinguishes a pending effort clear from no pending change", async () => {
-    registry.upsert({
+    actors.upsert({
       ...rec(UUID_A, "root", "active"),
       provider: "codex",
       model: "gpt-5.6-sol",
       effort: "high",
       desiredEffort: null,
     });
-    registry.upsert({
+    actors.upsert({
       ...rec(UUID_B, "root", "active"),
       provider: "codex",
       model: "gpt-5.6-sol",
@@ -579,15 +580,15 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads shows the default root handle when no identity is configured", async () => {
-    registry.upsert({ ...rec("root", null, "active"), isRoot: true });
+    actors.upsert({ ...rec("root", null, "active"), isRoot: true });
     const { res } = await call(deps, "GET", "/api/mesh/threads");
     const { threads } = JSON.parse(res.body);
     expect(threads.find((t: { id: string }) => t.id === "root").handle).toBe("root-actor");
   });
 
   it("GET /api/mesh/threads shows the configured root handle, leaving worker handles alone ", async () => {
-    registry.upsert({ ...rec("root", null, "active"), isRoot: true });
-    registry.upsert(rec(UUID_A, "root", "active"));
+    actors.upsert({ ...rec("root", null, "active"), isRoot: true });
+    actors.upsert(rec(UUID_A, "root", "active"));
     const configuredDeps: DashboardDataDeps = {
       ...deps,
       rootIdentity: { id: "root", handle: "ember-familiar" },
@@ -602,7 +603,7 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads identifies a generated-id root from isRoot", async () => {
-    registry.upsert({ ...rec(UUID_A, null, "active"), isRoot: true });
+    actors.upsert({ ...rec(UUID_A, null, "active"), isRoot: true });
     const configuredDeps: DashboardDataDeps = {
       ...deps,
       rootIdentity: { id: UUID_A, handle: "ember-familiar" },
@@ -614,14 +615,14 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads maps title and falls back on summarizeCharter", async () => {
-    registry.upsert({
+    actors.upsert({
       id: "root",
       charter: "root charter\nline 2",
       parentId: null,
       status: "active",
       createdAt: "2026-06-21T00:00:00.000Z",
     });
-    registry.upsert({
+    actors.upsert({
       id: UUID_A,
       charter: "child charter\nline 2",
       title: "Custom Title",
@@ -644,7 +645,7 @@ describe("handleMeshApiRequest", () => {
     // A charter well past the preview budget, with a distinctive tail so the
     // assertion is about the bytes on the wire rather than about a length.
     const long = `${"pursue the objective. ".repeat(60)}TAIL-MARKER`;
-    registry.upsert({
+    actors.upsert({
       id: UUID_A,
       charter: long,
       parentId: null,
@@ -665,7 +666,7 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads leaves a charter inside the budget exactly as it is", async () => {
-    registry.upsert({
+    actors.upsert({
       id: UUID_A,
       charter: "short charter\nline 2",
       parentId: null,
@@ -685,7 +686,7 @@ describe("handleMeshApiRequest", () => {
   it("GET /api/mesh/threads clips a charter on a character, not a code unit", async () => {
     // Emoji are two UTF-16 code units each, so a code-unit slice at 280 lands
     // inside the 140th one and ends the excerpt on half a character.
-    registry.upsert({
+    actors.upsert({
       id: UUID_A,
       charter: "\u{1F9ED}".repeat(400),
       parentId: null,
@@ -706,7 +707,7 @@ describe("handleMeshApiRequest", () => {
 
   it("GET /api/mesh/threads/charter serves the one actor's full charter", async () => {
     const long = `${"pursue the objective. ".repeat(60)}TAIL-MARKER`;
-    registry.upsert({
+    actors.upsert({
       id: UUID_A,
       charter: long,
       parentId: null,
@@ -720,7 +721,7 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads/charter 404s for an unknown or missing id", async () => {
-    registry.upsert(rec(UUID_A, null, "active"));
+    actors.upsert(rec(UUID_A, null, "active"));
 
     const unknown = (await call(deps, "GET", "/api/mesh/threads/charter?id=nope")).res;
     expect(unknown.statusCode).toBe(404);
@@ -732,8 +733,8 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads reports halted:false and every thread idle by default", async () => {
-    registry.upsert(rec("root", null, "active"));
-    registry.upsert(rec(UUID_A, "root", "active"));
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
 
     const { res } = await call(deps, "GET", "/api/mesh/threads");
     const body = JSON.parse(res.body);
@@ -742,7 +743,7 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads reports schedulerWarning:null when the at preflight is absent or ok", async () => {
-    registry.upsert(rec("root", null, "active"));
+    actors.upsert(rec("root", null, "active"));
 
     const absent = (await call(deps, "GET", "/api/mesh/threads")).res;
     expect(JSON.parse(absent.body).schedulerWarning).toBeNull();
@@ -753,7 +754,7 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads surfaces the at preflight issues when unavailable, dashboard/health-visible rather than console-only", async () => {
-    registry.upsert(rec("root", null, "active"));
+    actors.upsert(rec("root", null, "active"));
     deps = {
       ...deps,
       schedulerHealth: () => ({ ok: false, issues: ["`at` CLI not found — install at"] }),
@@ -764,8 +765,8 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads returns cursor and run states from one runtime capture", async () => {
-    registry.upsert(rec("root", null, "active"));
-    registry.upsert(rec(UUID_A, "root", "active"));
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
     const snapshot = {
       streamId: "epoch-a",
       revision: 17,
@@ -791,9 +792,9 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads surfaces halt, queued, and running snapshots", async () => {
-    registry.upsert(rec("root", null, "active"));
-    registry.upsert(rec(UUID_A, "root", "active"));
-    registry.upsert(rec(UUID_B, "root", "active"));
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+    actors.upsert(rec(UUID_B, "root", "active"));
     deps = {
       ...deps,
       isHalted: () => true,
@@ -811,8 +812,8 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads surfaces winding_down when a running actor is yielded", async () => {
-    registry.upsert(rec("root", null, "active"));
-    registry.upsert(rec(UUID_A, "root", "active"));
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
     deps = {
       ...deps,
       runningThreadIds: () => new Set([UUID_A]),
@@ -826,9 +827,9 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads exposes lastActiveAt from mesh_events", async () => {
-    registry.upsert(rec("root", null, "active"));
-    registry.upsert(rec(UUID_A, "root", "active"));
-    registry.upsert(rec(UUID_B, "root", "retired"));
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+    actors.upsert(rec(UUID_B, "root", "retired"));
 
     meshEvents.record({ kind: "run_start", actorId: UUID_A, ts: "2026-06-21T00:00:00.000Z" });
     meshEvents.record({
@@ -847,9 +848,9 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads exposes per-lane queue position and estimated start", async () => {
-    registry.upsert(rec("root", null, "active"));
-    registry.upsert(rec(UUID_A, "root", "active"));
-    registry.upsert(rec(UUID_B, "root", "active"));
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+    actors.upsert(rec(UUID_B, "root", "active"));
     deps = {
       ...deps,
       providerQueueSnapshots: () => [
@@ -870,9 +871,9 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads keeps each provider lane's queue position independent", async () => {
-    registry.upsert(rec("root", null, "active"));
-    registry.upsert(rec(UUID_A, "root", "active"));
-    registry.upsert(rec(UUID_B, "root", "active"));
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+    actors.upsert(rec(UUID_B, "root", "active"));
     // Two different provider lanes can each have a head at position 0 with
     // its own ETA; positions are only meaningful within a lane.
     deps = {
@@ -892,10 +893,10 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads reports null estimatedStartAt for an unknown ETA behind a staged run", async () => {
-    registry.upsert(rec("root", null, "active"));
-    registry.upsert(rec(UUID_A, "root", "active"));
-    registry.upsert(rec(UUID_B, "root", "active"));
-    registry.upsert(rec(UUID_C, "root", "active"));
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+    actors.upsert(rec(UUID_B, "root", "active"));
+    actors.upsert(rec(UUID_C, "root", "active"));
     deps = {
       ...deps,
       providerQueueSnapshots: () => [
@@ -917,8 +918,8 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads reflects dynamic pacing changes on the next request", async () => {
-    registry.upsert(rec("root", null, "active"));
-    registry.upsert(rec(UUID_A, "root", "active"));
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
     let estimatedStartAt = "2026-06-21T00:00:10.000Z";
     deps = {
       ...deps,
@@ -1294,8 +1295,8 @@ describe("handleMeshApiRequest", () => {
 
   describe("POST /api/mesh/actors/:id/chat", () => {
     beforeEach(() => {
-      registry.upsert(rec(UUID_A, null, "active"));
-      registry.upsert(rec(UUID_B, null, "retired"));
+      actors.upsert(rec(UUID_A, null, "active"));
+      actors.upsert(rec(UUID_B, null, "retired"));
     });
 
     it("sends human message, returns 200, and records human:operator event", async () => {
@@ -1668,7 +1669,7 @@ describe("handleMeshApiRequest", () => {
 
   describe("POST /api/mesh/actors/:id/interrupt ", () => {
     it("calls mesh.interrupt and returns 200 with result", async () => {
-      registry.upsert(rec(UUID_A, "root", "active"));
+      actors.upsert(rec(UUID_A, "root", "active"));
       const interruptMock = vi.fn().mockReturnValue({ interrupted: true });
       const meshDeps: DashboardDataDeps = {
         ...deps,
@@ -1695,7 +1696,7 @@ describe("handleMeshApiRequest", () => {
     });
 
     it("400s when actor is retired", async () => {
-      registry.upsert(rec(UUID_RETIRED, "root", "retired"));
+      actors.upsert(rec(UUID_RETIRED, "root", "retired"));
       const meshDeps: DashboardDataDeps = {
         ...deps,
         mesh: { interrupt: vi.fn() } as unknown as ActorMesh,
@@ -1712,7 +1713,7 @@ describe("handleMeshApiRequest", () => {
 
   describe("POST /api/mesh/actors/:id/run-now", () => {
     it("calls mesh.runNow and returns 200 with result", async () => {
-      registry.upsert(rec(UUID_A, "root", "active"));
+      actors.upsert(rec(UUID_A, "root", "active"));
       const runNowMock = vi.fn().mockReturnValue({ queued: true });
       const meshDeps: DashboardDataDeps = {
         ...deps,
@@ -1735,7 +1736,7 @@ describe("handleMeshApiRequest", () => {
     });
 
     it("400s when actor is retired", async () => {
-      registry.upsert(rec(UUID_RETIRED, "root", "retired"));
+      actors.upsert(rec(UUID_RETIRED, "root", "retired"));
       const meshDeps: DashboardDataDeps = {
         ...deps,
         mesh: { runNow: vi.fn() } as unknown as ActorMesh,
@@ -2026,7 +2027,7 @@ describe("handleMeshApiRequest", () => {
 
     describe("POST /api/mesh/obligations", () => {
       it("creates obligation and returns 201", async () => {
-        registry.upsert(rec(UUID_A, "root", "active"));
+        actors.upsert(rec(UUID_A, "root", "active"));
         const body = JSON.stringify({
           ownerId: UUID_A,
           title: "Build feature",
@@ -2061,7 +2062,7 @@ describe("handleMeshApiRequest", () => {
       });
 
       it("returns cited artifacts with mesh chat resolved and other schemes named", async () => {
-        registry.upsert(rec(UUID_A, "root", "active"));
+        actors.upsert(rec(UUID_A, "root", "active"));
         obligations.create({ id: "cited", ownerId: UUID_A, title: "Game Type" });
         const messageId = meshChat.record({
           senderId: HUMAN_OPERATOR,
@@ -2096,7 +2097,7 @@ describe("handleMeshApiRequest", () => {
       });
 
       it("rejects a create with no title", async () => {
-        registry.upsert(rec(UUID_A, "root", "active"));
+        actors.upsert(rec(UUID_A, "root", "active"));
         for (const body of [
           JSON.stringify({ ownerId: UUID_A, intent: "no heading" }),
           JSON.stringify({ ownerId: UUID_A, title: "   ", intent: "blank heading" }),
@@ -2110,7 +2111,7 @@ describe("handleMeshApiRequest", () => {
       });
 
       it("rejects an owner that is neither a live actor nor the operator", async () => {
-        registry.upsert(rec(UUID_RETIRED, "root", "retired"));
+        actors.upsert(rec(UUID_RETIRED, "root", "retired"));
         for (const ownerId of ["actor-1", UUID_RETIRED, "system:mesh"]) {
           const { res } = await call(
             deps,
@@ -2212,7 +2213,7 @@ describe("handleMeshApiRequest", () => {
 
     describe("POST /api/mesh/obligations/:id/external-ref", () => {
       it("links, relinks and unlinks after creation", async () => {
-        registry.upsert(rec(UUID_A, "root", "active"));
+        actors.upsert(rec(UUID_A, "root", "active"));
         obligations.create({ id: "linkable", ownerId: UUID_A, title: "Ship it" });
 
         const link = await call(
@@ -2240,7 +2241,7 @@ describe("handleMeshApiRequest", () => {
       });
 
       it("accepts a repository and rejects a sub-resource", async () => {
-        registry.upsert(rec(UUID_A, "root", "active"));
+        actors.upsert(rec(UUID_A, "root", "active"));
         obligations.create({ id: "repo-level", ownerId: UUID_A, title: "Keep rusa releasable" });
 
         const ok = await call(
@@ -2265,7 +2266,7 @@ describe("handleMeshApiRequest", () => {
       });
 
       it("lets an explicit camelCase null unlink even when the legacy alias is present", async () => {
-        registry.upsert(rec(UUID_A, "root", "active"));
+        actors.upsert(rec(UUID_A, "root", "active"));
         obligations.create({
           id: "explicit-unlink",
           ownerId: UUID_A,
@@ -2289,7 +2290,7 @@ describe("handleMeshApiRequest", () => {
       });
 
       it("rejects an omitted ref rather than treating it as an unlink", async () => {
-        registry.upsert(rec(UUID_A, "root", "active"));
+        actors.upsert(rec(UUID_A, "root", "active"));
         obligations.create({
           id: "keep-link",
           ownerId: UUID_A,

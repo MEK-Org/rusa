@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { RunResult } from "../providers/types.js";
 import type { MechanicalInboxForensics } from "./actor-mesh.js";
+import type { ActorRecord } from "./actor-record.js";
 import {
   type FailureSinkDeps,
   formatProviderLabel,
@@ -12,7 +13,6 @@ import {
   routeContinuationCapped,
   routeRunFailure,
 } from "./failure-sink.js";
-import type { ThreadRecord } from "./thread-registry.js";
 
 const FAIL: RunResult = {
   success: false,
@@ -21,7 +21,7 @@ const FAIL: RunResult = {
 };
 
 function makeDeps(
-  records: Record<string, Partial<ThreadRecord>>,
+  records: Record<string, Partial<ActorRecord>>,
   over: Partial<FailureSinkDeps> = {}
 ): {
   deps: FailureSinkDeps;
@@ -43,7 +43,7 @@ function makeDeps(
   const toChat: string[] = [];
   const logs: string[] = [];
   const deps: FailureSinkDeps = {
-    registry: { get: (id: string) => records[id] as ThreadRecord | undefined },
+    actors: { get: (id: string) => records[id] as ActorRecord | undefined },
     sendToParent: (toId, body, fromId, forensics) =>
       toParent.push({ toId, body, fromId, forensics }),
     postToErrorChat: (text) => toChat.push(text),

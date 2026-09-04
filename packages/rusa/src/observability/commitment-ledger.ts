@@ -1,6 +1,6 @@
+import type { ActorRecord } from "../actor/actor-record.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted, type RUN_TERMINAL_EVENT_KINDS } from "../actor/mesh-events.js";
-import type { ThreadRecord } from "../actor/thread-registry.js";
 import type { MeshEvent, MeshEventKind } from "../db/repositories/mesh-event-repository.js";
 
 export type CommitmentKind = "failed_run" | "missed_wake" | "request_commitment" | "silent_actor";
@@ -255,7 +255,7 @@ export function isProgressEvent(event: Pick<MeshEvent, "kind" | "payload">): boo
 }
 
 export function projectOpenCommitments(opts: {
-  threads: ThreadRecord[];
+  threads: ActorRecord[];
   events: MeshEvent[];
   requestCommitments?: RequestCommitmentInput[];
   now?: Date;
@@ -560,7 +560,7 @@ interface OwnerResolver {
   resolve(owner: string): OwnerResolution | null;
 }
 
-function buildOwnerResolver(threads: ThreadRecord[], rootHandle?: string): OwnerResolver {
+function buildOwnerResolver(threads: ActorRecord[], rootHandle?: string): OwnerResolver {
   const byIdOrHandle = new Map<string, OwnerResolution>();
   const defaultRootHandle = generateHandle("root");
   // The resolved (possibly configured, ISSUE_NUM) handle is what displays for root
@@ -590,7 +590,7 @@ function buildOwnerResolver(threads: ThreadRecord[], rootHandle?: string): Owner
 
 function inferOwnerExpectsRetirement(opts: {
   actorId: string;
-  thread: ThreadRecord | undefined;
+  thread: ActorRecord | undefined;
   actorEvents: MeshEvent[];
   activeChildCount: number;
 }): { value: boolean | null; reason: string } {
@@ -606,7 +606,7 @@ function inferOwnerExpectsRetirement(opts: {
 function makeRow(opts: {
   kind: CommitmentKind;
   actorId: string;
-  thread: ThreadRecord | undefined;
+  thread: ActorRecord | undefined;
   event: MeshEvent | null;
   now: Date;
   waitingOn: string | null;

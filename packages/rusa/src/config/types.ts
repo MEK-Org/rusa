@@ -2,7 +2,7 @@
  * Configuration types for rusa.
  */
 
-import type { ContextConfig } from "../actor/thread-registry.js";
+import type { ContextConfig } from "../actor/actor-record.js";
 
 export const DEFAULT_DEPLOY_BRANCH = "master";
 export type SandboxMode = "container-boundary" | "bwrap";

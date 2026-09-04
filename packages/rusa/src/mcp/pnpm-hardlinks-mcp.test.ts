@@ -14,8 +14,8 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it } from "vitest";
-import { InMemoryThreadRegistry } from "../actor/thread-registry.js";
 import { pnpmStoreFileForContent } from "../pnpm/hardlinks.js";
+import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import {
   createPnpmHardlinksMcpServer,
   type PnpmHardlinksToolDeps,
@@ -69,7 +69,7 @@ describe("pnpm hardlinks MCP", () => {
     const storeFile = pnpmStoreFileForContent(file, storeDir);
     mkdirSync(dirname(storeFile), { recursive: true });
     writeFileSync(storeFile, "module.exports = leftPad;\n");
-    const registry = new InMemoryThreadRegistry();
+    const registry = new InMemoryActorRepository();
     registry.upsert({
       id: "worker-1",
       charter: "test",
@@ -80,7 +80,7 @@ describe("pnpm hardlinks MCP", () => {
     return {
       rootId: "root",
       workersDir,
-      registry,
+      actors: registry,
       runningThreadIds: () => runningThreadIds,
       projectDir,
       storeDir,

@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -109,7 +109,8 @@ describe("resumeE2EInstance", () => {
   it("loads an existing instance without rewriting its scratch state", () => {
     root = mkdtempSync(join(TEST_TMPDIR, "rusa-e2e-resume-test-"));
     const provisioned = provisionE2EInstance({ root });
-    writeFileSync(join(provisioned.home, "threads.json"), '{"threads":[]}\n', "utf8");
+    mkdirSync(join(provisioned.home, "data"), { recursive: true });
+    writeFileSync(join(provisioned.home, "data", "mesh.db"), "", "utf8");
     writeFileSync(join(provisioned.scratchPath, "DESIGN.md"), "preserve me\n", "utf8");
 
     const resumed = resumeE2EInstance(root);
