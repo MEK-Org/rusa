@@ -8,11 +8,24 @@ import { providerCapabilityName, validateProviderSelection } from "./registry.js
  */
 export interface ProviderModelConfig {
   provider: string;
+  model: string;
+  effort?: string;
+}
+
+/**
+ * One raw provider/model/effort entry as it arrives from untrusted input
+ * (YAML, JSON, an MCP tool call) — `model` is optional here only because
+ * nothing upstream of {@link validateModelConfigPool} can enforce the
+ * required-field contract on parsed input; the validated
+ * {@link ProviderModelConfig} that comes out always has one.
+ */
+export interface RawProviderModelConfig {
+  provider: string;
   model?: string;
   effort?: string;
 }
 
-export type ModelConfigInput = ProviderModelConfig | ProviderModelConfig[];
+export type ModelConfigInput = RawProviderModelConfig | RawProviderModelConfig[];
 
 /**
  * Standing default coder pool used by `spawn_thread` when the caller omits
@@ -42,6 +55,29 @@ export const MAX_MODEL_CONFIG_POOL_SIZE = 8;
  * one require a portable actor: a native provider session is tied to one
  * provider and can't be handed between candidates.
  */
+/**
+ * Fill an omitted `model` on each entry from the actor's current declared
+ * pool, matched by provider — so an effort-only or provider-only partial
+ * `setActorModel` update ("keep running the same model, just change the
+ * effort") keeps working under the required-model contract. An entry whose
+ * provider has no match in `current` (e.g. a genuine cross-provider move)
+ * is left as-is and will still fail {@link validateModelConfigPool}'s
+ * required-model check — falling back to the actor's own currently-running
+ * model is safe and intentional; falling back to an unrelated provider's
+ * default is exactly what #169 forbids.
+ */
+export function fillModelConfigFromCurrent(
+  input: ModelConfigInput,
+  current: readonly ProviderModelConfig[] | undefined
+): ModelConfigInput {
+  const filled = (Array.isArray(input) ? input : [input]).map((entry) => {
+    if (entry.model?.trim()) return entry;
+    const match = current?.find((c) => c.provider === entry.provider);
+    return match ? { ...entry, model: match.model } : entry;
+  });
+  return Array.isArray(input) ? filled : filled[0];
+}
+
 export function validateModelConfigPool(
   config: RusaConfig,
   input: ModelConfigInput,
@@ -68,7 +104,16 @@ export function validateModelConfigPool(
     if (!providerName) {
       throw new Error("modelConfig entry is missing a provider");
     }
-    const selection = validateProviderSelection(config, providerName, entry.model, entry.effort);
+    // An omitted or blank model must fail here, before anything is mutated —
+    // never silently fall through to the provider's own default. #169
+    // migrates the formerly-required spawn model onto every pool entry.
+    const requestedModel = entry.model?.trim();
+    if (!requestedModel) {
+      throw new Error(
+        `modelConfig entry for provider "${providerName}" is missing a model — omitted/blank models are not allowed, since that would silently select the provider's default`
+      );
+    }
+    const selection = validateProviderSelection(config, providerName, requestedModel, entry.effort);
     const identity = JSON.stringify([
       providerCapabilityName(providerName, config),
       selection.model ?? "",
@@ -80,6 +125,11 @@ export function validateModelConfigPool(
       );
     }
     seen.add(identity);
+    if (!selection.model) {
+      throw new Error(
+        `modelConfig entry for provider "${providerName}" resolved to no model — this should be unreachable since a model was required above`
+      );
+    }
     return { provider: providerName, model: selection.model, effort: selection.effort };
   });
 }

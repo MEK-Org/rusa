@@ -59,6 +59,24 @@ export interface RunStartEvent extends MeshEvent<RunStartPayload> {
   kind: "run_start";
 }
 
+export interface RunSelectedPayload {
+  /** Declared provider alias as configured — kept distinct from `lane` so a configured alias is never silently erased by canonicalization. */
+  provider: string;
+  /** Canonical pacing/account lane (`providerThrottleKey`) this selection resolves to. */
+  lane: string;
+  model: string;
+  effort?: string;
+  /** Index of the selected candidate within the actor's declared pool, in declaration order. */
+  declaredIndex: number;
+  /** ISO-8601 quoted eligible-start time for this reservation. */
+  eligibleAt: string;
+  responsive: boolean;
+}
+
+export interface RunSelectedEvent extends MeshEvent<RunSelectedPayload> {
+  kind: "run_selected";
+}
+
 /** Largest body we persist per event; longer text is tail-truncated. */
 const MAX_BODY_CHARS = 40_000;
 

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { deterministicExhaustionFallback } from "../providers/exhaustion-classifier.js";
 import { FakeProvider } from "../providers/fake-provider.js";
-import type { ProviderModelConfig } from "../providers/model-config.js";
+import type { RawProviderModelConfig } from "../providers/model-config.js";
 import * as sandboxModule from "../providers/sandbox.js";
 import type { RunOptions, RunResult } from "../providers/types.js";
 import {
@@ -328,8 +328,8 @@ describe("Actor", () => {
     let promotions = 0;
     const priorities: boolean[] = [];
     const gate: NonNullable<ActorOptions["gate"]> = <T>(
-      fn: (selected: ProviderModelConfig) => Promise<T>,
-      candidates: readonly ProviderModelConfig[],
+      fn: (selected: RawProviderModelConfig) => Promise<T>,
+      candidates: readonly RawProviderModelConfig[],
       responsive: boolean
     ) => {
       priorities.push(responsive);
@@ -536,8 +536,8 @@ describe("Actor", () => {
       const actor = makeActor(
         {
           gate: <T>(
-            fn: (selected: ProviderModelConfig) => Promise<T>,
-            candidates: readonly ProviderModelConfig[]
+            fn: (selected: RawProviderModelConfig) => Promise<T>,
+            candidates: readonly RawProviderModelConfig[]
           ): RunStartHandle<T> => {
             runInvoke = async () => {
               try {

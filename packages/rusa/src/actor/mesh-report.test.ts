@@ -41,7 +41,7 @@ describe("generateMeshReport", () => {
         id: "worker-abcdef12",
         charter: "implement the feature",
         parentId: "root",
-        modelConfig: [{ provider: "claude" }],
+        modelConfig: [{ provider: "claude", model: "claude-sonnet-5" }],
         status: "active",
         createdAt: "t1",
       },

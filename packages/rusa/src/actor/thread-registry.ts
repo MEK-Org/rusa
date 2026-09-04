@@ -337,6 +337,11 @@ export function migrateLegacyModelConfig(
   }
 
   const current = normalizeModelEffortSelection(provider, rec.model ?? undefined, rec.effort);
+  if (!current.model) {
+    throw new Error(
+      `migrateLegacyModelConfig: record ${rec.id} has a legacy provider ("${rec.provider}") but no model, which the modelConfig contract cannot represent — resolve this record manually before loading it`
+    );
+  }
   const modelConfig: ProviderModelConfig[] = [
     { provider: rec.provider ?? provider, model: current.model, effort: current.effort },
   ];
@@ -349,10 +354,13 @@ export function migrateLegacyModelConfig(
       rec.desiredModel,
       typeof rec.desiredEffort === "string" ? rec.desiredEffort : undefined
     );
+    // A desired-provider-only swap (no explicit desired model) carries the
+    // current model forward, mirroring the DB migration's same fallback.
+    const desiredModel = desired.model ?? current.model;
     desiredModelConfig = [
       {
         provider: rec.desiredProvider ?? rec.provider ?? desiredProviderName,
-        model: desired.model,
+        model: desiredModel,
         effort: rec.desiredEffort === null ? undefined : desired.effort,
       },
     ];

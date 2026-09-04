@@ -1,5 +1,5 @@
 import type { ExhaustionClassifier } from "../providers/exhaustion-classifier.js";
-import type { ProviderModelConfig } from "../providers/model-config.js";
+import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
 import { teardownFlutterOverlay } from "../providers/sandbox.js";
 import {
   createInterruptAbortReason,
@@ -53,11 +53,15 @@ export interface ActorOptions {
   cwd: string;
   /**
    * The declared candidate pool this actor runs on (design MEK-Org/rusa#169).
-   * A single fixed-model actor still declares a one-element pool.
+   * A single fixed-model actor still declares a one-element pool. `model` is
+   * optional here (unlike the validated {@link ProviderModelConfig} pool
+   * contract) solely for root's own scalar config, which may omit a model to
+   * mean "the provider CLI's own default" — a worker's pool always carries
+   * concrete models, enforced upstream by `validateModelConfigPool`.
    */
-  modelConfig: ProviderModelConfig[];
+  modelConfig: RawProviderModelConfig[];
   /** Resolve one declared candidate into the coding provider that will run it. */
-  resolveProvider: (config: ProviderModelConfig) => CodingProvider;
+  resolveProvider: (config: RawProviderModelConfig) => CodingProvider;
   /** MCP servers attached as this actor's tools. */
   mcpServers: McpServerSpec[];
   /**
@@ -120,8 +124,8 @@ export interface ActorOptions {
    * both queues; the returned handle can promote a queued normal run.
    */
   gate?: <T>(
-    fn: (selected: ProviderModelConfig) => Promise<T>,
-    candidates: readonly ProviderModelConfig[],
+    fn: (selected: RawProviderModelConfig) => Promise<T>,
+    candidates: readonly RawProviderModelConfig[],
     responsive: boolean
   ) => Promise<T> | RunStartHandle<T>;
   /**
@@ -155,7 +159,7 @@ export interface ActorOptions {
   onRunStart?: (
     responsive: boolean,
     injectRecord: InjectRecord | undefined,
-    selected: ProviderModelConfig
+    selected: RawProviderModelConfig
   ) => void;
   /**
    * Optional hook fired ONCE per run, on the first chunk the provider emits —
@@ -196,6 +200,14 @@ export interface ActorOptions {
   onRunAbandoned?: (abandon: RunAbandon) => void;
   /** Publish the actor's derived runtime state after each real flag mutation cluster. */
   onRuntimeStateChanged?: (state: "queued" | "running" | "winding_down" | "idle") => void;
+  /**
+   * Fires when a genuinely queued (not yet started) run is actually
+   * cancelled — from {@link cancelQueuedRun} or a successful cancel inside
+   * {@link preemptForResponsive} — so a caller tracking queued-selection
+   * state (which lane a queued run reserved) can clear it. Never fires once
+   * the run has started; {@link onRunEnd}/{@link onRunAbandoned} cover that.
+   */
+  onQueuedRunCancelled?: () => void;
 }
 
 /** What ended without a result, and which brackets it closes. */
@@ -438,6 +450,7 @@ export class Actor {
   cancelQueuedRun(): boolean {
     if (!this.pendingStart?.cancel?.()) return false;
     this.cancelledQueuedRun = true;
+    this.opts.onQueuedRunCancelled?.();
     return true;
   }
 
@@ -484,9 +497,13 @@ export class Actor {
     this.publishRuntimeStateIfChanged();
 
     if (this.pendingStart) {
-      if (this.pendingStart.cancel && !this.pendingStart.cancel()) {
-        this.preemptedQueuedRun = true;
-        return { preempted: true, phase: "queued" };
+      if (this.pendingStart.cancel) {
+        if (this.pendingStart.cancel()) {
+          this.opts.onQueuedRunCancelled?.();
+        } else {
+          this.preemptedQueuedRun = true;
+          return { preempted: true, phase: "queued" };
+        }
       }
     }
 
@@ -738,7 +755,7 @@ export class Actor {
           this.opts.log?.(chunk);
         },
       });
-    const invoke = (selected: ProviderModelConfig): Promise<RunResult> => {
+    const invoke = (selected: RawProviderModelConfig): Promise<RunResult> => {
       // Both queues have selected this run. From this point a later responsive
       // wake obeys per-actor serialization; v1 never cancels a live provider.
       this.pendingStart = undefined;

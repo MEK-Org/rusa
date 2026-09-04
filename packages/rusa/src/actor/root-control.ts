@@ -69,17 +69,27 @@ export class RootControlService {
   spawnChild(request: RootChildRequest, principal: RootControlPrincipal): string {
     const charter = request.charter?.trim();
     if (!charter) throw new Error("charter is required");
-    const pool: readonly ProviderModelConfig[] = Array.isArray(request.modelConfig)
+    const rawPool = Array.isArray(request.modelConfig)
       ? request.modelConfig
       : [request.modelConfig];
-    if (pool.length === 0) throw new Error("modelConfig is required");
+    if (rawPool.length === 0) throw new Error("modelConfig is required");
     if (this.providers.length > 0) {
-      for (const { provider } of pool) {
+      for (const { provider } of rawPool) {
         if (!this.providers.includes(provider)) {
           throw new Error(`unknown provider: ${provider}`);
         }
       }
     }
+    // The real config-aware validation (including the required-model check,
+    // #169) happens inside mesh.spawn; this local pool is only for the
+    // provider-allowlist check above and the event-log record below, so it
+    // must not silently accept a missing model either.
+    const pool: readonly ProviderModelConfig[] = rawPool.map((entry) => {
+      const model = entry.model?.trim();
+      if (!model)
+        throw new Error(`modelConfig entry for provider "${entry.provider}" is missing a model`);
+      return { provider: entry.provider, model, effort: entry.effort };
+    });
     if (
       request.maxRuns !== undefined &&
       (!Number.isInteger(request.maxRuns) || request.maxRuns < 1)

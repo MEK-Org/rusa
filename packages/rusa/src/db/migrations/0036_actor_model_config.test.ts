@@ -65,4 +65,47 @@ describe("0036_actor_model_config", () => {
       { provider: "next-provider", model: "next-model" },
     ]);
   });
+
+  it("fails loudly on a legacy row with a provider but no model, rather than writing an entry the new contract can't represent", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    runUpTo(db, "0034_actor_runtime_state");
+    db.prepare(
+      `INSERT INTO actor_threads (
+        id, charter, parent_id, provider, model, effort,
+        desired_provider, desired_model, desired_effort, desired_effort_is_set,
+        is_root, status, human_unlocked, created_at
+      ) VALUES ('root', 'Own the mesh', NULL, 'codex', NULL, NULL,
+        NULL, NULL, NULL, 0,
+        1, 'active', 0, '2026-09-03T13:00:00.000Z')`
+    ).run();
+
+    expect(() => runUpTo(db, "0036_actor_model_config", "0034_actor_runtime_state")).toThrow(
+      /no model/
+    );
+  });
+
+  it("preserves an existing model on a partial desired-provider-only swap during migration", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    runUpTo(db, "0034_actor_runtime_state");
+    db.prepare(
+      `INSERT INTO actor_threads (
+        id, charter, parent_id, provider, model, effort,
+        desired_provider, desired_model, desired_effort, desired_effort_is_set,
+        is_root, status, human_unlocked, created_at
+      ) VALUES ('root', 'Own the mesh', NULL, 'codex', 'gpt-test', NULL,
+        'next-provider', NULL, NULL, 0,
+        1, 'active', 0, '2026-09-03T13:00:00.000Z')`
+    ).run();
+
+    runUpTo(db, "0036_actor_model_config", "0034_actor_runtime_state");
+
+    const row = db
+      .prepare("SELECT desired_model_config FROM actor_threads WHERE id = 'root'")
+      .get() as { desired_model_config: string };
+    expect(JSON.parse(row.desired_model_config)).toEqual([
+      { provider: "next-provider", model: "gpt-test" },
+    ]);
+  });
 });

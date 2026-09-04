@@ -85,7 +85,7 @@ import {
   FilePortableContextStore,
   type PortableContextStore,
 } from "../actor/portable-context-state.js";
-import { type PoolLaneCandidate, ProviderPacer, selectPoolLane } from "../actor/provider-pacer.js";
+import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "../actor/provider-pacer.js";
 import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-throttle-status.js";
 import { RootControlService } from "../actor/root-control.js";
 import { buildRootPrompt } from "../actor/root-prompt.js";
@@ -183,8 +183,8 @@ import { DiskUsageAlert } from "../observability/disk-alert.js";
 import { antigravityScratchDir } from "../providers/antigravity.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
-import type { ProviderModelConfig } from "../providers/model-config.js";
-import { validateModelConfigPool } from "../providers/model-config.js";
+import type { RawProviderModelConfig } from "../providers/model-config.js";
+import { fillModelConfigFromCurrent, validateModelConfigPool } from "../providers/model-config.js";
 import { refreshConfiguredProviderModelCatalogs } from "../providers/model-scrape.js";
 import {
   DEFAULT_ROOT_PROVIDER,
@@ -1513,7 +1513,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       });
     },
     validateModel: (record, modelConfig) => {
-      return validateModelConfigPool(config, modelConfig, {
+      const filled = fillModelConfigFromCurrent(modelConfig, record.modelConfig);
+      return validateModelConfigPool(config, filled, {
         portable: record.context?.type === "portable",
       });
     },
@@ -1547,46 +1548,68 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     grantableCapabilities: new Set([...grantableServers.keys(), ...PARENT_GRANTABLE_CAPABILITIES]),
     maxConcurrent: config.mesh?.maxConcurrent,
     providerGate: (fn, candidates, request) => {
-      const lanes: PoolLaneCandidate<ProviderModelConfig>[] = candidates.map((c) => ({
+      const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
         config: c,
         lane: providerThrottleKey(c.provider, config),
         pacer: pacerFor(providerThrottleKey(c.provider, config)),
       }));
-      // Responsive: bypass pacing/quoting and take the first healthy declared
-      // candidate in declaration order, falling back to the first candidate if
-      // every lane is halted (the halted state itself gates the run elsewhere).
-      const chosen = request.responsive
-        ? (lanes.find((l) => !isProviderHalted(l.config.provider)) ?? lanes[0])
-        : // Normal: quote every healthy lane and reserve the earliest, declaration
-          // order breaking ties. No `await` between select and submit — reservation
-          // must land in the same synchronous tick selectPoolLane read it in.
-          (selectPoolLane(
-            lanes.filter((l) => !isProviderHalted(l.config.provider)),
-            Date.now()
-          ) ??
-          selectPoolLane(lanes, Date.now()) ??
-          lanes[0]);
-      return chosen.pacer.submit(() => fn(chosen.config), {
+      // submitPoolGate owns both selection rules: normal requests quote every
+      // healthy lane and reserve the earliest (declaration order breaking
+      // ties); responsive requests bypass pacing and take the first healthy
+      // declared candidate, and its own `promote()` re-runs that same
+      // first-healthy-declared selection rather than merely promoting
+      // whichever lane was first reserved.
+      return submitPoolGate((selected) => fn(selected), lanes, {
         responsive: request.responsive,
         threadId: request.threadId,
         enqueueNormal: request.enqueueNormal,
-        // A staged modelConfig swap may land (via applyPendingModel) while this
-        // request sits in this lane's pacer queue. Re-checking here, right
-        // before start, means a genuinely-queued swap away from this lane is
-        // caught before it launches (and charges this lane's clock) under a
-        // pool the actor no longer declares — see actor.ts's gate retry loop
-        // for the other half of this contract (#199, extended to pools). A
-        // swap that keeps this lane in the live pool is not stale: V1 does not
-        // rebalance a reserved lane mid-queue merely because another pool
-        // member might now quote earlier.
+        isHalted: (c) => isProviderHalted(c.provider),
+        onSelected: request.threadId
+          ? (selection) => {
+              const provider = selection.candidate.provider;
+              const model = selection.candidate.model ?? "";
+              const effort = selection.candidate.effort;
+              request.onSelected?.({
+                provider,
+                lane: selection.lane,
+                model,
+                effort,
+                declaredIndex: selection.declaredIndex,
+                eligibleAt: selection.eligibleAt,
+                responsive: selection.responsive,
+              });
+              mesh.recordEvent({
+                kind: "run_selected",
+                actorId: request.threadId as string,
+                payload: JSON.stringify({
+                  provider,
+                  lane: selection.lane,
+                  model,
+                  effort,
+                  declaredIndex: selection.declaredIndex,
+                  eligibleAt: new Date(selection.eligibleAt).toISOString(),
+                  responsive: selection.responsive,
+                }),
+              });
+            }
+          : undefined,
+        // A staged modelConfig swap may land (via applyPendingModel) while
+        // this request sits in its reserved lane's pacer queue.
+        // Re-checking here, right before start, means a genuinely-queued
+        // swap away from this lane is caught before it launches (and
+        // charges this lane's clock) under a pool the actor no longer
+        // declares — see actor.ts's gate retry loop for the other half of
+        // this contract (#199, extended to pools). A swap that keeps this
+        // lane in the live pool is not stale: V1 does not rebalance a
+        // reserved lane mid-queue merely because another pool member might
+        // now quote earlier.
         revalidateProvider: request.threadId
-          ? () => {
+          ? (c) => {
               mesh.applyPendingModel(request.threadId as string);
               const liveConfigs = registry.get(request.threadId as string)?.modelConfig;
               if (!liveConfigs) return true;
-              return liveConfigs.some(
-                (c) => providerThrottleKey(c.provider, config) === chosen.lane
-              );
+              const lane = providerThrottleKey(c.provider, config);
+              return liveConfigs.some((lc) => providerThrottleKey(lc.provider, config) === lane);
             }
           : undefined,
       });
@@ -1667,7 +1690,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // candidate before registering MCP servers so a resolution failure can't leave
       // an inert endpoint mounted. A record without a pool (legacy/adopted) falls back
       // to the root provider.
-      const modelConfigPool: readonly ProviderModelConfig[] = rec.modelConfig ?? [
+      const modelConfigPool: readonly RawProviderModelConfig[] = rec.modelConfig ?? [
         {
           provider: config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER,
           model: config.rootActor?.model,
@@ -1866,7 +1889,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
         // Which declared candidate actually ran, for the failure-notice label —
         // set on each onRunStart, read back on that same run's onRunEnd.
-        let lastSelected: ProviderModelConfig = modelConfigPool[0];
+        let lastSelected: RawProviderModelConfig = modelConfigPool[0];
         const actor: Actor = new Actor({
           id,
           cwd,
@@ -1938,6 +1961,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           // the exhaustion-classified onRun failure notice below).
           gate: ctx.gate,
           beforeRun: ctx.beforeRun,
+          onQueuedRunCancelled: ctx.onQueuedRunCancelled,
           // Compatibility only: Actor enforces one corrective yield prompt
           // regardless of this legacy cap value.
           maxContinuations: WORKER_MAX_CONTINUATIONS,
@@ -1966,6 +1990,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           onRuntimeStateChanged: ctx.onRuntimeStateChanged,
           onRunStart: (responsive, injectRecord, selected) => {
             lastSelected = selected;
+            // The run actually launched: the queued reservation this
+            // describes no longer exists to cancel or report on.
+            mesh.clearSelection(id);
             const providerName = providerThrottleKey(selected.provider, config);
             const runId = beginActorRun(id, providerName);
             mesh.recordEvent({
@@ -2400,7 +2427,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // Which entry actually ran, for the failure-notice label — set on each
   // onRunStart, read back on that same run's onRunEnd (mirrors the worker
   // `lastSelected` pattern, since root's one entry can move too).
-  let rootLastSelected: ProviderModelConfig = {
+  let rootLastSelected: RawProviderModelConfig = {
     provider: provider.providerName,
     model: provider.model,
     effort: provider.effort,
@@ -2484,6 +2511,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         return inboxStore.countUnhandled(rootId) > 0;
       },
       gate: (fn, candidates, responsive) => mesh.gateRun(fn, candidates, responsive, rootId),
+      onQueuedRunCancelled: () => mesh.clearSelection(rootId),
       onContinue: (n) =>
         mesh.recordEvent({
           kind: "run_continued",
@@ -2509,6 +2537,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
       onRunStart: (responsive, injectRecord, selected) => {
         rootLastSelected = selected;
+        // The run actually launched: the queued reservation this describes
+        // no longer exists to cancel or report on.
+        mesh.clearSelection(rootId);
         const providerName = providerThrottleKey(selected.provider, config);
         const runId = beginActorRun(rootId, providerName);
         mesh.recordEvent({
@@ -2591,9 +2622,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     charter: config.rootActor?.charter ?? DEFAULT_ROOT_CHARTER,
     parentId: null,
     isRoot: true,
-    modelConfig: [
-      { provider: provider.providerName, model: provider.model, effort: provider.effort },
-    ],
+    // Only recorded when a concrete model is actually declared — root's own
+    // scalar config may omit `model` to mean "the provider CLI's own
+    // default", which the durable modelConfig pool contract (#169) can't
+    // represent (it requires a concrete model on every entry). Omitting the
+    // field here leaves `launchProviderName`'s fallback (below) as the
+    // provider-only source of truth for a CLI-default root.
+    ...(provider.model
+      ? {
+          modelConfig: [
+            { provider: provider.providerName, model: provider.model, effort: provider.effort },
+          ],
+        }
+      : {}),
     context: config.rootActor?.context,
     sessionId:
       config.rootActor?.context?.type === "portable" ? undefined : loadRootSessionId(sessionFile),

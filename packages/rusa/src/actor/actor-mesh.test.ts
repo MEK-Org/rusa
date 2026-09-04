@@ -8,7 +8,7 @@ import type { IssueClient } from "../gitops/issue-client.js";
 import { MESH_SYSTEM, resolveStampedAuthor } from "../mcp/stamp.js";
 import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
 import { FakeProvider } from "../providers/fake-provider.js";
-import type { ProviderModelConfig } from "../providers/model-config.js";
+import type { RawProviderModelConfig } from "../providers/model-config.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { Actor } from "./actor.js";
@@ -34,7 +34,7 @@ import type {
 } from "./inbox-store.js";
 import type { MeshEventInput, MeshEventSink } from "./mesh-events.js";
 import type { OsScheduler } from "./os-scheduler.js";
-import { ProviderPacer } from "./provider-pacer.js";
+import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "./provider-pacer.js";
 import { InMemoryThreadRegistry, type ThreadRecord } from "./thread-registry.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
@@ -2228,17 +2228,17 @@ describe("ActorMesh", () => {
     const running = mesh.spawn({
       charter: "running",
       parentId: "root",
-      modelConfig: { provider: "claude" },
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
     });
     const blocked = mesh.spawn({
       charter: "blocked",
       parentId: "root",
-      modelConfig: { provider: "codex" },
+      modelConfig: { provider: "codex", model: "gpt-5.6-sol" },
     });
     const unaffected = mesh.spawn({
       charter: "unaffected",
       parentId: "root",
-      modelConfig: { provider: "claude" },
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
     });
     mesh.sendMessage(running, "go", "root");
     mesh.sendMessage(blocked, "go", "root");
@@ -2273,15 +2273,14 @@ describe("ActorMesh", () => {
     const worker = mesh.spawn({
       charter: "worker",
       parentId: "root",
-      provider: "provider-a",
-      model: "model-a",
+      modelConfig: { provider: "provider-a", model: "model-a" },
       context: { type: "portable", mode: "ledger" },
     });
 
     // Stage a move to provider-b, then halt provider-b, while worker is idle —
     // the tuple has not launched yet, so beforeRun's halt gate must consult
     // the provider this run will actually dispatch to, not the stale current one.
-    mesh.setActorModel(worker, "model-b", "root", "provider-b");
+    mesh.setActorModel(worker, { provider: "provider-b", model: "model-b" }, "root");
     halted.add("provider-b");
 
     mesh.sendMessage(worker, "go", "root");
@@ -2291,7 +2290,7 @@ describe("ActorMesh", () => {
     expect(d.pending()).toBe(0);
     expect(mesh.runningThreadIds()).toEqual(new Set());
     expect(mesh.queuedThreadIds()).toEqual(new Set());
-    expect(registry.get(worker)?.provider).toBe("provider-a");
+    expect(registry.get(worker)?.modelConfig?.[0]?.provider).toBe("provider-a");
 
     // Lifting the halt and reconciling unseen inbox work (the production
     // halt-expiry/`/resume` path) replays the gated-off wake without a fresh
@@ -2302,7 +2301,7 @@ describe("ActorMesh", () => {
     await tick();
 
     expect(d.pending()).toBe(1);
-    expect(registry.get(worker)?.provider).toBe("provider-b");
+    expect(registry.get(worker)?.modelConfig?.[0]?.provider).toBe("provider-b");
 
     d.releaseAll();
     await tick();
@@ -2316,12 +2315,15 @@ describe("ActorMesh", () => {
       sharedProvider: d.provider,
       isHalted: (provider) => (provider ? halted.has(provider) : halted.size > 0),
     });
-    const running = mesh.spawn({ charter: "running", parentId: "root", provider: "provider-a" });
+    const running = mesh.spawn({
+      charter: "running",
+      parentId: "root",
+      modelConfig: { provider: "provider-a", model: "model-a" },
+    });
     const worker = mesh.spawn({
       charter: "worker",
       parentId: "root",
-      provider: "provider-a",
-      model: "model-a",
+      modelConfig: { provider: "provider-a", model: "model-a" },
       context: { type: "portable", mode: "ledger" },
     });
     mesh.sendMessage(running, "go", "root");
@@ -2332,8 +2334,8 @@ describe("ActorMesh", () => {
     // Stage the cross-provider swap while worker already sits queued behind
     // mesh capacity, then halt the new provider — not the old one it's
     // registered under.
-    mesh.setActorModel(worker, "model-b", "root", "provider-b");
-    expect(registry.get(worker)?.provider).toBe("provider-a");
+    mesh.setActorModel(worker, { provider: "provider-b", model: "model-b" }, "root");
+    expect(registry.get(worker)?.modelConfig?.[0]?.provider).toBe("provider-a");
     halted.add("provider-b");
 
     expect(mesh.cancelHaltedQueuedRuns()).toEqual([worker]);
@@ -2349,7 +2351,7 @@ describe("ActorMesh", () => {
     d.releaseAll();
     await tick();
 
-    expect(registry.get(worker)?.provider).toBe("provider-b");
+    expect(registry.get(worker)?.modelConfig?.[0]?.provider).toBe("provider-b");
     expect(d.pending()).toBe(1);
 
     d.releaseAll();
@@ -2918,15 +2920,15 @@ describe("ActorMesh", () => {
         modelSets.push({ actorId, newModel: modelConfig[0]?.model }),
       validateModel: (_record, modelConfig) => {
         const list = Array.isArray(modelConfig) ? modelConfig : [modelConfig];
-        const valid = list.filter((entry) => entry.model?.trim());
-        for (const entry of valid) {
-          if (entry.model === "forbidden-model") throw new Error("forbidden model");
-        }
-        return valid.map((entry) => ({
-          provider: entry.provider,
-          model: entry.model,
-          effort: entry.effort,
-        }));
+        return list.map((entry) => {
+          const model = entry.model?.trim();
+          if (!model)
+            throw new Error(
+              `modelConfig entry for provider "${entry.provider}" is missing a model`
+            );
+          if (model === "forbidden-model") throw new Error("forbidden model");
+          return { provider: entry.provider, model, effort: entry.effort };
+        });
       },
     });
     const parent = mesh.spawn({
@@ -2981,7 +2983,7 @@ describe("ActorMesh", () => {
 
     // Refuses an empty/whitespace modelConfig pool
     expect(() => mesh.setActorModel(child, { provider: "claude", model: "   " }, parent)).toThrow(
-      /empty modelConfig/
+      /missing a model/
     );
 
     // Throws on unknown thread
@@ -3005,7 +3007,12 @@ describe("ActorMesh", () => {
         const list = Array.isArray(modelConfig) ? modelConfig : [modelConfig];
         return list.map((entry) => {
           validations.push({ model: entry.model, effort: entry.effort });
-          return { provider: entry.provider, model: entry.model, effort: entry.effort };
+          const model = entry.model?.trim();
+          if (!model)
+            throw new Error(
+              `modelConfig entry for provider "${entry.provider}" is missing a model`
+            );
+          return { provider: entry.provider, model, effort: entry.effort };
         });
       },
     });
@@ -3044,25 +3051,36 @@ describe("ActorMesh", () => {
     expect(registry.get(child)?.desiredModelConfig).toBeUndefined();
   });
 
-  it("supports an effort-only update when the root uses its provider's default model", () => {
+  it("rejects an effort-only update when there is no current model on record to carry forward", () => {
+    // A root using its provider's own default model (#169) has no concrete
+    // model to record — commands/start.ts leaves `modelConfig` unset on that
+    // ThreadRecord entirely (see rootRecord construction). With no current
+    // model to fall back to, an effort-only update has nothing to carry the
+    // model from and must fail rather than silently pick a default; this
+    // mirrors production's `fillModelConfigFromCurrent` + `validateModelConfigPool`
+    // wiring in start.ts, which the fake `validateModel` below stands in for.
     const validations: Array<{ model?: string; effort?: string }> = [];
     const { mesh, registry } = setup({
       validateModel: (_record, modelConfig) => {
         const list = Array.isArray(modelConfig) ? modelConfig : [modelConfig];
         return list.map((entry) => {
           validations.push({ model: entry.model, effort: entry.effort });
-          return { provider: entry.provider, model: entry.model, effort: entry.effort };
+          const model = entry.model?.trim();
+          if (!model)
+            throw new Error(
+              `modelConfig entry for provider "${entry.provider}" is missing a model`
+            );
+          return { provider: entry.provider, model, effort: entry.effort };
         });
       },
     });
-    registry.patch("root", { modelConfig: [{ provider: "claude" }] });
+    expect(registry.get("root")?.modelConfig).toBeUndefined();
 
-    mesh.setActorModel("root", { provider: "claude", effort: "high" }, "root");
-
+    expect(() =>
+      mesh.setActorModel("root", { provider: "claude", effort: "high" }, "root")
+    ).toThrow(/missing a model/);
     expect(validations).toEqual([{ model: undefined, effort: "high" }]);
-    expect(registry.get("root")?.desiredModelConfig).toEqual([
-      { provider: "claude", effort: "high" },
-    ]);
+    expect(registry.get("root")?.desiredModelConfig).toBeUndefined();
   });
 
   it("lets only the root set its own portable model at its run boundary", () => {
@@ -3137,6 +3155,9 @@ describe("ActorMesh", () => {
             throw new Error("invalid model for antigravity");
           }
           const sel = normalizeModelEffortSelection(provider as string, entry.model, entry.effort);
+          if (!sel.model) {
+            throw new Error(`modelConfig entry for provider "${provider}" is missing a model`);
+          }
           return { provider: provider as string, model: sel.model, effort: sel.effort };
         });
       },
@@ -3770,7 +3791,7 @@ describe("ActorMesh", () => {
             id: ctx.record.id,
             cwd: `/tmp/${ctx.record.id}`,
             modelConfig: isBlocker
-              ? [{ provider: "blocker" }]
+              ? [{ provider: "blocker", model: "model-blocker" }]
               : (ctx.record.modelConfig ?? [{ provider: "provider-a", model: "model-a" }]),
             resolveProvider: isBlocker
               ? () => ({
@@ -3802,7 +3823,11 @@ describe("ActorMesh", () => {
         },
       });
 
-      const blocker = mesh.spawn({ charter: "blocker", parentId: "root" });
+      const blocker = mesh.spawn({
+        charter: "blocker",
+        parentId: "root",
+        modelConfig: { provider: "blocker", model: "model-blocker" },
+      });
       const worker = mesh.spawn({
         charter: "worker",
         parentId: "root",
@@ -3916,7 +3941,7 @@ describe("ActorMesh", () => {
             id: ctx.record.id,
             cwd: `/tmp/${ctx.record.id}`,
             modelConfig: isBlocker
-              ? [{ provider: "blocker" }]
+              ? [{ provider: "blocker", model: "model-blocker" }]
               : (ctx.record.modelConfig ?? [{ provider: "provider-a", model: "model-a" }]),
             resolveProvider: isBlocker
               ? () => ({
@@ -3951,7 +3976,11 @@ describe("ActorMesh", () => {
       // Provider B is already halted, before anything is staged or queued.
       halted.add("provider-b");
 
-      const blocker = mesh.spawn({ charter: "blocker", parentId: "root" });
+      const blocker = mesh.spawn({
+        charter: "blocker",
+        parentId: "root",
+        modelConfig: { provider: "blocker", model: "model-blocker" },
+      });
       const worker = mesh.spawn({
         charter: "worker",
         parentId: "root",
@@ -3999,6 +4028,358 @@ describe("ActorMesh", () => {
 
       expect(providerBRuns).toEqual([`/tmp/${worker}`]);
       expect(providerARuns).toEqual([]);
+    });
+  });
+
+  // #169 pool-aware HALT keying: with a genuine multi-candidate pool wired
+  // through `submitPoolGate` (mirroring the production providerGate in
+  // start.ts), a queued run's cancellation must key off the *actual reserved
+  // lane* (`mesh.getSelection`), not a whole-pool `allCandidatesHalted` scan —
+  // otherwise a halt on the reserved lane is masked by a healthy, unreserved
+  // sibling still sitting in the same declared pool.
+  describe("cancellation keys off the actual reserved lane, not the whole pool (#169)", () => {
+    it("cancels a queued run whose reserved lane is halted even though a healthy sibling remains in the pool, then resumes cleanly once cleared", async () => {
+      const poolARuns: string[] = [];
+      const poolBRuns: string[] = [];
+      const liveActors = new Map<string, Actor>();
+      const blockerDeferred = deferredProvider();
+      const halted = new Set<string>();
+      const providerByName = new Map<string, CodingProvider>([
+        [
+          "pool-a",
+          {
+            name: "pool-a",
+            providerName: "pool-a",
+            run: async (runOpts) => {
+              poolARuns.push(runOpts.cwd);
+              liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
+              return { success: true, exitCode: 0, output: "a" };
+            },
+          },
+        ],
+        [
+          "pool-b",
+          {
+            name: "pool-b",
+            providerName: "pool-b",
+            run: async (runOpts) => {
+              poolBRuns.push(runOpts.cwd);
+              liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
+              return { success: true, exitCode: 0, output: "b" };
+            },
+          },
+        ],
+      ]);
+      const pacers = new Map<string, ProviderPacer>();
+      const pacerFor = (name: string): ProviderPacer => {
+        let pacer = pacers.get(name);
+        if (!pacer) {
+          pacer = new ProviderPacer(0);
+          pacers.set(name, pacer);
+        }
+        return pacer;
+      };
+
+      const { mesh, registry, tick } = setup({
+        maxConcurrent: 1,
+        isHalted: (provider) => (provider ? halted.has(provider) : false),
+        // Mirrors the production providerGate wiring in start.ts: a real
+        // multi-lane pool selection via `submitPoolGate`, not the naive
+        // `candidates[0]` scaffold the gap-2/gap-3 blocks above use.
+        providerGate: (fn, candidates, request) => {
+          const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
+            config: c,
+            lane: c.provider,
+            pacer: pacerFor(c.provider),
+          }));
+          return submitPoolGate(fn, lanes, {
+            responsive: request.responsive,
+            threadId: request.threadId,
+            enqueueNormal: request.enqueueNormal,
+            isHalted: (c) => halted.has(c.provider),
+            onSelected: request.threadId
+              ? (selection) =>
+                  request.onSelected?.({
+                    provider: selection.candidate.provider,
+                    lane: selection.lane,
+                    model: selection.candidate.model ?? "",
+                    effort: selection.candidate.effort,
+                    declaredIndex: selection.declaredIndex,
+                    eligibleAt: selection.eligibleAt,
+                    responsive: selection.responsive,
+                  })
+              : undefined,
+          });
+        },
+        createActor: (ctx) => {
+          let actor!: Actor;
+          const isBlocker = ctx.record.charter === "blocker";
+          actor = new Actor({
+            id: ctx.record.id,
+            cwd: `/tmp/${ctx.record.id}`,
+            modelConfig: isBlocker
+              ? [{ provider: "blocker", model: "model-blocker" }]
+              : (ctx.record.modelConfig ?? [{ provider: "pool-a", model: "model-a" }]),
+            resolveProvider: isBlocker
+              ? () => ({
+                  ...blockerDeferred.provider,
+                  run: async (runOpts) => {
+                    const result = await blockerDeferred.provider.run(runOpts);
+                    if (result.success) actor.declareYield();
+                    return result;
+                  },
+                })
+              : (selected) => {
+                  const base = providerByName.get(selected.provider);
+                  if (!base) throw new Error(`no provider registered for ${selected.provider}`);
+                  return base;
+                },
+            mcpServers: [],
+            loadSessionId: () => ctx.getRecord()?.sessionId,
+            saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
+            buildPrompt: () => ({ prompt: "work" }),
+            gate: ctx.gate,
+            beforeRun: ctx.beforeRun,
+            onQueued: ctx.onQueued,
+            onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+            onRunEnd: (result) => ctx.onRunEnd(result),
+            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+            debounceMs: DEBOUNCE,
+          });
+          liveActors.set(ctx.record.id, actor);
+          return actor;
+        },
+      });
+
+      const blocker = mesh.spawn({
+        charter: "blocker",
+        parentId: "root",
+        modelConfig: { provider: "blocker", model: "model-blocker" },
+      });
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: [
+          { provider: "pool-a", model: "model-a" },
+          { provider: "pool-b", model: "model-b" },
+        ],
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      // Occupy the mesh's one concurrency slot.
+      mesh.sendMessage(blocker, "hold the slot", "root");
+      await tick();
+      expect(mesh.activeRunState(blocker)?.phase).toBe("running");
+
+      // Worker is genuinely queued; with both lanes tied on quote, declaration
+      // order picks pool-a as the reserved lane.
+      mesh.sendMessage(worker, "work", "root");
+      await tick();
+      expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+      expect(mesh.getSelection(worker)?.provider).toBe("pool-a");
+      expect(mesh.getSelection(worker)?.lane).toBe("pool-a");
+
+      // Halt only the *reserved* lane. pool-b — still healthy and still sitting
+      // in the same declared pool — must not mask this: a whole-pool
+      // `allCandidatesHalted` check would see pool-b healthy and wrongly skip
+      // cancellation, leaving the ticket set to launch on a halted provider.
+      halted.add("pool-a");
+      expect(mesh.cancelHaltedQueuedRuns()).toEqual([worker]);
+      await tick();
+
+      expect(mesh.queuedThreadIds()).toEqual(new Set());
+      expect(mesh.getSelection(worker)).toBeUndefined();
+      expect(poolARuns).toEqual([]);
+      expect(poolBRuns).toEqual([]);
+
+      // Clearing the halt and driving the production resume path re-admits
+      // the worker from the healthy pool, with no fresh external delivery.
+      halted.delete("pool-a");
+      expect(mesh.resumeCancelledRuns()).toEqual([worker]);
+      blockerDeferred.releaseAll();
+      await tick();
+
+      expect(poolARuns).toEqual([`/tmp/${worker}`]);
+      expect(poolBRuns).toEqual([]);
+      expect(mesh.runningThreadIds()).toEqual(new Set());
+      expect(mesh.queuedThreadIds()).toEqual(new Set());
+    });
+  });
+
+  // #169 responsive promotion reselects: a normal request that queued behind
+  // mesh capacity on a later-declared lane (because the earlier-declared one
+  // quoted later) must, on a responsive delivery, reselect onto the first
+  // healthy *declared* candidate — not merely bypass pacing on the lane it
+  // happened to already be queued on.
+  describe("responsive promotion reselects onto the earliest healthy declared lane (#169)", () => {
+    it("promotes a queued run from a later-declared lane onto an earlier-declared one, with exactly one immediate run", async () => {
+      const poolARuns: string[] = [];
+      const poolBRuns: string[] = [];
+      const liveActors = new Map<string, Actor>();
+      const blockerDeferred = deferredProvider();
+      // pool-a's run blocks until released, so the reselected-but-not-yet-
+      // finished state can be inspected before the run completes.
+      const poolAGates: Array<() => void> = [];
+      const providerByName = new Map<string, CodingProvider>([
+        [
+          "pool-a",
+          {
+            name: "pool-a",
+            providerName: "pool-a",
+            run: (runOpts) => {
+              poolARuns.push(runOpts.cwd);
+              return new Promise((resolve) => {
+                poolAGates.push(() => {
+                  liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
+                  resolve({ success: true, exitCode: 0, output: "a" });
+                });
+              });
+            },
+          },
+        ],
+        [
+          "pool-b",
+          {
+            name: "pool-b",
+            providerName: "pool-b",
+            run: async (runOpts) => {
+              poolBRuns.push(runOpts.cwd);
+              liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
+              return { success: true, exitCode: 0, output: "b" };
+            },
+          },
+        ],
+      ]);
+      const pacers = new Map<string, ProviderPacer>();
+      const pacerFor = (name: string): ProviderPacer => {
+        let pacer = pacers.get(name);
+        if (!pacer) {
+          pacer = new ProviderPacer(0);
+          pacers.set(name, pacer);
+        }
+        return pacer;
+      };
+      // pool-a is declared first but quotes later than pool-b, so the initial
+      // normal selection reserves pool-b — the exact setup a responsive
+      // promotion must correct.
+      pacerFor("pool-a").deferUntil(Date.now() + 20_000);
+
+      const { mesh, registry, tick } = setup({
+        maxConcurrent: 1,
+        providerGate: (fn, candidates, request) => {
+          const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
+            config: c,
+            lane: c.provider,
+            pacer: pacerFor(c.provider),
+          }));
+          return submitPoolGate(fn, lanes, {
+            responsive: request.responsive,
+            threadId: request.threadId,
+            enqueueNormal: request.enqueueNormal,
+            onSelected: request.threadId
+              ? (selection) =>
+                  request.onSelected?.({
+                    provider: selection.candidate.provider,
+                    lane: selection.lane,
+                    model: selection.candidate.model ?? "",
+                    effort: selection.candidate.effort,
+                    declaredIndex: selection.declaredIndex,
+                    eligibleAt: selection.eligibleAt,
+                    responsive: selection.responsive,
+                  })
+              : undefined,
+          });
+        },
+        createActor: (ctx) => {
+          let actor!: Actor;
+          const isBlocker = ctx.record.charter === "blocker";
+          actor = new Actor({
+            id: ctx.record.id,
+            cwd: `/tmp/${ctx.record.id}`,
+            modelConfig: isBlocker
+              ? [{ provider: "blocker", model: "model-blocker" }]
+              : (ctx.record.modelConfig ?? [{ provider: "pool-a", model: "model-a" }]),
+            resolveProvider: isBlocker
+              ? () => ({
+                  ...blockerDeferred.provider,
+                  run: async (runOpts) => {
+                    const result = await blockerDeferred.provider.run(runOpts);
+                    if (result.success) actor.declareYield();
+                    return result;
+                  },
+                })
+              : (selected) => {
+                  const base = providerByName.get(selected.provider);
+                  if (!base) throw new Error(`no provider registered for ${selected.provider}`);
+                  return base;
+                },
+            mcpServers: [],
+            loadSessionId: () => ctx.getRecord()?.sessionId,
+            saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
+            buildPrompt: () => ({ prompt: "work" }),
+            gate: ctx.gate,
+            beforeRun: ctx.beforeRun,
+            onQueued: ctx.onQueued,
+            onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+            onRunEnd: (result) => ctx.onRunEnd(result),
+            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+            debounceMs: DEBOUNCE,
+          });
+          liveActors.set(ctx.record.id, actor);
+          return actor;
+        },
+      });
+
+      const blocker = mesh.spawn({
+        charter: "blocker",
+        parentId: "root",
+        modelConfig: { provider: "blocker", model: "model-blocker" },
+      });
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: [
+          { provider: "pool-a", model: "model-a" },
+          { provider: "pool-b", model: "model-b" },
+        ],
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      // Occupy the mesh's one concurrency slot.
+      mesh.sendMessage(blocker, "hold the slot", "root");
+      await tick();
+      expect(mesh.activeRunState(blocker)?.phase).toBe("running");
+
+      // Worker queues behind mesh capacity, reserved on pool-b (the earlier
+      // quote) even though pool-a is declared first.
+      mesh.sendMessage(worker, "work", "root");
+      await tick();
+      expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+      expect(mesh.getSelection(worker)?.provider).toBe("pool-b");
+
+      // A responsive delivery must reselect onto pool-a — the first healthy
+      // declared candidate — cancelling the stale pool-b reservation, and
+      // bypass pacing/concurrency entirely (blocker still holds the mesh's
+      // only slot).
+      mesh.sendHumanMessage(worker, "urgent", "human-session");
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(poolARuns).toEqual([`/tmp/${worker}`]);
+      expect(poolBRuns).toEqual([]);
+      expect(mesh.getSelection(worker)?.provider).toBe("pool-a");
+      expect(mesh.getSelection(worker)?.responsive).toBe(true);
+      expect(mesh.runningThreadIds()).toEqual(new Set([blocker, worker]));
+
+      poolAGates.splice(0).forEach((release) => {
+        release();
+      });
+      blockerDeferred.releaseAll();
+      await tick();
+
+      expect(poolARuns).toEqual([`/tmp/${worker}`]);
+      expect(poolBRuns).toEqual([]);
+      expect(mesh.runningThreadIds()).toEqual(new Set());
+      expect(mesh.queuedThreadIds()).toEqual(new Set());
     });
   });
 
@@ -4165,7 +4546,7 @@ describe("ActorMesh", () => {
     const blocker = mesh.spawn({
       charter: "blocker",
       parentId: "root",
-      modelConfig: { provider: "deferred" },
+      modelConfig: { provider: "deferred", model: "model-blocker" },
     });
 
     const worker = mesh.spawn({
@@ -4698,12 +5079,12 @@ describe("ActorMesh", () => {
       const halted = mesh.spawn({
         charter: "halted",
         parentId: "root",
-        modelConfig: { provider: "claude" },
+        modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
       });
       const available = mesh.spawn({
         charter: "available",
         parentId: "root",
-        modelConfig: { provider: "agy" },
+        modelConfig: { provider: "agy", model: "agy-model" },
       });
       const haltedResource = "github:dummy-org/dummy-repo/issues/1288" as const;
       const availableResource = "github:dummy-org/dummy-repo/issues/1291" as const;
@@ -5934,8 +6315,8 @@ describe("ActorMesh", () => {
             saveSessionId: () => {},
             buildPrompt: () => ({ prompt: "prompt" }),
             gate: <T>(
-              fn: (selected: ProviderModelConfig) => Promise<T>,
-              candidates: readonly ProviderModelConfig[],
+              fn: (selected: RawProviderModelConfig) => Promise<T>,
+              candidates: readonly RawProviderModelConfig[],
               resp: boolean
             ): RunStartHandle<T> => {
               if (ctx.record.id === "t1") {

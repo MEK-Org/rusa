@@ -46,6 +46,7 @@ const ALL_MESH_EVENT_KINDS = Object.keys({
   actor_charter_set: 0,
   actor_model_set: 0,
   run_queued: 0,
+  run_selected: 0,
   run_start: 0,
   run_first_chunk: 0,
   run_end: 0,

@@ -37,6 +37,26 @@ export const actorModelConfig: Migration = {
       "UPDATE actor_threads SET model_config = ?, desired_model_config = ? WHERE id = ?"
     );
     for (const row of rows) {
+      // The new modelConfig contract requires `model` on every entry (#169).
+      // This table has no live writers yet (see the module comment), so a row
+      // whose scalar columns declare a provider but never a model is not a
+      // real, in-use record — but it's also not representable under the new
+      // contract, so fail loudly rather than writing a pool entry that would
+      // violate ProviderModelConfig's invariant on every future read.
+      if (row.provider !== null && row.model === null) {
+        throw new Error(
+          `0036_actor_model_config: row ${row.id} has a provider ("${row.provider}") but no model, which the new modelConfig contract cannot represent — resolve this row manually before migrating`
+        );
+      }
+      if (
+        (row.desired_provider !== null || row.desired_effort_is_set) &&
+        row.desired_model === null &&
+        row.provider === null
+      ) {
+        throw new Error(
+          `0036_actor_model_config: row ${row.id} has a desired provider/effort but no desired or current model, which the new modelConfig contract cannot represent — resolve this row manually before migrating`
+        );
+      }
       const modelConfig =
         row.provider !== null || row.model !== null || row.effort !== null
           ? JSON.stringify([
@@ -52,7 +72,11 @@ export const actorModelConfig: Migration = {
           ? JSON.stringify([
               {
                 provider: row.desired_provider ?? row.provider,
-                ...(row.desired_model !== null ? { model: row.desired_model } : {}),
+                ...(row.desired_model !== null
+                  ? { model: row.desired_model }
+                  : row.model !== null
+                    ? { model: row.model }
+                    : {}),
                 ...(row.desired_effort_is_set && row.desired_effort !== null
                   ? { effort: row.desired_effort }
                   : {}),

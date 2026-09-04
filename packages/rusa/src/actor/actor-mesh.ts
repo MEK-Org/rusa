@@ -1,7 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
 import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../mcp/stamp.js";
-import type { ModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
+import type {
+  ModelConfigInput,
+  ProviderModelConfig,
+  RawProviderModelConfig,
+} from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
 import {
@@ -156,9 +160,23 @@ export interface RetireOptions {
 }
 
 /** Human-readable subject line for a retire refusal — see {@link ActorMesh.retire}. */
-/** Bare object-or-array normalization for embedders that skip config-aware validation (tests). */
+/**
+ * Bare object-or-array normalization for embedders that skip config-aware
+ * validation (tests). Still enforces the one invariant that must never be
+ * bypassed: a missing/blank model must fail loudly rather than silently
+ * resolve to a provider default (#169).
+ */
 function normalizeModelConfigList(input: ModelConfigInput): ProviderModelConfig[] {
-  return Array.isArray(input) ? input : [input];
+  const list = Array.isArray(input) ? input : [input];
+  return list.map((entry) => {
+    const model = entry.model?.trim();
+    if (!model) {
+      throw new Error(
+        `modelConfig entry for provider "${entry.provider}" is missing a model — omitted/blank models are not allowed, since that would silently select the provider's default`
+      );
+    }
+    return { provider: entry.provider, model, effort: entry.effort };
+  });
 }
 
 /** Human-readable pool summary for the spawn/model-set event log. */
@@ -188,6 +206,29 @@ export interface MechanicalInboxForensics {
   status?: string;
 }
 
+/**
+ * The declared tuple a queued run has actually reserved — populated the
+ * moment a `providerGate` implementation reports it via `onSelected`, kept
+ * only while the run is queued, and read by both HALT safety
+ * ({@link ActorMesh.cancelHaltedQueuedRuns}, which must cancel on the
+ * reserved lane, not the whole declared pool) and selection telemetry/queued
+ * dashboard state. `provider` is the declared alias as configured;
+ * `lane` is the canonical pacing/account key (`providerThrottleKey`) it
+ * resolves to — deliberately kept distinct so a configured alias is never
+ * silently erased.
+ */
+export interface QueuedSelection {
+  provider: string;
+  lane: string;
+  model: string;
+  effort?: string;
+  /** Index of this candidate within the actor's declared pool, in declaration order. */
+  declaredIndex: number;
+  /** Epoch-ms quote for when this reservation becomes eligible to start. */
+  eligibleAt: number;
+  responsive: boolean;
+}
+
 /** What the mesh hands the factory to build a live {@link Actor} for a record. */
 export interface ActorFactoryContext {
   /** The record at spawn time. Use {@link getRecord} for the *current* state. */
@@ -202,8 +243,8 @@ export interface ActorFactoryContext {
    * declaration order breaks ties — and hands the selected tuple to `fn`.
    */
   gate: <T>(
-    fn: (selected: ProviderModelConfig) => Promise<T>,
-    candidates: readonly ProviderModelConfig[],
+    fn: (selected: RawProviderModelConfig) => Promise<T>,
+    candidates: readonly RawProviderModelConfig[],
     responsive: boolean
   ) => RunStartHandle<T>;
   /** Lease check run before each wake; returns false (and retires) when exhausted. */
@@ -214,6 +255,13 @@ export interface ActorFactoryContext {
   onRunEnd: (result: RunResult) => void;
   /** Forward the actor-owned runtime state to the mesh-wide sequencer. */
   onRuntimeStateChanged: (state: ActorRuntimeState) => void;
+  /**
+   * Fires when a genuinely queued (not yet started) run is cancelled —
+   * an operator HALT or an explicit interrupt — so the mesh can clear any
+   * recorded {@link QueuedSelection} for this actor. Never fires once the
+   * run has actually started; `onRunEnd` is the clearing point for that case.
+   */
+  onQueuedRunCancelled?: () => void;
 }
 
 export type ActorFactory = (ctx: ActorFactoryContext) => MeshActor;
@@ -301,13 +349,21 @@ export interface ActorMeshOptions {
    * candidate instead.
    */
   providerGate?: <T>(
-    fn: (selected: ProviderModelConfig) => Promise<T>,
-    candidates: readonly ProviderModelConfig[],
+    fn: (selected: RawProviderModelConfig) => Promise<T>,
+    candidates: readonly RawProviderModelConfig[],
     opts: {
       responsive: boolean;
       /** Owning actor, retained only for scheduler observability. */
       threadId?: string;
       enqueueNormal: <R>(run: () => Promise<R>) => RunStartHandle<R>;
+      /**
+       * Report the reserved candidate — at initial reservation and again on
+       * any later reselection (e.g. a responsive promote) — so the mesh can
+       * track it for HALT safety and selection telemetry. A `providerGate`
+       * implementation that never calls this leaves the mesh without a
+       * recorded selection, which falls back to whole-pool HALT checks.
+       */
+      onSelected?: (selection: QueuedSelection) => void;
     }
   ) => RunStartHandle<T>;
   /**
@@ -457,6 +513,8 @@ export class ActorMesh {
   ) => ProviderModelConfig[];
   private readonly limiter: ConcurrencyLimiter;
   private readonly providerGate: NonNullable<ActorMeshOptions["providerGate"]>;
+  /** Reserved-lane state for genuinely queued runs; see {@link QueuedSelection}. */
+  private readonly selections = new Map<string, QueuedSelection>();
   private readonly isHalted: (provider?: string) => boolean;
   private readonly isShuttingDown: () => boolean;
   private readonly idgen: () => string;
@@ -2765,8 +2823,8 @@ export class ActorMesh {
    * ties) and invokes `fn` with the winning tuple.
    */
   gateRun<T>(
-    fn: (selected: ProviderModelConfig) => Promise<T>,
-    candidates: readonly ProviderModelConfig[],
+    fn: (selected: RawProviderModelConfig) => Promise<T>,
+    candidates: readonly RawProviderModelConfig[],
     responsive = false,
     threadId?: string
   ): RunStartHandle<T> {
@@ -2774,7 +2832,22 @@ export class ActorMesh {
       responsive,
       threadId,
       enqueueNormal: (run) => this.limiter.enqueue(run),
+      onSelected: threadId ? (selection) => this.selections.set(threadId, selection) : undefined,
     });
+  }
+
+  /**
+   * Read-only snapshot of the declared tuple a queued run has actually
+   * reserved, for MCP/dashboard exposure. `undefined` once the run starts,
+   * is cancelled, or ends — never a stale reservation.
+   */
+  getSelection(id: string): QueuedSelection | undefined {
+    return this.selections.get(id);
+  }
+
+  /** Clear a recorded selection at start/cancel/end so it never outlives the reservation it describes. */
+  clearSelection(id: string): void {
+    this.selections.delete(id);
   }
 
   /**
@@ -2828,11 +2901,23 @@ export class ActorMesh {
     return modelConfig.every((c) => this.isHalted(c.provider));
   }
 
-  /** Cancel queued starts whose entire declared pool (the one that will launch) is halted. */
+  /**
+   * Cancel queued starts whose *actual reserved lane* is halted — keys off
+   * the recorded {@link QueuedSelection}, not the whole declared pool, so a
+   * halt on one candidate never cancels a reservation already sitting on a
+   * different, still-healthy candidate in the same pool. Falls back to the
+   * whole-pool check only when no selection has been recorded (a
+   * `providerGate` that never wired `onSelected`, or a request gated before
+   * this reservation existed).
+   */
   cancelHaltedQueuedRuns(): string[] {
     const cancelled: string[] = [];
     for (const [id, actor] of this.live) {
-      if (this.allCandidatesHalted(this.launchModelConfig(id)) && actor.cancelQueuedRun?.()) {
+      const selection = this.selections.get(id);
+      const halted = selection
+        ? this.isHalted(selection.provider)
+        : this.allCandidatesHalted(this.launchModelConfig(id));
+      if (halted && actor.cancelQueuedRun?.()) {
         cancelled.push(id);
       }
     }
@@ -2857,22 +2942,26 @@ export class ActorMesh {
       mesh: this,
       gate: (fn, candidates, responsive) => this.gateRun(fn, candidates, responsive, record.id),
       beforeRun: ({ mode }) => {
-        // Apply a pool staged while idle/queued before this dispatch's own
-        // gate()/admission reads the declared pool (#199, extended to pools):
-        // an in-flight run's beforeRun never re-fires for that same run, so
-        // this only ever lands on a fresh dispatch, never mid-run.
-        this.applyPendingModel(record.id);
         const rec = this.registry.get(record.id);
         if (!rec || rec.status !== "active") {
           return false;
         }
+        // Halt gate consults the pool this dispatch will actually launch —
+        // desired-if-staged, else current (#169) — without yet committing
+        // it, so a staged move onto a halted provider never mutates
+        // `modelConfig` for a run that never launches.
         if (
-          this.allCandidatesHalted(rec.modelConfig) ||
+          this.allCandidatesHalted(this.launchModelConfig(record.id)) ||
           this.isShuttingDown() ||
           !this.checkLease(record.id)
         ) {
           return false;
         }
+        // Apply a pool staged while idle/queued before this dispatch's own
+        // gate()/admission reads the declared pool (#199, extended to pools):
+        // an in-flight run's beforeRun never re-fires for that same run, so
+        // this only ever lands on a fresh dispatch, never mid-run.
+        this.applyPendingModel(record.id);
         if (mode === "yield-elicitation") return true;
         if (!this.inboxStore) return true;
         const actor = this.live.get(record.id);
@@ -2889,8 +2978,12 @@ export class ActorMesh {
       onRunEnd: (result) => {
         this.finishInboxRun(record.id);
         this.accountRun(record.id, result);
+        // Safety net: the start/cancel hooks are the primary clearing
+        // points, but a selection must never survive past its run ending.
+        this.clearSelection(record.id);
       },
       onRuntimeStateChanged: (state) => this.actorRuntimeStateChanged(record.id, state),
+      onQueuedRunCancelled: () => this.clearSelection(record.id),
     };
   }
 

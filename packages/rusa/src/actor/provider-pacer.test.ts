@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConcurrencyLimiter } from "./concurrency-limiter.js";
-import { ProviderPacer, selectPoolLane } from "./provider-pacer.js";
+import { ProviderPacer, selectPoolLane, submitPoolGate } from "./provider-pacer.js";
 
 describe("ProviderPacer", () => {
   beforeEach(() => vi.useFakeTimers());
@@ -280,6 +280,169 @@ describe("ProviderPacer", () => {
 
     it("returns undefined for an empty candidate list", () => {
       expect(selectPoolLane([], Date.now())).toBeUndefined();
+    });
+  });
+
+  describe("submitPoolGate", () => {
+    const laneFor = (config: string, intervalMs = 0) => ({
+      config,
+      lane: config,
+      pacer: new ProviderPacer(intervalMs, () => Date.now()),
+    });
+
+    it("excludes a halted candidate from selection", async () => {
+      const mesh = new ConcurrencyLimiter(1);
+      const a = laneFor("a");
+      const b = laneFor("b");
+      const started: string[] = [];
+      const handle = submitPoolGate(
+        async (config: string) => {
+          started.push(config);
+          return config;
+        },
+        [a, b],
+        {
+          isHalted: (config) => config === "a",
+          enqueueNormal: (fn) => mesh.enqueue(fn),
+        }
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(handle.result).resolves.toBe("b");
+      expect(started).toEqual(["b"]);
+    });
+
+    it("responsive requests bypass pacing and reserve the first healthy declared candidate, ignoring quotes", async () => {
+      const mesh = new ConcurrencyLimiter(1);
+      const a = laneFor("a", 10_000);
+      const b = laneFor("b", 10_000);
+      // Make "a" quote later than "b" so a naive earliest-quote pick would
+      // choose "b" — responsive must still land on "a", the first declared.
+      await a.pacer.submit(async () => "prior", { enqueueNormal: (fn) => mesh.enqueue(fn) }).result;
+
+      const handle = submitPoolGate(async (config: string) => config, [a, b], {
+        responsive: true,
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(handle.result).resolves.toBe("a");
+    });
+
+    it("breaks quote ties by declaration order", async () => {
+      const mesh = new ConcurrencyLimiter(1);
+      const first = laneFor("first");
+      const second = laneFor("second");
+      const handle = submitPoolGate(async (config: string) => config, [first, second], {
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(handle.result).resolves.toBe("first");
+    });
+
+    it("promote() on the already-reserved lane promotes in place without cancelling", async () => {
+      const mesh = new ConcurrencyLimiter(1);
+      let release!: () => void;
+      void mesh.run(() => new Promise<void>((resolve) => (release = resolve)));
+      await Promise.resolve();
+
+      const a = laneFor("a");
+      const b = laneFor("b");
+      const selections: string[] = [];
+      const handle = submitPoolGate(async (config: string) => config, [a, b], {
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+        onSelected: (sel) => selections.push(sel.candidate),
+      });
+      expect(selections).toEqual(["a"]);
+
+      handle.promote();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mesh.inFlight).toBe(1); // promoted out of the mesh queue, not started as a duplicate
+      release();
+      await expect(handle.result).resolves.toBe("a");
+      // No reselection needed: "a" was already the earliest healthy candidate.
+      expect(selections).toEqual(["a"]);
+    });
+
+    it("promote() reselects onto an earlier-declared healthy lane, cancelling the stale reservation, with exactly one invocation", async () => {
+      const mesh = new ConcurrencyLimiter(1);
+      let release!: () => void;
+      void mesh.run(() => new Promise<void>((resolve) => (release = resolve)));
+      await Promise.resolve();
+
+      const a = laneFor("a", 10_000);
+      const b = laneFor("b", 10_000);
+      // Defer "a" so the initial normal selection reserves "b" instead.
+      a.pacer.deferUntil(Date.now() + 20_000);
+
+      const started: string[] = [];
+      const selections: string[] = [];
+      const handle = submitPoolGate(
+        async (config: string) => {
+          started.push(config);
+          return config;
+        },
+        [a, b],
+        {
+          enqueueNormal: (fn) => mesh.enqueue(fn),
+          onSelected: (sel) => selections.push(sel.candidate),
+        }
+      );
+      expect(selections).toEqual(["b"]);
+
+      // Responsive input arrives while queued on "b": must reselect to "a",
+      // the earliest declared healthy candidate, cancelling "b"'s reservation.
+      handle.promote();
+      expect(selections).toEqual(["b", "a"]);
+
+      await vi.advanceTimersByTimeAsync(0);
+      release();
+      await expect(handle.result).resolves.toBe("a");
+      expect(started).toEqual(["a"]);
+
+      // "b"'s lane must not have been charged/left with a stranded ticket.
+      expect(b.pacer.waiting).toBe(0);
+    });
+
+    it("cancel() rejects the outer handle and stops the reserved lane from starting", async () => {
+      const mesh = new ConcurrencyLimiter(1);
+      const a = laneFor("a", 10_000);
+      const b = laneFor("b", 10_000);
+      await a.pacer.submit(async () => "prior", { enqueueNormal: (fn) => mesh.enqueue(fn) }).result;
+
+      let started = false;
+      const handle = submitPoolGate(
+        async (config: string) => {
+          started = true;
+          return config;
+        },
+        [a, b],
+        { enqueueNormal: (fn) => mesh.enqueue(fn) }
+      );
+
+      expect(handle.cancel?.()).toBe(true);
+      await expect(handle.result).rejects.toThrow(/cancelled before start/);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(started).toBe(false);
+    });
+
+    it("onSelected reports the declared index and lane alongside the config", async () => {
+      const mesh = new ConcurrencyLimiter(1);
+      const a = laneFor("provider-a");
+      const b = laneFor("provider-b");
+      let seen:
+        | { candidate: string; lane: string; declaredIndex: number; responsive: boolean }
+        | undefined;
+      submitPoolGate(async (config: string) => config, [a, b], {
+        enqueueNormal: (fn) => mesh.enqueue(fn),
+        onSelected: (sel) => {
+          seen = sel;
+        },
+      });
+      expect(seen).toMatchObject({
+        candidate: "provider-a",
+        lane: "provider-a",
+        declaredIndex: 0,
+        responsive: false,
+      });
     });
   });
 });

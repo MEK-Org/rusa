@@ -110,4 +110,30 @@ describe("validateModelConfigPool", () => {
       })
     ).toThrow(/provider/);
   });
+
+  it("rejects an entry with an omitted model rather than falling back to a provider default", () => {
+    expect(() =>
+      validateModelConfigPool(configWith(), { provider: "claude" }, { portable: false })
+    ).toThrow(/model/);
+  });
+
+  it("rejects an entry with a blank model", () => {
+    expect(() =>
+      validateModelConfigPool(
+        configWith(),
+        { provider: "claude", model: "   " },
+        { portable: false }
+      )
+    ).toThrow(/model/);
+  });
+
+  it("fails before mutation: the first invalid entry in a pool rejects the whole pool", () => {
+    expect(() =>
+      validateModelConfigPool(
+        configWith(),
+        [{ provider: "claude", model: "claude-sonnet-5" }, { provider: "kimi" }],
+        { portable: true }
+      )
+    ).toThrow(/model/);
+  });
 });
