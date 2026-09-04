@@ -116,7 +116,10 @@ import {
   finishDeferredRootSessionImport,
   importLegacyActorState,
 } from "../db/legacy-actor-import.js";
-import type { ReadyHeadChange } from "../db/repositories/obligation-repository.js";
+import type {
+  PrerequisiteAttention,
+  ReadyHeadChange,
+} from "../db/repositories/obligation-repository.js";
 import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
 import {
@@ -862,6 +865,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // once the mesh exists; until then a head change is simply not routed.
   let readyHeadSink: ((change: ReadyHeadChange) => void) | undefined;
   getRepositories().obligations.setReadyHeadListener((change) => readyHeadSink?.(change));
+
+  // #212 cancellation-repair attention: same deferred-sink shape as the
+  // ready-head listener above, and for the same reason — the mesh doesn't
+  // exist yet at this point in startup.
+  let prerequisiteCancellationSink: ((attention: PrerequisiteAttention) => void) | undefined;
+  getRepositories().obligations.setCancellationAttentionListener((attention) =>
+    prerequisiteCancellationSink?.(attention)
+  );
 
   try {
     populateModelCatalogsFromDb(getRepositories().modelScrapes);
@@ -2092,6 +2103,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       sequence
     );
   };
+  prerequisiteCancellationSink = ({ dependentId, dependentOwnerId, prerequisiteId }) => {
+    mesh.deliverPrerequisiteCancelledAttention(dependentOwnerId, dependentId, prerequisiteId);
+  };
 
   const rootControl = new RootControlService({
     mesh,
@@ -2675,6 +2689,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   } catch (_err) {
     // Database may be closed during test shutdown/teardown races
   }
+  try {
+    mesh.reconcileCancelledPrerequisiteAttention(getRepositories().obligations);
+  } catch (_err) {
+    // Database may be closed during test shutdown/teardown races
+  }
   const restored = actors.list().filter((r) => r.status === "active" && r.id !== rootId);
   if (restored.length > 0) {
     console.log(`[mesh] rehydrated ${restored.length} active actor(s) from the repository`);
@@ -3224,6 +3243,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // clearing the sink rather than the listener avoids touching the database
     // on a shutdown path that is about to close it.
     readyHeadSink = undefined;
+    prerequisiteCancellationSink = undefined;
     closeDb();
     console.log("✓ Goodbye!");
     process.exit(getShutdownExitCode(reason));

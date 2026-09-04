@@ -10,6 +10,7 @@ import { obligationTerminalNote } from "../migrations/0026_obligation_terminal_n
 import { obligationTitle } from "../migrations/0027_obligation_title.js";
 import { obligationArtifacts } from "../migrations/0028_obligation_artifacts.js";
 import { recurringObligations } from "../migrations/0035_recurring_obligations.js";
+import { obligationDependencies } from "../migrations/0037_obligation_dependencies.js";
 import { ObligationRepository } from "./obligation-repository.js";
 
 /** Records every scheduler call instead of touching the OS, for assertions. */
@@ -46,6 +47,7 @@ describe("ObligationRepository", () => {
     obligationTitle.up(db);
     obligationArtifacts.up(db);
     recurringObligations.up(db);
+    obligationDependencies.up(db);
     now = 1_000;
     repository = new ObligationRepository(
       db,
@@ -2097,6 +2099,370 @@ describe("ObligationRepository", () => {
         );
         expect(() => bare.reconcileScheduledObligations()).not.toThrow();
       });
+    });
+  });
+
+  describe("prerequisite dependencies (#212)", () => {
+    it("creates a blocked obligation as waiting outright, with no ready-head event", () => {
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+
+      const heads: Array<{ ownerId: string; headId: string | null }> = [];
+      repository.setReadyHeadListener(({ ownerId, head }) =>
+        heads.push({ ownerId, headId: head?.id ?? null })
+      );
+
+      const dependent = repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+        blockedBy: ["prereq"],
+      });
+
+      expect(dependent.status).toBe("waiting");
+      // Never observed ready, not even transiently within the same transaction.
+      expect(heads).toEqual([]);
+    });
+
+    it("creates ready outright when every named prerequisite is already done", () => {
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      repository.setTerminalStatus("prereq", "done");
+
+      const dependent = repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+        blockedBy: ["prereq"],
+      });
+      expect(dependent.status).toBe("ready");
+    });
+
+    it("releases every dependent fanned out from one prerequisite once it's done", () => {
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      repository.create({
+        title: "dep-1",
+        id: "dep-1",
+        ownerId: "actor-a",
+        blockedBy: ["prereq"],
+      });
+      repository.create({
+        title: "dep-2",
+        id: "dep-2",
+        ownerId: "actor-a",
+        blockedBy: ["prereq"],
+      });
+      expect(repository.require("dep-1").status).toBe("waiting");
+      expect(repository.require("dep-2").status).toBe("waiting");
+
+      repository.setTerminalStatus("prereq", "done");
+
+      expect(repository.require("dep-1").status).toBe("ready");
+      expect(repository.require("dep-2").status).toBe("ready");
+    });
+
+    it("keeps a dependent waiting while any one of several prerequisites is unmet", () => {
+      repository.create({ title: "p1", id: "p1", ownerId: "actor-a" });
+      repository.create({ title: "p2", id: "p2", ownerId: "actor-a" });
+      repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+        blockedBy: ["p1", "p2"],
+      });
+
+      repository.setTerminalStatus("p1", "done");
+      expect(repository.require("dependent").status).toBe("waiting");
+
+      repository.setTerminalStatus("p2", "done");
+      expect(repository.require("dependent").status).toBe("ready");
+    });
+
+    it("does not release a dependent when its prerequisite is cancelled, and retains the edge", () => {
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+        blockedBy: ["prereq"],
+      });
+
+      repository.setTerminalStatus("prereq", "cancelled");
+
+      expect(repository.require("dependent").status).toBe("waiting");
+      expect(
+        repository.listBlockedByPage("dependent", { limit: 10, offset: 0 }).obligations
+      ).toHaveLength(1);
+    });
+
+    it("queues durable cancellation-repair attention for each affected dependent, and delivers it after commit", () => {
+      const delivered: Array<{ dependentId: string; prerequisiteId: string }> = [];
+      repository.setCancellationAttentionListener((attention) => delivered.push(attention));
+
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      repository.create({
+        title: "dep-1",
+        id: "dep-1",
+        ownerId: "actor-b",
+        blockedBy: ["prereq"],
+      });
+      repository.create({
+        title: "dep-2",
+        id: "dep-2",
+        ownerId: "actor-c",
+        blockedBy: ["prereq"],
+      });
+
+      repository.setTerminalStatus("prereq", "cancelled");
+
+      expect(delivered).toEqual(
+        expect.arrayContaining([
+          { dependentId: "dep-1", dependentOwnerId: "actor-b", prerequisiteId: "prereq" },
+          { dependentId: "dep-2", dependentOwnerId: "actor-c", prerequisiteId: "prereq" },
+        ])
+      );
+      expect(delivered).toHaveLength(2);
+
+      // The fact is also recoverable straight from state, for boot reconciliation.
+      expect(repository.listPrerequisiteCancellationAttention()).toEqual(
+        expect.arrayContaining([
+          { dependentId: "dep-1", dependentOwnerId: "actor-b", prerequisiteId: "prereq" },
+          { dependentId: "dep-2", dependentOwnerId: "actor-c", prerequisiteId: "prereq" },
+        ])
+      );
+    });
+
+    it("queues cancellation attention immediately when the prerequisite is already cancelled at edge-creation time", () => {
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      repository.setTerminalStatus("prereq", "cancelled");
+
+      const delivered: Array<{ dependentId: string; prerequisiteId: string }> = [];
+      repository.setCancellationAttentionListener((attention) => delivered.push(attention));
+
+      repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-b",
+        blockedBy: ["prereq"],
+      });
+
+      expect(delivered).toEqual([
+        { dependentId: "dependent", dependentOwnerId: "actor-b", prerequisiteId: "prereq" },
+      ]);
+    });
+
+    it("repairs a cancellation-blocked dependent when its owner removes the edge", () => {
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+        blockedBy: ["prereq"],
+      });
+      repository.setTerminalStatus("prereq", "cancelled");
+
+      repository.removePrerequisite("dependent", "prereq");
+
+      expect(repository.require("dependent").status).toBe("ready");
+      expect(repository.listPrerequisiteCancellationAttention()).toEqual([]);
+    });
+
+    it("rejects a recurring obligation as a prerequisite, at create and via addPrerequisite", () => {
+      repository.create({
+        title: "recurring",
+        id: "recurring",
+        ownerId: "actor-a",
+        recurrence: { policy: "cron", cronExpr: "0 * * * *" },
+      });
+      repository.create({ title: "plain", id: "plain", ownerId: "actor-a" });
+
+      expect(() =>
+        repository.create({
+          title: "dependent",
+          id: "dependent",
+          ownerId: "actor-a",
+          blockedBy: ["recurring"],
+        })
+      ).toThrow(/recurring or scheduled/);
+
+      repository.create({ title: "dependent", id: "dependent", ownerId: "actor-a" });
+      expect(() => repository.addPrerequisite("dependent", "recurring")).toThrow(
+        /recurring or scheduled/
+      );
+    });
+
+    it("rejects an obligation naming itself as its own prerequisite, at create and via addPrerequisite", () => {
+      expect(() =>
+        repository.create({ title: "b", id: "b", ownerId: "actor-a", blockedBy: ["b"] })
+      ).toThrow(/blocked by itself/);
+
+      repository.create({ title: "a", id: "a", ownerId: "actor-a" });
+      expect(() => repository.addPrerequisite("a", "a")).toThrow(/blocked by itself/);
+    });
+
+    it("rejects a direct two-node cycle via addPrerequisite", () => {
+      repository.create({ title: "a", id: "a", ownerId: "actor-a" });
+      repository.create({ title: "b", id: "b", ownerId: "actor-a" });
+      repository.addPrerequisite("a", "b");
+      expect(() => repository.addPrerequisite("b", "a")).toThrow(/cycle/);
+    });
+
+    it("rejects a cycle formed by combining an explicit edge with the parent-child hierarchy", () => {
+      // parent "p" has live child "c"; naming p as a prerequisite of c would
+      // make p wait for c (hierarchy) while c waits for p (explicit) — a cycle.
+      repository.create({ title: "p", id: "p", ownerId: "actor-a" });
+      repository.create({ title: "c", id: "c", ownerId: "actor-a", parentId: "p" });
+
+      expect(() => repository.addPrerequisite("c", "p")).toThrow(/cycle/);
+    });
+
+    it("rejects creating a child whose declared prerequisite already transitively waits for the new parent", () => {
+      // "gp" already waits for its live child "p" (hierarchy). Making a new
+      // child of "p" depend on "gp" would close the loop: gp -> p -> new-child
+      // -> gp, the moment the new child's insert lands.
+      repository.create({ title: "gp", id: "gp", ownerId: "actor-a" });
+      repository.create({ title: "p", id: "p", ownerId: "actor-a", parentId: "gp" });
+
+      expect(() =>
+        repository.create({
+          title: "new-child",
+          id: "new-child",
+          ownerId: "actor-a",
+          parentId: "p",
+          blockedBy: ["gp"],
+        })
+      ).toThrow(/cycle/);
+    });
+
+    it("rejects reparenting an obligation onto something that already transitively waits for it", () => {
+      repository.create({ title: "p", id: "p", ownerId: "actor-a" });
+      repository.create({ title: "dependent", id: "dependent", ownerId: "actor-a" });
+      repository.create({
+        title: "gate",
+        id: "gate",
+        ownerId: "actor-a",
+        blockedBy: ["dependent"],
+      });
+      // gate waits for dependent; reparenting dependent under gate would add
+      // gate-waits-for-dependent (hierarchy) on top of the existing edge, and
+      // dependent has no path back to gate yet — so make gate the one being
+      // moved under dependent instead, which does create the cycle.
+      expect(() => repository.reparent("gate", "dependent")).toThrow(/already waits for/);
+    });
+
+    it("preserves prerequisite edges across reassignment", () => {
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+        blockedBy: ["prereq"],
+      });
+
+      repository.reassign("dependent", "actor-b");
+
+      expect(repository.require("dependent").ownerId).toBe("actor-b");
+      expect(
+        repository
+          .listBlockedByPage("dependent", { limit: 10, offset: 0 })
+          .obligations.map((o) => o.id)
+      ).toEqual(["prereq"]);
+      repository.setTerminalStatus("prereq", "done");
+      expect(repository.require("dependent").status).toBe("ready");
+    });
+
+    it("survives a repository restart (reload from the same on-disk state)", () => {
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+        blockedBy: ["prereq"],
+      });
+
+      // Simulate a fresh process attaching to the same database.
+      const reloaded = new ObligationRepository(
+        db,
+        (id) => ["actor-a", "actor-b", "actor-c"].includes(id),
+        () => now++
+      );
+
+      expect(reloaded.require("dependent").status).toBe("waiting");
+      expect(
+        reloaded
+          .listBlockedByPage("dependent", { limit: 10, offset: 0 })
+          .obligations.map((o) => o.id)
+      ).toEqual(["prereq"]);
+
+      reloaded.setTerminalStatus("prereq", "done");
+      expect(reloaded.require("dependent").status).toBe("ready");
+    });
+
+    it("survives compaction (VACUUM) with edges and readiness intact", () => {
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+        blockedBy: ["prereq"],
+      });
+
+      db.exec("VACUUM");
+
+      expect(repository.require("dependent").status).toBe("waiting");
+      repository.setTerminalStatus("prereq", "done");
+      expect(repository.require("dependent").status).toBe("ready");
+    });
+
+    it("paginates blockedBy and unblocks projections like sibling projections do", () => {
+      repository.create({ title: "p1", id: "p1", ownerId: "actor-a" });
+      repository.create({ title: "p2", id: "p2", ownerId: "actor-a" });
+      repository.create({ title: "p3", id: "p3", ownerId: "actor-a" });
+      repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+        blockedBy: ["p1", "p2", "p3"],
+      });
+
+      const page1 = repository.listBlockedByPage("dependent", { limit: 2, offset: 0 });
+      expect(page1.obligations.map((o) => o.id)).toEqual(["p1", "p2"]);
+      expect(page1.total).toBe(3);
+      expect(page1.hasMore).toBe(true);
+
+      const page2 = repository.listBlockedByPage("dependent", { limit: 2, offset: 2 });
+      expect(page2.obligations.map((o) => o.id)).toEqual(["p3"]);
+      expect(page2.hasMore).toBe(false);
+
+      const unblocks = repository.listUnblocksPage("p1", { limit: 10, offset: 0 });
+      expect(unblocks.obligations.map((o) => o.id)).toEqual(["dependent"]);
+      expect(unblocks.total).toBe(1);
+    });
+
+    it("adding a not-yet-done prerequisite to an already-ready obligation demotes it back to waiting", () => {
+      repository.create({ title: "dependent", id: "dependent", ownerId: "actor-a" });
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      expect(repository.require("dependent").status).toBe("ready");
+
+      repository.addPrerequisite("dependent", "prereq");
+      expect(repository.require("dependent").status).toBe("waiting");
+
+      repository.setTerminalStatus("prereq", "done");
+      expect(repository.require("dependent").status).toBe("ready");
+    });
+
+    it("adding the same prerequisite edge twice is a no-op", () => {
+      repository.create({ title: "dependent", id: "dependent", ownerId: "actor-a" });
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      repository.addPrerequisite("dependent", "prereq");
+      expect(() => repository.addPrerequisite("dependent", "prereq")).not.toThrow();
+      expect(
+        repository.listBlockedByPage("dependent", { limit: 10, offset: 0 }).obligations
+      ).toHaveLength(1);
+    });
+
+    it("removing a nonexistent edge is a no-op", () => {
+      repository.create({ title: "dependent", id: "dependent", ownerId: "actor-a" });
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      expect(() => repository.removePrerequisite("dependent", "prereq")).not.toThrow();
     });
   });
 });

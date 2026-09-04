@@ -1137,6 +1137,78 @@ export class ActorMesh {
     return true;
   }
 
+  /**
+   * Durable attention for a dependent left permanently blocked because a
+   * prerequisite was cancelled (#212). Unlike a ready head, this is a one-shot
+   * terminal fact rather than something that keeps changing while an actor
+   * runs — no sequence number is needed, only exact-once delivery of the one
+   * (dependent, prerequisite) pair.
+   */
+  deliverPrerequisiteCancelledAttention(
+    actorId: string,
+    dependentObligationId: string,
+    prerequisiteId: string
+  ): boolean {
+    if (!this.inboxStore) return false;
+    actorId = this.resolveThreadId(actorId);
+    const record = this.actors.get(actorId);
+    if (!record || record.status !== "active") return false;
+    const entryId = deduplicatedInboxEntryId(
+      `obligation-prereq-cancelled:${dependentObligationId}:${prerequisiteId}`,
+      actorId
+    );
+    const entries = this.inboxStore.append([
+      {
+        id: entryId,
+        actorId,
+        source: `obligation:${dependentObligationId}`,
+        payload: {
+          type: "obligation.prerequisite_cancelled",
+          obligationId: dependentObligationId,
+          prerequisiteId,
+        } as unknown as InboxPayload,
+      },
+    ]);
+    if (entries.length === 0) return false;
+    this.notifyInboxChanged(actorId);
+    return true;
+  }
+
+  /**
+   * Boot recovery for cancellation-repair attention (#212). The fact itself is
+   * always recoverable from obligation state (a live dependent whose named
+   * prerequisite is cancelled), so this simply replays that query through the
+   * same idempotent delivery path used at the moment of cancellation.
+   */
+  reconcileCancelledPrerequisiteAttention(obligations: {
+    listPrerequisiteCancellationAttention(): Iterable<{
+      dependentId: string;
+      dependentOwnerId: string;
+      prerequisiteId: string;
+    }>;
+  }): void {
+    if (!this.inboxStore) return;
+    try {
+      for (const {
+        dependentId,
+        dependentOwnerId,
+        prerequisiteId,
+      } of obligations.listPrerequisiteCancellationAttention()) {
+        if (dependentOwnerId.startsWith("human:") || dependentOwnerId.startsWith("system:")) {
+          continue;
+        }
+        const actorId = this.resolveThreadId(dependentOwnerId);
+        const record = this.actors.get(actorId);
+        if (!record || record.status !== "active") continue;
+        this.deliverPrerequisiteCancelledAttention(actorId, dependentId, prerequisiteId);
+      }
+    } catch (err) {
+      this.log(
+        `prerequisite-cancellation reconciliation failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
   inboxHandled(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
     if (this.inboxStore && this.inboxStore.countUnhandled(actorId) > 0) {
