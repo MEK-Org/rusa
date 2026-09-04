@@ -499,6 +499,14 @@ export interface RunStartE2EHooks {
   dashboard?: boolean;
   /** Optional deterministic quota source for dashboard scenarios; production never sets this. */
   quotaApi?: QuotaApiDeps;
+  /**
+   * The e2e harness's disposable bare-remote git dir (or its narrowly scoped
+   * shared git directory). When set, every sandboxed actor spawned in this
+   * instance — root and workers alike — gets it as an explicit writable bind,
+   * so a sandboxed actor's `git push` to the local scratch remote succeeds.
+   * Production never sets this.
+   */
+  remoteGitDir?: string;
   onReady?: (handles: RunStartE2EHandles) => void;
 }
 
@@ -1854,6 +1862,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           mcpServers: workerMcp,
           addDirs: [],
           sandbox,
+          e2eWritableRemoteDir: opts?.e2e?.remoteGitDir,
           prepareUnderstandingMount: understandingMountEnabled
             ? async () => {
                 const client = await localWriteDeps.getClient();
@@ -2351,6 +2360,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       addDirs,
       sandbox: Boolean(opts?.e2e),
       isE2eRoot: Boolean(opts?.e2e),
+      e2eWritableRemoteDir: opts?.e2e?.remoteGitDir,
       loadSessionId: () =>
         actors.get(rootId)?.context?.type === "portable"
           ? undefined

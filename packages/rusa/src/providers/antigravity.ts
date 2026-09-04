@@ -517,7 +517,8 @@ export class AntigravityProvider implements CodingProvider {
         "antigravity",
         tempMcpConfigPath,
         opts.sandbox.isE2eRoot,
-        opts.sandbox.understandingMount
+        opts.sandbox.understandingMount,
+        opts.sandbox.e2eWritableRemoteDir
       );
       tempPaths.push(...bwrapResult.tempPaths);
       if (opts.sandbox.understandingMount) {

@@ -10,6 +10,11 @@ export type SandboxOptions = {
   isE2eRoot?: boolean;
   /** Host directory containing the rendered read-only Integrated Understanding snapshot to mount at /tmp/understanding */
   understandingMount?: string;
+  /**
+   * E2E-only: the actor-mesh harness's disposable bare-remote git dir, bound
+   * writable so a sandboxed e2e actor can `git push`. Undefined in production.
+   */
+  e2eWritableRemoteDir?: string;
 };
 
 /**
