@@ -58,18 +58,18 @@ describe("Author Identity Stamp Security & HMAC Verification", () => {
     expect(res.status).toBe("none");
   });
 
-  it("should return status 'invalid' on bad HMAC signature", () => {
+  it("should return status 'unverifiable' on bad HMAC signature", () => {
     const validStamp = stampAuthor(actorId, repo, issueNumber);
     // Tamper with the HMAC portion (last hex word before -->)
     const tamperedStamp = validStamp.replace(/[0-9a-fA-F]{64}\s*-->/, `${"a".repeat(64)} -->`);
     const body = `Hello world\n\n${tamperedStamp}`;
 
     const res = verifyAuthorStamp(body, repo, issueNumber);
-    expect(res.status).toBe("invalid");
+    expect(res.status).toBe("unverifiable");
     expect(res.reason).toContain("HMAC mismatch");
   });
 
-  it("should return status 'invalid' on a stale timestamp (older than 15 minutes)", () => {
+  it("should return status 'expired' on a stale timestamp (older than 15 minutes)", () => {
     const nowTime = 1717171717000;
     vi.setSystemTime(new Date(nowTime));
 
@@ -79,30 +79,30 @@ describe("Author Identity Stamp Security & HMAC Verification", () => {
     vi.setSystemTime(new Date(nowTime + 16 * 60 * 1000));
 
     const res = verifyAuthorStamp(stamp, repo, issueNumber);
-    expect(res.status).toBe("invalid");
+    expect(res.status).toBe("expired");
     expect(res.reason).toContain("Stamp expired");
   });
 
-  it("should return status 'invalid' on context mismatch (different repo or issue number)", () => {
+  it("should return status 'unverifiable' on context mismatch (different repo or issue number)", () => {
     const stamp = stampAuthor(actorId, repo, issueNumber);
 
     // Verify under a different repo
     const resDifferentRepo = verifyAuthorStamp(stamp, "other/repo", issueNumber);
-    expect(resDifferentRepo.status).toBe("invalid");
+    expect(resDifferentRepo.status).toBe("unverifiable");
     expect(resDifferentRepo.reason).toContain("HMAC mismatch");
 
     // Verify under a different issue number
     const resDifferentIssue = verifyAuthorStamp(stamp, repo, 999);
-    expect(resDifferentIssue.status).toBe("invalid");
+    expect(resDifferentIssue.status).toBe("unverifiable");
     expect(resDifferentIssue.reason).toContain("HMAC mismatch");
   });
 
-  it("should return status 'invalid' when a v3 stamp is verified under a different repo", () => {
+  it("should return status 'unverifiable' when a v3 stamp is verified under a different repo", () => {
     const stamp = stampAuthor(actorId, repo, undefined, instanceId);
 
     const res = verifyAuthorStamp(stamp, "other/repo", issueNumber);
 
-    expect(res.status).toBe("invalid");
+    expect(res.status).toBe("unverifiable");
     expect(res.reason).toContain("HMAC mismatch");
   });
 
@@ -436,7 +436,7 @@ describe("resolveStampedAuthor ", () => {
     expect(resolve("issue_comment", "created", { comment: { body: "plain" } })).toBeNull();
   });
 
-  it("fails open and reports an anomaly on a forged stamp", () => {
+  it("fails open and reports an 'unverifiable' anomaly on a same-instance HMAC mismatch, never 'forgery'", () => {
     const forged = stampedBody("hi").replace(/[0-9a-fA-F]{64}\s*-->/, `${"a".repeat(64)} -->`);
     const anomalies: StampAnomaly[] = [];
     expect(
@@ -445,7 +445,9 @@ describe("resolveStampedAuthor ", () => {
       )
     ).toBeNull();
     expect(anomalies).toHaveLength(1);
-    expect(anomalies[0].detail).toBe("forgery");
+    expect(anomalies[0].detail).toBe("unverifiable");
+    expect(anomalies[0].reason).not.toContain("forgery");
+    expect(anomalies[0].body).not.toContain("forgery");
   });
 
   it("fails open and reports an anomaly on an unversioned stamp", () => {
@@ -462,5 +464,133 @@ describe("resolveStampedAuthor ", () => {
     expect(anomalies).toHaveLength(1);
     expect(anomalies[0].detail).toBe("migration");
     expect(anomalies[0].actorId).toBe(actorId);
+  });
+
+  describe("localInstanceId (foreign-instance short-circuit)", () => {
+    const localInstanceId = "our-instance";
+
+    const resolveWithLocal = (
+      payload: Record<string, unknown>,
+      onAnomaly?: (a: StampAnomaly) => void
+    ) =>
+      resolveStampedAuthor({
+        event: "issue_comment",
+        action: "created",
+        payload,
+        sender: "RusaBot",
+        botLogin,
+        repoFullName: repo,
+        number,
+        localInstanceId,
+        onAnomaly,
+      });
+
+    it("still verifies a same-instance stamp when localInstanceId matches", () => {
+      const own = `hi\n\n${stampAuthor(actorId, repo, number, localInstanceId)}`;
+      expect(resolveWithLocal({ comment: { body: own } })).toEqual({
+        actorId,
+        instanceId: localInstanceId,
+      });
+    });
+
+    it("short-circuits a foreign-instance stamp to null with a 'foreign_instance' anomaly, never HMAC-comparing", () => {
+      const foreignStamp = stampAuthor(actorId, repo, number, "their-instance");
+      const body = `hi\n\n${foreignStamp}`;
+      const anomalies: StampAnomaly[] = [];
+
+      expect(resolveWithLocal({ comment: { body } }, (a) => anomalies.push(a))).toBeNull();
+
+      expect(anomalies).toHaveLength(1);
+      expect(anomalies[0].detail).toBe("foreign_instance");
+      expect(anomalies[0].actorId).toBe(actorId);
+      expect(anomalies[0].reason).toBeUndefined();
+    });
+
+    it("never reaches HMAC comparison for a foreign-instance stamp, even when the HMAC field is corrupt", () => {
+      // Prove the short-circuit happens BEFORE any HMAC comparison: corrupt the HMAC to a
+      // value that is still valid hex (so the stamp regex still matches) but is certainly
+      // wrong, so that IF verifySignedStamp were ever reached it would fail as "unverifiable"
+      // rather than "foreign". A foreign stamp must never get that far.
+      const foreignStamp = stampAuthor(actorId, repo, number, "their-instance").replace(
+        /[0-9a-fA-F]{64}(\s*-->)/,
+        `${"0".repeat(64)}$1`
+      );
+      const body = `hi\n\n${foreignStamp}`;
+
+      const res = verifyAuthorStamp(body, repo, number, localInstanceId);
+
+      expect(res.status).toBe("foreign");
+    });
+
+    it("classifies an expired same-instance stamp as 'expired', quietly and distinctly from 'unverifiable'", () => {
+      vi.useFakeTimers();
+      const nowTime = 1717171717000;
+      vi.setSystemTime(new Date(nowTime));
+      const stamp = stampAuthor(actorId, repo, number, localInstanceId);
+      vi.setSystemTime(new Date(nowTime + 16 * 60 * 1000));
+
+      const body = `hi\n\n${stamp}`;
+      const anomalies: StampAnomaly[] = [];
+      expect(resolveWithLocal({ comment: { body } }, (a) => anomalies.push(a))).toBeNull();
+
+      expect(anomalies).toHaveLength(1);
+      expect(anomalies[0].detail).toBe("expired");
+      vi.useRealTimers();
+    });
+
+    it("classifies a same-instance HMAC mismatch as 'unverifiable', distinct from 'foreign_instance' and 'expired'", () => {
+      const validStamp = stampAuthor(actorId, repo, number, localInstanceId);
+      const tampered = validStamp.replace(/[0-9a-fA-F]{64}\s*-->/, `${"a".repeat(64)} -->`);
+      const body = `hi\n\n${tampered}`;
+      const anomalies: StampAnomaly[] = [];
+
+      expect(resolveWithLocal({ comment: { body } }, (a) => anomalies.push(a))).toBeNull();
+
+      expect(anomalies).toHaveLength(1);
+      expect(anomalies[0].detail).toBe("unverifiable");
+    });
+  });
+
+  it("no verification path emits detail 'forgery' anywhere (foreign, expired, unverifiable, migration, verified)", () => {
+    const allDetails: string[] = [];
+    const record = (a: StampAnomaly) => allDetails.push(a.detail);
+
+    const localInstanceId = "our-instance";
+    const base = {
+      event: "issue_comment",
+      action: "created",
+      sender: "RusaBot",
+      botLogin,
+      repoFullName: repo,
+      number,
+    };
+
+    resolveStampedAuthor({
+      ...base,
+      payload: {
+        comment: { body: `x\n\n${stampAuthor(actorId, repo, number, "their-instance")}` },
+      },
+      localInstanceId,
+      onAnomaly: record,
+    });
+    resolveStampedAuthor({
+      ...base,
+      payload: { comment: { body: `x <!-- mesh:author ${actorId} -->` } },
+      localInstanceId,
+      onAnomaly: record,
+    });
+    const tampered = stampAuthor(actorId, repo, number, localInstanceId).replace(
+      /[0-9a-fA-F]{64}\s*-->/,
+      `${"a".repeat(64)} -->`
+    );
+    resolveStampedAuthor({
+      ...base,
+      payload: { comment: { body: `x\n\n${tampered}` } },
+      localInstanceId,
+      onAnomaly: record,
+    });
+
+    expect(allDetails.length).toBeGreaterThan(0);
+    expect(allDetails).not.toContain("forgery");
   });
 });

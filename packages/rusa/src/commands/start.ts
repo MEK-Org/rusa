@@ -2683,9 +2683,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       botLogin,
       repoFullName,
       number,
+      localInstanceId: rootHandle,
       onAnomaly: (anomaly) => {
-        if (anomaly.detail === "forgery") {
-          console.error(`[webhook] ⚠️ LOUD stamp invalid signal: ${anomaly.reason}`);
+        if (anomaly.detail === "unverifiable") {
+          console.warn(`[webhook] stamp unverifiable: ${anomaly.reason}`);
         }
         mesh.recordEvent({
           kind: "stamp_invalid",
