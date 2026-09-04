@@ -5,6 +5,12 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ProviderConfig } from "../config/types.js";
 import {
+  formatExecutingNotice,
+  formatLiveError,
+  formatToolError,
+  truncateForLive,
+} from "./live-output.js";
+import {
   buildActorBwrapArgs,
   buildActorBwrapCommand,
   kimiSessionStoreDir,
@@ -245,6 +251,73 @@ export class KimiProvider implements CodingProvider {
         };
       };
 
+      // Live-output normalization (issue #210). Stream shapes verified against
+      // kimi-code's PromptJsonWriter: assistant text/tool_calls flush together
+      // at step boundaries, tool results arrive as role:"tool" lines, retries
+      // as role:"meta" turn.step.retrying lines, and a goal.summary object
+      // closes the stream.
+      let buffer = "";
+      const processLine = (line: string) => {
+        if (!line.trim()) return;
+        let json: Record<string, unknown>;
+        try {
+          json = JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          // Not JSON (e.g. stderr noise mixed into stdout) — keep the
+          // pre-normalization behavior of forwarding it raw.
+          opts.onChunk?.(line);
+          return;
+        }
+        if (json.role === "assistant") {
+          if (typeof json.content === "string" && json.content) {
+            opts.onChunk?.(json.content);
+          }
+          if (Array.isArray(json.tool_calls)) {
+            for (const call of json.tool_calls) {
+              const name =
+                call && typeof call === "object"
+                  ? String((call as { function?: { name?: unknown } }).function?.name ?? "tool")
+                  : "tool";
+              opts.onChunk?.(formatExecutingNotice(name));
+            }
+          }
+          return;
+        }
+        if (json.role === "tool") {
+          // Result arrival is liveness even though the body is suppressed.
+          opts.onChunk?.("");
+          const content = typeof json.content === "string" ? json.content : "";
+          if (content.startsWith("Error:") || content.startsWith("Failed:")) {
+            opts.onChunk?.(formatToolError(content));
+          }
+          return;
+        }
+        if (json.role === "meta") {
+          if (json.type === "turn.step.retrying") {
+            const name = String(json.error_name ?? "error");
+            const message = truncateForLive(String(json.error_message ?? ""), 160);
+            const attempt = json.next_attempt;
+            const max = json.max_attempts;
+            const attemptSuffix =
+              typeof attempt === "number" && typeof max === "number"
+                ? ` (attempt ${attempt}/${max})`
+                : "";
+            opts.onChunk?.(`\n[Retrying${attemptSuffix}: ${name}: ${message}]\n`);
+            return;
+          }
+          // session.resume_hint and other meta lines need no live rendering;
+          // the final parse captures the session id from the raw record.
+          opts.onChunk?.("");
+          return;
+        }
+        if (json.type === "error") {
+          opts.onChunk?.(formatLiveError(String(json.message ?? "unknown error")));
+          return;
+        }
+        // goal.summary and any future envelope types: tick liveness only.
+        opts.onChunk?.("");
+      };
+
       return runSubprocess({
         command: spawnCommand,
         args: spawnArgs,
@@ -253,7 +326,35 @@ export class KimiProvider implements CodingProvider {
         signal: opts.signal,
         onStdout: opts.onStdout,
         onStderr: opts.onStderr,
-        onChunk: opts.onChunk,
+        // Issue #210: kimi's stream-json lines are normalized for live output.
+        // The raw stdout/stderr still accumulates in `chunks` so the final
+        // parse (assistant text + session id) is unchanged; only reasoning/
+        // text, concise tool notices, and bounded errors reach onChunk, with
+        // an empty-string liveness tick on every suppressed result.
+        handleStdoutData: (data, chunks) => {
+          const text = data.toString();
+          opts.onStdout?.(text);
+          chunks.push(text);
+          buffer += text;
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            processLine(line);
+          }
+        },
+        handleStderrData: (data, chunks) => {
+          const text = data.toString();
+          opts.onStderr?.(text);
+          // The rendered stderr stream stays in the durable record but never
+          // reaches the live-output callback.
+          chunks.push(text);
+        },
+        onStdoutEnd: () => {
+          if (buffer) {
+            processLine(buffer);
+            buffer = "";
+          }
+        },
         cleanup: () => {
           cleanupMcpConfig();
           cleanupTempPaths();

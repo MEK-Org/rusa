@@ -90,6 +90,34 @@ describe("CodexProvider", () => {
     );
   });
 
+  it("passes --json so the exec stream is machine-parseable (issue #210)", async () => {
+    const config: ProviderConfig = { cliCommand: "codex" };
+    const provider = new CodexProvider("codex", config, "gpt-5-codex");
+
+    const mockChild = new EventEmitter() as EventEmitter & {
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+    };
+    mockChild.stdout = new EventEmitter();
+    mockChild.stderr = new EventEmitter();
+
+    vi.mocked(spawn).mockReturnValue(mockChild as ChildProcessWithoutNullStreams);
+
+    const runPromise = provider.run({
+      prompt: "test prompt",
+      cwd: "/tmp",
+    });
+
+    setTimeout(() => {
+      mockChild.emit("close", 0);
+    }, 10);
+
+    await runPromise;
+
+    const argv = vi.mocked(spawn).mock.calls[0]?.[1] as string[];
+    expect(argv).toContain("--json");
+  });
+
   it("runs codex inside bwrap sandbox when sandbox options are provided", async () => {
     const config: ProviderConfig = { cliCommand: "codex" };
     const provider = new CodexProvider("codex", config, "gpt-5-codex");
@@ -198,6 +226,7 @@ describe("CodexProvider", () => {
         "--yolo",
         "--cd",
         "/wt",
+        "--json",
         "--model",
         "gpt-5-codex",
         "do it",
@@ -210,6 +239,7 @@ describe("CodexProvider", () => {
         "--yolo",
         "--cd",
         "/wt",
+        "--json",
         "--model",
         "gpt-5.6-sol",
         "--config",
@@ -231,6 +261,7 @@ describe("CodexProvider", () => {
         "--yolo",
         "--cd",
         "/wt",
+        "--json",
         "--model",
         "gpt-5.6-sol",
         "--config",
@@ -245,6 +276,7 @@ describe("CodexProvider", () => {
         "--yolo",
         "--cd",
         "/wt",
+        "--json",
         "p",
       ]);
     });
@@ -257,6 +289,7 @@ describe("CodexProvider", () => {
         "exec",
         "resume",
         "--dangerously-bypass-approvals-and-sandbox",
+        "--json",
         "--model",
         "gpt-5-codex",
         id,
@@ -938,5 +971,207 @@ trust_level = "trusted"
       process.env.HOME = prevHome;
       rmSync(fakeHome, { recursive: true, force: true });
     }
+  });
+});
+
+describe("CodexProvider live-output normalization (issue #210)", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  /**
+   * Drive a provider run with the given JSONL stdout/stderr, emitted as one
+   * data event, then close with the given code. Returns the run result plus
+   * every live chunk the dashboard path would have received.
+   */
+  async function runWithStream(opts: {
+    stdout?: string;
+    stderr?: string;
+    exitCode?: number;
+  }): Promise<{ result: Awaited<ReturnType<CodexProvider["run"]>>; live: string[] }> {
+    const provider = new CodexProvider("codex", { cliCommand: "codex" }, "gpt-5-codex");
+    const child = new EventEmitter() as EventEmitter & {
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+    };
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    vi.mocked(spawn).mockReturnValue(child as unknown as ChildProcessWithoutNullStreams);
+
+    const live: string[] = [];
+    const runPromise = provider.run({
+      prompt: "test",
+      cwd: "/tmp",
+      onChunk: (c) => live.push(c),
+    });
+    if (opts.stdout) child.stdout.emit("data", Buffer.from(opts.stdout));
+    if (opts.stderr) child.stderr.emit("data", Buffer.from(opts.stderr));
+    child.emit("close", opts.exitCode ?? 0);
+    const result = await runPromise;
+    return { result, live };
+  }
+
+  const line = (o: unknown) => `${JSON.stringify(o)}\n`;
+
+  it("streams assistant text and uses it as the final output", async () => {
+    const { result, live } = await runWithStream({
+      stdout:
+        line({ type: "thread.started", thread_id: "01a0" }) +
+        line({ type: "turn.started" }) +
+        line({
+          type: "item.completed",
+          item: {
+            id: "item_1",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "All done." }],
+          },
+        }) +
+        line({ type: "turn.completed", usage: {} }),
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.output).toBe("All done.");
+    expect(live.join("")).toContain("All done.");
+  });
+
+  it("shows concise command notices and suppresses successful command output bodies", async () => {
+    const commandOutput = `test output\n${"o".repeat(800)}`;
+    const { result, live } = await runWithStream({
+      stdout:
+        line({ type: "turn.started" }) +
+        line({
+          type: "item.started",
+          item: {
+            id: "item_1",
+            type: "local_shell_call",
+            command: "pnpm test",
+            command_action: { type: "exec", command: ["pnpm", "test"] },
+          },
+        }) +
+        line({
+          type: "item.completed",
+          item: { id: "item_1", type: "local_shell_call", status: "completed" },
+        }) +
+        line({
+          type: "item.completed",
+          item: {
+            id: "item_2",
+            type: "local_shell_call_output",
+            call_id: "item_1",
+            output: commandOutput,
+            exit_code: 0,
+          },
+        }) +
+        line({
+          type: "item.completed",
+          item: {
+            id: "item_3",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "passed" }],
+          },
+        }),
+    });
+
+    const liveText = live.join("");
+    expect(liveText).toContain("[run_command: pnpm test]");
+    expect(liveText).not.toContain("test output");
+    // The raw JSONL (including the suppressed body) stays in the durable record.
+    expect(result.output).toBe("passed");
+  });
+
+  it("keeps bounded errors visible for failed commands without the output body", async () => {
+    const { live } = await runWithStream({
+      stdout:
+        line({
+          type: "item.completed",
+          item: { id: "item_1", type: "local_shell_call", status: "failed" },
+        }) +
+        line({
+          type: "item.completed",
+          item: {
+            id: "item_2",
+            type: "local_shell_call_output",
+            call_id: "item_1",
+            output: `fatal: ${"f".repeat(600)}`,
+            exit_code: 1,
+          },
+        }),
+    });
+
+    const liveText = live.join("");
+    expect(liveText).toContain("[Tool error:");
+    expect(liveText).toContain("exit code 1");
+    // Bounded excerpt: the first line shows, the rest of the body does not.
+    expect(liveText).toContain("fatal:");
+    expect(liveText).not.toContain("f".repeat(300));
+  });
+
+  it("shows concise MCP invocation notices and suppresses MCP result bodies", async () => {
+    const { live } = await runWithStream({
+      stdout:
+        line({
+          type: "item.started",
+          item: {
+            id: "item_1",
+            type: "mcp_tool_call",
+            server: "tracker",
+            tool: "create_issue",
+            arguments: '{"title":"secret"}',
+          },
+        }) +
+        line({
+          type: "item.completed",
+          item: {
+            id: "item_2",
+            type: "mcp_tool_call_response",
+            call_id: "item_1",
+            output: `{"number":41,"body":"${"b".repeat(400)}"}`,
+          },
+        }),
+    });
+
+    const liveText = live.join("");
+    expect(liveText).toContain("[MCP tracker:create_issue]");
+    expect(liveText).not.toContain('"number":41');
+    // Tool arguments beyond the concise notice are not exposed either.
+    expect(liveText).not.toContain("secret");
+  });
+
+  it("keeps turn failures visible and swallows transient reconnect noise", async () => {
+    const { result, live } = await runWithStream({
+      exitCode: 1,
+      stdout:
+        line({ type: "error", message: "Reconnecting... 2/5 (unexpected status 500)" }) +
+        line({ type: "turn.failed", error: { message: "usage limit reached, retry later" } }),
+    });
+
+    const liveText = live.join("");
+    expect(liveText).not.toContain("Reconnecting");
+    expect(liveText).toContain("[Error]:");
+    expect(liveText).toContain("usage limit reached");
+    expect(result.success).toBe(false);
+    // No assistant text → output falls back to the raw JSONL so failure
+    // classification (auth/quota strings) keeps working.
+    expect(result.output).toContain("usage limit reached");
+  });
+
+  it("does not forward the rendered stderr stream to live output", async () => {
+    const { result, live } = await runWithStream({
+      stderr: "Thinking...\nrunning `cargo build`...\n",
+      stdout: line({
+        type: "item.completed",
+        item: {
+          id: "item_1",
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "built" }],
+        },
+      }),
+    });
+
+    expect(live.join("")).not.toContain("cargo build");
+    expect(result.output).toBe("built");
   });
 });

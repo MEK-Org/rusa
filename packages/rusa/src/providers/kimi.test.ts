@@ -359,7 +359,7 @@ describe("KimiProvider", () => {
       expect(result.output).toBe("KIMI_SJ_OK");
     });
 
-    it("collects stderr into chunks (forwarded to onStderr and onChunk)", async () => {
+    it("collects stderr into the durable record without forwarding it to live output (issue #210)", async () => {
       const config: ProviderConfig = { cliCommand: "kimi" };
       const provider = new KimiProvider("kimi", config);
 
@@ -380,7 +380,8 @@ describe("KimiProvider", () => {
       });
 
       expect(stderrChunks.join("")).toContain("some stderr noise");
-      expect(allChunks.join("")).toContain("some stderr noise");
+      // The rendered stderr stream (TUI noise) must not reach the live dashboard path.
+      expect(allChunks.join("")).not.toContain("some stderr noise");
       // output comes from parsed assistant content (not raw)
       expect(result.output).toBe("Hello from kimi");
     });
@@ -700,5 +701,116 @@ describe("KimiProvider", () => {
       expect(result.cancelled).toBe(true);
       expect(result.exitCode).toBe(143);
     });
+  });
+});
+
+describe("KimiProvider live-output normalization (issue #210)", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  async function runWithStream(stdout: string): Promise<{
+    result: Awaited<ReturnType<KimiProvider["run"]>>;
+    live: string[];
+  }> {
+    const provider = new KimiProvider("kimi", { cliCommand: "kimi" });
+    vi.mocked(spawn).mockReturnValue(
+      makeMockChild({ stdout }) as unknown as ChildProcessWithoutNullStreams
+    );
+    const live: string[] = [];
+    const result = await provider.run({
+      prompt: "test",
+      cwd: "/tmp",
+      onChunk: (c) => live.push(c),
+    });
+    return { result, live };
+  }
+
+  const line = (o: unknown) => `${JSON.stringify(o)}\n`;
+
+  // Shape verified against kimi-code 0.40.1's PromptJsonWriter: assistant text
+  // and tool_calls flush together at step boundaries; tool results arrive as
+  // role:"tool" lines carrying the full output body.
+  const TOOL_STREAM =
+    line({
+      role: "assistant",
+      content: "Let me check the files.",
+      tool_calls: [
+        {
+          type: "function",
+          id: "call_1",
+          function: { name: "Bash", arguments: '{"command":"ls"}' },
+        },
+      ],
+    }) +
+    line({ role: "tool", tool_call_id: "call_1", content: `file a\n${"o".repeat(600)}` }) +
+    line({ role: "assistant", content: "Found it." }) +
+    line({ type: "goal.summary", goalId: null, status: "complete" });
+
+  it("streams assistant text and concise tool notices without raw JSON", async () => {
+    const { result, live } = await runWithStream(TOOL_STREAM);
+    const liveText = live.join("");
+
+    expect(liveText).toContain("Let me check the files.");
+    expect(liveText).toContain("[Executing Bash...]");
+    expect(liveText).toContain("Found it.");
+    expect(liveText).not.toContain('"tool_call_id"');
+    expect(result.output).toBe("Found it.");
+  });
+
+  it("suppresses successful tool-result bodies from live output while ticking liveness", async () => {
+    const { live } = await runWithStream(TOOL_STREAM);
+    const liveText = live.join("");
+
+    expect(liveText).not.toContain("file a");
+    // Result arrival signals liveness even though the body is suppressed.
+    expect(live).toContain("");
+  });
+
+  it("keeps bounded tool errors visible", async () => {
+    const errorBody = `Error: command failed: ${"e".repeat(500)}`;
+    const { live } = await runWithStream(
+      line({ role: "assistant", content: "Trying." }) +
+        line({ role: "tool", tool_call_id: "call_1", content: errorBody }) +
+        line({ role: "assistant", content: "Recovered." })
+    );
+    const liveText = live.join("");
+
+    expect(liveText).toContain("[Tool error:");
+    expect(liveText).toContain("command failed:");
+    expect(liveText).not.toContain("e".repeat(300));
+  });
+
+  it("surfaces retry notices from the meta stream, bounded", async () => {
+    const { live } = await runWithStream(
+      line({
+        role: "meta",
+        type: "turn.step.retrying",
+        failed_attempt: 1,
+        next_attempt: 2,
+        max_attempts: 5,
+        delay_ms: 1000,
+        error_name: "RateLimitError",
+        error_message: `slow down ${"r".repeat(400)}`,
+        status_code: 429,
+      }) + line({ role: "assistant", content: "OK" })
+    );
+    const liveText = live.join("");
+
+    expect(liveText).toContain("RateLimitError");
+    expect(liveText).toContain("attempt 2/5");
+    expect(liveText).not.toContain("r".repeat(300));
+  });
+
+  it("still captures the session id from the resume hint", async () => {
+    const { result } = await runWithStream(
+      line({ role: "assistant", content: "Done" }) +
+        line({
+          role: "meta",
+          type: "session.resume_hint",
+          session_id: "session_6c2ad3ad-abcd-1234-ef56-000000000099",
+        })
+    );
+    expect(result.sessionId).toBe("session_6c2ad3ad-abcd-1234-ef56-000000000099");
   });
 });
