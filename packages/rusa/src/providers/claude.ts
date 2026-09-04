@@ -4,6 +4,7 @@ import { rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderConfig } from "../config/types.js";
+import { formatExecutingNotice, formatToolError } from "./live-output.js";
 import {
   buildActorBwrapArgs,
   buildActorBwrapCommand,
@@ -171,6 +172,35 @@ export class ClaudeProvider implements CodingProvider {
 
     let buffer = "";
     const tokenLines: string[] = [];
+    // Extract the display text of a tool_result content field, which can be a
+    // plain string or an array of typed content items.
+    const toolResultText = (content: unknown): string => {
+      if (typeof content === "string") return content;
+      if (Array.isArray(content)) {
+        return content
+          .map((item) =>
+            item && typeof item === "object" && "text" in item
+              ? String((item as { text?: unknown }).text ?? "")
+              : ""
+          )
+          .filter(Boolean)
+          .join("\n");
+      }
+      return "";
+    };
+    // Issue #210: a tool result *arriving* is proof of liveness, but the body
+    // belongs in the durable record only — live output keeps a liveness tick
+    // plus a bounded error when the result is a failure.
+    const handleToolResult = (text: string, isError: boolean, chunks: string[]) => {
+      opts.onChunk?.("");
+      if (!text) return;
+      // The durable run record keeps the full result, as before.
+      chunks.push(`\n[Tool Result]:\n${text}\n`);
+      if (isError) {
+        const msg = formatToolError(text);
+        opts.onChunk?.(msg);
+      }
+    };
     const processLine = (line: string, chunks: string[]) => {
       if (!line.trim()) return;
       try {
@@ -186,31 +216,30 @@ export class ClaudeProvider implements CodingProvider {
             } else if (delta.type === "thinking_delta") {
               opts.onChunk?.(delta.thinking);
               chunks.push(delta.thinking);
-            } else if (delta.type === "input_json_delta") {
-              opts.onChunk?.(delta.partial_json);
-              chunks.push(delta.partial_json);
             }
+            // input_json_delta (streaming tool arguments) is deliberately not
+            // forwarded: the invocation notice at content_block_start already
+            // carries the concise signal, and raw argument fragments are noise.
           } else if (
             event.type === "content_block_start" &&
             event.content_block.type === "tool_use"
           ) {
             const tool = event.content_block.name;
-            const msg = `\n[Executing ${tool}...]\n`;
+            const msg = formatExecutingNotice(tool);
             opts.onChunk?.(msg);
             chunks.push(msg);
           }
         } else if (json.type === "user" && json.tool_use_result) {
-          // A tool_result *arriving* is proof of liveness regardless of whether it
-          // carries text. Signal the stall timer unconditionally so a backgrounded
-          // command (or any quiet mutation like sed -i / mv / mkdir) still resets
-          // the watchdog. The text-content guard below is a separate concern:
-          // empty results are transcript noise and should not be logged.
-          opts.onChunk?.("");
-          const result = json.tool_use_result.stdout || json.tool_use_result.stderr;
-          if (result) {
-            const msg = `\n[Tool Result]:\n${result}\n`;
-            opts.onChunk?.(msg);
-            chunks.push(msg);
+          // Convenience shape some claude builds attach to user events.
+          const result = json.tool_use_result;
+          const text = result.stdout || result.stderr || "";
+          handleToolResult(text, Boolean(result.is_error), chunks);
+        } else if (json.type === "user" && Array.isArray(json.message?.content)) {
+          // Canonical shape: tool results arrive as user-message content items.
+          for (const item of json.message.content) {
+            if (item?.type === "tool_result") {
+              handleToolResult(toolResultText(item.content), Boolean(item.is_error), chunks);
+            }
           }
         } else if (json.type === "assistant" && json.message?.content) {
           // Summary of the turn, can be used if we missed some deltas

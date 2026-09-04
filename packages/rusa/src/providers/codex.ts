@@ -4,6 +4,13 @@ import { basename, join } from "node:path";
 import { parse, stringify } from "smol-toml";
 import type { ProviderConfig } from "../config/types.js";
 import {
+  formatLiveError,
+  formatMcpInvocationNotice,
+  formatRunCommandNotice,
+  formatToolError,
+  truncateForLive,
+} from "./live-output.js";
+import {
   type ActorBwrapResult,
   buildActorBwrapArgs,
   buildActorBwrapCommand,
@@ -100,8 +107,13 @@ export interface CodexArgsOptions {
 
 /**
  * Build the `codex` CLI args (pure). Two shapes:
- * - fresh:  `exec --yolo --cd <cwd> [--model M] <prompt>`
- * - resume: `exec resume --dangerously-bypass-approvals-and-sandbox [--model M] <id> <prompt>`
+ * - fresh:  `exec --yolo --cd <cwd> --json [--model M] <prompt>`
+ * - resume: `exec resume --dangerously-bypass-approvals-and-sandbox --json [--model M] <id> <prompt>`
+ *
+ * `--json` selects the structured JSONL event stream on stdout (issue #210):
+ * the adapter parses `item.*`/`turn.*`/`error` events and normalizes what
+ * reaches the live-output callback, instead of forwarding codex's rendered
+ * transcript (which is written to stderr and dominates the live view).
  *
  * The resume shape is dictated by codex 0.137's subcommand grammar
  * (`codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]`), which does NOT accept
@@ -128,13 +140,13 @@ export function buildCodexArgs(o: CodexArgsOptions): string[] {
   }
 
   if (o.resumeSessionId) {
-    const args = ["exec", "resume", "--dangerously-bypass-approvals-and-sandbox"];
+    const args = ["exec", "resume", "--dangerously-bypass-approvals-and-sandbox", "--json"];
     if (model) args.push("--model", model);
     for (const override of configOverrides) args.push("--config", override);
     args.push(o.resumeSessionId, o.prompt);
     return args;
   }
-  const args = ["exec", "--yolo", "--cd", o.cwd];
+  const args = ["exec", "--yolo", "--cd", o.cwd, "--json"];
   if (model) args.push("--model", model);
   for (const override of configOverrides) args.push("--config", override);
   args.push(o.prompt);
@@ -502,6 +514,192 @@ export class CodexProvider implements CodingProvider {
         };
       };
 
+      // Issue #210: normalize the --json event stream for live output. The raw
+      // stdout/stderr still accumulates in `chunks` (the durable run record);
+      // only the curated reasoning/text/notices/errors reach onChunk. Every
+      // event ticks liveness (`onChunk("")`) so the stall watchdog keeps
+      // firing while tool results are suppressed.
+      let lineBuffer = "";
+      const assistantTexts: string[] = [];
+      const tick = () => opts.onChunk?.("");
+      const itemText = (item: { content?: unknown; text?: unknown }): string => {
+        if (typeof item.text === "string") return item.text;
+        if (Array.isArray(item.content)) {
+          return item.content
+            .map((c) =>
+              c && typeof c === "object" && "text" in c
+                ? String((c as { text?: unknown }).text ?? "")
+                : ""
+            )
+            .filter(Boolean)
+            .join("\n");
+        }
+        return "";
+      };
+      const shellCommandOf = (item: Record<string, unknown>): string => {
+        if (typeof item.command === "string") return item.command;
+        const action = item.command_action;
+        if (
+          action &&
+          typeof action === "object" &&
+          Array.isArray((action as { command?: unknown }).command)
+        ) {
+          return ((action as { command: unknown[] }).command ?? []).join(" ");
+        }
+        // Older function_call items carry a JSON arguments string.
+        if (item.type === "function_call" && typeof item.arguments === "string") {
+          try {
+            const args = JSON.parse(item.arguments) as { command?: unknown };
+            if (Array.isArray(args.command)) return args.command.join(" ");
+          } catch {
+            /* fall through to the generic notice */
+          }
+        }
+        return "";
+      };
+      const handleItemStarted = (item: Record<string, unknown>) => {
+        switch (item.type) {
+          case "local_shell_call":
+          case "function_call": {
+            const command = shellCommandOf(item);
+            if (command) opts.onChunk?.(formatRunCommandNotice(command));
+            else tick();
+            return;
+          }
+          case "mcp_tool_call":
+          case "custom_tool_call": {
+            const server = typeof item.server === "string" ? item.server : "mcp";
+            const tool = typeof item.tool === "string" ? item.tool : "tool";
+            opts.onChunk?.(formatMcpInvocationNotice(server, tool));
+            return;
+          }
+          default:
+            tick();
+        }
+      };
+      const handleItemCompleted = (item: Record<string, unknown>) => {
+        switch (item.type) {
+          case "message":
+          case "agent_message": {
+            const text = itemText(item);
+            if (text) {
+              opts.onChunk?.(text);
+              assistantTexts.push(text);
+            } else {
+              tick();
+            }
+            return;
+          }
+          case "reasoning": {
+            const text = itemText(item);
+            if (text) opts.onChunk?.(text);
+            else tick();
+            return;
+          }
+          case "local_shell_call":
+            // Completion without an exit code carries no actionable signal.
+            tick();
+            return;
+          case "function_call":
+            tick();
+            return;
+          case "local_shell_call_output":
+          case "function_call_output": {
+            const exitCode = typeof item.exit_code === "number" ? item.exit_code : 0;
+            const isError = Boolean(item.is_error) || exitCode !== 0;
+            if (isError) {
+              const output = typeof item.output === "string" ? item.output : "";
+              const detail = output.trim().split("\n", 1)[0] ?? "";
+              opts.onChunk?.(
+                formatToolError(
+                  detail
+                    ? `exit code ${exitCode}: ${truncateForLive(detail, 160)}`
+                    : `exit code ${exitCode}`
+                )
+              );
+            } else {
+              tick();
+            }
+            return;
+          }
+          case "mcp_tool_call_response":
+          case "custom_tool_call_output": {
+            const output = typeof item.output === "string" ? item.output : "";
+            if (item.is_error && output) {
+              opts.onChunk?.(formatToolError(output));
+            } else {
+              tick();
+            }
+            return;
+          }
+          case "error": {
+            const message = typeof item.message === "string" ? item.message : "unknown error";
+            opts.onChunk?.(formatLiveError(message));
+            return;
+          }
+          case "file_change": {
+            const path = typeof item.path === "string" ? item.path : "file";
+            opts.onChunk?.(`\n[edit: ${truncateForLive(path, 120)}]\n`);
+            return;
+          }
+          case "web_search_call":
+            opts.onChunk?.("\n[web_search]\n");
+            return;
+          default:
+            tick();
+        }
+      };
+      const processLine = (line: string) => {
+        if (!line.trim()) return;
+        let json: Record<string, unknown>;
+        try {
+          json = JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          // Not JSON — forward raw so unexpected provider output stays visible.
+          opts.onChunk?.(line);
+          return;
+        }
+        switch (json.type) {
+          case "thread.started":
+          case "turn.started":
+          case "turn.completed":
+          case "token_count":
+          case "task_started":
+          case "task_complete":
+            tick();
+            return;
+          case "turn.failed": {
+            const error = json.error as { message?: unknown } | undefined;
+            opts.onChunk?.(formatLiveError(String(error?.message ?? "turn failed")));
+            return;
+          }
+          case "error": {
+            const message = String(json.message ?? "");
+            // Codex retries model requests internally; the transient
+            // "Reconnecting..." noise is not actionable in the live view.
+            if (message.startsWith("Reconnecting")) tick();
+            else opts.onChunk?.(formatLiveError(message));
+            return;
+          }
+          case "warning":
+            tick();
+            return;
+          case "item.started":
+            handleItemStarted((json.item as Record<string, unknown>) ?? {});
+            return;
+          case "item.completed":
+            handleItemCompleted((json.item as Record<string, unknown>) ?? {});
+            return;
+          default:
+            tick();
+        }
+      };
+      // The final assistant text becomes the run output; when the run produced
+      // none (failures), fall back to the raw stream so auth/quota strings in
+      // error events keep reaching the failure classifiers.
+      const effectiveOutput = (rawOutput: string): string =>
+        assistantTexts.length > 0 ? assistantTexts.join("\n") : rawOutput;
+
       return runSubprocess({
         command: spawnCommand,
         args: spawnArgs,
@@ -510,7 +708,24 @@ export class CodexProvider implements CodingProvider {
         signal: opts.signal,
         onStdout: opts.onStdout,
         onStderr: opts.onStderr,
-        onChunk: opts.onChunk,
+        handleStdoutData: (data, chunks) => {
+          const text = data.toString();
+          opts.onStdout?.(text);
+          chunks.push(text);
+          lineBuffer += text;
+          const lines = lineBuffer.split("\n");
+          lineBuffer = lines.pop() ?? "";
+          for (const line of lines) {
+            processLine(line);
+          }
+        },
+        handleStderrData: (data, chunks) => {
+          const text = data.toString();
+          opts.onStderr?.(text);
+          // The rendered transcript stays in the durable record but never
+          // reaches the live-output callback (issue #210).
+          chunks.push(text);
+        },
         // Temp cleanup is owned by run() below, not per-spawn.
         buildKilledResult: ({
           output,
@@ -547,8 +762,13 @@ export class CodexProvider implements CodingProvider {
             graceKilled,
           }),
         buildExitResult: (output, exitCode) => {
+          if (lineBuffer) {
+            processLine(lineBuffer);
+            lineBuffer = "";
+          }
+          const outputText = effectiveOutput(output);
           // Auth-fail alarm: if the run fails with an auth error, alert the operator.
-          if (exitCode !== 0 && isCodexAuthFailure(output)) {
+          if (exitCode !== 0 && isCodexAuthFailure(outputText)) {
             console.error("\n=======================================================");
             console.error(
               "🚨 CODE PROMPT AUTHENTICATION ALARM: Codex subactor run failed due to auth error."
@@ -560,7 +780,7 @@ export class CodexProvider implements CodingProvider {
           }
           return buildResultWithSession({
             success: exitCode === 0,
-            output,
+            output: outputText,
             exitCode,
           });
         },
