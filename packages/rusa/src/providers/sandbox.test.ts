@@ -6,6 +6,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -201,7 +202,7 @@ describe("sandbox bwrap args", () => {
     expect(args).not.toContain("/tmp/rusa-home");
   });
 
-  it("skips the credentials/oauth binds for kimi when the host dir is absent, a plain file, or a symlink (least privilege)", async () => {
+  it("skips the credentials/oauth binds for kimi when the host dir is absent or a plain file (least privilege)", async () => {
     const home = mkdtempSync(join(tmpdir(), "mc-kimi-mesh-home-missing-"));
     tempDirs.push(home);
     mkdirSync(join(home, ".kimi-code"), { recursive: true });
@@ -222,6 +223,36 @@ describe("sandbox bwrap args", () => {
 
     expect(args).not.toContain("/tmp/kimi-home/credentials");
     expect(args).not.toContain("/tmp/kimi-home/oauth");
+  });
+
+  it("skips the credentials/oauth binds for kimi when the host path is a symlink, even one pointing at a real directory (least privilege)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "mc-kimi-mesh-home-symlink-"));
+    tempDirs.push(home);
+    mkdirSync(join(home, ".kimi-code"), { recursive: true });
+
+    // A decoy real directory elsewhere, outside the expected ~/.kimi-code tree, that
+    // credentials/ and oauth/ are symlinked to. If the bind helper used `statSync`
+    // (which follows symlinks) instead of `lstatSync`, it would treat these as real
+    // directories and bind the decoy writable into the sandbox — this proves it doesn't.
+    const decoy = mkdtempSync(join(tmpdir(), "mc-kimi-symlink-decoy-"));
+    tempDirs.push(decoy);
+    symlinkSync(decoy, join(home, ".kimi-code", "credentials"));
+    symlinkSync(decoy, join(home, ".kimi-code", "oauth"));
+
+    process.env.HOME = home;
+    execSyncMock.mockImplementation((command: string) => {
+      if (command === "pnpm store path") return "/tmp/pnpm-store\n";
+      const fallback = defaultExecSyncResponse(command);
+      if (fallback) return fallback;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const { buildActorBwrapArgs } = await import("./sandbox.js");
+    const { args } = buildActorBwrapArgs("/tmp/worktree", "kimi");
+
+    expect(args).not.toContain("/tmp/kimi-home/credentials");
+    expect(args).not.toContain("/tmp/kimi-home/oauth");
+    expect(args).not.toContain(decoy);
   });
 
   it("ro-binds the per-invocation mcp config to KIMI_CODE_HOME/mcp.json for kimi", async () => {

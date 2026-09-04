@@ -570,11 +570,19 @@ function addWritableBindIfExists(args: string[], source: string, target: string)
  * used for host credential directories, where a stray file left over from an older
  * layout, or a symlink that could point outside the expected host-credentials tree,
  * must not be bound writable in its place. Uses `lstatSync` (not `statSync`) so a
- * symlinked entry is rejected rather than followed.
+ * symlinked entry is rejected rather than followed. The existence check and the type
+ * check are a single `lstatSync` call (not a separate `existsSync` probe first) so a
+ * source that's deleted between the two — another actor's teardown racing this one's
+ * sandbox setup — can't turn into an unhandled ENOENT; any lstat failure is treated
+ * the same as "absent" and the bind is skipped rather than binding writable.
  */
 function addWritableDirBindIfRealDir(args: string[], source: string, target: string): void {
-  if (!existsSync(source)) return; // absent — best-effort, matches existing kimi/codex auth bind behavior
-  const st = lstatSync(source);
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(source);
+  } catch {
+    return; // absent, or raced away mid-probe — best-effort, matches existing kimi/codex auth bind behavior
+  }
   if (!st.isDirectory()) return; // not a real directory (plain file or symlink) — skip
   args.push("--bind", source, target);
 }
@@ -701,8 +709,11 @@ function providerWritableStateDirs(authMode: SandboxAuthMode | undefined): strin
       // (project state) on every run.
       return [join(home, ".claude"), join(home, ".claude.json")];
     case "kimi":
-      // KIMI_CODE_HOME=/tmp/kimi-home in buildMeshActorBwrapArgs handles all writes;
-      // no host dir needs to be writable.
+      // KIMI_CODE_HOME=/tmp/kimi-home in buildMeshActorBwrapArgs handles per-invocation
+      // writes, but credentials/ and oauth/ under host ~/.kimi-code ARE bound writable —
+      // at their own in-sandbox targets under /tmp/kimi-home, not in-place at their real
+      // host path, so they don't belong in this in-place-bind list. See the
+      // addWritableDirBindIfRealDir calls in buildMeshActorBwrapArgs.
       return [];
     case "codex":
       // Codex CLI stores auth in ~/.codex/auth.json and config in ~/.codex/config.toml.
