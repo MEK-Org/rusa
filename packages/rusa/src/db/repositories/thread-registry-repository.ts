@@ -136,8 +136,6 @@ export class DbThreadRegistry implements ThreadRegistry {
       );
     }
 
-    this.storeDesiredOverlay(record);
-
     this.db.transaction(() => {
       const retiredAt =
         record.status === "active"
@@ -172,6 +170,12 @@ export class DbThreadRegistry implements ThreadRegistry {
       for (const handle of record.handles ?? [])
         addHandle.run(record.id, handle.id, handle.role ?? null);
     })();
+
+    // Only stage the overlay once the SQLite write has actually committed —
+    // a thrown/rolled-back transaction must leave the prior overlay entry
+    // (if any) exactly as it was, not silently advance process memory ahead
+    // of durable state.
+    this.storeDesiredOverlay(record);
   }
 
   get(id: string): ThreadRecord | undefined {

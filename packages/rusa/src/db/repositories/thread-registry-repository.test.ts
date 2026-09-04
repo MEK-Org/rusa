@@ -231,4 +231,29 @@ describe("DbThreadRegistry", () => {
     const reopened = new DbThreadRegistry(db);
     expect(reopened.get("root")?.desiredModel).toBeUndefined();
   });
+
+  it("leaves the prior overlay entry unchanged when the underlying SQLite write fails, instead of staging ahead of durable state", () => {
+    registry.upsert(root);
+    registry.patch("root", { desiredModel: "claude-opus" });
+
+    const worker: ThreadRecord = {
+      id: "worker",
+      charter: "Implement a slice",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-09-03T13:01:00.000Z",
+    };
+    registry.upsert(worker);
+    registry.patch("worker", { desiredModel: "claude-sonnet" });
+
+    // parent_id REFERENCES actors(id) with no such row: the transaction must
+    // roll back on the FK violation, so the new desired* tuple must never
+    // reach the overlay and the previously staged one must survive intact.
+    expect(() =>
+      registry.upsert({ ...worker, parentId: "missing", desiredModel: "claude-haiku" })
+    ).toThrow();
+
+    expect(registry.get("worker")?.desiredModel).toBe("claude-sonnet");
+    expect(registry.get("root")?.desiredModel).toBe("claude-opus");
+  });
 });
