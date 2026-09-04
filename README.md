@@ -131,8 +131,8 @@ acting" is the unspoofable endpoint, not a tool argument the model fills in.
 **Two rules make the mesh safe:**
 
 1. **Ownership is a tree; messaging is a graph.** The `parentId` edge decides who
-   can retire whom and whose budget bounds a subtree. Communication follows
-   *handles*, which can reach beyond the parent.
+   can retire whom. Communication follows *handles*, which can reach beyond the
+   parent.
 2. **Delegation is asynchronous.** A parent must *never block* waiting on a child
    — it would waste a run and can deadlock the mesh. You fire a message and end
    your turn; the reply arrives as a fresh wake.

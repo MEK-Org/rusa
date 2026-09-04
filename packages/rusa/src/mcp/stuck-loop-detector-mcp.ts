@@ -23,7 +23,6 @@ export interface StuckLoopDetectorDeps {
 
 const CommitmentThresholdMinutesSchema = z
   .object({
-    actor_completion: z.number().nonnegative().optional(),
     failed_run: z.number().nonnegative().optional(),
     missed_wake: z.number().nonnegative().optional(),
     silent_actor: z.number().nonnegative().optional(),
@@ -100,10 +99,6 @@ function toCommitmentThresholds(
 ): Partial<CommitmentThresholds> | undefined {
   if (!minutes) return undefined;
   return {
-    actorCompletionMs:
-      minutes.actor_completion == null
-        ? DEFAULT_COMMITMENT_THRESHOLDS.actorCompletionMs
-        : minutes.actor_completion * 60_000,
     failedRunMs:
       minutes.failed_run == null
         ? DEFAULT_COMMITMENT_THRESHOLDS.failedRunMs

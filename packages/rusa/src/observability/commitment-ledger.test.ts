@@ -103,30 +103,6 @@ describe("commitment ledger projection", () => {
     expect(report.rows).toEqual([]);
   });
 
-  it("does not emit actor-completion rows for standing or ambiguous actors", () => {
-    const report = projectOpenCommitments({
-      now: NOW,
-      threads: [
-        thread("root", null),
-        thread("cron"),
-        thread("lead"),
-        thread("lead-child", "lead"),
-        thread("held-lead"),
-      ],
-      events: [
-        event("e1", "root", "run_yielded", "2026-06-30T00:00:00.000Z", { detail: "complete" }),
-        event("e2", "cron", "scheduled_wake", "2026-06-29T00:00:00.000Z"),
-        event("e3", "cron", "run_yielded", "2026-06-30T00:00:00.000Z", { detail: "complete" }),
-        event("e4", "lead", "run_yielded", "2026-06-30T00:00:00.000Z", { detail: "complete" }),
-        event("e5", "held-lead", "run_yielded", "2026-06-30T00:00:00.000Z", {
-          detail: "complete",
-        }),
-      ],
-    });
-
-    expect(report.rows.filter((row) => row.kind === "actor_completion")).toEqual([]);
-  });
-
   it("reports null retirement expectation for childless no-cron actors until Phase 2 metadata exists", () => {
     const report = projectOpenCommitments({
       now: NOW,
@@ -156,7 +132,6 @@ describe("commitment ledger projection", () => {
       ],
     });
 
-    expect(report.rows.filter((row) => row.kind === "actor_completion")).toEqual([]);
     expect(report.rows).toContainEqual(
       expect.objectContaining({
         kind: "silent_actor",
