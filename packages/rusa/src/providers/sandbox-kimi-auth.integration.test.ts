@@ -81,18 +81,23 @@ describe.skipIf(!BWRAP_CAPABLE)("Kimi shared credential bind (real bwrap)", () =
     try {
       const argsB = buildActorBwrapArgs(actorDirB, "kimi").args;
 
-      const runRenameOver = (args: string[], payload: string) =>
+      // Each bwrap invocation gets its own PID namespace, so "$$" is the same value (e.g. 2)
+      // in both sandboxes even though they run concurrently — over the shared host-bound
+      // credentials dir that collides both writers onto one temp filename. Use a label unique
+      // per writer (plus the loop index) instead, so the two writers never touch the same temp
+      // path while still racing real, simultaneous rename-over writes to the same target file.
+      const runRenameOver = (args: string[], payload: string, label: string) =>
         execFileAsync("bwrap", [
           ...args,
           "--",
           "/bin/sh",
           "-c",
-          `for i in $(seq 1 50); do printf %s '${payload}' > /tmp/kimi-home/credentials/kimi-code.json.tmp.$$ && mv /tmp/kimi-home/credentials/kimi-code.json.tmp.$$ /tmp/kimi-home/credentials/kimi-code.json; done`,
+          `for i in $(seq 1 50); do printf %s '${payload}' > /tmp/kimi-home/credentials/kimi-code.json.tmp.${label}.$i && mv /tmp/kimi-home/credentials/kimi-code.json.tmp.${label}.$i /tmp/kimi-home/credentials/kimi-code.json; done`,
         ]);
 
       await Promise.all([
-        runRenameOver(argsA, '{"accessToken":"synthetic-writer-a"}'),
-        runRenameOver(argsB, '{"accessToken":"synthetic-writer-b"}'),
+        runRenameOver(argsA, '{"accessToken":"synthetic-writer-a"}', "a"),
+        runRenameOver(argsB, '{"accessToken":"synthetic-writer-b"}', "b"),
       ]);
 
       const hostContent = readFileSync(hostCredsFile, "utf8");
