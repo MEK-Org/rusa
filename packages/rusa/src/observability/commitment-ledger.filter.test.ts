@@ -115,13 +115,13 @@ function event(
 const THREADS: ThreadRecord[] = [
   thread("root", null),
   thread("steward", "root"),
-  thread("done-leaf", "steward", { budget: { maxRuns: 1 } }),
+  thread("done-leaf", "steward"),
   thread("failed-leaf", "steward"),
   thread("capped-leaf", "steward"),
   thread("silent-leaf", "root"),
   thread("abandoned-leaf", "steward"),
-  thread("event-driven", "steward", { budget: { maxRuns: 1 } }),
-  thread("waked", "steward", { budget: { maxRuns: 1 } }),
+  thread("event-driven", "steward"),
+  thread("waked", "steward"),
   thread("never-ran", "root"),
   thread("retired-leaf", "steward", { status: "retired" }),
 ];
@@ -137,7 +137,7 @@ const TRACKING_NOTE = [
 
 function baseEvents(): MeshEvent[] {
   return [
-    // Yielded complete, still active, owner holds a max-runs lease → actor_completion.
+    // Yielded complete, still active, no later progress → silent_actor.
     event("e-done-yield", "done-leaf", "run_yielded", "2026-06-29T00:00:00.000Z", {
       detail: "complete",
       body: YIELD_NOTE,
@@ -231,12 +231,7 @@ describe("commitment ledger event filter", () => {
   it("is a fixture the projection has plenty to say about", () => {
     const report = project(baseEvents());
     const kinds = new Set(report.rows.map((row) => row.kind));
-    expect([...kinds].sort()).toEqual([
-      "actor_completion",
-      "failed_run",
-      "request_commitment",
-      "silent_actor",
-    ]);
+    expect([...kinds].sort()).toEqual(["failed_run", "request_commitment", "silent_actor"]);
     // Losslessness is only worth testing if the filter drops something.
     expect(asFetchedByTheReader(baseEvents()).length).toBeLessThan(baseEvents().length);
   });

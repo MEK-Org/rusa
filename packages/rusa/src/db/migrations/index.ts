@@ -31,6 +31,7 @@ import { actorRunsFocusFold } from "./0032_actor_runs_focus_fold.js";
 import { referenceCache } from "./0033_reference_cache.js";
 import { actorRuntimeState } from "./0034_actor_runtime_state.js";
 import { recurringObligations } from "./0035_recurring_obligations.js";
+import { correctActorSchema } from "./0036_correct_actor_schema.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -74,4 +75,5 @@ export const migrations: Migration[] = [
   referenceCache,
   actorRuntimeState,
   recurringObligations,
+  correctActorSchema,
 ];

@@ -3,17 +3,11 @@ import { abandonedRunHadStarted, type RUN_TERMINAL_EVENT_KINDS } from "../actor/
 import type { ThreadRecord } from "../actor/thread-registry.js";
 import type { MeshEvent, MeshEventKind } from "../db/repositories/mesh-event-repository.js";
 
-export type CommitmentKind =
-  | "actor_completion"
-  | "failed_run"
-  | "missed_wake"
-  | "request_commitment"
-  | "silent_actor";
+export type CommitmentKind = "failed_run" | "missed_wake" | "request_commitment" | "silent_actor";
 export type CommitmentStatus = "open" | "resolved" | "ignored";
 export type SourceArtifactType = "mesh_event" | "yield_note" | "message" | "github" | "manual";
 
 export interface CommitmentThresholds {
-  actorCompletionMs: number;
   failedRunMs: number;
   missedWakeMs: number;
   silentActorMs: number;
@@ -65,7 +59,6 @@ export interface CommitmentLedgerStoryboardSnapshot {
 }
 
 export const DEFAULT_COMMITMENT_THRESHOLDS: CommitmentThresholds = {
-  actorCompletionMs: 6 * 60 * 60 * 1000, // 6 hours
   failedRunMs: 15 * 60 * 1000, // 15 minutes
   // 10 minutes, against the wake → `run_queued` leg  — a measured gap of
   // 30 s healthy vs 10 h dropped, so the exact figure is not load-bearing. It was
@@ -347,36 +340,6 @@ export function projectOpenCommitments(opts: {
     }
     const isEventDriven = eventSubscriptions.size > 0;
 
-    const completeYield = lastWhere(
-      actorEvents,
-      (event) => event.kind === "run_yielded" && event.detail === "complete"
-    );
-    if (
-      thread?.status === "active" &&
-      thread.parentId != null &&
-      completeYield &&
-      retirementExpectation.value === true &&
-      !hasLater(actorEvents, completeYield, (event) => event.kind === "actor_retired") &&
-      ageMs(now, completeYield.ts) >= thresholds.actorCompletionMs
-    ) {
-      rows.push(
-        makeRow({
-          kind: "actor_completion",
-          actorId,
-          thread,
-          event: completeYield,
-          now,
-          waitingOn,
-          ownerExpectsRetirement: retirementExpectation.value,
-          confidence: 0.95,
-          reason:
-            "Actor yielded complete and remains active while its owner is expected to retire it.",
-          evidence: { retirement_expectation_reason: retirementExpectation.reason },
-        })
-      );
-      hasSpecificRow.add(actorId);
-    }
-
     const lastBadRun = lastWhere(
       actorEvents,
       (event) =>
@@ -637,7 +600,6 @@ function inferOwnerExpectsRetirement(opts: {
     return { value: false, reason: "has_scheduled_wake_history" };
   }
   if (opts.activeChildCount > 0) return { value: false, reason: "has_live_children" };
-  if (opts.thread.budget?.maxRuns != null) return { value: true, reason: "has_max_runs_lease" };
   return { value: null, reason: "ambiguous_childless_leaf" };
 }
 

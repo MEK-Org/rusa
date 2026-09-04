@@ -10,7 +10,7 @@
  * the mesh before bouncing the systemd service, and because it is in-memory the
  * freshly-booted process comes up with it `false` — there is **nothing to clear
  * on restart** and the operator HALT is never touched. The run-gate consults both
- * independently: `shouldRun = !isHalted() && !isShuttingDown() && <lease>`, so the
+ * independently: `shouldRun = !isHalted() && !isShuttingDown()`, so the
  * dashboard's HALTED indicator (derived from the HALT file) never conflates an
  * operator halt with a transient deploy drain.
  *

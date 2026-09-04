@@ -51,16 +51,10 @@ describe("commitment ledger projection", () => {
   it("projects open commitment rows with owner, source artifact, confidence, and waiting-on", () => {
     const report = projectOpenCommitments({
       now: NOW,
-      threads: [
-        thread("done", "steward", "2026-06-29T00:00:00.000Z", {
-          budget: { maxRuns: 1 },
-        }),
-        thread("failed", "steward"),
-        thread("silent", "root"),
-      ],
+      threads: [thread("failed", "steward"), thread("silent", "root")],
       events: [
-        event("e1", "done", "run_yielded", "2026-06-30T00:00:00.000Z", {
-          detail: "complete",
+        event("e1", "failed", "run_yielded", "2026-06-30T09:00:00.000Z", {
+          detail: "blocked",
           body: "implemented\nWaiting-on: thread:steward retire",
         }),
         event("e2", "failed", "run_end", "2026-06-30T11:00:00.000Z", { success: false }),
@@ -69,26 +63,25 @@ describe("commitment ledger projection", () => {
     });
 
     expect(report.rows.map((row) => [row.subject_actor_id, row.kind])).toEqual([
-      ["done", "actor_completion"],
       ["failed", "failed_run"],
       ["silent", "silent_actor"],
     ]);
     expect(report.rows[0]).toEqual(
       expect.objectContaining({
-        id: "actor_completion:done:e1",
+        id: "failed_run:failed:e2",
         status: "open",
         owner_actor_id: "steward",
         source_artifact_type: "mesh_event",
-        source_artifact_ref: "e1",
+        source_artifact_ref: "e2",
         waiting_on: "thread:steward retire",
-        owner_expects_retirement: true,
-        confidence: 0.95,
+        owner_expects_retirement: null,
+        confidence: 0.9,
         resolved_at: null,
       })
     );
     expect(report.rows[0].evidence_json).toMatchObject({
-      event_kind: "run_yielded",
-      retirement_expectation_reason: "has_max_runs_lease",
+      event_kind: "run_end",
+      retirement_expectation_reason: "ambiguous_childless_leaf",
     });
   });
 
@@ -110,30 +103,6 @@ describe("commitment ledger projection", () => {
     expect(report.rows).toEqual([]);
   });
 
-  it("does not emit actor-completion rows for standing or ambiguous actors", () => {
-    const report = projectOpenCommitments({
-      now: NOW,
-      threads: [
-        thread("root", null),
-        thread("cron"),
-        thread("lead"),
-        thread("lead-child", "lead"),
-        thread("held-lead"),
-      ],
-      events: [
-        event("e1", "root", "run_yielded", "2026-06-30T00:00:00.000Z", { detail: "complete" }),
-        event("e2", "cron", "scheduled_wake", "2026-06-29T00:00:00.000Z"),
-        event("e3", "cron", "run_yielded", "2026-06-30T00:00:00.000Z", { detail: "complete" }),
-        event("e4", "lead", "run_yielded", "2026-06-30T00:00:00.000Z", { detail: "complete" }),
-        event("e5", "held-lead", "run_yielded", "2026-06-30T00:00:00.000Z", {
-          detail: "complete",
-        }),
-      ],
-    });
-
-    expect(report.rows.filter((row) => row.kind === "actor_completion")).toEqual([]);
-  });
-
   it("reports null retirement expectation for childless no-cron actors until Phase 2 metadata exists", () => {
     const report = projectOpenCommitments({
       now: NOW,
@@ -152,7 +121,7 @@ describe("commitment ledger projection", () => {
     );
   });
 
-  it("does not treat childless complete yields as expected retirement without a max-runs lease", () => {
+  it("does not treat childless complete yields as expected retirement", () => {
     const report = projectOpenCommitments({
       now: NOW,
       threads: [thread("held-lead")],
@@ -163,7 +132,6 @@ describe("commitment ledger projection", () => {
       ],
     });
 
-    expect(report.rows.filter((row) => row.kind === "actor_completion")).toEqual([]);
     expect(report.rows).toContainEqual(
       expect.objectContaining({
         kind: "silent_actor",
@@ -487,18 +455,11 @@ describe("commitment ledger projection", () => {
       threads: [
         thread("root", null, "2026-06-30T11:45:00.000Z"),
         thread("cloudy-porpoise", "root", "2026-06-30T11:45:00.000Z", { status: "retired" }),
-        thread("done-worker", "steward", "2026-06-30T00:00:00.000Z", {
-          budget: { maxRuns: 1 },
-        }),
         thread("failed-worker", "steward", "2026-06-30T10:00:00.000Z"),
         thread("standing-cron", "root", "2026-06-30T08:00:00.000Z"),
       ],
       events: [
         event("root-run", "root", "run_start", "2026-06-30T11:50:00.000Z"),
-        event("done-yield", "done-worker", "run_yielded", "2026-06-30T00:00:00.000Z", {
-          detail: "complete",
-          body: "Done.\nWaiting-on: steward retirement",
-        }),
         event("failed-start", "failed-worker", "run_start", "2026-06-30T11:00:00.000Z"),
         event("failed-end", "failed-worker", "run_end", "2026-06-30T11:30:00.000Z", {
           success: false,
@@ -523,7 +484,6 @@ describe("commitment ledger projection", () => {
 
     expect(report.rows.map((row) => row.subject_actor_id)).toEqual([
       "Operator ask: turn observability into a drive-to-done report",
-      "done-worker",
       "failed-worker",
     ]);
     expect(report.rows).toEqual([
@@ -536,16 +496,6 @@ describe("commitment ledger projection", () => {
         waiting_on: "observability lead follow-through",
         confidence: 1,
         age_ms: 4 * 60 * 60 * 1000,
-      }),
-      expect.objectContaining({
-        kind: "actor_completion",
-        owner_actor_id: "steward",
-        subject_actor_id: "done-worker",
-        source_artifact_ref: "done-yield",
-        waiting_on: "steward retirement",
-        confidence: 0.95,
-        owner_expects_retirement: true,
-        age_ms: 12 * 60 * 60 * 1000,
       }),
       expect.objectContaining({
         kind: "failed_run",
@@ -594,9 +544,7 @@ function buildMvpStoryboardSnapshots(): CommitmentLedgerStoryboardSnapshot[] {
   const allThreads = [
     thread("root", null, "2026-06-30T00:00:00.000Z"),
     thread("standing-cron", "root", "2026-06-30T00:00:00.000Z"),
-    thread("review-worker", "root", "2026-07-01T15:00:00.000Z", {
-      budget: { maxRuns: 1 },
-    }),
+    thread("review-worker", "root", "2026-07-01T15:00:00.000Z"),
   ];
   const allEvents = [
     event("cron-wake-t0", "standing-cron", "scheduled_wake", "2026-06-30T17:50:00.000Z"),
@@ -646,7 +594,7 @@ function buildMvpStoryboardSnapshots(): CommitmentLedgerStoryboardSnapshot[] {
       title: "T2 the slip",
       now: new Date("2026-07-01T22:10:00.000Z"),
       narration:
-        "Mocked time jumps forward: one ask dissolved because root drove it to done, while #531 is still open after 27h 30m. A single mechanical row is present but does not crowd the operator-ask.",
+        "Mocked time jumps forward: one ask dissolved because root drove it to done, while #531 is still open after 27h 30m.",
     },
     {
       id: "t3",

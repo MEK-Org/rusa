@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import { actorRuntimeState } from "../db/migrations/0034_actor_runtime_state.js";
+import { runMigrations } from "../db/migrations/runner.js";
 import { DbThreadRegistry } from "../db/repositories/thread-registry-repository.js";
 import {
   FileThreadRegistry,
@@ -49,7 +49,7 @@ function suite(name: string, make: () => ThreadRegistry) {
   describe(name, () => {
     it("upserts, gets, and lists", () => {
       const r = make();
-      r.upsert(rec("a", { parentId: null }));
+      r.upsert(rec("a", { parentId: null, isRoot: true }));
       r.upsert(rec("b", { parentId: "a" }));
       expect(r.get("a")?.charter).toBe("charter a");
       expect(
@@ -62,7 +62,7 @@ function suite(name: string, make: () => ThreadRegistry) {
 
     it("returns children of a parent", () => {
       const r = make();
-      r.upsert(rec("a", { parentId: null }));
+      r.upsert(rec("a", { parentId: null, isRoot: true }));
       r.upsert(rec("b", { parentId: "a" }));
       r.upsert(rec("c", { parentId: "a" }));
       r.upsert(rec("d", { parentId: "b" }));
@@ -76,7 +76,7 @@ function suite(name: string, make: () => ThreadRegistry) {
 
     it("resolves ids and generated handles back to thread ids", () => {
       const r = make();
-      r.upsert(rec("root", { parentId: null }));
+      r.upsert(rec("root", { parentId: null, isRoot: true }));
       r.upsert(rec("b4b43d69-5e63-4db2-b44b-35c031096aad"));
 
       expect(r.resolveHandle("b4b43d69-5e63-4db2-b44b-35c031096aad")).toBe(
@@ -91,7 +91,7 @@ function suite(name: string, make: () => ThreadRegistry) {
 
     it("never lets a retired record shadow a live actor on a handle collision", () => {
       const r = make();
-      r.upsert(rec("root", { parentId: null }));
+      r.upsert(rec("root", { parentId: null, isRoot: true }));
       // Insert the RETIRED record FIRST so it wins insertion-order iteration —
       // the pre-fix bug returned it because the scan ignored status. Both ids
       // collide to the same generated handle via handleForId.
@@ -106,7 +106,7 @@ function suite(name: string, make: () => ThreadRegistry) {
       // With no live holder of the handle, a retired-only match does not resolve
       // (routing must surface "no live actor", not silently target a dead thread).
       const r2 = make();
-      r2.upsert(rec("root", { parentId: null }));
+      r2.upsert(rec("root", { parentId: null, isRoot: true }));
       r2.upsert(rec("dead-only", { status: "retired" }));
       expect(
         r2.resolveHandle("shared-handle", (id) => (id === "dead-only" ? "shared-handle" : id))
@@ -118,7 +118,7 @@ function suite(name: string, make: () => ThreadRegistry) {
 
     it("patches without clobbering other fields", () => {
       const r = make();
-      r.upsert(rec("a", { parentId: null, handles: [{ id: "a", role: "peer" }] }));
+      r.upsert(rec("a", { parentId: null, isRoot: true, handles: [{ id: "a", role: "peer" }] }));
       r.patch("a", { sessionId: "sess-1" });
       r.patch("a", { status: "retired" });
       const got = r.get("a");
@@ -136,7 +136,7 @@ function suite(name: string, make: () => ThreadRegistry) {
 
     it("isolates returned records from internal state", () => {
       const r = make();
-      r.upsert(rec("a", { parentId: null }));
+      r.upsert(rec("a", { parentId: null, isRoot: true }));
       const got = r.get("a");
       if (got) got.charter = "mutated";
       expect(r.get("a")?.charter).toBe("charter a");
@@ -147,8 +147,8 @@ function suite(name: string, make: () => ThreadRegistry) {
 suite("InMemoryThreadRegistry", () => new InMemoryThreadRegistry());
 suite("DbThreadRegistry (behavior)", () => {
   const db = new Database(":memory:");
+  runMigrations(db);
   db.pragma("foreign_keys = ON");
-  actorRuntimeState.up(db);
   return new DbThreadRegistry(db);
 });
 

@@ -25,7 +25,6 @@ describe("RootControlService", () => {
         charter: "  Investigate the failure  ",
         provider: " agy ",
         model: " gemini-3.5-flash-medium ",
-        maxRuns: 3,
       },
       "human:operator"
     );
@@ -37,7 +36,6 @@ describe("RootControlService", () => {
       provider: "agy",
       model: "gemini-3.5-flash-medium",
       context: undefined,
-      budget: { maxRuns: 3 },
       conversationId: undefined,
       title: undefined,
     });

@@ -91,6 +91,7 @@ describe("Database Migration System", () => {
       "0033_reference_cache",
       "0034_actor_runtime_state",
       "0035_recurring_obligations",
+      "0036_correct_actor_schema",
     ]);
 
     const meshEventsColumns = (

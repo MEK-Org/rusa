@@ -226,7 +226,6 @@ describe("agent-execution MCP server", () => {
         provider: "claude",
         model: "claude-sonnet-4-6",
         effort: "high",
-        max_runs: 5,
       },
     })) as CallToolResult;
     const { thread_id } = dataOf(res) as { thread_id: string };
@@ -237,7 +236,6 @@ describe("agent-execution MCP server", () => {
     expect(rec?.provider).toBe("claude");
     expect(rec?.model).toBe("claude-sonnet-4-6");
     expect(rec?.effort).toBe("high");
-    expect(rec?.budget?.maxRuns).toBe(5);
     // The caller got a handle to its new child.
     expect(registry.get("root")?.handles).toEqual([{ id: "t1" }]);
   });

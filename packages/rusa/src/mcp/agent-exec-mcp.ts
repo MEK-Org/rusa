@@ -220,12 +220,6 @@ export function createAgentExecMcpServer(
           .describe(
             "Optional provider-native reasoning level (for example 'high' or 'xhigh'). Omit to preserve the provider/model default."
           ),
-        max_runs: z
-          .number()
-          .int()
-          .positive()
-          .optional()
-          .describe("Optional lease: retire the child automatically after this many runs."),
         conversation_id: z
           .string()
           .optional()
@@ -246,16 +240,7 @@ export function createAgentExecMcpServer(
           ),
       },
     },
-    async ({
-      charter,
-      provider,
-      model,
-      effort,
-      max_runs,
-      conversation_id,
-      title,
-      context_mode,
-    }) => {
+    async ({ charter, provider, model, effort, conversation_id, title, context_mode }) => {
       try {
         const trimmedProvider = provider?.trim();
         if (!trimmedProvider) throw new Error("provider is required");
@@ -270,7 +255,6 @@ export function createAgentExecMcpServer(
                   provider: trimmedProvider,
                   model: trimmedModel,
                   effort,
-                  maxRuns: max_runs,
                   conversationId: conversation_id,
                   title,
                   context,
@@ -283,7 +267,6 @@ export function createAgentExecMcpServer(
                 provider: trimmedProvider,
                 model: trimmedModel,
                 effort,
-                budget: max_runs ? { maxRuns: max_runs } : undefined,
                 conversationId: conversation_id,
                 title,
                 context,

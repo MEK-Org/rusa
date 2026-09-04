@@ -62,61 +62,64 @@ describe("A/B arm parenting ", () => {
     }),
   });
 
-  it("keeps the arms out of the live root's subtree", () => {
+  it("puts the arms two hops below root — real ancestor authority, but invisible to root's direct list_threads", () => {
     const { mesh } = setup();
-    const arms = spawnArms(mesh, adoptRigHolder(mesh));
+    const arms = spawnArms(mesh, adoptRigHolder(mesh, ROOT_ID));
 
-    // The authority lever: `retire_thread` permits a retire only when the caller is an
-    // ancestor, and `isAncestorOf` walks `parentId` upward. Root is no longer on that path.
-    expect(mesh.isAncestorOf(ROOT_ID, arms.native)).toBe(false);
-    expect(mesh.isAncestorOf(ROOT_ID, arms.portable)).toBe(false);
+    // The holder is now an ordinary child of the real root (not a second parentless
+    // actor — the corrected schema caps that shape to one row), so root genuinely is
+    // an ancestor of the arms via the holder. That is fine: the fix never depended on
+    // an authority trick, only on the arms not being root's DIRECT children (below).
+    expect(mesh.isAncestorOf(ROOT_ID, arms.native)).toBe(true);
+    expect(mesh.isAncestorOf(ROOT_ID, arms.portable)).toBe(true);
     expect(mesh.isAncestorOf(RIG_HOLDER_ID, arms.native)).toBe(true);
     expect(mesh.isAncestorOf(RIG_HOLDER_ID, arms.portable)).toBe(true);
   });
 
   it("makes the arms invisible to root's list_threads — the deduping STIMULUS is gone", () => {
     const { mesh } = setup();
-    const arms = spawnArms(mesh, adoptRigHolder(mesh));
+    const arms = spawnArms(mesh, adoptRigHolder(mesh, ROOT_ID));
 
     // `list_threads` is exactly this filter (agent-exec-mcp.ts). Root never sees two
-    // identically chartered children, so it has nothing to deduplicate — which is the
-    // actual fix; the authority block above is only the belt.
+    // identically chartered DIRECT children, so it has nothing to deduplicate — the
+    // arms being root's grandchildren via the holder is what fixes this.
     const rootChildren = mesh.list().filter((r) => r.parentId === ROOT_ID);
     expect(rootChildren.map((r) => r.id)).not.toContain(arms.native);
     expect(rootChildren.map((r) => r.id)).not.toContain(arms.portable);
-    expect(rootChildren).toHaveLength(0);
+    expect(rootChildren.map((r) => r.id)).toEqual([RIG_HOLDER_ID]);
   });
 
-  it("is a real change: parenting the arms to root puts them back in reach", () => {
-    // The counter-test. Without it, both assertions above would still pass against a
-    // mesh where `isAncestorOf` was simply broken.
+  it("is a real change: parenting the arms directly to root puts them back in reach", () => {
+    // The counter-test. Without it, the assertion above would still pass against a
+    // mesh where the list_threads filter was simply broken.
     const { mesh } = setup();
     const arms = spawnArms(mesh, ROOT_ID);
     expect(mesh.isAncestorOf(ROOT_ID, arms.native)).toBe(true);
     expect(mesh.list().filter((r) => r.parentId === ROOT_ID)).toHaveLength(2);
   });
 
-  it("adopts the holder as its own tree root, with no provider to burn quota on", () => {
+  it("adopts the holder as root's own child, with no provider to burn quota on", () => {
     const { mesh, registry } = setup();
-    adoptRigHolder(mesh);
+    adoptRigHolder(mesh, ROOT_ID);
     const rec = registry.get(RIG_HOLDER_ID);
-    expect(rec?.parentId).toBeNull();
+    expect(rec?.parentId).toBe(ROOT_ID);
     expect(rec?.isRoot).toBe(false);
     expect(rec?.status).toBe("active");
     expect(rec?.provider).toBeUndefined();
   });
 
-  it("keeps the parentless holder as an immovable ownership boundary", () => {
+  it("does not create a second parentless top-level actor", () => {
+    // The corrected actor schema derives root authority from parent_id IS NULL and caps
+    // it to one row via a partial unique index; a parentless holder (the old shape)
+    // would either collide with that index or read back as a second apparent root.
     const { mesh, registry } = setup();
-    const holderId = adoptRigHolder(mesh);
-    const arms = spawnArms(mesh, holderId);
-
-    expect(() => mesh.reparentThread(holderId, ROOT_ID)).toThrow(
-      `Cannot give the top-level thread ${holderId} a parent`
-    );
-    expect(registry.get(holderId)?.parentId).toBeNull();
-    expect(mesh.isAncestorOf(ROOT_ID, arms.native)).toBe(false);
-    expect(mesh.isAncestorOf(ROOT_ID, arms.portable)).toBe(false);
+    adoptRigHolder(mesh, ROOT_ID);
+    expect(
+      registry
+        .list()
+        .filter((r) => r.parentId === null)
+        .map((r) => r.id)
+    ).toEqual([ROOT_ID]);
   });
 });
 

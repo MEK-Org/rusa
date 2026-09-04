@@ -91,11 +91,8 @@ configuration:
 - They **report to their parent, not to humans.** Completion is the *parent's*
   judgment: a worker may *propose* it's done, but the parent owns retirement
   (and retiring a thread retires its whole subtree).
-- Each thread carries an optional **budget/lease** (`max_runs`) that bounds its
-  subtree, so self-similar spawning can't run away.
-
 Every actor is backed by a durable **thread registry record** (charter, parent,
-session handle, status, lease) — the one piece of state that *can't* be
+session handle, status) — the one piece of state that *can't* be
 re-derived from the humans' tools, and what lets the root reconstitute "who's
 working on what" after a restart. See
 [`thread-registry.ts`](packages/rusa/src/actor/thread-registry.ts).
@@ -125,7 +122,7 @@ acting" is the unspoofable endpoint, not a tool argument the model fills in.
 
 | Primitive | What it does |
 | --- | --- |
-| `spawn_thread(charter, …)` | Create a child actor that owns `charter`, in its own session. Returns its `thread_id`; you become its parent. **Non-blocking** — the child runs asynchronously. `provider`/`model` pick the harness/tier, optional `effort` sets its provider-native reasoning level, and `max_runs` sets a lease. |
+| `spawn_thread(charter, …)` | Create a child actor that owns `charter`, in its own session. Returns its `thread_id`; you become its parent. **Non-blocking** — the child runs asynchronously. `provider`/`model` pick the harness/tier, and optional `effort` sets its provider-native reasoning level. |
 | `send_message(thread_id, body)` | Deliver a message to a thread's inbox (parent, child, or an introduced peer). The recipient wakes, sees who it came from, and may reply *later* as a new message. **Always async.** |
 | `introduce(holder, target, role?)` | Grant `holder` a handle to `target` so it can message it directly (e.g. let a coder reach a reviewer). The id *is* the capability (object-capability style). |
 | `list_threads()` | List the children you've spawned, with charter summaries and status — your org chart for deciding what to follow up on or retire. |
@@ -134,8 +131,8 @@ acting" is the unspoofable endpoint, not a tool argument the model fills in.
 **Two rules make the mesh safe:**
 
 1. **Ownership is a tree; messaging is a graph.** The `parentId` edge decides who
-   can retire whom and whose budget bounds a subtree. Communication follows
-   *handles*, which can reach beyond the parent.
+   can retire whom. Communication follows *handles*, which can reach beyond the
+   parent.
 2. **Delegation is asynchronous.** A parent must *never block* waiting on a child
    — it would waste a run and can deadlock the mesh. You fire a message and end
    your turn; the reply arrives as a fresh wake.

@@ -170,7 +170,6 @@ class ActorTree extends StatelessWidget {
         title: request.title,
         provider: request.provider,
         model: request.model,
-        maxRuns: request.maxRuns,
       );
     } catch (err) {
       if (!context.mounted) return;
@@ -222,14 +221,12 @@ class _SpawnRequest {
     this.title,
     this.provider,
     this.model,
-    this.maxRuns,
   });
 
   final String charter;
   final String? title;
   final String? provider;
   final String? model;
-  final int? maxRuns;
 }
 
 class _SpawnActorDialog extends StatefulWidget {
@@ -246,7 +243,6 @@ class _SpawnActorDialogState extends State<_SpawnActorDialog> {
   final _title = TextEditingController();
   final _charter = TextEditingController();
   final _model = TextEditingController();
-  final _maxRuns = TextEditingController();
   String? _provider;
 
   @override
@@ -260,7 +256,6 @@ class _SpawnActorDialogState extends State<_SpawnActorDialog> {
     _title.dispose();
     _charter.dispose();
     _model.dispose();
-    _maxRuns.dispose();
     super.dispose();
   }
 
@@ -314,19 +309,6 @@ class _SpawnActorDialogState extends State<_SpawnActorDialog> {
                   controller: _model,
                   decoration: const InputDecoration(labelText: 'Model'),
                 ),
-                const SizedBox(height: 12),
-                TextFormField(
-                  controller: _maxRuns,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(labelText: 'Maximum runs'),
-                  validator: (value) {
-                    if (value == null || value.trim().isEmpty) return null;
-                    final parsed = int.tryParse(value);
-                    return parsed == null || parsed < 1
-                        ? 'Enter a positive integer'
-                        : null;
-                  },
-                ),
               ],
             ),
           ),
@@ -347,9 +329,6 @@ class _SpawnActorDialogState extends State<_SpawnActorDialog> {
                 title: _optional(_title.text),
                 provider: _provider,
                 model: _optional(_model.text),
-                maxRuns: _optional(_maxRuns.text) == null
-                    ? null
-                    : int.parse(_maxRuns.text.trim()),
               ),
             );
           },

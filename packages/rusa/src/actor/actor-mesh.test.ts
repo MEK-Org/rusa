@@ -1683,21 +1683,6 @@ describe("ActorMesh", () => {
     expect(last).toContain("code reviewer (high-tier)");
   });
 
-  it("enforces the lease: stops running and retires when maxRuns is hit", async () => {
-    const { mesh, registry, fake, tick } = setup();
-    const id = mesh.spawn({ charter: "bounded work", parentId: "root", budget: { maxRuns: 2 } });
-    mesh.sendMessage(id, "go", "root");
-    await tick(); // run 1
-    mesh.sendMessage(id, "again", "root");
-    await tick(); // run 2
-    mesh.sendMessage(id, "and again", "root");
-    await tick(); // run 3 attempted → lease exhausted → retire, no run
-
-    expect(fake(id).calls).toHaveLength(2);
-    expect(registry.get(id)?.status).toBe("retired");
-    expect(mesh.get(id)).toBeUndefined();
-  });
-
   it("calls onRetire for every node in a retired subtree", async () => {
     const retired: string[] = [];
     const { mesh, tick } = setup({ onRetire: (r) => retired.push(r.id) });
@@ -2364,7 +2349,7 @@ describe("ActorMesh", () => {
     await tick();
   });
 
-  it("runningThreadIds excludes a halt/lease-gated wake (nothing actually executes)", async () => {
+  it("runningThreadIds excludes a halt-gated wake (nothing actually executes)", async () => {
     const d = deferredProvider();
     // Halted: every wake is gated off in beforeRun before the run body, so the
     // actor must never be reported as running even though it was poked.
