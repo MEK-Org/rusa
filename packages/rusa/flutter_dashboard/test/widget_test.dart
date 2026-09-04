@@ -197,10 +197,6 @@ void main() {
         find.widgetWithText(TextFormField, 'Model'),
         'gemini-3.5-flash-medium',
       );
-      await tester.enterText(
-        find.widgetWithText(TextFormField, 'Maximum runs'),
-        '3',
-      );
       await tester.tap(find.widgetWithText(FilledButton, 'Spawn'));
       await tester.pump(const Duration(milliseconds: 100));
 
@@ -209,7 +205,6 @@ void main() {
         title: 'Context evaluator',
         provider: 'agy',
         model: 'gemini-3.5-flash-medium',
-        maxRuns: 3,
       ));
       expect(store.primary.value, 'spawned-child');
       await store.dispose();

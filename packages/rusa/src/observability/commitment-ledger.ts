@@ -637,7 +637,6 @@ function inferOwnerExpectsRetirement(opts: {
     return { value: false, reason: "has_scheduled_wake_history" };
   }
   if (opts.activeChildCount > 0) return { value: false, reason: "has_live_children" };
-  if (opts.thread.budget?.maxRuns != null) return { value: true, reason: "has_max_runs_lease" };
   return { value: null, reason: "ambiguous_childless_leaf" };
 }
 

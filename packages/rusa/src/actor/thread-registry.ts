@@ -3,18 +3,6 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import { generateHandle } from "./handle-generator.js";
 
-/**
- * A thread's lease — the finite rope a parent hands a child (design Part E). The
- * subtree is bounded so self-similar spawning can't run away. v1 bounds the
- * number of wakes; depth/token bounds can join later.
- */
-export interface ActorBudget {
-  /** Max number of times this actor may run before it's force-retired. */
-  maxRuns?: number;
-  /** Runs consumed so far (maintained by the mesh). */
-  runsUsed?: number;
-}
-
 export type ThreadStatus = "active" | "retired";
 
 export interface NativeContextConfig {
@@ -62,7 +50,7 @@ export interface ActorHandle {
 
 /**
  * The durable record for one actor/thread (design B.6): existence, charter,
- * parent, working-memory session handle, status, and lease. This is the *only*
+ * parent, working-memory session handle, and status. This is the *only*
  * state not re-derivable from the humans' tools — it's what lets the root
  * reconstitute "who's working on what" after a restart. Working memory itself
  * (the compacted session) stays a losable cache; only the record is durable.
@@ -73,10 +61,10 @@ export interface ThreadRecord {
   /** What this actor owns — authored by the spawning message, refinable later. */
   charter: string;
   /**
-   * Owning parent (the *ownership tree* edge): who can retire this actor and
-   * whose budget bounds it. `null` only for the root (whose parent is the human).
-   * Communication, by contrast, follows {@link handles}, which can reach beyond
-   * the parent — ownership is a tree, messaging is a graph.
+   * Owning parent (the *ownership tree* edge): who can retire this actor.
+   * `null` only for the root (whose parent is the human). Communication, by
+   * contrast, follows {@link handles}, which can reach beyond the parent —
+   * ownership is a tree, messaging is a graph.
    */
   parentId: string | null;
   /**
@@ -135,7 +123,6 @@ export interface ThreadRecord {
    */
   isRoot?: boolean;
   status: ThreadStatus;
-  budget?: ActorBudget;
   /** Pending scheduled deliveries for this actor. */
   pendingDeliveries?: PendingMessageDelivery[];
   /** Whether the operator has ever messaged this actor, unlocking the reply channel. */

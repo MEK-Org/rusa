@@ -36,7 +36,6 @@ import {
 } from "./mesh-events.js";
 import type { OsScheduler } from "./os-scheduler.js";
 import type {
-  ActorBudget,
   ActorHandle,
   ContextConfig,
   PendingMessageDelivery,
@@ -115,8 +114,6 @@ export interface SpawnRequest {
   context?: ContextConfig;
   /** Peers to seed the child's address book with (introductions at birth). */
   handles?: ActorHandle[];
-  /** Optional lease bounding the child's subtree (Part E). */
-  budget?: ActorBudget;
   /**
    * Resume an existing provider conversation as this actor's session instead of
    * minting a fresh one. The id is CLI-specific, so it must belong to the chosen
@@ -193,11 +190,11 @@ export interface ActorFactoryContext {
    * actor supplies its provider; consumers that do not care can ignore it.
    */
   gate: <T>(fn: () => Promise<T>, provider: string, responsive: boolean) => RunStartHandle<T>;
-  /** Lease check run before each wake; returns false (and retires) when exhausted. */
+  /** Pre-run gate run before each wake; returns false (and drops the wake) when blocked. */
   beforeRun: (context: { mode: ActorRunMode }) => boolean;
   /** General lifecycle hook after the pre-run gate and before scheduler admission. */
   onQueued: (context: { responsive: boolean; mode: ActorRunMode }) => void;
-  /** Post-run accounting (budget) + completion-review hook. */
+  /** Post-run accounting (token usage) + completion-review hook. */
   onRunEnd: (result: RunResult) => void;
   /** Forward the actor-owned runtime state to the mesh-wide sequencer. */
   onRuntimeStateChanged: (state: ActorRuntimeState) => void;
@@ -1071,7 +1068,6 @@ export class ActorMesh {
       sessionId: req.conversationId,
       title: req.title,
       status: "active",
-      budget: req.budget ? { ...req.budget, runsUsed: req.budget.runsUsed ?? 0 } : undefined,
       createdAt: this.now(),
     };
     this.registry.upsert(record);
@@ -2882,11 +2878,7 @@ export class ActorMesh {
         if (!rec || rec.status !== "active") {
           return false;
         }
-        if (
-          this.isHalted(this.launchProvider(record.id)) ||
-          this.isShuttingDown() ||
-          !this.checkLease(record.id)
-        ) {
+        if (this.isHalted(this.launchProvider(record.id)) || this.isShuttingDown()) {
           return false;
         }
         if (mode === "yield-elicitation") return true;
@@ -2910,22 +2902,7 @@ export class ActorMesh {
     };
   }
 
-  /** Enforce the lease: retire and skip the run when the budget is exhausted. */
-  private checkLease(id: string): boolean {
-    const rec = this.registry.get(id);
-    const budget = rec?.budget;
-    if (budget?.maxRuns != null && (budget.runsUsed ?? 0) >= budget.maxRuns) {
-      this.log(`lease exhausted for ${id} (${budget.runsUsed}/${budget.maxRuns}) — retiring`);
-      // `force`: this fires from inside the actor's own pre-run gate, so the thread is
-      // by definition mid-wake. The lease is the mesh's own bound on the subtree and
-      // must not be defeatable by the actor being busy — that is what a lease is for.
-      this.retire(id, { force: true });
-      return false;
-    }
-    return true;
-  }
-
-  /** Account one completed run against the lease. */
+  /** Record per-run token usage for accounting. */
   private accountRun(id: string, result: RunResult): void {
     if (result.tokenUsage) {
       const usage = result.tokenUsage;
@@ -2954,10 +2931,6 @@ export class ActorMesh {
         );
       }
     }
-    const rec = this.registry.get(id);
-    if (!rec?.budget) return;
-    const runsUsed = (rec.budget.runsUsed ?? 0) + 1;
-    this.registry.patch(id, { budget: { ...rec.budget, runsUsed } });
   }
 
   private armPendingDelivery(toId: string, msg: PendingMessageDelivery): void {

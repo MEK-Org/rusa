@@ -8,7 +8,6 @@ export interface RootChildRequest {
   model: string;
   effort?: string;
   context?: ContextConfig;
-  maxRuns?: number;
   conversationId?: string;
   title?: string;
 }
@@ -21,7 +20,6 @@ export interface RootControlMesh {
     model: string;
     effort?: string;
     context?: ContextConfig;
-    budget?: { maxRuns: number };
     conversationId?: string;
     title?: string;
   }): string;
@@ -79,12 +77,6 @@ export class RootControlService {
     if (this.providers.length > 0 && !this.providers.includes(provider)) {
       throw new Error(`unknown provider: ${provider}`);
     }
-    if (
-      request.maxRuns !== undefined &&
-      (!Number.isInteger(request.maxRuns) || request.maxRuns < 1)
-    ) {
-      throw new Error("maxRuns must be a positive integer");
-    }
     const effort = request.effort?.trim();
     if (request.effort !== undefined && !effort) {
       throw new Error("effort must be a non-empty string when set");
@@ -96,7 +88,6 @@ export class RootControlService {
       model,
       ...(effort ? { effort } : {}),
       context: normalizeContext(request.context),
-      budget: request.maxRuns ? { maxRuns: request.maxRuns } : undefined,
       conversationId: optionalTrimmed(request.conversationId),
       title: optionalTrimmed(request.title),
     });
