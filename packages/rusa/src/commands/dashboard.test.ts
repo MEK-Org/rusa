@@ -31,7 +31,9 @@ const mockReferenceCacheRepo = vi.hoisted(() => ({ get: vi.fn(), set: vi.fn(), d
 const mockDbModule = vi.hoisted(() => ({
   initDb: vi.fn(() => ({})),
   getRepositories: vi.fn(() => ({
-    actors: { list: vi.fn(() => []) },
+    actors: {
+      list: vi.fn((): { id: string; parentId: string | null; isRoot: boolean }[] => []),
+    },
     meshEvents: {},
     meshChat: {},
     obligations: {},
@@ -94,6 +96,31 @@ describe("runDashboard", () => {
     await runDashboard();
 
     expect(mockLegacyImport.importLegacyActorState).not.toHaveBeenCalled();
+  });
+
+  it("picks the root by isRoot, matching ActorMesh, not by a parentless shape", async () => {
+    mockDbModule.getRepositories.mockReturnValue({
+      actors: {
+        list: vi.fn(() => [
+          { id: "legacy-parentless", parentId: null, isRoot: false },
+          { id: "the-real-root", parentId: null, isRoot: true },
+        ]),
+      },
+      meshEvents: {},
+      meshChat: {},
+      obligations: {},
+      referenceCache: mockReferenceCacheRepo,
+    });
+
+    await runDashboard();
+
+    expect(mockWebhookServerModule.startDashboardServer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mesh: expect.objectContaining({
+          rootIdentity: expect.objectContaining({ id: "the-real-root" }),
+        }),
+      })
+    );
   });
 
   it("wires a repository-backed reference cache so standalone dashboard can serve persisted rows", async () => {
