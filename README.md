@@ -95,7 +95,7 @@ Every actor is backed by a durable **actor repository record** (charter, parent,
 session handle, status) — the one piece of state that *can't* be
 re-derived from the humans' tools, and what lets the root reconstitute "who's
 working on what" after a restart. See
-[`actor-repository.ts`](packages/rusa/src/db/repositories/actor-repository.ts).
+[`actor-repository.ts`](packages/rusa/src/repositories/actor-repository.ts).
 
 ### Concurrency Limiter
 
