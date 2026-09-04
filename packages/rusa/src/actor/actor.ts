@@ -119,8 +119,8 @@ export interface ActorOptions {
     responsive: boolean
   ) => Promise<T> | RunStartHandle<T>;
   /**
-   * Optional pre-run check (e.g. budget/lease). Return `false` to skip this run
-   * (the wake is dropped). Defaults to always-run.
+   * Optional pre-run check (e.g. halted provider, mesh shutdown). Return `false`
+   * to skip this run (the wake is dropped). Defaults to always-run.
    */
   beforeRun?: (context: { mode: ActorRunMode }) => boolean | Promise<boolean>;
   /**
@@ -164,7 +164,7 @@ export interface ActorOptions {
    * that absence is the signal — do not synthesize one on the kill path.
    */
   onFirstChunk?: () => void;
-  /** Optional post-run hook (completion review, budget accounting, firehose tap). */
+  /** Optional post-run hook (completion review, token accounting, firehose tap). */
   onRunEnd?: (result: RunResult) => void | Promise<void>;
   /**
    * The other terminal hook: the run opportunity ended WITHOUT reporting a
@@ -380,8 +380,9 @@ export class Actor {
    * call yield_run.
    */
   private continueOrIdle(): RunNudge | null {
-    // The wake was gated off (lease/budget) — treat it as a dropped trigger, not
-    // a run that fell short, so we don't spin re-checking the same closed gate.
+    // The wake was gated off (beforeRun returned false) — treat it as a dropped
+    // trigger, not a run that fell short, so we don't spin re-checking the same
+    // closed gate.
     if (this.lastRunSkipped) {
       this.continuations = 0;
       return null;

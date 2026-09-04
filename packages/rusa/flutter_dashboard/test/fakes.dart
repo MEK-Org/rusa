@@ -159,7 +159,6 @@ class FakeApi extends DashboardApi {
           String? title,
           String? provider,
           String? model,
-          int? maxRuns,
         })
       >[];
   String spawnedRootChildId = 'spawned-child';
@@ -229,14 +228,12 @@ class FakeApi extends DashboardApi {
     String? title,
     String? provider,
     String? model,
-    int? maxRuns,
   }) async {
     rootSpawnCalls.add((
       charter: charter,
       title: title,
       provider: provider,
       model: model,
-      maxRuns: maxRuns,
     ));
     threadsResult = [
       ...threadsResult,

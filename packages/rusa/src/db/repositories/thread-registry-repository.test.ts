@@ -22,7 +22,6 @@ const root: ThreadRecord = {
   title: "Root",
   isRoot: true,
   status: "active",
-  budget: { maxRuns: 10, runsUsed: 2 },
   humanUnlocked: true,
   lastChatSessionId: "chat-1",
   createdAt: "2026-09-03T13:00:00.000Z",

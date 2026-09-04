@@ -192,7 +192,6 @@ describe("handleMeshApiRequest", () => {
         charter: "Investigate the flaky build",
         provider: "agy",
         model: "gemini-3.5-flash-medium",
-        maxRuns: 4,
         title: "Build investigator",
       })
     );
@@ -208,7 +207,6 @@ describe("handleMeshApiRequest", () => {
           charter: "Investigate the flaky build",
           provider: "agy",
           model: "gemini-3.5-flash-medium",
-          maxRuns: 4,
           title: "Build investigator",
         },
       },

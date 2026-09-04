@@ -381,14 +381,12 @@ class DashboardStore {
     String? title,
     String? provider,
     String? model,
-    int? maxRuns,
   }) async {
     final id = await _api.spawnRootChild(
       charter: charter,
       title: title,
       provider: provider,
       model: model,
-      maxRuns: maxRuns,
     );
     await refreshThreads();
     clickActor(id);

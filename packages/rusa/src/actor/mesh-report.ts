@@ -281,9 +281,6 @@ function renderTopology(records: ThreadRecord[], counts: Map<string, number>): s
       r.provider ? chip(r.provider, "muted-chip") : "",
       r.model ? chip(r.model, "muted-chip") : "",
       r.effort ? chip(`effort ${r.effort}`, "muted-chip") : "",
-      r.budget?.maxRuns != null
-        ? chip(`runs ${r.budget.runsUsed ?? 0}/${r.budget.maxRuns}`, "muted-chip")
-        : "",
       counts.has(r.id) ? chip(`${counts.get(r.id)} events`, "muted-chip") : "",
     ]
       .filter(Boolean)

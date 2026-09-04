@@ -20,8 +20,6 @@ type ThreadRow = {
   title: string | null;
   is_root: number;
   status: ThreadRecord["status"];
-  budget_max_runs: number | null;
-  budget_runs_used: number | null;
   human_unlocked: number;
   last_chat_session_id: string | null;
   created_at: string;
@@ -37,16 +35,15 @@ export class DbThreadRegistry implements ThreadRegistry {
         .prepare(`INSERT INTO actor_threads (
         id, charter, parent_id, provider, model, effort, desired_provider, desired_model, desired_effort, desired_effort_is_set,
         session_id, context_type, context_mode, context_compaction_model, title, is_root, status,
-        budget_max_runs, budget_runs_used, human_unlocked, last_chat_session_id, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        human_unlocked, last_chat_session_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET charter=excluded.charter, parent_id=excluded.parent_id,
         provider=excluded.provider, model=excluded.model, effort=excluded.effort,
         desired_provider=excluded.desired_provider, desired_model=excluded.desired_model,
         desired_effort=excluded.desired_effort, desired_effort_is_set=excluded.desired_effort_is_set, session_id=excluded.session_id,
         context_type=excluded.context_type, context_mode=excluded.context_mode,
         context_compaction_model=excluded.context_compaction_model, title=excluded.title,
-        is_root=excluded.is_root, status=excluded.status, budget_max_runs=excluded.budget_max_runs,
-        budget_runs_used=excluded.budget_runs_used, human_unlocked=excluded.human_unlocked,
+        is_root=excluded.is_root, status=excluded.status, human_unlocked=excluded.human_unlocked,
         last_chat_session_id=excluded.last_chat_session_id, created_at=excluded.created_at`)
         .run(
           record.id,
@@ -66,8 +63,6 @@ export class DbThreadRegistry implements ThreadRegistry {
           record.title ?? null,
           record.isRoot ? 1 : 0,
           record.status,
-          record.budget?.maxRuns ?? null,
-          record.budget?.runsUsed ?? null,
           record.humanUnlocked ? 1 : 0,
           record.lastChatSessionId ?? null,
           record.createdAt
@@ -171,14 +166,6 @@ export class DbThreadRegistry implements ThreadRegistry {
           : {}),
       ...(row.title === null ? {} : { title: row.title }),
       ...(row.is_root ? { isRoot: true } : {}),
-      ...(row.budget_max_runs === null && row.budget_runs_used === null
-        ? {}
-        : {
-            budget: {
-              ...(row.budget_max_runs === null ? {} : { maxRuns: row.budget_max_runs }),
-              ...(row.budget_runs_used === null ? {} : { runsUsed: row.budget_runs_used }),
-            },
-          }),
       ...(handles.length
         ? {
             handles: handles.map((handle) => ({

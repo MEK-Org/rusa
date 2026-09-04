@@ -27,8 +27,6 @@ export const actorRuntimeState: Migration = {
         title TEXT,
         is_root INTEGER NOT NULL DEFAULT 0 CHECK (is_root IN (0, 1)),
         status TEXT NOT NULL CHECK (status IN ('active', 'retired')),
-        budget_max_runs INTEGER,
-        budget_runs_used INTEGER,
         human_unlocked INTEGER NOT NULL DEFAULT 0 CHECK (human_unlocked IN (0, 1)),
         last_chat_session_id TEXT,
         created_at TEXT NOT NULL,
