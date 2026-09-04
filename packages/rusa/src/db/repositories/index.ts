@@ -63,8 +63,8 @@ export class Repositories {
     this.obligations.setActorExists(probe);
   }
 
-  setCronSubsystem(scheduler: ObligationActivationScheduler): void {
-    this.obligations.setCronSubsystem(scheduler);
+  setOsScheduler(scheduler: ObligationActivationScheduler): void {
+    this.obligations.setOsScheduler(scheduler);
   }
 }
 

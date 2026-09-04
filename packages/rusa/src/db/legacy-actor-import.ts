@@ -306,7 +306,7 @@ export function importLegacyActorState(options: {
   );
   if (pending.length > 0 && !options.scheduledMessages) {
     throw new Error(
-      "Legacy actor import: pending messages require the host cron subsystem; run `rusa start` to import them"
+      "Legacy actor import: pending messages require the host OS scheduler; run `rusa start` to import them"
     );
   }
   const ordered = validateGraph(records, pending);

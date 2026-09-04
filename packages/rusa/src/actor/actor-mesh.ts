@@ -391,7 +391,7 @@ export interface ActorMeshOptions {
    * rejected, bounding what the primitive can ever hand out. Defaults to empty.
    */
   grantableCapabilities?: ReadonlySet<string>;
-  /** Host-owned one-shot messages. Production supplies the `at`-backed cron subsystem. */
+  /** Host-owned one-shot messages. Production supplies the `at`-backed OS scheduler. */
   scheduledMessages?: ScheduledMessageScheduler;
   /** Atomic boundary for recording a scheduled message's chat/audit rows. */
   withTransaction?: (fn: () => void) => void;
@@ -1760,7 +1760,7 @@ export class ActorMesh {
         return { delivered: false, status: rec?.status };
       }
       if (!this.scheduledMessages) {
-        throw new Error("Scheduled-message cron subsystem is not configured");
+        throw new Error("Scheduled-message OS scheduler is not configured");
       }
       if (
         this.scheduledMessages.listMessageDeliveries().filter((message) => message.toId === toId)

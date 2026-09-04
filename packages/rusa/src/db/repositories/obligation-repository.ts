@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js";
 import {
   cronExprEverFires,
   isValidCronExpr,
   NonFiringCronExprError,
   nextCronOccurrence,
-} from "../../actor/wake-cron.js";
+} from "../../actor/cron-expression.js";
+import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js";
 import {
   assertObligationStatus,
   type EntityId,
@@ -354,7 +354,7 @@ export class ObligationRepository {
     }
   }
 
-  setCronSubsystem(scheduler: ObligationActivationScheduler): void {
+  setOsScheduler(scheduler: ObligationActivationScheduler): void {
     this.scheduler = scheduler;
   }
 

@@ -4,25 +4,27 @@ import {
   type AtIo,
   type AtProbe,
   AtUnavailableError,
-  DefaultCronSubsystem,
-  decodeScheduledMessagePayload,
-  encodeScheduledMessagePayload,
   execAtIo,
   preflightAt,
-  TruncatedCronBlockError,
   unavailableAtIo,
+} from "./at-queue.js";
+import { type CrontabIo, CrontabMutator } from "./crontab.js";
+import {
+  DefaultOsScheduler,
+  decodeScheduledMessagePayload,
+  encodeScheduledMessagePayload,
+  TruncatedCronBlockError,
 } from "./os-scheduler.js";
-import { type CrontabIo, CrontabMutator } from "./wake-cron.js";
 
 vi.mock("node:child_process", () => {
   const mocked = { spawnSync: vi.fn(), execFileSync: vi.fn() };
   return { ...mocked, default: mocked };
 });
 
-describe("DefaultCronSubsystem", () => {
+describe("DefaultOsScheduler", () => {
   let cron: CrontabIo;
   let at: AtIo;
-  let scheduler: DefaultCronSubsystem;
+  let scheduler: DefaultOsScheduler;
   let cronData: string;
 
   beforeEach(() => {
@@ -40,7 +42,7 @@ describe("DefaultCronSubsystem", () => {
       remove: vi.fn(),
     };
 
-    scheduler = new DefaultCronSubsystem(new CrontabMutator(cron), at, {
+    scheduler = new DefaultOsScheduler(new CrontabMutator(cron), at, {
       tokenFile: "/token",
       portFile: "/port",
     });
@@ -288,7 +290,7 @@ describe("DefaultCronSubsystem", () => {
   });
 });
 
-describe("one cron subsystem for actor wakes and obligations", () => {
+describe("one OS scheduler for actor wakes and obligations", () => {
   it("consolidates both writers behind one instance so an interleaved wake-schedule mutation and a recurrence mutation cannot lose either entry, and every foreign byte survives", async () => {
     // Seed a crontab with a foreign (unrelated feature) `# mc-wake:` block
     // and arbitrary untagged user lines, exactly as the addendum requires.
@@ -310,9 +312,9 @@ describe("one cron subsystem for actor wakes and obligations", () => {
       remove: vi.fn(),
     };
 
-    // One subsystem owns the sole mutator and both public scheduling slices.
+    // One scheduler owns the sole mutator and both public scheduling slices.
     const mutator = new CrontabMutator(cron);
-    const scheduler = new DefaultCronSubsystem(mutator, at, {
+    const scheduler = new DefaultOsScheduler(mutator, at, {
       tokenFile: "/token",
       portFile: "/port",
     });
@@ -441,7 +443,7 @@ describe("unavailableAtIo", () => {
   });
 });
 
-describe("DefaultCronSubsystem with an unavailable `at` facility", () => {
+describe("DefaultOsScheduler with an unavailable `at` facility", () => {
   it("keeps cron scheduling working — a pure cron activation never touches `at`", () => {
     let cronData = "";
     const cron: CrontabIo = {
@@ -450,7 +452,7 @@ describe("DefaultCronSubsystem with an unavailable `at` facility", () => {
         cronData = data;
       },
     };
-    const scheduler = new DefaultCronSubsystem(
+    const scheduler = new DefaultOsScheduler(
       new CrontabMutator(cron),
       unavailableAtIo(["at missing"]),
       {
@@ -470,7 +472,7 @@ describe("DefaultCronSubsystem with an unavailable `at` facility", () => {
 
   it("fails a completion-interval (at-kind) activation with the named prerequisite error", () => {
     const cron: CrontabIo = { read: () => "", write: () => {} };
-    const scheduler = new DefaultCronSubsystem(
+    const scheduler = new DefaultOsScheduler(
       new CrontabMutator(cron),
       unavailableAtIo(["at missing"]),
       {

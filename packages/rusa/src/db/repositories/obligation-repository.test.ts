@@ -1721,7 +1721,7 @@ describe("ObligationRepository", () => {
 
     beforeEach(() => {
       scheduler = new FakeObligationScheduler();
-      repository.setCronSubsystem(scheduler);
+      repository.setOsScheduler(scheduler);
       repository.create({ title: "rec", id: "rec-1", ownerId: "actor-a", intent: "recur" });
     });
 

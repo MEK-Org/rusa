@@ -13,6 +13,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Actor } from "../actor/actor.js";
 import { ActorMesh, type MeshActor, type RetireCleanup } from "../actor/actor-mesh.js";
 import type { ActorRecord, PortableContextConfig } from "../actor/actor-record.js";
+import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
 import {
   CAPABILITY_GRANTS_FILENAME,
   FileCapabilityGrantStore,
@@ -20,6 +21,7 @@ import {
 } from "../actor/capability-grants.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
 import { assertSpawnContextSupported } from "../actor/context-selection.js";
+import { CrontabMutator, execCrontabIo, preflightCron } from "../actor/crontab.js";
 import { E2EInstanceManager } from "../actor/e2e-instance-manager.js";
 import {
   type EventResource,
@@ -56,13 +58,7 @@ import {
   type RunAbandonedPayload,
   runEndPayload,
 } from "../actor/mesh-events.js";
-import {
-  type ActorWakeScheduler,
-  DefaultCronSubsystem,
-  execAtIo,
-  preflightAt,
-  unavailableAtIo,
-} from "../actor/os-scheduler.js";
+import { type ActorWakeScheduler, DefaultOsScheduler } from "../actor/os-scheduler.js";
 import {
   assemblePortableContext,
   assemblePortableContextV2,
@@ -91,14 +87,11 @@ import { resolveRootActorId } from "../actor/root-actor-id.js";
 import { RootControlService } from "../actor/root-control.js";
 import { buildRootPrompt } from "../actor/root-prompt.js";
 import {
-  CrontabMutator,
   ensureWakeToken,
-  execCrontabIo,
-  preflightCron,
   wakePortPath,
   wakeTokenPath,
   writeWakePort,
-} from "../actor/wake-cron.js";
+} from "../actor/wake-callback.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "../actor/worker-prompt.js";
 import type { ActorLiveness } from "../actor/workspace-sweep.js";
 import {
@@ -417,7 +410,7 @@ export function postBackOnlinePing(opts: {
  */
 export function createStartRetireCleanups(
   workersDir: string,
-  cronSubsystem: Pick<ActorWakeScheduler, "cancel">,
+  osScheduler: Pick<ActorWakeScheduler, "cancel">,
   e2eInstance?: Pick<E2EInstanceManager, "stopForActorRetirement">,
   scratch?: { dir: string; listActors: () => readonly ActorLiveness[] }
 ): RetireCleanup[] {
@@ -468,7 +461,7 @@ export function createStartRetireCleanups(
       : []),
     {
       name: "cron wake",
-      run: (record) => cronSubsystem.cancel(record.id),
+      run: (record) => osScheduler.cancel(record.id),
     },
   ];
 }
@@ -768,7 +761,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const database = initDb(mcHome);
   console.log("✓ Database ready");
 
-  // One host scheduling subsystem owns every cron/at mutation: recurring
+  // One OS scheduler owns every cron/at mutation: recurring
   // actor wakes, recurring or interval obligations, and one-shot messages.
   const cronPreflight = preflightCron();
   if (!cronPreflight.ok) {
@@ -782,7 +775,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       `[start] \`at\` scheduling unavailable — cron-only recurrences still work, but completion-interval obligations and scheduled messages will fail until this is fixed: ${atPreflight.issues.join("; ")}`
     );
   }
-  const cronSubsystem = new DefaultCronSubsystem(
+  const osScheduler = new DefaultOsScheduler(
     new CrontabMutator(execCrontabIo()),
     atPreflight.ok ? execAtIo() : unavailableAtIo(atPreflight.issues),
     {
@@ -797,7 +790,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     db: database,
     repositories: getRepositories(),
     providerCapabilityName: (providerName) => providerCapabilityName(providerName, config),
-    scheduledMessages: cronSubsystem,
+    scheduledMessages: osScheduler,
   });
   if (legacyActorImport.importedActors > 0 || legacyActorImport.importedScheduledMessages > 0) {
     console.log(
@@ -1526,7 +1519,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     },
     events: meshEvents,
     recordChat: (opts) => getRepositories().meshChat.record(opts),
-    scheduledMessages: cronSubsystem,
+    scheduledMessages: osScheduler,
     withTransaction: (fn) => getDb().transaction(fn)(),
     recordRunYield: (actorId, status, note) => {
       const runId = activeRunIds.get(actorId);
@@ -1590,7 +1583,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       return notifyingParent ? deliverable : undefined;
     },
     log: (m) => console.log(`[mesh] ${m}`),
-    retireCleanups: createStartRetireCleanups(workersDir, cronSubsystem, e2eInstance, {
+    retireCleanups: createStartRetireCleanups(workersDir, osScheduler, e2eInstance, {
       dir: antigravityScratchDir(),
       listActors: actorLiveness,
     }),
@@ -2098,7 +2091,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // Every cron/at job reads this file when it fires, so jobs survive restarts
   // without capturing an ephemeral port.
   writeWakePort(mcHome, mcpHttp.boundPort);
-  getRepositories().setCronSubsystem(cronSubsystem);
+  getRepositories().setOsScheduler(osScheduler);
 
   mcpHttp.setWakeHandler({
     token: wakeToken,
@@ -2147,7 +2140,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const rootAgentDir = join(mcHome, "root-agent");
   mkdirSync(rootAgentDir, { recursive: true });
   const rootMeshUrl = mcpHttp.addServer(rootId, () =>
-    createAgentExecMcpServer(mesh, rootId, rootId, cronSubsystem, {
+    createAgentExecMcpServer(mesh, rootId, rootId, osScheduler, {
       rootControl,
       onWrite: () => {
         mesh.markUnkillable(rootId);
