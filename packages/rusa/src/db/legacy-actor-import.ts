@@ -253,6 +253,12 @@ function validateGraph(records: ActorRecord[], pending: ScheduledMessage[]): Act
  * messages after their jobs are installed. If a crash leaves the source file
  * in place, a later boot verifies the actor projection, replaces the same
  * tagged host jobs, and archives only after every schedule succeeds.
+ *
+ * `dryRun` runs the identical parse/validate path (including the divergence
+ * check against any existing rows) but skips every write: no DB transaction,
+ * no scheduler installs, no archiving. It exists for `rusa db-check`, which
+ * must report what an import would do without touching the copied home's
+ * legacy files or requiring a real host scheduler.
  */
 export function importLegacyActorState(options: {
   mcHome: string;
@@ -260,6 +266,7 @@ export function importLegacyActorState(options: {
   repositories: Repositories;
   scheduledMessages?: ScheduledMessageScheduler;
   providerCapabilityName?: (providerName: string) => string;
+  dryRun?: boolean;
 }): LegacyActorImportResult {
   const threadsPath = join(options.mcHome, "threads.json");
   const sessionPath = join(options.mcHome, "root-agent", "session.json");
@@ -288,13 +295,13 @@ export function importLegacyActorState(options: {
       if (root.sessionId && root.sessionId !== rootSessionId) {
         throw new Error("Legacy actor import: root session file diverges from SQLite");
       }
-      if (!root.sessionId && rootSessionId)
+      if (!root.sessionId && rootSessionId && !options.dryRun)
         options.repositories.actors.patch(root.id, { sessionId: rootSessionId });
     }
     return {
       importedActors: 0,
       importedScheduledMessages: 0,
-      backupFiles: hasSession ? [archive(sessionPath)] : [],
+      backupFiles: hasSession && !options.dryRun ? [archive(sessionPath)] : [],
     };
   }
 
@@ -310,7 +317,7 @@ export function importLegacyActorState(options: {
       toId: legacy.id,
     }))
   );
-  if (pending.length > 0 && !options.scheduledMessages) {
+  if (pending.length > 0 && !options.scheduledMessages && !options.dryRun) {
     throw new Error(
       "Legacy actor import: pending messages require the host OS scheduler; run `rusa start` to import them"
     );
@@ -322,21 +329,24 @@ export function importLegacyActorState(options: {
     return {
       importedActors: 0,
       importedScheduledMessages: 0,
-      backupFiles: [archive(threadsPath)],
+      backupFiles: options.dryRun ? [] : [archive(threadsPath)],
       deferredRootSessionId: rootSessionId,
     };
   }
 
   if (existing.length === 0) {
-    options.db.transaction(() => {
-      // Parent rows must exist before children, and all actor rows must exist
-      // before address-book foreign keys can be inserted.
-      for (const record of ordered) options.repositories.actors.upsert({ ...record, handles: [] });
-      for (const record of ordered) {
-        if (record.handles?.length)
-          options.repositories.actors.patch(record.id, { handles: record.handles });
-      }
-    })();
+    if (!options.dryRun) {
+      options.db.transaction(() => {
+        // Parent rows must exist before children, and all actor rows must exist
+        // before address-book foreign keys can be inserted.
+        for (const record of ordered)
+          options.repositories.actors.upsert({ ...record, handles: [] });
+        for (const record of ordered) {
+          if (record.handles?.length)
+            options.repositories.actors.patch(record.id, { handles: record.handles });
+        }
+      })();
+    }
   } else {
     const expectedById = new Map(records.map((record) => [record.id, canonical(record)]));
     const actualById = new Map(existing.map((record) => [record.id, canonical(record)]));
@@ -350,28 +360,30 @@ export function importLegacyActorState(options: {
     }
   }
 
-  options.db.transaction(() => {
-    for (const delivery of pending) {
-      options.repositories.meshChat.record({
-        id: delivery.id,
-        senderId: delivery.fromId,
-        recipientId: delivery.toId,
-        body: delivery.body,
-        sessionId: delivery.sessionId,
-      });
-      options.repositories.meshEvents.record({
-        id: `${delivery.id}:sent`,
-        kind: "message_sent",
-        actorId: delivery.fromId,
-        detail: delivery.sessionId,
-        payload: JSON.stringify({ messageId: delivery.id, to: delivery.toId }),
-      });
-    }
-  })();
-  for (const delivery of pending) options.scheduledMessages?.scheduleMessageDelivery(delivery);
+  if (!options.dryRun) {
+    options.db.transaction(() => {
+      for (const delivery of pending) {
+        options.repositories.meshChat.record({
+          id: delivery.id,
+          senderId: delivery.fromId,
+          recipientId: delivery.toId,
+          body: delivery.body,
+          sessionId: delivery.sessionId,
+        });
+        options.repositories.meshEvents.record({
+          id: `${delivery.id}:sent`,
+          kind: "message_sent",
+          actorId: delivery.fromId,
+          detail: delivery.sessionId,
+          payload: JSON.stringify({ messageId: delivery.id, to: delivery.toId }),
+        });
+      }
+    })();
+    for (const delivery of pending) options.scheduledMessages?.scheduleMessageDelivery(delivery);
+  }
 
-  const backupFiles = [archive(threadsPath)];
-  if (hasSession) backupFiles.push(archive(sessionPath));
+  const backupFiles = options.dryRun ? [] : [archive(threadsPath)];
+  if (hasSession && !options.dryRun) backupFiles.push(archive(sessionPath));
   return {
     importedActors: existing.length === 0 ? records.length : 0,
     importedScheduledMessages: pending.length,

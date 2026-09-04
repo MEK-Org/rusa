@@ -6,6 +6,7 @@ import { runActorChat } from "./commands/chat.js";
 import { runChatSmoke } from "./commands/chat-smoke.js";
 import { CONFIG_DOCS, printConfigDocs } from "./commands/config-docs.js";
 import { runDashboard } from "./commands/dashboard.js";
+import { runDbCheck } from "./commands/db-check.js";
 import { runDev } from "./commands/dev.js";
 import { runActorMeshE2EUp } from "./commands/e2e-actor-mesh.js";
 import { runForwardWebhooks } from "./commands/forward-webhooks.js";
@@ -288,6 +289,17 @@ program
   .option("--out <file>", "Output HTML path (default: <repo>/e2e-reports/mesh-report.html)")
   .action((opts: { home?: string; out?: string }) => {
     runReport({ home: opts.home, out: opts.out });
+  });
+
+program
+  .command("db-check")
+  .description("Preflight pending migrations and legacy imports against a copy of an instance home")
+  .requiredOption(
+    "--home <path>",
+    "Copied instance home to check (no default; never the live home)"
+  )
+  .action((opts: { home: string }) => {
+    runDbCheck({ home: opts.home });
   });
 
 program

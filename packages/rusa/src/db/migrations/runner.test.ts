@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { runMigrations } from "./runner.js";
+import { pendingMigrationIds, runMigrations } from "./runner.js";
 
 describe("Database Migration System", () => {
   let testDbDir: string;
@@ -147,6 +147,24 @@ describe("Database Migration System", () => {
       db.prepare("SELECT COUNT(*) as cnt FROM _migrations").get() as { cnt: number }
     ).cnt;
     expect(countAfter).toBe(countBefore);
+
+    db.close();
+  });
+
+  it("pendingMigrationIds reports what runMigrations would apply, without applying it", () => {
+    const db = new Database(dbPath);
+
+    const beforeIds = pendingMigrationIds(db);
+    expect(beforeIds).toContain("0001_initial_schema");
+    expect(beforeIds.length).toBeGreaterThan(30);
+    // Reporting must not itself apply anything.
+    const migrationsRow = db.prepare("SELECT COUNT(*) as cnt FROM _migrations").get() as {
+      cnt: number;
+    };
+    expect(migrationsRow.cnt).toBe(0);
+
+    runMigrations(db);
+    expect(pendingMigrationIds(db)).toEqual([]);
 
     db.close();
   });
