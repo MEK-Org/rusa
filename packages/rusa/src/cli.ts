@@ -296,7 +296,7 @@ program
   .description("Preflight pending migrations and legacy imports against a copy of an instance home")
   .requiredOption(
     "--home <path>",
-    "Copied instance home to check (no default; never the live home)"
+    "Copied instance home to check (no default; refused if it resolves, directly or via symlink, to the live configured/default Rusa home)"
   )
   .action((opts: { home: string }) => {
     runDbCheck({ home: opts.home });
