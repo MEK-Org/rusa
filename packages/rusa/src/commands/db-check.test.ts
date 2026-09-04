@@ -27,6 +27,19 @@ describe("db-check", () => {
     expect(() => runDbCheckAgainstHome("   ")).toThrow(/--home is required/);
   });
 
+  it("refuses a nonexistent home path without creating it", () => {
+    const missing = join(home, "typo-nonexistent");
+    expect(existsSync(missing)).toBe(false);
+    expect(() => runDbCheckAgainstHome(missing)).toThrow(/does not exist as a directory/);
+    expect(existsSync(missing)).toBe(false);
+  });
+
+  it("refuses a home path that is a file, not a directory", () => {
+    const filePath = join(home, "not-a-dir");
+    writeFileSync(filePath, "not a home");
+    expect(() => runDbCheckAgainstHome(filePath)).toThrow(/does not exist as a directory/);
+  });
+
   it("applies pending migrations to the copied home's mesh.db and reports them", () => {
     const first = runDbCheckAgainstHome(home);
     expect(first.pendingMigrationIds.length).toBeGreaterThan(0);

@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { importLegacyActorState } from "../db/legacy-actor-import.js";
@@ -23,6 +23,9 @@ export interface DbCheckResult {
 export function runDbCheckAgainstHome(home: string): DbCheckResult {
   if (!home.trim()) {
     throw new Error("rusa db-check: --home is required and has no default fallback");
+  }
+  if (!existsSync(home) || !statSync(home).isDirectory()) {
+    throw new Error(`rusa db-check: --home "${home}" does not exist as a directory`);
   }
   const dataDir = join(home, "data");
   mkdirSync(dataDir, { recursive: true });
