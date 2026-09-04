@@ -35,85 +35,91 @@ import type { Migration } from "./types.js";
  */
 export const correctActorSchema: Migration = {
   id: "0036_correct_actor_schema",
-  noTransaction: true,
   up: (db: Database) => {
-    db.exec("PRAGMA foreign_keys = OFF;");
-    db.transaction(() => {
-      const rootlessNonRoot = db
-        .prepare("SELECT id FROM actor_threads WHERE parent_id IS NULL AND is_root = 0")
-        .all() as Array<{ id: string }>;
-      if (rootlessNonRoot.length > 0) {
-        throw new Error(
-          "0036_correct_actor_schema: refusing to migrate parentless, non-root actor(s) " +
-            `(${rootlessNonRoot.map((r) => r.id).join(", ")}) — the corrected schema derives ` +
-            "root authority from parent_id IS NULL, so carrying these rows forward as-is would " +
-            "grant them apparent root authority. Give them an explicit parent or remove them " +
-            "from this database before applying this migration."
-        );
-      }
+    const rootlessNonRoot = db
+      .prepare("SELECT id FROM actor_threads WHERE parent_id IS NULL AND is_root = 0")
+      .all() as Array<{ id: string }>;
+    if (rootlessNonRoot.length > 0) {
+      throw new Error(
+        "0036_correct_actor_schema: refusing to migrate parentless, non-root actor(s) " +
+          `(${rootlessNonRoot.map((r) => r.id).join(", ")}) — the corrected schema derives ` +
+          "root authority from parent_id IS NULL, so carrying these rows forward as-is would " +
+          "grant them apparent root authority. Give them an explicit parent or remove them " +
+          "from this database before applying this migration."
+      );
+    }
 
-      db.exec(`
-        CREATE TABLE actors (
-          id TEXT PRIMARY KEY,
-          charter TEXT NOT NULL,
-          parent_id TEXT REFERENCES actors(id),
-          model_config TEXT CHECK (model_config IS NULL OR json_valid(model_config)),
-          context_config TEXT CHECK (context_config IS NULL OR json_valid(context_config)),
-          title TEXT,
-          retired_at TEXT,
-          created_at TEXT NOT NULL
-        );
-      `);
+    // No PRAGMA foreign_keys toggle: SQLite checks a FK constraint at the end
+    // of the statement that touches it (immediate) or at COMMIT (deferred),
+    // never mid-statement per row, so the self-referential rebuild below is
+    // safe under `foreign_keys = ON` as-is. That also lets the runner wrap
+    // this migration and its `_migrations` marker insert in one ordinary
+    // transaction — PRAGMA foreign_keys is a no-op inside a transaction, so
+    // the old noTransaction escape hatch would have made that impossible.
+    db.exec(`
+      CREATE TABLE actors (
+        id TEXT PRIMARY KEY,
+        charter TEXT NOT NULL,
+        parent_id TEXT REFERENCES actors(id),
+        model_config TEXT CHECK (
+          model_config IS NULL OR (json_valid(model_config) AND json_type(model_config) = 'object')
+        ),
+        context_config TEXT CHECK (
+          context_config IS NULL OR (json_valid(context_config) AND json_type(context_config) = 'object')
+        ),
+        title TEXT,
+        retired_at TEXT,
+        created_at TEXT NOT NULL
+      );
+    `);
 
-      db.exec(`
-        INSERT INTO actors (id, charter, parent_id, model_config, context_config, title, retired_at, created_at)
-        SELECT
-          id,
-          charter,
-          parent_id,
-          CASE
-            WHEN provider IS NULL AND model IS NULL AND effort IS NULL THEN NULL
-            ELSE json_object('provider', provider, 'model', model, 'effort', effort)
-          END,
-          CASE
-            WHEN context_type IS NULL AND session_id IS NULL THEN NULL
-            ELSE json_object(
-              'type', context_type,
-              'sessionId', session_id,
-              'mode', context_mode,
-              'compactionModel', context_compaction_model
-            )
-          END,
-          title,
-          CASE WHEN status = 'retired' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE NULL END,
-          created_at
-        FROM actor_threads;
-      `);
+    db.exec(`
+      INSERT INTO actors (id, charter, parent_id, model_config, context_config, title, retired_at, created_at)
+      SELECT
+        id,
+        charter,
+        parent_id,
+        CASE
+          WHEN provider IS NULL AND model IS NULL AND effort IS NULL THEN NULL
+          ELSE json_object('provider', provider, 'model', model, 'effort', effort)
+        END,
+        CASE
+          WHEN context_type IS NULL AND session_id IS NULL THEN NULL
+          ELSE json_object(
+            'type', context_type,
+            'sessionId', session_id,
+            'mode', context_mode,
+            'compactionModel', context_compaction_model
+          )
+        END,
+        title,
+        CASE WHEN status = 'retired' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE NULL END,
+        created_at
+      FROM actor_threads;
+    `);
 
-      db.exec(`
-        CREATE INDEX actors_parent_id_idx ON actors (parent_id);
-        CREATE INDEX actors_retired_at_idx ON actors (retired_at);
-        CREATE UNIQUE INDEX actors_single_root_idx ON actors ((parent_id IS NULL)) WHERE parent_id IS NULL;
-      `);
+    db.exec(`
+      CREATE INDEX actors_parent_id_idx ON actors (parent_id);
+      CREATE INDEX actors_retired_at_idx ON actors (retired_at);
+      CREATE UNIQUE INDEX actors_single_root_idx ON actors ((parent_id IS NULL)) WHERE parent_id IS NULL;
+    `);
 
-      db.exec(`
-        CREATE TABLE new_actor_handles (
-          actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
-          target_id TEXT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
-          role TEXT,
-          PRIMARY KEY (actor_id, target_id)
-        );
-      `);
-      db.exec(`
-        INSERT INTO new_actor_handles (actor_id, target_id, role)
-        SELECT actor_id, target_id, role FROM actor_handles;
-      `);
-      db.exec("DROP TABLE actor_handles;");
-      db.exec("ALTER TABLE new_actor_handles RENAME TO actor_handles;");
+    db.exec(`
+      CREATE TABLE new_actor_handles (
+        actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
+        target_id TEXT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
+        role TEXT,
+        PRIMARY KEY (actor_id, target_id)
+      );
+    `);
+    db.exec(`
+      INSERT INTO new_actor_handles (actor_id, target_id, role)
+      SELECT actor_id, target_id, role FROM actor_handles;
+    `);
+    db.exec("DROP TABLE actor_handles;");
+    db.exec("ALTER TABLE new_actor_handles RENAME TO actor_handles;");
 
-      db.exec("DROP TABLE actor_pending_deliveries;");
-      db.exec("DROP TABLE actor_threads;");
-    })();
-    db.exec("PRAGMA foreign_keys = ON;");
+    db.exec("DROP TABLE actor_pending_deliveries;");
+    db.exec("DROP TABLE actor_threads;");
   },
 };

@@ -165,6 +165,43 @@ describe("0036_correct_actor_schema", () => {
     ).toThrow();
   });
 
+  it("rejects well-formed JSON that is not an object, for both model_config and context_config", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    applyThrough(db, "0036_correct_actor_schema");
+
+    const nonObjectJsonValues = ["[1,2,3]", "123", '"a string"', "true", "null"];
+    let n = 0;
+    for (const value of nonObjectJsonValues) {
+      n += 1;
+      expect(() =>
+        db
+          .prepare(
+            `INSERT INTO actors (id, charter, parent_id, model_config, created_at)
+             VALUES (?, 'Own the mesh', NULL, ?, '2026-09-03T13:00:00.000Z')`
+          )
+          .run(`model-${n}`, value)
+      ).toThrow(/CHECK constraint failed/);
+      expect(() =>
+        db
+          .prepare(
+            `INSERT INTO actors (id, charter, parent_id, context_config, created_at)
+             VALUES (?, 'Own the mesh', NULL, ?, '2026-09-03T13:00:00.000Z')`
+          )
+          .run(`context-${n}`, value)
+      ).toThrow(/CHECK constraint failed/);
+    }
+
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO actors (id, charter, parent_id, model_config, context_config, created_at)
+           VALUES ('valid', 'Own the mesh', NULL, '{"provider":"codex"}', '{"type":"native"}', '2026-09-03T13:00:00.000Z')`
+        )
+        .run()
+    ).not.toThrow();
+  });
+
   it("refuses to migrate a parentless, non-root actor rather than silently granting it root authority", () => {
     const db = new Database(":memory:");
     db.pragma("foreign_keys = ON");
@@ -196,5 +233,63 @@ describe("0036_correct_actor_schema", () => {
     expect(upgradedColumns.map((c) => c.name).sort()).toEqual(
       freshColumns.map((c) => c.name).sort()
     );
+  });
+
+  it("keeps the schema transform and the migration marker atomic: a crash after the transform but before the marker rolls everything back, and a rerun then succeeds", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    applyThrough(db, "0035_recurring_obligations");
+    db.prepare(
+      `INSERT INTO actor_threads (id, charter, parent_id, is_root, status, created_at)
+       VALUES ('root', 'Own the mesh', NULL, 1, 'active', '2026-09-03T13:00:00.000Z')`
+    ).run();
+
+    const migration = migrations.find((m) => m.id === "0036_correct_actor_schema");
+    if (!migration) throw new Error("Could not find 0036 migration");
+
+    // Simulate the runner crashing between the schema transform and the
+    // `_migrations` marker insert by pre-occupying that primary key, so the
+    // insert the runner performs inside the same transaction fails.
+    db.prepare("INSERT INTO _migrations (id) VALUES (?)").run(migration.id);
+
+    const runAsRunnerWould = () =>
+      db.transaction(() => {
+        migration.up(db);
+        db.prepare("INSERT INTO _migrations (id) VALUES (?)").run(migration.id);
+      })();
+
+    expect(runAsRunnerWould).toThrow();
+
+    const tablesAfterCrash = new Set(
+      (
+        db
+          .prepare(
+            `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`
+          )
+          .all() as Array<{ name: string }>
+      ).map((row) => row.name)
+    );
+    expect(tablesAfterCrash.has("actors")).toBe(false);
+    expect(tablesAfterCrash.has("actor_threads")).toBe(true);
+    expect(db.prepare("SELECT * FROM actor_threads WHERE id = 'root'").get()).toBeTruthy();
+    expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
+
+    // Clear the pre-occupied marker (the injected stand-in for the crash) and
+    // rerun exactly as the runner would; it should now succeed cleanly.
+    db.prepare("DELETE FROM _migrations WHERE id = ?").run(migration.id);
+    expect(runAsRunnerWould).not.toThrow();
+
+    const tablesAfterRerun = new Set(
+      (
+        db
+          .prepare(
+            `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`
+          )
+          .all() as Array<{ name: string }>
+      ).map((row) => row.name)
+    );
+    expect(tablesAfterRerun.has("actors")).toBe(true);
+    expect(tablesAfterRerun.has("actor_threads")).toBe(false);
+    expect(db.prepare("SELECT id FROM _migrations WHERE id = ?").get(migration.id)).toBeTruthy();
   });
 });
