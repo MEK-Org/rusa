@@ -1778,6 +1778,25 @@ describe("ObligationRepository", () => {
       );
     });
 
+    it("rejects enabling recurrence on an obligation already named as a prerequisite (#212)", () => {
+      repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+        blockedBy: ["rec-1"],
+      });
+
+      expect(() =>
+        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" })
+      ).toThrow(/recurring or scheduled/);
+      expect(() =>
+        repository.setRecurrence("rec-1", { policy: "completion_interval", intervalSeconds: 60 })
+      ).toThrow(/recurring or scheduled/);
+      expect(repository.require("rec-1").recurrencePolicy).toBeNull();
+      // Disabling recurrence is not naming it as one, so it stays unaffected by the guard.
+      expect(() => repository.setRecurrence("rec-1", null)).not.toThrow();
+    });
+
     it("sets a cron policy on a ready obligation without touching next_ready_at, and arms the OS entry", () => {
       const updated = repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
       expect(updated.status).toBe("ready");
@@ -2367,6 +2386,74 @@ describe("ObligationRepository", () => {
       ).toEqual(["prereq"]);
       repository.setTerminalStatus("prereq", "done");
       expect(repository.require("dependent").status).toBe("ready");
+    });
+
+    it("re-delivers cancellation-repair attention to the new owner immediately on reassign, not only after restart", () => {
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+        blockedBy: ["prereq"],
+      });
+      repository.setTerminalStatus("prereq", "cancelled");
+
+      const delivered: Array<{
+        dependentId: string;
+        dependentOwnerId: string;
+        prerequisiteId: string;
+      }> = [];
+      repository.setCancellationAttentionListener((attention) => delivered.push(attention));
+
+      repository.reassign("dependent", "actor-b");
+
+      expect(delivered).toEqual([
+        { dependentId: "dependent", dependentOwnerId: "actor-b", prerequisiteId: "prereq" },
+      ]);
+    });
+
+    it("re-delivers cancellation-repair attention to the inheriting owner on retirement inheritance", () => {
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-b",
+        blockedBy: ["prereq"],
+      });
+      repository.setTerminalStatus("prereq", "cancelled");
+
+      const delivered: Array<{
+        dependentId: string;
+        dependentOwnerId: string;
+        prerequisiteId: string;
+      }> = [];
+      repository.setCancellationAttentionListener((attention) => delivered.push(attention));
+
+      repository.inheritRetiringActorObligationsInternal("actor-b", "actor-a");
+
+      expect(delivered).toEqual([
+        { dependentId: "dependent", dependentOwnerId: "actor-a", prerequisiteId: "prereq" },
+      ]);
+      expect(repository.require("dependent").ownerId).toBe("actor-a");
+    });
+
+    it("includes a recurring dependent that is currently 'scheduled' in cancellation reconciliation", () => {
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+        recurrence: { policy: "completion_interval", intervalSeconds: 60 },
+      });
+      repository.addPrerequisite("dependent", "prereq");
+      repository.setTerminalStatus("dependent", "done");
+      expect(repository.require("dependent").status).toBe("scheduled");
+
+      repository.setTerminalStatus("prereq", "cancelled");
+
+      expect(repository.listPrerequisiteCancellationAttention()).toEqual([
+        { dependentId: "dependent", dependentOwnerId: "actor-a", prerequisiteId: "prereq" },
+      ]);
     });
 
     it("survives a repository restart (reload from the same on-disk state)", () => {

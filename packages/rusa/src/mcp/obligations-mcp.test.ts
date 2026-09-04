@@ -726,6 +726,37 @@ describe("obligations MCP", () => {
     expect(obligation.status).toBe("waiting");
   });
 
+  it("rejects blocked_by on create_obligation for a non-owner target, and honors the owner-ancestor policy (#212)", async () => {
+    repository.create({ title: "prereq", id: "prereq", ownerId: "actor-b" });
+
+    const denied = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const deniedResult = (await denied.callTool({
+      name: "create_obligation",
+      arguments: {
+        title: "dependent",
+        owner_id: "actor-b",
+        blocked_by: ["prereq"],
+      },
+    })) as CallToolResult;
+    expect(deniedResult.isError).toBe(true);
+    expect(repository.get("dependent")).toBeNull();
+
+    const ancestor = await connect(
+      createObligationsMcpServer(repository, "actor-a", { canManage: () => true })
+    );
+    const ancestorResult = (await ancestor.callTool({
+      name: "create_obligation",
+      arguments: {
+        title: "dependent",
+        owner_id: "actor-b",
+        blocked_by: ["prereq"],
+      },
+    })) as CallToolResult;
+    expect(ancestorResult.isError).toBeFalsy();
+    const { obligation } = dataOf(ancestorResult) as { obligation: { status: string } };
+    expect(obligation.status).toBe("waiting");
+  });
+
   it("adds and removes a prerequisite for the owner, and honors the owner-ancestor policy", async () => {
     repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
     repository.create({ title: "dependent", id: "dependent", ownerId: "actor-a" });

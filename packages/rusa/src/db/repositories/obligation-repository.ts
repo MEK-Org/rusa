@@ -514,7 +514,7 @@ export class ObligationRepository {
          JOIN obligations dependent ON dependent.id = op.dependent_id
          JOIN obligations prerequisite ON prerequisite.id = op.prerequisite_id
          WHERE prerequisite.status = 'cancelled'
-           AND dependent.status IN ('ready', 'waiting')`
+           AND dependent.status IN ('ready', 'waiting', 'scheduled')`
       )
       .all() as Array<{
       dependent_id: string;
@@ -887,6 +887,37 @@ export class ObligationRepository {
         "recurring or scheduled obligations cannot be prerequisites"
       );
     }
+  }
+
+  /** Reject enabling recurrence on `id` while any live dependent already names it as a prerequisite (#212). */
+  private assertNotNamedAsPrerequisite(id: string): void {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS count FROM obligation_prerequisites WHERE prerequisite_id = ?`)
+      .get(id) as { count: number };
+    if (row.count > 0) {
+      throw new ObligationValidationError(
+        "recurring or scheduled obligations cannot be prerequisites"
+      );
+    }
+  }
+
+  /**
+   * Cancelled-prerequisite edges still dangling on `dependentId` — used to
+   * (re-)deliver cancellation-repair attention at an ownership boundary
+   * (reassign, retirement inheritance) so the *current* owner is prompted
+   * immediately rather than only after a restart reconciles from
+   * {@link listPrerequisiteCancellationAttention} (#212).
+   */
+  private cancelledPrerequisitesOf(dependentId: string): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT op.prerequisite_id AS prerequisite_id
+         FROM obligation_prerequisites op
+         JOIN obligations prerequisite ON prerequisite.id = op.prerequisite_id
+         WHERE op.dependent_id = ? AND prerequisite.status = 'cancelled'`
+      )
+      .all(dependentId) as Array<{ prerequisite_id: string }>;
+    return rows.map((row) => row.prerequisite_id);
   }
 
   /** True when every prerequisite `id` declares is `done` (vacuously true for none). */
@@ -1392,6 +1423,18 @@ export class ObligationRepository {
       this.db
         .prepare("UPDATE obligations SET owner_id = ?, updated_at = ? WHERE id = ?")
         .run(ownerId, this.stamp(), id);
+
+      // Reassignment moves the standing block to a new owner who has never
+      // seen it — re-deliver cancellation-repair attention at the moment of
+      // transfer rather than leaving it to boot reconciliation (#212).
+      for (const prerequisiteId of this.cancelledPrerequisitesOf(id)) {
+        this.pendingCancellationAttention.push({
+          dependentId: id,
+          dependentOwnerId: ownerId,
+          prerequisiteId,
+        });
+      }
+
       return this.require(id);
     });
   }
@@ -1745,6 +1788,12 @@ export class ObligationRepository {
       if (isTerminalObligationStatus(obligation.status)) {
         throw new ObligationValidationError("terminal obligations cannot be recurring");
       }
+      // v1 rejects a recurring/scheduled obligation as a prerequisite at the
+      // edge itself (#212, {@link assertEligiblePrerequisite}) — the same
+      // invariant must hold going the other direction: turning recurrence on
+      // for an obligation some dependent already named would let a prohibited
+      // edge exist anyway, just created in the opposite order.
+      if (recurrence !== null) this.assertNotNamedAsPrerequisite(id);
 
       if (recurrence === null) {
         // Every state this row can be in — including `scheduled`, where the
@@ -1987,6 +2036,20 @@ export class ObligationRepository {
       .get(retiringActorId, status) as { count: number };
     if (source.count === 0) return 0;
 
+    // Captured before the transfer, while `dependent.owner_id` still names
+    // the retiring actor: the inheriting owner has never seen these dangling
+    // edges, so each gets fresh attention at this ownership boundary rather
+    // than waiting for boot reconciliation (#212).
+    const cancelledBlocked = this.db
+      .prepare(
+        `SELECT DISTINCT op.dependent_id AS dependent_id, op.prerequisite_id AS prerequisite_id
+         FROM obligation_prerequisites op
+         JOIN obligations dependent ON dependent.id = op.dependent_id
+         JOIN obligations prerequisite ON prerequisite.id = op.prerequisite_id
+         WHERE dependent.owner_id = ? AND dependent.status = ? AND prerequisite.status = 'cancelled'`
+      )
+      .all(retiringActorId, status) as Array<{ dependent_id: string; prerequisite_id: string }>;
+
     const result = this.db
       .prepare(
         `UPDATE obligations
@@ -1994,6 +2057,15 @@ export class ObligationRepository {
          WHERE owner_id = ? AND status = ?`
       )
       .run(parentActorId, this.stamp(), retiringActorId, status);
+
+    for (const { dependent_id: dependentId, prerequisite_id: prerequisiteId } of cancelledBlocked) {
+      this.pendingCancellationAttention.push({
+        dependentId,
+        dependentOwnerId: parentActorId,
+        prerequisiteId,
+      });
+    }
+
     return result.changes;
   }
 

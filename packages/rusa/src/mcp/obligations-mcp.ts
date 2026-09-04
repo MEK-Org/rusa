@@ -47,9 +47,17 @@ export interface ObligationsMcpOptions {
   ) => { ok: true; ownerId: string } | { ok: false; error: string };
 
   isFenced?: () => boolean;
-  /** Whether this actor may make an owner-authorized mutation to an obligation. */
-  canManage?: (actorId: string, obligation: ReturnType<ObligationRepository["require"]>) => boolean;
+  /**
+   * Whether this actor may make an owner-authorized mutation to an obligation.
+   * Takes only `ownerId` — not the full obligation — so the same check also
+   * gates `blocked_by` at creation, before the obligation being authorized for
+   * exists as a row.
+   */
+  canManage?: (actorId: string, obligation: ManageableObligation) => boolean;
 }
+
+/** The one field {@link ObligationsMcpOptions.canManage} needs to decide. */
+type ManageableObligation = Pick<ReturnType<ObligationRepository["require"]>, "ownerId">;
 
 const DEFAULT_PAGE_LIMIT = 50;
 
@@ -137,7 +145,7 @@ export function createObligationsMcpServer(
     { isFenced: options?.isFenced }
   );
   const ownerId = actorId;
-  const canManage = (obligation: ReturnType<ObligationRepository["require"]>): boolean =>
+  const canManage = (obligation: ManageableObligation): boolean =>
     options?.canManage ? options.canManage(actorId, obligation) : obligation.ownerId === actorId;
 
   server.registerTool(
@@ -340,6 +348,14 @@ export function createObligationsMcpServer(
       try {
         const owner = options?.resolveOwner?.(owner_id) ?? { ok: true as const, ownerId: owner_id };
         if (!owner.ok) return toolError(new Error(owner.error));
+        // `blocked_by` imposes wait edges on the obligation being created —
+        // the same decision `add_obligation_prerequisite` gates behind
+        // `canManage` on an existing row. The row doesn't exist yet here, so
+        // the same seam is checked against the owner it is about to be
+        // created for (#212).
+        if (blocked_by && blocked_by.length > 0 && !canManage({ ownerId: owner.ownerId })) {
+          throw new Error("not authorized to manage this obligation's prerequisites");
+        }
         const obligation = repository.create({
           ownerId: owner.ownerId,
           title,
