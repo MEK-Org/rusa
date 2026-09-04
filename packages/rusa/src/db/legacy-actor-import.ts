@@ -23,7 +23,7 @@ const pendingSchema = z
     id: z.string().min(1),
     fromId: z.string().min(1),
     body: z.string(),
-    deliverAt: z.string().datetime(),
+    deliverAt: z.string().datetime({ offset: true }),
     sessionId: z.string().optional(),
   })
   .strict();
@@ -47,7 +47,7 @@ const legacyActorSchema = z
     pendingDeliveries: z.array(pendingSchema).optional(),
     humanUnlocked: z.boolean().optional(),
     lastChatSessionId: z.string().optional(),
-    createdAt: z.string().datetime(),
+    createdAt: z.string().datetime({ offset: true }),
   })
   // Historical budget fields and other retired JSON-only state are intentionally discarded.
   .passthrough();
@@ -111,6 +111,11 @@ function readJson(path: string): unknown {
   }
 }
 
+/** Normalize an accepted ISO-8601 datetime (Z or offset form) to canonical trailing-Z. */
+function toCanonicalTimestamp(value: string): string {
+  return new Date(value).toISOString();
+}
+
 function backupPath(path: string): string {
   const timestamp = new Date().toISOString().replaceAll(":", "-");
   let candidate = `${path}.imported-${timestamp}.bak`;
@@ -154,7 +159,7 @@ function durableRecord(
     ...(legacy.title ? { title: legacy.title } : {}),
     ...(legacy.sessionId ? { sessionId: legacy.sessionId } : {}),
     status: legacy.status,
-    createdAt: legacy.createdAt,
+    createdAt: toCanonicalTimestamp(legacy.createdAt),
   };
   if (record.parentId === null) {
     record.isRoot = true;
@@ -301,6 +306,7 @@ export function importLegacyActorState(options: {
   const pending = parsed.threads.flatMap((legacy) =>
     (legacy.pendingDeliveries ?? []).map((delivery) => ({
       ...delivery,
+      deliverAt: toCanonicalTimestamp(delivery.deliverAt),
       toId: legacy.id,
     }))
   );
