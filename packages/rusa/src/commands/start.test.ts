@@ -1710,6 +1710,81 @@ describe("runStart webhook event routing (Phase 4)", () => {
     ]);
   });
 
+  it("threads e2e.remoteGitDir into both the root actor and a spawned worker as e2eWritableRemoteDir; production (no e2e.remoteGitDir) leaves it undefined on both", async () => {
+    const config = {
+      github: { account: "mock-bot" },
+      providers: { antigravity: { cliCommand: "agy" } },
+      rootActor: { provider: "antigravity", effort: "high" },
+      geminiApiKey: "fake-gemini-key",
+    };
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
+    writeFileSync(
+      join(homeDir, "threads.json"),
+      JSON.stringify({
+        threads: [
+          legacyRootThread,
+          {
+            id: "e2e-worker",
+            charter: "worker",
+            parentId: "root",
+            provider: "antigravity",
+            status: "active",
+            createdAt: "2026-01-01T00:00:01.000Z",
+          },
+        ],
+      }),
+      "utf8"
+    );
+
+    const remoteGitDir = "/home/e2e-operator/.rusa-e2e/run-abc/remote/repo.git";
+    let mesh: ActorMesh | undefined;
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          remoteGitDir,
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    await readyPromise;
+
+    if (!mesh) throw new Error("mesh not ready");
+    const rootOpts = (mesh.get("root") as unknown as { opts: { e2eWritableRemoteDir?: string } })
+      .opts;
+    const workerOpts = (
+      mesh.get("e2e-worker") as unknown as { opts: { e2eWritableRemoteDir?: string } }
+    ).opts;
+    expect(rootOpts.e2eWritableRemoteDir).toBe(remoteGitDir);
+    expect(workerOpts.e2eWritableRemoteDir).toBe(remoteGitDir);
+  });
+
+  it("leaves e2eWritableRemoteDir undefined on the root actor for a plain (non-e2e) boot", async () => {
+    // No e2e.remoteGitDir at all here — the production boot path (`rusa start`)
+    // never sets it, so this actor/start seam must not invent a value.
+    let mesh: ActorMesh | undefined;
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    await readyPromise;
+
+    if (!mesh) throw new Error("mesh not ready");
+    const rootOpts = (mesh.get("root") as unknown as { opts: { e2eWritableRemoteDir?: string } })
+      .opts;
+    expect(rootOpts.e2eWritableRemoteDir).toBeUndefined();
+  });
+
   it("runs a configured portable root stateless and injects its own recent context", async () => {
     let mesh: ActorMesh | undefined;
     writeFileSync(

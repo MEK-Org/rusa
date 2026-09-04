@@ -213,6 +213,7 @@ export async function runActorMeshE2EUp(opts: {
       rootDriver: opts.rootDriver,
       dashboard: true,
       quotaApi: createDashboardE2EQuotaApi(),
+      remoteGitDir: instance.remotePath,
       onReady: (handles) => {
         emitGitHubEvent = handles.emitGitHubEvent;
         void startTrackerServer({ port: TRACKER_PORT, tracker }).then((s) => {

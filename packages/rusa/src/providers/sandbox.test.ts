@@ -383,6 +383,86 @@ describe("sandbox bwrap args", () => {
     expect(args[targetIndex - 2]).toBe("--ro-bind");
   });
 
+  describe("e2e writable remote dir (harness's disposable bare remote)", () => {
+    function stubPnpmStore() {
+      execSyncMock.mockImplementation((command: string) => {
+        if (command === "pnpm store path") return "/tmp/pnpm-store\n";
+        const fallback = defaultExecSyncResponse(command);
+        if (fallback) return fallback;
+        throw new Error(`Unexpected command: ${command}`);
+      });
+    }
+
+    it("is absent from ordinary production sandbox args (no e2eWritableRemoteDir passed)", async () => {
+      stubPnpmStore();
+      const { buildActorBwrapArgs } = await import("./sandbox.js");
+      const { args } = buildActorBwrapArgs("/tmp/worktree", "claude");
+
+      const sentinel = "/home/e2e-operator/.rusa-e2e/run-abc/remote/repo.git";
+      expect(args).not.toContain(sentinel);
+    });
+
+    it("binds the e2e remote dir writable in place for an ordinary sandboxed worker (not just the E2E root)", async () => {
+      stubPnpmStore();
+      const remoteDir = mkdtempSync(join(tmpdir(), "mc-e2e-remote-"));
+      tempDirs.push(remoteDir);
+
+      const { buildActorBwrapArgs } = await import("./sandbox.js");
+      // isE2eRoot=false: this is an ordinary sandboxed worker, not the root double.
+      const { args } = buildActorBwrapArgs(
+        "/tmp/worktree",
+        "claude",
+        undefined,
+        false,
+        undefined,
+        remoteDir
+      );
+
+      const bindIndex = args.findIndex(
+        (a, i) => a === "--bind" && args[i + 1] === remoteDir && args[i + 2] === remoteDir
+      );
+      expect(bindIndex).toBeGreaterThan(-1);
+    });
+
+    it("binds the e2e remote dir writable in place for the sandboxed E2E root too", async () => {
+      stubPnpmStore();
+      const remoteDir = mkdtempSync(join(tmpdir(), "mc-e2e-remote-root-"));
+      tempDirs.push(remoteDir);
+
+      const { buildActorBwrapArgs } = await import("./sandbox.js");
+      const { args } = buildActorBwrapArgs(
+        "/tmp/root-agent",
+        "claude",
+        undefined,
+        true,
+        undefined,
+        remoteDir
+      );
+
+      const bindIndex = args.findIndex(
+        (a, i) => a === "--bind" && args[i + 1] === remoteDir && args[i + 2] === remoteDir
+      );
+      expect(bindIndex).toBeGreaterThan(-1);
+    });
+
+    it("skips the bind when the e2e remote dir is set but does not exist on disk", async () => {
+      stubPnpmStore();
+      const { buildActorBwrapArgs } = await import("./sandbox.js");
+      const missingDir = join(tmpdir(), "mc-e2e-remote-does-not-exist");
+
+      const { args } = buildActorBwrapArgs(
+        "/tmp/worktree",
+        "claude",
+        undefined,
+        false,
+        undefined,
+        missingDir
+      );
+
+      expect(args).not.toContain(missingDir);
+    });
+  });
+
   describe("claude E2E root-agent cred layout ", () => {
     function makeE2eRootHome(withHostCreds: boolean) {
       const home = mkdtempSync(join(tmpdir(), "mc-claude-e2e-home-"));
