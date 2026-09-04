@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { decodeScheduledMessagePayload, type ScheduledMessage } from "../actor/os-scheduler.js";
 import type { McpServerSpec } from "../providers/types.js";
 
 export interface McpHttpServerOptions {
@@ -28,6 +29,16 @@ export interface McpHttpServerOptions {
  * loopback endpoint with a bearer token; the handler authenticates and delivers a
  * mechanical wake. Stateless — cron owns timing + durability.
  */
+export interface WakeObligationHandler {
+  token: string;
+  deliver: (id: string) => void;
+}
+
+export interface WakeMessageHandler {
+  token: string;
+  deliver: (message: ScheduledMessage) => void;
+}
+
 export interface WakeHandler {
   /** The bearer token the cron job must present (minted at install, chmod-600 file). */
   token: string;
@@ -65,6 +76,7 @@ function safeEqual(a: string, b: string): boolean {
 
 /** Wake bodies are tiny (actorId + reason); cap to bound a runaway/malicious body. */
 const MAX_WAKE_BODY_BYTES = 8 * 1024;
+const MAX_SCHEDULED_MESSAGE_BODY_BYTES = 256 * 1024;
 
 function readTextBody(req: IncomingMessage, maxBytes = MAX_WAKE_BODY_BYTES): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -143,6 +155,8 @@ export class McpHttpServer {
   private readonly tokenToName = new Map<string, string>();
   /** Cron-driven wake endpoint backend; null until {@link setWakeHandler} wires it. */
   private wake: WakeHandler | null;
+  private wakeObligation?: WakeObligationHandler | null;
+  private wakeMessage?: WakeMessageHandler | null;
   /** Host-jobs exit endpoint backend; null until {@link setHostJobExitHandler} wires it. */
   private hostJobExit: HostJobExitHandler | null;
 
@@ -170,6 +184,12 @@ export class McpHttpServer {
    */
   setWakeHandler(wake: WakeHandler): void {
     this.wake = wake;
+  }
+  setWakeObligationHandler(wake: WakeObligationHandler): void {
+    this.wakeObligation = wake;
+  }
+  setWakeMessageHandler(wake: WakeMessageHandler): void {
+    this.wakeMessage = wake;
   }
 
   /**
@@ -266,6 +286,14 @@ export class McpHttpServer {
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if ((req.url ?? "").split("?")[0] === "/wake") {
       await this.handleWake(req, res);
+      return;
+    }
+    if ((req.url ?? "").split("?")[0] === "/wake-obligation") {
+      await this.handleWakeObligationRequest(req, res);
+      return;
+    }
+    if ((req.url ?? "").split("?")[0] === "/wake-message") {
+      await this.handleWakeMessageRequest(req, res);
       return;
     }
     if ((req.url ?? "").split("?")[0] === "/host-jobs/exit") {
@@ -406,6 +434,96 @@ export class McpHttpServer {
    * the required fields present; the actor-liveness branching `/wake` does lives
    * inside `onExit` (via `deliverWake`), not this endpoint.
    */
+  private async handleWakeObligationRequest(
+    req: IncomingMessage,
+    res: ServerResponse
+  ): Promise<void> {
+    const send = (code: number, payload: Record<string, unknown>) => {
+      res.writeHead(code, { "content-type": "application/json" });
+      res.end(JSON.stringify(payload));
+    };
+    try {
+      if (!this.wakeObligation) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("not found");
+        return;
+      }
+      if (req.method !== "POST") {
+        send(405, { error: "method not allowed" });
+        return;
+      }
+      const auth = (req.headers.authorization as string | undefined) ?? "";
+      if (!safeEqual(auth, `Bearer ${this.wakeObligation.token}`)) {
+        send(401, { error: "unauthorized" });
+        return;
+      }
+      let raw: string;
+      try {
+        raw = await readTextBody(req);
+      } catch {
+        send(413, { error: "body too large" });
+        return;
+      }
+      const params = new URLSearchParams(raw);
+      const id = params.get("id");
+      if (!id) {
+        send(400, { error: "id required" });
+        return;
+      }
+      this.wakeObligation.deliver(id);
+      send(200, { ok: true });
+    } catch {
+      if (!res.headersSent) send(500, { error: "internal error" });
+    }
+  }
+
+  private async handleWakeMessageRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const send = (code: number, payload: Record<string, unknown>) => {
+      res.writeHead(code, { "content-type": "application/json" });
+      res.end(JSON.stringify(payload));
+    };
+    try {
+      if (!this.wakeMessage) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("not found");
+        return;
+      }
+      if (req.method !== "POST") {
+        send(405, { error: "method not allowed" });
+        return;
+      }
+      const auth = (req.headers.authorization as string | undefined) ?? "";
+      if (!safeEqual(auth, `Bearer ${this.wakeMessage.token}`)) {
+        send(401, { error: "unauthorized" });
+        return;
+      }
+      let raw: string;
+      try {
+        raw = await readTextBody(req, MAX_SCHEDULED_MESSAGE_BODY_BYTES);
+      } catch {
+        send(413, { error: "body too large" });
+        return;
+      }
+      const params = new URLSearchParams(raw);
+      const payload = params.get("payload");
+      if (!payload) {
+        send(400, { error: "payload required" });
+        return;
+      }
+      let message: ScheduledMessage;
+      try {
+        message = decodeScheduledMessagePayload(payload);
+      } catch {
+        send(400, { error: "invalid payload" });
+        return;
+      }
+      this.wakeMessage.deliver(message);
+      send(200, { ok: true });
+    } catch {
+      if (!res.headersSent) send(500, { error: "internal error" });
+    }
+  }
+
   private async handleHostJobExit(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const send = (code: number, payload: Record<string, unknown>) => {
       res.writeHead(code, { "content-type": "application/json" });

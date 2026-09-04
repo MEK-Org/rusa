@@ -1,4 +1,6 @@
 import type Database from "better-sqlite3";
+import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js";
+import type { ActorRepository } from "../../repositories/actor-repository.js";
 import { ActorRunRepository } from "./actor-run-repository.js";
 import { InboxFocusRepository } from "./inbox-focus-repository.js";
 import { InboxRepository } from "./inbox-repository.js";
@@ -10,6 +12,7 @@ import { ObligationRepository } from "./obligation-repository.js";
 import { QuotaScrapeRepository } from "./quota-scrape-repository.js";
 import { RawInputRepository } from "./raw-input-repository.js";
 import { ReferenceCacheRepository } from "./reference-cache-repository.js";
+import { SqliteActorRepository } from "./sqlite-actor-repository.js";
 
 /**
  * Aggregate of the entity repositories the actor mesh + the retained
@@ -21,6 +24,7 @@ import { ReferenceCacheRepository } from "./reference-cache-repository.js";
  */
 export class Repositories {
   readonly actorRuns: ActorRunRepository;
+  readonly actors: ActorRepository;
   readonly meshEvents: MeshEventRepository;
   readonly rawInputs: RawInputRepository;
   readonly maintenance: MaintenanceRepository;
@@ -34,6 +38,7 @@ export class Repositories {
 
   constructor(db: Database.Database) {
     this.actorRuns = new ActorRunRepository(db);
+    this.actors = new SqliteActorRepository(db);
     this.meshEvents = new MeshEventRepository(db);
     this.rawInputs = new RawInputRepository(db);
     this.maintenance = new MaintenanceRepository(db);
@@ -47,15 +52,19 @@ export class Repositories {
   }
 
   /**
-   * Wire the actor-existence probe once the thread registry exists.
+   * Wire the actor-existence probe against the authoritative actor repository.
    *
-   * Separate from construction because the registry is built later in boot.
+   * Separate from construction to keep the obligation repository's callback explicit.
    * Called from `runStart`; without it the obligation store cannot tell a live
    * actor from a typo, which is the omission that let owner drift back in
    * through the write boundary.
    */
   setActorExists(probe: (actorId: string) => boolean): void {
     this.obligations.setActorExists(probe);
+  }
+
+  setOsScheduler(scheduler: ObligationActivationScheduler): void {
+    this.obligations.setOsScheduler(scheduler);
   }
 }
 
@@ -85,3 +94,4 @@ export { QuotaScrapeRepository } from "./quota-scrape-repository.js";
 export type { RawInput } from "./raw-input-repository.js";
 export { RawInputRepository } from "./raw-input-repository.js";
 export { ReferenceCacheRepository } from "./reference-cache-repository.js";
+export { SqliteActorRepository } from "./sqlite-actor-repository.js";

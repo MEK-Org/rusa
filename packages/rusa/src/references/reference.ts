@@ -25,9 +25,13 @@
  * per-entity special cases.
  *
  * **Provider wrinkles stop at the boundary.** GitHub addresses a PR at
- * `/pull/76` but its issues at `/issues/33`, and an issue comment only as an
- * HTML anchor (`#issuecomment-12345`). Adopting either would import an
- * inconsistency into a grammar whose value comes from being uniform. This
+ * `/pull/76` but its issues at `/issues/33`, and a comment or review only as
+ * an HTML anchor — `#issuecomment-12345` for a conversation comment,
+ * `#discussion_r12345` for a diff-anchored review comment (GitHub's own split
+ * between `issues/N/comments` and `pulls/N/comments`), and
+ * `#pullrequestreview-9001` for a review's own summary. Adopting any of these
+ * would import an inconsistency into a grammar whose value comes from being
+ * uniform. This
  * codebase already does this translation elsewhere and it is the right shape:
  * GitHub delivers issue and PR comments under one `issue_comment` event, and
  * the webhook layer splits them into our own `{kind: "comment", scope}` model
@@ -336,12 +340,22 @@ export function referenceUrl(reference: Reference): string | null {
     return `https://github.com/${branch.owner}/${branch.repo}/tree/${encodeURIComponent(branch.branch)}`;
   }
   const segments = [...reference.segments];
+  // `pulls/N/comments` is GitHub's own split from `issues/N/comments`: a
+  // diff-anchored review comment rather than a conversation comment, so it
+  // needs the `discussion_r` anchor instead of `issuecomment`.
+  const isPullRequest = segments[2] === "pulls";
 
   let anchor = "";
   const commentIndex = segments.indexOf("comments");
+  const reviewIndex = segments.indexOf("reviews");
   if (commentIndex === segments.length - 2) {
-    anchor = `#issuecomment-${segments[commentIndex + 1]}`;
+    anchor = isPullRequest
+      ? `#discussion_r${segments[commentIndex + 1]}`
+      : `#issuecomment-${segments[commentIndex + 1]}`;
     segments.length = commentIndex;
+  } else if (isPullRequest && reviewIndex === segments.length - 2) {
+    anchor = `#pullrequestreview-${segments[reviewIndex + 1]}`;
+    segments.length = reviewIndex;
   }
   if (segments[2] === "pulls") segments[2] = "pull";
 

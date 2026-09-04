@@ -131,7 +131,7 @@ export function parseAuthor(body: string | null | undefined): string | null {
 }
 
 export interface VerificationResult {
-  status: "verified" | "migration" | "invalid" | "none";
+  status: "verified" | "migration" | "foreign" | "expired" | "unverifiable" | "none";
   actorId?: string;
   instanceId?: string;
   reason?: string;
@@ -236,11 +236,19 @@ export function authorStampBodyForWebhookPayload(
  * - Re-evaluation Trigger: If stamps ever gain authority beyond webhook suppression
  *   and event routing, this residual MUST be re-weighed (to satisfy the no-authority-creep
  *   condition).
+ *
+ * `localInstanceId`, when given, is this process's own instance handle. A v2/v3 stamp
+ * whose `instanceId` doesn't match it came from another instance sharing the same bot
+ * login (#201) — that is short-circuited to `foreign` before the HMAC is ever
+ * computed or compared, since a foreign instance's HMAC can never match ours anyway and
+ * the comparison would just relabel "not ours" as "invalid". Omitting it (legacy callers)
+ * skips the check and verifies purely against this instance's own secret, as before.
  */
 export function verifyAuthorStamp(
   body: string | null | undefined,
   repo: string,
-  issueNumber: number
+  issueNumber: number,
+  localInstanceId?: string
 ): VerificationResult {
   if (!body) {
     return { status: "none" };
@@ -280,6 +288,10 @@ export function verifyAuthorStamp(
     const issuedAt = parseInt(lastV3[3], 10);
     const hmac = lastV3[4];
 
+    if (localInstanceId !== undefined && instanceId !== localInstanceId) {
+      return { status: "foreign", actorId, instanceId };
+    }
+
     const expectedHmac = computeRepoHmac(actorId, instanceId, issuedAt, repo);
     return verifySignedStamp({
       actorId,
@@ -295,6 +307,10 @@ export function verifyAuthorStamp(
     const instanceId = lastV2[2];
     const issuedAt = parseInt(lastV2[3], 10);
     const hmac = lastV2[4];
+
+    if (localInstanceId !== undefined && instanceId !== localInstanceId) {
+      return { status: "foreign", actorId, instanceId };
+    }
 
     const expectedHmac = computeHmac(actorId, instanceId, issuedAt, repo, issueNumber);
     return verifySignedStamp({
@@ -327,8 +343,11 @@ function verifySignedStamp(opts: {
   const expectedHmacBuf = Buffer.from(expectedHmac, "hex");
 
   if (hmacBuf.length !== expectedHmacBuf.length || !timingSafeEqual(hmacBuf, expectedHmacBuf)) {
+    // Same instanceId as ours, yet the HMAC doesn't match: post-restart key rotation and an
+    // actual forged stamp are indistinguishable by this mechanism, so neither is claimed
+    // (#201).
     return {
-      status: "invalid",
+      status: "unverifiable",
       reason: `HMAC mismatch. Expected ${expectedHmac}, got ${hmac}. Context: ${context}`,
     };
   }
@@ -344,7 +363,7 @@ function verifySignedStamp(opts: {
   const FRESHNESS_WINDOW_MS = 15 * 60 * 1000;
   if (Math.abs(ageMs) > FRESHNESS_WINDOW_MS) {
     return {
-      status: "invalid",
+      status: "expired",
       reason: `Stamp expired. Age: ${ageMs}ms, window: ${FRESHNESS_WINDOW_MS}ms`,
     };
   }
@@ -358,7 +377,7 @@ export interface StampedAuthor {
 }
 
 export interface StampAnomaly {
-  detail: "migration" | "forgery";
+  detail: "migration" | "foreign_instance" | "expired" | "unverifiable";
   actorId?: string;
   reason?: string;
   body: string;
@@ -367,11 +386,15 @@ export interface StampAnomaly {
 /**
  * Resolves the verified stamped author of a webhook event, or null when the event carries
  * no author we can vouch for (non-bot sender, no repo/number, bodiless event, unstamped,
- * expired, or forged). Null means fail open: the caller delivers.
+ * foreign, expired, or unverifiable). Null means fail open: the caller delivers.
  *
  * This owns the pairing of "which body may speak for this sender" with "is that body's
  * stamp valid". Keeping the two together is the point — resolving the body at the call site
  * is what let the directive fallback chain leak into authorship .
+ *
+ * `localInstanceId` (this process's own instance handle) is threaded through to
+ * verifyAuthorStamp so a stamp from another instance sharing the same bot login is
+ * recognized as `foreign` — never HMAC-compared, never called a forgery (#201).
  */
 export function resolveStampedAuthor(opts: {
   event: string;
@@ -381,14 +404,15 @@ export function resolveStampedAuthor(opts: {
   botLogin: string | undefined;
   repoFullName: string | undefined;
   number: number | undefined;
+  localInstanceId?: string;
   onAnomaly?: (anomaly: StampAnomaly) => void;
 }): StampedAuthor | null {
-  const { event, action, payload, sender, botLogin, repoFullName, number } = opts;
+  const { event, action, payload, sender, botLogin, repoFullName, number, localInstanceId } = opts;
   if (botLogin == null || sender?.toLowerCase() !== botLogin) return null;
   if (!repoFullName || number == null) return null;
 
   const body = authorStampBodyForWebhookPayload(event, action, payload);
-  const verification = verifyAuthorStamp(body, repoFullName, number);
+  const verification = verifyAuthorStamp(body, repoFullName, number, localInstanceId);
 
   if (verification.status === "verified" && verification.actorId && verification.instanceId) {
     return { actorId: verification.actorId, instanceId: verification.instanceId };
@@ -399,12 +423,25 @@ export function resolveStampedAuthor(opts: {
       actorId: verification.actorId,
       body: `Unversioned stamp (actor: ${verification.actorId}) on ${repoFullName}#${number}. Expected migration; delivering event.`,
     });
-  } else if (verification.status === "invalid") {
+  } else if (verification.status === "foreign") {
     opts.onAnomaly?.({
-      detail: "forgery",
+      detail: "foreign_instance",
+      actorId: verification.actorId,
+      body: `Foreign-instance stamp (actor: ${verification.actorId}, instance: ${verification.instanceId}) on ${repoFullName}#${number}. Not ours; delivering event.`,
+    });
+  } else if (verification.status === "expired") {
+    opts.onAnomaly?.({
+      detail: "expired",
       actorId: verification.actorId,
       reason: verification.reason,
-      body: `INVALID stamp on ${repoFullName}#${number}: ${verification.reason}. Delivering event.`,
+      body: `Expired stamp on ${repoFullName}#${number}: ${verification.reason}. Delivering event.`,
+    });
+  } else if (verification.status === "unverifiable") {
+    opts.onAnomaly?.({
+      detail: "unverifiable",
+      actorId: verification.actorId,
+      reason: verification.reason,
+      body: `Unverifiable stamp on ${repoFullName}#${number}: ${verification.reason}. Delivering event.`,
     });
   }
   return null;

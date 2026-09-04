@@ -72,3 +72,41 @@ describe("MeshChatRepository.listChatByActors", () => {
     expect(page.nextCursor).toBeNull();
   });
 });
+
+describe("MeshChatRepository.record idempotency", () => {
+  it("ignores a second record() call with a previously-used id instead of duplicating the row", () => {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE mesh_chat (
+        id TEXT PRIMARY KEY,
+        ts TEXT NOT NULL,
+        sender_id TEXT NOT NULL,
+        recipient_id TEXT NOT NULL,
+        body TEXT NOT NULL,
+        session_id TEXT
+      )
+    `);
+    const repo = new MeshChatRepository(db);
+
+    const firstId = repo.record({
+      id: "delivery-1",
+      senderId: "root",
+      recipientId: "worker",
+      body: "first body wins",
+    });
+    // A retry after a crash between this write and a later durable step
+    // reuses the same stable id — it must not create a second row, and it
+    // must still report the original id back to the caller.
+    const secondId = repo.record({
+      id: "delivery-1",
+      senderId: "root",
+      recipientId: "worker",
+      body: "retry body must be ignored",
+    });
+
+    expect(firstId).toBe("delivery-1");
+    expect(secondId).toBe("delivery-1");
+    expect(repo.listForActor("worker")).toHaveLength(1);
+    expect(repo.listForActor("worker")[0]?.body).toBe("first body wins");
+  });
+});

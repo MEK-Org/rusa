@@ -1,14 +1,15 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import Database from "better-sqlite3";
 import { type MeshEvent, MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
+import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
+import type { ActorRecord } from "./actor-record.js";
 import { generateHandle } from "./handle-generator.js";
-import type { ThreadRecord } from "./thread-registry.js";
 
 /**
  * Generate a self-contained HTML report of an actor-mesh run from its durable
- * artifacts: the thread registry (`threads.json` — who exists, the ownership tree
- * and address-book graph) and the append-only `mesh_events` log (what happened —
+ * artifacts: the SQLite actor repository (who exists, the ownership tree and
+ * address-book graph) and the append-only `mesh_events` log (what happened —
  * messages routed, wakes, spawns, retires, run outputs).
  *
  * This is the "rich log" v1: a single chronological timeline you can filter down
@@ -16,8 +17,7 @@ import type { ThreadRecord } from "./thread-registry.js";
  * Because every event carries an ordering and a timestamp, the same data backs a
  * future scrubbable DES timeline with no schema change — only a front-end one.
  *
- * Read-only: the DB is opened readonly and `threads.json` is only parsed, so it
- * is safe to run against a live instance.
+ * Read-only: the database is opened readonly, so it is safe to run against a live instance.
  */
 export function generateMeshReport(opts: { home: string; out?: string }): {
   outPath: string;
@@ -29,9 +29,8 @@ export function generateMeshReport(opts: { home: string; out?: string }): {
   }
   const outPath = opts.out ?? join(opts.home, "mesh-report.html");
 
-  const records = readRegistry(join(opts.home, "threads.json"));
-
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+  let records: ActorRecord[];
   let events: MeshEvent[];
   try {
     const hasTable =
@@ -39,6 +38,10 @@ export function generateMeshReport(opts: { home: string; out?: string }): {
         .prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name = 'mesh_events'`)
         .get() !== undefined;
     events = hasTable ? new MeshEventRepository(db).list() : [];
+    const hasActors =
+      db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='actors'").get() !==
+      undefined;
+    records = hasActors ? new SqliteActorRepository(db).list() : [];
   } finally {
     db.close();
   }
@@ -56,15 +59,6 @@ export function generateMeshReport(opts: { home: string; out?: string }): {
       runs: events.filter((e) => e.kind === "run_end").length,
     },
   };
-}
-
-function readRegistry(file: string): ThreadRecord[] {
-  try {
-    const parsed = JSON.parse(readFileSync(file, "utf-8")) as { threads?: ThreadRecord[] };
-    return parsed.threads ?? [];
-  } catch {
-    return [];
-  }
 }
 
 /** Max rendered chars per artifact panel; longer text is truncated with a note. */
@@ -265,8 +259,8 @@ function renderEventCard(e: MeshEvent, labelFor: (id: string) => string): string
   );
 }
 
-function renderTopology(records: ThreadRecord[], counts: Map<string, number>): string {
-  const byParent = new Map<string | null, ThreadRecord[]>();
+function renderTopology(records: ActorRecord[], counts: Map<string, number>): string {
+  const byParent = new Map<string | null, ActorRecord[]>();
   for (const r of records) {
     const key = r.parentId ?? null;
     const siblings = byParent.get(key) ?? [];
@@ -275,15 +269,12 @@ function renderTopology(records: ThreadRecord[], counts: Map<string, number>): s
   }
   const known = new Set(records.map((r) => r.id));
 
-  const renderNode = (r: ThreadRecord): string => {
+  const renderNode = (r: ActorRecord): string => {
     const meta = [
       chip(r.status, statusChipClass(r.status)),
       r.provider ? chip(r.provider, "muted-chip") : "",
       r.model ? chip(r.model, "muted-chip") : "",
       r.effort ? chip(`effort ${r.effort}`, "muted-chip") : "",
-      r.budget?.maxRuns != null
-        ? chip(`runs ${r.budget.runsUsed ?? 0}/${r.budget.maxRuns}`, "muted-chip")
-        : "",
       counts.has(r.id) ? chip(`${counts.get(r.id)} events`, "muted-chip") : "",
     ]
       .filter(Boolean)
@@ -315,11 +306,7 @@ function renderTopology(records: ThreadRecord[], counts: Map<string, number>): s
   return `<ul class="tree">${roots.map((r) => `<li>${renderNode(r)}</li>`).join("")}</ul>`;
 }
 
-function renderReport(data: {
-  home: string;
-  records: ThreadRecord[];
-  events: MeshEvent[];
-}): string {
+function renderReport(data: { home: string; records: ActorRecord[]; events: MeshEvent[] }): string {
   const labelById = new Map(data.records.map((r) => [r.id, shortId(r.id)]));
   const labelFor = (id: string): string => labelById.get(id) ?? shortId(id);
 

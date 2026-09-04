@@ -330,6 +330,12 @@ function renderWaitingRef(obligation: Obligation): string {
   return `- [WAITING] ${obligation.id}${ref}`;
 }
 
+function renderScheduledRef(obligation: Obligation): string {
+  const ref = obligation.externalRef ? ` (${obligation.externalRef.key})` : "";
+  const when = obligation.nextReadyAt ? ` returns at ${obligation.nextReadyAt}` : "";
+  return `- [SCHEDULED] ${obligation.id}${ref}${when}`;
+}
+
 /**
  * Project the actor's obligation queue into the prompt, per Operator's ratified rule
  * (ISSUE_NUM comment 5369843998, carried in ISSUE_NUM):
@@ -357,7 +363,8 @@ function renderWaitingRef(obligation: Obligation): string {
 function renderObligations(obligations: Obligation[]): string {
   const ready = obligations.filter((obligation) => obligation.status === "ready");
   const waiting = obligations.filter((obligation) => obligation.status === "waiting");
-  if (ready.length === 0 && waiting.length === 0) return "";
+  const scheduled = obligations.filter((obligation) => obligation.status === "scheduled");
+  if (ready.length === 0 && waiting.length === 0 && scheduled.length === 0) return "";
 
   const trailing = "\n";
   const budget =
@@ -397,6 +404,13 @@ function renderObligations(obligations: Obligation[]): string {
   if (allReadyFit) {
     for (const obligation of waiting) {
       const rendered = renderWaitingRef(obligation);
+      const cost = byteLen(rendered) + (lines.length > 0 ? 1 : 0);
+      if (used + cost > budget) break;
+      lines.push(rendered);
+      used += cost;
+    }
+    for (const obligation of scheduled) {
+      const rendered = renderScheduledRef(obligation);
       const cost = byteLen(rendered) + (lines.length > 0 ? 1 : 0);
       if (used + cost > budget) break;
       lines.push(rendered);

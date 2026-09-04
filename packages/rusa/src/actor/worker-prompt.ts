@@ -1,5 +1,5 @@
+import type { ActorHandle } from "./actor-record.js";
 import { generateHandle } from "./handle-generator.js";
-import type { ActorHandle } from "./thread-registry.js";
 
 /** A handle resolved to its display label for the address book. */
 export interface ResolvedHandle {
@@ -371,7 +371,7 @@ export function buildWorkerPrompt(
 
 You have a private working directory — your current directory, yours alone. Clone
 whatever repositories your charter calls for into it (you have git and \`gh\`).
-Use a plain \`git clone\` — never \`--single-branch\` or \`--depth\`. Those narrow
+Always use \`git clone --recurse-submodules\` — never \`--single-branch\` or \`--depth\`. Those narrow
 \`remote.origin.fetch\`, and after that \`git fetch\` exits 0 with no output forever
 while every branch outside the refspec silently stops advancing, so reads off
 \`origin/<branch>\` stay confidently stale.

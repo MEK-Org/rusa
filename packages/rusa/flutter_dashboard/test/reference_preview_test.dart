@@ -8,6 +8,20 @@ Widget _host(Widget child) => MaterialApp(
   home: Scaffold(body: SingleChildScrollView(child: child)),
 );
 
+/// Every string actually rendered by a `Text`/`SelectableText` in the tree,
+/// joined with a separator. Substring checks against this catch a raw id
+/// hiding inside a composite string (e.g. "human:operator → root"), which
+/// `find.text(rawId)` — an exact-match finder — cannot.
+String _allRenderedText(WidgetTester tester) {
+  final texts = tester
+      .widgetList<Text>(find.byType(Text))
+      .map((w) => w.data ?? '');
+  final selectable = tester
+      .widgetList<SelectableText>(find.byType(SelectableText))
+      .map((w) => w.data ?? '');
+  return [...texts, ...selectable].join('|');
+}
+
 void main() {
   group('ReferenceDto', () {
     test('parses a resolved reference', () {
@@ -73,93 +87,336 @@ void main() {
   });
 
   group('ReferencePreview', () {
-    testWidgets('shows the cited text and its provenance', (tester) async {
+    testWidgets(
+      'renders a compact header — scheme, link button, label, then the '
+      'resolved cited-by handle — with no footer, raw ref, url, or cache '
+      'status anywhere',
+      (tester) async {
+        await tester.pumpWidget(
+          _host(
+            ReferencePreview(
+              reference: const ReferenceDto(
+                ref: 'github:MEK-Org/rusa/issues/204',
+                scheme: 'github',
+                title: 'github:MEK-Org/rusa/issues/204',
+                entity: {
+                  'type': 'github_issue',
+                  'title': 'Polish obligation artifact previews',
+                  'description': 'Some description body.',
+                },
+                url: 'https://github.com/MEK-Org/rusa/issues/204',
+                cacheState: 'fresh',
+              ),
+              attachedBy: 'raw-actor-id',
+              lookupActorHandle: (id) =>
+                  id == 'raw-actor-id' ? 'operator-handle' : null,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        // The four header elements are present...
+        expect(find.text('GITHUB'), findsOneWidget);
+        expect(find.byIcon(Icons.open_in_new), findsOneWidget);
+        expect(
+          find.text('Polish obligation artifact previews'),
+          findsOneWidget,
+        );
+        expect(find.text('cited by operator-handle'), findsOneWidget);
+
+        // ...and appear left to right in that order.
+        final schemeX = tester.getCenter(find.text('GITHUB')).dx;
+        final linkX = tester.getCenter(find.byIcon(Icons.open_in_new)).dx;
+        final labelX = tester
+            .getCenter(find.text('Polish obligation artifact previews'))
+            .dx;
+        final citedByX = tester
+            .getCenter(find.text('cited by operator-handle'))
+            .dx;
+        expect(schemeX, lessThan(linkX));
+        expect(linkX, lessThan(labelX));
+        expect(labelX, lessThan(citedByX));
+
+        // No cache-state badge, no raw ref/url text, no raw attachedBy id,
+        // and no footer row of any kind.
+        expect(find.text('FRESH'), findsNothing);
+        expect(find.text('github:MEK-Org/rusa/issues/204'), findsNothing);
+        expect(
+          find.text('https://github.com/MEK-Org/rusa/issues/204'),
+          findsNothing,
+        );
+        expect(find.text('raw-actor-id'), findsNothing);
+        expect(find.text('cited by raw-actor-id'), findsNothing);
+      },
+    );
+
+    testWidgets(
+      "the citer's own label wins the header slot over the resolved title",
+      (tester) async {
+        await tester.pumpWidget(
+          _host(
+            const ReferencePreview(
+              reference: ReferenceDto(
+                ref: 'github:foo/bar/issues/1',
+                scheme: 'github',
+                title: 'fallback title',
+                entity: {
+                  'type': 'github_issue',
+                  'title': 'Resolved Issue Title',
+                  'description': 'desc',
+                },
+              ),
+              label: "Operator's own gloss",
+            ),
+          ),
+        );
+
+        expect(find.text("Operator's own gloss"), findsOneWidget);
+        expect(find.text('Resolved Issue Title'), findsNothing);
+      },
+    );
+
+    testWidgets('omits the link button when the reference has no url', (
+      tester,
+    ) async {
       await tester.pumpWidget(
         _host(
           const ReferencePreview(
             reference: ReferenceDto(
               ref: 'mesh:messages/abc',
               scheme: 'mesh',
-              title: 'human:operator → root',
-              body: 'A monster-catching JRPG in a cave.',
-              author: 'human:operator',
-              url: 'https://example.test/citation',
+              title: 'title',
+              body: 'body',
             ),
-            label: "Operator's answer",
-            attachedBy: 'root',
           ),
         ),
       );
 
-      expect(find.text('MESH'), findsOneWidget);
-      expect(find.text('human:operator → root'), findsOneWidget);
-      expect(find.text('A monster-catching JRPG in a cave.'), findsOneWidget);
-      expect(find.text('by human:operator'), findsOneWidget);
-      expect(find.text('https://example.test/citation'), findsOneWidget);
-      expect(find.text("Operator's answer"), findsOneWidget);
-      expect(find.text('cited by root'), findsOneWidget);
-      // The ref itself stays visible and selectable — a citation you cannot
-      // copy is a citation you cannot chase.
-      expect(find.text('mesh:messages/abc'), findsOneWidget);
+      expect(find.byIcon(Icons.open_in_new), findsNothing);
     });
 
-    testWidgets('is only as tall as the text it quotes', (tester) async {
-      tester.view.physicalSize = const Size(1200, 900);
-      tester.view.devicePixelRatio = 1.0;
-      addTearDown(tester.view.reset);
-
-      Future<double> heightOf(String body) async {
-        await tester.pumpWidget(
-          MaterialApp(
-            home: Scaffold(
-              body: ListView(
-                children: [
-                  ReferencePreview(
-                    reference: ReferenceDto(
-                      ref: 'mesh:messages/abc',
-                      scheme: 'mesh',
-                      title: 'human:operator → root',
-                      body: body,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        );
-        await tester.pumpAndSettle();
-        return tester.getSize(find.byType(SelectableText).first).height;
-      }
-
-      final oneLine = await heightOf('Can you help me plan it out?');
-      final fourLines = await heightOf(List.filled(4, 'line').join('\n'));
-
-      // Regression guard. SelectableText wraps an EditableText, which sizes to
-      // `maxLines` rather than to its content — passing one made a single-line
-      // citation render eight lines tall. Height must track the text.
-      expect(oneLine, lessThan(30));
-      expect(fourLines, greaterThan(oneLine * 3));
-    });
-
-    testWidgets('displays cache state chips correctly', (tester) async {
-      for (final state in ['fresh', 'stale', 'pending', 'unavailable']) {
+    testWidgets(
+      'tapping the link button opens exactly the reference URL, via the '
+      'injected opener',
+      (tester) async {
+        final openedUrls = <String>[];
         await tester.pumpWidget(
           _host(
             ReferencePreview(
-              reference: ReferenceDto(
+              reference: const ReferenceDto(
                 ref: 'github:foo/bar/issues/1',
                 scheme: 'github',
-                title: 'issue',
-                cacheState: state,
+                title: 'Issue 1',
+                url: 'https://example.test/issue/1',
+              ),
+              openLink: openedUrls.add,
+            ),
+          ),
+        );
+
+        await tester.tap(find.byIcon(Icons.open_in_new));
+        await tester.pump();
+
+        expect(openedUrls, ['https://example.test/issue/1']);
+      },
+    );
+
+    testWidgets(
+      'resolves both mesh message sender and recipient to handles, shown '
+      'with no "by" prefix, and never leaks either raw id — even with no '
+      'lookup supplied',
+      (tester) async {
+        await tester.pumpWidget(
+          _host(
+            const ReferencePreview(
+              reference: ReferenceDto(
+                ref: 'mesh:messages/abc',
+                scheme: 'mesh',
+                title: 'human:operator → root',
+                body: 'A monster-catching JRPG in a cave.',
+                entity: {
+                  'type': 'mesh_message',
+                  'senderId': 'human:operator',
+                  'recipientId': 'root',
+                },
               ),
             ),
           ),
         );
-        expect(find.text(state.toUpperCase()), findsOneWidget);
-      }
+
+        expect(find.text('Operator → Unknown actor'), findsWidgets);
+        expect(find.textContaining('by Operator'), findsNothing);
+        final rendered = _allRenderedText(tester);
+        expect(rendered.contains('human:operator'), false);
+        expect(rendered.contains('root'), false);
+      },
+    );
+
+    testWidgets(
+      'resolves a known mesh sender and recipient to their handles via the '
+      'actor lookup, never the raw ids',
+      (tester) async {
+        await tester.pumpWidget(
+          _host(
+            ReferencePreview(
+              reference: const ReferenceDto(
+                ref: 'mesh:messages/abc',
+                scheme: 'mesh',
+                title: 'actor-1 → actor-2',
+                body: 'known participants',
+                entity: {
+                  'type': 'mesh_message',
+                  'senderId': 'actor-1',
+                  'recipientId': 'actor-2',
+                },
+              ),
+              lookupActorHandle: (id) => switch (id) {
+                'actor-1' => 'alice',
+                'actor-2' => 'bob',
+                _ => null,
+              },
+            ),
+          ),
+        );
+
+        expect(find.text('alice → bob'), findsWidgets);
+        final rendered = _allRenderedText(tester);
+        expect(rendered.contains('actor-1'), false);
+        expect(rendered.contains('actor-2'), false);
+      },
+    );
+
+    testWidgets(
+      'resolves a mesh message sender and recipient that no lookup can find '
+      'to "Unknown actor", never the raw ids — and a citer label does not '
+      'hide the participant context',
+      (tester) async {
+        await tester.pumpWidget(
+          _host(
+            ReferencePreview(
+              reference: const ReferenceDto(
+                ref: 'mesh:messages/abc',
+                scheme: 'mesh',
+                title: 'retired-actor-77 → retired-actor-88',
+                body: 'gone from this mesh view',
+                entity: {
+                  'type': 'mesh_message',
+                  'senderId': 'retired-actor-77',
+                  'recipientId': 'retired-actor-88',
+                },
+              ),
+              label: "Operator's opening ask",
+              lookupActorHandle: (id) => null,
+            ),
+          ),
+        );
+
+        // The citer's label takes the header slot, but the resolved
+        // participant context still appears elsewhere on the card.
+        expect(find.text("Operator's opening ask"), findsOneWidget);
+        expect(find.text('Unknown actor → Unknown actor'), findsWidgets);
+        final rendered = _allRenderedText(tester);
+        expect(rendered.contains('retired-actor-77'), false);
+        expect(rendered.contains('retired-actor-88'), false);
+      },
+    );
+
+    testWidgets(
+      'shows "cited by Unknown actor", never the raw id, when the citer '
+      'cannot be resolved',
+      (tester) async {
+        await tester.pumpWidget(
+          _host(
+            const ReferencePreview(
+              reference: ReferenceDto(
+                ref: 'github:foo/bar/issues/1',
+                scheme: 'github',
+                title: 'Issue 1',
+              ),
+              attachedBy: 'retired-actor-77',
+            ),
+          ),
+        );
+
+        expect(find.text('cited by Unknown actor'), findsOneWidget);
+        expect(find.text('cited by retired-actor-77'), findsNothing);
+        expect(find.text('retired-actor-77'), findsNothing);
+      },
+    );
+
+    testWidgets('shows a github author with the "by" prefix, unresolved', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _host(
+          const ReferencePreview(
+            reference: ReferenceDto(
+              ref: 'github:foo/bar/issues/1',
+              scheme: 'github',
+              title: 'Issue 1',
+              author: 'octocat',
+            ),
+          ),
+        ),
+      );
+
+      expect(find.text('by octocat'), findsOneWidget);
     });
 
-    testWidgets('truncates long text and allows expanding', (tester) async {
+    testWidgets(
+      'shows "Show more" only when the body genuinely overflows five lines '
+      'at the rendered width, not from a character-count heuristic',
+      (tester) async {
+        // Long enough to run past five lines when wrapped narrow, but short
+        // enough to fit within five lines at a wide layout — proving the
+        // toggle tracks actual layout, not body length.
+        const body =
+            'The quick brown fox jumps over the lazy dog near the riverbank '
+            'while the sun sets slowly behind the distant hills.';
+
+        await tester.pumpWidget(
+          _host(
+            SizedBox(
+              width: 220,
+              child: ReferencePreview(
+                reference: const ReferenceDto(
+                  ref: 'mesh:messages/narrow',
+                  scheme: 'mesh',
+                  title: 'title',
+                  body: body,
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('Show more'), findsOneWidget);
+
+        await tester.pumpWidget(
+          _host(
+            SizedBox(
+              width: 900,
+              child: ReferencePreview(
+                reference: const ReferenceDto(
+                  ref: 'mesh:messages/wide',
+                  scheme: 'mesh',
+                  title: 'title',
+                  body: body,
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('Show more'), findsNothing);
+      },
+    );
+
+    testWidgets('expanding "Show more" reveals the full text', (tester) async {
       final longBody = List.filled(10, 'Long line of text').join('\n');
       await tester.pumpWidget(
         _host(
@@ -173,12 +430,56 @@ void main() {
           ),
         ),
       );
+      await tester.pump();
+      await tester.pump();
 
       expect(find.text('Show more'), findsOneWidget);
       await tester.tap(find.text('Show more'));
       await tester.pumpAndSettle();
       expect(find.text('Show less'), findsOneWidget);
     });
+
+    testWidgets(
+      'measures overflow with the ambient text scaler, so text that fits at '
+      '1x but would visually clip under larger accessibility scaling is not '
+      'reported as fitting',
+      (tester) async {
+        const body =
+            'The quick brown fox jumps over the lazy dog near the riverbank '
+            'while the sun sets slowly behind the distant hills.';
+
+        Widget hostScaled(double scale) => MaterialApp(
+          home: Scaffold(
+            body: SingleChildScrollView(
+              child: MediaQuery(
+                data: MediaQueryData(textScaler: TextScaler.linear(scale)),
+                child: const SizedBox(
+                  width: 900,
+                  child: ReferencePreview(
+                    reference: ReferenceDto(
+                      ref: 'mesh:messages/scaled',
+                      scheme: 'mesh',
+                      title: 'title',
+                      body: body,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+
+        await tester.pumpWidget(hostScaled(1));
+        await tester.pump();
+        await tester.pump();
+        expect(find.text('Show more'), findsNothing);
+
+        await tester.pumpWidget(hostScaled(3));
+        await tester.pump();
+        await tester.pump();
+        expect(find.text('Show more'), findsOneWidget);
+      },
+    );
 
     testWidgets('displays different entity types properly', (tester) async {
       await tester.pumpWidget(
@@ -223,6 +524,38 @@ void main() {
         _host(
           const ReferencePreview(
             reference: ReferenceDto(
+              ref: 'github:foo/bar/issues/1/comments/9',
+              scheme: 'github',
+              title: 'Comment',
+              entity: {'type': 'github_comment', 'body': 'A comment body'},
+            ),
+          ),
+        ),
+      );
+      expect(find.text('A comment body'), findsOneWidget);
+
+      await tester.pumpWidget(
+        _host(
+          const ReferencePreview(
+            reference: ReferenceDto(
+              ref: 'github:foo/bar/pulls/2/reviews/7',
+              scheme: 'github',
+              title: 'Review',
+              entity: {
+                'type': 'github_review',
+                'body': 'Ship it.',
+                'state': 'APPROVED',
+              },
+            ),
+          ),
+        ),
+      );
+      expect(find.text('Ship it.'), findsOneWidget);
+
+      await tester.pumpWidget(
+        _host(
+          const ReferencePreview(
+            reference: ReferenceDto(
               ref: 'gchat:spaces/abc',
               scheme: 'gchat',
               title: 'Space',
@@ -247,6 +580,114 @@ void main() {
       );
       expect(find.text('Msg content'), findsOneWidget);
     });
+
+    testWidgets(
+      'an unlabeled cached comment/review never shows the raw canonical ref '
+      'as its title — a cache-boundary response with no title override still '
+      'gets a safe generic label',
+      (tester) async {
+        await tester.pumpWidget(
+          _host(
+            const ReferencePreview(
+              reference: ReferenceDto(
+                ref: 'github:foo/bar/issues/1/comments/9',
+                scheme: 'github',
+                // As a cache-boundary response would look before its title
+                // was resolved server-side: the raw canonical ref.
+                title: 'github:foo/bar/issues/1/comments/9',
+                entity: {'type': 'github_comment', 'body': 'A comment body'},
+              ),
+            ),
+          ),
+        );
+
+        expect(find.text('github:foo/bar/issues/1/comments/9'), findsNothing);
+        expect(find.text('GitHub comment'), findsOneWidget);
+
+        await tester.pumpWidget(
+          _host(
+            const ReferencePreview(
+              reference: ReferenceDto(
+                ref: 'github:foo/bar/pulls/2/reviews/7',
+                scheme: 'github',
+                title: 'github:foo/bar/pulls/2/reviews/7',
+                entity: {
+                  'type': 'github_review',
+                  'body': 'Ship it.',
+                  'state': 'APPROVED',
+                },
+              ),
+            ),
+          ),
+        );
+
+        expect(find.text('github:foo/bar/pulls/2/reviews/7'), findsNothing);
+        expect(find.text('GitHub review'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'a generic unavailable/unrecognized reference never shows the raw '
+      'canonical ref as its title',
+      (tester) async {
+        await tester.pumpWidget(
+          _host(
+            const ReferencePreview(
+              reference: ReferenceDto(
+                ref: 'github:foo/bar/branch@main',
+                scheme: 'github',
+                title: 'github:foo/bar/branch@main',
+                unavailable: 'branch content is not fetched',
+              ),
+            ),
+          ),
+        );
+
+        expect(find.text('github:foo/bar/branch@main'), findsNothing);
+        expect(find.text('GitHub reference'), findsOneWidget);
+
+        await tester.pumpWidget(
+          _host(
+            const ReferencePreview(
+              reference: ReferenceDto(
+                ref: 'gchat:spaces/abc/messages/999',
+                scheme: 'gchat',
+                title: 'gchat:spaces/abc/messages/999',
+                unavailable: 'could not load context',
+              ),
+            ),
+          ),
+        );
+
+        expect(find.text('gchat:spaces/abc/messages/999'), findsNothing);
+        expect(find.text('Chat reference'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'an empty-body review shows its verdict as content, not "No content."',
+      (tester) async {
+        await tester.pumpWidget(
+          _host(
+            const ReferencePreview(
+              reference: ReferenceDto(
+                ref: 'github:foo/bar/pulls/2/reviews/9002',
+                scheme: 'github',
+                title: 'Review',
+                entity: {
+                  'type': 'github_review',
+                  'body': '',
+                  'state': 'APPROVED',
+                },
+              ),
+            ),
+          ),
+        );
+
+        expect(find.text('No content.'), findsNothing);
+        expect(find.text('Approved.'), findsOneWidget);
+      },
+    );
 
     testWidgets('says why it could not expand, rather than showing nothing', (
       tester,

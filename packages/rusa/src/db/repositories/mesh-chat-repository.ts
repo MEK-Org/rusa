@@ -44,7 +44,7 @@ export class MeshChatRepository {
     const id = opts.id ?? randomUUID();
     this.db
       .prepare(
-        `INSERT INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id)
+        `INSERT OR IGNORE INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id)
          VALUES (?, ?, ?, ?, ?, ?)`
       )
       .run(

@@ -6,7 +6,6 @@ import { resolveContextSelection } from "../actor/context-selection.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import type { InboxPage, InboxPayload, InboxStore } from "../actor/inbox-store.js";
 import type { RootControlService } from "../actor/root-control.js";
-import type { ThreadRegistry } from "../actor/thread-registry.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import {
   generateAvatarForce,
@@ -22,11 +21,12 @@ import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { ObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { resolveReferenceSync } from "../references/resolve.js";
+import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { SseHub } from "./sse.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
 export interface DashboardDataDeps {
-  registry: ThreadRegistry;
+  actors: ActorRepository;
   meshEvents: MeshEventRepository;
   meshChat: MeshChatRepository;
   /** Durable obligation repository for task and dependency management. */
@@ -48,6 +48,14 @@ export interface DashboardDataDeps {
    */
   isHalted?: () => boolean;
   /**
+   * Read-only snapshot of both host-scheduler preflights: crontab/crond and
+   * `at`/`atrm`/`atd`/`atq`. Surfaced as the top-level `schedulerWarning`
+   * field on `/api/mesh/threads`; either facility may be degraded while the
+   * service and the unaffected scheduling paths continue to run.
+   * Optional; absent or an ok result reports `schedulerWarning: null`.
+   */
+  schedulerHealth?: () => { ok: boolean; issues: string[] };
+  /**
    * Read-only snapshot of the thread ids whose live actor is *genuinely
    * executing a run right now* (between run_start and run_end — i.e. the
    * TriggerRunner's running flag), used to derive each thread's `runState`.
@@ -60,8 +68,18 @@ export interface DashboardDataDeps {
   queuedThreadIds?: () => Set<string>;
   /** Optional yield check for testing runState without full mesh instance. */
   isYielded?: (actorId: string) => boolean;
-  /** The provider-paced FIFO heads with their exact next eligible start time. */
-  providerQueueHeads?: () => Array<{ threadId: string; availableAt: string }>;
+  /**
+   * Read-only, per-lane FIFO snapshots from every live `ProviderPacer`,
+   * flattened across lanes. `position` is 0-based within its own provider
+   * lane (not globally comparable across lanes); `estimatedStartAt` is an
+   * ISO-8601 projection or `null` when it can't be honestly quoted yet —
+   * see `ProviderPacer.getQueueSnapshot` for the full contract this mirrors.
+   */
+  providerQueueSnapshots?: () => Array<{
+    threadId: string;
+    position: number;
+    estimatedStartAt: string | null;
+  }>;
   /**
    * This instance's configured root identity  — the resolved display
    * handle and avatar override, if `rootActor.handle`/`rootActor.avatar` are
@@ -78,7 +96,7 @@ export interface DashboardDataDeps {
   geminiApiKey?: string;
   referenceCache?: import("../references/cache-service.js").ReferenceCacheService;
   chatClient?: import("../chat/types.js").ChatClient;
-  issueClient?: { getIssue?: (repo: string, number: number) => Promise<unknown> };
+  issueClient?: import("../references/resolve.js").ReferenceResolverDeps["issueClient"];
 }
 
 /** Route prefix for the per-actor avatar endpoint . */
@@ -178,8 +196,20 @@ interface ThreadDto {
   chatDisabled: boolean;
   /** ISO-8601 timestamp of the actor's most recent mesh event, or null if none. */
   lastActiveAt: string | null;
-  /** Exact provider-pacer release time, populated only for a provider queue head. */
-  nextProviderAvailableAt?: string | null;
+  /**
+   * 0-based position within this actor's provider lane, or `null` when the
+   * actor isn't in a provider queue right now. Not comparable across
+   * different provider lanes — only meaningful relative to other actors on
+   * the same lane.
+   */
+  queuePosition?: number | null;
+  /**
+   * ISO-8601 estimate of when this actor's provider run will start, or
+   * `null` when the estimate can't be honestly quoted yet (see
+   * `ProviderPacer.getQueueSnapshot`). Recomputed on every request from
+   * live pacer state — never persisted, and shifts as pacing changes.
+   */
+  estimatedStartAt?: string | null;
 }
 
 /**
@@ -450,7 +480,6 @@ export async function handleMeshApiRequest(
                 provider: typeof body.provider === "string" ? body.provider : "",
                 model: typeof body.model === "string" ? body.model : "",
                 effort: typeof body.effort === "string" ? body.effort : undefined,
-                maxRuns: typeof body.maxRuns === "number" ? body.maxRuns : undefined,
                 title: typeof body.title === "string" ? body.title : undefined,
                 context,
               },
@@ -472,7 +501,7 @@ export async function handleMeshApiRequest(
         return true;
       }
       const actorId = match[1];
-      const rec = deps.registry.get(actorId);
+      const rec = deps.actors.get(actorId);
       if (!rec) {
         sendJson(res, 404, { error: "actor not found" });
         return true;
@@ -530,7 +559,7 @@ export async function handleMeshApiRequest(
         return true;
       }
       const actorId = decodeURIComponent(interruptMatch[1]);
-      const rec = deps.registry.get(actorId);
+      const rec = deps.actors.get(actorId);
       if (!rec) {
         sendJson(res, 404, { error: "actor not found" });
         return true;
@@ -579,7 +608,7 @@ export async function handleMeshApiRequest(
         return true;
       }
       const actorId = decodeURIComponent(runNowMatch[1]);
-      const rec = deps.registry.get(actorId);
+      const rec = deps.actors.get(actorId);
       if (!rec) {
         sendJson(res, 404, { error: "actor not found" });
         return true;
@@ -826,7 +855,7 @@ export async function handleMeshApiRequest(
           const priority =
             typeof rawPriority === "number" && Number.isFinite(rawPriority) ? rawPriority : null;
 
-          const owner = resolveObligationOwner(deps.registry, ownerId);
+          const owner = resolveObligationOwner(deps.actors, ownerId);
           if (!owner.ok) {
             sendJson(res, 400, { error: owner.error });
             return;
@@ -1081,7 +1110,7 @@ export async function handleMeshApiRequest(
             sendJson(res, 404, { error: "obligation not found" });
             return;
           }
-          const owner = resolveObligationOwner(deps.registry, ownerId);
+          const owner = resolveObligationOwner(deps.actors, ownerId);
           if (!owner.ok) {
             sendJson(res, 400, { error: owner.error });
             return;
@@ -1136,7 +1165,7 @@ export async function handleMeshApiRequest(
     return true;
   }
 
-  const { registry, meshEvents, sseHub } = deps;
+  const { actors, meshEvents, sseHub } = deps;
 
   if (pathname === "/api/mesh/control/options") {
     if (!deps.rootControl) {
@@ -1153,7 +1182,7 @@ export async function handleMeshApiRequest(
   // list route because the dispatcher matches on exact pathname.
   if (pathname === "/api/mesh/threads/charter") {
     const id = url.searchParams.get("id");
-    const thread = id ? registry.get(id) : undefined;
+    const thread = id ? actors.get(id) : undefined;
     if (!thread) {
       sendJson(res, 404, { error: "thread not found" });
       return true;
@@ -1172,15 +1201,15 @@ export async function handleMeshApiRequest(
     // thread in a single pass — no await between reads, so the view can't tear.
     const running = deps.runningThreadIds?.() ?? new Set<string>();
     const queued = deps.queuedThreadIds?.() ?? new Set<string>();
-    const providerQueueHeads = new Map(
-      (deps.providerQueueHeads?.() ?? []).map((head) => [head.threadId, head.availableAt])
+    const providerQueueSnapshots = new Map(
+      (deps.providerQueueSnapshots?.() ?? []).map((entry) => [entry.threadId, entry])
     );
     const rootHandle = deps.rootIdentity?.handle ?? generateHandle("root");
     // Aggregate last activity once for all actors; the covering index on
     // mesh_events(actor_id, ts) makes this cheap .
     const lastActiveByActor = meshEvents.latestActivityByActor();
 
-    const threads: ThreadDto[] = registry.list().map((r) => {
+    const threads: ThreadDto[] = actors.list().map((r) => {
       let runState: "running" | "queued" | "winding_down" | "idle" = "idle";
       if (runtime) {
         runState = runtime.states.get(r.id) ?? "idle";
@@ -1206,11 +1235,14 @@ export async function handleMeshApiRequest(
         runState,
         chatDisabled: r.status === "retired",
         lastActiveAt: lastActiveByActor.get(r.id) ?? null,
-        nextProviderAvailableAt: providerQueueHeads.get(r.id) ?? null,
+        queuePosition: providerQueueSnapshots.get(r.id)?.position ?? null,
+        estimatedStartAt: providerQueueSnapshots.get(r.id)?.estimatedStartAt ?? null,
       };
     });
+    const schedulerHealth = deps.schedulerHealth?.();
     sendJson(res, 200, {
       halted: deps.isHalted?.() ?? false,
+      schedulerWarning: schedulerHealth && !schedulerHealth.ok ? schedulerHealth.issues : null,
       runtimeCursor: runtime ? { streamId: runtime.streamId, revision: runtime.revision } : null,
       threads,
     });
@@ -1298,7 +1330,7 @@ export async function handleMeshApiRequest(
     const limit = clampLimit(url);
     const offset = parsePositiveInt(url, "offset") ?? 0;
 
-    if (status && !["ready", "waiting", "done", "cancelled"].includes(status)) {
+    if (status && !["ready", "waiting", "done", "cancelled", "scheduled"].includes(status)) {
       sendJson(res, 400, { error: "invalid status" });
       return true;
     }
@@ -1351,11 +1383,16 @@ export async function handleMeshApiRequest(
     }
     const limit = clampLimit(url);
     const offset = parsePositiveInt(url, "offset") ?? 0;
+    const completionsOffset = parsePositiveInt(url, "completions_offset") ?? 0;
     const children = deps.obligations.listChildrenPage(id, { limit, offset });
     const blockingChildren = deps.obligations.listChildrenPage(id, {
       limit,
       offset: 0,
       blockingOnly: true,
+    });
+    const completions = deps.obligations.listCompletionsPage(id, {
+      limit,
+      offset: completionsOffset,
     });
     const parent = obligation.parentId ? deps.obligations.get(obligation.parentId) : null;
     const artifacts = await Promise.all(
@@ -1375,6 +1412,9 @@ export async function handleMeshApiRequest(
       parent,
       children: children.obligations,
       blockingChildren: blockingChildren.obligations,
+      completions: completions.completions,
+      completionsTotal: completions.total,
+      completionsHasMore: completions.hasMore,
       artifacts,
     });
     return true;

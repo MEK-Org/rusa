@@ -1,6 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { ThreadRegistry } from "../actor/thread-registry.js";
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import {
   COMMITMENT_LEDGER_BODY_KINDS,
@@ -9,13 +8,14 @@ import {
   DEFAULT_COMMITMENT_THRESHOLDS,
   projectOpenCommitments,
 } from "../observability/commitment-ledger.js";
+import type { ActorRepository } from "../repositories/actor-repository.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 
 export const STUCK_LOOP_DETECTOR_MCP_NAME = "stuck-loop-detector";
 
 export interface StuckLoopDetectorDeps {
-  registry: ThreadRegistry;
+  actors: ActorRepository;
   meshEvents: MeshEventRepository;
   /** This instance's configured root display handle ; see `projectOpenCommitments`. */
   rootHandle?: string;
@@ -23,7 +23,6 @@ export interface StuckLoopDetectorDeps {
 
 const CommitmentThresholdMinutesSchema = z
   .object({
-    actor_completion: z.number().nonnegative().optional(),
     failed_run: z.number().nonnegative().optional(),
     missed_wake: z.number().nonnegative().optional(),
     silent_actor: z.number().nonnegative().optional(),
@@ -49,7 +48,7 @@ export function createStuckLoopDetectorMcpServer(
     {
       title: "List open mesh commitments",
       description:
-        "Return open commitment-ledger rows projected in memory from mesh_events plus threads.json, including owner, source artifact, confidence, waiting-on, and retirement expectation.",
+        "Return open commitment-ledger rows projected in memory from mesh_events plus the actor repository, including owner, source artifact, confidence, waiting-on, and retirement expectation.",
       inputSchema: {
         now: z
           .string()
@@ -75,7 +74,7 @@ export function createStuckLoopDetectorMcpServer(
       try {
         return toolOk(
           projectOpenCommitments({
-            threads: deps.registry.list(),
+            threads: deps.actors.list(),
             events: deps.meshEvents.listByKinds(COMMITMENT_LEDGER_KINDS, {
               bodyKinds: COMMITMENT_LEDGER_BODY_KINDS,
             }),
@@ -100,10 +99,6 @@ function toCommitmentThresholds(
 ): Partial<CommitmentThresholds> | undefined {
   if (!minutes) return undefined;
   return {
-    actorCompletionMs:
-      minutes.actor_completion == null
-        ? DEFAULT_COMMITMENT_THRESHOLDS.actorCompletionMs
-        : minutes.actor_completion * 60_000,
     failedRunMs:
       minutes.failed_run == null
         ? DEFAULT_COMMITMENT_THRESHOLDS.failedRunMs

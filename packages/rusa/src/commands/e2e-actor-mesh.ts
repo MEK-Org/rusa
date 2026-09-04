@@ -9,8 +9,8 @@ import {
 import { createServer, type Server } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { ContextConfig } from "../actor/actor-record.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
-import type { ContextConfig } from "../actor/thread-registry.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import type { ChatMessage } from "../chat/types.js";
 import type { QuotaApiDeps } from "../dashboard/quota-api.js";
@@ -272,7 +272,7 @@ export function startRootControlServer(opts: {
     const actorMatch = url.pathname.match(/^\/actors\/([^/]+)$/);
     if (req.method === "GET" && actorMatch) {
       const id = decodeURIComponent(actorMatch[1]);
-      const record = opts.handles.mesh.registry.get(id);
+      const record = opts.handles.mesh.actors.get(id);
       if (!record) {
         send(res, 404, { error: "actor not found" });
         return;
@@ -291,7 +291,7 @@ export function startRootControlServer(opts: {
         return;
       }
       const id = decodeURIComponent(contextMatch[1]);
-      if (!opts.handles.mesh.registry.get(id)) {
+      if (!opts.handles.mesh.actors.get(id)) {
         send(res, 404, { error: "actor not found" });
         return;
       }
@@ -355,7 +355,6 @@ export function startRootControlServer(opts: {
               provider: typeof body.provider === "string" ? body.provider : "",
               model: typeof body.model === "string" ? body.model : "",
               effort: typeof body.effort === "string" ? body.effort : undefined,
-              maxRuns: typeof body.maxRuns === "number" ? body.maxRuns : undefined,
               title: typeof body.title === "string" ? body.title : undefined,
               context,
             },
@@ -620,7 +619,7 @@ function printDriveHelp(opts: {
     `  curl -s -XPOST ${tracker}/repos/${opts.repo}/issues -d '{"title":"...","body":"..."}'`
   );
   console.log(`\nObserve: tail this process's stdout (the actor firehose),`);
-  console.log(`  inspect ${join(opts.rootDir, "home", "threads.json")}, or query ${tracker}.`);
+  console.log(`  inspect ${join(opts.rootDir, "home", "data", "mesh.db")}, or query ${tracker}.`);
   console.log(`\nTear down:  pnpm e2e am-down --root ${opts.rootDir}\n`);
   console.log(`Instance ready. Ctrl-C for graceful shutdown (root kept; am-down removes it).\n`);
 }

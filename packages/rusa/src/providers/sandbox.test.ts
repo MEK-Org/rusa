@@ -6,6 +6,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -148,14 +149,14 @@ describe("sandbox bwrap args", () => {
     );
   });
 
-  it("sets KIMI_CODE_HOME=/tmp/kimi-home, ro-binds config, and writable-copies credentials + oauth from host ~/.kimi-code for kimi (buildActorBwrapArgs)", async () => {
+  it("sets KIMI_CODE_HOME=/tmp/kimi-home, ro-binds config, and binds the real host credentials/ + oauth/ dirs writable for kimi (buildActorBwrapArgs)", async () => {
     const home = mkdtempSync(join(tmpdir(), "mc-kimi-mesh-home-"));
     tempDirs.push(home);
     mkdirSync(join(home, ".kimi-code", "credentials"), { recursive: true });
     mkdirSync(join(home, ".kimi-code", "oauth"), { recursive: true });
     writeFileSync(join(home, ".kimi-code", "config.toml"), "default_model = 'kimi-for-coding'\n");
     writeFileSync(join(home, ".kimi-code", "credentials", "kimi-code.json"), "{}");
-    writeFileSync(join(home, ".kimi-code", "oauth", "kimi-code"), "mock-oauth-token");
+    writeFileSync(join(home, ".kimi-code", "oauth", "kimi-code"), "");
     process.env.HOME = home;
 
     execSyncMock.mockImplementation((command: string) => {
@@ -177,35 +178,81 @@ describe("sandbox bwrap args", () => {
     expect(args[configIdx - 1]).toBe(join(home, ".kimi-code", "config.toml"));
     expect(args[configIdx - 2]).toBe("--ro-bind");
 
-    // credentials/: kimi rewrites it on every run, so it's copied to a per-actor host-/tmp
-    // dir and bound WRITABLE  — a ro-bind would EROFS. The host dir is NOT the bind
-    // source (it stays untouched), and the copy is registered for cleanup.
+    // credentials/: kimi rewrites kimi-code.json on every run (tmp-write + rename), which a
+    // ro-bind would EROFS on. The REAL host directory is bound writable directly — no per-actor
+    // copy — so the rewrite's rename lands in the real host store and survives run teardown.
     const credsIdx = args.indexOf("/tmp/kimi-home/credentials");
     expect(credsIdx).toBeGreaterThan(-1);
     expect(args[credsIdx - 2]).toBe("--bind"); // writable, not ro-bind
-    const credsTempPath = args[credsIdx - 1];
-    tempDirs.push(credsTempPath);
-    expect(credsTempPath).toContain("rusa-kimicreds-");
-    expect(credsTempPath).not.toBe(join(home, ".kimi-code", "credentials"));
-    expect(tempPaths).toContain(credsTempPath);
-    // The copy really contains the host creds file (so kimi finds its credentials).
-    expect(existsSync(join(credsTempPath, "kimi-code.json"))).toBe(true);
+    expect(args[credsIdx - 1]).toBe(join(home, ".kimi-code", "credentials"));
 
-    // OAuth token is copied to a host-/tmp temp file and bound writable (enables refresh)
-    const oauthIdx = args.indexOf("/tmp/kimi-home/oauth/kimi-code");
+    // oauth/: the CLI's own refresh lock lives here (a sibling lockfile next to the token file),
+    // which needs a writable directory, not a writable single file. Bound directly from the
+    // real host dir for the same reason as credentials/ above.
+    const oauthIdx = args.indexOf("/tmp/kimi-home/oauth");
     expect(oauthIdx).toBeGreaterThan(-1);
     expect(args[oauthIdx - 2]).toBe("--bind"); // writable, not ro-bind
-    const oauthTempPath = args[oauthIdx - 1];
-    tempDirs.push(oauthTempPath);
-    expect(oauthTempPath).toContain("rusa-auth-kimi-");
-    expect(tempPaths).toContain(oauthTempPath);
+    expect(args[oauthIdx - 1]).toBe(join(home, ".kimi-code", "oauth"));
 
-    // Host ~/.kimi-code itself is NOT bound writable (no rw bind of the host dir)
-    expect(args.join(" ")).not.toContain(
-      `--bind ${join(home, ".kimi-code")} ${join(home, ".kimi-code")}`
-    );
+    // No per-run temp copies of either credentials or oauth remain.
+    expect(tempPaths.some((p) => p.includes("rusa-kimicreds-"))).toBe(false);
+    expect(tempPaths.some((p) => p.includes("rusa-auth-kimi-"))).toBe(false);
+
     // No synthetic HOME remapping (mesh actor keeps real home)
     expect(args).not.toContain("/tmp/rusa-home");
+  });
+
+  it("skips the credentials/oauth binds for kimi when the host dir is absent or a plain file (least privilege)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "mc-kimi-mesh-home-missing-"));
+    tempDirs.push(home);
+    mkdirSync(join(home, ".kimi-code"), { recursive: true });
+    // credentials/ absent entirely.
+    // oauth/ exists but as a plain file, not a directory.
+    writeFileSync(join(home, ".kimi-code", "oauth"), "not-a-directory");
+
+    process.env.HOME = home;
+    execSyncMock.mockImplementation((command: string) => {
+      if (command === "pnpm store path") return "/tmp/pnpm-store\n";
+      const fallback = defaultExecSyncResponse(command);
+      if (fallback) return fallback;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const { buildActorBwrapArgs } = await import("./sandbox.js");
+    const { args } = buildActorBwrapArgs("/tmp/worktree", "kimi");
+
+    expect(args).not.toContain("/tmp/kimi-home/credentials");
+    expect(args).not.toContain("/tmp/kimi-home/oauth");
+  });
+
+  it("skips the credentials/oauth binds for kimi when the host path is a symlink, even one pointing at a real directory (least privilege)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "mc-kimi-mesh-home-symlink-"));
+    tempDirs.push(home);
+    mkdirSync(join(home, ".kimi-code"), { recursive: true });
+
+    // A decoy real directory elsewhere, outside the expected ~/.kimi-code tree, that
+    // credentials/ and oauth/ are symlinked to. If the bind helper used `statSync`
+    // (which follows symlinks) instead of `lstatSync`, it would treat these as real
+    // directories and bind the decoy writable into the sandbox — this proves it doesn't.
+    const decoy = mkdtempSync(join(tmpdir(), "mc-kimi-symlink-decoy-"));
+    tempDirs.push(decoy);
+    symlinkSync(decoy, join(home, ".kimi-code", "credentials"));
+    symlinkSync(decoy, join(home, ".kimi-code", "oauth"));
+
+    process.env.HOME = home;
+    execSyncMock.mockImplementation((command: string) => {
+      if (command === "pnpm store path") return "/tmp/pnpm-store\n";
+      const fallback = defaultExecSyncResponse(command);
+      if (fallback) return fallback;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const { buildActorBwrapArgs } = await import("./sandbox.js");
+    const { args } = buildActorBwrapArgs("/tmp/worktree", "kimi");
+
+    expect(args).not.toContain("/tmp/kimi-home/credentials");
+    expect(args).not.toContain("/tmp/kimi-home/oauth");
+    expect(args).not.toContain(decoy);
   });
 
   it("ro-binds the per-invocation mcp config to KIMI_CODE_HOME/mcp.json for kimi", async () => {

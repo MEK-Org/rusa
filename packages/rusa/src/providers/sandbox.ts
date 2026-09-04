@@ -3,8 +3,8 @@ import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
-  cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -566,6 +566,28 @@ function addWritableBindIfExists(args: string[], source: string, target: string)
 }
 
 /**
+ * Like {@link addWritableBindIfExists}, but only for a real, non-symlink directory —
+ * used for host credential directories, where a stray file left over from an older
+ * layout, or a symlink that could point outside the expected host-credentials tree,
+ * must not be bound writable in its place. Uses `lstatSync` (not `statSync`) so a
+ * symlinked entry is rejected rather than followed. The existence check and the type
+ * check are a single `lstatSync` call (not a separate `existsSync` probe first) so a
+ * source that's deleted between the two — another actor's teardown racing this one's
+ * sandbox setup — can't turn into an unhandled ENOENT; any lstat failure is treated
+ * the same as "absent" and the bind is skipped rather than binding writable.
+ */
+function addWritableDirBindIfRealDir(args: string[], source: string, target: string): void {
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(source);
+  } catch {
+    return; // absent, or raced away mid-probe — best-effort, matches existing kimi/codex auth bind behavior
+  }
+  if (!st.isDirectory()) return; // not a real directory (plain file or symlink) — skip
+  args.push("--bind", source, target);
+}
+
+/**
  * `--dir` every ancestor of `target` so a later `--bind`/`--ro-bind` onto a
  * shadowed (freshly `--tmpfs`'d) tree has somewhere to mount — bwrap does NOT
  * auto-vivify a bind target's parent directories under a fresh tmpfs. Exported
@@ -687,8 +709,11 @@ function providerWritableStateDirs(authMode: SandboxAuthMode | undefined): strin
       // (project state) on every run.
       return [join(home, ".claude"), join(home, ".claude.json")];
     case "kimi":
-      // KIMI_CODE_HOME=/tmp/kimi-home in buildMeshActorBwrapArgs handles all writes;
-      // no host dir needs to be writable.
+      // KIMI_CODE_HOME=/tmp/kimi-home in buildMeshActorBwrapArgs handles per-invocation
+      // writes, but credentials/ and oauth/ under host ~/.kimi-code ARE bound writable —
+      // at their own in-sandbox targets under /tmp/kimi-home, not in-place at their real
+      // host path, so they don't belong in this in-place-bind list. See the
+      // addWritableDirBindIfRealDir calls in buildMeshActorBwrapArgs.
       return [];
     case "codex":
       // Codex CLI stores auth in ~/.codex/auth.json and config in ~/.codex/config.toml.
@@ -893,40 +918,30 @@ function buildMeshActorBwrapArgs(o: {
     args.push("--dir", "/tmp/kimi-home");
     // config.toml is static — bind read-only from the host ~/.kimi-code.
     addReadonlyBindIfExists(args, join(kimiCodeDir, "config.toml"), "/tmp/kimi-home/config.toml");
-    // credentials/: kimi (0.23.6) rewrites credentials/kimi-code.json on EVERY run (atomic
-    // tmp-write + rename inside the dir), so a read-only bind fails with EROFS and makes the
-    // provider unusable for any sandboxed actor . Copy the dir to a per-actor host-/tmp
-    // dir and bind it writable — same discipline as the oauth token below: the host creds stay
-    // untouched, the in-run rewrite lands in the throwaway copy and is discarded on run-end, and
-    // per-actor copies never race. Needs the whole dir writable because kimi renames a tmp file
-    // over kimi-code.json (a single-file bind can't be renamed over).
-    const kimiCredsSrc = join(kimiCodeDir, "credentials");
-    if (existsSync(kimiCredsSrc)) {
-      try {
-        const credsTemp = join(tmpdir(), `rusa-kimicreds-${basename(o.actorDir)}`);
-        rmSync(credsTemp, { recursive: true, force: true }); // clear any stale copy from a prior crash
-        cpSync(kimiCredsSrc, credsTemp, { recursive: true });
-        args.push("--bind", credsTemp, "/tmp/kimi-home/credentials");
-        tempPaths.push(credsTemp);
-      } catch {
-        // best-effort: kimi will fail at auth if creds are missing — not a sandbox setup error
-      }
-    }
-    // OAuth token: copy to a per-actor host-/tmp file and bind writable so token refresh
-    // can succeed within the run. This remains discard-on-run-end because kimi's token
-    // lifecycle is separate from codex's globally rotating shared refresh token.
-    const kimiOauthSrc = join(kimiCodeDir, "oauth", "kimi-code");
-    if (existsSync(kimiOauthSrc)) {
-      try {
-        const oauthTemp = join(tmpdir(), `rusa-auth-kimi-${basename(o.actorDir)}`);
-        writeFileSync(oauthTemp, readFileSync(kimiOauthSrc), { mode: 0o600 });
-        args.push("--dir", "/tmp/kimi-home/oauth");
-        args.push("--bind", oauthTemp, "/tmp/kimi-home/oauth/kimi-code");
-        tempPaths.push(oauthTemp);
-      } catch {
-        // best-effort: kimi will fail at auth if no token — not a sandbox setup error
-      }
-    }
+    // credentials/: the installed kimi CLI writes credentials/kimi-code.json via a same-dir
+    // tmp-file + fsync + rename on every refresh (a read-only bind fails that rename with
+    // EROFS), so this needs a real directory bind, not a single-file one — a file bind can't
+    // be renamed over. Bind the REAL host dir instead of a per-actor copy: kimi's refresh
+    // token rotates on use (see oauth/ below), so a copy's rewrite would leave the copy
+    // holding the live token and the host holding the one that rotation just burned — the
+    // next run (or a sibling actor) would start from a dead token. A directory bind means the
+    // rewrite's rename lands in the real host dir and every actor shares one live credential.
+    addWritableDirBindIfRealDir(
+      args,
+      join(kimiCodeDir, "credentials"),
+      "/tmp/kimi-home/credentials"
+    );
+    // oauth/: not a legacy token file — per the installed CLI's own OAuth manager (readable in
+    // its bundled build output), refreshing takes a cross-process advisory lock at
+    // `${KIMI_CODE_HOME}/oauth/kimi-code` (via `proper-lockfile`, mkdir-based) before rotating
+    // the refresh token, guarding exactly the race this issue is about; the CLI's own comment
+    // is explicit that skipping the lock would mean "racing refresh_token rotation". That lock
+    // needs a writable parent directory (proper-lockfile creates a sibling `kimi-code.lock`
+    // entry next to the target), so this is a directory bind too, not a file bind. Binding the
+    // real host oauth/ dir — instead of each actor getting its own copy and thus its own private
+    // lock namespace — is what actually restores the CLI's built-in single-refresh-owner
+    // protection across concurrent actors; rusa does not need a lock of its own on top of it.
+    addWritableDirBindIfRealDir(args, join(kimiCodeDir, "oauth"), "/tmp/kimi-home/oauth");
     // Cross-invocation session continuity (ISSUE_NUM + follow-up): kimi keeps its session
     // transcripts under KIMI_CODE_HOME/sessions AND a sibling KIMI_CODE_HOME/session_index.jsonl
     // that maps a session id to its workdir bucket. /tmp/kimi-home is a per-invocation sandbox
@@ -936,9 +951,10 @@ function buildMeshActorBwrapArgs(o: {
     // (isolated by solid-rusa's Layer 2 real-`-r` E2E). Persist BOTH in a per-actor host-/tmp
     // dir laid out like KIMI_CODE_HOME's session slice and bind each into place — same
     // memory-not-secret discipline as codex's rollout store (see {@link kimiSessionStoreDir}):
-    // NOT tempPaths, survive across runs/retire/redeploy. Creds/oauth above stay ephemeral
-    // (separate paths, unaffected). Must come AFTER the initial `--tmpfs /tmp` and the
-    // `--dir /tmp/kimi-home` above, or they would be shadowed.
+    // NOT tempPaths, survive across runs/retire/redeploy — like credentials/ and oauth/ above,
+    // but for session continuity rather than auth (separate paths, unaffected by each other).
+    // Must come AFTER the initial `--tmpfs /tmp` and the `--dir /tmp/kimi-home` above, or they
+    // would be shadowed.
     const kimiSessionsStore = kimiSessionStoreDir(o.actorDir);
     mkdirSync(join(kimiSessionsStore, "sessions"), { recursive: true, mode: 0o700 });
     const kimiIndexPath = join(kimiSessionsStore, "session_index.jsonl");

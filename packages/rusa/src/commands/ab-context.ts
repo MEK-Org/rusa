@@ -95,10 +95,11 @@ import { assertBwrapAvailable } from "../providers/sandbox.js";
 import { type RunStartE2EHandles, runStart } from "./start.js";
 
 /**
- * The rig's own thread — the A/B arms' parent, and NOT a descendant of the instance's
- * live root actor (`"root"`, which the arms used to hang off).
+ * The rig's own thread — the A/B arms' parent, so they are the live root actor's
+ * grandchildren rather than direct children of it (`"root"`, which the arms used to hang
+ * off).
  *
- * ## Why the arms cannot hang off root (an issue)
+ * ## Why the arms cannot hang directly off root (an issue)
  * They used to. Root is the live autonomous actor of the provisioned instance: it runs on
  * a real provider, it lists its children, and it is chartered to keep its own subtree
  * tidy. Two children spawned back-to-back with the SAME {@link HARNESS_CHARTER} are, from
@@ -111,21 +112,27 @@ import { type RunStartE2EHandles, runStart } from "./start.js";
  * `retire_thread` against a thread with an active run — an issue option 2, its own PR
  * and a mesh-core seam) stops the damage but leaves root staring at a duplicate it is
  * chartered to clean up, so it will keep trying by other means. Removing the arms from
- * root's subtree removes the STIMULUS: `list_threads` filters on `parentId === selfId`, so
- * root never sees the arms at all, has nothing to deduplicate, and — as a belt —
- * `isAncestorOf("root", arm)` is now false, so the retire is refused on authority even if
- * something did ask for it.
+ * root's DIRECT children removes the STIMULUS instead: `list_threads` filters on
+ * `parentId === selfId`, so as long as the arms are root's grandchildren rather than its
+ * children, root never sees them at all and has nothing to deduplicate.
  *
- * The holder is a driver-owned stub: `parentId: null` (the only shape that escapes root's
- * subtree, and the same shape root itself is seeded with), adopted rather than spawned, and
- * inert. It has no provider and never runs — `requestRun()` is a deliberate no-op, so the
- * yields and failure notices the arms address to their parent land in a thread that burns
- * no quota answering them. `mesh-report` renders it as a second tree root, which is what
- * it is: the rig's tree, sitting beside the instance's.
+ * The holder supplies that one extra hop: it is an ordinary child of the real root
+ * (`parentId: rootId`), adopted rather than spawned, and inert. It has no provider and
+ * never runs — `requestRun()` is a deliberate no-op, so the yields and failure notices the
+ * arms address to their parent land in a thread that burns no quota answering them.
  *
- * Root authority decoupling : `isRoot` is explicitly `false` (the default for
- * parentless non-root stubs), so the holder has no capability grant/revoke authority.
- * It is also inert in practice — no provider, no MCP surface and no run loop.
+ * It is deliberately NOT parentless. A `parentId: null` record used to be the trick (the
+ * "only shape that escapes root's subtree"), but the corrected actor schema caps
+ * parentless rows to exactly one — the genuine mesh root — via a partial unique index, and
+ * refuses to even migrate a database holding a second one (this holder's old shape). With
+ * the holder parented to the real root, `isAncestorOf(rootId, arm)` is now true — root
+ * really can retire the rig through the ordinary tree, which is fine, since this is root's
+ * own dev tooling and not a second identically-chartered sibling. Only the list_threads
+ * STIMULUS removal is load-bearing here, not an authority trick.
+ *
+ * Root authority decoupling : `isRoot` is explicitly `false`, so the holder has no
+ * capability grant/revoke authority. It is also inert in practice — no provider, no MCP
+ * surface and no run loop.
  */
 export const RIG_HOLDER_ID = "ab-rig-holder";
 
@@ -161,20 +168,22 @@ class RigHolderActor implements MeshActor {
 }
 
 /**
- * Register {@link RIG_HOLDER_ID} on `mesh` and return its id, for use as the arms'
- * `parentId`. Exported so the invariant it establishes — the arms are outside the live
- * root's subtree — is testable against a real mesh rather than restated in a test.
+ * Register {@link RIG_HOLDER_ID} on `mesh`, parented to `rootId`, and return its id for
+ * use as the arms' `parentId`. Exported so the invariant it establishes — the arms are
+ * outside root's direct-child list — is testable against a real mesh rather than restated
+ * in a test.
  *
- * `adopt` rather than `spawn`: `spawn` always writes a `parentId`, and a `parentId: null`
- * record is the ONLY shape that sits outside every other tree. This is the same call
- * `start.ts` uses to seed the instance root.
+ * `adopt` rather than `spawn`: `spawn` would make this a normal dispatched child (queued
+ * for a run, subject to a provider launch); `adopt` registers the record and wires the
+ * already-inert {@link RigHolderActor} directly, the same call `start.ts` uses to seed the
+ * instance root itself.
  */
-export function adoptRigHolder(mesh: ActorMesh): string {
+export function adoptRigHolder(mesh: ActorMesh, rootId: string): string {
   mesh.adopt(
     {
       id: RIG_HOLDER_ID,
       charter: RIG_HOLDER_CHARTER,
-      parentId: null,
+      parentId: rootId,
       isRoot: false,
       status: "active",
       title: "A/B rig (driver-owned)",
@@ -608,9 +617,9 @@ async function runProviderContextABBody(
   const handles = await ready;
   const { mesh } = handles;
 
-  // Adopt the rig's own root-level holder BEFORE spawning the arms — see RIG_HOLDER_ID
-  // for why the arms must not be root's children (an issue).
-  adoptRigHolder(mesh);
+  // Adopt the rig's own holder BEFORE spawning the arms — see RIG_HOLDER_ID for why the
+  // arms must not be root's DIRECT children (an issue).
+  adoptRigHolder(mesh, handles.rootControl.rootId);
 
   const chosenProvider = opts.provider?.trim();
   if (!chosenProvider) {
@@ -1067,7 +1076,7 @@ async function runProviderContextABBody(
   // different models is void no matter how clean everything else reads.
   const armProvenance = Object.fromEntries(
     variants.map(([variant, id]) => {
-      const rec = mesh.registry.get(id);
+      const rec = mesh.actors.get(id);
       const windows = stepWindows[variant];
       return [
         variant,

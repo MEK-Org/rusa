@@ -124,7 +124,7 @@ gemini-3.1-pro-high       Gemini 3.1 Pro (High)
 
   it("retains last-known-good catalog and records parse error when agy output parses zero models", async () => {
     setProviderModelCatalog("agy", [
-      { displayLabel: "old-model", identifier: "old-model", passable: true },
+      { displayLabel: "gemini-old-model", identifier: "gemini-old-model", passable: true },
     ]);
     const mockStore = {
       recordRaw: vi.fn().mockReturnValue("scrape-agy-empty"),
@@ -145,7 +145,12 @@ gemini-3.1-pro-high       Gemini 3.1 Pro (High)
     expect(res.status).toBe("unknown");
     expect(mockStore.recordParseError).toHaveBeenCalledWith("scrape-agy-empty", expect.any(Error));
     expect(getProviderModelCatalog("agy")).toEqual([
-      { displayLabel: "old-model", identifier: "old-model", passable: true, efforts: [] },
+      {
+        displayLabel: "gemini-old-model",
+        identifier: "gemini-old-model",
+        passable: true,
+        efforts: [],
+      },
     ]);
   });
 

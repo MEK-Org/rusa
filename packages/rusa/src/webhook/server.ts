@@ -7,7 +7,6 @@ import { fileURLToPath } from "node:url";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { InboxStore } from "../actor/inbox-store.js";
 import type { RootControlService } from "../actor/root-control.js";
-import type { ThreadRegistry } from "../actor/thread-registry.js";
 import type { DashboardConfig } from "../config/types.js";
 import { type DashboardDataDeps, handleMeshApiRequest } from "../dashboard/api.js";
 import {
@@ -33,6 +32,7 @@ import {
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import type { ActorRepository } from "../repositories/actor-repository.js";
 import { readBuildSentinel } from "../update/build-sentinel.js";
 import { handleVoiceApiRequest, type VoiceApiDeps } from "../voice/voice-api.js";
 import type { VoiceService } from "../voice/voice-service.js";
@@ -117,7 +117,7 @@ export interface WebhookServerOptions {
  * static UI is served.
  */
 export interface DashboardMeshRefs {
-  registry: ThreadRegistry;
+  actors: ActorRepository;
   meshEvents: MeshEventRepository;
   meshChat: MeshChatRepository;
   /** Durable obligation repository for task and dependency management. */
@@ -131,12 +131,14 @@ export interface DashboardMeshRefs {
   rootControl?: RootControlService;
   /** Read-only emergency-brake state (HALT sentinel) → top-level `halted` flag. */
   isHalted?: () => boolean;
+  /** Boot-time `at` preflight snapshot → top-level `schedulerWarning`; see `DashboardDataDeps`. */
+  schedulerHealth?: DashboardDataDeps["schedulerHealth"];
   /** Read-only snapshot of thread ids whose actor is executing a run right now. */
   runningThreadIds?: () => Set<string>;
   /** Read-only snapshot of thread ids waiting for their provider run to start. */
   queuedThreadIds?: () => Set<string>;
-  /** Provider-paced FIFO heads with their exact next eligible start time. */
-  providerQueueHeads?: DashboardDataDeps["providerQueueHeads"];
+  /** Per-lane provider queue snapshots; see `DashboardDataDeps`. */
+  providerQueueSnapshots?: DashboardDataDeps["providerQueueSnapshots"];
   /** This instance's configured root identity ; see `DashboardDataDeps`. */
   rootIdentity?: DashboardDataDeps["rootIdentity"];
   /** Gemini API key, for on-demand avatar generation ; see `DashboardDataDeps`. */
@@ -453,7 +455,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
   const dataDeps: DashboardDataDeps | null =
     options.mesh && sseHub
       ? {
-          registry: options.mesh.registry,
+          actors: options.mesh.actors,
           meshEvents: options.mesh.meshEvents,
           meshChat: options.mesh.meshChat,
           obligations: options.mesh.obligations,
@@ -462,9 +464,10 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           mesh: options.mesh.mesh,
           rootControl: options.mesh.rootControl,
           isHalted: options.mesh.isHalted,
+          schedulerHealth: options.mesh.schedulerHealth,
           runningThreadIds: options.mesh.runningThreadIds,
           queuedThreadIds: options.mesh.queuedThreadIds,
-          providerQueueHeads: options.mesh.providerQueueHeads,
+          providerQueueSnapshots: options.mesh.providerQueueSnapshots,
           rootIdentity: options.mesh.rootIdentity,
           geminiApiKey: options.mesh.geminiApiKey,
           referenceCache: options.mesh.referenceCache,
@@ -478,7 +481,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
   const voiceDeps: VoiceApiDeps | null =
     options.mesh && sseHub
       ? {
-          registry: options.mesh.registry,
+          actors: options.mesh.actors,
           sseHub,
           mesh: options.mesh.mesh,
           service: options.voice?.service ?? null,

@@ -10,6 +10,7 @@ import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
+import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { Actor } from "./actor.js";
 import type {
   ActorFactoryContext,
@@ -19,6 +20,7 @@ import type {
   SpawnRequest,
 } from "./actor-mesh.js";
 import { ActorMesh } from "./actor-mesh.js";
+import type { ActorRecord } from "./actor-record.js";
 import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
 import type { EventResource } from "./event-subscriptions.js";
 import { ExternalRootDriver } from "./external-root-driver.js";
@@ -32,7 +34,8 @@ import type {
   InboxStore,
 } from "./inbox-store.js";
 import type { MeshEventInput, MeshEventSink } from "./mesh-events.js";
-import { InMemoryThreadRegistry, type ThreadRecord } from "./thread-registry.js";
+import type { ScheduledMessage, ScheduledMessageScheduler } from "./os-scheduler.js";
+import { ProviderPacer } from "./provider-pacer.js";
 import { buildWorkerPrompt, resolveHandleLabels } from "./worker-prompt.js";
 
 const DEBOUNCE = 10;
@@ -149,6 +152,7 @@ function setup(
     isShuttingDown?: () => boolean;
     events?: MeshEventSink;
     recordChat?: (opts: {
+      id?: string;
       senderId: string;
       recipientId: string;
       body: string;
@@ -163,23 +167,30 @@ function setup(
     validateSpawn?: ActorMeshOptions["validateSpawn"];
     validateModel?: ActorMeshOptions["validateModel"];
     onModelSet?: ActorMeshOptions["onModelSet"];
+    onQueued?: ActorMeshOptions["onQueued"];
     createActor?: ActorMeshOptions["createActor"];
     rootId?: string;
     obligations?: ActorMeshOptions["obligations"];
+    providerGate?: ActorMeshOptions["providerGate"];
+    scheduledMessages?: FakeScheduledMessageScheduler;
+    actors?: InMemoryActorRepository;
+    withTransaction?: ActorMeshOptions["withTransaction"];
   } = {}
 ) {
-  const registry = new InMemoryThreadRegistry();
+  const registry = opts.actors ?? new InMemoryActorRepository();
   const providers = new Map<string, CodingProvider>();
   const logs: string[] = [];
   let seq = 0;
   let chatSeq = 0;
+  const scheduledMessages = opts.scheduledMessages ?? new FakeScheduledMessageScheduler();
 
   const mesh = new ActorMesh({
-    registry,
+    actors: registry,
     rootId: opts.rootId ?? "root",
     validateSpawn: opts.validateSpawn,
     validateModel: opts.validateModel,
     onModelSet: opts.onModelSet,
+    onQueued: opts.onQueued,
     maxConcurrent: opts.maxConcurrent ?? 4,
     isHalted: opts.isHalted,
     isShuttingDown: opts.isShuttingDown,
@@ -187,6 +198,8 @@ function setup(
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
     inboxStore: opts.inboxStore ?? createMemoryInboxStore(),
     obligations: opts.obligations,
+    scheduledMessages,
+    withTransaction: opts.withTransaction,
     onInboxEntriesSeen: opts.onInboxEntriesSeen,
     grantableCapabilities: opts.grantableCapabilities,
     idgen: opts.idgen ?? (() => `t${++seq}`),
@@ -197,6 +210,7 @@ function setup(
     onSpawn: opts.onSpawn,
     onRevive: opts.onRevive,
     retireCleanups: opts.retireCleanups,
+    providerGate: opts.providerGate,
     log: (m) => logs.push(m),
     createActor: (ctx) => {
       if (opts.createActor) return opts.createActor(ctx);
@@ -244,6 +258,10 @@ function setup(
         gate: ctx.gate,
         beforeRun: ctx.beforeRun,
         onQueued: ctx.onQueued,
+        // Mirrors the production onRunStart wiring in start.ts (#199): apply a
+        // pending model/provider/effort tuple before this run's own dispatch,
+        // the same way start.ts calls `mesh.applyPendingModel` there.
+        onRunStart: () => mesh.applyPendingModel(ctx.record.id),
         onRunEnd: ctx.onRunEnd,
         onRuntimeStateChanged: ctx.onRuntimeStateChanged,
         debounceMs: DEBOUNCE,
@@ -269,6 +287,7 @@ function setup(
     saveSessionId: (id) => registry.patch(rootId, { sessionId: id }),
     buildPrompt: () => ({ prompt: "Work from your inbox." }),
     onQueued: (context) => mesh.actorQueued(rootId, context),
+    onRunStart: () => mesh.applyPendingModel(rootId),
     onRunEnd: () => mesh.finishInboxRun(rootId),
     onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
     debounceMs: DEBOUNCE,
@@ -298,7 +317,42 @@ function setup(
 
   const tick = () => vi.advanceTimersByTimeAsync(DEBOUNCE + 1);
   const fake = (id: string) => providers.get(id) as FakeProvider;
-  return { registry, mesh: testMesh, rawSpawn, providers, root, logs, tick, fake };
+  return {
+    registry,
+    mesh: testMesh,
+    rawSpawn,
+    providers,
+    root,
+    logs,
+    tick,
+    fake,
+    scheduledMessages,
+  };
+}
+
+class FakeScheduledMessageScheduler implements ScheduledMessageScheduler {
+  messageDeliveries = new Map<string, ScheduledMessage>();
+  scheduleMessageDeliveryImpl?: (message: ScheduledMessage) => void;
+
+  scheduleMessageDelivery(message: ScheduledMessage): void {
+    this.scheduleMessageDeliveryImpl?.(message);
+    this.messageDeliveries.set(message.id, structuredClone(message));
+  }
+  cancelMessageDelivery(id: string): void {
+    this.messageDeliveries.delete(id);
+  }
+  listMessageDeliveries(): ScheduledMessage[] {
+    return [...this.messageDeliveries.values()].map((message) => structuredClone(message));
+  }
+  listForRecipient(actorId: string): ScheduledMessage[] {
+    return this.listMessageDeliveries().filter((message) => message.toId === actorId);
+  }
+  fire(id: string): ScheduledMessage {
+    const message = this.messageDeliveries.get(id);
+    if (!message) throw new Error(`scheduled message not found: ${id}`);
+    this.messageDeliveries.delete(id);
+    return structuredClone(message);
+  }
 }
 
 const payload = (type: string, merged?: boolean): InboxPayload =>
@@ -358,11 +412,11 @@ describe("ActorMesh", () => {
   });
 
   it("passes the provider through the shared rate gate", async () => {
-    const registry = new InMemoryThreadRegistry();
+    const registry = new InMemoryActorRepository();
     const selected: string[] = [];
     let gate!: ActorFactoryContext["gate"];
     const mesh = new ActorMesh({
-      registry,
+      actors: registry,
       idgen: () => "worker",
       rateLimit: async (fn, provider) => {
         selected.push(provider);
@@ -523,7 +577,7 @@ describe("ActorMesh", () => {
   });
 
   it("isolates rehydration failures so one throwing thread does not block other threads", () => {
-    const registry = new InMemoryThreadRegistry();
+    const registry = new InMemoryActorRepository();
     registry.upsert({
       id: "t1",
       charter: "bad worker",
@@ -541,7 +595,7 @@ describe("ActorMesh", () => {
 
     const logs: string[] = [];
     const mesh = new ActorMesh({
-      registry,
+      actors: registry,
       idgen: () => "t3",
       now: () => "2026-01-01T00:00:00Z",
       log: (m) => logs.push(m),
@@ -1317,7 +1371,7 @@ describe("ActorMesh", () => {
 
     await routeRunFailure(
       {
-        registry,
+        actors: registry,
         sendToParent: (toId, body, fromId, forensics) =>
           mesh.deliverMechanicalInboxNotice(toId, body, fromId, forensics),
         postToErrorChat: null,
@@ -1585,7 +1639,7 @@ describe("ActorMesh", () => {
       inboxStore,
       events: (e) => events.push(e),
     });
-    const rootId = mesh.registry.get("root")?.id ?? "root";
+    const rootId = mesh.actors.get("root")?.id ?? "root";
     expect(mesh.deliverWake("root:daily-bless-cut", "cut morning bless", "responsive")).toBe(true);
     await tick();
 
@@ -1644,21 +1698,6 @@ describe("ActorMesh", () => {
     expect(last).toContain("Work from your inbox");
     // The coder's prompt advertises the reviewer handle it was granted.
     expect(last).toContain("code reviewer (high-tier)");
-  });
-
-  it("enforces the lease: stops running and retires when maxRuns is hit", async () => {
-    const { mesh, registry, fake, tick } = setup();
-    const id = mesh.spawn({ charter: "bounded work", parentId: "root", budget: { maxRuns: 2 } });
-    mesh.sendMessage(id, "go", "root");
-    await tick(); // run 1
-    mesh.sendMessage(id, "again", "root");
-    await tick(); // run 2
-    mesh.sendMessage(id, "and again", "root");
-    await tick(); // run 3 attempted → lease exhausted → retire, no run
-
-    expect(fake(id).calls).toHaveLength(2);
-    expect(registry.get(id)?.status).toBe("retired");
-    expect(mesh.get(id)).toBeUndefined();
   });
 
   it("calls onRetire for every node in a retired subtree", async () => {
@@ -2234,7 +2273,100 @@ describe("ActorMesh", () => {
     await tick();
   });
 
-  it("runningThreadIds excludes a halt/lease-gated wake (nothing actually executes)", async () => {
+  it("a staged move to an already-halted provider never invokes it, and dispatches once the halt lifts (idle actor)", async () => {
+    const d = deferredProvider();
+    const halted = new Set<string>();
+    const { mesh, registry, tick } = setup({
+      sharedProvider: d.provider,
+      isHalted: (provider) => (provider ? halted.has(provider) : halted.size > 0),
+    });
+    const worker = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      provider: "provider-a",
+      model: "model-a",
+      context: { type: "portable", mode: "ledger" },
+    });
+
+    // Stage a move to provider-b, then halt provider-b, while worker is idle —
+    // the tuple has not launched yet, so beforeRun's halt gate must consult
+    // the provider this run will actually dispatch to, not the stale current one.
+    mesh.setActorModel(worker, "model-b", "root", "provider-b");
+    halted.add("provider-b");
+
+    mesh.sendMessage(worker, "go", "root");
+    await tick();
+
+    // Gated off before the provider ever launched.
+    expect(d.pending()).toBe(0);
+    expect(mesh.runningThreadIds()).toEqual(new Set());
+    expect(mesh.queuedThreadIds()).toEqual(new Set());
+    expect(registry.get(worker)?.provider).toBe("provider-a");
+
+    // Lifting the halt and reconciling unseen inbox work (the production
+    // halt-expiry/`/resume` path) replays the gated-off wake without a fresh
+    // external trigger.
+    halted.delete("provider-b");
+    mesh.resumeCancelledRuns();
+    mesh.reconcileUnseenInbox();
+    await tick();
+
+    expect(d.pending()).toBe(1);
+    expect(registry.get(worker)?.provider).toBe("provider-b");
+
+    d.releaseAll();
+    await tick();
+  });
+
+  it("a provider swap staged while genuinely queued is cancelled by a halt on the new provider, not the old one, and replays on resume", async () => {
+    const d = deferredProvider();
+    const halted = new Set<string>();
+    const { mesh, registry, tick } = setup({
+      maxConcurrent: 1,
+      sharedProvider: d.provider,
+      isHalted: (provider) => (provider ? halted.has(provider) : halted.size > 0),
+    });
+    const running = mesh.spawn({ charter: "running", parentId: "root", provider: "provider-a" });
+    const worker = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      provider: "provider-a",
+      model: "model-a",
+      context: { type: "portable", mode: "ledger" },
+    });
+    mesh.sendMessage(running, "go", "root");
+    mesh.sendMessage(worker, "go", "root");
+    await tick();
+    expect(mesh.queuedThreadIds()).toEqual(new Set([worker]));
+
+    // Stage the cross-provider swap while worker already sits queued behind
+    // mesh capacity, then halt the new provider — not the old one it's
+    // registered under.
+    mesh.setActorModel(worker, "model-b", "root", "provider-b");
+    expect(registry.get(worker)?.provider).toBe("provider-a");
+    halted.add("provider-b");
+
+    expect(mesh.cancelHaltedQueuedRuns()).toEqual([worker]);
+    await tick();
+    expect(mesh.queuedThreadIds()).toEqual(new Set());
+
+    halted.delete("provider-b");
+    expect(mesh.resumeCancelledRuns()).toEqual([worker]);
+    await tick();
+    expect(mesh.queuedThreadIds()).toEqual(new Set([worker]));
+
+    // Free the concurrency slot: worker is admitted here, after the swap.
+    d.releaseAll();
+    await tick();
+
+    expect(registry.get(worker)?.provider).toBe("provider-b");
+    expect(d.pending()).toBe(1);
+
+    d.releaseAll();
+    await tick();
+  });
+
+  it("runningThreadIds excludes a halt-gated wake (nothing actually executes)", async () => {
     const d = deferredProvider();
     // Halted: every wake is gated off in beforeRun before the run body, so the
     // actor must never be reported as running even though it was poked.
@@ -2261,7 +2393,7 @@ describe("ActorMesh", () => {
 
   it("a revoke triggers the unmount hook for the endpoint, idempotently", async () => {
     const revoked: Array<[string, string]> = [];
-    const registry = new InMemoryThreadRegistry();
+    const registry = new InMemoryActorRepository();
     registry.upsert({
       id: "root",
       charter: "root",
@@ -2278,7 +2410,7 @@ describe("ActorMesh", () => {
       createdAt: "2026-01-01T00:00:00Z",
     });
     const mesh = new ActorMesh({
-      registry,
+      actors: registry,
       createActor: () => ({}) as unknown as Actor,
       onCapabilityRevoked: (actorId, capability) => {
         revoked.push([actorId, capability]);
@@ -2292,7 +2424,7 @@ describe("ActorMesh", () => {
 
   it("a grant triggers the live-mount hook after the grant is active", () => {
     const mounted: Array<[string, string, string[]]> = [];
-    const registry = new InMemoryThreadRegistry();
+    const registry = new InMemoryActorRepository();
     registry.upsert({
       id: "root",
       charter: "root",
@@ -2310,7 +2442,7 @@ describe("ActorMesh", () => {
     });
     let mesh!: ActorMesh;
     mesh = new ActorMesh({
-      registry,
+      actors: registry,
       createActor: () => ({}) as unknown as Actor,
       grantableCapabilities: new Set(["understanding-write"]),
       onCapabilityGranted: (actorId, capability) => {
@@ -2802,8 +2934,9 @@ describe("ActorMesh", () => {
     const child = mesh.spawn({ charter: "child", parentId: parent, model: "claude-sonnet-5" });
     const sibling = mesh.spawn({ charter: "sibling", parentId: "root" });
 
-    // Parent can stage a child's model. Even while idle, the child keeps its
-    // current model through the next dispatched run and applies at run end.
+    // Parent can stage a child's model. The child is idle, so the staged
+    // model stays pending until its next dispatch (triggered below by
+    // sendMessage), where it applies before that run's run_start.
     mesh.setActorModel(child, "claude-opus-4-8", parent);
     expect(registry.get(child)?.model).toBe("claude-sonnet-5");
     expect(registry.get(child)?.desiredModel).toBe("claude-opus-4-8");
@@ -2914,7 +3047,7 @@ describe("ActorMesh", () => {
 
   it("lets only the root set its own portable model at its run boundary", () => {
     const events: MeshEventInput[] = [];
-    const modelSets: Array<{ actorId: string; newModel: string; record: ThreadRecord }> = [];
+    const modelSets: Array<{ actorId: string; newModel: string; record: ActorRecord }> = [];
     const { mesh, registry } = setup({
       events: (event) => events.push(event),
       onModelSet: (actorId, newModel, record) => modelSets.push({ actorId, newModel, record }),
@@ -3069,9 +3202,9 @@ describe("ActorMesh", () => {
     expect(registry.get(nativeChild)?.provider).toBe("claude");
     expect(registry.get(nativeChild)?.model).toBe("claude-opus-4-8");
 
-    // 7. Defers model/provider changes while actor is running or queued and applies at run end
+    // 7. Defers model/provider changes while actor is running; applies at run end
     const { provider: deferredRunProvider, releaseAll: releaseDeferred } = deferredProvider();
-    const modelSetCalls: Array<{ actorId: string; newModel: string; record: ThreadRecord }> = [];
+    const modelSetCalls: Array<{ actorId: string; newModel: string; record: ActorRecord }> = [];
     const busyMeshSetup = setup({
       sharedProvider: deferredRunProvider,
       events: (event) => events.push(event),
@@ -3158,14 +3291,24 @@ describe("ActorMesh", () => {
     expect(queuedMeshSetup.registry.get(queuedChild)?.model).toBe("claude-sonnet-5");
     expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModel).toBe("claude-opus-4-8");
 
-    // Releasing the blocker admits the queued run, which still uses the old
-    // model. The pending value must survive until that run itself completes.
+    // Releasing the blocker admits the queued run. Per #199, a tuple staged
+    // while queued is applied at THIS dispatch — before the queued run's own
+    // run_start — not deferred to the end of the run it was staged behind.
     queuedDeferred.releaseAll();
     await queuedMeshSetup.tick();
     expect(queuedMeshSetup.mesh.activeRunState(queuedChild)?.phase).toBe("running");
-    expect(queuedMeshSetup.registry.get(queuedChild)?.model).toBe("claude-sonnet-5");
-    expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModel).toBe("claude-opus-4-8");
+    expect(queuedMeshSetup.registry.get(queuedChild)?.model).toBe("claude-opus-4-8");
+    expect(queuedMeshSetup.registry.get(queuedChild)?.desiredModel).toBeUndefined();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "actor_model_set",
+        actorId: queuedChild,
+        detail: "claude-sonnet-5 -> claude-opus-4-8",
+      })
+    );
 
+    // The now-launched run itself completes on the tuple it was admitted
+    // with; nothing further is staged, so this release is a plain run end.
     queuedDeferred.releaseAll();
     await queuedMeshSetup.tick();
     expect(queuedMeshSetup.registry.get(queuedChild)?.model).toBe("claude-opus-4-8");
@@ -3210,6 +3353,10 @@ describe("ActorMesh", () => {
     dynamicMeshSetup.mesh.sendMessage(movingWorker, "apply staged provider", "root");
     await dynamicMeshSetup.tick();
     expect(dynamicMeshSetup.registry.get(movingWorker)?.provider).toBe("provider-b");
+    // Per #199, the staged provider applies at THIS dispatch (movingWorker was
+    // idle when staged), so this very run already launched on provider-b.
+    expect(providerBExecuted).toBe(true);
+    providerBExecuted = false;
 
     // When provider-b is halted, wake is skipped (provider-a halt does not block it)
     haltedProvider = "provider-b";
@@ -3222,6 +3369,509 @@ describe("ActorMesh", () => {
     dynamicMeshSetup.mesh.sendMessage(movingWorker, "do work", "root");
     await dynamicMeshSetup.tick();
     expect(providerBExecuted).toBe(true);
+  });
+
+  // #199: a tuple staged while an actor is queued/idle must apply at that
+  // actor's next dispatch (before run_start / provider launch), not at the
+  // end of the run it happens to land in.
+  describe("setActorModel dispatch-time boundary (#199)", () => {
+    it("applies a tuple staged while idle to the very next run, before that run's provider launch", async () => {
+      const events: MeshEventInput[] = [];
+      const seenModelAtRunStart: string[] = [];
+      const { mesh, registry, tick } = setup({
+        events: (event) => events.push(event),
+        sharedProvider: {
+          name: "test-provider",
+          providerName: "test-provider",
+          run: async () => {
+            seenModelAtRunStart.push(registry.get(worker)?.model ?? "");
+            return { success: true, exitCode: 0, output: "ok" };
+          },
+        },
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        provider: "test-provider",
+        model: "model-a",
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      // Idle, no unhandled inbox: staging must not itself dispatch anything.
+      mesh.setActorModel(worker, "model-b", "root");
+      expect(mesh.activeRunState(worker)).toBeNull();
+      expect(registry.get(worker)?.model).toBe("model-a");
+      expect(registry.get(worker)?.desiredModel).toBe("model-b");
+
+      // The next dispatch (a fresh message) must already run on the staged
+      // model — the run body itself observes "model-b", not "model-a".
+      mesh.sendMessage(worker, "work", "root");
+      await tick();
+
+      expect(seenModelAtRunStart).toEqual(["model-b"]);
+      expect(registry.get(worker)?.model).toBe("model-b");
+      expect(registry.get(worker)?.desiredModel).toBeUndefined();
+      expect(events).toContainEqual(
+        expect.objectContaining({ kind: "actor_model_set", actorId: worker })
+      );
+    });
+
+    it("applies a tuple staged while queued to that same queued run, before it launches", async () => {
+      const seenModelAtRunStart: string[] = [];
+      const deferred = deferredProvider();
+      const { mesh, registry, tick } = setup({
+        maxConcurrent: 1,
+        sharedProvider: {
+          name: "deferred",
+          providerName: "deferred",
+          run: async (opts) => {
+            if (opts.cwd === `/tmp/${worker}`) {
+              seenModelAtRunStart.push(registry.get(worker)?.model ?? "");
+            }
+            return deferred.provider.run(opts);
+          },
+        },
+      });
+
+      const blocker = mesh.spawn({ charter: "blocker", parentId: "root" });
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        provider: "deferred",
+        model: "model-a",
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      mesh.sendMessage(blocker, "hold the slot", "root");
+      await tick();
+      expect(mesh.activeRunState(blocker)?.phase).toBe("running");
+
+      mesh.sendMessage(worker, "work", "root");
+      await tick();
+      expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+
+      // Re-pin while queued, still behind the blocker.
+      mesh.setActorModel(worker, "model-b", "root");
+      expect(registry.get(worker)?.model).toBe("model-a");
+      expect(registry.get(worker)?.desiredModel).toBe("model-b");
+
+      // Admit the queued run: its own body must already see "model-b".
+      deferred.releaseAll();
+      await tick();
+      expect(mesh.activeRunState(worker)?.phase).toBe("running");
+      expect(seenModelAtRunStart).toEqual(["model-b"]);
+      expect(registry.get(worker)?.model).toBe("model-b");
+      expect(registry.get(worker)?.desiredModel).toBeUndefined();
+
+      deferred.releaseAll();
+      await tick();
+    });
+
+    it("keeps an in-flight run on its already-launched tuple; only the following run picks up the staged one", async () => {
+      const seenModelAtRunStart: string[] = [];
+      const deferred = deferredProvider();
+      const { mesh, registry, tick } = setup({
+        sharedProvider: {
+          name: "deferred",
+          providerName: "deferred",
+          run: async (opts) => {
+            seenModelAtRunStart.push(registry.get(worker)?.model ?? "");
+            return deferred.provider.run(opts);
+          },
+        },
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        provider: "deferred",
+        model: "model-a",
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      mesh.sendMessage(worker, "run 1", "root");
+      await tick();
+      expect(mesh.activeRunState(worker)?.phase).toBe("running");
+      expect(seenModelAtRunStart).toEqual(["model-a"]);
+
+      // Staged mid-flight: must not disturb the run already underway.
+      mesh.setActorModel(worker, "model-b", "root");
+      expect(registry.get(worker)?.model).toBe("model-a");
+
+      deferred.releaseAll();
+      await tick();
+      expect(mesh.activeRunState(worker)).toBeNull();
+      expect(registry.get(worker)?.model).toBe("model-b");
+      expect(registry.get(worker)?.desiredModel).toBeUndefined();
+
+      // The following run is the first to actually execute on "model-b".
+      mesh.sendMessage(worker, "run 2", "root");
+      await tick();
+      expect(seenModelAtRunStart).toEqual(["model-a", "model-b"]);
+
+      deferred.releaseAll();
+      await tick();
+    });
+
+    it("emits actor_model_set at the applying dispatch, not when the tuple is merely staged", async () => {
+      const trace: string[] = [];
+      const { mesh, tick } = setup({
+        events: (event) => {
+          if (event.kind === "actor_model_set") trace.push(`event:${event.actorId}`);
+        },
+        sharedProvider: {
+          name: "test-provider",
+          providerName: "test-provider",
+          run: async () => {
+            trace.push("run-body");
+            return { success: true, exitCode: 0, output: "ok" };
+          },
+        },
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        provider: "test-provider",
+        model: "model-a",
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      mesh.setActorModel(worker, "model-b", "root");
+      expect(trace).toEqual([]); // no event yet: nothing has been applied
+
+      mesh.sendMessage(worker, "work", "root");
+      await tick();
+
+      // The event fires at dispatch, ahead of the run body it applies to.
+      expect(trace).toEqual([`event:${worker}`, "run-body"]);
+    });
+
+    it("re-pinning an idle actor with unhandled inbox dispatches exactly one run, already on the new tuple", async () => {
+      let runCount = 0;
+      const seenModelAtRunStart: string[] = [];
+      const { mesh, registry, tick } = setup({
+        onQueued: (actorId, ctx) =>
+          mesh.recordEvent({ kind: "run_queued", actorId, detail: ctx.mode }),
+        sharedProvider: {
+          name: "test-provider",
+          providerName: "test-provider",
+          run: async () => {
+            runCount++;
+            seenModelAtRunStart.push(registry.get(worker)?.model ?? "");
+            if (runCount === 1) return { success: false, exitCode: 1, output: "failed" };
+            return { success: true, exitCode: 0, output: "ok" };
+          },
+        },
+      });
+
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        provider: "test-provider",
+        model: "model-a",
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      mesh.sendMessage(worker, "work", "root");
+      await tick();
+      expect(runCount).toBe(1);
+      expect(mesh.activeRunState(worker)).toBeNull(); // idle again, failed run left inbox unhandled
+
+      // Re-pin: this is the #202 path (idle + unhandled inbox => immediate dispatch).
+      mesh.setActorModel(worker, "model-c", "root");
+      await tick();
+
+      // Exactly one new run — the re-pin dispatch itself, not a duplicate.
+      expect(runCount).toBe(2);
+      expect(seenModelAtRunStart).toEqual(["model-a", "model-c"]);
+      expect(registry.get(worker)?.model).toBe("model-c");
+    });
+  });
+
+  // #199 amend gap 2: `Actor.executeTurn` reads `this.opts.provider.providerName`
+  // once, before `gate()`, to pick a pacer lane. A provider staged while the
+  // request is genuinely queued behind mesh capacity must not launch (and
+  // charge the interval clock) under the stale lane it was submitted to.
+  describe("cross-provider swap while queued is gated under the new provider (#199 amend gap 2)", () => {
+    it("a provider swap staged while genuinely queued behind mesh capacity launches under the new provider, never the old one", async () => {
+      const providerARuns: string[] = [];
+      const providerBRuns: string[] = [];
+      const liveActors = new Map<string, Actor>();
+      const blockerDeferred = deferredProvider();
+      const pacers = new Map<string, ProviderPacer>();
+      const pacerFor = (name: string): ProviderPacer => {
+        let pacer = pacers.get(name);
+        if (!pacer) {
+          pacer = new ProviderPacer(0);
+          pacers.set(name, pacer);
+        }
+        return pacer;
+      };
+
+      const { mesh, registry, tick } = setup({
+        maxConcurrent: 1,
+        onModelSet: (actorId, _newModel, record) => {
+          const live = mesh.get(actorId);
+          if (live && record.provider === "provider-b") {
+            live.setProvider?.({
+              name: "provider-b",
+              providerName: "provider-b",
+              run: async (runOpts) => {
+                providerBRuns.push(runOpts.cwd);
+                liveActors.get(actorId)?.declareYield();
+                return { success: true, exitCode: 0, output: "b" };
+              },
+            });
+          }
+        },
+        // Mirrors the production providerGate wiring in start.ts: one
+        // ProviderPacer lane per provider, revalidated (via applyPendingModel)
+        // right before a queued request would actually start.
+        providerGate: (fn, providerName, request) =>
+          pacerFor(providerName).submit(fn, {
+            responsive: request.responsive,
+            threadId: request.threadId,
+            enqueueNormal: request.enqueueNormal,
+            revalidateProvider: request.threadId
+              ? () => {
+                  mesh.applyPendingModel(request.threadId as string);
+                  const live = mesh.get(request.threadId as string)?.getProvider?.();
+                  if (!live) return true;
+                  return live.providerName === providerName;
+                }
+              : undefined,
+          }),
+        createActor: (ctx) => {
+          let actor!: Actor;
+          const isBlocker = ctx.record.charter === "blocker";
+          const provider: CodingProvider = isBlocker
+            ? {
+                ...blockerDeferred.provider,
+                run: async (runOpts) => {
+                  const result = await blockerDeferred.provider.run(runOpts);
+                  if (result.success) actor.declareYield();
+                  return result;
+                },
+              }
+            : {
+                name: "provider-a",
+                providerName: "provider-a",
+                run: async (runOpts) => {
+                  providerARuns.push(runOpts.cwd);
+                  actor.declareYield();
+                  return { success: true, exitCode: 0, output: "a" };
+                },
+              };
+          actor = new Actor({
+            id: ctx.record.id,
+            cwd: `/tmp/${ctx.record.id}`,
+            provider,
+            mcpServers: [],
+            loadSessionId: () => ctx.getRecord()?.sessionId,
+            saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
+            buildPrompt: () => ({ prompt: "work" }),
+            gate: ctx.gate,
+            beforeRun: ctx.beforeRun,
+            onQueued: ctx.onQueued,
+            onRunStart: () => mesh.applyPendingModel(ctx.record.id),
+            onRunEnd: (result) => ctx.onRunEnd(result),
+            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+            debounceMs: DEBOUNCE,
+          });
+          liveActors.set(ctx.record.id, actor);
+          return actor;
+        },
+      });
+
+      const blocker = mesh.spawn({ charter: "blocker", parentId: "root" });
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        provider: "provider-a",
+        model: "model-a",
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      // Occupy the mesh's one concurrency slot.
+      mesh.sendMessage(blocker, "hold the slot", "root");
+      await tick();
+      expect(mesh.activeRunState(blocker)?.phase).toBe("running");
+
+      // Worker is genuinely queued behind mesh capacity, not merely staged.
+      mesh.sendMessage(worker, "work", "root");
+      await tick();
+      expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+
+      // Stage the cross-provider swap while the request already sits in the
+      // mesh queue — the exact race the retry/revalidation exists for.
+      mesh.setActorModel(worker, "model-b", "root", "provider-b");
+      expect(registry.get(worker)?.provider).toBe("provider-a");
+
+      // Free the slot: the queued worker request is admitted for the first
+      // time here, after the swap was staged.
+      blockerDeferred.releaseAll();
+      await tick();
+
+      expect(registry.get(worker)?.provider).toBe("provider-b");
+      expect(providerBRuns).toEqual([`/tmp/${worker}`]);
+      expect(providerARuns).toEqual([]);
+    });
+  });
+
+  // #199 amend gap 3: a halt already in effect on provider B, from before the
+  // swap was even staged, must still block a queued-on-A ticket that lands on
+  // B only once it is naturally selected from the mesh queue. No `/halt`
+  // command fires after staging, so `cancelHaltedQueuedRuns` never scans this
+  // ticket — the only remaining choke point is the RunStartStaleProviderError
+  // retry in `Actor.executeTurn`, which must re-check the halt gate (via
+  // `beforeRun`) before resubmitting under the newly-live provider.
+  describe("cross-provider swap onto an already-halted provider while genuinely queued (#199 amend gap 3)", () => {
+    it("never invokes the halted provider, leaves nothing active, and replays once on resume without a fresh external delivery", async () => {
+      const providerARuns: string[] = [];
+      const providerBRuns: string[] = [];
+      const liveActors = new Map<string, Actor>();
+      const blockerDeferred = deferredProvider();
+      const halted = new Set<string>();
+      const pacers = new Map<string, ProviderPacer>();
+      const pacerFor = (name: string): ProviderPacer => {
+        let pacer = pacers.get(name);
+        if (!pacer) {
+          pacer = new ProviderPacer(0);
+          pacers.set(name, pacer);
+        }
+        return pacer;
+      };
+
+      const { mesh, registry, tick } = setup({
+        maxConcurrent: 1,
+        isHalted: (provider) => (provider ? halted.has(provider) : false),
+        onModelSet: (actorId, _newModel, record) => {
+          const live = mesh.get(actorId);
+          if (live && record.provider === "provider-b") {
+            live.setProvider?.({
+              name: "provider-b",
+              providerName: "provider-b",
+              run: async (runOpts) => {
+                providerBRuns.push(runOpts.cwd);
+                liveActors.get(actorId)?.declareYield();
+                return { success: true, exitCode: 0, output: "b" };
+              },
+            });
+          }
+        },
+        // Mirrors the production providerGate wiring in start.ts (same as the
+        // gap-2 describe block above).
+        providerGate: (fn, providerName, request) =>
+          pacerFor(providerName).submit(fn, {
+            responsive: request.responsive,
+            threadId: request.threadId,
+            enqueueNormal: request.enqueueNormal,
+            revalidateProvider: request.threadId
+              ? () => {
+                  mesh.applyPendingModel(request.threadId as string);
+                  const live = mesh.get(request.threadId as string)?.getProvider?.();
+                  if (!live) return true;
+                  return live.providerName === providerName;
+                }
+              : undefined,
+          }),
+        createActor: (ctx) => {
+          let actor!: Actor;
+          const isBlocker = ctx.record.charter === "blocker";
+          const provider: CodingProvider = isBlocker
+            ? {
+                ...blockerDeferred.provider,
+                run: async (runOpts) => {
+                  const result = await blockerDeferred.provider.run(runOpts);
+                  if (result.success) actor.declareYield();
+                  return result;
+                },
+              }
+            : {
+                name: "provider-a",
+                providerName: "provider-a",
+                run: async (runOpts) => {
+                  providerARuns.push(runOpts.cwd);
+                  actor.declareYield();
+                  return { success: true, exitCode: 0, output: "a" };
+                },
+              };
+          actor = new Actor({
+            id: ctx.record.id,
+            cwd: `/tmp/${ctx.record.id}`,
+            provider,
+            mcpServers: [],
+            loadSessionId: () => ctx.getRecord()?.sessionId,
+            saveSessionId: (id) => registry.patch(ctx.record.id, { sessionId: id }),
+            buildPrompt: () => ({ prompt: "work" }),
+            gate: ctx.gate,
+            beforeRun: ctx.beforeRun,
+            onQueued: ctx.onQueued,
+            onRunStart: () => mesh.applyPendingModel(ctx.record.id),
+            onRunEnd: (result) => ctx.onRunEnd(result),
+            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+            debounceMs: DEBOUNCE,
+          });
+          liveActors.set(ctx.record.id, actor);
+          return actor;
+        },
+      });
+
+      // Provider B is already halted, before anything is staged or queued.
+      halted.add("provider-b");
+
+      const blocker = mesh.spawn({ charter: "blocker", parentId: "root" });
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        provider: "provider-a",
+        model: "model-a",
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      // Occupy the mesh's one concurrency slot.
+      mesh.sendMessage(blocker, "hold the slot", "root");
+      await tick();
+      expect(mesh.activeRunState(blocker)?.phase).toBe("running");
+
+      // Worker's beforeRun passes on provider-a (not halted) and sits
+      // genuinely queued behind mesh capacity.
+      mesh.sendMessage(worker, "work", "root");
+      await tick();
+      expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+
+      // Stage the cross-provider swap onto the already-halted provider-b
+      // while worker is genuinely queued. No halt command fires here, so
+      // `cancelHaltedQueuedRuns` is never invoked for this ticket.
+      mesh.setActorModel(worker, "model-b", "root", "provider-b");
+      expect(registry.get(worker)?.provider).toBe("provider-a");
+      expect(halted.has("provider-b")).toBe(true);
+
+      // Free the slot: the queued ticket is naturally selected here, well
+      // after the swap was staged and B was halted.
+      blockerDeferred.releaseAll();
+      await tick();
+
+      // The halted provider must never actually be invoked, and the run must
+      // not be left dangling as active.
+      expect(providerBRuns).toEqual([]);
+      expect(providerARuns).toEqual([]);
+      expect(mesh.runningThreadIds()).toEqual(new Set());
+      expect(mesh.queuedThreadIds()).toEqual(new Set());
+
+      // Clear the halt and drive the production resume/reconcile path: the
+      // same unhandled work launches once on provider-b, with no fresh
+      // external delivery.
+      halted.delete("provider-b");
+      mesh.resumeCancelledRuns();
+      mesh.reconcileUnseenInbox();
+      await tick();
+
+      expect(providerBRuns).toEqual([`/tmp/${worker}`]);
+      expect(providerARuns).toEqual([]);
+    });
   });
 
   it("reparentThread moves the actor to a new parent and hands the new parent a handle", async () => {
@@ -3250,6 +3900,184 @@ describe("ActorMesh", () => {
     const dead = mesh.spawn({ charter: "dead", parentId: "root" });
     registry.patch(dead, { status: "retired" });
     expect(() => mesh.reparentThread(b, dead)).toThrow(/non-active/);
+  });
+
+  it("setActorModel queues a run if the actor is idle and has unhandled inbox entries", async () => {
+    let shouldFail = false;
+    let runCount = 0;
+    const events: MeshEventInput[] = [];
+    const { mesh, tick } = setup({
+      events: (e) => events.push(e),
+      onQueued: (actorId, ctx) => {
+        mesh.recordEvent({ kind: "run_queued", actorId, detail: ctx.mode });
+      },
+      sharedProvider: {
+        name: "test-provider",
+        providerName: "test-provider",
+        run: async () => {
+          runCount++;
+          if (shouldFail) return { success: false, exitCode: 1, output: "failed" };
+          return { success: true, exitCode: 0, output: "ok" };
+        },
+      },
+    });
+
+    const worker = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      provider: "test-provider",
+      model: "model-a",
+      context: { type: "portable", mode: "ledger" },
+    });
+
+    // Queue a run that fails.
+    shouldFail = true;
+    mesh.sendMessage(worker, "work", "root");
+    await tick();
+    expect(runCount).toBe(1);
+
+    expect(mesh.activeRunState(worker)).toBeNull(); // idle
+    events.length = 0;
+
+    // Re-pin should queue it now.
+    mesh.setActorModel(worker, "model-c", "root");
+
+    // Tick to let the new run execute.
+    shouldFail = false;
+    await tick();
+
+    expect(runCount).toBe(2);
+    expect(mesh.actors.get(worker)?.model).toBe("model-c");
+    expect(events).toContainEqual(expect.objectContaining({ kind: "run_queued", actorId: worker }));
+  });
+
+  it("setActorModel does not queue an idle actor with an empty inbox", async () => {
+    let runCount = 0;
+    const { mesh, tick } = setup({
+      sharedProvider: {
+        name: "test-provider",
+        providerName: "test-provider",
+        run: async () => {
+          runCount++;
+          return { success: true, exitCode: 0, output: "ok" };
+        },
+      },
+    });
+
+    const worker = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      provider: "test-provider",
+      model: "model-a",
+      context: { type: "portable", mode: "ledger" },
+    });
+
+    expect(mesh.activeRunState(worker)).toBeNull();
+
+    mesh.setActorModel(worker, "model-b", "root");
+    await tick();
+
+    expect(runCount).toBe(0);
+    expect(mesh.activeRunState(worker)).toBeNull();
+    expect(mesh.actors.get(worker)?.desiredModel).toBe("model-b");
+    expect(mesh.actors.get(worker)?.model).toBe("model-a");
+  });
+
+  it("setActorModel does not duplicate a running run", async () => {
+    let runCount = 0;
+    const deferred = deferredProvider();
+    const { mesh, tick } = setup({
+      sharedProvider: {
+        name: "deferred",
+        providerName: "deferred",
+        run: async (opts) => {
+          runCount++;
+          return deferred.provider.run(opts);
+        },
+      },
+    });
+
+    const worker = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      provider: "deferred",
+      model: "model-a",
+      context: { type: "portable", mode: "ledger" },
+    });
+
+    mesh.sendMessage(worker, "work", "root");
+    await tick();
+    expect(mesh.activeRunState(worker)?.phase).toBe("running");
+    expect(runCount).toBe(1);
+
+    // Re-pin while the run is in-flight.
+    mesh.setActorModel(worker, "model-b", "root");
+
+    // Finish the in-flight run.
+    deferred.releaseAll();
+    await tick();
+
+    expect(mesh.activeRunState(worker)).toBeNull();
+    expect(runCount).toBe(1);
+    expect(mesh.actors.get(worker)?.model).toBe("model-b");
+  });
+
+  it("setActorModel does not duplicate a queued run", async () => {
+    let runCount = 0;
+    const deferred = deferredProvider();
+    const { mesh, tick } = setup({
+      maxConcurrent: 1,
+      sharedProvider: {
+        name: "deferred",
+        providerName: "deferred",
+        run: async (opts) => {
+          runCount++;
+          return deferred.provider.run(opts);
+        },
+      },
+    });
+
+    const blocker = mesh.spawn({
+      charter: "blocker",
+      parentId: "root",
+      provider: "deferred",
+    });
+
+    const worker = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      provider: "deferred",
+      model: "model-a",
+      context: { type: "portable", mode: "ledger" },
+    });
+
+    // Blocker occupies the concurrency slot.
+    mesh.sendMessage(blocker, "block", "root");
+    await tick();
+    expect(mesh.activeRunState(blocker)?.phase).toBe("running");
+
+    // Worker is queued behind the blocker.
+    mesh.sendMessage(worker, "work", "root");
+    await tick();
+    expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+    expect(runCount).toBe(1);
+
+    // Re-pin while the worker is queued.
+    mesh.setActorModel(worker, "model-b", "root");
+    expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+
+    // Release the blocker so the worker is admitted.
+    deferred.releaseAll();
+    await tick();
+    expect(mesh.activeRunState(worker)?.phase).toBe("running");
+    expect(runCount).toBe(2);
+
+    // Complete the worker's run.
+    deferred.releaseAll();
+    await tick();
+    expect(mesh.activeRunState(worker)).toBeNull();
+    expect(runCount).toBe(2);
+    expect(mesh.actors.get(worker)?.model).toBe("model-b");
   });
 
   it("reviveThread rolls back to retired if re-instantiation fails, staying re-tryable ", async () => {
@@ -4328,226 +5156,362 @@ describe("ActorMesh", () => {
     });
   });
 
-  describe("Scheduled messages ", () => {
-    it("rejects immediate self-sends and sub-minimum delay self-sends", () => {
+  describe("Scheduled messages", () => {
+    it("rejects immediate self-sends and invalid delivery windows", () => {
       const { mesh } = setup();
       const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
+      const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
 
       expect(() => mesh.sendMessage(t1, "hello", t1)).toThrow(/Immediate self-sends/);
-
-      const tooSoon = new Date(Date.now() + 30000).toISOString();
-      expect(() => mesh.sendMessage(t1, "hello", t1, undefined, tooSoon)).toThrow(
-        /minimum 60s delay/
-      );
+      expect(() =>
+        mesh.sendMessage(t1, "hello", t1, undefined, new Date(Date.now() + 30_000).toISOString())
+      ).toThrow(/minimum 60s delay/);
+      expect(() =>
+        mesh.sendMessage(t1, "hello", t2, undefined, new Date(Date.now() - 1).toISOString())
+      ).toThrow(/must be in the future/);
+      expect(() =>
+        mesh.sendMessage(
+          t1,
+          "hello",
+          t2,
+          undefined,
+          new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
+        )
+      ).toThrow(/beyond max horizon/);
     });
 
-    it("rejects over-horizon deliver_at", () => {
-      const { mesh } = setup();
-      const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
-      const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
+    it("enforces the recipient cap from the authoritative host queue", () => {
+      const { mesh, scheduledMessages } = setup();
+      const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+      const sender = mesh.spawn({ charter: "sender", parentId: "root" });
+      const deliverAt = new Date(Date.now() + 100_000).toISOString();
 
-      const tooLate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-      expect(() => mesh.sendMessage(t1, "hello", t2, undefined, tooLate)).toThrow(
-        /beyond max horizon/
-      );
-    });
-
-    it("rejects scheduling if the recipient has reached the cap of 10 pending deliveries", () => {
-      const { mesh } = setup();
-      const t1 = mesh.spawn({ charter: "t1", parentId: "root" });
-      const t2 = mesh.spawn({ charter: "t2", parentId: "root" });
-
-      const future = new Date(Date.now() + 5000).toISOString();
       for (let i = 0; i < 10; i++) {
-        mesh.sendMessage(t1, `msg ${i}`, t2, undefined, future);
+        mesh.sendMessage(recipient, `msg ${i}`, sender, undefined, deliverAt);
       }
 
-      expect(() => mesh.sendMessage(t1, "11th msg", t2, undefined, future)).toThrow(
+      expect(scheduledMessages.listForRecipient(recipient)).toHaveLength(10);
+      expect(() => mesh.sendMessage(recipient, "11th msg", sender, undefined, deliverAt)).toThrow(
         /cap of 10 pending deliveries/
       );
     });
 
-    it("survives mesh restart and fires exactly-once (re-arms timers)", async () => {
-      // Required test: Schedule a send, restart the mesh, assert it still fires.
-      const { registry, mesh: mesh1 } = setup();
-      const t1 = mesh1.spawn({ charter: "t1", parentId: "root" });
-      const t2 = mesh1.spawn({ charter: "t2", parentId: "root" });
+    it("places the complete message in the host queue and records acceptance once", () => {
+      const chatRows: unknown[] = [];
+      const events: MeshEventInput[] = [];
+      const { mesh, scheduledMessages } = setup({
+        recordChat: (row) => {
+          chatRows.push(row);
+          return row.id ?? "missing-id";
+        },
+        events: (event) => events.push(event),
+      });
+      const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+      const sender = mesh.spawn({ charter: "sender", parentId: "root" });
+      const deliverAt = new Date(Date.now() + 100_000).toISOString();
 
-      const deliverAt = new Date(Date.now() + 100000).toISOString();
-      mesh1.sendMessage(t1, "scheduled message", t2, undefined, deliverAt);
+      expect(
+        mesh.sendMessage(
+          recipient,
+          "body with 'quotes' & newlines\nnext",
+          sender,
+          "session-1",
+          deliverAt
+        )
+      ).toEqual({ delivered: true });
 
-      // It is pending in the registry
-      expect(registry.get(t1)?.pendingDeliveries).toHaveLength(1);
-      expect(registry.get(t1)).not.toHaveProperty("messageClaims");
-
-      // Restart the mesh (simulate restart by creating a new ActorMesh instance on the same registry)
-      mesh1.shutdownAll();
-
-      const { mesh: mesh2, fake } = setup();
-      // Point mesh2 to the same registry
-      Object.assign(mesh2, { registry });
-      // Run boot sequence
-      mesh2.rehydrateAll();
-      mesh2.reconcilePendingDeliveries();
-      mesh2.reconcileInbox();
-
-      // Still pending
-      expect(registry.get(t1)?.pendingDeliveries).toHaveLength(1);
-
-      // Fast-forward time so timer fires and runner executes
-      await vi.advanceTimersByTimeAsync(100000 + 30000);
-
-      // It should have fired and woken the actor.
-      expect(registry.get(t1)?.pendingDeliveries).toHaveLength(0);
-      expect(fake(t1).calls).toHaveLength(1);
-      expect(fake(t1).calls[0]?.prompt).toContain("Work from your inbox");
+      expect(scheduledMessages.listForRecipient(recipient)).toEqual([
+        expect.objectContaining({
+          id: expect.any(String),
+          toId: recipient,
+          fromId: sender,
+          body: "body with 'quotes' & newlines\nnext",
+          deliverAt,
+          sessionId: "session-1",
+        }),
+      ]);
+      expect(chatRows).toHaveLength(1);
+      expect(events.filter((event) => event.kind === "message_sent")).toHaveLength(1);
+      expect(events.filter((event) => event.kind === "message_received")).toHaveLength(0);
     });
 
-    it("fires overdue deliveries at startup", async () => {
-      const { registry, mesh: mesh1 } = setup();
-      const t1 = mesh1.spawn({ charter: "t1", parentId: "root" });
-      const t2 = mesh1.spawn({ charter: "t2", parentId: "root" });
+    it("does not write chat or audit state when the host rejects the job", () => {
+      const scheduler = new FakeScheduledMessageScheduler();
+      scheduler.scheduleMessageDeliveryImpl = () => {
+        throw new Error("at rejected the job");
+      };
+      const recordChat = vi.fn(() => "unexpected");
+      const events = vi.fn();
+      const { mesh } = setup({ scheduledMessages: scheduler, recordChat, events });
+      const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+      const sender = mesh.spawn({ charter: "sender", parentId: "root" });
 
-      // Schedule it
-      const deliverAt = new Date(Date.now() + 100000).toISOString();
-      mesh1.sendMessage(t1, "overdue", t2, undefined, deliverAt);
-
-      mesh1.shutdownAll();
-
-      // Advance time while mesh is dead
-      await vi.advanceTimersByTimeAsync(150000);
-
-      const { mesh: mesh2, fake } = setup();
-      Object.assign(mesh2, { registry });
-
-      // Boot
-      mesh2.rehydrateAll();
-      mesh2.reconcilePendingDeliveries(); // Should queue setTimeout(0)
-      mesh2.reconcileInbox();
-
-      // Let setTimeout(0) and the runner execute
-      await vi.advanceTimersByTimeAsync(30000);
-
-      expect(registry.get(t1)?.pendingDeliveries).toHaveLength(0);
-      expect(fake(t1).calls).toHaveLength(1);
-      expect(fake(t1).calls[0]?.prompt).toContain("Work from your inbox");
+      expect(() =>
+        mesh.sendMessage(
+          recipient,
+          "scheduled message",
+          sender,
+          undefined,
+          new Date(Date.now() + 100_000).toISOString()
+        )
+      ).toThrow(/at rejected the job/);
+      expect(scheduler.listMessageDeliveries()).toEqual([]);
+      expect(recordChat).not.toHaveBeenCalled();
+      expect(
+        events.mock.calls.some(
+          ([event]) => event.kind === "message_sent" || event.kind === "message_received"
+        )
+      ).toBe(false);
     });
 
-    it("notifies sender exactly once when recipient retires while holding pending deliveries", async () => {
+    it("removes the host job when the acceptance transaction fails", () => {
+      const scheduler = new FakeScheduledMessageScheduler();
+      const { mesh } = setup({
+        scheduledMessages: scheduler,
+        recordChat: (row) => row.id ?? "missing-id",
+        events: () => {
+          throw new Error("audit write failed");
+        },
+      });
+      const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+      const sender = mesh.spawn({ charter: "sender", parentId: "root" });
+
+      expect(() =>
+        mesh.sendMessage(
+          recipient,
+          "scheduled message",
+          sender,
+          undefined,
+          new Date(Date.now() + 100_000).toISOString()
+        )
+      ).toThrow(/audit write failed/);
+      expect(scheduler.listMessageDeliveries()).toEqual([]);
+    });
+
+    it("boot reconciliation keeps live recipients and removes jobs for inactive recipients", () => {
       const inboxStore = createMemoryInboxStore();
-      const { mesh, registry, fake, tick } = setup({ inboxStore });
+      const { mesh, scheduledMessages } = setup({ inboxStore });
+      const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+      const sender = mesh.spawn({ charter: "sender", parentId: "root" });
+      const deliverAt = new Date(Date.now() + 100_000).toISOString();
+      scheduledMessages.scheduleMessageDelivery({
+        id: "live-message",
+        toId: recipient,
+        fromId: sender,
+        body: "keep",
+        deliverAt,
+      });
+      scheduledMessages.scheduleMessageDelivery({
+        id: "orphan-message",
+        toId: "missing-recipient",
+        fromId: sender,
+        body: "drop",
+        deliverAt,
+      });
+
+      mesh.reconcilePendingDeliveries();
+
+      expect(scheduledMessages.listMessageDeliveries()).toEqual([
+        expect.objectContaining({ id: "live-message" }),
+      ]);
+      expect(inboxStore.entries).toContainEqual(
+        expect.objectContaining({
+          actorId: sender,
+          payload: expect.objectContaining({
+            pendingMessageId: "orphan-message",
+            note: expect.stringContaining("[scheduled message dropped]"),
+          }),
+        })
+      );
+    });
+
+    it("reconstructs acceptance history when a crash occurs after the at job is installed", () => {
+      const chatRows = new Map<string, string>();
+      const events: MeshEventInput[] = [];
+      const { mesh } = setup({
+        recordChat: (row) => {
+          const id = row.id ?? "missing-id";
+          chatRows.set(id, row.body);
+          return id;
+        },
+        events: (event) => events.push(event),
+      });
+      const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+      const sender = mesh.spawn({ charter: "sender", parentId: "root" });
+      events.length = 0;
+      const message: ScheduledMessage = {
+        id: "host-only-message",
+        toId: recipient,
+        fromId: sender,
+        body: "survived in at",
+        deliverAt: new Date(Date.now() - 1_000).toISOString(),
+      };
+
+      mesh.deliverScheduledMessage(message);
+
+      expect(chatRows.get(message.id)).toBe(message.body);
+      expect(events.map((event) => event.kind)).toEqual(["message_sent", "message_received"]);
+    });
+
+    it("makes callback retries idempotent without a local pending-message row", () => {
+      const storedInbox = createMemoryInboxStore();
+      let failAppend = true;
+      const inboxStore: InboxStore = {
+        ...storedInbox,
+        append: (inputs) => {
+          if (failAppend) {
+            failAppend = false;
+            throw new Error("disk full");
+          }
+          return storedInbox.append(inputs);
+        },
+      };
+      const eventIds = new Set<string>();
+      const eventKinds: string[] = [];
+      const chatIds = new Set<string>();
+      const { mesh, scheduledMessages } = setup({
+        inboxStore,
+        recordChat: (row) => {
+          const id = row.id ?? "missing-id";
+          chatIds.add(id);
+          return id;
+        },
+        events: (event) => {
+          if (event.id && eventIds.has(event.id)) return;
+          if (event.id) eventIds.add(event.id);
+          if (event.kind === "message_sent" || event.kind === "message_received") {
+            eventKinds.push(event.kind);
+          }
+        },
+      });
+      const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+      const sender = mesh.spawn({ charter: "sender", parentId: "root" });
+      mesh.sendMessage(
+        recipient,
+        "retry me",
+        sender,
+        undefined,
+        new Date(Date.now() + 100_000).toISOString()
+      );
+      const queued = scheduledMessages.listForRecipient(recipient)[0];
+      expect(queued).toBeDefined();
+
+      const callbackPayload = scheduledMessages.fire(queued.id);
+      expect(() => mesh.deliverScheduledMessage(callbackPayload)).toThrow(/disk full/);
+      expect(() => mesh.deliverScheduledMessage(callbackPayload)).not.toThrow();
+
+      expect(chatIds).toEqual(new Set([queued.id]));
+      expect(storedInbox.entries.filter((entry) => entry.actorId === recipient)).toHaveLength(1);
+      expect(eventKinds).toEqual(["message_sent", "message_received"]);
+    });
+
+    it("survives a mesh restart because the complete payload remains in the host queue", () => {
+      const actors = new InMemoryActorRepository();
+      const scheduler = new FakeScheduledMessageScheduler();
+      const inboxStore = createMemoryInboxStore();
+      const { mesh: mesh1 } = setup({
+        actors,
+        scheduledMessages: scheduler,
+        inboxStore,
+        recordChat: (row) => row.id ?? "missing-id",
+      });
+      const recipient = mesh1.spawn({ charter: "recipient", parentId: "root" });
+      const sender = mesh1.spawn({ charter: "sender", parentId: "root" });
+      mesh1.sendMessage(
+        recipient,
+        "restart-boundary message",
+        sender,
+        undefined,
+        new Date(Date.now() + 100_000).toISOString()
+      );
+      const queued = scheduler.listForRecipient(recipient)[0];
+      mesh1.shutdownAll();
+
+      const { mesh: mesh2 } = setup({
+        actors,
+        scheduledMessages: scheduler,
+        inboxStore,
+        recordChat: (row) => row.id ?? "missing-id",
+      });
+      mesh2.rehydrateAll();
+      mesh2.deliverScheduledMessage(scheduler.fire(queued.id));
+
+      expect(inboxStore.entries).toContainEqual(
+        expect.objectContaining({
+          id: queued.id,
+          actorId: recipient,
+          payload: expect.objectContaining({ type: "mesh.scheduled_message" }),
+        })
+      );
+      expect(scheduler.listMessageDeliveries()).toEqual([]);
+    });
+
+    it("notifies the sender exactly once when the recipient retires", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh, fake, tick, scheduledMessages } = setup({ inboxStore });
       const sender = mesh.spawn({ charter: "sender", parentId: "root" });
       const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+      mesh.sendMessage(
+        recipient,
+        "long wait",
+        sender,
+        undefined,
+        new Date(Date.now() + 100_000).toISOString()
+      );
+      const pendingMessageId = scheduledMessages.listForRecipient(recipient)[0]?.id;
 
-      const deliverAt = new Date(Date.now() + 100000).toISOString();
-      mesh.sendMessage(recipient, "long wait", sender, undefined, deliverAt);
-      const pendingMessageId = registry.get(recipient)?.pendingDeliveries?.[0]?.id;
-
-      expect(registry.get(recipient)?.pendingDeliveries).toHaveLength(1);
-
-      // Retire the recipient before timers advance
       mesh.retire(recipient);
       await tick();
 
-      // Assert sender receives exactly one drop notification
-      const senderCalls = fake(sender).calls;
-      expect(senderCalls).toHaveLength(1);
-      expect(senderCalls[0]?.prompt).toContain("Work from your inbox");
+      expect(fake(sender).calls).toHaveLength(1);
       expect(inboxStore.entries).toEqual([
         expect.objectContaining({
           actorId: sender,
           source: "mesh:mechanical:system:mesh",
           payload: expect.objectContaining({
             type: "mesh.mechanical_note",
-            note: expect.stringContaining("[scheduled message dropped]"),
-            runId: recipient,
-            actorId: recipient,
-            originalFromId: sender,
             pendingMessageId,
-            fromId: "system:mesh",
+            originalFromId: sender,
           }),
         }),
       ]);
-
-      // Assert pendingDeliveries is empty on recipient
-      expect(registry.get(recipient)?.pendingDeliveries ?? []).toEqual([]);
-
-      // Advance past deliverAt and ensure NO duplicate notification is sent
-      await vi.advanceTimersByTimeAsync(150000);
-      expect(fake(sender).calls).toHaveLength(1);
+      expect(scheduledMessages.listForRecipient(recipient)).toEqual([]);
     });
 
-    it("notifies sender's parent when both sender and recipient retire while holding pending deliveries", async () => {
+    it("routes a dropped-message notice to the sender's nearest live ancestor", async () => {
       const inboxStore = createMemoryInboxStore();
-      const { mesh, fake, tick } = setup({ inboxStore });
-      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
-      const sender = mesh.spawn({ charter: "sender", parentId: parent });
+      const { mesh, fake, tick, scheduledMessages } = setup({ inboxStore });
+      const grandparent = mesh.spawn({ charter: "grandparent", parentId: "root" });
+      const sender = mesh.spawn({ charter: "sender", parentId: grandparent });
       const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
+      mesh.sendMessage(
+        recipient,
+        "never arrive",
+        sender,
+        undefined,
+        new Date(Date.now() + 100_000).toISOString()
+      );
 
-      const deliverAt = new Date(Date.now() + 100000).toISOString();
-      mesh.sendMessage(recipient, "never arrive", sender, undefined, deliverAt);
-
-      // Retire sender first
       mesh.retire(sender);
       await tick();
-
-      // Then retire recipient
       mesh.retire(recipient);
       await tick();
 
-      // Ensure sender's parent got the notification
-      const parentCalls = fake(parent).calls;
-      expect(parentCalls).toHaveLength(1);
-      expect(parentCalls[0]?.prompt).toContain("Work from your inbox");
-      expect(inboxStore.entries[0]).toMatchObject({
-        actorId: parent,
-        payload: expect.objectContaining({
-          note: expect.stringContaining("[scheduled message dropped]"),
-          originalFromId: sender,
-          fromId: "system:mesh",
-        }),
-      });
-    });
-
-    // Retiring a subtree recurses into children *before* marking the ancestor
-    // retired, so the sender still reads `status: "active"` while it is itself
-    // being torn down. Notifying it posts into an actor that is about to be
-    // closed and have its claims cleared — accepted, then destroyed.
-    it("notifies the nearest live ancestor when the sender is an ancestor mid-retire", async () => {
-      const inboxStore = createMemoryInboxStore();
-      const { mesh, fake, tick } = setup({ inboxStore });
-      const grandparent = mesh.spawn({ charter: "grandparent", parentId: "root" });
-      const ancestor = mesh.spawn({ charter: "ancestor", parentId: grandparent });
-      const recipient = mesh.spawn({ charter: "recipient", parentId: ancestor });
-
-      const deliverAt = new Date(Date.now() + 100000).toISOString();
-      mesh.sendMessage(recipient, "never arrive", ancestor, undefined, deliverAt);
-
-      // Retiring the ancestor takes the recipient down with it. The drop
-      // notification must not be handed to the ancestor, which is unwinding.
-      mesh.retire(ancestor);
-      await tick();
-
-      expect(fake(ancestor).calls).toHaveLength(0);
-
-      const gpCalls = fake(grandparent).calls;
-      expect(gpCalls).toHaveLength(1);
-      expect(gpCalls[0]?.prompt).toContain("Work from your inbox");
+      expect(fake(grandparent).calls).toHaveLength(1);
       expect(inboxStore.entries[0]).toMatchObject({
         actorId: grandparent,
         payload: expect.objectContaining({
           note: expect.stringContaining("[scheduled message dropped]"),
-          originalFromId: ancestor,
-          fromId: "system:mesh",
+          originalFromId: sender,
         }),
       });
+      expect(scheduledMessages.listForRecipient(recipient)).toEqual([]);
     });
   });
-
   describe("retire cancels pending wakes & late wakes no-op ", () => {
     it("cancels an actor's own self-scheduled pending delivery when retired", async () => {
       const inboxStore = createMemoryInboxStore();
-      const { mesh, registry, fake, tick } = setup({ inboxStore });
+      const { mesh, registry, fake, tick, scheduledMessages } = setup({ inboxStore });
       const parent = mesh.spawn({ charter: "parent", parentId: "root" });
       const worker = mesh.spawn({ charter: "worker", parentId: parent });
 
@@ -4555,14 +5519,14 @@ describe("ActorMesh", () => {
       const deliverAt = new Date(Date.now() + 100000).toISOString();
       const res = mesh.sendMessage(worker, "self follow-up wake", worker, undefined, deliverAt);
       expect(res.delivered).toBe(true);
-      expect(registry.get(worker)?.pendingDeliveries).toHaveLength(1);
+      expect(scheduledMessages.listForRecipient(worker)).toHaveLength(1);
 
       // Retire the worker
       mesh.retire(worker);
       await tick();
 
       // Pending deliveries on retired worker should be cleared
-      expect(registry.get(worker)?.pendingDeliveries ?? []).toEqual([]);
+      expect(scheduledMessages.listForRecipient(worker)).toEqual([]);
       expect(registry.get(worker)?.status).toBe("retired");
 
       // Advance time past the deliverAt timestamp
@@ -4607,29 +5571,30 @@ describe("ActorMesh", () => {
       expect(fake(worker).calls).toHaveLength(0);
     });
 
-    it("late firePendingDelivery on retired actor drops cleanly without attempting execution", async () => {
+    it("a late host callback after retirement is a deduplicated drop", async () => {
       const inboxStore = createMemoryInboxStore();
-      const { mesh, registry, fake, tick } = setup({ inboxStore });
+      const { mesh, fake, tick, scheduledMessages } = setup({ inboxStore });
       const parent = mesh.spawn({ charter: "parent", parentId: "root" });
       const worker = mesh.spawn({ charter: "worker", parentId: parent });
 
       const deliverAt = new Date(Date.now() + 100000).toISOString();
       mesh.sendMessage(worker, "late message", parent, undefined, deliverAt);
-      const pendingId = registry.get(worker)?.pendingDeliveries?.[0]?.id ?? "";
-      expect(pendingId).toBeTruthy();
+      const pending = scheduledMessages.listForRecipient(worker)[0];
+      expect(pending).toBeDefined();
 
       // Retire worker
       mesh.retire(worker);
       await tick();
 
-      // Calling firePendingDelivery after retirement should drop cleanly
-      (
-        mesh as unknown as { firePendingDelivery: (toId: string, id: string) => void }
-      ).firePendingDelivery(worker, pendingId);
+      // An `at` process may already have started while cancellation races it.
+      // Its callback must remain harmless and must not duplicate the notice
+      // retirement already delivered to the sender.
+      mesh.deliverScheduledMessage(pending);
       await tick();
 
       // Worker should not have run
       expect(fake(worker).calls).toHaveLength(0);
+      expect(inboxStore.entries.filter((entry) => entry.actorId === parent)).toHaveLength(1);
     });
 
     it("queued run in concurrency limiter for an actor force-retired while queued skips execution", async () => {
@@ -4684,7 +5649,7 @@ describe("ActorMesh", () => {
 
       // Force-retire worker2 while queued
       mesh.retire(worker2, { force: true });
-      expect(mesh.registry.get(worker2)?.status).toBe("retired");
+      expect(mesh.actors.get(worker2)?.status).toBe("retired");
 
       // Release worker1 so concurrency slot opens
       deferred.releaseAll();
@@ -4768,7 +5733,7 @@ describe("ActorMesh", () => {
 
       // Retire worker after gate admission but before invoke
       mesh.retire(worker, { force: true });
-      expect(mesh.registry.get(worker)?.status).toBe("retired");
+      expect(mesh.actors.get(worker)?.status).toBe("retired");
 
       // Invoke now executes post-admission
       await expect(runInvoke()).rejects.toThrow(RunStartCancelledError);

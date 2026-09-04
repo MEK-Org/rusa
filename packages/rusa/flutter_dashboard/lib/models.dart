@@ -46,7 +46,8 @@ class ThreadDto {
     this.chatDisabled = false,
     this.commitmentKind,
     this.waitingOn,
-    this.nextProviderAvailableAt,
+    this.queuePosition,
+    this.estimatedStartAt,
     this.ownerExpectsRetirement,
   });
 
@@ -94,7 +95,14 @@ class ThreadDto {
 
   final String? commitmentKind;
   final String? waitingOn;
-  final String? nextProviderAvailableAt;
+
+  /// 0-based position within this actor's own provider lane; not comparable
+  /// across actors on different lanes. Null when not in a provider queue.
+  final int? queuePosition;
+
+  /// ISO-8601 estimate of this actor's provider run start, or null when the
+  /// scheduler can't honestly quote one yet (e.g. behind a staged run).
+  final String? estimatedStartAt;
   final bool? ownerExpectsRetirement;
 
   bool get isRetired => status == 'retired';
@@ -119,7 +127,8 @@ class ThreadDto {
     bool? chatDisabled,
     String? commitmentKind,
     String? waitingOn,
-    String? nextProviderAvailableAt,
+    int? queuePosition,
+    String? estimatedStartAt,
     bool? ownerExpectsRetirement,
   }) => ThreadDto(
     id: id ?? this.id,
@@ -149,8 +158,8 @@ class ThreadDto {
     chatDisabled: chatDisabled ?? this.chatDisabled,
     commitmentKind: commitmentKind ?? this.commitmentKind,
     waitingOn: waitingOn ?? this.waitingOn,
-    nextProviderAvailableAt:
-        nextProviderAvailableAt ?? this.nextProviderAvailableAt,
+    queuePosition: queuePosition ?? this.queuePosition,
+    estimatedStartAt: estimatedStartAt ?? this.estimatedStartAt,
     ownerExpectsRetirement:
         ownerExpectsRetirement ?? this.ownerExpectsRetirement,
   );
@@ -175,7 +184,8 @@ class ThreadDto {
     chatDisabled: j['chatDisabled'] as bool? ?? false,
     commitmentKind: j['commitmentKind'] as String?,
     waitingOn: j['waitingOn'] as String?,
-    nextProviderAvailableAt: j['nextProviderAvailableAt'] as String?,
+    queuePosition: j['queuePosition'] as int?,
+    estimatedStartAt: j['estimatedStartAt'] as String?,
     ownerExpectsRetirement: j['ownerExpectsRetirement'] as bool?,
   );
 }
@@ -188,11 +198,18 @@ class ThreadsSnapshot {
     required this.halted,
     required this.threads,
     this.runtimeCursor,
+    this.schedulerWarning,
   });
 
   final bool halted;
   final List<ThreadDto> threads;
   final RuntimeCursor? runtimeCursor;
+
+  /// Boot-time `at`/`atrm`/`atd`/`atq` preflight issues, when that facility is
+  /// unavailable — null when it's fine or the server doesn't report it. A
+  /// missing one-shot facility never fails boot (cron-only recurrences keep
+  /// working); this is the health-visible surface for that non-fatal state.
+  final List<String>? schedulerWarning;
 
   factory ThreadsSnapshot.fromJson(Map<String, dynamic> j) => ThreadsSnapshot(
     halted: j['halted'] as bool? ?? false,
@@ -201,6 +218,9 @@ class ThreadsSnapshot {
         : RuntimeCursor.fromJson(j['runtimeCursor'] as Map<String, dynamic>),
     threads: (j['threads'] as List<dynamic>? ?? const [])
         .map((e) => ThreadDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    schedulerWarning: (j['schedulerWarning'] as List<dynamic>?)
+        ?.map((e) => e as String)
         .toList(),
   );
 }
@@ -272,7 +292,8 @@ class ActorViewState {
   bool get chatDisabled => thread.chatDisabled;
   String? get commitmentKind => thread.commitmentKind;
   String? get waitingOn => thread.waitingOn;
-  String? get nextProviderAvailableAt => thread.nextProviderAvailableAt;
+  int? get queuePosition => thread.queuePosition;
+  String? get estimatedStartAt => thread.estimatedStartAt;
   bool? get ownerExpectsRetirement => thread.ownerExpectsRetirement;
 
   bool get isRunning => runState == RunState.running;
@@ -316,6 +337,34 @@ class ActorViewState {
 /// Normalized snapshot of all actor states across the mesh.
 /// Serves as the single source of truth for the actor tree, detail panel,
 /// and overview tab.
+/// Orders queued actors by expected run order. Actors with a parseable
+/// `estimatedStartAt` sort ascending by that time; actors without one (an
+/// honest "unknown", not a fabricated instant) sort after all known times.
+/// Within either group, ties break by `queuePosition` then by `id`, so the
+/// result is fully deterministic and stable across rebuilds.
+int _compareQueuedActors(ActorViewState a, ActorViewState b) {
+  final aTime = a.estimatedStartAt == null
+      ? null
+      : DateTime.tryParse(a.estimatedStartAt!)?.millisecondsSinceEpoch;
+  final bTime = b.estimatedStartAt == null
+      ? null
+      : DateTime.tryParse(b.estimatedStartAt!)?.millisecondsSinceEpoch;
+
+  if (aTime != null && bTime != null && aTime != bTime) {
+    return aTime.compareTo(bTime);
+  }
+  if (aTime != null && bTime == null) return -1;
+  if (aTime == null && bTime != null) return 1;
+
+  final aPos = a.queuePosition;
+  final bPos = b.queuePosition;
+  if (aPos != null && bPos != null && aPos != bPos) return aPos.compareTo(bPos);
+  if (aPos != null && bPos == null) return -1;
+  if (aPos == null && bPos != null) return 1;
+
+  return a.id.compareTo(b.id);
+}
+
 class ActorStateSnapshot {
   const ActorStateSnapshot({
     this.revision = 0,
@@ -336,8 +385,12 @@ class ActorStateSnapshot {
   List<ActorViewState> get runningActors =>
       all.where((a) => a.isRunning || a.isWindingDown).toList();
 
+  /// Queued actors sorted by expected run order: known estimated start
+  /// times first (ascending), then actors with no honest estimate yet, each
+  /// group broken deterministically by lane position and finally by id so
+  /// ties never reorder between rebuilds.
   List<ActorViewState> get queuedActors =>
-      all.where((a) => a.isQueued).toList();
+      all.where((a) => a.isQueued).toList()..sort(_compareQueuedActors);
 
   DotState dotFor(String actorId) {
     return actors[actorId]?.dotState ?? DotState.idle;
@@ -1015,6 +1068,11 @@ class ObligationDto {
     this.prioritySourceId,
     this.terminalNote,
     this.resolutionRef,
+    this.recurrencePolicy,
+    this.recurrenceCron,
+    this.recurrenceIntervalSeconds,
+    this.nextReadyAt,
+    this.hasCompletionHistory = false,
   });
 
   final String id;
@@ -1036,7 +1094,7 @@ class ObligationDto {
   final String? updatedAt;
   final String? intent;
   final String? externalRef;
-  final String status; // "ready" | "waiting" | "done" | "cancelled"
+  final String status; // "ready" | "waiting" | "done" | "cancelled" | "scheduled"
   final double? priority;
   final double effectivePriority;
   final String? prioritySourceId;
@@ -1049,6 +1107,29 @@ class ObligationDto {
   /// principal's own words. Null while live, and null for a terminal
   /// obligation whose reason was never stated or predates the column.
   final String? terminalNote;
+
+  /// `"cron"` | `"completion_interval"` | null. Null means this obligation
+  /// never recurs — the three recurrence fields below are only meaningful
+  /// together.
+  final String? recurrencePolicy;
+
+  /// The 5-field cron expression driving a `"cron"`-policy obligation. Null
+  /// for `"completion_interval"` policy and for non-recurring obligations.
+  final String? recurrenceCron;
+
+  /// Seconds after completion before a `"completion_interval"`-policy
+  /// obligation returns to ready. Null for `"cron"` policy and for
+  /// non-recurring obligations.
+  final int? recurrenceIntervalSeconds;
+
+  /// When a `scheduled` obligation returns to ready. Null unless [status] is
+  /// `scheduled`.
+  final String? nextReadyAt;
+
+  /// Whether the durable completion ledger contains at least one row, even if
+  /// recurrence was later disabled. Exact counts live on the detail snapshot's
+  /// completion-page metadata rather than every obligation projection.
+  final bool hasCompletionHistory;
 
   /// What to show as the heading. Prefers [title]; falls back to [intent] so a
   /// row written before the split still reads, rather than rendering blank.
@@ -1074,7 +1155,9 @@ class ObligationDto {
   bool get isWaiting => status == 'waiting';
   bool get isDone => status == 'done';
   bool get isCancelled => status == 'cancelled';
+  bool get isScheduled => status == 'scheduled';
   bool get isTerminal => status == 'done' || status == 'cancelled';
+  bool get isRecurring => recurrencePolicy != null;
 
   factory ObligationDto.fromJson(Map<String, dynamic> j) {
     // The server sends a parsed reference object; older rows and some fixtures
@@ -1100,6 +1183,11 @@ class ObligationDto {
       prioritySourceId: j['prioritySourceId'] as String?,
       terminalNote: j['terminalNote'] as String?,
       resolutionRef: j['resolutionRef'] as String?,
+      recurrencePolicy: j['recurrencePolicy'] as String?,
+      recurrenceCron: j['recurrenceCron'] as String?,
+      recurrenceIntervalSeconds: j['recurrenceIntervalSeconds'] as int?,
+      nextReadyAt: j['nextReadyAt'] as String?,
+      hasCompletionHistory: j['hasCompletionHistory'] as bool? ?? false,
     );
   }
 }
@@ -1170,6 +1258,39 @@ class ObligationListPage {
       );
 }
 
+/// One completed cycle of a recurring obligation, as returned in the
+/// `completions` page of `GET /api/mesh/obligations/:id`.
+class ObligationCompletionDto {
+  const ObligationCompletionDto({
+    required this.id,
+    required this.obligationId,
+    required this.sequence,
+    required this.completedAt,
+    this.note,
+    this.resolutionRef,
+    this.nextReadyAt,
+  });
+
+  final String id;
+  final String obligationId;
+  final int sequence;
+  final String completedAt;
+  final String? note;
+  final String? resolutionRef;
+  final String? nextReadyAt;
+
+  factory ObligationCompletionDto.fromJson(Map<String, dynamic> j) =>
+      ObligationCompletionDto(
+        id: j['id'] as String? ?? '',
+        obligationId: j['obligationId'] as String? ?? '',
+        sequence: j['sequence'] as int? ?? 0,
+        completedAt: j['completedAt'] as String? ?? '',
+        note: j['note'] as String?,
+        resolutionRef: j['resolutionRef'] as String?,
+        nextReadyAt: j['nextReadyAt'] as String?,
+      );
+}
+
 class ObligationDetailSnapshot {
   const ObligationDetailSnapshot({
     required this.obligation,
@@ -1177,6 +1298,9 @@ class ObligationDetailSnapshot {
     required this.children,
     required this.blockingChildren,
     this.artifacts = const [],
+    this.completions = const [],
+    this.completionsTotal = 0,
+    this.completionsHasMore = false,
   });
 
   final ObligationDto obligation;
@@ -1184,6 +1308,9 @@ class ObligationDetailSnapshot {
   final List<ObligationDto> children;
   final List<ObligationDto> blockingChildren;
   final List<ObligationArtifactDto> artifacts;
+  final List<ObligationCompletionDto> completions;
+  final int completionsTotal;
+  final bool completionsHasMore;
 
   factory ObligationDetailSnapshot.fromJson(
     Map<String, dynamic> j,
@@ -1220,5 +1347,10 @@ class ObligationDetailSnapshot {
               )
               .toList()
         : const <ObligationArtifactDto>[],
+    completions: (j['completions'] as List<dynamic>? ?? const [])
+        .map((e) => ObligationCompletionDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    completionsTotal: j['completionsTotal'] as int? ?? 0,
+    completionsHasMore: j['completionsHasMore'] as bool? ?? false,
   );
 }

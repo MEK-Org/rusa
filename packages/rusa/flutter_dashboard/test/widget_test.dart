@@ -197,10 +197,6 @@ void main() {
         find.widgetWithText(TextFormField, 'Model'),
         'gemini-3.5-flash-medium',
       );
-      await tester.enterText(
-        find.widgetWithText(TextFormField, 'Maximum runs'),
-        '3',
-      );
       await tester.tap(find.widgetWithText(FilledButton, 'Spawn'));
       await tester.pump(const Duration(milliseconds: 100));
 
@@ -209,7 +205,6 @@ void main() {
         title: 'Context evaluator',
         provider: 'agy',
         model: 'gemini-3.5-flash-medium',
-        maxRuns: 3,
       ));
       expect(store.primary.value, 'spawned-child');
       await store.dispose();
@@ -936,6 +931,37 @@ void main() {
         tester.getTopLeft(find.text('Halted')).dx,
         lessThan(tester.getTopLeft(find.text('Actors')).dx),
       );
+      await store.dispose();
+    });
+  });
+
+  testWidgets('header shows a scheduler warning badge when at is unavailable', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final api = FakeApi()
+        ..schedulerWarning = ['`atq` cannot be queried']
+        ..threadsResult = [makeThread('root', created: 't0')];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 1100,
+              child: MeshHeader(
+                store: store,
+                selected: DashboardView.actors,
+                onSelect: (_) {},
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(find.text('Scheduler'), findsOneWidget);
       await store.dispose();
     });
   });

@@ -291,7 +291,7 @@ export interface WakeOnExitScriptOptions {
  * The `ExecStopPost` script content: reads the unit's real exit info via
  * `systemctl --user show`, then POSTs it to the additive `/host-jobs/exit`
  * endpoint (same bearer token as `/wake` — one host-side secret file, see
- * `wake-cron.ts`). `--retry` absorbs the brief window where the orchestrator
+ * `os-scheduler.ts`). `--retry` absorbs the brief window where the orchestrator
  * itself is mid-deploy-restart. Never fails the unit's stop sequence — the
  * final curl is best-effort (`|| true`), since a lost wake is recoverable
  * (`job_status` still reflects the real systemd state) but a stuck ExecStopPost

@@ -33,6 +33,29 @@ describe("MeshEventRepository", () => {
     expect(typeof events[0].id).toBe("string");
   });
 
+  it("ignores a second record() call with a previously-used id instead of duplicating the event", () => {
+    const firstId = repo.record({
+      id: "delivery-1:sent",
+      kind: "message_sent",
+      actorId: "worker-1",
+      detail: "first",
+    });
+    // A retry after a crash between this write and a later durable step
+    // reuses the same deterministic id — it must not append a second event.
+    const secondId = repo.record({
+      id: "delivery-1:sent",
+      kind: "message_sent",
+      actorId: "worker-1",
+      detail: "retry must be ignored",
+    });
+
+    expect(firstId).toBe("delivery-1:sent");
+    expect(secondId).toBe("delivery-1:sent");
+    const events = repo.list();
+    expect(events).toHaveLength(1);
+    expect(events[0]?.detail).toBe("first");
+  });
+
   it("preserves insertion order regardless of timestamp", () => {
     // Out-of-order stamps; rowid ordering should still reflect insertion order.
     repo.record({ kind: "run_start", actorId: "a", ts: "2026-06-21T00:00:05.000Z" });

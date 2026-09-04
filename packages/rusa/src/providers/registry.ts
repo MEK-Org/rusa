@@ -5,7 +5,7 @@ import { CODEX_REASONING_EFFORTS, CodexProvider } from "./codex.js";
 import { CopilotProvider } from "./copilot.js";
 import { FakeProvider } from "./fake-provider.js";
 import { KimiProvider } from "./kimi.js";
-import { validateModelPin } from "./model-catalog.js";
+import { isAntigravityGeminiModel, validateModelPin } from "./model-catalog.js";
 import type { ModelEffortSelection } from "./reasoning-effort.js";
 import { normalizeModelEffortSelection, validateReasoningEffort } from "./reasoning-effort.js";
 import type { CodingProvider } from "./types.js";
@@ -81,6 +81,14 @@ export function validateProviderSelection(
   }
   let allowedEfforts = providerAdapters[capabilityName]?.efforts;
   if (selection.model) {
+    if (
+      (capabilityName === "agy" || capabilityName === "antigravity") &&
+      !isAntigravityGeminiModel(selection.model)
+    ) {
+      throw new Error(
+        `Antigravity supports Gemini models only; rejected model "${selection.model}" for provider "${providerName}"`
+      );
+    }
     const validation = validateModelPin(capabilityName, selection.model);
     if (validation.status === "unknown") {
       console.warn(`[model-catalog] ${validation.warning}`);

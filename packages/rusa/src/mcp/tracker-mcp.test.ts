@@ -138,6 +138,7 @@ function recordingIssueClient(): { client: IssueClient; calls: Call[] } {
       calls.push({ method: "getPrReviewComments", args: [repo, prNumber, reviewId] });
       return [{ path: "a.ts", line: 1, body: "c", diffHunk: "@@" }];
     },
+    getPullRequestReview: async () => null,
     getParentIssueNumber: async (repo, issueNumber) => {
       calls.push({ method: "getParentIssueNumber", args: [repo, issueNumber] });
       return 7;

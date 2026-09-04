@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ThreadRecord } from "../actor/thread-registry.js";
+import type { ActorRecord } from "../actor/actor-record.js";
 import type { MeshEvent, MeshEventKind } from "../db/repositories/mesh-event-repository.js";
 import {
   COMMITMENT_LEDGER_BODY_KINDS,
@@ -75,7 +75,7 @@ const IGNORED_KINDS = ALL_MESH_EVENT_KINDS.filter(
   (kind) => !COMMITMENT_LEDGER_KINDS.includes(kind)
 );
 
-function thread(id: string, parentId: string | null, extra: Partial<ThreadRecord> = {}) {
+function thread(id: string, parentId: string | null, extra: Partial<ActorRecord> = {}) {
   return {
     id,
     charter: `charter for ${id}`,
@@ -83,7 +83,7 @@ function thread(id: string, parentId: string | null, extra: Partial<ThreadRecord
     status: "active",
     createdAt: "2026-06-27T00:00:00.000Z",
     ...extra,
-  } satisfies ThreadRecord;
+  } satisfies ActorRecord;
 }
 
 function event(
@@ -112,16 +112,16 @@ function event(
  * negative half: they are the actors a *dropped* read would turn into a false
  * alarm, where the others are the ones it would silence.
  */
-const THREADS: ThreadRecord[] = [
+const THREADS: ActorRecord[] = [
   thread("root", null),
   thread("steward", "root"),
-  thread("done-leaf", "steward", { budget: { maxRuns: 1 } }),
+  thread("done-leaf", "steward"),
   thread("failed-leaf", "steward"),
   thread("capped-leaf", "steward"),
   thread("silent-leaf", "root"),
   thread("abandoned-leaf", "steward"),
-  thread("event-driven", "steward", { budget: { maxRuns: 1 } }),
-  thread("waked", "steward", { budget: { maxRuns: 1 } }),
+  thread("event-driven", "steward"),
+  thread("waked", "steward"),
   thread("never-ran", "root"),
   thread("retired-leaf", "steward", { status: "retired" }),
 ];
@@ -137,7 +137,7 @@ const TRACKING_NOTE = [
 
 function baseEvents(): MeshEvent[] {
   return [
-    // Yielded complete, still active, owner holds a max-runs lease → actor_completion.
+    // Yielded complete, still active, no later progress → silent_actor.
     event("e-done-yield", "done-leaf", "run_yielded", "2026-06-29T00:00:00.000Z", {
       detail: "complete",
       body: YIELD_NOTE,
@@ -231,12 +231,7 @@ describe("commitment ledger event filter", () => {
   it("is a fixture the projection has plenty to say about", () => {
     const report = project(baseEvents());
     const kinds = new Set(report.rows.map((row) => row.kind));
-    expect([...kinds].sort()).toEqual([
-      "actor_completion",
-      "failed_run",
-      "request_commitment",
-      "silent_actor",
-    ]);
+    expect([...kinds].sort()).toEqual(["failed_run", "request_commitment", "silent_actor"]);
     // Losslessness is only worth testing if the filter drops something.
     expect(asFetchedByTheReader(baseEvents()).length).toBeLessThan(baseEvents().length);
   });

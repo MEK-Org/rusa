@@ -103,6 +103,24 @@ const LiveLine _kLiveGap = LiveLine(
 );
 const int _kEventsPageSize = 50;
 
+// The Events/Conversation/Operator-chat tabs each merge a REST history page
+// with an unbounded live SSE prepend. A `before`-cursor `Load More` fetch is
+// bounded by how many times the operator clicks it, but the live prepend
+// alone grows for as long as the tab stays on one selection — that's the
+// actual "lifetime of an open tab" leak. Capping post-prepend keeps that
+// growth bounded while never truncating a page the operator just explicitly
+// paged in: trimming only fires when a fresh live row arrives, and it always
+// drops from the *oldest* end, so a still-open cursor can keep walking
+// further back through server history regardless of what the capped
+// in-memory window currently holds.
+const int _kFeedRetentionCap = _kEventsPageSize * 10;
+
+// Overview's yield window has always been a REST-seeded newest-50/seven-day
+// contract (see `refreshYieldEvents`); the live `run_yielded` prepend must
+// keep honoring the same "newest 50" half of that contract instead of
+// growing without bound for the life of the tab.
+const int _kYieldPageSize = 50;
+
 /// Retired actors whose most recent mesh event is older than this are hidden
 /// from the dashboard tree even when "Show retired" is enabled .
 ///
@@ -186,6 +204,7 @@ class DashboardStore {
     const ActorStateSnapshot(),
   );
   final _halted = BehaviorSubject<bool>.seeded(false);
+  final _schedulerWarning = BehaviorSubject<List<String>?>.seeded(null);
   final _showRetired = BehaviorSubject<bool>.seeded(false);
   final _selection = BehaviorSubject<Set<String>>.seeded(const {});
   final _collapsed = BehaviorSubject<Set<String>>.seeded(const {});
@@ -244,6 +263,7 @@ class DashboardStore {
   // ── Exposed streams ──
   ValueStream<ActorStateSnapshot> get actorStates => _actorStates.stream;
   ValueStream<bool> get halted => _halted.stream;
+  ValueStream<List<String>?> get schedulerWarning => _schedulerWarning.stream;
   ValueStream<bool> get showRetired => _showRetired.stream;
   ValueStream<Set<String>> get selection => _selection.stream;
   ValueStream<Set<String>> get collapsed => _collapsed.stream;
@@ -339,7 +359,7 @@ class DashboardStore {
       final page = await _api.fetchEvents(
         since: window,
         kinds: const ['run_yielded'],
-        limit: 50,
+        limit: _kYieldPageSize,
         order: 'desc',
       );
       final list = List<MeshEvent>.of(_yieldEvents.value);
@@ -347,7 +367,9 @@ class DashboardStore {
         if (_seenYieldEventIds.add(e.id)) list.add(e);
       }
       list.sort((a, b) => b.ts.compareTo(a.ts));
-      _yieldEvents.add(list);
+      _yieldEvents.add(
+        _capRetained(list, _kYieldPageSize, _seenYieldEventIds, (e) => e.id),
+      );
     } catch (_) {}
   }
 
@@ -359,14 +381,12 @@ class DashboardStore {
     String? title,
     String? provider,
     String? model,
-    int? maxRuns,
   }) async {
     final id = await _api.spawnRootChild(
       charter: charter,
       title: title,
       provider: provider,
       model: model,
-      maxRuns: maxRuns,
     );
     await refreshThreads();
     clickActor(id);
@@ -977,7 +997,14 @@ class DashboardStore {
     if (e.kind == 'run_yielded') {
       if (_seenYieldEventIds.add(e.id)) {
         final cur = _yieldEvents.value;
-        _yieldEvents.add([e, ...cur]);
+        _yieldEvents.add(
+          _capRetained(
+            [e, ...cur],
+            _kYieldPageSize,
+            _seenYieldEventIds,
+            (x) => x.id,
+          ),
+        );
       }
     }
 
@@ -990,7 +1017,16 @@ class DashboardStore {
       if (kf != null && e.kind != kf) return;
       if (_seenEventIds.add(e.id)) {
         final cur = _events.value;
-        _events.add(cur.copyWith(events: [e, ...cur.events]));
+        _events.add(
+          cur.copyWith(
+            events: _capRetained(
+              [e, ...cur.events],
+              _kFeedRetentionCap,
+              _seenEventIds,
+              (x) => x.id,
+            ),
+          ),
+        );
       }
     }
 
@@ -1013,7 +1049,16 @@ class DashboardStore {
           if (sel.contains(actorId) && sel.contains(recipientId)) {
             if (_seenConversationMessageIds.add(c.id)) {
               final cur = _conversation.value;
-              _conversation.add(cur.copyWith(chat: [c, ...cur.chat]));
+              _conversation.add(
+                cur.copyWith(
+                  chat: _capRetained(
+                    [c, ...cur.chat],
+                    _kFeedRetentionCap,
+                    _seenConversationMessageIds,
+                    (x) => x.id,
+                  ),
+                ),
+              );
             }
           }
         }
@@ -1024,12 +1069,39 @@ class DashboardStore {
               (actorId == 'human:operator' && recipientId == selectedId)) {
             if (_seenOperatorChatMessageIds.add(c.id)) {
               final cur = _operatorChat.value;
-              _operatorChat.add(cur.copyWith(chat: [c, ...cur.chat]));
+              _operatorChat.add(
+                cur.copyWith(
+                  chat: _capRetained(
+                    [c, ...cur.chat],
+                    _kFeedRetentionCap,
+                    _seenOperatorChatMessageIds,
+                    (x) => x.id,
+                  ),
+                ),
+              );
             }
           }
         }
       }
     }
+  }
+
+  /// Bounds a newest-first [items] list to its newest [cap] entries, evicting
+  /// the dropped tail's ids from [seenIds]. Evicting those ids (rather than
+  /// leaving them stuck in the de-dupe set) is what keeps trimmed history
+  /// reachable: a later `before`-cursor page that lands on one of those rows
+  /// is no longer mistaken for a live-seam duplicate and is re-admitted.
+  List<T> _capRetained<T>(
+    List<T> items,
+    int cap,
+    Set<String> seenIds,
+    String Function(T) idOf,
+  ) {
+    if (items.length <= cap) return items;
+    for (var i = cap; i < items.length; i++) {
+      seenIds.remove(idOf(items[i]));
+    }
+    return items.sublist(0, cap);
   }
 
   void _onRuntimeHello(RuntimeHello hello) {
@@ -1133,6 +1205,7 @@ class DashboardStore {
       _runtimeRetry = null;
       _runtimeRetryDelay = _kRuntimeRetryInitial;
       _halted.add(snap.halted);
+      _schedulerWarning.add(snap.schedulerWarning);
       _updateActorStatesFromThreads(snap.threads);
       _runtimeCursor = snap.runtimeCursor;
       _error.add(null);
@@ -1277,6 +1350,7 @@ class DashboardStore {
     await Future.wait([
       _actorStates.close(),
       _halted.close(),
+      _schedulerWarning.close(),
       _showRetired.close(),
       _selection.close(),
       _primary.close(),

@@ -451,15 +451,13 @@ async function parseQuotaWithLlm(
     const text = await extractGeminiText(response);
     const parsed = JSON.parse(text);
 
-    const result: Partial<ProviderQuotaSnapshot> = {
-      status: parsed.status,
-    };
-
     const realWindows = Array.isArray(parsed.windows)
       ? (parsed.windows as LlmQuotaWindow[]).filter(
           (w) => !w.placeholder && typeof w.usedPercent === "number"
         )
       : [];
+    const status = parsed.status;
+    const result: Partial<ProviderQuotaSnapshot> = { status };
 
     validateParsedWindowsCompleteness(output, provider, realWindows);
 

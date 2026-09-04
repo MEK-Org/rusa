@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 
+import '../actor_display.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
+import '../util.dart';
 import 'avatar.dart';
 import 'header.dart';
 import 'obligation_card.dart';
@@ -11,11 +13,7 @@ import 'obligation_dialogs.dart';
 import 'reference_preview.dart';
 
 class WorkTab extends StatefulWidget {
-  const WorkTab({
-    super.key,
-    required this.store,
-    required this.onSelectView,
-  });
+  const WorkTab({super.key, required this.store, required this.onSelectView});
 
   final DashboardStore store;
   final ValueChanged<DashboardView> onSelectView;
@@ -110,13 +108,29 @@ class _WorkTabState extends State<WorkTab> {
   List<_FlatNode> _flattenTree(List<ObligationTreeDto> nodes, int depth) {
     final result = <_FlatNode>[];
     for (final node in nodes) {
-      if (!_showDone && node.obligation.isTerminal) continue;
+      // A terminal obligation still shows if it retains completion history —
+      // the same "recurring, or ledger rows survived recurrence being turned
+      // off" test the detail panel uses to decide whether to render the
+      // COMPLETION HISTORY section at all.
+      final visible =
+          _showDone ||
+          !node.obligation.isTerminal ||
+          node.obligation.isRecurring ||
+          node.obligation.hasCompletionHistory;
+      if (!visible) continue;
       final id = node.obligation.id;
       final hasVisibleChildren = _showDone
           ? node.children.isNotEmpty
-          : node.children.any((c) => !c.obligation.isTerminal);
+          : node.children.any(
+              (c) =>
+                  !c.obligation.isTerminal ||
+                  c.obligation.isRecurring ||
+                  c.obligation.hasCompletionHistory,
+            );
       final isCollapsed = !_expandedIds.contains(id);
-      result.add(_FlatNode(node.obligation, depth, hasVisibleChildren, isCollapsed));
+      result.add(
+        _FlatNode(node.obligation, depth, hasVisibleChildren, isCollapsed),
+      );
       if (hasVisibleChildren && !isCollapsed) {
         result.addAll(_flattenTree(node.children, depth + 1));
       }
@@ -145,10 +159,7 @@ class _WorkTabState extends State<WorkTab> {
                 style: const TextStyle(color: MeshColors.textSecondary),
               ),
               const SizedBox(height: 12),
-              ElevatedButton(
-                onPressed: _loadRoots,
-                child: const Text('Retry'),
-              ),
+              ElevatedButton(onPressed: _loadRoots, child: const Text('Retry')),
             ],
           ),
         ),
@@ -200,7 +211,10 @@ class _WorkTabState extends State<WorkTab> {
                     : const Center(
                         child: Text(
                           'Select an obligation from the tree.',
-                          style: TextStyle(color: MeshColors.textMuted, fontSize: 14),
+                          style: TextStyle(
+                            color: MeshColors.textMuted,
+                            fontSize: 14,
+                          ),
                         ),
                       ),
               ),
@@ -212,162 +226,175 @@ class _WorkTabState extends State<WorkTab> {
   }
 
   Widget _narrowBackBar() => Container(
-        height: 48,
-        padding: const EdgeInsets.symmetric(horizontal: 12),
-        color: MeshColors.bgSecondary,
-        child: Row(
-          children: [
-            IconButton(
-              icon: const Icon(Icons.arrow_back, color: MeshColors.textSecondary, size: 20),
-              onPressed: () => setState(() => _selectedObligationId = null),
-            ),
-            const SizedBox(width: 8),
-            const Text(
-              'Back to List',
-              style: TextStyle(
-                color: MeshColors.textPrimary,
-                fontWeight: FontWeight.w600,
-                fontSize: 14,
-              ),
-            ),
-          ],
+    height: 48,
+    padding: const EdgeInsets.symmetric(horizontal: 12),
+    color: MeshColors.bgSecondary,
+    child: Row(
+      children: [
+        IconButton(
+          icon: const Icon(
+            Icons.arrow_back,
+            color: MeshColors.textSecondary,
+            size: 20,
+          ),
+          onPressed: () => setState(() => _selectedObligationId = null),
         ),
-      );
+        const SizedBox(width: 8),
+        const Text(
+          'Back to List',
+          style: TextStyle(
+            color: MeshColors.textPrimary,
+            fontWeight: FontWeight.w600,
+            fontSize: 14,
+          ),
+        ),
+      ],
+    ),
+  );
 
   Widget _sidebar(List<_FlatNode> nodes) => Container(
-        decoration: const BoxDecoration(
-          color: MeshColors.bgSecondary,
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 16, 12, 12),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+    decoration: const BoxDecoration(color: MeshColors.bgSecondary),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 16, 12, 12),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text(
+                'WORK QUEUE',
+                style: TextStyle(
+                  color: MeshColors.textSecondary,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 0.8,
+                ),
+              ),
+              Row(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Text(
-                    'WORK QUEUE',
-                    style: TextStyle(
-                      color: MeshColors.textSecondary,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600,
-                      letterSpacing: 0.8,
+                  IconButton(
+                    icon: Icon(
+                      _showDone ? Icons.visibility : Icons.visibility_off,
+                      size: 18,
                     ),
+                    onPressed: () => setState(() => _showDone = !_showDone),
+                    tooltip: _showDone ? 'Hide Done' : 'Show Done',
                   ),
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      IconButton(
-                        icon: Icon(_showDone ? Icons.visibility : Icons.visibility_off, size: 18),
-                        onPressed: () => setState(() => _showDone = !_showDone),
-                        tooltip: _showDone ? 'Hide Done' : 'Show Done',
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.add, size: 18),
-                        onPressed: () => showCreateObligationDialog(
-                          context,
-                          widget.store,
-                          onCreated: _loadRoots,
-                        ),
-                        tooltip: 'New Root Obligation',
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.refresh, size: 18),
-                        onPressed: _loadRoots,
-                        tooltip: 'Refresh Queue',
-                      ),
-                    ],
+                  IconButton(
+                    icon: const Icon(Icons.add, size: 18),
+                    onPressed: () => showCreateObligationDialog(
+                      context,
+                      widget.store,
+                      onCreated: _loadRoots,
+                    ),
+                    tooltip: 'New Root Obligation',
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.refresh, size: 18),
+                    onPressed: _loadRoots,
+                    tooltip: 'Refresh Queue',
                   ),
                 ],
               ),
-            ),
-            const Divider(height: 1, color: MeshColors.border),
-            Expanded(
-              child: nodes.isEmpty
-                  ? const Center(
-                      child: Text(
-                        'No obligations found',
-                        style: TextStyle(color: MeshColors.textMuted),
-                      ),
-                    )
-                  : ListView.builder(
-                      padding: const EdgeInsets.symmetric(vertical: 8),
-                      itemCount: nodes.length,
-                      itemBuilder: (context, index) {
-                        final node = nodes[index];
-                        final isSelected = node.obligation.id == _selectedObligationId;
-
-                        return InkWell(
-                          onTap: () => widget.store.setFocusedObligationId(node.obligation.id),
-                          child: Container(
-                            color: isSelected ? MeshColors.bgSelected : null,
-                            padding: EdgeInsets.only(
-                              left: 12.0 + (node.depth * 16.0),
-                              right: 12.0,
-                              top: 8.0,
-                              bottom: 8.0,
-                            ),
-                            child: Row(
-                              children: [
-                                SizedBox(
-                                  width: 24,
-                                  height: 24,
-                                  child: node.hasChildren
-                                      ? IconButton(
-                                          padding: EdgeInsets.zero,
-                                          icon: Icon(
-                                            node.isCollapsed
-                                                ? Icons.chevron_right
-                                                : Icons.keyboard_arrow_down,
-                                            size: 18,
-                                            color: MeshColors.textMuted,
-                                          ),
-                                          onPressed: () {
-                                            setState(() {
-                                              if (node.isCollapsed) {
-                                                _expandedIds.add(node.obligation.id);
-                                              } else {
-                                                _expandedIds.remove(node.obligation.id);
-                                              }
-                                            });
-                                          },
-                                        )
-                                      : null,
-                                ),
-                                const SizedBox(width: 4),
-                                _statusDot(node.obligation.status),
-                                const SizedBox(width: 8),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        node.obligation.heading,
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          color: isSelected
-                                              ? MeshColors.textPrimary
-                                              : MeshColors.textSecondary,
-                                          fontSize: 13,
-                                          fontWeight:
-                                              isSelected ? FontWeight.bold : FontWeight.normal,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        );
-                      },
-                    ),
-            ),
-          ],
+            ],
+          ),
         ),
-      );
+        const Divider(height: 1, color: MeshColors.border),
+        Expanded(
+          child: nodes.isEmpty
+              ? const Center(
+                  child: Text(
+                    'No obligations found',
+                    style: TextStyle(color: MeshColors.textMuted),
+                  ),
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  itemCount: nodes.length,
+                  itemBuilder: (context, index) {
+                    final node = nodes[index];
+                    final isSelected =
+                        node.obligation.id == _selectedObligationId;
+
+                    return InkWell(
+                      onTap: () => widget.store.setFocusedObligationId(
+                        node.obligation.id,
+                      ),
+                      child: Container(
+                        color: isSelected ? MeshColors.bgSelected : null,
+                        padding: EdgeInsets.only(
+                          left: 12.0 + (node.depth * 16.0),
+                          right: 12.0,
+                          top: 8.0,
+                          bottom: 8.0,
+                        ),
+                        child: Row(
+                          children: [
+                            SizedBox(
+                              width: 24,
+                              height: 24,
+                              child: node.hasChildren
+                                  ? IconButton(
+                                      padding: EdgeInsets.zero,
+                                      icon: Icon(
+                                        node.isCollapsed
+                                            ? Icons.chevron_right
+                                            : Icons.keyboard_arrow_down,
+                                        size: 18,
+                                        color: MeshColors.textMuted,
+                                      ),
+                                      onPressed: () {
+                                        setState(() {
+                                          if (node.isCollapsed) {
+                                            _expandedIds.add(
+                                              node.obligation.id,
+                                            );
+                                          } else {
+                                            _expandedIds.remove(
+                                              node.obligation.id,
+                                            );
+                                          }
+                                        });
+                                      },
+                                    )
+                                  : null,
+                            ),
+                            const SizedBox(width: 4),
+                            _statusDot(node.obligation.status),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    node.obligation.heading,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      color: isSelected
+                                          ? MeshColors.textPrimary
+                                          : MeshColors.textSecondary,
+                                      fontSize: 13,
+                                      fontWeight: isSelected
+                                          ? FontWeight.bold
+                                          : FontWeight.normal,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
+    ),
+  );
 
   Widget _statusDot(String status) {
     Color color = MeshColors.statusIdle;
@@ -384,14 +411,14 @@ class _WorkTabState extends State<WorkTab> {
       case 'cancelled':
         color = MeshColors.statusHalted;
         break;
+      case 'scheduled':
+        color = MeshColors.accent;
+        break;
     }
     return Container(
       width: 8,
       height: 8,
-      decoration: BoxDecoration(
-        color: color,
-        shape: BoxShape.circle,
-      ),
+      decoration: BoxDecoration(color: color, shape: BoxShape.circle),
     );
   }
 }
@@ -404,7 +431,7 @@ class _FlatNode {
   final bool isCollapsed;
 }
 
-class _DetailView extends StatelessWidget {
+class _DetailView extends StatefulWidget {
   const _DetailView({
     required this.obligationId,
     required this.store,
@@ -418,9 +445,66 @@ class _DetailView extends StatelessWidget {
   final VoidCallback? onMutated;
 
   @override
+  State<_DetailView> createState() => _DetailViewState();
+}
+
+class _DetailViewState extends State<_DetailView> {
+  // Completion history accumulates across "Load earlier completions" clicks
+  // instead of being replaced by each new page, so an earlier page stays on
+  // screen (extending the history, not losing access to it).
+  List<ObligationCompletionDto> _completions = const [];
+  int _completionsTotal = 0;
+  bool _completionsHasMore = false;
+  late Future<ObligationDetailSnapshot> _future;
+
+  DashboardStore get store => widget.store;
+  ValueChanged<DashboardView> get onSelectView => widget.onSelectView;
+  VoidCallback? get onMutated => widget.onMutated;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetch();
+  }
+
+  @override
+  void didUpdateWidget(covariant _DetailView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.obligationId != widget.obligationId) {
+      _completions = const [];
+      _completionsTotal = 0;
+      _completionsHasMore = false;
+      _fetch();
+    }
+  }
+
+  void _fetch() {
+    final offset = _completions.length;
+    final future = store.api.fetchObligationDetail(
+      widget.obligationId,
+      completionsOffset: offset,
+    );
+    _future = future;
+    future.then((data) {
+      if (!mounted) return;
+      setState(() {
+        _completions = offset == 0
+            ? data.completions
+            : [..._completions, ...data.completions];
+        _completionsTotal = data.completionsTotal;
+        _completionsHasMore = data.completionsHasMore;
+      });
+    });
+  }
+
+  void _loadMoreCompletions() {
+    setState(_fetch);
+  }
+
+  @override
   Widget build(BuildContext context) {
     return FutureBuilder<ObligationDetailSnapshot>(
-      future: store.api.fetchObligationDetail(obligationId),
+      future: _future,
       builder: (context, snapshot) {
         if (snapshot.hasError && !snapshot.hasData) {
           return Center(
@@ -481,7 +565,8 @@ class _DetailView extends StatelessWidget {
               _SectionHeader('CITED ARTIFACTS'),
               for (final artifact in data.artifacts)
                 ReferencePreview(
-                  reference: artifact.reference ??
+                  reference:
+                      artifact.reference ??
                       // Unresolvable in v1 (anything but mesh chat). Still shown:
                       // the citation exists and is worth seeing even when we
                       // cannot expand it.
@@ -489,15 +574,20 @@ class _DetailView extends StatelessWidget {
                         ref: artifact.ref,
                         scheme: artifact.ref.split(':').first,
                         title: artifact.ref,
-                        unavailable: 'Not resolvable yet — only mesh chat is read back so far.',
+                        unavailable:
+                            'Not resolvable yet — only mesh chat is read back so far.',
                       ),
                   label: artifact.label,
                   attachedBy: artifact.attachedBy,
+                  lookupActorHandle: (id) => store.actor(id)?.handle,
                 ),
               const SizedBox(height: 16),
             ],
             _SectionHeader('OWNER'),
             _ownerPanel(o.ownerId),
+            const SizedBox(height: 24),
+            _SectionHeader('CREATOR'),
+            _creatorPanel(o.creatorId),
             // Shown even when absent: linking an obligation to the issue it
             // turned into is a normal later step, and a section that only
             // appears once a ref exists gives no way to add the first one.
@@ -505,6 +595,19 @@ class _DetailView extends StatelessWidget {
             _SectionHeader('EXTERNAL LINK'),
             _externalRefPanel(context, o),
             const SizedBox(height: 24),
+            if (o.isScheduled) ...[
+              _SectionHeader('SCHEDULE'),
+              _schedulePanel(o),
+              const SizedBox(height: 24),
+            ],
+            // Disabling recurrence finalizes a scheduled row but deliberately
+            // retains its ledger.  History belongs to the durable obligation,
+            // not to its current recurrence setting.
+            if (o.isRecurring || o.hasCompletionHistory) ...[
+              _SectionHeader('COMPLETION HISTORY'),
+              _completionsPanel(),
+              const SizedBox(height: 24),
+            ],
             _SectionHeader('CHILDREN'),
             _childrenPanel(context, data),
             const SizedBox(height: 28),
@@ -517,25 +620,98 @@ class _DetailView extends StatelessWidget {
   }
 
   Widget _ownerPanel(String ownerId) {
-    // One id space: the category is read off the id's prefix, the same way
-    // `isHumanOperator` does server-side. A known actor renders as its handle;
-    // anything else renders as the id itself.
     final isHuman = ownerId.startsWith('human:');
     final isSystem = ownerId.startsWith('system:');
     final isActor = !isHuman && !isSystem;
-    final displayId = store.actor(ownerId)?.handle ?? ownerId;
-    // The second line exists to disambiguate the first. When the first line
-    // already IS the raw id — the operator, a system component, or an actor
-    // this dashboard has no record of — repeating it says nothing, so fall back
-    // to the category the prefix encodes. That is the cue the old `Kind: ACTOR`
-    // line carried before owner_kind was dropped.
-    final ownerSubtitle = displayId != ownerId
-        ? ownerId
-        : isHuman
-            ? 'Operator'
-            : isSystem
-                ? 'System component'
-                : 'Actor — not in this mesh view';
+
+    return _identityPanel(
+      ownerId,
+      action: isActor
+          ? TextButton(
+              onPressed: () {
+                store.clickActor(ownerId);
+                store.setDetailPanelIndex(4); // Select Inbox tab
+                onSelectView(DashboardView.actors);
+              },
+              child: const Text(
+                'View Owner Inbox →',
+                style: TextStyle(color: MeshColors.accent),
+              ),
+            )
+          : isHuman
+          ? TextButton(
+              onPressed: () {
+                onSelectView(DashboardView.overview);
+              },
+              child: const Text(
+                'View Owner Queue →',
+                style: TextStyle(color: MeshColors.accent),
+              ),
+            )
+          : null,
+    );
+  }
+
+  /// Who raised this obligation. Null is a real, honest state — a row that
+  /// predates creator attribution — not something to paper over by falling
+  /// back to the owner or guessing.
+  Widget _creatorPanel(String? creatorId) {
+    if (creatorId == null) {
+      return Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: MeshColors.bgSecondary,
+          border: Border.all(color: MeshColors.border),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          children: [
+            const CircleAvatar(
+              radius: 14,
+              backgroundColor: Color(0xFF1E293B),
+              child: Icon(
+                Icons.person_off_outlined,
+                size: 16,
+                color: MeshColors.textMuted,
+              ),
+            ),
+            const SizedBox(width: 12),
+            const Expanded(
+              child: Text(
+                'Unknown — predates creator attribution',
+                style: TextStyle(
+                  color: MeshColors.textMuted,
+                  fontSize: 12,
+                  fontStyle: FontStyle.italic,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+    return _identityPanel(creatorId);
+  }
+
+  /// One id space: the category is read off the id's prefix, the same way
+  /// `isHumanOperator` does server-side. A known actor renders as its handle;
+  /// anything else falls back to "Unknown actor" — never the raw id. Shared
+  /// by Owner (always present) and Creator (rendered separately when null,
+  /// above).
+  Widget _identityPanel(String id, {Widget? action}) {
+    final isHuman = id.startsWith('human:');
+    final isSystem = id.startsWith('system:');
+    final isActor = !isHuman && !isSystem;
+    final displayId = actorDisplayLabel(id, (i) => store.actor(i)?.handle);
+    // The second line adds category context beyond the primary label — for
+    // human/system ids the primary label already says it, so there is
+    // nothing more to add. Raw actor/thread ids only belong under the handle
+    // in actor detail view, never bare here.
+    final subtitle = isHuman || isSystem
+        ? null
+        : displayId != 'Unknown actor'
+        ? 'Actor'
+        : 'Actor — not in this mesh view';
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -547,12 +723,16 @@ class _DetailView extends StatelessWidget {
       child: Row(
         children: [
           if (isActor)
-            ActorAvatar(id: ownerId, size: 28)
+            ActorAvatar(id: id, size: 28)
           else
             const CircleAvatar(
               radius: 14,
               backgroundColor: Color(0xFF1E293B),
-              child: Icon(Icons.person, size: 16, color: MeshColors.textSecondary),
+              child: Icon(
+                Icons.person,
+                size: 16,
+                color: MeshColors.textSecondary,
+              ),
             ),
           const SizedBox(width: 12),
           Expanded(
@@ -567,29 +747,149 @@ class _DetailView extends StatelessWidget {
                     fontFamily: kMonoFontFamily,
                   ),
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  ownerSubtitle,
-                  style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),
-                ),
+                if (subtitle != null) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    subtitle,
+                    style: const TextStyle(
+                      color: MeshColors.textMuted,
+                      fontSize: 11,
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
-          if (isActor)
-            TextButton(
-              onPressed: () {
-                store.clickActor(ownerId);
-                store.setDetailPanelIndex(4); // Select Inbox tab
-                onSelectView(DashboardView.actors);
-              },
-              child: const Text('View Owner Inbox →', style: TextStyle(color: MeshColors.accent)),
-            )
-          else if (isHuman)
-            TextButton(
-              onPressed: () {
-                onSelectView(DashboardView.overview);
-              },
-              child: const Text('View Owner Queue →', style: TextStyle(color: MeshColors.accent)),
+          ?action,
+        ],
+      ),
+    );
+  }
+
+  Widget _schedulePanel(ObligationDto o) {
+    final policyLabel = o.recurrencePolicy == 'cron'
+        ? 'Cron: ${o.recurrenceCron}'
+        : o.recurrencePolicy == 'completion_interval'
+        ? 'Every ${o.recurrenceIntervalSeconds}s after completion'
+        : 'One-time';
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: MeshColors.bgSecondary,
+        border: Border.all(color: MeshColors.border),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.schedule, size: 16, color: MeshColors.accent),
+              const SizedBox(width: 8),
+              Text(
+                policyLabel,
+                style: const TextStyle(
+                  color: MeshColors.textPrimary,
+                  fontSize: 13,
+                  fontFamily: kMonoFontFamily,
+                ),
+              ),
+            ],
+          ),
+          if (o.nextReadyAt != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Returns ${formatReturnsIn(o.nextReadyAt!)} (${formatTs(o.nextReadyAt!)})',
+              style: const TextStyle(
+                color: MeshColors.textMuted,
+                fontSize: 11.5,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _completionsPanel() {
+    final completions = _completions;
+
+    if (completions.isEmpty) {
+      return Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: MeshColors.bgSecondary,
+          border: Border.all(color: MeshColors.border),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: const Text(
+          'No completed cycles yet.',
+          style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
+        ),
+      );
+    }
+
+    final remaining = _completionsTotal - completions.length;
+
+    return Container(
+      decoration: BoxDecoration(
+        color: MeshColors.bgSecondary,
+        border: Border.all(color: MeshColors.border),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          for (final completion in completions) ...[
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Cycle ${completion.sequence} — ${formatTs(completion.completedAt)}',
+                    style: const TextStyle(
+                      color: MeshColors.textPrimary,
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  if (completion.note != null &&
+                      completion.note!.trim().isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      completion.note!,
+                      style: const TextStyle(
+                        color: MeshColors.textSecondary,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                  if (completion.resolutionRef != null &&
+                      completion.resolutionRef!.trim().isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      completion.resolutionRef!,
+                      style: const TextStyle(
+                        color: MeshColors.accent,
+                        fontSize: 11.5,
+                        fontFamily: kMonoFontFamily,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            const Divider(height: 1, color: MeshColors.border),
+          ],
+          if (_completionsHasMore)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              child: TextButton(
+                onPressed: _loadMoreCompletions,
+                child: Text('Load earlier completions ($remaining remaining)'),
+              ),
             ),
         ],
       ),
@@ -601,11 +901,22 @@ class _DetailView extends StatelessWidget {
     final edit = o.isTerminal
         ? null
         : IconButton(
-            icon: const Icon(Icons.edit_outlined, size: 16, color: MeshColors.textSecondary),
-            tooltip: ref.isEmpty ? 'Link an issue, PR or repo' : 'Change or unlink',
+            icon: const Icon(
+              Icons.edit_outlined,
+              size: 16,
+              color: MeshColors.textSecondary,
+            ),
+            tooltip: ref.isEmpty
+                ? 'Link an issue, PR or repo'
+                : 'Change or unlink',
             padding: EdgeInsets.zero,
             constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
-            onPressed: () => showEditExternalRefDialog(context, store, o, onUpdated: onMutated),
+            onPressed: () => showEditExternalRefDialog(
+              context,
+              store,
+              o,
+              onUpdated: onMutated,
+            ),
           );
     if (ref.isEmpty) {
       return Container(
@@ -689,7 +1000,10 @@ class _DetailView extends StatelessWidget {
                 icon: const Icon(Icons.add, size: 14),
                 label: const Text('Add Child', style: TextStyle(fontSize: 11)),
                 style: TextButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
                   minimumSize: Size.zero,
                   tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                   foregroundColor: MeshColors.accent,
@@ -709,7 +1023,6 @@ class _DetailView extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-
           for (var i = 0; i < list.length; i++) ...[
             Builder(
               builder: (innerContext) {
@@ -718,45 +1031,61 @@ class _DetailView extends StatelessWidget {
                   obligation: c,
                   store: store,
                   showOwner: true,
-                  showActions: false, // In the original, the work_tab children row didn't have actions menu.
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  showActions:
+                      false, // In the original, the work_tab children row didn't have actions menu.
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 12,
+                  ),
                   showReorder: list.length > 1,
-                  onMoveUp: i > 0 ? () async {
-                    final previousId = i - 2 >= 0 ? list[i - 2].id : null;
-                    final nextId = list[i - 1].id;
-                    try {
-                      await store.api.reorderObligation(
-                        c.id,
-                        previousId: previousId,
-                        nextId: nextId,
-                      );
-                      onMutated?.call();
-                    } catch (err) {
-                      if (innerContext.mounted) {
-                        ScaffoldMessenger.of(innerContext).showSnackBar(
-                          SnackBar(content: Text('Failed to reorder: $err'), backgroundColor: MeshColors.statusHalted),
-                        );
-                      }
-                    }
-                  } : null,
-                  onMoveDown: i < list.length - 1 ? () async {
-                    final previousId = list[i + 1].id;
-                    final nextId = i + 2 < list.length ? list[i + 2].id : null;
-                    try {
-                      await store.api.reorderObligation(
-                        c.id,
-                        previousId: previousId,
-                        nextId: nextId,
-                      );
-                      onMutated?.call();
-                    } catch (err) {
-                      if (innerContext.mounted) {
-                        ScaffoldMessenger.of(innerContext).showSnackBar(
-                          SnackBar(content: Text('Failed to reorder: $err'), backgroundColor: MeshColors.statusHalted),
-                        );
-                      }
-                    }
-                  } : null,
+                  onMoveUp: i > 0
+                      ? () async {
+                          final previousId = i - 2 >= 0 ? list[i - 2].id : null;
+                          final nextId = list[i - 1].id;
+                          try {
+                            await store.api.reorderObligation(
+                              c.id,
+                              previousId: previousId,
+                              nextId: nextId,
+                            );
+                            onMutated?.call();
+                          } catch (err) {
+                            if (innerContext.mounted) {
+                              ScaffoldMessenger.of(innerContext).showSnackBar(
+                                SnackBar(
+                                  content: Text('Failed to reorder: $err'),
+                                  backgroundColor: MeshColors.statusHalted,
+                                ),
+                              );
+                            }
+                          }
+                        }
+                      : null,
+                  onMoveDown: i < list.length - 1
+                      ? () async {
+                          final previousId = list[i + 1].id;
+                          final nextId = i + 2 < list.length
+                              ? list[i + 2].id
+                              : null;
+                          try {
+                            await store.api.reorderObligation(
+                              c.id,
+                              previousId: previousId,
+                              nextId: nextId,
+                            );
+                            onMutated?.call();
+                          } catch (err) {
+                            if (innerContext.mounted) {
+                              ScaffoldMessenger.of(innerContext).showSnackBar(
+                                SnackBar(
+                                  content: Text('Failed to reorder: $err'),
+                                  backgroundColor: MeshColors.statusHalted,
+                                ),
+                              );
+                            }
+                          }
+                        }
+                      : null,
                 );
               },
             ),
@@ -785,7 +1114,9 @@ class _DetailView extends StatelessWidget {
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
               decoration: BoxDecoration(
-                color: o.isDone ? const Color(0xFF064E3B) : const Color(0xFF450A0A),
+                color: o.isDone
+                    ? const Color(0xFF064E3B)
+                    : const Color(0xFF450A0A),
                 borderRadius: BorderRadius.circular(6),
               ),
               child: Row(
@@ -794,13 +1125,17 @@ class _DetailView extends StatelessWidget {
                   Icon(
                     o.isDone ? Icons.check_circle : Icons.cancel,
                     size: 16,
-                    color: o.isDone ? const Color(0xFF34D399) : const Color(0xFFF87171),
+                    color: o.isDone
+                        ? const Color(0xFF34D399)
+                        : const Color(0xFFF87171),
                   ),
                   const SizedBox(width: 8),
                   Text(
                     'This obligation is in terminal status (${o.status.toUpperCase()}).',
                     style: TextStyle(
-                      color: o.isDone ? const Color(0xFF34D399) : const Color(0xFFF87171),
+                      color: o.isDone
+                          ? const Color(0xFF34D399)
+                          : const Color(0xFFF87171),
                       fontSize: 12,
                       fontWeight: FontWeight.w600,
                     ),

@@ -13,7 +13,11 @@ import type {
   RunResult,
   SandboxOptions,
 } from "../providers/types.js";
-import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
+import {
+  RunStartCancelledError,
+  type RunStartHandle,
+  RunStartStaleProviderError,
+} from "./concurrency-limiter.js";
 import type { InjectRecord } from "./portable-context.js";
 import {
   type ActorRunMode,
@@ -115,8 +119,8 @@ export interface ActorOptions {
     responsive: boolean
   ) => Promise<T> | RunStartHandle<T>;
   /**
-   * Optional pre-run check (e.g. budget/lease). Return `false` to skip this run
-   * (the wake is dropped). Defaults to always-run.
+   * Optional pre-run check (e.g. halted provider, mesh shutdown). Return `false`
+   * to skip this run (the wake is dropped). Defaults to always-run.
    */
   beforeRun?: (context: { mode: ActorRunMode }) => boolean | Promise<boolean>;
   /**
@@ -160,7 +164,7 @@ export interface ActorOptions {
    * that absence is the signal — do not synthesize one on the kill path.
    */
   onFirstChunk?: () => void;
-  /** Optional post-run hook (completion review, budget accounting, firehose tap). */
+  /** Optional post-run hook (completion review, token accounting, firehose tap). */
   onRunEnd?: (result: RunResult) => void | Promise<void>;
   /**
    * The other terminal hook: the run opportunity ended WITHOUT reporting a
@@ -376,8 +380,9 @@ export class Actor {
    * call yield_run.
    */
   private continueOrIdle(): RunNudge | null {
-    // The wake was gated off (lease/budget) — treat it as a dropped trigger, not
-    // a run that fell short, so we don't spin re-checking the same closed gate.
+    // The wake was gated off (beforeRun returned false) — treat it as a dropped
+    // trigger, not a run that fell short, so we don't spin re-checking the same
+    // closed gate.
     if (this.lastRunSkipped) {
       this.continuations = 0;
       return null;
@@ -778,13 +783,48 @@ export class Actor {
     let result: RunResult;
     try {
       if (this.opts.gate) {
-        const gated = this.opts.gate(invoke, this.opts.provider.providerName, responsive);
-        const start: RunStartHandle<RunResult> =
-          gated instanceof Promise
-            ? { result: gated, started: false, promote: () => {}, cancel: () => false }
-            : gated;
-        this.pendingStart = start;
-        result = await start.result;
+        // A staged provider swap can land while this request is genuinely
+        // queued behind another provider's pacer/capacity. `gate` rejects
+        // with RunStartStaleProviderError in that case rather than starting
+        // under the wrong lane; re-reading `this.opts.provider` (now live,
+        // via the same applyPendingModel call that raised the rejection) and
+        // re-gating picks the correct lane instead of losing the run.
+        for (;;) {
+          const gated = this.opts.gate(invoke, this.opts.provider.providerName, responsive);
+          const start: RunStartHandle<RunResult> =
+            gated instanceof Promise
+              ? { result: gated, started: false, promote: () => {}, cancel: () => false }
+              : gated;
+          this.pendingStart = start;
+          try {
+            result = await start.result;
+            break;
+          } catch (err) {
+            if (err instanceof RunStartStaleProviderError) {
+              // The provider that just became live (via the same
+              // applyPendingModel call that raised this rejection) may be
+              // durably halted — the pacer only re-validated lane
+              // membership, not halt state, since halting is a separate
+              // concern from provider pacing. Re-run the same admission gate
+              // this run already passed once on its original provider; if
+              // the newly-live provider is halted, this is exactly a queued
+              // run cancelled out from under it, so retain the same replay
+              // flag `cancelQueuedRun` sets, letting `resumeCancelledRun`
+              // (already the production halt/resume replay path) relaunch it
+              // once the halt clears — no parallel lifecycle construct.
+              if (
+                this.opts.beforeRun &&
+                !(await this.opts.beforeRun({ mode: nudge.mode ?? "ordinary" }))
+              ) {
+                this.cancelledQueuedRun = true;
+                this.lastRunSkipped = true;
+                return;
+              }
+              continue;
+            }
+            throw err;
+          }
+        }
       } else {
         result = await invoke();
       }

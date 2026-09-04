@@ -2,6 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { encodeScheduledMessagePayload } from "../actor/os-scheduler.js";
 import { FakeChatClient } from "../chat/fake.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import { createChatWriteMcpServer } from "./chat-mcp.js";
@@ -62,6 +63,7 @@ function fakeIssueClient(): { client: IssueClient; labels: string[] } {
     addReaction: async () => {},
     addCommentReaction: async () => {},
     getPrReviewComments: async () => [],
+    getPullRequestReview: async () => null,
     getParentIssueNumber: async () => null,
     getRootIssueNumber: async () => null,
     hasSubIssues: async () => false,
@@ -497,6 +499,90 @@ describe("McpHttpServer", () => {
       });
       expect(resp.status).toBe(413);
       expect(delivered).toBe(false); // rejected before reaching the backend
+    });
+  });
+
+  describe("POST /wake-obligation", () => {
+    const TOKEN = "secret-wake-token";
+    const wakeUrl = () => `${http.urls()[0].url.replace(/\/mcp\/[^/]+$/, "")}/wake-obligation`;
+    const post = (init: RequestInit) => fetch(wakeUrl(), { method: "POST", ...init });
+
+    it("404s when no wake handler is wired (no info leak)", async () => {
+      const resp = await post({ body: "id=123", headers: { authorization: `Bearer ${TOKEN}` } });
+      expect(resp.status).toBe(404);
+    });
+
+    it("delivers a wake and passes id through", async () => {
+      let deliveredId = "";
+      http.setWakeObligationHandler({
+        token: TOKEN,
+        deliver: (id) => {
+          deliveredId = id;
+        },
+      });
+
+      const resp = await post({ body: "id=123", headers: { authorization: `Bearer ${TOKEN}` } });
+      expect(resp.status).toBe(200);
+      expect(await resp.json()).toEqual({ ok: true });
+      expect(deliveredId).toBe("123");
+    });
+
+    it("401s on bad token", async () => {
+      http.setWakeObligationHandler({ token: TOKEN, deliver: () => {} });
+      const resp = await post({ body: "id=123", headers: { authorization: "Bearer bad" } });
+      expect(resp.status).toBe(401);
+    });
+  });
+
+  describe("POST /wake-message", () => {
+    const TOKEN = "secret-wake-token";
+    const wakeUrl = () => `${http.urls()[0].url.replace(/\/mcp\/[^/]+$/, "")}/wake-message`;
+    const post = (init: RequestInit) => fetch(wakeUrl(), { method: "POST", ...init });
+
+    it("404s when no wake handler is wired (no info leak)", async () => {
+      const resp = await post({ body: "id=123", headers: { authorization: `Bearer ${TOKEN}` } });
+      expect(resp.status).toBe(404);
+    });
+
+    it("delivers the complete versioned message payload", async () => {
+      const message = {
+        id: "message-123",
+        toId: "recipient",
+        fromId: "sender",
+        body: "hello & goodbye\nnext line",
+        deliverAt: "2026-09-04T12:34:56.000Z",
+        sessionId: "session-1",
+      };
+      let delivered: unknown;
+      http.setWakeMessageHandler({
+        token: TOKEN,
+        deliver: (scheduled) => {
+          delivered = scheduled;
+        },
+      });
+
+      const resp = await post({
+        body: new URLSearchParams({ payload: encodeScheduledMessagePayload(message) }),
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      expect(resp.status).toBe(200);
+      expect(await resp.json()).toEqual({ ok: true });
+      expect(delivered).toEqual(message);
+    });
+
+    it("rejects a malformed or unknown-version message payload", async () => {
+      http.setWakeMessageHandler({ token: TOKEN, deliver: () => {} });
+      const resp = await post({
+        body: "payload=not-valid-base64-json",
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      expect(resp.status).toBe(400);
+    });
+
+    it("401s on bad token", async () => {
+      http.setWakeMessageHandler({ token: TOKEN, deliver: () => {} });
+      const resp = await post({ body: "id=123", headers: { authorization: "Bearer bad" } });
+      expect(resp.status).toBe(401);
     });
   });
 

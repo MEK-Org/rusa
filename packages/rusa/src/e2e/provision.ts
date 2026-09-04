@@ -174,7 +174,7 @@ export function resumeE2EInstance(root: string): E2EInstance {
   const tmp = join(root, "tmp");
   const required = [
     join(home, "config.yaml"),
-    join(home, "threads.json"),
+    join(home, "data", "mesh.db"),
     join(remotePath, "HEAD"),
     join(scratchPath, ".git"),
     gitConfigGlobal,

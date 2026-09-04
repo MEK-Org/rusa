@@ -181,7 +181,7 @@ describe("ClaudeProvider", () => {
     expect(onChunk).toHaveBeenCalledWith("\n[Executing Bash...]\n");
   });
 
-  it("handles tool results in stream-json", async () => {
+  it("suppresses successful tool-result bodies from live output (issue #210)", async () => {
     const config: ProviderConfig = { cliCommand: "claude" };
     const provider = new ClaudeProvider("claude", config);
 
@@ -208,8 +208,14 @@ describe("ClaudeProvider", () => {
     mockChild.stdout.emit("data", Buffer.from(`${event}\n`));
     mockChild.emit("close", 0);
 
-    await runPromise;
-    expect(onChunk).toHaveBeenCalledWith("\n[Tool Result]:\noutput line 1\noutput line 2\n");
+    const result = await runPromise;
+    // Liveness tick fires on result arrival, but the body never reaches live output.
+    expect(onChunk).toHaveBeenCalledWith("");
+    for (const call of onChunk.mock.calls) {
+      expect(String(call[0])).not.toContain("output line 1");
+    }
+    // The durable run record keeps the full tool result.
+    expect(result.output).toContain("output line 1\noutput line 2");
   });
 
   // ISSUE_NUM — arbiter: an empty tool_result must still reset the stall timer.
@@ -304,7 +310,7 @@ describe("ClaudeProvider", () => {
     await runPromise;
   });
 
-  it("handles input_json_delta in stream-json", async () => {
+  it("does not forward input_json_delta partial tool arguments to live output (issue #210)", async () => {
     const config: ProviderConfig = { cliCommand: "claude" };
     const provider = new ClaudeProvider("claude", config);
 
@@ -335,7 +341,9 @@ describe("ClaudeProvider", () => {
     mockChild.emit("close", 0);
 
     await runPromise;
-    expect(onChunk).toHaveBeenCalledWith('{"arg": "val"}');
+    for (const call of onChunk.mock.calls) {
+      expect(String(call[0])).not.toContain('{"arg": "val"}');
+    }
   });
 
   it("handles result with fallback in stream-json", async () => {
@@ -527,5 +535,110 @@ describe("ClaudeProvider", () => {
 
     expect(configPath).toBeDefined();
     expect(dirname(configPath as string)).toBe(tmpdir());
+  });
+});
+
+describe("ClaudeProvider live-output normalization (issue #210)", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function makeChild(): EventEmitter & { stdout: EventEmitter; stderr: EventEmitter } {
+    const mockChild = new EventEmitter() as unknown as EventEmitter & {
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+    };
+    mockChild.stdout = new EventEmitter();
+    mockChild.stderr = new EventEmitter();
+    vi.mocked(spawn).mockReturnValue(mockChild as unknown as ChildProcessWithoutNullStreams);
+    return mockChild;
+  }
+
+  // Canonical stream-json shape the real CLI emits: tool results arrive as user
+  // messages whose content array carries tool_result items.
+  const canonicalToolResult = (text: string, isError: boolean) =>
+    JSON.stringify({
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_1",
+            content: [{ type: "text", text }],
+            is_error: isError,
+          },
+        ],
+      },
+    });
+
+  it("suppresses successful canonical tool_result bodies from onChunk but keeps them in the durable output", async () => {
+    const provider = new ClaudeProvider("claude", { cliCommand: "claude" });
+    const child = makeChild();
+    const onChunk = vi.fn();
+    const body = `file listing line\n${"x".repeat(600)}`;
+    const runPromise = provider.run({ prompt: "test", cwd: "/tmp", onChunk });
+
+    child.stdout.emit("data", Buffer.from(`${canonicalToolResult(body, false)}\n`));
+    child.emit("close", 0);
+
+    const result = await runPromise;
+    expect(onChunk).toHaveBeenCalledWith("");
+    for (const call of onChunk.mock.calls) {
+      expect(String(call[0])).not.toContain("file listing line");
+    }
+    expect(result.output).toContain(body);
+  });
+
+  it("keeps bounded canonical tool errors visible while truncating the body", async () => {
+    const provider = new ClaudeProvider("claude", { cliCommand: "claude" });
+    const child = makeChild();
+    const onChunk = vi.fn();
+    const errorBody = `command failed: ${"y".repeat(600)}`;
+    const runPromise = provider.run({ prompt: "test", cwd: "/tmp", onChunk });
+
+    child.stdout.emit("data", Buffer.from(`${canonicalToolResult(errorBody, true)}\n`));
+    child.emit("close", 0);
+
+    const result = await runPromise;
+    const live = onChunk.mock.calls.map((c) => String(c[0])).join("");
+    expect(live).toContain("[Tool error:");
+    expect(live).toContain("command failed:");
+    expect(live).not.toContain("y".repeat(300));
+    // Full error remains in the durable run record.
+    expect(result.output).toContain(errorBody);
+  });
+
+  it("keeps reasoning, text, and tool invocation notices visible", async () => {
+    const provider = new ClaudeProvider("claude", { cliCommand: "claude" });
+    const child = makeChild();
+    const onChunk = vi.fn();
+    const runPromise = provider.run({ prompt: "test", cwd: "/tmp", onChunk });
+
+    const events = [
+      JSON.stringify({
+        type: "stream_event",
+        event: {
+          type: "content_block_delta",
+          delta: { type: "thinking_delta", thinking: "Let me think" },
+        },
+      }),
+      JSON.stringify({
+        type: "stream_event",
+        event: { type: "content_block_start", content_block: { type: "tool_use", name: "Bash" } },
+      }),
+      JSON.stringify({
+        type: "stream_event",
+        event: { type: "content_block_delta", delta: { type: "text_delta", text: "Done." } },
+      }),
+    ];
+    child.stdout.emit("data", Buffer.from(`${events.join("\n")}\n`));
+    child.emit("close", 0);
+
+    await runPromise;
+    const live = onChunk.mock.calls.map((c) => String(c[0])).join("");
+    expect(live).toContain("Let me think");
+    expect(live).toContain("[Executing Bash...]");
+    expect(live).toContain("Done.");
   });
 });

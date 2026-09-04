@@ -4,9 +4,9 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { InMemoryThreadRegistry } from "../actor/thread-registry.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
+import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import {
   createStuckLoopDetectorMcpServer,
   STUCK_LOOP_DETECTOR_MCP_NAME,
@@ -31,25 +31,39 @@ describe("stuck-loop-detector MCP", () => {
     const db = new Database(":memory:");
     runMigrations(db);
     const meshEvents = new MeshEventRepository(db);
-    const registry = new InMemoryThreadRegistry();
+    const registry = new InMemoryActorRepository();
     registry.upsert({
       id: "worker-1",
       charter: "worker",
       parentId: "steward",
       status: "active",
-      budget: { maxRuns: 1 },
       createdAt: "2026-06-30T10:00:00.000Z",
     });
     meshEvents.record({
       kind: "run_yielded",
       actorId: "worker-1",
-      detail: "complete",
-      body: "done\nWaiting-on: steward retire",
+      detail: "blocked",
+      body: "in progress\nWaiting-on: steward retire",
+      ts: "2026-06-29T23:00:00.000Z",
+      id: "yield-note",
+    });
+    meshEvents.record({
+      kind: "run_start",
+      actorId: "worker-1",
       ts: "2026-06-30T00:00:00.000Z",
-      id: "yield-1",
+      id: "start-1",
+    });
+    meshEvents.record({
+      kind: "run_end",
+      actorId: "worker-1",
+      success: false,
+      ts: "2026-06-30T00:30:00.000Z",
+      id: "run-end-1",
     });
 
-    const client = await connect(createStuckLoopDetectorMcpServer({ registry, meshEvents }));
+    const client = await connect(
+      createStuckLoopDetectorMcpServer({ actors: registry, meshEvents })
+    );
     const { tools } = await client.listTools();
     expect(tools.map((tool) => tool.name)).toEqual(["list_open_commitments"]);
     expect(tools[0].description).toContain("commitment-ledger rows");
@@ -60,7 +74,7 @@ describe("stuck-loop-detector MCP", () => {
         now: "2026-06-30T12:00:00.000Z",
         min_confidence: 0.8,
         owner_actor_id: "steward",
-        thresholds_minutes: { actor_completion: 60 },
+        thresholds_minutes: { failed_run: 60 },
       },
     })) as CallToolResult;
 
@@ -71,17 +85,17 @@ describe("stuck-loop-detector MCP", () => {
         subject_actor_id: string;
         source_artifact_ref: string;
         waiting_on: string;
-        owner_expects_retirement: boolean;
+        owner_expects_retirement: boolean | null;
       }[];
     };
     expect(report.rows).toEqual([
       expect.objectContaining({
-        kind: "actor_completion",
+        kind: "failed_run",
         owner_actor_id: "steward",
         subject_actor_id: "worker-1",
-        source_artifact_ref: "yield-1",
+        source_artifact_ref: "run-end-1",
         waiting_on: "steward retire",
-        owner_expects_retirement: true,
+        owner_expects_retirement: null,
       }),
     ]);
   });
@@ -90,7 +104,7 @@ describe("stuck-loop-detector MCP", () => {
     const db = new Database(":memory:");
     runMigrations(db);
     const meshEvents = new MeshEventRepository(db);
-    const registry = new InMemoryThreadRegistry();
+    const registry = new InMemoryActorRepository();
     meshEvents.record({
       id: "issue-531-tracking",
       kind: "message_sent",
@@ -99,7 +113,9 @@ describe("stuck-loop-detector MCP", () => {
       ts: "2026-06-30T18:40:00.000Z",
     });
 
-    const client = await connect(createStuckLoopDetectorMcpServer({ registry, meshEvents }));
+    const client = await connect(
+      createStuckLoopDetectorMcpServer({ actors: registry, meshEvents })
+    );
     const result = (await client.callTool({
       name: "list_open_commitments",
       arguments: {
@@ -133,7 +149,7 @@ describe("stuck-loop-detector MCP", () => {
     const db = new Database(":memory:");
     runMigrations(db);
     const meshEvents = new MeshEventRepository(db);
-    const registry = new InMemoryThreadRegistry();
+    const registry = new InMemoryActorRepository();
     meshEvents.record({
       id: "issue-664-tracking",
       kind: "message_sent",
@@ -143,7 +159,11 @@ describe("stuck-loop-detector MCP", () => {
     });
 
     const client = await connect(
-      createStuckLoopDetectorMcpServer({ registry, meshEvents, rootHandle: "ember-familiar" })
+      createStuckLoopDetectorMcpServer({
+        actors: registry,
+        meshEvents,
+        rootHandle: "ember-familiar",
+      })
     );
     const result = (await client.callTool({
       name: "list_open_commitments",

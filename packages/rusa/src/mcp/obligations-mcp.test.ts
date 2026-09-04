@@ -10,6 +10,7 @@ import { obligationTimestamps } from "../db/migrations/0025_obligation_timestamp
 import { obligationTerminalNote } from "../db/migrations/0026_obligation_terminal_note.js";
 import { obligationTitle } from "../db/migrations/0027_obligation_title.js";
 import { obligationArtifacts } from "../db/migrations/0028_obligation_artifacts.js";
+import { recurringObligations } from "../db/migrations/0035_recurring_obligations.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { createObligationsMcpServer } from "./obligations-mcp.js";
@@ -40,10 +41,11 @@ describe("obligations MCP", () => {
     obligationTerminalNote.up(db);
     obligationTitle.up(db);
     obligationArtifacts.up(db);
+    recurringObligations.up(db);
     repository = new ObligationRepository(db);
   });
 
-  it("exposes all 9 obligation tools", async () => {
+  it("exposes all 10 obligation tools", async () => {
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
     const { tools } = await client.listTools();
     expect(tools.map((tool) => tool.name).sort()).toEqual([
@@ -55,6 +57,7 @@ describe("obligations MCP", () => {
       "reorder_obligation",
       "reparent_obligation",
       "set_external_ref",
+      "set_obligation_recurrence",
       "set_obligation_status",
     ]);
   });
@@ -305,6 +308,40 @@ describe("obligations MCP", () => {
 
     // A comment is evidence about the work; attach_artifact is its home.
     expect(res.isError).toBe(true);
+  });
+
+  it("sets recurrence for the owner via set_obligation_recurrence", async () => {
+    repository.create({ title: "recurring", id: "rec-owned", ownerId: "actor-a" });
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+
+    const res = (await client.callTool({
+      name: "set_obligation_recurrence",
+      arguments: { id: "rec-owned", recurrence: { policy: "cron", cronExpr: "0 * * * *" } },
+    })) as CallToolResult;
+    expect(res.isError).toBeFalsy();
+    expect(repository.require("rec-owned").recurrencePolicy).toBe("cron");
+  });
+
+  it("rejects set_obligation_recurrence for a non-owner, and honors the owner-ancestor policy", async () => {
+    repository.create({ title: "foreign recurring", id: "rec-foreign", ownerId: "actor-b" });
+
+    const denied = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const deniedResult = (await denied.callTool({
+      name: "set_obligation_recurrence",
+      arguments: { id: "rec-foreign", recurrence: { policy: "cron", cronExpr: "0 * * * *" } },
+    })) as CallToolResult;
+    expect(deniedResult.isError).toBe(true);
+    expect(repository.require("rec-foreign").recurrencePolicy).toBeNull();
+
+    const ancestor = await connect(
+      createObligationsMcpServer(repository, "actor-a", { canManage: () => true })
+    );
+    const ancestorResult = (await ancestor.callTool({
+      name: "set_obligation_recurrence",
+      arguments: { id: "rec-foreign", recurrence: { policy: "cron", cronExpr: "0 * * * *" } },
+    })) as CallToolResult;
+    expect(ancestorResult.isError).toBeFalsy();
+    expect(repository.require("rec-foreign").recurrencePolicy).toBe("cron");
   });
 
   it("reorders obligations via reorder_obligation", async () => {
@@ -594,6 +631,68 @@ describe("obligations MCP", () => {
       children: { items: [{ id: "z-live" }], total: 2, truncated: true, nextCursor: null },
       blockingChildren: { items: [{ id: "z-live" }], total: 1 },
     });
+  });
+
+  it("pages the completion ledger independently and rejects a mismatched cursor", async () => {
+    repository.create({
+      title: "recurring",
+      id: "recurring",
+      ownerId: "actor-a",
+    });
+    repository.setRecurrence("recurring", {
+      policy: "completion_interval",
+      intervalSeconds: 999_999_999,
+    });
+    for (let i = 0; i < 2; i++) {
+      repository.setTerminalStatus("recurring", "done", `cycle ${i}`);
+      repository.activateScheduled("recurring");
+    }
+
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const first = (await client.callTool({
+      name: "get_obligation",
+      arguments: { id: "recurring", limit: 1 },
+    })) as CallToolResult;
+    const firstData = dataOf(first) as {
+      completions: {
+        items: Array<{ sequence: number; note: string | null }>;
+        total: number;
+        truncated: boolean;
+        nextCursor: string;
+      };
+    };
+    expect(firstData.completions).toMatchObject({
+      items: [{ sequence: 2, note: "cycle 1" }],
+      total: 2,
+      truncated: true,
+    });
+    expect(firstData.completions.nextCursor).toBeTypeOf("string");
+
+    const second = (await client.callTool({
+      name: "get_obligation",
+      arguments: {
+        id: "recurring",
+        limit: 1,
+        completions_cursor: firstData.completions.nextCursor,
+      },
+    })) as CallToolResult;
+    expect(dataOf(second)).toMatchObject({
+      completions: {
+        items: [{ sequence: 1, note: "cycle 0" }],
+        total: 2,
+        truncated: true,
+        nextCursor: null,
+      },
+    });
+
+    // The cursor is scoped to the obligation it paged — a different id must
+    // not silently reuse someone else's offset.
+    repository.create({ title: "other", id: "other", ownerId: "actor-a" });
+    const mismatched = (await client.callTool({
+      name: "get_obligation",
+      arguments: { id: "other", completions_cursor: firstData.completions.nextCursor },
+    })) as CallToolResult;
+    expect(mismatched.isError).toBe(true);
   });
 
   it("returns an error for a missing obligation", async () => {

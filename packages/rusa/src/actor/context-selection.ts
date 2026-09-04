@@ -1,4 +1,4 @@
-import type { ContextConfig } from "./thread-registry.js";
+import type { ContextConfig } from "./actor-record.js";
 
 /**
  * What a spawn caller may ask for on the wire — one flat vocabulary shared by
@@ -29,7 +29,7 @@ export function isContextSelection(value: unknown): value is ContextSelection {
  * Turn a wire-level selection into the durable {@link ContextConfig}, or throw
  * with a message naming the valid values.
  *
- * Returns `undefined` for "not specified", which the registry already reads as
+ * Returns `undefined` for "not specified", which the actor repository reads as
  * native — spawning without a selection must leave the record byte-identical to
  * what it was before this door existed.
  *
@@ -78,7 +78,7 @@ export function resolveContextSelection(
 
 /**
  * Validate and normalize the durable object form used in configuration and the
- * thread registry. The mode-specific rules stay delegated to
+ * actor repository. The mode-specific rules stay delegated to
  * {@link resolveContextSelection}, so YAML and spawn callers cannot drift.
  */
 export function resolveContextConfig(value: unknown): ContextConfig | undefined {

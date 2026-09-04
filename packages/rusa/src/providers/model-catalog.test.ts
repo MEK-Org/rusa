@@ -410,6 +410,29 @@ describe("validateModelPin", () => {
       'model pin validation failed for provider "agy": rejected "Gemini Pro"; acceptable values: "Gemini 3.7 Flash", "gemini-3.7-flash", "Gemini 3.1 Pro", "gemini-3.1-pro"'
     );
   });
+
+  it("keeps a gemini-* identifier with a non-Gemini cosmetic label during normalization", () => {
+    setProviderModelCatalog("agy", [
+      {
+        identifier: "gemini-3.7-flash-high",
+        displayLabel: "Custom Flash 3.7 (High)",
+        passable: true,
+      },
+      {
+        identifier: "claude-sonnet",
+        displayLabel: "Claude Sonnet",
+        passable: true,
+      },
+    ]);
+    expect(getProviderModelCatalog("agy")).toEqual([
+      {
+        identifier: "gemini-3.7-flash",
+        displayLabel: "Custom Flash 3.7",
+        passable: true,
+        efforts: ["high"],
+      },
+    ]);
+  });
 });
 
 describe("parseAgyModelsOutput", () => {
@@ -419,6 +442,7 @@ describe("parseAgyModelsOutput", () => {
 gemini-3.7-flash-medium   Gemini 3.7 Flash (Medium)
 gemini-3.1-pro-high       Gemini 3.1 Pro (High)
 claude-sonnet-4-6         Claude Sonnet 4.6 (Thinking)
+claude-opus-4-6-thinking  Claude Opus 4.6 (Thinking)
 gpt-oss-120b-medium       GPT-OSS 120B (Medium)
 `;
     const entries = parseAgyModelsOutput(raw);
@@ -434,12 +458,27 @@ gpt-oss-120b-medium       GPT-OSS 120B (Medium)
         passable: true,
       },
       { identifier: "gemini-3.1-pro-high", displayLabel: "Gemini 3.1 Pro (High)", passable: true },
+    ]);
+  });
+
+  it("keeps a gemini-* identifier with a non-Gemini cosmetic label while excluding non-Gemini identifiers", () => {
+    const raw = `
+gemini-3.7-flash-high     Custom Flash 3.7
+gemini-3.1-pro-high       Pro 3.1
+claude-sonnet-4-6         Claude Sonnet 4.6 (Thinking)
+`;
+    const entries = parseAgyModelsOutput(raw);
+    expect(entries).toEqual([
       {
-        identifier: "claude-sonnet-4-6",
-        displayLabel: "Claude Sonnet 4.6 (Thinking)",
+        identifier: "gemini-3.7-flash-high",
+        displayLabel: "Custom Flash 3.7",
         passable: true,
       },
-      { identifier: "gpt-oss-120b-medium", displayLabel: "GPT-OSS 120B (Medium)", passable: true },
+      {
+        identifier: "gemini-3.1-pro-high",
+        displayLabel: "Pro 3.1",
+        passable: true,
+      },
     ]);
   });
 
@@ -449,6 +488,7 @@ gpt-oss-120b-medium       GPT-OSS 120B (Medium)
 gemini-3.6-flash-high\tGemini 3.6 Flash (High)
 gemini-3.1-pro-high\tGemini 3.1 Pro (High)
 claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)
+claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)
 gpt-oss-120b-medium\tGPT-OSS 120B (Medium)`;
     const entries = parseAgyModelsOutput(raw);
     expect(entries).toEqual([
@@ -463,12 +503,6 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)`;
         passable: true,
       },
       { identifier: "gemini-3.1-pro-high", displayLabel: "Gemini 3.1 Pro (High)", passable: true },
-      {
-        identifier: "claude-sonnet-4-6",
-        displayLabel: "Claude Sonnet 4.6 (Thinking)",
-        passable: true,
-      },
-      { identifier: "gpt-oss-120b-medium", displayLabel: "GPT-OSS 120B (Medium)", passable: true },
     ]);
   });
 
@@ -512,7 +546,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)`;
 });
 
 describe("extractKimiModelsFromToml", () => {
-  it("extracts config keys and model identifiers from config TOML", () => {
+  it("extracts only config keys as passable identifiers from config TOML", () => {
     const toml = `
 default_model = "kimi-code/k3"
 
@@ -529,11 +563,22 @@ display_name = "K3"
 
     const entries = extractKimiModelsFromToml(toml);
     expect(entries).toEqual([
-      { displayLabel: "K2.7 Coding", identifier: "kimi-code/kimi-for-coding" },
-      { displayLabel: "K2.7 Coding", identifier: "kimi-for-coding" },
-      { displayLabel: "K3", identifier: "kimi-code/k3" },
-      { displayLabel: "K3", identifier: "k3" },
+      { displayLabel: "K2.7 Coding", identifier: "kimi-code/kimi-for-coding", passable: true },
+      { displayLabel: "K3", identifier: "kimi-code/k3", passable: true },
     ]);
+  });
+
+  it("does not advertise bare model slugs the Kimi CLI rejects", () => {
+    const toml = `
+[models."kimi-code/kimi-for-coding"]
+provider = "managed:kimi-code"
+model = "kimi-for-coding"
+display_name = "K2.7 Coding"
+`;
+
+    const entries = extractKimiModelsFromToml(toml);
+    expect(entries.map((entry) => entry.identifier)).toEqual(["kimi-code/kimi-for-coding"]);
+    expect(entries.some((entry) => entry.identifier === "kimi-for-coding")).toBe(false);
   });
 
   it("handles missing models section or invalid TOML gracefully", () => {
@@ -586,29 +631,23 @@ display_name = "K3"
       scrapeStore: mockStore,
     });
 
-    expect(entries).toEqual([
-      { displayLabel: "K3", identifier: "kimi-code/k3" },
-      { displayLabel: "K3", identifier: "k3" },
-    ]);
+    expect(entries).toEqual([{ displayLabel: "K3", identifier: "kimi-code/k3", passable: true }]);
     expect(recordedRaw).toHaveLength(1);
     expect(recordedRaw[0].provider).toBe("kimi");
     expect(recordedRaw[0].rawOutput).toBe(tomlContent);
     expect(recordedParsed).toEqual([
       {
         id: "scrape-kimi-1",
-        models: [
-          { displayLabel: "K3", identifier: "kimi-code/k3" },
-          { displayLabel: "K3", identifier: "k3" },
-        ],
+        models: [{ displayLabel: "K3", identifier: "kimi-code/k3", passable: true }],
       },
     ]);
 
     expect(getProviderModelCatalog("kimi")).toEqual([
-      { displayLabel: "K3", identifier: "kimi-code/k3" },
-      { displayLabel: "K3", identifier: "k3" },
+      { displayLabel: "K3", identifier: "kimi-code/k3", passable: true },
     ]);
     expect(validateModelPin("kimi", "kimi-code/k3")).toEqual({ status: "accepted" });
-    expect(validateModelPin("kimi", "k3")).toEqual({ status: "accepted" });
+    expect(() => validateModelPin("kimi", "k3")).toThrow();
+    expect(() => validateModelPin("kimi", "K3")).toThrow();
     expect(() => validateModelPin("kimi", "unsupported-model")).toThrow();
   });
 });

@@ -2,7 +2,9 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
-import { ensureWakeToken, preflightCron } from "../actor/wake-cron.js";
+import { preflightAt } from "../actor/at-queue.js";
+import { preflightCron } from "../actor/crontab.js";
+import { ensureWakeToken } from "../actor/wake-callback.js";
 import { loadConfig, resolveHome } from "../config/index.js";
 import type { RusaConfig } from "../config/types.js";
 import {
@@ -329,6 +331,15 @@ function installSingleRusaService(opts: {
     );
   } else {
     console.log("✓ cron preflight passed (crontab + daemon present)");
+  }
+
+  const atInfo = preflightAt();
+  if (!atInfo.ok) {
+    console.warn(
+      `⚠️  at preflight: ${atInfo.issues.join("; ")} — interval obligations won't wake until fixed`
+    );
+  } else {
+    console.log("✓ at preflight passed (at + daemon present)");
   }
 
   // ── ISSUE_NUM: self-update safety wiring ──

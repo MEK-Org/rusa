@@ -1,4 +1,12 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -15,7 +23,7 @@ import { closeDb, getDb, getRepositories } from "../db/index.js";
 import type { GitHubPollingIssueClient, IssueClient } from "../gitops/issue-client.js";
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { stampAuthor } from "../mcp/stamp.js";
-import { setProviderModelCatalog } from "../providers/model-catalog.js";
+import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
 
 const worktreeMock = vi.hoisted(() => ({
@@ -422,7 +430,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     };
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
     // Most startup tests exercise the upgrade/restart path used by current prod.
-    // Fresh-install UUID selection is covered directly by resolveRootThreadId.
+    // Fresh-install UUID selection is covered directly by resolveRootActorId.
     writeFileSync(
       join(homeDir, "threads.json"),
       JSON.stringify({
@@ -492,8 +500,10 @@ describe("runStart webhook event routing (Phase 4)", () => {
             {
               id: "test-kimi-worker",
               charter: "test",
+              parentId: "root",
               provider: "kimi",
               status: "active",
+              createdAt: "2026-01-01T00:00:01.000Z",
             },
           ],
         }),
@@ -536,13 +546,22 @@ describe("runStart webhook event routing (Phase 4)", () => {
         join(homeDir, "threads.json"),
         JSON.stringify({
           threads: [
-            { id: "root", charter: "root", parentId: null, isRoot: true, status: "active" },
+            {
+              id: "root",
+              charter: "root",
+              parentId: null,
+              isRoot: true,
+              status: "active",
+              createdAt: "2026-01-01T00:00:00.000Z",
+            },
             {
               id: "live-worker",
               charter: "worker",
               parentId: "root",
-              provider: "kimi",
+              provider: "antigravity",
+              effort: "high",
               status: "active",
+              createdAt: "2026-01-01T00:00:01.000Z",
             },
             {
               id: "retired-worker",
@@ -550,6 +569,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
               parentId: "root",
               provider: "kimi",
               status: "retired",
+              createdAt: "2026-01-01T00:00:02.000Z",
             },
           ],
         }),
@@ -567,12 +587,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         });
       });
 
-      // Read the live id back out of the registry boot actually loaded, rather
-      // than assuming the file we wrote survived `resolveRootThreadId`.
-      const threads = JSON.parse(readFileSync(join(homeDir, "threads.json"), "utf8")) as {
-        threads: Array<{ id: string; status: string }>;
-      };
-      const liveId = threads.threads.find((t) => t.status === "active")?.id;
+      const liveId = getRepositories().actors.get("live-worker")?.id;
       expect(liveId).toBeDefined();
 
       const obligations = getRepositories().obligations;
@@ -1736,7 +1751,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     });
 
     if (!mesh) throw new Error("mesh not ready");
-    expect(mesh.registry.get("root")?.context).toEqual({ type: "portable", mode: "tail" });
+    expect(mesh.actors.get("root")?.context).toEqual({ type: "portable", mode: "tail" });
     const rootActor = mesh.get("root");
     if (!rootActor) throw new Error("root actor not ready");
     const actorOpts = (
@@ -1757,13 +1772,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     expect(actorOpts.loadSessionId()).toBeUndefined();
     actorOpts.saveSessionId("must-not-persist");
-    expect(mesh.registry.get("root")?.sessionId).toBeUndefined();
+    expect(mesh.actors.get("root")?.sessionId).toBeUndefined();
     expect(logSpy).toHaveBeenCalledWith(
       expect.stringContaining("session=portable/tail (stateless)")
     );
-    expect(JSON.parse(readFileSync(join(rootAgentDir, "session.json"), "utf8"))).toEqual({
-      sessionId: "stale-native",
-    });
+    expect(existsSync(join(rootAgentDir, "session.json"))).toBe(false);
+    expect(
+      readdirSync(rootAgentDir).some((name) => name.startsWith("session.json.imported-"))
+    ).toBe(true);
 
     actorOpts.onRunStart?.(false);
     await actorOpts.onRunEnd?.({
@@ -1958,6 +1974,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(pollerMock.startGitHubEventPoller).not.toHaveBeenCalled();
 
       sigintListener?.("SIGINT");
+      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, "start did not exit");
     } finally {
       processOnSpy.mockRestore();
     }
@@ -2016,6 +2033,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       );
 
       sigintListener?.("SIGINT");
+      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, "start did not exit");
     } finally {
       processOnSpy.mockRestore();
       errorSpy.mockRestore();
@@ -2061,6 +2079,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       );
 
       sigintListener?.("SIGINT");
+      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, "start did not exit");
     } finally {
       processOnSpy.mockRestore();
       worktreeMock.getRemoteUrl.mockReturnValue("https://github.com/dummy-org/dummy-repo.git");
@@ -2109,6 +2128,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       );
 
       sigintListener?.("SIGINT");
+      await waitUntil(() => vi.mocked(process.exit).mock.calls.length > 0, "start did not exit");
     } finally {
       processOnSpy.mockRestore();
       errorSpy.mockRestore();
@@ -2959,7 +2979,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     // runner occasionally exceeds the 5s default and reds the bless PR. Give it
   }, 15000);
 
-  it("requires provider and model on spawn and refuses unresolvable configurations loudly (ISSUE_NUM, ISSUE_NUM)", async () => {
+  it("requires provider and model on spawn and refuses unresolvable configurations loudly", async () => {
     let mesh: ActorMesh | undefined;
     const config = {
       github: {
@@ -3006,7 +3026,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     // The central spawn validator rejects before allocating an actor identity
     // or durable record.
-    const list1 = activeMesh.registry.list();
+    const list1 = activeMesh.actors.list();
     const failedWorker = list1.find((r) => r.charter === "unresolvable provider worker");
     expect(failedWorker).toBeUndefined();
 
@@ -3059,9 +3079,21 @@ describe("runStart webhook event routing (Phase 4)", () => {
         charter: "invalid model pin worker",
         parentId: "root",
         provider: "antigravity",
-        model: "bad-unsupported-model",
+        model: "gemini-bad-unsupported-model",
       });
     }).toThrow(/model pin validation failed/);
+
+    expect(() => {
+      activeMesh.spawn({
+        charter: "non-Gemini Antigravity worker",
+        parentId: "root",
+        provider: "antigravity",
+        model: "claude-sonnet-4-6",
+      });
+    }).toThrow(/Antigravity supports Gemini models only/);
+    expect(
+      activeMesh.actors.list().find((record) => record.charter === "non-Gemini Antigravity worker")
+    ).toBeUndefined();
 
     // 5. Positive test: explicit-and-VALID provider/model -> succeeds
     const validWorkerId = activeMesh.spawn({
@@ -3071,11 +3103,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
       model: "Gemini 3.7 Flash (High)",
     });
     expect(activeMesh.get(validWorkerId)).toBeDefined();
-    const validWorkerRecord = activeMesh.registry.get(validWorkerId);
+    const validWorkerRecord = activeMesh.actors.get(validWorkerId);
     expect(validWorkerRecord?.status).toBe("active");
-    expect(activeMesh.registry.get("root")?.handles?.some((h) => h.id === validWorkerId)).toBe(
-      true
-    );
+    expect(activeMesh.actors.get("root")?.handles?.some((h) => h.id === validWorkerId)).toBe(true);
 
     // 6. Cross-provider move validates against TARGET provider's catalog and resolves target provider
     const portableWorkerId = activeMesh.spawn({
@@ -3085,8 +3115,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
       model: "Claude 3.5 Sonnet",
       context: { type: "portable", mode: "ledger" },
     });
-    expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("claude");
-    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
+    expect(activeMesh.actors.get(portableWorkerId)?.provider).toBe("claude");
+    expect(activeMesh.actors.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
+
+    expect(() => {
+      activeMesh.setActorModel(portableWorkerId, "gpt-oss-120b-medium", "root", "antigravity");
+    }).toThrow(/Antigravity supports Gemini models only/);
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredProvider).toBeUndefined();
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredModel).toBeUndefined();
 
     // Unconfigured target provider is rejected before state change, record untouched
     expect(() => {
@@ -3097,22 +3133,22 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "unconfigured-provider"
       );
     }).toThrow(/unconfigured-provider/);
-    expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("claude");
-    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
+    expect(activeMesh.actors.get(portableWorkerId)?.provider).toBe("claude");
+    expect(activeMesh.actors.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
 
     // Valid target provider + model stages for the next run boundary.
     activeMesh.setActorModel(portableWorkerId, "Gemini 3.7 Flash (High)", "root", "antigravity");
-    expect(activeMesh.registry.get(portableWorkerId)?.provider).toBe("claude");
-    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
-    expect(activeMesh.registry.get(portableWorkerId)?.desiredProvider).toBe("antigravity");
-    expect(activeMesh.registry.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash");
-    expect(activeMesh.registry.get(portableWorkerId)?.desiredEffort).toBe("high");
+    expect(activeMesh.actors.get(portableWorkerId)?.provider).toBe("claude");
+    expect(activeMesh.actors.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredProvider).toBe("antigravity");
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash");
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredEffort).toBe("high");
 
     // Invalid model for target provider fails validation
     expect(() => {
       activeMesh.setActorModel(
         portableWorkerId,
-        "bad-model-for-antigravity",
+        "gemini-bad-model-for-antigravity",
         "root",
         "antigravity"
       );
@@ -3128,10 +3164,133 @@ describe("runStart webhook event routing (Phase 4)", () => {
         "low"
       );
     }).toThrow(/conflicting reasoning efforts/);
-    expect(activeMesh.registry.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
-    expect(activeMesh.registry.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash");
-    expect(activeMesh.registry.get(portableWorkerId)?.desiredEffort).toBe("high");
-    expect(activeMesh.registry.get(portableWorkerId)?.desiredProvider).toBe("antigravity");
+    expect(activeMesh.actors.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash");
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredEffort).toBe("high");
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredProvider).toBe("antigravity");
+  });
+
+  it("root's run_start records the live model after a tuple staged while idle, not the value frozen when root was built (#199 amend gap 1)", async () => {
+    // A prior test in this file registers a real "antigravity"/"agy" model
+    // catalog via setProviderModelCatalog and never clears it; that module-level
+    // state otherwise leaks into this test and rejects the pin below.
+    clearProviderModelCatalog("antigravity");
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+    const activeMesh = mesh;
+
+    const rootActor = activeMesh.get("root");
+    if (!rootActor) throw new Error("root actor not ready");
+    const originalModel = activeMesh.actors.get("root")?.model;
+
+    // Stage a new model on root while idle. Per #199, this must apply at
+    // root's very next dispatch, before that run's run_start is recorded —
+    // it must not merely sit staged past this run.
+    activeMesh.setActorModel("root", "Gemini 4.1 Ultra (High)", "root");
+    expect(activeMesh.actors.get("root")?.model).toBe(originalModel);
+    expect(activeMesh.actors.get("root")?.desiredModel).toBe("Gemini 4.1 Ultra");
+
+    // Directly invoke the production onRunStart closure — the same technique
+    // used elsewhere in this file to exercise root's real dispatch-time
+    // wiring without driving a full provider/gate/queue cycle.
+    const actorOpts = (
+      rootActor as unknown as { opts: { onRunStart?: (responsive: boolean) => void } }
+    ).opts;
+    actorOpts.onRunStart?.(false);
+
+    expect(activeMesh.actors.get("root")?.model).toBe("Gemini 4.1 Ultra");
+
+    const runStartEvents = getRepositories().meshEvents.listEventsByActors(["root"], {
+      kinds: ["run_start"],
+      limit: 10,
+    }).events;
+    expect(runStartEvents).toHaveLength(1);
+    const payload = JSON.parse(runStartEvents[0]?.payload ?? "{}") as {
+      model?: string;
+      effort?: string;
+    };
+    // Gap #1 (#199 amend): this run's own run_start payload must record the
+    // now-live model — the tuple this very run launches on — not the value
+    // frozen in start.ts's `provider` closure variable at root construction.
+    expect(payload.model).toBe("Gemini 4.1 Ultra");
+    expect(payload.model).not.toBe(originalModel);
+  });
+
+  it("root's beforeRun halt-gate checks the tuple that will actually launch, not the frozen boot-time provider (#199 amend gap 2)", async () => {
+    clearProviderModelCatalog("antigravity");
+    clearProviderModelCatalog("claude");
+    const config = {
+      github: { account: "mock-bot" },
+      providers: {
+        antigravity: { cliCommand: "agy" },
+        claude: { cliCommand: "claude" },
+      },
+      rootActor: {
+        provider: "antigravity",
+        effort: "high",
+        context: { type: "portable", mode: "ledger" },
+      },
+      geminiApiKey: "fake-gemini-key",
+    };
+    writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
+
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+    const activeMesh = mesh;
+    const rootActor = activeMesh.get("root");
+    if (!rootActor) throw new Error("root actor not ready");
+
+    // Directly invoke the production beforeRun closure — same technique used
+    // above for onRunStart — to exercise root's real halt-gate wiring without
+    // driving a full provider/gate/queue cycle. `mode: "yield-elicitation"`
+    // short-circuits past the unrelated inbox-watermark check so only the
+    // halt-gate logic under test is exercised.
+    const actorOpts = (
+      rootActor as unknown as { opts: { beforeRun?: (arg: { mode: string }) => boolean } }
+    ).opts;
+
+    // Stage a move to claude while root is idle on antigravity.
+    activeMesh.setActorModel("root", "claude-sonnet-5", "root", "claude");
+    expect(activeMesh.actors.get("root")?.provider).toBe("antigravity");
+    expect(activeMesh.actors.get("root")?.desiredProvider).toBe("claude");
+
+    const halt = new HaltSwitch(join(homeDir, "HALT"));
+
+    // Halt the NEW provider (claude) — the one root will actually launch on.
+    // Gap #2: beforeRun must consult the live launch tuple (claude), not the
+    // rootProviderName ("antigravity") frozen at root construction — so a
+    // halt scoped to claude must still block dispatch.
+    halt.halt("halt claude", { providers: ["claude"] });
+    expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(false);
+    halt.resume();
+
+    // Halt the OLD provider (antigravity) instead — root is no longer
+    // launching on antigravity, so this halt must not wrongly block it.
+    halt.halt("halt antigravity", { providers: ["antigravity"] });
+    expect(actorOpts.beforeRun?.({ mode: "yield-elicitation" })).toBe(true);
+    halt.resume();
   });
 
   it("routes delegated chat spaces to the delegatee while others bubble to root", async () => {
@@ -3493,7 +3652,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
   });
 
   it("rehydrates active workers on boot and retires unresolvable ones without blocking others", async () => {
-    // Write threads.json directly in homeDir to simulate persisted registry on boot
+    // Write the legacy file directly to simulate the one-time upgrade path on boot.
     const threads = {
       threads: [
         legacyRootThread,
@@ -3538,13 +3697,13 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     // Assert that bad rehydrate worker (t1) is NOT live, and registry marked it retired
     expect(mesh.get("t1")).toBeUndefined();
-    const t1Record = mesh.registry.get("t1");
+    const t1Record = mesh.actors.get("t1");
     expect(t1Record).toBeDefined();
     expect(t1Record?.status).toBe("retired");
 
     // Assert that good rehydrate worker (t2) IS live, and registry left it active
     expect(mesh.get("t2")).toBeDefined();
-    const t2Record = mesh.registry.get("t2");
+    const t2Record = mesh.actors.get("t2");
     expect(t2Record).toBeDefined();
     expect(t2Record?.status).toBe("active");
   });

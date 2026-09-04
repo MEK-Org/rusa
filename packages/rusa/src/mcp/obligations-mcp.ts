@@ -22,6 +22,9 @@ type ObligationServerRepository = Pick<
   | "movePriorityInternal"
   | "reassign"
   | "reparent"
+  | "setRecurrence"
+  | "listCompletionsPage"
+  | "require"
 >;
 
 export interface ObligationsMcpOptions {
@@ -49,7 +52,7 @@ const DEFAULT_PAGE_LIMIT = 50;
 type PageCursor =
   | {
       v: 1;
-      scope: "children" | "blocking-children";
+      scope: "children" | "blocking-children" | "completions";
       obligationId: string;
       offset: number;
     }
@@ -72,7 +75,7 @@ function decodeCursor(cursor: string): PageCursor {
       parsed.v !== 1 ||
       !Number.isSafeInteger(parsed.offset) ||
       parsed.offset < 0 ||
-      !["children", "blocking-children", "owned"].includes(parsed.scope)
+      !["children", "blocking-children", "owned", "completions"].includes(parsed.scope)
     ) {
       throw new Error("invalid cursor fields");
     }
@@ -84,7 +87,7 @@ function decodeCursor(cursor: string): PageCursor {
 
 function childOffset(
   cursor: string | undefined,
-  scope: "children" | "blocking-children",
+  scope: "children" | "blocking-children" | "completions",
   obligationId: string
 ): number {
   if (!cursor) return 0;
@@ -142,9 +145,10 @@ export function createObligationsMcpServer(
         limit: z.number().int().min(1).max(100).optional().default(DEFAULT_PAGE_LIMIT),
         children_cursor: z.string().max(1_024).optional(),
         blocking_children_cursor: z.string().max(1_024).optional(),
+        completions_cursor: z.string().max(1_024).optional(),
       },
     },
-    async ({ id, limit, children_cursor, blocking_children_cursor }) => {
+    async ({ id, limit, children_cursor, blocking_children_cursor, completions_cursor }) => {
       try {
         const obligation = repository.get(id);
         if (!obligation) throw new Error("obligation not found");
@@ -155,6 +159,11 @@ export function createObligationsMcpServer(
           limit,
           offset: blockingOffset,
           blockingOnly: true,
+        });
+        const completionsOffset = childOffset(completions_cursor, "completions", id);
+        const completionsPage = repository.listCompletionsPage(id, {
+          limit,
+          offset: completionsOffset,
         });
         return toolOk({
           obligation,
@@ -186,6 +195,19 @@ export function createObligationsMcpServer(
                 })
               : null,
           },
+          completions: {
+            items: completionsPage.completions,
+            total: completionsPage.total,
+            truncated: completionsOffset > 0 || completionsPage.hasMore,
+            nextCursor: completionsPage.hasMore
+              ? encodeCursor({
+                  v: 1,
+                  scope: "completions",
+                  obligationId: id,
+                  offset: completionsOffset + limit,
+                })
+              : null,
+          },
         });
       } catch (err) {
         return toolError(err);
@@ -200,7 +222,7 @@ export function createObligationsMcpServer(
       description:
         "List a bounded page of obligations owned by this actor in ready-before-waiting queue order. Actor identity is bound by the server.",
       inputSchema: {
-        status: z.enum(["ready", "waiting", "done", "cancelled"]).optional(),
+        status: z.enum(["ready", "waiting", "done", "cancelled", "scheduled"]).optional(),
         limit: z.number().int().min(1).max(100).optional().default(DEFAULT_PAGE_LIMIT),
         cursor: z.string().max(1_024).optional(),
       },
@@ -243,9 +265,19 @@ export function createObligationsMcpServer(
         intent: z.string().nullable().optional(),
         external_ref: z.string().trim().min(1).nullable().optional(),
         priority: z.number().finite().nullable().optional(),
+        recurrence: z
+          .union([
+            z.object({ policy: z.literal("cron"), cronExpr: z.string().trim().min(1) }),
+            z.object({
+              policy: z.literal("completion_interval"),
+              intervalSeconds: z.number().int().min(1),
+            }),
+          ])
+          .nullable()
+          .optional(),
       },
     },
-    async ({ owner_id, title, parent_id, intent, external_ref, priority }) => {
+    async ({ owner_id, title, parent_id, intent, external_ref, priority, recurrence }) => {
       try {
         const owner = options?.resolveOwner?.(owner_id) ?? { ok: true as const, ownerId: owner_id };
         if (!owner.ok) return toolError(new Error(owner.error));
@@ -256,6 +288,7 @@ export function createObligationsMcpServer(
           intent: intent ?? null,
           externalRef: external_ref ?? null,
           priority: priority ?? null,
+          recurrence: recurrence ?? null,
           // Bound by the server from this server's actor identity, exactly like
           // `owner` on list_owned. There is deliberately no `created_by` field
           // in inputSchema: #1671's trust boundary requires that attribution is
@@ -266,6 +299,37 @@ export function createObligationsMcpServer(
         return toolOk({ obligation });
       } catch (err) {
         return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "set_obligation_recurrence",
+    {
+      title: "Set recurrence for an obligation",
+      description:
+        "Enables, changes, or disables recurrence for an obligation, and reconciles its OS job.",
+      inputSchema: {
+        id: z.string().trim().min(1),
+        recurrence: z
+          .union([
+            z.object({ policy: z.literal("cron"), cronExpr: z.string().trim().min(1) }),
+            z.object({
+              policy: z.literal("completion_interval"),
+              intervalSeconds: z.number().int().min(1),
+            }),
+          ])
+          .nullable(),
+      },
+    },
+    async ({ id, recurrence }) => {
+      try {
+        const existing = repository.require(id);
+        if (!canManage(existing)) throw new Error("not authorized to manage this obligation");
+        const obligation = repository.setRecurrence(id, recurrence);
+        return toolOk({ obligation });
+      } catch (error) {
+        return toolError(error);
       }
     }
   );

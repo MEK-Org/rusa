@@ -1,19 +1,13 @@
+import type { ActorRecord } from "../actor/actor-record.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted, type RUN_TERMINAL_EVENT_KINDS } from "../actor/mesh-events.js";
-import type { ThreadRecord } from "../actor/thread-registry.js";
 import type { MeshEvent, MeshEventKind } from "../db/repositories/mesh-event-repository.js";
 
-export type CommitmentKind =
-  | "actor_completion"
-  | "failed_run"
-  | "missed_wake"
-  | "request_commitment"
-  | "silent_actor";
+export type CommitmentKind = "failed_run" | "missed_wake" | "request_commitment" | "silent_actor";
 export type CommitmentStatus = "open" | "resolved" | "ignored";
 export type SourceArtifactType = "mesh_event" | "yield_note" | "message" | "github" | "manual";
 
 export interface CommitmentThresholds {
-  actorCompletionMs: number;
   failedRunMs: number;
   missedWakeMs: number;
   silentActorMs: number;
@@ -65,7 +59,6 @@ export interface CommitmentLedgerStoryboardSnapshot {
 }
 
 export const DEFAULT_COMMITMENT_THRESHOLDS: CommitmentThresholds = {
-  actorCompletionMs: 6 * 60 * 60 * 1000, // 6 hours
   failedRunMs: 15 * 60 * 1000, // 15 minutes
   // 10 minutes, against the wake → `run_queued` leg  — a measured gap of
   // 30 s healthy vs 10 h dropped, so the exact figure is not load-bearing. It was
@@ -262,7 +255,7 @@ export function isProgressEvent(event: Pick<MeshEvent, "kind" | "payload">): boo
 }
 
 export function projectOpenCommitments(opts: {
-  threads: ThreadRecord[];
+  threads: ActorRecord[];
   events: MeshEvent[];
   requestCommitments?: RequestCommitmentInput[];
   now?: Date;
@@ -346,36 +339,6 @@ export function projectOpenCommitments(opts: {
       }
     }
     const isEventDriven = eventSubscriptions.size > 0;
-
-    const completeYield = lastWhere(
-      actorEvents,
-      (event) => event.kind === "run_yielded" && event.detail === "complete"
-    );
-    if (
-      thread?.status === "active" &&
-      thread.parentId != null &&
-      completeYield &&
-      retirementExpectation.value === true &&
-      !hasLater(actorEvents, completeYield, (event) => event.kind === "actor_retired") &&
-      ageMs(now, completeYield.ts) >= thresholds.actorCompletionMs
-    ) {
-      rows.push(
-        makeRow({
-          kind: "actor_completion",
-          actorId,
-          thread,
-          event: completeYield,
-          now,
-          waitingOn,
-          ownerExpectsRetirement: retirementExpectation.value,
-          confidence: 0.95,
-          reason:
-            "Actor yielded complete and remains active while its owner is expected to retire it.",
-          evidence: { retirement_expectation_reason: retirementExpectation.reason },
-        })
-      );
-      hasSpecificRow.add(actorId);
-    }
 
     const lastBadRun = lastWhere(
       actorEvents,
@@ -597,7 +560,7 @@ interface OwnerResolver {
   resolve(owner: string): OwnerResolution | null;
 }
 
-function buildOwnerResolver(threads: ThreadRecord[], rootHandle?: string): OwnerResolver {
+function buildOwnerResolver(threads: ActorRecord[], rootHandle?: string): OwnerResolver {
   const byIdOrHandle = new Map<string, OwnerResolution>();
   const defaultRootHandle = generateHandle("root");
   // The resolved (possibly configured, ISSUE_NUM) handle is what displays for root
@@ -627,7 +590,7 @@ function buildOwnerResolver(threads: ThreadRecord[], rootHandle?: string): Owner
 
 function inferOwnerExpectsRetirement(opts: {
   actorId: string;
-  thread: ThreadRecord | undefined;
+  thread: ActorRecord | undefined;
   actorEvents: MeshEvent[];
   activeChildCount: number;
 }): { value: boolean | null; reason: string } {
@@ -637,14 +600,13 @@ function inferOwnerExpectsRetirement(opts: {
     return { value: false, reason: "has_scheduled_wake_history" };
   }
   if (opts.activeChildCount > 0) return { value: false, reason: "has_live_children" };
-  if (opts.thread.budget?.maxRuns != null) return { value: true, reason: "has_max_runs_lease" };
   return { value: null, reason: "ambiguous_childless_leaf" };
 }
 
 function makeRow(opts: {
   kind: CommitmentKind;
   actorId: string;
-  thread: ThreadRecord | undefined;
+  thread: ActorRecord | undefined;
   event: MeshEvent | null;
   now: Date;
   waitingOn: string | null;

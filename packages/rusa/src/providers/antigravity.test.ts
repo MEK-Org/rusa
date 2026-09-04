@@ -167,15 +167,15 @@ describe("AntigravityProvider", () => {
   it("prefers a catalog-exact suffix-like base display label before legacy parsing", async () => {
     setProviderModelCatalog("agy", [
       {
-        identifier: "future-model-v1",
-        displayLabel: "Future Model-high",
+        identifier: "gemini-future-model-v1",
+        displayLabel: "Gemini Future Model-high",
         passable: true,
       },
     ]);
     const provider = new AntigravityProvider(
       "antigravity",
       { cliCommand: "agy" },
-      "Future Model-high"
+      "Gemini Future Model-high"
     );
     const child = mockChildProcess();
     vi.mocked(spawn).mockReturnValue(child as ChildProcessWithoutNullStreams);
@@ -187,7 +187,7 @@ describe("AntigravityProvider", () => {
     const args = vi.mocked(spawn).mock.calls[0][1];
     expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2)).toEqual([
       "--model",
-      "future-model-v1",
+      "gemini-future-model-v1",
     ]);
     expect(args).not.toContain("--effort");
   });

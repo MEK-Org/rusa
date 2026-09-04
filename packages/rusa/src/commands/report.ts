@@ -20,7 +20,7 @@ function defaultReportPath(): string {
 
 /**
  * Build a self-contained HTML report of the actor mesh's activity from its
- * durable artifacts (`threads.json` + the `mesh_events` log). Read-only, so it's
+ * durable SQLite actor repository and `mesh_events` log. Read-only, so it's
  * safe to run against the live service.
  */
 export function runReport(opts?: { home?: string; out?: string }): void {

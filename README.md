@@ -47,7 +47,7 @@ self-similarity is what makes the mesh easy to reason about: there is no special
 
    Shared, orthogonal to the tree:
      • tracker-MCP (gh) / chat-MCP (gchat)  — the facts, re-derived each wake
-     • thread registry (durable)            — the org chart of live actors
+     • actor repository (durable, SQLite)   — the org chart of live actors
      • firehose                             — every actor's raw streamed output
 ```
 
@@ -91,14 +91,11 @@ configuration:
 - They **report to their parent, not to humans.** Completion is the *parent's*
   judgment: a worker may *propose* it's done, but the parent owns retirement
   (and retiring a thread retires its whole subtree).
-- Each thread carries an optional **budget/lease** (`max_runs`) that bounds its
-  subtree, so self-similar spawning can't run away.
-
-Every actor is backed by a durable **thread registry record** (charter, parent,
-session handle, status, lease) — the one piece of state that *can't* be
+Every actor is backed by a durable **actor repository record** (charter, parent,
+session handle, status) — the one piece of state that *can't* be
 re-derived from the humans' tools, and what lets the root reconstitute "who's
 working on what" after a restart. See
-[`thread-registry.ts`](packages/rusa/src/actor/thread-registry.ts).
+[`actor-repository.ts`](packages/rusa/src/repositories/actor-repository.ts).
 
 ### Concurrency Limiter
 
@@ -110,6 +107,22 @@ FIFO gate that lets at most `N` provider runs execute at once and queues the
 rest, starting them as slots free. Each actor wraps its provider run in this
 shared gate, so the whole mesh respects one global concurrency cap regardless of
 how many threads are live.
+
+### Host Scheduling
+
+One host scheduling subsystem owns every cron and `at` mutation. Recurring
+actor wakes live directly in the user's crontab. Obligation recurrence policy
+remains durable in SQLite and is reconciled into cron jobs or one-shot `at`
+activations. Scheduled sends are different: the complete, versioned message
+payload lives in the `at` job, so `atq` is the pending-message authority and
+there is no application pending-message table or restart re-arming pass.
+
+Host callbacks use the loopback MCP HTTP server and a file-backed bearer token.
+Scheduled-message callbacks retry for up to ten minutes and re-read the current
+ephemeral port on every attempt. Cron-backed features require `crontab` plus a
+running cron daemon; one-shot obligations and scheduled sends additionally
+require `at`, `atq`, `atrm`, and a running `atd`. Startup and the dashboard
+surface degraded prerequisites without preventing cron-only work from running.
 
 ---
 
@@ -125,7 +138,7 @@ acting" is the unspoofable endpoint, not a tool argument the model fills in.
 
 | Primitive | What it does |
 | --- | --- |
-| `spawn_thread(charter, …)` | Create a child actor that owns `charter`, in its own session. Returns its `thread_id`; you become its parent. **Non-blocking** — the child runs asynchronously. `provider`/`model` pick the harness/tier, optional `effort` sets its provider-native reasoning level, and `max_runs` sets a lease. |
+| `spawn_thread(charter, …)` | Create a child actor that owns `charter`, in its own session. Returns its `thread_id`; you become its parent. **Non-blocking** — the child runs asynchronously. `provider`/`model` pick the harness/tier, and optional `effort` sets its provider-native reasoning level. |
 | `send_message(thread_id, body)` | Deliver a message to a thread's inbox (parent, child, or an introduced peer). The recipient wakes, sees who it came from, and may reply *later* as a new message. **Always async.** |
 | `introduce(holder, target, role?)` | Grant `holder` a handle to `target` so it can message it directly (e.g. let a coder reach a reviewer). The id *is* the capability (object-capability style). |
 | `list_threads()` | List the children you've spawned, with charter summaries and status — your org chart for deciding what to follow up on or retire. |
@@ -134,8 +147,8 @@ acting" is the unspoofable endpoint, not a tool argument the model fills in.
 **Two rules make the mesh safe:**
 
 1. **Ownership is a tree; messaging is a graph.** The `parentId` edge decides who
-   can retire whom and whose budget bounds a subtree. Communication follows
-   *handles*, which can reach beyond the parent.
+   can retire whom. Communication follows *handles*, which can reach beyond the
+   parent.
 2. **Delegation is asynchronous.** A parent must *never block* waiting on a child
    — it would waste a run and can deadlock the mesh. You fire a message and end
    your turn; the reply arrives as a fresh wake.
@@ -154,7 +167,7 @@ rusa/
 │       │   ├── actor.ts                # the Actor unit (inbox + session + tools)
 │       │   ├── actor-mesh.ts           # scheduler: spawn / sendMessage / retire
 │       │   ├── concurrency-limiter.ts  # cross-actor capacity gate
-│       │   ├── thread-registry.ts      # durable per-thread records
+│       │   ├── actor-record.ts         # ActorRecord: the actor's persisted shape (charter, parent, status, …)
 │       │   ├── trigger-runner.ts       # per-actor debounce/single-flight loop
 │       │   ├── root-prompt.ts          # the default root charter + per-wake prompt
 │       │   └── worker-prompt.ts        # worker scaffold + delegation discipline
@@ -165,6 +178,7 @@ rusa/
 │       ├── chat/               # Google Chat client, OAuth, Pub/Sub + Workspace Events source
 │       ├── commands/           # CLI subcommands (start, init, dashboard, e2e, service, …)
 │       ├── config/             # config loading + docs
+│       ├── repositories/       # actor-repository.ts: the ActorRepository persistence contract
 │       ├── db/                 # SQLite schema, migrations, repositories
 │       ├── gitops/             # git + the IssueClient (gh) seam
 │       ├── providers/          # coding harnesses: claude, codex, antigravity, gemini, copilot, kimi
@@ -256,4 +270,4 @@ The system keeps three tiers of memory, deliberately separated:
 | **Facts** | tracker-MCP / chat-MCP (issues, PRs, chat) | not ours — re-derived each wake |
 
 Sessions are reconstructable; the only state rusa durably *owns* is its
-long-term library plus the thread registry (the org chart of live actors).
+long-term library plus the actor repository (the org chart of live actors).

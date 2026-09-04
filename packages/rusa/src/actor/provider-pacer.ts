@@ -1,4 +1,8 @@
-import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
+import {
+  RunStartCancelledError,
+  type RunStartHandle,
+  RunStartStaleProviderError,
+} from "./concurrency-limiter.js";
 
 export interface ProviderPacerSubmitOptions {
   responsive?: boolean;
@@ -8,6 +12,17 @@ export interface ProviderPacerSubmitOptions {
   enqueueNormal: <T>(fn: () => Promise<T>) => RunStartHandle<T>;
   /** Fires at the actual provider start, never when either queue is entered. */
   onStarted?: () => void;
+  /**
+   * Consulted at the same selection-time point as the adaptive interval
+   * revalidation, right before this request would actually start: applies any
+   * pending model/provider change and reports whether the actor's live
+   * provider still matches the lane this request was submitted under. A
+   * `false` return rejects the request with {@link RunStartStaleProviderError}
+   * instead of starting it, so the caller can re-gate under the new provider
+   * — a request that waited in this lane must not start (and charge this
+   * lane's interval clock) under a provider it no longer belongs to.
+   */
+  revalidateProvider?: () => boolean;
 }
 
 interface PacerRequest<T> {
@@ -50,19 +65,55 @@ export class ProviderPacer {
   }
 
   /**
-   * The only request for which the provider governor has a meaningful next
-   * eligible-start time. Once a request reaches mesh concurrency, that time is
-   * no longer an ETA, so deliberately do not report it for the staged
-   * request. While a request is staged, `nextAvailableAt` also can't be
-   * trusted for the request behind it: the queue can't advance until the
-   * staged request actually starts and recomputes `nextAvailableAt`, so the
-   * stale value could already be in the past.
+   * A read-only, side-effect-free snapshot of this lane's FIFO order, for
+   * dashboard display only — never persisted, and recomputed fresh on every
+   * call from current pacer state.
+   *
+   * Public contract:
+   * - `position` is 0-based within this lane, in FIFO start order. The
+   *   staged request (if any) occupies position 0; queued requests follow
+   *   in submission order.
+   * - `estimatedStartAt` is an epoch-ms projection: the head of the queue
+   *   (once the staged request, if any, is out of the way) is estimated at
+   *   `nextAvailableAt`, and each subsequent entry adds one `intervalMs`.
+   * - `estimatedStartAt` is `null` whenever the time can't be honestly
+   *   quoted: for the staged request itself (it has already cleared the
+   *   pacing gate and is only waiting on mesh concurrency, not on
+   *   `nextAvailableAt`) and for every entry behind it, since the lane
+   *   can't advance until the staged request actually starts and
+   *   recomputes `nextAvailableAt` — the current value could already be
+   *   stale. Callers must render `null` as "unknown", never fabricate a
+   *   time.
+   * - Requests submitted without a `threadId` are omitted from the
+   *   returned entries (nothing to key them by) but still consume a
+   *   `position`, so surviving entries keep their true FIFO position.
    */
-  get queueHead(): { threadId: string; availableAt: number } | null {
-    if (this.staged) return null;
-    const request = this.queue[0];
-    if (!request?.opts.threadId) return null;
-    return { threadId: request.opts.threadId, availableAt: this.nextAvailableAt };
+  getQueueSnapshot(): Array<{
+    threadId: string;
+    position: number;
+    estimatedStartAt: number | null;
+  }> {
+    const snapshot: Array<{ threadId: string; position: number; estimatedStartAt: number | null }> =
+      [];
+    let position = 0;
+    let eta: number | null = this.staged ? null : this.nextAvailableAt;
+
+    if (this.staged) {
+      if (this.staged.opts.threadId) {
+        snapshot.push({ threadId: this.staged.opts.threadId, position, estimatedStartAt: null });
+      }
+      position++;
+    }
+
+    for (const request of this.queue) {
+      if (request.opts.threadId) {
+        snapshot.push({ threadId: request.opts.threadId, position, estimatedStartAt: eta });
+      }
+      position++;
+      if (eta !== null) eta += this.intervalMs;
+    }
+
+    return snapshot;
   }
 
   setInterval(intervalMs: number): void {
@@ -177,6 +228,18 @@ export class ProviderPacer {
       if (this.staged === request) this.staged = null;
       request.meshRun = undefined;
 
+      // The actor's provider may have changed while this ticket waited in the
+      // mesh queue. Starting it here would charge this lane's interval clock
+      // for a run that is about to launch under a different provider. Reject
+      // so the caller re-gates under the now-live provider and picks the
+      // correct lane instead.
+      if (!request.responsive && request.opts.revalidateProvider?.() === false) {
+        request.state = "settled";
+        request.reject(new RunStartStaleProviderError());
+        this.schedule();
+        return;
+      }
+
       // The adaptive interval may have increased while this ticket waited in
       // the mesh queue. Revalidate at selection time rather than starting early.
       if (!request.responsive && this.now() < this.nextAvailableAt) {
@@ -192,6 +255,13 @@ export class ProviderPacer {
         request.state = "settled";
         request.reject(error);
       }
+      // `staged` was already cleared at the top of this closure, before
+      // `revalidateProvider()` (a production callback that applies registry
+      // state and can throw) had a chance to run. A throw here skips every
+      // `schedule()` call this closure would otherwise reach, so without this
+      // call nothing re-triggers `stageNext()` and every request still
+      // waiting behind this one strands in the lane forever.
+      this.schedule();
     });
   }
 
