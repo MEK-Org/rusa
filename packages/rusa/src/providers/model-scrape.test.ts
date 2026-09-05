@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +16,13 @@ import {
   refreshProviderModelCatalog,
   scrapeCodexModelScreen,
 } from "./model-scrape.js";
+import {
+  groupStillHosts,
+  processTable,
+  reapProcess,
+  reapProcessGroup,
+  unsafeGroupReason,
+} from "./test-support/process-group-cleanup.js";
 
 /**
  * Every codex refresh now reads the CLI's models cache before it considers the
@@ -743,17 +750,22 @@ done
     // it spawns), so draining it is the real "no orphaned probe processes"
     // check. The server's own argv embeds the pane command verbatim, hence the
     // new-session exclusion; without it the server is misread as a descendant.
+    // The recheck before the reap deliberately drops that exclusion - see the
+    // cleanup site below for why it belongs here and not there.
     const paneGroupOf = (bin: string): number | undefined => {
-      const line = execFileSync("ps", ["-eo", "pgid=,args="], { encoding: "utf8" })
-        .split("\n")
-        .find((l) => l.includes(bin) && !l.includes("new-session"));
-      const pgid = Number(line?.trim().split(/\s+/)[0]);
-      return Number.isInteger(pgid) ? pgid : undefined;
+      const row = processTable().find(
+        (r) => r.args.includes(bin) && !r.args.includes("new-session")
+      );
+      if (row === undefined) return undefined;
+      // tmux setsids the pane leader, so the tree it holds is always a group of
+      // its own. A group of 1, or this runner's own, means the match is the
+      // runner rather than the probe - fail the test loudly instead of handing
+      // cleanup a group whose reaping would kill the run that asked for it.
+      const unsafe = unsafeGroupReason(row.pgid);
+      if (unsafe) throw new Error(`refusing to track the probe's group: ${unsafe} - ${row.args}`);
+      return row.pgid;
     };
-    const paneGroupSize = (pgid: number) =>
-      execFileSync("ps", ["-eo", "pgid="], { encoding: "utf8" })
-        .split("\n")
-        .filter((l) => Number(l.trim()) === pgid).length;
+    const paneGroupSize = (pgid: number) => processTable().filter((r) => r.pgid === pgid).length;
 
     const before = probeDirs();
     // The probe creates its temp dir synchronously, so it is observable as soon
@@ -781,6 +793,9 @@ done
       // is nothing left to derive it from.
       paneGroup = paneGroupOf(mockBin);
       expect(paneGroup).toBeDefined();
+      // Establishing the separate group is the probe's job; proving it is this
+      // test's, because everything below signals that group by its negative id.
+      expect(unsafeGroupReason(paneGroup as number)).toBeUndefined();
       expect(paneGroupSize(paneGroup as number)).toBeGreaterThan(0);
 
       // Slam the door: the socket is gone, so no kill-server can ever land.
@@ -802,11 +817,27 @@ done
       // A failing run deliberately creates an unreapable server; never let one
       // escape onto the shared box - and reap the descendant group too, since
       // that is the residue #84 was actually about.
+      // Both paths go through the guarded helpers: inside a sandbox whose init
+      // is PID 1, a misread group id is not a stray signal, it is this run.
       for (const line of serversFor(sock)) {
-        const pid = Number(line.trim().split(/\s+/)[0]);
-        if (Number.isInteger(pid)) spawnSync("kill", ["-9", String(pid)]);
+        reapProcess(Number(line.trim().split(/\s+/)[0]));
       }
-      if (paneGroup !== undefined) spawnSync("kill", ["-9", `-${paneGroup}`]);
+      // Group ids are recycled, and this one was read tens of seconds ago, so
+      // only signal it while it still holds something this probe started. That
+      // shrinks the window to the gap between the check and the signal rather
+      // than closing it - `ps` is a snapshot, not a lock.
+      // `mockBin` is this run's own mkdtemp path, which is the uniqueness
+      // `groupStillHosts` asks its callers for: as a substring of argv it can
+      // name only processes this test started. It is matched here without the
+      // new-session exclusion paneGroupOf needs, and that asymmetry is
+      // deliberate rather than an oversight to tidy up. tmux setsids the pane
+      // leader, so the server never shares the pane group and the filter would
+      // exclude nothing; and a member of this group that did carry the
+      // server's argv would be probe residue to drain, not to spare. Adding
+      // the exclusion here could only shrink what cleanup reaps.
+      if (paneGroup !== undefined && groupStillHosts(paneGroup, mockBin)) {
+        reapProcessGroup(paneGroup);
+      }
       rmSync(tempHome, { recursive: true, force: true });
       rmSync(actorDir, { recursive: true, force: true });
     }
