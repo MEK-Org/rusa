@@ -1354,6 +1354,13 @@ export async function handleMeshApiRequest(
   // already fetched. This returns the same root page metadata (`total`,
   // `hasMore`) alongside every requested root's full tree in one response,
   // computed by a single bulk repository read.
+  //
+  // Defaults to excluding quiet terminal roots (done/cancelled, not
+  // recurring, no completion history) — a production snapshot showed 48 of
+  // 50 returned roots in that state, each still costing a full tree fetch
+  // and parse purely to be filtered client-side. `includeTerminalRoots=true`
+  // (the Work tab's on-demand "Show Done" reload) restores the unfiltered
+  // page.
   if (pathname === "/api/mesh/obligations/forest") {
     if (!deps.obligations) {
       sendJson(res, 503, { error: "obligations data unavailable" });
@@ -1361,7 +1368,17 @@ export async function handleMeshApiRequest(
     }
     const limit = clampLimit(url);
     const offset = parsePositiveInt(url, "offset") ?? 0;
-    const page = deps.obligations.listPage({ rootsOnly: true, limit, offset });
+    const rawIncludeTerminalRoots =
+      url.searchParams.get("includeTerminalRoots") ??
+      url.searchParams.get("include_terminal_roots");
+    const includeTerminalRoots =
+      rawIncludeTerminalRoots === "true" || rawIncludeTerminalRoots === "1";
+    const page = deps.obligations.listPage({
+      rootsOnly: true,
+      excludeQuietTerminalRoots: !includeTerminalRoots,
+      limit,
+      offset,
+    });
     const trees = deps.obligations.getForest(page.obligations.map((obligation) => obligation.id));
     sendJson(res, 200, { trees, total: page.total, hasMore: page.hasMore });
     return true;

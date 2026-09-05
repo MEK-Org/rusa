@@ -92,6 +92,15 @@ export interface ListObligationsOptions {
   ownerId?: EntityId;
   status?: ObligationStatus;
   rootsOnly?: boolean;
+  /**
+   * Drop terminal (done/cancelled) rows that carry no reason to keep
+   * surfacing them: not recurring, and no completion-ledger history. Used by
+   * the dashboard's default Work tab load (#241) so a stale `capture:*` stub
+   * doesn't cost a tree fetch just to be hidden client-side; recurring or
+   * historied terminal rows still come through since the UI shows those by
+   * default regardless of the "Show Done" toggle.
+   */
+  excludeQuietTerminalRoots?: boolean;
 }
 
 export interface ObligationPageOptions {
@@ -890,6 +899,13 @@ export class ObligationRepository {
     }
     if (options.rootsOnly) {
       clauses.push("obligation.parent_id IS NULL");
+    }
+    if (options.excludeQuietTerminalRoots) {
+      clauses.push(
+        `(obligation.status NOT IN ('done', 'cancelled')
+          OR obligation.recurrence_policy IS NOT NULL
+          OR EXISTS (SELECT 1 FROM obligation_completions WHERE obligation_id = obligation.id))`
+      );
     }
     const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
     const rows = this.db

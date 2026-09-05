@@ -601,23 +601,37 @@ class FakeApi extends DashboardApi {
     );
   }
 
+  final fetchObligationForestCalls = <({bool includeTerminalRoots})>[];
+
   @override
   Future<ObligationForest> fetchObligationForest({
     int? limit,
     int? offset,
+    bool includeTerminalRoots = false,
   }) async {
+    fetchObligationForestCalls.add((includeTerminalRoots: includeTerminalRoots));
     final page = await fetchObligations(
       rootsOnly: true,
       limit: limit,
       offset: offset,
     );
+    // Mirrors the server default (#241): quiet terminal roots (done/
+    // cancelled, not recurring, no completion history) are excluded unless
+    // explicitly requested.
+    final roots = includeTerminalRoots
+        ? page.obligations
+        : page.obligations
+              .where(
+                (o) => !o.isTerminal || o.isRecurring || o.hasCompletionHistory,
+              )
+              .toList();
     final trees = await Future.wait(
-      page.obligations.map((o) => fetchObligationTree(o.id)),
+      roots.map((o) => fetchObligationTree(o.id)),
     );
     return ObligationForest(
       trees: trees,
-      total: page.total,
-      hasMore: page.hasMore,
+      total: includeTerminalRoots ? page.total : roots.length,
+      hasMore: includeTerminalRoots ? page.hasMore : false,
     );
   }
 

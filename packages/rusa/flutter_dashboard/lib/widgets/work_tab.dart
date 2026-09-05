@@ -30,16 +30,24 @@ class _WorkTabState extends State<WorkTab> {
   String? _selectedObligationId;
   StreamSubscription<String?>? _focusSub;
   bool _showDone = false;
+  bool _fetchedTerminalRoots = false;
 
-  Future<void> _loadRoots() async {
+  /// [forceIncludeTerminal] widens a single load beyond the current "Show
+  /// Done" setting — used when a focus link names an obligation the default
+  /// (terminal-excluding) load didn't fetch at all.
+  Future<void> _loadRoots({bool forceIncludeTerminal = false}) async {
+    final includeTerminal = forceIncludeTerminal || _showDone;
     try {
       setState(() {
         if (_rootTrees.isEmpty) _loading = true;
         _error = null;
       });
-      final forest = await widget.store.api.fetchObligationForest();
+      final forest = await widget.store.api.fetchObligationForest(
+        includeTerminalRoots: includeTerminal,
+      );
       setState(() {
         _rootTrees = forest.trees;
+        _fetchedTerminalRoots = includeTerminal;
         _loading = false;
       });
       _checkFocusLink();
@@ -53,8 +61,11 @@ class _WorkTabState extends State<WorkTab> {
 
   void _checkFocusLink() {
     final focusedId = widget.store.focusedObligationId.valueOrNull;
-    if (focusedId != null) {
-      _expandAncestors(focusedId);
+    if (focusedId == null) return;
+    if (!_expandAncestors(focusedId) && !_fetchedTerminalRoots) {
+      // The focused obligation may live under a quiet terminal root the
+      // default load excluded (#241); widen once before giving up.
+      _loadRoots(forceIncludeTerminal: true);
     }
   }
 
@@ -276,7 +287,10 @@ class _WorkTabState extends State<WorkTab> {
                       _showDone ? Icons.visibility : Icons.visibility_off,
                       size: 18,
                     ),
-                    onPressed: () => setState(() => _showDone = !_showDone),
+                    onPressed: () {
+                      setState(() => _showDone = !_showDone);
+                      _loadRoots();
+                    },
                     tooltip: _showDone ? 'Hide Done' : 'Show Done',
                   ),
                   IconButton(

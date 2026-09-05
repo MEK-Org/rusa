@@ -1379,6 +1379,48 @@ describe("ObligationRepository", () => {
         "root-z",
       ]);
     });
+
+    it("listPage excludeQuietTerminalRoots drops done/cancelled roots with no recurrence or completion history, keeps everything else", () => {
+      repository.create({ id: "live-root", title: "live-root", ownerId: "actor-a" });
+      repository.create({ id: "quiet-done", title: "quiet-done", ownerId: "actor-a" });
+      repository.setTerminalStatus("quiet-done", "done");
+      repository.create({ id: "quiet-cancelled", title: "quiet-cancelled", ownerId: "actor-a" });
+      repository.setTerminalStatus("quiet-cancelled", "cancelled");
+
+      repository.create({ id: "recurring-done", title: "recurring-done", ownerId: "actor-a" });
+      repository.setRecurrence("recurring-done", { policy: "cron", cronExpr: "0 * * * *" });
+      repository.setTerminalStatus("recurring-done", "done");
+
+      repository.create({ id: "historied-done", title: "historied-done", ownerId: "actor-a" });
+      repository.setRecurrence("historied-done", { policy: "cron", cronExpr: "0 * * * *" });
+      repository.setTerminalStatus("historied-done", "done");
+      repository.activateScheduled("historied-done");
+      repository.setRecurrence("historied-done", null);
+      repository.setTerminalStatus("historied-done", "done");
+
+      const filtered = repository.listPage({
+        rootsOnly: true,
+        excludeQuietTerminalRoots: true,
+        limit: 50,
+      });
+      expect(filtered.obligations.map((o) => o.id).sort()).toEqual([
+        "historied-done",
+        "live-root",
+        "recurring-done",
+      ]);
+      expect(filtered.total).toBe(3);
+      expect(filtered.hasMore).toBe(false);
+
+      const unfiltered = repository.listPage({ rootsOnly: true, limit: 50 });
+      expect(unfiltered.obligations.map((o) => o.id).sort()).toEqual([
+        "historied-done",
+        "live-root",
+        "quiet-cancelled",
+        "quiet-done",
+        "recurring-done",
+      ]);
+      expect(unfiltered.total).toBe(5);
+    });
   });
 
   it("does not cap or warn on an owner ready queue", () => {

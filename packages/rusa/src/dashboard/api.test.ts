@@ -1868,6 +1868,30 @@ describe("handleMeshApiRequest", () => {
         const { res } = await call(noObligationsDeps, "GET", "/api/mesh/obligations/forest");
         expect(res.statusCode).toBe(503);
       });
+
+      it("excludes quiet terminal roots by default, includes them with includeTerminalRoots=true (#241)", async () => {
+        obligations.create({ title: "live-root", id: "live-root", ownerId: "actor-1" });
+        obligations.create({ title: "quiet-done", id: "quiet-done", ownerId: "actor-1" });
+        obligations.setTerminalStatus("quiet-done", "done");
+
+        const { res: defaultRes } = await call(deps, "GET", "/api/mesh/obligations/forest");
+        const defaultData = JSON.parse(defaultRes.body);
+        expect(
+          defaultData.trees.map((t: { obligation: { id: string } }) => t.obligation.id)
+        ).toEqual(["live-root"]);
+        expect(defaultData.total).toBe(1);
+
+        const { res: includedRes } = await call(
+          deps,
+          "GET",
+          "/api/mesh/obligations/forest?includeTerminalRoots=true"
+        );
+        const includedData = JSON.parse(includedRes.body);
+        expect(
+          includedData.trees.map((t: { obligation: { id: string } }) => t.obligation.id).sort()
+        ).toEqual(["live-root", "quiet-done"]);
+        expect(includedData.total).toBe(2);
+      });
     });
 
     describe("GET /api/mesh/obligations/:id", () => {

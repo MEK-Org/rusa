@@ -160,4 +160,130 @@ void main() {
       await store.dispose();
     });
   });
+
+  testWidgets(
+    'excludes quiet terminal roots from the default load, fetches them on '
+    'Show Done (#241)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final liveRoot = makeObligation(
+          'root-live',
+          ownerId: 'root',
+          intent: 'Live root',
+        );
+        final quietTerminalRoot = makeObligation(
+          'root-quiet-done',
+          ownerId: 'root',
+          intent: 'Stale done stub',
+          status: 'done',
+        );
+        final recurringTerminalRoot = makeObligation(
+          'root-recurring-done',
+          ownerId: 'root',
+          intent: 'Recurring but currently done',
+          status: 'done',
+          recurrencePolicy: 'cron',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [
+            liveRoot,
+            quietTerminalRoot,
+            recurringTerminalRoot,
+          ];
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('Live root'), findsOneWidget);
+        expect(find.text('Recurring but currently done'), findsOneWidget);
+        expect(find.text('Stale done stub'), findsNothing);
+        expect(api.fetchObligationForestCalls, hasLength(1));
+        expect(
+          api.fetchObligationForestCalls.single.includeTerminalRoots,
+          isFalse,
+        );
+
+        await tester.tap(find.byTooltip('Show Done'));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('Stale done stub'), findsOneWidget);
+        expect(api.fetchObligationForestCalls, hasLength(2));
+        expect(
+          api.fetchObligationForestCalls.last.includeTerminalRoots,
+          isTrue,
+        );
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'widens to include terminal roots to resolve a focus link the default '
+    'load excluded (#241)',
+    (tester) async {
+      await tester.runAsync(() async {
+        final quietRoot = makeObligation(
+          'root-quiet',
+          ownerId: 'root',
+          intent: 'Stale done stub',
+          status: 'done',
+        );
+        final child = makeObligation(
+          'child-under-quiet-root',
+          parentId: 'root-quiet',
+          ownerId: 'root',
+          intent: 'Focused child under a quiet root',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [quietRoot, child];
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        store.setFocusedObligationId('child-under-quiet-root');
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        expect(api.fetchObligationForestCalls, hasLength(2));
+        expect(
+          api.fetchObligationForestCalls.first.includeTerminalRoots,
+          isFalse,
+        );
+        expect(
+          api.fetchObligationForestCalls.last.includeTerminalRoots,
+          isTrue,
+        );
+        expect(
+          find.text('Focused child under a quiet root'),
+          findsWidgets,
+        );
+
+        await store.dispose();
+      });
+    },
+  );
 }
