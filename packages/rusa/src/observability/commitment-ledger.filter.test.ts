@@ -62,6 +62,7 @@ const ALL_MESH_EVENT_KINDS = Object.keys({
   scheduled_wake: 0,
   event_source_subscribed: 0,
   event_source_unsubscribed: 0,
+  scheduled_message_cancelled: 0,
   stamp_invalid: 0,
   host_job_submitted: 0,
   host_job_stopped: 0,

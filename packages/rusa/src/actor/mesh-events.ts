@@ -134,6 +134,13 @@ export type MeshEventKind =
   // actor, `payload` = { from, messageId }. A wake whose
   // target wasn't live carries the dropped-message marker in `detail`.
   | "scheduled_wake"
+  // An authorized actor cancelled a pending scheduled message before it was
+  // delivered — the disposition step retirement now requires (#191). `actorId` =
+  // the DECIDER, not either endpoint, because the event records a judgment
+  // rather than a delivery; `detail` = the cancelled message id (so the
+  // (kind, detail) index answers "what happened to this message?"); `payload` =
+  // { messageId, fromId, toId, deliverAt, cancelledBy, reason? }.
+  | "scheduled_message_cancelled"
   // Event source subscriptions (design ISSUE_NUM, phase 2)
   | "event_source_subscribed"
   | "event_source_unsubscribed"
