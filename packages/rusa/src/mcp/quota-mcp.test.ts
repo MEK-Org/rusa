@@ -24,6 +24,7 @@ vi.mock("@google/genai", () => ({
 }));
 
 import type { RusaConfig } from "../config/types.js";
+import { buildQuotaSnapshot } from "../dashboard/quota-api.js";
 import { KimiAuthRequiredError } from "../providers/kimi-usage-scrape.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import { buildActorBwrapArgs } from "../providers/sandbox.js";
@@ -977,6 +978,79 @@ describe("quota MCP server", () => {
       expect(parsed.limits).toHaveLength(4);
       expect(parsed.limits?.filter((l) => l.scope === "provider")).toHaveLength(2);
       expect(parsed.limits?.filter((l) => l.scope === "model")).toHaveLength(2);
+    });
+
+    it("a reserve panel keeps its scopes end to end: the provider headline reads 48% used (#249)", async () => {
+      // Sanitized live panel from an operator report: a model reserve weekly at
+      // 100% left, the provider's own weekly at 52% left, then a model heading
+      // whose 5h and weekly rows are model-scoped too. Scopes in row order are
+      // model, provider, model, model — and the provider's headline must come
+      // from its own weekly, not from the reserve row printed above it.
+      const rawCodexOutput =
+        "gpt-reserve Weekly limit:    [████████████████████] 100% left (resets 14:56 on 12 Sep)\n" +
+        "Weekly limit:                [██████████░░░░░░░░░░] 52% left (resets 18:08 on 7 Sep)\n" +
+        "GPT-5.3-Codex-Spark limit:\n" +
+        "5h limit:                    [████████████████████] 100% left (resets 19:56)\n" +
+        "Weekly limit:                [████████████████████] 100% left (resets 16:11 on 7 Sep)";
+
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Weekly limit",
+                kind: "weekly",
+                usedPercent: 0,
+                resetAtIso: "2026-09-12T14:56:00.000Z",
+                scope: "model",
+              },
+              {
+                label: "Weekly limit",
+                kind: "weekly",
+                usedPercent: 48,
+                resetAtIso: "2026-09-07T18:08:00.000Z",
+                scope: "provider",
+              },
+              {
+                label: "5h limit",
+                kind: "five_hour",
+                usedPercent: 0,
+                resetAtIso: "2026-09-05T19:56:00.000Z",
+                scope: "model",
+              },
+              {
+                label: "Weekly limit",
+                kind: "weekly",
+                usedPercent: 0,
+                resetAtIso: "2026-09-07T16:11:00.000Z",
+                scope: "model",
+              },
+            ],
+          }),
+      });
+
+      const parsed = await parseCodexQuota(rawCodexOutput, "test-key");
+      expect(parsed.limits?.map((l) => l.scope)).toEqual(["model", "provider", "model", "model"]);
+
+      // `parseCodexQuota` answers a partial snapshot; the service names the
+      // provider it probed, exactly as the cache hands it to the endpoint.
+      const snapshot = await buildQuotaSnapshot({
+        getQuota: async () => ({ provider: "codex", status: "available", ...parsed }),
+        providers: ["codex"],
+      });
+      const codex = snapshot.providers[0];
+
+      expect(codex.usedPercent).toBe(48);
+      expect(codex.windows).toEqual([
+        expect.objectContaining({
+          id: "weekly",
+          label: "Weekly limit",
+          usedPercent: 48,
+          headline: true,
+          resetAtIso: "2026-09-07T18:08:00.000Z",
+        }),
+      ]);
     });
 
     it("threads an LLM-emitted resetAtIso through unchanged to the resulting limits ", async () => {
