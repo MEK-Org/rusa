@@ -185,6 +185,77 @@ describe("db-check", () => {
     ).toBe("root-session");
   });
 
+  it("plans the event-subscription import against actors the same run has only planned", () => {
+    writeFileSync(
+      join(home, "threads.json"),
+      JSON.stringify({
+        threads: [
+          {
+            id: "root",
+            charter: "root charter",
+            parentId: null,
+            status: "active",
+            createdAt: "2026-01-01T00:00:00Z",
+          },
+          {
+            id: "worker",
+            charter: "worker charter",
+            parentId: "root",
+            status: "active",
+            createdAt: "2026-01-01T00:00:01Z",
+          },
+        ],
+      })
+    );
+    const subscriptions = JSON.stringify({
+      version: 3,
+      subscriptions: [
+        {
+          resource: "github:dummy-org/dummy-repo",
+          actorId: "worker",
+          subscribedBy: "root",
+          subscribedAt: "2026-01-02T00:00:00Z",
+        },
+      ],
+    });
+    writeFileSync(join(home, "event-subscriptions.json"), subscriptions);
+
+    const result = runDbCheckAgainstHome(home);
+
+    expect(result.plannedActors).toBe(2);
+    expect(result.plannedEventSubscriptions).toBe(1);
+
+    // Plan mode never archives the source or writes durable subscription rows.
+    expect(readFileSync(join(home, "event-subscriptions.json"), "utf8")).toBe(subscriptions);
+    const db = new Database(join(home, "data", "mesh.db"));
+    expect(new Repositories(db).eventSubscriptions.list()).toEqual([]);
+    db.close();
+  });
+
+  it("reports no planned subscriptions on a fresh home and creates no subscription file", () => {
+    const result = runDbCheckAgainstHome(home);
+
+    expect(result.plannedEventSubscriptions).toBe(0);
+    expect(existsSync(join(home, "event-subscriptions.json"))).toBe(false);
+  });
+
+  it("exits non-zero when the legacy subscription file holds unresolved ownership", () => {
+    writeFileSync(
+      join(home, "event-subscriptions.json"),
+      JSON.stringify({
+        version: 3,
+        subscriptions: [{ resource: "github:dummy-org/dummy-repo", actorId: "" }],
+      })
+    );
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    runDbCheck({ home });
+
+    expect(process.exit).toHaveBeenCalledWith(1);
+    expect(consoleError).toHaveBeenCalledWith(expect.stringContaining("unresolved row(s)"));
+    consoleError.mockRestore();
+  });
+
   it("exits non-zero with the actionable underlying failure on invalid legacy state", () => {
     writeFileSync(
       join(home, "threads.json"),
@@ -222,7 +293,7 @@ describe("db-check", () => {
     runDbCheck({ home });
 
     expect(process.exit).not.toHaveBeenCalled();
-    expect(consoleLog).toHaveBeenCalledWith(expect.stringContaining("Legacy import plan"));
+    expect(consoleLog).toHaveBeenCalledWith(expect.stringContaining("0 event subscription(s)"));
     expect(consoleLog).toHaveBeenCalledWith("✓ db-check passed");
     consoleLog.mockRestore();
   });

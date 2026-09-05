@@ -23,7 +23,6 @@ import {
   type EventResource,
   type EventSubscriptionAuditEvent,
   type EventSubscriptionStore,
-  FileEventSubscriptionStore,
   isSubResourceOf,
   missingAuditedEventSubscriptions,
   normalizeEventResource,
@@ -113,6 +112,7 @@ import {
   importLegacyActorState,
 } from "../db/legacy-actor-import.js";
 import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
+import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
 import type {
   PrerequisiteAttention,
   ReadyHeadChange,
@@ -1307,10 +1307,23 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // registers the glass-goals `understanding-write` server (claude FS isolation
   // ISSUE_NUM having landed); grantable-servers.test.ts locks the contents.
   const capabilityGrants = getRepositories().capabilityGrants;
-  const persistentEventSubscriptions = new FileEventSubscriptionStore(
-    join(mcHome, "event-subscriptions.json"),
-    rootId
-  );
+  // Explicit subscription ownership and its tombstones are durable in SQLite;
+  // `event-subscriptions.json` is only a legacy source, imported once and then
+  // archived. The config-implied seed is rebuilt in memory below, so nothing
+  // here recreates a JSON source of truth.
+  const legacyEventSubscriptionImport = importLegacyEventSubscriptionState({
+    mcHome,
+    db: database,
+    repositories: getRepositories(),
+    rootId,
+  });
+  if (legacyEventSubscriptionImport.importedSubscriptions > 0) {
+    console.log(
+      `[mesh] imported ${legacyEventSubscriptionImport.importedSubscriptions} explicit ` +
+        "event subscription(s) into SQLite"
+    );
+  }
+  const persistentEventSubscriptions = getRepositories().eventSubscriptions;
   warnMissingConfiguredEventSubscriptionsAtBoot(
     persistentEventSubscriptions,
     eventSubscriptionAudit,

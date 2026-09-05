@@ -57,6 +57,25 @@ export interface EventSubscription {
   unsubscribedAt?: string;
 }
 
+/** Legacy on-disk location of the explicit subscriptions, relative to the instance home. */
+export const EVENT_SUBSCRIPTIONS_FILENAME = "event-subscriptions.json";
+
+/**
+ * The one-active-subscriber-per-resource refusal. Shared so every store
+ * implementation refuses in identical words and callers can match on it without
+ * knowing which store is underneath.
+ */
+export function activeSubscriberConflictMessage(
+  resource: EventResource,
+  holderActorId: string,
+  actorId: string
+): string {
+  return (
+    `event source ${resource} already has an active subscriber ` +
+    `(actor ${holderActorId}); unsubscribe it before subscribing actor ${actorId}`
+  );
+}
+
 /**
  * Persistence boundary for event subscriptions — mirrors
  * {@link CapabilityGrantStore}: a local JSON file in production
@@ -321,8 +340,7 @@ export class InMemoryEventSubscriptionStore implements EventSubscriptionStore {
       : this.activeForResource(resource).find((s) => s.actorId !== subscription.actorId);
     if (holder && !normalized.unsubscribedAt) {
       throw new Error(
-        `event source ${resource} already has an active subscriber ` +
-          `(actor ${holder.actorId}); unsubscribe it before subscribing actor ${subscription.actorId}`
+        activeSubscriberConflictMessage(resource, holder.actorId, subscription.actorId)
       );
     }
     this.subs.set(`${resource}:${subscription.actorId}`, normalized);
@@ -392,12 +410,188 @@ export class UnionEventSubscriptionStore implements EventSubscriptionStore {
   }
 }
 
+/** The canonical `event-subscriptions.json` document version this module writes. */
+export const EVENT_SUBSCRIPTION_DOCUMENT_VERSION = 3;
+
+/** One source row the document could not resolve, with its 1-based position. */
+export interface LegacyEventSubscriptionRejection {
+  row: number;
+  reason: string;
+}
+
+export interface LegacyEventSubscriptionDocument {
+  /**
+   * Accepted rows, tombstones first: replaying them through `restore()` in this
+   * order never trips the one-active-subscriber invariant.
+   */
+  subscriptions: EventSubscription[];
+  /** Rows that could not be resolved. Every one is an ownership claim, so no caller may ignore them. */
+  rejections: LegacyEventSubscriptionRejection[];
+  /** Rows present in the source document, before any filtering. */
+  rowCount: number;
+  /** True when the document is not already at {@link EVENT_SUBSCRIPTION_DOCUMENT_VERSION}. */
+  needsMigration: boolean;
+}
+
 /**
- * JSON-file-backed subscription store — the durable store, mirroring
- * {@link FileCapabilityGrantStore}: loads once on construction, rewrites the
- * whole file atomically on every mutation. A mutation becomes visible in memory
- * only after its snapshot has been replaced, so callers never receive a false
- * success for a failed write or rename.
+ * Parse one `event-subscriptions.json` document into the rows a store should
+ * hold, touching no filesystem. Structural problems (unreadable JSON, an
+ * unknown document version) throw; row-level problems come back as
+ * {@link LegacyEventSubscriptionRejection}s so each caller decides what they
+ * mean. {@link FileEventSubscriptionStore} quarantines them and boots on the
+ * remainder; the SQLite importer refuses the whole file instead, because
+ * committing the remainder would make a dropped ownership claim durable.
+ */
+export function parseLegacyEventSubscriptionDocument(
+  raw: string,
+  options: { file: string; rootId: string }
+): LegacyEventSubscriptionDocument {
+  const { file, rootId } = options;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    // Fail closed instead of silently booting with an empty routing authority.
+    // The source file remains untouched for manual repair.
+    throw new Error(`invalid event subscription file: ${file}`, { cause: error });
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`invalid event subscription file root: ${file}`);
+  }
+  const document = parsed as { version?: unknown; subscriptions?: unknown };
+  if (
+    document.version !== undefined &&
+    (!Number.isInteger(document.version) || (document.version as number) < 1)
+  ) {
+    throw new Error(`invalid event subscription file version: ${String(document.version)}`);
+  }
+  if (
+    typeof document.version === "number" &&
+    document.version > EVENT_SUBSCRIPTION_DOCUMENT_VERSION
+  ) {
+    throw new Error(`unsupported event subscription file version: ${document.version}`);
+  }
+  if (document.subscriptions !== undefined && !Array.isArray(document.subscriptions)) {
+    throw new Error(`invalid event subscription rows: ${file}`);
+  }
+
+  const isUnversioned = document.version === undefined;
+  const rows = (document.subscriptions ?? []) as unknown[];
+  const rejections: LegacyEventSubscriptionRejection[] = [];
+  type ParsedRow = {
+    index: number;
+    subscription: EventSubscription;
+    stateChangedAt: number;
+  };
+  const parsedRows: ParsedRow[] = [];
+  for (const [index, row] of rows.entries()) {
+    try {
+      const subscription = parsePersistedSubscription(row);
+      // Pre-union documents recorded the root's config-implied subscriptions as
+      // durable rows. `reconcileEventSources` re-seeds those on every boot, so
+      // carrying them forward would resurrect sources the config no longer names.
+      if (
+        isUnversioned &&
+        subscription.actorId === rootId &&
+        subscription.subscribedBy === rootId
+      ) {
+        continue;
+      }
+      parsedRows.push({
+        index,
+        subscription,
+        stateChangedAt: Date.parse(subscription.unsubscribedAt ?? subscription.subscribedAt),
+      });
+    } catch (error) {
+      rejections.push({
+        row: index + 1,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  const reject = (row: ParsedRow, reason: string): void => {
+    rejections.push({ row: row.index + 1, reason });
+  };
+
+  // Legacy spellings can normalize multiple rows onto one (resource, actor)
+  // key. Resolve that actor's latest state before comparing active owners.
+  const pairRows = new Map<string, ParsedRow[]>();
+  for (const row of parsedRows) {
+    const key = `${row.subscription.resource}\0${row.subscription.actorId}`;
+    const group = pairRows.get(key) ?? [];
+    group.push(row);
+    pairRows.set(key, group);
+  }
+  const resolvedRows: ParsedRow[] = [];
+  for (const group of pairRows.values()) {
+    const latestAt = Math.max(...group.map((row) => row.stateChangedAt));
+    const latest = group.filter((row) => row.stateChangedAt === latestAt);
+    // At an exact transition tie, retain an inactive state. Otherwise choose
+    // by normalized row content so reversing the file cannot change behavior.
+    const [winner] = [...latest].sort((a, b) => {
+      const inactive =
+        Number(Boolean(b.subscription.unsubscribedAt)) -
+        Number(Boolean(a.subscription.unsubscribedAt));
+      if (inactive !== 0) return inactive;
+      return persistedRowTieKey(a.subscription).localeCompare(persistedRowTieKey(b.subscription));
+    });
+    if (!winner) continue;
+    resolvedRows.push(winner);
+    for (const row of group) {
+      if (row !== winner) {
+        reject(row, `a later state already exists for ${row.subscription.resource}`);
+      }
+    }
+  }
+
+  // Tombstones cannot contend for live ownership. Among active actors, an
+  // unambiguous newest subscribe wins. Equal instants are rejected as an
+  // authority conflict instead of assigning ownership from JSON file order.
+  const subscriptions: EventSubscription[] = [];
+  for (const { subscription } of resolvedRows.filter(
+    ({ subscription }) => subscription.unsubscribedAt
+  )) {
+    subscriptions.push(subscription);
+  }
+  const activeByResource = new Map<string, ParsedRow[]>();
+  for (const row of resolvedRows.filter(({ subscription }) => !subscription.unsubscribedAt)) {
+    const group = activeByResource.get(row.subscription.resource) ?? [];
+    group.push(row);
+    activeByResource.set(row.subscription.resource, group);
+  }
+  for (const [resource, group] of activeByResource) {
+    const newestAt = Math.max(...group.map((row) => Date.parse(row.subscription.subscribedAt)));
+    const newest = group.filter((row) => Date.parse(row.subscription.subscribedAt) === newestAt);
+    if (newest.length !== 1) {
+      for (const row of group) reject(row, `ambiguous active subscribers for ${resource}`);
+      continue;
+    }
+    const [winner] = newest;
+    if (!winner) continue;
+    for (const row of group) {
+      if (row !== winner) reject(row, `a newer active subscriber already owns ${resource}`);
+    }
+    subscriptions.push(winner.subscription);
+  }
+
+  return {
+    subscriptions,
+    rejections,
+    rowCount: rows.length,
+    needsMigration:
+      isUnversioned ||
+      (document.version as number | undefined) !== EVENT_SUBSCRIPTION_DOCUMENT_VERSION,
+  };
+}
+
+/**
+ * JSON-file-backed subscription store — the legacy durable store, retained to
+ * read a pre-cutover `event-subscriptions.json` (and by tests). Loads once on
+ * construction, rewrites the whole file atomically on every mutation. A
+ * mutation becomes visible in memory only after its snapshot has been replaced,
+ * so callers never receive a false success for a failed write or rename.
+ * Production authority now lives in SQLite; see `DbEventSubscriptionStore`.
  */
 export class FileEventSubscriptionStore implements EventSubscriptionStore {
   private mem = new InMemoryEventSubscriptionStore();
@@ -416,128 +610,13 @@ export class FileEventSubscriptionStore implements EventSubscriptionStore {
       throw error;
     }
 
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (error) {
-      // Fail closed instead of silently booting with an empty routing authority.
-      // The source file remains untouched for manual repair.
-      throw new Error(`invalid event subscription file: ${file}`, { cause: error });
-    }
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new Error(`invalid event subscription file root: ${file}`);
-    }
-    const document = parsed as { version?: unknown; subscriptions?: unknown };
-    if (
-      document.version !== undefined &&
-      (!Number.isInteger(document.version) || (document.version as number) < 1)
-    ) {
-      throw new Error(`invalid event subscription file version: ${String(document.version)}`);
-    }
-    if (typeof document.version === "number" && document.version > 3) {
-      throw new Error(`unsupported event subscription file version: ${document.version}`);
-    }
-    if (document.subscriptions !== undefined && !Array.isArray(document.subscriptions)) {
-      throw new Error(`invalid event subscription rows: ${file}`);
+    const document = parseLegacyEventSubscriptionDocument(raw, { file, rootId });
+    for (const subscription of document.subscriptions) this.mem.restore(subscription);
+    for (const rejection of document.rejections) {
+      this.warn(`[mesh] skipped event subscription row ${rejection.row}: ${rejection.reason}`);
     }
 
-    const isUnversioned = document.version === undefined;
-    const rows = (document.subscriptions ?? []) as unknown[];
-    let rejected = 0;
-    type ParsedRow = {
-      index: number;
-      subscription: EventSubscription;
-      stateChangedAt: number;
-    };
-    const parsedRows: ParsedRow[] = [];
-    for (const [index, row] of rows.entries()) {
-      try {
-        const subscription = parsePersistedSubscription(row);
-        if (
-          isUnversioned &&
-          subscription.actorId === rootId &&
-          subscription.subscribedBy === rootId
-        ) {
-          continue;
-        }
-        parsedRows.push({
-          index,
-          subscription,
-          stateChangedAt: Date.parse(subscription.unsubscribedAt ?? subscription.subscribedAt),
-        });
-      } catch (error) {
-        rejected += 1;
-        this.warn(
-          `[mesh] skipped event subscription row ${index + 1}: ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
-    }
-
-    const reject = (row: ParsedRow, reason: string): void => {
-      rejected += 1;
-      this.warn(`[mesh] skipped event subscription row ${row.index + 1}: ${reason}`);
-    };
-
-    // Legacy spellings can normalize multiple rows onto one (resource, actor)
-    // key. Resolve that actor's latest state before comparing active owners.
-    const pairRows = new Map<string, ParsedRow[]>();
-    for (const row of parsedRows) {
-      const key = `${row.subscription.resource}\0${row.subscription.actorId}`;
-      const group = pairRows.get(key) ?? [];
-      group.push(row);
-      pairRows.set(key, group);
-    }
-    const resolvedRows: ParsedRow[] = [];
-    for (const group of pairRows.values()) {
-      const latestAt = Math.max(...group.map((row) => row.stateChangedAt));
-      const latest = group.filter((row) => row.stateChangedAt === latestAt);
-      // At an exact transition tie, retain an inactive state. Otherwise choose
-      // by normalized row content so reversing the file cannot change behavior.
-      const [winner] = [...latest].sort((a, b) => {
-        const inactive =
-          Number(Boolean(b.subscription.unsubscribedAt)) -
-          Number(Boolean(a.subscription.unsubscribedAt));
-        if (inactive !== 0) return inactive;
-        return persistedRowTieKey(a.subscription).localeCompare(persistedRowTieKey(b.subscription));
-      });
-      if (!winner) continue;
-      resolvedRows.push(winner);
-      for (const row of group) {
-        if (row !== winner) {
-          reject(row, `a later state already exists for ${row.subscription.resource}`);
-        }
-      }
-    }
-
-    // Tombstones cannot contend for live ownership. Among active actors, an
-    // unambiguous newest subscribe wins. Equal instants are rejected as an
-    // authority conflict instead of assigning ownership from JSON file order.
-    for (const { subscription } of resolvedRows.filter(
-      ({ subscription }) => subscription.unsubscribedAt
-    )) {
-      this.mem.restore(subscription);
-    }
-    const activeByResource = new Map<string, ParsedRow[]>();
-    for (const row of resolvedRows.filter(({ subscription }) => !subscription.unsubscribedAt)) {
-      const group = activeByResource.get(row.subscription.resource) ?? [];
-      group.push(row);
-      activeByResource.set(row.subscription.resource, group);
-    }
-    for (const [resource, group] of activeByResource) {
-      const newestAt = Math.max(...group.map((row) => Date.parse(row.subscription.subscribedAt)));
-      const newest = group.filter((row) => Date.parse(row.subscription.subscribedAt) === newestAt);
-      if (newest.length !== 1) {
-        for (const row of group) reject(row, `ambiguous active subscribers for ${resource}`);
-        continue;
-      }
-      const [winner] = newest;
-      if (!winner) continue;
-      for (const row of group) {
-        if (row !== winner) reject(row, `a newer active subscriber already owns ${resource}`);
-      }
-      this.mem.restore(winner.subscription);
-    }
-
+    const rejected = document.rejections.length;
     if (rejected > 0) {
       const recoveryFile = rejectedSnapshotPath(this.file, raw);
       try {
@@ -557,10 +636,9 @@ export class FileEventSubscriptionStore implements EventSubscriptionStore {
       );
     }
 
-    const needsMigrationFlush = isUnversioned || (document.version as number | undefined) !== 3;
-    if (needsMigrationFlush && rows.length > 0 && rejected === 0) {
+    if (document.needsMigration && document.rowCount > 0 && rejected === 0) {
       this.flush(this.mem.list());
-    } else if (needsMigrationFlush && rejected > 0) {
+    } else if (document.needsMigration && rejected > 0) {
       this.warn(
         `[mesh] event subscription migration left the source file unchanged after ${rejected} rejected row(s)`
       );
@@ -573,10 +651,14 @@ export class FileEventSubscriptionStore implements EventSubscriptionStore {
     // fsync-based guarantee against host/power loss.
     const temporary = `${this.file}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      writeFileSync(temporary, JSON.stringify({ version: 3, subscriptions }, null, 2), {
-        encoding: "utf8",
-        mode: 0o600,
-      });
+      writeFileSync(
+        temporary,
+        JSON.stringify({ version: EVENT_SUBSCRIPTION_DOCUMENT_VERSION, subscriptions }, null, 2),
+        {
+          encoding: "utf8",
+          mode: 0o600,
+        }
+      );
       this.replaceFile(temporary, this.file);
     } catch (error) {
       try {

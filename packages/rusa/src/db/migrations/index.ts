@@ -33,6 +33,7 @@ import { actorRuntimeState } from "./0034_actor_runtime_state.js";
 import { recurringObligations } from "./0035_recurring_obligations.js";
 import { capabilityGrants } from "./0036_capability_grants.js";
 import { obligationDependencies } from "./0037_obligation_dependencies.js";
+import { eventSubscriptions } from "./0038_event_subscriptions.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -78,4 +79,5 @@ export const migrations: Migration[] = [
   recurringObligations,
   capabilityGrants,
   obligationDependencies,
+  eventSubscriptions,
 ];
