@@ -12,6 +12,7 @@ import {
 import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { E2E_RUNS_DIR_NAME, missingResumeRequirements } from "../e2e/provision.js";
 import {
   addReadonlyBindIfExists,
   addWritableDirBindIfRealDir,
@@ -271,7 +272,48 @@ export class E2EInstanceManager {
     return worktree;
   }
 
-  private buildBwrapArgs(worktree: string): string[] {
+  /**
+   * A resume root must be a preserved instance under this helper's own runs
+   * area (not an arbitrary caller-supplied path) and must structurally look
+   * like something `rusa-e2e am-up --resume` can reopen, per
+   * {@link missingResumeRequirements}.
+   */
+  private validateResumableRoot(requestedPath: string): string {
+    if (!requestedPath.trim()) throw new Error("e2e-instance: resume root path is required");
+    if (!isAbsolute(requestedPath)) {
+      throw new Error(`e2e-instance: resume root path must be absolute: ${requestedPath}`);
+    }
+    const runsDir = join(this.hostHome, E2E_RUNS_DIR_NAME);
+    let realRunsDir: string;
+    let root: string;
+    try {
+      realRunsDir = realpathSync(runsDir);
+    } catch {
+      throw new Error(`e2e-instance: no preserved e2e runs exist under ${runsDir}`);
+    }
+    try {
+      root = realpathSync(resolve(requestedPath));
+    } catch {
+      throw new Error(`e2e-instance: resume root does not exist: ${requestedPath}`);
+    }
+    if (!statSync(root).isDirectory()) {
+      throw new Error(`e2e-instance: resume root is not a directory: ${requestedPath}`);
+    }
+    if (!isSelfOrDescendant(realRunsDir, root)) {
+      throw new Error(
+        `e2e-instance: REFUSED foreign resume root ${root}; it must be a preserved instance under ${realRunsDir}`
+      );
+    }
+    const missing = missingResumeRequirements(root);
+    if (missing.length > 0) {
+      throw new Error(
+        `e2e-instance: ${root} is not a resumable e2e root (missing ${missing.join(", ")})`
+      );
+    }
+    return root;
+  }
+
+  private buildBwrapArgs(worktree: string, resumeRoot?: string): string[] {
     const runtimeHome = join(this.runtimeDir, "home");
     const providerBin = join(this.runtimeDir, "provider-bin");
     const baseConfigHome = join(this.runtimeDir, "base-config");
@@ -326,7 +368,7 @@ export class E2EInstanceManager {
       const result = setupFlutterOverlay(args, this.flutterRoot, realRuntime);
       wrapperDir = result.wrapperDir;
     }
-    for (const path of [realRuntime, worktree]) {
+    for (const path of [realRuntime, worktree, ...(resumeRoot ? [resumeRoot] : [])]) {
       ensureTargetParentDirs(args, path);
       args.push("--bind", path, path);
     }
@@ -447,6 +489,7 @@ export class E2EInstanceManager {
       "run",
       "e2e",
       "am-up",
+      ...(resumeRoot ? ["--root", resumeRoot, "--resume"] : []),
       "--root-driver",
       "external",
       ...(hasBaseConfig ? ["--base-config-home", baseConfigHome] : []),
@@ -534,6 +577,60 @@ export class E2EInstanceManager {
       unitName: E2E_INSTANCE_UNIT_NAME,
       startedAt: this.now(),
     };
+    return this.launchAndAwaitPort(worktree, undefined, record, () =>
+      rmSync(this.stateFile, { force: true })
+    );
+  }
+
+  /**
+   * Resume a preserved e2e root this actor previously held: reuse its
+   * recorded, re-validated worktree and pass the caller's requested root
+   * straight through to `am-up --root <root> --resume`, never provisioning
+   * fresh instance state. A failed resume restores the pre-resume holder
+   * record instead of discarding it, so the preserved root's attribution
+   * survives a retry.
+   */
+  async resume(actorId: string, requestedRoot: string): Promise<E2EInstanceStatus> {
+    const existing = this.readRecord();
+    const existingStatus = this.liveStatus();
+    if (this.isLive(existingStatus)) {
+      throw new Error(
+        existing
+          ? `e2e-instance: already held by ${existing.actorHandle} (${existing.actorId}) serving ${existing.worktree}; ` +
+              "it comes down only when that actor calls down/stop, that actor is retired, or the mesh shuts down"
+          : `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} is already active but its holder record is missing; ` +
+              "an operator must stop the orphaned unit before retrying"
+      );
+    }
+    if (!existing) {
+      throw new Error(
+        "e2e-instance: no preserved holder record to resume; call up() to provision a fresh instance"
+      );
+    }
+    if (existing.actorId !== actorId) {
+      throw new Error(
+        `e2e-instance: held by ${existing.actorHandle} (${existing.actorId}); only the holder may resume`
+      );
+    }
+
+    const resumeRoot = this.validateResumableRoot(requestedRoot);
+    const worktree = this.validateOwnedWorktree(actorId, existing.worktree);
+    const record: E2EInstanceRecord = {
+      actorId,
+      actorHandle: existing.actorHandle,
+      worktree,
+      unitName: E2E_INSTANCE_UNIT_NAME,
+      startedAt: this.now(),
+    };
+    return this.launchAndAwaitPort(worktree, resumeRoot, record, () => this.writeRecord(existing));
+  }
+
+  private async launchAndAwaitPort(
+    worktree: string,
+    resumeRoot: string | undefined,
+    record: E2EInstanceRecord,
+    onFailure: () => void
+  ): Promise<E2EInstanceStatus> {
     this.writeRecord(record);
     try {
       this.exec("systemd-run", [
@@ -549,10 +646,10 @@ export class E2EInstanceManager {
         "--property=TimeoutStopSec=30s",
         "--",
         "bwrap",
-        ...this.buildBwrapArgs(worktree),
+        ...this.buildBwrapArgs(worktree, resumeRoot),
       ]);
     } catch (err) {
-      rmSync(this.stateFile, { force: true });
+      onFailure();
       throw err;
     }
     const deadline = Date.now() + this.startupTimeoutMs;
@@ -560,6 +657,7 @@ export class E2EInstanceManager {
     while (Date.now() < deadline) {
       if (!this.isLive(liveStatus)) {
         this.cleanupFailedStart();
+        onFailure();
         throw new Error(
           `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} failed before port ${E2E_INSTANCE_PORT} became ready ` +
             `(active=${liveStatus.activeState}, sub=${liveStatus.subState}, result=${liveStatus.result})`
@@ -572,6 +670,7 @@ export class E2EInstanceManager {
       liveStatus = this.liveStatus();
     }
     this.cleanupFailedStart();
+    onFailure();
     throw new Error(
       `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} did not open port ${E2E_INSTANCE_PORT} ` +
         `within ${this.startupTimeoutMs}ms (active=${liveStatus.activeState}, sub=${liveStatus.subState})`
