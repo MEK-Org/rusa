@@ -45,31 +45,32 @@ For an existing clone, fetch/check out the branch and run
 does not build Flutter or start any leader services.
 
 Create a separate follower home, then copy the enrollment secret from the leader
-using your existing SSH access. For the development host:
+using your existing SSH access. All addresses, names and absolute paths below
+are placeholders: substitute your own values locally, and do not commit private
+infrastructure details or enrollment secrets to the repository.
 
 ```sh
-mkdir -p "$HOME/.rusa-follower-prototype"
-scp siliconfamiliar_ismattkelleraliv@metacoder.tail4ab4ae.ts.net:/home/siliconfamiliar_ismattkelleraliv/.rusa-tailnet-prototype/enrollment-token \
-  "$HOME/.rusa-follower-prototype/token"
-chmod 600 "$HOME/.rusa-follower-prototype/token"
+mkdir -p /absolute/path/to/follower-home
+scp '<ssh-user>@<leader-tailnet-host>:/absolute/private/path/enrollment-token' \
+  /absolute/path/to/follower-home/token
+chmod 600 /absolute/path/to/follower-home/token
 ```
 
-Use your normal SSH host alias if this SSH spelling is not configured for your
-account. The enrollment secret is never committed to the repository. It grants
+You can use your normal SSH host alias instead. The enrollment secret grants
 access to this prototype gateway, so keep the token file private.
 
 From the cloned repository, start the follower in the foreground:
 
 ```sh
 node packages/rusa/build/follower/follower.js \
-  --leader http://100.124.251.63:8290 \
-  --id mac-air \
-  --home "$HOME/.rusa-follower-prototype" \
-  --token-file "$HOME/.rusa-follower-prototype/token" \
+  --leader 'http://<leader-tailscale-ip>:8290' \
+  --id '<follower-name>' \
+  --home /absolute/path/to/follower-home \
+  --token-file /absolute/path/to/follower-home/token \
   --sandbox none
 ```
 
-Leave this terminal running. `Follower mac-air registered` means enrollment
+Leave this terminal running. `Follower <follower-name> registered` means enrollment
 succeeded; it does not yet mean an actor was spawned. No inbound Mac listener,
 Tailscale Serve configuration, or Mac Remote Login is needed. Outbound access
 from the Mac to the leader's TCP port 8290 must be allowed by the tailnet policy.
@@ -91,14 +92,13 @@ node scripts/follower-token.mjs /absolute/private/path/enrollment-token
 node build/tailnet-leader/commands/e2e.cli.js am-up \
   --root /absolute/path/to/a/new/disposable/leader \
   --root-driver external --port-offset 200 \
-  --follower-bind 100.124.251.63 --follower-port 8290 \
+  --follower-bind '<leader-tailscale-ip>' --follower-port 8290 \
   --follower-token-file /absolute/private/path/enrollment-token
 ```
 
-Substitute the leader's own Tailscale IPv4 address. The development host's
-running instance is managed by the distinct user unit
-`rusa-tailnet-prototype.service` and lives under
-`~/.rusa-tailnet-prototype/leader-20260905`. Only that unit belongs to this test.
+Substitute the leader's own Tailscale IPv4 address. If managing this process
+through a service manager, choose a distinct test-only unit name and state
+directory. Stop only that test unit; do not stop another mesh's instance.
 
 ## Spawn and test
 
@@ -106,7 +106,7 @@ The leader's control API remains loopback-only. On the leader:
 
 ```sh
 curl -fsS http://127.0.0.1:8286/followers
-node scripts/follower-smoke.mjs --target mac-air --port 8286
+node scripts/follower-smoke.mjs --target '<follower-name>' --port 8286
 ```
 
 The smoke test uses the real Actor, provider registry, MCP HTTP transport and
@@ -130,7 +130,7 @@ For real work, use the existing control API and add `target`:
 
 ```sh
 curl -fsS http://127.0.0.1:8286/actors -H 'content-type: application/json' \
-  -d '{"target":"mac-air","provider":"claude","model":"claude-sonnet-5","charter":"Perform the bounded task sent in your inbox, report to your parent, and yield."}'
+  -d '{"target":"<follower-name>","provider":"claude","model":"claude-sonnet-5","charter":"Perform the bounded task sent in your inbox, report to your parent, and yield."}'
 ```
 
 Send work to the returned ID with `POST /actors/<id>/messages`. Spawning alone
