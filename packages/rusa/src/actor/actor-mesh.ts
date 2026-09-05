@@ -91,6 +91,8 @@ export interface ActorRuntimeStateSnapshot {
 }
 
 export interface SpawnRequest {
+  /** Experimental execution placement. Not yet persisted or supported by production startup. */
+  executionTarget?: string;
   /** What the new actor owns — authored by the spawning message (B.5). */
   charter: string;
   /** The spawning actor's id (becomes the child's parent + gets a handle to the child). */
@@ -171,6 +173,7 @@ export interface MechanicalInboxForensics {
 
 /** What the mesh hands the factory to build a live {@link Actor} for a record. */
 export interface ActorFactoryContext {
+  executionTarget?: string;
   /** The record at spawn time. Use {@link getRecord} for the *current* state. */
   record: ActorRecord;
   /** Read the live record (charter + handles can change between wakes). */
@@ -1107,7 +1110,10 @@ export class ActorMesh {
     this.grantHandle(parentId, { id });
     let actor: MeshActor;
     try {
-      actor = this.createActor(this.factoryContext(record));
+      actor = this.createActor({
+        ...this.factoryContext(record),
+        executionTarget: req.executionTarget,
+      });
     } catch (err) {
       this.revokeHandle(parentId, id);
       this.actors.patch(id, { status: "retired" });

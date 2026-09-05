@@ -13,6 +13,8 @@
     "scripts/verify-build.mjs"
   ],
   "scripts": {
+    "build:follower": "tsup --config tsup.follower.config.ts",
+    "prototype:process-actors": "tsup --config tsup.process-prototype.config.ts && node build/process-actors/demo.js",
     "build": "tsup && node scripts/copy-assets.mjs && pnpm run build:dashboard-ui",
     "build:dashboard-ui": "node scripts/build-dashboard-ui.mjs",
     "analyze:dashboard-ui": "node scripts/flutter-run.mjs analyze",
