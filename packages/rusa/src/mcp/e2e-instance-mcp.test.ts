@@ -13,9 +13,10 @@ async function connect(server: McpServer): Promise<Client> {
 }
 
 describe("e2e-instance MCP", () => {
-  it("mounts up/start, down/stop, and status with the grantee identity baked in", async () => {
+  it("mounts up/start, down/stop, status, and resume with the grantee identity baked in", async () => {
     const manager = {
       up: vi.fn(() => ({ state: "up" as const, port: 8083 as const })),
+      resume: vi.fn(() => ({ state: "up" as const, port: 8083 as const })),
       down: vi.fn(() => ({ state: "down" as const, port: 8083 as const })),
       status: vi.fn(() => ({ state: "down" as const, port: 8083 as const })),
     };
@@ -23,6 +24,7 @@ describe("e2e-instance MCP", () => {
 
     expect((await client.listTools()).tools.map((tool) => tool.name).sort()).toEqual([
       "down",
+      "resume",
       "start",
       "status",
       "stop",
@@ -30,14 +32,38 @@ describe("e2e-instance MCP", () => {
     ]);
     await client.callTool({ name: "up", arguments: { worktree: "/owned/repo" } });
     await client.callTool({ name: "start", arguments: { worktree: "/owned/other" } });
+    await client.callTool({ name: "resume", arguments: { root: "/owned/preserved-run" } });
     await client.callTool({ name: "down", arguments: {} });
     await client.callTool({ name: "stop", arguments: {} });
     await client.callTool({ name: "status", arguments: {} });
 
     expect(manager.up).toHaveBeenNthCalledWith(1, "actor-a", "/owned/repo");
     expect(manager.up).toHaveBeenNthCalledWith(2, "actor-a", "/owned/other");
+    expect(manager.resume).toHaveBeenCalledWith("actor-a", "/owned/preserved-run");
     expect(manager.down).toHaveBeenCalledTimes(2);
     expect(manager.down).toHaveBeenCalledWith("actor-a");
     expect(manager.status).toHaveBeenCalledOnce();
+  });
+
+  it("surfaces a resume rejection as a tool error instead of throwing", async () => {
+    const manager = {
+      up: vi.fn(),
+      resume: vi.fn(() => {
+        throw new Error(
+          "e2e-instance: held by handle-actor-b (actor-b); only the holder may resume"
+        );
+      }),
+      down: vi.fn(),
+      status: vi.fn(),
+    };
+    const client = await connect(createE2EInstanceServer({ manager }, "actor-a"));
+
+    const result = await client.callTool({
+      name: "resume",
+      arguments: { root: "/owned/preserved-run" },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result.content)).toMatch(/only the holder may resume/);
   });
 });
