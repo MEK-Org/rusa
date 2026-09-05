@@ -42,19 +42,23 @@ class ProviderModelConfig {
   /// the provider default. Efforts are per candidate, not per actor.
   final String? effort;
 
+  /// Both `provider` and `model` are required by the server contract, so a
+  /// payload missing either fails the parse the same way [ThreadDto]'s own
+  /// required fields do — API drift is louder as a cast error than as a
+  /// half-blank candidate nothing upstream ever declared.
   factory ProviderModelConfig.fromJson(Map<String, dynamic> j) =>
       ProviderModelConfig(
-        provider: j['provider'] as String? ?? '',
-        model: j['model'] as String? ?? '',
+        provider: j['provider'] as String,
+        model: j['model'] as String,
         effort: j['effort'] as String?,
       );
 
   /// One candidate on one line — `provider · model · effort medium` — with
-  /// whatever the server omitted left out rather than rendered as a blank.
+  /// the effort clause dropped when the server sent no explicit effort.
   String get label => [
-    if (provider.isNotEmpty) provider,
-    if (model.isNotEmpty) model,
-    if (effort != null && effort!.isNotEmpty) 'effort $effort',
+    provider,
+    model,
+    if (effort != null) 'effort $effort',
   ].join(' · ');
 
   @override

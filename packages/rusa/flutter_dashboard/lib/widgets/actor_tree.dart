@@ -416,13 +416,16 @@ class _ActorRowState extends State<_ActorRow> {
     );
     if (pool == null) return label;
     final lines = [
-      'Configured candidates, in order:',
-      ...pool.map((e) => '• ${e.label}'),
+      if (pool.isNotEmpty) ...[
+        'Configured candidates, in order:',
+        ...pool.map((e) => '• ${e.label}'),
+      ],
       if (staged != null && !listEquals(staged, pool)) ...[
         'Staged for next run:',
         ...staged.map((e) => '• ${e.label}'),
       ],
     ];
+    if (lines.isEmpty) return label;
     return Tooltip(message: lines.join('\n'), child: label);
   }
 
@@ -440,22 +443,30 @@ class _ActorRowState extends State<_ActorRow> {
     // chip (the server's first-entry view) is left off for a pool. The full
     // list is in the Info panel, which is the readable surface on a phone.
     final pool = thread.modelConfig;
-    final isPool = pool.length > 1;
+    final staged = thread.desiredModelConfig;
+    // Both predicates read whole pools rather than the server's first-entry
+    // compatibility fields, which describe a pool replacement only by
+    // accident: `[a, b] → [a, c, d]` leaves `desiredModel` identical to
+    // `model` while replacing everything, and one model staged to become
+    // three is a pool row before the replacement lands. `desiredModel` is
+    // derived server-side from `desiredModelConfig[0]`, so it is only the
+    // fallback for a payload predating the full field.
+    final isPool = pool.length > 1 || (staged?.length ?? 0) > 1;
+    final staging = staged != null
+        ? !listEquals(staged, pool)
+        : thread.desiredModel != null && thread.desiredModel != thread.model;
     final showModel = thread.model != null || thread.desiredModel != null;
     final showEffort =
         !isPool && (thread.effort != null || thread.effortChangePending);
-    final staging =
-        thread.desiredModel != null && thread.desiredModel != thread.model;
-    final singleText = staging
-        ? '${thread.model ?? "default"} → ${thread.desiredModel}'
-        : (thread.model ?? '');
+    final current = thread.model ?? 'default';
+    final desired = thread.desiredModel ?? 'default';
+    final singleText = staging ? '$current → $desired' : (thread.model ?? '');
     // Both sides carry their own count, so a staged pool replacement never
     // reads as one model becoming one other model.
     final poolText = staging
-        ? '${thread.model ?? "default"}${_poolSuffix(pool.length)}'
-              ' → ${thread.desiredModel}'
-              '${_poolSuffix(thread.desiredModelConfig?.length ?? 0)}'
-        : '${thread.model ?? "default"}${_poolSuffix(pool.length)}';
+        ? '$current${_poolSuffix(pool.length)}'
+              ' → $desired${_poolSuffix(staged?.length ?? 0)}'
+        : '$current${_poolSuffix(pool.length)}';
 
     return Container(
       decoration: BoxDecoration(
@@ -551,7 +562,7 @@ class _ActorRowState extends State<_ActorRow> {
                           child: _modelLabel(
                             isPool ? poolText : singleText,
                             pool: isPool ? pool : null,
-                            staged: thread.desiredModelConfig,
+                            staged: staged,
                           ),
                         ),
                       if (showEffort) ...[
