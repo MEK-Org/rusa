@@ -2,6 +2,27 @@ import type { Database } from "better-sqlite3";
 import { migrations } from "./index.js";
 
 /**
+ * IDs of migrations not yet recorded as applied. Safe to call before
+ * {@link runMigrations}: it only ensures the `_migrations` bookkeeping table
+ * exists, which `runMigrations` does unconditionally anyway. Used by
+ * `rusa db-check` to report what a real run would apply.
+ */
+export function pendingMigrationIds(db: Database): string[] {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS _migrations (
+      id TEXT PRIMARY KEY,
+      applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+  const applied = new Set(
+    (db.prepare("SELECT id FROM _migrations").all() as Array<{ id: string }>).map((m) => m.id)
+  );
+  return migrations
+    .filter((migration) => !applied.has(migration.id))
+    .map((migration) => migration.id);
+}
+
+/**
  * Executes all pending migrations against the provided database.
  * Handles both fresh databases and upgrades from pre-migration systems.
  */

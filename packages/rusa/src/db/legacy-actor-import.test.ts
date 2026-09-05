@@ -202,6 +202,41 @@ describe("legacy actor import", () => {
     expect(repositories.actors.get("root")?.charter).toBe("root charter");
   });
 
+  it("accepts a legacy createdAt with an explicit ISO-8601 UTC offset and normalizes it to trailing-Z", () => {
+    writeFileSync(
+      join(home, "threads.json"),
+      JSON.stringify({
+        threads: [
+          {
+            id: "root",
+            charter: "root charter",
+            parentId: null,
+            status: "active",
+            createdAt: "2026-01-02T03:04:05.123456+00:00",
+            pendingDeliveries: [
+              {
+                id: "scheduled-offset",
+                fromId: "root",
+                body: "check back later",
+                deliverAt: "2026-01-03T03:04:05.123456+00:00",
+              },
+            ],
+          },
+        ],
+      })
+    );
+    writeFileSync(
+      join(home, "root-agent", "session.json"),
+      JSON.stringify({ sessionId: "root-session" })
+    );
+
+    const result = importState();
+
+    expect(result.importedActors).toBe(1);
+    expect(repositories.actors.get("root")?.createdAt).toBe("2026-01-02T03:04:05.123Z");
+    expect(scheduled.get("scheduled-offset")?.deliverAt).toBe("2026-01-03T03:04:05.123Z");
+  });
+
   it("validates the complete graph before writing any rows", () => {
     writeFileSync(
       join(home, "threads.json"),
