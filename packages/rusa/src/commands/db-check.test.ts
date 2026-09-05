@@ -2,6 +2,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -13,6 +14,14 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Repositories } from "../db/repositories/index.js";
 import { runDbCheck, runDbCheckAgainstHome } from "./db-check.js";
+
+interface LegacyGrant {
+  actorId: string;
+  capability: string;
+  grantedBy: string;
+  grantedAt: string;
+  revokedAt?: string;
+}
 
 describe("db-check", () => {
   let home: string;
@@ -327,6 +336,256 @@ describe("db-check", () => {
     expect(consoleError).toHaveBeenCalledWith(expect.stringContaining("unresolved row(s)"));
     consoleError.mockRestore();
   });
+  function writeThreads(
+    threads: Array<{ id: string; parentId: string | null; createdAt: string }>
+  ): void {
+    writeFileSync(
+      join(home, "threads.json"),
+      JSON.stringify({
+        threads: threads.map((thread) => ({
+          ...thread,
+          charter: "test actor",
+          status: "active",
+        })),
+      })
+    );
+  }
+
+  function writeGrants(grants: LegacyGrant[]): void {
+    writeFileSync(join(home, "capability-grants.json"), JSON.stringify({ grants }));
+  }
+
+  /** Open the preflighted copy's database; `runDbCheckAgainstHome` must have created it. */
+  function withDb<T>(read: (repositories: Repositories, db: Database.Database) => T): T {
+    const db = new Database(join(home, "data", "mesh.db"));
+    try {
+      db.pragma("foreign_keys = ON");
+      return read(new Repositories(db), db);
+    } finally {
+      db.close();
+    }
+  }
+
+  function countRows(table: string): number {
+    return withDb(
+      (_repositories, db) =>
+        (db.prepare(`SELECT COUNT(*) as n FROM ${table}`).get() as { n: number }).n
+    );
+  }
+
+  /** Every legacy source an import would archive is still exactly where it was. */
+  function expectNothingArchived(sources: string[]): void {
+    for (const source of sources) expect(existsSync(join(home, source))).toBe(true);
+    expect(readdirSync(home).filter((entry) => entry.endsWith(".bak"))).toEqual([]);
+  }
+
+  it("counts grants that name actors the same preflight only plans to import", () => {
+    // Boot imports legacy actors before legacy grants, so at boot these actors
+    // exist by the time the grant import validates them. Preflight writes
+    // neither, so the grant plan has to see the planned actors to agree.
+    writeThreads([
+      { id: "root", parentId: null, createdAt: "2026-01-01T00:00:00Z" },
+      { id: "worker", parentId: "root", createdAt: "2026-01-01T00:00:01Z" },
+    ]);
+    writeGrants([
+      {
+        actorId: "worker",
+        capability: "secret:gemini-api-key",
+        grantedBy: "root",
+        grantedAt: "2026-02-01T00:00:00Z",
+      },
+      {
+        actorId: "worker",
+        capability: "secret:mistral-api-key",
+        grantedBy: "root",
+        grantedAt: "2026-02-01T00:00:00Z",
+        revokedAt: "2026-02-02T00:00:00Z",
+      },
+    ]);
+
+    const result = runDbCheckAgainstHome(home);
+
+    expect(result.plannedActors).toBe(2);
+    expect(result.plannedCapabilityGrants).toBe(2);
+
+    expect(countRows("actors")).toBe(0);
+    expect(countRows("capability_grants")).toBe(0);
+    expectNothingArchived(["threads.json", "capability-grants.json"]);
+    expect(
+      JSON.parse(readFileSync(join(home, "capability-grants.json"), "utf8")).grants
+    ).toHaveLength(2);
+  });
+
+  it("counts grants against actors already committed to the copy", () => {
+    runDbCheckAgainstHome(home);
+    withDb((repositories) => {
+      repositories.actors.upsert({
+        id: "root",
+        charter: "root charter",
+        parentId: null,
+        isRoot: true,
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+    });
+    writeGrants([
+      {
+        actorId: "root",
+        capability: "secret:gemini-api-key",
+        grantedBy: "root",
+        grantedAt: "2026-02-01T00:00:00Z",
+      },
+    ]);
+
+    const result = runDbCheckAgainstHome(home);
+
+    expect(result.plannedActors).toBe(0);
+    expect(result.plannedCapabilityGrants).toBe(1);
+    expect(countRows("capability_grants")).toBe(0);
+    expectNothingArchived(["capability-grants.json"]);
+  });
+
+  it("plans no grants when the copy has no legacy grant file", () => {
+    const result = runDbCheckAgainstHome(home);
+
+    expect(result.plannedCapabilityGrants).toBe(0);
+    // Preflight must not conjure the retired file it is checking for.
+    expect(existsSync(join(home, "capability-grants.json"))).toBe(false);
+  });
+
+  it("plans no grants when durable rows already match the file, and archives nothing", () => {
+    runDbCheckAgainstHome(home);
+    withDb((repositories) => {
+      repositories.actors.upsert({
+        id: "root",
+        charter: "root charter",
+        parentId: null,
+        isRoot: true,
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      repositories.capabilityGrants.grant({
+        actorId: "root",
+        capability: "secret:gemini-api-key",
+        grantedBy: "root",
+        // The importer normalizes the file's timestamps to millisecond-Z form,
+        // so a committed row only matches when it is already canonical.
+        grantedAt: "2026-02-01T00:00:00.000Z",
+      });
+      repositories.capabilityGrants.revoke(
+        "root",
+        "secret:gemini-api-key",
+        "2026-02-02T00:00:00.000Z"
+      );
+    });
+    writeGrants([
+      {
+        actorId: "root",
+        capability: "secret:gemini-api-key",
+        grantedBy: "root",
+        grantedAt: "2026-02-01T00:00:00Z",
+        revokedAt: "2026-02-02T00:00:00Z",
+      },
+    ]);
+
+    const result = runDbCheckAgainstHome(home);
+
+    // Boot would archive the matched file; preflight reports the import is
+    // already done and leaves the file for boot to archive.
+    expect(result.plannedCapabilityGrants).toBe(0);
+    expect(countRows("capability_grants")).toBe(1);
+    expectNothingArchived(["capability-grants.json"]);
+  });
+
+  it("exits non-zero when the grant file diverges from durable grants", () => {
+    runDbCheckAgainstHome(home);
+    withDb((repositories) => {
+      repositories.actors.upsert({
+        id: "root",
+        charter: "root charter",
+        parentId: null,
+        isRoot: true,
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      repositories.capabilityGrants.grant({
+        actorId: "root",
+        capability: "secret:gemini-api-key",
+        grantedBy: "root",
+        grantedAt: "2026-02-01T00:00:00.000Z",
+      });
+    });
+    writeGrants([
+      {
+        actorId: "root",
+        capability: "secret:mistral-api-key",
+        grantedBy: "root",
+        grantedAt: "2026-02-01T00:00:00Z",
+      },
+    ]);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    runDbCheck({ home });
+
+    expect(process.exit).toHaveBeenCalledWith(1);
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining("refusing to overwrite durable grants")
+    );
+    expect(countRows("capability_grants")).toBe(1);
+    expectNothingArchived(["capability-grants.json"]);
+    consoleError.mockRestore();
+  });
+
+  it("exits non-zero when a grant names an actor no import would create", () => {
+    writeThreads([{ id: "root", parentId: null, createdAt: "2026-01-01T00:00:00Z" }]);
+    writeGrants([
+      {
+        actorId: "ghost",
+        capability: "secret:gemini-api-key",
+        grantedBy: "root",
+        grantedAt: "2026-02-01T00:00:00Z",
+      },
+    ]);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    runDbCheck({ home });
+
+    expect(process.exit).toHaveBeenCalledWith(1);
+    expect(consoleError).toHaveBeenCalledWith(expect.stringContaining("unknown actor 'ghost'"));
+    expectNothingArchived(["threads.json", "capability-grants.json"]);
+    consoleError.mockRestore();
+  });
+
+  it("exits non-zero on a malformed grant file rather than passing preflight", () => {
+    writeFileSync(join(home, "capability-grants.json"), "{ not json");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    runDbCheck({ home });
+
+    expect(process.exit).toHaveBeenCalledWith(1);
+    expect(consoleError).toHaveBeenCalledWith(expect.stringContaining("cannot parse"));
+    expectNothingArchived(["capability-grants.json"]);
+    consoleError.mockRestore();
+  });
+
+  it("exits non-zero on a structurally invalid grant entry", () => {
+    writeThreads([{ id: "root", parentId: null, createdAt: "2026-01-01T00:00:00Z" }]);
+    writeGrants([
+      {
+        actorId: "root",
+        capability: "secret:gemini-api-key",
+        grantedBy: "root",
+        grantedAt: "yesterday",
+      },
+    ]);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    runDbCheck({ home });
+
+    expect(process.exit).toHaveBeenCalledWith(1);
+    expectNothingArchived(["threads.json", "capability-grants.json"]);
+    consoleError.mockRestore();
+  });
 
   it("exits non-zero with the actionable underlying failure on invalid legacy state", () => {
     writeFileSync(
@@ -365,8 +624,12 @@ describe("db-check", () => {
     runDbCheck({ home });
 
     expect(process.exit).not.toHaveBeenCalled();
-    expect(consoleLog).toHaveBeenCalledWith(expect.stringContaining("0 event source ownership(s)"));
-    expect(consoleLog).toHaveBeenCalledWith(expect.stringContaining("0 host job(s)"));
+    expect(consoleLog).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Legacy import plan: 0 actor(s), 0 scheduled message(s), 0 capability grant(s), " +
+          "0 event source ownership(s), 0 host job(s)"
+      )
+    );
     expect(consoleLog).toHaveBeenCalledWith("✓ db-check passed");
     consoleLog.mockRestore();
   });
