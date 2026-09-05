@@ -165,6 +165,13 @@ export function reapProcess(pid: number, opts: ReapOptions = {}): ReapOutcome {
  * of seconds can end up signalling whatever inherited it. Re-deriving the
  * membership from a live `ps` keeps the reap aimed at the original tree while
  * still draining members whose own argv no longer names the marker.
+ *
+ * This narrows the race, it does not close it. `ps` is a snapshot, not a lock:
+ * the group can still turn over between the row being read here and the signal
+ * being sent, so the exposure shrinks from the tens of seconds a remembered id
+ * was held to the gap between check and kill. Closing it outright needs a
+ * handle the kernel keeps alive (a pidfd, or owning the group ourselves), not
+ * a number re-read from the process table.
  */
 export function groupStillHosts(
   pgid: number,

@@ -821,7 +821,9 @@ done
         reapProcess(Number(line.trim().split(/\s+/)[0]));
       }
       // Group ids are recycled, and this one was read tens of seconds ago, so
-      // only signal it while it still holds something this probe started.
+      // only signal it while it still holds something this probe started. That
+      // shrinks the window to the gap between the check and the signal rather
+      // than closing it - `ps` is a snapshot, not a lock.
       if (paneGroup !== undefined && groupStillHosts(paneGroup, mockBin)) {
         reapProcessGroup(paneGroup);
       }

@@ -34,6 +34,21 @@ function recorder() {
   };
 }
 
+/**
+ * A pid and pgid this run demonstrably is not.
+ *
+ * The guards short-circuit in order, so which branch catches a target depends
+ * on the identity the sandbox handed this run: under `bwrap --new-session` our
+ * own pgid is 1 and the broadcast guard fires first, and a shell-led run has
+ * its group leader as its parent. Injecting an identity pins the branch under
+ * test without that lottery.
+ */
+const FOREIGN = (() => {
+  let candidate = 4242;
+  while (candidate === process.pid || candidate === process.ppid) candidate += 1;
+  return candidate;
+})();
+
 function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -72,14 +87,18 @@ describe("guarded process-group cleanup (#262)", () => {
     expect(rec.sent).toEqual([]);
   });
 
-  it("refuses the caller's own process group", () => {
+  it("refuses the caller's own process group, whichever guard catches it", () => {
     const rec = recorder();
     const own = ownProcessGroupId();
 
     const outcome = reapProcessGroup(own, { send: rec.send });
 
+    // Nothing sent is the invariant; the wording is not, because an own pgid
+    // of 1 is caught by the broadcast guard before the own-group one. The
+    // refusal still has to name the number it declined. The own-group branch
+    // itself is pinned by injected identity below.
     expect(outcome.signalled).toBe(false);
-    expect(outcome.refusedBecause).toContain("own group");
+    expect(outcome.refusedBecause).toContain(String(own));
     expect(rec.sent).toEqual([]);
   });
 
@@ -109,24 +128,38 @@ describe("guarded process-group cleanup (#262)", () => {
     expect(rec.sent).toEqual([{ target: -4242, signal: "SIGKILL" }]);
   });
 
-  it("refuses direct kills of init, of this process, and of its parent", () => {
+  it("refuses direct kills of init, of this run, of its parent and of its group leader", () => {
     const rec = recorder();
 
-    expect(reapProcess(1, { send: rec.send }).refusedBecause).toContain("init");
-    expect(reapProcess(process.pid, { send: rec.send }).refusedBecause).toContain("caller itself");
-    expect(reapProcess(process.ppid, { send: rec.send }).refusedBecause).toContain("parent");
-    expect(reapProcess(ownProcessGroupId(), { send: rec.send }).refusedBecause).toContain(
-      "own group"
-    );
+    // These four collapse onto each other under some identities - ppid is 1
+    // for a reparented runner, the group leader is 1 under `--new-session` and
+    // is the parent for a shell-led run. What holds for every identity is that
+    // each is refused, nothing is sent, and the refusal names the number.
+    for (const target of [1, process.pid, process.ppid, ownProcessGroupId()]) {
+      const outcome = reapProcess(target, { send: rec.send });
+      expect(outcome.signalled).toBe(false);
+      expect(outcome.refusedBecause).toContain(String(target));
+    }
     expect(rec.sent).toEqual([]);
   });
 
   it("names why each unsafe target was refused", () => {
-    expect(unsafeGroupReason(1)).toBeDefined();
+    expect(unsafeGroupReason(1)).toContain("broadcast");
     expect(unsafeGroupReason(ownProcessGroupId())).toBeDefined();
-    expect(unsafeGroupReason(4242, 99)).toBeUndefined();
-    expect(unsafeProcessReason(1)).toBeDefined();
-    expect(unsafeProcessReason(4242, 99)).toBeUndefined();
+    expect(unsafeGroupReason(FOREIGN, 99)).toBeUndefined();
+    expect(unsafeProcessReason(1)).toContain("init");
+    expect(unsafeProcessReason(FOREIGN, 99)).toBeUndefined();
+
+    // The own-group branches, pinned on an id this run cannot be so they are
+    // asserted whatever pgid the sandbox gave us.
+    expect(unsafeGroupReason(FOREIGN, FOREIGN)).toContain("own group");
+    expect(unsafeProcessReason(FOREIGN, FOREIGN)).toContain("own group");
+    // The branches that read this run's real identity, where it can tell them
+    // apart: a pid of 1 is init before it is anything else.
+    if (process.pid > 1) expect(unsafeProcessReason(process.pid)).toContain("caller itself");
+    if (process.ppid > 1 && process.ppid !== process.pid) {
+      expect(unsafeProcessReason(process.ppid)).toContain("parent");
+    }
   });
 
   it("reads pgid and argv out of the process table", () => {
@@ -156,18 +189,24 @@ describe("guarded process-group cleanup (#262)", () => {
     expect(pid).toBeDefined();
     if (pid === undefined) return;
 
-    const grandchildPid = await new Promise<number>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("grandchild never reported its pid")), 5_000);
-      child.stdout?.on("data", (d: Buffer) => {
-        const parsed = Number(d.toString().trim().split("\n")[0]);
-        if (Number.isInteger(parsed) && parsed > 1) {
-          clearTimeout(timer);
-          resolve(parsed);
-        }
-      });
-    });
-
+    // The wait for the grandchild's pid is inside the try: a child that never
+    // reports must still be reaped, or a timeout here leaks the tree it made.
+    let grandchildPid: number | undefined;
     try {
+      grandchildPid = await new Promise<number>((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error("grandchild never reported its pid")),
+          5_000
+        );
+        child.stdout?.on("data", (d: Buffer) => {
+          const parsed = Number(d.toString().trim().split("\n")[0]);
+          if (Number.isInteger(parsed) && parsed > 1) {
+            clearTimeout(timer);
+            resolve(parsed);
+          }
+        });
+      });
+
       // The group is demonstrably separate: not ours, not init, not a broadcast.
       expect(pid).toBeGreaterThan(1);
       expect(pid).not.toBe(ownProcessGroupId());
@@ -182,8 +221,10 @@ describe("guarded process-group cleanup (#262)", () => {
       // Outside-in reaping is the whole point: the grandchild goes too.
       expect(await waitForDeath(grandchildPid)).toBe(true);
     } finally {
+      // The group reap covers the grandchild; the direct one is the backstop
+      // for a grandchild that somehow left the group before we got here.
       reapProcessGroup(pid);
-      reapProcess(grandchildPid);
+      if (grandchildPid !== undefined) reapProcess(grandchildPid);
     }
   });
 });
