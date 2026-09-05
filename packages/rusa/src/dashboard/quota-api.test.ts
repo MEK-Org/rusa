@@ -137,6 +137,55 @@ const agyState: ProviderQuotaSnapshot = {
   ],
 };
 
+/**
+ * The sanitized codex `/status` panel behind the reserve-headline defect (#249),
+ * carried here as the extractor already scopes it — row order model, provider,
+ * model, model:
+ *
+ *   gpt-reserve Weekly limit:    [████████████████████] 100% left (resets 14:56 on 12 Sep)
+ *   Weekly limit:                [██████████░░░░░░░░░░] 52% left (resets 18:08 on 7 Sep)
+ *   GPT-5.3-Codex-Spark limit:
+ *   5h limit:                    [████████████████████] 100% left (resets 19:56)
+ *   Weekly limit:                [████████████████████] 100% left (resets 16:11 on 7 Sep)
+ *
+ * The model reserve's weekly row sits first and reads 100% left, so it used to
+ * win the weekly headline and report the provider as 0% used.
+ */
+const codexReservePanelState: ProviderQuotaSnapshot = {
+  provider: "codex",
+  status: "available",
+  limits: [
+    {
+      label: "Weekly limit",
+      kind: "weekly",
+      percentLeft: 100,
+      resetAtIso: "2026-09-12T14:56:00.000Z",
+      scope: "model",
+    },
+    {
+      label: "Weekly limit",
+      kind: "weekly",
+      percentLeft: 52,
+      resetAtIso: "2026-09-07T18:08:00.000Z",
+      scope: "provider",
+    },
+    {
+      label: "5h limit",
+      kind: "five_hour",
+      percentLeft: 100,
+      resetAtIso: "2026-09-05T19:56:00.000Z",
+      scope: "model",
+    },
+    {
+      label: "Weekly limit",
+      kind: "weekly",
+      percentLeft: 100,
+      resetAtIso: "2026-09-07T16:11:00.000Z",
+      scope: "model",
+    },
+  ],
+};
+
 const kimiState: ProviderQuotaSnapshot = {
   provider: "kimi",
   status: "available",
@@ -401,6 +450,65 @@ describe("dashboard quota snapshot", () => {
     expect(codex?.usedPercent).toBe(7);
   });
 
+  it("codex: reports the provider's own weekly, not a model reserve at 100% left (#249)", async () => {
+    const { deps } = fakeDeps({ codex: codexReservePanelState });
+    const snapshot = await buildQuotaSnapshot(deps);
+    const codex = snapshot.providers.find((p) => p.provider === "codex");
+
+    expect(codex?.windows).toEqual([
+      {
+        id: "weekly",
+        label: "Weekly limit",
+        usedPercent: 48,
+        status: "available",
+        resetAtIso: "2026-09-07T18:08:00.000Z",
+        headline: true,
+        windowMs: WEEK_MS,
+        scrapedAt: null,
+      },
+    ]);
+    expect(codex?.usedPercent).toBe(48);
+  });
+
+  it("codex: a model-only panel yields no headline rather than an unqualified provider Weekly", async () => {
+    const { deps } = fakeDeps({
+      codex: {
+        ...codexReservePanelState,
+        limits: codexReservePanelState.limits?.filter((limit) => limit.scope === "model"),
+      },
+    });
+    const snapshot = await buildQuotaSnapshot(deps);
+    const codex = snapshot.providers.find((p) => p.provider === "codex");
+
+    expect(codex?.windows).toEqual([]);
+    expect(codex?.usedPercent).toBeNull();
+  });
+
+  it("codex: the durable fallback path drops model rows too", async () => {
+    const now = Date.parse("2026-09-05T20:00:00.000Z");
+    const snapshot = await buildQuotaSnapshot({
+      getQuota: async () => ({ provider: "codex", status: "unknown" }),
+      providers: ["codex"],
+      now: () => now,
+      listHistory: () => [
+        historyPoint({
+          scope: "model",
+          label: "Weekly limit",
+          observedAt: "2026-09-05T19:00:00.000Z",
+          percentLeft: 100,
+        }),
+        historyPoint({
+          label: "Weekly limit",
+          observedAt: "2026-09-05T19:00:00.000Z",
+          percentLeft: 52,
+        }),
+      ],
+    });
+
+    expect(snapshot.providers[0].windows.map((w) => w.usedPercent)).toEqual([48]);
+    expect(snapshot.providers[0].usedPercent).toBe(48);
+  });
+
   it("codex: yields no windows when limits are absent", async () => {
     const { deps } = fakeDeps({
       claude: claudeState,
@@ -443,6 +551,20 @@ describe("dashboard quota snapshot", () => {
     ]);
     expect(agy).not.toHaveProperty("groups");
     // Headline usedPercent mirrors the first group's headline (weekly) window.
+    expect(agy?.usedPercent).toBe(20);
+  });
+
+  it("agy: a window the parse left unscoped is still the provider's own, as ingestion counts it", async () => {
+    const { deps } = fakeDeps({
+      agy: {
+        ...agyState,
+        limits: [{ label: "Weekly", kind: "weekly", percentLeft: 80 }],
+      },
+    });
+    const snapshot = await buildQuotaSnapshot(deps);
+    const agy = snapshot.providers.find((p) => p.provider === "agy");
+
+    expect(agy?.windows.map((w) => w.id)).toEqual(["weekly"]);
     expect(agy?.usedPercent).toBe(20);
   });
 

@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { QuotaThrottleStatus } from "../actor/quota-throttle-status.js";
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
+import { isProviderScopedWindow } from "../quota/window-scope.js";
 
 /**
  * Server-side cached per-provider quota endpoint for the dashboard header (ISSUE_NUM,
@@ -225,18 +226,16 @@ function codexWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
 function agyWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
   if (!state.limits) return [];
   const scrapedAt = state.scrapedAt ?? null;
-  return state.limits
-    .filter((limit) => limit.scope === "provider")
-    .map((limit) => ({
-      id: limit.kind ?? "other",
-      label: limit.label,
-      usedPercent: 100 - limit.percentLeft,
-      status: limit.percentLeft <= 0 ? "exhausted" : "available",
-      resetAtIso: limit.resetAtIso ?? null,
-      headline: limit.kind === "weekly",
-      windowMs: windowMsFor(limit.kind ?? "other"),
-      scrapedAt,
-    }));
+  return state.limits.map((limit) => ({
+    id: limit.kind ?? "other",
+    label: limit.label,
+    usedPercent: 100 - limit.percentLeft,
+    status: limit.percentLeft <= 0 ? "exhausted" : "available",
+    resetAtIso: limit.resetAtIso ?? null,
+    headline: limit.kind === "weekly",
+    windowMs: windowMsFor(limit.kind ?? "other"),
+    scrapedAt,
+  }));
 }
 
 function kimiWindows(state: ProviderQuotaSnapshot): QuotaWindowDto[] {
@@ -292,17 +291,31 @@ function toProviderDto(
 
 const HISTORY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000;
 
+/**
+ * A provider's windows are its provider-scoped ones only, decided by the same
+ * `isProviderScopedWindow` rule observation ingestion applies (issue #249). The
+ * filter lives here, ahead of the per-provider mappers, so every provider gets
+ * one rule: a codex panel that carries a model reserve at 100% left used to hand
+ * that row the weekly headline and report the provider as 0% used while its own
+ * weekly window was half spent. Model rows are dropped from provider
+ * presentation rather than relabelled — the extractor's scope metadata is
+ * consumed as-is, and no window is invented or re-scoped here.
+ */
 function windowsForProvider(
   provider: SupportedProvider,
   state: ProviderQuotaSnapshot
 ): QuotaWindowDto[] {
+  const providerScoped: ProviderQuotaSnapshot = {
+    ...state,
+    limits: state.limits?.filter(isProviderScopedWindow),
+  };
   return provider === "claude"
-    ? claudeWindows(state)
+    ? claudeWindows(providerScoped)
     : provider === "codex"
-      ? codexWindows(state)
+      ? codexWindows(providerScoped)
       : provider === "kimi"
-        ? kimiWindows(state)
-        : agyWindows(state);
+        ? kimiWindows(providerScoped)
+        : agyWindows(providerScoped);
 }
 
 /** Build dashboard history without replaying or re-implementing the controller. */
