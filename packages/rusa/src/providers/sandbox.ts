@@ -563,7 +563,8 @@ function injectSecretsMasking(
   }
 }
 
-function addReadonlyBindIfExists(args: string[], source: string, target: string): void {
+/** Exported for reuse by the e2e instance manager's outer Kimi auth projection. */
+export function addReadonlyBindIfExists(args: string[], source: string, target: string): void {
   if (existsSync(source)) {
     args.push("--ro-bind", source, target);
   }
@@ -585,8 +586,13 @@ function addWritableBindIfExists(args: string[], source: string, target: string)
  * source that's deleted between the two — another actor's teardown racing this one's
  * sandbox setup — can't turn into an unhandled ENOENT; any lstat failure is treated
  * the same as "absent" and the bind is skipped rather than binding writable.
+ *
+ * Exported for reuse by the e2e instance manager: its outer synthetic HOME needs the
+ * same narrow, real-directory-only writable projection of `~/.kimi-code`'s
+ * `credentials/` and `oauth/` that this module already grants a direct (non-e2e) actor
+ * sandbox — see the e2e-instance-manager's own kimi-code handling for why.
  */
-function addWritableDirBindIfRealDir(args: string[], source: string, target: string): void {
+export function addWritableDirBindIfRealDir(args: string[], source: string, target: string): void {
   let st: ReturnType<typeof lstatSync>;
   try {
     st = lstatSync(source);
