@@ -575,3 +575,201 @@ export function ingestKimiHostModels(opts?: {
   }
   return entries;
 }
+
+/**
+ * The one visibility value the Codex CLI's own model picker lists.
+ * Entries carrying any other value (`"hide"`) are reachable by pin but are not
+ * what `/model` enumerates, so the catalog does not advertise them.
+ */
+export const CODEX_LISTED_VISIBILITY = "list";
+
+/**
+ * How old the Codex models cache may be and still be preferred over driving the
+ * TUI. The CLI rewrites the file whenever it starts, and the daemon refreshes
+ * catalogs on start and daily, so a file older than a day means the CLI has not
+ * run in that window — and the TUI fallback launches the CLI, which refreshes
+ * the file for the next pass. One day is therefore the point where falling back
+ * both costs least and repairs the cheap source.
+ */
+export const CODEX_MODELS_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Why a Codex models cache could not be used, or that it could.
+ * `malformed` covers every structural problem including a missing or
+ * unparseable `fetched_at`, since the freshness rule cannot be applied without
+ * one; `stale` is reserved for a well-formed cache that is simply too old.
+ */
+export type CodexModelsCacheStatus =
+  | "usable"
+  | "absent"
+  | "unreadable"
+  | "malformed"
+  | "stale"
+  | "empty";
+
+export interface CodexModelsCacheRead {
+  status: CodexModelsCacheStatus;
+  entries: ModelEntry[];
+  fetchedAt?: string;
+  /** Bounded, path-free explanation, present on every non-usable status. */
+  reason?: string;
+}
+
+/**
+ * Identifier-only projection of a `models_cache.json` document.
+ *
+ * Two fields are read and no others: `visibility`, to take exactly the subset
+ * the picker lists, and `slug`, which is the value codex accepts for `--model`.
+ * A cache entry also carries `display_name`, `description`, `availability_nux`
+ * and `model_messages` — vendor- and model-authored prose — and #195 settled
+ * that catalog validation consumes identifiers only, so none of it is read,
+ * stored or advertised. The slug is copied into both fields, which is also
+ * exactly what `normalizeModelEntries` reduces a Codex entry to.
+ *
+ * Returns null when the content is not a cache document at all.
+ */
+export function extractCodexModelsFromCacheJson(
+  content: string
+): { fetchedAt?: string; entries: ModelEntry[] } | null {
+  let doc: unknown;
+  try {
+    doc = JSON.parse(content);
+  } catch {
+    return null;
+  }
+  if (typeof doc !== "object" || doc === null) return null;
+  const models = (doc as { models?: unknown }).models;
+  if (!Array.isArray(models)) return null;
+  const rawFetchedAt = (doc as { fetched_at?: unknown }).fetched_at;
+  const fetchedAt = typeof rawFetchedAt === "string" ? rawFetchedAt : undefined;
+
+  const seen = new Set<string>();
+  const entries: ModelEntry[] = [];
+  for (const model of models) {
+    if (typeof model !== "object" || model === null) continue;
+    const { slug, visibility } = model as { slug?: unknown; visibility?: unknown };
+    if (visibility !== CODEX_LISTED_VISIBILITY) continue;
+    if (typeof slug !== "string") continue;
+    const identifier = slug.trim();
+    if (!identifier || seen.has(identifier)) continue;
+    seen.add(identifier);
+    entries.push({ displayLabel: identifier, identifier, passable: true });
+  }
+  return { fetchedAt, entries };
+}
+
+/** Resolves the host Codex models cache path, honouring `CODEX_HOME` as codex does. */
+export function getHostCodexModelsCachePath(): string {
+  return join(process.env.CODEX_HOME || join(homedir(), ".codex"), "models_cache.json");
+}
+
+/**
+ * Read and age-check the host Codex models cache. Every failure is a named
+ * status with a bounded reason so the caller can say which stage gave up; the
+ * reason never carries a filesystem path, since it ends up in operator-facing
+ * logs and issue reports.
+ */
+export function readCodexModelsCache(opts?: {
+  cachePath?: string;
+  now?: number;
+  maxAgeMs?: number;
+}): CodexModelsCacheRead {
+  const path = opts?.cachePath ?? getHostCodexModelsCachePath();
+  if (!existsSync(path)) {
+    return { status: "absent", entries: [], reason: "codex models cache file is absent" };
+  }
+  let content: string;
+  try {
+    content = readFileSync(path, "utf8");
+  } catch (err) {
+    return {
+      status: "unreadable",
+      entries: [],
+      reason: `codex models cache could not be read: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  const parsed = extractCodexModelsFromCacheJson(content);
+  if (!parsed) {
+    return {
+      status: "malformed",
+      entries: [],
+      reason: "codex models cache is not a JSON document with a models array",
+    };
+  }
+  const fetchedAtMs = parsed.fetchedAt ? Date.parse(parsed.fetchedAt) : Number.NaN;
+  if (Number.isNaN(fetchedAtMs)) {
+    return {
+      status: "malformed",
+      entries: [],
+      reason: "codex models cache has no parseable fetched_at timestamp",
+    };
+  }
+  const maxAgeMs = opts?.maxAgeMs ?? CODEX_MODELS_CACHE_MAX_AGE_MS;
+  const ageMs = (opts?.now ?? Date.now()) - fetchedAtMs;
+  if (ageMs > maxAgeMs) {
+    return {
+      status: "stale",
+      entries: [],
+      fetchedAt: parsed.fetchedAt,
+      reason: `codex models cache is stale (fetched at ${parsed.fetchedAt}, max age ${maxAgeMs}ms)`,
+    };
+  }
+  if (parsed.entries.length === 0) {
+    return {
+      status: "empty",
+      entries: [],
+      fetchedAt: parsed.fetchedAt,
+      reason: `codex models cache lists no models with visibility "${CODEX_LISTED_VISIBILITY}"`,
+    };
+  }
+  return { status: "usable", entries: parsed.entries, fetchedAt: parsed.fetchedAt };
+}
+
+/**
+ * Ingests the Codex CLI's own models cache as the catalog source:
+ * 1. Reads and age-checks `models_cache.json`
+ * 2. Projects the listed entries down to identifiers
+ * 3. Persists the projection to model_scrapes
+ * 4. Populates the in-memory catalog for "codex"
+ *
+ * The persisted raw output is that identifier projection rather than the file
+ * itself. The file is a quarter-megabyte of model-authored prose per refresh,
+ * none of which the catalog is allowed to consume, so storing it verbatim would
+ * be paying to keep the exact material #195 put outside the trust boundary.
+ */
+export function ingestCodexHostModels(opts?: {
+  cachePath?: string;
+  scrapeStore?: ModelScrapeStore;
+  now?: number;
+  maxAgeMs?: number;
+}): CodexModelsCacheRead {
+  const read = readCodexModelsCache(opts);
+  if (read.status !== "usable") return read;
+
+  const scrapedAt = new Date().toISOString();
+  try {
+    const id = opts?.scrapeStore?.recordRaw({
+      provider: "codex",
+      scrapedAt,
+      rawOutput: JSON.stringify(
+        {
+          source: "codex-models-cache",
+          fetchedAt: read.fetchedAt,
+          listedIdentifiers: read.entries.map((entry) => entry.identifier),
+        },
+        null,
+        2
+      ),
+    });
+    if (id && opts?.scrapeStore) {
+      opts.scrapeStore.recordParsed(id, read.entries);
+    }
+  } catch (err) {
+    console.warn(
+      `[model-catalog] failed to persist codex models cache scrape: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  setProviderModelCatalog("codex", read.entries);
+  return read;
+}

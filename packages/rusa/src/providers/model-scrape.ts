@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { RusaConfig } from "../config/types.js";
 import {
   getProviderModelCatalog,
+  ingestCodexHostModels,
   ingestKimiHostModels,
   type ModelCatalogExtraction,
   type ModelScrapeStore,
@@ -21,18 +22,50 @@ export interface ModelProbeOptions {
   configDir?: string;
 }
 
+/**
+ * Timing bounds for the generated tmux script. Production derives all three
+ * from the caller's deadline; they are overridable only so the readiness and
+ * render control-flow can be exercised end-to-end against a fake codex without
+ * waiting out the real multi-second budget. Overriding does not change
+ * production behavior.
+ */
+export interface CodexModelTmuxTiming {
+  /** Whole-script budget in seconds. Default: the deadline less 10s of teardown grace. */
+  budgetS?: number;
+  /** Seconds from script start allowed for the composer to become ready. Default: 40% of the budget. */
+  readySecs?: number;
+  /** Seconds to wait for the panel after one `/model` submission. Default 15. */
+  attemptSecs?: number;
+}
+
 /** tmux orchestration: launch codex, send /model, capture the rendered menu panel . */
 export function buildCodexModelTmuxScript(
   cliCommand: string,
   sockPath: string,
   trustArg: string,
-  deadlineSeconds: number
+  deadlineSeconds: number,
+  timing: CodexModelTmuxTiming = {}
 ): string {
+  // The waits are derived from the caller's deadline rather than from a fixed
+  // iteration count. Fixed counts gave the composer ~20s and the panel ~20s no
+  // matter how long the caller was willing to wait, so a 90s probe abandoned a
+  // slow-but-healthy start at ~43s with half its budget unspent - and reported
+  // it as a hard failure. Ten seconds of the budget is left for the final
+  // capture and reap so the script always beats the Node-side timer.
+  const budgetS = timing.budgetS ?? Math.max(deadlineSeconds - 10, 10);
+  const readySecs = timing.readySecs ?? Math.max(Math.floor(budgetS * 0.4), 10);
+  const attemptSecs = timing.attemptSecs ?? 15;
   const q = JSON.stringify;
   return [
     "set -u",
     `SOCK=${q(sockPath)}`,
     "S=probe",
+    // Both deadlines are measured against SECONDS (seconds since this shell
+    // started), so the readiness wait and every /model attempt draw on one
+    // shared budget instead of each holding an independent stopwatch.
+    `BUDGET_S=${budgetS}`,
+    `READY_S=${readySecs}`,
+    `ATTEMPT_S=${attemptSecs}`,
     'tmux -S "$SOCK" kill-server 2>/dev/null || true',
     // Bound the session's own command so the probe tree cannot outlive the
     // probe. Every other reaping path can be cut: the tmux server runs in its
@@ -48,9 +81,9 @@ export function buildCodexModelTmuxScript(
     // good. It also keeps someone's status bar or key bindings out of the pane
     // text this probe greps.
     `tmux -f /dev/null -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 timeout --kill-after=5 ${deadlineSeconds} ${q(cliCommand)}${trustArg ? ` ${trustArg}` : ""}`,
-    // Wait up to ~20s for the composer prompt to become ready (not just the banner).
+    // Wait for the composer prompt to become ready (not just the banner).
     "ready=0",
-    "for i in $(seq 1 40); do",
+    'while [ "$SECONDS" -lt "$READY_S" ]; do',
     '  scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
     '  if printf "%s" "$scr" | grep -qiE "Ask Codex to do anything"; then',
     "    ready=1",
@@ -65,28 +98,50 @@ export function buildCodexModelTmuxScript(
     "fi",
     // Settle before sending keys so TUI is fully accepting input.
     "sleep 2",
-    // Type the /model command with literal keys and submit after a short pause.
-    'tmux -S "$SOCK" send-keys -t "$S" -l "/model"',
-    "sleep 1.5",
-    'tmux -S "$SOCK" send-keys -t "$S" Enter',
-    // Wait up to ~20s for the model menu panel to render.
-    // On codex CLI, the first Enter may be consumed by the autocomplete popup.
-    // Poll for confirmation: if the menu hasn't rendered yet and the popup or
-    // prompt is still visible, re-send Enter to submit the command.
+    // One /model attempt: type the command with literal keys, submit after a
+    // short pause, then poll for the panel. On codex CLI, the first Enter may be
+    // consumed by the autocomplete popup; if the menu hasn't rendered and the
+    // popup or prompt is still visible, re-send Enter to submit the command.
     // Note: Keep regex in sync with extractModelCatalog pre-extraction guard in model-catalog.ts
+    "attempt_model() {",
+    "  rendered=0",
+    '  tmux -S "$SOCK" send-keys -t "$S" -l "/model"',
+    "  sleep 1.5",
+    '  tmux -S "$SOCK" send-keys -t "$S" Enter',
+    "  local deadline=$((SECONDS + ATTEMPT_S))",
+    '  while [ "$SECONDS" -lt "$deadline" ] && [ "$SECONDS" -lt "$BUDGET_S" ]; do',
+    '    scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
+    '    if printf "%s" "$scr" | grep -qiE "Select Model|Select a model|Select model and effort|[0-9]+\\.[[:space:]]*gpt-"; then',
+    "      rendered=1",
+    "      return 0",
+    "    fi",
+    '    if printf "%s" "$scr" | grep -qiE "change model|switch model|select model|choose model"; then',
+    '      tmux -S "$SOCK" send-keys -t "$S" Enter',
+    '    elif printf "%s" "$scr" | grep -qE "(›|>)[[:space:]]*/model"; then',
+    '      tmux -S "$SOCK" send-keys -t "$S" Enter',
+    "    fi",
+    "    sleep 0.5",
+    "  done",
+    "  return 0",
+    "}",
+    // Re-submit /model while the budget allows. A submission that is swallowed
+    // without opening the panel used to burn the entire render window waiting
+    // for a keystroke nothing was going to answer; sending it again is what the
+    // /status probe already does for its own swallowed-submission case.
     "rendered=0",
-    "for i in $(seq 1 40); do",
-    '  scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
-    '  if printf "%s" "$scr" | grep -qiE "Select Model|Select a model|Select model and effort|[0-9]+\\.[[:space:]]*gpt-"; then',
-    "    rendered=1",
+    'while [ "$SECONDS" -lt "$BUDGET_S" ]; do',
+    "  attempt_model",
+    '  if [ "$rendered" -eq 1 ]; then',
     "    break",
     "  fi",
-    '  if printf "%s" "$scr" | grep -qiE "change model|switch model|select model|choose model"; then',
-    '    tmux -S "$SOCK" send-keys -t "$S" Enter',
-    '  elif printf "%s" "$scr" | grep -qE "(›|>)[[:space:]]*/model"; then',
-    '    tmux -S "$SOCK" send-keys -t "$S" Enter',
+    // Retype only from a composer that is demonstrably empty again: the
+    // placeholder is back, so the earlier text was consumed without opening the
+    // panel. A half-typed line or an open popup is left alone rather than typed
+    // over, since typing into an open picker is how a probe turns into a change.
+    '  scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
+    '  if ! printf "%s" "$scr" | grep -qiE "Ask Codex to do anything"; then',
+    "    break",
     "  fi",
-    "  sleep 0.5",
     "done",
     'if [ "$rendered" -eq 0 ]; then',
     '  echo "ERROR: /model panel never rendered in Codex session" >&2',
@@ -96,6 +151,70 @@ export function buildCodexModelTmuxScript(
     'tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true',
     'tmux -S "$SOCK" kill-server 2>/dev/null || true',
   ].join("\n");
+}
+
+/**
+ * The wrapper's own failure vocabulary. Each marker is a line the script writes
+ * to stderr immediately before exiting 1, and the reason is what an operator
+ * needs in order to act: whether codex never got far enough to be asked, or was
+ * asked and never answered.
+ */
+const CODEX_SCRAPE_STAGE_REASONS: ReadonlyArray<{ marker: string; reason: string }> = [
+  {
+    marker: "composer never became ready",
+    reason: "the Codex composer never became ready, so /model was never submitted",
+  },
+  {
+    marker: "/model panel never rendered",
+    reason: "/model was submitted but the model panel never rendered",
+  },
+];
+
+/** Longest unrecognized stderr excerpt carried into an error message. */
+const CODEX_SCRAPE_STDERR_EXCERPT_LIMIT = 200;
+
+/** Most stderr bytes retained while the wrapper runs; the tail is what names the stage. */
+const CODEX_SCRAPE_STDERR_BUFFER_LIMIT = 8_192;
+
+/**
+ * Replace control bytes with spaces so an excerpt of someone else's stderr
+ * cannot move a cursor, clear a screen, or otherwise repaint the log it lands
+ * in. Written by hand because the equivalent regex is a lint error for the very
+ * reason it is wanted here: it contains control characters.
+ */
+function flattenControlBytes(line: string): string {
+  let flattened = "";
+  for (const ch of line) {
+    const code = ch.codePointAt(0) ?? 0;
+    flattened += code < 0x20 || code === 0x7f ? " " : ch;
+  }
+  return flattened;
+}
+
+/**
+ * Turn the wrapper's stderr into a bounded, actionable reason for a non-zero exit.
+ *
+ * Only stderr is read, and it can hold nothing but the wrapper's own markers
+ * plus whatever bash or tmux says: the rendered screen leaves through stdout via
+ * `capture-pane`, and the prompt is never echoed anywhere. An unrecognized
+ * failure still yields its last line, flattened and truncated, because "exit 1
+ * with no stage" is otherwise indistinguishable from every other exit 1.
+ */
+export function describeCodexScrapeFailure(stderr: string): string {
+  for (const { marker, reason } of CODEX_SCRAPE_STAGE_REASONS) {
+    if (stderr.includes(marker)) return reason;
+  }
+  const lastLine = stderr
+    .split("\n")
+    .map((line) => flattenControlBytes(line).trim())
+    .filter(Boolean)
+    .pop();
+  if (!lastLine) return "the wrapper exited without a stage marker or any stderr";
+  const excerpt =
+    lastLine.length > CODEX_SCRAPE_STDERR_EXCERPT_LIMIT
+      ? `${lastLine.slice(0, CODEX_SCRAPE_STDERR_EXCERPT_LIMIT)}...`
+      : lastLine;
+  return `the wrapper exited without a stage marker (stderr: ${excerpt})`;
 }
 
 /**
@@ -176,7 +295,10 @@ export async function scrapeAgyModels(opts?: {
  * real host ~/.codex in-place — any OAuth token rotation naturally persists and
  * host auth is never revoked or deleted.
  */
-export async function scrapeCodexModelScreen(opts: ModelProbeOptions): Promise<string> {
+export async function scrapeCodexModelScreen(
+  opts: ModelProbeOptions,
+  timing?: CodexModelTmuxTiming
+): Promise<string> {
   const cliCommand = opts.cliCommand ?? "codex";
   const timeoutMs = opts.timeoutMs ?? 90_000;
   mkdirSync(opts.actorDir, { recursive: true });
@@ -197,7 +319,8 @@ export async function scrapeCodexModelScreen(opts: ModelProbeOptions): Promise<s
     cliCommand,
     sock,
     trustArg,
-    Math.ceil(timeoutMs / 1000) + 1
+    Math.ceil(timeoutMs / 1000) + 1,
+    timing
   );
 
   const killTmux = () => {
@@ -219,6 +342,11 @@ export async function scrapeCodexModelScreen(opts: ModelProbeOptions): Promise<s
   try {
     return await new Promise<string>((resolve, reject) => {
       const chunks: string[] = [];
+      // Kept apart from the captured screen: the pane text arrives on stdout and
+      // is the catalog's raw input, while stderr carries only the wrapper's own
+      // stage markers. Merging them would both corrupt the capture and make the
+      // failure reason unquotable without quoting the screen.
+      let stderr = "";
       const child = spawn("bash", ["-c", script], {
         cwd: opts.actorDir,
         env: {
@@ -262,10 +390,19 @@ export async function scrapeCodexModelScreen(opts: ModelProbeOptions): Promise<s
       );
       opts.signal?.addEventListener("abort", onAbort);
       child.stdout.on("data", (d: Buffer) => chunks.push(d.toString()));
+      child.stderr.on("data", (d: Buffer) => {
+        // Bounded in memory as well as in the message: a wrapper stuck in a
+        // failure loop must not be able to grow this without limit.
+        stderr = (stderr + d.toString()).slice(-CODEX_SCRAPE_STDERR_BUFFER_LIMIT);
+      });
       child.on("error", (err) => settle(err));
       child.on("close", (code) => {
         if (code !== 0 && code !== null) {
-          settle(new Error(`codex /model scrape failed with exit code ${code}`));
+          settle(
+            new Error(
+              `codex /model scrape failed with exit code ${code}: ${describeCodexScrapeFailure(stderr)}`
+            )
+          );
         } else {
           settle();
         }
@@ -403,6 +540,21 @@ export async function refreshProviderModelCatalog(opts: {
     }
   }
 
+  // Cheapest source first for codex: the CLI's own models cache is the very list
+  // its picker renders, so reading it costs a file read where the TUI costs a
+  // whole codex start, a rented PTY and a keystroke race. The interactive path
+  // stays as the fallback for exactly the cases the cache cannot answer -
+  // absent, malformed, stale, or listing nothing - and falling back also
+  // restarts codex, which is what rewrites the cache for the next refresh.
+  let codexCacheReason: string | undefined;
+  if (provider === "codex") {
+    const cached = ingestCodexHostModels({ scrapeStore });
+    if (cached.status === "usable") {
+      return { status: "known", entries: cached.entries };
+    }
+    codexCacheReason = cached.reason;
+  }
+
   let rawOutput = "";
   try {
     if (provider === "codex") {
@@ -422,7 +574,12 @@ export async function refreshProviderModelCatalog(opts: {
     // branch: two probers whose abort semantics diverge would mean a restart is quiet
     // or noisy depending on which providers happen to be configured.
     if (signal?.aborted) return abortedProbeResult();
-    const message = `model probe failed for provider "${provider}": ${err instanceof Error ? err.message : String(err)}`;
+    // Both stages in one line: which cheap source was declined, and how the
+    // fallback then failed. Either half alone leaves an operator guessing which
+    // of the two to go and look at.
+    const message = `model probe failed for provider "${provider}": ${err instanceof Error ? err.message : String(err)}${
+      codexCacheReason ? ` (fell back to the /model TUI because ${codexCacheReason})` : ""
+    }`;
     logFailedRefresh(provider, message, scrapeStore);
     return {
       status: "unknown",

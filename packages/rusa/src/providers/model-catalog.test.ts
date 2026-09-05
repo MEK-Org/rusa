@@ -5,15 +5,19 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { extractGeminiText, getGeminiClient } from "../understanding/gemini-utils.js";
 import { buildAntigravityArgs, resolveAntigravitySelection } from "./antigravity.js";
 import {
+  CODEX_MODELS_CACHE_MAX_AGE_MS,
   clearProviderModelCatalog,
+  extractCodexModelsFromCacheJson,
   extractKimiModelsFromToml,
   extractModelCatalog,
   getAllProviderModelCatalogs,
   getProviderModelCatalog,
+  ingestCodexHostModels,
   ingestKimiHostModels,
   PROVIDER_MODEL_DESCRIPTORS,
   parseAgyModelsOutput,
   populateModelCatalogsFromDb,
+  readCodexModelsCache,
   recordAndExtractModelCatalog,
   setProviderModelCatalog,
   validateModelPin,
@@ -649,6 +653,246 @@ display_name = "K3"
     expect(() => validateModelPin("kimi", "k3")).toThrow();
     expect(() => validateModelPin("kimi", "K3")).toThrow();
     expect(() => validateModelPin("kimi", "unsupported-model")).toThrow();
+  });
+});
+
+describe("codex models cache", () => {
+  let tmpDir: string;
+
+  // The shape observed in an installed Codex CLI's models_cache.json: a listed
+  // model, a hidden one, and the prose fields the catalog is not allowed to read.
+  const cacheDoc = (fetchedAt: string) => ({
+    fetched_at: fetchedAt,
+    etag: 'W/"cache-etag"',
+    client_version: "0.153.4",
+    models: [
+      {
+        slug: "gpt-5.6-sol",
+        display_name: "GPT-5.6-Sol",
+        description: "Our most capable model for complex, demanding work.",
+        visibility: "list",
+        supported_reasoning_levels: [{ effort: "high", description: "Greater reasoning depth" }],
+        availability_nux: { message: "This is a new generation of intelligence." },
+        model_messages: { persistent_instructions: "You are now in persistent mode." },
+      },
+      { slug: "gpt-5.5", display_name: "GPT-5.5", visibility: "list" },
+      { slug: "gpt-reserve", display_name: "GPT-Reserve", visibility: "hide" },
+    ],
+  });
+
+  const writeCache = (content: string): string => {
+    tmpDir = mkdtempSync(join(tmpdir(), "codex-cache-test-"));
+    const cachePath = join(tmpDir, "models_cache.json");
+    writeFileSync(cachePath, content);
+    return cachePath;
+  };
+
+  afterEach(() => {
+    if (tmpDir) {
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch {
+        /* best effort */
+      }
+    }
+  });
+
+  it("takes only the slugs of entries the picker lists", () => {
+    const parsed = extractCodexModelsFromCacheJson(
+      JSON.stringify(cacheDoc("2026-09-05T13:04:16.694709369Z"))
+    );
+
+    expect(parsed?.fetchedAt).toBe("2026-09-05T13:04:16.694709369Z");
+    expect(parsed?.entries).toEqual([
+      { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol", passable: true },
+      { displayLabel: "gpt-5.5", identifier: "gpt-5.5", passable: true },
+    ]);
+  });
+
+  it("advertises no cache prose, only identifiers", () => {
+    // #195's boundary: the catalog is identifiers, and a cache entry's
+    // display_name, description, availability message and model-authored
+    // instructions are none of the catalog's business - so they must not reach a
+    // ModelEntry field, not even the display label.
+    const parsed = extractCodexModelsFromCacheJson(
+      JSON.stringify(cacheDoc("2026-09-05T13:04:16.694709369Z"))
+    );
+    const serialized = JSON.stringify(parsed?.entries);
+
+    for (const prose of [
+      "GPT-5.6-Sol",
+      "Our most capable model",
+      "new generation of intelligence",
+      "persistent mode",
+      "Greater reasoning depth",
+    ]) {
+      expect(serialized).not.toContain(prose);
+    }
+    for (const entry of parsed?.entries ?? []) {
+      expect(entry.displayLabel).toBe(entry.identifier);
+    }
+  });
+
+  it("skips entries without a usable slug or with any other visibility", () => {
+    const parsed = extractCodexModelsFromCacheJson(
+      JSON.stringify({
+        fetched_at: "2026-09-05T13:04:16Z",
+        models: [
+          { slug: "gpt-5.5", visibility: "list" },
+          { slug: "gpt-5.5", visibility: "list" },
+          { slug: "  ", visibility: "list" },
+          { slug: 42, visibility: "list" },
+          { visibility: "list" },
+          { slug: "gpt-hidden", visibility: "hidden" },
+          { slug: "gpt-listed", visibility: "List" },
+          null,
+        ],
+      })
+    );
+
+    expect(parsed?.entries).toEqual([
+      { displayLabel: "gpt-5.5", identifier: "gpt-5.5", passable: true },
+    ]);
+  });
+
+  it("reads a fresh cache as usable", () => {
+    const cachePath = writeCache(JSON.stringify(cacheDoc("2026-09-05T12:00:00.000Z")));
+
+    expect(
+      readCodexModelsCache({ cachePath, now: Date.parse("2026-09-05T13:00:00.000Z") })
+    ).toEqual({
+      status: "usable",
+      fetchedAt: "2026-09-05T12:00:00.000Z",
+      entries: [
+        { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol", passable: true },
+        { displayLabel: "gpt-5.5", identifier: "gpt-5.5", passable: true },
+      ],
+    });
+  });
+
+  it("names each unusable cache condition without leaking its path", () => {
+    const absent = readCodexModelsCache({ cachePath: join(tmpdir(), "no-such-codex-cache.json") });
+    expect(absent.status).toBe("absent");
+    expect(absent.entries).toEqual([]);
+
+    const malformed = readCodexModelsCache({ cachePath: writeCache("{ not json") });
+    expect(malformed.status).toBe("malformed");
+    rmSync(tmpDir, { recursive: true, force: true });
+
+    const notACache = readCodexModelsCache({ cachePath: writeCache('{"models":"nope"}') });
+    expect(notACache.status).toBe("malformed");
+    rmSync(tmpDir, { recursive: true, force: true });
+
+    // Without a parseable timestamp the freshness rule cannot be applied at all,
+    // so the cache is structurally unusable rather than merely old.
+    const undated = readCodexModelsCache({
+      cachePath: writeCache(JSON.stringify({ models: [{ slug: "gpt-5.5", visibility: "list" }] })),
+    });
+    expect(undated.status).toBe("malformed");
+    rmSync(tmpDir, { recursive: true, force: true });
+
+    const stale = readCodexModelsCache({
+      cachePath: writeCache(JSON.stringify(cacheDoc("2026-09-03T12:00:00.000Z"))),
+      now: Date.parse("2026-09-05T12:00:00.000Z"),
+    });
+    expect(stale.status).toBe("stale");
+    expect(stale.entries).toEqual([]);
+    rmSync(tmpDir, { recursive: true, force: true });
+
+    const empty = readCodexModelsCache({
+      cachePath: writeCache(
+        JSON.stringify({
+          fetched_at: "2026-09-05T12:00:00.000Z",
+          models: [{ slug: "gpt-reserve", visibility: "hide" }],
+        })
+      ),
+      now: Date.parse("2026-09-05T12:30:00.000Z"),
+    });
+    expect(empty.status).toBe("empty");
+
+    for (const read of [absent, malformed, notACache, undated, stale, empty]) {
+      expect(read.reason).toBeTruthy();
+      expect(read.reason).not.toContain(tmpdir());
+    }
+  });
+
+  it("ages the cache out exactly at the documented maximum", () => {
+    const cachePath = writeCache(JSON.stringify(cacheDoc("2026-09-04T12:00:00.000Z")));
+    const fetchedAtMs = Date.parse("2026-09-04T12:00:00.000Z");
+
+    expect(
+      readCodexModelsCache({ cachePath, now: fetchedAtMs + CODEX_MODELS_CACHE_MAX_AGE_MS }).status
+    ).toBe("usable");
+    expect(
+      readCodexModelsCache({ cachePath, now: fetchedAtMs + CODEX_MODELS_CACHE_MAX_AGE_MS + 1 })
+        .status
+    ).toBe("stale");
+  });
+
+  it("records the identifier projection, not the cache file, and sets the codex catalog", () => {
+    const cachePath = writeCache(JSON.stringify(cacheDoc("2026-09-05T12:00:00.000Z")));
+    const recordedRaw: Array<{ provider: string; rawOutput: string }> = [];
+    const mockStore = {
+      recordRaw: vi.fn((opts) => {
+        recordedRaw.push(opts);
+        return "scrape-codex-cache-1";
+      }),
+      recordParsed: vi.fn(),
+      recordParseError: vi.fn(),
+    };
+
+    const read = ingestCodexHostModels({
+      cachePath,
+      scrapeStore: mockStore,
+      now: Date.parse("2026-09-05T12:30:00.000Z"),
+    });
+
+    expect(read.status).toBe("usable");
+    expect(recordedRaw).toHaveLength(1);
+    expect(recordedRaw[0].provider).toBe("codex");
+    // A quarter-megabyte of model-authored prose per refresh is exactly what
+    // #195 keeps outside the catalog's trust boundary; the store keeps what the
+    // entries were derived from instead.
+    expect(JSON.parse(recordedRaw[0].rawOutput)).toEqual({
+      source: "codex-models-cache",
+      fetchedAt: "2026-09-05T12:00:00.000Z",
+      listedIdentifiers: ["gpt-5.6-sol", "gpt-5.5"],
+    });
+    expect(recordedRaw[0].rawOutput).not.toContain("Our most capable model");
+    expect(mockStore.recordParsed).toHaveBeenCalledWith("scrape-codex-cache-1", read.entries);
+
+    expect(getProviderModelCatalog("codex")).toEqual([
+      { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol", passable: true },
+      { displayLabel: "gpt-5.5", identifier: "gpt-5.5", passable: true },
+    ]);
+    expect(validateModelPin("codex", "gpt-5.6-sol")).toEqual({
+      status: "accepted",
+      efforts: undefined,
+    });
+    // The display name the cache carried is prose, and prose is not a pin.
+    expect(() => validateModelPin("codex", "GPT-5.6-Sol")).toThrow();
+  });
+
+  it("leaves the last-known-good catalog alone when the cache is unusable", () => {
+    setProviderModelCatalog("codex", [
+      { displayLabel: "gpt-5.4", identifier: "gpt-5.4", passable: true },
+    ]);
+    const mockStore = {
+      recordRaw: vi.fn(),
+      recordParsed: vi.fn(),
+      recordParseError: vi.fn(),
+    };
+
+    const read = ingestCodexHostModels({
+      cachePath: join(tmpdir(), "no-such-codex-cache.json"),
+      scrapeStore: mockStore,
+    });
+
+    expect(read.status).toBe("absent");
+    expect(mockStore.recordRaw).not.toHaveBeenCalled();
+    expect(getProviderModelCatalog("codex")).toEqual([
+      { displayLabel: "gpt-5.4", identifier: "gpt-5.4", passable: true },
+    ]);
   });
 });
 

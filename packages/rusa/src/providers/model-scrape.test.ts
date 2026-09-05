@@ -2,7 +2,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RusaConfig } from "../config/types.js";
 import {
   clearProviderModelCatalog,
@@ -11,14 +11,55 @@ import {
 } from "./model-catalog.js";
 import {
   buildCodexModelTmuxScript,
+  describeCodexScrapeFailure,
   refreshConfiguredProviderModelCatalogs,
   refreshProviderModelCatalog,
   scrapeCodexModelScreen,
 } from "./model-scrape.js";
 
+/**
+ * Every codex refresh now reads the CLI's models cache before it considers the
+ * TUI, and `CODEX_HOME` is how codex itself says where that cache lives. Tests
+ * point it at a directory they own so a suite never reads - or is decided by -
+ * whatever cache the machine running it happens to have.
+ */
+const codexHomes: string[] = [];
+function stubCodexHome(cache?: unknown): string {
+  const dir = mkdtempSync(join(tmpdir(), "codex-home-test-"));
+  codexHomes.push(dir);
+  if (cache !== undefined) {
+    writeFileSync(
+      join(dir, "models_cache.json"),
+      typeof cache === "string" ? cache : JSON.stringify(cache)
+    );
+  }
+  vi.stubEnv("CODEX_HOME", dir);
+  return dir;
+}
+
+/** A cache the freshness rule accepts, listing exactly the given slugs. */
+function freshCache(slugs: string[]) {
+  return {
+    fetched_at: new Date().toISOString(),
+    models: [
+      ...slugs.map((slug) => ({ slug, display_name: slug.toUpperCase(), visibility: "list" })),
+      { slug: "gpt-hidden", display_name: "Hidden", visibility: "hide" },
+    ],
+  };
+}
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+  while (codexHomes.length > 0) {
+    const dir = codexHomes.pop();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 describe("refreshProviderModelCatalog", () => {
   it("probes codex and records extracted catalog", async () => {
     clearProviderModelCatalog();
+    stubCodexHome();
     const mockStore = {
       recordRaw: vi.fn().mockReturnValue("scrape-codex-1"),
       recordParsed: vi.fn(),
@@ -100,6 +141,7 @@ gemini-3.1-pro-high       Gemini 3.1 Pro (High)
   });
 
   it("handles probe failure gracefully without throwing and retains last-known-good catalog", async () => {
+    stubCodexHome();
     setProviderModelCatalog("codex", [
       { displayLabel: "old-model", identifier: "old-model", passable: true },
     ]);
@@ -171,6 +213,7 @@ gemini-3.1-pro-high       Gemini 3.1 Pro (High)
   });
 
   it("includes last scraped timestamp from getLatestParsedForProvider in warning log on probe failure", async () => {
+    stubCodexHome();
     setProviderModelCatalog("codex", [
       { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol", passable: true },
     ]);
@@ -206,10 +249,116 @@ gemini-3.1-pro-high       Gemini 3.1 Pro (High)
 
     warnSpy.mockRestore();
   });
+
+  it("takes the codex catalog from the CLI's own models cache without starting a TUI", async () => {
+    clearProviderModelCatalog();
+    stubCodexHome(freshCache(["gpt-5.6-sol", "gpt-5.5"]));
+    const mockStore = {
+      recordRaw: vi.fn().mockReturnValue("scrape-codex-cache"),
+      recordParsed: vi.fn(),
+      recordParseError: vi.fn(),
+    };
+    const mockScrapeCodex = vi.fn().mockResolvedValue("codex screen");
+
+    const res = await refreshProviderModelCatalog({
+      provider: "codex",
+      workersDir: "/tmp/test-workers",
+      scrapeStore: mockStore,
+      probers: { scrapeCodex: mockScrapeCodex },
+    });
+
+    // The whole point of the cheap source: a usable cache means no codex start,
+    // no PTY, and no keystroke race for a list that was already on disk.
+    expect(mockScrapeCodex).not.toHaveBeenCalled();
+    expect(res).toEqual({
+      status: "known",
+      entries: [
+        { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol", passable: true },
+        { displayLabel: "gpt-5.5", identifier: "gpt-5.5", passable: true },
+      ],
+    });
+    expect(getProviderModelCatalog("codex")).toEqual([
+      { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol", passable: true },
+      { displayLabel: "gpt-5.5", identifier: "gpt-5.5", passable: true },
+    ]);
+    expect(mockStore.recordRaw).toHaveBeenCalled();
+  });
+
+  it("falls back to the TUI when the cache is malformed", async () => {
+    clearProviderModelCatalog();
+    stubCodexHome("{ this is not json");
+    const mockScrapeCodex = vi.fn().mockResolvedValue("codex screen");
+
+    await refreshProviderModelCatalog({
+      provider: "codex",
+      workersDir: "/tmp/test-workers",
+      probers: { scrapeCodex: mockScrapeCodex },
+    });
+
+    expect(mockScrapeCodex).toHaveBeenCalled();
+  });
+
+  it("falls back to the TUI when the cache is too old to trust", async () => {
+    clearProviderModelCatalog();
+    stubCodexHome({
+      fetched_at: "2026-09-03T12:00:00.000Z",
+      models: [{ slug: "gpt-5.6-sol", visibility: "list" }],
+    });
+    const mockScrapeCodex = vi.fn().mockResolvedValue("codex screen");
+
+    await refreshProviderModelCatalog({
+      provider: "codex",
+      workersDir: "/tmp/test-workers",
+      probers: { scrapeCodex: mockScrapeCodex },
+    });
+
+    // A stale cache means codex has not started in a day; the fallback both gets
+    // an answer now and restarts codex, which is what rewrites the cache.
+    expect(mockScrapeCodex).toHaveBeenCalled();
+  });
+
+  it("names both the declined cache and the failing TUI stage when everything fails", async () => {
+    stubCodexHome("{ this is not json");
+    setProviderModelCatalog("codex", [
+      { displayLabel: "gpt-5.4", identifier: "gpt-5.4", passable: true },
+    ]);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const res = await refreshProviderModelCatalog({
+        provider: "codex",
+        workersDir: "/tmp/test-workers",
+        probers: {
+          scrapeCodex: vi
+            .fn()
+            .mockRejectedValue(
+              new Error(
+                "codex /model scrape failed with exit code 1: /model was submitted but the model panel never rendered"
+              )
+            ),
+        },
+      });
+
+      if (res.status !== "unknown") throw new Error(`expected unknown, got ${res.status}`);
+      // One line an operator can act on: which cheap source was declined, and
+      // how far the fallback got before giving up.
+      expect(res.message).toContain("the model panel never rendered");
+      expect(res.message).toContain("codex models cache is not a JSON document");
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("retaining last-known-good catalog")
+      );
+      expect(getProviderModelCatalog("codex")).toEqual([
+        { displayLabel: "gpt-5.4", identifier: "gpt-5.4", passable: true },
+      ]);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
 });
 
 describe("refreshConfiguredProviderModelCatalogs", () => {
   it("probes all configured providers in config", async () => {
+    stubCodexHome();
     const mockStore = {
       recordRaw: vi.fn().mockReturnValue("scrape-1"),
       recordParsed: vi.fn(),
@@ -241,6 +390,7 @@ describe("refreshConfiguredProviderModelCatalogs", () => {
   });
 
   it("hands every prober the caller's abort signal", async () => {
+    stubCodexHome();
     const mockScrapeCodex = vi.fn().mockResolvedValue("codex screen");
     const mockScrapeAgy = vi.fn().mockResolvedValue("agy screen");
     const controller = new AbortController();
@@ -326,6 +476,7 @@ describe("refreshConfiguredProviderModelCatalogs", () => {
     );
 
   it("stays quiet when codex is aborted mid-probe, not just before it starts", async () => {
+    stubCodexHome();
     const controller = new AbortController();
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -379,6 +530,7 @@ describe("refreshConfiguredProviderModelCatalogs", () => {
     // The other half of the branch: silence is conditioned on the OWNER having
     // aborted, so an ordinary rejection must not inherit it. Without this, adding
     // the quiet path could have muted every provider failure and no test would say so.
+    stubCodexHome();
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
@@ -592,5 +744,189 @@ done
     expect(script).toContain("Select Model");
     expect(script).toContain("ERROR: /model panel never rendered in Codex session");
     expect(script).toContain("exit 1");
+  });
+
+  it("waits out a composer that takes its time appearing ", async () => {
+    // Readiness is polled against a deadline, so a codex that spends several
+    // seconds on startup before drawing its composer is a slow success rather
+    // than a failure - which is what a daemon start actually looks like.
+    const actorDir = mkdtempSync(join(tmpdir(), "codex-test-actor-slow-ready-"));
+    const mockBin = join(actorDir, "mock-codex-slow-ready.sh");
+    writeFileSync(
+      mockBin,
+      `#!/bin/bash
+echo "OpenAI Codex"
+sleep 4
+echo "Ask Codex to do anything"
+while read -r line; do
+  if [ "$line" = "/model" ]; then
+    echo "Select Model and Effort"
+    echo "1. gpt-5.6-sol (current)"
+    echo "2. gpt-5.6-terra"
+    sleep 30
+  fi
+done
+`,
+      { mode: 0o755 }
+    );
+
+    try {
+      const output = await scrapeCodexModelScreen(
+        { actorDir, cliCommand: mockBin, timeoutMs: 45_000 },
+        { readySecs: 20, attemptSecs: 8, budgetS: 35 }
+      );
+      expect(output).toContain("Select Model and Effort");
+      expect(output).toContain("gpt-5.6-sol");
+    } finally {
+      rmSync(actorDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("re-submits /model when the first submission is swallowed ", async () => {
+    // The swallowed-submission case: the composer accepted the text and cleared
+    // it, but no panel opened. Waiting out the render window for a keystroke
+    // nothing was going to answer is how a healthy codex became an exit 1.
+    const actorDir = mkdtempSync(join(tmpdir(), "codex-test-actor-retry-"));
+    const mockBin = join(actorDir, "mock-codex-swallow.sh");
+    writeFileSync(
+      mockBin,
+      `#!/bin/bash
+echo "OpenAI Codex"
+echo "Ask Codex to do anything"
+seen=0
+while read -r line; do
+  if [ "$line" = "/model" ]; then
+    seen=$((seen + 1))
+    if [ "$seen" -ge 2 ]; then
+      echo "Select Model and Effort"
+      echo "1. gpt-5.6-sol (current)"
+      sleep 30
+    fi
+  fi
+done
+`,
+      { mode: 0o755 }
+    );
+
+    try {
+      const output = await scrapeCodexModelScreen(
+        { actorDir, cliCommand: mockBin, timeoutMs: 45_000 },
+        { readySecs: 10, attemptSecs: 4, budgetS: 35 }
+      );
+      expect(output).toContain("Select Model and Effort");
+      expect(output).toContain("gpt-5.6-sol");
+    } finally {
+      rmSync(actorDir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("reports a composer that never became ready as that stage ", async () => {
+    const actorDir = mkdtempSync(join(tmpdir(), "codex-test-actor-no-composer-"));
+    const mockBin = join(actorDir, "mock-codex-no-composer.sh");
+    // Banner only: codex started but never reached the point of taking input.
+    writeFileSync(
+      mockBin,
+      `#!/bin/bash
+echo "OpenAI Codex"
+while true; do
+  sleep 1
+done
+`,
+      { mode: 0o755 }
+    );
+
+    try {
+      await expect(
+        scrapeCodexModelScreen(
+          { actorDir, cliCommand: mockBin, timeoutMs: 30_000 },
+          { readySecs: 3, attemptSecs: 2, budgetS: 10 }
+        )
+      ).rejects.toThrow(
+        "codex /model scrape failed with exit code 1: the Codex composer never became ready, so /model was never submitted"
+      );
+    } finally {
+      rmSync(actorDir, { recursive: true, force: true });
+    }
+  }, 45_000);
+
+  it("reports an unrendered panel as that stage, without quoting the screen ", async () => {
+    const actorDir = mkdtempSync(join(tmpdir(), "codex-test-actor-no-panel-"));
+    const mockBin = join(actorDir, "mock-codex-no-panel.sh");
+    // Ready, then deaf: the composer took the command and nothing opened.
+    writeFileSync(
+      mockBin,
+      `#!/bin/bash
+echo "OpenAI Codex"
+echo "Ask Codex to do anything"
+echo "sensitive-pane-text-do-not-quote"
+while true; do
+  sleep 1
+done
+`,
+      { mode: 0o755 }
+    );
+
+    try {
+      await expect(
+        scrapeCodexModelScreen(
+          { actorDir, cliCommand: mockBin, timeoutMs: 30_000 },
+          { readySecs: 6, attemptSecs: 2, budgetS: 9 }
+        )
+      ).rejects.toThrow(
+        "codex /model scrape failed with exit code 1: /model was submitted but the model panel never rendered"
+      );
+
+      // The diagnostic comes from stderr, which carries the wrapper's own
+      // markers; the rendered screen leaves through stdout and stays there.
+      await expect(
+        scrapeCodexModelScreen(
+          { actorDir, cliCommand: mockBin, timeoutMs: 30_000 },
+          { readySecs: 6, attemptSecs: 2, budgetS: 9 }
+        )
+      ).rejects.not.toThrow("sensitive-pane-text-do-not-quote");
+    } finally {
+      rmSync(actorDir, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  it("spends the caller's whole deadline instead of a fixed poll count ", () => {
+    // The failure this repairs: a 90s probe abandoned a slow start at ~43s
+    // because both waits were fixed 40-iteration loops, then reported it as if
+    // codex had refused. Every wait is now derived from the caller's deadline.
+    const script = buildCodexModelTmuxScript("codex", "/tmp/sock", "", 91);
+    expect(script).toContain("BUDGET_S=81");
+    expect(script).toContain("READY_S=32");
+    expect(script).toContain("ATTEMPT_S=15");
+    expect(script).not.toContain("seq 1 40");
+    expect(script).toContain('while [ "$SECONDS" -lt "$READY_S" ]; do');
+  });
+});
+
+describe("describeCodexScrapeFailure", () => {
+  it("names the stage the wrapper gave up in", () => {
+    expect(
+      describeCodexScrapeFailure("ERROR: composer never became ready in Codex session\n")
+    ).toBe("the Codex composer never became ready, so /model was never submitted");
+    expect(
+      describeCodexScrapeFailure("ERROR: /model panel never rendered in Codex session\n")
+    ).toBe("/model was submitted but the model panel never rendered");
+  });
+
+  it("still says something bounded when no stage marker was written", () => {
+    expect(describeCodexScrapeFailure("")).toBe(
+      "the wrapper exited without a stage marker or any stderr"
+    );
+    expect(describeCodexScrapeFailure("   \n\n")).toBe(
+      "the wrapper exited without a stage marker or any stderr"
+    );
+
+    const flattened = describeCodexScrapeFailure("open terminal failed: missing or unsuitable\n");
+    expect(flattened).toBe(
+      "the wrapper exited without a stage marker (stderr: open terminal failed: missing or unsuitable)"
+    );
+
+    const long = describeCodexScrapeFailure(`tmux: ${"x".repeat(500)}`);
+    expect(long.length).toBeLessThan(280);
+    expect(long).toContain("...");
   });
 });
