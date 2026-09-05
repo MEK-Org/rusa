@@ -37,12 +37,9 @@ class _WorkTabState extends State<WorkTab> {
         if (_rootTrees.isEmpty) _loading = true;
         _error = null;
       });
-      final page = await widget.store.api.fetchObligations(rootsOnly: true);
-      final trees = await Future.wait(
-        page.obligations.map((o) => widget.store.api.fetchObligationTree(o.id)),
-      );
+      final forest = await widget.store.api.fetchObligationForest();
       setState(() {
-        _rootTrees = trees;
+        _rootTrees = forest.trees;
         _loading = false;
       });
       _checkFocusLink();

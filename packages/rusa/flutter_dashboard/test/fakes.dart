@@ -602,6 +602,26 @@ class FakeApi extends DashboardApi {
   }
 
   @override
+  Future<ObligationForest> fetchObligationForest({
+    int? limit,
+    int? offset,
+  }) async {
+    final page = await fetchObligations(
+      rootsOnly: true,
+      limit: limit,
+      offset: offset,
+    );
+    final trees = await Future.wait(
+      page.obligations.map((o) => fetchObligationTree(o.id)),
+    );
+    return ObligationForest(
+      trees: trees,
+      total: page.total,
+      hasMore: page.hasMore,
+    );
+  }
+
+  @override
   Future<ObligationDto> createObligation({
     required String ownerId,
     required String title,

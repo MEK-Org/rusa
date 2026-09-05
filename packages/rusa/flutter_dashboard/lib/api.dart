@@ -378,6 +378,22 @@ class DashboardApi {
     );
   }
 
+  /// One root page's full trees in a single request — see #241. Replaces the
+  /// former `fetchObligations(rootsOnly: true)` + one `fetchObligationTree`
+  /// per returned root.
+  Future<ObligationForest> fetchObligationForest({
+    int? limit,
+    int? offset,
+  }) async {
+    final q = <String, String>{
+      if (limit != null) 'limit': '$limit',
+      if (offset != null) 'offset': '$offset',
+    };
+    return ObligationForest.fromJson(
+      await _getJson(_u('/api/mesh/obligations/forest', q)),
+    );
+  }
+
   // ── Obligations write routes ──
 
   Future<ObligationDto> createObligation({

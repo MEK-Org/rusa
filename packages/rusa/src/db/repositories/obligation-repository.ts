@@ -916,22 +916,97 @@ export class ObligationRepository {
   }
 
   getTree(rootId: string): ObligationTree {
-    const seen = new Set<string>();
-    const visit = (id: string): ObligationTree => {
-      if (seen.has(id)) throw new ObligationValidationError(`obligation cycle detected at: ${id}`);
-      seen.add(id);
-      const obligation = this.require(id);
-      const childObligations = this.listChildren(id);
-      const children = childObligations.map((child) => visit(child.id));
+    const [tree] = this.getForest([rootId]);
+    if (!tree) throw new ObligationValidationError(`obligation not found: ${rootId}`);
+    return tree;
+  }
+
+  /**
+   * Trees for several roots in one bulk read, in the order requested.
+   *
+   * A root and every one of its descendants used to cost one `require()` plus
+   * one `listChildren()` — each re-running the whole-table effective-priority
+   * CTE — for every node in the subtree (#241). This instead runs the
+   * effective-priority CTE once and joins it against a second recursive CTE
+   * that walks from the requested roots down through `obligations.parent_id`,
+   * so the query cost no longer scales with the number of nodes visited.
+   * The depth cap mirrors the row count so a genuine cycle (which application
+   * code prevents on write, but this stays defensive about) still terminates
+   * the SQL walk instead of recursing forever, surfacing as the same
+   * downstream "cycle detected" error once duplicate ids reach tree assembly.
+   */
+  getForest(rootIds: readonly string[]): ObligationTree[] {
+    if (rootIds.length === 0) return [];
+    const placeholders = rootIds.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `${EFFECTIVE_PRIORITY_CTE},
+         subtree(id, depth) AS (
+           SELECT id, 0 FROM obligations WHERE id IN (${placeholders})
+           UNION ALL
+           SELECT child.id, parent.depth + 1
+           FROM obligations child
+           JOIN subtree parent ON parent.id = child.parent_id
+           WHERE parent.depth < (SELECT COUNT(*) FROM obligations)
+         )
+         SELECT obligation.*,
+                effective_priority.effective_priority,
+                effective_priority.priority_source_id,
+                EXISTS(
+                  SELECT 1
+                  FROM obligation_completions
+                  WHERE obligation_id = obligation.id
+                ) AS has_completion_history
+         FROM obligations obligation
+         JOIN effective_priority ON effective_priority.id = obligation.id
+         JOIN subtree ON subtree.id = obligation.id`
+      )
+      .all(...rootIds) as ObligationRow[];
+
+    const byId = new Map<string, ObligationRow>();
+    const childrenByParent = new Map<string, ObligationRow[]>();
+    for (const row of rows) {
+      byId.set(row.id, row);
+      if (row.parent_id !== null) {
+        const siblings = childrenByParent.get(row.parent_id);
+        if (siblings) siblings.push(row);
+        else childrenByParent.set(row.parent_id, [row]);
+      }
+    }
+    for (const siblings of childrenByParent.values()) {
+      siblings.sort((a, b) =>
+        a.effective_priority !== b.effective_priority
+          ? a.effective_priority - b.effective_priority
+          : a.id < b.id
+            ? -1
+            : a.id > b.id
+              ? 1
+              : 0
+      );
+    }
+
+    const visit = (row: ObligationRow, seen: Set<string>): ObligationTree => {
+      if (seen.has(row.id)) {
+        throw new ObligationValidationError(`obligation cycle detected at: ${row.id}`);
+      }
+      seen.add(row.id);
+      const childRows = childrenByParent.get(row.id) ?? [];
+      const childObligations = childRows.map(toObligation);
       return {
-        obligation,
-        children,
+        obligation: toObligation(row),
+        children: childRows.map((child) => visit(child, seen)),
         blockingChildren: childObligations.filter((child) =>
           isBlockingObligationStatus(child.status)
         ),
       };
     };
-    return visit(rootId);
+
+    const trees: ObligationTree[] = [];
+    for (const rootId of rootIds) {
+      const rootRow = byId.get(rootId);
+      if (rootRow) trees.push(visit(rootRow, new Set()));
+    }
+    return trees;
   }
 
   /** Apply an explicit priority using the v1 subtree/self inheritance contract. */
