@@ -1176,4 +1176,22 @@ describe("loadConfig observability.logging", () => {
         ?.logging?.level
     ).toBe(" WARN ");
   });
+
+  it("loads a configured format", () => {
+    const config = loadConfig(writeConfig({ observability: { logging: { format: "pretty" } } }));
+    expect(config.observability?.logging?.format).toBe("pretty");
+  });
+
+  it("leaves the format unset when omitted, so the logger picks by terminal", () => {
+    expect(loadConfig(writeConfig()).observability?.logging?.format).toBeUndefined();
+  });
+
+  it("rejects a format that is not a format", () => {
+    expect(() =>
+      loadConfig(writeConfig({ observability: { logging: { format: "yaml" } } }))
+    ).toThrow(/observability.logging.format must be one of json, pretty, auto/);
+    expect(() => loadConfig(writeConfig({ observability: { logging: { format: 1 } } }))).toThrow(
+      /observability.logging.format must be one of/
+    );
+  });
 });

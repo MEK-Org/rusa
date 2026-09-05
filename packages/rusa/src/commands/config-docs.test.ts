@@ -25,6 +25,11 @@ describe("config docs", () => {
     expect(CONFIG_DOCS).toContain("docs/logging.md");
   });
 
+  it("documents how an interactive run stays readable", () => {
+    expect(CONFIG_DOCS).toContain("RUSA_LOG_FORMAT");
+    expect(CONFIG_DOCS).toContain("auto is pretty when stdout is a terminal");
+  });
+
   it("documents the quickstart profile", () => {
     expect(CONFIG_DOCS).toContain("profile: quickstart");
     expect(CONFIG_DOCS).toContain("local git bridge delivery");

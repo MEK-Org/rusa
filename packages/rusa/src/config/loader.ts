@@ -383,6 +383,20 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       );
     }
   }
+  const loggingFormat = parsed.observability?.logging?.format;
+  if (loggingFormat !== undefined) {
+    // Same reasoning as the level: a typo in config is worth failing boot over,
+    // while `RUSA_LOG_FORMAT` falls back to the default rather than dying.
+    const allowed = ["json", "pretty", "auto"];
+    if (
+      typeof loggingFormat !== "string" ||
+      !allowed.includes(loggingFormat.trim().toLowerCase())
+    ) {
+      throw new Error(
+        `config.yaml: observability.logging.format must be one of ${allowed.join(", ")}`
+      );
+    }
+  }
   const chat = parsed.chat;
   if (chat !== undefined) {
     if (chat.gchat !== undefined) {

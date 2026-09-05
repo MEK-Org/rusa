@@ -15,6 +15,7 @@ import { createLogger, type Logger } from "./logger.js";
 function recordingLogger(): { logger: Logger; records: () => Record<string, unknown>[] } {
   const lines: string[] = [];
   const logger = createLogger({
+    format: "json",
     level: "debug",
     destination: {
       write: (chunk: string) => {

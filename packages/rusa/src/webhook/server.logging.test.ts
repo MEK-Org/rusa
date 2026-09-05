@@ -44,6 +44,7 @@ class MockServerResponse extends EventEmitter {
 function recordingLogger(): { logger: Logger; records: () => Record<string, unknown>[] } {
   const lines: string[] = [];
   const logger = createLogger({
+    format: "json",
     level: "debug",
     secrets: [secret],
     destination: {

@@ -113,6 +113,7 @@ const UUID_RETIRED = "rrrrrrrr-0000-4000-8000-000000000003";
 function recordingLogger() {
   const lines: string[] = [];
   const logger = createLogger({
+    format: "json",
     destination: {
       write: (chunk: string) => {
         lines.push(chunk);

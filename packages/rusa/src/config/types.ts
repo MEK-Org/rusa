@@ -278,6 +278,13 @@ export interface LoggingConfig {
    * operator can raise verbosity for one run without editing config.
    */
   level?: string;
+  /**
+   * How records are rendered: `json`, `pretty`, or `auto` (the default —
+   * `pretty` when stdout is a terminal, `json` otherwise). This picks the
+   * presentation of the one record stream; it never duplicates a record.
+   * The `RUSA_LOG_FORMAT` environment variable overrides it.
+   */
+  format?: string;
 }
 
 export interface RootActorConfig {

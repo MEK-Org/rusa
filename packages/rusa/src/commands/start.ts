@@ -175,7 +175,11 @@ import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "../
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { composeActorOutputSinks } from "../observability/actor-output-sink.js";
 import { DiskUsageAlert } from "../observability/disk-alert.js";
-import { collectConfigSecrets, collectEnvSecrets } from "../observability/log-secrets.js";
+import {
+  collectConfigSecretEntries,
+  collectEnvSecretEntries,
+  unscrubbableSecretSources,
+} from "../observability/log-secrets.js";
 import { createLogger, type Logger } from "../observability/logger.js";
 import { antigravityScratchDir } from "../providers/antigravity.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
@@ -754,7 +758,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // Secrets are registered in two steps because the first records are written
   // before there is a config to read: the environment is known now, and the
   // config's own credentials are added the moment `loadConfig` returns.
-  const knownSecrets = new Set(collectEnvSecrets());
+  const envSecretEntries = collectEnvSecretEntries();
+  const knownSecrets = new Set(envSecretEntries.map((entry) => entry.value));
   const readSecrets = () => [...knownSecrets];
   const bootLog = createLogger({ secrets: readSecrets, context: { component: "start" } });
 
@@ -782,12 +787,27 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   }
   // Config is parsed: its credentials join the scrub set (which `bootLog` shares
   // through the same closure) and its configured level takes effect.
-  for (const secret of collectConfigSecrets(config)) knownSecrets.add(secret);
+  const configSecretEntries = collectConfigSecretEntries(config);
+  for (const { value } of configSecretEntries) knownSecrets.add(value);
   const log = createLogger({
     level: config.observability?.logging?.level,
+    format: config.observability?.logging?.format,
     secrets: readSecrets,
     context: { component: "start" },
   });
+
+  // A credential too short to scrub is the one gap value redaction has; say so
+  // by name while it is still cheap to lengthen, and never by value.
+  for (const { source, length } of unscrubbableSecretSources([
+    ...envSecretEntries,
+    ...configSecretEntries,
+  ])) {
+    log.warn("secret_not_scrubbable", {
+      source,
+      length,
+      impact: "too short to remove from log text; only credential-named fields are redacted",
+    });
+  }
   const portableContextStore = new FilePortableContextStore(join(mcHome, "portable-context"));
   const portableContextApiKey = config.geminiApiKey?.trim() || null;
   const portableContextCompactors = new Map<string, PortableContextCompactor>();

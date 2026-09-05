@@ -16,6 +16,9 @@ import { type DestinationStream, destination, type Logger as PinoLogger, pino } 
  * - **An event-first call shape.** `log.info("run_start", { actorId })` keeps
  *   the message a stable identifier and pushes everything that varies into
  *   structured fields, which is what makes records greppable and testable.
+ * - **Two presentations of one stream.** The record is the same object either
+ *   way; only its rendering differs. A terminal gets a readable line, a pipe or
+ *   a service manager gets JSON. See {@link resolveLogFormat}.
  *
  * See `docs/logging.md` for the conventions this module exists to support.
  */
@@ -34,15 +37,40 @@ export const DEFAULT_LOG_LEVEL: LogLevelSetting = "info";
 /** Environment variable that overrides the configured level. */
 export const LOG_LEVEL_ENV_VAR = "RUSA_LOG_LEVEL";
 
+/** How a record is rendered. The record itself is identical either way. */
+export type LogFormat = "json" | "pretty";
+
+/** Formats plus `auto`, which picks by whether a terminal is attached. */
+export type LogFormatSetting = LogFormat | "auto";
+
+const FORMAT_SETTINGS: readonly LogFormatSetting[] = ["json", "pretty", "auto"];
+
+/** The format used when nothing is configured, and when a bad value is given. */
+export const DEFAULT_LOG_FORMAT: LogFormatSetting = "auto";
+
+/** Environment variable that overrides the configured format. */
+export const LOG_FORMAT_ENV_VAR = "RUSA_LOG_FORMAT";
+
 /** The replacement written wherever a secret or sensitive field is removed. */
 export const REDACTED = "[redacted]";
 
 /**
- * A secret shorter than this is not scrubbed from free text: a two-character
- * value matches everywhere and would redact the record into uselessness.
- * Real credentials are far longer than this bound.
+ * A secret shorter than this is not scrubbed from free text. The bound exists
+ * only because a one- or two-character value occurs inside ordinary words, so
+ * scrubbing it would replace most of every record — including the event names a
+ * reader needs to see what happened.
+ *
+ * It is set as low as that hazard allows rather than at a length real
+ * credentials happen to exceed: between this bound and any higher one sits a
+ * short configured secret that could reach an error message or a stack frame,
+ * where no field-name rule protects it. Over-redaction is a readability cost;
+ * under-redaction is a leak.
+ *
+ * A configured credential below the bound cannot be removed from free text at
+ * all. That is not left silent: `rusa start` records `secret_not_scrubbable`
+ * naming the config key (never the value) — see `unscrubbableSecretSources`.
  */
-export const MIN_SCRUBBABLE_SECRET_LENGTH = 6;
+export const MIN_SCRUBBABLE_SECRET_LENGTH = 3;
 
 /** How far down a `cause` chain an error is serialized before stopping. */
 const MAX_CAUSE_DEPTH = 5;
@@ -100,8 +128,13 @@ export interface CreateLoggerOptions {
    * service logger is built before its config has been parsed).
    */
   secrets?: readonly string[] | (() => readonly string[]);
-  /** Where JSON lines go. Defaults to a synchronous stdout destination. */
+  /** Where records go. Defaults to a synchronous stdout destination. */
   destination?: DestinationStream;
+  /**
+   * How records are rendered: `json`, `pretty`, or `auto` (the default —
+   * `pretty` when stdout is a terminal). `RUSA_LOG_FORMAT` overrides it.
+   */
+  format?: string;
   /** Bindings for the root logger. Defaults to `{ component: "rusa" }`. */
   context?: LogContext;
 }
@@ -123,6 +156,121 @@ export function resolveLogLevel(
     if (match) return match;
   }
   return DEFAULT_LOG_LEVEL;
+}
+
+/**
+ * Resolve the presentation from a configured value, the environment and whether
+ * a terminal is attached, preferring the environment for the same reason the
+ * level does.
+ *
+ * `auto` is what keeps #177's two requirements from fighting: interactive CLI
+ * output stays human-readable, and nothing is double-logged, because this
+ * chooses how the single record stream is *rendered* rather than adding a
+ * second stream of prose beside it. A person watching a terminal reads lines; a
+ * pipe, a file or a service manager gets JSON.
+ */
+export function resolveLogFormat(
+  configured?: string,
+  env: NodeJS.ProcessEnv = process.env,
+  isTTY: boolean = process.stdout?.isTTY === true
+): LogFormat {
+  for (const candidate of [env[LOG_FORMAT_ENV_VAR], configured]) {
+    const normalized = candidate?.trim().toLowerCase();
+    if (!normalized) continue;
+    const match = FORMAT_SETTINGS.find((format) => format === normalized);
+    if (!match) continue;
+    if (match !== "auto") return match;
+    break;
+  }
+  return isTTY ? "pretty" : "json";
+}
+
+/** Record keys that the readable line renders in its own right. */
+const PRETTY_HEADER_KEYS = new Set(["level", "time", "msg", "component", "err"]);
+
+const LEVEL_TAG: Record<string, string> = {
+  debug: "DEBUG",
+  info: "INFO ",
+  warn: "WARN ",
+  error: "ERROR",
+};
+
+/** `2026-09-05T16:04:11.235Z` -> `16:04:11.235`; anything else passes through. */
+function prettyTime(time: unknown): string {
+  if (typeof time !== "string") return "";
+  const match = /T(\d{2}:\d{2}:\d{2}\.\d{3})Z?$/.exec(time);
+  return match ? match[1] : time;
+}
+
+/** A field value as one short token: bare when it is already word-like. */
+function prettyValue(value: unknown): string {
+  if (typeof value === "string") return /^[\w.:/@+-]*$/.test(value) ? value : JSON.stringify(value);
+  if (value === null || value === undefined) return String(value);
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+/** The `err` field as indented lines: the chain a person reads top-down. */
+function prettyError(err: unknown, indent = "    "): string[] {
+  if (typeof err === "string") return [`${indent}${err}`];
+  if (err === null || typeof err !== "object") return [];
+  const { name, message, stack, cause } = err as Record<string, unknown>;
+  const lines: string[] = [];
+  const heading = [name, message].filter((part) => typeof part === "string" && part).join(": ");
+  if (heading) lines.push(`${indent}${heading}`);
+  if (typeof stack === "string") {
+    for (const frame of stack.split("\n").slice(1)) lines.push(`${indent}${frame.trim()}`);
+  }
+  if (cause !== undefined && cause !== null) {
+    lines.push(`${indent}caused by:`);
+    lines.push(...prettyError(cause, `${indent}  `));
+  }
+  return lines;
+}
+
+/**
+ * Render one JSON record as a readable line. A record that will not parse is
+ * returned unchanged: a presentation choice must never cost a log line.
+ */
+export function formatRecordLine(line: string): string {
+  let record: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(line);
+    if (!parsed || typeof parsed !== "object") return line;
+    record = parsed as Record<string, unknown>;
+  } catch {
+    return line;
+  }
+  const level = typeof record.level === "string" ? record.level : "info";
+  const head = [
+    prettyTime(record.time),
+    LEVEL_TAG[level] ?? level.toUpperCase(),
+    typeof record.component === "string" ? record.component : "",
+    typeof record.msg === "string" ? record.msg : "",
+  ].filter(Boolean);
+  const fields = Object.entries(record)
+    .filter(([key]) => !PRETTY_HEADER_KEYS.has(key))
+    .map(([key, value]) => `${key}=${prettyValue(value)}`);
+  return [[...head, ...fields].join(" "), ...prettyError(record.err)].join("\n");
+}
+
+/**
+ * Wrap a destination so records reach it as readable lines instead of JSON.
+ *
+ * This reformats Pino's own output rather than using a Pino transport: a
+ * transport runs on a worker thread, and `rusa start` leaves through
+ * `process.exit()`, which would drop whatever the worker had not yet flushed —
+ * the same reason the JSON destination is synchronous. Reformatting in-process
+ * keeps every record on the write that produced it.
+ */
+export function prettyDestination(target: DestinationStream): DestinationStream {
+  return {
+    write(chunk: string): void {
+      for (const line of chunk.split("\n")) {
+        if (line.trim()) target.write(`${formatRecordLine(line)}\n`);
+      }
+    },
+  };
 }
 
 /** Replace every occurrence of a known secret in `text`. */
@@ -229,8 +377,11 @@ function wrap(target: PinoLogger, readSecrets: () => readonly string[]): Logger 
  */
 export function createLogger(options: CreateLoggerOptions = {}): Logger {
   const configuredSecrets = options.secrets;
+  const format = resolveLogFormat(options.format);
   const readSecrets: () => readonly string[] =
     typeof configuredSecrets === "function" ? configuredSecrets : () => configuredSecrets ?? [];
+  const target = options.destination ?? destination({ dest: 1, sync: true });
+  const sink = format === "pretty" ? prettyDestination(target) : target;
   const root = pino(
     {
       level: resolveLogLevel(options.level),
@@ -247,7 +398,8 @@ export function createLogger(options: CreateLoggerOptions = {}): Logger {
     // Synchronous by choice: `rusa start` exits through `process.exit()` on
     // shutdown and on fatal config errors, which would drop a buffered record —
     // and the record explaining why the process died is the one that matters.
-    options.destination ?? destination({ dest: 1, sync: true })
+    // `pretty` reformats that same stream in place; it does not tee it.
+    sink
   );
   return wrap(root, readSecrets);
 }

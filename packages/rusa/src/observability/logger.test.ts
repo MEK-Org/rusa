@@ -3,10 +3,14 @@ import {
   type CreateLoggerOptions,
   createLogger,
   DEFAULT_LOG_LEVEL,
+  formatRecordLine,
+  LOG_FORMAT_ENV_VAR,
   LOG_LEVEL_ENV_VAR,
+  MIN_SCRUBBABLE_SECRET_LENGTH,
   nullLogger,
   REDACTED,
   redactValue,
+  resolveLogFormat,
   resolveLogLevel,
   type SerializedError,
   serializeError,
@@ -23,6 +27,9 @@ import {
 function recordingLogger(options: Omit<CreateLoggerOptions, "destination"> = {}) {
   const lines: string[] = [];
   const logger = createLogger({
+    // Pinned: `auto` would render pretty lines under a TTY, and these tests are
+    // about the record, not its presentation.
+    format: "json",
     ...options,
     destination: {
       write: (chunk: string) => {
@@ -39,15 +46,39 @@ function recordingLogger(options: Omit<CreateLoggerOptions, "destination"> = {})
   return { logger, lines, records };
 }
 
+/** A logger rendering readable lines to memory, plus the raw lines produced. */
+function prettyLogger(options: Omit<CreateLoggerOptions, "destination" | "format"> = {}) {
+  const written: string[] = [];
+  const logger = createLogger({
+    ...options,
+    format: "pretty",
+    destination: {
+      write: (chunk: string) => {
+        written.push(chunk);
+      },
+    },
+  });
+  const lines = (): string[] =>
+    written
+      .join("")
+      .split("\n")
+      .filter((line) => line.length > 0);
+  return { logger, lines };
+}
+
 const originalLevelEnv = process.env[LOG_LEVEL_ENV_VAR];
+const originalFormatEnv = process.env[LOG_FORMAT_ENV_VAR];
 
 beforeEach(() => {
   delete process.env[LOG_LEVEL_ENV_VAR];
+  delete process.env[LOG_FORMAT_ENV_VAR];
 });
 
 afterEach(() => {
   if (originalLevelEnv === undefined) delete process.env[LOG_LEVEL_ENV_VAR];
   else process.env[LOG_LEVEL_ENV_VAR] = originalLevelEnv;
+  if (originalFormatEnv === undefined) delete process.env[LOG_FORMAT_ENV_VAR];
+  else process.env[LOG_FORMAT_ENV_VAR] = originalFormatEnv;
   vi.restoreAllMocks();
 });
 
@@ -316,7 +347,10 @@ describe("redaction", () => {
   });
 
   it("leaves a value too short to distinguish from ordinary text alone", () => {
-    expect(redactValue("the cat sat on the mat", ["cat"])).toBe("the cat sat on the mat");
+    // The bound exists only for values that would swallow the record; a
+    // three-character secret is scrubbed, and `start` reports anything shorter.
+    expect(redactValue("the cat sat on the mat", ["at"])).toBe("the cat sat on the mat");
+    expect(redactValue("the cat sat on the mat", ["cat"])).toBe(`the ${REDACTED} sat on the mat`);
   });
 
   it("survives a cycle and stops at a depth limit instead of recursing forever", () => {
@@ -336,5 +370,158 @@ describe("nullLogger", () => {
     expect(() => {
       nullLogger.child({ component: "test" }).error("boom", { err: new Error("x") });
     }).not.toThrow();
+  });
+});
+
+/**
+ * #177 asks for two things that only look opposed: interactive CLI output stays
+ * human-readable, and no event is written twice. Both hold because the format
+ * selects how the *one* record stream is rendered — a terminal gets lines, a
+ * pipe or a service manager gets JSON, and neither gets the other's copy.
+ */
+describe("interactive presentation", () => {
+  const noEnv = {} as NodeJS.ProcessEnv;
+
+  it("renders readable lines for a terminal and JSON for a pipe", () => {
+    expect(resolveLogFormat(undefined, noEnv, true)).toBe("pretty");
+    expect(resolveLogFormat(undefined, noEnv, false)).toBe("json");
+    expect(resolveLogFormat("auto", noEnv, true)).toBe("pretty");
+  });
+
+  it("honors an explicit configured format over the attached terminal", () => {
+    expect(resolveLogFormat("json", noEnv, true)).toBe("json");
+    expect(resolveLogFormat("pretty", noEnv, false)).toBe("pretty");
+  });
+
+  it("lets the environment override the configured format", () => {
+    const env = { [LOG_FORMAT_ENV_VAR]: "pretty" } as NodeJS.ProcessEnv;
+    expect(resolveLogFormat("json", env, false)).toBe("pretty");
+  });
+
+  it("falls back to the terminal check when a format value is unrecognized", () => {
+    const env = { [LOG_FORMAT_ENV_VAR]: "yaml" } as NodeJS.ProcessEnv;
+    expect(resolveLogFormat(undefined, env, true)).toBe("pretty");
+    expect(resolveLogFormat("technicolor", noEnv, false)).toBe("json");
+  });
+
+  it("writes a line a person can read, carrying level, component, event and fields", () => {
+    const { logger, lines } = prettyLogger({ context: { component: "start" } });
+
+    logger.info("service_starting", { home: "/srv/rusa", port: 8080 });
+
+    expect(lines()).toHaveLength(1);
+    const line = lines()[0];
+    expect(() => JSON.parse(line)).toThrow();
+    expect(line).toContain("INFO");
+    expect(line).toContain("start");
+    expect(line).toContain("service_starting");
+    expect(line).toContain("home=/srv/rusa");
+    expect(line).toContain("port=8080");
+  });
+
+  it("writes one line per record, never the record and its prose", () => {
+    const { logger, lines } = prettyLogger({ context: { component: "start" } });
+
+    logger.info("service_starting", { home: "/srv/rusa" });
+    logger.warn("cron_preflight_failed", { issues: ["crontab missing"] });
+
+    expect(lines()).toHaveLength(2);
+    expect(lines().filter((line) => line.includes("service_starting"))).toHaveLength(1);
+  });
+
+  it("shows the error and its cause chain under the event", () => {
+    const { logger, lines } = prettyLogger({ context: { component: "webhook" } });
+    const cause = new Error("ECONNREFUSED 127.0.0.1:443");
+    const err = new Error("delivery failed", { cause });
+
+    logger.error("delivery_failed", { err, deliveryId: "d-1" });
+
+    const rendered = lines().join("\n");
+    expect(rendered).toContain("delivery_failed");
+    expect(rendered).toContain("deliveryId=d-1");
+    expect(rendered).toContain("Error: delivery failed");
+    expect(rendered).toContain("caused by:");
+    expect(rendered).toContain("ECONNREFUSED 127.0.0.1:443");
+  });
+
+  it("still filters by level, so a readable run is not a louder one", () => {
+    const { logger, lines } = prettyLogger({ level: "warn" });
+
+    logger.debug("cache_hit", {});
+    logger.info("service_starting", {});
+    logger.warn("cron_preflight_failed", {});
+
+    expect(lines()).toHaveLength(1);
+    expect(lines()[0]).toContain("cron_preflight_failed");
+  });
+
+  it("still scrubs secrets once rendered", () => {
+    const secret = "AIzaSyFAKE-fixture-key-0000";
+    const { logger, lines } = prettyLogger({ secrets: [secret] });
+
+    logger.error("provider_call_failed", { err: new Error(`GET /v1?key=${secret} failed`) });
+
+    const rendered = lines().join("\n");
+    expect(rendered).not.toContain(secret);
+    expect(rendered).toContain(REDACTED);
+  });
+
+  it("passes a line it cannot parse through rather than dropping it", () => {
+    expect(formatRecordLine("not json at all")).toBe("not json at all");
+    expect(formatRecordLine("12")).toBe("12");
+  });
+});
+
+/**
+ * The scrub bound is the one gap in value redaction, so its edges are pinned
+ * here: a short configured credential reaching an error message or a stack
+ * frame — where no field-name rule applies — is still removed.
+ */
+describe("short configured secrets", () => {
+  it("scrubs a secret at the bound out of a message, a stack and a nested field", () => {
+    const secret = "s3c";
+    expect(secret).toHaveLength(MIN_SCRUBBABLE_SECRET_LENGTH);
+    const { logger, records } = recordingLogger({ secrets: [secret] });
+
+    logger.error("webhook_delivery_failed", {
+      err: new Error(`signature check used ${secret}`),
+      request: { query: `token=${secret}` },
+    });
+
+    const record = records()[0];
+    const err = record.err as SerializedError;
+    expect(err.message).toBe(`signature check used ${REDACTED}`);
+    expect(err.stack).toContain(REDACTED);
+    expect(err.stack).not.toContain(secret);
+    expect(record.request).toEqual({ query: `token=${REDACTED}` });
+  });
+
+  it("scrubs a five-character secret, which no field name would have caught", () => {
+    const secret = "hunt2";
+    const { logger, records } = recordingLogger({ secrets: [secret] });
+
+    logger.error("config_load_failed", { reason: `bad value ${secret} in profile` });
+
+    expect(records()[0].reason).toBe(`bad value ${REDACTED} in profile`);
+  });
+
+  it("scrubs a short secret out of a cause deeper in the chain", () => {
+    const secret = "tok1";
+    const { logger, records } = recordingLogger({ secrets: [secret] });
+
+    logger.error("run_failed", {
+      err: new Error("run failed", { cause: new Error(`auth ${secret} rejected`) }),
+    });
+
+    const cause = (records()[0].err as SerializedError).cause as SerializedError;
+    expect(cause.message).toBe(`auth ${REDACTED} rejected`);
+  });
+
+  it("leaves a value below the bound alone, which is what start.ts reports", () => {
+    const { logger, records } = recordingLogger({ secrets: ["ab"] });
+
+    logger.info("service_starting", { home: "/srv/absolute" });
+
+    expect(records()[0].home).toBe("/srv/absolute");
   });
 });

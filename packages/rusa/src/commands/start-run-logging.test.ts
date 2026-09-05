@@ -13,6 +13,7 @@ import { logRunEnd } from "./start.js";
 function recordingLogger(): { logger: Logger; records: () => Record<string, unknown>[] } {
   const lines: string[] = [];
   const logger = createLogger({
+    format: "json",
     destination: {
       write: (chunk: string) => {
         lines.push(chunk);

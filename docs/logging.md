@@ -45,6 +45,31 @@ observability:
 `RUSA_LOG_LEVEL` overrides the configured value for one run. A bad value in
 config fails boot; a bad value in the environment falls back to `info`.
 
+## Format
+
+The same records render two ways. `auto` — the default — picks `pretty` when
+stdout is a terminal and `json` otherwise, so running `rusa start` by hand reads
+as text while the service under systemd stays machine-parseable:
+
+```yaml
+observability:
+  logging:
+    format: auto # auto | json | pretty
+```
+
+`RUSA_LOG_FORMAT` overrides it for one run, which is how you get JSON out of an
+interactive shell (`RUSA_LOG_FORMAT=json rusa start | jq`) or readable lines out
+of a pipe.
+
+This is a choice of *presentation*, not a second stream: an event is written
+once either way. Prose printed beside a record it duplicates is the thing this
+logger exists to remove — if a lifecycle event should be readable, it is
+readable because of this setting, not because someone also `console.log`ged it.
+
+Rendering happens in-process rather than through a Pino transport. A transport
+runs on a worker thread, and `rusa start` leaves through `process.exit()`, which
+would drop whatever the worker had not yet flushed.
+
 ## Conventions
 
 **A stable event, then fields.** The first argument is an identifier that does
@@ -95,6 +120,14 @@ configured secret *value* out of every string it writes — including out of an
 error message or a stack frame down the `cause` chain. Register a new
 credential source in `observability/log-secrets.ts` when you add one.
 
+Value scrubbing has one bound: a credential under
+`MIN_SCRUBBABLE_SECRET_LENGTH` (3) characters is left alone, because a one- or
+two-character value occurs inside ordinary words and scrubbing it would replace
+most of every record. A configured credential that short is not silently
+unprotected — `rusa start` records `secret_not_scrubbable` naming the config key
+and its length, never its value, so an operator finds out at boot rather than
+from a leaked stack frame.
+
 **One bounded record per event.** A large payload belongs in an artifact, with
 a safe reference in the record. Field *names* stay low-cardinality —
 `{ actorId }`, never a field named after the actor.
@@ -126,8 +159,15 @@ records are JSON:
 $ journalctl --user -u rusa -o cat | jq -c 'select(.component == "actor-run")'
 ```
 
-For a readable local run, pipe it through a pretty-printer:
+Run by hand in a terminal, the same records arrive as readable lines with no
+extra tooling:
 
 ```console
-$ rusa start | npx pino-pretty
+$ rusa start
+16:04:11.235 INFO  start service_starting version=0.1.0 home=/srv/rusa
+16:04:11.402 INFO  start database_ready home=/srv/rusa
 ```
+
+`RUSA_LOG_FORMAT` gets you the other one either way: `RUSA_LOG_FORMAT=json rusa
+start | jq` for JSON in a terminal, `RUSA_LOG_FORMAT=pretty` for readable lines
+out of a pipe.

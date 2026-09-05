@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { RusaConfig } from "../config/types.js";
-import { collectConfigSecrets, collectEnvSecrets, SECRET_ENV_VARS } from "./log-secrets.js";
+import {
+  collectConfigSecretEntries,
+  collectConfigSecrets,
+  collectEnvSecretEntries,
+  collectEnvSecrets,
+  SECRET_ENV_VARS,
+  unscrubbableSecretSources,
+} from "./log-secrets.js";
 
 // Synthetic values only; none of these is a real credential.
 const envFixture = {
@@ -55,5 +62,60 @@ describe("collectConfigSecrets", () => {
 
   it("returns nothing for a config that carries no credentials", () => {
     expect(collectConfigSecrets({} as RusaConfig)).toEqual([]);
+  });
+});
+
+describe("unscrubbableSecretSources", () => {
+  it("names a configured credential too short to remove from log text", () => {
+    const config = { webhook: { port: 8080, secret: "ab" } } as RusaConfig;
+
+    expect(unscrubbableSecretSources(collectConfigSecretEntries(config))).toEqual([
+      { source: "webhook.secret", length: 2 },
+    ]);
+  });
+
+  it("reports the source and the length, never the value", () => {
+    const short = unscrubbableSecretSources([{ source: "geminiApiKey", value: "xy" }]);
+
+    expect(JSON.stringify(short)).not.toContain("xy");
+  });
+
+  it("says nothing about credentials the scrubber can handle", () => {
+    const config = {
+      geminiApiKey: "AIzaSyFAKE-fixture-key-0000",
+      webhook: { port: 8080, secret: "fixture-webhook-secret-0000" },
+    } as RusaConfig;
+
+    expect(unscrubbableSecretSources(collectConfigSecretEntries(config))).toEqual([]);
+  });
+
+  it("reports a source once even when it appears twice", () => {
+    const short = unscrubbableSecretSources([
+      { source: "GH_TOKEN", value: "ab" },
+      { source: "GH_TOKEN", value: "cd" },
+    ]);
+
+    expect(short).toEqual([{ source: "GH_TOKEN", length: 2 }]);
+  });
+});
+
+describe("labeled secret entries", () => {
+  it("carries the environment variable each credential came from", () => {
+    expect(collectEnvSecretEntries(envFixture)).toEqual([
+      { source: "GEMINI_API_KEY", value: "AIzaSyFAKE-fixture-key-0000" },
+      { source: "GH_TOKEN", value: "ghp_fixtureFIXTUREfixture0000" },
+    ]);
+  });
+
+  it("carries the config key each credential came from", () => {
+    const config = {
+      mistralApiKey: "fixture-mistral-key-0000",
+      webhook: { port: 8080, secret: "fixture-webhook-secret-0000" },
+    } as RusaConfig;
+
+    expect(collectConfigSecretEntries(config)).toEqual([
+      { source: "mistralApiKey", value: "fixture-mistral-key-0000" },
+      { source: "webhook.secret", value: "fixture-webhook-secret-0000" },
+    ]);
   });
 });
