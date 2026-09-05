@@ -116,6 +116,23 @@ export class ProviderPacer {
     return snapshot;
   }
 
+  /**
+   * A side-effect-free ETA for the next reservation on this lane: the later of
+   * `now` and the known next-available timestamp, plus one interval per
+   * request already queued or staged ahead of it. Lets a multi-lane pool
+   * compare candidates before committing to one via {@link submit}.
+   */
+  quote(now: number = this.now()): number {
+    return Math.max(now, this.nextAvailableAt) + this.waiting * this.intervalMs;
+  }
+
+  get queueHead(): { threadId: string; availableAt: number } | null {
+    if (this.staged) return null;
+    const request = this.queue[0];
+    if (!request?.opts.threadId) return null;
+    return { threadId: request.opts.threadId, availableAt: this.nextAvailableAt };
+  }
+
   setInterval(intervalMs: number): void {
     this.assertInterval(intervalMs);
     this.intervalMs = intervalMs;
@@ -287,4 +304,171 @@ export class ProviderPacer {
       throw new Error(`intervalMs must be >= 0, got ${intervalMs}`);
     }
   }
+}
+
+export interface PoolLaneCandidate<C> {
+  config: C;
+  lane: string;
+  pacer: ProviderPacer;
+}
+
+/**
+ * Pick the earliest-available declared candidate across canonical provider
+ * lanes, by comparing each lane's side-effect-free {@link ProviderPacer.quote}.
+ * Ties go to the earlier-declared candidate (strict `<` keeps the first seen).
+ * Callers must reserve the winning lane (via `submit`) synchronously, with no
+ * `await` between calling this and reserving — JS's single-threaded execution
+ * is what keeps concurrent wakes from double-booking the same slot.
+ */
+export function selectPoolLane<C>(
+  candidates: readonly PoolLaneCandidate<C>[],
+  now: number
+): PoolLaneCandidate<C> | undefined {
+  let best: PoolLaneCandidate<C> | undefined;
+  let bestQuote = Number.POSITIVE_INFINITY;
+  for (const candidate of candidates) {
+    const quote = candidate.pacer.quote(now);
+    if (quote < bestQuote) {
+      bestQuote = quote;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+export interface PoolGateSelection<C> {
+  candidate: C;
+  lane: string;
+  declaredIndex: number;
+  eligibleAt: number;
+  responsive: boolean;
+}
+
+export interface SubmitPoolGateOptions<C>
+  extends Omit<ProviderPacerSubmitOptions, "revalidateProvider"> {
+  /** Excludes a declared candidate from selection (e.g. an emergency-halted provider). */
+  isHalted?: (config: C) => boolean;
+  /**
+   * Fires synchronously every time a candidate is reserved — the initial
+   * reservation and any later `promote()`-driven reselection — so callers can
+   * track which declared tuple a queued run actually holds, for cancellation
+   * and telemetry.
+   */
+  onSelected?: (selection: PoolGateSelection<C>) => void;
+  /** Same contract as {@link ProviderPacerSubmitOptions.revalidateProvider}, scoped to the currently reserved candidate. */
+  revalidateProvider?: (config: C) => boolean;
+}
+
+/**
+ * Reserve the earliest-available declared candidate across multiple provider
+ * lanes as a single composed {@link RunStartHandle}. A normal request paces
+ * through the winning lane's `ProviderPacer`, chosen by {@link selectPoolLane}
+ * (earliest quote, ties to declaration order) among non-halted candidates. A
+ * responsive request skips pacing entirely and reserves the first healthy
+ * declared candidate, ignoring quotes.
+ *
+ * `promote()` does not merely promote whichever lane happened to be reserved
+ * first — it re-runs that same first-healthy-declared selection, so a
+ * responsive wake always lands on the earliest declared candidate even when
+ * the original normal reservation is on a later one. When that reselects a
+ * different lane, the stale reservation is cancelled; a `generation` counter
+ * on the outer handle ignores the stale lane's now-asynchronous cancellation
+ * rejection so it can never clobber the freshly reserved lane's later result.
+ */
+export function submitPoolGate<C, T>(
+  fn: (config: C) => Promise<T>,
+  candidates: readonly PoolLaneCandidate<C>[],
+  opts: SubmitPoolGateOptions<C>,
+  now: () => number = () => Date.now()
+): RunStartHandle<T> {
+  if (candidates.length === 0) {
+    throw new Error("submitPoolGate requires at least one candidate");
+  }
+
+  let resolveResult!: (value: T | PromiseLike<T>) => void;
+  let rejectResult!: (reason?: unknown) => void;
+  const result = new Promise<T>((res, rej) => {
+    resolveResult = res;
+    rejectResult = rej;
+  });
+
+  let generation = 0;
+  let inner: RunStartHandle<T> | undefined;
+  let currentCandidate: PoolLaneCandidate<C> | undefined;
+  let settled = false;
+
+  const healthy = (): readonly PoolLaneCandidate<C>[] => {
+    if (!opts.isHalted) return candidates;
+    const alive = candidates.filter((c) => !opts.isHalted?.(c.config));
+    // Never produce an unreservable pool: if every declared candidate reads
+    // as halted (e.g. a race with the halt map), fall back to the full pool
+    // and let the caller's own beforeRun/halt gate remain the real authority.
+    return alive.length > 0 ? alive : candidates;
+  };
+
+  const reserve = (candidate: PoolLaneCandidate<C>, responsive: boolean): void => {
+    generation++;
+    const myGeneration = generation;
+    currentCandidate = candidate;
+    const eligibleAt = responsive ? now() : candidate.pacer.quote(now());
+    const handle = candidate.pacer.submit(() => fn(candidate.config), {
+      responsive,
+      threadId: opts.threadId,
+      enqueueNormal: opts.enqueueNormal,
+      onStarted: opts.onStarted,
+      revalidateProvider: opts.revalidateProvider
+        ? () => opts.revalidateProvider?.(candidate.config) ?? true
+        : undefined,
+    });
+    inner = handle;
+    handle.result.then(
+      (value) => {
+        if (myGeneration !== generation || settled) return;
+        settled = true;
+        resolveResult(value);
+      },
+      (error: unknown) => {
+        if (myGeneration !== generation || settled) return;
+        settled = true;
+        rejectResult(error);
+      }
+    );
+    opts.onSelected?.({
+      candidate: candidate.config,
+      lane: candidate.lane,
+      declaredIndex: candidates.indexOf(candidate),
+      eligibleAt,
+      responsive,
+    });
+  };
+
+  const responsive = opts.responsive === true;
+  const initial = responsive ? healthy()[0] : selectPoolLane(healthy(), now());
+  reserve(initial ?? candidates[0], responsive);
+
+  return {
+    result,
+    get started() {
+      return inner?.started ?? false;
+    },
+    promote: () => {
+      if (settled || inner?.started) return;
+      const target = healthy()[0] ?? candidates[0];
+      if (currentCandidate === target) {
+        inner?.promote();
+        return;
+      }
+      // Reselecting onto a different, earlier-declared healthy lane: reserve
+      // it first (bumping `generation`) so the stale lane's async
+      // cancellation rejection is guaranteed to be ignored by `reserve`'s
+      // generation guard above, then cancel the stale reservation.
+      const stale = inner;
+      reserve(target, true);
+      stale?.cancel?.();
+    },
+    cancel: () => {
+      if (settled) return false;
+      return inner?.cancel?.() ?? false;
+    },
+  };
 }

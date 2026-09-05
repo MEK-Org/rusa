@@ -20,6 +20,7 @@ import type { ObligationRepository } from "../db/repositories/obligation-reposit
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { ObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
+import type { ProviderModelConfig } from "../providers/model-config.js";
 import { resolveReferenceSync } from "../references/resolve.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { SseHub } from "./sse.js";
@@ -168,6 +169,7 @@ interface ThreadDto {
   handle: string;
   parentId: string | null;
   status: string;
+  /** The declared candidate pool's first (or only) entry — compat view of {@link modelConfig}. */
   provider: string | null;
   /** The single authoritative model for this actor, as configured in the registry. */
   model: string | null;
@@ -179,6 +181,22 @@ interface ThreadDto {
   desiredEffort?: string | null;
   /** Pending desired provider staged for next run boundary, or null if none. */
   desiredProvider?: string | null;
+  /** The declared candidate pool, in earliest-available order. */
+  modelConfig: ProviderModelConfig[];
+  /** Pending full-pool replacement staged for the next run boundary, if any. */
+  desiredModelConfig?: ProviderModelConfig[];
+  /**
+   * The reserved candidate for a genuinely queued run, or null when idle/running
+   * or nothing has been reserved yet. `selectedProvider` is the declared alias;
+   * `selectedLane` is the canonical pacing lane it resolves to — kept distinct
+   * so a configured alias is never silently overwritten by its lane.
+   */
+  selectedProvider?: string | null;
+  selectedLane?: string | null;
+  selectedModel?: string | null;
+  selectedEffort?: string | null;
+  /** Epoch-ms quote for when the reserved candidate becomes eligible to start. */
+  eligibleAt?: number | null;
   /**
    * The leading `CHARTER_PREVIEW_CHARS` characters of the charter, ellipsised
    * when clipped. The full text is detail data: `GET
@@ -477,9 +495,11 @@ export async function handleMeshApiRequest(
             const id = deps.rootControl?.spawnChild(
               {
                 charter: typeof body.charter === "string" ? body.charter : "",
-                provider: typeof body.provider === "string" ? body.provider : "",
-                model: typeof body.model === "string" ? body.model : "",
-                effort: typeof body.effort === "string" ? body.effort : undefined,
+                modelConfig: {
+                  provider: typeof body.provider === "string" ? body.provider : "",
+                  model: typeof body.model === "string" ? body.model : "",
+                  effort: typeof body.effort === "string" ? body.effort : undefined,
+                },
                 title: typeof body.title === "string" ? body.title : undefined,
                 context,
               },
@@ -1218,17 +1238,22 @@ export async function handleMeshApiRequest(
       } else if (queued.has(r.id)) {
         runState = "queued";
       }
+      const selection = runState === "queued" ? deps.mesh?.getSelection(r.id) : undefined;
       return {
         id: r.id,
         handle: r.isRoot === true ? rootHandle : generateHandle(r.id),
         parentId: r.parentId,
         status: r.status,
-        provider: r.provider ?? null,
-        model: r.model ?? null,
-        effort: r.effort ?? null,
-        desiredModel: r.desiredModel ?? null,
-        ...(r.desiredEffort !== undefined ? { desiredEffort: r.desiredEffort } : {}),
-        desiredProvider: r.desiredProvider ?? null,
+        provider: r.modelConfig?.[0]?.provider ?? null,
+        model: r.modelConfig?.[0]?.model ?? null,
+        effort: r.modelConfig?.[0]?.effort ?? null,
+        desiredModel: r.desiredModelConfig?.[0]?.model ?? null,
+        ...(r.desiredModelConfig !== undefined
+          ? { desiredEffort: r.desiredModelConfig[0]?.effort ?? null }
+          : {}),
+        desiredProvider: r.desiredModelConfig?.[0]?.provider ?? null,
+        modelConfig: r.modelConfig ?? [],
+        ...(r.desiredModelConfig !== undefined ? { desiredModelConfig: r.desiredModelConfig } : {}),
         charterPreview: charterPreview(r.charter),
         title: r.title ?? summarizeCharter(r.charter),
         createdAt: r.createdAt,
@@ -1237,6 +1262,11 @@ export async function handleMeshApiRequest(
         lastActiveAt: lastActiveByActor.get(r.id) ?? null,
         queuePosition: providerQueueSnapshots.get(r.id)?.position ?? null,
         estimatedStartAt: providerQueueSnapshots.get(r.id)?.estimatedStartAt ?? null,
+        selectedProvider: selection?.provider ?? null,
+        selectedLane: selection?.lane ?? null,
+        selectedModel: selection?.model ?? null,
+        selectedEffort: selection?.effort ?? null,
+        eligibleAt: selection?.eligibleAt ?? null,
       };
     });
     const schedulerHealth = deps.schedulerHealth?.();

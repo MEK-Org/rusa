@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { deterministicExhaustionFallback } from "../providers/exhaustion-classifier.js";
 import { FakeProvider } from "../providers/fake-provider.js";
+import type { RawProviderModelConfig } from "../providers/model-config.js";
 import * as sandboxModule from "../providers/sandbox.js";
 import type { RunOptions, RunResult } from "../providers/types.js";
 import {
@@ -28,7 +29,8 @@ function makeActor(over: Partial<ActorOptions> = {}, provider = new FakeProvider
   return new Actor({
     id: "a1",
     cwd: "/tmp/a1",
-    provider,
+    modelConfig: [{ provider: provider.providerName }],
+    resolveProvider: () => provider,
     mcpServers: [],
     loadSessionId: () => session,
     saveSessionId: (id) => {
@@ -165,7 +167,7 @@ describe("Actor", () => {
     expect(provider.calls[1]?.session?.id).toBe("fake-session-1");
   });
 
-  it("updates its provider in-place with setProvider for subsequent runs ", async () => {
+  it("resolves the live provider per-run, so an in-place swap takes effect on the next run", async () => {
     let actor!: Actor;
     const provider1 = new FakeProvider(() => {
       actor.declareYield();
@@ -175,14 +177,15 @@ describe("Actor", () => {
       actor.declareYield();
       return {};
     });
-    actor = makeActor({}, provider1);
+    let live: FakeProvider = provider1;
+    actor = makeActor({ resolveProvider: () => live }, provider1);
 
     actor.requestRun();
     await vi.advanceTimersByTimeAsync(10);
     expect(provider1.calls).toHaveLength(1);
     expect(provider2.calls).toHaveLength(0);
 
-    actor.setProvider(provider2);
+    live = provider2;
 
     actor.requestRun();
     await vi.advanceTimersByTimeAsync(10);
@@ -255,9 +258,9 @@ describe("Actor", () => {
     });
     const actor = makeActor(
       {
-        gate: (invoke) => {
+        gate: (invoke, candidates) => {
           if (invokeCalled) {
-            return invoke();
+            return invoke(candidates[0]);
           }
           return {
             started: false,
@@ -268,7 +271,7 @@ describe("Actor", () => {
               resolveInvoke = () => {
                 invokeCalled = true;
                 try {
-                  resolve(invoke());
+                  resolve(invoke(candidates[0]));
                 } catch (e) {
                   resolve(Promise.reject(e));
                 }
@@ -313,10 +316,10 @@ describe("Actor", () => {
     let gatedProvider: string | undefined;
     actor = makeActor(
       {
-        gate: async (fn, providerName) => {
+        gate: async (fn, candidates) => {
           gated++;
-          gatedProvider = providerName;
-          return fn();
+          gatedProvider = candidates[0]?.provider;
+          return fn(candidates[0]);
         },
         onRunEnd: (r) => {
           seen.push(r);
@@ -341,14 +344,14 @@ describe("Actor", () => {
     let promotions = 0;
     const priorities: boolean[] = [];
     const gate: NonNullable<ActorOptions["gate"]> = <T>(
-      fn: () => Promise<T>,
-      _provider: string,
+      fn: (selected: RawProviderModelConfig) => Promise<T>,
+      candidates: readonly RawProviderModelConfig[],
       responsive: boolean
     ) => {
       priorities.push(responsive);
       if (responsive) {
         return {
-          result: Promise.resolve().then(fn),
+          result: Promise.resolve().then(() => fn(candidates[0])),
           started: false,
           promote: () => {},
         };
@@ -360,7 +363,7 @@ describe("Actor", () => {
         started: false,
         promote: () => {
           promotions++;
-          queueMicrotask(() => void fn().then(resolve));
+          queueMicrotask(() => void fn(candidates[0]).then(resolve));
         },
       };
     };
@@ -395,7 +398,7 @@ describe("Actor", () => {
     });
     actor = makeActor(
       {
-        gate: (fn) => limiter.enqueue(fn),
+        gate: (fn, candidates) => limiter.enqueue(() => fn(candidates[0])),
       },
       provider
     );
@@ -426,7 +429,7 @@ describe("Actor", () => {
     });
     actor = makeActor(
       {
-        gate: (fn) => limiter.enqueue(fn),
+        gate: (fn, candidates) => limiter.enqueue(() => fn(candidates[0])),
       },
       provider
     );
@@ -493,7 +496,7 @@ describe("Actor", () => {
       });
       actor = makeActor(
         {
-          gate: (fn) => limiter.enqueue(fn),
+          gate: (fn, candidates) => limiter.enqueue(() => fn(candidates[0])),
           onRunEnd: () => {
             ended++;
           },
@@ -548,10 +551,13 @@ describe("Actor", () => {
 
       const actor = makeActor(
         {
-          gate: <T>(fn: () => Promise<T>): RunStartHandle<T> => {
+          gate: <T>(
+            fn: (selected: RawProviderModelConfig) => Promise<T>,
+            candidates: readonly RawProviderModelConfig[]
+          ): RunStartHandle<T> => {
             runInvoke = async () => {
               try {
-                const res = await fn();
+                const res = await fn(candidates[0]);
                 resolveResult(res);
                 return res;
               } catch (err) {
@@ -1018,9 +1024,9 @@ describe("Actor", () => {
     const actor = makeActor(
       {
         onQueued: (event) => queuedEvents.push(event),
-        gate: (fn, _provider, responsive) => {
+        gate: (fn, candidates, responsive) => {
           gatedPriorities.push(responsive);
-          return fn();
+          return fn(candidates[0]);
         },
         onRunStart: (responsive) => {
           startPriorities.push(responsive);
@@ -1272,9 +1278,9 @@ describe("Actor", () => {
         {
           onQueued: () => order.push("queued"),
           onRunStart: () => order.push("start"),
-          gate: async (fn) => {
+          gate: async (fn, candidates) => {
             await gateHeld;
-            return fn();
+            return fn(candidates[0]);
           },
         },
         provider
@@ -1378,9 +1384,9 @@ describe("Actor", () => {
       const provider = new FakeProvider();
       const actor = makeActor(
         {
-          gate: async (fn) => {
+          gate: async (fn, candidates) => {
             await gateHeld;
-            return fn();
+            return fn(candidates[0]);
           },
         },
         provider
@@ -1412,9 +1418,9 @@ describe("Actor", () => {
       const actor = makeActor(
         {
           timeoutMs: 60_000,
-          gate: async (fn) => {
+          gate: async (fn, candidates) => {
             await gateHeld;
-            return fn();
+            return fn(candidates[0]);
           },
         },
         provider

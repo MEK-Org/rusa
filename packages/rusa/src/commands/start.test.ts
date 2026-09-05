@@ -24,6 +24,7 @@ import type { GitHubPollingIssueClient, IssueClient } from "../gitops/issue-clie
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { stampAuthor } from "../mcp/stamp.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
+import type { ProviderModelConfig } from "../providers/model-config.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
 
 const worktreeMock = vi.hoisted(() => ({
@@ -1246,8 +1247,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const workerId = mesh.spawn({
       charter: "worker tasks",
       parentId: "root",
-      provider: "antigravity",
-      model: "Gemini 3.7 Flash (High)",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
     });
     // Real topology : root retains the covering org source it delegates
     // slices from — the retired subscriber's event bubbles to root via that
@@ -1836,7 +1836,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
           loadSessionId: () => string | undefined;
           saveSessionId: (id: string) => void;
           buildPrompt: () => { prompt: string; injectRecord?: { runCount: number } };
-          onRunStart?: (responsive: boolean) => void;
+          onRunStart?: (
+            responsive: boolean,
+            injectRecord: { runCount: number } | undefined,
+            selected: { provider: string; model?: string; effort?: string }
+          ) => void;
           onRunEnd?: (result: {
             success: boolean;
             output: string;
@@ -1857,7 +1861,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       readdirSync(rootAgentDir).some((name) => name.startsWith("session.json.imported-"))
     ).toBe(true);
 
-    actorOpts.onRunStart?.(false);
+    actorOpts.onRunStart?.(false, undefined, { provider: "antigravity", effort: "high" });
     await actorOpts.onRunEnd?.({
       success: true,
       output: "PORTABLE_ROOT_CONTEXT_MARKER",
@@ -1967,7 +1971,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
       rootActor as unknown as {
         opts: {
           buildPrompt: () => { prompt: string };
-          onRunStart?: (responsive: boolean) => void;
+          onRunStart?: (
+            responsive: boolean,
+            injectRecord: { runCount: number } | undefined,
+            selected: { provider: string; model?: string; effort?: string }
+          ) => void;
           onRunEnd?: (result: {
             success: boolean;
             output: string;
@@ -1976,7 +1984,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         };
       }
     ).opts;
-    actorOpts.onRunStart?.(false);
+    actorOpts.onRunStart?.(false, undefined, { provider: "antigravity", effort: "high" });
     await actorOpts.onRunEnd?.({ success: true, output: "root completed", exitCode: 0 });
 
     expect(compactSpy).toHaveBeenCalledOnce();
@@ -2008,7 +2016,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       recipientId: "root",
       body: "Fold this after truncation.",
     });
-    actorOpts.onRunStart?.(false);
+    actorOpts.onRunStart?.(false, undefined, { provider: "antigravity", effort: "high" });
     await actorOpts.onRunEnd?.({ success: true, output: "second run", exitCode: 0 });
     expect(compactSpy).toHaveBeenCalledTimes(2);
     const advancedState = JSON.parse(
@@ -2339,8 +2347,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const workerId = mesh.spawn({
       charter: "directed worker",
       parentId: "root",
-      provider: "antigravity",
-      model: "Gemini 3.7 Flash (High)",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
     });
 
     await emitGitHubEvent("issue_comment", {
@@ -2387,8 +2394,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const workerId = mesh.spawn({
       charter: "directed worker",
       parentId: "root",
-      provider: "antigravity",
-      model: "Gemini 3.7 Flash (High)",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
     });
     mesh.subscribeEventSource("github:dummy-org", "root", "root");
 
@@ -2502,8 +2508,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       const workerId = mesh.spawn({
         charter: "directed worker",
         parentId: "root",
-        provider: "antigravity",
-        model: "Gemini 3.7 Flash (High)",
+        modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
       });
       await emitGitHubEvent("issue_comment", {
         action: "created",
@@ -2770,8 +2775,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       const prWorker = mesh.spawn({
         charter: "pr tasks",
         parentId: "root",
-        provider: "antigravity",
-        model: "Gemini 3.7 Flash (High)",
+        modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
       });
       mesh.subscribeEventSource("github:dummy-org/dummy-repo/pulls/77", prWorker, "root");
       mesh.subscribeEventSource("github:dummy-org/dummy-repo", "root", "root");
@@ -2936,8 +2940,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const workerId = mesh.spawn({
       charter: "worker tasks",
       parentId: "root",
-      provider: "antigravity",
-      model: "Gemini 3.7 Flash (High)",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
     });
     // Real topology : root retains the covering org source it delegates
     // slices from — the retired subscriber's event bubbles to root via that
@@ -2992,14 +2995,12 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const issueWorker = mesh.spawn({
       charter: "issue tasks",
       parentId: "root",
-      provider: "antigravity",
-      model: "Gemini 3.7 Flash (High)",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
     });
     const prWorker = mesh.spawn({
       charter: "pr tasks",
       parentId: "root",
-      provider: "antigravity",
-      model: "Gemini 3.7 Flash (High)",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
     });
 
     mesh.subscribeEventSource("github:dummy-org/dummy-repo/issues/123", issueWorker, "root");
@@ -3095,8 +3096,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       activeMesh.spawn({
         charter: "unresolvable provider worker",
         parentId: "root",
-        provider: "unconfigured-provider",
-        model: "some-model",
+        modelConfig: { provider: "unconfigured-provider", model: "some-model" },
       });
     }).toThrow(/unconfigured-provider/);
 
@@ -3111,29 +3111,26 @@ describe("runStart webhook event routing (Phase 4)", () => {
       activeMesh.spawn({
         charter: "unresolvable model worker",
         parentId: "root",
-        provider: "antigravity",
-        model: "   ", // spaces/empty model
+        modelConfig: { provider: "antigravity", model: "   " }, // spaces/empty model
       });
-    }).toThrow(/model is required/);
+    }).toThrow(/is missing a model/);
 
     // 3. an issue: omitting provider or model is refused at the boundary
     expect(() => {
       activeMesh.spawn({
         charter: "missing provider worker",
         parentId: "root",
-        provider: "",
-        model: "Gemini 3.7 Flash (High)",
+        modelConfig: { provider: "", model: "Gemini 3.7 Flash (High)" },
       });
-    }).toThrow(/provider is required/);
+    }).toThrow(/missing a provider/);
 
     expect(() => {
       activeMesh.spawn({
         charter: "missing model worker",
         parentId: "root",
-        provider: "antigravity",
-        model: "",
+        modelConfig: { provider: "antigravity", model: "" },
       });
-    }).toThrow(/model is required/);
+    }).toThrow(/is missing a model/);
 
     // 4. Catalog validation hardening: invalid model pin rejected against resolved provider
     setProviderModelCatalog("antigravity", [
@@ -3154,8 +3151,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       activeMesh.spawn({
         charter: "invalid model pin worker",
         parentId: "root",
-        provider: "antigravity",
-        model: "gemini-bad-unsupported-model",
+        modelConfig: { provider: "antigravity", model: "gemini-bad-unsupported-model" },
       });
     }).toThrow(/model pin validation failed/);
 
@@ -3163,8 +3159,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       activeMesh.spawn({
         charter: "non-Gemini Antigravity worker",
         parentId: "root",
-        provider: "antigravity",
-        model: "claude-sonnet-4-6",
+        modelConfig: { provider: "antigravity", model: "claude-sonnet-4-6" },
       });
     }).toThrow(/Antigravity supports Gemini models only/);
     expect(
@@ -3175,8 +3170,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const validWorkerId = activeMesh.spawn({
       charter: "valid worker",
       parentId: "root",
-      provider: "antigravity",
-      model: "Gemini 3.7 Flash (High)",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
     });
     expect(activeMesh.get(validWorkerId)).toBeDefined();
     const validWorkerRecord = activeMesh.actors.get(validWorkerId);
@@ -3187,46 +3181,63 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const portableWorkerId = activeMesh.spawn({
       charter: "portable worker",
       parentId: "root",
-      provider: "claude",
-      model: "Claude 3.5 Sonnet",
+      modelConfig: { provider: "claude", model: "Claude 3.5 Sonnet" },
       context: { type: "portable", mode: "ledger" },
     });
-    expect(activeMesh.actors.get(portableWorkerId)?.provider).toBe("claude");
-    expect(activeMesh.actors.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
+    expect(activeMesh.actors.get(portableWorkerId)?.modelConfig?.[0]?.provider).toBe("claude");
+    expect(activeMesh.actors.get(portableWorkerId)?.modelConfig?.[0]?.model).toBe(
+      "Claude 3.5 Sonnet"
+    );
 
     expect(() => {
-      activeMesh.setActorModel(portableWorkerId, "gpt-oss-120b-medium", "root", "antigravity");
+      activeMesh.setActorModel(
+        portableWorkerId,
+        { provider: "antigravity", model: "gpt-oss-120b-medium" },
+        "root"
+      );
     }).toThrow(/Antigravity supports Gemini models only/);
-    expect(activeMesh.actors.get(portableWorkerId)?.desiredProvider).toBeUndefined();
-    expect(activeMesh.actors.get(portableWorkerId)?.desiredModel).toBeUndefined();
+    expect(
+      activeMesh.actors.get(portableWorkerId)?.desiredModelConfig?.[0]?.provider
+    ).toBeUndefined();
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredModelConfig?.[0]?.model).toBeUndefined();
 
     // Unconfigured target provider is rejected before state change, record untouched
     expect(() => {
       activeMesh.setActorModel(
         portableWorkerId,
-        "Gemini 3.7 Flash (High)",
-        "root",
-        "unconfigured-provider"
+        { provider: "unconfigured-provider", model: "Gemini 3.7 Flash (High)" },
+        "root"
       );
     }).toThrow(/unconfigured-provider/);
-    expect(activeMesh.actors.get(portableWorkerId)?.provider).toBe("claude");
-    expect(activeMesh.actors.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
+    expect(activeMesh.actors.get(portableWorkerId)?.modelConfig?.[0]?.provider).toBe("claude");
+    expect(activeMesh.actors.get(portableWorkerId)?.modelConfig?.[0]?.model).toBe(
+      "Claude 3.5 Sonnet"
+    );
 
     // Valid target provider + model stages for the next run boundary.
-    activeMesh.setActorModel(portableWorkerId, "Gemini 3.7 Flash (High)", "root", "antigravity");
-    expect(activeMesh.actors.get(portableWorkerId)?.provider).toBe("claude");
-    expect(activeMesh.actors.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
-    expect(activeMesh.actors.get(portableWorkerId)?.desiredProvider).toBe("antigravity");
-    expect(activeMesh.actors.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash");
-    expect(activeMesh.actors.get(portableWorkerId)?.desiredEffort).toBe("high");
+    activeMesh.setActorModel(
+      portableWorkerId,
+      { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
+      "root"
+    );
+    expect(activeMesh.actors.get(portableWorkerId)?.modelConfig?.[0]?.provider).toBe("claude");
+    expect(activeMesh.actors.get(portableWorkerId)?.modelConfig?.[0]?.model).toBe(
+      "Claude 3.5 Sonnet"
+    );
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredModelConfig?.[0]?.provider).toBe(
+      "antigravity"
+    );
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredModelConfig?.[0]?.model).toBe(
+      "Gemini 3.7 Flash"
+    );
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredModelConfig?.[0]?.effort).toBe("high");
 
     // Invalid model for target provider fails validation
     expect(() => {
       activeMesh.setActorModel(
         portableWorkerId,
-        "gemini-bad-model-for-antigravity",
-        "root",
-        "antigravity"
+        { provider: "antigravity", model: "gemini-bad-model-for-antigravity" },
+        "root"
       );
     }).toThrow(/model pin validation failed/);
 
@@ -3234,19 +3245,23 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(() => {
       activeMesh.setActorModel(
         portableWorkerId,
-        "Gemini 3.7 Flash (High)",
-        "root",
-        "antigravity",
-        "low"
+        { provider: "antigravity", model: "Gemini 3.7 Flash (High)", effort: "low" },
+        "root"
       );
     }).toThrow(/conflicting reasoning efforts/);
-    expect(activeMesh.actors.get(portableWorkerId)?.model).toBe("Claude 3.5 Sonnet");
-    expect(activeMesh.actors.get(portableWorkerId)?.desiredModel).toBe("Gemini 3.7 Flash");
-    expect(activeMesh.actors.get(portableWorkerId)?.desiredEffort).toBe("high");
-    expect(activeMesh.actors.get(portableWorkerId)?.desiredProvider).toBe("antigravity");
+    expect(activeMesh.actors.get(portableWorkerId)?.modelConfig?.[0]?.model).toBe(
+      "Claude 3.5 Sonnet"
+    );
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredModelConfig?.[0]?.model).toBe(
+      "Gemini 3.7 Flash"
+    );
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredModelConfig?.[0]?.effort).toBe("high");
+    expect(activeMesh.actors.get(portableWorkerId)?.desiredModelConfig?.[0]?.provider).toBe(
+      "antigravity"
+    );
   });
 
-  it("root's run_start records the live model after a tuple staged while idle, not the value frozen when root was built (#199 amend gap 1)", async () => {
+  it("root's run_start records the live model after a pool staged while idle, not the value frozen when root was built (#199 amend gap 1, extended to pools)", async () => {
     // A prior test in this file registers a real "antigravity"/"agy" model
     // catalog via setProviderModelCatalog and never clears it; that module-level
     // state otherwise leaks into this test and rejects the pin below.
@@ -3268,24 +3283,41 @@ describe("runStart webhook event routing (Phase 4)", () => {
 
     const rootActor = activeMesh.get("root");
     if (!rootActor) throw new Error("root actor not ready");
-    const originalModel = activeMesh.actors.get("root")?.model;
+    const originalModel = activeMesh.actors.get("root")?.modelConfig?.[0]?.model;
 
-    // Stage a new model on root while idle. Per #199, this must apply at
-    // root's very next dispatch, before that run's run_start is recorded —
-    // it must not merely sit staged past this run.
-    activeMesh.setActorModel("root", "Gemini 4.1 Ultra (High)", "root");
-    expect(activeMesh.actors.get("root")?.model).toBe(originalModel);
-    expect(activeMesh.actors.get("root")?.desiredModel).toBe("Gemini 4.1 Ultra");
+    // Stage a new model on root while idle. Per #199 (extended to pools),
+    // this must apply inside beforeRun at root's very next dispatch — before
+    // that run's own gate()/run_start — not merely sit staged past this run.
+    activeMesh.setActorModel(
+      "root",
+      { provider: "antigravity", model: "Gemini 4.1 Ultra (High)" },
+      "root"
+    );
+    expect(activeMesh.actors.get("root")?.modelConfig?.[0]?.model).toBe(originalModel);
+    expect(activeMesh.actors.get("root")?.desiredModelConfig?.[0]?.model).toBe("Gemini 4.1 Ultra");
 
-    // Directly invoke the production onRunStart closure — the same technique
-    // used elsewhere in this file to exercise root's real dispatch-time
-    // wiring without driving a full provider/gate/queue cycle.
+    // Directly invoke the production beforeRun/onRunStart closures — the
+    // same technique used elsewhere in this file to exercise root's real
+    // dispatch-time wiring without driving a full provider/gate/queue cycle.
     const actorOpts = (
-      rootActor as unknown as { opts: { onRunStart?: (responsive: boolean) => void } }
+      rootActor as unknown as {
+        opts: {
+          beforeRun?: (arg: { mode: string }) => boolean;
+          onRunStart?: (
+            responsive: boolean,
+            injectRecord: undefined,
+            selected: ProviderModelConfig
+          ) => void;
+        };
+      }
     ).opts;
-    actorOpts.onRunStart?.(false);
+    actorOpts.beforeRun?.({ mode: "yield-elicitation" });
 
-    expect(activeMesh.actors.get("root")?.model).toBe("Gemini 4.1 Ultra");
+    expect(activeMesh.actors.get("root")?.modelConfig?.[0]?.model).toBe("Gemini 4.1 Ultra");
+
+    const liveSelected = activeMesh.actors.get("root")?.modelConfig?.[0];
+    if (!liveSelected) throw new Error("root modelConfig missing after dispatch");
+    actorOpts.onRunStart?.(false, undefined, liveSelected);
 
     const runStartEvents = getRepositories().meshEvents.listEventsByActors(["root"], {
       kinds: ["run_start"],
@@ -3296,14 +3328,15 @@ describe("runStart webhook event routing (Phase 4)", () => {
       model?: string;
       effort?: string;
     };
-    // Gap #1 (#199 amend): this run's own run_start payload must record the
-    // now-live model — the tuple this very run launches on — not the value
-    // frozen in start.ts's `provider` closure variable at root construction.
+    // Gap #1 (#199 amend, extended to pools): this run's own run_start
+    // payload must record the now-live model — the entry this very run
+    // launches on — not the value frozen in start.ts's `provider` closure
+    // variable at root construction.
     expect(payload.model).toBe("Gemini 4.1 Ultra");
     expect(payload.model).not.toBe(originalModel);
   });
 
-  it("root's beforeRun halt-gate checks the tuple that will actually launch, not the frozen boot-time provider (#199 amend gap 2)", async () => {
+  it("root's beforeRun halt-gate checks the entry that will actually launch, not the frozen boot-time provider (#199 amend gap 2, extended to pools)", async () => {
     clearProviderModelCatalog("antigravity");
     clearProviderModelCatalog("claude");
     const config = {
@@ -3314,6 +3347,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       },
       rootActor: {
         provider: "antigravity",
+        model: "Gemini 3.7 Flash",
         effort: "high",
         context: { type: "portable", mode: "ledger" },
       },
@@ -3348,9 +3382,9 @@ describe("runStart webhook event routing (Phase 4)", () => {
     ).opts;
 
     // Stage a move to claude while root is idle on antigravity.
-    activeMesh.setActorModel("root", "claude-sonnet-5", "root", "claude");
-    expect(activeMesh.actors.get("root")?.provider).toBe("antigravity");
-    expect(activeMesh.actors.get("root")?.desiredProvider).toBe("claude");
+    activeMesh.setActorModel("root", { provider: "claude", model: "claude-sonnet-5" }, "root");
+    expect(activeMesh.actors.get("root")?.modelConfig?.[0]?.provider).toBe("antigravity");
+    expect(activeMesh.actors.get("root")?.desiredModelConfig?.[0]?.provider).toBe("claude");
 
     const halt = new HaltSwitch(join(homeDir, "HALT"));
 
@@ -3412,8 +3446,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const childId = mesh.spawn({
       charter: "child",
       parentId: "root",
-      provider: "antigravity",
-      model: "Gemini 3.7 Flash (High)",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
     });
     mesh.delegateEventSource("gchat:spaces/delegated", childId, "root");
 
@@ -3737,6 +3770,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           charter: "bad rehydrate worker",
           parentId: "root",
           provider: "unconfigured-provider",
+          model: "some-model",
           status: "active",
           createdAt: "2026-01-01T00:00:00Z",
         },
@@ -3825,8 +3859,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const workerId = mesh.spawn({
       charter: "chat-reader worker",
       parentId: "root",
-      provider: "antigravity",
-      model: "Gemini 3.7 Flash (High)",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
     });
 
     const actor = mesh.get(workerId) as unknown as {

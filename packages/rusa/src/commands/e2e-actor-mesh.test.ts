@@ -42,7 +42,10 @@ describe("external root E2E control server", () => {
     expect(spawned.status).toBe(201);
     expect(await spawned.json()).toEqual({ id: "child-1" });
     expect(spawnChild).toHaveBeenCalledWith(
-      expect.objectContaining({ charter: "implement the fixture", provider: "agy" }),
+      expect.objectContaining({
+        charter: "implement the fixture",
+        modelConfig: { provider: "agy", model: "gemini-3.5-flash-medium", effort: undefined },
+      }),
       "e2e-controller"
     );
 

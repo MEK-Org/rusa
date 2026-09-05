@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import { z } from "zod";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
+import type { ProviderModelConfig } from "../../providers/model-config.js";
 import type { ActorRepository } from "../../repositories/actor-repository.js";
 
 type ActorRow = {
@@ -17,9 +18,14 @@ type ActorRow = {
 
 export const ACTOR_CONFIG_SCHEMA_VERSION = 1 as const;
 
-const modelConfigSchema = z
+/** schemaVersion for a `model_config` document written before #169's pool contract. */
+const LEGACY_MODEL_CONFIG_SCHEMA_VERSION = 1 as const;
+/** schemaVersion for a `model_config` document holding a `ProviderModelConfig[]` pool. */
+const MODEL_CONFIG_POOL_SCHEMA_VERSION = 2 as const;
+
+const legacyModelConfigSchema = z
   .object({
-    schemaVersion: z.literal(ACTOR_CONFIG_SCHEMA_VERSION),
+    schemaVersion: z.literal(LEGACY_MODEL_CONFIG_SCHEMA_VERSION),
     provider: z.string().optional(),
     model: z.string().optional(),
     effort: z.string().optional(),
@@ -30,7 +36,23 @@ const modelConfigSchema = z
       config.provider !== undefined || config.model !== undefined || config.effort !== undefined,
     { message: "at least one model selection field is required" }
   );
-type ModelConfigDocument = z.infer<typeof modelConfigSchema>;
+
+const modelConfigEntrySchema = z
+  .object({
+    provider: z.string().min(1),
+    model: z.string().min(1),
+    effort: z.string().optional(),
+  })
+  .strict();
+
+const modelConfigPoolSchema = z
+  .object({
+    schemaVersion: z.literal(MODEL_CONFIG_POOL_SCHEMA_VERSION),
+    entries: z.array(modelConfigEntrySchema).min(1),
+  })
+  .strict();
+
+const modelConfigDocumentSchema = z.union([modelConfigPoolSchema, legacyModelConfigSchema]);
 
 const contextConfigSchema = z.discriminatedUnion("type", [
   z
@@ -64,27 +86,44 @@ function parseDocument<T>(
   }
 }
 
-/** Builds the versioned model-config document, or null when the tuple is entirely unset. */
+/** Builds the versioned model-config document, or null when the pool is unset/empty. */
 function buildModelConfig(record: ActorRecord): string | null {
-  const config: Omit<ModelConfigDocument, "schemaVersion"> = {};
-  if (record.provider !== undefined) config.provider = record.provider;
-  if (record.model !== undefined) config.model = record.model;
-  if (record.effort !== undefined) config.effort = record.effort;
-  if (!Object.keys(config).length) return null;
-  return JSON.stringify({ schemaVersion: ACTOR_CONFIG_SCHEMA_VERSION, ...config });
+  if (!record.modelConfig || record.modelConfig.length === 0) return null;
+  const entries = record.modelConfig.map((entry) => ({
+    provider: entry.provider,
+    model: entry.model,
+    ...(entry.effort !== undefined ? { effort: entry.effort } : {}),
+  }));
+  return JSON.stringify({ schemaVersion: MODEL_CONFIG_POOL_SCHEMA_VERSION, entries });
 }
 
-function parseModelConfig(
-  actorId: string,
-  json: string | null
-): Pick<ActorRecord, "provider" | "model" | "effort"> {
+/**
+ * Parses the `model_config` document. A document written before #169's pool
+ * contract (`schemaVersion: 1`, a single optional provider/model/effort) is
+ * migrated on read into a one-entry pool. A legacy document missing either
+ * `provider` or `model` predates the required-model contract and can't form a
+ * valid entry — `modelConfig` is left unset so callers fall back the same way
+ * they do for an actor with no configuration at all, rather than failing to
+ * load the row.
+ */
+function parseModelConfig(actorId: string, json: string | null): Pick<ActorRecord, "modelConfig"> {
   if (!json) return {};
-  const parsed = parseDocument(actorId, "model_config", json, modelConfigSchema);
-  return {
-    ...(parsed.provider !== undefined ? { provider: parsed.provider } : {}),
-    ...(parsed.model !== undefined ? { model: parsed.model } : {}),
-    ...(parsed.effort !== undefined ? { effort: parsed.effort } : {}),
-  };
+  const parsed = parseDocument(actorId, "model_config", json, modelConfigDocumentSchema);
+  if ("entries" in parsed) {
+    return { modelConfig: parsed.entries };
+  }
+  if (parsed.provider !== undefined && parsed.model !== undefined) {
+    return {
+      modelConfig: [
+        {
+          provider: parsed.provider,
+          model: parsed.model,
+          ...(parsed.effort !== undefined ? { effort: parsed.effort } : {}),
+        },
+      ],
+    };
+  }
+  return {};
 }
 
 /**
@@ -139,11 +178,9 @@ function parseContextConfig(
   };
 }
 
-/** A staged, not-yet-applied model/provider/effort change. */
+/** A staged, not-yet-applied replacement for the actor's declared modelConfig pool. */
 type DesiredOverlayEntry = {
-  desiredProvider?: string;
-  desiredModel?: string;
-  desiredEffort?: string | null;
+  desiredModelConfig?: ProviderModelConfig[];
 };
 
 /**
@@ -151,10 +188,11 @@ type DesiredOverlayEntry = {
  * versioned documents whose schema is validated here, at their consumption
  * boundary; the database stores them as ordinary TEXT.
  *
- * `desiredProvider`/`desiredModel`/`desiredEffort` are process memory, not a
- * durable row (an unapplied model change is discardable), so they live in an
- * instance-local overlay. Every successful upsert fully replaces an actor's
- * overlay entry from the desired-* keys present on the incoming record.
+ * `desiredModelConfig` is process memory, not a durable row (an unapplied
+ * pool change is discardable — see MEK-Org/rusa#169's binding to #199
+ * dispatch-time-apply semantics), so it lives in an instance-local overlay.
+ * Every successful upsert fully replaces an actor's overlay entry when
+ * `desiredModelConfig` is present as a key on the incoming record.
  */
 export class SqliteActorRepository implements ActorRepository {
   private readonly desiredOverlay = new Map<string, DesiredOverlayEntry>();
@@ -242,12 +280,8 @@ export class SqliteActorRepository implements ActorRepository {
   }
 
   private storeDesiredOverlay(record: ActorRecord): void {
-    const overlay: DesiredOverlayEntry = {};
-    if ("desiredProvider" in record) overlay.desiredProvider = record.desiredProvider;
-    if ("desiredModel" in record) overlay.desiredModel = record.desiredModel;
-    if ("desiredEffort" in record) overlay.desiredEffort = record.desiredEffort;
-    if (Object.keys(overlay).length) {
-      this.desiredOverlay.set(record.id, overlay);
+    if ("desiredModelConfig" in record) {
+      this.desiredOverlay.set(record.id, { desiredModelConfig: record.desiredModelConfig });
     } else {
       this.desiredOverlay.delete(record.id);
     }
