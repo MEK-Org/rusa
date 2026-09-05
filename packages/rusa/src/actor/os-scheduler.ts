@@ -387,11 +387,17 @@ export class DefaultOsScheduler implements OsScheduler {
       this.mutator.mutate((lines) => {
         const kept = this.stripCronBlock(lines, tag, endTag);
         const priorTz = this.lastCronTzLine(kept);
+        // Debian vixie cron treats CRON_TZ as an environment variable, and an
+        // empty assignment must use the quoted form CRON_TZ="" — a bare
+        // CRON_TZ= is rejected as "bad minute" and the whole crontab install
+        // fails closed. Cron doesn't interpret CRON_TZ scheduling semantics
+        // here anyway since the deployment host is UTC, so the quoted empty
+        // assignment is harmless.
         kept.push(
           tag,
           "CRON_TZ=UTC",
           `${time.cronExpr} ${curlLine}`,
-          priorTz ?? "CRON_TZ=",
+          priorTz ?? 'CRON_TZ=""',
           endTag
         );
         return { lines: kept, result: undefined };
