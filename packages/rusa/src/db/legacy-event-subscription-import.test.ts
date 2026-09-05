@@ -5,7 +5,7 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   EVENT_SUBSCRIPTIONS_FILENAME,
-  type EventSubscription,
+  type EventSourceOwnership,
 } from "../actor/event-subscriptions.js";
 import {
   applyLegacyEventSubscriptionImport,
@@ -22,7 +22,7 @@ const ACTOR_B = "actor-thread-b";
 const REPO = "github:dummy-org/dummy-repo";
 const OTHER = "github:dummy-org/other";
 
-const row = (over: Partial<EventSubscription> = {}): EventSubscription => ({
+const row = (over: Partial<EventSourceOwnership> = {}): EventSourceOwnership => ({
   resource: REPO,
   actorId: ACTOR_A,
   subscribedBy: ROOT,
@@ -73,7 +73,7 @@ describe("legacy event-subscription import", () => {
     const result = runImport();
     expect(result).toEqual({ importedSubscriptions: 0, backupFiles: [] });
     expect(existsSync(filePath)).toBe(false);
-    expect(repositories.eventSubscriptions.list()).toEqual([]);
+    expect(repositories.eventSourceOwners.list()).toEqual([]);
     expect(repositories.legacyImportReceipts.has(EVENT_SUBSCRIPTION_IMPORT_SOURCE)).toBe(false);
   });
 
@@ -88,11 +88,11 @@ describe("legacy event-subscription import", () => {
     const result = runImport();
 
     expect(result.importedSubscriptions).toBe(2);
-    expect(repositories.eventSubscriptions.activeForResource(REPO).map((s) => s.actorId)).toEqual([
+    expect(repositories.eventSourceOwners.activeForResource(REPO).map((s) => s.actorId)).toEqual([
       ACTOR_A,
     ]);
-    expect(repositories.eventSubscriptions.activeForResource(OTHER)).toEqual([]);
-    expect(repositories.eventSubscriptions.list()).toHaveLength(2);
+    expect(repositories.eventSourceOwners.activeForResource(OTHER)).toEqual([]);
+    expect(repositories.eventSourceOwners.list()).toHaveLength(2);
     expect(repositories.legacyImportReceipts.has(EVENT_SUBSCRIPTION_IMPORT_SOURCE)).toBe(true);
 
     // The source is archived, not deleted: still byte-identical on disk.
@@ -104,7 +104,7 @@ describe("legacy event-subscription import", () => {
   it("normalizes legacy reference spellings onto the canonical key", () => {
     writeLegacy([row({ resource: "github_repo:dummy-org/dummy-repo" })]);
     runImport();
-    expect(repositories.eventSubscriptions.list()[0]?.resource).toBe(REPO);
+    expect(repositories.eventSourceOwners.list()[0]?.resource).toBe(REPO);
   });
 
   it("drops an unversioned document's config-implied root rows and keeps explicit ones", () => {
@@ -118,7 +118,7 @@ describe("legacy event-subscription import", () => {
     const result = runImport();
 
     expect(result.importedSubscriptions).toBe(1);
-    expect(repositories.eventSubscriptions.list()).toEqual([
+    expect(repositories.eventSourceOwners.list()).toEqual([
       expect.objectContaining({ resource: OTHER, actorId: ACTOR_A }),
     ]);
   });
@@ -126,18 +126,18 @@ describe("legacy event-subscription import", () => {
   it("re-running after a completed import is a no-op", () => {
     writeLegacy([row()]);
     runImport();
-    const after = repositories.eventSubscriptions.list();
+    const after = repositories.eventSourceOwners.list();
 
     const second = runImport();
     expect(second).toEqual({ importedSubscriptions: 0, backupFiles: [] });
-    expect(repositories.eventSubscriptions.list()).toEqual(after);
+    expect(repositories.eventSourceOwners.list()).toEqual(after);
   });
 
   describe("refuses rather than importing a partial ownership view", () => {
     const expectRefusal = (pattern: RegExp): void => {
       const before = readFileSync(filePath, "utf8");
       expect(() => runImport()).toThrow(pattern);
-      expect(repositories.eventSubscriptions.list()).toEqual([]);
+      expect(repositories.eventSourceOwners.list()).toEqual([]);
       expect(repositories.legacyImportReceipts.has(EVENT_SUBSCRIPTION_IMPORT_SOURCE)).toBe(false);
       // The source stays exactly where the operator can repair it.
       expect(readFileSync(filePath, "utf8")).toBe(before);
@@ -171,12 +171,12 @@ describe("legacy event-subscription import", () => {
     });
 
     it("refuses when durable rows exist with no import receipt", () => {
-      repositories.eventSubscriptions.subscribe(row({ resource: OTHER, actorId: ACTOR_B }));
+      repositories.eventSourceOwners.subscribe(row({ resource: OTHER, actorId: ACTOR_B }));
       writeLegacy([row()]);
 
       const before = readFileSync(filePath, "utf8");
       expect(() => runImport()).toThrow(/without an import receipt/);
-      expect(repositories.eventSubscriptions.list()).toHaveLength(1);
+      expect(repositories.eventSourceOwners.list()).toHaveLength(1);
       expect(readFileSync(filePath, "utf8")).toBe(before);
     });
   });
@@ -188,12 +188,12 @@ describe("legacy event-subscription import", () => {
 
       // Crash between plan and apply.
       planLegacyEventSubscriptionImport({ mcHome: home, repositories, rootId: ROOT });
-      expect(repositories.eventSubscriptions.list()).toEqual([]);
+      expect(repositories.eventSourceOwners.list()).toEqual([]);
       expect(repositories.legacyImportReceipts.has(EVENT_SUBSCRIPTION_IMPORT_SOURCE)).toBe(false);
       expect(readFileSync(filePath, "utf8")).toBe(before);
 
       expect(runImport().importedSubscriptions).toBe(2);
-      expect(repositories.eventSubscriptions.list()).toHaveLength(2);
+      expect(repositories.eventSourceOwners.list()).toHaveLength(2);
     });
 
     it("a failure inside the transaction commits nothing", () => {
@@ -210,7 +210,7 @@ describe("legacy event-subscription import", () => {
       planResult.plan.subscriptions.push(row({ resource: OTHER, actorId: "no-such-actor" }));
       expect(() => applyLegacyEventSubscriptionImport(planResult, { db, repositories })).toThrow();
 
-      expect(repositories.eventSubscriptions.list()).toEqual([]);
+      expect(repositories.eventSourceOwners.list()).toEqual([]);
       expect(repositories.legacyImportReceipts.has(EVENT_SUBSCRIPTION_IMPORT_SOURCE)).toBe(false);
       expect(existsSync(filePath)).toBe(true);
     });
@@ -220,8 +220,8 @@ describe("legacy event-subscription import", () => {
       runImport();
 
       // The mesh moves on: ownership is handed to another actor.
-      repositories.eventSubscriptions.unsubscribe(REPO, ACTOR_A, "2026-06-28T00:00:00Z");
-      repositories.eventSubscriptions.subscribe(
+      repositories.eventSourceOwners.unsubscribe(REPO, ACTOR_A, "2026-06-28T00:00:00Z");
+      repositories.eventSourceOwners.subscribe(
         row({ actorId: ACTOR_B, subscribedAt: "2026-06-28T00:00:01Z" })
       );
 
@@ -233,9 +233,9 @@ describe("legacy event-subscription import", () => {
       expect(result.importedSubscriptions).toBe(0);
       expect(result.backupFiles).toHaveLength(1);
       expect(existsSync(filePath)).toBe(false);
-      expect(repositories.eventSubscriptions.activeForResource(REPO).map((s) => s.actorId)).toEqual(
-        [ACTOR_B]
-      );
+      expect(repositories.eventSourceOwners.activeForResource(REPO).map((s) => s.actorId)).toEqual([
+        ACTOR_B,
+      ]);
     });
   });
 });

@@ -12,7 +12,7 @@ export interface DbCheckResult {
   pendingMigrationIds: string[];
   plannedActors: number;
   plannedScheduledMessages: number;
-  plannedEventSubscriptions: number;
+  plannedEventSourceOwnerships: number;
 }
 
 /** Resolve symlinks when the path exists on disk; otherwise just normalize it. */
@@ -88,7 +88,7 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
       pendingMigrationIds: pending,
       plannedActors: plan.plannedActors,
       plannedScheduledMessages: plan.plannedScheduledMessages,
-      plannedEventSubscriptions: subscriptionPlan.plannedSubscriptions,
+      plannedEventSourceOwnerships: subscriptionPlan.plannedSubscriptions,
     };
   } finally {
     db.close();
@@ -107,7 +107,7 @@ export function runDbCheck(opts: { home: string }): void {
     console.log(
       `Legacy import plan: ${result.plannedActors} actor(s), ` +
         `${result.plannedScheduledMessages} scheduled message(s), ` +
-        `${result.plannedEventSubscriptions} event subscription(s)`
+        `${result.plannedEventSourceOwnerships} event source ownership(s)`
     );
     console.log("✓ db-check passed");
   } catch (err) {

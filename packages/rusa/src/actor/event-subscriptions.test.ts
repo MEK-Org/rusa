@@ -1,15 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { testEventSubscriptionStoreContract } from "./event-subscription-store.contract.js";
+import { testEventSourceOwnerStoreContract } from "./event-source-owner-store.contract.js";
+import { testEventSourceSubscriptionStoreContract } from "./event-source-subscription-store.contract.js";
 import {
   type EventResource,
-  type EventSubscription,
-  InMemoryEventSubscriptionStore,
+  type EventSourceOwnership,
+  InMemoryEventSourceOwnerStore,
+  InMemoryEventSourceSubscriptionStore,
   isStrictSubResourceOf,
   isSubResourceOf,
-  missingAuditedEventSubscriptions,
+  missingAuditedEventSourceOwnerships,
   normalizeEventResource,
   parentOf,
   parseLegacyEventSubscriptionDocument,
+  reconcileEventSourceSubscriptions,
   reconcileEventSources,
   resourceKey,
   sameResource,
@@ -21,8 +24,8 @@ const ACTOR_A = "actor-thread-a";
 const ACTOR_B = "actor-thread-b";
 
 const sub = (
-  over: Partial<Omit<EventSubscription, "resource">> & { resource?: EventResource } = {}
-): EventSubscription => ({
+  over: Partial<Omit<EventSourceOwnership, "resource">> & { resource?: EventResource } = {}
+): EventSourceOwnership => ({
   actorId: ACTOR_A,
   subscribedBy: "root",
   subscribedAt: "2026-06-27T00:00:00Z",
@@ -32,10 +35,74 @@ const sub = (
 
 // Behavior shared by every store implementation lives in the contract suite so
 // the in-memory seed store and the SQLite store are held to the same rules.
-testEventSubscriptionStoreContract(
-  "InMemoryEventSubscriptionStore",
-  () => new InMemoryEventSubscriptionStore()
+testEventSourceOwnerStoreContract(
+  "InMemoryEventSourceOwnerStore",
+  () => new InMemoryEventSourceOwnerStore()
 );
+
+testEventSourceSubscriptionStoreContract(
+  "InMemoryEventSourceSubscriptionStore",
+  () => new InMemoryEventSourceSubscriptionStore()
+);
+
+describe("reconcileEventSourceSubscriptions", () => {
+  const store = () => new InMemoryEventSourceSubscriptionStore();
+  const directSub = (resource: EventResource, actorId: string) => ({
+    resource: resourceKey(resource),
+    actorId,
+    subscribedBy: actorId,
+    subscribedAt: "2026-06-27T00:00:00Z",
+  });
+
+  it("keeps a subscription anchored under a configured source", () => {
+    const subscriptions = store();
+    subscriptions.subscribe(directSub(`${REPO}/issues/9`, ACTOR_A));
+    expect(reconcileEventSourceSubscriptions(subscriptions, [REPO])).toEqual([]);
+    expect(subscriptions.list()).toHaveLength(1);
+  });
+
+  it("keeps a subscription on the configured source itself", () => {
+    const subscriptions = store();
+    subscriptions.subscribe(directSub(REPO, ACTOR_A));
+    expect(reconcileEventSourceSubscriptions(subscriptions, [REPO])).toEqual([]);
+    expect(subscriptions.list()).toHaveLength(1);
+  });
+
+  it("drops a subscription outside every configured source, and reports it", () => {
+    const subscriptions = store();
+    subscriptions.subscribe(directSub(OTHER, ACTOR_B));
+    const dropped = reconcileEventSourceSubscriptions(subscriptions, [REPO]);
+    expect(dropped.map((subscription) => subscription.actorId)).toEqual([ACTOR_B]);
+    expect(subscriptions.list()).toEqual([]);
+  });
+
+  it("drops a subscription on a strict ANCESTOR of the configured source", () => {
+    // Config declares one repo; a subscription to the whole org is wider than
+    // the instance is allowed to see, so anchoring must be containment and not
+    // mere relatedness.
+    const subscriptions = store();
+    subscriptions.subscribe(directSub("github:dummy-org", ACTOR_A));
+    expect(reconcileEventSourceSubscriptions(subscriptions, [REPO])).toHaveLength(1);
+    expect(subscriptions.list()).toEqual([]);
+  });
+
+  it("drops every subscription when nothing is configured", () => {
+    const subscriptions = store();
+    subscriptions.subscribe(directSub(REPO, ACTOR_A));
+    subscriptions.subscribe(directSub(OTHER, ACTOR_B));
+    expect(reconcileEventSourceSubscriptions(subscriptions, [])).toHaveLength(2);
+    expect(subscriptions.list()).toEqual([]);
+  });
+
+  it("is idempotent — a second pass over reconciled state drops nothing", () => {
+    const subscriptions = store();
+    subscriptions.subscribe(directSub(REPO, ACTOR_A));
+    subscriptions.subscribe(directSub(OTHER, ACTOR_B));
+    reconcileEventSourceSubscriptions(subscriptions, [REPO]);
+    expect(reconcileEventSourceSubscriptions(subscriptions, [REPO])).toEqual([]);
+    expect(subscriptions.list().map((subscription) => subscription.actorId)).toEqual([ACTOR_A]);
+  });
+});
 
 // The SQLite importer is now the only caller of the legacy parse, so the
 // pre-cutover document semantics are pinned here directly instead of through
@@ -177,7 +244,7 @@ describe("parseLegacyEventSubscriptionDocument", () => {
     expect(document.subscriptions.map((row) => row.actorId)).toEqual([ACTOR_A, ACTOR_B]);
 
     // Replaying in that order is exactly what the importer does.
-    const store = new InMemoryEventSubscriptionStore();
+    const store = new InMemoryEventSourceOwnerStore();
     for (const subscription of document.subscriptions) store.restore(subscription);
     expect(store.activeForResource(REPO).map((row) => row.actorId)).toEqual([ACTOR_B]);
   });
@@ -244,13 +311,13 @@ describe("parseLegacyEventSubscriptionDocument", () => {
   });
 });
 
-describe("missingAuditedEventSubscriptions", () => {
+describe("missingAuditedEventSourceOwnerships", () => {
   it("reports only audit-confirmed active rows missing from the durable store", () => {
-    const store = new InMemoryEventSubscriptionStore();
+    const store = new InMemoryEventSourceOwnerStore();
     store.subscribe(sub({ resource: OTHER, actorId: ACTOR_B }));
 
     expect(
-      missingAuditedEventSubscriptions(store, [
+      missingAuditedEventSourceOwnerships(store, [
         { kind: "event_source_subscribed", actorId: ACTOR_A, detail: REPO },
         { kind: "event_source_subscribed", actorId: ACTOR_B, detail: OTHER },
       ])
@@ -258,14 +325,14 @@ describe("missingAuditedEventSubscriptions", () => {
   });
 
   it("treats a later unsubscribe as settled and an empty audit stream as unknown", () => {
-    const store = new InMemoryEventSubscriptionStore();
+    const store = new InMemoryEventSourceOwnerStore();
     expect(
-      missingAuditedEventSubscriptions(store, [
+      missingAuditedEventSourceOwnerships(store, [
         { kind: "event_source_subscribed", actorId: ACTOR_A, detail: REPO },
         { kind: "event_source_unsubscribed", actorId: ACTOR_A, detail: REPO },
       ])
     ).toEqual([]);
-    expect(missingAuditedEventSubscriptions(store, [])).toEqual([]);
+    expect(missingAuditedEventSourceOwnerships(store, [])).toEqual([]);
   });
 });
 
@@ -277,7 +344,7 @@ describe("reconcileEventSources", () => {
   const rootId = "root";
 
   it("seeds configured root sources and is idempotent across reboots", () => {
-    const store = new InMemoryEventSubscriptionStore();
+    const store = new InMemoryEventSourceOwnerStore();
     const now = () => "2026-07-02T00:00:00Z";
 
     const first = reconcileEventSources(store, [rootOrg, chat], rootId, now);
@@ -297,7 +364,7 @@ describe("reconcileEventSources", () => {
   });
 
   it("seeds and reconciles the system family as a config-owned root source", () => {
-    const store = new InMemoryEventSubscriptionStore();
+    const store = new InMemoryEventSourceOwnerStore();
     const now = () => "2026-07-02T00:00:00Z";
 
     const first = reconcileEventSources(store, [system], rootId, now);
@@ -313,7 +380,7 @@ describe("reconcileEventSources", () => {
   // pin the rule from the surviving side, which had no coverage — narrowing
   // config to drop a delegation is tested above, keeping one is not.
   it("keeps a delegation of a repo under a still-configured org", () => {
-    const store = new InMemoryEventSubscriptionStore();
+    const store = new InMemoryEventSourceOwnerStore();
     const repo = "github:dummy-org/dummy-repo";
     store.subscribe(sub({ resource: repo, actorId: "child", subscribedBy: "root" }));
 
@@ -327,7 +394,7 @@ describe("reconcileEventSources", () => {
   });
 
   it("lets a delegation of a configured repo outrank the implied root seed", () => {
-    const store = new InMemoryEventSubscriptionStore();
+    const store = new InMemoryEventSourceOwnerStore();
     const repo = "github:dummy-org/dummy-repo";
     store.subscribe(sub({ resource: repo, actorId: "child", subscribedBy: "root" }));
 
@@ -341,7 +408,7 @@ describe("reconcileEventSources", () => {
   });
 
   it("drops orphaned delegations in the persistent store", () => {
-    const store = new InMemoryEventSubscriptionStore();
+    const store = new InMemoryEventSourceOwnerStore();
     store.subscribe(sub({ resource: removedOrg, actorId: "child", subscribedBy: "root" }));
     store.subscribe(
       sub({
@@ -370,7 +437,7 @@ describe("reconcileEventSources", () => {
   });
 
   it("seeds a configured github_repo source and drops orphaned delegations", () => {
-    const store = new InMemoryEventSubscriptionStore();
+    const store = new InMemoryEventSourceOwnerStore();
     const reclaimed = "github:dummy-org/reclaimed";
     store.subscribe(sub({ resource: reclaimed, actorId: "root", subscribedBy: "root" }));
     const legacyBranch = "github:dummy-org/deploy/branches/master";
@@ -389,7 +456,7 @@ describe("reconcileEventSources", () => {
   });
 
   it("drops removed chat_space active delegations", () => {
-    const store = new InMemoryEventSubscriptionStore();
+    const store = new InMemoryEventSourceOwnerStore();
     const keptSpace = "gchat:spaces/KEPT";
     const removedSpace = "gchat:spaces/REMOVED";
     const childSpace = "gchat:spaces/CHILD";
@@ -413,14 +480,14 @@ describe("reconcileEventSources", () => {
   });
 });
 
-describe("UnionEventSubscriptionStore and implied persistence", () => {
+describe("UnionEventSourceOwnerStore and implied persistence", () => {
   // Durability of these outcomes across a restart is pinned on the SQLite store
-  // (event-subscription-repository.test.ts); what is fixed here is the union
+  // (event-source-owner-repository.test.ts); what is fixed here is the union
   // rule itself — which side of the union wins for a given resource.
   it("suppresses the config-implied row once the explicit store holds a tombstone", () => {
     const rootOrg = "github:dummy-org";
     const rootId = "root";
-    const explicit = new InMemoryEventSubscriptionStore();
+    const explicit = new InMemoryEventSourceOwnerStore();
 
     const sync = reconcileEventSources(explicit, [rootOrg], rootId, () => "2026-01-01T00:00:00Z");
     expect(sync.store.activeForResource(rootOrg)).toHaveLength(1);
@@ -446,7 +513,7 @@ describe("UnionEventSubscriptionStore and implied persistence", () => {
   it("keeps the implied row out of the explicit store entirely", () => {
     const rootOrg = "github:dummy-org";
     const rootId = "root";
-    const explicit = new InMemoryEventSubscriptionStore();
+    const explicit = new InMemoryEventSourceOwnerStore();
 
     const sync = reconcileEventSources(explicit, [rootOrg], rootId, () => "2026-01-01T00:00:00Z");
 

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   type EventResource,
-  type EventSubscription,
-  type EventSubscriptionStore,
+  type EventSourceOwnerStore,
+  type EventSourceOwnership,
   resourceKey,
 } from "./event-subscriptions.js";
 
@@ -13,8 +13,8 @@ export const ACTOR_A = "actor-thread-a";
 export const ACTOR_B = "actor-thread-b";
 
 export const sub = (
-  over: Partial<Omit<EventSubscription, "resource">> & { resource?: EventResource } = {}
-): EventSubscription => ({
+  over: Partial<Omit<EventSourceOwnership, "resource">> & { resource?: EventResource } = {}
+): EventSourceOwnership => ({
   actorId: ACTOR_A,
   subscribedBy: ROOT,
   subscribedAt: "2026-06-27T00:00:00Z",
@@ -23,17 +23,17 @@ export const sub = (
 });
 
 /**
- * Behavior every {@link EventSubscriptionStore} implementation must satisfy,
- * independent of backing storage — run against `InMemoryEventSubscriptionStore`
- * and `DbEventSubscriptionStore`. Storage-specific concerns (FK/index
+ * Behavior every {@link EventSourceOwnerStore} implementation must satisfy,
+ * independent of backing storage — run against `InMemoryEventSourceOwnerStore`
+ * and `DbEventSourceOwnerStore`. Storage-specific concerns (FK/index
  * enforcement, cross-connection visibility, reload across a restart) stay in
  * each store's own test file.
  */
-export function testEventSubscriptionStoreContract(
+export function testEventSourceOwnerStoreContract(
   name: string,
-  makeStore: () => EventSubscriptionStore
+  makeStore: () => EventSourceOwnerStore
 ): void {
-  describe(`${name} (EventSubscriptionStore contract)`, () => {
+  describe(`${name} (EventSourceOwnerStore contract)`, () => {
     it("subscribes an actor and reports it active for the resource", () => {
       const store = makeStore();
       store.subscribe(sub());

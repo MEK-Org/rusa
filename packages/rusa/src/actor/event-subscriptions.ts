@@ -8,14 +8,28 @@ import {
 } from "../references/reference.js";
 
 /**
- * Event-source subscriptions. An actor subscribes to an external event source —
- * named using the canonical URL-style reference grammar (`<scheme>:<path>`) — so
- * that events from that source (pushes, issues, PRs, chat messages, ...) are
- * routed to it. This module is the pure persistence layer for those
- * subscriptions.
+ * Event sources — external things that emit events (pushes, issues, PRs, chat
+ * messages, ...), named with the canonical URL-style reference grammar
+ * (`<scheme>:<path>`). This module is the pure persistence layer for the two
+ * distinct relationships an actor can have with one.
  *
- * Subscriptions attach to the subscriber's **actor id** (its stable thread id),
- * not a handle.
+ * **Ownership** is single. One actor owns a source at a time; ownership arrives
+ * by delegation, by the config-implied seed, or by creating the resource; and it
+ * governs bubbling — an event with no live owner at its exact source may climb
+ * to the owner of the parent resource. {@link EventSourceOwnerStore} holds it,
+ * with releases kept as tombstones so a delegated-away source does not silently
+ * revert to the seed at the next restart.
+ *
+ * **Subscription** is many. Any actor may subscribe itself to any in-scope
+ * source and receives *direct* events on that exact source.
+ * {@link EventSourceSubscriptionStore} holds those, and they deliberately have
+ * none of ownership's machinery: no seed to outrank, so no tombstones; no
+ * bubbling, so no parent walk; no part in ownership resolution, so a subscriber
+ * can never be handed work an owner has claimed. Bubbling exists to stop
+ * important events being missed by whoever is responsible; a subscriber is not
+ * responsible, it is interested.
+ *
+ * Both attach to the actor's **actor id** (its stable thread id), not a handle.
  */
 export type EventSourceKind =
   | "github_org"
@@ -42,7 +56,7 @@ export type LegacyEventResourceInput =
   | { kind: "chat_space"; space: string }
   | { kind: "system" };
 
-export interface EventSubscription {
+export interface EventSourceOwnership {
   /** The subscribed-to event source (canonical reference string `<scheme>:<path>`). */
   resource: string;
   /** The subscriber's actor id (stable thread id), not a handle. */
@@ -59,11 +73,11 @@ export interface EventSubscription {
 export const EVENT_SUBSCRIPTIONS_FILENAME = "event-subscriptions.json";
 
 /**
- * The one-active-subscriber-per-resource refusal. Shared so every store
+ * The one-active-owner-per-resource refusal. Shared so every store
  * implementation refuses in identical words and callers can match on it without
  * knowing which store is underneath.
  */
-export function activeSubscriberConflictMessage(
+export function activeOwnerConflictMessage(
   resource: EventResource,
   holderActorId: string,
   actorId: string
@@ -75,12 +89,18 @@ export function activeSubscriberConflictMessage(
 }
 
 /**
- * Persistence boundary for event subscriptions — mirrors
+ * Persistence boundary for event-source **ownership** — mirrors
  * {@link CapabilityGrantStore}: SQLite in production
- * (`DbEventSubscriptionStore`), in-memory for the config-implied seed and for
+ * (`DbEventSourceOwnerStore`), in-memory for the config-implied seed and for
  * tests. Keyed on (resource, actorId); one record per pair.
+ *
+ * The verbs stay `subscribe`/`unsubscribe` because they are the actions the
+ * audit stream has always recorded (`event_source_subscribed` /
+ * `event_source_unsubscribed`), and renaming them would desync history from the
+ * events {@link missingAuditedEventSourceOwnerships} replays. What they mean is
+ * "take ownership" and "release ownership".
  */
-export interface EventSubscriptionStore {
+export interface EventSourceOwnerStore {
   /**
    * Subscribe `actorId` to `resource`. Idempotent on (resource, actorId):
    * re-subscribing the same actor reactivates it (clearing any prior
@@ -91,16 +111,18 @@ export interface EventSubscriptionStore {
    * re-subscribe never throws (it is idempotent), and an inactive
    * (unsubscribed) prior holder does not block a new subscriber.
    */
-  subscribe(subscription: Omit<EventSubscription, "resource"> & { resource: EventResource }): void;
+  subscribe(
+    subscription: Omit<EventSourceOwnership, "resource"> & { resource: EventResource }
+  ): void;
   /** Mark the (resource, actorId) subscription inactive; no-op if none is active. */
   unsubscribe(resource: EventResource, actorId: string, at: string): void;
   /** Every subscription, active and inactive — the audit/inspection view. */
-  list(): EventSubscription[];
+  list(): EventSourceOwnership[];
   /** The subscriptions currently active for a resource (≤1 by the invariant). */
-  activeForResource(resource: EventResource): EventSubscription[];
+  activeForResource(resource: EventResource): EventSourceOwnership[];
 }
 
-export interface EventSubscriptionAuditEvent {
+export interface EventSourceOwnershipAuditEvent {
   kind: "event_source_subscribed" | "event_source_unsubscribed" | string;
   actorId: string | null;
   detail: string | null;
@@ -113,9 +135,9 @@ export interface EventSubscriptionAuditEvent {
  * truncated analytics stream proves nothing about the durable file, so file-only
  * rows are never reported and audit data is never used to mutate behavior.
  */
-export function missingAuditedEventSubscriptions(
-  store: EventSubscriptionStore,
-  events: readonly EventSubscriptionAuditEvent[]
+export function missingAuditedEventSourceOwnerships(
+  store: EventSourceOwnerStore,
+  events: readonly EventSourceOwnershipAuditEvent[]
 ): Array<{ resource: EventResource; actorId: string }> {
   const auditedActive = new Map<string, { resource: EventResource; actorId: string }>();
   for (const event of events) {
@@ -248,22 +270,22 @@ export function parentOf(resource: EventResource): string | undefined {
 }
 
 export interface EventSourceBootSyncResult {
-  store: EventSubscriptionStore;
-  droppedDelegations: EventSubscription[];
+  store: EventSourceOwnerStore;
+  droppedDelegations: EventSourceOwnership[];
 }
 
 export function reconcileEventSources(
-  persistentStore: EventSubscriptionStore,
+  persistentStore: EventSourceOwnerStore,
   configured: EventResource[],
   rootId: string,
   now: () => string
 ): EventSourceBootSyncResult {
-  const impliedStore = new InMemoryEventSubscriptionStore();
-  const droppedDelegations: EventSubscription[] = [];
+  const impliedStore = new InMemoryEventSourceOwnerStore();
+  const droppedDelegations: EventSourceOwnership[] = [];
 
   for (const resource of configured) {
     // One active subscriber per resource. We seed implied subscriptions for the root,
-    // but the UnionEventSubscriptionStore means persistent explicit overrides (if any)
+    // but the UnionEventSourceOwnerStore means persistent explicit overrides (if any)
     // will take precedence if the root later delegates it or drops it.
     impliedStore.subscribe({
       resource: resourceKey(resource),
@@ -291,7 +313,7 @@ export function reconcileEventSources(
   }
 
   return {
-    store: new UnionEventSubscriptionStore(impliedStore, persistentStore),
+    store: new UnionEventSourceOwnerStore(impliedStore, persistentStore),
     droppedDelegations,
   };
 }
@@ -318,17 +340,19 @@ export function isStrictSubResourceOf(x: EventResource, y: EventResource): boole
 }
 
 /** In-memory subscription store — for tests and the e2e runner. */
-export class InMemoryEventSubscriptionStore implements EventSubscriptionStore {
-  private readonly subs = new Map<string, EventSubscription>();
+export class InMemoryEventSourceOwnerStore implements EventSourceOwnerStore {
+  private readonly subs = new Map<string, EventSourceOwnership>();
 
-  subscribe(subscription: Omit<EventSubscription, "resource"> & { resource: EventResource }): void {
+  subscribe(
+    subscription: Omit<EventSourceOwnership, "resource"> & { resource: EventResource }
+  ): void {
     this.restore({ ...subscription, unsubscribedAt: undefined });
   }
 
   /** Hydrate one already-durable row without reactivating a tombstone. */
-  restore(subscription: EventSubscription): void {
+  restore(subscription: EventSourceOwnership): void {
     const resource = resourceKey(subscription.resource);
-    const normalized: EventSubscription = {
+    const normalized: EventSourceOwnership = {
       ...subscription,
       resource,
     };
@@ -337,9 +361,7 @@ export class InMemoryEventSubscriptionStore implements EventSubscriptionStore {
       ? undefined
       : this.activeForResource(resource).find((s) => s.actorId !== subscription.actorId);
     if (holder && !normalized.unsubscribedAt) {
-      throw new Error(
-        activeSubscriberConflictMessage(resource, holder.actorId, subscription.actorId)
-      );
+      throw new Error(activeOwnerConflictMessage(resource, holder.actorId, subscription.actorId));
     }
     this.subs.set(`${resource}:${subscription.actorId}`, normalized);
   }
@@ -351,23 +373,25 @@ export class InMemoryEventSubscriptionStore implements EventSubscriptionStore {
     this.subs.set(`${key}:${actorId}`, { ...existing, unsubscribedAt: at });
   }
 
-  list(): EventSubscription[] {
+  list(): EventSourceOwnership[] {
     return [...this.subs.values()].map((s) => ({ ...s }));
   }
 
-  activeForResource(resource: EventResource): EventSubscription[] {
+  activeForResource(resource: EventResource): EventSourceOwnership[] {
     const key = resourceKey(resource);
     return this.list().filter((s) => s.resource === key && !s.unsubscribedAt);
   }
 }
 
-export class UnionEventSubscriptionStore implements EventSubscriptionStore {
+export class UnionEventSourceOwnerStore implements EventSourceOwnerStore {
   constructor(
-    private readonly baseStore: EventSubscriptionStore,
-    private readonly mutatingStore: EventSubscriptionStore
+    private readonly baseStore: EventSourceOwnerStore,
+    private readonly mutatingStore: EventSourceOwnerStore
   ) {}
 
-  subscribe(subscription: Omit<EventSubscription, "resource"> & { resource: EventResource }): void {
+  subscribe(
+    subscription: Omit<EventSourceOwnership, "resource"> & { resource: EventResource }
+  ): void {
     this.mutatingStore.subscribe(subscription);
   }
 
@@ -382,14 +406,14 @@ export class UnionEventSubscriptionStore implements EventSubscriptionStore {
     this.mutatingStore.unsubscribe(key, actorId, at);
   }
 
-  list(): EventSubscription[] {
+  list(): EventSourceOwnership[] {
     const base = this.baseStore.list();
     const mutating = this.mutatingStore.list();
     const activeMutatingResources = new Set(
       mutating.filter((s) => !s.unsubscribedAt).map((s) => s.resource)
     );
 
-    const merged = new Map<string, EventSubscription>();
+    const merged = new Map<string, EventSourceOwnership>();
     for (const s of base) {
       if (activeMutatingResources.has(s.resource)) {
         continue;
@@ -402,10 +426,96 @@ export class UnionEventSubscriptionStore implements EventSubscriptionStore {
     return [...merged.values()];
   }
 
-  activeForResource(resource: EventResource): EventSubscription[] {
+  activeForResource(resource: EventResource): EventSourceOwnership[] {
     const key = resourceKey(resource);
     return this.list().filter((s) => s.resource === key && !s.unsubscribedAt);
   }
+}
+
+/**
+ * One actor's standing interest in one event source. There is no
+ * `unsubscribedAt` counterpart to {@link EventSourceOwnership}: ownership keeps
+ * tombstones only because they have to keep outranking the config-implied seed
+ * that `reconcileEventSources` re-derives on every boot, and a subscription has
+ * no seed to outrank. Removing one is a deletion.
+ */
+export interface EventSourceSubscription {
+  /** The subscribed-to event source (canonical reference string `<scheme>:<path>`). */
+  resource: string;
+  /** The subscriber's actor id (stable thread id), not a handle. */
+  actorId: string;
+  /** Who performed the subscribe — the subscriber itself, or an operator/mechanical path. */
+  subscribedBy: string;
+  /** ISO timestamp of the (most recent) subscribe. */
+  subscribedAt: string;
+}
+
+/**
+ * Persistence boundary for direct event-source **subscriptions**: SQLite in
+ * production (`DbEventSourceSubscriptionStore`), in-memory for tests and the
+ * e2e runner. Keyed on (resource, actorId); any number of actors may subscribe
+ * to one resource.
+ */
+export interface EventSourceSubscriptionStore {
+  /** Subscribe `actorId` to `resource`. Idempotent on (resource, actorId). */
+  subscribe(subscription: EventSourceSubscription): void;
+  /** Remove the (resource, actorId) subscription; no-op if absent. */
+  unsubscribe(resource: EventResource, actorId: string): void;
+  /** Every subscription — the audit/inspection view. */
+  list(): EventSourceSubscription[];
+  /** The actors subscribed to this exact resource. Never consults ancestors. */
+  subscribersOf(resource: EventResource): EventSourceSubscription[];
+}
+
+/** In-memory subscription store — for tests and the e2e runner. */
+export class InMemoryEventSourceSubscriptionStore implements EventSourceSubscriptionStore {
+  private readonly subs = new Map<string, EventSourceSubscription>();
+
+  subscribe(subscription: EventSourceSubscription): void {
+    const resource = resourceKey(subscription.resource);
+    this.subs.set(`${resource}\0${subscription.actorId}`, { ...subscription, resource });
+  }
+
+  unsubscribe(resource: EventResource, actorId: string): void {
+    this.subs.delete(`${resourceKey(resource)}\0${actorId}`);
+  }
+
+  list(): EventSourceSubscription[] {
+    return [...this.subs.values()].map((subscription) => ({ ...subscription }));
+  }
+
+  subscribersOf(resource: EventResource): EventSourceSubscription[] {
+    const key = resourceKey(resource);
+    return this.list().filter((subscription) => subscription.resource === key);
+  }
+}
+
+/**
+ * Boot-time anchoring for direct subscriptions, the counterpart of the
+ * unanchored-delegation sweep in {@link reconcileEventSources}.
+ *
+ * A subscription survives only while its resource is still contained by a
+ * configured source. Narrowing `config.yaml` is how an instance stops being
+ * responsible for a slice of the world, and a subscription that outlived that
+ * narrowing would keep delivering events from outside it — the same firehose
+ * an unanchored delegation would reopen, through a door ownership already
+ * closed. Deleted rather than tombstoned, because a subscription has no seed to
+ * suppress; if the config widens again the actor can simply subscribe again.
+ */
+export function reconcileEventSourceSubscriptions(
+  store: EventSourceSubscriptionStore,
+  configured: readonly EventResource[]
+): EventSourceSubscription[] {
+  const dropped: EventSourceSubscription[] = [];
+  for (const subscription of store.list()) {
+    const anchored = configured.some((resource) =>
+      isSubResourceOf(subscription.resource, resource)
+    );
+    if (anchored) continue;
+    store.unsubscribe(subscription.resource, subscription.actorId);
+    dropped.push(subscription);
+  }
+  return dropped;
 }
 
 /** The highest `event-subscriptions.json` document version this parser understands. */
@@ -422,7 +532,7 @@ export interface LegacyEventSubscriptionDocument {
    * Accepted rows, tombstones first: replaying them through `restore()` in this
    * order never trips the one-active-subscriber invariant.
    */
-  subscriptions: EventSubscription[];
+  subscriptions: EventSourceOwnership[];
   /** Rows that could not be resolved. Every one is an ownership claim, so no caller may ignore them. */
   rejections: LegacyEventSubscriptionRejection[];
 }
@@ -480,7 +590,7 @@ export function parseLegacyEventSubscriptionDocument(
   const rejections: LegacyEventSubscriptionRejection[] = [];
   type ParsedRow = {
     index: number;
-    subscription: EventSubscription;
+    subscription: EventSourceOwnership;
     stateChangedAt: number;
   };
   const parsedRows: ParsedRow[] = [];
@@ -548,7 +658,7 @@ export function parseLegacyEventSubscriptionDocument(
   // Tombstones cannot contend for live ownership. Among active actors, an
   // unambiguous newest subscribe wins. Equal instants are rejected as an
   // authority conflict instead of assigning ownership from JSON file order.
-  const subscriptions: EventSubscription[] = [];
+  const subscriptions: EventSourceOwnership[] = [];
   for (const { subscription } of resolvedRows.filter(
     ({ subscription }) => subscription.unsubscribedAt
   )) {
@@ -578,7 +688,7 @@ export function parseLegacyEventSubscriptionDocument(
   return { subscriptions, rejections };
 }
 
-function parsePersistedSubscription(value: unknown): EventSubscription {
+function parsePersistedSubscription(value: unknown): EventSourceOwnership {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("row is not an object");
   }
@@ -602,7 +712,7 @@ function parsePersistedSubscription(value: unknown): EventSubscription {
   };
 }
 
-function persistedRowTieKey(subscription: EventSubscription): string {
+function persistedRowTieKey(subscription: EventSourceOwnership): string {
   return [
     subscription.resource,
     subscription.actorId,

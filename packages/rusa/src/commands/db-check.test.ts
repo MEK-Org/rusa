@@ -223,19 +223,19 @@ describe("db-check", () => {
     const result = runDbCheckAgainstHome(home);
 
     expect(result.plannedActors).toBe(2);
-    expect(result.plannedEventSubscriptions).toBe(1);
+    expect(result.plannedEventSourceOwnerships).toBe(1);
 
     // Plan mode never archives the source or writes durable subscription rows.
     expect(readFileSync(join(home, "event-subscriptions.json"), "utf8")).toBe(subscriptions);
     const db = new Database(join(home, "data", "mesh.db"));
-    expect(new Repositories(db).eventSubscriptions.list()).toEqual([]);
+    expect(new Repositories(db).eventSourceOwners.list()).toEqual([]);
     db.close();
   });
 
   it("reports no planned subscriptions on a fresh home and creates no subscription file", () => {
     const result = runDbCheckAgainstHome(home);
 
-    expect(result.plannedEventSubscriptions).toBe(0);
+    expect(result.plannedEventSourceOwnerships).toBe(0);
     expect(existsSync(join(home, "event-subscriptions.json"))).toBe(false);
   });
 
@@ -293,7 +293,7 @@ describe("db-check", () => {
     runDbCheck({ home });
 
     expect(process.exit).not.toHaveBeenCalled();
-    expect(consoleLog).toHaveBeenCalledWith(expect.stringContaining("0 event subscription(s)"));
+    expect(consoleLog).toHaveBeenCalledWith(expect.stringContaining("0 event source ownership(s)"));
     expect(consoleLog).toHaveBeenCalledWith("✓ db-check passed");
     consoleLog.mockRestore();
   });

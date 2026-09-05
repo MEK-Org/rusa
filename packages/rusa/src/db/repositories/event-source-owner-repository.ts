@@ -1,9 +1,9 @@
 import type Database from "better-sqlite3";
 import {
-  activeSubscriberConflictMessage,
+  activeOwnerConflictMessage,
   type EventResource,
-  type EventSubscription,
-  type EventSubscriptionStore,
+  type EventSourceOwnerStore,
+  type EventSourceOwnership,
   resourceKey,
 } from "../../actor/event-subscriptions.js";
 
@@ -15,7 +15,7 @@ type SubscriptionRow = {
   unsubscribed_at: string | null;
 };
 
-function fromRow(row: SubscriptionRow): EventSubscription {
+function fromRow(row: SubscriptionRow): EventSourceOwnership {
   return {
     resource: row.resource,
     actorId: row.actor_id,
@@ -28,36 +28,38 @@ function fromRow(row: SubscriptionRow): EventSubscription {
 const SELECT_COLUMNS = "resource, actor_id, subscribed_by, subscribed_at, unsubscribed_at";
 
 /**
- * SQLite implementation of {@link EventSubscriptionStore} — every call reads
- * straight from `event_subscriptions` with no process-local cache, so a
+ * SQLite implementation of {@link EventSourceOwnerStore} — every call reads
+ * straight from `event_source_owners` with no process-local cache, so a
  * subscribe or unsubscribe committed by another connection is visible to the
  * next call without an orchestrator restart. `actor_id` is owned by the
- * referenced `actors` row (0038_event_subscriptions).
+ * referenced `actors` row (0038_event_source_owners).
  *
  * This holds only *explicit* subscriptions. The config-implied seed lives in an
- * `InMemoryEventSubscriptionStore` that `reconcileEventSources` rebuilds each
+ * `InMemoryEventSourceOwnerStore` that `reconcileEventSources` rebuilds each
  * boot and unions over this one, so a tombstone written here keeps suppressing
  * its implied counterpart across restarts.
  */
-export class DbEventSubscriptionStore implements EventSubscriptionStore {
+export class DbEventSourceOwnerStore implements EventSourceOwnerStore {
   constructor(private readonly db: Database.Database) {}
 
-  subscribe(subscription: Omit<EventSubscription, "resource"> & { resource: EventResource }): void {
+  subscribe(
+    subscription: Omit<EventSourceOwnership, "resource"> & { resource: EventResource }
+  ): void {
     this.write({ ...subscription, unsubscribedAt: undefined });
   }
 
   /**
    * Hydrate one already-durable row without reactivating a tombstone — the
    * write the legacy importer needs, and the counterpart of
-   * `InMemoryEventSubscriptionStore.restore`. Deliberately off
-   * {@link EventSubscriptionStore}: nothing in the mesh may resurrect a
+   * `InMemoryEventSourceOwnerStore.restore`. Deliberately off
+   * {@link EventSourceOwnerStore}: nothing in the mesh may resurrect a
    * subscription except through `subscribe`.
    */
-  restore(subscription: EventSubscription): void {
+  restore(subscription: EventSourceOwnership): void {
     this.write(subscription);
   }
 
-  private write(subscription: EventSubscription): void {
+  private write(subscription: EventSourceOwnership): void {
     const resource = resourceKey(subscription.resource);
     // One active subscriber per resource. The conflict check and the write are
     // one transaction so a concurrent writer cannot slip between them; the
@@ -69,13 +71,13 @@ export class DbEventSubscriptionStore implements EventSubscriptionStore {
         );
         if (holder) {
           throw new Error(
-            activeSubscriberConflictMessage(resource, holder.actorId, subscription.actorId)
+            activeOwnerConflictMessage(resource, holder.actorId, subscription.actorId)
           );
         }
       }
       this.db
         .prepare(
-          `INSERT INTO event_subscriptions
+          `INSERT INTO event_source_owners
              (resource, actor_id, subscribed_by, subscribed_at, unsubscribed_at)
            VALUES (?, ?, ?, ?, ?)
            ON CONFLICT(resource, actor_id) DO UPDATE SET
@@ -96,25 +98,25 @@ export class DbEventSubscriptionStore implements EventSubscriptionStore {
   unsubscribe(resource: EventResource, actorId: string, at: string): void {
     this.db
       .prepare(
-        `UPDATE event_subscriptions SET unsubscribed_at = ?
+        `UPDATE event_source_owners SET unsubscribed_at = ?
          WHERE resource = ? AND actor_id = ? AND unsubscribed_at IS NULL`
       )
       .run(at, resourceKey(resource), actorId);
   }
 
-  list(): EventSubscription[] {
+  list(): EventSourceOwnership[] {
     return (
       this.db
-        .prepare(`SELECT ${SELECT_COLUMNS} FROM event_subscriptions`)
+        .prepare(`SELECT ${SELECT_COLUMNS} FROM event_source_owners`)
         .all() as SubscriptionRow[]
     ).map(fromRow);
   }
 
-  activeForResource(resource: EventResource): EventSubscription[] {
+  activeForResource(resource: EventResource): EventSourceOwnership[] {
     return (
       this.db
         .prepare(
-          `SELECT ${SELECT_COLUMNS} FROM event_subscriptions
+          `SELECT ${SELECT_COLUMNS} FROM event_source_owners
            WHERE resource = ? AND unsubscribed_at IS NULL`
         )
         .all(resourceKey(resource)) as SubscriptionRow[]

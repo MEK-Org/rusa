@@ -11,15 +11,15 @@ import {
   REPO,
   ROOT,
   sub,
-  testEventSubscriptionStoreContract,
-} from "../../actor/event-subscription-store.contract.js";
+  testEventSourceOwnerStoreContract,
+} from "../../actor/event-source-owner-store.contract.js";
 import { reconcileEventSources } from "../../actor/event-subscriptions.js";
 import { runMigrations } from "../migrations/runner.js";
 import { widenToWal } from "../wal.js";
-import { DbEventSubscriptionStore } from "./event-subscription-repository.js";
+import { DbEventSourceOwnerStore } from "./event-source-owner-repository.js";
 
 /**
- * Seeds the actors this suite subscribes — event_subscriptions.actor_id is
+ * Seeds the actors this suite subscribes — event_source_owners.actor_id is
  * FK-owned. `actors` caps parentless rows to one (root topology), so the
  * first id seeds as root and every subsequent id is parented under it.
  */
@@ -41,18 +41,18 @@ function makeDb(): Database.Database {
   return db;
 }
 
-testEventSubscriptionStoreContract(
-  "DbEventSubscriptionStore",
-  () => new DbEventSubscriptionStore(makeDb())
+testEventSourceOwnerStoreContract(
+  "DbEventSourceOwnerStore",
+  () => new DbEventSourceOwnerStore(makeDb())
 );
 
-describe("DbEventSubscriptionStore (DB-specific)", () => {
+describe("DbEventSourceOwnerStore (DB-specific)", () => {
   let db: Database.Database;
-  let store: DbEventSubscriptionStore;
+  let store: DbEventSourceOwnerStore;
 
   beforeEach(() => {
     db = makeDb();
-    store = new DbEventSubscriptionStore(db);
+    store = new DbEventSourceOwnerStore(db);
   });
 
   it("refuses to subscribe an actor id with no actors row", () => {
@@ -64,7 +64,7 @@ describe("DbEventSubscriptionStore (DB-specific)", () => {
     expect(() =>
       db
         .prepare(
-          "INSERT INTO event_subscriptions (resource, actor_id, subscribed_by, subscribed_at) VALUES (?, ?, ?, ?)"
+          "INSERT INTO event_source_owners (resource, actor_id, subscribed_by, subscribed_at) VALUES (?, ?, ?, ?)"
         )
         .run(REPO, ACTOR_A, ROOT, "2026-06-30T00:00:00Z")
     ).toThrow();
@@ -75,7 +75,7 @@ describe("DbEventSubscriptionStore (DB-specific)", () => {
     expect(() =>
       db
         .prepare(
-          "INSERT INTO event_subscriptions (resource, actor_id, subscribed_by, subscribed_at) VALUES (?, ?, ?, ?)"
+          "INSERT INTO event_source_owners (resource, actor_id, subscribed_by, subscribed_at) VALUES (?, ?, ?, ?)"
         )
         .run(REPO, ACTOR_B, ROOT, "2026-06-30T00:00:00Z")
     ).toThrow();
@@ -118,7 +118,7 @@ describe("DbEventSubscriptionStore (DB-specific)", () => {
   });
 });
 
-describe("DbEventSubscriptionStore (file-backed database)", () => {
+describe("DbEventSourceOwnerStore (file-backed database)", () => {
   let directory: string;
   let file: string;
 
@@ -145,14 +145,14 @@ describe("DbEventSubscriptionStore (file-backed database)", () => {
 
   it("persists active rows and tombstones across a database reopen", () => {
     const first = open();
-    const writer = new DbEventSubscriptionStore(first);
+    const writer = new DbEventSourceOwnerStore(first);
     writer.subscribe(sub({ resource: REPO, actorId: ACTOR_A }));
     writer.subscribe(sub({ resource: OTHER, actorId: ACTOR_B }));
     writer.unsubscribe(OTHER, ACTOR_B, "2026-06-28T00:00:00Z");
     first.close();
 
     const reopened = open();
-    const reloaded = new DbEventSubscriptionStore(reopened);
+    const reloaded = new DbEventSourceOwnerStore(reopened);
     expect(reloaded.activeForResource(REPO).map((row) => row.actorId)).toEqual([ACTOR_A]);
     expect(reloaded.activeForResource(OTHER)).toEqual([]);
     expect(reloaded.list()).toHaveLength(2);
@@ -162,13 +162,13 @@ describe("DbEventSubscriptionStore (file-backed database)", () => {
   it("a second connection observes a committed subscribe without reopening", () => {
     const service = open();
     const dashboard = open();
-    const reader = new DbEventSubscriptionStore(dashboard);
+    const reader = new DbEventSourceOwnerStore(dashboard);
     expect(reader.activeForResource(REPO)).toEqual([]);
 
-    new DbEventSubscriptionStore(service).subscribe(sub({ actorId: ACTOR_A }));
+    new DbEventSourceOwnerStore(service).subscribe(sub({ actorId: ACTOR_A }));
     expect(reader.activeForResource(REPO).map((row) => row.actorId)).toEqual([ACTOR_A]);
 
-    new DbEventSubscriptionStore(service).unsubscribe(REPO, ACTOR_A, "2026-06-28T00:00:00Z");
+    new DbEventSourceOwnerStore(service).unsubscribe(REPO, ACTOR_A, "2026-06-28T00:00:00Z");
     expect(reader.activeForResource(REPO)).toEqual([]);
 
     service.close();
@@ -177,7 +177,7 @@ describe("DbEventSubscriptionStore (file-backed database)", () => {
 
   it("observes a subscribe committed by a separate process", () => {
     const service = open();
-    const reader = new DbEventSubscriptionStore(service);
+    const reader = new DbEventSourceOwnerStore(service);
     expect(reader.activeForResource(REPO)).toEqual([]);
 
     // A real second process, as the dashboard and CLI are: the reader holds no
@@ -191,7 +191,7 @@ describe("DbEventSubscriptionStore (file-backed database)", () => {
         `import Database from "better-sqlite3";
          const db = new Database(process.argv[1]);
          db.prepare(
-           "INSERT INTO event_subscriptions (resource, actor_id, subscribed_by, subscribed_at) VALUES (?, ?, ?, ?)"
+           "INSERT INTO event_source_owners (resource, actor_id, subscribed_by, subscribed_at) VALUES (?, ?, ?, ?)"
          ).run(process.argv[2], process.argv[3], process.argv[3], "2026-06-27T00:00:00Z");
          db.close();`,
         file,
@@ -212,7 +212,7 @@ describe("DbEventSubscriptionStore (file-backed database)", () => {
     // explicitly unsubscribes — which must leave a durable tombstone.
     const first = open();
     const firstBoot = reconcileEventSources(
-      new DbEventSubscriptionStore(first),
+      new DbEventSourceOwnerStore(first),
       configured,
       ROOT,
       () => "2026-06-27T00:00:00Z"
@@ -226,7 +226,7 @@ describe("DbEventSubscriptionStore (file-backed database)", () => {
     // tombstone still suppresses it.
     const second = open();
     const secondBoot = reconcileEventSources(
-      new DbEventSubscriptionStore(second),
+      new DbEventSourceOwnerStore(second),
       configured,
       ROOT,
       () => "2026-06-29T00:00:00Z"
@@ -241,7 +241,7 @@ describe("DbEventSubscriptionStore (file-backed database)", () => {
   it("keeps an explicit delegation over the implied seed, and drops it once unanchored", () => {
     const first = open();
     const firstBoot = reconcileEventSources(
-      new DbEventSubscriptionStore(first),
+      new DbEventSourceOwnerStore(first),
       [REPO],
       ROOT,
       () => "2026-06-27T00:00:00Z"
@@ -254,7 +254,7 @@ describe("DbEventSubscriptionStore (file-backed database)", () => {
     // Restart with the delegation still anchored in config: it survives.
     const second = open();
     const secondBoot = reconcileEventSources(
-      new DbEventSubscriptionStore(second),
+      new DbEventSourceOwnerStore(second),
       [REPO],
       ROOT,
       () => "2026-06-29T00:00:00Z"
@@ -265,14 +265,14 @@ describe("DbEventSubscriptionStore (file-backed database)", () => {
     // Restart after the operator removed the source from config: dropped.
     const third = open();
     const thirdBoot = reconcileEventSources(
-      new DbEventSubscriptionStore(third),
+      new DbEventSourceOwnerStore(third),
       [OTHER],
       ROOT,
       () => "2026-06-30T00:00:00Z"
     );
     expect(thirdBoot.droppedDelegations.map((row) => row.actorId)).toEqual([ACTOR_A]);
     expect(thirdBoot.store.activeForResource(REPO)).toEqual([]);
-    expect(new DbEventSubscriptionStore(third).list()).toEqual(
+    expect(new DbEventSourceOwnerStore(third).list()).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ actorId: ACTOR_A, unsubscribedAt: "2026-06-30T00:00:00Z" }),
       ])
@@ -282,7 +282,7 @@ describe("DbEventSubscriptionStore (file-backed database)", () => {
 });
 
 /**
- * `event_subscriptions.actor_id` is FK-owned, which the JSON store had no
+ * `event_source_owners.actor_id` is FK-owned, which the JSON store had no
  * equivalent of. On a fresh install `resolveRootActorId` mints a root id
  * whose `actors` row only lands later, when `mesh.adopt` upserts it — after
  * the boot wiring that reconciles event sources. These lock the property that
@@ -290,12 +290,12 @@ describe("DbEventSubscriptionStore (file-backed database)", () => {
  * of an existing row, so nothing is ever INSERTed against an id the `actors`
  * table has not seen yet.
  */
-describe("DbEventSubscriptionStore (boot before root adoption)", () => {
+describe("DbEventSourceOwnerStore (boot before root adoption)", () => {
   it("seeds the config-implied subscriptions for a root that has no actors row yet", () => {
     const db = new Database(":memory:");
     runMigrations(db);
     db.pragma("foreign_keys = ON");
-    const store = new DbEventSubscriptionStore(db);
+    const store = new DbEventSourceOwnerStore(db);
     const unadoptedRoot = "root-not-yet-adopted";
 
     const boot = reconcileEventSources(store, [REPO], unadoptedRoot, () => "2026-06-27T00:00:00Z");
@@ -310,7 +310,7 @@ describe("DbEventSubscriptionStore (boot before root adoption)", () => {
 
   it("tombstones an unanchored delegation without inserting a row for the unadopted root", () => {
     const db = makeDb();
-    const store = new DbEventSubscriptionStore(db);
+    const store = new DbEventSourceOwnerStore(db);
     store.subscribe(sub({ actorId: ACTOR_A }));
     const unadoptedRoot = "root-not-yet-adopted";
 

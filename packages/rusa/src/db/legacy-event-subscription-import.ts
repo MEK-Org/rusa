@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type Database from "better-sqlite3";
 import {
   EVENT_SUBSCRIPTIONS_FILENAME,
-  type EventSubscription,
+  type EventSourceOwnership,
   parseLegacyEventSubscriptionDocument,
 } from "../actor/event-subscriptions.js";
 import type { Repositories } from "./repositories/index.js";
@@ -14,7 +14,7 @@ export const EVENT_SUBSCRIPTION_IMPORT_SOURCE = EVENT_SUBSCRIPTIONS_FILENAME;
 /** The read-only slice of {@link Repositories} a plan is allowed to touch. */
 interface PlanRepositories {
   actors: Pick<Repositories["actors"], "list">;
-  eventSubscriptions: Pick<Repositories["eventSubscriptions"], "list">;
+  eventSourceOwners: Pick<Repositories["eventSourceOwners"], "list">;
   legacyImportReceipts: Pick<Repositories["legacyImportReceipts"], "has">;
 }
 
@@ -43,7 +43,7 @@ export interface LegacyEventSubscriptionImportResult {
 export type LegacyEventSubscriptionImportPlan =
   | { kind: "noop" }
   | { kind: "already-imported" }
-  | { kind: "import"; subscriptions: EventSubscription[] };
+  | { kind: "import"; subscriptions: EventSourceOwnership[] };
 
 export interface LegacyEventSubscriptionImportPlanResult {
   plan: LegacyEventSubscriptionImportPlan;
@@ -55,7 +55,7 @@ export interface LegacyEventSubscriptionImportPlanResult {
 
 /**
  * Parse and validate `event-subscriptions.json` against the current
- * `event_subscriptions` projection without performing any write. Only accepts a
+ * `event_source_owners` projection without performing any write. Only accepts a
  * read-only slice of {@link Repositories}, so it cannot open a DB transaction,
  * write a subscription, or archive the legacy file.
  *
@@ -127,7 +127,7 @@ export function planLegacyEventSubscriptionImport(options: {
   // No receipt but durable rows already exist: something wrote subscriptions
   // outside the importer, so neither side can be shown to be newer. Refuse
   // rather than guess which ownership survives.
-  const existing = options.repositories.eventSubscriptions.list();
+  const existing = options.repositories.eventSourceOwners.list();
   if (existing.length > 0) {
     throw new Error(
       `Legacy event-subscription import: ${filePath} is present but ${existing.length} durable ` +
@@ -176,7 +176,7 @@ export function applyLegacyEventSubscriptionImport(
         // The plan orders tombstones first, so replaying it never trips the
         // one-active-subscriber invariant on its way to the final state.
         for (const subscription of subscriptions) {
-          options.repositories.eventSubscriptions.restore(subscription);
+          options.repositories.eventSourceOwners.restore(subscription);
         }
         options.repositories.legacyImportReceipts.record(
           EVENT_SUBSCRIPTION_IMPORT_SOURCE,
