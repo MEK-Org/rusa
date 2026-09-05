@@ -73,11 +73,14 @@ try {
   await api(`/actors/${id}/messages`, { body: "First round trip" });
   const first = await waitForRun(1);
   assert.equal(first.execution.followerId, values.target);
-  assert(first.execution.actorPid);
+  assert.equal(first.execution.runtime, "remote-instance");
+  assert.equal(first.execution.instancePid, followers.find((f) => f.id === values.target).pid);
+  const siblingRecord = await api(`/actors/${sibling}`);
+  assert.equal(siblingRecord.execution.instancePid, first.execution.instancePid);
   await api(`/actors/${id}/messages`, { body: "Second round trip" });
   const second = await waitForRun(2);
   assert.equal(second.sessionId, first.sessionId);
-  assert.equal(second.execution.actorPid, first.execution.actorPid);
+  assert.equal(second.execution.instancePid, first.execution.instancePid);
   const inbox = await api("/root/inbox");
   assert(inbox.entries.filter((entry) => entry.payload.fromId === id).length >= 2);
   await api(`/actors/${id}/retire`, {});

@@ -1,29 +1,27 @@
-import { fork } from "node:child_process";
 import type { ActorOptions } from "../../actor/actor.js";
 import type { ActorFactoryContext, ActorRuntimeState, MeshActor } from "../../actor/actor-mesh.js";
 import type { RunStartHandle } from "../../actor/concurrency-limiter.js";
 import type { RunNudge } from "../../actor/trigger-runner.js";
 import type { CodingProvider } from "../../providers/types.js";
-import type { ActorHost } from "./actor-host.js";
-import type { Bootstrap, ChildMessage, ParentMessage, RunSnapshot } from "./protocol.js";
+import type { ActorChannel } from "./actor-channel.js";
+import type { ActorEvent, Bootstrap, LeaderCommand, RunSnapshot } from "./protocol.js";
 
-export interface ProcessActorOptions {
-  host?: ActorHost;
-  childEntry: string | URL;
+export interface ActorHandleOptions {
+  host: ActorChannel;
   bootstrap: Bootstrap;
   context: ActorFactoryContext;
   // Read only after central scheduler admission, so queued runs get fresh work.
   snapshot: () => RunSnapshot;
   saveSession: (sessionId: string) => void;
-  onEvent?: (event: ChildMessage) => void;
+  onEvent?: (event: ActorEvent) => void;
   onFailure: (error: Error) => void;
   actorOptions?: ActorOptions;
 }
 
-/** Experimental MeshActor adapter. One real Actor lives in each child process. */
-export class ProcessActor implements MeshActor {
+/** MeshActor compatibility handle; connection/lifetime belongs to RemoteInstance. */
+export class ActorHandle implements MeshActor {
   readonly id: string;
-  readonly process: ActorHost;
+  readonly channel: ActorChannel;
   readonly ready: Promise<number>;
   readonly exited: Promise<void>;
   private state: ActorRuntimeState = "idle";
@@ -31,17 +29,10 @@ export class ProcessActor implements MeshActor {
   private closed = false;
   private gates = new Map<number, { handle: RunStartHandle<void>; release: () => void }>();
   private startupTimer: ReturnType<typeof setTimeout>;
-  private killTimer?: ReturnType<typeof setTimeout>;
 
-  constructor(private readonly opts: ProcessActorOptions) {
+  constructor(private readonly opts: ActorHandleOptions) {
     this.id = opts.bootstrap.id;
-    this.process =
-      opts.host ??
-      fork(opts.childEntry, [], {
-        cwd: opts.bootstrap.cwd,
-        execArgv: [],
-        stdio: ["ignore", "inherit", "inherit", "ipc"],
-      });
+    this.channel = opts.host;
     let resolveReady!: (pid: number) => void;
     let rejectReady!: (error: Error) => void;
     this.ready = new Promise((resolve, reject) => {
@@ -51,26 +42,25 @@ export class ProcessActor implements MeshActor {
     // Factories are synchronous; boot failure can arrive before the caller awaits ready.
     void this.ready.catch(() => {});
     this.startupTimer = setTimeout(
-      () => this.fail(new Error("Actor child startup timed out")),
+      () => this.fail(new Error("Remote actor startup timed out")),
       10_000
     );
-    this.process.on("message", (raw) => {
-      const message = raw as ChildMessage;
+    this.channel.on("message", (raw) => {
+      const message = raw as ActorEvent;
       if (message.type === "ready") {
         clearTimeout(this.startupTimer);
         resolveReady(message.pid);
       }
       void this.receive(message).catch((error) => this.fail(error));
     });
-    this.process.on("error", (error) => {
+    this.channel.on("error", (error) => {
       rejectReady(error);
       this.fail(error);
     });
     this.exited = new Promise((resolve) =>
-      this.process.once("exit", (code, signal) => {
+      this.channel.once("exit", (code, signal) => {
         clearTimeout(this.startupTimer);
-        clearTimeout(this.killTimer);
-        const error = new Error(`Actor child exited (${signal ?? code})`);
+        const error = new Error(`Remote actor exited (${signal ?? code})`);
         rejectReady(error);
         if (!this.closed) this.fail(error);
         this.releaseGates();
@@ -123,13 +113,9 @@ export class ProcessActor implements MeshActor {
     if (this.closed) return;
     this.closed = true;
     clearTimeout(this.startupTimer);
-    // Keep running slots occupied until the child releases them or exits.
+    // Keep running slots occupied until the remote actor releases them or exits.
     for (const gate of this.gates.values()) gate.handle.cancel?.();
     this.send({ type: "stop" });
-    if (this.process.exitCode === null && this.process.signalCode === null) {
-      this.killTimer = setTimeout(() => this.process.kill("SIGKILL"), 1500);
-      this.killTimer.unref();
-    }
   }
 
   private releaseGates(): void {
@@ -146,14 +132,14 @@ export class ProcessActor implements MeshActor {
     this.opts.onFailure(error);
   }
 
-  private send(message: ParentMessage): void {
-    if (this.process.connected)
-      this.process.send(message, (error) => {
+  private send(message: LeaderCommand): void {
+    if (this.channel.connected)
+      this.channel.send(message, (error) => {
         if (error) this.fail(error);
       });
   }
 
-  private async receive(message: ChildMessage): Promise<void> {
+  private async receive(message: ActorEvent): Promise<void> {
     const ctx = this.opts.context;
     const hooks = this.opts.actorOptions;
     this.opts.onEvent?.(message);
@@ -228,7 +214,7 @@ export class ProcessActor implements MeshActor {
               this.send({ type: "reply", requestId });
               break;
             case "sendMessage":
-              // Bind sender identity here; the child cannot choose a different actor.
+              // Bind sender identity here; the remote actor cannot choose a different actor.
               this.send({
                 type: "reply",
                 requestId,

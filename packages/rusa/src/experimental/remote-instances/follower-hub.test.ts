@@ -3,6 +3,7 @@ import { once } from "node:events";
 import { createServer } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { FollowerHub } from "./follower-hub.js";
+import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 
 const hubs: FollowerHub[] = [];
 afterEach(async () => {
@@ -20,7 +21,12 @@ async function setup() {
       body: JSON.stringify(body),
     });
   const register = async (id: string) => {
-    const response = await post("/register", { id, platform: "darwin", pid: 123 });
+    const response = await post("/register", {
+      id,
+      platform: "darwin",
+      pid: 123,
+      protocolVersion: INSTANCE_PROTOCOL_VERSION,
+    });
     expect(response.status).toBe(200);
     return { id, ...((await response.json()) as { session: string }) };
   };
@@ -32,10 +38,20 @@ describe("leader follower gateway", () => {
     const h = await setup();
     expect((await fetch(`${h.origin}/followers`)).status).toBe(401);
     const identity = await h.register("mac");
-    expect((await h.post("/register", { id: "mac", platform: "darwin", pid: 124 })).status).toBe(
+    expect(
+      (
+        await h.post("/register", {
+          id: "mac",
+          platform: "darwin",
+          pid: 124,
+          protocolVersion: INSTANCE_PROTOCOL_VERSION,
+        })
+      ).status
+    ).toBe(409);
+    expect((await h.post("/poll", { id: "mac", session: "wrong" })).status).toBe(410);
+    expect((await h.post("/register", { id: "old", platform: "darwin", pid: 124 })).status).toBe(
       409
     );
-    expect((await h.post("/poll", { id: "mac", session: "wrong" })).status).toBe(410);
     expect(() => h.hub.createHost("unknown", "actor")).toThrow("not connected");
     await h.post("/unregister", identity);
     expect(h.hub.list()).toEqual([]);
@@ -46,6 +62,8 @@ describe("leader follower gateway", () => {
     const identity = await h.register("mac");
     const other = await h.register("other");
     const a = h.hub.createHost("mac", "a");
+    const received: unknown[] = [];
+    a.on("message", (event) => received.push(event));
     h.hub.createHost("mac", "b");
     a.send({ type: "wake" }, (error) => expect(error).toBeNull());
     const response = await h.post("/poll", identity);
@@ -54,12 +72,13 @@ describe("leader follower gateway", () => {
       ...other,
       events: [{ actorId: "a", message: { type: "ready", pid: 999 } }],
     });
-    expect(a.pid).toBeUndefined();
+    expect(received).toEqual([]);
+    expect(a.pid).toBe(123);
     await h.post("/events", {
       ...identity,
-      events: [{ actorId: "a", message: { type: "ready", pid: 42 } }],
+      events: [{ actorId: "a", message: { type: "ready", pid: 123 } }],
     });
-    expect(a.pid).toBe(42);
+    expect(received).toEqual([{ type: "ready", pid: 123 }]);
     const exited = once(a, "exit");
     await h.post("/events", {
       ...identity,

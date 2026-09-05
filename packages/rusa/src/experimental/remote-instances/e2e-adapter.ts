@@ -1,29 +1,26 @@
+import { Actor } from "../../actor/actor.js";
 import type { RunStartE2EHooks } from "../../commands/start.js";
 import type { RusaConfig } from "../../config/types.js";
+import { ActorHandle } from "./actor-handle.js";
 import type { FollowerHub } from "./follower-hub.js";
-import { ProcessActor } from "./process-actor.js";
 
-export function processWorkerFactory(
+export function instanceWorkerFactory(
   config: RusaConfig,
-  paths: { childEntry: URL; providerModule: URL },
-  hub?: FollowerHub
+  hub: FollowerHub
 ): NonNullable<RunStartE2EHooks["createWorkerActor"]> {
   return (context, options) => {
     const record = context.record;
     const name = record.provider ?? config.rootActor?.provider ?? "antigravity";
     const target = context.executionTarget;
-    if (target && !hub) throw new Error("Follower gateway is not enabled");
-    const host = target ? hub?.createHost(target, record.id) : undefined;
-    const toolUrls = () =>
-      target && hub ? hub.toolUrls(target, record.id, options.mcpServers) : options.mcpServers;
-    const runtime = new ProcessActor({
+    if (!target) return new Actor(options);
+    const host = hub.createHost(target, record.id);
+    const toolUrls = () => hub.toolUrls(target, record.id, options.mcpServers);
+    const runtime = new ActorHandle({
       host,
-      childEntry: paths.childEntry,
       bootstrap: {
         id: record.id,
         cwd: options.cwd,
         sessionId: options.loadSessionId(),
-        providerModule: paths.providerModule.href,
         providerOptions: {
           providers: { [name]: config.providers[name] },
           name,
@@ -58,11 +55,13 @@ export function processWorkerFactory(
       saveSession: options.saveSessionId,
       onEvent: (event) => {
         if (event.type === "ready") {
-          options.log?.(`[process-actor] coordinator=${process.pid} actor=${event.pid}\n`);
+          options.log?.(
+            `[remote-instance] coordinator=${process.pid} follower=${target} pid=${event.pid}\n`
+          );
         }
       },
       onFailure: (error) => {
-        options.log?.(`[process-actor] ${error.message}\n`);
+        options.log?.(`[remote-instance] ${error.message}\n`);
         void options.onRunEnd?.({ success: false, output: error.message, exitCode: -1 });
       },
     });

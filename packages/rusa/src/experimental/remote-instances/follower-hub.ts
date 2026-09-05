@@ -1,5 +1,4 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { EventEmitter } from "node:events";
 import {
   createServer,
   type IncomingMessage,
@@ -7,67 +6,18 @@ import {
   type ServerResponse,
 } from "node:http";
 import type { McpServerSpec } from "../../providers/types.js";
-import type { ActorHost } from "./actor-host.js";
-import type { ChildMessage, ParentMessage } from "./protocol.js";
+import type { ActorChannel } from "./actor-channel.js";
+import type { ActorEvent, LeaderCommand } from "./protocol.js";
+import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
+import { RemoteInstance } from "./remote-instance.js";
 
 export interface FollowerCommand {
   actorId: string;
-  message: ParentMessage | { type: "kill" };
+  message: LeaderCommand;
 }
 export interface FollowerEvent {
   actorId: string;
-  message: ChildMessage | { type: "exit"; code: number | null; signal: NodeJS.Signals | null };
-}
-interface Follower {
-  id: string;
-  session: string;
-  platform: string;
-  pid: number;
-  seen: number;
-  commands: FollowerCommand[];
-  poll?: ServerResponse;
-  pollTimer?: ReturnType<typeof setTimeout>;
-  hosts: Map<string, FollowerActorHost>;
-}
-
-class FollowerActorHost extends EventEmitter implements ActorHost {
-  get nodeId(): string {
-    return this.followerId;
-  }
-  pid?: number;
-  connected = true;
-  exitCode: number | null = null;
-  signalCode: NodeJS.Signals | null = null;
-  constructor(
-    readonly followerId: string,
-    private readonly enqueue: (message: FollowerCommand["message"]) => void
-  ) {
-    super();
-  }
-  send(message: ParentMessage, callback: (error: Error | null) => void): boolean {
-    if (!this.connected) {
-      callback(new Error("Follower actor disconnected"));
-      return false;
-    }
-    this.enqueue(message);
-    callback(null);
-    return true;
-  }
-  kill(): boolean {
-    if (!this.connected) return false;
-    this.enqueue({ type: "kill" });
-    return true;
-  }
-  receive(message: FollowerEvent["message"]): void {
-    if (!this.connected) return;
-    if (message.type === "ready") this.pid = message.pid;
-    if (message.type === "exit") {
-      this.connected = false;
-      this.exitCode = message.code;
-      this.signalCode = message.signal;
-      this.emit("exit", message.code, message.signal);
-    } else this.emit("message", message);
-  }
+  message: ActorEvent | { type: "exit"; code: number | null; signal: NodeJS.Signals | null };
 }
 
 async function readJson(req: IncomingMessage): Promise<unknown> {
@@ -90,7 +40,7 @@ function reply(res: ServerResponse, status: number, value: unknown): void {
  * Control requests use an enrollment secret; MCP URLs are per-actor capabilities.
  */
 export class FollowerHub {
-  private followers = new Map<string, Follower>();
+  private followers = new Map<string, RemoteInstance>();
   private routes = new Map<string, { followerId: string; actorId: string; target: string }>();
   private sweep = setInterval(() => {
     for (const follower of this.followers.values()) {
@@ -134,17 +84,11 @@ export class FollowerHub {
       lastSeen: new Date(f.seen).toISOString(),
     }));
   }
-  createHost(followerId: string, actorId: string): ActorHost {
+  createHost(followerId: string, actorId: string): ActorChannel {
     const follower = this.followers.get(followerId);
     if (!follower) throw new Error(`Follower ${followerId} is not connected`);
-    if (follower.hosts.has(actorId)) throw new Error("Actor already assigned");
-    const host = new FollowerActorHost(followerId, (message) => {
-      follower.commands.push({ actorId, message });
-      this.flush(follower);
-    });
-    follower.hosts.set(actorId, host);
+    const host = follower.createHost(actorId);
     host.once("exit", () => {
-      follower.hosts.delete(actorId);
       for (const [key, route] of this.routes)
         if (route.actorId === actorId) this.routes.delete(key);
     });
@@ -172,18 +116,9 @@ export class FollowerHub {
     this.server.closeAllConnections();
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
   }
-  private drop(follower: Follower): void {
-    clearTimeout(follower.pollTimer);
-    if (follower.poll) reply(follower.poll, 410, { error: "Follower disconnected" });
+  private drop(follower: RemoteInstance): void {
     this.followers.delete(follower.id);
-    for (const host of [...follower.hosts.values()])
-      host.receive({ type: "exit", code: -1, signal: null });
-  }
-  private flush(follower: Follower): void {
-    if (!follower.poll || !follower.commands.length) return;
-    clearTimeout(follower.pollTimer);
-    reply(follower.poll, 200, follower.commands.splice(0));
-    follower.poll = undefined;
+    follower.close();
   }
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const path = new URL(req.url ?? "/", "http://localhost").pathname;
@@ -225,6 +160,10 @@ export class FollowerHub {
     }
     const body = (await readJson(req)) as Record<string, unknown>;
     if (path === "/register") {
+      if (body.protocolVersion !== INSTANCE_PROTOCOL_VERSION) {
+        reply(res, 409, { error: "Incompatible instance protocol; rebuild leader and follower" });
+        return;
+      }
       if (
         typeof body.id !== "string" ||
         !/^[a-zA-Z0-9_-]{1,64}$/.test(body.id) ||
@@ -237,17 +176,9 @@ export class FollowerHub {
         reply(res, 409, { error: "Follower already connected" });
         return;
       }
-      const follower: Follower = {
-        id: body.id,
-        session: randomBytes(32).toString("hex"),
-        platform: body.platform,
-        pid: body.pid,
-        seen: Date.now(),
-        commands: [],
-        hosts: new Map(),
-      };
+      const follower = new RemoteInstance(body.id, body.platform, body.pid);
       this.followers.set(follower.id, follower);
-      reply(res, 200, { session: follower.session });
+      reply(res, 200, { session: follower.session, protocolVersion: INSTANCE_PROTOCOL_VERSION });
       return;
     }
     const follower = typeof body.id === "string" ? this.followers.get(body.id) : undefined;
@@ -276,7 +207,7 @@ export class FollowerHub {
           follower.poll = undefined;
         }
       }, 20_000);
-      this.flush(follower);
+      follower.flush();
       return;
     }
     if (path === "/events") {
@@ -290,7 +221,7 @@ export class FollowerHub {
           typeof event.message.type !== "string"
         )
           throw new Error("Invalid event");
-        follower.hosts.get(event.actorId)?.receive(event.message);
+        follower.receive(event);
       }
       reply(res, 200, {});
       return;

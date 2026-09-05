@@ -1,10 +1,10 @@
-import { type ChildProcess, fork } from "node:child_process";
 import { mkdirSync, readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type { FollowerCommand, FollowerEvent } from "./follower-hub.js";
-import type { Bootstrap, ChildMessage, ParentMessage } from "./protocol.js";
+import { FollowerInstance } from "./follower-instance.js";
+import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 
 const { values } = parseArgs({
   options: {
@@ -31,7 +31,11 @@ if (leader.protocol !== "http:" && leader.protocol !== "https:")
 const token = readFileSync(values["token-file"], "utf8").trim();
 const root = resolve(values.home);
 mkdirSync(join(root, "workers"), { recursive: true });
-const children = new Map<string, ChildProcess>();
+// Instance-wide configuration is local; never mutate cwd/env for individual actors.
+process.env.RUSA_HOME = root;
+const instance = new FollowerInstance(root, values.sandbox === "bwrap", (event) =>
+  emit(event.actorId, event.message)
+);
 let session = "";
 let stopped = false;
 const events: FollowerEvent[] = [];
@@ -71,76 +75,20 @@ async function flush(): Promise<void> {
     sending = false;
   }
 }
-function dispatch(command: FollowerCommand): void {
-  if (!command || !/^[a-zA-Z0-9_-]{1,128}$/.test(command.actorId))
-    throw new Error("Invalid actor ID");
-  const { actorId, message } = command;
-  if (message.type === "init") {
-    if (children.has(actorId)) throw new Error("Actor already exists on follower");
-    const cwd = join(root, "workers", actorId);
-    mkdirSync(cwd, { recursive: true });
-    const bootstrap: Bootstrap = {
-      ...message.bootstrap,
-      id: actorId,
-      cwd,
-      // Never resolve an executable/module/working directory supplied by the leader.
-      providerModule: new URL("./process-actor-provider.js", import.meta.url).href,
-      actorOptions: {
-        ...message.bootstrap.actorOptions,
-        addDirs: [],
-        sandbox: values.sandbox === "bwrap",
-      },
-    };
-    const child = fork(new URL("./process-actor-child.js", import.meta.url), [], {
-      cwd,
-      execArgv: [],
-      stdio: ["ignore", "pipe", "pipe", "ipc"],
-      // Config and credentials are local. Do not borrow any leader RUSA_HOME.
-      env: { ...process.env, RUSA_HOME: root },
-    });
-    children.set(actorId, child);
-    child.stdout?.on("data", (chunk: Buffer) =>
-      emit(actorId, { type: "log", chunk: chunk.toString() })
-    );
-    child.stderr?.on("data", (chunk: Buffer) =>
-      emit(actorId, { type: "log", chunk: chunk.toString() })
-    );
-    child.on("message", (raw) => emit(actorId, raw as ChildMessage));
-    child.on("error", (error) => emit(actorId, { type: "fatal", error: error.message }));
-    child.once("exit", (code, signal) => {
-      children.delete(actorId);
-      emit(actorId, { type: "exit", code, signal });
-      console.log(`Actor ${actorId} exited; follower remains connected (${children.size} actors).`);
-    });
-    child.send({ type: "init", bootstrap } satisfies ParentMessage);
-    console.log(`Actor ${actorId}: pid=${child.pid} cwd=${cwd}`);
-    return;
-  }
-  const child = children.get(actorId);
-  if (!child) return;
-  if (message.type === "kill") child.kill("SIGKILL");
-  else if (child.connected)
-    child.send(message, (error) => {
-      if (error) emit(actorId, { type: "fatal", error: error.message });
-    });
-}
 async function stop(code: number): Promise<void> {
   if (stopped) return;
   stopped = true;
   clearTimeout(sendTimer);
-  for (const child of children.values()) {
-    if (child.connected) child.send({ type: "stop" } satisfies ParentMessage);
-  }
+  instance.close();
   // A lost leader ends this follower generation. No commands are replayed automatically.
   const force = setTimeout(() => {
-    for (const child of children.values()) child.kill("SIGKILL");
     process.exit(code);
   }, 1500);
   if (session) await post("/unregister", {}).catch(() => {});
-  if (!children.size) {
-    clearTimeout(force);
-    process.exit(code);
-  }
+  // Give interrupted provider invocations time to unwind, as part of instance shutdown.
+  while (instance.actorIds.length) await new Promise((resolve) => setTimeout(resolve, 20));
+  clearTimeout(force);
+  process.exit(code);
 }
 process.on("SIGINT", () => {
   void stop(0);
@@ -149,16 +97,20 @@ process.on("SIGTERM", () => {
   void stop(0);
 });
 try {
-  ({ session } = await post<{ session: string }>("/register", {
+  const registration = await post<{ session: string; protocolVersion: number }>("/register", {
     platform: process.platform,
     pid: process.pid,
-  }));
+    protocolVersion: INSTANCE_PROTOCOL_VERSION,
+  });
+  session = registration.session;
+  if (registration.protocolVersion !== INSTANCE_PROTOCOL_VERSION)
+    throw new Error("Incompatible instance protocol; rebuild leader and follower");
   console.log(
     `Follower ${values.id} registered with ${leader.origin}; pid=${process.pid}; sandbox=${values.sandbox}`
   );
   while (!stopped) {
     const commands = await post<FollowerCommand[]>("/poll", {});
-    for (const command of commands) dispatch(command);
+    for (const command of commands) instance.dispatch(command);
   }
 } catch (error) {
   console.error(String(error));

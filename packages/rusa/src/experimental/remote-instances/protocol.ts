@@ -4,11 +4,11 @@ import type { ActorRecord } from "../../actor/actor-record.js";
 import type { ActorRunMode, RunNudge } from "../../actor/trigger-runner.js";
 import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/types.js";
 
-// Local, trusted Node IPC only. These are data boundaries, not a network API.
+// Commands/events multiplexed by actor ID over the authenticated instance connection.
+export const INSTANCE_PROTOCOL_VERSION = 2;
 export interface Bootstrap {
   id: string;
   cwd: string;
-  providerModule: string;
   sessionId?: string;
   providerOptions?: Record<string, unknown>;
   mcpServers?: McpServerSpec[];
@@ -42,7 +42,7 @@ export type Request =
   | { op: "admit"; provider: string; responsive: boolean }
   | { op: "sendMessage"; to: string; body: string };
 
-export type ParentMessage =
+export type LeaderCommand =
   | { type: "init"; bootstrap: Bootstrap }
   | { type: "wake"; nudge?: RunNudge }
   | { type: "yield"; status?: string; note?: string }
@@ -50,7 +50,7 @@ export type ParentMessage =
   | { type: "stop" }
   | { type: "reply"; requestId: number; value?: unknown; error?: string };
 
-export type ChildMessage =
+export type ActorEvent =
   | { type: "ready"; pid: number }
   | { type: "request"; requestId: number; request: Request }
   | { type: "release"; requestId: number }

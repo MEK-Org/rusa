@@ -32,11 +32,6 @@ program
   .option("--resume", "Resume an existing instance root without reprovisioning")
   .option("--base-config-home <path>", "Home to seed providers and the Gemini key from")
   .option("--root-driver <driver>", "Root driver: provider or external", "provider")
-  .option(
-    "--worker-runtime <runtime>",
-    "Worker actor runtime: in-process or process (prototype)",
-    "in-process"
-  )
   .option("--port-offset <n>", "Offset the disposable instance's default ports", Number, 0)
   .option("--follower-bind <ip>", "Enable follower gateway on this Tailscale IPv4 address")
   .option("--follower-port <port>", "Follower gateway port", Number, 8190)
@@ -49,7 +44,6 @@ program
       root?: string;
       baseConfigHome?: string;
       rootDriver: string;
-      workerRuntime: string;
       portOffset: number;
       followerBind?: string;
       followerPort: number;
@@ -60,16 +54,8 @@ program
       if (opts.rootDriver !== "provider" && opts.rootDriver !== "external") {
         throw new Error("--root-driver must be provider or external");
       }
-      if (opts.workerRuntime !== "in-process" && opts.workerRuntime !== "process") {
-        throw new Error("--worker-runtime must be in-process or process");
-      }
-      if (
-        opts.followerBind &&
-        (!opts.followerTokenFile || opts.workerRuntime !== "process" || opts.resume)
-      ) {
-        throw new Error(
-          "Follower prototype requires --worker-runtime process, --follower-token-file, and a fresh instance"
-        );
+      if (opts.followerBind && (!opts.followerTokenFile || opts.resume)) {
+        throw new Error("Follower prototype requires --follower-token-file and a fresh instance");
       }
       await runActorMeshE2EUp({
         root: opts.root,
@@ -82,13 +68,6 @@ program
                 host: opts.followerBind,
                 port: opts.followerPort,
                 tokenFile: opts.followerTokenFile,
-              }
-            : undefined,
-        processWorkers:
-          opts.workerRuntime === "process"
-            ? {
-                childEntry: new URL("./process-actor-child.js", import.meta.url),
-                providerModule: new URL("./process-actor-provider.js", import.meta.url),
               }
             : undefined,
         rootControlPort: opts.rootControlPort,

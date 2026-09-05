@@ -19,9 +19,9 @@ import { FakeIssueClient } from "../e2e/fake-issue-client.js";
 import { LocalTracker } from "../e2e/local-tracker.js";
 import { PID_FILE, provisionE2EInstance, resumeE2EInstance } from "../e2e/provision.js";
 import { startTrackerServer } from "../e2e/tracker-server.js";
-import { processWorkerFactory } from "../experimental/process-actors/e2e-adapter.js";
-import { FollowerHub } from "../experimental/process-actors/follower-hub.js";
-import { ProcessActor } from "../experimental/process-actors/process-actor.js";
+import { ActorHandle } from "../experimental/remote-instances/actor-handle.js";
+import { instanceWorkerFactory } from "../experimental/remote-instances/e2e-adapter.js";
+import { FollowerHub } from "../experimental/remote-instances/follower-hub.js";
 import { setIssueClient } from "../gitops/issue-client.js";
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
@@ -116,7 +116,6 @@ export async function runActorMeshE2EUp(opts: {
   root?: string;
   baseConfigHome?: string;
   rootDriver?: "provider" | "external";
-  processWorkers?: { childEntry: URL; providerModule: URL };
   followerGateway?: { host: string; port: number; tokenFile: string };
   portOffset?: number;
   rootControlPort?: number;
@@ -233,9 +232,7 @@ export async function runActorMeshE2EUp(opts: {
       chatClient,
       chatSource,
       rootDriver: opts.rootDriver,
-      createWorkerActor: opts.processWorkers
-        ? processWorkerFactory(config, opts.processWorkers, followerHub)
-        : undefined,
+      createWorkerActor: followerHub ? instanceWorkerFactory(config, followerHub) : undefined,
       dashboard: true,
       quotaApi: createDashboardE2EQuotaApi(),
       remoteGitDir: instance.remotePath,
@@ -313,12 +310,12 @@ export function startRootControlServer(opts: {
       send(res, 200, {
         ...record,
         execution:
-          opts.handles.mesh.get(id) instanceof ProcessActor
+          opts.handles.mesh.get(id) instanceof ActorHandle
             ? {
-                runtime: "process",
+                runtime: "remote-instance",
                 coordinatorPid: process.pid,
-                actorPid: (opts.handles.mesh.get(id) as ProcessActor).process.pid,
-                followerId: (opts.handles.mesh.get(id) as ProcessActor).process.nodeId,
+                instancePid: (opts.handles.mesh.get(id) as ActorHandle).channel.pid,
+                followerId: (opts.handles.mesh.get(id) as ActorHandle).channel.nodeId,
               }
             : { runtime: "in-process", coordinatorPid: process.pid },
         running: opts.handles.mesh.runningThreadIds().has(id),

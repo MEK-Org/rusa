@@ -9,9 +9,7 @@ export default defineConfig({
   entry: {
     cli: "src/cli.ts",
     "commands/e2e.cli": "src/commands/e2e.cli.ts",
-    "commands/process-actor-child": "src/experimental/process-actors/child.ts",
-    "commands/process-actor-provider": "src/experimental/process-actors/configured-provider.ts",
-    "commands/follower": "src/experimental/process-actors/follower.ts",
+    "commands/follower": "src/experimental/remote-instances/follower.ts",
   },
   format: ["esm"],
   target: "node20",

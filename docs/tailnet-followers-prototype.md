@@ -4,6 +4,24 @@ Start the leader and follower independently, then choose a registered follower
 when spawning an actor. One leader remains authoritative; a follower hosts
 multiple actors and stays connected when individual actors are retired.
 
+Both leader and follower host ordinary `Actor` objects inside their single Node
+process. Only provider CLI invocations are subprocesses. On the leader,
+`FollowerHub` maintains registered `RemoteInstance` objects, each of which owns
+its actor channels and command queue. `ActorHandle` is only the compatibility
+adapter for the existing mesh interface; it never spawns or kills a process.
+
+```text
+Leader Node process                       Follower Node process
+  ActorMesh / authoritative state           FollowerInstance
+  RemoteInstance ── instance connection ──▶   Actor A → provider CLI subprocess
+    actor-addressed handles                 Actor B → provider CLI subprocess
+```
+
+The earlier local-process demo, per-actor Node entrypoint, and `--worker-runtime`
+mode have been removed. Protocol version 2 requires rebuilding both ends;
+old followers are rejected at enrollment. Existing running instances are not
+automatically upgraded or restarted.
+
 The leader runs a disposable E2E instance with its own directory, ports and
 database. Its GitHub/chat endpoints are fakes. Never stop another mesh's E2E
 instance to run this experiment. `--port-offset 200` uses ports 8283–8286,
@@ -72,7 +90,7 @@ RUSA_DIST_DIR=build/tailnet-leader node scripts/copy-assets.mjs
 node scripts/follower-token.mjs /absolute/private/path/enrollment-token
 node build/tailnet-leader/commands/e2e.cli.js am-up \
   --root /absolute/path/to/a/new/disposable/leader \
-  --root-driver external --worker-runtime process --port-offset 200 \
+  --root-driver external --port-offset 200 \
   --follower-bind 100.124.251.63 --follower-port 8290 \
   --follower-token-file /absolute/private/path/enrollment-token
 ```
@@ -95,7 +113,18 @@ The smoke test uses the real Actor, provider registry, MCP HTTP transport and
 durable mesh messaging with a scripted provider. It verifies two runs in the
 same actor/session, two replies to the parent's inbox, and that retiring one
 actor leaves the follower and its sibling alive. It retires its test actors.
+It also checks that both actors execute in the registered follower's single PID.
 Follower workspaces are retained for inspection.
+
+Automated instance tests (including a separately launched follower process):
+
+```sh
+pnpm exec vitest run src/experimental/remote-instances
+```
+
+The fixture provider is test-only. Tests cover instance registration/versioning,
+shared PID, actor-local sessions, fresh admission-time prompts, active retirement,
+initialization failure, disconnect, and MCP capability routing/revocation.
 
 For real work, use the existing control API and add `target`:
 
@@ -113,9 +142,10 @@ prototype exposes placement through the E2E controller; the model-facing
 
 The follower authenticates with a secret, receives a registration session, and
 long-polls the leader for actor commands. It forwards actor events over HTTP.
-Each actor still runs the original `Actor` class in its own child process.
-The child uses locally installed provider adapters and credentials; leader
-working-directory and module paths are replaced with follower-local paths.
+Each actor runs the original `Actor` class inside the follower process, using
+locally installed provider adapters and credentials. The follower assigns each
+actor a local workspace without changing process-wide cwd or per-actor environment.
+Provider factories are local code, never module paths supplied over the network.
 
 The leader keeps records, inboxes, prompt assembly, admission, accounting and
 MCP servers. Per-actor unguessable gateway URLs forward only assigned leader
@@ -132,6 +162,10 @@ these instances. A connection failure stops the follower generation; automatic
 reconnect, command replay, actor migration and exactly-once effects are deferred.
 The leader expires unresponsive followers after 45 seconds. Provider process-tree
 cleanup after an abrupt crash still needs validation beyond this experiment.
+There is deliberately no per-actor Node crash isolation, matching the leader.
+Retirement interrupts/closes only that Actor; instance shutdown closes all actors.
+The unsandboxed Codex adapter does not yet capture/resume sessions; scripted
+session-continuity tests do not establish real Codex session continuity on macOS.
 
 Local files stay on the follower. Media/file transfer, leader-local repository
 URL rewrites, host-job tools, Understanding mounts, provider/model changes and

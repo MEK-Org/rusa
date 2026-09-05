@@ -2,35 +2,49 @@ import { setTimeout as delay } from "node:timers/promises";
 import { ActorMesh } from "../../actor/actor-mesh.js";
 import { ExternalRootDriver } from "../../actor/external-root-driver.js";
 import { InMemoryActorRepository } from "../../repositories/in-memory-actor-repository.js";
-import { ProcessActor } from "./process-actor.js";
-import type { ChildMessage } from "./protocol.js";
+import { ActorHandle } from "./actor-handle.js";
+import { createProvider } from "./fixture-provider.js";
+import { FollowerInstance } from "./follower-instance.js";
+import type { ActorEvent, ProviderFactory } from "./protocol.js";
+import { RemoteInstance } from "./remote-instance.js";
 
 export async function waitUntil(check: () => boolean, timeoutMs = 10_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!check()) {
-    if (Date.now() >= deadline) throw new Error("Timed out waiting for process actor");
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for instance actor");
     await delay(10);
   }
 }
 
 /** All coordinator state is ephemeral here. No production DB, config, or service access. */
 export function createHarness(options: {
-  childEntry: string | URL;
-  providerModule: string;
   cwd: string;
   delayMs?: number;
+  providerFactory?: ProviderFactory;
 }) {
   const actors = new InMemoryActorRepository();
-  const runtimes = new Map<string, ProcessActor>();
+  const runtimes = new Map<string, ActorHandle>();
+  const remote = new RemoteInstance("test-follower", process.platform, process.pid);
+  const follower = new FollowerInstance(
+    options.cwd,
+    false,
+    (event) => queueMicrotask(() => remote.receive(structuredClone(event))),
+    options.providerFactory ?? createProvider
+  );
+  // Exercise the same instance commands without opening a port in unit tests.
+  remote.flush = () => {
+    for (const command of remote.commands.splice(0))
+      queueMicrotask(() => follower.dispatch(structuredClone(command)));
+  };
   const messages: Array<{ fromId: string; toId: string; body: string }> = [];
-  const events: Array<{ actorId: string; event: ChildMessage }> = [];
+  const events: Array<{ actorId: string; event: ActorEvent }> = [];
   const failures: Error[] = [];
   let sequence = 0;
   const mesh = new ActorMesh({
     actors,
     rootId: "root",
     maxConcurrent: 1,
-    idgen: () => `process-worker-${++sequence}`,
+    idgen: () => `instance-worker-${++sequence}`,
     recordChat: (message) => {
       messages.push({ fromId: message.senderId, toId: message.recipientId, body: message.body });
       return `message-${messages.length}`;
@@ -38,13 +52,12 @@ export function createHarness(options: {
     createActor: (context) => {
       let cursor = 0;
       let admittedCursor = 0;
-      const runtime = new ProcessActor({
-        childEntry: options.childEntry,
+      const runtime = new ActorHandle({
+        host: remote.createHost(context.record.id),
         context,
         bootstrap: {
           id: context.record.id,
           cwd: options.cwd,
-          providerModule: options.providerModule,
           providerOptions: { delayMs: options.delayMs },
           sessionId: context.record.sessionId,
         },
@@ -95,6 +108,8 @@ export function createHarness(options: {
     messages,
     events,
     failures,
+    follower,
+    remote,
     runtime: (id: string) => {
       const runtime = runtimes.get(id);
       if (!runtime) throw new Error(`No runtime for ${id}`);
@@ -104,7 +119,7 @@ export function createHarness(options: {
       const id = mesh.spawn({
         charter,
         parentId: "root",
-        provider: "process-fixture",
+        provider: "instance-fixture",
         model: "scripted",
       });
       mesh.sendMessage(id, "Begin your charter", "root");
@@ -113,6 +128,8 @@ export function createHarness(options: {
     async close() {
       mesh.shutdownAll();
       await Promise.all([...runtimes.values()].map((runtime) => runtime.exited));
+      follower.close();
+      remote.close();
     },
   };
 }
