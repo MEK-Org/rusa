@@ -37,7 +37,9 @@ export interface E2EInstanceRecord {
   /**
    * The exact e2e root `up()` established and passed as `--root` for this
    * holder's launch. Absent only on a record written before this binding
-   * existed; resume falls back to runs-area confinement for those.
+   * existed; resume then falls back to confining the root to this helper's
+   * own preserved-runs areas (the runs sibling, or the nested launch-home
+   * area a pre-change launch created its root under).
    */
   resumableRoot?: string;
 }
@@ -165,6 +167,14 @@ export class E2EInstanceManager {
    * would delete the very state a resume needs to retry from.
    */
   private readonly runsDir: string;
+  /**
+   * Where a pre-change helper's launches created their roots: inside bwrap,
+   * HOME was `${runtimeDir}/home`, so am-up chose `${legacyRunsDir}/run-*`.
+   * Legacy holder records without a persisted `resumableRoot` may resume a
+   * structurally valid root here — it is still wholly helper-owned, and
+   * cleanupFailedStart preserves it across the runtime wipe.
+   */
+  private readonly legacyRunsDir: string;
   private readonly now: () => string;
   private readonly hostHome: string;
   private readonly toolchainPath: string;
@@ -182,6 +192,7 @@ export class E2EInstanceManager {
     this.stateFile = join(opts.mcHome, "e2e-instance.json");
     this.runtimeDir = join(opts.mcHome, "e2e-instance", "runtime");
     this.runsDir = join(opts.mcHome, "e2e-instance", "runs");
+    this.legacyRunsDir = join(this.runtimeDir, "home", ".rusa-e2e");
     this.now = opts.now ?? (() => new Date().toISOString());
     this.hostHome = opts.hostHome ?? homedir();
     this.flutterRoot = opts.flutterRoot ?? resolveHostFlutterRoot();
@@ -287,11 +298,13 @@ export class E2EInstanceManager {
 
   /**
    * A resume root must match the exact root `up()` persisted for the current
-   * holder (`expectedRoot`); a legacy record predating that binding instead
-   * falls back to confining the root under this helper's own runs area
-   * (`this.runsDir`). Either way the root must structurally look like
-   * something `rusa-e2e am-up --resume` can reopen, per
-   * {@link missingResumeRequirements}.
+   * holder (`expectedRoot`). A legacy record predating that binding instead
+   * falls back to confining the root to a preserved-runs area this helper
+   * owns: either the runs sibling (`this.runsDir`) or the nested launch-home
+   * area (`${runtimeDir}/home/.rusa-e2e`) a pre-change launch created its
+   * root under, since that helper set HOME there before invoking am-up.
+   * Either way the root must structurally look like something
+   * `rusa-e2e am-up --resume` can reopen, per {@link missingResumeRequirements}.
    */
   private validateResumableRoot(requestedPath: string, expectedRoot: string | undefined): string {
     if (!requestedPath.trim()) throw new Error("e2e-instance: resume root path is required");
@@ -315,15 +328,24 @@ export class E2EInstanceManager {
         );
       }
     } else {
-      let realRunsDir: string;
-      try {
-        realRunsDir = realpathSync(this.runsDir);
-      } catch {
-        throw new Error(`e2e-instance: no preserved e2e runs exist under ${this.runsDir}`);
-      }
-      if (!isSelfOrDescendant(realRunsDir, root)) {
+      const preservedAreas = [this.runsDir, this.legacyRunsDir]
+        .map((area) => {
+          try {
+            return realpathSync(area);
+          } catch {
+            return undefined;
+          }
+        })
+        .filter((area): area is string => area !== undefined);
+      if (preservedAreas.length === 0) {
         throw new Error(
-          `e2e-instance: REFUSED foreign resume root ${root}; it must be a preserved instance under ${realRunsDir}`
+          `e2e-instance: no preserved e2e runs exist under ${this.runsDir} or ${this.legacyRunsDir}`
+        );
+      }
+      if (!preservedAreas.some((area) => isSelfOrDescendant(area, root))) {
+        throw new Error(
+          `e2e-instance: REFUSED foreign resume root ${root}; it must be a preserved instance under ` +
+            preservedAreas.join(" or ")
         );
       }
     }
@@ -661,7 +683,7 @@ export class E2EInstanceManager {
     let liveStatus = this.liveStatus();
     while (Date.now() < deadline) {
       if (!this.isLive(liveStatus)) {
-        this.cleanupFailedStart();
+        this.cleanupFailedStart(root);
         onFailure();
         throw new Error(
           `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} failed before port ${E2E_INSTANCE_PORT} became ready ` +
@@ -674,7 +696,7 @@ export class E2EInstanceManager {
       await this.delay(this.startupPollMs);
       liveStatus = this.liveStatus();
     }
-    this.cleanupFailedStart();
+    this.cleanupFailedStart(root);
     onFailure();
     throw new Error(
       `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} did not open port ${E2E_INSTANCE_PORT} ` +
@@ -732,7 +754,14 @@ export class E2EInstanceManager {
     rmSync(this.runtimeDir, { recursive: true, force: true });
   }
 
-  private cleanupFailedStart(): void {
+  /**
+   * Best-effort cleanup after a failed launch. `preserveRoot` is the exact
+   * root the failed launch was using: a legacy root may live under
+   * `runtimeDir` (the pre-change launch HOME), and the wholesale runtime
+   * wipe would destroy the very preserved state a retry resumes from — so
+   * it is relocated aside for the wipe and moved back afterwards.
+   */
+  private cleanupFailedStart(preserveRoot?: string): void {
     try {
       if (this.liveStatus().loadState !== "not-found") {
         this.exec("systemctl", ["--user", "stop", E2E_INSTANCE_UNIT_NAME]);
@@ -742,6 +771,35 @@ export class E2EInstanceManager {
     }
     teardownFlutterOverlay(this.runtimeDir);
     rmSync(this.stateFile, { force: true });
+    let nestedRoot: string | undefined;
+    let preservedAside: string | undefined;
+    let realRuntimeDir = this.runtimeDir;
+    try {
+      realRuntimeDir = realpathSync(this.runtimeDir);
+    } catch {
+      // runtimeDir is about to be wiped anyway.
+    }
+    if (preserveRoot && isSelfOrDescendant(realRuntimeDir, preserveRoot)) {
+      nestedRoot = preserveRoot;
+      try {
+        preservedAside = join(dirname(this.runtimeDir), `.preserved-${randomUUID()}`);
+        renameSync(nestedRoot, preservedAside);
+      } catch {
+        // If the root cannot be moved aside, skipping the runtime wipe keeps
+        // it intact; leftover runtime junk is tolerable next to a destroyed
+        // preserved instance.
+        return;
+      }
+    }
     rmSync(this.runtimeDir, { recursive: true, force: true });
+    if (nestedRoot && preservedAside) {
+      try {
+        mkdirSync(dirname(nestedRoot), { recursive: true, mode: 0o700 });
+        renameSync(preservedAside, nestedRoot);
+      } catch {
+        // The wipe happened and the root could not be restored; surface
+        // nothing here — the original startup error is what the caller sees.
+      }
+    }
   }
 }
