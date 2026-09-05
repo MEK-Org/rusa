@@ -1290,6 +1290,166 @@ describe("ObligationRepository", () => {
     expect(tree.children[0]?.blockingChildren.map((o) => o.id)).toEqual(["check"]);
   });
 
+  describe("getTree / getForest query cost (#241)", () => {
+    /** A forest deep/wide enough that a per-node query pattern would be obvious in the prepare count. */
+    function buildForest(rootId: string, ownerId: string, depth: number, branching: number): void {
+      repository.create({ id: rootId, title: rootId, ownerId });
+      let frontier = [rootId];
+      for (let level = 0; level < depth; level += 1) {
+        const next: string[] = [];
+        for (const parentId of frontier) {
+          for (let branch = 0; branch < branching; branch += 1) {
+            const id = `${parentId}-${branch}`;
+            repository.create({ id, title: id, parentId, ownerId });
+            next.push(id);
+          }
+        }
+        frontier = next;
+      }
+    }
+
+    it("reads a 40-node subtree in a bounded number of statements, not one per node", () => {
+      buildForest("root-a", "actor-a", 3, 3); // 1 + 3 + 9 + 27 = 40 nodes
+      const prepareSpy = vi.spyOn(db, "prepare");
+      const tree = repository.getTree("root-a");
+      expect(prepareSpy.mock.calls.length).toBe(1);
+      prepareSpy.mockRestore();
+
+      let total = 1;
+      const walk = (node: typeof tree): void => {
+        total += node.children.length;
+        for (const child of node.children) walk(child);
+      };
+      walk(tree);
+      expect(total).toBe(40);
+    });
+
+    it("builds multiple root trees from one bulk read, in the order requested, with terminal children retained but non-blocking", () => {
+      buildForest("root-x", "actor-a", 1, 2); // root-x, root-x-0, root-x-1
+      buildForest("root-y", "actor-b", 1, 2);
+      repository.setTerminalStatus("root-x-0", "done");
+
+      const prepareSpy = vi.spyOn(db, "prepare");
+      const [treeY, treeX] = repository.getForest(["root-y", "root-x"]);
+      expect(prepareSpy.mock.calls.length).toBe(1);
+      prepareSpy.mockRestore();
+
+      expect(treeY.obligation.id).toBe("root-y");
+      expect(treeX.obligation.id).toBe("root-x");
+      expect(treeX.children.map((c) => c.obligation.id).sort()).toEqual(["root-x-0", "root-x-1"]);
+      expect(treeX.children.find((c) => c.obligation.id === "root-x-0")?.obligation.status).toBe(
+        "done"
+      );
+      expect(treeX.blockingChildren.map((c) => c.id)).toEqual(["root-x-1"]);
+    });
+
+    it("orders children by effective priority then id, matching listChildren", () => {
+      repository.create({ id: "ord-root", title: "ord-root", ownerId: "actor-a" });
+      repository.create({
+        id: "ord-b",
+        title: "b",
+        parentId: "ord-root",
+        ownerId: "actor-a",
+        priority: 5,
+      });
+      repository.create({
+        id: "ord-a",
+        title: "a",
+        parentId: "ord-root",
+        ownerId: "actor-a",
+        priority: 5,
+      });
+      repository.create({
+        id: "ord-c",
+        title: "c",
+        parentId: "ord-root",
+        ownerId: "actor-a",
+        priority: 1,
+      });
+
+      const tree = repository.getTree("ord-root");
+      expect(tree.children.map((c) => c.obligation.id)).toEqual(
+        repository.listChildren("ord-root").map((o) => o.id)
+      );
+      expect(tree.children.map((c) => c.obligation.id)).toEqual(["ord-c", "ord-a", "ord-b"]);
+    });
+
+    it("getForest does not misreport a cycle when a requested root is also a descendant of another requested root", () => {
+      repository.create({ id: "ancestor", title: "ancestor", ownerId: "actor-a" });
+      repository.create({
+        id: "descendant",
+        title: "descendant",
+        parentId: "ancestor",
+        ownerId: "actor-a",
+      });
+      repository.create({
+        id: "grandchild",
+        title: "grandchild",
+        parentId: "descendant",
+        ownerId: "actor-a",
+      });
+
+      const [ancestorTree, descendantTree] = repository.getForest(["ancestor", "descendant"]);
+      expect(ancestorTree.obligation.id).toBe("ancestor");
+      expect(ancestorTree.children.map((c) => c.obligation.id)).toEqual(["descendant"]);
+      expect(ancestorTree.children[0]?.children.map((c) => c.obligation.id)).toEqual([
+        "grandchild",
+      ]);
+      expect(descendantTree.obligation.id).toBe("descendant");
+      expect(descendantTree.children.map((c) => c.obligation.id)).toEqual(["grandchild"]);
+    });
+
+    it("getForest returns [] for no roots and omits roots that don't exist", () => {
+      expect(repository.getForest([])).toEqual([]);
+      buildForest("root-z", "actor-a", 0, 0);
+      expect(repository.getForest(["missing", "root-z"]).map((t) => t.obligation.id)).toEqual([
+        "root-z",
+      ]);
+    });
+
+    it("listPage excludeQuietTerminalRoots drops done/cancelled roots with no recurrence or completion history, keeps everything else", () => {
+      repository.create({ id: "live-root", title: "live-root", ownerId: "actor-a" });
+      repository.create({ id: "quiet-done", title: "quiet-done", ownerId: "actor-a" });
+      repository.setTerminalStatus("quiet-done", "done");
+      repository.create({ id: "quiet-cancelled", title: "quiet-cancelled", ownerId: "actor-a" });
+      repository.setTerminalStatus("quiet-cancelled", "cancelled");
+
+      repository.create({ id: "recurring-done", title: "recurring-done", ownerId: "actor-a" });
+      repository.setRecurrence("recurring-done", { policy: "cron", cronExpr: "0 * * * *" });
+      repository.setTerminalStatus("recurring-done", "done");
+
+      repository.create({ id: "historied-done", title: "historied-done", ownerId: "actor-a" });
+      repository.setRecurrence("historied-done", { policy: "cron", cronExpr: "0 * * * *" });
+      repository.setTerminalStatus("historied-done", "done");
+      repository.activateScheduled("historied-done");
+      repository.setRecurrence("historied-done", null);
+      repository.setTerminalStatus("historied-done", "done");
+
+      const filtered = repository.listPage({
+        rootsOnly: true,
+        excludeQuietTerminalRoots: true,
+        limit: 50,
+      });
+      expect(filtered.obligations.map((o) => o.id).sort()).toEqual([
+        "historied-done",
+        "live-root",
+        "recurring-done",
+      ]);
+      expect(filtered.total).toBe(3);
+      expect(filtered.hasMore).toBe(false);
+
+      const unfiltered = repository.listPage({ rootsOnly: true, limit: 50 });
+      expect(unfiltered.obligations.map((o) => o.id).sort()).toEqual([
+        "historied-done",
+        "live-root",
+        "quiet-cancelled",
+        "quiet-done",
+        "recurring-done",
+      ]);
+      expect(unfiltered.total).toBe(5);
+    });
+  });
+
   it("does not cap or warn on an owner ready queue", () => {
     for (let index = 0; index < 150; index += 1) {
       repository.create({

@@ -601,6 +601,52 @@ class FakeApi extends DashboardApi {
     );
   }
 
+  final fetchObligationForestCalls = <({bool includeTerminalRoots})>[];
+
+  /// When non-empty, each fetchObligationForest call takes the next of these
+  /// instead of resolving immediately — lets a test hold multiple calls open
+  /// and complete them in whichever order it wants, to prove a stale response
+  /// can't overwrite a newer one. The result is computed from [obligationsResult]
+  /// as it stood when the call was made (matching a real request that read a
+  /// snapshot of the data and is merely slow to arrive), then held until the
+  /// gate completes — so mutating [obligationsResult] afterward does not change
+  /// what an already in-flight call returns.
+  final forestGates = <Completer<void>>[];
+
+  @override
+  Future<ObligationForest> fetchObligationForest({
+    int? limit,
+    int? offset,
+    bool includeTerminalRoots = false,
+  }) async {
+    fetchObligationForestCalls.add((includeTerminalRoots: includeTerminalRoots));
+    final page = await fetchObligations(
+      rootsOnly: true,
+      limit: limit,
+      offset: offset,
+    );
+    // Mirrors the server default (#241): quiet terminal roots (done/
+    // cancelled, not recurring, no completion history) are excluded unless
+    // explicitly requested.
+    final roots = includeTerminalRoots
+        ? page.obligations
+        : page.obligations
+              .where(
+                (o) => !o.isTerminal || o.isRecurring || o.hasCompletionHistory,
+              )
+              .toList();
+    final trees = await Future.wait(
+      roots.map((o) => fetchObligationTree(o.id)),
+    );
+    final forest = ObligationForest(
+      trees: trees,
+      total: includeTerminalRoots ? page.total : roots.length,
+      hasMore: includeTerminalRoots ? page.hasMore : false,
+    );
+    if (forestGates.isNotEmpty) await forestGates.removeAt(0).future;
+    return forest;
+  }
+
   @override
   Future<ObligationDto> createObligation({
     required String ownerId,

@@ -1785,6 +1785,96 @@ describe("handleMeshApiRequest", () => {
       });
     });
 
+    describe("GET /api/mesh/obligations/forest", () => {
+      it("returns one root page's trees, in root-page order, without a request per root", async () => {
+        obligations.create({ title: "root-1", id: "root-1", ownerId: "actor-1" });
+        obligations.create({
+          title: "child-1",
+          id: "child-1",
+          parentId: "root-1",
+          ownerId: "actor-1",
+        });
+        obligations.create({ title: "root-2", id: "root-2", ownerId: "actor-1" });
+        obligations.create({
+          title: "sub-child",
+          id: "sub-child",
+          parentId: "child-1",
+          ownerId: "actor-1",
+        });
+
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/forest");
+        expect(res.statusCode).toBe(200);
+        const data = JSON.parse(res.body);
+
+        expect(data.total).toBe(2);
+        expect(data.hasMore).toBe(false);
+        // root-1 has a child, so it is "waiting" and the root page (ready
+        // before waiting, same as the plain obligations list) orders root-2
+        // first — the forest preserves that page order rather than imposing
+        // its own.
+        expect(data.trees.map((t: { obligation: { id: string } }) => t.obligation.id)).toEqual([
+          "root-2",
+          "root-1",
+        ]);
+        const root1 = data.trees[1];
+        expect(root1.children).toHaveLength(1);
+        expect(root1.children[0].obligation.id).toBe("child-1");
+        expect(root1.children[0].children[0].obligation.id).toBe("sub-child");
+      });
+
+      it("honors limit/offset the same way the root page does", async () => {
+        obligations.create({ title: "root-1", id: "root-1", ownerId: "actor-1" });
+        obligations.create({ title: "root-2", id: "root-2", ownerId: "actor-1" });
+
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/forest?limit=1&offset=1");
+        expect(res.statusCode).toBe(200);
+        const data = JSON.parse(res.body);
+        expect(data.total).toBe(2);
+        expect(data.hasMore).toBe(false);
+        expect(data.trees.map((t: { obligation: { id: string } }) => t.obligation.id)).toEqual([
+          "root-2",
+        ]);
+      });
+
+      it("returns an empty forest when there are no roots", async () => {
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/forest");
+        expect(res.statusCode).toBe(200);
+        const data = JSON.parse(res.body);
+        expect(data.trees).toEqual([]);
+        expect(data.total).toBe(0);
+      });
+
+      it("503s when obligations data is unavailable", async () => {
+        const noObligationsDeps = { ...deps, obligations: undefined };
+        const { res } = await call(noObligationsDeps, "GET", "/api/mesh/obligations/forest");
+        expect(res.statusCode).toBe(503);
+      });
+
+      it("excludes quiet terminal roots by default, includes them with includeTerminalRoots=true (#241)", async () => {
+        obligations.create({ title: "live-root", id: "live-root", ownerId: "actor-1" });
+        obligations.create({ title: "quiet-done", id: "quiet-done", ownerId: "actor-1" });
+        obligations.setTerminalStatus("quiet-done", "done");
+
+        const { res: defaultRes } = await call(deps, "GET", "/api/mesh/obligations/forest");
+        const defaultData = JSON.parse(defaultRes.body);
+        expect(
+          defaultData.trees.map((t: { obligation: { id: string } }) => t.obligation.id)
+        ).toEqual(["live-root"]);
+        expect(defaultData.total).toBe(1);
+
+        const { res: includedRes } = await call(
+          deps,
+          "GET",
+          "/api/mesh/obligations/forest?includeTerminalRoots=true"
+        );
+        const includedData = JSON.parse(includedRes.body);
+        expect(
+          includedData.trees.map((t: { obligation: { id: string } }) => t.obligation.id).sort()
+        ).toEqual(["live-root", "quiet-done"]);
+        expect(includedData.total).toBe(2);
+      });
+    });
+
     describe("GET /api/mesh/obligations/:id", () => {
       it("returns obligation with parent, children, and blockingChildren", async () => {
         obligations.create({

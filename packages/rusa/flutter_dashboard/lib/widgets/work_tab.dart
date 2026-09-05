@@ -30,23 +30,39 @@ class _WorkTabState extends State<WorkTab> {
   String? _selectedObligationId;
   StreamSubscription<String?>? _focusSub;
   bool _showDone = false;
+  bool _fetchedTerminalRoots = false;
 
-  Future<void> _loadRoots() async {
+  /// Bumped at the start of every [_loadRoots] call and compared when that
+  /// call's future resolves. `_loadRoots` fires from several independent
+  /// triggers (initial load, Show Done toggle, retry, mutation callbacks,
+  /// on-demand terminal widening) with no ordering guarantee between their
+  /// underlying requests, so an older call finishing after a newer one must
+  /// not overwrite the newer call's result.
+  int _loadGeneration = 0;
+
+  /// [forceIncludeTerminal] widens a single load beyond the current "Show
+  /// Done" setting — used when a focus link names an obligation the default
+  /// (terminal-excluding) load didn't fetch at all.
+  Future<void> _loadRoots({bool forceIncludeTerminal = false}) async {
+    final includeTerminal = forceIncludeTerminal || _showDone;
+    final generation = ++_loadGeneration;
     try {
       setState(() {
         if (_rootTrees.isEmpty) _loading = true;
         _error = null;
       });
-      final page = await widget.store.api.fetchObligations(rootsOnly: true);
-      final trees = await Future.wait(
-        page.obligations.map((o) => widget.store.api.fetchObligationTree(o.id)),
+      final forest = await widget.store.api.fetchObligationForest(
+        includeTerminalRoots: includeTerminal,
       );
+      if (!mounted || generation != _loadGeneration) return;
       setState(() {
-        _rootTrees = trees;
+        _rootTrees = forest.trees;
+        _fetchedTerminalRoots = includeTerminal;
         _loading = false;
       });
       _checkFocusLink();
     } catch (e) {
+      if (!mounted || generation != _loadGeneration) return;
       setState(() {
         _error = e.toString();
         _loading = false;
@@ -56,8 +72,11 @@ class _WorkTabState extends State<WorkTab> {
 
   void _checkFocusLink() {
     final focusedId = widget.store.focusedObligationId.valueOrNull;
-    if (focusedId != null) {
-      _expandAncestors(focusedId);
+    if (focusedId == null) return;
+    if (!_expandAncestors(focusedId) && !_fetchedTerminalRoots) {
+      // The focused obligation may live under a quiet terminal root the
+      // default load excluded (#241); widen once before giving up.
+      _loadRoots(forceIncludeTerminal: true);
     }
   }
 
@@ -279,7 +298,10 @@ class _WorkTabState extends State<WorkTab> {
                       _showDone ? Icons.visibility : Icons.visibility_off,
                       size: 18,
                     ),
-                    onPressed: () => setState(() => _showDone = !_showDone),
+                    onPressed: () {
+                      setState(() => _showDone = !_showDone);
+                      _loadRoots();
+                    },
                     tooltip: _showDone ? 'Hide Done' : 'Show Done',
                   ),
                   IconButton(

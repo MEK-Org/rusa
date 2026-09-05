@@ -1237,6 +1237,27 @@ class ObligationTreeDto {
       );
 }
 
+class ObligationForest {
+  const ObligationForest({
+    required this.trees,
+    required this.total,
+    required this.hasMore,
+  });
+
+  final List<ObligationTreeDto> trees;
+  final int total;
+  final bool hasMore;
+
+  factory ObligationForest.fromJson(Map<String, dynamic> j) =>
+      ObligationForest(
+        trees: (j['trees'] as List<dynamic>? ?? const [])
+            .map((e) => ObligationTreeDto.fromJson(e as Map<String, dynamic>))
+            .toList(),
+        total: j['total'] as int? ?? 0,
+        hasMore: j['hasMore'] as bool? ?? false,
+      );
+}
+
 class ObligationListPage {
   const ObligationListPage({
     required this.items,

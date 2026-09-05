@@ -107,6 +107,15 @@ export interface ListObligationsOptions {
   ownerId?: EntityId;
   status?: ObligationStatus;
   rootsOnly?: boolean;
+  /**
+   * Drop terminal (done/cancelled) rows that carry no reason to keep
+   * surfacing them: not recurring, and no completion-ledger history. Used by
+   * the dashboard's default Work tab load (#241) so a stale `capture:*` stub
+   * doesn't cost a tree fetch just to be hidden client-side; recurring or
+   * historied terminal rows still come through since the UI shows those by
+   * default regardless of the "Show Done" toggle.
+   */
+  excludeQuietTerminalRoots?: boolean;
 }
 
 export interface ObligationPageOptions {
@@ -1329,6 +1338,13 @@ export class ObligationRepository {
     if (options.rootsOnly) {
       clauses.push("obligation.parent_id IS NULL");
     }
+    if (options.excludeQuietTerminalRoots) {
+      clauses.push(
+        `(obligation.status NOT IN ('done', 'cancelled')
+          OR obligation.recurrence_policy IS NOT NULL
+          OR EXISTS (SELECT 1 FROM obligation_completions WHERE obligation_id = obligation.id))`
+      );
+    }
     const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
@@ -1354,22 +1370,78 @@ export class ObligationRepository {
   }
 
   getTree(rootId: string): ObligationTree {
-    const seen = new Set<string>();
-    const visit = (id: string): ObligationTree => {
-      if (seen.has(id)) throw new ObligationValidationError(`obligation cycle detected at: ${id}`);
-      seen.add(id);
-      const obligation = this.require(id);
-      const childObligations = this.listChildren(id);
-      const children = childObligations.map((child) => visit(child.id));
+    const [tree] = this.getForest([rootId]);
+    if (!tree) throw new ObligationValidationError(`obligation not found: ${rootId}`);
+    return tree;
+  }
+
+  /**
+   * Trees for several roots in one bulk read, in the order requested.
+   *
+   * A root and every one of its descendants used to cost one `require()` plus
+   * one `listChildren()` — each re-running the whole-table effective-priority
+   * CTE — for every node in the subtree (#241). An earlier version of this
+   * fix bounded the read to just the requested subtrees with a second
+   * recursive CTE; at this table's actual scale (a few hundred rows) that
+   * bound bought nothing measurable and added its own bug — a root whose
+   * descendant was *also* requested as a separate root reached that
+   * descendant via two seed paths, producing a duplicate row that
+   * `childrenByParent` (unlike `byId`) didn't dedupe, which surfaced as a
+   * false "cycle detected" error. Reading every row once, unfiltered, and
+   * assembling every tree from one in-memory parent→children index removes
+   * both the bound and the bug: each id appears exactly once (primary key),
+   * so no id can reach the assembly step twice.
+   */
+  getForest(rootIds: readonly string[]): ObligationTree[] {
+    if (rootIds.length === 0) return [];
+    const rows = this.db
+      .prepare(`${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}`)
+      .all() as ObligationRow[];
+
+    const byId = new Map<string, ObligationRow>();
+    const childrenByParent = new Map<string, ObligationRow[]>();
+    for (const row of rows) {
+      byId.set(row.id, row);
+      if (row.parent_id !== null) {
+        const siblings = childrenByParent.get(row.parent_id);
+        if (siblings) siblings.push(row);
+        else childrenByParent.set(row.parent_id, [row]);
+      }
+    }
+    for (const siblings of childrenByParent.values()) {
+      siblings.sort((a, b) =>
+        a.effective_priority !== b.effective_priority
+          ? a.effective_priority - b.effective_priority
+          : a.id < b.id
+            ? -1
+            : a.id > b.id
+              ? 1
+              : 0
+      );
+    }
+
+    const visit = (row: ObligationRow, seen: Set<string>): ObligationTree => {
+      if (seen.has(row.id)) {
+        throw new ObligationValidationError(`obligation cycle detected at: ${row.id}`);
+      }
+      seen.add(row.id);
+      const childRows = childrenByParent.get(row.id) ?? [];
+      const childObligations = childRows.map(toObligation);
       return {
-        obligation,
-        children,
+        obligation: toObligation(row),
+        children: childRows.map((child) => visit(child, seen)),
         blockingChildren: childObligations.filter((child) =>
           isBlockingObligationStatus(child.status)
         ),
       };
     };
-    return visit(rootId);
+
+    const trees: ObligationTree[] = [];
+    for (const rootId of rootIds) {
+      const rootRow = byId.get(rootId);
+      if (rootRow) trees.push(visit(rootRow, new Set()));
+    }
+    return trees;
   }
 
   /** Apply an explicit priority using the v1 subtree/self inheritance contract. */
