@@ -12,7 +12,7 @@ repository-relative; line numbers are that commit's.
 recorded where it applies: the launch clock is now stamped on confirmation
 rather than on grant (§5.5), which also removes the rollback machinery
 entirely; multi-pool surface is gone (§5.1); degraded mode is bounded by pool
-size and then fails closed (§5.7); old-writer exclusion is a path relocation
+size and then fails closed (§5.7 — superseded in revision 4, below); old-writer exclusion is a path relocation
 rather than a cooperative flag (§8.2); and the claim that centralising parsing
 reduces PTY scrapes was wrong and is withdrawn (§3.1).
 
@@ -25,6 +25,20 @@ it — the processes that *consume* the shared account are a strictly larger set
 than the processes that pace it, so observation ingestion may not assume a
 same-host reporter (A1a). §4.3 keeps the Option 3 trigger, narrowed to a second
 *leader* sharing credentials from another host.
+
+**Revision 4** answers three correctness findings against revision 3, and the
+answer to each is a narrower claim rather than more machinery. The spacing bound
+is restated over *normal* starts only, because a responsive start is by
+construction unheld and can land beside an outstanding hold (§5.5). The premise
+that a launch cannot begin after its lease has expired is demoted from a fact to
+a stated client obligation, with a margin, a detection path and a repair (§5.5,
+§6.2) — the coordinator hands out a duration and then sees nothing until the
+confirm, so it cannot enforce it. And degraded local pacing is deleted outright:
+the bounded formula was aggregate-safe only under a *total* outage and silently
+over-launched under a partial one, so a disconnected instance now waits and then
+fails closed (§5.7). That deletion removes the `poolInstances` knob and the
+reasoning that depended on it; A7 is reused for the assumption the launch
+deadline actually rests on.
 
 ## Contents
 
@@ -217,9 +231,18 @@ recommendation, and §4.3 says what changes if it is wrong.
 - **A6 — One short, scheduled write-quiesce is acceptable once.** Flipping
   ingestion ownership needs a moment with no instance writing. Seconds, once,
   planned.
-- **A7 — The operator can state a maximum instance count for the pool.**
-  Degraded-mode safety (§5.7) is derived from it, and it cannot be discovered
-  at runtime by a client that has just lost its coordinator.
+- **A7 — A client can bound the delay between deciding to spawn and the
+  provider process actually starting.** This is what makes the launch deadline
+  (§5.5) enforceable rather than decorative, and it is the weakest link in the
+  spacing guarantee: it is an obligation on the client, not a property the
+  coordinator can check. *Confidence: medium on one host — the gap is an
+  event-loop turn plus process creation, but a loaded host or a slow sandbox
+  widens it. Unestablished across a #237 leader-to-follower dispatch, which is
+  Q9.*
+
+  An earlier revision used A7 for a different claim — that the operator can
+  state a maximum instance count — which existed only to bound the degraded
+  pacer that §5.7 has now deleted.
 
 ---
 
@@ -304,7 +327,7 @@ later; it is not claimed as a benefit of Option 2 here, and the comparison in
 | **Operations** | No new supervision | One process to supervise; ordering with instances | Above, plus network policy and cross-host rollout |
 | **Compatibility** | N writers all carrying the schema; ad-hoc widening on open | One writer; versioned wire contract; clients carry no schema | Same as 2 |
 | **Latency** | In-process SQLite call (µs) | UDS round trip (sub-ms), at ≤ one reservation per interval (A2) | Network RTT plus TLS; still negligible at A2 rates |
-| **Availability** | No new dependency; a corrupt or locked file stops everyone anyway | New SPOF; needs an explicit degraded mode | Same SPOF plus network partitions |
+| **Availability** | No new dependency; a corrupt or locked file stops everyone anyway | New SPOF; an unreachable coordinator stops normal launching (§5.7) | Same SPOF plus network partitions |
 | **Security** | Filesystem ACL on one file | Filesystem ACL on one socket; unreachable off-host; one more holder of `geminiApiKey` | Authn/authz, transport encryption, exposed port |
 | **Scrape / parse cost** | N scrapes, N parses | **N scrapes, N parses — unchanged** | Same as 2 |
 | **Backup** | One SQLite file, but no single process owns quiescing it | One SQLite file with exactly one writer that can quiesce and `VACUUM INTO` | Same as 2 |
@@ -385,9 +408,20 @@ on the path, not a competing destination.
   ownership flip needs redesign — probably a coordinator that begins as a
   read-through proxy and takes the write lock only when it observes no other
   writer for a full tick. That is more machinery; it is not proposed here.
-- **A7 is unacceptable** (no maximum instance count can be stated): degraded
-  mode has no safe bound, and §5.7 should collapse to fail-closed immediately
-  on disconnection.
+- **A7 is false** (a client cannot bound its own spawn latency — a stalled
+  event loop, a slow sandbox, or a #237 dispatch that carries no deadline of its
+  own): the launch deadline in §5.5 stops being enforceable, and the spacing
+  guarantee weakens from "holds, given the client obligation" to "holds on
+  average, with excursions detected after the fact". Late-confirm repair keeps
+  those excursions from compounding, but the bound would have to be restated as
+  a statistical one, and criterion 2 would have to be rewritten to match. Q9
+  asks who owns this across the follower dispatch.
+- **A2 is false** (launch rate stops being low): §5.7's "wait for the
+  coordinator, then fail closed" stops being cheap, because a run would be
+  waiting through a meaningful share of its own interval rather than a rounding
+  error. Bounded local pacing would have to come back — and with it the
+  partial-failure problem that deleting it solved, which would then need the
+  client registry or heartbeats this design declined to build.
 
 ---
 
@@ -554,6 +588,63 @@ While a hold is live, **no other grant is issued for that lane.** At most one
 unconfirmed launch exists per lane at a time, which is what keeps the reasoning
 short.
 
+#### The launch deadline
+
+A hold bounds *permission*, and permission is only useful if the launch it
+authorises happens while that permission is still live. The coordinator cannot
+enforce this: it hands out a duration and then sees nothing at all until
+`confirmLaunch`. The rule therefore has to sit in the client, and this design
+states it as an obligation rather than assuming it as a fact.
+
+**The obligation.** A client records a monotonic timestamp when it *sends* each
+`reserveLaunch` attempt, and on the attempt that comes back `granted` it derives
+its deadline from that send — not from when the response arrived:
+
+```
+deadline = monotonicNow(at send) + leaseTtlMs - spawnMarginMs
+```
+
+Anchoring at send is what makes it conservative. The coordinator stamps
+`expires_at` when the grant commits, which is strictly after the send, so a
+send-anchored deadline always falls before the server's expiry. Request latency,
+a delayed response and a scheduler stall between send and receive are absorbed
+rather than ignored, and because it is a monotonic reading rather than a wall
+clock it survives an NTP step. `spawnMarginMs` covers the last stretch: the
+client refuses to spawn unless the remaining time exceeds it, and re-reserves
+instead.
+
+**What it does not do.** Checking a deadline and calling `spawn` are two
+operations, and nothing makes them one. A client that passes the check and then
+stalls — a garbage-collection pause, a loaded host, a slow sandbox — starts the
+provider late anyway. `spawnMarginMs` makes that improbable; it does not make it
+impossible, and no claim below assumes an atomic check-and-spawn. A7 names the
+assumption so it can be argued with; §4.3 says what follows if it is wrong.
+
+**Detection and repair, because prevention is incomplete.** A confirm carries
+the fact that a provider started, so the coordinator can always compare its
+arrival against `expires_at`. A confirm arriving after expiry is accepted,
+counted as a **late confirm**, and used to move the lane clock forward from the
+real start rather than being refused. The excursion is then bounded by the
+client's overshoot and does not compound into the next interval. A client that
+starts late *and* then dies leaves nothing to detect; that is the residual, and
+it is the same residual the crash case in §6.2 already carries.
+
+**Across a #237 dispatch the deadline has to travel.** Under leader-authoritative
+remote instances the leader holds the lease and the *follower* spawns the
+provider, so the deadline has to be enforced where the spawn happens, not where
+the reservation lives: the leader would send a remaining duration with the
+dispatch, and the follower would refuse to start once it had elapsed. No such
+field exists in that dispatch today, and this proposal does not design one —
+Q9 asks who should. Until it does, A7 is unestablished for any launch that
+crosses a follower connection.
+
+**Considered and rejected: a pre-spawn authorization call.** An extra
+`authorizeSpawn` immediately before `spawn` would shrink the window to one round
+trip plus spawn latency, but it cannot close it, for exactly the reason above —
+the authorization and the process creation are still two operations. It would
+add an RPC to the launch path and buy a smaller copy of the same residual. The
+deadline stays client-side and the repair path carries the remainder.
+
 #### `POST /v1/reserveLaunch`
 
 ```jsonc
@@ -571,6 +662,7 @@ Response is one of:
 ```jsonc
 { "status": "granted", "leaseId": "...", "leaseTtlMs": 120000 }
 { "status": "queued",  "ticketId": "...", "position": 1, "retryAfterMs": 30000 }
+{ "status": "expired", "leaseId": "...", "retryAfterMs": 0 }
 ```
 
 Semantics:
@@ -588,6 +680,13 @@ Semantics:
 - **`requestId` makes the call idempotent.** A retry after a lost response
   returns the same ticket or the same lease — never a second lease. This is the
   difference between an at-least-once transport and a double-spent allowance.
+  Two details of that retry matter for the deadline above. A retry that finds a
+  live lease returns its **remaining** TTL, never a fresh one, so a client
+  cannot extend a hold by retrying into it. A retry that finds the lease already
+  reaped returns `status: "expired"` rather than resurrecting it: the ambiguity
+  resolves toward *you hold no permission*, the client must not spawn, and it
+  re-reserves under a new `requestId`. A lost response and a silent one are
+  therefore the same case, and both resolve conservatively.
 - **Where it sits in the launch path:** the client reserves *after* clearing its
   own mesh concurrency limiter and immediately before spawning the provider.
   That inverts today's order (pacer first, then mesh queue —
@@ -599,10 +698,35 @@ Semantics:
 
 #### `POST /v1/confirmLaunch`
 
-`{ leaseId }`. **The provider process has actually started.** In one
-transaction the coordinator sets `last_started_at = now`,
-`next_available_at = now + interval_ms`, and closes the lease as `confirmed`,
-releasing the hold. `now` is coordinator time (§5.4).
+`{ leaseId }`. **The provider process has actually started.** A confirmation is
+an assertion of fact, not a request for permission — permission was the grant —
+so the coordinator always records it. In one transaction it sets
+`last_started_at = now`, advances the lane clock **monotonically**
+
+```
+next_available_at = max(next_available_at, now + interval_ms)
+```
+
+and closes the lease, releasing the hold. `now` is coordinator time (§5.4).
+
+The `max` is not decoration. It is what stops a confirmation that arrives after
+something else has already moved the lane — a responsive start, or the lease's
+own expiry — from pulling the clock backwards and handing out an early grant.
+Every path that stamps this clock uses the same monotonic form.
+
+The response reports what the coordinator found, so the client learns something
+it had no way to know locally:
+
+| Confirm arrives | `outcome` | Clock | Meaning |
+| --- | --- | --- | --- |
+| hold still live | `confirmed` | advanced from `now` | the normal path |
+| after `expires_at` | `late` | advanced from `now`, monotonically | the launch deadline was missed (§5.5) |
+| after a responsive start took the lane | `invalidated` | advanced from `now`, monotonically | the lane was charged while the hold was outstanding |
+
+`late` and `invalidated` are counted and alertable (§9.3); a rising `late` rate
+is the signal that A7 is breaking down. Neither is an error returned to the
+client, because the provider is already running and declining to record a real
+start would be strictly worse than recording it.
 
 Idempotent by `leaseId`: a repeated confirm returns the first result and does
 not advance the clock twice.
@@ -621,7 +745,12 @@ restore" problem all disappear rather than being solved.
 
 A cancel is a client asserting that no provider was spawned, and it is trusted
 as such. A client that spawns and then cancels has lied to the pool; that is a
-client bug, and it is the only way to defeat the spacing bound below.
+client bug, and it is the only way to defeat the spacing bound below by
+assertion rather than by timing.
+
+Cancelling a lease that has already expired or been invalidated is a no-op that
+returns the settled outcome. There is still nothing to roll back, and the client
+learns it should have re-reserved.
 
 #### `POST /v1/renewLaunch`
 
@@ -631,14 +760,30 @@ then it expires regardless. Renewal no longer affects spacing — the clock is
 stamped at the real start either way — so its only job is to stop a slow-but-
 healthy spawn from being treated as a crash.
 
+A renewal moves `expires_at`, so the client recomputes its launch deadline from
+the send of the *renew*, by the same rule and for the same reason. A renewal
+that fails or is lost leaves the earlier deadline standing, which is the
+conservative direction.
+
 #### `POST /v1/recordLaunch`
 
 `{ source, lane, threadId, requestId }`. **The responsive path.** A responsive
 run never queues and is never held; it reports that it has started, and the
-coordinator stamps `last_started_at`/`next_available_at` exactly as
-`confirmLaunch` does. This mirrors today's behaviour, where a responsive request
-skips the queue (`provider-pacer.ts:173-175`) but still charges the lane clock
-(`:285-292`). Idempotent by `requestId`.
+coordinator stamps `last_started_at` and advances the lane clock monotonically,
+exactly as `confirmLaunch` does. This mirrors today's behaviour, where a
+responsive request skips the queue (`provider-pacer.ts:173-175`) but still
+charges the lane clock (`:285-292`). Idempotent by `requestId`.
+
+Because it is unheld, a responsive start can land while a normal hold is
+outstanding. When it does, the coordinator marks that hold `invalidated` in the
+same transaction, and the holder finds out on its next call: a client that has
+not yet spawned sees the invalidation on its pre-spawn check and re-reserves
+rather than starting; a client that has already spawned confirms and gets
+`outcome: "invalidated"`, with its real start recorded either way.
+
+That narrows the window; it does not close it. The holder may already be inside
+`spawn`, which is the same non-atomicity as the launch deadline above. What
+follows for the guarantee is stated below rather than papered over.
 
 #### Expiry
 
@@ -647,37 +792,76 @@ touching the lane, and by a sweep every `leaseSweepMs`). On expiry the lease
 closes with `outcome: "expired"`, the hold is released, and:
 
 ```
-next_available_at = expires_at + interval_ms
+next_available_at = max(next_available_at, expires_at + interval_ms)
 ```
 
 The clock advances **as if the launch had happened at the last possible
-instant**. That asymmetry with `cancelLaunch` is deliberate: a cancel is a
+instant**, and monotonically, so a reap can never pull the lane backwards past a
+start that has already been recorded. That asymmetry with `cancelLaunch` is deliberate: a cancel is a
 client *telling* us it did not start; an expiry is silence, and silence is
 compatible with "the client spawned the provider and then died". Advancing from
-`expires_at` rather than from `granted_at` is what makes the spacing bound below
-hold with no exception for the crash case.
+`expires_at` rather than from `granted_at` is what removes the crash case from
+the spacing argument below — given the launch deadline, which is what makes
+`expires_at` an upper bound on the real start rather than a guess.
 
 The cost is bounded and easy to state: a crash between grant and spawn leaves
 the lane idle for up to `leaseTtlMs` longer than necessary. `leaseTtlMs` is
 therefore the tuning knob for "what a crash costs", which is a property worth
 having explicitly. **Prefer idle to double-spent.**
 
-#### The spacing bound
+#### What the spacing bound covers, and what it does not
 
-For any two consecutive confirmed or presumed starts on a lane, the second
-starts at least `interval_ms` after the first. By case:
+The guarantee is narrower than an earlier revision claimed. It is stated in
+three parts because the three parts have genuinely different strengths, and
+collapsing them into one table is what produced the wrong claim.
 
-| First launch settles by | Clock set to | Actual first start | Spacing |
+**Guaranteed, by the schema.** At most one hold exists on a lane at a time. That
+is the partial unique index in §7, not handler logic, so no argument about
+ordering or interleaving can defeat it.
+
+**Guaranteed for normal starts, given the client obligation.** For any two
+consecutive *normal* starts on a lane, the second is at least `interval_ms`
+after the first, provided each client honours the launch deadline (A7, above).
+By case:
+
+| First normal launch settles by | Clock set to | Actual first start | Spacing to the next normal start |
 | --- | --- | --- | --- |
-| `confirmLaunch` at `c` | `c + interval` | `c` | exactly `interval` |
-| expiry at `e` | `e + interval` | somewhere in `[g, e]` | ≥ `interval` |
+| `confirmLaunch` at `c` | `max(prev, c + interval)` | `c` | ≥ `interval` |
+| expiry at `e` | `max(prev, e + interval)` | in `[g, e]`, by A7 | ≥ `interval` |
 | `cancelLaunch` | untouched | none occurred | n/a |
-| `recordLaunch` at `r` (responsive) | `r + interval` | `r` | exactly `interval` |
 
-Because the hold is exclusive, no second grant exists during any of these
-windows, so there is no third case to check. The cost of exclusivity is that a
-lane's effective period is `interval + spawn latency` rather than `interval`;
-at A2 rates (spawn seconds, interval hundreds of seconds) that is noise.
+Exclusivity is what keeps this to three rows: no second grant exists during any
+settlement window, so there is no fourth case among normal launches.
+
+**Not guaranteed: any pair involving a responsive start.** A responsive start is
+by construction unqueued and unheld — that is precisely what "an operator's
+urgent wake must not depend on a sidecar" costs. It can therefore occur at any
+instant, including while a normal hold is outstanding, and the exclusivity index
+does not prevent it because there is no second *grant* to prevent: the start
+simply happens and is reported. So a responsive start and a normal start can
+land arbitrarily close together.
+
+What *is* guaranteed is that a responsive start charges the lane like any other:
+it stamps the clock, monotonically, so every subsequent normal start is a full
+interval behind it, and the invalidation above stops the outstanding holder from
+piling straight on top when it can still be stopped.
+
+This is not a regression against today. Responsive runs already skip the pacer's
+queue (`provider-pacer.ts:173-175`) while still charging the clock (`:285-292`),
+so the pool has never spaced them. What was wrong was the claim: listing
+`recordLaunch` as a fourth compositional row implied an all-starts invariant the
+design does not have and cannot have while responsive runs stay unblocked. The
+exception is now explicit, its effect on other traffic is bounded, and the
+policy question goes to §12 Q3 rather than being answered by a table.
+
+**Residual: a start that happens after its deadline.** Detected on confirm and
+repaired forward (above); invisible if the client also dies before confirming
+(§6.2). The excursion is bounded by the client's overshoot and does not
+propagate to the next interval.
+
+The cost of exclusivity is unchanged: a lane's effective period is
+`interval + spawn latency` rather than `interval`; at A2 rates (spawn seconds,
+interval hundreds of seconds) that is noise.
 
 #### `GET /v1/lanes`
 
@@ -698,12 +882,19 @@ One error envelope: `{ "error": { "code": "...", "message": "...", "retryable": 
 
 | Code | Meaning | Client action |
 | --- | --- | --- |
-| `protocol_mismatch` | `protocolMajor` differs | Refuse to run normal launches; log loudly |
+| `protocol_mismatch` | `protocolMajor` differs | Fail normal launches closed at once (§5.7); log loudly |
 | `lane_unknown` | Lane not configured | Refuse |
-| `lease_not_found` | Confirm/cancel/renew on a reaped or unknown lease | Treat as expired; do not retry |
-| `lease_expired` | Renew after `maxLeaseMs` | Re-reserve |
-| `stale_snapshot` | Read while hard-stale and caller demanded fresh | Use degraded pacing |
+| `lease_not_found` | Confirm/cancel/renew on a `leaseId` the coordinator has never held | Do not retry; do not spawn |
+| `lease_expired` | Renew after `maxLeaseMs` | Re-reserve; the deadline has passed |
+| `stale_snapshot` | Read while hard-stale and caller demanded fresh | Proceed at `maxIntervalSeconds` |
 | `busy` | Write contention beyond `busy_timeout` | Retry with jittered backoff |
+
+Note what is deliberately **not** in this table: confirming a lease that has
+already expired is not an error. Settled leases are retained for seven days
+(§9.4), so the coordinator still knows the lease and records the start as a late
+confirm (§5.5). `lease_not_found` is reserved for an identifier the coordinator
+has genuinely never seen — a client bug or a database that has been replaced —
+and only then is refusing the right answer.
 
 Every mutating call is safe to retry, because every mutating call carries a
 caller-minted idempotency key (`idempotencyKey` for observations, `requestId`
@@ -723,48 +914,83 @@ for reservations and responsive records, `leaseId` for the lease lifecycle).
   **The degradation is always toward slower, never faster.**
 
 **Unavailable** — the socket is gone, the connection fails, or the handshake is
-refused. An earlier revision proposed indefinite fail-slow at
-`maxIntervalSeconds` per instance and justified it by comparison with today's
-uncoordinated behaviour. That comparison was against the wrong baseline: the
-promise being made is the *pool's* lane rate, and N instances each pacing
-themselves at interval `D` produce an aggregate of `N/D`, which exceeds the
-promised `1/interval` whenever `N × interval > D`. The revised behaviour is
-bounded by construction and then stops:
+refused. Two earlier revisions got this wrong in opposite directions, and the
+second failure is the more instructive one.
 
-1. **Bounded degraded pacing during a grace window.** A disconnected instance
-   paces normal launches locally at
+The first proposed indefinite local fail-slow at `maxIntervalSeconds` per
+instance, justified by comparison with today's uncoordinated behaviour — the
+wrong baseline, because the promise being made is the *pool's* lane rate, and N
+instances each pacing themselves at interval `D` aggregate to `N/D`.
 
-   ```
-   degradedIntervalSeconds = poolInstances × max(lastKnownIntervalSeconds, maxIntervalSeconds)
-   ```
+The second replaced that with a bounded local pacer,
 
-   where `poolInstances` is required configuration (A7), not a default. The
-   aggregate across the pool is then at most the promised lane rate, which is
-   the property the earlier revision failed to establish. With two instances and
-   a 3600 s cap this is a 7200 s spacing per instance — deliberately painful,
-   because a disconnected coordinator is a thing to fix, not to live in.
-2. **Then fail closed.** After `degradedGraceSeconds` with no successful
-   handshake, the instance **stops starting normal runs** and says so in its
-   health output and in chat. The grace window exists for one observed reason:
-   a coordinator restart during an ordinary upgrade (§8.3) must not stop the
-   pool. Its default is therefore sized to a restart (300 s), not to an outage.
-   Everything beyond that window is anticipated availability optimisation, and
-   this design declines to build it.
-3. **Responsive launches are never blocked**, in any state. An operator's
+```
+degradedIntervalSeconds = poolInstances × max(lastKnownIntervalSeconds, maxIntervalSeconds)
+```
+
+which is aggregate-safe **only if every instance is disconnected at once and the
+coordinator is granting nothing.** That is the total-outage case, and it was the
+only case the formula was checked against. Under a *partial* failure — one
+instance refused at `hello` on a protocol-major mismatch, or unable to open the
+socket for a permission reason, while the coordinator serves everyone else — the
+connected clients keep consuming the full `1/interval` lane rate and the
+disconnected one adds `1/(poolInstances × interval)` on top. The pool exceeds the
+rate it promises, with a correct instance count and a correctly implemented
+formula. The formula was answering a question the client cannot ask: *is anyone
+else still getting grants?*
+
+Rather than build the machinery that would let it ask — a client registry,
+heartbeats, lane capacity reserved for the absent — this revision deletes the
+degraded pacer. **A client with no grant does not start a normal run.** That is
+provable under every failure mode, partial or total, precisely because it never
+depends on knowing what the rest of the pool is doing.
+
+What makes the deletion affordable is A2. The lane interval is hundreds to
+thousands of seconds; a coordinator restart during an ordinary upgrade (§8.3)
+takes seconds. A run that waits out a restart has lost a rounding error of its
+own interval. The restart case never needed local launching — it needed the run
+not to *fail*. So:
+
+1. **Wait; do not launch.** A disconnected instance retries the connection with
+   backoff and defers normal starts meanwhile, reusing the deferral the pacer
+   already has (`provider-pacer.ts:149`). Nothing starts, so nothing can be
+   over-rate. This is the whole of the restart story, and it replaces a formula
+   with an absence.
+2. **A refusal is not an outage, and fails closed at once.** If the coordinator
+   answers and rejects the client — protocol-major mismatch, failed
+   authentication, a socket this instance may not open — then it is up and
+   serving others, there is no restart to wait out, and waiting would only delay
+   an inevitable failure. Normal runs fail immediately, carrying the refusal
+   reason. This is exactly the partial failure the old formula mishandled, and
+   it is now the one case the client *can* diagnose from its own vantage point.
+3. **Then fail closed on silence too.** After `unavailableGraceSeconds` with no
+   successful handshake, the instance stops deferring and starts failing normal
+   runs, and says so in its health output and in chat. The window is sized to a
+   restart (300 s by default), not to an outage: past it, a growing queue of
+   silently deferred runs is worse than a loud refusal. Q5 asks how long it
+   should be.
+4. **Responsive launches are never blocked**, in any state. An operator's
    urgent wake must not depend on a sidecar. This is a deliberate, stated
    exposure rather than a bounded one: responsive runs are human-initiated and
    rate-limited by the human, and the alternative — an operator unable to wake
-   the system because a sidecar is down — is worse. It is Q3 in §12.
-4. **The client never writes to the quota database.** Not while degraded, not
-   ever, once ownership has flipped (§8.2). This is the rule that makes "avoid
-   concurrent old/new writers" enforceable rather than aspirational.
-5. Observations are **buffered in memory** — a bounded ring, default 200 entries
+   the system because a sidecar is down — is worse. It is Q3 in §12, and after
+   this revision it is the *only* path by which a provider start can occur with
+   no coordinator involvement at all.
+5. **The client never writes to the quota database.** Not while disconnected,
+   not ever, once ownership has flipped (§8.2). This is the rule that makes
+   "avoid concurrent old/new writers" enforceable rather than aspirational.
+6. Observations are **buffered in memory** — a bounded ring, default 200 entries
    per provider, oldest dropped — and replayed on reconnect with their original
    `scrapedAt` and `idempotencyKey`. Slot dedupe plus the idempotency key make
-   replay exactly-once in effect.
+   replay exactly-once in effect. Collection is untouched by disconnection: an
+   instance that may not launch can still watch, which is the separability §8.4
+   argues for, arriving as a side effect.
 
-If `poolInstances` cannot be stated (A7 fails), step 1 has no safe bound and the
-honest behaviour is to fail closed immediately on disconnection.
+The `poolInstances` configuration disappears with the pacer it existed to bound,
+and so does the earlier form of A7. The trade is deliberate and worth naming: a
+total coordinator outage now stops normal launching after five minutes where the
+previous design would have kept launching slowly. That is availability traded for
+a guarantee that holds in cases the previous design did not survive.
 
 ---
 
@@ -825,9 +1051,9 @@ sequenceDiagram
     Note over A: process dies - may or may not have spawned
     Note over C: t = expires_at, sweep
     C->>D: lease L1 -> "expired"; hold released
-    C->>D: next_available_at = expires_at + interval_ms
+    C->>D: next_available_at = max(next_available_at, expires_at + interval_ms)
     Note over C,D: advanced as if the launch happened at the last possible instant
-    Note over C: so spacing holds even though the real start is unknown
+    Note over C: normal spacing holds if A honoured its launch deadline
     Note over C: cost is bounded - at most leaseTtlMs of extra idleness
     C->>C: metric quota_coordinator_leases_expired_total{lane} += 1
 ```
@@ -836,9 +1062,17 @@ The two crash windows, stated explicitly:
 
 - **Crashed before spawning.** The lane is idle for up to `leaseTtlMs` longer
   than it needed to be. This is the price of not being told.
-- **Crashed after spawning, before confirming.** The real start was somewhere in
-  `[granted_at, expires_at]`; the clock is advanced from `expires_at`, so the
-  next start is at least `interval_ms` after the real one. No double spend.
+- **Crashed after spawning, before confirming.** The real start lies in
+  `[granted_at, expires_at]` **if A honoured its launch deadline** (§5.5). The
+  clock advances from `expires_at`, so the next normal start is at least
+  `interval_ms` after the real one, and no allowance is double-spent.
+- **Crashed after spawning *late*.** The premise in the previous bullet is a
+  client obligation (A7), not something the coordinator can check, and a client
+  that both overran its deadline and died leaves no confirm to detect it with.
+  This is the one window the design cannot see. Its cost is the overshoot alone:
+  the clock still advances a full interval from `expires_at`, so the error does
+  not propagate past the next start. A client that overruns and *survives* is
+  visible, because its confirm arrives late and is counted (§5.5).
 
 Recovery: once A restarts it simply reserves again with a fresh `requestId`. It
 inherits no state and needs none.
@@ -911,9 +1145,11 @@ sequenceDiagram
     Note over A: idempotency turns an ambiguous failure into a certain one
 
     Note over A,C: socket stays down
-    A->>A: bounded degraded pacing at poolInstances x interval
-    Note over A: after degradedGraceSeconds, normal runs stop
+    A->>A: normal starts deferred, connection retried with backoff
+    Note over A: nothing launches - no grant means no normal start
+    Note over A: after unavailableGraceSeconds, normal runs fail closed
     A->>A: responsive runs still launch; health degraded; alert raised
+    Note over A,C: a handshake refusal instead of silence fails closed at once
     Note over A: zero direct writes to the quota database, in every branch
 ```
 
@@ -955,7 +1191,7 @@ CREATE TABLE IF NOT EXISTS quota_leases (
   source         TEXT NOT NULL,            -- reporting instance id
   thread_id      TEXT,
   mode           TEXT NOT NULL CHECK (mode IN ('normal','responsive')),
-  state          TEXT NOT NULL CHECK (state IN ('queued','granted','confirmed','cancelled','expired')),
+  state          TEXT NOT NULL CHECK (state IN ('queued','granted','confirmed','cancelled','expired','invalidated')),
   enqueued_at    TEXT NOT NULL,            -- FIFO key, coordinator clock
   granted_at     TEXT,
   expires_at     TEXT,
@@ -990,7 +1226,15 @@ Notes:
 - `UNIQUE (lane, request_id)` is what makes `reserveLaunch` idempotent at the
   storage layer, not merely in the handler.
 - `idx_quota_leases_one_hold` makes "one outstanding launch per lane" a database
-  invariant. A handler bug cannot produce two live holds.
+  invariant. A handler bug cannot produce two live holds. It does not — and
+  cannot — constrain a responsive `recordLaunch`, which takes no hold at all;
+  §5.5 states that exception rather than hiding it behind the index.
+- `invalidated` is the state a hold enters when a responsive start charges its
+  lane underneath it (§5.5). It releases the hold like any other terminal state,
+  so the partial index stays satisfied.
+- A **late confirm** needs no column: it is exactly a lease whose `state` is
+  `confirmed` and whose `settled_at` is after its `expires_at`. Storing a
+  derived flag would be one more thing that could disagree with the timestamps.
 - No `granted_lane_version` and no stored pre-grant clock value: §5.5 removed
   the rollback that would have needed them.
 - The partial index on `state = 'queued'` keyed by `enqueued_at` makes "is this
@@ -1185,18 +1429,27 @@ logging is exactly that — `start.ts:1327-1331`).
 | `quota_coordinator_leases_confirmed_total` | counter | `lane` |
 | `quota_coordinator_leases_cancelled_total` | counter | `lane` |
 | `quota_coordinator_leases_expired_total` | counter | `lane` |
+| `quota_coordinator_late_confirms_total` | counter | `lane`, `source` |
+| `quota_coordinator_holds_invalidated_total` | counter | `lane` |
 | `quota_coordinator_hold_seconds` | histogram | `lane` (grant → settle) |
 | `quota_coordinator_reservation_wait_seconds` | histogram | `lane` |
 | `quota_coordinator_lane_interval_seconds` | gauge | `lane` |
 | `quota_coordinator_lane_waiters` | gauge | `lane` |
 | `quota_coordinator_observations_total` | counter | `provider`, `source`, `result` |
 | `quota_coordinator_snapshot_age_seconds` | gauge | `provider` |
-| `quota_coordinator_degraded_clients` | gauge | — |
+| `quota_client_coordinator_connected` | gauge | `source` |
+
+`quota_client_coordinator_connected` is emitted by the **instance**, not by the
+coordinator, and the reason is §5.7's whole lesson: a coordinator cannot count
+clients it cannot see, so a coordinator-side "degraded clients" gauge would read
+zero in exactly the partial failure that matters.
 
 Alert on: `leases_expired_total` rising (clients crashing between grant and
-confirm, which now costs real idleness), `snapshot_age_seconds` past
-`hardStaleAfterMs` (the sensor is blind), and `degraded_clients > 0` for longer
-than `degradedGraceSeconds` (the pool has stopped launching normal runs).
+confirm, which now costs real idleness); `late_confirms_total` rising at all,
+because that is A7 breaking down and it is the only visible symptom of it;
+`snapshot_age_seconds` past `hardStaleAfterMs` (the sensor is blind); and
+`quota_client_coordinator_connected = 0` on any instance for longer than
+`unavailableGraceSeconds` (that instance has stopped launching normal runs).
 
 `quota_coordinator_hold_seconds` is the one to watch during rollout: it is the
 spawn latency now sitting inside each interval, and if it ever approaches
@@ -1211,25 +1464,30 @@ observation per `(provider, kind)` is never pruned
 from under it.
 
 New: settled leases pruned after 7 days; `quota_ingest_receipts` pruned after
-7 days, which must exceed the largest plausible degraded-buffer replay delay
-(§5.7 caps that at `degradedGraceSeconds`, 300 s by default).
+7 days, which must exceed the largest plausible disconnected-buffer replay delay
+(§5.7 sizes that window at `unavailableGraceSeconds`, 300 s by default, and
+observation buffering continues past it even though launching does not).
 
 ### 9.5 Rollback drill
 
 Rehearse before stage 1, not during an incident: bring the coordinator down
-mid-flight and confirm each of (a) normal runs continue at
-`poolInstances × interval` during the grace window, (b) normal runs stop after
-it, (c) responsive runs are unaffected throughout, (d) no instance writes to the
-quota database, (e) buffered observations replay and dedupe on reconnect,
-(f) `degraded_clients` fires.
+mid-flight and confirm each of (a) normal runs are *deferred* rather than
+launched for the whole grace window — no provider starts at all, (b) they fail
+closed with a legible reason after it, (c) responsive runs are unaffected
+throughout, (d) no instance writes to the quota database, (e) buffered
+observations replay and dedupe on reconnect, (f)
+`quota_client_coordinator_connected` drops and the alert fires. Then rehearse the
+partial case separately: point one instance at a socket it may not open while the
+others stay connected, and confirm that instance fails closed immediately rather
+than pacing itself locally.
 
 ---
 
 ## 10. Test criteria
 
 Every criterion below is a statement about observable state, not about intent.
-Items 1–11 are unit/integration tests in the package; item 12 is an end-to-end
-check. The multi-process pattern already exists in
+Items 1–11 and 13–15 are unit/integration tests in the package; item 12 is the
+end-to-end check. The multi-process pattern already exists in
 `packages/rusa/src/quota/shared-store.test.ts:495` (`startConcurrentOpener`
 spawns a real second Node process against the same database file) and is the
 right foundation for 1–6.
@@ -1240,7 +1498,9 @@ right foundation for 1–6.
 2. **Spacing is measured from actual starts.** Grant A, wait most of
    `leaseTtlMs`, then `confirmLaunch`. B's subsequent grant-and-confirm must be
    at least `interval_ms` after **A's confirm**, not after A's grant. This is
-   the criterion the grant-time design would have failed.
+   the criterion the grant-time design would have failed. It asserts the
+   guarantee for clients that honour the launch deadline; item 13 covers the
+   client that does not.
 3. **Crash after grant is conservative.** Kill a granted client without confirm
    or cancel. After `leaseTtlMs` the lease reads `expired` and
    `next_available_at` equals `expires_at + interval_ms` — never earlier.
@@ -1259,11 +1519,13 @@ right foundation for 1–6.
 8. **Staleness degrades one way.** With observations aged past
    `hardStaleAfterMs`, successive starts are spaced at `maxIntervalSeconds` —
    never at the last reasoned interval, never faster.
-9. **Degraded mode is bounded, then closed.** Remove the socket. Assert: normal
-   launches spaced at `poolInstances × interval`; normal launches stop after
-   `degradedGraceSeconds`; responsive launches unaffected throughout;
+9. **Disconnection launches nothing.** Remove the socket. Assert: **zero**
+   normal provider starts for the whole window — not slower ones; normal runs
+   are deferred and then fail closed after `unavailableGraceSeconds`, with the
+   reason legible; responsive launches unaffected throughout;
    `quota_scrapes`/`quota_observations` row counts unchanged for the whole
-   window; buffered observations replay and dedupe on reconnect.
+   window; buffered observations replay and dedupe on reconnect. Asserting *no*
+   start is what makes this checkable without knowing the pool size.
 10. **Old-writer exclusion is mechanical.** With the database renamed and a
     directory at the old path, a build containing **no** coordinator awareness
     fails at open with `SQLITE_CANTOPEN` and writes nothing. Assert on the real
@@ -1273,13 +1535,37 @@ right foundation for 1–6.
     `schema_version` is lower than the file's refuses to open it and exits
     non-zero.
 12. **Two real instances.** Two full instances with separate homes, pointed at
-    one coordinator. Assert the *union* of provider start timestamps across both
-    instances is spaced by at least the lane interval. This is the criterion
-    #178 asks for: concurrent clients cannot both consume the same allowance.
+    one coordinator. Assert the *union* of **normal** provider start timestamps
+    across both instances is spaced by at least the lane interval, with no
+    responsive run in the fixture. This is the criterion #178 asks for:
+    concurrent clients cannot both consume the same allowance. The restriction to
+    normal starts is not a convenience — §5.5 says the union over *all* starts is
+    not spaced, and a criterion that asserted otherwise would be asserting a
+    property the design does not claim.
     Note that no two-instance fixture exists yet: `E2EInstanceManager` provisions
     a *single* sandboxed instance on a fixed port
     (`packages/rusa/src/actor/e2e-instance-manager.ts:48`, `:137-151`), so
     building the second one is part of this criterion's cost, not a given.
+13. **A late start is detected and repaired, not lost.** Grant a lease, let it
+    expire without confirming, then confirm anyway. Assert: the lease reads
+    `confirmed` with `settled_at > expires_at`; `late_confirms_total` increments;
+    `next_available_at` equals `max(value at expiry, confirm instant + interval)`
+    — so it moves forward from the real start and never backwards. Then grant to
+    a second client and assert its start is a full interval after the late one.
+    The excursion must not propagate.
+14. **A responsive start invalidates an outstanding hold.** Grant normal lease A;
+    call `recordLaunch` on the same lane; assert A's state is `invalidated`, the
+    lane clock is stamped from the responsive start, and A's subsequent
+    `confirmLaunch` returns `outcome: "invalidated"` while still recording the
+    start monotonically. Assert also that a client checking before spawn sees the
+    invalidation and re-reserves rather than starting. This is the criterion that
+    pins the exception in §5.5 to observable behaviour rather than prose.
+15. **A refusal fails closed immediately.** Point a client at a live coordinator
+    that rejects it — protocol-major mismatch at `hello`, or a socket it may not
+    open — while another client stays connected and keeps launching. Assert the
+    refused instance starts **no** normal run, at once and without waiting out
+    `unavailableGraceSeconds`, and that the connected instance is unaffected.
+    This is the partial failure the bounded degraded pacer got wrong.
 
 ---
 
@@ -1303,11 +1589,14 @@ not a mesh one. None of these should be filed before that.
    placeholder, and the misconfiguration guard. Covers 10.
 6. **Reservation adoption in the launch path.** `providerGate`
    (`start.ts:1663-1675`) reserves through the coordinator after mesh admission
-   and confirms at spawn; responsive uses `recordLaunch`; the dashboard lane
-   view reads `GET /v1/lanes`. Covers 2 and 8.
-7. **Degraded mode.** Bounded local pacer, `poolInstances` config, grace window,
-   fail-closed transition, observation ring buffer and replay, health surfacing.
-   Covers 9.
+   and confirms at spawn; the client-side launch deadline and its pre-spawn
+   check (§5.5), including the `expired` and `invalidated` responses; responsive
+   uses `recordLaunch`; the dashboard lane view reads `GET /v1/lanes`. Covers 2,
+   8, 13 and 14.
+7. **Unavailability handling.** Deferral and reconnect backoff on a lost socket,
+   immediate fail-closed on an answered refusal, the `unavailableGraceSeconds`
+   transition, observation ring buffer and replay, health surfacing. No local
+   pacer and no pool-size configuration. Covers 9 and 15.
 8. **Operational packaging.** systemd unit and alert companion, backup job,
    metrics through the #177 logger, rollback drill documented.
 9. **End-to-end two-instance test.** Covers 12.
@@ -1341,10 +1630,16 @@ alternative is an opt-in "this instance also hosts the coordinator" mode, which
 removes a unit but introduces a leader-election problem the moment that instance
 restarts. This proposal assumes the separate unit is the cheaper of the two.
 
-**Q3 — Is an unbounded responsive path acceptable?** §5.7 keeps responsive
+**Q3 — Is an unbounded, unspaced responsive path acceptable?** Two consequences
+travel together and both are policy, not engineering. §5.7 keeps responsive
 launches working in every degraded state, on the argument that an operator
-unable to wake the system is worse than a quota overrun. That is a policy call,
-and it is the one place this design deliberately declines to bound the rate.
+unable to wake the system is worse than a quota overrun — after this revision
+that is the only way a provider can start with no coordinator involvement at all.
+And §5.5 admits that a responsive start, being unheld, can land arbitrarily close
+to a normal one, so the pool's spacing guarantee covers normal starts only. Both
+follow from "never block the human", and both would be closed by the same
+decision: make responsive runs take a hold like everything else, and accept that
+an operator's urgent wake can be made to wait.
 
 **Q4 — Reserve after mesh admission, or before?** §5.5 recommends reserving
 immediately before spawn, which keeps holds short but moves cross-instance
@@ -1353,10 +1648,14 @@ alternative — reserve first, hold a long heartbeated lease — preserves
 submission-order fairness at the cost of holds that outlive crashes for much
 longer, and every second of hold is now real lane idleness.
 
-**Q5 — What is `poolInstances`, and who maintains it?** A7 requires the operator
-to state a maximum instance count so degraded mode has a safe bound (§5.7). If
-that number cannot be kept accurate, degraded mode should fail closed
-immediately instead.
+**Q5 — How long should an instance wait for an absent coordinator before it
+fails runs?** This replaces an earlier question about maintaining a
+`poolInstances` count, which §5.7 deleted along with the degraded pacer it fed.
+The remaining choice is simpler and entirely operational: `unavailableGraceSeconds`
+is defaulted to 300 s because that covers a restart during an upgrade, but the
+cost of it being too short is a failed run during routine maintenance, and the
+cost of it being too long is a queue of deferred runs that surface as silence.
+The operator knows which of those is worse here; the design does not.
 
 **Q6 — Should the coordinator run as its own service user?** §8.2's path
 relocation is sufficient to exclude old writers. A dedicated user with
@@ -1377,3 +1676,16 @@ the follower side, and this proposal deliberately does not add it. Until
 something does, that consumption stays invisible to the controller — the same
 blind spot interactive use already occupies. The question is whether closing it
 belongs to #237, to a follow-up here, or nowhere yet.
+
+**Q9 — Who enforces the launch deadline when the process holding the lease is
+not the process that spawns?** §5.5 puts a monotonic deadline in the client and
+makes the coordinator detect and repair overruns, which is sufficient while the
+reserving process and the spawning process are the same one. Under #237 they are
+not: the leader reserves and the follower spawns, across a connection that can
+itself be delayed. Making the guarantee hold there needs a remaining-duration
+field on the dispatch and a follower that refuses a stale one. Neither exists,
+and this proposal deliberately does not design them — inventing a field in
+another component's protocol is exactly the kind of gap worth asking about
+rather than filling. The question is whether that belongs to #237's dispatch
+contract, to a follow-up here, or to a decision that leader-dispatched launches
+simply do not get the spacing guarantee until it does.
