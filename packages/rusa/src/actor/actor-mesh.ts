@@ -137,8 +137,13 @@ export interface ActiveRunState {
 
 export interface RetireOptions {
   /**
-   * Complete override: retire immediately even if a run in the subtree is actively running.
-   * Operator / root-control / internal teardown only.
+   * Run-guard override: retire immediately even if a run in the subtree is actively
+   * running. Operator / root-control only.
+   *
+   * Deliberately *not* an override for the undisposed-work preflight (#191). Force
+   * exists because a wedged actor must stay retirable, and a wedged run is the mesh's
+   * own problem to break; a live obligation or an undelivered message is somebody's
+   * work, and no flag turns "I could not wait for this run" into "throw that away".
    */
   force?: boolean;
   /**
@@ -2335,20 +2340,23 @@ export class ActorMesh {
    * were then reported as a comparison. Deferring the destructive cleanups (which the
    * mesh already does) makes that loss quieter, not smaller.
    *
-   * `force` exists for the operator's lever and for the mesh's own internal teardown —
-   * a wedged actor must stay retirable, and the subtree cascade must not re-check a
-   * subtree the entry call already cleared.
+   * `force` exists for the operator's lever — a wedged actor must stay retirable.
    *
    * `forceQueued` cancels queued runs in the subtree before retirement, but still refuses
    * if any thread in the subtree is actively running (inside the provider call). This is
-   * exposed to actors via the `retire_thread` MCP tool with `force: true` (an issue).
+   * the flag the `retire_thread` MCP tool passes, so an actor's `force: true` overrides
+   * only the *queued*-run refusal.
    *
    * **Also refuses while the subtree still holds undisposed work** — a live
    * obligation, or a scheduled message in either direction (#191). That refusal
    * names every blocker so the retirer can reassign, finish, or cancel each one
    * and retry; nothing is dropped mechanically as a fallback, because a dropped
-   * delivery is a decision nobody made. Only `force` — the operator's lever and
-   * the mesh's own subtree cascade — passes it.
+   * delivery is a decision nobody made. **No flag passes it**, `force` included:
+   * the two refusals answer different questions, and overriding "someone is still
+   * working" was never a licence to destroy the work itself. The subtree cascade
+   * skips it by going through {@link retireUnchecked} instead — the entry call
+   * already cleared the whole subtree, and re-asking mid-teardown would only
+   * re-answer the same question against a tree that is already coming apart.
    *
    * @throws when the subtree has running runs (or queued runs without `force`/`forceQueued`).
    * @throws {RetirementBlockedError} when the subtree holds live obligations or pending messages.
@@ -2375,11 +2383,20 @@ export class ActorMesh {
           );
         }
       }
-      const blockers = this.retirementBlockers(id);
-      if (blockers.obligations.length > 0 || blockers.messages.length > 0) {
-        throw new RetirementBlockedError(blockers, describeRetirementBlockers(id, blockers));
-      }
     }
+    // Outside the `force` branch on purpose: see the doc comment above.
+    const blockers = this.retirementBlockers(id);
+    if (blockers.obligations.length > 0 || blockers.messages.length > 0) {
+      throw new RetirementBlockedError(blockers, describeRetirementBlockers(id, blockers));
+    }
+    this.retireUnchecked(id);
+  }
+
+  /**
+   * Tear down one thread with both retirement guards already answered — the
+   * subtree cascade's entry point, and never reachable from outside the mesh.
+   */
+  private retireUnchecked(id: string): void {
     // Marked before the child recursion: children retiring below us must be able
     // to see that we are on our way out, since the repository won't say so until
     // this call finishes. Cleared in the finally so a throwing cleanup can't
@@ -2558,8 +2575,15 @@ export class ActorMesh {
    * thread would still let a retire two levels up tear down a busy grandchild, or
    * one still holding a live obligation. The visited set is defensive insurance
    * against a pre-corrupted cyclic tree, matching {@link reparentThread}'s cycle guard.
+   *
+   * `includeRetired` chooses which question is being asked. A retired thread can
+   * never have a run in flight, so the run guard stops at active children. Work
+   * outlives its owner, though: a subtree retired before #191 landed can still hold
+   * live obligations and scheduled messages under a `retired` record, and skipping
+   * those rows would let an ancestor retire over exactly the orphans this preflight
+   * exists to catch.
    */
-  private subtreeActorIds(id: string): string[] {
+  private subtreeActorIds(id: string, opts: { includeRetired?: boolean } = {}): string[] {
     const ids: string[] = [];
     const seen = new Set<string>();
     const walk = (cursor: string): void => {
@@ -2567,7 +2591,7 @@ export class ActorMesh {
       seen.add(cursor);
       ids.push(cursor);
       for (const child of this.actors.children(cursor)) {
-        if (child.status === "active") walk(child.id);
+        if (opts.includeRetired || child.status === "active") walk(child.id);
       }
     };
     walk(id);
@@ -2600,12 +2624,17 @@ export class ActorMesh {
    * machinery for a case nobody has hit yet; if rescheduling a handoff turns out
    * to be routine, that is the evidence for building it.
    *
+   * The walk covers retired descendants as well as active ones. Ownership is a
+   * property of the work, not of whether its owner is still running, so an
+   * obligation or a send left behind by an already-retired child is still this
+   * subtree's to answer for — and answering for it is the whole point.
+   *
    * Read-only, and safe to call before deciding to retire: the same list the
    * refusal would print.
    */
   retirementBlockers(id: string): RetirementBlockers {
     id = this.resolveThreadId(id);
-    const subtree = new Set(this.subtreeActorIds(id));
+    const subtree = new Set(this.subtreeActorIds(id, { includeRetired: true }));
     const obligations: ObligationRetirementBlocker[] = [];
     for (const ownerId of subtree) {
       for (const obligation of this.obligations?.listLiveOwnedBy?.(ownerId) ?? []) {
@@ -2711,20 +2740,19 @@ export class ActorMesh {
 
   private retireInner(id: string): void {
     for (const child of this.actors.children(id)) {
-      // `force`: the entry call already cleared this whole subtree, and re-checking
-      // here would only re-answer the same question against a tree we're mid-teardown of.
-      if (child.status === "active") this.retire(child.id, { force: true });
+      if (child.status === "active") this.retireUnchecked(child.id);
     }
     const actor = this.live.get(id);
     actor?.close();
     this.live.delete(id);
     const record = this.actors.get(id);
-    for (const message of this.scheduledMessages
-      ?.listMessageDeliveries()
-      .filter((entry) => entry.toId === id) ?? []) {
-      this.notifyScheduledDeliveryDropped(id, message);
-      this.scheduledMessages?.cancelMessageDelivery(message.id);
-    }
+    // No mechanical drop of this thread's pending deliveries here (#191). Every
+    // entry into retirement now preflights the whole subtree for scheduled
+    // messages in either direction, so reaching teardown means someone already
+    // decided each one by name through `cancelScheduledMessage` — which is also
+    // the only place the `scheduled_message_cancelled` audit record is written.
+    // Dropping here would have been a second, unaudited way for a message to
+    // die, reachable only by racing a check that cannot actually be raced.
     if (record && this.onRetire) {
       try {
         this.onRetire(record);

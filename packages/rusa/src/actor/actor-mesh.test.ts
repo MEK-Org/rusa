@@ -6072,9 +6072,9 @@ describe("ActorMesh", () => {
       expect(scheduler.listMessageDeliveries()).toEqual([]);
     });
 
-    it("notifies the sender exactly once when a forced retirement drops the delivery", async () => {
+    it("refuses even a forced retirement while a delivery is pending, and drops nothing", async () => {
       const inboxStore = createMemoryInboxStore();
-      const { mesh, fake, tick, scheduledMessages } = setup({ inboxStore });
+      const { mesh, fake, tick, registry, scheduledMessages } = setup({ inboxStore });
       const sender = mesh.spawn({ charter: "sender", parentId: "root" });
       const recipient = mesh.spawn({ charter: "recipient", parentId: "root" });
       mesh.sendMessage(
@@ -6084,27 +6084,29 @@ describe("ActorMesh", () => {
         undefined,
         new Date(Date.now() + 100_000).toISOString()
       );
-      const pendingMessageId = scheduledMessages.listForRecipient(recipient)[0]?.id;
+      const pendingMessageId = scheduledMessages.listForRecipient(recipient)[0]?.id as string;
 
-      // `force` is the only path that still drops a pending delivery
-      // mechanically (#191): an ordinary retire refuses until the sender or an
-      // ancestor has decided what happens to it.
-      mesh.retire(recipient, { force: true });
+      // Retirement no longer drops a pending delivery on any path (#191).
+      // `force` overrides the run-in-flight guard; it was never a licence to
+      // destroy the work itself, so the operator is told to decide this
+      // message by name instead of having it dropped on their behalf.
+      expect(() => mesh.retire(recipient, { force: true })).toThrow(RetirementBlockedError);
       await tick();
 
-      expect(fake(sender).calls).toHaveLength(1);
-      expect(inboxStore.entries).toEqual([
-        expect.objectContaining({
-          actorId: sender,
-          source: "mesh:mechanical:system:mesh",
-          payload: expect.objectContaining({
-            type: "mesh.mechanical_note",
-            pendingMessageId,
-            originalFromId: sender,
-          }),
-        }),
+      expect(registry.get(recipient)?.status).toBe("active");
+      expect(scheduledMessages.listForRecipient(recipient).map((m) => m.id)).toEqual([
+        pendingMessageId,
       ]);
-      expect(scheduledMessages.listForRecipient(recipient)).toEqual([]);
+      // Nothing dropped means nobody notified: no mechanical notice, no run.
+      expect(fake(sender).calls).toHaveLength(0);
+      expect(inboxStore.entries).toEqual([]);
+
+      // Once someone entitled to decide has decided, the retirement goes through.
+      mesh.cancelScheduledMessage(pendingMessageId, "root", "recipient is going away");
+      mesh.retire(recipient, { force: true });
+      await tick();
+      expect(registry.get(recipient)?.status).toBe("retired");
+      expect(inboxStore.entries).toEqual([]);
     });
 
     it("routes a dropped-message notice to the sender's nearest live ancestor", async () => {
@@ -6121,9 +6123,18 @@ describe("ActorMesh", () => {
         new Date(Date.now() + 100_000).toISOString()
       );
 
-      mesh.retire(sender, { force: true });
+      const pending = scheduledMessages.listForRecipient(recipient)[0];
+      expect(pending).toBeDefined();
+
+      // Retirement drops nothing now (#191), so the surviving route to this
+      // notice is the one it was always really for: the OS job firing after
+      // the cancellation and retirement that raced it.
+      mesh.cancelScheduledMessage(pending.id, grandparent, "recipient is going away");
+      mesh.retire(sender);
       await tick();
-      mesh.retire(recipient, { force: true });
+      mesh.retire(recipient);
+      await tick();
+      mesh.deliverScheduledMessage(pending);
       await tick();
 
       expect(fake(grandparent).calls).toHaveLength(1);
@@ -6138,7 +6149,7 @@ describe("ActorMesh", () => {
     });
   });
   describe("retire cancels pending wakes & late wakes no-op ", () => {
-    it("cancels an actor's own self-scheduled pending delivery when retired", async () => {
+    it("blocks retirement on an actor's own pending self-wake until it is cancelled", async () => {
       const inboxStore = createMemoryInboxStore();
       const { mesh, registry, fake, tick, scheduledMessages } = setup({ inboxStore });
       const parent = mesh.spawn({ charter: "parent", parentId: "root" });
@@ -6148,32 +6159,30 @@ describe("ActorMesh", () => {
       const deliverAt = new Date(Date.now() + 100000).toISOString();
       const res = mesh.sendMessage(worker, "self follow-up wake", worker, undefined, deliverAt);
       expect(res.delivered).toBe(true);
+      const pending = scheduledMessages.listForRecipient(worker);
+      expect(pending).toHaveLength(1);
+
+      // Both endpoints are inside the subtree, so the wake is `internal` — and
+      // it blocks like any other, force included (#191).
+      expect(() => mesh.retire(worker, { force: true })).toThrow(RetirementBlockedError);
+      expect(registry.get(worker)?.status).toBe("active");
       expect(scheduledMessages.listForRecipient(worker)).toHaveLength(1);
 
-      // Retire the worker, overriding the pending-delivery refusal
-      mesh.retire(worker, { force: true });
+      // The parent decides the wake is moot; only then does the worker go.
+      mesh.cancelScheduledMessage(pending[0].id, parent, "worker is done");
+      mesh.retire(worker);
       await tick();
 
-      // Pending deliveries on retired worker should be cleared
       expect(scheduledMessages.listForRecipient(worker)).toEqual([]);
       expect(registry.get(worker)?.status).toBe("retired");
 
       // Advance time past the deliverAt timestamp
       await vi.advanceTimersByTimeAsync(150000);
 
-      // Worker should NOT have run
+      // Nothing wakes, and nobody is told a message was dropped, because none was.
       expect(fake(worker).calls).toHaveLength(0);
-      // Parent should have received the dropped scheduled message notification
-      expect(fake(parent).calls).toHaveLength(1);
-      expect(inboxStore.entries).toContainEqual(
-        expect.objectContaining({
-          actorId: parent,
-          payload: expect.objectContaining({
-            note: expect.stringContaining("retired before delivery: self follow-up wake"),
-            originalFromId: worker,
-          }),
-        })
-      );
+      expect(fake(parent).calls).toHaveLength(0);
+      expect(inboxStore.entries).toEqual([]);
     });
 
     it("deliverWake gracefully drops and returns false on retired actor without crashing", async () => {
@@ -6211,13 +6220,14 @@ describe("ActorMesh", () => {
       const pending = scheduledMessages.listForRecipient(worker)[0];
       expect(pending).toBeDefined();
 
-      // Retire worker, overriding the pending-delivery refusal
-      mesh.retire(worker, { force: true });
+      mesh.cancelScheduledMessage(pending.id, parent, "worker is done");
+      mesh.retire(worker);
       await tick();
 
-      // An `at` process may already have started while cancellation races it.
-      // Its callback must remain harmless and must not duplicate the notice
-      // retirement already delivered to the sender.
+      // An `at` process may already have started while cancellation raced it,
+      // and curl may retry the callback. Both must stay harmless, and the
+      // sender hears about it once rather than once per callback.
+      mesh.deliverScheduledMessage(pending);
       mesh.deliverScheduledMessage(pending);
       await tick();
 
@@ -6965,15 +6975,64 @@ describe("ActorMesh", () => {
       expect(registry.get(worker)?.status).toBe("retired");
     });
 
-    it("still lets the operator's force override past the blockers", () => {
-      const { mesh, registry, owned } = meshWithObligations();
+    it("refuses the operator's force too, and destroys nothing un-audited", () => {
+      const events: Array<{ kind: string; actorId?: string; detail?: string }> = [];
+      const { mesh, registry, owned, scheduledMessages } = meshWithObligations({
+        events: (e) => events.push(e),
+      });
       const worker = mesh.spawn({ charter: "worker", parentId: "root" });
       owned.set(worker, [{ id: "ob-2", status: "ready", title: "unfinished" }]);
       mesh.sendMessage(worker, "wake myself", worker, undefined, inFuture());
 
-      // A wedged actor must stay retirable; the override is audited by its caller.
+      // `force` answers "a run is in flight and I cannot wait for it". It was
+      // never an answer to "someone's work is undisposed of", so it does not
+      // buy past this boundary — and because nothing is destroyed here, there
+      // is no destruction that escapes the cancellation audit either.
+      expect(() => mesh.retire(worker, { force: true })).toThrow(RetirementBlockedError);
+      expect(registry.get(worker)?.status).toBe("active");
+      expect(scheduledMessages.listMessageDeliveries()).toHaveLength(1);
+      expect(events.filter((e) => e.kind === "scheduled_message_cancelled")).toEqual([]);
+
+      // The operator disposes of both blockers explicitly, and the message's
+      // end is recorded with a decider's name on it.
+      const [pending] = mesh.retirementBlockers(worker).messages;
+      mesh.cancelScheduledMessage(pending.messageId, "root", "worker is wedged, wake is moot");
+      owned.set(worker, []);
       mesh.retire(worker, { force: true });
+
       expect(registry.get(worker)?.status).toBe("retired");
+      expect(events.filter((e) => e.kind === "scheduled_message_cancelled")).toMatchObject([
+        { actorId: "root", detail: pending.messageId },
+      ]);
+    });
+
+    it("blocks on work orphaned under an already-retired descendant", () => {
+      const { mesh, registry, owned, scheduledMessages } = meshWithObligations();
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      const peer = mesh.spawn({ charter: "peer", parentId: "root" });
+      mesh.retire(child);
+      expect(registry.get(child)?.status).toBe("retired");
+
+      // Rows a pre-#191 teardown could leave behind: an obligation and an
+      // outgoing send whose owner is a `retired` record. Walking only active
+      // children would skip exactly these, and the ancestor would then retire
+      // straight over the orphans the preflight exists to catch.
+      owned.set(child, [{ id: "ob-orphan", status: "ready", title: "left behind" }]);
+      mesh.sendMessage(peer, "stale handoff", child, undefined, inFuture());
+      const messageId = scheduledMessages.listMessageDeliveries()[0].id;
+
+      const blockers = mesh.retirementBlockers(parent);
+      expect(blockers.obligations).toMatchObject([{ obligationId: "ob-orphan", ownerId: child }]);
+      expect(blockers.messages).toMatchObject([
+        { messageId, fromId: child, toId: peer, direction: "outgoing" },
+      ]);
+      expect(() => mesh.retire(parent)).toThrow(RetirementBlockedError);
+      expect(registry.get(parent)?.status).toBe("active");
+
+      // The run guard keeps its own, narrower scope: a retired thread cannot
+      // have a run in flight, so it stays out of that walk.
+      expect(mesh.activeRunsInSubtree(parent)).toEqual([]);
     });
   });
 

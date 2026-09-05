@@ -504,7 +504,9 @@ export function createAgentExecMcpServer(
           .optional()
           .describe(
             "Retire even if the thread or a descendant has a queued run (cancelling the queued run). " +
-              "Still refused if any thread in the subtree has an active run in flight."
+              "Still refused if any thread in the subtree has an active run in flight, and it does " +
+              "not bypass the obligation/message refusal above — that work is disposed of by name, " +
+              "never overridden by a flag."
           ),
       },
     },
