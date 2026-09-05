@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:rxdart/rxdart.dart';
@@ -392,6 +393,42 @@ class _ActorRowState extends State<_ActorRow> {
     );
   }
 
+  /// How many further candidates a pool declares beyond the one named — so a
+  /// row reads `claude-opus-5 +2`, not as if that were the actor's one model.
+  String _poolSuffix(int length) => length > 1 ? ' +${length - 1}' : '';
+
+  /// The row's one-line model label. With a pool, the same label is wrapped in
+  /// a tooltip carrying every declared candidate in order, so the counts in the
+  /// row are expandable in place without opening the actor.
+  Widget _modelLabel(
+    String text, {
+    List<ProviderModelConfig>? pool,
+    List<ProviderModelConfig>? staged,
+  }) {
+    final label = Text(
+      text,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: kMonoStyle.copyWith(
+        fontSize: 11,
+        color: MeshColors.textSecondary,
+      ),
+    );
+    if (pool == null) return label;
+    final lines = [
+      if (pool.isNotEmpty) ...[
+        'Configured candidates, in order:',
+        ...pool.map((e) => '• ${e.label}'),
+      ],
+      if (staged != null && !listEquals(staged, pool)) ...[
+        'Staged for next run:',
+        ...staged.map((e) => '• ${e.label}'),
+      ],
+    ];
+    if (lines.isEmpty) return label;
+    return Tooltip(message: lines.join('\n'), child: label);
+  }
+
   Widget _buildContent(
     BuildContext context, {
     bool isHoveredTarget = false,
@@ -400,6 +437,36 @@ class _ActorRowState extends State<_ActorRow> {
     final dot = widget.dot;
     final isRunning = !thread.isRetired && dot == DotState.active;
     final isQueued = !thread.isRetired && dot == DotState.queued;
+    // A pool row summarises rather than naming one candidate as the model:
+    // `+N` says how many more are declared, and the tooltip spells the whole
+    // pool out. Per-candidate effort lives there too, so the single effort
+    // chip (the server's first-entry view) is left off for a pool. The full
+    // list is in the Info panel, which is the readable surface on a phone.
+    final pool = thread.modelConfig;
+    final staged = thread.desiredModelConfig;
+    // Both predicates read whole pools rather than the server's first-entry
+    // compatibility fields, which describe a pool replacement only by
+    // accident: `[a, b] → [a, c, d]` leaves `desiredModel` identical to
+    // `model` while replacing everything, and one model staged to become
+    // three is a pool row before the replacement lands. `desiredModel` is
+    // derived server-side from `desiredModelConfig[0]`, so it is only the
+    // fallback for a payload predating the full field.
+    final isPool = pool.length > 1 || (staged?.length ?? 0) > 1;
+    final staging = staged != null
+        ? !listEquals(staged, pool)
+        : thread.desiredModel != null && thread.desiredModel != thread.model;
+    final showModel = thread.model != null || thread.desiredModel != null;
+    final showEffort =
+        !isPool && (thread.effort != null || thread.effortChangePending);
+    final current = thread.model ?? 'default';
+    final desired = thread.desiredModel ?? 'default';
+    final singleText = staging ? '$current → $desired' : (thread.model ?? '');
+    // Both sides carry their own count, so a staged pool replacement never
+    // reads as one model becoming one other model.
+    final poolText = staging
+        ? '$current${_poolSuffix(pool.length)}'
+              ' → $desired${_poolSuffix(staged?.length ?? 0)}'
+        : '$current${_poolSuffix(pool.length)}';
 
     return Container(
       decoration: BoxDecoration(
@@ -484,32 +551,22 @@ class _ActorRowState extends State<_ActorRow> {
                     color: MeshColors.textMuted,
                   ),
                 ),
-                if (thread.model != null ||
-                    thread.desiredModel != null ||
-                    thread.effort != null ||
-                    thread.effortChangePending ||
+                if (showModel ||
+                    showEffort ||
                     thread.commitmentKind != null) ...[
                   const SizedBox(height: 4),
                   Row(
                     children: [
-                      if (thread.model != null || thread.desiredModel != null)
+                      if (showModel)
                         Flexible(
-                          child: Text(
-                            thread.desiredModel != null &&
-                                    thread.desiredModel != thread.model
-                                ? '${thread.model ?? "default"} → ${thread.desiredModel}'
-                                : (thread.model ?? ''),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: kMonoStyle.copyWith(
-                              fontSize: 11,
-                              color: MeshColors.textSecondary,
-                            ),
+                          child: _modelLabel(
+                            isPool ? poolText : singleText,
+                            pool: isPool ? pool : null,
+                            staged: staged,
                           ),
                         ),
-                      if (thread.effort != null ||
-                          thread.effortChangePending) ...[
-                        if (thread.model != null || thread.desiredModel != null)
+                      if (showEffort) ...[
+                        if (showModel)
                           const SizedBox(width: 6),
                         Flexible(
                           child: Text(
@@ -527,10 +584,7 @@ class _ActorRowState extends State<_ActorRow> {
                         ),
                       ],
                       if (thread.commitmentKind != null) ...[
-                        if (thread.model != null ||
-                            thread.desiredModel != null ||
-                            thread.effort != null ||
-                            thread.effortChangePending)
+                        if (showModel || showEffort)
                           const SizedBox(width: 6),
                         _WorkStateBadge(
                           kind: thread.commitmentKind!,

@@ -24,6 +24,61 @@ RunState runStateFromJson(Object? raw) => switch (raw) {
   _ => RunState.unknown,
 };
 
+/// One declared provider/model/effort candidate, mirroring the server's
+/// `ProviderModelConfig` (`packages/rusa/src/providers/model-config.ts`). An
+/// actor declares an ordered pool of these; a run resolves one of them at
+/// start time.
+class ProviderModelConfig {
+  const ProviderModelConfig({
+    required this.provider,
+    required this.model,
+    this.effort,
+  });
+
+  final String provider;
+  final String model;
+
+  /// Explicit provider-native reasoning level for this candidate, or null for
+  /// the provider default. Efforts are per candidate, not per actor.
+  final String? effort;
+
+  /// Both `provider` and `model` are required by the server contract, so a
+  /// payload missing either fails the parse the same way [ThreadDto]'s own
+  /// required fields do — API drift is louder as a cast error than as a
+  /// half-blank candidate nothing upstream ever declared.
+  factory ProviderModelConfig.fromJson(Map<String, dynamic> j) =>
+      ProviderModelConfig(
+        provider: j['provider'] as String,
+        model: j['model'] as String,
+        effort: j['effort'] as String?,
+      );
+
+  /// One candidate on one line — `provider · model · effort medium` — with
+  /// the effort clause dropped when the server sent no explicit effort.
+  String get label => [
+    provider,
+    model,
+    if (effort != null) 'effort $effort',
+  ].join(' · ');
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ProviderModelConfig &&
+          runtimeType == other.runtimeType &&
+          provider == other.provider &&
+          model == other.model &&
+          effort == other.effort;
+
+  @override
+  int get hashCode => Object.hash(provider, model, effort);
+}
+
+List<ProviderModelConfig> _modelConfigFromJson(Object? raw) =>
+    (raw as List<dynamic>? ?? const [])
+        .map((e) => ProviderModelConfig.fromJson(e as Map<String, dynamic>))
+        .toList();
+
 /// A mesh thread/actor, as returned by `GET /api/mesh/threads`.
 class ThreadDto {
   const ThreadDto({
@@ -38,6 +93,8 @@ class ThreadDto {
     this.desiredEffort,
     this.effortChangePending = false,
     this.desiredProvider,
+    this.modelConfig = const [],
+    this.desiredModelConfig,
     required this.charterPreview,
     this.title = '',
     required this.createdAt,
@@ -75,6 +132,18 @@ class ThreadDto {
 
   /// Pending desired provider staged for next run boundary, or null if none.
   final String? desiredProvider;
+
+  /// Every declared candidate, in the configured earliest-available order.
+  /// [provider]/[model]/[effort] above are the server's compatibility view of
+  /// this list's *first* entry only: for a pool of more than one, the running
+  /// candidate is resolved at run start, so the first entry is a declaration
+  /// and not evidence of what any run selected.
+  final List<ProviderModelConfig> modelConfig;
+
+  /// A whole-pool replacement staged for the next run boundary, or null when
+  /// nothing is staged. Never empty when present: the server rejects an empty
+  /// pool, so a staged replacement always names at least one candidate.
+  final List<ProviderModelConfig>? desiredModelConfig;
 
   /// The leading slice of the charter the server sends with the list — enough
   /// for the two-line excerpt in the overview, never the whole text. The full
@@ -119,6 +188,8 @@ class ThreadDto {
     Object? desiredEffort = _keepThreadField,
     bool? effortChangePending,
     Object? desiredProvider = _keepThreadField,
+    List<ProviderModelConfig>? modelConfig,
+    Object? desiredModelConfig = _keepThreadField,
     String? charterPreview,
     String? title,
     String? createdAt,
@@ -150,6 +221,10 @@ class ThreadDto {
     desiredProvider: identical(desiredProvider, _keepThreadField)
         ? this.desiredProvider
         : desiredProvider as String?,
+    modelConfig: modelConfig ?? this.modelConfig,
+    desiredModelConfig: identical(desiredModelConfig, _keepThreadField)
+        ? this.desiredModelConfig
+        : desiredModelConfig as List<ProviderModelConfig>?,
     charterPreview: charterPreview ?? this.charterPreview,
     title: title ?? this.title,
     createdAt: createdAt ?? this.createdAt,
@@ -176,6 +251,19 @@ class ThreadDto {
     desiredEffort: j['desiredEffort'] as String?,
     effortChangePending: j.containsKey('desiredEffort'),
     desiredProvider: j['desiredProvider'] as String?,
+    modelConfig: _modelConfigFromJson(j['modelConfig']),
+    // Keyed on a non-null value, not key presence: the server emits this key
+    // only when something is staged (`...(r.desiredModelConfig !== undefined ?
+    // {...} : {})`), and a staged pool is always non-empty because
+    // `validateModelConfigPool` rejects an empty one. So `[]` is not a state
+    // the server can express, and turning an unexpected null into one would
+    // render a "Staged for next run (0)" panel for an actor with nothing
+    // staged. `desiredEffort` above is the opposite case and keeps
+    // `containsKey`: there the server does emit an explicit null, meaning a
+    // staged clear.
+    desiredModelConfig: j['desiredModelConfig'] != null
+        ? _modelConfigFromJson(j['desiredModelConfig'])
+        : null,
     charterPreview: j['charterPreview'] as String? ?? '',
     title: j['title'] as String? ?? '',
     createdAt: j['createdAt'] as String? ?? '',
