@@ -22,50 +22,39 @@ export interface ModelProbeOptions {
   configDir?: string;
 }
 
-/**
- * Timing bounds for the generated tmux script. Production derives all three
- * from the caller's deadline; they are overridable only so the readiness and
- * render control-flow can be exercised end-to-end against a fake codex without
- * waiting out the real multi-second budget. Overriding does not change
- * production behavior.
- */
-export interface CodexModelTmuxTiming {
-  /** Whole-script budget in seconds. Default: the deadline less 10s of teardown grace. */
-  budgetS?: number;
-  /** Seconds from script start allowed for the composer to become ready. Default: 40% of the budget. */
-  readySecs?: number;
-  /** Seconds to wait for the panel after one `/model` submission. Default 15. */
-  attemptSecs?: number;
-}
-
 /** tmux orchestration: launch codex, send /model, capture the rendered menu panel . */
 export function buildCodexModelTmuxScript(
   cliCommand: string,
   sockPath: string,
   trustArg: string,
-  deadlineSeconds: number,
-  timing: CodexModelTmuxTiming = {}
+  deadlineSeconds: number
 ): string {
   // The waits are derived from the caller's deadline rather than from a fixed
   // iteration count. Fixed counts gave the composer ~20s and the panel ~20s no
   // matter how long the caller was willing to wait, so a 90s probe abandoned a
   // slow-but-healthy start at ~43s with half its budget unspent - and reported
-  // it as a hard failure. Ten seconds of the budget is left for the final
-  // capture and reap so the script always beats the Node-side timer.
-  const budgetS = timing.budgetS ?? Math.max(deadlineSeconds - 10, 10);
-  const readySecs = timing.readySecs ?? Math.max(Math.floor(budgetS * 0.4), 10);
-  const attemptSecs = timing.attemptSecs ?? 15;
+  // it as a hard failure.
+  //
+  // The derivation is clamped rather than merely subtracted, so
+  // `ready <= budget < deadline` holds for every deadline a caller can ask for
+  // and not just for the 90s default: the script's own budget must stay inside
+  // the deadline it is nested in, or the promise that the script self-reaps and
+  // names its own failure quietly becomes "the Node timer kills it". Teardown
+  // grace is 10s of that deadline, but never more than half of a short one.
+  const deadlineS = Math.max(2, Math.floor(deadlineSeconds));
+  const graceS = Math.max(1, Math.min(10, Math.floor(deadlineS / 2)));
+  const budgetS = Math.max(1, deadlineS - graceS);
+  const readySecs = Math.max(1, Math.min(Math.floor(budgetS * 0.4), budgetS));
   const q = JSON.stringify;
   return [
     "set -u",
     `SOCK=${q(sockPath)}`,
     "S=probe",
     // Both deadlines are measured against SECONDS (seconds since this shell
-    // started), so the readiness wait and every /model attempt draw on one
-    // shared budget instead of each holding an independent stopwatch.
+    // started), so the readiness wait and the render wait draw on one shared
+    // budget instead of each holding an independent stopwatch.
     `BUDGET_S=${budgetS}`,
     `READY_S=${readySecs}`,
-    `ATTEMPT_S=${attemptSecs}`,
     'tmux -S "$SOCK" kill-server 2>/dev/null || true',
     // Bound the session's own command so the probe tree cannot outlive the
     // probe. Every other reaping path can be cut: the tmux server runs in its
@@ -80,7 +69,7 @@ export function buildCodexModelTmuxScript(
     // system tmux.conf would otherwise disable, stranding an empty server for
     // good. It also keeps someone's status bar or key bindings out of the pane
     // text this probe greps.
-    `tmux -f /dev/null -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 timeout --kill-after=5 ${deadlineSeconds} ${q(cliCommand)}${trustArg ? ` ${trustArg}` : ""}`,
+    `tmux -f /dev/null -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 timeout --kill-after=5 ${deadlineS} ${q(cliCommand)}${trustArg ? ` ${trustArg}` : ""}`,
     // Wait for the composer prompt to become ready (not just the banner).
     "ready=0",
     'while [ "$SECONDS" -lt "$READY_S" ]; do',
@@ -98,50 +87,37 @@ export function buildCodexModelTmuxScript(
     "fi",
     // Settle before sending keys so TUI is fully accepting input.
     "sleep 2",
-    // One /model attempt: type the command with literal keys, submit after a
-    // short pause, then poll for the panel. On codex CLI, the first Enter may be
-    // consumed by the autocomplete popup; if the menu hasn't rendered and the
-    // popup or prompt is still visible, re-send Enter to submit the command.
+    // Type the /model command with literal keys and submit after a short pause.
+    // The text is typed exactly once. On codex CLI the first Enter may be
+    // consumed by the autocomplete popup, so an unrendered panel is re-confirmed
+    // with another Enter while the popup or the pending prompt is still on
+    // screen - the same shape the /status probe uses for its own swallowed
+    // submission. Enter is the safe key to repeat: it commits what is already in
+    // the composer and adds nothing to it. Retyping is not attempted, because
+    // deciding it is safe needs proof that the composer is empty *now*, and
+    // nothing capture-pane returns distinguishes a live empty composer from the
+    // same placeholder sitting in scrollback - so the check would authorize
+    // typing into whatever is actually focused, which is how a probe that only
+    // looks turns into one that changes something.
+    'tmux -S "$SOCK" send-keys -t "$S" -l "/model"',
+    "sleep 1.5",
+    'tmux -S "$SOCK" send-keys -t "$S" Enter',
+    // Wait for the model menu panel to render, for whatever is left of the
+    // shared budget.
     // Note: Keep regex in sync with extractModelCatalog pre-extraction guard in model-catalog.ts
-    "attempt_model() {",
-    "  rendered=0",
-    '  tmux -S "$SOCK" send-keys -t "$S" -l "/model"',
-    "  sleep 1.5",
-    '  tmux -S "$SOCK" send-keys -t "$S" Enter',
-    "  local deadline=$((SECONDS + ATTEMPT_S))",
-    '  while [ "$SECONDS" -lt "$deadline" ] && [ "$SECONDS" -lt "$BUDGET_S" ]; do',
-    '    scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
-    '    if printf "%s" "$scr" | grep -qiE "Select Model|Select a model|Select model and effort|[0-9]+\\.[[:space:]]*gpt-"; then',
-    "      rendered=1",
-    "      return 0",
-    "    fi",
-    '    if printf "%s" "$scr" | grep -qiE "change model|switch model|select model|choose model"; then',
-    '      tmux -S "$SOCK" send-keys -t "$S" Enter',
-    '    elif printf "%s" "$scr" | grep -qE "(›|>)[[:space:]]*/model"; then',
-    '      tmux -S "$SOCK" send-keys -t "$S" Enter',
-    "    fi",
-    "    sleep 0.5",
-    "  done",
-    "  return 0",
-    "}",
-    // Re-submit /model while the budget allows. A submission that is swallowed
-    // without opening the panel used to burn the entire render window waiting
-    // for a keystroke nothing was going to answer; sending it again is what the
-    // /status probe already does for its own swallowed-submission case.
     "rendered=0",
     'while [ "$SECONDS" -lt "$BUDGET_S" ]; do',
-    "  attempt_model",
-    '  if [ "$rendered" -eq 1 ]; then',
-    "    break",
-    "  fi",
-    // Retype only from a composer that is demonstrably empty again: the
-    // placeholder is back, so the earlier text was consumed without opening the
-    // panel. A half-typed line or an open popup is left alone rather than typed
-    // over, since typing into an open picker is how a probe turns into a change.
     '  scr=$(tmux -S "$SOCK" capture-pane -t "$S" -p 2>/dev/null || true)',
-    '  if ! printf "%s" "$scr" | grep -qiE "Ask Codex to do anything"; then',
+    '  if printf "%s" "$scr" | grep -qiE "Select Model|Select a model|Select model and effort|[0-9]+\\.[[:space:]]*gpt-"; then',
+    "    rendered=1",
     "    break",
     "  fi",
+    '  if printf "%s" "$scr" | grep -qiE "change model|switch model|select model|choose model"; then',
+    '    tmux -S "$SOCK" send-keys -t "$S" Enter',
+    '  elif printf "%s" "$scr" | grep -qE "(›|>)[[:space:]]*/model"; then',
+    '    tmux -S "$SOCK" send-keys -t "$S" Enter',
+    "  fi",
+    "  sleep 0.5",
     "done",
     'if [ "$rendered" -eq 0 ]; then',
     '  echo "ERROR: /model panel never rendered in Codex session" >&2',
@@ -215,6 +191,34 @@ export function describeCodexScrapeFailure(stderr: string): string {
       ? `${lastLine.slice(0, CODEX_SCRAPE_STDERR_EXCERPT_LIMIT)}...`
       : lastLine;
   return `the wrapper exited without a stage marker (stderr: ${excerpt})`;
+}
+
+/** How long the installed codex is given to print its version. */
+const CODEX_VERSION_TIMEOUT_MS = 10_000;
+
+/**
+ * The version of the codex CLI installed on this host, or null when it cannot
+ * be established.
+ *
+ * `codex --version` prints `codex-cli <semver>` on stdout; stderr is ignored
+ * because the CLI also warns there about unrelated environment conditions. Only
+ * the version token is taken, and any failure - no binary, non-zero exit,
+ * unrecognizable output - is reported as null rather than guessed at, since the
+ * caller uses this to decide whether a cache may be trusted and a wrong answer
+ * there is worse than no answer.
+ */
+export function readInstalledCodexVersion(cliCommand = "codex"): string | null {
+  try {
+    const res = spawnSync(cliCommand, ["--version"], {
+      encoding: "utf8",
+      timeout: CODEX_VERSION_TIMEOUT_MS,
+    });
+    if (res.status !== 0) return null;
+    const match = /(\d+\.\d+\.\d+[\w.+-]*)/.exec(res.stdout ?? "");
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -295,10 +299,7 @@ export async function scrapeAgyModels(opts?: {
  * real host ~/.codex in-place — any OAuth token rotation naturally persists and
  * host auth is never revoked or deleted.
  */
-export async function scrapeCodexModelScreen(
-  opts: ModelProbeOptions,
-  timing?: CodexModelTmuxTiming
-): Promise<string> {
+export async function scrapeCodexModelScreen(opts: ModelProbeOptions): Promise<string> {
   const cliCommand = opts.cliCommand ?? "codex";
   const timeoutMs = opts.timeoutMs ?? 90_000;
   mkdirSync(opts.actorDir, { recursive: true });
@@ -319,8 +320,7 @@ export async function scrapeCodexModelScreen(
     cliCommand,
     sock,
     trustArg,
-    Math.ceil(timeoutMs / 1000) + 1,
-    timing
+    Math.ceil(timeoutMs / 1000) + 1
   );
 
   const killTmux = () => {
@@ -544,11 +544,15 @@ export async function refreshProviderModelCatalog(opts: {
   // its picker renders, so reading it costs a file read where the TUI costs a
   // whole codex start, a rented PTY and a keystroke race. The interactive path
   // stays as the fallback for exactly the cases the cache cannot answer -
-  // absent, malformed, stale, or listing nothing - and falling back also
-  // restarts codex, which is what rewrites the cache for the next refresh.
+  // absent, malformed, written by a codex that is no longer the installed one,
+  // stale, or listing nothing - and falling back also restarts codex, which is
+  // what rewrites the cache for the next refresh.
   let codexCacheReason: string | undefined;
   if (provider === "codex") {
-    const cached = ingestCodexHostModels({ scrapeStore });
+    const cached = ingestCodexHostModels({
+      scrapeStore,
+      installedClientVersion: readInstalledCodexVersion(),
+    });
     if (cached.status === "usable") {
       return { status: "known", entries: cached.entries };
     }

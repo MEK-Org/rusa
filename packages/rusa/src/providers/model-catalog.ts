@@ -594,16 +594,30 @@ export const CODEX_LISTED_VISIBILITY = "list";
 export const CODEX_MODELS_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 /**
+ * How far ahead of the reader's clock a `fetched_at` may sit and still be taken
+ * as a real timestamp. Writer and reader are the same host, so the only sources
+ * of a future stamp are a clock correction landing between write and read, or a
+ * corrupt file; a few minutes absorbs the former without letting the latter
+ * grant a cache indefinite freshness while wall time catches up to it.
+ */
+export const CODEX_MODELS_CACHE_MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
+
+/**
  * Why a Codex models cache could not be used, or that it could.
  * `malformed` covers every structural problem including a missing or
  * unparseable `fetched_at`, since the freshness rule cannot be applied without
- * one; `stale` is reserved for a well-formed cache that is simply too old.
+ * one. `stale` is the timestamp failing to place the file inside the trusted
+ * window - too old, or implausibly far in the future. `client-mismatch` is the
+ * file failing to belong to the codex that is installed now, whether because it
+ * names a different client version or because no installed version could be
+ * read to compare it against.
  */
 export type CodexModelsCacheStatus =
   | "usable"
   | "absent"
   | "unreadable"
   | "malformed"
+  | "client-mismatch"
   | "stale"
   | "empty";
 
@@ -626,11 +640,14 @@ export interface CodexModelsCacheRead {
  * stored or advertised. The slug is copied into both fields, which is also
  * exactly what `normalizeModelEntries` reduces a Codex entry to.
  *
+ * `client_version` is read as well, but only as an identifier to compare
+ * against the installed CLI - never as a claim about what the models are.
+ *
  * Returns null when the content is not a cache document at all.
  */
 export function extractCodexModelsFromCacheJson(
   content: string
-): { fetchedAt?: string; entries: ModelEntry[] } | null {
+): { fetchedAt?: string; clientVersion?: string; entries: ModelEntry[] } | null {
   let doc: unknown;
   try {
     doc = JSON.parse(content);
@@ -642,6 +659,8 @@ export function extractCodexModelsFromCacheJson(
   if (!Array.isArray(models)) return null;
   const rawFetchedAt = (doc as { fetched_at?: unknown }).fetched_at;
   const fetchedAt = typeof rawFetchedAt === "string" ? rawFetchedAt : undefined;
+  const rawClientVersion = (doc as { client_version?: unknown }).client_version;
+  const clientVersion = typeof rawClientVersion === "string" ? rawClientVersion : undefined;
 
   const seen = new Set<string>();
   const entries: ModelEntry[] = [];
@@ -655,7 +674,7 @@ export function extractCodexModelsFromCacheJson(
     seen.add(identifier);
     entries.push({ displayLabel: identifier, identifier, passable: true });
   }
-  return { fetchedAt, entries };
+  return { fetchedAt, clientVersion, entries };
 }
 
 /** Resolves the host Codex models cache path, honouring `CODEX_HOME` as codex does. */
@@ -664,15 +683,26 @@ export function getHostCodexModelsCachePath(): string {
 }
 
 /**
- * Read and age-check the host Codex models cache. Every failure is a named
- * status with a bounded reason so the caller can say which stage gave up; the
- * reason never carries a filesystem path, since it ends up in operator-facing
- * logs and issue reports.
+ * Read, attribute and age-check the host Codex models cache. Every failure is a
+ * named status with a bounded reason so the caller can say which stage gave up;
+ * the reason never carries a filesystem path, since it ends up in
+ * operator-facing logs and issue reports.
+ *
+ * `installedClientVersion` is what the codex on this host reports now, or null
+ * when that could not be determined. Age alone does not establish that a cache
+ * describes the models the installed binary offers: an upgrade replaces the
+ * binary without touching the file, and cache-first refreshing is precisely the
+ * path that would not start the new binary to find out. Passing it is how the
+ * caller says which codex the answer has to belong to. Omitting it entirely
+ * (`undefined`) checks age only, which is for callers reading a file whose
+ * provenance is already known - a fixture, or a cache being inspected rather
+ * than trusted.
  */
 export function readCodexModelsCache(opts?: {
   cachePath?: string;
   now?: number;
   maxAgeMs?: number;
+  installedClientVersion?: string | null;
 }): CodexModelsCacheRead {
   const path = opts?.cachePath ?? getHostCodexModelsCachePath();
   if (!existsSync(path)) {
@@ -682,10 +712,21 @@ export function readCodexModelsCache(opts?: {
   try {
     content = readFileSync(path, "utf8");
   } catch (err) {
+    // The code, never the message: Node spells a filesystem failure
+    // `EACCES: permission denied, open '/home/<someone>/.codex/models_cache.json'`,
+    // and this reason is written into operator-facing logs and pasted into issue
+    // reports. The code is the actionable half and carries no path; it is
+    // pattern-checked rather than trusted, so only a real errno-shaped token
+    // can reach the message.
+    const rawCode = (err as { code?: unknown } | null)?.code;
+    const code =
+      typeof rawCode === "string" && /^[A-Z][A-Z0-9_]{1,31}$/.test(rawCode) ? rawCode : undefined;
     return {
       status: "unreadable",
       entries: [],
-      reason: `codex models cache could not be read: ${err instanceof Error ? err.message : String(err)}`,
+      reason: code
+        ? `codex models cache could not be read (${code})`
+        : "codex models cache could not be read",
     };
   }
 
@@ -705,6 +746,34 @@ export function readCodexModelsCache(opts?: {
       reason: "codex models cache has no parseable fetched_at timestamp",
     };
   }
+  // Attribution before freshness: a cache written by a codex that is no longer
+  // installed describes that codex's models, however recently it was written.
+  // Upgrades are exactly when the catalog changes, and are the one moment
+  // cache-first would otherwise keep serving the previous binary's list until
+  // it aged out. Declining sends this refresh to the TUI, which starts the
+  // installed binary - and starting it is what rewrites the file, so the next
+  // refresh is cheap again.
+  if (opts?.installedClientVersion !== undefined) {
+    const installed = opts.installedClientVersion;
+    if (installed === null) {
+      return {
+        status: "client-mismatch",
+        entries: [],
+        fetchedAt: parsed.fetchedAt,
+        reason:
+          "the installed codex client version could not be read, so the cache could not be attributed to it",
+      };
+    }
+    if (parsed.clientVersion !== installed) {
+      return {
+        status: "client-mismatch",
+        entries: [],
+        fetchedAt: parsed.fetchedAt,
+        reason: `codex models cache was written by client version ${parsed.clientVersion ?? "(unstated)"}, but ${installed} is installed`,
+      };
+    }
+  }
+
   const maxAgeMs = opts?.maxAgeMs ?? CODEX_MODELS_CACHE_MAX_AGE_MS;
   const ageMs = (opts?.now ?? Date.now()) - fetchedAtMs;
   if (ageMs > maxAgeMs) {
@@ -713,6 +782,17 @@ export function readCodexModelsCache(opts?: {
       entries: [],
       fetchedAt: parsed.fetchedAt,
       reason: `codex models cache is stale (fetched at ${parsed.fetchedAt}, max age ${maxAgeMs}ms)`,
+    };
+  }
+  // A negative age is not freshness. Without this, a stamp a year ahead - a
+  // clock jump, a corrupt write - reads as "aged -365 days" and holds the
+  // catalog trusted until wall time catches up to it.
+  if (ageMs < -CODEX_MODELS_CACHE_MAX_FUTURE_SKEW_MS) {
+    return {
+      status: "stale",
+      entries: [],
+      fetchedAt: parsed.fetchedAt,
+      reason: `codex models cache is stamped in the future (fetched at ${parsed.fetchedAt}, max skew ${CODEX_MODELS_CACHE_MAX_FUTURE_SKEW_MS}ms)`,
     };
   }
   if (parsed.entries.length === 0) {
@@ -743,6 +823,7 @@ export function ingestCodexHostModels(opts?: {
   scrapeStore?: ModelScrapeStore;
   now?: number;
   maxAgeMs?: number;
+  installedClientVersion?: string | null;
 }): CodexModelsCacheRead {
   const read = readCodexModelsCache(opts);
   if (read.status !== "usable") return read;

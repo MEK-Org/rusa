@@ -24,6 +24,22 @@ import {
  * whatever cache the machine running it happens to have.
  */
 const codexHomes: string[] = [];
+
+/**
+ * The version the stubbed codex reports. A cache is only trusted when it names
+ * the installed client, so a suite must decide what "installed" means rather
+ * than inheriting whatever codex the machine running it happens to have.
+ */
+const STUB_CODEX_VERSION = "9.9.9-test";
+
+/** Puts a codex on PATH that reports `version` and does nothing else. */
+function stubInstalledCodex(version: string = STUB_CODEX_VERSION): void {
+  const dir = mkdtempSync(join(tmpdir(), "codex-bin-test-"));
+  codexHomes.push(dir);
+  writeFileSync(join(dir, "codex"), `#!/bin/bash\necho "codex-cli ${version}"\n`, { mode: 0o755 });
+  vi.stubEnv("PATH", `${dir}:${process.env.PATH ?? ""}`);
+}
+
 function stubCodexHome(cache?: unknown): string {
   const dir = mkdtempSync(join(tmpdir(), "codex-home-test-"));
   codexHomes.push(dir);
@@ -34,6 +50,7 @@ function stubCodexHome(cache?: unknown): string {
     );
   }
   vi.stubEnv("CODEX_HOME", dir);
+  stubInstalledCodex();
   return dir;
 }
 
@@ -41,6 +58,7 @@ function stubCodexHome(cache?: unknown): string {
 function freshCache(slugs: string[]) {
   return {
     fetched_at: new Date().toISOString(),
+    client_version: STUB_CODEX_VERSION,
     models: [
       ...slugs.map((slug) => ({ slug, display_name: slug.toUpperCase(), visibility: "list" })),
       { slug: "gpt-hidden", display_name: "Hidden", visibility: "hide" },
@@ -302,6 +320,7 @@ gemini-3.1-pro-high       Gemini 3.1 Pro (High)
     clearProviderModelCatalog();
     stubCodexHome({
       fetched_at: "2026-09-03T12:00:00.000Z",
+      client_version: STUB_CODEX_VERSION,
       models: [{ slug: "gpt-5.6-sol", visibility: "list" }],
     });
     const mockScrapeCodex = vi.fn().mockResolvedValue("codex screen");
@@ -314,6 +333,70 @@ gemini-3.1-pro-high       Gemini 3.1 Pro (High)
 
     // A stale cache means codex has not started in a day; the fallback both gets
     // an answer now and restarts codex, which is what rewrites the cache.
+    expect(mockScrapeCodex).toHaveBeenCalled();
+  });
+
+  it("falls back to the TUI when the cache belongs to a different codex build", async () => {
+    // The upgrade window: `npm i -g` replaces the binary and leaves the cache
+    // untouched, so a cache-first refresh would keep serving the previous
+    // build's model list - for up to a day, and precisely across the moment the
+    // list is most likely to have changed. Age cannot see this; the
+    // client_version the cache carries can.
+    clearProviderModelCatalog();
+    stubCodexHome({ ...freshCache(["gpt-5.5"]), client_version: "0.1.0-previous" });
+    const mockScrapeCodex = vi.fn().mockRejectedValue(new Error("tui unavailable"));
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const res = await refreshProviderModelCatalog({
+        provider: "codex",
+        workersDir: "/tmp/test-workers",
+        probers: { scrapeCodex: mockScrapeCodex },
+      });
+
+      expect(mockScrapeCodex).toHaveBeenCalled();
+      if (res.status !== "unknown") throw new Error(`expected unknown, got ${res.status}`);
+      expect(res.message).toContain("written by client version 0.1.0-previous");
+      expect(res.message).toContain(STUB_CODEX_VERSION);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("uses the cache when it names the codex that is installed now", async () => {
+    clearProviderModelCatalog();
+    stubCodexHome(freshCache(["gpt-5.6-sol"]));
+    const mockScrapeCodex = vi.fn().mockResolvedValue("codex screen");
+
+    const res = await refreshProviderModelCatalog({
+      provider: "codex",
+      workersDir: "/tmp/test-workers",
+      probers: { scrapeCodex: mockScrapeCodex },
+    });
+
+    expect(mockScrapeCodex).not.toHaveBeenCalled();
+    expect(res.entries).toEqual([
+      { displayLabel: "gpt-5.6-sol", identifier: "gpt-5.6-sol", passable: true },
+    ]);
+  });
+
+  it("declines the cache when no installed codex version can be read", async () => {
+    // Unattributable is not the same as fresh: without a version to compare
+    // against, nothing establishes that this file describes the codex that
+    // would answer a pin.
+    clearProviderModelCatalog();
+    stubCodexHome(freshCache(["gpt-5.5"]));
+    const emptyBin = mkdtempSync(join(tmpdir(), "codex-bin-none-"));
+    codexHomes.push(emptyBin);
+    vi.stubEnv("PATH", emptyBin);
+    const mockScrapeCodex = vi.fn().mockResolvedValue("codex screen");
+
+    await refreshProviderModelCatalog({
+      provider: "codex",
+      workersDir: "/tmp/test-workers",
+      probers: { scrapeCodex: mockScrapeCodex },
+    });
+
     expect(mockScrapeCodex).toHaveBeenCalled();
   });
 
@@ -771,10 +854,11 @@ done
     );
 
     try {
-      const output = await scrapeCodexModelScreen(
-        { actorDir, cliCommand: mockBin, timeoutMs: 45_000 },
-        { readySecs: 20, attemptSecs: 8, budgetS: 35 }
-      );
+      const output = await scrapeCodexModelScreen({
+        actorDir,
+        cliCommand: mockBin,
+        timeoutMs: 45_000,
+      });
       expect(output).toContain("Select Model and Effort");
       expect(output).toContain("gpt-5.6-sol");
     } finally {
@@ -782,10 +866,12 @@ done
     }
   }, 60_000);
 
-  it("re-submits /model when the first submission is swallowed ", async () => {
-    // The swallowed-submission case: the composer accepted the text and cleared
-    // it, but no panel opened. Waiting out the render window for a keystroke
-    // nothing was going to answer is how a healthy codex became an exit 1.
+  it("re-confirms with Enter when the popup swallows the first submission ", async () => {
+    // The evidenced swallowed-submission case: the autocomplete popup takes the
+    // first Enter, so the command is staged rather than run and no panel opens.
+    // Waiting out the render window for a keystroke nothing was going to answer
+    // is how a healthy codex became an exit 1. Enter is the only key re-sent -
+    // it commits what is already in the composer and adds nothing to it.
     const actorDir = mkdtempSync(join(tmpdir(), "codex-test-actor-retry-"));
     const mockBin = join(actorDir, "mock-codex-swallow.sh");
     writeFileSync(
@@ -793,15 +879,15 @@ done
       `#!/bin/bash
 echo "OpenAI Codex"
 echo "Ask Codex to do anything"
-seen=0
+pending=0
 while read -r line; do
   if [ "$line" = "/model" ]; then
-    seen=$((seen + 1))
-    if [ "$seen" -ge 2 ]; then
-      echo "Select Model and Effort"
-      echo "1. gpt-5.6-sol (current)"
-      sleep 30
-    fi
+    pending=1
+    echo "change model  - press enter to confirm"
+  elif [ "$pending" = "1" ]; then
+    echo "Select Model and Effort"
+    echo "1. gpt-5.6-sol (current)"
+    sleep 30
   fi
 done
 `,
@@ -809,10 +895,11 @@ done
     );
 
     try {
-      const output = await scrapeCodexModelScreen(
-        { actorDir, cliCommand: mockBin, timeoutMs: 45_000 },
-        { readySecs: 10, attemptSecs: 4, budgetS: 35 }
-      );
+      const output = await scrapeCodexModelScreen({
+        actorDir,
+        cliCommand: mockBin,
+        timeoutMs: 30_000,
+      });
       expect(output).toContain("Select Model and Effort");
       expect(output).toContain("gpt-5.6-sol");
     } finally {
@@ -837,10 +924,7 @@ done
 
     try {
       await expect(
-        scrapeCodexModelScreen(
-          { actorDir, cliCommand: mockBin, timeoutMs: 30_000 },
-          { readySecs: 3, attemptSecs: 2, budgetS: 10 }
-        )
+        scrapeCodexModelScreen({ actorDir, cliCommand: mockBin, timeoutMs: 12_000 })
       ).rejects.toThrow(
         "codex /model scrape failed with exit code 1: the Codex composer never became ready, so /model was never submitted"
       );
@@ -868,10 +952,7 @@ done
 
     try {
       await expect(
-        scrapeCodexModelScreen(
-          { actorDir, cliCommand: mockBin, timeoutMs: 30_000 },
-          { readySecs: 6, attemptSecs: 2, budgetS: 9 }
-        )
+        scrapeCodexModelScreen({ actorDir, cliCommand: mockBin, timeoutMs: 16_000 })
       ).rejects.toThrow(
         "codex /model scrape failed with exit code 1: /model was submitted but the model panel never rendered"
       );
@@ -879,10 +960,7 @@ done
       // The diagnostic comes from stderr, which carries the wrapper's own
       // markers; the rendered screen leaves through stdout and stays there.
       await expect(
-        scrapeCodexModelScreen(
-          { actorDir, cliCommand: mockBin, timeoutMs: 30_000 },
-          { readySecs: 6, attemptSecs: 2, budgetS: 9 }
-        )
+        scrapeCodexModelScreen({ actorDir, cliCommand: mockBin, timeoutMs: 16_000 })
       ).rejects.not.toThrow("sensitive-pane-text-do-not-quote");
     } finally {
       rmSync(actorDir, { recursive: true, force: true });
@@ -896,9 +974,37 @@ done
     const script = buildCodexModelTmuxScript("codex", "/tmp/sock", "", 91);
     expect(script).toContain("BUDGET_S=81");
     expect(script).toContain("READY_S=32");
-    expect(script).toContain("ATTEMPT_S=15");
     expect(script).not.toContain("seq 1 40");
     expect(script).toContain('while [ "$SECONDS" -lt "$READY_S" ]; do');
+  });
+
+  it("keeps ready <= budget < deadline for every deadline a caller can ask for ", () => {
+    // The script's budget is nested inside the deadline its own session command
+    // carries, so the ordering has to hold for a 3s probe as well as a 90s one.
+    // Where it does not, the script stops being the thing that reaps itself and
+    // names its stage, and the Node-side timer kills it instead - which is the
+    // undiagnosable exit this PR exists to remove.
+    for (const deadline of [1, 2, 3, 5, 12, 21, 30, 91, 600]) {
+      const script = buildCodexModelTmuxScript("codex", "/tmp/sock", "", deadline);
+      const budget = Number(/BUDGET_S=(\d+)/.exec(script)?.[1]);
+      const ready = Number(/READY_S=(\d+)/.exec(script)?.[1]);
+      const applied = Number(/timeout --kill-after=5 (\d+) /.exec(script)?.[1]);
+      expect(ready).toBeGreaterThanOrEqual(1);
+      expect(ready).toBeLessThanOrEqual(budget);
+      expect(budget).toBeLessThan(applied);
+    }
+  });
+
+  it("types the /model command exactly once ", () => {
+    // Enter may be re-sent; the command text may not be re-typed. Nothing
+    // capture-pane returns distinguishes a live empty composer from the same
+    // placeholder text sitting in scrollback, so a retype would be authorized by
+    // a predicate that cannot see what is focused - and typing into an open
+    // picker is how a probe that only reads turns into one that changes state.
+    const script = buildCodexModelTmuxScript("codex", "/tmp/sock", "", 91);
+    const typed = script.match(/send-keys -t "\$S" -l "\/model"/g) ?? [];
+    expect(typed).toHaveLength(1);
+    expect(script).not.toContain("attempt_model");
   });
 });
 

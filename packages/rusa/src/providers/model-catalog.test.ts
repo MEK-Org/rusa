@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -6,6 +6,7 @@ import { extractGeminiText, getGeminiClient } from "../understanding/gemini-util
 import { buildAntigravityArgs, resolveAntigravitySelection } from "./antigravity.js";
 import {
   CODEX_MODELS_CACHE_MAX_AGE_MS,
+  CODEX_MODELS_CACHE_MAX_FUTURE_SKEW_MS,
   clearProviderModelCatalog,
   extractCodexModelsFromCacheJson,
   extractKimiModelsFromToml,
@@ -816,6 +817,25 @@ describe("codex models cache", () => {
     }
   });
 
+  it("reports an unreadable cache by error code, never by path", () => {
+    // A directory where the file should be is the deterministic unreadable
+    // case: readFileSync raises EISDIR, and Node writes the full path into the
+    // message it raises with. This reason is logged for operators and pasted
+    // into issue reports, so what it must never carry is that path.
+    tmpDir = mkdtempSync(join(tmpdir(), "codex-cache-unreadable-marker-"));
+    const cachePath = join(tmpDir, "models_cache.json");
+    mkdirSync(cachePath);
+
+    const read = readCodexModelsCache({ cachePath });
+
+    expect(read.status).toBe("unreadable");
+    expect(read.entries).toEqual([]);
+    expect(read.reason).toBe("codex models cache could not be read (EISDIR)");
+    expect(read.reason).not.toContain(cachePath);
+    expect(read.reason).not.toContain("unreadable-marker");
+    expect(read.reason).not.toContain(tmpdir());
+  });
+
   it("ages the cache out exactly at the documented maximum", () => {
     const cachePath = writeCache(JSON.stringify(cacheDoc("2026-09-04T12:00:00.000Z")));
     const fetchedAtMs = Date.parse("2026-09-04T12:00:00.000Z");
@@ -827,6 +847,69 @@ describe("codex models cache", () => {
       readCodexModelsCache({ cachePath, now: fetchedAtMs + CODEX_MODELS_CACHE_MAX_AGE_MS + 1 })
         .status
     ).toBe("stale");
+  });
+
+  it("refuses a cache stamped further ahead than clock skew explains", () => {
+    // A negative age is not freshness. A stamp far in the future would
+    // otherwise hold the catalog trusted until wall time caught up to it, which
+    // is the stale-catalog symptom with extra steps.
+    const cachePath = writeCache(JSON.stringify(cacheDoc("2026-09-05T12:00:00.000Z")));
+    const fetchedAtMs = Date.parse("2026-09-05T12:00:00.000Z");
+
+    expect(
+      readCodexModelsCache({
+        cachePath,
+        now: fetchedAtMs - CODEX_MODELS_CACHE_MAX_FUTURE_SKEW_MS,
+      }).status
+    ).toBe("usable");
+    const beyondSkew = readCodexModelsCache({
+      cachePath,
+      now: fetchedAtMs - CODEX_MODELS_CACHE_MAX_FUTURE_SKEW_MS - 1,
+    });
+    expect(beyondSkew.status).toBe("stale");
+    expect(beyondSkew.entries).toEqual([]);
+    expect(beyondSkew.reason).toContain("stamped in the future");
+    expect(
+      readCodexModelsCache({ cachePath, now: fetchedAtMs - 365 * 24 * 60 * 60 * 1000 }).status
+    ).toBe("stale");
+  });
+
+  it("trusts a cache only while it names the installed codex", () => {
+    // Age says when the file was written, not which binary wrote it. An upgrade
+    // swaps the binary and leaves the file alone, so without this a refresh
+    // keeps serving the previous build's model list until it ages out - across
+    // exactly the moment the list is most likely to have changed.
+    const cachePath = writeCache(JSON.stringify(cacheDoc("2026-09-05T12:00:00.000Z")));
+    const now = Date.parse("2026-09-05T13:00:00.000Z");
+
+    expect(readCodexModelsCache({ cachePath, now, installedClientVersion: "0.153.4" }).status).toBe(
+      "usable"
+    );
+
+    const upgraded = readCodexModelsCache({ cachePath, now, installedClientVersion: "0.154.0" });
+    expect(upgraded.status).toBe("client-mismatch");
+    expect(upgraded.entries).toEqual([]);
+    expect(upgraded.reason).toContain("0.153.4");
+    expect(upgraded.reason).toContain("0.154.0");
+
+    // Unknown provenance is not trusted provenance.
+    const unknown = readCodexModelsCache({ cachePath, now, installedClientVersion: null });
+    expect(unknown.status).toBe("client-mismatch");
+    expect(unknown.reason).toContain("could not be read");
+
+    // A cache from a codex too old to stamp its version cannot be attributed.
+    const unstamped = readCodexModelsCache({
+      cachePath: writeCache(
+        JSON.stringify({
+          fetched_at: "2026-09-05T12:00:00.000Z",
+          models: [{ slug: "gpt-5.5", visibility: "list" }],
+        })
+      ),
+      now,
+      installedClientVersion: "0.153.4",
+    });
+    expect(unstamped.status).toBe("client-mismatch");
+    expect(unstamped.reason).toContain("(unstated)");
   });
 
   it("records the identifier projection, not the cache file, and sets the codex catalog", () => {
