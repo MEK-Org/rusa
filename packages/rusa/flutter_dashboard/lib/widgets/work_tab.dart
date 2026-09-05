@@ -32,11 +32,20 @@ class _WorkTabState extends State<WorkTab> {
   bool _showDone = false;
   bool _fetchedTerminalRoots = false;
 
+  /// Bumped at the start of every [_loadRoots] call and compared when that
+  /// call's future resolves. `_loadRoots` fires from several independent
+  /// triggers (initial load, Show Done toggle, retry, mutation callbacks,
+  /// on-demand terminal widening) with no ordering guarantee between their
+  /// underlying requests, so an older call finishing after a newer one must
+  /// not overwrite the newer call's result.
+  int _loadGeneration = 0;
+
   /// [forceIncludeTerminal] widens a single load beyond the current "Show
   /// Done" setting — used when a focus link names an obligation the default
   /// (terminal-excluding) load didn't fetch at all.
   Future<void> _loadRoots({bool forceIncludeTerminal = false}) async {
     final includeTerminal = forceIncludeTerminal || _showDone;
+    final generation = ++_loadGeneration;
     try {
       setState(() {
         if (_rootTrees.isEmpty) _loading = true;
@@ -45,6 +54,7 @@ class _WorkTabState extends State<WorkTab> {
       final forest = await widget.store.api.fetchObligationForest(
         includeTerminalRoots: includeTerminal,
       );
+      if (!mounted || generation != _loadGeneration) return;
       setState(() {
         _rootTrees = forest.trees;
         _fetchedTerminalRoots = includeTerminal;
@@ -52,6 +62,7 @@ class _WorkTabState extends State<WorkTab> {
       });
       _checkFocusLink();
     } catch (e) {
+      if (!mounted || generation != _loadGeneration) return;
       setState(() {
         _error = e.toString();
         _loading = false;
