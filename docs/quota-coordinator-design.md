@@ -8,14 +8,23 @@ No quota storage, schema, or pacing behaviour changes with this document.
 Every source citation below is against `origin/staging` at `49656e2`. Paths are
 repository-relative; line numbers are that commit's.
 
-**Revision 2** incorporates review. Six things changed materially, and each is
+**Revision 2** incorporated review. Six things changed materially, and each is
 recorded where it applies: the launch clock is now stamped on confirmation
 rather than on grant (§5.5), which also removes the rollback machinery
-entirely; the recommendation is conditional on the topology decision (§4.1);
-multi-pool surface is gone (§5.1); degraded mode is bounded by pool size and
-then fails closed (§5.7); old-writer exclusion is a path relocation rather than
-a cooperative flag (§8.2); and the claim that centralising parsing reduces PTY
-scrapes was wrong and is withdrawn (§3.2).
+entirely; multi-pool surface is gone (§5.1); degraded mode is bounded by pool
+size and then fails closed (§5.7); old-writer exclusion is a path relocation
+rather than a cooperative flag (§8.2); and the claim that centralising parsing
+reduces PTY scrapes was wrong and is withdrawn (§3.1).
+
+**Revision 3** settles the topology assumption, which revision 2 had left
+conditional. Option 2 is now recommended outright (§4.1) on the evidence in
+#237: remote instances are leader-authoritative, so followers execute provider
+CLIs but never pace, and the coordinator's client set stays on one host. The
+same ruling made the design's job harder in one place, and §8.4 is rewritten for
+it — the processes that *consume* the shared account are a strictly larger set
+than the processes that pace it, so observation ingestion may not assume a
+same-host reporter (A1a). §4.3 keeps the Option 3 trigger, narrowed to a second
+*leader* sharing credentials from another host.
 
 ## Contents
 
@@ -156,6 +165,14 @@ Quota lanes exist for four providers — `claude`, `codex`, `agy`, `kimi`
 (`packages/rusa/src/providers/registry.ts:64-68`), which fans config aliases of
 one CLI onto one lane.
 
+The one piece of roadmap that changes this picture is #237, and it changes it
+less than it first appears. Its remote instances are leader-authoritative — the
+leader keeps records, durable inboxes, prompt assembly, admission, tool
+execution, scheduling and accounting, while the follower contributes provider
+execution and filesystem work. So a follower adds a host that *runs provider
+CLIs* without adding a host that *decides when they start*. That distinction is
+what A1 and A1a are built on, and §8.4 is where it stops being free.
+
 ---
 
 ## 2. Assumptions
@@ -163,11 +180,25 @@ one CLI onto one lane.
 Stated so they can be corrected. Each one is load-bearing for the
 recommendation, and §4.3 says what changes if it is wrong.
 
-- **A1 — One host, one user session.** Every instance sharing provider
-  credentials runs on the same host under the same user account, as it does
-  today (§1.6). *Confidence: high for today, unverified for the roadmap.*
-  **This assumption is not mine to confirm; it gates the recommendation
-  (§4.1) and is Q1 in §12.**
+- **A1 — Every coordinator client is on one host, under one user session.**
+  Everything that *paces* — that reserves, confirms, and is bound by the lane
+  clock — runs on the same host under the same user account, as it does today
+  (§1.6). *Confidence: high for today; high for the roadmap as of #237.*
+
+  The scoping is the load-bearing part, and it was sharpened when the topology
+  assumption was settled on this proposal. #237's remote instances keep
+  admission, scheduling and accounting leader-authoritative and leave followers
+  executing provider CLIs only. A follower on another machine therefore never
+  calls `reserveLaunch`; its leader does, on the leader's own host. Production
+  and staging remain the full set of coordinator clients. §4.3 states what
+  would reopen this.
+- **A1a — Provider *consumption* is not confined to that host, and this design
+  does not change that.** A follower's provider CLI on another machine bills the
+  same account (#237), and so does interactive human use on any other machine.
+  Neither is reachable by a reservation. The pacing boundary and the observation
+  boundary are therefore different sizes. §8.4 is written to that, and explains
+  why unpaced consumption has to be *observed* even though it cannot be
+  reserved.
 - **A2 — Launch rate is low.** Normal starts are spaced by a controller
   interval capped at `maxIntervalSeconds`, default 3600
   (`config/types.ts:96`), and the sensor ticks every `tickSeconds`, default 300
@@ -285,31 +316,32 @@ later; it is not claimed as a benefit of Option 2 here, and the comparison in
 
 ## 4. Recommendation
 
-### 4.1 Conditional: Option 2 if the one-host horizon is confirmed, otherwise Option 3
+### 4.1 Option 2 — the same-host sidecar
 
-The recommendation is deliberately **conditional**, because its deciding input
-is a fact about the roadmap that this document cannot establish. A1 is true of
-the system as configured today (§1.6), but "unverified for the roadmap" is not
-a basis for choosing a transport whose authentication model is *filesystem
-permissions*. Topology is the decision input here, not an implementation
-detail.
+**Adopt Option 2.** It is the smallest option that meets the contract #178 asks
+for, and the topology assumption it rests on has been settled rather than
+assumed: A1 is now high-confidence for the roadmap as well as for today.
 
-- **If the one-host, one-user horizon is confirmed (Q1) → Option 2.** It is
-  then the smallest option that meets the contract #178 asks for.
-- **If instances will run on more than one host within the horizon → Option 3
-  directly.** Do not build Option 2 first and migrate: the wire contract
-  survives, but the authentication model does not, and shipping a UDS
-  boundary would mean building the auth layer under time pressure later.
+An earlier revision of this document made the recommendation conditional,
+because choosing a transport whose entire authentication model is *filesystem
+permissions* is not something to do on an unverified assumption about where
+instances will run. That question has since been decided, on the evidence in
+#237: remote instances are leader-authoritative, so the leader keeps admission,
+scheduling and accounting, and a follower only executes provider CLIs. Followers
+are not coordinator clients and never will be under that design — which leaves
+production and staging, on one host under one user, as the complete client set.
+A Unix domain socket fits that set exactly.
 
-Everything in §5 through §11 is written to hold under either answer. The wire
-contract, the reservation semantics, the storage schema, the rollout and the
-tests are transport-agnostic; only §5.2's listener and §5.3's authentication
-differ between the two.
+The condition has therefore collapsed, but it has not disappeared. §4.3 keeps
+the trigger that would move this to Option 3, and it is narrower than "more than
+one host": it is a second *leader* sharing the same provider credentials from
+another host. Nothing on the roadmap proposes that today.
 
-**No human communication establishing the one-host horizon is cited here,
-because none is known to me.** The topology question is escalated and pending;
-until it is answered, "Option 2" is a recommendation conditioned on an
-assumption, not a decision.
+Everything in §5 through §11 remains transport-agnostic — the wire contract,
+reservation semantics, storage schema, rollout and tests are unchanged by the
+choice; only §5.2's listener and §5.3's authentication depend on it. That is
+deliberate, and it is what makes the Option 3 trigger survivable rather than a
+rewrite.
 
 Within Option 2, the recommendation is narrow:
 
@@ -334,8 +366,19 @@ on the path, not a competing destination.
 
 ### 4.3 What would change this recommendation
 
-- **A1 is false, now or within the roadmap** → Option 3, as above. This is the
-  live question.
+- **A second leader shares these provider credentials from another host** →
+  Option 3, and §5.3 must grow a real per-instance credential and transport
+  before anything ships. This is the precise trigger, and it is narrower than
+  "the mesh spans hosts": #237 already spans hosts without producing a second
+  coordinator client, because followers do not pace. What breaks A1 is a second
+  *authoritative* process reserving against the same account, not a second
+  machine running provider CLIs.
+- **A1a stops being tolerable** (unpaced consumption from followers or
+  interactive use grows large enough that observation feedback cannot absorb
+  it): that is not an argument for Option 3, which would not help. It is an
+  argument for extending *reservation* to the follower dispatch path, which is
+  a change to #237's admission model rather than to this coordinator's
+  topology.
 - **A3 is false** (a lost reservation is acceptable): Option 1 plus an
   in-memory advisory lock would do, and this proposal is over-built.
 - **A6 is unacceptable** (no write-quiesce is ever schedulable): §8.3's
@@ -1049,10 +1092,10 @@ not yet complete, and that is the honest description of a canary.
 must serve the old and the new `protocolMinor`; a `protocolMajor` bump means
 stopping every instance, which is a deliberate cost that should be rare.
 
-### 8.4 Scrape collection stays separable
+### 8.4 Collection stays separable, and reporters need not be coordinator clients
 
 The coordinator has no PTY, no tmux, no sandbox and no provider CLI. It receives
-raw text over the socket. Consequences, stated as guarantees:
+raw text. Consequences, stated as guarantees:
 
 - Today's in-instance collector keeps working unchanged (A5). **The number of
   scrapes is unchanged**; see §3.1.
@@ -1062,6 +1105,42 @@ raw text over the socket. Consequences, stated as guarantees:
   of work, not this one.
 - A client that only *reads* (a dashboard, a report) needs `GET /v1/snapshot`
   and nothing else.
+
+**The set of processes that consume the account is larger than the set that
+paces it.** That is A1a, and it is the one place where settling the topology
+question made the design's job *harder* rather than easier. A follower's
+provider CLI on another host bills the same account (#237), and so does
+interactive human use on any other machine. Neither is a coordinator client;
+neither can be reached by a reservation.
+
+This matters because the controller only reacts to what it observes.
+Consumption the pool never sees is consumption the PID loop cannot compensate
+for — it shows up later as an unexplained window exhaustion rather than as a
+widened interval. Interactive use on another machine is already this kind of
+blind spot today. The point of writing §8.4 this way is to stop that blind spot
+from *growing* as #237 lands.
+
+So the ingestion contract must not assume its reporter is a same-host
+coordinator client. Concretely, `POST /v1/observations` derives nothing from the
+transport: `source`, `scrapedAt` and `idempotencyKey` are all data on the
+request, and the endpoint takes no peer credentials and makes no host
+assumption. Reporter identity is payload, not a property of the socket. That is
+what keeps a report relayable, and it is a constraint on the contract rather
+than a feature to build.
+
+**The smallest path that preserves the security boundary is for the leader to
+relay.** A follower reports its scrape to its leader over the instance
+connection it already holds (#237), and the leader — a same-host coordinator
+client — forwards it with `source` naming the follower. No second listener, no
+network-facing bind, no change to §5.3. The alternative, exposing ingestion on a
+network transport, would reintroduce for the ingest path alone exactly the
+authentication and transport work that choosing Option 2 defers.
+
+To be clear about what exists: **#237 implements no quota scraping or reporting
+on the follower side**, and this proposal does not add it. Whether a follower
+should scrape its own provider panels, and who owns that work, is Q8 and is out
+of scope here. The obligation this design accepts is narrower — not to preclude
+it — which the transport-independent contract above discharges.
 
 ---
 
@@ -1206,8 +1285,9 @@ right foundation for 1–6.
 
 ## 11. Implementation issues this would cut
 
-Sequenced. None of these should be filed until this proposal is approved, and
-none should be filed before Q1 is answered, since Q1 decides the transport.
+Sequenced. The topology question that previously gated all of these is settled
+(§4.1), so what remains is approval of the design as a whole — a human decision,
+not a mesh one. None of these should be filed before that.
 
 1. **Reservation storage and lease lifecycle.** The three new tables (§7) and
    the grant/confirm/cancel/renew/expire transaction, behind `SharedQuotaStore`.
@@ -1236,15 +1316,25 @@ none should be filed before Q1 is answered, since Q1 decides the transport.
 
 ## 12. Open questions
 
-Each needs a decision before implementation issues are cut. Answers change the
-design, not just the wording.
+Q1 is settled and is kept below as a record. The rest need a decision before
+implementation issues are cut, and answers change the design rather than just
+the wording. None of them is a mesh decision; approval of the design as a whole
+is the operator's.
 
 **Q1 — Will every instance sharing provider credentials run on one host, under
-one user account, for the foreseeable roadmap?** This is the deciding input for
-§4.1 and it is escalated rather than answered here. "Yes" → Option 2 as
-specified. "No" or "not for long" → Option 3, and §5.3 must grow a real
-credential and transport before anything ships. No implementation issue should
-be cut until this is answered.
+one user account, for the foreseeable roadmap? — SETTLED.** Yes, for every
+process that *paces*. The only multi-host work on the roadmap is #237, and its
+remote instances are leader-authoritative: admission, scheduling and accounting
+stay with the leader, and followers only execute provider CLIs. A follower never
+calls `reserveLaunch`; its leader does, on the leader's own host. Production and
+staging therefore remain the complete set of coordinator clients, and Option 2
+is adopted (§4.1). A1's confidence is raised accordingly.
+
+The ruling carried two riders, both now folded in: observation sources are
+broader than coordinator clients, so ingestion must not assume a same-host
+reporter (A1a, §8.4); and the Option 3 trigger stands as a second *leader*
+sharing credentials from another host (§4.3). The question is kept here rather
+than deleted so the decision, and its scope, stay on the record.
 
 **Q2 — Is a fourth `systemd --user` unit acceptable operational weight?** The
 alternative is an opt-in "this instance also hosts the coordinator" mode, which
@@ -1278,3 +1368,12 @@ host?
 only moment in the rollout that requires every instance to be stopped at once,
 and it is what makes "no concurrent old and new writers" a guarantee rather
 than a hope.
+
+**Q8 — Who scrapes a remote follower's provider panels, and is that in scope
+at all?** A1a says a follower's provider CLI bills the shared account, and §8.4
+keeps ingestion relayable so a follower's observations *could* reach the
+coordinator through its leader. But #237 implements no scraping or reporting on
+the follower side, and this proposal deliberately does not add it. Until
+something does, that consumption stays invisible to the controller — the same
+blind spot interactive use already occupies. The question is whether closing it
+belongs to #237, to a follow-up here, or nowhere yet.
