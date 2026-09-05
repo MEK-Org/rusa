@@ -314,7 +314,7 @@ export function createObligationsMcpServer(
     {
       title: "Create a new obligation",
       description:
-        "Create a new obligation. `title` is the heading a queue shows; keep it to one short line and put the detail in `intent`. If parent_id is specified, the parent obligation transitions to waiting if it was ready. `blocked_by` names other obligations this one must wait on: it is created `waiting` outright unless every one of them is already `done`, and a recurring or scheduled obligation cannot be named.",
+        "Create a new obligation. `title` is the heading a queue shows; keep it to one short line and put the detail in `intent`. If parent_id is specified, the parent obligation transitions to waiting if it was ready. `blocked_by` names other obligations this one must wait on: it is created `waiting` outright unless every one of them is already `done`. Rejected if this obligation is itself recurring or scheduled, or if anything named in `blocked_by` is: recurrence and prerequisite edges cannot mix on either side.",
       inputSchema: {
         owner_id: z.string().trim().min(1),
         title: z.string().trim().min(1).max(OBLIGATION_TITLE_MAX),
@@ -568,7 +568,7 @@ export function createObligationsMcpServer(
     {
       title: "Make an obligation wait on another",
       description:
-        "Declare that `id` must wait for `prerequisite_id` to reach `done`. Idempotent: naming the same prerequisite twice is a no-op. Rejects a recurring or scheduled prerequisite, and any cycle in the combined wait-for graph across explicit prerequisites and the parent/live-child relation.",
+        "Declare that `id` must wait for `prerequisite_id` to reach `done`. Idempotent: naming the same prerequisite twice is a no-op. Rejects a recurring or scheduled obligation on either side of the edge, and any cycle in the combined wait-for graph across explicit prerequisites and the parent/live-child relation.",
       inputSchema: {
         id: z.string().trim().min(1),
         prerequisite_id: z.string().trim().min(1),

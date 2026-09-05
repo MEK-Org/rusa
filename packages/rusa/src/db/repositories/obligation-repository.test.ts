@@ -1914,28 +1914,19 @@ describe("ObligationRepository", () => {
       expect(scheduler.cancelled).toContain("rec-1");
     });
 
-    it("switching an overdue scheduled obligation to completion_interval waits on an unmet prerequisite instead of going ready", () => {
+    it("rejects naming a prerequisite for a dependent that is currently scheduled", () => {
       repository.create({ title: "blocker", id: "blocker-1", ownerId: "actor-a", intent: "block" });
       repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
       repository.setTerminalStatus("rec-1", "done");
-      // Back-date the completion so any positive interval is already overdue,
-      // matching the sibling test above.
-      db.prepare(`UPDATE obligation_completions SET completed_at = ? WHERE obligation_id = ?`).run(
-        "1960-01-01T00:00:00.000Z",
-        "rec-1"
-      );
-      // Named while `rec-1` is already `scheduled`, so this occurrence picks up
-      // an unmet prerequisite it didn't have when it first went scheduled —
-      // the same setup `activateScheduled`'s own regression test uses.
-      repository.addPrerequisite("rec-1", "blocker-1");
+      expect(repository.require("rec-1").status).toBe("scheduled");
 
-      const switched = repository.setRecurrence("rec-1", {
-        policy: "completion_interval",
-        intervalSeconds: 1,
-      });
-      expect(switched.status).toBe("waiting");
-      expect(switched.nextReadyAt).toBeNull();
-      expect(switched.recurrencePolicy).toBe("completion_interval");
+      // A scheduled row re-arms on its own cycle independent of any wait-for
+      // graph (#212) — it cannot pick up a prerequisite while armed, whether
+      // via addPrerequisite or by re-enabling recurrence with one already
+      // named, since neither direction of that edge is ever allowed to exist.
+      expect(() => repository.addPrerequisite("rec-1", "blocker-1")).toThrow(
+        /recurring or scheduled/
+      );
     });
 
     it("switching a scheduled obligation to completion_interval with a future interval stays scheduled and re-arms an `at` job", () => {
@@ -2273,6 +2264,37 @@ describe("ObligationRepository", () => {
       );
     });
 
+    it("retries a cancellation-repair attention that failed to append, on the next mutation, without a restart", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+        blockedBy: ["prereq"],
+      });
+
+      let shouldThrow = true;
+      const delivered: Array<{ dependentId: string; prerequisiteId: string }> = [];
+      repository.setCancellationAttentionListener((attention) => {
+        if (shouldThrow) {
+          shouldThrow = false;
+          throw new Error("transient append failure");
+        }
+        delivered.push(attention);
+      });
+
+      repository.setTerminalStatus("prereq", "cancelled");
+      expect(delivered).toEqual([]);
+
+      repository.create({ title: "unrelated", id: "unrelated", ownerId: "actor-a" });
+
+      expect(delivered).toEqual([
+        { dependentId: "dependent", dependentOwnerId: "actor-a", prerequisiteId: "prereq" },
+      ]);
+      warn.mockRestore();
+    });
+
     it("queues cancellation attention immediately when the prerequisite is already cancelled at edge-creation time", () => {
       repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
       repository.setTerminalStatus("prereq", "cancelled");
@@ -2355,6 +2377,45 @@ describe("ObligationRepository", () => {
       expect(() => repository.addPrerequisite("dependent", "recurring")).toThrow(
         /recurring or scheduled/
       );
+    });
+
+    it("rejects a recurring obligation as a dependent, at create and via addPrerequisite", () => {
+      repository.create({
+        title: "recurring",
+        id: "recurring",
+        ownerId: "actor-a",
+        recurrence: { policy: "cron", cronExpr: "0 * * * *" },
+      });
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+
+      expect(() =>
+        repository.create({
+          title: "dependent",
+          id: "dependent",
+          ownerId: "actor-a",
+          recurrence: { policy: "cron", cronExpr: "0 * * * *" },
+          blockedBy: ["prereq"],
+        })
+      ).toThrow(/recurring or scheduled/);
+
+      expect(() => repository.addPrerequisite("recurring", "prereq")).toThrow(
+        /recurring or scheduled/
+      );
+    });
+
+    it("rejects enabling recurrence on an obligation that already names its own prerequisite (#212)", () => {
+      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+      repository.create({
+        title: "dependent",
+        id: "dependent",
+        ownerId: "actor-a",
+        blockedBy: ["prereq"],
+      });
+
+      expect(() =>
+        repository.setRecurrence("dependent", { policy: "cron", cronExpr: "0 * * * *" })
+      ).toThrow(/recurring or scheduled/);
+      expect(repository.require("dependent").recurrencePolicy).toBeNull();
     });
 
     it("rejects an obligation naming itself as its own prerequisite, at create and via addPrerequisite", () => {
@@ -2525,25 +2586,6 @@ describe("ObligationRepository", () => {
 
       expect(delivered).toEqual([]);
       expect(repository.listPrerequisiteCancellationAttention()).toEqual([]);
-    });
-
-    it("includes a recurring dependent that is currently 'scheduled' in cancellation reconciliation", () => {
-      repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
-      repository.create({
-        title: "dependent",
-        id: "dependent",
-        ownerId: "actor-a",
-        recurrence: { policy: "completion_interval", intervalSeconds: 60 },
-      });
-      repository.addPrerequisite("dependent", "prereq");
-      repository.setTerminalStatus("dependent", "done");
-      expect(repository.require("dependent").status).toBe("scheduled");
-
-      repository.setTerminalStatus("prereq", "cancelled");
-
-      expect(repository.listPrerequisiteCancellationAttention()).toEqual([
-        { dependentId: "dependent", dependentOwnerId: "actor-a", prerequisiteId: "prereq" },
-      ]);
     });
 
     it("survives a repository restart (reload from the same on-disk state)", () => {

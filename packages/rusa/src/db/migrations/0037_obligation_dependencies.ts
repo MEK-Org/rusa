@@ -24,7 +24,6 @@ export const obligationDependencies: Migration = {
       CREATE TABLE IF NOT EXISTS obligation_prerequisites (
         dependent_id    TEXT NOT NULL REFERENCES obligations(id) ON DELETE CASCADE,
         prerequisite_id TEXT NOT NULL REFERENCES obligations(id) ON DELETE CASCADE,
-        created_at      TEXT NOT NULL,
         PRIMARY KEY (dependent_id, prerequisite_id),
         CHECK (dependent_id <> prerequisite_id)
       );

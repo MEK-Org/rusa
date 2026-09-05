@@ -20,12 +20,11 @@ function seedDb(): Database.Database {
 function link(
   db: Database.Database,
   dependentId = "dependent-1",
-  prerequisiteId = "prereq-1",
-  createdAt = "2026-09-04T00:00:00.000Z"
+  prerequisiteId = "prereq-1"
 ): void {
   db.prepare(
-    `INSERT INTO obligation_prerequisites (dependent_id, prerequisite_id, created_at) VALUES (?, ?, ?)`
-  ).run(dependentId, prerequisiteId, createdAt);
+    `INSERT INTO obligation_prerequisites (dependent_id, prerequisite_id) VALUES (?, ?)`
+  ).run(dependentId, prerequisiteId);
 }
 
 describe("0037_obligation_dependencies", () => {

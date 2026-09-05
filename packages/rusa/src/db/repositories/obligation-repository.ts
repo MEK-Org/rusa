@@ -491,6 +491,22 @@ export class ObligationRepository {
    */
   private pendingCancellationAttention: PrerequisiteAttention[] = [];
 
+  /**
+   * `(dependentId, prerequisiteId)` keys whose cancellation-attention delivery
+   * threw on a previous {@link mutate} call (#212) — e.g. a transient inbox
+   * append failure. Kept only as keys, not the stale payload: the next
+   * mutation re-derives each one from current persisted truth via
+   * {@link listPrerequisiteCancellationAttention} before retrying, so a
+   * dependent's owner is repaired within this process rather than only after
+   * a restart, and a pair that stopped being live (edge removed, dependent
+   * went terminal) is dropped instead of retried forever.
+   */
+  private failedCancellationAttentionKeys = new Set<string>();
+
+  private cancellationAttentionKey(attention: PrerequisiteAttention): string {
+    return `${attention.dependentId} ${attention.prerequisiteId}`;
+  }
+
   setCancellationAttentionListener(
     listener: ((attention: PrerequisiteAttention) => void) | undefined
   ): void {
@@ -683,10 +699,35 @@ export class ObligationRepository {
 
     const cancellationAttentionListener = this.cancellationAttentionListener;
     if (cancellationAttentionListener) {
-      for (const attention of this.pendingCancellationAttention) {
+      const toDeliver = [...this.pendingCancellationAttention];
+      const queuedKeys = new Set(toDeliver.map((a) => this.cancellationAttentionKey(a)));
+
+      // A prior mutation's delivery may have thrown (e.g. a transient inbox
+      // append failure) — retry it here from current persisted truth rather
+      // than the stale payload that failed, so it is repaired within this
+      // process instead of only after a restart reconciles it.
+      if (this.failedCancellationAttentionKeys.size > 0) {
+        const stillFailing = new Set(this.failedCancellationAttentionKeys);
+        for (const attention of this.listPrerequisiteCancellationAttention()) {
+          const key = this.cancellationAttentionKey(attention);
+          if (!this.failedCancellationAttentionKeys.has(key) || queuedKeys.has(key)) continue;
+          toDeliver.push(attention);
+          queuedKeys.add(key);
+          stillFailing.delete(key);
+        }
+        // Anything left here no longer matches a live dangling edge — the
+        // edge was removed, or the dependent went terminal — so there is
+        // nothing left to retry.
+        for (const key of stillFailing) this.failedCancellationAttentionKeys.delete(key);
+      }
+
+      for (const attention of toDeliver) {
+        const key = this.cancellationAttentionKey(attention);
         try {
           cancellationAttentionListener(attention);
+          this.failedCancellationAttentionKeys.delete(key);
         } catch (err) {
+          this.failedCancellationAttentionKeys.add(key);
           console.warn(
             `[obligations] cancellation-attention listener failed for ${attention.dependentId}: ${
               err instanceof Error ? err.message : String(err)
@@ -786,6 +827,11 @@ export class ObligationRepository {
       // ready-head diff computed inside this same transaction could still
       // observe it as ready.
       const prerequisiteIds = [...new Set(input.blockedBy ?? [])];
+      if (recurrence != null && prerequisiteIds.length > 0) {
+        throw new ObligationValidationError(
+          "recurring or scheduled obligations cannot participate in prerequisite edges"
+        );
+      }
       const prerequisites: Obligation[] = [];
       for (const prerequisiteId of prerequisiteIds) {
         if (prerequisiteId === id) {
@@ -868,9 +914,9 @@ export class ObligationRepository {
       for (const prerequisite of prerequisites) {
         this.db
           .prepare(
-            `INSERT INTO obligation_prerequisites (dependent_id, prerequisite_id, created_at) VALUES (?, ?, ?)`
+            `INSERT INTO obligation_prerequisites (dependent_id, prerequisite_id) VALUES (?, ?)`
           )
-          .run(id, prerequisite.id, stampedAt);
+          .run(id, prerequisite.id);
         if (prerequisite.status === "cancelled") {
           this.pendingCancellationAttention.push({
             dependentId: id,
@@ -896,19 +942,39 @@ export class ObligationRepository {
   private assertEligiblePrerequisite(prerequisite: Obligation): void {
     if (prerequisite.recurrencePolicy !== null) {
       throw new ObligationValidationError(
-        "recurring or scheduled obligations cannot be prerequisites"
+        "recurring or scheduled obligations cannot participate in prerequisite edges"
       );
     }
   }
 
-  /** Reject enabling recurrence on `id` while any live dependent already names it as a prerequisite (#212). */
-  private assertNotNamedAsPrerequisite(id: string): void {
+  /**
+   * Reject a dependent v1 cannot yet express recurrence against (#212): a
+   * recurring/scheduled obligation re-arms itself on its own cycle, so also
+   * gating it on a prerequisite would mix two different "when is this ready
+   * again" mechanisms on one row.
+   */
+  private assertEligibleDependent(dependent: Obligation): void {
+    if (dependent.recurrencePolicy !== null) {
+      throw new ObligationValidationError(
+        "recurring or scheduled obligations cannot participate in prerequisite edges"
+      );
+    }
+  }
+
+  /**
+   * Reject enabling recurrence on `id` while it participates in the
+   * prerequisite graph on either side (#212) — as a prerequisite some live
+   * dependent already names, or as a dependent that already names its own.
+   */
+  private assertNotInDependencyGraph(id: string): void {
     const row = this.db
-      .prepare(`SELECT COUNT(*) AS count FROM obligation_prerequisites WHERE prerequisite_id = ?`)
-      .get(id) as { count: number };
+      .prepare(
+        `SELECT COUNT(*) AS count FROM obligation_prerequisites WHERE prerequisite_id = ? OR dependent_id = ?`
+      )
+      .get(id, id) as { count: number };
     if (row.count > 0) {
       throw new ObligationValidationError(
-        "recurring or scheduled obligations cannot be prerequisites"
+        "recurring or scheduled obligations cannot participate in prerequisite edges"
       );
     }
   }
@@ -994,6 +1060,7 @@ export class ObligationRepository {
       }
       const prerequisite = this.require(prerequisiteId);
       this.assertEligiblePrerequisite(prerequisite);
+      this.assertEligibleDependent(dependent);
 
       const existing = this.db
         .prepare(
@@ -1010,9 +1077,9 @@ export class ObligationRepository {
 
       this.db
         .prepare(
-          `INSERT INTO obligation_prerequisites (dependent_id, prerequisite_id, created_at) VALUES (?, ?, ?)`
+          `INSERT INTO obligation_prerequisites (dependent_id, prerequisite_id) VALUES (?, ?)`
         )
-        .run(dependentId, prerequisiteId, this.stamp());
+        .run(dependentId, prerequisiteId);
 
       // Attention-queuing and demotion are independent facts about the named
       // prerequisite — a cancelled prerequisite is also a non-done one, so
@@ -1062,7 +1129,7 @@ export class ObligationRepository {
         `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
          JOIN obligation_prerequisites edge ON edge.prerequisite_id = obligation.id
          WHERE edge.dependent_id = ?
-         ORDER BY edge.created_at, edge.prerequisite_id
+         ORDER BY edge.prerequisite_id
          LIMIT ? OFFSET ?`
       )
       .all(id, limit + 1, offset) as ObligationRow[];
@@ -1086,7 +1153,7 @@ export class ObligationRepository {
         `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
          JOIN obligation_prerequisites edge ON edge.dependent_id = obligation.id
          WHERE edge.prerequisite_id = ?
-         ORDER BY edge.created_at, edge.dependent_id
+         ORDER BY edge.dependent_id
          LIMIT ? OFFSET ?`
       )
       .all(id, limit + 1, offset) as ObligationRow[];
@@ -1809,12 +1876,13 @@ export class ObligationRepository {
       if (isTerminalObligationStatus(obligation.status)) {
         throw new ObligationValidationError("terminal obligations cannot be recurring");
       }
-      // v1 rejects a recurring/scheduled obligation as a prerequisite at the
-      // edge itself (#212, {@link assertEligiblePrerequisite}) — the same
-      // invariant must hold going the other direction: turning recurrence on
-      // for an obligation some dependent already named would let a prohibited
-      // edge exist anyway, just created in the opposite order.
-      if (recurrence !== null) this.assertNotNamedAsPrerequisite(id);
+      // v1 rejects a prerequisite edge with either endpoint recurring/
+      // scheduled at the edge itself (#212, {@link assertEligiblePrerequisite},
+      // {@link assertEligibleDependent}) — the same invariant must hold going
+      // the other direction: turning recurrence on for an obligation already
+      // participating in the graph on either side would let a prohibited edge
+      // exist anyway, just created in the opposite order.
+      if (recurrence !== null) this.assertNotInDependencyGraph(id);
 
       if (recurrence === null) {
         // Every state this row can be in — including `scheduled`, where the
@@ -1869,17 +1937,14 @@ export class ObligationRepository {
             const completedTime = Date.parse(lastCompletion.completed_at);
             const readyTime = completedTime + recurrence.intervalSeconds * 1000;
             if (readyTime <= this.now()) {
-              // This is the same direct scheduled→ready transition
-              // `activateScheduled` performs, so it must apply the same
-              // prerequisite check — an occurrence can pick up an unmet
-              // prerequisite after it was first armed, and going overdue
-              // must not let it skip straight past that.
-              const nextStatus = this.prerequisitesSatisfied(id) ? "ready" : "waiting";
+              // A recurring/scheduled obligation can never itself be a
+              // dependent (#212, {@link assertNotInDependencyGraph}), so this
+              // direct scheduled→ready transition has no prerequisite to check.
               this.db
                 .prepare(
-                  `UPDATE obligations SET status = ?, next_ready_at = NULL, recurrence_policy = 'completion_interval', recurrence_cron = NULL, recurrence_interval_seconds = ?, updated_at = ? WHERE id = ?`
+                  `UPDATE obligations SET status = 'ready', next_ready_at = NULL, recurrence_policy = 'completion_interval', recurrence_cron = NULL, recurrence_interval_seconds = ?, updated_at = ? WHERE id = ?`
                 )
-                .run(nextStatus, recurrence.intervalSeconds, this.stamp(), id);
+                .run(recurrence.intervalSeconds, this.stamp(), id);
             } else {
               const nextReadyAt = new Date(readyTime).toISOString();
               this.db
@@ -1907,16 +1972,14 @@ export class ObligationRepository {
       const obligation = this.get(id);
       if (!obligation) return null;
       if (obligation.status !== "scheduled") return obligation;
-      // A recurring obligation can still declare its own prerequisites (only
-      // being named *as* a prerequisite is rejected) — reapply the same
-      // readiness check `create` applies, so a still-unmet one keeps this
-      // occurrence `waiting` instead of firing early.
-      const nextStatus = this.prerequisitesSatisfied(id) ? "ready" : "waiting";
+      // A recurring/scheduled obligation can never itself be a dependent
+      // (#212, {@link assertNotInDependencyGraph}), so this transition has no
+      // prerequisite to check.
       this.db
         .prepare(
-          `UPDATE obligations SET status = ?, next_ready_at = NULL, updated_at = ? WHERE id = ?`
+          `UPDATE obligations SET status = 'ready', next_ready_at = NULL, updated_at = ? WHERE id = ?`
         )
-        .run(nextStatus, this.stamp(), id);
+        .run(this.stamp(), id);
 
       return this.require(id);
     });
