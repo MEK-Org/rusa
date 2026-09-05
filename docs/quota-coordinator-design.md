@@ -841,10 +841,19 @@ does not prevent it because there is no second *grant* to prevent: the start
 simply happens and is reported. So a responsive start and a normal start can
 land arbitrarily close together.
 
-What *is* guaranteed is that a responsive start charges the lane like any other:
-it stamps the clock, monotonically, so every subsequent normal start is a full
-interval behind it, and the invalidation above stops the outstanding holder from
-piling straight on top when it can still be stopped.
+What *is* guaranteed is narrower than "everything after it waits", and the
+difference is worth being exact about. A responsive start charges the lane like
+any other — it stamps the clock, monotonically — so every normal start **granted
+after** it is a full interval behind it.
+
+The normal start that is *not* is the holder whose lease the responsive start
+invalidated and which was already inside `spawn`. It received its grant before
+the responsive launch existed and cannot be recalled, so it can begin at any
+moment, including immediately. The invalidation stops such a holder in every case
+where it can still be stopped — anything short of an in-flight spawn — and
+because holds are exclusive there is **at most one** of them. So the exception is
+one start per responsive launch, not a class of them, and it is the same
+non-atomicity the launch deadline already leaves rather than a second hole.
 
 This is not a regression against today. Responsive runs already skip the pacer's
 queue (`provider-pacer.ts:173-175`) while still charging the clock (`:285-292`),
@@ -1558,8 +1567,12 @@ right foundation for 1–6.
     lane clock is stamped from the responsive start, and A's subsequent
     `confirmLaunch` returns `outcome: "invalidated"` while still recording the
     start monotonically. Assert also that a client checking before spawn sees the
-    invalidation and re-reserves rather than starting. This is the criterion that
-    pins the exception in §5.5 to observable behaviour rather than prose.
+    invalidation and re-reserves rather than starting. Then assert the
+    unstoppable case in the same shape: a holder that had *already* spawned still
+    records its start, the lane clock ends at the later of the two, and no
+    further grant issues until a full interval after that. The exception must be
+    one start wide and no wider, which is what makes it a documented residual
+    rather than an unbounded one.
 15. **A refusal fails closed immediately.** Point a client at a live coordinator
     that rejects it — protocol-major mismatch at `hello`, or a socket it may not
     open — while another client stays connected and keeps launching. Assert the
