@@ -1412,19 +1412,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     rootId,
   });
   if (legacyEventSubscriptionImport.importedSubscriptions > 0) {
-    console.log(
-      `[mesh] imported ${legacyEventSubscriptionImport.importedSubscriptions} explicit ` +
-        "event subscription(s) into SQLite"
-    );
+    log.info("legacy_event_subscriptions_imported", {
+      subscriptions: legacyEventSubscriptionImport.importedSubscriptions,
+    });
   } else if (legacyEventSubscriptionImport.backupFiles.length > 0) {
     // A source file still present after the receipt committed is stale by
     // construction — a failed archive rename, or one restored by hand. It is
     // archived unread rather than replayed, and saying so is what stops an
-    // operator concluding the file they put back took effect.
-    console.log(
-      "[mesh] archived a stale event-subscriptions.json unread; SQLite is authoritative: " +
-        legacyEventSubscriptionImport.backupFiles.join(", ")
-    );
+    // operator concluding the file they put back took effect. `warn`, not
+    // `info`: nothing is broken, but a document someone placed there did not
+    // become state, and the backup path is where to find it.
+    log.warn("legacy_event_subscriptions_archived_unread", {
+      backups: legacyEventSubscriptionImport.backupFiles,
+    });
   }
   const persistentEventSubscriptions = getRepositories().eventSubscriptions;
   warnMissingConfiguredEventSubscriptionsAtBoot(

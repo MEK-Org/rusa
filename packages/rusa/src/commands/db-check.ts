@@ -64,6 +64,14 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
     // subscription plan is told about them explicitly instead of failing on an
     // ordering that only exists because preflight plans and never applies.
     const pendingActors = plan.plan.kind === "import" ? plan.plan.records : [];
+    // Parentless *is* the definition of root that boot's `resolveRootActorId`
+    // uses, and neither side can hold two: the `actors` table carries a unique
+    // index over `parent_id IS NULL`, and a legacy document with anything other
+    // than exactly one root is refused while planning, above. So the first match
+    // is the only match, and preflight recognizes the same config-implied rows
+    // boot would. Boot mints a root id when both sides are empty; preflight
+    // cannot invent one, and does not need to — a minted id has never appeared
+    // in a legacy document, so it matches nothing either.
     const rootId =
       repositories.actors.list().find((actor) => actor.parentId === null)?.id ??
       pendingActors.find((actor) => actor.parentId === null)?.id;
