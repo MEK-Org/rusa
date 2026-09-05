@@ -13,6 +13,8 @@ import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
+  addReadonlyBindIfExists,
+  addWritableDirBindIfRealDir,
   buildToolchainPath,
   ensureTargetParentDirs,
   getCorepackPath,
@@ -353,13 +355,15 @@ export class E2EInstanceManager {
 
     // Mirror staging's provider access at the synthetic HOME expected by the
     // nested actor sandboxes. Claude/Antigravity/Copilot need writable token
-    // refresh state; Codex and Kimi copy their credentials before use.
+    // refresh state; Codex reads its host auth.json read-only here (the nested
+    // sandbox binds it writable directly, matching the direct/non-e2e path).
+    // Kimi is handled separately below: it needs a narrower, per-subdirectory
+    // split rather than one blanket read-only (or writable) directory bind.
     for (const [relativePath, writable] of [
       [".claude", true],
       [".claude.json", true],
       [".gemini", true],
       [".codex", false],
-      [".kimi-code", false],
       [".copilot", true],
       [join(".config", "github-copilot"), true],
       [join(".config", "copilot"), true],
@@ -370,6 +374,39 @@ export class E2EInstanceManager {
       ensureMountTarget(source, target);
       args.push(writable ? "--bind" : "--ro-bind", realpathIfExists(source), target);
     }
+
+    // Kimi's nested actor sandbox (sandbox.ts) needs `KIMI_CODE_HOME/credentials`
+    // and `KIMI_CODE_HOME/oauth` writable — refresh replaces credentials/kimi-code.json
+    // via same-directory rename, and proper-lockfile's mkdir-based refresh lock lives
+    // in oauth/ — but this outer projection previously bound the whole `~/.kimi-code`
+    // read-only. A bind mount inherits the RDONLY flag of the mount its source lives
+    // under, so the nested sandbox's own writable `--bind` of a path inside that
+    // read-only outer mount stayed read-only, and kimi's refresh failed with EROFS
+    // (issue #225). Project credentials/ and oauth/ writable here too — the exact
+    // same real host directories the direct (non-e2e) actor sandbox already binds
+    // writable, not a private copy: kimi's refresh token rotates on use, so a copy
+    // would fork the live token away from the host's copy of it (see sandbox.ts's
+    // own reasoning for the direct sandbox's identical choice). config.toml is
+    // static and stays read-only; nothing else under ~/.kimi-code is exposed.
+    const kimiCodeDir = join(this.hostHome, ".kimi-code");
+    const runtimeKimiCodeDir = join(runtimeHome, ".kimi-code");
+    const kimiConfigSource = join(kimiCodeDir, "config.toml");
+    if (existsSync(kimiConfigSource)) {
+      const kimiConfigTarget = join(runtimeKimiCodeDir, "config.toml");
+      ensureMountTarget(kimiConfigSource, kimiConfigTarget);
+      addReadonlyBindIfExists(args, realpathIfExists(kimiConfigSource), kimiConfigTarget);
+    }
+    for (const sub of ["credentials", "oauth"] as const) {
+      const source = join(kimiCodeDir, sub);
+      if (!existsSync(source)) continue;
+      const target = join(runtimeKimiCodeDir, sub);
+      ensureMountTarget(source, target);
+      // Not realpath-resolved: addWritableDirBindIfRealDir's own lstat rejects a
+      // symlinked entry rather than following it, matching the direct sandbox's
+      // guard against a stray symlink pointing outside the expected host tree.
+      addWritableDirBindIfRealDir(args, source, target);
+    }
+
     for (const [command, source] of Object.entries(this.providerExecutables)) {
       if (!existsSync(source)) continue;
       const target = join(providerBin, command);

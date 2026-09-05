@@ -37,6 +37,10 @@ describe("E2EInstanceManager", () => {
     mkdirSync(dirname(claudeExecutable), { recursive: true });
     mkdirSync(join(root, ".claude"), { recursive: true });
     mkdirSync(join(root, ".codex"), { recursive: true });
+    mkdirSync(join(root, ".kimi-code", "credentials"), { recursive: true });
+    mkdirSync(join(root, ".kimi-code", "oauth"), { recursive: true });
+    writeFileSync(join(root, ".kimi-code", "config.toml"), "");
+    writeFileSync(join(root, ".kimi-code", "credentials", "kimi-code.json"), "{}");
     writeFileSync(
       join(actorWorktree, "package.json"),
       `${JSON.stringify({ packageManager: "pnpm@10.29.3" })}\n`
@@ -382,5 +386,112 @@ describe("E2EInstanceManager", () => {
     await subject.up("actor-a", actorWorktree);
 
     expect(statSync(claudeJsonTarget).isFile()).toBe(true);
+  });
+
+  it("projects Kimi credentials/oauth writable but config.toml read-only, never the whole ~/.kimi-code tree, on a clean up()", async () => {
+    // Deliberately NOT a stale-runtime scenario (that's #224's territory) — a plain
+    // first `up()` against a clean managed instance already hit issue #225's EROFS,
+    // because the outer projection bound the whole ~/.kimi-code tree read-only. A
+    // nested Kimi sandbox's own writable bind of credentials/ or oauth/ (see
+    // sandbox.ts) inherits the RDONLY flag of the outer mount its source lives
+    // under, so it stayed read-only no matter what the nested sandbox asked for.
+    const subject = manager();
+    await subject.up("actor-a", actorWorktree);
+
+    const launch = calls.find((call) => call.file === "systemd-run");
+    const runtimeKimiCodeDir = join(mcHome, "e2e-instance", "runtime", "home", ".kimi-code");
+    expect(launch?.args).toEqual(
+      expect.arrayContaining([
+        "--bind",
+        join(root, ".kimi-code", "credentials"),
+        join(runtimeKimiCodeDir, "credentials"),
+      ])
+    );
+    expect(launch?.args).toEqual(
+      expect.arrayContaining([
+        "--bind",
+        join(root, ".kimi-code", "oauth"),
+        join(runtimeKimiCodeDir, "oauth"),
+      ])
+    );
+    expect(launch?.args).toEqual(
+      expect.arrayContaining([
+        "--ro-bind",
+        join(root, ".kimi-code", "config.toml"),
+        join(runtimeKimiCodeDir, "config.toml"),
+      ])
+    );
+    // Never a single blanket bind (read-only OR writable) of the whole directory —
+    // that would either reproduce #225 (read-only) or over-grant nested actors
+    // authority over the entire host ~/.kimi-code tree (writable).
+    expect(launch?.args).not.toEqual(
+      expect.arrayContaining(["--ro-bind", join(root, ".kimi-code"), runtimeKimiCodeDir])
+    );
+    expect(launch?.args).not.toEqual(
+      expect.arrayContaining(["--bind", join(root, ".kimi-code"), runtimeKimiCodeDir])
+    );
+  });
+
+  it("keeps Kimi credentials/oauth writable across the externally-stopped-unit recovery shape", async () => {
+    // Mirrors "rejects re-up after an external stop..." above: the transient unit
+    // dies outside down() while the holder record survives, so a same-actor
+    // down() + up() is the only recovery path (#224's refusal/cleanup lifecycle).
+    // #225's regression is narrower — once that recovery completes, is the
+    // rebuilt runtime's Kimi projection still correctly writable?
+    const subject = manager();
+    const runtimeKimiCodeDir = join(mcHome, "e2e-instance", "runtime", "home", ".kimi-code");
+
+    await subject.up("actor-a", actorWorktree);
+    active = false; // external stop: host restart, operator systemctl stop, a crash
+    await expect(subject.up("actor-b", join(workersDir, "actor-b"))).rejects.toThrow(
+      /already held by handle-actor-a/
+    );
+
+    subject.down("actor-a");
+    await subject.up("actor-a", actorWorktree);
+
+    const relaunch = calls.filter((call) => call.file === "systemd-run").at(-1);
+    expect(relaunch?.args).toEqual(
+      expect.arrayContaining([
+        "--bind",
+        join(root, ".kimi-code", "credentials"),
+        join(runtimeKimiCodeDir, "credentials"),
+      ])
+    );
+    expect(relaunch?.args).toEqual(
+      expect.arrayContaining([
+        "--bind",
+        join(root, ".kimi-code", "oauth"),
+        join(runtimeKimiCodeDir, "oauth"),
+      ])
+    );
+  });
+
+  it("keeps Kimi credentials/oauth writable when a recordless orphan runtime is cleared before rebuilding", async () => {
+    // Same recordless-orphan precondition as "clears a recordless orphan runtime..."
+    // above (state stranded by a crash before a holder record was persisted) — here
+    // checking the Kimi projection specifically survives clearOrphanRuntime + rebuild.
+    const subject = manager();
+    const runtimeKimiCodeDir = join(mcHome, "e2e-instance", "runtime", "home", ".kimi-code");
+    mkdirSync(join(runtimeKimiCodeDir, "credentials"), { recursive: true });
+    writeFileSync(join(runtimeKimiCodeDir, "oauth"), "stale file, not a directory");
+
+    await subject.up("actor-a", actorWorktree);
+
+    const launch = calls.find((call) => call.file === "systemd-run");
+    expect(launch?.args).toEqual(
+      expect.arrayContaining([
+        "--bind",
+        join(root, ".kimi-code", "credentials"),
+        join(runtimeKimiCodeDir, "credentials"),
+      ])
+    );
+    expect(launch?.args).toEqual(
+      expect.arrayContaining([
+        "--bind",
+        join(root, ".kimi-code", "oauth"),
+        join(runtimeKimiCodeDir, "oauth"),
+      ])
+    );
   });
 });
