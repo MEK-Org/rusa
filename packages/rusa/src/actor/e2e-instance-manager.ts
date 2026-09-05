@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -12,7 +13,7 @@ import {
 import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { E2E_RUNS_DIR_NAME, missingResumeRequirements } from "../e2e/provision.js";
+import { missingResumeRequirements } from "../e2e/provision.js";
 import {
   addReadonlyBindIfExists,
   addWritableDirBindIfRealDir,
@@ -35,6 +36,12 @@ export interface E2EInstanceRecord {
   worktree: string;
   unitName: string;
   startedAt: string;
+  /**
+   * The exact e2e root `up()` established and passed as `--root` for this
+   * holder's launch. Absent only on a record written before this binding
+   * existed; resume falls back to runs-area confinement for those.
+   */
+  resumableRoot?: string;
 }
 
 export interface E2EInstanceLiveStatus {
@@ -153,6 +160,13 @@ function isLoopbackPortReady(port: number): Promise<boolean> {
 export class E2EInstanceManager {
   private readonly stateFile: string;
   private readonly runtimeDir: string;
+  /**
+   * Preserved e2e roots live here, as a SIBLING of `runtimeDir` — never
+   * inside it. `runtimeDir` is wiped wholesale on every teardown/failed
+   * launch (stopUnit/cleanupFailedStart); nesting a preserved root under it
+   * would delete the very state a resume needs to retry from.
+   */
+  private readonly runsDir: string;
   private readonly now: () => string;
   private readonly hostHome: string;
   private readonly toolchainPath: string;
@@ -169,6 +183,7 @@ export class E2EInstanceManager {
   constructor(private readonly opts: E2EInstanceManagerOptions) {
     this.stateFile = join(opts.mcHome, "e2e-instance.json");
     this.runtimeDir = join(opts.mcHome, "e2e-instance", "runtime");
+    this.runsDir = join(opts.mcHome, "e2e-instance", "runs");
     this.now = opts.now ?? (() => new Date().toISOString());
     this.hostHome = opts.hostHome ?? homedir();
     this.flutterRoot = opts.flutterRoot ?? resolveHostFlutterRoot();
@@ -273,24 +288,19 @@ export class E2EInstanceManager {
   }
 
   /**
-   * A resume root must be a preserved instance under this helper's own runs
-   * area (not an arbitrary caller-supplied path) and must structurally look
-   * like something `rusa-e2e am-up --resume` can reopen, per
+   * A resume root must match the exact root `up()` persisted for the current
+   * holder (`expectedRoot`); a legacy record predating that binding instead
+   * falls back to confining the root under this helper's own runs area
+   * (`this.runsDir`). Either way the root must structurally look like
+   * something `rusa-e2e am-up --resume` can reopen, per
    * {@link missingResumeRequirements}.
    */
-  private validateResumableRoot(requestedPath: string): string {
+  private validateResumableRoot(requestedPath: string, expectedRoot: string | undefined): string {
     if (!requestedPath.trim()) throw new Error("e2e-instance: resume root path is required");
     if (!isAbsolute(requestedPath)) {
       throw new Error(`e2e-instance: resume root path must be absolute: ${requestedPath}`);
     }
-    const runsDir = join(this.hostHome, E2E_RUNS_DIR_NAME);
-    let realRunsDir: string;
     let root: string;
-    try {
-      realRunsDir = realpathSync(runsDir);
-    } catch {
-      throw new Error(`e2e-instance: no preserved e2e runs exist under ${runsDir}`);
-    }
     try {
       root = realpathSync(resolve(requestedPath));
     } catch {
@@ -299,10 +309,25 @@ export class E2EInstanceManager {
     if (!statSync(root).isDirectory()) {
       throw new Error(`e2e-instance: resume root is not a directory: ${requestedPath}`);
     }
-    if (!isSelfOrDescendant(realRunsDir, root)) {
-      throw new Error(
-        `e2e-instance: REFUSED foreign resume root ${root}; it must be a preserved instance under ${realRunsDir}`
-      );
+    if (expectedRoot !== undefined) {
+      if (root !== expectedRoot) {
+        throw new Error(
+          `e2e-instance: REFUSED resume root ${root}; only the exact root persisted for this holder ` +
+            `(${expectedRoot}) may be resumed`
+        );
+      }
+    } else {
+      let realRunsDir: string;
+      try {
+        realRunsDir = realpathSync(this.runsDir);
+      } catch {
+        throw new Error(`e2e-instance: no preserved e2e runs exist under ${this.runsDir}`);
+      }
+      if (!isSelfOrDescendant(realRunsDir, root)) {
+        throw new Error(
+          `e2e-instance: REFUSED foreign resume root ${root}; it must be a preserved instance under ${realRunsDir}`
+        );
+      }
     }
     const missing = missingResumeRequirements(root);
     if (missing.length > 0) {
@@ -313,7 +338,7 @@ export class E2EInstanceManager {
     return root;
   }
 
-  private buildBwrapArgs(worktree: string, resumeRoot?: string): string[] {
+  private buildBwrapArgs(worktree: string, root: string, resume: boolean): string[] {
     const runtimeHome = join(this.runtimeDir, "home");
     const providerBin = join(this.runtimeDir, "provider-bin");
     const baseConfigHome = join(this.runtimeDir, "base-config");
@@ -322,6 +347,10 @@ export class E2EInstanceManager {
     mkdirSync(this.pubCache, { recursive: true, mode: 0o700 });
     mkdirSync(providerBin, { recursive: true, mode: 0o700 });
     mkdirSync(baseConfigHome, { recursive: true, mode: 0o700 });
+    // `--bind` requires the source to exist on the host. A fresh (non-resume)
+    // root is a bare directory `up()` has not created yet; a resume root
+    // already exists (validateResumableRoot required it), so this is a no-op.
+    mkdirSync(root, { recursive: true, mode: 0o700 });
     const realHostHome = realpathIfExists(this.hostHome);
     const realMcHome = realpathIfExists(this.opts.mcHome);
     const realRuntime = realpathIfExists(this.runtimeDir);
@@ -368,7 +397,7 @@ export class E2EInstanceManager {
       const result = setupFlutterOverlay(args, this.flutterRoot, realRuntime);
       wrapperDir = result.wrapperDir;
     }
-    for (const path of [realRuntime, worktree, ...(resumeRoot ? [resumeRoot] : [])]) {
+    for (const path of [realRuntime, worktree, root]) {
       ensureTargetParentDirs(args, path);
       args.push("--bind", path, path);
     }
@@ -489,7 +518,9 @@ export class E2EInstanceManager {
       "run",
       "e2e",
       "am-up",
-      ...(resumeRoot ? ["--root", resumeRoot, "--resume"] : []),
+      "--root",
+      root,
+      ...(resume ? ["--resume"] : []),
       "--root-driver",
       "external",
       ...(hasBaseConfig ? ["--base-config-home", baseConfigHome] : []),
@@ -570,14 +601,19 @@ export class E2EInstanceManager {
 
     const worktree = this.validateOwnedWorktree(actorId, requestedPath);
     this.prepareWorktree(worktree);
+    // Establish the exact root up front (rather than letting am-up pick one
+    // internally) so a later resume can bind to it exactly, instead of merely
+    // to "any structurally valid root under the runs area".
+    const resumableRoot = join(this.runsDir, `run-${randomUUID()}`);
     const record: E2EInstanceRecord = {
       actorId,
       actorHandle: this.opts.handleForId(actorId),
       worktree,
       unitName: E2E_INSTANCE_UNIT_NAME,
       startedAt: this.now(),
+      resumableRoot,
     };
-    return this.launchAndAwaitPort(worktree, undefined, record, () =>
+    return this.launchAndAwaitPort(worktree, resumableRoot, false, record, () =>
       rmSync(this.stateFile, { force: true })
     );
   }
@@ -613,7 +649,7 @@ export class E2EInstanceManager {
       );
     }
 
-    const resumeRoot = this.validateResumableRoot(requestedRoot);
+    const resumeRoot = this.validateResumableRoot(requestedRoot, existing.resumableRoot);
     const worktree = this.validateOwnedWorktree(actorId, existing.worktree);
     const record: E2EInstanceRecord = {
       actorId,
@@ -621,13 +657,19 @@ export class E2EInstanceManager {
       worktree,
       unitName: E2E_INSTANCE_UNIT_NAME,
       startedAt: this.now(),
+      // Backfills the exact-root binding for a legacy record that resumed
+      // via the runs-area fallback, so its NEXT resume is exact-bound too.
+      resumableRoot: resumeRoot,
     };
-    return this.launchAndAwaitPort(worktree, resumeRoot, record, () => this.writeRecord(existing));
+    return this.launchAndAwaitPort(worktree, resumeRoot, true, record, () =>
+      this.writeRecord(existing)
+    );
   }
 
   private async launchAndAwaitPort(
     worktree: string,
-    resumeRoot: string | undefined,
+    root: string,
+    resume: boolean,
     record: E2EInstanceRecord,
     onFailure: () => void
   ): Promise<E2EInstanceStatus> {
@@ -646,7 +688,7 @@ export class E2EInstanceManager {
         "--property=TimeoutStopSec=30s",
         "--",
         "bwrap",
-        ...this.buildBwrapArgs(worktree, resumeRoot),
+        ...this.buildBwrapArgs(worktree, root, resume),
       ]);
     } catch (err) {
       onFailure();

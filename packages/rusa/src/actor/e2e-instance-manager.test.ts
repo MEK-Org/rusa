@@ -10,7 +10,6 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { E2E_RUNS_DIR_NAME } from "../e2e/provision.js";
 import { teardownFlutterOverlay } from "../providers/sandbox.js";
 import { E2E_INSTANCE_UNIT_NAME, E2EInstanceManager } from "./e2e-instance-manager.js";
 
@@ -187,11 +186,15 @@ describe("E2EInstanceManager", () => {
     expect(launch?.args).not.toEqual(
       expect.arrayContaining([expect.stringContaining("RuntimeMaxSec")])
     );
-    expect(launch?.args.slice(-9)).toEqual([
+    const resumableRoot = subject.status().holder?.resumableRoot;
+    expect(resumableRoot?.startsWith(join(mcHome, "e2e-instance", "runs", "run-"))).toBe(true);
+    expect(launch?.args.slice(-11)).toEqual([
       "pnpm",
       "run",
       "e2e",
       "am-up",
+      "--root",
+      resumableRoot,
       "--root-driver",
       "external",
       "--base-config-home",
@@ -388,8 +391,10 @@ describe("E2EInstanceManager", () => {
 
     expect(statSync(claudeJsonTarget).isFile()).toBe(true);
   describe("resume", () => {
-    const writeResumableRoot = (): string => {
-      const resumeRoot = join(root, E2E_RUNS_DIR_NAME, "run-preserved");
+    // Populates the structural files a resumable e2e root must have, at a
+    // caller-supplied path — never invents its own path, since the whole
+    // point of exact-root binding is that only `up()` gets to choose it.
+    const writeResumableRootAt = (resumeRoot: string): void => {
       mkdirSync(join(resumeRoot, "home", "data"), { recursive: true });
       writeFileSync(join(resumeRoot, "home", "config.yaml"), "providers: {}\n");
       writeFileSync(join(resumeRoot, "home", "data", "mesh.db"), "");
@@ -397,14 +402,19 @@ describe("E2EInstanceManager", () => {
       writeFileSync(join(resumeRoot, "remote", "repo.git", "HEAD"), "ref: refs/heads/main\n");
       mkdirSync(join(resumeRoot, "scratch", ".git"), { recursive: true });
       writeFileSync(join(resumeRoot, "gitconfig"), "[user]\n");
-      return resumeRoot;
     };
 
-    it("resumes a preserved holder's root with explicit --root/--resume and reuses its worktree unmodified", async () => {
+    it("resumes the exact root established by up(), with --root/--resume, and reuses its worktree unmodified", async () => {
       const subject = manager();
       await subject.up("actor-a", actorWorktree);
+      const upLaunch = calls.find((call) => call.file === "systemd-run");
+      const upRootIndex = upLaunch?.args.indexOf("--root") ?? -1;
+      const upRoot = upLaunch?.args[upRootIndex + 1];
       active = false; // externally stopped: the holder record survives, unlike down()
-      const resumeRoot = writeResumableRoot();
+      const resumeRoot = subject.status().holder?.resumableRoot;
+      expect(resumeRoot).toBe(upRoot); // the fresh launch root IS the one later resumed
+      if (!resumeRoot) throw new Error("expected a persisted resumableRoot");
+      writeResumableRootAt(resumeRoot);
       const callsBeforeResume = calls.length;
 
       const status = await subject.resume("actor-a", resumeRoot);
@@ -416,6 +426,7 @@ describe("E2EInstanceManager", () => {
         worktree: actorWorktree,
         unitName: E2E_INSTANCE_UNIT_NAME,
         startedAt: "2026-08-08T00:00:00.000Z",
+        resumableRoot: resumeRoot,
       });
       // Resume must not re-run submodule/install/build against the reused worktree.
       expect(
@@ -449,40 +460,84 @@ describe("E2EInstanceManager", () => {
       const subject = manager();
       await subject.up("actor-a", actorWorktree);
       active = false;
-      const resumeRoot = writeResumableRoot();
 
-      await expect(subject.resume("actor-b", resumeRoot)).rejects.toThrow(
+      // The actor-identity check runs before root validation, so the root
+      // argument's value is irrelevant to this rejection.
+      await expect(subject.resume("actor-b", join(mcHome, "irrelevant"))).rejects.toThrow(
         /held by handle-actor-a \(actor-a\); only the holder may resume/
       );
       expect(calls.filter((call) => call.file === "systemd-run")).toHaveLength(1);
     });
 
-    it("rejects a resume root outside the helper-owned e2e runs area", async () => {
+    it("rejects a resume root that isn't the exact root persisted for this holder", async () => {
       const subject = manager();
       await subject.up("actor-a", actorWorktree);
       active = false;
-      writeResumableRoot(); // ensures the runs area itself exists on disk
+      const resumeRoot = subject.status().holder?.resumableRoot;
+      if (!resumeRoot) throw new Error("expected a persisted resumableRoot");
+      writeResumableRootAt(resumeRoot);
+      const otherRoot = join(mcHome, "e2e-instance", "runs", "run-other");
+      writeResumableRootAt(otherRoot);
+
+      await expect(subject.resume("actor-a", otherRoot)).rejects.toThrow(
+        /REFUSED resume root.+only the exact root persisted for this holder/
+      );
+      expect(calls.filter((call) => call.file === "systemd-run")).toHaveLength(1);
+    });
+
+    it("falls back to runs-area confinement for a legacy record without a persisted resumableRoot", async () => {
+      const subject = manager();
+      writeFileSync(
+        join(mcHome, "e2e-instance.json"),
+        `${JSON.stringify({
+          actorId: "actor-a",
+          actorHandle: "handle-actor-a",
+          worktree: actorWorktree,
+          unitName: E2E_INSTANCE_UNIT_NAME,
+          startedAt: "2026-08-08T00:00:00.000Z",
+        })}\n`
+      );
+      const legacyRoot = join(mcHome, "e2e-instance", "runs", "run-legacy");
+      writeResumableRootAt(legacyRoot);
+
+      const status = await subject.resume("actor-a", legacyRoot);
+
+      expect(status.state).toBe("up");
+      // The exact-root binding is backfilled so the NEXT resume is exact-bound.
+      expect(status.holder?.resumableRoot).toBe(legacyRoot);
+      expect(calls.filter((call) => call.file === "systemd-run")).toHaveLength(1);
+    });
+
+    it("rejects a legacy record's resume root outside the helper-owned e2e runs area", async () => {
+      const subject = manager();
+      writeFileSync(
+        join(mcHome, "e2e-instance.json"),
+        `${JSON.stringify({
+          actorId: "actor-a",
+          actorHandle: "handle-actor-a",
+          worktree: actorWorktree,
+          unitName: E2E_INSTANCE_UNIT_NAME,
+          startedAt: "2026-08-08T00:00:00.000Z",
+        })}\n`
+      );
+      mkdirSync(join(mcHome, "e2e-instance", "runs"), { recursive: true });
       const foreignRoot = join(root, "elsewhere", "run-x");
-      mkdirSync(join(foreignRoot, "home", "data"), { recursive: true });
-      writeFileSync(join(foreignRoot, "home", "config.yaml"), "providers: {}\n");
-      writeFileSync(join(foreignRoot, "home", "data", "mesh.db"), "");
-      mkdirSync(join(foreignRoot, "remote", "repo.git"), { recursive: true });
-      writeFileSync(join(foreignRoot, "remote", "repo.git", "HEAD"), "ref: refs/heads/main\n");
-      mkdirSync(join(foreignRoot, "scratch", ".git"), { recursive: true });
-      writeFileSync(join(foreignRoot, "gitconfig"), "[user]\n");
+      writeResumableRootAt(foreignRoot);
 
       await expect(subject.resume("actor-a", foreignRoot)).rejects.toThrow(
         /REFUSED foreign resume root/
       );
-      expect(calls.filter((call) => call.file === "systemd-run")).toHaveLength(1);
+      expect(calls.filter((call) => call.file === "systemd-run")).toHaveLength(0);
     });
 
     it("rejects a root that is not structurally a resumable e2e instance", async () => {
       const subject = manager();
       await subject.up("actor-a", actorWorktree);
       active = false;
-      const incompleteRoot = join(root, E2E_RUNS_DIR_NAME, "run-incomplete");
-      mkdirSync(incompleteRoot, { recursive: true });
+      // up() created this directory (for the bind mount) but nothing inside it:
+      // exactly the "not structurally resumable" case.
+      const incompleteRoot = subject.status().holder?.resumableRoot;
+      if (!incompleteRoot) throw new Error("expected a persisted resumableRoot");
 
       await expect(subject.resume("actor-a", incompleteRoot)).rejects.toThrow(
         /is not a resumable e2e root \(missing/
@@ -493,9 +548,10 @@ describe("E2EInstanceManager", () => {
     it("rejects resume while the singleton is currently live", async () => {
       const subject = manager();
       await subject.up("actor-a", actorWorktree);
-      const resumeRoot = writeResumableRoot();
 
-      await expect(subject.resume("actor-a", resumeRoot)).rejects.toThrow(
+      // The liveness check runs before root validation, so the root
+      // argument's value is irrelevant to this rejection.
+      await expect(subject.resume("actor-a", join(mcHome, "irrelevant"))).rejects.toThrow(
         /already held by handle-actor-a \(actor-a\).+down\/stop.+retired.+mesh shuts down/
       );
       expect(calls.filter((call) => call.file === "systemd-run")).toHaveLength(1);
@@ -503,9 +559,9 @@ describe("E2EInstanceManager", () => {
 
     it("rejects resume when no preserved holder record exists", async () => {
       const subject = manager();
-      const resumeRoot = writeResumableRoot();
 
-      await expect(subject.resume("actor-a", resumeRoot)).rejects.toThrow(
+      // No record exists, so the root argument's value is irrelevant.
+      await expect(subject.resume("actor-a", join(mcHome, "irrelevant"))).rejects.toThrow(
         /no preserved holder record to resume/
       );
     });
@@ -549,7 +605,9 @@ describe("E2EInstanceManager", () => {
       });
       await subject.up("actor-a", actorWorktree);
       active = false;
-      const resumeRoot = writeResumableRoot();
+      const resumeRoot = subject.status().holder?.resumableRoot;
+      if (!resumeRoot) throw new Error("expected a persisted resumableRoot");
+      writeResumableRootAt(resumeRoot);
       nowValue = "2026-08-08T01:00:00.000Z";
 
       await expect(subject.resume("actor-a", resumeRoot)).rejects.toThrow(
@@ -565,6 +623,7 @@ describe("E2EInstanceManager", () => {
         worktree: actorWorktree,
         unitName: E2E_INSTANCE_UNIT_NAME,
         startedAt: "2026-08-08T00:00:00.000Z",
+        resumableRoot: resumeRoot,
       });
     });
   });
