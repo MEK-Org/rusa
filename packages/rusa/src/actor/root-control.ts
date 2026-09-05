@@ -3,6 +3,7 @@ import type { ActorHandle, ActorRecord, ContextConfig } from "./actor-record.js"
 export type RootControlPrincipal = "root-llm" | "human:operator" | "e2e-controller";
 
 export interface RootChildRequest {
+  executionTarget?: string;
   charter: string;
   provider: string;
   model: string;
@@ -14,6 +15,7 @@ export interface RootChildRequest {
 
 export interface RootControlMesh {
   spawn(request: {
+    executionTarget?: string;
     charter: string;
     parentId: string;
     provider: string;
@@ -82,6 +84,7 @@ export class RootControlService {
       throw new Error("effort must be a non-empty string when set");
     }
     const id = this.options.mesh.spawn({
+      ...(request.executionTarget ? { executionTarget: request.executionTarget } : {}),
       charter,
       parentId: this.rootId,
       provider,

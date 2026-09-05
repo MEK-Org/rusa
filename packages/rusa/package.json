@@ -13,6 +13,7 @@
     "scripts/verify-build.mjs"
   ],
   "scripts": {
+    "build:follower": "tsup --config tsup.follower.config.ts",
     "build": "tsup && node scripts/copy-assets.mjs && pnpm run build:dashboard-ui",
     "build:dashboard-ui": "node scripts/build-dashboard-ui.mjs",
     "analyze:dashboard-ui": "node scripts/flutter-run.mjs analyze",

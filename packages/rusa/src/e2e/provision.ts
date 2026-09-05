@@ -52,6 +52,7 @@ export interface E2EInstance {
  * minimal-but-valid shape otherwise.
  */
 export function buildE2EConfig(opts: {
+  dashboardPort?: number;
   scratchPath: string;
   baseConfig?: RusaConfig | null;
   /** Actor-mesh root config (provider/charter). */
@@ -75,7 +76,7 @@ export function buildE2EConfig(opts: {
     geminiApiKey: base?.geminiApiKey ?? "MISSING",
     // Required by the schema; the e2e instance never starts a webhook server.
     webhook: { port: 0, secret: "" },
-    dashboard: { port: E2E_DASHBOARD_PORT },
+    dashboard: { port: opts.dashboardPort ?? E2E_DASHBOARD_PORT },
     understanding: { rootNodeId: E2E_IU_ROOT_NODE_ID },
     // Capture full prompts/transcripts so an agent can inspect what happened.
     invocationDebug: { enabled: true },
@@ -93,6 +94,7 @@ export function buildE2EConfig(opts: {
  * agent's writes to its worktree, which lives under RUSA_HOME=root.
  */
 export function provisionE2EInstance(opts: {
+  dashboardPort?: number;
   root?: string;
   baseConfigHome?: string;
   rootActor?: RusaConfig["rootActor"];
@@ -154,6 +156,7 @@ export function provisionE2EInstance(opts: {
   }
 
   const config = buildE2EConfig({
+    dashboardPort: opts.dashboardPort,
     scratchPath,
     baseConfig,
     rootActor: opts.rootActor,

@@ -10,8 +10,13 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Actor } from "../actor/actor.js";
-import { ActorMesh, type MeshActor, type RetireCleanup } from "../actor/actor-mesh.js";
+import { Actor, type ActorOptions } from "../actor/actor.js";
+import {
+  type ActorFactoryContext,
+  ActorMesh,
+  type MeshActor,
+  type RetireCleanup,
+} from "../actor/actor-mesh.js";
 import type { ActorRecord, PortableContextConfig } from "../actor/actor-record.js";
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
 import {
@@ -184,7 +189,7 @@ import {
   validateProviderSelection,
 } from "../providers/registry.js";
 import { assertBwrapAvailable, teardownFlutterOverlay } from "../providers/sandbox.js";
-import type { McpServerSpec, RunResult } from "../providers/types.js";
+import type { CodingProvider, McpServerSpec, RunResult } from "../providers/types.js";
 import { resolveQuotaDatabasePath, SharedQuotaStore } from "../quota/shared-store.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
@@ -493,6 +498,11 @@ export interface RunStartE2EHandles {
  * The issue-client edge is swapped via the existing `setIssueClient` global.
  */
 export interface RunStartE2EHooks {
+  /** Experimental execution seam; production always constructs a local Actor. */
+  createWorkerActor?: (
+    context: ActorFactoryContext,
+    options: ActorOptions
+  ) => MeshActor & { getProvider(): CodingProvider };
   chatClient?: ChatClient;
   chatSource?: ChatSource;
   rootDriver?: "provider" | "external";
@@ -1854,8 +1864,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const sandbox = config.sandbox !== "container-boundary";
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
-        let actor: Actor;
-        actor = new Actor({
+        let actor: MeshActor & { getProvider(): CodingProvider };
+        const actorOptions: ActorOptions = {
           id,
           cwd,
           provider: workerProvider,
@@ -2023,7 +2033,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             }
           },
           log: makeFirehose(id), // firehose (4d: session-tag) → console + dashboard SSE
-        });
+        };
+        actor = opts?.e2e?.createWorkerActor?.(ctx, actorOptions) ?? new Actor(actorOptions);
         liveWorkerMcp.set(id, workerMcp);
         return actor;
       } catch (err) {

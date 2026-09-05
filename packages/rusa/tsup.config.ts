@@ -6,7 +6,11 @@ import { defineConfig } from "tsup";
 const outDir = process.env.RUSA_DIST_DIR ?? "dist";
 
 export default defineConfig({
-  entry: ["src/cli.ts", "src/commands/e2e.cli.ts"],
+  entry: {
+    cli: "src/cli.ts",
+    "commands/e2e.cli": "src/commands/e2e.cli.ts",
+    "commands/follower": "src/experimental/remote-instances/follower.ts",
+  },
   format: ["esm"],
   target: "node20",
   outDir,
