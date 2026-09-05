@@ -942,42 +942,23 @@ export class ObligationRepository {
    *
    * A root and every one of its descendants used to cost one `require()` plus
    * one `listChildren()` — each re-running the whole-table effective-priority
-   * CTE — for every node in the subtree (#241). This instead runs the
-   * effective-priority CTE once and joins it against a second recursive CTE
-   * that walks from the requested roots down through `obligations.parent_id`,
-   * so the query cost no longer scales with the number of nodes visited.
-   * The depth cap mirrors the row count so a genuine cycle (which application
-   * code prevents on write, but this stays defensive about) still terminates
-   * the SQL walk instead of recursing forever, surfacing as the same
-   * downstream "cycle detected" error once duplicate ids reach tree assembly.
+   * CTE — for every node in the subtree (#241). An earlier version of this
+   * fix bounded the read to just the requested subtrees with a second
+   * recursive CTE; at this table's actual scale (a few hundred rows) that
+   * bound bought nothing measurable and added its own bug — a root whose
+   * descendant was *also* requested as a separate root reached that
+   * descendant via two seed paths, producing a duplicate row that
+   * `childrenByParent` (unlike `byId`) didn't dedupe, which surfaced as a
+   * false "cycle detected" error. Reading every row once, unfiltered, and
+   * assembling every tree from one in-memory parent→children index removes
+   * both the bound and the bug: each id appears exactly once (primary key),
+   * so no id can reach the assembly step twice.
    */
   getForest(rootIds: readonly string[]): ObligationTree[] {
     if (rootIds.length === 0) return [];
-    const placeholders = rootIds.map(() => "?").join(", ");
     const rows = this.db
-      .prepare(
-        `${EFFECTIVE_PRIORITY_CTE},
-         subtree(id, depth) AS (
-           SELECT id, 0 FROM obligations WHERE id IN (${placeholders})
-           UNION ALL
-           SELECT child.id, parent.depth + 1
-           FROM obligations child
-           JOIN subtree parent ON parent.id = child.parent_id
-           WHERE parent.depth < (SELECT COUNT(*) FROM obligations)
-         )
-         SELECT obligation.*,
-                effective_priority.effective_priority,
-                effective_priority.priority_source_id,
-                EXISTS(
-                  SELECT 1
-                  FROM obligation_completions
-                  WHERE obligation_id = obligation.id
-                ) AS has_completion_history
-         FROM obligations obligation
-         JOIN effective_priority ON effective_priority.id = obligation.id
-         JOIN subtree ON subtree.id = obligation.id`
-      )
-      .all(...rootIds) as ObligationRow[];
+      .prepare(`${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}`)
+      .all() as ObligationRow[];
 
     const byId = new Map<string, ObligationRow>();
     const childrenByParent = new Map<string, ObligationRow[]>();

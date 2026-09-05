@@ -1310,7 +1310,7 @@ describe("ObligationRepository", () => {
       buildForest("root-a", "actor-a", 3, 3); // 1 + 3 + 9 + 27 = 40 nodes
       const prepareSpy = vi.spyOn(db, "prepare");
       const tree = repository.getTree("root-a");
-      expect(prepareSpy.mock.calls.length).toBeLessThanOrEqual(2);
+      expect(prepareSpy.mock.calls.length).toBe(1);
       prepareSpy.mockRestore();
 
       let total = 1;
@@ -1329,7 +1329,7 @@ describe("ObligationRepository", () => {
 
       const prepareSpy = vi.spyOn(db, "prepare");
       const [treeY, treeX] = repository.getForest(["root-y", "root-x"]);
-      expect(prepareSpy.mock.calls.length).toBeLessThanOrEqual(2);
+      expect(prepareSpy.mock.calls.length).toBe(1);
       prepareSpy.mockRestore();
 
       expect(treeY.obligation.id).toBe("root-y");
@@ -1370,6 +1370,31 @@ describe("ObligationRepository", () => {
         repository.listChildren("ord-root").map((o) => o.id)
       );
       expect(tree.children.map((c) => c.obligation.id)).toEqual(["ord-c", "ord-a", "ord-b"]);
+    });
+
+    it("getForest does not misreport a cycle when a requested root is also a descendant of another requested root", () => {
+      repository.create({ id: "ancestor", title: "ancestor", ownerId: "actor-a" });
+      repository.create({
+        id: "descendant",
+        title: "descendant",
+        parentId: "ancestor",
+        ownerId: "actor-a",
+      });
+      repository.create({
+        id: "grandchild",
+        title: "grandchild",
+        parentId: "descendant",
+        ownerId: "actor-a",
+      });
+
+      const [ancestorTree, descendantTree] = repository.getForest(["ancestor", "descendant"]);
+      expect(ancestorTree.obligation.id).toBe("ancestor");
+      expect(ancestorTree.children.map((c) => c.obligation.id)).toEqual(["descendant"]);
+      expect(ancestorTree.children[0]?.children.map((c) => c.obligation.id)).toEqual([
+        "grandchild",
+      ]);
+      expect(descendantTree.obligation.id).toBe("descendant");
+      expect(descendantTree.children.map((c) => c.obligation.id)).toEqual(["grandchild"]);
     });
 
     it("getForest returns [] for no roots and omits roots that don't exist", () => {
