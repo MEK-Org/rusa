@@ -32,25 +32,62 @@ describe.skipIf(!BWRAP_CAPABLE)(
       temps.length = 0;
     });
 
-    it("sandbox with --new-session protects CLI from its own tool-timeout group kill", async () => {
+    it("refuses a group kill that resolves to its own group, reaps a setsid one", async () => {
       const tmp = mkdtempSync(join(tmpdir(), "mc-sandbox-pgkill-"));
       temps.push(tmp);
 
       const script = join(tmp, "fake-cli.sh");
-      // A fake "provider CLI" running inside bwrap.
+      // A fake "provider CLI" running inside bwrap, exercising both shapes of
+      // the group kill a real CLI issues when a tool times out.
+      //
+      // The first shape is the one that made this test itself dangerous: a
+      // child started without a session of its own shares the CLI's group, so
+      // the group kill resolves to the CLI - and under --new-session that group
+      // is 1, where a negative-pid kill is a namespace-wide broadcast sparing
+      // only the sender. Proving that by firing it and checking the CLI
+      // survived only holds while the PID namespace does; anywhere it does not,
+      // the same line takes out the runner and everything beside it. So the
+      // hazard is now observed and reported, never sent.
+      //
+      // The second shape is the cleanup a CLI should do: setsid gives the child
+      // tree a group of its own, the guard proves that group is neither init,
+      // nor a broadcast, nor the caller's, and only then is it signalled.
       writeFileSync(
         script,
         [
           "#!/bin/bash",
-          "set -euo pipefail",
-          // Spawn a child command (NO set -m, so it shares the CLI's process group)
+          "set -uo pipefail",
+          'SELF_PGID=$(ps -o pgid= $$ | tr -d " ")',
+          'echo "SELF_PGID=$SELF_PGID"',
           "( sleep 300 ) &",
-          "CHILD=$!",
+          "SHARED=$!",
           "sleep 0.15",
-          "PGID=$(ps -o pgid= $CHILD | tr -d ' ')",
-          // Kill the child's process group, as the real CLI does on tool timeout
-          "kill -KILL -- -$PGID",
-          // CLI should survive and exit 0
+          'SHARED_PGID=$(ps -o pgid= $SHARED | tr -d " ")',
+          'if [ -z "$SHARED_PGID" ] || [ "$SHARED_PGID" -le 1 ] || [ "$SHARED_PGID" = "$SELF_PGID" ]; then',
+          '  echo "REFUSED_SELF_GROUP shared_pgid=$SHARED_PGID self_pgid=$SELF_PGID"',
+          "else",
+          '  echo "SEPARATE_WITHOUT_SETSID shared_pgid=$SHARED_PGID self_pgid=$SELF_PGID"',
+          "fi",
+          "kill -KILL $SHARED 2>/dev/null",
+          "export PIDS=/tmp/rusa-owned-group.$$.pids",
+          "setsid bash -c 'echo $$ > $PIDS; sleep 300 & echo $! >> $PIDS; wait' &",
+          "for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do",
+          '  [ -f $PIDS ] && [ "$(wc -l < $PIDS)" -ge 2 ] && break',
+          "  sleep 0.1",
+          "done",
+          "LEADER=$(sed -n 1p $PIDS)",
+          "GRANDCHILD=$(sed -n 2p $PIDS)",
+          'OWNED_PGID=$(ps -o pgid= $LEADER | tr -d " ")',
+          'echo "OWNED leader=$LEADER grandchild=$GRANDCHILD pgid=$OWNED_PGID"',
+          'if [ -z "$OWNED_PGID" ] || [ "$OWNED_PGID" -le 1 ] || [ "$OWNED_PGID" = "$SELF_PGID" ]; then',
+          '  echo "UNSAFE_OWNED_GROUP pgid=$OWNED_PGID self_pgid=$SELF_PGID"',
+          "  exit 3",
+          "fi",
+          "kill -KILL -- -$OWNED_PGID",
+          "sleep 0.2",
+          'if kill -0 $GRANDCHILD 2>/dev/null; then echo "GRANDCHILD_SURVIVED"; exit 4; fi',
+          'echo "REAPED_OWNED_GROUP pgid=$OWNED_PGID"',
+          "exit 0",
         ].join("\n")
       );
       chmodSync(script, 0o755);
@@ -62,7 +99,7 @@ describe.skipIf(!BWRAP_CAPABLE)(
         command: "bwrap",
         args: [...bwrapArgs.args, script],
         cwd: tmp,
-        timeoutMs: 5000,
+        timeoutMs: 15000,
         buildKilledResult: (sig) => ({
           success: false,
           exitCode: sig.exitCode,
@@ -81,12 +118,13 @@ describe.skipIf(!BWRAP_CAPABLE)(
 
       const result = await runPromise;
 
-      // Without --new-session, the CLI's PGID is 0, so kill -0 kills the CLI itself (exit 137).
-      // With --new-session, the CLI's PGID is 1, and kill -1 is a broadcast that excludes the sender, so the CLI survives.
+      // The CLI is still standing because the unsafe kill was never sent - not
+      // because a broadcast happened to spare it.
+      expect(result.output).toContain("REFUSED_SELF_GROUP");
+      expect(result.output).toContain("REAPED_OWNED_GROUP");
+      expect(result.output).not.toContain("GRANDCHILD_SURVIVED");
       expect(result.success).toBe(true);
-      if (!result.success) {
-        expect(result.exitCode).not.toBe(137);
-      }
+      expect(result.exitCode).toBe(0);
     });
 
     it("aborting runSubprocess from outside kills grandchild processes inside bwrap", async () => {
