@@ -2004,10 +2004,18 @@ export class ActorMesh {
     // owner, a source no live actor owns), and never displaces the owner when it
     // did. The exact resource only: a subscription does not bubble.
     //
-    // A directed delivery is the one case where this does not apply. A verified
-    // bot directive names the single actor an event is for; fanning it out to
-    // subscribers would make `mesh:deliver` mean something other than what it
-    // says.
+    // A *successfully targeted* delivery is the one case where this does not
+    // apply. A verified bot directive names the single actor an event is for;
+    // fanning it out to subscribers would make `mesh:deliver` mean something
+    // other than what it says.
+    //
+    // Read `directed` precisely: it is set only on that happy path. A directive
+    // overridden by a live obligation, or one naming a target that is no longer
+    // live, resolves ownership normally and still reaches subscribers. That is
+    // deliberate rather than incidental — a standing interest in a source's
+    // direct events is not defeated by a directive aimed at someone else, or by
+    // one that failed to land. Those paths also leave `directed` false for the
+    // author-suppression exemption below, which only a landed directive earns.
     if (!directed) {
       for (const subscriber of this.liveDirectSubscribers(resource)) {
         if (!destinations.includes(subscriber)) destinations.push(subscriber);

@@ -5892,6 +5892,28 @@ describe("ActorMesh", () => {
       expect(fake(watcher).calls).toHaveLength(0);
     });
 
+    it("still wakes a subscriber when the directive names a target that is not live", async () => {
+      // The exemption above belongs to a directive that *landed*, not to the
+      // presence of `directedTarget`. An ignored directive falls back to the
+      // ownership ladder, and a standing interest in this source's events is
+      // not defeated by someone else's failed hand-off.
+      const { mesh, tick, fake, logs } = setup();
+      const owner = mesh.spawn({ charter: "owner", parentId: "root" });
+      const watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
+      mesh.subscribeEventSource(ISSUE, owner, "root");
+      mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+
+      mesh.deliverEvent(ISSUE, "issue event", {
+        directedTarget: "not-live",
+        inboxPayload: payload("issues.opened"),
+      });
+      await tick();
+
+      expect(logs).toContain("mesh:deliver target not live: not-live — directive ignored");
+      expect(fake(owner).calls).toHaveLength(1);
+      expect(fake(watcher).calls).toHaveLength(1);
+    });
+
     it("does not make a subscriber the effective owner", () => {
       // The hazard this pins: `effectiveOwnerOf` reads the head of the ownership
       // resolution, and delegate/reclaim are gated on it. A subscriber leaking
@@ -6930,6 +6952,33 @@ describe("ActorMesh", () => {
       );
 
       expect(woken).toEqual([owner]);
+      expect(woken).not.toContain(directedTarget);
+    });
+
+    it("still wakes a subscriber when a live obligation overrides the directive", async () => {
+      // The obligation beats the directive, so the delivery never becomes
+      // `directed` and the subscriber is merged as usual. Worth pinning
+      // separately: this is the one directed path where ownership is decided by
+      // the obligation branch, and a future change that set `directed` as soon
+      // as a target was named would silently drop the subscriber here.
+      let owner = "";
+      let watcher = "";
+      let directedTarget = "";
+      const woken = await wokenBy(
+        owning({ [REF]: "t3" }),
+        (mesh) => {
+          watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
+          directedTarget = mesh.spawn({ charter: "directed target", parentId: "root" });
+          owner = mesh.spawn({ charter: "obligation owner", parentId: "root" });
+          mesh.addEventSourceSubscriber(issue, watcher, watcher);
+        },
+        issue,
+        undefined,
+        () => ({ directedTarget })
+      );
+
+      expect(owner).toBe("t3");
+      expect(woken.sort()).toEqual([owner, watcher].sort());
       expect(woken).not.toContain(directedTarget);
     });
 
