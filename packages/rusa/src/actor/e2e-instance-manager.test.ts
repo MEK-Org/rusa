@@ -1,4 +1,12 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -314,5 +322,65 @@ describe("E2EInstanceManager", () => {
     await expect(subject.up("actor-b", join(workersDir, "actor-b"))).rejects.toThrow(
       /already held by handle-actor-a \(actor-a\)/
     );
+  });
+
+  it("rejects re-up after an external stop leaves holder+runtime intact, then rebuilds Claude mount targets once the holder brings it down", async () => {
+    writeFileSync(join(root, ".claude.json"), '{"marker":"file-v1"}\n');
+    const subject = manager();
+    const stateFile = join(mcHome, "e2e-instance.json");
+    const runtimeDir = join(mcHome, "e2e-instance", "runtime");
+    const claudeJsonTarget = join(runtimeDir, "home", ".claude.json");
+
+    await subject.up("actor-a", actorWorktree);
+    expect(statSync(claudeJsonTarget).isFile()).toBe(true);
+    const recordBefore = readFileSync(stateFile, "utf8");
+
+    // The incident: the transient unit is stopped outside down() (host
+    // restart, an operator's `systemctl stop`, a crash) while the holder
+    // record and runtime directory survive untouched.
+    active = false;
+
+    const callsBeforeReUp = calls.length;
+    await expect(subject.up("actor-b", join(workersDir, "actor-b"))).rejects.toThrow(
+      /already held by handle-actor-a \(actor-a\).+down\/stop.+retired.+mesh shuts down/
+    );
+    // Rejected before any worktree preparation or relaunch attempt.
+    expect(calls.slice(callsBeforeReUp).some((call) => call.file === "git")).toBe(false);
+    expect(calls.slice(callsBeforeReUp).some((call) => call.file === "systemd-run")).toBe(false);
+    // The preserved holder record and runtime were not mutated by the refusal.
+    expect(readFileSync(stateFile, "utf8")).toBe(recordBefore);
+    expect(statSync(claudeJsonTarget).isFile()).toBe(true);
+
+    // Only the holder can bring the dead unit state down.
+    subject.down("actor-a");
+    expect(existsSync(stateFile)).toBe(false);
+    expect(existsSync(runtimeDir)).toBe(false);
+
+    // The host's Claude state is now a differently-shaped path (a directory
+    // instead of a file). A fresh up() must build a mount target that
+    // matches this current shape, not reuse anything from the prior run.
+    rmSync(join(root, ".claude.json"), { force: true });
+    mkdirSync(join(root, ".claude.json"), { recursive: true });
+
+    await subject.up("actor-a", actorWorktree);
+    expect(statSync(claudeJsonTarget).isDirectory()).toBe(true);
+  });
+
+  it("clears a recordless orphan runtime before rebuilding mount targets, instead of reusing a stale shape", async () => {
+    writeFileSync(join(root, ".claude.json"), '{"marker":"file"}\n');
+    const subject = manager();
+    const runtimeDir = join(mcHome, "e2e-instance", "runtime");
+    const claudeJsonTarget = join(runtimeDir, "home", ".claude.json");
+
+    // No holder record and no live unit, but a leftover runtime tree whose
+    // Claude mount target is a stale directory even though the current host
+    // source is a plain file (e.g. state stranded by a crash before this
+    // manager could persist its own holder record).
+    mkdirSync(claudeJsonTarget, { recursive: true });
+    expect(statSync(claudeJsonTarget).isDirectory()).toBe(true);
+
+    await subject.up("actor-a", actorWorktree);
+
+    expect(statSync(claudeJsonTarget).isFile()).toBe(true);
   });
 });

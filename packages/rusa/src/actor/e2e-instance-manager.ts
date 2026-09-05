@@ -465,18 +465,28 @@ export class E2EInstanceManager {
   async up(actorId: string, requestedPath: string): Promise<E2EInstanceStatus> {
     const existing = this.readRecord();
     const existingStatus = this.liveStatus();
-    if (existing && this.isLive(existingStatus)) {
+    // A valid holder record is ownership on its own: the transient unit behind
+    // it can be inactive, failed, or gone (host restart, `systemctl stop`, an
+    // OOM kill) without releasing that ownership. Reject before touching the
+    // worktree or runtime so a stopped-but-still-held instance can only be
+    // reclaimed by that actor's own down/stop (or, separately, resumed).
+    if (existing) {
       throw new Error(
         `e2e-instance: already held by ${existing.actorHandle} (${existing.actorId}) serving ${existing.worktree}; ` +
           "it comes down only when that actor calls down/stop, that actor is retired, or the mesh shuts down"
       );
     }
-    if (!existing && this.isLive(existingStatus)) {
+    if (this.isLive(existingStatus)) {
       throw new Error(
         `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} is already active but its holder record is missing; ` +
           "an operator must stop the orphaned unit before retrying"
       );
     }
+    // No valid holder record and no live unit: any surviving runtime directory
+    // is an orphan (its owning record is gone), not preserved state. Clear it
+    // before rebuilding mount targets so a stale file-vs-directory shape left
+    // by a prior run (e.g. runtime/home/.claude.json) can't reach bwrap.
+    this.clearOrphanRuntime();
 
     const worktree = this.validateOwnedWorktree(actorId, requestedPath);
     this.prepareWorktree(worktree);
@@ -557,6 +567,17 @@ export class E2EInstanceManager {
 
   stopForMeshShutdown(): void {
     if (this.readRecord() || this.isLive(this.liveStatus())) this.stopUnit();
+  }
+
+  /**
+   * Removes a runtime directory left behind with no owning holder record and
+   * no live unit — orphaned state, distinct from a preserved holder's runtime
+   * (which `up()` never reaches while a record exists) or a live singleton's
+   * runtime (torn down only via stopUnit/cleanupFailedStart).
+   */
+  private clearOrphanRuntime(): void {
+    teardownFlutterOverlay(this.runtimeDir);
+    rmSync(this.runtimeDir, { recursive: true, force: true });
   }
 
   private stopUnit(): void {
