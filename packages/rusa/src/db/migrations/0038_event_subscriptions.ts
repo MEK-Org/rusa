@@ -24,9 +24,13 @@ import type { Migration } from "./types.js";
  *
  * `ON DELETE RESTRICT` matches `capability_grants` and `obligations.parent_id`.
  * There is no actor-deletion path today — `ActorRepository` exposes no delete
- * and retirement is a `retired_at` timestamp — so RESTRICT costs nothing now
- * and, if a deletion path is ever added, forces it to unsubscribe first rather
- * than silently discarding who owned which event source.
+ * and retirement is a `retired_at` timestamp — so RESTRICT costs nothing now.
+ * Note that unsubscribing does not release the reference: it leaves a tombstone
+ * that still names the actor, so RESTRICT holds against an actor's whole
+ * subscription history, not just its live rows. That is the intent — a future
+ * deletion path has to decide out loud what becomes of the record of who owned
+ * which event source, where an unconstrained column or `ON DELETE CASCADE`
+ * would discard it silently.
  *
  * `subscribed_by` stays unconstrained text, like `capability_grants.granted_by`:
  * it records who performed the subscribe, which may be an operator or a
