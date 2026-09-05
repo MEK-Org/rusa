@@ -9,6 +9,7 @@ import 'fakes.dart';
 Map<String, dynamic> entry(
   String id, {
   String source = 'mesh:root',
+  String type = 'mesh.message',
   Map<String, dynamic>? reference,
 }) => {
   'id': id,
@@ -16,7 +17,7 @@ Map<String, dynamic> entry(
   'deliveredAt': '2026-09-05T12:00:00.000Z',
   'handledAt': null,
   'handledNote': null,
-  'payload': {'type': 'mesh.message', 'content': 'Body of $id'},
+  'payload': {'type': type, 'content': 'Body of $id'},
   'reference': ?reference,
 };
 
@@ -124,6 +125,54 @@ void main() {
         // Stacked: same column, inbox strictly above.
         expect((inboxTop.dx - obligationsTop.dx).abs(), lessThan(2));
         expect(inboxTop.dy, lessThan(obligationsTop.dy));
+      },
+    );
+
+    testWidgets(
+      'a long type/source at just-above-breakpoint width does not overflow '
+      'the narrowed two-column card',
+      (tester) async {
+        // Just over the 700px two-column breakpoint, each ~318px-wide column
+        // is the tightest a card header ever gets while still side by side —
+        // and real GitHub payloads carry long `type`/`source` strings (e.g.
+        // `pull_request_review_comment.created`,
+        // `github:owner/repo/pulls/N`) that a plain `Row` can't shrink to fit.
+        final api = FakeApi()
+          ..inboxResultsByStatus['unhandled'] = {
+            'entries': [
+              entry(
+                'entry-1',
+                source: 'github:MEK-Org/some-really-long-repo-name/pulls/24389',
+                type: 'pull_request_review_comment.created',
+              ),
+            ],
+          }
+          ..inboxResultsByStatus['handled'] = {'entries': []}
+          ..obligationsResult = [
+            makeObligation(
+              'ob-1',
+              ownerId: 'actor-a',
+              intent: 'Ready obligation',
+            ),
+          ];
+        final store = DashboardStore(
+          api: api,
+          stream: FakeStream(),
+          quotaCache: FakeQuotaCache(),
+          treePreferencesCache: FakeTreePreferencesCache(),
+        );
+
+        await _pump(tester, store, size: const Size(710, 900));
+
+        // A RenderFlex overflow surfaces as an exception during the pump
+        // above, not as a rendered widget — asserting no exception was
+        // recorded is what actually pins "no overflow", not just that the
+        // header's text made it onto the tree somewhere.
+        expect(tester.takeException(), isNull);
+        expect(
+          find.textContaining('PULL_REQUEST_REVIEW_COMMENT'),
+          findsOneWidget,
+        );
       },
     );
 

@@ -241,10 +241,7 @@ class _InboxTabState extends State<InboxTab> {
           if (resolved.isNotEmpty) const SizedBox(height: 24),
         ],
         if (resolved.isNotEmpty) ...[
-          _SectionTitle(
-            'Recently resolved signals',
-            'last ${resolved.length}',
-          ),
+          _SectionTitle('Recently resolved signals', 'last ${resolved.length}'),
           _sectionPanel(resolved),
         ],
       ],
@@ -282,10 +279,7 @@ class _InboxTabState extends State<InboxTab> {
                 style: TextStyle(fontSize: 11),
               ),
               style: TextButton.styleFrom(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 8,
-                  vertical: 4,
-                ),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                 minimumSize: Size.zero,
                 tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                 foregroundColor: MeshColors.accent,
@@ -575,72 +569,63 @@ class _InboxTabState extends State<InboxTab> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.center,
+            // A two-column or narrow-stacked layout can give this card much
+            // less width than the single-column page always used to — and a
+            // real GitHub `type`/`source` can run long (e.g.
+            // `pull_request_review_comment.created`,
+            // `github:owner/repo/pulls/N`). A plain `Row` can't shrink the
+            // chip when it alone is wider than what's left, which overflows;
+            // a flat `Wrap` lets the chip, source, arrival time, and dismiss
+            // each drop to their own line instead.
+            Wrap(
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 8,
+              runSpacing: 4,
               children: [
                 _InboxChip(payload['type']?.toString() ?? 'INBOX ITEM'),
-                const SizedBox(width: 8),
-                // A two-column or narrow-stacked layout can give this card
-                // much less width than the single-column page always used
-                // to. Source, arrival time, and dismiss wrap onto their own
-                // line instead of overflowing when they no longer fit
-                // alongside the chip on one line.
-                Expanded(
-                  child: Wrap(
-                    alignment: WrapAlignment.spaceBetween,
-                    crossAxisAlignment: WrapCrossAlignment.center,
-                    spacing: 8,
-                    runSpacing: 4,
-                    children: [
+                Text(
+                  e['source']?.toString() ?? '',
+                  style: const TextStyle(
+                    color: MeshColors.accent,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                Wrap(
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  spacing: 8,
+                  runSpacing: 4,
+                  children: [
+                    if (arrivedAt != null)
                       Text(
-                        e['source']?.toString() ?? '',
+                        'Arrived: ${formatTs(arrivedAt.toString())}',
                         style: const TextStyle(
-                          color: MeshColors.accent,
-                          fontWeight: FontWeight.w600,
+                          color: MeshColors.textMuted,
+                          fontSize: 11,
+                          fontFamily: kMonoFontFamily,
                         ),
                       ),
-                      Wrap(
-                        crossAxisAlignment: WrapCrossAlignment.center,
-                        spacing: 8,
-                        runSpacing: 4,
-                        children: [
-                          if (arrivedAt != null)
-                            Text(
-                              'Arrived: ${formatTs(arrivedAt.toString())}',
-                              style: const TextStyle(
-                                color: MeshColors.textMuted,
-                                fontSize: 11,
-                                fontFamily: kMonoFontFamily,
-                              ),
-                            ),
-                          // Only an outstanding entry is dismissible. A resolved
-                          // one already carries someone's account of it, and the
-                          // server will not let a second clear overwrite that note.
-                          if (!handled)
-                            TextButton.icon(
-                              onPressed: () => _dismiss(e),
-                              icon: const Icon(
-                                Icons.check_circle_outline,
-                                size: 14,
-                              ),
-                              label: const Text(
-                                'Dismiss',
-                                style: TextStyle(fontSize: 11),
-                              ),
-                              style: TextButton.styleFrom(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 8,
-                                  vertical: 4,
-                                ),
-                                minimumSize: Size.zero,
-                                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                                foregroundColor: MeshColors.textSecondary,
-                              ),
-                            ),
-                        ],
+                    // Only an outstanding entry is dismissible. A resolved
+                    // one already carries someone's account of it, and the
+                    // server will not let a second clear overwrite that note.
+                    if (!handled)
+                      TextButton.icon(
+                        onPressed: () => _dismiss(e),
+                        icon: const Icon(Icons.check_circle_outline, size: 14),
+                        label: const Text(
+                          'Dismiss',
+                          style: TextStyle(fontSize: 11),
+                        ),
+                        style: TextButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          minimumSize: Size.zero,
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                          foregroundColor: MeshColors.textSecondary,
+                        ),
                       ),
-                    ],
-                  ),
+                  ],
                 ),
               ],
             ),

@@ -396,29 +396,49 @@ function clampLimit(url: URL): number {
 
 /**
  * Inbox entries intentionally store lightweight pointers. The dashboard is the
- * presentation boundary, so resolve a mesh-message pointer here and never leak
- * its opaque id into the UI payload.
+ * presentation boundary, so resolve a mesh-message pointer, or a GitHub source
+ * (see `deriveGitHubInboxNotification` — its `source` is the exact reference
+ * the event was about), here and never leak an opaque id or an unlinked
+ * `github:` label into the UI payload.
+ *
+ * Google Chat sources are deliberately left alone: a chat event's `source` is
+ * the containing space (routing granularity), not the specific message, so
+ * resolving it here would show the wrong entity. Every other payload keeps
+ * its raw JSON, which is the honest rendering until that has a resolver.
  */
-function resolveInboxPage(page: InboxPage, deps: DashboardDataDeps): InboxPage {
-  const entries = page.entries.map((entry) => {
-    const { messageId, ...payload } = entry.payload as InboxPayload & {
-      messageId?: unknown;
-    };
-    if (typeof messageId !== "string") return entry;
-    // `content` is kept as-is so nothing that reads it today regresses;
-    // `reference` is the addition, so the dashboard can render an inbox item
-    // through the same widget as an obligation's cited artifacts. Only mesh
-    // chat resolves in v1 — every other payload keeps its raw JSON, which is
-    // the honest rendering until those sources have resolvers.
-    const reference = resolveReferenceSync(`mesh:messages/${messageId}`, {
-      meshChat: deps.meshChat,
-    });
-    return {
-      ...entry,
-      payload: reference.body !== null ? { ...payload, content: reference.body } : payload,
-      reference,
-    };
-  });
+async function resolveInboxPage(page: InboxPage, deps: DashboardDataDeps): Promise<InboxPage> {
+  const entries = await Promise.all(
+    page.entries.map(async (entry) => {
+      const { messageId, ...payload } = entry.payload as InboxPayload & {
+        messageId?: unknown;
+      };
+      if (typeof messageId === "string") {
+        // `content` is kept as-is so nothing that reads it today regresses;
+        // `reference` is the addition, so the dashboard can render an inbox item
+        // through the same widget as an obligation's cited artifacts.
+        const reference = resolveReferenceSync(`mesh:messages/${messageId}`, {
+          meshChat: deps.meshChat,
+        });
+        return {
+          ...entry,
+          payload: reference.body !== null ? { ...payload, content: reference.body } : payload,
+          reference,
+        };
+      }
+      if (entry.source.startsWith("github:")) {
+        // Same cache/resolver an obligation's cited artifacts use, so a
+        // GitHub-sourced inbox entry gets the identical rich preview and
+        // "open in new tab" link rather than a second rendering path.
+        const reference = deps.referenceCache
+          ? await deps.referenceCache
+              .get(entry.source, deps)
+              .catch(() => resolveReferenceSync(entry.source, { meshChat: deps.meshChat }))
+          : resolveReferenceSync(entry.source, { meshChat: deps.meshChat });
+        return { ...entry, reference };
+      }
+      return entry;
+    })
+  );
   return { ...page, entries };
 }
 
@@ -1305,7 +1325,7 @@ export async function handleMeshApiRequest(
     sendJson(
       res,
       200,
-      resolveInboxPage(
+      await resolveInboxPage(
         deps.inbox.list(actorId, {
           status: status as "unhandled" | "handled" | "all" | undefined,
           limit: clampLimit(url),
