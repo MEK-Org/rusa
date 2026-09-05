@@ -172,6 +172,15 @@ export function reapProcess(pid: number, opts: ReapOptions = {}): ReapOutcome {
  * was held to the gap between check and kill. Closing it outright needs a
  * handle the kernel keeps alive (a pidfd, or owning the group ourselves), not
  * a number re-read from the process table.
+ *
+ * The marker is matched as a substring of argv, so it has to be unique to the
+ * run that is asking: callers pass the per-run `mkdtemp` absolute path of the
+ * fixture they spawned, which nothing else on the box can carry. A marker
+ * generic enough to also name a stranger's process fails in one direction
+ * only - toward a spurious true, forfeiting the narrowing this check exists
+ * for. It can never redirect a signal: the group id is still the caller's own
+ * capture, and `reapProcessGroup` refuses <= 1 and the caller's group after
+ * this returns.
  */
 export function groupStillHosts(
   pgid: number,
