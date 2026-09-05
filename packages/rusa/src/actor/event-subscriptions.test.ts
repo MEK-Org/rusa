@@ -1,17 +1,15 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
+import { testEventSubscriptionStoreContract } from "./event-subscription-store.contract.js";
 import {
   type EventResource,
   type EventSubscription,
-  FileEventSubscriptionStore,
   InMemoryEventSubscriptionStore,
   isStrictSubResourceOf,
   isSubResourceOf,
   missingAuditedEventSubscriptions,
   normalizeEventResource,
   parentOf,
+  parseLegacyEventSubscriptionDocument,
   reconcileEventSources,
   resourceKey,
   sameResource,
@@ -32,236 +30,75 @@ const sub = (
   resource: resourceKey(over.resource ?? REPO),
 });
 
-describe("InMemoryEventSubscriptionStore", () => {
-  it("subscribes an actor and reports it active for the resource", () => {
-    const store = new InMemoryEventSubscriptionStore();
-    store.subscribe(sub());
-    const active = store.activeForResource(REPO);
-    expect(active).toHaveLength(1);
-    expect(active[0]?.actorId).toBe(ACTOR_A);
-    expect(store.activeForResource(OTHER)).toEqual([]);
-  });
+// Behavior shared by every store implementation lives in the contract suite so
+// the in-memory seed store and the SQLite store are held to the same rules.
+testEventSubscriptionStoreContract(
+  "InMemoryEventSubscriptionStore",
+  () => new InMemoryEventSubscriptionStore()
+);
 
-  it("is idempotent per (resource, actorId) — re-subscribe does not duplicate", () => {
-    const store = new InMemoryEventSubscriptionStore();
-    store.subscribe(sub());
-    store.subscribe(sub({ subscribedAt: "2026-06-28T00:00:00Z" }));
-    expect(store.list()).toHaveLength(1);
-    expect(store.activeForResource(REPO)).toHaveLength(1);
-  });
-
-  it("re-subscribing the same actor clears a prior unsubscribedAt (reactivates)", () => {
-    const store = new InMemoryEventSubscriptionStore();
-    store.subscribe(sub());
-    store.unsubscribe(REPO, ACTOR_A, "2026-06-28T00:00:00Z");
-    expect(store.activeForResource(REPO)).toEqual([]);
-
-    store.subscribe(sub({ subscribedAt: "2026-06-29T00:00:00Z" }));
-    expect(store.activeForResource(REPO)).toHaveLength(1);
-    expect(store.list()).toHaveLength(1);
-    expect(store.list()[0]?.unsubscribedAt).toBeUndefined();
-  });
-
-  it("unsubscribe marks the row inactive but keeps it in the audit list", () => {
-    const store = new InMemoryEventSubscriptionStore();
-    store.subscribe(sub());
-    store.unsubscribe(REPO, ACTOR_A, "2026-06-28T00:00:00Z");
-    expect(store.activeForResource(REPO)).toEqual([]);
-    const all = store.list();
-    expect(all).toHaveLength(1);
-    expect(all[0]?.unsubscribedAt).toBe("2026-06-28T00:00:00Z");
-  });
-
-  it("list() returns both active and inactive subscriptions", () => {
-    const store = new InMemoryEventSubscriptionStore();
-    store.subscribe(sub({ resource: REPO, actorId: ACTOR_A }));
-    store.subscribe(sub({ resource: OTHER, actorId: ACTOR_B }));
-    store.unsubscribe(OTHER, ACTOR_B, "2026-06-28T00:00:00Z");
-    expect(store.list()).toHaveLength(2);
-    expect(store.activeForResource(REPO)).toHaveLength(1);
-    expect(store.activeForResource(OTHER)).toEqual([]);
-  });
-
-  it("unsubscribing an unknown subscription is a no-op", () => {
-    const store = new InMemoryEventSubscriptionStore();
-    store.unsubscribe(REPO, "nobody", "2026-06-28T00:00:00Z");
-    expect(store.list()).toEqual([]);
-  });
-
-  describe("one active subscriber per resource", () => {
-    it("throws when a different actor is already actively subscribed", () => {
-      const store = new InMemoryEventSubscriptionStore();
-      store.subscribe(sub({ actorId: ACTOR_A }));
-      expect(() => store.subscribe(sub({ actorId: ACTOR_B }))).toThrow(/dummy-org\/dummy-repo/);
-      expect(() => store.subscribe(sub({ actorId: ACTOR_B }))).toThrow(ACTOR_A);
-      // The conflicting subscribe did not land.
-      expect(store.activeForResource(REPO).map((s) => s.actorId)).toEqual([ACTOR_A]);
-      expect(store.list()).toHaveLength(1);
-    });
-
-    it("same-actor re-subscribe stays idempotent (no throw)", () => {
-      const store = new InMemoryEventSubscriptionStore();
-      store.subscribe(sub({ actorId: ACTOR_A }));
-      expect(() => store.subscribe(sub({ actorId: ACTOR_A }))).not.toThrow();
-      expect(store.list()).toHaveLength(1);
-    });
-
-    it("a new actor can subscribe after the prior holder unsubscribes", () => {
-      const store = new InMemoryEventSubscriptionStore();
-      store.subscribe(sub({ actorId: ACTOR_A }));
-      store.unsubscribe(REPO, ACTOR_A, "2026-06-28T00:00:00Z");
-      expect(() => store.subscribe(sub({ actorId: ACTOR_B }))).not.toThrow();
-      expect(store.activeForResource(REPO).map((s) => s.actorId)).toEqual([ACTOR_B]);
-      // The prior holder's row survives for audit.
-      expect(store.list()).toHaveLength(2);
-    });
-
-    it("different resources are independent", () => {
-      const store = new InMemoryEventSubscriptionStore();
-      store.subscribe(sub({ resource: REPO, actorId: ACTOR_A }));
-      expect(() => store.subscribe(sub({ resource: OTHER, actorId: ACTOR_B }))).not.toThrow();
-      expect(store.activeForResource(REPO).map((s) => s.actorId)).toEqual([ACTOR_A]);
-      expect(store.activeForResource(OTHER).map((s) => s.actorId)).toEqual([ACTOR_B]);
-    });
-  });
-});
-
-describe("FileEventSubscriptionStore", () => {
-  let dir: string;
-  let file: string;
+// The SQLite importer is now the only caller of the legacy parse, so the
+// pre-cutover document semantics are pinned here directly instead of through
+// the retired JSON store. Every rejection is an ownership claim the importer
+// refuses the whole file over; these cases fix which rows produce one.
+describe("parseLegacyEventSubscriptionDocument", () => {
   const rootId = "root";
-
-  beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "eventsubs-"));
-    file = join(dir, "event-subscriptions.json");
-  });
-  afterEach(() => {
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("persists subscriptions across instances (reload round-trips)", () => {
-    const a = new FileEventSubscriptionStore(file, rootId);
-    a.subscribe(sub());
-    const b = new FileEventSubscriptionStore(file, rootId);
-    expect(b.activeForResource(REPO).map((s) => s.actorId)).toEqual([ACTOR_A]);
-  });
-
-  it("persists unsubscriptions across instances (active + inactive survives reload)", () => {
-    const a = new FileEventSubscriptionStore(file, rootId);
-    a.subscribe(sub({ resource: REPO, actorId: ACTOR_A }));
-    a.subscribe(sub({ resource: OTHER, actorId: ACTOR_B }));
-    a.unsubscribe(OTHER, ACTOR_B, "2026-06-28T00:00:00Z");
-
-    const b = new FileEventSubscriptionStore(file, rootId);
-    expect(b.activeForResource(REPO).map((s) => s.actorId)).toEqual([ACTOR_A]);
-    expect(b.activeForResource(OTHER)).toEqual([]);
-    expect(b.list()).toHaveLength(2);
-    expect(b.list().find((s) => s.actorId === ACTOR_B)?.unsubscribedAt).toBe(
-      "2026-06-28T00:00:00Z"
-    );
-  });
-
-  it("preserves the one-active-subscriber invariant across reload", () => {
-    const a = new FileEventSubscriptionStore(file, rootId);
-    a.subscribe(sub({ actorId: ACTOR_A }));
-    const b = new FileEventSubscriptionStore(file, rootId);
-    expect(() => b.subscribe(sub({ actorId: ACTOR_B }))).toThrow(
-      /already has an active subscriber/
-    );
-  });
-
-  it("starts empty when the file is missing", () => {
-    const store = new FileEventSubscriptionStore(join(dir, "does-not-exist.json"), rootId);
-    expect(store.list()).toEqual([]);
-  });
-
-  it("fails loudly instead of accepting an empty store when the file is corrupt JSON", () => {
-    writeFileSync(file, "{ this is not valid json ]");
-    expect(() => new FileEventSubscriptionStore(file, rootId)).toThrow(
-      /invalid event subscription file/
-    );
-    expect(readFileSync(file, "utf8")).toBe("{ this is not valid json ]");
-  });
-
-  it("preserves the prior snapshot when atomic replacement fails", () => {
-    const seed = new FileEventSubscriptionStore(file, rootId);
-    seed.subscribe(sub());
-    const priorSnapshot = readFileSync(file, "utf8");
-    const replaceFile = vi.fn(() => {
-      throw new Error("injected rename failure");
+  const parse = (document: unknown) =>
+    parseLegacyEventSubscriptionDocument(JSON.stringify(document), {
+      file: "event-subscriptions.json",
+      rootId,
     });
-    const store = new FileEventSubscriptionStore(file, rootId, () => {}, replaceFile);
 
-    expect(() => store.subscribe(sub({ resource: OTHER, actorId: ACTOR_B }))).toThrow(
-      /injected rename failure/
-    );
-    expect(readFileSync(file, "utf8")).toBe(priorSnapshot);
-    expect(store.list()).toEqual([expect.objectContaining({ actorId: ACTOR_A })]);
-    expect(readdirSync(dir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
-  });
-
-  it("writes snapshots through a same-directory temporary file without leftovers", () => {
-    const store = new FileEventSubscriptionStore(file, rootId);
-    store.subscribe(sub());
-
-    expect(JSON.parse(readFileSync(file, "utf8"))).toMatchObject({
-      version: 3,
-      subscriptions: [expect.objectContaining({ actorId: ACTOR_A })],
-    });
-    expect(readdirSync(dir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
-  });
-
-  it("isolates malformed and conflicting rows while retaining later valid rows", () => {
-    writeFileSync(
-      file,
-      JSON.stringify({
-        version: 3,
-        subscriptions: [
-          sub({ actorId: ACTOR_A }),
-          {
-            ...sub({
-              resource: "github_repo:dummy-org/dummy-repo",
-              actorId: ACTOR_B,
-              subscribedAt: "2026-06-29T00:00:00Z",
-            }),
-          },
-          { ...sub({ resource: OTHER, actorId: "" }) },
-          sub({ resource: OTHER, actorId: ACTOR_B }),
-        ],
+  it("fails closed on a document it cannot read rather than reporting no subscriptions", () => {
+    expect(() =>
+      parseLegacyEventSubscriptionDocument("{ this is not valid json ]", {
+        file: "event-subscriptions.json",
+        rootId,
       })
+    ).toThrow(/invalid event subscription file/);
+    expect(() => parse([])).toThrow(/invalid event subscription file root/);
+    expect(() => parse({ version: 0, subscriptions: [] })).toThrow(
+      /invalid event subscription file version/
     );
-    const warnings: string[] = [];
-    const store = new FileEventSubscriptionStore(file, rootId, (message) => warnings.push(message));
-
-    expect(store.activeForResource(REPO).map((row) => row.actorId)).toEqual([ACTOR_B]);
-    expect(store.activeForResource(OTHER).map((row) => row.actorId)).toEqual([ACTOR_B]);
-    expect(
-      warnings.filter((message) => message.includes("skipped event subscription row"))
-    ).toHaveLength(2);
-    expect(warnings).toHaveLength(3);
-    expect(warnings.at(-1)).toContain("preserved 2 rejected");
+    expect(() => parse({ version: 4, subscriptions: [] })).toThrow(
+      /unsupported event subscription file version/
+    );
+    expect(() => parse({ version: 3, subscriptions: {} })).toThrow(
+      /invalid event subscription rows/
+    );
   });
 
-  it("quarantines rejected evidence before a later reconciliation rewrites the source", () => {
-    const original = JSON.stringify({
+  it("reads an empty or absent subscription list as no subscriptions", () => {
+    expect(parse({ version: 3 })).toEqual({ subscriptions: [], rejections: [] });
+    expect(parse({ version: 3, subscriptions: [] })).toEqual({ subscriptions: [], rejections: [] });
+  });
+
+  it("reports a malformed row by position instead of dropping it silently", () => {
+    const document = parse({
       version: 3,
-      subscriptions: [sub({ actorId: ACTOR_A }), { resource: REPO, actorId: "" }],
+      subscriptions: [sub({ actorId: ACTOR_A }), { resource: OTHER, actorId: "" }],
     });
-    writeFileSync(file, original);
-    const store = new FileEventSubscriptionStore(file, rootId, () => {});
-    const recovery = readdirSync(dir).find((name) => name.includes(".rejected-"));
 
-    expect(recovery).toBeDefined();
-    expect(readFileSync(join(dir, recovery as string), "utf8")).toBe(original);
-
-    reconcileEventSources(store, [OTHER], rootId, () => "2026-06-29T00:00:00Z");
-
-    expect(readFileSync(join(dir, recovery as string), "utf8")).toBe(original);
-    expect(readFileSync(file, "utf8")).not.toBe(original);
-    expect(JSON.parse(readFileSync(file, "utf8"))).toMatchObject({ version: 3 });
+    expect(document.subscriptions.map((row) => row.actorId)).toEqual([ACTOR_A]);
+    expect(document.rejections).toEqual([{ row: 2, reason: "actorId must be a non-empty string" }]);
   });
 
-  it("chooses the most recent active subscriber independently of file order", () => {
+  it("rejects an invalid timestamp instead of letting it outrank a valid row", () => {
+    const document = parse({
+      version: 3,
+      subscriptions: [
+        sub({ actorId: ACTOR_A, subscribedAt: "zzz" }),
+        sub({ actorId: ACTOR_B, subscribedAt: "2026-06-29T00:00:00Z" }),
+      ],
+    });
+
+    expect(document.subscriptions.map((row) => row.actorId)).toEqual([ACTOR_B]);
+    expect(document.rejections).toEqual([
+      { row: 1, reason: "subscribedAt must be a valid timestamp" },
+    ]);
+  });
+
+  it("keeps the newest active owner and rejects the loser, independently of row order", () => {
     const older = sub({ actorId: ACTOR_A, subscribedAt: "2026-06-27T00:00:00Z" });
     const newer = sub({ actorId: ACTOR_B, subscribedAt: "2026-06-29T00:00:00Z" });
 
@@ -269,31 +106,15 @@ describe("FileEventSubscriptionStore", () => {
       [older, newer],
       [newer, older],
     ]) {
-      writeFileSync(file, JSON.stringify({ version: 3, subscriptions }));
-      const store = new FileEventSubscriptionStore(file, rootId, () => {});
-      expect(store.activeForResource(REPO).map((row) => row.actorId)).toEqual([ACTOR_B]);
+      const document = parse({ version: 3, subscriptions });
+      expect(document.subscriptions.map((row) => row.actorId)).toEqual([ACTOR_B]);
+      expect(document.rejections.map((rejection) => rejection.reason)).toEqual([
+        `a newer active subscriber already owns ${REPO}`,
+      ]);
     }
   });
 
-  it("rejects invalid timestamps instead of letting them outrank valid rows", () => {
-    writeFileSync(
-      file,
-      JSON.stringify({
-        version: 3,
-        subscriptions: [
-          sub({ actorId: ACTOR_A, subscribedAt: "zzz" }),
-          sub({ actorId: ACTOR_B, subscribedAt: "2026-06-29T00:00:00Z" }),
-        ],
-      })
-    );
-    const warnings: string[] = [];
-    const store = new FileEventSubscriptionStore(file, rootId, (message) => warnings.push(message));
-
-    expect(store.activeForResource(REPO).map((row) => row.actorId)).toEqual([ACTOR_B]);
-    expect(warnings.some((message) => message.includes("valid timestamp"))).toBe(true);
-  });
-
-  it("rejects tied active owners independently of file order", () => {
+  it("rejects tied active owners rather than assigning ownership from row order", () => {
     const utc = sub({ actorId: ACTOR_A, subscribedAt: "2026-06-27T00:00:00Z" });
     const offset = sub({ actorId: ACTOR_B, subscribedAt: "2026-06-26T20:00:00-04:00" });
 
@@ -301,18 +122,24 @@ describe("FileEventSubscriptionStore", () => {
       [utc, offset],
       [offset, utc],
     ]) {
-      writeFileSync(file, JSON.stringify({ version: 3, subscriptions }));
-      const store = new FileEventSubscriptionStore(file, rootId, () => {});
-      expect(store.activeForResource(REPO)).toEqual([]);
+      const document = parse({ version: 3, subscriptions });
+      expect(document.subscriptions).toEqual([]);
+      expect(document.rejections.map((rejection) => rejection.reason)).toEqual([
+        `ambiguous active subscribers for ${REPO}`,
+        `ambiguous active subscribers for ${REPO}`,
+      ]);
     }
   });
 
-  it("resolves a normalized active/tombstone pair by its latest transition", () => {
-    const active = sub({
+  it("collapses two spellings of one (resource, actor) pair onto its latest transition", () => {
+    // The legacy spelling normalizes onto the same canonical key as the
+    // tombstone, so the pair resolves to the later of the two states.
+    const active = {
       resource: "github_repo:dummy-org/dummy-repo",
       actorId: ACTOR_A,
+      subscribedBy: rootId,
       subscribedAt: "2026-06-27T00:00:00Z",
-    });
+    };
     const tombstone = sub({
       actorId: ACTOR_A,
       subscribedAt: "2026-06-27T00:00:00Z",
@@ -323,43 +150,97 @@ describe("FileEventSubscriptionStore", () => {
       [active, tombstone],
       [tombstone, active],
     ]) {
-      writeFileSync(file, JSON.stringify({ version: 3, subscriptions }));
-      const store = new FileEventSubscriptionStore(file, rootId, () => {});
-      expect(store.activeForResource(REPO)).toEqual([]);
-      expect(store.list()).toEqual([
-        expect.objectContaining({ unsubscribedAt: "2026-06-28T00:00:00Z" }),
+      const document = parse({ version: 3, subscriptions });
+      expect(document.subscriptions).toEqual([
+        expect.objectContaining({ resource: REPO, unsubscribedAt: "2026-06-28T00:00:00Z" }),
+      ]);
+      expect(document.rejections.map((rejection) => rejection.reason)).toEqual([
+        `a later state already exists for ${REPO}`,
       ]);
     }
   });
 
-  it("loads an inactive row without tripping over an earlier active holder", () => {
-    writeFileSync(
-      file,
-      JSON.stringify({
-        version: 3,
-        subscriptions: [
-          sub({ actorId: ACTOR_A }),
-          sub({
-            actorId: ACTOR_B,
-            unsubscribedAt: "2026-06-28T00:00:00Z",
-          }),
-        ],
-      })
-    );
-    const store = new FileEventSubscriptionStore(file, rootId);
+  it("orders tombstones ahead of active rows so a replay never trips the ownership guard", () => {
+    const document = parse({
+      version: 3,
+      subscriptions: [
+        sub({ actorId: ACTOR_B, subscribedAt: "2026-06-27T00:00:00Z" }),
+        sub({
+          actorId: ACTOR_A,
+          subscribedAt: "2026-06-25T00:00:00Z",
+          unsubscribedAt: "2026-06-26T00:00:00Z",
+        }),
+      ],
+    });
 
-    expect(store.list()).toHaveLength(2);
-    expect(store.activeForResource(REPO).map((row) => row.actorId)).toEqual([ACTOR_A]);
+    expect(document.rejections).toEqual([]);
+    expect(document.subscriptions.map((row) => row.actorId)).toEqual([ACTOR_A, ACTOR_B]);
+
+    // Replaying in that order is exactly what the importer does.
+    const store = new InMemoryEventSubscriptionStore();
+    for (const subscription of document.subscriptions) store.restore(subscription);
+    expect(store.activeForResource(REPO).map((row) => row.actorId)).toEqual([ACTOR_B]);
   });
 
-  it("the conflict guard throws before mutating (File store)", () => {
-    const store = new FileEventSubscriptionStore(file, rootId);
-    store.subscribe(sub({ actorId: ACTOR_A }));
-    expect(() => store.subscribe(sub({ actorId: ACTOR_B }))).toThrow();
-    expect(store.list()).toHaveLength(1);
-    // A reload sees only the first subscriber.
-    const reloaded = new FileEventSubscriptionStore(file, rootId);
-    expect(reloaded.activeForResource(REPO).map((s) => s.actorId)).toEqual([ACTOR_A]);
+  it("normalizes version 2 object resources onto canonical reference strings", () => {
+    const document = parse({
+      version: 2,
+      subscriptions: [
+        {
+          resource: { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+          actorId: "child-worker",
+          subscribedBy: rootId,
+          subscribedAt: "2026-01-01T00:00:00Z",
+        },
+        {
+          resource: {
+            kind: "github_branch",
+            repo: "dummy-org/dummy-repo",
+            ref: "refs/heads/staging",
+          },
+          actorId: "deploy-worker",
+          subscribedBy: rootId,
+          subscribedAt: "2026-01-01T00:00:00Z",
+        },
+        {
+          resource: { kind: "chat_space", space: "spaces/ALERT" },
+          actorId: "chat-worker",
+          subscribedBy: rootId,
+          subscribedAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+    });
+
+    expect(document.rejections).toEqual([]);
+    expect(document.subscriptions.map((row) => row.resource)).toEqual([
+      "github:dummy-org/dummy-repo",
+      "github:dummy-org/dummy-repo/branches/staging",
+      "gchat:spaces/ALERT",
+    ]);
+  });
+
+  it("drops an unversioned document's config-implied root rows and keeps explicit ones", () => {
+    const document = parse({
+      subscriptions: [
+        {
+          resource: { kind: "github_org", org: "dummy-org" },
+          actorId: rootId,
+          subscribedBy: rootId,
+          subscribedAt: "2025-01-01T00:00:00Z",
+        },
+        {
+          resource: { kind: "github_repo", repo: "dummy-org/dummy-repo" },
+          actorId: ACTOR_A,
+          subscribedBy: rootId,
+          subscribedAt: "2025-01-01T00:00:00Z",
+        },
+      ],
+    });
+
+    expect(document.rejections).toEqual([]);
+    expect(document.subscriptions).toEqual([
+      expect.objectContaining({ resource: REPO, actorId: ACTOR_A }),
+    ]);
   });
 });
 
@@ -533,187 +414,44 @@ describe("reconcileEventSources", () => {
 });
 
 describe("UnionEventSubscriptionStore and implied persistence", () => {
-  it("shows an implied-only row disappears immediately and stays suppressed after reloading the v2/v3 file", () => {
-    const file = join(tmpdir(), `event-subs-test-legacy-${Date.now()}.json`);
+  // Durability of these outcomes across a restart is pinned on the SQLite store
+  // (event-subscription-repository.test.ts); what is fixed here is the union
+  // rule itself — which side of the union wins for a given resource.
+  it("suppresses the config-implied row once the explicit store holds a tombstone", () => {
     const rootOrg = "github:dummy-org";
     const rootId = "root";
+    const explicit = new InMemoryEventSubscriptionStore();
 
-    // Legacy file with no version and an implied-only row
-    writeFileSync(
-      file,
-      JSON.stringify({
-        subscriptions: [
-          {
-            resource: { kind: "github_org", org: "dummy-org" },
-            actorId: rootId,
-            subscribedBy: rootId,
-            subscribedAt: "2025-01-01T00:00:00Z",
-          },
-        ],
-      })
-    );
-
-    // Boot 1: The file is unversioned, so it should run the migration, drop the row, and immediately flush version: 3
-    let sync = reconcileEventSources(
-      new FileEventSubscriptionStore(file, rootId),
-      [rootOrg],
-      rootId,
-      () => "2026-01-01T00:00:00Z"
-    );
-
-    // It is active because it's implied by config
+    const sync = reconcileEventSources(explicit, [rootOrg], rootId, () => "2026-01-01T00:00:00Z");
     expect(sync.store.activeForResource(rootOrg)).toHaveLength(1);
 
-    // But it has disappeared immediately from the persistent file
-    let saved = JSON.parse(readFileSync(file, "utf8"));
-    expect(saved.version).toBe(3);
-    expect(saved.subscriptions).toEqual([]);
-
-    // Boot 2: Reloading the v3 file. The implied row stays suppressed from disk.
-    sync = reconcileEventSources(
-      new FileEventSubscriptionStore(file, rootId),
-      [rootOrg],
-      rootId,
-      () => "2026-02-01T00:00:00Z"
-    );
-
-    expect(sync.store.activeForResource(rootOrg)).toHaveLength(1);
-    saved = JSON.parse(readFileSync(file, "utf8"));
-    expect(saved.subscriptions).toEqual([]);
-  });
-
-  it("migrates version 2 legacy object subscriptions to version 3 canonical reference strings", () => {
-    const file = join(tmpdir(), `event-subs-test-v2-migration-${Date.now()}.json`);
-    const rootId = "root";
-
-    // Version 2 file with legacy object resources
-    writeFileSync(
-      file,
-      JSON.stringify({
-        version: 2,
-        subscriptions: [
-          {
-            resource: { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-            actorId: "child-worker",
-            subscribedBy: rootId,
-            subscribedAt: "2026-01-01T00:00:00Z",
-          },
-          {
-            resource: {
-              kind: "github_branch",
-              repo: "dummy-org/dummy-repo",
-              ref: "refs/heads/staging",
-            },
-            actorId: "deploy-worker",
-            subscribedBy: rootId,
-            subscribedAt: "2026-01-01T00:00:00Z",
-          },
-          {
-            resource: { kind: "chat_space", space: "spaces/ALERT" },
-            actorId: "chat-worker",
-            subscribedBy: rootId,
-            subscribedAt: "2026-01-01T00:00:00Z",
-          },
-        ],
-      })
-    );
-
-    const store = new FileEventSubscriptionStore(file, rootId);
-    expect(store.activeForResource("github:dummy-org/dummy-repo").map((s) => s.actorId)).toEqual([
-      "child-worker",
-    ]);
-    expect(
-      store.activeForResource("github:dummy-org/dummy-repo/branches/staging").map((s) => s.actorId)
-    ).toEqual(["deploy-worker"]);
-    expect(store.activeForResource("gchat:spaces/ALERT").map((s) => s.actorId)).toEqual([
-      "chat-worker",
-    ]);
-
-    const saved = JSON.parse(readFileSync(file, "utf8"));
-    expect(saved.version).toBe(3);
-    expect(saved.subscriptions).toEqual([
-      expect.objectContaining({
-        resource: "github:dummy-org/dummy-repo",
-        actorId: "child-worker",
-      }),
-      expect.objectContaining({
-        resource: "github:dummy-org/dummy-repo/branches/staging",
-        actorId: "deploy-worker",
-      }),
-      expect.objectContaining({
-        resource: "gchat:spaces/ALERT",
-        actorId: "chat-worker",
-      }),
-    ]);
-  });
-
-  it("loads valid legacy rows but leaves the source file untouched when another row is rejected", () => {
-    const file = join(tmpdir(), `event-subs-test-invalid-${Date.now()}.json`);
-    const rootId = "root";
-    writeFileSync(
-      file,
-      JSON.stringify({
-        version: 2,
-        subscriptions: [
-          {
-            resource: "not-a-reference",
-            actorId: "invalid-worker",
-            subscribedBy: rootId,
-            subscribedAt: "2026-01-01T00:00:00Z",
-          },
-          {
-            resource: { kind: "github_repo", repo: "dummy-org/dummy-repo" },
-            actorId: "valid-worker",
-            subscribedBy: rootId,
-            subscribedAt: "2026-01-01T00:00:00Z",
-          },
-        ],
-      })
-    );
-
-    const original = readFileSync(file, "utf8");
-    const store = new FileEventSubscriptionStore(file, rootId, () => undefined);
-    expect(store.list().map((subscription) => subscription.actorId)).toEqual(["valid-worker"]);
-    expect(readFileSync(file, "utf8")).toBe(original);
-  });
-
-  it("locks the existing same-key inactive-collision behavior", () => {
-    const file = join(tmpdir(), `event-subs-test-tombstone-${Date.now()}.json`);
-    writeFileSync(file, JSON.stringify({ version: 3, subscriptions: [] }));
-    const rootOrg = "github:dummy-org";
-    const rootId = "root";
-
-    let sync = reconcileEventSources(
-      new FileEventSubscriptionStore(file, rootId),
-      [rootOrg],
-      rootId,
-      () => "2026-01-01T00:00:00Z"
-    );
-
-    // Active via baseStore
-    expect(sync.store.activeForResource(rootOrg)).toHaveLength(1);
-
-    // Explicitly unsubscribe. This should write a tombstone to the file.
+    // Unsubscribing writes a tombstone to the explicit store, which outranks
+    // the implied seed config keeps re-deriving.
     sync.store.unsubscribe(rootOrg, rootId, "2026-02-01T00:00:00Z");
-
-    // The union store correctly hides the base active row
     expect(sync.store.activeForResource(rootOrg)).toEqual([]);
+    expect(explicit.list()).toEqual([
+      expect.objectContaining({ actorId: rootId, unsubscribedAt: "2026-02-01T00:00:00Z" }),
+    ]);
 
-    // The tombstone is saved to disk
-    const saved = JSON.parse(readFileSync(file, "utf8"));
-    expect(saved.subscriptions).toHaveLength(1);
-    expect(saved.subscriptions[0].unsubscribedAt).toBe("2026-02-01T00:00:00Z");
-
-    // Boot 2: Reloading the v3 file
-    sync = reconcileEventSources(
-      new FileEventSubscriptionStore(file, rootId),
+    // A later boot re-derives the same implied seed and stays suppressed.
+    const rebooted = reconcileEventSources(
+      explicit,
       [rootOrg],
       rootId,
       () => "2026-03-01T00:00:00Z"
     );
+    expect(rebooted.store.activeForResource(rootOrg)).toEqual([]);
+  });
 
-    // The tombstone continues to suppress the implied config row
-    expect(sync.store.activeForResource(rootOrg)).toEqual([]);
+  it("keeps the implied row out of the explicit store entirely", () => {
+    const rootOrg = "github:dummy-org";
+    const rootId = "root";
+    const explicit = new InMemoryEventSubscriptionStore();
+
+    const sync = reconcileEventSources(explicit, [rootOrg], rootId, () => "2026-01-01T00:00:00Z");
+
+    expect(sync.store.activeForResource(rootOrg)).toHaveLength(1);
+    expect(explicit.list()).toEqual([]);
   });
 });
 
