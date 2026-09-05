@@ -40,6 +40,20 @@ fails closed (§5.7). That deletion removes the `poolInstances` knob and the
 reasoning that depended on it; A7 is reused for the assumption the launch
 deadline actually rests on.
 
+**Revision 5** answers two follow-up findings against revision 4, both of the
+same kind: a mechanism named but not defined, and a sequence left describing
+behaviour the text above it had deleted. The "pre-spawn check" that revision 4
+relied on to make an invalidation visible was never a call — `reserveLaunch`
+answered `granted`, `queued` or `expired`, `confirmLaunch` is by definition
+post-spawn, and no lease-status operation existed — so an unspawned holder had
+nothing on which to learn it had been invalidated, and criterion 14 was untestable
+as written. §5.5 now defines the check as a **mandatory idempotent
+`reserveLaunch` retry under the same `requestId`**, adds `invalidated` as that
+call's fourth response, and reconciles requiring it with the adjacent rejection
+of a *new* authorization RPC. And §6.4's restart sequence still narrated bounded
+degraded pacing; it now defers with zero normal starts, like every other
+unavailability path in §5.7.
+
 ## Contents
 
 1. [What exists today](#1-what-exists-today)
@@ -536,7 +550,7 @@ Response: `{ "result": "applied" | "deduped" | "rejected", "observations": [...]
 "reason": "..." }`.
 
 - `idempotencyKey` is stored and unique per provider. A replay returns the
-  *original* result without re-parsing — this is what makes the degraded-mode
+  *original* result without re-parsing — this is what makes the unavailability
   replay buffer (§5.7) safe, and it costs no LLM call.
 - Beneath that, today's slot dedupe is retained unchanged: canonical rows stay
   keyed `(provider, kind, observed_slot)` with the existing winner rule
@@ -642,8 +656,72 @@ crosses a follower connection.
 `authorizeSpawn` immediately before `spawn` would shrink the window to one round
 trip plus spawn latency, but it cannot close it, for exactly the reason above —
 the authorization and the process creation are still two operations. It would
-add an RPC to the launch path and buy a smaller copy of the same residual. The
-deadline stays client-side and the repair path carries the remainder.
+add an endpoint to the launch path and buy a smaller copy of the same residual.
+The deadline stays client-side and the repair path carries the remainder. What
+*is* required immediately before `spawn` is the check defined next, which is not
+this proposal under another name — the subsection ends by saying why.
+
+#### The pre-spawn check
+
+The deadline tells a client when not to spawn on its own clock. It says nothing
+about permission being taken away underneath it, which is what happens when a
+responsive `recordLaunch` charges a lane while a normal hold is outstanding and
+the coordinator marks that hold `invalidated`. A holder has to be able to read
+that, and an earlier revision named a "pre-spawn check" without saying which
+call it was — naming a mechanism the protocol did not have.
+
+**It is `reserveLaunch`, re-sent with the same `requestId`.** Immediately before
+`spawn`, and after the deadline test, the client repeats its own reservation
+verbatim. This adds no endpoint. Idempotency already keys the call by
+`requestId` and already returns the existing lease rather than a second one, so
+the retry *is* a read of that lease's current state through a key the client
+already holds — the lease-status operation the check needs is one the protocol
+has had all along, and it was only ever missing an answer for one state.
+
+| The retry finds | Response | The client |
+| --- | --- | --- |
+| the lease still `granted` | `granted`, with the **remaining** TTL | spawns, then confirms |
+| the lease `invalidated` by a responsive start | `invalidated` | does not spawn; re-reserves under a new `requestId` |
+| no live permission under this key — reaped past `expires_at`, or already settled | `expired` | does not spawn; re-reserves under a new `requestId` |
+| a ticket and no lease yet | `queued` | keeps waiting; it never reached a pre-spawn |
+| no answer at all — refusal, timeout, closed socket | none | does not spawn (§5.7) |
+
+`invalidated` is the fourth `reserveLaunch` response and the only one this
+revision adds. Like `expired` it is terminal for that `requestId`: the key is
+spent, and retrying it again reads the same terminal state rather than being
+resurrected into a grant.
+
+**Why it is not simply `expired`.** Both stop the launch, so a client could act
+on either. They are different faults, and collapsing them would cost the
+diagnosis: `invalidated` says the pool did something to a client that was on
+time, while `expired` says this client was slow and its `spawnMarginMs` or lease
+TTL is mis-sized. The late-confirm alert in §9.3 is only readable if those two
+populations stay separate.
+
+**The check does not move the deadline.** A retry returns remaining TTL, never a
+fresh one, so the deadline stays anchored to the send of the *original*
+reservation. `renewLaunch` remains the only call that moves it.
+
+**Skipping it is a client bug with a stated consequence.** A client that spawns
+without checking cannot observe an invalidation, so it behaves exactly like the
+in-flight holder below — the exception stops being a race and becomes a policy.
+Criterion 14 tests the checking client; a client that does not check is outside
+the guarantee rather than quietly inside it.
+
+**Why requiring this is consistent with rejecting `authorizeSpawn`.** The two
+answer different questions. What is rejected is a *new call that claims to
+shrink the deadline race*, which it cannot, since authorization and process
+creation stay two operations. What is required here is an *existing call that
+makes invalidation observable*, without which marking a hold `invalidated`
+changes a row nobody reads and criterion 14 has nothing to assert.
+
+The cost is the same cost, and pretending otherwise would be dishonest: this
+check puts a round trip on the launch path, which is precisely what was held
+against `authorizeSpawn`. The difference is what the round trip buys. It does
+not narrow the window between the check and `spawn` — that residual is stated
+unchanged above and below, and no guarantee in this document leans on it. It
+buys the stoppable half of the responsive exception, which is the only half any
+mechanism can buy.
 
 #### `POST /v1/reserveLaunch`
 
@@ -663,6 +741,7 @@ Response is one of:
 { "status": "granted", "leaseId": "...", "leaseTtlMs": 120000 }
 { "status": "queued",  "ticketId": "...", "position": 1, "retryAfterMs": 30000 }
 { "status": "expired", "leaseId": "...", "retryAfterMs": 0 }
+{ "status": "invalidated", "leaseId": "...", "retryAfterMs": 0 }
 ```
 
 Semantics:
@@ -685,8 +764,12 @@ Semantics:
   cannot extend a hold by retrying into it. A retry that finds the lease already
   reaped returns `status: "expired"` rather than resurrecting it: the ambiguity
   resolves toward *you hold no permission*, the client must not spawn, and it
-  re-reserves under a new `requestId`. A lost response and a silent one are
-  therefore the same case, and both resolve conservatively.
+  re-reserves under a new `requestId`. A retry that finds the lease
+  `invalidated` returns `status: "invalidated"`, terminal in the same way and
+  for a different reason. A lost response and a silent one are therefore the
+  same case, and both resolve conservatively. Taken together these four answers
+  are what let the same call serve as the mandatory pre-spawn check above,
+  without a second endpoint for reading lease state.
 - **Where it sits in the launch path:** the client reserves *after* clearing its
   own mesh concurrency limiter and immediately before spawning the provider.
   That inverts today's order (pacer first, then mesh queue —
@@ -777,8 +860,9 @@ charges the lane clock (`:285-292`). Idempotent by `requestId`.
 Because it is unheld, a responsive start can land while a normal hold is
 outstanding. When it does, the coordinator marks that hold `invalidated` in the
 same transaction, and the holder finds out on its next call: a client that has
-not yet spawned sees the invalidation on its pre-spawn check and re-reserves
-rather than starting; a client that has already spawned confirms and gets
+not yet spawned sees `status: "invalidated"` on the mandatory pre-spawn
+`reserveLaunch` retry (§5.5) and re-reserves rather than starting; a client that
+has already spawned confirms and gets
 `outcome: "invalidated"`, with its real start recorded either way.
 
 That narrows the window; it does not close it. The holder may already be inside
@@ -850,7 +934,8 @@ The normal start that is *not* is the holder whose lease the responsive start
 invalidated and which was already inside `spawn`. It received its grant before
 the responsive launch existed and cannot be recalled, so it can begin at any
 moment, including immediately. The invalidation stops such a holder in every case
-where it can still be stopped — anything short of an in-flight spawn — and
+where it can still be stopped — the pre-spawn retry returns `invalidated` for
+anything short of an in-flight spawn — and
 because holds are exclusive there is **at most one** of them. So the exception is
 one start per responsive launch, not a class of them, and it is the same
 non-atomicity the launch deadline already leaves rather than a second hole.
@@ -1120,8 +1205,9 @@ sequenceDiagram
     B->>C: reserveLaunch(r2) -> queued(T2)
     Note over C: coordinator restarts (deploy or crash)
     B->>C: reserveLaunch(r2)
-    Note over B,C: connection refused
-    B->>B: enter bounded degraded pacing, buffer observations
+    Note over B,C: socket not accepting — silence, not an answered refusal
+    B->>B: defer normal launches (zero starts), buffer observations
+    Note over B: fails runs closed if this outlasts unavailableGraceSeconds
     Note over C: back up
     C->>D: open, check schema_version, reap expired leases
     B->>C: GET /v1/hello -> protocolMajor match
@@ -1138,6 +1224,12 @@ too; only their expiry timer is re-derived, from `expires_at`. A restart that
 outlasts a hold's TTL settles it as an expiry, which is the conservative case
 above — the restart itself can therefore cost at most one extra interval per
 lane, never a double spend.
+
+B starts nothing at all while the coordinator is down (§5.7), so a restart
+shorter than `unavailableGraceSeconds` costs latency rather than rate, and a
+longer one fails B's normal runs rather than pacing them locally. That is the
+availability trade §5.7 names, appearing here in the sequence that used to
+contradict it.
 
 ### 6.5 Transport failure
 
@@ -1240,7 +1332,9 @@ Notes:
   §5.5 states that exception rather than hiding it behind the index.
 - `invalidated` is the state a hold enters when a responsive start charges its
   lane underneath it (§5.5). It releases the hold like any other terminal state,
-  so the partial index stays satisfied.
+  so the partial index stays satisfied. The holder reads it back through its own
+  `requestId` on the pre-spawn retry, which is why the state needs no separate
+  lease-status endpoint to be observable.
 - A **late confirm** needs no column: it is exactly a lease whose `state` is
   `confirmed` and whose `settled_at` is after its `expires_at`. Storing a
   derived flag would be one more thing that could disagree with the timestamps.
@@ -1566,8 +1660,12 @@ right foundation for 1–6.
     call `recordLaunch` on the same lane; assert A's state is `invalidated`, the
     lane clock is stamped from the responsive start, and A's subsequent
     `confirmLaunch` returns `outcome: "invalidated"` while still recording the
-    start monotonically. Assert also that a client checking before spawn sees the
-    invalidation and re-reserves rather than starting. Then assert the
+    start monotonically. Assert also that a holder that has *not* yet spawned
+    learns this through the mandatory pre-spawn check and no other channel: its
+    `reserveLaunch` retry under the same `requestId` returns
+    `status: "invalidated"`, and it re-reserves under a new one rather than
+    starting. A client that skips that retry is outside this criterion, which is
+    what makes the retry mandatory rather than advisory. Then assert the
     unstoppable case in the same shape: a holder that had *already* spawned still
     records its start, the lane clock ends at the later of the two, and no
     further grant issues until a full interval after that. The exception must be
@@ -1602,8 +1700,9 @@ not a mesh one. None of these should be filed before that.
    placeholder, and the misconfiguration guard. Covers 10.
 6. **Reservation adoption in the launch path.** `providerGate`
    (`start.ts:1663-1675`) reserves through the coordinator after mesh admission
-   and confirms at spawn; the client-side launch deadline and its pre-spawn
-   check (§5.5), including the `expired` and `invalidated` responses; responsive
+   and confirms at spawn; the client-side launch deadline and the mandatory
+   pre-spawn `reserveLaunch` retry (§5.5), including its `expired` and
+   `invalidated` responses; responsive
    uses `recordLaunch`; the dashboard lane view reads `GET /v1/lanes`. Covers 2,
    8, 13 and 14.
 7. **Unavailability handling.** Deferral and reconnect backoff on a lost socket,
