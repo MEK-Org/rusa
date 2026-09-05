@@ -2295,6 +2295,49 @@ describe("ObligationRepository", () => {
       warn.mockRestore();
     });
 
+    it("retries both failed cancellation-repair attentions when the two id pairs collide under a delimiter join (#212)", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      // Obligation ids are opaque non-empty strings, so a space is legal
+      // inside one: `("dep 1", "gate")` and `("dep", "1 gate")` are different
+      // edges that a space-joined retry key cannot tell apart.
+      repository.create({ title: "gate", id: "gate", ownerId: "actor-a" });
+      repository.create({ title: "one gate", id: "1 gate", ownerId: "actor-a" });
+      repository.create({
+        title: "dep one",
+        id: "dep 1",
+        ownerId: "actor-a",
+        blockedBy: ["gate"],
+      });
+      repository.create({ title: "dep", id: "dep", ownerId: "actor-a", blockedBy: ["1 gate"] });
+
+      let shouldThrow = true;
+      const delivered: Array<{
+        dependentId: string;
+        dependentOwnerId: string;
+        prerequisiteId: string;
+      }> = [];
+      repository.setCancellationAttentionListener((attention) => {
+        if (shouldThrow) throw new Error("transient append failure");
+        delivered.push(attention);
+      });
+
+      repository.setTerminalStatus("gate", "cancelled");
+      repository.setTerminalStatus("1 gate", "cancelled");
+      expect(delivered).toEqual([]);
+
+      shouldThrow = false;
+      repository.create({ title: "unrelated", id: "unrelated", ownerId: "actor-a" });
+
+      expect(delivered).toEqual(
+        expect.arrayContaining([
+          { dependentId: "dep 1", dependentOwnerId: "actor-a", prerequisiteId: "gate" },
+          { dependentId: "dep", dependentOwnerId: "actor-a", prerequisiteId: "1 gate" },
+        ])
+      );
+      expect(delivered).toHaveLength(2);
+      warn.mockRestore();
+    });
+
     it("queues cancellation attention immediately when the prerequisite is already cancelled at edge-creation time", () => {
       repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
       repository.setTerminalStatus("prereq", "cancelled");

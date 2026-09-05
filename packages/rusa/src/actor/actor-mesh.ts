@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
 import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../mcp/stamp.js";
+import { prerequisiteEdgeKey } from "../obligations/obligation.js";
 import type {
   ModelConfigInput,
   ProviderModelConfig,
@@ -1154,7 +1155,7 @@ export class ActorMesh {
     const record = this.actors.get(actorId);
     if (!record || record.status !== "active") return false;
     const entryId = deduplicatedInboxEntryId(
-      `obligation-prereq-cancelled:${dependentObligationId}:${prerequisiteId}`,
+      `obligation-prereq-cancelled:${prerequisiteEdgeKey(dependentObligationId, prerequisiteId)}`,
       actorId
     );
     const entries = this.inboxStore.append([

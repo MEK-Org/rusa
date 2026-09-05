@@ -19,6 +19,7 @@ import {
   ObligationValidationError,
   parseExternalRef,
   parseObligationReference,
+  prerequisiteEdgeKey,
   validateEntityId,
   validateObligationTitle,
 } from "../../obligations/obligation.js";
@@ -504,7 +505,7 @@ export class ObligationRepository {
   private failedCancellationAttentionKeys = new Set<string>();
 
   private cancellationAttentionKey(attention: PrerequisiteAttention): string {
-    return `${attention.dependentId} ${attention.prerequisiteId}`;
+    return prerequisiteEdgeKey(attention.dependentId, attention.prerequisiteId);
   }
 
   setCancellationAttentionListener(
@@ -1121,7 +1122,13 @@ export class ObligationRepository {
     });
   }
 
-  /** Bounded page of `id`'s own prerequisites, oldest-declared first. */
+  /**
+   * Bounded page of `id`'s own prerequisites, in `prerequisite_id` order.
+   *
+   * The edge carries no declaration timestamp, so declaration order is not a
+   * fact this table can serve; ordering by the id makes paging deterministic
+   * and stable across calls, which is what a cursor actually needs.
+   */
   listBlockedByPage(id: string, options: ObligationPageOptions): ObligationPage {
     const { limit, offset } = validatePage(options);
     const rows = this.db
@@ -1145,7 +1152,10 @@ export class ObligationRepository {
     };
   }
 
-  /** Bounded page of obligations `id` unblocks — the reverse of {@link listBlockedByPage}. */
+  /**
+   * Bounded page of obligations `id` unblocks — the reverse of
+   * {@link listBlockedByPage}, ordered by `dependent_id` for the same reason.
+   */
   listUnblocksPage(id: string, options: ObligationPageOptions): ObligationPage {
     const { limit, offset } = validatePage(options);
     const rows = this.db

@@ -1175,6 +1175,29 @@ describe("ActorMesh", () => {
     expect(rootEntries()).toHaveLength(2);
   });
 
+  it("keeps prerequisite-cancellation attention distinct for id pairs that collide under a delimiter join (#212)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    // An obligation id is only required to be non-empty, so `:` is legal
+    // inside one. Joining the pair on a fixed separator collapses
+    // `("a:b", "c")` and `("a", "b:c")` onto one dedupe key, which for a
+    // one-shot notice means one dependent's repair prompt silently
+    // suppressing the other's.
+    expect(mesh.deliverPrerequisiteCancelledAttention("root", "a:b", "c")).toBe(true);
+    expect(mesh.deliverPrerequisiteCancelledAttention("root", "a", "b:c")).toBe(true);
+    await tick();
+
+    expect(rootEntries()).toHaveLength(2);
+    expect(rootEntries().map((entry) => entry.payload)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ obligationId: "a:b", prerequisiteId: "c" }),
+        expect.objectContaining({ obligationId: "a", prerequisiteId: "b:c" }),
+      ])
+    );
+  });
+
   it("does not deliver prerequisite-cancellation attention to a retired actor", async () => {
     const inboxStore = createMemoryInboxStore();
     const { mesh, registry } = setup({ inboxStore });
