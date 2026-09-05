@@ -36,9 +36,9 @@ export type ModelConfigInput = RawProviderModelConfig | RawProviderModelConfig[]
  * multi-entry pool would.
  */
 export const DEFAULT_CODER_POOL: readonly ProviderModelConfig[] = [
-  { provider: "claude", model: "claude-sonnet-5" },
+  { provider: "claude", model: "claude-opus-5" },
   { provider: "kimi", model: "kimi-for-coding" },
-  { provider: "codex", model: "gpt-5.6-sol" },
+  { provider: "codex", model: "gpt-5.6-sol", effort: "high" },
 ];
 
 /**
