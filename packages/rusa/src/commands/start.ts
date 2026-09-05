@@ -14,11 +14,7 @@ import { Actor } from "../actor/actor.js";
 import { ActorMesh, type MeshActor, type RetireCleanup } from "../actor/actor-mesh.js";
 import type { ActorRecord, PortableContextConfig } from "../actor/actor-record.js";
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
-import {
-  CAPABILITY_GRANTS_FILENAME,
-  FileCapabilityGrantStore,
-  PARENT_GRANTABLE_CAPABILITIES,
-} from "../actor/capability-grants.js";
+import { PARENT_GRANTABLE_CAPABILITIES } from "../actor/capability-grants.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
 import { assertSpawnContextSupported } from "../actor/context-selection.js";
 import { CrontabMutator, execCrontabIo, preflightCron } from "../actor/crontab.js";
@@ -116,6 +112,7 @@ import {
   finishDeferredRootSessionImport,
   importLegacyActorState,
 } from "../db/legacy-actor-import.js";
+import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
 import type {
   PrerequisiteAttention,
   ReadyHeadChange,
@@ -805,6 +802,17 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     );
   }
 
+  const legacyCapabilityGrantImport = importLegacyCapabilityGrantState({
+    mcHome,
+    db: database,
+    repositories: getRepositories(),
+  });
+  if (legacyCapabilityGrantImport.importedGrants > 0) {
+    console.log(
+      `[mesh] imported ${legacyCapabilityGrantImport.importedGrants} capability grant(s) into SQLite`
+    );
+  }
+
   const recoveredOpenRuns = getRepositories().actorRuns.abandonOpen(
     "service restarted before run completion"
   );
@@ -1298,7 +1306,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // granted, and the factory is what `createActor` mounts for a grantee. Phase 1b
   // registers the glass-goals `understanding-write` server (claude FS isolation
   // ISSUE_NUM having landed); grantable-servers.test.ts locks the contents.
-  const capabilityGrants = new FileCapabilityGrantStore(join(mcHome, CAPABILITY_GRANTS_FILENAME));
+  const capabilityGrants = getRepositories().capabilityGrants;
   const persistentEventSubscriptions = new FileEventSubscriptionStore(
     join(mcHome, "event-subscriptions.json"),
     rootId
@@ -1892,7 +1900,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // Workers run untrusted code, so isolating them from the privileged plane is
         // mandatory: a fresh tmpfs /tmp stops one actor reading another's MCP-config
         // endpoint token from shared /tmp (identity harvest), and the read-only `/`
-        // bind stops tampering with ~/.rusa runtime state and capability-grants.json.
+        // bind stops tampering with ~/.rusa runtime state, including mesh.db.
         // Root is NOT built here and stays unsandboxed — it is the trusted plane.
         // The Actor derives the sandbox (rooted at cwd, git+gh); each provider mounts
         // its own auth dir rw (see providerWritableStateDirs).

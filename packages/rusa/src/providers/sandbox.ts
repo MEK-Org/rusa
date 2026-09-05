@@ -16,14 +16,12 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import Database from "better-sqlite3";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import {
-  CAPABILITY_GRANTS_FILENAME,
-  FileCapabilityGrantStore,
-} from "../actor/capability-grants.js";
 import { hostJobAuditArtifactDir } from "../actor/host-job-audit-artifact.js";
 import { loadConfig } from "../config/loader.js";
 import { SECRETS_DIRNAME } from "../config/secrets.js";
+import { DbCapabilityGrantStore } from "../db/repositories/capability-grant-repository.js";
 
 export type SandboxAuthMode = "copilot" | "claude" | "codex" | "antigravity" | "kimi";
 
@@ -461,12 +459,13 @@ function injectGoogleCredentialShadow(args: string[]): void {
  * mounts in argument order), so the grantee reads the key at the same well-known
  * path as on the host. `secret:mistral-api-key` does the same for
  * `secrets/mistral-api-key` and also exports the OCR tool's required
- * `MISTRAL_API_KEY`. Grants are read straight from the grant-store JSON under
- * `$RUSA_HOME` (the sandbox layer never imports the mesh — same discipline
+ * `MISTRAL_API_KEY`. Grants are read straight from the `capability_grants`
+ * table in `$RUSA_HOME/data/mesh.db` through a short-lived readonly
+ * connection (the sandbox layer never imports the mesh — same discipline
  * as `loadConfig()` in {@link injectWorkerGithubCredential}), keyed by the actor
  * id (= the worker dir's basename, see start.ts `join(workersDir, actorId)`).
  * Evaluated per-spawn, so grant/revoke takes effect on the actor's next run.
- * Fail-closed to MASKED: any read/parse error means "no grant", never "leaked".
+ * Fail-closed to MASKED: any open/read error means "no grant", never "leaked".
  */
 export function deriveSecretEnvVar(filename: string): string {
   if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(filename)) {
@@ -504,11 +503,22 @@ function injectSecretsMasking(
 
   let activeGrants: string[] = [];
   try {
-    const grants = new FileCapabilityGrantStore(join(mcHome, CAPABILITY_GRANTS_FILENAME));
-    activeGrants = grants.activeFor(actorId);
+    // Path must match db/index.ts's initDb layout (`<mcHome>/data/mesh.db`).
+    // Opened fresh per spawn, readonly, and closed immediately — this never
+    // holds the mesh's own connection, which may belong to a different
+    // `mcHome` in the same process (e.g. under test).
+    const db = new Database(join(mcHome, "data", "mesh.db"), {
+      readonly: true,
+      fileMustExist: true,
+    });
+    try {
+      activeGrants = new DbCapabilityGrantStore(db).activeFor(actorId);
+    } finally {
+      db.close();
+    }
   } catch {
-    // Fail-closed: an unreadable/invalid grant store means "no grant" (the
-    // secrets dir stays fully masked), never a leaked secret.
+    // Fail-closed: no database yet, or an unreadable/corrupt one, means "no
+    // grant" (the secrets dir stays fully masked), never a leaked secret.
   }
 
   const secretGrants = activeGrants
