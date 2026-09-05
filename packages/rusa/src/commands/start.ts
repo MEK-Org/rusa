@@ -879,9 +879,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     repositories: getRepositories(),
   });
   if (legacyCapabilityGrantImport.importedGrants > 0) {
-    console.log(
-      `[mesh] imported ${legacyCapabilityGrantImport.importedGrants} capability grant(s) into SQLite`
-    );
+    log.info("legacy_capability_grants_imported", {
+      grants: legacyCapabilityGrantImport.importedGrants,
+    });
   }
 
   const recoveredOpenRuns = getRepositories().actorRuns.abandonOpen(
