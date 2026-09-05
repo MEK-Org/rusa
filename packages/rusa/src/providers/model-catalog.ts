@@ -624,6 +624,7 @@ export type CodexModelsCacheStatus =
 export interface CodexModelsCacheRead {
   status: CodexModelsCacheStatus;
   entries: ModelEntry[];
+  /** The cache's `fetched_at` as an ISO string, rendered from the parsed instant. */
   fetchedAt?: string;
   /** Bounded, path-free explanation, present on every non-usable status. */
   reason?: string;
@@ -746,6 +747,12 @@ export function readCodexModelsCache(opts?: {
       reason: "codex models cache has no parseable fetched_at timestamp",
     };
   }
+  // From here down the timestamp is the parsed instant re-rendered, never the
+  // string the file carried. `Date.parse` accepts trailing parenthesised text -
+  // `Tue Sep 05 2026 00:00:00 GMT+0000 (<anything>)` parses - so echoing the raw
+  // field would let a corrupt cache put arbitrary bytes into an operator log and
+  // into the stored scrape record.
+  const fetchedAt = new Date(fetchedAtMs).toISOString();
   // Attribution before freshness: a cache written by a codex that is no longer
   // installed describes that codex's models, however recently it was written.
   // Upgrades are exactly when the catalog changes, and are the one moment
@@ -759,17 +766,25 @@ export function readCodexModelsCache(opts?: {
       return {
         status: "client-mismatch",
         entries: [],
-        fetchedAt: parsed.fetchedAt,
+        fetchedAt,
         reason:
           "the installed codex client version could not be read, so the cache could not be attributed to it",
       };
     }
     if (parsed.clientVersion !== installed) {
+      // Neither version is named. `installed` is a semver token this process
+      // read from `codex --version`, but `client_version` is whatever the file
+      // says - any length, any bytes, a path - and this reason is written into
+      // operator logs and pasted into issue reports. That the cache belongs to
+      // another build is the whole actionable fact; `codex --version` and the
+      // file itself are where the two versions live.
       return {
         status: "client-mismatch",
         entries: [],
-        fetchedAt: parsed.fetchedAt,
-        reason: `codex models cache was written by client version ${parsed.clientVersion ?? "(unstated)"}, but ${installed} is installed`,
+        fetchedAt,
+        reason: parsed.clientVersion
+          ? "codex models cache was written by a different codex client version than the one installed"
+          : "codex models cache does not state which codex client version wrote it",
       };
     }
   }
@@ -780,8 +795,8 @@ export function readCodexModelsCache(opts?: {
     return {
       status: "stale",
       entries: [],
-      fetchedAt: parsed.fetchedAt,
-      reason: `codex models cache is stale (fetched at ${parsed.fetchedAt}, max age ${maxAgeMs}ms)`,
+      fetchedAt,
+      reason: `codex models cache is stale (fetched at ${fetchedAt}, max age ${maxAgeMs}ms)`,
     };
   }
   // A negative age is not freshness. Without this, a stamp a year ahead - a
@@ -791,19 +806,19 @@ export function readCodexModelsCache(opts?: {
     return {
       status: "stale",
       entries: [],
-      fetchedAt: parsed.fetchedAt,
-      reason: `codex models cache is stamped in the future (fetched at ${parsed.fetchedAt}, max skew ${CODEX_MODELS_CACHE_MAX_FUTURE_SKEW_MS}ms)`,
+      fetchedAt,
+      reason: `codex models cache is stamped in the future (fetched at ${fetchedAt}, max skew ${CODEX_MODELS_CACHE_MAX_FUTURE_SKEW_MS}ms)`,
     };
   }
   if (parsed.entries.length === 0) {
     return {
       status: "empty",
       entries: [],
-      fetchedAt: parsed.fetchedAt,
+      fetchedAt,
       reason: `codex models cache lists no models with visibility "${CODEX_LISTED_VISIBILITY}"`,
     };
   }
-  return { status: "usable", entries: parsed.entries, fetchedAt: parsed.fetchedAt };
+  return { status: "usable", entries: parsed.entries, fetchedAt };
 }
 
 /**

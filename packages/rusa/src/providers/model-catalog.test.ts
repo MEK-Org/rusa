@@ -660,6 +660,9 @@ display_name = "K3"
 describe("codex models cache", () => {
   let tmpDir: string;
 
+  /** The byte a terminal escape sequence starts with, spelled without one. */
+  const ESC = String.fromCharCode(27);
+
   // The shape observed in an installed Codex CLI's models_cache.json: a listed
   // model, a hidden one, and the prose fields the catalog is not allowed to read.
   const cacheDoc = (fetchedAt: string) => ({
@@ -889,8 +892,9 @@ describe("codex models cache", () => {
     const upgraded = readCodexModelsCache({ cachePath, now, installedClientVersion: "0.154.0" });
     expect(upgraded.status).toBe("client-mismatch");
     expect(upgraded.entries).toEqual([]);
-    expect(upgraded.reason).toContain("0.153.4");
-    expect(upgraded.reason).toContain("0.154.0");
+    expect(upgraded.reason).toBe(
+      "codex models cache was written by a different codex client version than the one installed"
+    );
 
     // Unknown provenance is not trusted provenance.
     const unknown = readCodexModelsCache({ cachePath, now, installedClientVersion: null });
@@ -909,7 +913,58 @@ describe("codex models cache", () => {
       installedClientVersion: "0.153.4",
     });
     expect(unstamped.status).toBe("client-mismatch");
-    expect(unstamped.reason).toContain("(unstated)");
+    expect(unstamped.reason).toBe(
+      "codex models cache does not state which codex client version wrote it"
+    );
+  });
+
+  it("keeps every byte the cache authored out of the reasons it produces", () => {
+    // The reasons land in operator logs and in pasted issue reports, and the
+    // file is vendor-written. `client_version` and `fetched_at` are the two
+    // fields this code reads outside the identifier projection, so they are the
+    // two that could carry a repainting escape sequence, a home directory or a
+    // kilobyte of arbitrary text into a log line if a reason echoed them.
+    const hostile = `${ESC}[2J/home/someone/.codex/models_cache.json${String.fromCharCode(10)}${"A".repeat(5000)}`;
+    const now = Date.parse("2026-09-05T13:00:00.000Z");
+
+    const version = readCodexModelsCache({
+      cachePath: writeCache(
+        JSON.stringify({ ...cacheDoc("2026-09-05T12:00:00.000Z"), client_version: hostile })
+      ),
+      now,
+      installedClientVersion: "0.153.4",
+    });
+    expect(version.status).toBe("client-mismatch");
+    expect(version.reason).toBe(
+      "codex models cache was written by a different codex client version than the one installed"
+    );
+    rmSync(tmpDir, { recursive: true, force: true });
+
+    // `Date.parse` accepts trailing parenthesised text, so this timestamp is
+    // both real and hostile: it dates the file to a year ago and smuggles the
+    // payload along with it.
+    const stamped = readCodexModelsCache({
+      cachePath: writeCache(
+        JSON.stringify(cacheDoc(`Fri Sep 05 2025 12:00:00 GMT+0000 (${hostile})`))
+      ),
+      now,
+      installedClientVersion: "0.153.4",
+    });
+    expect(stamped.status).toBe("stale");
+    expect(stamped.reason).toBe(
+      `codex models cache is stale (fetched at 2025-09-05T12:00:00.000Z, max age ${CODEX_MODELS_CACHE_MAX_AGE_MS}ms)`
+    );
+    // The canonical instant is what the record keeps too, so the raw field
+    // cannot ride into the scrape store either.
+    expect(stamped.fetchedAt).toBe("2025-09-05T12:00:00.000Z");
+
+    for (const read of [version, stamped]) {
+      for (const fragment of [ESC, "/home/someone", "models_cache.json", "AAAAA"]) {
+        expect(read.reason).not.toContain(fragment);
+        expect(read.fetchedAt ?? "").not.toContain(fragment);
+      }
+      expect((read.reason ?? "").length).toBeLessThan(200);
+    }
   });
 
   it("records the identifier projection, not the cache file, and sets the codex catalog", () => {

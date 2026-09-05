@@ -356,8 +356,12 @@ gemini-3.1-pro-high       Gemini 3.1 Pro (High)
 
       expect(mockScrapeCodex).toHaveBeenCalled();
       if (res.status !== "unknown") throw new Error(`expected unknown, got ${res.status}`);
-      expect(res.message).toContain("written by client version 0.1.0-previous");
-      expect(res.message).toContain(STUB_CODEX_VERSION);
+      // The fallback message names the stage, not the versions: the cache's
+      // client_version is vendor-written text and this string is logged.
+      expect(res.message).toContain(
+        "fell back to the /model TUI because codex models cache was written by a different codex client version than the one installed"
+      );
+      expect(res.message).not.toContain("0.1.0-previous");
     } finally {
       warnSpy.mockRestore();
     }
