@@ -312,6 +312,15 @@ export function serializeError(
 /**
  * Deep-copy a field value with secrets scrubbed, sensitive keys dropped, errors
  * serialized, and cycles broken. Returns data safe to hand to `JSON.stringify`.
+ *
+ * What is bounded here is *termination*, not size: depth stops at
+ * {@link MAX_FIELD_DEPTH}, a `cause` chain at {@link MAX_CAUSE_DEPTH}, and a
+ * cycle becomes `[circular]`, so no input can make this walk forever. Breadth
+ * and string length are deliberately not capped — a truncated record is a
+ * record that lies about what happened, and the caller knows which of its
+ * values are large in a way this function cannot. Keeping payloads out of
+ * records is a convention (see `docs/logging.md`), enforced by review rather
+ * than by silently discarding the middle of the evidence.
  */
 export function redactValue(
   value: unknown,

@@ -58,8 +58,8 @@ observability:
 ```
 
 `RUSA_LOG_FORMAT` overrides it for one run, which is how you get JSON out of an
-interactive shell (`RUSA_LOG_FORMAT=json rusa start | jq`) or readable lines out
-of a pipe.
+interactive shell (`RUSA_LOG_FORMAT=json rusa start`) or readable lines out of a
+pipe. See "Reading the log" before piping that JSON into a strict reader.
 
 This is a choice of *presentation*, not a second stream: an event is written
 once either way. Prose printed beside a record it duplicates is the thing this
@@ -132,6 +132,14 @@ from a leaked stack frame.
 a safe reference in the record. Field *names* stay low-cardinality —
 `{ actorId }`, never a field named after the actor.
 
+That bound is yours, not the logger's. The logger bounds the shapes that would
+otherwise not terminate — recursion stops at depth 8, a `cause` chain at 5
+links, and a cycle becomes `[circular]` — but it does not cap how *wide* or how
+*long* a value is. A 50 MB string or a million-element array handed to
+`log.info` is scrubbed and written in full, on a synchronous destination, which
+stalls the process for as long as that write takes. Log the count and the
+identifier, not the collection.
+
 **Tests assert event and field pairs**, never rendered prose or timestamps.
 Write to an in-memory stream, parse the lines, and assert on the object.
 
@@ -156,8 +164,11 @@ whoever is already touching a module for another reason — not in one sweep.
 records are JSON:
 
 ```console
-$ journalctl --user -u rusa -o cat | jq -c 'select(.component == "actor-run")'
+$ journalctl --user -u rusa -o cat | jq -Rc 'fromjson? // empty | select(.component == "actor-run")'
 ```
+
+`-R` is there because the stream carries raw actor output too — see the caveat
+at the end of this section.
 
 Run by hand in a terminal, the same records arrive as readable lines with no
 extra tooling:
@@ -171,3 +182,19 @@ $ rusa start
 `RUSA_LOG_FORMAT` gets you the other one either way: `RUSA_LOG_FORMAT=json rusa
 start | jq` for JSON in a terminal, `RUSA_LOG_FORMAT=pretty` for readable lines
 out of a pipe.
+
+### One caveat: stdout is not only JSON yet
+
+`rusa start` still mirrors raw actor model output to stdout, alongside these
+records. That text is not JSON and is not a log record — it is the actor's own
+prose, and it predates this logger — so a strict reader fails on it:
+
+```console
+$ rusa start | jq -c 'select(.component == "actor-run")'   # dies on the first actor chunk
+$ rusa start | jq -Rc 'fromjson? // empty | select(.component == "actor-run")'   # skips it
+```
+
+Use the `-R` form until [#192](https://github.com/MEK-Org/rusa/issues/192)
+retires the stdout mirror; the actor output is already durable in the transcript
+and on the dashboard's SSE stream, so removing it there costs nothing here. Once
+it lands, stdout is JSON lines only and plain `jq` works.

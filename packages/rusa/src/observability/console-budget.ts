@@ -12,6 +12,8 @@
  * stays deliberate.
  */
 
+import ts from "typescript";
+
 /** How the gate treats each production source file. */
 export interface ConsoleBudgetPolicy {
   /**
@@ -44,120 +46,35 @@ export interface ConsoleBudgetResult {
   ratchets: ConsoleBudgetViolation[];
 }
 
-/** Matches `console.<member>` where `console` is not itself a property access. */
-const CONSOLE_ACCESS = /(?<![\w$.])console\s*\.\s*[a-zA-Z$_][\w$]*/g;
-
 /**
- * Characters after which a `/` opens a regular expression rather than dividing.
- * Without this the scanner reads the `"` inside `/["']/` as a string opener and
- * swallows the code that follows it. The empty string covers start-of-file.
+ * Count direct `console.*` call sites in one file's source.
+ *
+ * The count comes off the TypeScript AST. `typescript` is already a dependency,
+ * and parsing settles by construction what a text scan has to keep guessing at:
+ * a `console.log` written inside a comment, a string, a template literal or a
+ * regular expression never becomes a node, so it cannot be counted, and no
+ * regex-versus-division heuristic has to be maintained to keep that true.
+ *
+ * `console["log"]` counts too — a bracket is not a way around the gate.
+ *
+ * `fileName` only picks the dialect to parse as; pass the real path so a `.tsx`
+ * file is read as TSX rather than as TypeScript.
  */
-const REGEX_PRECEDING = new Set([
-  "",
-  "\n",
-  "(",
-  ",",
-  "=",
-  ":",
-  "[",
-  "!",
-  "&",
-  "|",
-  "?",
-  "{",
-  "}",
-  ";",
-  "+",
-  "-",
-  "*",
-  "%",
-  "~",
-  "^",
-  "<",
-  ">",
-]);
-
-/**
- * Blank out comments, string literals, template literals, and regular
- * expressions, leaving code positions intact. A URL inside a string must not
- * read as a line comment, a prose mention of `console.warn` in a doc comment
- * must not count as a call site, and neither must the literal text
- * `"console.log("` in a test fixture.
- */
-export function stripNonCode(source: string): string {
-  let out = "";
-  let previousCode = "";
-  let index = 0;
-  const end = source.length;
-  const keepNewlines = (from: number, to: number): void => {
-    for (let i = from; i < to; i++) if (source[i] === "\n") out += "\n";
+export function countConsoleCalls(source: string, fileName = "scan.ts"): number {
+  const parsed = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, false);
+  let count = 0;
+  const visit = (node: ts.Node): void => {
+    if (
+      (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === "console"
+    ) {
+      count++;
+    }
+    ts.forEachChild(node, visit);
   };
-  while (index < end) {
-    const char = source[index];
-    const next = source[index + 1];
-    if (char === "/" && next === "/") {
-      while (index < end && source[index] !== "\n") index++;
-      continue;
-    }
-    if (char === "/" && next === "*") {
-      const start = index;
-      index += 2;
-      while (index < end && !(source[index] === "*" && source[index + 1] === "/")) index++;
-      index = Math.min(index + 2, end);
-      keepNewlines(start, index);
-      continue;
-    }
-    if (char === "/" && REGEX_PRECEDING.has(previousCode)) {
-      index++;
-      let inClass = false;
-      while (index < end) {
-        const c = source[index];
-        if (c === "\\") {
-          index += 2;
-          continue;
-        }
-        if (c === "\n") break;
-        if (c === "[") inClass = true;
-        else if (c === "]") inClass = false;
-        else if (c === "/" && !inClass) {
-          index++;
-          break;
-        }
-        index++;
-      }
-      previousCode = "/";
-      continue;
-    }
-    if (char === '"' || char === "'" || char === "`") {
-      const start = index;
-      index++;
-      while (index < end) {
-        const c = source[index];
-        if (c === "\\") {
-          index += 2;
-          continue;
-        }
-        if (c === char) {
-          index++;
-          break;
-        }
-        index++;
-      }
-      keepNewlines(start, index);
-      previousCode = "'";
-      continue;
-    }
-    out += char;
-    if (char === "\n") previousCode = "\n";
-    else if (char.trim()) previousCode = char;
-    index++;
-  }
-  return out;
-}
-
-/** Count direct `console.*` references in one file's source. */
-export function countConsoleCalls(source: string): number {
-  return stripNonCode(source).match(CONSOLE_ACCESS)?.length ?? 0;
+  ts.forEachChild(parsed, visit);
+  return count;
 }
 
 /** Compare a scan of the production tree against the policy. */

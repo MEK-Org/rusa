@@ -9,7 +9,6 @@ import {
   evaluateConsoleBudget,
   formatConsoleBudgetFailure,
   formatConsoleBudgetRatchet,
-  stripNonCode,
 } from "./console-budget.js";
 
 /**
@@ -35,7 +34,7 @@ function scanProductionSources(): ConsoleUsage[] {
     const file = relative(packageRoot, absolute).split(sep).join("/");
     // Excluded from the compiled build, so not production code.
     if (file.startsWith("src/v2/runs/")) continue;
-    const count = countConsoleCalls(readFileSync(absolute, "utf8"));
+    const count = countConsoleCalls(readFileSync(absolute, "utf8"), file);
     if (count > 0) usage.push({ file, count });
   }
   return usage;
@@ -75,8 +74,12 @@ describe("countConsoleCalls", () => {
     expect(countConsoleCalls("deps.console.log('a'); myconsole.log('b');")).toBe(0);
   });
 
-  it("keeps line positions intact so a stripped file still lines up", () => {
-    expect(stripNonCode("const a = 1;\n// gone\nconsole.log(a);").split("\n")).toHaveLength(3);
+  it("counts a bracketed access, so a bracket is not a way around the gate", () => {
+    expect(countConsoleCalls('console["log"]("a"); console[method]("b");')).toBe(2);
+  });
+
+  it("recovers from an unterminated literal instead of losing the rest of the file", () => {
+    expect(countConsoleCalls('const broken = "oops;\nconsole.log(1);')).toBe(1);
   });
 });
 

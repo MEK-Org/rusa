@@ -1212,6 +1212,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // closure: raw agent prose is a different stream from the structured
   // diagnostics above, and each destination it reaches should be a line someone
   // chose. #192 owns retiring the stdout mirror, which is one entry from here.
+  // Until it does, fd 1 carries both this raw prose and the logger's JSON lines;
+  // docs/logging.md says so where it tells an operator how to read the log.
   const emitActorOutput = composeActorOutputSinks(
     [
       {
