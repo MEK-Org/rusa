@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Repositories } from "../db/repositories/index.js";
 import { runDbCheck, runDbCheckAgainstHome } from "./db-check.js";
 
 describe("db-check", () => {
@@ -145,6 +146,43 @@ describe("db-check", () => {
     expect(meshChatCount).toBe(0);
     expect(meshEventsCount).toBe(0);
     db.close();
+  });
+
+  it("plans adopting an existing root's session without threads.json, mutating nothing", () => {
+    // First run applies migrations and gives us a real mesh.db to seed.
+    runDbCheckAgainstHome(home);
+
+    const dbPath = join(home, "data", "mesh.db");
+    const db = new Database(dbPath);
+    const repositories = new Repositories(db);
+    repositories.actors.upsert({
+      id: "root",
+      charter: "root charter",
+      parentId: null,
+      isRoot: true,
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    db.close();
+
+    writeFileSync(
+      join(home, "root-agent", "session.json"),
+      JSON.stringify({ sessionId: "root-session" })
+    );
+
+    const result = runDbCheckAgainstHome(home);
+
+    expect(result.plannedActors).toBe(1);
+    expect(result.plannedScheduledMessages).toBe(0);
+
+    // Plan mode never patches the actor row or touches the session source.
+    const verifyDb = new Database(dbPath);
+    const root = new Repositories(verifyDb).actors.get("root");
+    expect(root?.sessionId).toBeUndefined();
+    verifyDb.close();
+    expect(
+      JSON.parse(readFileSync(join(home, "root-agent", "session.json"), "utf8")).sessionId
+    ).toBe("root-session");
   });
 
   it("exits non-zero with the actionable underlying failure on invalid legacy state", () => {

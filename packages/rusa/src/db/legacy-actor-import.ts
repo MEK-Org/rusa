@@ -338,7 +338,7 @@ export function planLegacyActorImport(options: {
         sessionId: rootSessionId ?? "",
         shouldPatchSession,
       },
-      plannedActors: 0,
+      plannedActors: shouldPatchSession ? 1 : 0,
       plannedScheduledMessages: 0,
     };
   }
