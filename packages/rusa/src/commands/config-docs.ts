@@ -50,7 +50,7 @@ Minimal example:
     # context:                       # optional; omit for native provider sessions
     #   type: portable
     #   mode: ledger                # ledger (requires geminiApiKey) or tail
-    #   compactionModel: gemini-3.1-flash-lite
+    #   compactionModel: gemini-3.5-flash-lite
     # handle: ember-familiar           # optional; a secondary instance's own display handle 
     # avatar: /path/to/ember.jpg       # optional; overrides the bundled root avatar image
 

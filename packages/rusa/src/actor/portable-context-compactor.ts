@@ -16,7 +16,7 @@ import {
   portableMemoryPrioritySchema,
 } from "./portable-context-state.js";
 
-export const DEFAULT_PORTABLE_CONTEXT_COMPACTOR_MODEL = "gemini-3.1-flash-lite";
+export const DEFAULT_PORTABLE_CONTEXT_COMPACTOR_MODEL = "gemini-3.5-flash-lite";
 
 export function resolvePortableContextCompactorModel(model?: string): string {
   return model?.trim() || DEFAULT_PORTABLE_CONTEXT_COMPACTOR_MODEL;

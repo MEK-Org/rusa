@@ -121,7 +121,7 @@ export async function extractModelCatalog(
   try {
     const client = getGeminiClient(apiKey);
     const response = await client.models.generateContent({
-      model: "gemini-3.1-flash-lite",
+      model: "gemini-3.5-flash-lite",
       contents: `Extract the model catalog for provider '${descriptor.provider}' from this raw enumeration output:\n\n${rawOutput}`,
       config: {
         responseMimeType: "application/json",
