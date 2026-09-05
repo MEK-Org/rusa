@@ -20,6 +20,7 @@ import type { ObligationRepository } from "../db/repositories/obligation-reposit
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { ObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
 import { resolveReferenceSync } from "../references/resolve.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
@@ -28,6 +29,8 @@ import type { SseHub } from "./sse.js";
 /** Everything the mesh Data API needs, injected by the server wiring. */
 export interface DashboardDataDeps {
   actors: ActorRepository;
+  /** Application logger for route diagnostics. Absent → nothing is logged. */
+  logger?: Logger;
   meshEvents: MeshEventRepository;
   meshChat: MeshChatRepository;
   /** Durable obligation repository for task and dependency management. */
@@ -761,9 +764,14 @@ export async function handleMeshApiRequest(
           // handles error boundaries to ensure thrown errors are entirely body-free,
           // we can safely log the stable, locally-authored error message server-side
           // for debugging while returning a generic 502 status to the client.
-          console.error(
-            `avatar generate for ${targetId} failed: ${err instanceof Error ? err.message : "unknown error"}`
-          );
+          // Still message-only, never the raw error: `callGeminiImage` promises
+          // a locally-authored, body-free message, and passing the Error through
+          // would put a provider response body into the record.
+          (deps?.logger ?? nullLogger).error("avatar_generate_failed", {
+            component: "dashboard-api",
+            actorId: targetId,
+            reason: err instanceof Error ? err.message : "unknown error",
+          });
           sendJson(res, 502, { error: "avatar generation failed" });
         });
       return true;

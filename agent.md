@@ -11,6 +11,10 @@ This is a repository for orchestrating AI agents to build software.
   - `pnpm build`
 - **State validation commands in PR descriptions.** Include the exact commands run and verification outcomes.
 - **Diff hygiene.** Keep pull requests concise, targeted, and focused only on the task at hand. Avoid unnecessary diff churn across unrelated files.
+- **Log through the application logger.** Diagnostics go through the structured
+  logger, not `console.*`; read [docs/logging.md](docs/logging.md) before adding
+  one. A mechanical gate rejects new direct `console.*` diagnostics outside the
+  reviewed CLI-output allowlist.
 
 ## Referencing prior work
 

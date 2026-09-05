@@ -1198,7 +1198,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(sandboxMock.assertBwrapAvailable).not.toHaveBeenCalled();
   });
 
-  it("exits loudly when bwrap is required but unavailable", async () => {
+  it("exits when bwrap is required but unavailable, without printing to the console", async () => {
+    // The diagnostic is now the `sandbox_unavailable` record carrying the
+    // preflight error, written to the service's structured stream rather than
+    // printed as prose. What this test pins is the fatal exit, and that the
+    // failure path no longer writes to the console at all.
     sandboxMock.assertBwrapAvailable.mockImplementationOnce(() => {
       throw new Error("bubblewrap (bwrap) is required but not installed.");
     });
@@ -1207,9 +1211,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await runStart();
 
     expect(process.exit).toHaveBeenCalledWith(1);
-    expect(consoleError).toHaveBeenCalledWith(
-      "❌ bubblewrap (bwrap) is required but not installed."
-    );
+    expect(consoleError).not.toHaveBeenCalled();
     consoleError.mockRestore();
   });
 
