@@ -1725,6 +1725,22 @@ describe("ObligationRepository", () => {
       repository.create({ title: "rec", id: "rec-1", ownerId: "actor-a", intent: "recur" });
     });
 
+    it("completing a never-recurring ready obligation makes no scheduler call (#227)", () => {
+      const scheduleSpy = vi.spyOn(scheduler, "scheduleObligationActivation");
+      const cancelSpy = vi.spyOn(scheduler, "cancelObligationActivation");
+      repository.setTerminalStatus("rec-1", "done");
+      expect(scheduleSpy).not.toHaveBeenCalled();
+      expect(cancelSpy).not.toHaveBeenCalled();
+    });
+
+    it("cancelling a never-recurring waiting obligation makes no scheduler call (#227)", () => {
+      const scheduleSpy = vi.spyOn(scheduler, "scheduleObligationActivation");
+      const cancelSpy = vi.spyOn(scheduler, "cancelObligationActivation");
+      repository.setTerminalStatus("rec-1", "cancelled");
+      expect(scheduleSpy).not.toHaveBeenCalled();
+      expect(cancelSpy).not.toHaveBeenCalled();
+    });
+
     it("rejects an invalid cron expression or non-positive interval without mutating", () => {
       expect(() => repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "bad" })).toThrow(
         "invalid cron expression"
