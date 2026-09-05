@@ -1149,6 +1149,116 @@ describe("ActorMesh", () => {
     expect(inboxStore.entries).toHaveLength(0);
   });
 
+  it("delivers prerequisite-cancellation attention exactly once per (dependent, prerequisite) pair (#212)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    expect(mesh.deliverPrerequisiteCancelledAttention("root", "dep-1", "gate-1")).toBe(true);
+    await tick();
+
+    const first = rootEntries();
+    expect(first).toHaveLength(1);
+    expect(first[0].source).toBe("obligation:dep-1");
+    expect(first[0].payload).toMatchObject({
+      type: "obligation.prerequisite_cancelled",
+      obligationId: "dep-1",
+      prerequisiteId: "gate-1",
+    });
+
+    // Replay of the exact same fact is a no-op.
+    expect(mesh.deliverPrerequisiteCancelledAttention("root", "dep-1", "gate-1")).toBe(false);
+    expect(rootEntries()).toHaveLength(1);
+
+    // A different prerequisite on the same dependent is genuinely new attention.
+    expect(mesh.deliverPrerequisiteCancelledAttention("root", "dep-1", "gate-2")).toBe(true);
+    expect(rootEntries()).toHaveLength(2);
+  });
+
+  it("keeps prerequisite-cancellation attention distinct for id pairs that collide under a delimiter join (#212)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    // An obligation id is only required to be non-empty, so `:` is legal
+    // inside one. Joining the pair on a fixed separator collapses
+    // `("a:b", "c")` and `("a", "b:c")` onto one dedupe key, which for a
+    // one-shot notice means one dependent's repair prompt silently
+    // suppressing the other's.
+    expect(mesh.deliverPrerequisiteCancelledAttention("root", "a:b", "c")).toBe(true);
+    expect(mesh.deliverPrerequisiteCancelledAttention("root", "a", "b:c")).toBe(true);
+    await tick();
+
+    expect(rootEntries()).toHaveLength(2);
+    expect(rootEntries().map((entry) => entry.payload)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ obligationId: "a:b", prerequisiteId: "c" }),
+        expect.objectContaining({ obligationId: "a", prerequisiteId: "b:c" }),
+      ])
+    );
+  });
+
+  it("does not deliver prerequisite-cancellation attention to a retired actor", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, registry } = setup({ inboxStore });
+    const id = mesh.spawn({ charter: "worker", parentId: "root" });
+    registry.patch(id, { status: "retired" });
+
+    expect(mesh.deliverPrerequisiteCancelledAttention(id, "dep-1", "gate-1")).toBe(false);
+    expect(inboxStore.entries.filter((entry) => entry.actorId === id)).toHaveLength(0);
+  });
+
+  it("reconciles missing prerequisite-cancellation attention on boot and is idempotent on repeat (#212)", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, fake, tick } = setup({ inboxStore });
+    const rootEntries = () => inboxStore.entries.filter((entry) => entry.actorId === "root");
+
+    const obligations = {
+      listPrerequisiteCancellationAttention: () => [
+        { dependentId: "dep-1", dependentOwnerId: "root", prerequisiteId: "gate-1" },
+      ],
+    };
+
+    expect(rootEntries()).toHaveLength(0);
+
+    mesh.reconcileCancelledPrerequisiteAttention(obligations);
+    await tick();
+
+    expect(rootEntries()).toHaveLength(1);
+    expect(rootEntries()[0].source).toBe("obligation:dep-1");
+    expect(rootEntries()[0].payload).toMatchObject({
+      type: "obligation.prerequisite_cancelled",
+      obligationId: "dep-1",
+      prerequisiteId: "gate-1",
+    });
+    expect(fake("root").calls.length).toBeGreaterThan(0);
+
+    const callCountBefore = fake("root").calls.length;
+    mesh.reconcileCancelledPrerequisiteAttention(obligations);
+    await tick();
+
+    expect(rootEntries()).toHaveLength(1);
+    expect(fake("root").calls.length).toBe(callCountBefore);
+  });
+
+  it("skips non-actor owners and retired actors during prerequisite-cancellation reconciliation", async () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh, registry } = setup({ inboxStore });
+    const retiredId = mesh.spawn({ charter: "worker", parentId: "root" });
+    registry.patch(retiredId, { status: "retired" });
+
+    const obligations = {
+      listPrerequisiteCancellationAttention: () => [
+        { dependentId: "dep-human", dependentOwnerId: "human:matt", prerequisiteId: "gate" },
+        { dependentId: "dep-sys", dependentOwnerId: "system:cron", prerequisiteId: "gate" },
+        { dependentId: "dep-retired", dependentOwnerId: retiredId, prerequisiteId: "gate" },
+      ],
+    };
+
+    mesh.reconcileCancelledPrerequisiteAttention(obligations);
+    expect(inboxStore.entries).toHaveLength(0);
+  });
+
   it("re-queues an actor that leaves inbox work unhandled, and stops once the inbox drains", async () => {
     const inboxStore = createMemoryInboxStore();
     // Handle exactly one entry per run so the actor deliberately under-drains,
