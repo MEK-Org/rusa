@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:rxdart/rxdart.dart';
@@ -392,6 +393,39 @@ class _ActorRowState extends State<_ActorRow> {
     );
   }
 
+  /// How many further candidates a pool declares beyond the one named — so a
+  /// row reads `claude-opus-5 +2`, not as if that were the actor's one model.
+  String _poolSuffix(int length) => length > 1 ? ' +${length - 1}' : '';
+
+  /// The row's one-line model label. With a pool, the same label is wrapped in
+  /// a tooltip carrying every declared candidate in order, so the counts in the
+  /// row are expandable in place without opening the actor.
+  Widget _modelLabel(
+    String text, {
+    List<ProviderModelConfig>? pool,
+    List<ProviderModelConfig>? staged,
+  }) {
+    final label = Text(
+      text,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: kMonoStyle.copyWith(
+        fontSize: 11,
+        color: MeshColors.textSecondary,
+      ),
+    );
+    if (pool == null) return label;
+    final lines = [
+      'Configured candidates, in order:',
+      ...pool.map((e) => '• ${e.label}'),
+      if (staged != null && !listEquals(staged, pool)) ...[
+        'Staged for next run:',
+        ...staged.map((e) => '• ${e.label}'),
+      ],
+    ];
+    return Tooltip(message: lines.join('\n'), child: label);
+  }
+
   Widget _buildContent(
     BuildContext context, {
     bool isHoveredTarget = false,
@@ -400,6 +434,28 @@ class _ActorRowState extends State<_ActorRow> {
     final dot = widget.dot;
     final isRunning = !thread.isRetired && dot == DotState.active;
     final isQueued = !thread.isRetired && dot == DotState.queued;
+    // A pool row summarises rather than naming one candidate as the model:
+    // `+N` says how many more are declared, and the tooltip spells the whole
+    // pool out. Per-candidate effort lives there too, so the single effort
+    // chip (the server's first-entry view) is left off for a pool. The full
+    // list is in the Info panel, which is the readable surface on a phone.
+    final pool = thread.modelConfig;
+    final isPool = pool.length > 1;
+    final showModel = thread.model != null || thread.desiredModel != null;
+    final showEffort =
+        !isPool && (thread.effort != null || thread.effortChangePending);
+    final staging =
+        thread.desiredModel != null && thread.desiredModel != thread.model;
+    final singleText = staging
+        ? '${thread.model ?? "default"} → ${thread.desiredModel}'
+        : (thread.model ?? '');
+    // Both sides carry their own count, so a staged pool replacement never
+    // reads as one model becoming one other model.
+    final poolText = staging
+        ? '${thread.model ?? "default"}${_poolSuffix(pool.length)}'
+              ' → ${thread.desiredModel}'
+              '${_poolSuffix(thread.desiredModelConfig?.length ?? 0)}'
+        : '${thread.model ?? "default"}${_poolSuffix(pool.length)}';
 
     return Container(
       decoration: BoxDecoration(
@@ -484,32 +540,22 @@ class _ActorRowState extends State<_ActorRow> {
                     color: MeshColors.textMuted,
                   ),
                 ),
-                if (thread.model != null ||
-                    thread.desiredModel != null ||
-                    thread.effort != null ||
-                    thread.effortChangePending ||
+                if (showModel ||
+                    showEffort ||
                     thread.commitmentKind != null) ...[
                   const SizedBox(height: 4),
                   Row(
                     children: [
-                      if (thread.model != null || thread.desiredModel != null)
+                      if (showModel)
                         Flexible(
-                          child: Text(
-                            thread.desiredModel != null &&
-                                    thread.desiredModel != thread.model
-                                ? '${thread.model ?? "default"} → ${thread.desiredModel}'
-                                : (thread.model ?? ''),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: kMonoStyle.copyWith(
-                              fontSize: 11,
-                              color: MeshColors.textSecondary,
-                            ),
+                          child: _modelLabel(
+                            isPool ? poolText : singleText,
+                            pool: isPool ? pool : null,
+                            staged: thread.desiredModelConfig,
                           ),
                         ),
-                      if (thread.effort != null ||
-                          thread.effortChangePending) ...[
-                        if (thread.model != null || thread.desiredModel != null)
+                      if (showEffort) ...[
+                        if (showModel)
                           const SizedBox(width: 6),
                         Flexible(
                           child: Text(
@@ -527,10 +573,7 @@ class _ActorRowState extends State<_ActorRow> {
                         ),
                       ],
                       if (thread.commitmentKind != null) ...[
-                        if (thread.model != null ||
-                            thread.desiredModel != null ||
-                            thread.effort != null ||
-                            thread.effortChangePending)
+                        if (showModel || showEffort)
                           const SizedBox(width: 6),
                         _WorkStateBadge(
                           kind: thread.commitmentKind!,
