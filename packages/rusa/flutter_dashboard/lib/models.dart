@@ -141,7 +141,8 @@ class ThreadDto {
   final List<ProviderModelConfig> modelConfig;
 
   /// A whole-pool replacement staged for the next run boundary, or null when
-  /// nothing is staged.
+  /// nothing is staged. Never empty when present: the server rejects an empty
+  /// pool, so a staged replacement always names at least one candidate.
   final List<ProviderModelConfig>? desiredModelConfig;
 
   /// The leading slice of the charter the server sends with the list — enough
@@ -251,7 +252,16 @@ class ThreadDto {
     effortChangePending: j.containsKey('desiredEffort'),
     desiredProvider: j['desiredProvider'] as String?,
     modelConfig: _modelConfigFromJson(j['modelConfig']),
-    desiredModelConfig: j.containsKey('desiredModelConfig')
+    // Keyed on a non-null value, not key presence: the server emits this key
+    // only when something is staged (`...(r.desiredModelConfig !== undefined ?
+    // {...} : {})`), and a staged pool is always non-empty because
+    // `validateModelConfigPool` rejects an empty one. So `[]` is not a state
+    // the server can express, and turning an unexpected null into one would
+    // render a "Staged for next run (0)" panel for an actor with nothing
+    // staged. `desiredEffort` above is the opposite case and keeps
+    // `containsKey`: there the server does emit an explicit null, meaning a
+    // staged clear.
+    desiredModelConfig: j['desiredModelConfig'] != null
         ? _modelConfigFromJson(j['desiredModelConfig'])
         : null,
     charterPreview: j['charterPreview'] as String? ?? '',

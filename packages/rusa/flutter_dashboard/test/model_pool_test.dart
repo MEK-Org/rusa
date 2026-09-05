@@ -122,6 +122,33 @@ void main() {
       ]);
     });
 
+    test('an explicit null desiredModelConfig means nothing staged, not an '
+        'empty staged pool', () {
+      // The server omits the key when nothing is staged, so this is drift.
+      // Either way it must not become `[]`: a staged pool is never empty
+      // (`validateModelConfigPool` rejects one), so an empty list would be a
+      // state the server cannot express, and it compares unequal to any real
+      // pool — rendering a bogus "Staged for next run (0)".
+      final t = ThreadDto.fromJson({
+        'id': 'a',
+        'handle': 'a-handle',
+        'parentId': null,
+        'status': 'active',
+        'provider': 'claude',
+        'model': 'claude-opus-5',
+        'modelConfig': [
+          {'provider': 'claude', 'model': 'claude-opus-5'},
+          {'provider': 'kimi', 'model': 'kimi-for-coding'},
+        ],
+        'desiredModelConfig': null,
+        'charterPreview': 'c',
+        'createdAt': 't0',
+      });
+
+      expect(t.desiredModelConfig, isNull);
+      expect(t.modelConfig, hasLength(2));
+    });
+
     test('a malformed candidate fails the parse rather than fabricating one', () {
       // provider/model are required by the server contract, so a missing one
       // is API drift and should be as loud as a missing `id`.
