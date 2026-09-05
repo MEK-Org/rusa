@@ -59,15 +59,15 @@ export interface LegacyEventSubscriptionImportPlanResult {
  * read-only slice of {@link Repositories}, so it cannot open a DB transaction,
  * write a subscription, or archive the legacy file.
  *
- * Refuses — rather than importing a partial view — whenever the document holds a
- * row the file store would have quarantined. Booting on the remainder is
- * defensible for a file that stays reparable in place; committing the remainder
- * is not, because it silently makes "this actor no longer owns this event
- * source" durable. Every unresolved row is named in the error so the operator
- * can repair the source and re-run.
+ * Refuses — rather than importing a partial view — whenever the parse rejects a
+ * row. The retired JSON store quarantined such rows and booted on the
+ * remainder, which is defensible for a file that stays reparable in place;
+ * committing the remainder is not, because it silently makes "this actor no
+ * longer owns this event source" durable. Every unresolved row is named in the
+ * error so the operator can repair the source and re-run.
  *
- * A legacy row still resolves exactly as it does on the file path: canonical
- * reference spellings converge to one key, several spellings of one
+ * A legacy row otherwise resolves exactly as the JSON store resolved it:
+ * canonical reference spellings converge to one key, several spellings of one
  * (resource, actor) pair collapse to that pair's latest state, tombstones are
  * preserved as tombstones, and an unversioned document's root-owned rows are
  * dropped as the config-implied seed `reconcileEventSources` re-derives anyway.

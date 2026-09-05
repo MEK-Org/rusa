@@ -1,5 +1,3 @@
-import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import {
   asGitHubBranch,
   githubBranchReference,
@@ -78,9 +76,9 @@ export function activeSubscriberConflictMessage(
 
 /**
  * Persistence boundary for event subscriptions — mirrors
- * {@link CapabilityGrantStore}: a local JSON file in production
- * ({@link FileEventSubscriptionStore}), in-memory for tests. Keyed on
- * (resource, actorId); one record per pair.
+ * {@link CapabilityGrantStore}: SQLite in production
+ * (`DbEventSubscriptionStore`), in-memory for the config-implied seed and for
+ * tests. Keyed on (resource, actorId); one record per pair.
  */
 export interface EventSubscriptionStore {
   /**
@@ -410,7 +408,7 @@ export class UnionEventSubscriptionStore implements EventSubscriptionStore {
   }
 }
 
-/** The canonical `event-subscriptions.json` document version this module writes. */
+/** The highest `event-subscriptions.json` document version this parser understands. */
 export const EVENT_SUBSCRIPTION_DOCUMENT_VERSION = 3;
 
 /** One source row the document could not resolve, with its 1-based position. */
@@ -427,20 +425,22 @@ export interface LegacyEventSubscriptionDocument {
   subscriptions: EventSubscription[];
   /** Rows that could not be resolved. Every one is an ownership claim, so no caller may ignore them. */
   rejections: LegacyEventSubscriptionRejection[];
-  /** Rows present in the source document, before any filtering. */
-  rowCount: number;
-  /** True when the document is not already at {@link EVENT_SUBSCRIPTION_DOCUMENT_VERSION}. */
-  needsMigration: boolean;
 }
 
 /**
  * Parse one `event-subscriptions.json` document into the rows a store should
  * hold, touching no filesystem. Structural problems (unreadable JSON, an
  * unknown document version) throw; row-level problems come back as
- * {@link LegacyEventSubscriptionRejection}s so each caller decides what they
- * mean. {@link FileEventSubscriptionStore} quarantines them and boots on the
- * remainder; the SQLite importer refuses the whole file instead, because
- * committing the remainder would make a dropped ownership claim durable.
+ * {@link LegacyEventSubscriptionRejection}s rather than being dropped, because
+ * every one of them is an ownership claim. The SQLite importer is the only
+ * caller and refuses the whole document when any row is rejected: committing
+ * the remainder would make a dropped ownership claim durable and invisible.
+ *
+ * The resolutions performed here are the non-lossy deterministic ones the
+ * retired JSON store also performed — legacy spellings converge to one
+ * canonical key, several spellings of one (resource, actor) pair collapse to
+ * that pair's latest state, and an unversioned document's root-owned rows are
+ * dropped as the config-implied seed `reconcileEventSources` re-derives anyway.
  */
 export function parseLegacyEventSubscriptionDocument(
   raw: string,
@@ -575,129 +575,7 @@ export function parseLegacyEventSubscriptionDocument(
     subscriptions.push(winner.subscription);
   }
 
-  return {
-    subscriptions,
-    rejections,
-    rowCount: rows.length,
-    needsMigration:
-      isUnversioned ||
-      (document.version as number | undefined) !== EVENT_SUBSCRIPTION_DOCUMENT_VERSION,
-  };
-}
-
-/**
- * JSON-file-backed subscription store — the legacy durable store, retained to
- * read a pre-cutover `event-subscriptions.json` (and by tests). Loads once on
- * construction, rewrites the whole file atomically on every mutation. A
- * mutation becomes visible in memory only after its snapshot has been replaced,
- * so callers never receive a false success for a failed write or rename.
- * Production authority now lives in SQLite; see `DbEventSubscriptionStore`.
- */
-export class FileEventSubscriptionStore implements EventSubscriptionStore {
-  private mem = new InMemoryEventSubscriptionStore();
-
-  constructor(
-    private readonly file: string,
-    rootId: string,
-    private readonly warn: (message: string) => void = console.warn,
-    private readonly replaceFile: typeof renameSync = renameSync
-  ) {
-    let raw: string;
-    try {
-      raw = readFileSync(file, "utf-8");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-      throw error;
-    }
-
-    const document = parseLegacyEventSubscriptionDocument(raw, { file, rootId });
-    for (const subscription of document.subscriptions) this.mem.restore(subscription);
-    for (const rejection of document.rejections) {
-      this.warn(`[mesh] skipped event subscription row ${rejection.row}: ${rejection.reason}`);
-    }
-
-    const rejected = document.rejections.length;
-    if (rejected > 0) {
-      const recoveryFile = rejectedSnapshotPath(this.file, raw);
-      try {
-        writeFileSync(recoveryFile, raw, { encoding: "utf8", mode: 0o600, flag: "wx" });
-      } catch (error) {
-        if (
-          (error as NodeJS.ErrnoException).code !== "EEXIST" ||
-          readFileSync(recoveryFile, "utf8") !== raw
-        ) {
-          throw new Error(`could not preserve rejected event subscription rows: ${recoveryFile}`, {
-            cause: error,
-          });
-        }
-      }
-      this.warn(
-        `[mesh] preserved ${rejected} rejected event subscription row(s) in ${recoveryFile}`
-      );
-    }
-
-    if (document.needsMigration && document.rowCount > 0 && rejected === 0) {
-      this.flush(this.mem.list());
-    } else if (document.needsMigration && rejected > 0) {
-      this.warn(
-        `[mesh] event subscription migration left the source file unchanged after ${rejected} rejected row(s)`
-      );
-    }
-  }
-
-  private flush(subscriptions: EventSubscription[]): void {
-    // A same-directory temporary plus rename prevents a process interruption
-    // from exposing a partial JSON document. This is atomic replacement, not an
-    // fsync-based guarantee against host/power loss.
-    const temporary = `${this.file}.${process.pid}.${randomUUID()}.tmp`;
-    try {
-      writeFileSync(
-        temporary,
-        JSON.stringify({ version: EVENT_SUBSCRIPTION_DOCUMENT_VERSION, subscriptions }, null, 2),
-        {
-          encoding: "utf8",
-          mode: 0o600,
-        }
-      );
-      this.replaceFile(temporary, this.file);
-    } catch (error) {
-      try {
-        unlinkSync(temporary);
-      } catch {
-        // The temporary file may not have been created. Preserve the write error.
-      }
-      throw error;
-    }
-  }
-
-  private commit(mutate: (candidate: InMemoryEventSubscriptionStore) => void): void {
-    const candidate = new InMemoryEventSubscriptionStore();
-    for (const subscription of this.mem.list()) candidate.restore(subscription);
-    mutate(candidate);
-    this.flush(candidate.list());
-    this.mem = candidate;
-  }
-
-  subscribe(subscription: Omit<EventSubscription, "resource"> & { resource: EventResource }): void {
-    this.commit((candidate) => candidate.subscribe(subscription));
-  }
-
-  unsubscribe(resource: EventResource, actorId: string, at: string): void {
-    this.commit((candidate) => candidate.unsubscribe(resource, actorId, at));
-  }
-
-  list(): EventSubscription[] {
-    return this.mem.list();
-  }
-
-  activeForResource(resource: EventResource): EventSubscription[] {
-    return this.mem.activeForResource(resource);
-  }
-}
-
-function rejectedSnapshotPath(file: string, raw: string): string {
-  const digest = createHash("sha256").update(raw).digest("hex");
-  return `${file}.rejected-${digest}.json`;
+  return { subscriptions, rejections };
 }
 
 function parsePersistedSubscription(value: unknown): EventSubscription {

@@ -24,10 +24,10 @@ export const sub = (
 
 /**
  * Behavior every {@link EventSubscriptionStore} implementation must satisfy,
- * independent of backing storage — run against `InMemoryEventSubscriptionStore`,
- * `FileEventSubscriptionStore`, and `DbEventSubscriptionStore`. Storage-specific
- * concerns (file quarantine and reload, FK/index enforcement, cross-connection
- * visibility) stay in each store's own test file.
+ * independent of backing storage — run against `InMemoryEventSubscriptionStore`
+ * and `DbEventSubscriptionStore`. Storage-specific concerns (FK/index
+ * enforcement, cross-connection visibility, reload across a restart) stay in
+ * each store's own test file.
  */
 export function testEventSubscriptionStoreContract(
   name: string,
