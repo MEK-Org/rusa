@@ -1,7 +1,8 @@
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { testEventSubscriptionStoreContract } from "./event-subscription-store.contract.js";
 import {
   type EventResource,
   type EventSubscription,
@@ -16,6 +17,11 @@ import {
   resourceKey,
   sameResource,
 } from "./event-subscriptions.js";
+
+const contractDirectories: string[] = [];
+afterAll(() => {
+  for (const directory of contractDirectories) rmSync(directory, { recursive: true, force: true });
+});
 
 const REPO = "github:dummy-org/dummy-repo";
 const OTHER = "github:dummy-org/other";
@@ -32,98 +38,17 @@ const sub = (
   resource: resourceKey(over.resource ?? REPO),
 });
 
-describe("InMemoryEventSubscriptionStore", () => {
-  it("subscribes an actor and reports it active for the resource", () => {
-    const store = new InMemoryEventSubscriptionStore();
-    store.subscribe(sub());
-    const active = store.activeForResource(REPO);
-    expect(active).toHaveLength(1);
-    expect(active[0]?.actorId).toBe(ACTOR_A);
-    expect(store.activeForResource(OTHER)).toEqual([]);
-  });
+// Behavior shared by every store implementation lives in the contract suite so
+// the file store and the SQLite store are held to the same rules.
+testEventSubscriptionStoreContract(
+  "InMemoryEventSubscriptionStore",
+  () => new InMemoryEventSubscriptionStore()
+);
 
-  it("is idempotent per (resource, actorId) — re-subscribe does not duplicate", () => {
-    const store = new InMemoryEventSubscriptionStore();
-    store.subscribe(sub());
-    store.subscribe(sub({ subscribedAt: "2026-06-28T00:00:00Z" }));
-    expect(store.list()).toHaveLength(1);
-    expect(store.activeForResource(REPO)).toHaveLength(1);
-  });
-
-  it("re-subscribing the same actor clears a prior unsubscribedAt (reactivates)", () => {
-    const store = new InMemoryEventSubscriptionStore();
-    store.subscribe(sub());
-    store.unsubscribe(REPO, ACTOR_A, "2026-06-28T00:00:00Z");
-    expect(store.activeForResource(REPO)).toEqual([]);
-
-    store.subscribe(sub({ subscribedAt: "2026-06-29T00:00:00Z" }));
-    expect(store.activeForResource(REPO)).toHaveLength(1);
-    expect(store.list()).toHaveLength(1);
-    expect(store.list()[0]?.unsubscribedAt).toBeUndefined();
-  });
-
-  it("unsubscribe marks the row inactive but keeps it in the audit list", () => {
-    const store = new InMemoryEventSubscriptionStore();
-    store.subscribe(sub());
-    store.unsubscribe(REPO, ACTOR_A, "2026-06-28T00:00:00Z");
-    expect(store.activeForResource(REPO)).toEqual([]);
-    const all = store.list();
-    expect(all).toHaveLength(1);
-    expect(all[0]?.unsubscribedAt).toBe("2026-06-28T00:00:00Z");
-  });
-
-  it("list() returns both active and inactive subscriptions", () => {
-    const store = new InMemoryEventSubscriptionStore();
-    store.subscribe(sub({ resource: REPO, actorId: ACTOR_A }));
-    store.subscribe(sub({ resource: OTHER, actorId: ACTOR_B }));
-    store.unsubscribe(OTHER, ACTOR_B, "2026-06-28T00:00:00Z");
-    expect(store.list()).toHaveLength(2);
-    expect(store.activeForResource(REPO)).toHaveLength(1);
-    expect(store.activeForResource(OTHER)).toEqual([]);
-  });
-
-  it("unsubscribing an unknown subscription is a no-op", () => {
-    const store = new InMemoryEventSubscriptionStore();
-    store.unsubscribe(REPO, "nobody", "2026-06-28T00:00:00Z");
-    expect(store.list()).toEqual([]);
-  });
-
-  describe("one active subscriber per resource", () => {
-    it("throws when a different actor is already actively subscribed", () => {
-      const store = new InMemoryEventSubscriptionStore();
-      store.subscribe(sub({ actorId: ACTOR_A }));
-      expect(() => store.subscribe(sub({ actorId: ACTOR_B }))).toThrow(/dummy-org\/dummy-repo/);
-      expect(() => store.subscribe(sub({ actorId: ACTOR_B }))).toThrow(ACTOR_A);
-      // The conflicting subscribe did not land.
-      expect(store.activeForResource(REPO).map((s) => s.actorId)).toEqual([ACTOR_A]);
-      expect(store.list()).toHaveLength(1);
-    });
-
-    it("same-actor re-subscribe stays idempotent (no throw)", () => {
-      const store = new InMemoryEventSubscriptionStore();
-      store.subscribe(sub({ actorId: ACTOR_A }));
-      expect(() => store.subscribe(sub({ actorId: ACTOR_A }))).not.toThrow();
-      expect(store.list()).toHaveLength(1);
-    });
-
-    it("a new actor can subscribe after the prior holder unsubscribes", () => {
-      const store = new InMemoryEventSubscriptionStore();
-      store.subscribe(sub({ actorId: ACTOR_A }));
-      store.unsubscribe(REPO, ACTOR_A, "2026-06-28T00:00:00Z");
-      expect(() => store.subscribe(sub({ actorId: ACTOR_B }))).not.toThrow();
-      expect(store.activeForResource(REPO).map((s) => s.actorId)).toEqual([ACTOR_B]);
-      // The prior holder's row survives for audit.
-      expect(store.list()).toHaveLength(2);
-    });
-
-    it("different resources are independent", () => {
-      const store = new InMemoryEventSubscriptionStore();
-      store.subscribe(sub({ resource: REPO, actorId: ACTOR_A }));
-      expect(() => store.subscribe(sub({ resource: OTHER, actorId: ACTOR_B }))).not.toThrow();
-      expect(store.activeForResource(REPO).map((s) => s.actorId)).toEqual([ACTOR_A]);
-      expect(store.activeForResource(OTHER).map((s) => s.actorId)).toEqual([ACTOR_B]);
-    });
-  });
+testEventSubscriptionStoreContract("FileEventSubscriptionStore", () => {
+  const directory = mkdtempSync(join(tmpdir(), "eventsubs-contract-"));
+  contractDirectories.push(directory);
+  return new FileEventSubscriptionStore(join(directory, "event-subscriptions.json"), "root");
 });
 
 describe("FileEventSubscriptionStore", () => {
