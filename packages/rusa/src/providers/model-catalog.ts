@@ -575,3 +575,297 @@ export function ingestKimiHostModels(opts?: {
   }
   return entries;
 }
+
+/**
+ * The one visibility value the Codex CLI's own model picker lists.
+ * Entries carrying any other value (`"hide"`) are reachable by pin but are not
+ * what `/model` enumerates, so the catalog does not advertise them.
+ */
+export const CODEX_LISTED_VISIBILITY = "list";
+
+/**
+ * How old the Codex models cache may be and still be preferred over driving the
+ * TUI. The CLI rewrites the file whenever it starts, and the daemon refreshes
+ * catalogs on start and daily, so a file older than a day means the CLI has not
+ * run in that window — and the TUI fallback launches the CLI, which refreshes
+ * the file for the next pass. One day is therefore the point where falling back
+ * both costs least and repairs the cheap source.
+ */
+export const CODEX_MODELS_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * How far ahead of the reader's clock a `fetched_at` may sit and still be taken
+ * as a real timestamp. Writer and reader are the same host, so the only sources
+ * of a future stamp are a clock correction landing between write and read, or a
+ * corrupt file; a few minutes absorbs the former without letting the latter
+ * grant a cache indefinite freshness while wall time catches up to it.
+ */
+export const CODEX_MODELS_CACHE_MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
+
+/**
+ * Why a Codex models cache could not be used, or that it could.
+ * `malformed` covers every structural problem including a missing or
+ * unparseable `fetched_at`, since the freshness rule cannot be applied without
+ * one. `stale` is the timestamp failing to place the file inside the trusted
+ * window - too old, or implausibly far in the future. `client-mismatch` is the
+ * file failing to belong to the codex that is installed now, whether because it
+ * names a different client version or because no installed version could be
+ * read to compare it against.
+ */
+export type CodexModelsCacheStatus =
+  | "usable"
+  | "absent"
+  | "unreadable"
+  | "malformed"
+  | "client-mismatch"
+  | "stale"
+  | "empty";
+
+export interface CodexModelsCacheRead {
+  status: CodexModelsCacheStatus;
+  entries: ModelEntry[];
+  /** The cache's `fetched_at` as an ISO string, rendered from the parsed instant. */
+  fetchedAt?: string;
+  /** Bounded, path-free explanation, present on every non-usable status. */
+  reason?: string;
+}
+
+/**
+ * Identifier-only projection of a `models_cache.json` document.
+ *
+ * Two fields are read and no others: `visibility`, to take exactly the subset
+ * the picker lists, and `slug`, which is the value codex accepts for `--model`.
+ * A cache entry also carries `display_name`, `description`, `availability_nux`
+ * and `model_messages` — vendor- and model-authored prose — and #195 settled
+ * that catalog validation consumes identifiers only, so none of it is read,
+ * stored or advertised. The slug is copied into both fields, which is also
+ * exactly what `normalizeModelEntries` reduces a Codex entry to.
+ *
+ * `client_version` is read as well, but only as an identifier to compare
+ * against the installed CLI - never as a claim about what the models are.
+ *
+ * Returns null when the content is not a cache document at all.
+ */
+export function extractCodexModelsFromCacheJson(
+  content: string
+): { fetchedAt?: string; clientVersion?: string; entries: ModelEntry[] } | null {
+  let doc: unknown;
+  try {
+    doc = JSON.parse(content);
+  } catch {
+    return null;
+  }
+  if (typeof doc !== "object" || doc === null) return null;
+  const models = (doc as { models?: unknown }).models;
+  if (!Array.isArray(models)) return null;
+  const rawFetchedAt = (doc as { fetched_at?: unknown }).fetched_at;
+  const fetchedAt = typeof rawFetchedAt === "string" ? rawFetchedAt : undefined;
+  const rawClientVersion = (doc as { client_version?: unknown }).client_version;
+  const clientVersion = typeof rawClientVersion === "string" ? rawClientVersion : undefined;
+
+  const seen = new Set<string>();
+  const entries: ModelEntry[] = [];
+  for (const model of models) {
+    if (typeof model !== "object" || model === null) continue;
+    const { slug, visibility } = model as { slug?: unknown; visibility?: unknown };
+    if (visibility !== CODEX_LISTED_VISIBILITY) continue;
+    if (typeof slug !== "string") continue;
+    const identifier = slug.trim();
+    if (!identifier || seen.has(identifier)) continue;
+    seen.add(identifier);
+    entries.push({ displayLabel: identifier, identifier, passable: true });
+  }
+  return { fetchedAt, clientVersion, entries };
+}
+
+/** Resolves the host Codex models cache path, honouring `CODEX_HOME` as codex does. */
+export function getHostCodexModelsCachePath(): string {
+  return join(process.env.CODEX_HOME || join(homedir(), ".codex"), "models_cache.json");
+}
+
+/**
+ * Read, attribute and age-check the host Codex models cache. Every failure is a
+ * named status with a bounded reason so the caller can say which stage gave up;
+ * the reason never carries a filesystem path, since it ends up in
+ * operator-facing logs and issue reports.
+ *
+ * `installedClientVersion` is what the codex on this host reports now, or null
+ * when that could not be determined. Age alone does not establish that a cache
+ * describes the models the installed binary offers: an upgrade replaces the
+ * binary without touching the file, and cache-first refreshing is precisely the
+ * path that would not start the new binary to find out. Passing it is how the
+ * caller says which codex the answer has to belong to. Omitting it entirely
+ * (`undefined`) checks age only, which is for callers reading a file whose
+ * provenance is already known - a fixture, or a cache being inspected rather
+ * than trusted.
+ */
+export function readCodexModelsCache(opts?: {
+  cachePath?: string;
+  now?: number;
+  maxAgeMs?: number;
+  installedClientVersion?: string | null;
+}): CodexModelsCacheRead {
+  const path = opts?.cachePath ?? getHostCodexModelsCachePath();
+  if (!existsSync(path)) {
+    return { status: "absent", entries: [], reason: "codex models cache file is absent" };
+  }
+  let content: string;
+  try {
+    content = readFileSync(path, "utf8");
+  } catch (err) {
+    // The code, never the message: Node spells a filesystem failure
+    // `EACCES: permission denied, open '/home/<someone>/.codex/models_cache.json'`,
+    // and this reason is written into operator-facing logs and pasted into issue
+    // reports. The code is the actionable half and carries no path; it is
+    // pattern-checked rather than trusted, so only a real errno-shaped token
+    // can reach the message.
+    const rawCode = (err as { code?: unknown } | null)?.code;
+    const code =
+      typeof rawCode === "string" && /^[A-Z][A-Z0-9_]{1,31}$/.test(rawCode) ? rawCode : undefined;
+    return {
+      status: "unreadable",
+      entries: [],
+      reason: code
+        ? `codex models cache could not be read (${code})`
+        : "codex models cache could not be read",
+    };
+  }
+
+  const parsed = extractCodexModelsFromCacheJson(content);
+  if (!parsed) {
+    return {
+      status: "malformed",
+      entries: [],
+      reason: "codex models cache is not a JSON document with a models array",
+    };
+  }
+  const fetchedAtMs = parsed.fetchedAt ? Date.parse(parsed.fetchedAt) : Number.NaN;
+  if (Number.isNaN(fetchedAtMs)) {
+    return {
+      status: "malformed",
+      entries: [],
+      reason: "codex models cache has no parseable fetched_at timestamp",
+    };
+  }
+  // From here down the timestamp is the parsed instant re-rendered, never the
+  // string the file carried. `Date.parse` accepts trailing parenthesised text -
+  // `Tue Sep 05 2026 00:00:00 GMT+0000 (<anything>)` parses - so echoing the raw
+  // field would let a corrupt cache put arbitrary bytes into an operator log and
+  // into the stored scrape record.
+  const fetchedAt = new Date(fetchedAtMs).toISOString();
+  // Attribution before freshness: a cache written by a codex that is no longer
+  // installed describes that codex's models, however recently it was written.
+  // Upgrades are exactly when the catalog changes, and are the one moment
+  // cache-first would otherwise keep serving the previous binary's list until
+  // it aged out. Declining sends this refresh to the TUI, which starts the
+  // installed binary - and starting it is what rewrites the file, so the next
+  // refresh is cheap again.
+  if (opts?.installedClientVersion !== undefined) {
+    const installed = opts.installedClientVersion;
+    if (installed === null) {
+      return {
+        status: "client-mismatch",
+        entries: [],
+        fetchedAt,
+        reason:
+          "the installed codex client version could not be read, so the cache could not be attributed to it",
+      };
+    }
+    if (parsed.clientVersion !== installed) {
+      // Neither version is named. `installed` is a semver token this process
+      // read from `codex --version`, but `client_version` is whatever the file
+      // says - any length, any bytes, a path - and this reason is written into
+      // operator logs and pasted into issue reports. That the cache belongs to
+      // another build is the whole actionable fact; `codex --version` and the
+      // file itself are where the two versions live.
+      return {
+        status: "client-mismatch",
+        entries: [],
+        fetchedAt,
+        reason: parsed.clientVersion
+          ? "codex models cache was written by a different codex client version than the one installed"
+          : "codex models cache does not state which codex client version wrote it",
+      };
+    }
+  }
+
+  const maxAgeMs = opts?.maxAgeMs ?? CODEX_MODELS_CACHE_MAX_AGE_MS;
+  const ageMs = (opts?.now ?? Date.now()) - fetchedAtMs;
+  if (ageMs > maxAgeMs) {
+    return {
+      status: "stale",
+      entries: [],
+      fetchedAt,
+      reason: `codex models cache is stale (fetched at ${fetchedAt}, max age ${maxAgeMs}ms)`,
+    };
+  }
+  // A negative age is not freshness. Without this, a stamp a year ahead - a
+  // clock jump, a corrupt write - reads as "aged -365 days" and holds the
+  // catalog trusted until wall time catches up to it.
+  if (ageMs < -CODEX_MODELS_CACHE_MAX_FUTURE_SKEW_MS) {
+    return {
+      status: "stale",
+      entries: [],
+      fetchedAt,
+      reason: `codex models cache is stamped in the future (fetched at ${fetchedAt}, max skew ${CODEX_MODELS_CACHE_MAX_FUTURE_SKEW_MS}ms)`,
+    };
+  }
+  if (parsed.entries.length === 0) {
+    return {
+      status: "empty",
+      entries: [],
+      fetchedAt,
+      reason: `codex models cache lists no models with visibility "${CODEX_LISTED_VISIBILITY}"`,
+    };
+  }
+  return { status: "usable", entries: parsed.entries, fetchedAt };
+}
+
+/**
+ * Ingests the Codex CLI's own models cache as the catalog source:
+ * 1. Reads and age-checks `models_cache.json`
+ * 2. Projects the listed entries down to identifiers
+ * 3. Persists the projection to model_scrapes
+ * 4. Populates the in-memory catalog for "codex"
+ *
+ * The persisted raw output is that identifier projection rather than the file
+ * itself. The file is a quarter-megabyte of model-authored prose per refresh,
+ * none of which the catalog is allowed to consume, so storing it verbatim would
+ * be paying to keep the exact material #195 put outside the trust boundary.
+ */
+export function ingestCodexHostModels(opts?: {
+  cachePath?: string;
+  scrapeStore?: ModelScrapeStore;
+  now?: number;
+  maxAgeMs?: number;
+  installedClientVersion?: string | null;
+}): CodexModelsCacheRead {
+  const read = readCodexModelsCache(opts);
+  if (read.status !== "usable") return read;
+
+  const scrapedAt = new Date().toISOString();
+  try {
+    const id = opts?.scrapeStore?.recordRaw({
+      provider: "codex",
+      scrapedAt,
+      rawOutput: JSON.stringify(
+        {
+          source: "codex-models-cache",
+          fetchedAt: read.fetchedAt,
+          listedIdentifiers: read.entries.map((entry) => entry.identifier),
+        },
+        null,
+        2
+      ),
+    });
+    if (id && opts?.scrapeStore) {
+      opts.scrapeStore.recordParsed(id, read.entries);
+    }
+  } catch (err) {
+    console.warn(
+      `[model-catalog] failed to persist codex models cache scrape: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  setProviderModelCatalog("codex", read.entries);
+  return read;
+}
