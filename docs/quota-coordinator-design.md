@@ -1111,6 +1111,10 @@ sequenceDiagram
     Note over C,D: hold L1 is live on this lane
     D-->>C: ticket T2 enqueued
     C-->>B: queued(T2, position=1)
+    Note over A: deadline = monotonic(send of r1) + 120s - spawnMarginMs
+    A->>C: reserveLaunch(r1) mandatory pre-spawn check, same requestId
+    C-->>A: granted(L1, remaining 118s) same lease, remaining TTL
+    Note over A: expired or invalidated, or no answer, means do not spawn (5.5)
     A->>A: spawn provider (takes 4s)
     A->>C: confirmLaunch(L1)
     Note over C,D: last_started_at = now; next_available_at = now + 600s; hold released
@@ -1121,7 +1125,11 @@ sequenceDiagram
     B->>C: reserveLaunch(requestId=r2)
     C->>D: BEGIN IMMEDIATE (r2)
     D-->>C: lease L2 granted
-    C-->>B: granted(L2)
+    C-->>B: granted(L2, leaseTtlMs=120000)
+    B->>C: reserveLaunch(r2) mandatory pre-spawn check, same requestId
+    C-->>B: granted(L2, remaining 119s) never a second lease
+    Note over B: expired or invalidated, or no answer, means do not spawn (5.5)
+    B->>B: spawn provider
     B->>C: confirmLaunch(L2)
     Note over C: B's real start is >= 600s after A's real start
 ```
@@ -1130,6 +1138,19 @@ sequenceDiagram
 sides, so the gap between two real provider starts is at least `interval_ms`.
 The spawn latency between grant and confirm sits inside the interval rather than
 being spent from it.
+
+Both grant paths run the same three steps in the same order — deadline test,
+mandatory same-`requestId` `reserveLaunch` (§5.5), then `spawn` — because this
+is the sequence an implementer copies, and a happy path that skipped the check
+would teach the contract wrongly. Note what the retry returns on each side: the
+*same* lease with its **remaining** TTL, never a fresh one and never a second
+lease, which is why the check cannot be used to extend a hold. The deadline each
+client tests against is still the one anchored at the send of its original
+reservation. The terminal answers are drawn here as a note rather than a branch
+because this is the happy path. All three terminal outcomes mean *do not
+spawn*, and each is carried somewhere it can be checked: they are specified in
+§5.5, the no-answer case is sequenced in §6.4 and §6.5, and criteria 5, 14 and
+15 assert the `expired`, `invalidated` and refused answers respectively.
 
 ### 6.2 Client crash after reservation
 
@@ -1611,7 +1632,12 @@ right foundation for 1–6.
    `next_available_at` byte-identical to its pre-grant value.
 5. **Reservation idempotency.** Two `reserveLaunch` calls with one `requestId`
    yield one row in `quota_leases`; two `confirmLaunch` calls with one `leaseId`
-   advance the clock exactly once.
+   advance the clock exactly once. Assert the retry's *answers* as well, because
+   the pre-spawn check is built on them (§5.5): a retry into a live lease returns
+   that same lease with a strictly smaller **remaining** TTL and never a fresh
+   one, so the check cannot extend a hold; and a retry into a lease already
+   reaped past `expires_at` returns `status: "expired"` rather than resurrecting
+   it.
 6. **Restart preserves order.** With three waiters queued, restart the
    coordinator; grants follow the original `enqueued_at` order, and at no point
    do two rows for one lane hold `state = 'granted'` (the partial unique index
