@@ -67,6 +67,13 @@ export interface ActorOptions {
    */
   isE2eRoot?: boolean;
   /**
+   * E2E-only: the actor-mesh harness's disposable bare-remote git dir, passed
+   * through to the sandbox layer as a writable bind. Undefined in production
+   * — only the e2e actor-mesh runner sets this, for both the root actor and
+   * every sandboxed worker it spawns.
+   */
+  e2eWritableRemoteDir?: string;
+  /**
    * Optional factory to prepare and return a host directory containing the
    * Integrated Understanding snapshot to mount into the sandbox at /tmp/understanding.
    * Called per launch when sandboxed.
@@ -644,6 +651,7 @@ export class Actor {
           worktreePath: this.opts.cwd,
           isE2eRoot: this.opts.isE2eRoot,
           understandingMount,
+          e2eWritableRemoteDir: this.opts.e2eWritableRemoteDir,
         }
       : undefined;
 

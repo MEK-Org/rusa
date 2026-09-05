@@ -125,6 +125,22 @@ describe("Actor", () => {
     });
   });
 
+  it("passes e2eWritableRemoteDir through to sandbox options when the actor opts set it (e2e-only propagation)", async () => {
+    const provider = new FakeProvider();
+    const actor = makeActor(
+      { sandbox: true, e2eWritableRemoteDir: "/home/e2e-operator/.rusa-e2e/run-1/remote/repo.git" },
+      provider
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(provider.calls[0]?.sandbox).toEqual({
+      worktreePath: "/tmp/a1",
+      e2eWritableRemoteDir: "/home/e2e-operator/.rusa-e2e/run-1/remote/repo.git",
+    });
+  });
+
   it("skips provider sandbox options when disabled", async () => {
     const provider = new FakeProvider();
     const actor = makeActor({ sandbox: false }, provider);

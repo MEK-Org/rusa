@@ -1368,7 +1368,14 @@ export class ObligationRepository {
           )
           .run(status, normalizeTerminalNote(note), resolution, completedAt, id);
 
-        this.markScheduleDirty(id);
+        // A never-recurring obligation has no cron entry and can never reach
+        // `scheduled`, so it never owned an OS activation — only recurring
+        // obligations (cron, still-armed while ready/waiting, or
+        // completion_interval, owning a pending `at` job while scheduled)
+        // need the post-commit reconciliation to tear anything down.
+        if (obligation.recurrencePolicy !== null) {
+          this.markScheduleDirty(id);
+        }
       }
 
       if (obligation.parentId !== null) this.reReadyParentIfUnblocked(obligation.parentId);

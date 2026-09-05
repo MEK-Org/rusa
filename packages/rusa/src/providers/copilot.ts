@@ -41,7 +41,8 @@ export class CopilotProvider implements CodingProvider {
         "copilot",
         undefined,
         opts.sandbox.isE2eRoot,
-        opts.sandbox.understandingMount
+        opts.sandbox.understandingMount,
+        opts.sandbox.e2eWritableRemoteDir
       );
       tempPaths.push(...bwrapResult.tempPaths);
       if (opts.sandbox.understandingMount) {
