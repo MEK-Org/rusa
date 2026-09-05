@@ -211,7 +211,7 @@ export function createAgentExecMcpServer(
         model_config: modelConfigSchema
           .optional()
           .describe(
-            "Provider/model/effort choice(s) for the child, in earliest-available order. A single object pins one choice; pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review). An array declares a pool of acceptable choices, tried whichever is earliest-available first — requires context_mode 'ledger' or 'tail', since a native provider session can't move between candidates. Omit to use the standing default coder pool."
+            "Provider/model/effort choice(s) for the child, in earliest-available order. A single object pins one choice; pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review). An array declares a pool of acceptable choices, tried whichever is earliest-available first — requires context_mode 'ledger' or 'tail', since a native provider session can't move between candidates. Omit to use the standing default coder pool for a portable spawn (context_mode 'ledger' or 'tail'); a native spawn must declare a single model_config entry."
           ),
         conversation_id: z
           .string()
