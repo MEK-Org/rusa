@@ -1416,6 +1416,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       `[mesh] imported ${legacyEventSubscriptionImport.importedSubscriptions} explicit ` +
         "event subscription(s) into SQLite"
     );
+  } else if (legacyEventSubscriptionImport.backupFiles.length > 0) {
+    // A source file still present after the receipt committed is stale by
+    // construction — a failed archive rename, or one restored by hand. It is
+    // archived unread rather than replayed, and saying so is what stops an
+    // operator concluding the file they put back took effect.
+    console.log(
+      "[mesh] archived a stale event-subscriptions.json unread; SQLite is authoritative: " +
+        legacyEventSubscriptionImport.backupFiles.join(", ")
+    );
   }
   const persistentEventSubscriptions = getRepositories().eventSubscriptions;
   warnMissingConfiguredEventSubscriptionsAtBoot(
