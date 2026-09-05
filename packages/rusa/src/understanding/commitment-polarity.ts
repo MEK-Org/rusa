@@ -2,7 +2,7 @@ import { Type } from "@google/genai";
 import { extractGeminiText, getGeminiClient, withGeminiRetry } from "./gemini-utils.js";
 
 /** Cheap, fast model — this is a per-claim yes/no/unknown read, not a distillation. */
-const POLARITY_MODEL = "gemini-3.1-flash-lite";
+const POLARITY_MODEL = "gemini-3.5-flash-lite";
 
 /** Upper bound on one cited excerpt handed to the evaluator. */
 const EXCERPT_LEN = 1200;
