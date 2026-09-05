@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../link_opener.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -9,17 +10,30 @@ import 'header.dart';
 import 'obligation_card.dart';
 import 'obligation_dialogs.dart';
 
+/// Below this available width, the inbox and obligations sections stack in a
+/// single column instead of sitting side by side. Kept local rather than
+/// shared with `dashboard_body.dart`'s `kNarrowBreakpoint` — that constant
+/// reflects the whole-window master-detail reflow, while this one reflects
+/// the width actually available to this tab's content, which can differ once
+/// the actor tree panel is factored in.
+const double _kTwoColumnBreakpoint = 700;
+
 class InboxTab extends StatefulWidget {
   const InboxTab({
     super.key,
     required this.actorId,
     required this.store,
     this.onSelectView,
+    this.openLink = openInNewTab,
   });
 
   final String actorId;
   final DashboardStore store;
   final ValueChanged<DashboardView>? onSelectView;
+
+  /// Opens an inbox entry's referenced external link. Injectable so tests can
+  /// assert exactly what gets opened without touching a real browser.
+  final void Function(String url) openLink;
 
   @override
   State<InboxTab> createState() => _InboxTabState();
@@ -164,74 +178,130 @@ class _InboxTabState extends State<InboxTab> {
         );
       }
 
-      return ListView(
-        padding: const EdgeInsets.all(20),
-        children: [
-          if (readyObligations.isNotEmpty) ...[
-            _SectionTitle(
-              'Ready Obligations',
-              '${readyObligations.length} ready',
-              action: TextButton.icon(
-                onPressed: () => showCreateObligationDialog(
-                  context,
-                  widget.store,
-                  defaultOwnerId: widget.actorId,
-                  onCreated: _refresh,
-                ),
-                icon: const Icon(Icons.add, size: 14),
-                label: const Text(
-                  'New Obligation',
-                  style: TextStyle(fontSize: 11),
-                ),
-                style: TextButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 8,
-                    vertical: 4,
-                  ),
-                  minimumSize: Size.zero,
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                  foregroundColor: MeshColors.accent,
-                ),
+      final inboxSection = _inboxSection(pending, resolved);
+      final obligationsSection = _obligationsSection(
+        context,
+        readyObligations,
+        waitingObligations,
+        scheduledObligations,
+        blockerMap,
+      );
+      // Both sections present is what earns the side-by-side layout — with
+      // only one, a half-empty row would just waste the other half.
+      final sections = [
+        inboxSection,
+        obligationsSection,
+      ].whereType<Widget>().toList();
+
+      return LayoutBuilder(
+        builder: (context, constraints) {
+          if (constraints.maxWidth >= _kTwoColumnBreakpoint &&
+              inboxSection != null &&
+              obligationsSection != null) {
+            return SingleChildScrollView(
+              padding: const EdgeInsets.all(20),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(child: inboxSection),
+                  const SizedBox(width: 24),
+                  Expanded(child: obligationsSection),
+                ],
               ),
-            ),
-            _obligationsPanel(readyObligations, blockerMap, isReadyList: true),
-            const SizedBox(height: 24),
-          ],
-          if (waitingObligations.isNotEmpty) ...[
-            _SectionTitle(
-              'Waiting Obligations',
-              '${waitingObligations.length} waiting',
-            ),
-            _obligationsPanel(waitingObligations, blockerMap),
-            const SizedBox(height: 24),
-          ],
-          if (scheduledObligations.isNotEmpty) ...[
-            _SectionTitle(
-              'Scheduled',
-              '${scheduledObligations.length} scheduled',
-            ),
-            _obligationsPanel(scheduledObligations, blockerMap),
-            const SizedBox(height: 24),
-          ],
-          if (pending.isNotEmpty) ...[
-            _SectionTitle(
-              'Outstanding inbox signals',
-              '${pending.length} pending',
-            ),
-            _sectionPanel(pending),
-            const SizedBox(height: 24),
-          ],
-          if (resolved.isNotEmpty) ...[
-            _SectionTitle(
-              'Recently resolved signals',
-              'last ${resolved.length}',
-            ),
-            _sectionPanel(resolved),
-          ],
-        ],
+            );
+          }
+          return ListView(
+            padding: const EdgeInsets.all(20),
+            children: [
+              for (var i = 0; i < sections.length; i++) ...[
+                sections[i],
+                if (i < sections.length - 1) const SizedBox(height: 24),
+              ],
+            ],
+          );
+        },
       );
     },
   );
+
+  /// The inbox-signals column: outstanding then recently resolved. Null when
+  /// there is nothing to show, so the caller can decide whether a two-column
+  /// layout is worth it.
+  Widget? _inboxSection(List<dynamic> pending, List<dynamic> resolved) {
+    if (pending.isEmpty && resolved.isEmpty) return null;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (pending.isNotEmpty) ...[
+          _SectionTitle(
+            'Outstanding inbox signals',
+            '${pending.length} pending',
+          ),
+          _sectionPanel(pending),
+          if (resolved.isNotEmpty) const SizedBox(height: 24),
+        ],
+        if (resolved.isNotEmpty) ...[
+          _SectionTitle('Recently resolved signals', 'last ${resolved.length}'),
+          _sectionPanel(resolved),
+        ],
+      ],
+    );
+  }
+
+  /// The obligations column: ready, then waiting, then scheduled — the same
+  /// grouping the single-column layout used. Null when there is nothing to
+  /// show.
+  Widget? _obligationsSection(
+    BuildContext context,
+    List<ObligationDto> ready,
+    List<ObligationDto> waiting,
+    List<ObligationDto> scheduled,
+    Map<String, List<ObligationDto>> blockerMap,
+  ) {
+    if (ready.isEmpty && waiting.isEmpty && scheduled.isEmpty) return null;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (ready.isNotEmpty) ...[
+          _SectionTitle(
+            'Ready Obligations',
+            '${ready.length} ready',
+            action: TextButton.icon(
+              onPressed: () => showCreateObligationDialog(
+                context,
+                widget.store,
+                defaultOwnerId: widget.actorId,
+                onCreated: _refresh,
+              ),
+              icon: const Icon(Icons.add, size: 14),
+              label: const Text(
+                'New Obligation',
+                style: TextStyle(fontSize: 11),
+              ),
+              style: TextButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                minimumSize: Size.zero,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                foregroundColor: MeshColors.accent,
+              ),
+            ),
+          ),
+          _obligationsPanel(ready, blockerMap, isReadyList: true),
+          if (waiting.isNotEmpty || scheduled.isNotEmpty)
+            const SizedBox(height: 24),
+        ],
+        if (waiting.isNotEmpty) ...[
+          _SectionTitle('Waiting Obligations', '${waiting.length} waiting'),
+          _obligationsPanel(waiting, blockerMap),
+          if (scheduled.isNotEmpty) const SizedBox(height: 24),
+        ],
+        if (scheduled.isNotEmpty) ...[
+          _SectionTitle('Scheduled', '${scheduled.length} scheduled'),
+          _obligationsPanel(scheduled, blockerMap),
+        ],
+      ],
+    );
+  }
 
   Widget _obligationsPanel(
     List<ObligationDto> items,
@@ -499,53 +569,64 @@ class _InboxTabState extends State<InboxTab> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Row(
+            // A two-column or narrow-stacked layout can give this card much
+            // less width than the single-column page always used to — and a
+            // real GitHub `type`/`source` can run long (e.g.
+            // `pull_request_review_comment.created`,
+            // `github:owner/repo/pulls/N`). A plain `Row` can't shrink the
+            // chip when it alone is wider than what's left, which overflows;
+            // a flat `Wrap` lets the chip, source, arrival time, and dismiss
+            // each drop to their own line instead.
+            Wrap(
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 8,
+              runSpacing: 4,
               children: [
                 _InboxChip(payload['type']?.toString() ?? 'INBOX ITEM'),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    e['source']?.toString() ?? '',
-                    style: const TextStyle(
-                      color: MeshColors.accent,
-                      fontWeight: FontWeight.w600,
-                    ),
+                Text(
+                  e['source']?.toString() ?? '',
+                  style: const TextStyle(
+                    color: MeshColors.accent,
+                    fontWeight: FontWeight.w600,
                   ),
                 ),
-                if (arrivedAt != null) ...[
-                  const SizedBox(width: 8),
-                  Text(
-                    'Arrived: ${formatTs(arrivedAt.toString())}',
-                    style: const TextStyle(
-                      color: MeshColors.textMuted,
-                      fontSize: 11,
-                      fontFamily: kMonoFontFamily,
-                    ),
-                  ),
-                ],
-                // Only an outstanding entry is dismissible. A resolved one already
-                // carries someone's account of it, and the server will not let a
-                // second clear overwrite that note.
-                if (!handled) ...[
-                  const SizedBox(width: 8),
-                  TextButton.icon(
-                    onPressed: () => _dismiss(e),
-                    icon: const Icon(Icons.check_circle_outline, size: 14),
-                    label: const Text(
-                      'Dismiss',
-                      style: TextStyle(fontSize: 11),
-                    ),
-                    style: TextButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 4,
+                Wrap(
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  spacing: 8,
+                  runSpacing: 4,
+                  children: [
+                    if (arrivedAt != null)
+                      Text(
+                        'Arrived: ${formatTs(arrivedAt.toString())}',
+                        style: const TextStyle(
+                          color: MeshColors.textMuted,
+                          fontSize: 11,
+                          fontFamily: kMonoFontFamily,
+                        ),
                       ),
-                      minimumSize: Size.zero,
-                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                      foregroundColor: MeshColors.textSecondary,
-                    ),
-                  ),
-                ],
+                    // Only an outstanding entry is dismissible. A resolved
+                    // one already carries someone's account of it, and the
+                    // server will not let a second clear overwrite that note.
+                    if (!handled)
+                      TextButton.icon(
+                        onPressed: () => _dismiss(e),
+                        icon: const Icon(Icons.check_circle_outline, size: 14),
+                        label: const Text(
+                          'Dismiss',
+                          style: TextStyle(fontSize: 11),
+                        ),
+                        style: TextButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          minimumSize: Size.zero,
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                          foregroundColor: MeshColors.textSecondary,
+                        ),
+                      ),
+                  ],
+                ),
               ],
             ),
             const SizedBox(height: 9),
@@ -558,6 +639,7 @@ class _InboxTabState extends State<InboxTab> {
               ReferencePreview(
                 reference: reference,
                 lookupActorHandle: (id) => widget.store.actor(id)?.handle,
+                openLink: widget.openLink,
               )
             else
               Text(

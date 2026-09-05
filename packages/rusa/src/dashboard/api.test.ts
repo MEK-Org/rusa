@@ -1127,6 +1127,53 @@ describe("handleMeshApiRequest", () => {
     });
   });
 
+  it("GET /api/mesh/inbox resolves a GitHub-sourced entry's source into a linkable reference", async () => {
+    // Shaped like `deriveGitHubInboxNotification`'s output for an
+    // issue-comment webhook: no `messageId`, and `source` is the exact
+    // `github:<owner>/<repo>/issues/<n>` reference the event was about.
+    inbox.append([
+      {
+        id: "github-inbox-entry",
+        actorId: UUID_A,
+        source: "github:MEK-Org/rusa/issues/243",
+        payload: { type: "issue_comment.created", commentId: 1 },
+      },
+    ]);
+
+    const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
+    const entry = JSON.parse(res.body).entries[0];
+    // No issueClient/referenceCache is wired in this suite's deps, so this
+    // exercises the synchronous fallback — which still derives a real,
+    // clickable GitHub URL with no network access, because `referenceUrl` is
+    // pure. The rest of the tracker-backed content is covered by
+    // resolveReferenceSync's/referenceUrl's own unit tests.
+    expect(entry.reference).toMatchObject({
+      ref: "github:MEK-Org/rusa/issues/243",
+      scheme: "github",
+      url: "https://github.com/MEK-Org/rusa/issues/243",
+    });
+    // The raw payload is untouched — only mesh-message entries get rewritten.
+    expect(entry.payload).toEqual({ type: "issue_comment.created", commentId: 1 });
+  });
+
+  it("GET /api/mesh/inbox leaves a Google Chat space source unresolved (no per-message reference)", async () => {
+    // A chat event's `source` is the containing space (routing granularity),
+    // not the specific message — resolving it here would show the wrong
+    // entity, so this stays out of scope and keeps its raw payload.
+    inbox.append([
+      {
+        id: "gchat-inbox-entry",
+        actorId: UUID_A,
+        source: "gchat:spaces/AAAA123",
+        payload: { type: "gchat.message", messageName: "spaces/AAAA123/messages/BBBB" },
+      },
+    ]);
+
+    const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
+    const entry = JSON.parse(res.body).entries[0];
+    expect(entry.reference).toBeUndefined();
+  });
+
   describe("POST /api/mesh/actors/:id/inbox/handled", () => {
     const post = async (actorId: string, body: unknown) => {
       const { res } = await call(
