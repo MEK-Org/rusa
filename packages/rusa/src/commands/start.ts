@@ -169,6 +169,7 @@ import {
   UNDERSTANDING_READ_MCP_NAME,
 } from "../mcp/understanding-mcp.js";
 import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "../mcp/update-mcp.js";
+import { isTerminalObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { composeActorOutputSinks } from "../observability/actor-output-sink.js";
 import { DiskUsageAlert } from "../observability/disk-alert.js";
@@ -1650,6 +1651,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // here rather than at routing time hangs boot.
     obligations: {
       findLiveByExternalRef: (ref) => getRepositories().obligations.findLiveByExternalRef(ref),
+      // Retirement's fail-closed preflight (#191): every non-terminal obligation
+      // owned in the subtree is a blocker, so `scheduled` counts alongside
+      // `ready` and `waiting` — a recurrence that has not fired yet is still
+      // work somebody has to own after the actor is gone.
+      listLiveOwnedBy: (ownerId) =>
+        getRepositories()
+          .obligations.listOwned(ownerId)
+          .filter((obligation) => !isTerminalObligationStatus(obligation.status))
+          .map((obligation) => ({
+            id: obligation.id,
+            status: obligation.status,
+            title: obligation.title,
+          })),
     },
     inboxStore,
     onInboxEntriesSeen: (_actorId, entries) =>

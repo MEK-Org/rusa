@@ -4,7 +4,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it, vi } from "vitest";
 import { Actor } from "../actor/actor.js";
-import { ActorMesh } from "../actor/actor-mesh.js";
+import { ActorMesh, type MeshObligationPort } from "../actor/actor-mesh.js";
+import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import type { RunResult } from "../providers/types.js";
@@ -43,8 +44,27 @@ function heldRun(): { responder: () => Promise<Partial<RunResult>>; release: () 
 /** Let the actor's 1ms debounce fire and its run reach the provider. */
 const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 20));
 
+/** An in-memory stand-in for the `at`-backed scheduler the host supplies. */
+class FakeScheduledMessages implements ScheduledMessageScheduler {
+  readonly messages = new Map<string, ScheduledMessage>();
+  scheduleMessageDelivery(message: ScheduledMessage): void {
+    this.messages.set(message.id, message);
+  }
+  cancelMessageDelivery(id: string): void {
+    this.messages.delete(id);
+  }
+  listMessageDeliveries(): ScheduledMessage[] {
+    return [...this.messages.values()];
+  }
+}
+
 function setup(
-  opts: { childResponder?: () => Promise<Partial<RunResult>>; maxConcurrent?: number } = {}
+  opts: {
+    childResponder?: () => Promise<Partial<RunResult>>;
+    maxConcurrent?: number;
+    scheduledMessages?: ScheduledMessageScheduler;
+    obligations?: MeshObligationPort;
+  } = {}
 ) {
   const registry = new InMemoryActorRepository();
   const events: {
@@ -58,6 +78,8 @@ function setup(
   const mesh = new ActorMesh({
     actors: registry,
     maxConcurrent: opts.maxConcurrent,
+    scheduledMessages: opts.scheduledMessages,
+    obligations: opts.obligations,
     events: (e) => events.push(e),
     grantableCapabilities: new Set([
       "understanding-write",
@@ -115,6 +137,7 @@ describe("agent-execution MCP server", () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual(
       [
+        "cancel_scheduled_message",
         "delegate_event_source",
         "grant_capability",
         "introduce",
@@ -170,6 +193,7 @@ describe("agent-execution MCP server", () => {
     expect(names).not.toContain("reparent_thread");
     expect(names.sort()).toEqual(
       [
+        "cancel_scheduled_message",
         "delegate_event_source",
         "grant_capability",
         "introduce",
@@ -486,6 +510,143 @@ describe("agent-execution MCP server", () => {
 
     held.release();
     await settle();
+  });
+
+  describe("retirement blockers are cleared through the message tools (#191)", () => {
+    const DELIVER_AT = "2026-01-02T00:00:00Z";
+
+    /** Root, a child to retire, and a peer outside the retiring subtree. */
+    async function scenario() {
+      const scheduledMessages = new FakeScheduledMessages();
+      const { mesh, registry } = setup({ scheduledMessages });
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+      });
+      const peer = mesh.spawn({
+        charter: "peer",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+      });
+      scheduledMessages.scheduleMessageDelivery({
+        id: "msg-in",
+        toId: worker,
+        fromId: peer,
+        body: "still coming",
+        deliverAt: DELIVER_AT,
+      });
+      scheduledMessages.scheduleMessageDelivery({
+        id: "msg-out",
+        toId: peer,
+        fromId: worker,
+        body: "recheck the deploy",
+        deliverAt: DELIVER_AT,
+      });
+      return { mesh, registry, scheduledMessages, rootClient, worker, peer };
+    }
+
+    it("list_pending_messages names the stable id the cancel tool takes", async () => {
+      const { mesh, worker } = await scenario();
+      const workerClient = await connect(createAgentExecMcpServer(mesh, worker, "root"));
+
+      const pending = dataOf(
+        (await workerClient.callTool({
+          name: "list_pending_messages",
+          arguments: {},
+        })) as CallToolResult
+      ) as Array<{ message_id: string; sender: string; recipient: string }>;
+
+      expect(pending.map((m) => m.message_id).sort()).toEqual(["msg-in", "msg-out"]);
+    });
+
+    it("retire_thread refuses with both directions named, then succeeds once they are cancelled", async () => {
+      const { registry, scheduledMessages, rootClient, worker, peer } = await scenario();
+
+      const refused = (await rootClient.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: worker },
+      })) as CallToolResult;
+
+      expect(refused.isError).toBe(true);
+      const message = String(dataOf(refused));
+      expect(message).toContain(`msg-in [incoming] ${peer} -> ${worker}`);
+      expect(message).toContain(`msg-out [outgoing] ${worker} -> ${peer}`);
+      expect(registry.get(worker)?.status).toBe("active");
+      expect(scheduledMessages.listMessageDeliveries()).toHaveLength(2);
+
+      for (const id of ["msg-in", "msg-out"]) {
+        const cancelled = (await rootClient.callTool({
+          name: "cancel_scheduled_message",
+          arguments: { message_id: id, reason: "worker is done" },
+        })) as CallToolResult;
+        expect(cancelled.isError).toBeFalsy();
+      }
+      expect(scheduledMessages.listMessageDeliveries()).toEqual([]);
+
+      const retired = (await rootClient.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: worker },
+      })) as CallToolResult;
+      expect(retired.isError).toBeFalsy();
+      expect(registry.get(worker)?.status).toBe("retired");
+    });
+
+    it("cancel_scheduled_message refuses a caller with no claim on the message", async () => {
+      const { mesh, scheduledMessages } = await scenario();
+      const stranger = mesh.spawn({
+        charter: "stranger",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+      });
+      const strangerClient = await connect(createAgentExecMcpServer(mesh, stranger, "root"));
+
+      const refused = (await strangerClient.callTool({
+        name: "cancel_scheduled_message",
+        arguments: { message_id: "msg-in" },
+      })) as CallToolResult;
+
+      expect(refused.isError).toBe(true);
+      expect(String(dataOf(refused))).toContain("may only cancel scheduled messages");
+      expect(scheduledMessages.listMessageDeliveries()).toHaveLength(2);
+    });
+
+    it("retire_thread refuses while the subtree owns a live obligation", async () => {
+      const scheduledMessages = new FakeScheduledMessages();
+      const owned = new Map<string, Array<{ id: string; status: string; title: string | null }>>();
+      const { mesh, registry } = setup({
+        scheduledMessages,
+        obligations: {
+          findLiveByExternalRef: () => null,
+          listLiveOwnedBy: (ownerId) => owned.get(ownerId) ?? [],
+        },
+      });
+      const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+      });
+      owned.set(worker, [{ id: "ob-7", status: "ready", title: "hand back the review" }]);
+
+      const refused = (await client.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: worker },
+      })) as CallToolResult;
+
+      expect(refused.isError).toBe(true);
+      expect(String(dataOf(refused))).toContain("ob-7 [ready]");
+      expect(registry.get(worker)?.status).toBe("active");
+
+      owned.set(worker, []);
+      const retired = (await client.callTool({
+        name: "retire_thread",
+        arguments: { thread_id: worker },
+      })) as CallToolResult;
+      expect(retired.isError).toBeFalsy();
+      expect(registry.get(worker)?.status).toBe("retired");
+    });
   });
 
   it("retire_thread refuses a queued report without force, but retires with force: true ", async () => {

@@ -137,8 +137,13 @@ export interface ActiveRunState {
 
 export interface RetireOptions {
   /**
-   * Complete override: retire immediately even if a run in the subtree is actively running.
-   * Operator / root-control / internal teardown only.
+   * Run-guard override: retire immediately even if a run in the subtree is actively
+   * running. Operator / root-control only.
+   *
+   * Deliberately *not* an override for the undisposed-work preflight (#191). Force
+   * exists because a wedged actor must stay retirable, and a wedged run is the mesh's
+   * own problem to break; a live obligation or an undelivered message is somebody's
+   * work, and no flag turns "I could not wait for this run" into "throw that away".
    */
   force?: boolean;
   /**
@@ -146,6 +151,67 @@ export interface RetireOptions {
    * but still refuse if any thread in the subtree is actively running.
    */
   forceQueued?: boolean;
+}
+
+/** One live obligation, in the detail a retirement refusal needs to name it. */
+export interface LiveObligationSummary {
+  id: string;
+  status: string;
+  title: string | null;
+}
+
+/**
+ * The narrow slice of the obligation store the mesh reads.
+ *
+ * `listLiveOwnedBy` is what lets retirement fail closed on unfinished work; a
+ * mesh wired without it — an isolated test, an embedder built before
+ * obligations existed — still retires on the run-in-flight guard alone.
+ */
+export interface MeshObligationPort {
+  findLiveByExternalRef(ref: string): { ownerId: string } | null;
+  listLiveOwnedBy?(ownerId: string): readonly LiveObligationSummary[];
+}
+
+/** One live obligation owned inside a retiring subtree (#191). */
+export interface ObligationRetirementBlocker {
+  obligationId: string;
+  ownerId: string;
+  status: string;
+  title: string | null;
+}
+
+/**
+ * One pending scheduled message with an endpoint inside a retiring subtree
+ * (#191). `direction` is stated relative to that subtree: `incoming` = awaiting
+ * delivery to it, `outgoing` = scheduled by it, `internal` = both.
+ */
+export interface MessageRetirementBlocker {
+  messageId: string;
+  fromId: string;
+  toId: string;
+  deliverAt: string;
+  direction: "incoming" | "outgoing" | "internal";
+}
+
+/** Everything a subtree must dispose of before it can retire — see {@link ActorMesh.retirementBlockers}. */
+export interface RetirementBlockers {
+  obligations: ObligationRetirementBlocker[];
+  messages: MessageRetirementBlocker[];
+}
+
+/**
+ * Retirement refused because the subtree still holds work someone has to decide
+ * about. Carries the blockers structurally as well as in the message, so a
+ * caller that wants to act on them doesn't have to parse prose back out.
+ */
+export class RetirementBlockedError extends Error {
+  constructor(
+    readonly blockers: RetirementBlockers,
+    message: string
+  ) {
+    super(message);
+    this.name = "RetirementBlockedError";
+  }
 }
 
 /** Human-readable subject line for a retire refusal — see {@link ActorMesh.retire}. */
@@ -184,6 +250,71 @@ function describeActiveRuns(target: string, busy: readonly ActiveRunState[]): st
       : `a thread in its subtree has a run in flight — ${named}`;
   }
   return `${busy.length} threads in its subtree have runs in flight — ${named}`;
+}
+
+/** How many blockers of each kind a refusal spells out before summarising the rest. */
+const LISTED_RETIREMENT_BLOCKERS = 10;
+
+function listWithOverflow<T>(items: readonly T[], render: (item: T) => string): string[] {
+  const lines = items.slice(0, LISTED_RETIREMENT_BLOCKERS).map(render);
+  if (items.length > LISTED_RETIREMENT_BLOCKERS) {
+    lines.push(`  …and ${items.length - LISTED_RETIREMENT_BLOCKERS} more`);
+  }
+  return lines;
+}
+
+/**
+ * The retirement refusal an actor actually reads. Every blocker is named by a
+ * stable id and paired with the operation that clears it, because the whole
+ * point of refusing is that the caller can then resolve each one and retry —
+ * a refusal that only says "there is pending work" leaves them nothing to do.
+ */
+function describeRetirementBlockers(target: string, blockers: RetirementBlockers): string {
+  const lines: string[] = [];
+  if (blockers.obligations.length > 0) {
+    lines.push(
+      `${blockers.obligations.length} live obligation(s) owned in its subtree — reassign or finish each:`
+    );
+    lines.push(
+      ...listWithOverflow(
+        blockers.obligations,
+        (o) =>
+          `  ${o.obligationId} [${o.status}] owned by ${o.ownerId}${o.title ? ` — ${o.title}` : ""}`
+      )
+    );
+  }
+  if (blockers.messages.length > 0) {
+    lines.push(
+      `${blockers.messages.length} pending scheduled message(s) touching its subtree — ` +
+        "cancel each with cancel_scheduled_message, re-sending any that still matter:"
+    );
+    lines.push(
+      ...listWithOverflow(
+        blockers.messages,
+        (m) => `  ${m.messageId} [${m.direction}] ${m.fromId} -> ${m.toId} at ${m.deliverAt}`
+      )
+    );
+  }
+  return [
+    `cannot retire ${target}: its subtree still holds work that needs an explicit decision.`,
+    ...lines,
+    "Nothing was retired. Resolve every blocker above, then retire again.",
+  ].join("\n");
+}
+
+/**
+ * Principals that act with operator authority rather than as a thread in the
+ * ownership tree: the root LLM's control surface, a human, and the e2e
+ * controller. Their scope is enforced by the surface that mints them, not by
+ * ancestry, since none of them is a node in the tree to begin with.
+ */
+function isTrustedControlPrincipal(by: string): boolean {
+  return (
+    by === "root-llm" ||
+    by === "human:operator" ||
+    by.startsWith("human:") ||
+    by === "e2e-controller"
+  );
 }
 
 export interface MechanicalInboxForensics {
@@ -457,7 +588,7 @@ export interface ActorMeshOptions {
    * it, routing falls back entirely to subscriptions, which is what every mesh
    * built before obligations existed does.
    */
-  obligations?: { findLiveByExternalRef(ref: string): { ownerId: string } | null };
+  obligations?: MeshObligationPort;
   /** Durable actor inbox used for singleton wake recovery. Optional for isolated tests. */
   inboxStore?: InboxStore;
   /** General lifecycle hook matching onYield. */
@@ -543,9 +674,7 @@ export class ActorMesh {
   }) => string;
   private readonly grants: CapabilityGrantStore;
   private readonly eventSubscriptions: EventSubscriptionStore;
-  private readonly obligations?: {
-    findLiveByExternalRef(ref: string): { ownerId: string } | null;
-  };
+  private readonly obligations?: MeshObligationPort;
   private readonly inboxStore?: InboxStore;
   private readonly onQueued?: ActorMeshOptions["onQueued"];
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
@@ -2211,15 +2340,26 @@ export class ActorMesh {
    * were then reported as a comparison. Deferring the destructive cleanups (which the
    * mesh already does) makes that loss quieter, not smaller.
    *
-   * `force` exists for the operator's lever and for the mesh's own internal teardown —
-   * a wedged actor must stay retirable, and the subtree cascade must not re-check a
-   * subtree the entry call already cleared.
+   * `force` exists for the operator's lever — a wedged actor must stay retirable.
    *
    * `forceQueued` cancels queued runs in the subtree before retirement, but still refuses
    * if any thread in the subtree is actively running (inside the provider call). This is
-   * exposed to actors via the `retire_thread` MCP tool with `force: true` (an issue).
+   * the flag the `retire_thread` MCP tool passes, so an actor's `force: true` overrides
+   * only the *queued*-run refusal.
+   *
+   * **Also refuses while the subtree still holds undisposed work** — a live
+   * obligation, or a scheduled message in either direction (#191). That refusal
+   * names every blocker so the retirer can reassign, finish, or cancel each one
+   * and retry; nothing is dropped mechanically as a fallback, because a dropped
+   * delivery is a decision nobody made. **No flag passes it**, `force` included:
+   * the two refusals answer different questions, and overriding "someone is still
+   * working" was never a licence to destroy the work itself. The subtree cascade
+   * skips it by going through {@link retireUnchecked} instead — the entry call
+   * already cleared the whole subtree, and re-asking mid-teardown would only
+   * re-answer the same question against a tree that is already coming apart.
    *
    * @throws when the subtree has running runs (or queued runs without `force`/`forceQueued`).
+   * @throws {RetirementBlockedError} when the subtree holds live obligations or pending messages.
    */
   retire(id: string, opts: RetireOptions = {}): void {
     id = this.resolveThreadId(id);
@@ -2244,6 +2384,19 @@ export class ActorMesh {
         }
       }
     }
+    // Outside the `force` branch on purpose: see the doc comment above.
+    const blockers = this.retirementBlockers(id);
+    if (blockers.obligations.length > 0 || blockers.messages.length > 0) {
+      throw new RetirementBlockedError(blockers, describeRetirementBlockers(id, blockers));
+    }
+    this.retireUnchecked(id);
+  }
+
+  /**
+   * Tear down one thread with both retirement guards already answered — the
+   * subtree cascade's entry point, and never reachable from outside the mesh.
+   */
+  private retireUnchecked(id: string): void {
     // Marked before the child recursion: children retiring below us must be able
     // to see that we are on our way out, since the repository won't say so until
     // this call finishes. Cleared in the finally so a throwing cleanup can't
@@ -2277,12 +2430,7 @@ export class ActorMesh {
     // `root-llm` is a RootControlPrincipal, not a thread id. RootControlService
     // scopes its target to the injected rootId's subtree before calling here;
     // human/e2e principals are operator-level bypasses by design.
-    const isTrustedPrincipal =
-      by === "root-llm" ||
-      by === "human:operator" ||
-      by.startsWith("human:") ||
-      by === "e2e-controller";
-    if (!isTrustedPrincipal && !this.isAncestorOf(by, targetId)) {
+    if (!isTrustedControlPrincipal(by) && !this.isAncestorOf(by, targetId)) {
       throw new Error(
         `actor ${by} may only interrupt its descendants (cannot interrupt ${targetId})`
       );
@@ -2422,29 +2570,155 @@ export class ActorMesh {
   }
 
   /**
-   * Every thread at or below `id` with a run in flight — the retire guard's input, and
-   * what {@link listChildRunStates} reports.
+   * Every thread at or below `id`, the scope each whole-subtree retirement check
+   * shares. Whole-subtree because retire is whole-subtree: checking only the named
+   * thread would still let a retire two levels up tear down a busy grandchild, or
+   * one still holding a live obligation. The visited set is defensive insurance
+   * against a pre-corrupted cyclic tree, matching {@link reparentThread}'s cycle guard.
    *
-   * Whole-subtree because retire is whole-subtree: refusing only on the named thread
-   * would still let a retire two levels up tear down a busy grandchild. The visited set
-   * is defensive insurance against a pre-corrupted cyclic tree, matching
-   * {@link reparentThread}'s cycle guard.
+   * `includeRetired` chooses which question is being asked. A retired thread can
+   * never have a run in flight, so the run guard stops at active children. Work
+   * outlives its owner, though: a subtree retired before #191 landed can still hold
+   * live obligations and scheduled messages under a `retired` record, and skipping
+   * those rows would let an ancestor retire over exactly the orphans this preflight
+   * exists to catch.
    */
-  activeRunsInSubtree(id: string): ActiveRunState[] {
-    id = this.resolveThreadId(id);
-    const busy: ActiveRunState[] = [];
+  private subtreeActorIds(id: string, opts: { includeRetired?: boolean } = {}): string[] {
+    const ids: string[] = [];
     const seen = new Set<string>();
     const walk = (cursor: string): void => {
       if (seen.has(cursor)) return;
       seen.add(cursor);
-      const state = this.activeRunState(cursor);
-      if (state) busy.push(state);
+      ids.push(cursor);
       for (const child of this.actors.children(cursor)) {
-        if (child.status === "active") walk(child.id);
+        if (opts.includeRetired || child.status === "active") walk(child.id);
       }
     };
     walk(id);
+    return ids;
+  }
+
+  /**
+   * Every thread at or below `id` with a run in flight — the retire guard's input, and
+   * what {@link listChildRunStates} reports.
+   */
+  activeRunsInSubtree(id: string): ActiveRunState[] {
+    id = this.resolveThreadId(id);
+    const busy: ActiveRunState[] = [];
+    for (const actorId of this.subtreeActorIds(id)) {
+      const state = this.activeRunState(actorId);
+      if (state) busy.push(state);
+    }
     return busy;
+  }
+
+  /**
+   * Everything in `id`'s subtree that needs an explicit decision before it can
+   * retire: live obligations owned anywhere in it, and pending scheduled
+   * messages with either endpoint in it.
+   *
+   * Both message directions block by decision (#191). Inbound alone is the
+   * narrower rule, but it leaves a retired actor able to speak later with no
+   * live sender to answer for what it said or to handle a failed delivery. The
+   * alternative — letting the retirer name outgoing sends to preserve — is
+   * machinery for a case nobody has hit yet; if rescheduling a handoff turns out
+   * to be routine, that is the evidence for building it.
+   *
+   * The walk covers retired descendants as well as active ones. Ownership is a
+   * property of the work, not of whether its owner is still running, so an
+   * obligation or a send left behind by an already-retired child is still this
+   * subtree's to answer for — and answering for it is the whole point.
+   *
+   * Read-only, and safe to call before deciding to retire: the same list the
+   * refusal would print.
+   */
+  retirementBlockers(id: string): RetirementBlockers {
+    id = this.resolveThreadId(id);
+    const subtree = new Set(this.subtreeActorIds(id, { includeRetired: true }));
+    const obligations: ObligationRetirementBlocker[] = [];
+    for (const ownerId of subtree) {
+      for (const obligation of this.obligations?.listLiveOwnedBy?.(ownerId) ?? []) {
+        obligations.push({
+          obligationId: obligation.id,
+          ownerId,
+          status: obligation.status,
+          title: obligation.title,
+        });
+      }
+    }
+    const messages: MessageRetirementBlocker[] = [];
+    for (const message of this.scheduledMessages?.listMessageDeliveries() ?? []) {
+      const incoming = subtree.has(message.toId);
+      const outgoing = subtree.has(message.fromId);
+      if (!incoming && !outgoing) continue;
+      messages.push({
+        messageId: message.id,
+        fromId: message.fromId,
+        toId: message.toId,
+        deliverAt: message.deliverAt,
+        direction: incoming && outgoing ? "internal" : incoming ? "incoming" : "outgoing",
+      });
+    }
+    return { obligations, messages };
+  }
+
+  /**
+   * Cancel one pending scheduled message on the authority of an actor entitled
+   * to decide its fate: either endpoint, an ancestor of either (the same
+   * boundary retirement uses), or a trusted operator principal.
+   *
+   * The disposition half of the fail-closed retirement boundary (#191).
+   * Retirement refuses while a scheduled message touches the subtree; the
+   * retirer cancels what no longer matters and re-sends what does, and the
+   * `scheduled_message_cancelled` event records who decided — so a message that
+   * never arrives has a decider's name on it rather than a teardown's.
+   */
+  cancelScheduledMessage(
+    messageId: string,
+    by: string,
+    reason?: string
+  ): { messageId: string; fromId: string; toId: string; deliverAt: string } {
+    by = this.resolveThreadId(by);
+    const message = this.scheduledMessages
+      ?.listMessageDeliveries()
+      .find((entry) => entry.id === messageId);
+    if (!message) {
+      throw new Error(
+        `unknown pending message id: ${messageId} — it may have already been delivered or cancelled`
+      );
+    }
+    const authorized =
+      isTrustedControlPrincipal(by) ||
+      this.isAncestorOf(by, message.fromId) ||
+      this.isAncestorOf(by, message.toId);
+    if (!authorized) {
+      throw new Error(
+        `actor ${by} may only cancel scheduled messages it sent or receives, or that involve one of its descendants (cannot cancel ${messageId})`
+      );
+    }
+    this.scheduledMessages?.cancelMessageDelivery(messageId);
+    this.recordEvent({
+      kind: "scheduled_message_cancelled",
+      actorId: by,
+      detail: messageId,
+      payload: JSON.stringify({
+        messageId,
+        fromId: message.fromId,
+        toId: message.toId,
+        deliverAt: message.deliverAt,
+        cancelledBy: by,
+        ...(reason ? { reason } : {}),
+      }),
+    });
+    this.log(
+      `scheduled message ${messageId} (${message.fromId} -> ${message.toId} at ${message.deliverAt}) cancelled by ${by}`
+    );
+    return {
+      messageId,
+      fromId: message.fromId,
+      toId: message.toId,
+      deliverAt: message.deliverAt,
+    };
   }
 
   /**
@@ -2466,20 +2740,19 @@ export class ActorMesh {
 
   private retireInner(id: string): void {
     for (const child of this.actors.children(id)) {
-      // `force`: the entry call already cleared this whole subtree, and re-checking
-      // here would only re-answer the same question against a tree we're mid-teardown of.
-      if (child.status === "active") this.retire(child.id, { force: true });
+      if (child.status === "active") this.retireUnchecked(child.id);
     }
     const actor = this.live.get(id);
     actor?.close();
     this.live.delete(id);
     const record = this.actors.get(id);
-    for (const message of this.scheduledMessages
-      ?.listMessageDeliveries()
-      .filter((entry) => entry.toId === id) ?? []) {
-      this.notifyScheduledDeliveryDropped(id, message);
-      this.scheduledMessages?.cancelMessageDelivery(message.id);
-    }
+    // No mechanical drop of this thread's pending deliveries here (#191). Every
+    // entry into retirement now preflights the whole subtree for scheduled
+    // messages in either direction, so reaching teardown means someone already
+    // decided each one by name through `cancelScheduledMessage` — which is also
+    // the only place the `scheduled_message_cancelled` audit record is written.
+    // Dropping here would have been a second, unaudited way for a message to
+    // die, reachable only by racing a check that cannot actually be raced.
     if (record && this.onRetire) {
       try {
         this.onRetire(record);
@@ -3204,13 +3477,24 @@ export class ActorMesh {
     target.requestRun();
   }
 
-  /** Scheduled messages visible to an actor, used by the MCP projection. */
-  listPendingMessagesFor(
-    actorId: string
-  ): Array<{ recipient: string; sender: string; deliverAt: string; body: string }> {
+  /**
+   * Scheduled messages visible to an actor, used by the MCP projection.
+   *
+   * The id leads: it is the only handle on a pending message, so an actor that
+   * has to cancel one — because retirement refused until it did (#191) — can
+   * name the exact message rather than describing it.
+   */
+  listPendingMessagesFor(actorId: string): Array<{
+    messageId: string;
+    recipient: string;
+    sender: string;
+    deliverAt: string;
+    body: string;
+  }> {
     return (this.scheduledMessages?.listMessageDeliveries() ?? [])
       .filter((message) => message.fromId === actorId || message.toId === actorId)
       .map((message) => ({
+        messageId: message.id,
         recipient: message.toId,
         sender: message.fromId,
         deliverAt: message.deliverAt,

@@ -317,18 +317,57 @@ export function createAgentExecMcpServer(
     {
       title: "List pending scheduled messages",
       description:
-        "List all pending messages scheduled for future delivery where you are the sender or the recipient.",
+        "List all pending messages scheduled for future delivery where you are the sender or the recipient. " +
+        "Each carries the stable message_id you pass to cancel_scheduled_message.",
       inputSchema: {},
     },
     async () => {
       try {
         const pending = mesh.listPendingMessagesFor(selfId).map((message) => ({
+          message_id: message.messageId,
           recipient: message.recipient,
           sender: message.sender,
           deliver_at: message.deliverAt,
           body: message.body.slice(0, 100) + (message.body.length > 100 ? "..." : ""),
         }));
         return toolOk(pending);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "cancel_scheduled_message",
+    {
+      title: "Cancel a pending scheduled message",
+      description:
+        "Cancel a message scheduled for future delivery, before it is delivered. You may cancel a " +
+        "message you sent or are receiving, or one involving a descendant of yours. Retirement " +
+        "refuses while any scheduled message touches the subtree you're retiring, so this is how " +
+        "you clear those blockers — cancel each one, and send a replacement (send_message with " +
+        "deliver_at) for whatever still needs to happen. Your decision is recorded against the " +
+        "cancelled message.",
+      inputSchema: {
+        message_id: z
+          .string()
+          .describe("The stable message id from list_pending_messages or a retirement refusal."),
+        reason: z
+          .string()
+          .optional()
+          .describe("Why it no longer applies — kept with the cancellation record."),
+      },
+    },
+    async ({ message_id, reason }) => {
+      try {
+        const cancelled = mesh.cancelScheduledMessage(message_id, selfId, reason);
+        options?.onWrite?.();
+        return toolOk({
+          cancelled: cancelled.messageId,
+          sender: cancelled.fromId,
+          recipient: cancelled.toId,
+          deliver_at: cancelled.deliverAt,
+        });
       } catch (err) {
         return toolError(err);
       }
@@ -453,7 +492,11 @@ export function createAgentExecMcpServer(
         "own descendants — completion is the parent's judgment. Refused while that subtree " +
         "has a run in flight: retiring mid-run abandons the provider call and destroys that " +
         "run's work. A queued run can be cancelled and retired by passing force: true. " +
-        "Check run_state in list_threads, or just wait for the thread's yield.",
+        "Check run_state in list_threads, or just wait for the thread's yield. " +
+        "Also refused while the subtree still owns a live obligation or has a scheduled " +
+        "message pending in either direction; the refusal names each one, and nothing is " +
+        "retired until you have reassigned or finished those obligations and cancelled " +
+        "(cancel_scheduled_message) or re-sent those messages.",
       inputSchema: {
         thread_id: z.string().describe("The descendant thread to retire."),
         force: z
@@ -461,7 +504,9 @@ export function createAgentExecMcpServer(
           .optional()
           .describe(
             "Retire even if the thread or a descendant has a queued run (cancelling the queued run). " +
-              "Still refused if any thread in the subtree has an active run in flight."
+              "Still refused if any thread in the subtree has an active run in flight, and it does " +
+              "not bypass the obligation/message refusal above — that work is disposed of by name, " +
+              "never overridden by a flag."
           ),
       },
     },
