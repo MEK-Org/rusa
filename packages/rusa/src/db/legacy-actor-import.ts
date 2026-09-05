@@ -4,6 +4,7 @@ import type Database from "better-sqlite3";
 import { z } from "zod";
 import type { ActorRecord } from "../actor/actor-record.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-scheduler.js";
+import type { ProviderModelConfig } from "../providers/model-config.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import type { Repositories } from "./repositories/index.js";
 
@@ -66,37 +67,50 @@ function migrateLegacyActorModelEffort(
   record: ActorRecord,
   providerCapabilityName: (providerName: string) => string
 ): ActorRecord {
-  const provider = providerCapabilityName(record.provider ?? "");
-  if (record.status === "retired" && (record.model === null || provider !== record.provider)) {
+  const entry = record.modelConfig?.[0];
+  if (!entry) return record;
+  const provider = providerCapabilityName(entry.provider);
+  if (record.status === "retired" && provider !== entry.provider) {
     return record;
   }
 
-  const current = normalizeModelEffortSelection(provider, record.model, record.effort);
-  const desiredProvider = providerCapabilityName(record.desiredProvider ?? record.provider ?? "");
-  const desired = record.desiredModel
-    ? normalizeModelEffortSelection(
-        desiredProvider,
-        record.desiredModel,
-        typeof record.desiredEffort === "string" ? record.desiredEffort : undefined
-      )
-    : undefined;
-  const desiredEffort = desired
-    ? record.desiredEffort === null
-      ? null
-      : desired.effort
-    : record.desiredEffort;
+  const current = normalizeModelEffortSelection(provider, entry.model, entry.effort);
+  // desired-* is never present on a record from durableRecord() (it's
+  // process-local, deliberately not imported), so this branch is inert in
+  // practice; kept so a future caller that does carry a staged pool is
+  // normalized the same way as the live entry.
+  const desiredEntry = record.desiredModelConfig?.[0];
+  const desiredProvider = desiredEntry ? providerCapabilityName(desiredEntry.provider) : undefined;
+  const desired =
+    desiredEntry && desiredProvider
+      ? normalizeModelEffortSelection(desiredProvider, desiredEntry.model, desiredEntry.effort)
+      : undefined;
   if (
-    current.model === record.model &&
-    current.effort === record.effort &&
-    (!desired || (desired.model === record.desiredModel && desiredEffort === record.desiredEffort))
+    current.model === entry.model &&
+    current.effort === entry.effort &&
+    (!desired || (desired.model === desiredEntry?.model && desired.effort === desiredEntry?.effort))
   ) {
     return record;
   }
+  const newEntry: ProviderModelConfig = {
+    provider: entry.provider,
+    model: current.model ?? entry.model,
+    ...(current.effort !== undefined ? { effort: current.effort } : {}),
+  };
   return {
     ...record,
-    model: current.model,
-    effort: current.effort,
-    ...(desired ? { desiredModel: desired.model, desiredEffort } : {}),
+    modelConfig: [newEntry],
+    ...(desired && desiredEntry
+      ? {
+          desiredModelConfig: [
+            {
+              provider: desiredEntry.provider,
+              model: desired.model ?? desiredEntry.model,
+              ...(desired.effort !== undefined ? { effort: desired.effort } : {}),
+            },
+          ],
+        }
+      : {}),
   };
 }
 
@@ -152,14 +166,22 @@ function durableRecord(
       : legacy.context?.type === "native"
         ? ({ type: "native" } as const)
         : undefined;
+  const modelConfig: ProviderModelConfig[] | undefined =
+    legacy.provider && legacy.model
+      ? [
+          {
+            provider: legacy.provider,
+            model: legacy.model,
+            ...(legacy.effort ? { effort: legacy.effort } : {}),
+          },
+        ]
+      : undefined;
   const record: ActorRecord = {
     id: legacy.id,
     charter: legacy.charter,
     parentId: legacy.parentId,
     ...(legacy.handles ? { handles: legacy.handles } : {}),
-    ...(legacy.provider ? { provider: legacy.provider } : {}),
-    ...(legacy.model ? { model: legacy.model } : {}),
-    ...(legacy.effort ? { effort: legacy.effort } : {}),
+    ...(modelConfig ? { modelConfig } : {}),
     ...(context ? { context } : {}),
     ...(legacy.title ? { title: legacy.title } : {}),
     ...(legacy.sessionId ? { sessionId: legacy.sessionId } : {}),
@@ -184,9 +206,7 @@ function canonical(record: ActorRecord): string {
     handles: [...(record.handles ?? [])]
       .map((handle) => ({ id: handle.id, ...(handle.role ? { role: handle.role } : {}) }))
       .sort((left, right) => left.id.localeCompare(right.id)),
-    provider: record.provider ?? null,
-    model: record.model ?? null,
-    effort: record.effort ?? null,
+    modelConfig: record.modelConfig ?? null,
     sessionId: record.sessionId ?? null,
     context: record.context ?? null,
     title: record.title ?? null,

@@ -1,12 +1,11 @@
+import type { ModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
 import type { ActorHandle, ActorRecord, ContextConfig } from "./actor-record.js";
 
 export type RootControlPrincipal = "root-llm" | "human:operator" | "e2e-controller";
 
 export interface RootChildRequest {
   charter: string;
-  provider: string;
-  model: string;
-  effort?: string;
+  modelConfig: ModelConfigInput;
   context?: ContextConfig;
   conversationId?: string;
   title?: string;
@@ -16,9 +15,7 @@ export interface RootControlMesh {
   spawn(request: {
     charter: string;
     parentId: string;
-    provider: string;
-    model: string;
-    effort?: string;
+    modelConfig: ModelConfigInput;
     context?: ContextConfig;
     conversationId?: string;
     title?: string;
@@ -70,31 +67,37 @@ export class RootControlService {
   spawnChild(request: RootChildRequest, principal: RootControlPrincipal): string {
     const charter = request.charter?.trim();
     if (!charter) throw new Error("charter is required");
-    const provider = request.provider?.trim();
-    if (!provider) throw new Error("provider is required");
-    const model = request.model?.trim();
-    if (!model) throw new Error("model is required");
-    if (this.providers.length > 0 && !this.providers.includes(provider)) {
-      throw new Error(`unknown provider: ${provider}`);
+    const rawPool = Array.isArray(request.modelConfig)
+      ? request.modelConfig
+      : [request.modelConfig];
+    if (rawPool.length === 0) throw new Error("modelConfig is required");
+    if (this.providers.length > 0) {
+      for (const { provider } of rawPool) {
+        if (!this.providers.includes(provider)) {
+          throw new Error(`unknown provider: ${provider}`);
+        }
+      }
     }
-    const effort = request.effort?.trim();
-    if (request.effort !== undefined && !effort) {
-      throw new Error("effort must be a non-empty string when set");
-    }
+    // The real config-aware validation (including the required-model check,
+    // #169) happens inside mesh.spawn; this local pool is only for the
+    // provider-allowlist check above and the event-log record below, so it
+    // must not silently accept a missing model either.
+    const pool: readonly ProviderModelConfig[] = rawPool.map((entry) => {
+      const model = entry.model?.trim();
+      if (!model)
+        throw new Error(`modelConfig entry for provider "${entry.provider}" is missing a model`);
+      return { provider: entry.provider, model, effort: entry.effort };
+    });
     const id = this.options.mesh.spawn({
       charter,
       parentId: this.rootId,
-      provider,
-      model,
-      ...(effort ? { effort } : {}),
+      modelConfig: request.modelConfig,
       context: normalizeContext(request.context),
       conversationId: optionalTrimmed(request.conversationId),
       title: optionalTrimmed(request.title),
     });
     this.record(principal, "spawn_child", id, {
-      provider,
-      model,
-      ...(effort ? { effort } : {}),
+      modelConfig: pool,
       context: normalizeContext(request.context),
     });
     return id;

@@ -81,7 +81,7 @@ import {
   FilePortableContextStore,
   type PortableContextStore,
 } from "../actor/portable-context-state.js";
-import { ProviderPacer } from "../actor/provider-pacer.js";
+import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "../actor/provider-pacer.js";
 import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-throttle-status.js";
 import { resolveRootActorId } from "../actor/root-actor-id.js";
 import { RootControlService } from "../actor/root-control.js";
@@ -174,14 +174,16 @@ import { DiskUsageAlert } from "../observability/disk-alert.js";
 import { antigravityScratchDir } from "../providers/antigravity.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
+import type { RawProviderModelConfig } from "../providers/model-config.js";
+import { fillModelConfigFromCurrent, validateModelConfigPool } from "../providers/model-config.js";
 import { refreshConfiguredProviderModelCatalogs } from "../providers/model-scrape.js";
 import {
   DEFAULT_ROOT_PROVIDER,
   normalizeFallbackModel,
   providerCapabilityName,
+  providerThrottleKey,
   resolveProvider,
   resolveRootProvider,
-  validateProviderSelection,
 } from "../providers/registry.js";
 import { assertBwrapAvailable, teardownFlutterOverlay } from "../providers/sandbox.js";
 import type { McpServerSpec, RunResult } from "../providers/types.js";
@@ -333,13 +335,6 @@ function queuedReactionTarget(entry: InboxEntry): QueuedReactionTarget | null {
 
 function isQuotaThrottleProvider(value: string): value is QuotaThrottleProvider {
   return (QUOTA_THROTTLE_PROVIDERS as readonly string[]).includes(value);
-}
-
-/** Map configured provider names to the canonical quota-probe keys. */
-function providerThrottleKey(providerName: string, config: RusaConfig): string {
-  const cliCommand = config.providers[providerName]?.cliCommand;
-  const key = cliCommand ?? providerName;
-  return key === "antigravity" ? "agy" : key;
 }
 
 function configuredQuotaThrottleProviders(config: RusaConfig): QuotaThrottleProvider[] {
@@ -1512,18 +1507,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       assertSpawnContextSupported(req, {
         ledgerCompactionAvailable: portableContextApiKey !== null,
       });
-      const provider = req.provider?.trim();
-      if (!provider) throw new Error("provider is required");
-      const model = req.model?.trim();
-      if (!model) throw new Error("model is required");
-      return validateProviderSelection(config, provider, model, req.effort);
+      return validateModelConfigPool(config, req.modelConfig, {
+        portable: req.context?.type === "portable",
+      });
     },
-    validateModel: (record, newModel, newProvider, newEffort) => {
-      const effectiveProvider =
-        (newProvider?.trim() || record.provider) ??
-        config.rootActor?.provider ??
-        DEFAULT_ROOT_PROVIDER;
-      return validateProviderSelection(config, effectiveProvider, newModel, newEffort);
+    validateModel: (record, modelConfig) => {
+      const filled = fillModelConfigFromCurrent(modelConfig, record.modelConfig);
+      return validateModelConfigPool(config, filled, {
+        portable: record.context?.type === "portable",
+      });
     },
     events: meshEvents,
     recordChat: (opts) => getRepositories().meshChat.record(opts),
@@ -1556,24 +1548,69 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // sandbox honors them instead (see injectSecretsMasking in sandbox.ts).
     grantableCapabilities: new Set([...grantableServers.keys(), ...PARENT_GRANTABLE_CAPABILITIES]),
     maxConcurrent: config.mesh?.maxConcurrent,
-    providerGate: (fn, providerName, request) => {
-      const key = providerThrottleKey(providerName, config);
-      return pacerFor(key).submit(fn, {
+    providerGate: (fn, candidates, request) => {
+      const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
+        config: c,
+        lane: providerThrottleKey(c.provider, config),
+        pacer: pacerFor(providerThrottleKey(c.provider, config)),
+      }));
+      // submitPoolGate owns both selection rules: normal requests quote every
+      // healthy lane and reserve the earliest (declaration order breaking
+      // ties); responsive requests bypass pacing and take the first healthy
+      // declared candidate, and its own `promote()` re-runs that same
+      // first-healthy-declared selection rather than merely promoting
+      // whichever lane was first reserved.
+      return submitPoolGate((selected) => fn(selected), lanes, {
         responsive: request.responsive,
         threadId: request.threadId,
         enqueueNormal: request.enqueueNormal,
-        // A staged provider change may land (via applyPendingModel) while this
-        // request sits in the mesh queue behind this lane's interval/capacity.
-        // Re-checking here, right before start, means a genuinely-queued swap
-        // is caught before it launches (and charges this lane's clock) under
-        // the wrong provider — see actor.ts's gate retry loop for the other
-        // half of this contract.
+        isHalted: (c) => isProviderHalted(c.provider),
+        onSelected: request.threadId
+          ? (selection) => {
+              const provider = selection.candidate.provider;
+              const model = selection.candidate.model ?? "";
+              const effort = selection.candidate.effort;
+              request.onSelected?.({
+                provider,
+                lane: selection.lane,
+                model,
+                effort,
+                declaredIndex: selection.declaredIndex,
+                eligibleAt: selection.eligibleAt,
+                responsive: selection.responsive,
+              });
+              mesh.recordEvent({
+                kind: "run_selected",
+                actorId: request.threadId as string,
+                payload: JSON.stringify({
+                  provider,
+                  lane: selection.lane,
+                  model,
+                  effort,
+                  declaredIndex: selection.declaredIndex,
+                  eligibleAt: new Date(selection.eligibleAt).toISOString(),
+                  responsive: selection.responsive,
+                }),
+              });
+            }
+          : undefined,
+        // A staged modelConfig swap may land (via applyPendingModel) while
+        // this request sits in its reserved lane's pacer queue.
+        // Re-checking here, right before start, means a genuinely-queued
+        // swap away from this lane is caught before it launches (and
+        // charges this lane's clock) under a pool the actor no longer
+        // declares — see actor.ts's gate retry loop for the other half of
+        // this contract (#199, extended to pools). A swap that keeps this
+        // lane in the live pool is not stale: V1 does not rebalance a
+        // reserved lane mid-queue merely because another pool member might
+        // now quote earlier.
         revalidateProvider: request.threadId
-          ? () => {
+          ? (c) => {
               mesh.applyPendingModel(request.threadId as string);
-              const liveProvider = mesh.get(request.threadId as string)?.getProvider?.();
-              if (!liveProvider) return true;
-              return providerThrottleKey(liveProvider.providerName, config) === key;
+              const liveConfigs = actors.get(request.threadId as string)?.modelConfig;
+              if (!liveConfigs) return true;
+              const lane = providerThrottleKey(c.provider, config);
+              return liveConfigs.some((lc) => providerThrottleKey(lc.provider, config) === lane);
             }
           : undefined,
       });
@@ -1624,23 +1661,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     onRetire: (record) => {
       teardownActorMcp(record.id);
     },
-    onModelSet: (actorId, _newModel, record) => {
+    onModelSet: (actorId, newModelConfig) => {
       try {
-        const effectiveProvider =
-          record.provider ?? config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER;
-        const updatedProvider = resolveProvider(
-          config,
-          effectiveProvider,
-          record.model,
-          record.effort
-        );
         const liveActor = mesh.get(actorId);
-        if (liveActor && typeof liveActor.setProvider === "function") {
-          liveActor.setProvider(updatedProvider);
+        if (liveActor && typeof liveActor.setModelConfig === "function") {
+          liveActor.setModelConfig(newModelConfig);
         }
       } catch (err) {
         console.warn(
-          `[mesh] failed to update live provider for ${actorId}: ${err instanceof Error ? err.message : String(err)}`
+          `[mesh] failed to update live modelConfig for ${actorId}: ${err instanceof Error ? err.message : String(err)}`
         );
       }
     },
@@ -1657,44 +1686,49 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     createActor: (ctx) => {
       const id = ctx.record.id;
       const rec = ctx.record;
-      // Provider/tier: run on the harness+model the spawn requested (e.g. a claude
-      // worker, or a stronger model for review). Resolve before registering MCP servers
-      // so resolution failures do not leave inert endpoints. Fall back to the root provider.
-      let workerProvider = provider;
-      if (rec.provider || rec.model) {
-        try {
-          workerProvider = resolveProvider(
-            config,
-            rec.provider ?? config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER,
-            rec.model,
-            rec.effort
-          );
-        } catch (err) {
-          const reason = err instanceof Error ? err.message : String(err);
-          const requestedProvider =
-            rec.provider ?? config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER;
-          const requestedModel = rec.model;
-          const errorMsg = `worker ${id} spawn failed: requested provider "${requestedProvider}" / model "${requestedModel ?? "default"}" could not be resolved: ${reason}`;
-          console.error(`[mesh] ${errorMsg}`);
-
-          teardownActorMcp(id);
-          actors.patch(id, { status: "retired" });
-
-          mesh.recordEvent({
-            kind: "run_end",
-            actorId: id,
-            success: false,
-            detail: "spawn failed",
-            body: errorMsg,
-          });
-
-          if (rec.parentId) {
-            failureSink.sendToParent(rec.parentId, `[spawn failed] ${errorMsg}`, id);
-          } else {
-            failureSink.postToErrorChat?.(`⚠️ ${errorMsg}`);
-          }
-          throw new Error(errorMsg);
+      // Provider/tier: run on the pool the spawn declared (e.g. a claude worker, or a
+      // stronger model for review), earliest-available first. Resolve every declared
+      // candidate before registering MCP servers so a resolution failure can't leave
+      // an inert endpoint mounted. A record without a pool (legacy/adopted) falls back
+      // to the root provider.
+      const modelConfigPool: readonly RawProviderModelConfig[] = rec.modelConfig ?? [
+        {
+          provider: config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER,
+          model: config.rootActor?.model,
+          effort: config.rootActor?.effort,
+        },
+      ];
+      try {
+        for (const candidate of modelConfigPool) {
+          resolveProvider(config, candidate.provider, candidate.model, candidate.effort);
         }
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        const poolDesc = modelConfigPool
+          .map(
+            (c) => `${c.provider}${c.model ? `:${c.model}` : ""}${c.effort ? ` @ ${c.effort}` : ""}`
+          )
+          .join(", ");
+        const errorMsg = `worker ${id} spawn failed: declared modelConfig [${poolDesc}] could not be resolved: ${reason}`;
+        console.error(`[mesh] ${errorMsg}`);
+
+        teardownActorMcp(id);
+        actors.patch(id, { status: "retired" });
+
+        mesh.recordEvent({
+          kind: "run_end",
+          actorId: id,
+          success: false,
+          detail: "spawn failed",
+          body: errorMsg,
+        });
+
+        if (rec.parentId) {
+          failureSink.sendToParent(rec.parentId, `[spawn failed] ${errorMsg}`, id);
+        } else {
+          failureSink.postToErrorChat?.(`⚠️ ${errorMsg}`);
+        }
+        throw new Error(errorMsg);
       }
 
       try {
@@ -1854,11 +1888,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const sandbox = config.sandbox !== "container-boundary";
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
-        let actor: Actor;
-        actor = new Actor({
+        // Which declared candidate actually ran, for the failure-notice label —
+        // set on each onRunStart, read back on that same run's onRunEnd.
+        let lastSelected: RawProviderModelConfig = modelConfigPool[0];
+        const actor: Actor = new Actor({
           id,
           cwd,
-          provider: workerProvider,
+          modelConfig: [...modelConfigPool],
+          resolveProvider: (selected) =>
+            resolveProvider(config, selected.provider, selected.model, selected.effort),
           mcpServers: workerMcp,
           addDirs: [],
           sandbox,
@@ -1923,6 +1961,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           // the exhaustion-classified onRun failure notice below).
           gate: ctx.gate,
           beforeRun: ctx.beforeRun,
+          onQueuedRunCancelled: ctx.onQueuedRunCancelled,
           // Compatibility only: Actor enforces one corrective yield prompt
           // regardless of this legacy cap value.
           maxContinuations: WORKER_MAX_CONTINUATIONS,
@@ -1949,12 +1988,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             });
           },
           onRuntimeStateChanged: ctx.onRuntimeStateChanged,
-          onRunStart: (responsive, injectRecord) => {
-            // Apply a tuple staged while this actor was queued/idle before its
-            // own run_start is recorded (#199), so this dispatch launches on the
-            // new provider/model/effort rather than the one it was queued on.
-            mesh.applyPendingModel(id);
-            const providerName = providerThrottleKey(actor.getProvider().providerName, config);
+          onRunStart: (responsive, injectRecord, selected) => {
+            lastSelected = selected;
+            // The run actually launched: the queued reservation this
+            // describes no longer exists to cancel or report on.
+            mesh.clearSelection(id);
+            const providerName = providerThrottleKey(selected.provider, config);
             const runId = beginActorRun(id, providerName);
             mesh.recordEvent({
               kind: "run_start",
@@ -1965,8 +2004,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               body: injectRecord ? JSON.stringify(injectRecord) : undefined,
               payload: JSON.stringify({
                 provider: providerName,
-                model: actor.getProvider().model,
-                effort: actor.getProvider().effort,
+                model: selected.model,
+                effort: selected.effort,
                 responsive,
                 runId,
               }),
@@ -2018,7 +2057,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                 failureSink,
                 id,
                 result,
-                formatProviderLabel(actor.getProvider(), result.model)
+                formatProviderLabel(
+                  {
+                    providerName: lastSelected.provider,
+                    model: lastSelected.model,
+                    effort: lastSelected.effort,
+                  },
+                  result.model
+                )
               );
             }
           },
@@ -2349,13 +2395,31 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           mesh.actorRuntimeStateChanged(rootId, state)
         )
       : null;
+  // Which entry actually ran, for the failure-notice label — set on each
+  // onRunStart, read back on that same run's onRunEnd (mirrors the worker
+  // `lastSelected` pattern, since root's one entry can move too).
+  let rootLastSelected: RawProviderModelConfig = {
+    provider: provider.providerName,
+    model: provider.model,
+    effort: provider.effort,
+  };
   let root: MeshActor;
   root =
     externalRoot ??
     new Actor({
       id: rootId,
       cwd: rootAgentDir,
-      provider,
+      // Root's declared pool always has exactly one entry (it never draws
+      // from a multi-candidate pool at launch-time selection — that's a
+      // worker-only concept; `fallback` below is its own, separate degrade
+      // path), but that one entry can still be moved via `set_actor_model`
+      // (#199 amend gaps 1-2), so resolution must read the live entry rather
+      // than freeze the boot-time `resolveRootProvider` result.
+      modelConfig: [
+        { provider: provider.providerName, model: provider.model, effort: provider.effort },
+      ],
+      resolveProvider: (selected) =>
+        resolveProvider(config, selected.provider, selected.model, selected.effort),
       mcpServers: rootMcp,
       addDirs,
       sandbox: Boolean(opts?.e2e),
@@ -2398,9 +2462,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // Responsive human wakes bypass normal pacing/concurrency; background root
       // wakes use the same normal scheduling path as workers.
       beforeRun: ({ mode }): boolean => {
+        // Same dispatch-time apply as the worker beforeRun (#199, extended to
+        // pools): a pool staged while root was queued/idle must land before
+        // this run's own gate()/admission and run_start, not at the end of
+        // the run after. Root's declared pool is always fixed at one entry
+        // (see the `modelConfig` comment on root's Actor construction above).
+        mesh.applyPendingModel(rootId);
         const rootRecord = actors.get(rootId);
-        const launchProviderName =
-          rootRecord?.desiredProvider ?? rootRecord?.provider ?? rootProviderName;
+        const launchProviderName = rootRecord?.modelConfig?.[0]?.provider ?? rootProviderName;
         if (isProviderHalted(launchProviderName) || gracefulShutdown.isShuttingDown()) {
           return false;
         }
@@ -2412,7 +2481,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         }
         return inboxStore.countUnhandled(rootId) > 0;
       },
-      gate: (fn, providerName, responsive) => mesh.gateRun(fn, providerName, responsive, rootId),
+      gate: (fn, candidates, responsive) => mesh.gateRun(fn, candidates, responsive, rootId),
+      onQueuedRunCancelled: () => mesh.clearSelection(rootId),
       onContinue: (n) =>
         mesh.recordEvent({
           kind: "run_continued",
@@ -2436,17 +2506,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         });
       },
       onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
-      onRunStart: (responsive, injectRecord) => {
-        // Same dispatch-time apply as the worker onRunStart above (#199): a
-        // tuple staged while the root was queued/idle must land before this
-        // run's run_start rather than at the end of the run after.
-        mesh.applyPendingModel(rootId);
-        // Read live, not the closure `provider`: applyPendingModel above may
-        // have just called root.setProvider(...) via onModelSet, and this
-        // run must record/launch that new tuple, not the one root was built
-        // with.
-        const liveProvider = root.getProvider?.() ?? provider;
-        const providerName = providerThrottleKey(liveProvider.providerName, config);
+      onRunStart: (responsive, injectRecord, selected) => {
+        rootLastSelected = selected;
+        // The run actually launched: the queued reservation this describes
+        // no longer exists to cancel or report on.
+        mesh.clearSelection(rootId);
+        const providerName = providerThrottleKey(selected.provider, config);
         const runId = beginActorRun(rootId, providerName);
         mesh.recordEvent({
           kind: "run_start",
@@ -2457,8 +2522,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           body: injectRecord ? JSON.stringify(injectRecord) : undefined,
           payload: JSON.stringify({
             provider: providerName,
-            model: liveProvider.model,
-            effort: liveProvider.effort,
+            model: selected.model,
+            effort: selected.effort,
             responsive,
             runId,
           }),
@@ -2510,7 +2575,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             failureSink,
             rootId,
             result,
-            formatProviderLabel(provider, result.model)
+            formatProviderLabel(
+              {
+                providerName: rootLastSelected.provider,
+                model: rootLastSelected.model,
+                effort: rootLastSelected.effort,
+              },
+              result.model
+            )
           );
         }
       },
@@ -2521,9 +2593,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     charter: config.rootActor?.charter ?? DEFAULT_ROOT_CHARTER,
     parentId: null,
     isRoot: true,
-    provider: config.rootActor?.provider,
-    model: config.rootActor?.model,
-    effort: config.rootActor?.effort,
+    // Only recorded when a concrete model is actually declared — root's own
+    // scalar config may omit `model` to mean "the provider CLI's own
+    // default", which the durable modelConfig pool contract (#169) can't
+    // represent (it requires a concrete model on every entry). Omitting the
+    // field here leaves `launchProviderName`'s fallback (below) as the
+    // provider-only source of truth for a CLI-default root.
+    ...(provider.model
+      ? {
+          modelConfig: [
+            { provider: provider.providerName, model: provider.model, effort: provider.effort },
+          ],
+        }
+      : {}),
     context: config.rootActor?.context,
     sessionId:
       config.rootActor?.context?.type === "portable"

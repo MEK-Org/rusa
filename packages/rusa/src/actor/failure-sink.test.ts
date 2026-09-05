@@ -62,7 +62,6 @@ describe("routeRunFailure", () => {
         providerName: "codex",
         model: "gpt-5.6-sol",
         effort: "xhigh",
-        run: async () => ({ success: true, output: "", exitCode: 0 }),
       })
     ).toBe("codex/gpt-5.6-sol @ xhigh");
   });

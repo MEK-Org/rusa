@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
 import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../mcp/stamp.js";
-import {
-  type ModelEffortSelection,
-  normalizeModelEffortSelection,
-} from "../providers/reasoning-effort.js";
-import type { CodingProvider, RunResult } from "../providers/types.js";
+import type {
+  ModelConfigInput,
+  ProviderModelConfig,
+  RawProviderModelConfig,
+} from "../providers/model-config.js";
+import type { RunResult } from "../providers/types.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./actor-record.js";
@@ -71,8 +72,7 @@ export interface MeshActor {
   interrupt?(by?: string): { interrupted: boolean; runStartTime?: Date; wasQueued?: boolean };
   getInterruptedWatermark?(): Date | null;
   clearInterruptWatermark?(): void;
-  setProvider?(provider: CodingProvider): void;
-  getProvider?(): CodingProvider;
+  setModelConfig?(modelConfig: ProviderModelConfig[]): void;
 }
 
 export type ActorRuntimeState = "queued" | "running" | "winding_down" | "idle";
@@ -95,12 +95,11 @@ export interface SpawnRequest {
   charter: string;
   /** The spawning actor's id (becomes the child's parent + gets a handle to the child). */
   parentId: string;
-  /** Coding harness for the child (a `providers` key). Required . */
-  provider: string;
-  /** Model/tier id for the child's provider. Required . */
-  model: string;
-  /** Provider-native reasoning level. Omit to preserve the provider/model default. */
-  effort?: string;
+  /**
+   * The child's declared provider/model/effort pool — a single entry or a
+   * bounded, non-empty, portable-only-above-length-one array (design MEK-Org/rusa#169).
+   */
+  modelConfig: ModelConfigInput;
   /** Working-memory ownership and portable-context policy. Missing means native. */
   context?: ContextConfig;
   /** Peers to seed the child's address book with (introductions at birth). */
@@ -149,6 +148,32 @@ export interface RetireOptions {
 }
 
 /** Human-readable subject line for a retire refusal — see {@link ActorMesh.retire}. */
+/**
+ * Bare object-or-array normalization for embedders that skip config-aware
+ * validation (tests). Still enforces the one invariant that must never be
+ * bypassed: a missing/blank model must fail loudly rather than silently
+ * resolve to a provider default (#169).
+ */
+function normalizeModelConfigList(input: ModelConfigInput): ProviderModelConfig[] {
+  const list = Array.isArray(input) ? input : [input];
+  return list.map((entry) => {
+    const model = entry.model?.trim();
+    if (!model) {
+      throw new Error(
+        `modelConfig entry for provider "${entry.provider}" is missing a model — omitted/blank models are not allowed, since that would silently select the provider's default`
+      );
+    }
+    return { provider: entry.provider, model, effort: entry.effort };
+  });
+}
+
+/** Human-readable pool summary for the spawn/model-set event log. */
+function describeModelConfigPool(pool: readonly ProviderModelConfig[]): string {
+  return pool
+    .map((c) => `${c.provider}${c.model ? `:${c.model}` : ""}${c.effort ? ` @ ${c.effort}` : ""}`)
+    .join(", ");
+}
+
 function describeActiveRuns(target: string, busy: readonly ActiveRunState[]): string {
   const named = busy.map((r) => `${r.actorId} (${r.phase})`).join(", ");
   const self = busy.find((r) => r.actorId === target);
@@ -169,6 +194,29 @@ export interface MechanicalInboxForensics {
   status?: string;
 }
 
+/**
+ * The declared tuple a queued run has actually reserved — populated the
+ * moment a `providerGate` implementation reports it via `onSelected`, kept
+ * only while the run is queued, and read by both HALT safety
+ * ({@link ActorMesh.cancelHaltedQueuedRuns}, which must cancel on the
+ * reserved lane, not the whole declared pool) and selection telemetry/queued
+ * dashboard state. `provider` is the declared alias as configured;
+ * `lane` is the canonical pacing/account key (`providerThrottleKey`) it
+ * resolves to — deliberately kept distinct so a configured alias is never
+ * silently erased.
+ */
+export interface QueuedSelection {
+  provider: string;
+  lane: string;
+  model: string;
+  effort?: string;
+  /** Index of this candidate within the actor's declared pool, in declaration order. */
+  declaredIndex: number;
+  /** Epoch-ms quote for when this reservation becomes eligible to start. */
+  eligibleAt: number;
+  responsive: boolean;
+}
+
 /** What the mesh hands the factory to build a live {@link Actor} for a record. */
 export interface ActorFactoryContext {
   /** The record at spawn time. Use {@link getRecord} for the *current* state. */
@@ -178,10 +226,16 @@ export interface ActorFactoryContext {
   mesh: ActorMesh;
   /**
    * Wrap the provider run in the shared cross-actor concurrency gate. The
-   * actor supplies its provider; consumers that do not care can ignore it.
+   * actor supplies its declared candidate pool; the gate atomically selects
+   * (quotes/reserves) the earliest-eligible canonical provider pacing lane —
+   * declaration order breaks ties — and hands the selected tuple to `fn`.
    */
-  gate: <T>(fn: () => Promise<T>, provider: string, responsive: boolean) => RunStartHandle<T>;
-  /** Pre-run gate run before each wake; returns false (and drops the wake) when blocked. */
+  gate: <T>(
+    fn: (selected: RawProviderModelConfig) => Promise<T>,
+    candidates: readonly RawProviderModelConfig[],
+    responsive: boolean
+  ) => RunStartHandle<T>;
+  /** Lease check run before each wake; returns false (and retires) when exhausted. */
   beforeRun: (context: { mode: ActorRunMode }) => boolean;
   /** General lifecycle hook after the pre-run gate and before scheduler admission. */
   onQueued: (context: { responsive: boolean; mode: ActorRunMode }) => void;
@@ -189,6 +243,13 @@ export interface ActorFactoryContext {
   onRunEnd: (result: RunResult) => void;
   /** Forward the actor-owned runtime state to the mesh-wide sequencer. */
   onRuntimeStateChanged: (state: ActorRuntimeState) => void;
+  /**
+   * Fires when a genuinely queued (not yet started) run is cancelled —
+   * an operator HALT or an explicit interrupt — so the mesh can clear any
+   * recorded {@link QueuedSelection} for this actor. Never fires once the
+   * run has actually started; `onRunEnd` is the clearing point for that case.
+   */
+  onQueuedRunCancelled?: () => void;
 }
 
 export type ActorFactory = (ctx: ActorFactoryContext) => MeshActor;
@@ -249,15 +310,17 @@ export interface ActorMeshOptions {
   rootId?: string;
   /** Builds a live Actor for a thread record (resolves provider/cwd/mcp/session). */
   createActor: ActorFactory;
-  /** Synchronous gate run before a spawn id or durable record is created. */
-  validateSpawn?: (req: SpawnRequest) => ModelEffortSelection | undefined;
-  /** Synchronous validator before setting an actor's model in-place . */
-  validateModel?: (
-    record: ActorRecord,
-    newModel: string | undefined,
-    newProvider?: string,
-    newEffort?: string | null
-  ) => ModelEffortSelection | undefined;
+  /**
+   * Synchronous, config-aware normalization/validation gate run before a spawn
+   * id or durable record is created — bounds the pool, enforces portable-only
+   * above length one, validates each tuple, and rejects duplicates.
+   */
+  validateSpawn?: (req: SpawnRequest) => ProviderModelConfig[];
+  /**
+   * Synchronous, config-aware validator before staging an actor's
+   * `desiredModelConfig` replacement.
+   */
+  validateModel?: (record: ActorRecord, modelConfig: ModelConfigInput) => ProviderModelConfig[];
   /** Cross-actor concurrency cap for non-responsive runs (default 4). */
   maxConcurrent?: number;
   /**
@@ -265,15 +328,30 @@ export interface ActorMeshOptions {
    * {@link providerGate}; retained for embedders that do not need promotion.
    */
   rateLimit?: <T>(fn: () => Promise<T>, provider: string) => Promise<T>;
-  /** Provider pacing composed with the mesh's normal-run concurrency queue. */
+  /**
+   * Provider pacing composed with the mesh's normal-run concurrency queue.
+   * Given the actor's declared candidate pool, atomically selects (quotes and
+   * reserves) the earliest-eligible canonical provider lane — declaration
+   * order breaks ties — and invokes `fn` with the winning tuple. A responsive
+   * run bypasses pacing/concurrency and picks the first healthy declared
+   * candidate instead.
+   */
   providerGate?: <T>(
-    fn: () => Promise<T>,
-    provider: string,
+    fn: (selected: RawProviderModelConfig) => Promise<T>,
+    candidates: readonly RawProviderModelConfig[],
     opts: {
       responsive: boolean;
       /** Owning actor, retained only for scheduler observability. */
       threadId?: string;
       enqueueNormal: <R>(run: () => Promise<R>) => RunStartHandle<R>;
+      /**
+       * Report the reserved candidate — at initial reservation and again on
+       * any later reselection (e.g. a responsive promote) — so the mesh can
+       * track it for HALT safety and selection telemetry. A `providerGate`
+       * implementation that never calls this leaves the mesh without a
+       * recorded selection, which falls back to whole-pool HALT checks.
+       */
+      onSelected?: (selection: QueuedSelection) => void;
     }
   ) => RunStartHandle<T>;
   /**
@@ -350,7 +428,7 @@ export interface ActorMeshOptions {
    * Called after an actor's model is durably updated in the repository,
    * for live resource / provider updating on the active actor.
    */
-  onModelSet?: (actorId: string, newModel: string, record: ActorRecord) => void;
+  onModelSet?: (actorId: string, modelConfig: ProviderModelConfig[], record: ActorRecord) => void;
   /**
    * Per-actor durable-registration cleanup hooks run during retire. Each hook is
    * failure-isolated so one broken teardown cannot stop the rest of the cascade.
@@ -420,15 +498,15 @@ export interface ActorMeshOptions {
 export class ActorMesh {
   readonly actors: ActorRepository;
   private readonly createActor: ActorFactory;
-  private readonly validateSpawn?: (req: SpawnRequest) => ModelEffortSelection | undefined;
+  private readonly validateSpawn?: (req: SpawnRequest) => ProviderModelConfig[];
   private readonly validateModel?: (
     record: ActorRecord,
-    newModel: string | undefined,
-    newProvider?: string,
-    newEffort?: string | null
-  ) => ModelEffortSelection | undefined;
+    modelConfig: ModelConfigInput
+  ) => ProviderModelConfig[];
   private readonly limiter: ConcurrencyLimiter;
   private readonly providerGate: NonNullable<ActorMeshOptions["providerGate"]>;
+  /** Reserved-lane state for genuinely queued runs; see {@link QueuedSelection}. */
+  private readonly selections = new Map<string, QueuedSelection>();
   private readonly isHalted: (provider?: string) => boolean;
   private readonly isShuttingDown: () => boolean;
   private readonly idgen: () => string;
@@ -448,7 +526,11 @@ export class ActorMesh {
     actorId: string,
     capability: string
   ) => Promise<void> | void;
-  private readonly onModelSet?: (actorId: string, newModel: string, record: ActorRecord) => void;
+  private readonly onModelSet?: (
+    actorId: string,
+    modelConfig: ProviderModelConfig[],
+    record: ActorRecord
+  ) => void;
   private readonly retireCleanups: RetireCleanup[];
   private readonly events: MeshEventSink;
   private readonly recordChat?: (opts: {
@@ -525,15 +607,19 @@ export class ActorMesh {
     this.limiter = new ConcurrencyLimiter(opts.maxConcurrent ?? 4);
     this.providerGate =
       opts.providerGate ??
-      ((fn, provider, admissionOpts) => {
+      ((fn, candidates, admissionOpts) => {
+        // No real pacing wired (e.g. an isolated test mesh): declaration order
+        // is the whole policy, matching a fixed single-choice actor's behavior.
+        const selected = candidates[0];
+        const run = () => fn(selected);
         if (opts.rateLimit) {
           const result = opts.rateLimit(
-            () => (admissionOpts.responsive ? fn() : admissionOpts.enqueueNormal(fn).result),
-            provider
+            () => (admissionOpts.responsive ? run() : admissionOpts.enqueueNormal(run).result),
+            selected.provider
           );
           return { result, started: false, promote: () => {}, cancel: () => false };
         }
-        return admissionOpts.responsive ? immediateStart(fn) : admissionOpts.enqueueNormal(fn);
+        return admissionOpts.responsive ? immediateStart(run) : admissionOpts.enqueueNormal(run);
       });
     this.isHalted = opts.isHalted ?? (() => false);
     this.isShuttingDown = opts.isShuttingDown ?? (() => false);
@@ -1069,28 +1155,17 @@ export class ActorMesh {
   spawn(req: SpawnRequest): string {
     const charter = req.charter?.trim();
     if (!charter) throw new Error("charter is required");
-    const provider = req.provider?.trim();
-    if (!provider) throw new Error("provider is required");
-    const initialSelection = normalizeModelEffortSelection(provider, req.model, req.effort);
-    const selection =
-      this.validateSpawn?.({
-        ...req,
-        provider,
-        model: initialSelection.model ?? "",
-        effort: initialSelection.effort,
-      }) ?? initialSelection;
-    const model = selection.model?.trim();
-    if (!model) throw new Error("model is required");
-    const effort = selection.effort;
+    const modelConfig = this.validateSpawn?.(req) ?? normalizeModelConfigList(req.modelConfig);
+    if (modelConfig.length === 0) {
+      throw new Error("modelConfig must declare at least one provider/model entry");
+    }
     const id = this.idgen();
     const parentId = this.resolveThreadId(req.parentId);
     const record: ActorRecord = {
       id,
       charter,
       parentId,
-      provider,
-      model,
-      effort,
+      modelConfig,
       context: req.context,
       handles: req.handles ? [...req.handles] : undefined,
       // Seed the session so the actor's first run resumes this conversation
@@ -1131,7 +1206,7 @@ export class ActorMesh {
       kind: "actor_spawned",
       actorId: id,
       detail: charter,
-      body: `provider=${provider} model=${model}${effort ? ` effort=${effort}` : ""}`,
+      body: `modelConfig=${describeModelConfigPool(modelConfig)}`,
       // TODO: Consider extracting the human or controller principal and storing it in payload.requestedBy
       payload: JSON.stringify({ parentId }),
     });
@@ -2521,23 +2596,19 @@ export class ActorMesh {
   }
 
   /**
-   * Update an existing actor's model in-place in the actor repository.
+   * Stage a full replacement of an existing actor's declared modelConfig pool.
    * Root or parent-gated: root may set the model for any thread in its subtree;
    * root may also set its own model;
    * a non-root parent may only set the model for its own descendants (and never
    * raise its own tier).
-   * Optionally moves portable (ledger/tail) actors across providers.
-   * Takes effect at the end of the actor's current run if one is in flight;
-   * otherwise applies at the actor's next dispatch, before that run's
-   * run_start and launch.
+   * A pool of more than one entry, or a change of provider, requires a
+   * portable (ledger/tail) actor — a native provider session can't move.
+   * The replacement is atomic (the whole pool or nothing). Takes effect at the
+   * end of the actor's current run if one is in flight; otherwise applies at
+   * the actor's next dispatch, before that run's run_start and launch (see
+   * {@link applyPendingModel}).
    */
-  setActorModel(
-    id: string,
-    model: string | undefined,
-    requestedBy: string,
-    provider?: string,
-    effort?: string | null
-  ): void {
+  setActorModel(id: string, modelConfig: ModelConfigInput, requestedBy: string): void {
     id = this.resolveThreadId(id);
     requestedBy = this.resolveThreadId(requestedBy);
     const record = this.actors.get(id);
@@ -2555,52 +2626,34 @@ export class ActorMesh {
         );
       }
     }
-    const requestedModel = model?.trim();
-    if (model !== undefined && !requestedModel) {
-      throw new Error(`Cannot set an empty model on thread: ${id}`);
+    const validated =
+      this.validateModel?.(record, modelConfig) ?? normalizeModelConfigList(modelConfig);
+    if (validated.length === 0) {
+      throw new Error(`Cannot set an empty modelConfig on thread: ${id}`);
     }
-    const trimmedProvider = provider?.trim() || undefined;
-    if (model === undefined && effort === undefined && trimmedProvider === undefined) {
-      throw new Error(`Cannot set actor model: model, provider, or effort is required`);
+    const portable = record.context?.type === "portable";
+    if (validated.length > 1 && !portable) {
+      throw new Error(
+        `Cannot set a modelConfig pool of more than one entry on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail) actors can use a multi-candidate pool.`
+      );
     }
-    if (trimmedProvider !== undefined && trimmedProvider !== record.provider) {
-      if (record.context?.type !== "portable") {
-        throw new Error(
-          `Cannot change provider on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail) actors can be moved across providers.`
-        );
-      }
+    const currentProvider = record.modelConfig?.[0]?.provider;
+    if (
+      !portable &&
+      validated.length === 1 &&
+      currentProvider !== undefined &&
+      validated[0].provider !== currentProvider
+    ) {
+      throw new Error(
+        `Cannot change provider on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail) actors can be moved across providers.`
+      );
     }
-    const effectiveProvider = trimmedProvider ?? record.provider ?? "";
-    const initialSelection = normalizeModelEffortSelection(
-      effectiveProvider,
-      requestedModel,
-      effort
-    );
-    const nextModel = initialSelection.model ?? record.model;
-    const requestedEffort =
-      effort === null
-        ? null
-        : effort !== undefined || initialSelection.effort !== undefined
-          ? initialSelection.effort
-          : record.effort;
-    const selection =
-      this.validateModel?.(record, nextModel, trimmedProvider, requestedEffort) ??
-      normalizeModelEffortSelection(effectiveProvider, nextModel, requestedEffort);
-    const validatedModel = selection.model ?? nextModel;
-    const validatedEffort = selection.effort;
-    // Boundary contract: an in-flight run completes on its already-launched
-    // model, and the desired value applies at that run's end. An idle or
-    // queued actor has no launched run yet, so the desired value applies at
-    // its next dispatch, before run_start is recorded and before launch.
-    const patch: Partial<ActorRecord> = { desiredProvider: trimmedProvider };
-    if (model !== undefined) patch.desiredModel = validatedModel;
-    if (effort !== undefined || validatedEffort !== record.effort) {
-      if (effort === null) patch.desiredEffort = null;
-      else if (validatedEffort !== undefined) {
-        patch.desiredEffort = validatedEffort;
-      }
-    }
-    this.actors.patch(id, patch);
+    // Boundary contract (#199): an in-flight run completes on its
+    // already-launched pool, and the staged pool applies at that run's end.
+    // An idle or queued actor has no launched run yet, so the staged pool
+    // applies atomically at its next dispatch, before run_start is recorded
+    // and before launch (see {@link applyPendingModel}).
+    this.actors.patch(id, { desiredModelConfig: validated });
 
     if (this.inboxStore && this.live.has(id) && this.activeRunState(id) === null) {
       const unhandled = this.inboxStore.list(id, { status: "unhandled" }).entries;
@@ -2611,69 +2664,38 @@ export class ActorMesh {
   }
 
   /**
-   * Apply the pending model/provider change at whichever boundary the actor's
-   * current state puts it behind next: dispatch (queued/idle, called from the
-   * `onRunStart` wiring just before that run's `run_start` is recorded and its
-   * provider launches) or run end (mid-run, called from {@link finishInboxRun}).
+   * Apply the staged modelConfig replacement at whichever boundary the
+   * actor's current state puts it behind next: dispatch (queued/idle, called
+   * from the `onRunStart` wiring just before that run's `run_start` is
+   * recorded and its provider launches) or run end (mid-run, called from
+   * {@link finishInboxRun}).
    * Public — like {@link finishInboxRun} and {@link actorQueued} — because the
    * externally-constructed root actor wires its own `onRunStart`/`onRunEnd`
    * outside the `createActor` factory and must call this directly.
    * A no-op when nothing is staged, so calling it from both boundaries on the
-   * same run is safe: whichever fires first consumes the pending tuple.
+   * same run is safe: whichever fires first consumes the pending pool.
    */
   applyPendingModel(id: string): void {
     const record = this.actors.get(id);
-    if (
-      !record ||
-      (record.desiredModel === undefined &&
-        record.desiredProvider === undefined &&
-        record.desiredEffort === undefined)
-    )
-      return;
+    if (!record || record.desiredModelConfig === undefined) return;
 
-    const trimmedModel = record.desiredModel ?? record.model;
-    const trimmedProvider = record.desiredProvider;
-    const oldModel = record.model;
-    const oldProvider = record.provider;
-    const oldEffort = record.effort;
-    const nextEffort =
-      record.desiredEffort === null ? undefined : (record.desiredEffort ?? record.effort);
+    const oldModelConfig = record.modelConfig;
+    const newModelConfig = record.desiredModelConfig;
 
-    const patch: Partial<ActorRecord> = {
-      ...(record.desiredModel !== undefined ? { model: trimmedModel } : {}),
-      effort: nextEffort,
-      desiredModel: undefined,
-      desiredEffort: undefined,
-      desiredProvider: undefined,
-    };
-    if (trimmedProvider !== undefined) {
-      patch.provider = trimmedProvider;
-    }
-    this.actors.patch(id, patch);
+    this.actors.patch(id, { modelConfig: newModelConfig, desiredModelConfig: undefined });
 
     const verified = this.actors.get(id);
-    if (
-      verified?.model !== trimmedModel ||
-      verified?.effort !== nextEffort ||
-      (trimmedProvider !== undefined && verified?.provider !== trimmedProvider)
-    ) {
+    if (!verified) throw new Error(`Failed to reload thread after model update: ${id}`);
+    if (JSON.stringify(verified.modelConfig) !== JSON.stringify(newModelConfig)) {
       throw new Error(`Failed to verify deferred model update for thread: ${id}`);
     }
-    if (!verified) throw new Error(`Failed to reload thread after model update: ${id}`);
 
-    this.onModelSet?.(id, trimmedModel ?? "", verified);
-
-    const oldSelection = `${oldModel ?? "default"}${oldEffort ? ` @ ${oldEffort}` : ""}`;
-    const newSelection = `${trimmedModel ?? "default"}${nextEffort ? ` @ ${nextEffort}` : ""}`;
-    const detail =
-      trimmedProvider && trimmedProvider !== oldProvider
-        ? `${oldProvider ?? "default"}:${oldSelection} -> ${trimmedProvider}:${newSelection}`
-        : `${oldSelection} -> ${newSelection}`;
+    this.onModelSet?.(id, newModelConfig, verified);
 
     this.recordEvent({
       kind: "actor_model_set",
       actorId: id,
-      detail,
+      detail: `${oldModelConfig ? describeModelConfigPool(oldModelConfig) : "default"} -> ${describeModelConfigPool(newModelConfig)}`,
     });
   }
 
@@ -2820,18 +2842,38 @@ export class ActorMesh {
     return this.limiter.inFlight;
   }
 
-  /** Schedule a run through provider pacing and the normal-only mesh queue. */
+  /**
+   * Schedule a run through provider pacing and the normal-only mesh queue.
+   * Given the actor's declared candidate pool, atomically selects the
+   * earliest-eligible canonical provider lane (declaration order breaks
+   * ties) and invokes `fn` with the winning tuple.
+   */
   gateRun<T>(
-    fn: () => Promise<T>,
-    provider: string,
+    fn: (selected: RawProviderModelConfig) => Promise<T>,
+    candidates: readonly RawProviderModelConfig[],
     responsive = false,
     threadId?: string
   ): RunStartHandle<T> {
-    return this.providerGate(fn, provider, {
+    return this.providerGate(fn, candidates, {
       responsive,
       threadId,
       enqueueNormal: (run) => this.limiter.enqueue(run),
+      onSelected: threadId ? (selection) => this.selections.set(threadId, selection) : undefined,
     });
+  }
+
+  /**
+   * Read-only snapshot of the declared tuple a queued run has actually
+   * reserved, for MCP/dashboard exposure. `undefined` once the run starts,
+   * is cancelled, or ends — never a stale reservation.
+   */
+  getSelection(id: string): QueuedSelection | undefined {
+    return this.selections.get(id);
+  }
+
+  /** Clear a recorded selection at start/cancel/end so it never outlives the reservation it describes. */
+  clearSelection(id: string): void {
+    this.selections.delete(id);
   }
 
   /**
@@ -2867,32 +2909,54 @@ export class ActorMesh {
   }
 
   /**
-   * The provider a thread's next run will actually launch on: a staged
-   * `desiredProvider` has not been applied to `provider` yet (that happens in
-   * {@link applyPendingModel} at dispatch), so every halt-gate check must
-   * consult this instead of the record's current `provider` — otherwise a
-   * staged move to an already-halted provider slips through a still-open old
-   * provider's gate.
+   * The modelConfig pool a thread's next run will actually launch on: a
+   * staged `desiredModelConfig` has not been applied to `modelConfig` yet
+   * (that happens in {@link applyPendingModel} at dispatch), so every
+   * halt-gate check must consult this instead of the record's current
+   * `modelConfig` — otherwise a staged move to an already-halted pool slips
+   * through a still-open old pool's gate.
    */
-  private launchProvider(id: string): string | undefined {
+  private launchModelConfig(id: string): ProviderModelConfig[] | undefined {
     const rec = this.actors.get(id);
-    return rec?.desiredProvider ?? rec?.provider;
+    return rec?.desiredModelConfig ?? rec?.modelConfig;
   }
 
-  /** Cancel queued starts selected by provider-aware halt state. */
+  /** True only when every declared candidate in the pool is halted. */
+  private allCandidatesHalted(modelConfig: readonly ProviderModelConfig[] | undefined): boolean {
+    if (!modelConfig || modelConfig.length === 0) return false;
+    return modelConfig.every((c) => this.isHalted(c.provider));
+  }
+
+  /**
+   * Cancel queued starts whose *actual reserved lane* is halted — keys off
+   * the recorded {@link QueuedSelection}, not the whole declared pool, so a
+   * halt on one candidate never cancels a reservation already sitting on a
+   * different, still-healthy candidate in the same pool. Falls back to the
+   * whole-pool check only when no selection has been recorded (a
+   * `providerGate` that never wired `onSelected`, or a request gated before
+   * this reservation existed).
+   */
   cancelHaltedQueuedRuns(): string[] {
     const cancelled: string[] = [];
     for (const [id, actor] of this.live) {
-      if (this.isHalted(this.launchProvider(id)) && actor.cancelQueuedRun?.()) cancelled.push(id);
+      const selection = this.selections.get(id);
+      const halted = selection
+        ? this.isHalted(selection.provider)
+        : this.allCandidatesHalted(this.launchModelConfig(id));
+      if (halted && actor.cancelQueuedRun?.()) {
+        cancelled.push(id);
+      }
     }
     return cancelled;
   }
 
-  /** Replay starts canceled by a halt once their provider is no longer blocked. */
+  /** Replay starts canceled by a halt once at least one pool candidate is no longer blocked. */
   resumeCancelledRuns(): string[] {
     const resumed: string[] = [];
     for (const [id, actor] of this.live) {
-      if (!this.isHalted(this.launchProvider(id)) && actor.resumeCancelledRun?.()) resumed.push(id);
+      if (!this.allCandidatesHalted(this.launchModelConfig(id)) && actor.resumeCancelledRun?.()) {
+        resumed.push(id);
+      }
     }
     return resumed;
   }
@@ -2902,15 +2966,24 @@ export class ActorMesh {
       record,
       getRecord: () => this.actors.get(record.id),
       mesh: this,
-      gate: (fn, provider, responsive) => this.gateRun(fn, provider, responsive, record.id),
+      gate: (fn, candidates, responsive) => this.gateRun(fn, candidates, responsive, record.id),
       beforeRun: ({ mode }) => {
         const rec = this.actors.get(record.id);
         if (!rec || rec.status !== "active") {
           return false;
         }
-        if (this.isHalted(this.launchProvider(record.id)) || this.isShuttingDown()) {
+        // Halt gate consults the pool this dispatch will actually launch —
+        // desired-if-staged, else current (#169) — without yet committing
+        // it, so a staged move onto a halted provider never mutates
+        // `modelConfig` for a run that never launches.
+        if (this.allCandidatesHalted(this.launchModelConfig(record.id)) || this.isShuttingDown()) {
           return false;
         }
+        // Apply a pool staged while idle/queued before this dispatch's own
+        // gate()/admission reads the declared pool (#199, extended to pools):
+        // an in-flight run's beforeRun never re-fires for that same run, so
+        // this only ever lands on a fresh dispatch, never mid-run.
+        this.applyPendingModel(record.id);
         if (mode === "yield-elicitation") return true;
         if (!this.inboxStore) return true;
         const actor = this.live.get(record.id);
@@ -2927,8 +3000,12 @@ export class ActorMesh {
       onRunEnd: (result) => {
         this.finishInboxRun(record.id);
         this.accountRun(record.id, result);
+        // Safety net: the start/cancel hooks are the primary clearing
+        // points, but a selection must never survive past its run ending.
+        this.clearSelection(record.id);
       },
       onRuntimeStateChanged: (state) => this.actorRuntimeStateChanged(record.id, state),
+      onQueuedRunCancelled: () => this.clearSelection(record.id),
     };
   }
 

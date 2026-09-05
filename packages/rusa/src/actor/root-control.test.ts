@@ -23,8 +23,7 @@ describe("RootControlService", () => {
     const id = service.spawnChild(
       {
         charter: "  Investigate the failure  ",
-        provider: " agy ",
-        model: " gemini-3.5-flash-medium ",
+        modelConfig: { provider: "agy", model: "gemini-3.5-flash-medium" },
       },
       "human:operator"
     );
@@ -33,8 +32,7 @@ describe("RootControlService", () => {
     expect(mesh.spawn).toHaveBeenCalledWith({
       charter: "Investigate the failure",
       parentId: "root",
-      provider: "agy",
-      model: "gemini-3.5-flash-medium",
+      modelConfig: { provider: "agy", model: "gemini-3.5-flash-medium" },
       context: undefined,
       conversationId: undefined,
       title: undefined,
@@ -57,19 +55,18 @@ describe("RootControlService", () => {
     service.spawnChild(
       {
         charter: "review",
-        provider: "claude",
-        model: "claude-opus-4-8",
-        effort: "max",
+        modelConfig: { provider: "claude", model: "claude-opus-4-8", effort: "max" },
       },
       "root-llm"
     );
 
     expect(mesh.spawn).toHaveBeenCalledWith(
-      expect.objectContaining({ model: "claude-opus-4-8", effort: "max" })
+      expect.objectContaining({
+        modelConfig: { provider: "claude", model: "claude-opus-4-8", effort: "max" },
+      })
     );
     expect(JSON.parse(events[0].payload ?? "{}")).toMatchObject({
-      model: "claude-opus-4-8",
-      effort: "max",
+      modelConfig: [{ provider: "claude", model: "claude-opus-4-8", effort: "max" }],
     });
   });
 
@@ -112,33 +109,18 @@ describe("RootControlService", () => {
     const { mesh, service } = setup();
     expect(() =>
       service.spawnChild(
-        { charter: "work", provider: "missing", model: "claude-sonnet-4-6" },
+        { charter: "work", modelConfig: { provider: "missing", model: "claude-sonnet-4-6" } },
         "human:operator"
       )
     ).toThrow(/unknown provider/);
     expect(mesh.spawn).not.toHaveBeenCalled();
   });
 
-  it("rejects spawnChild when provider or model is missing ", () => {
+  it("rejects spawnChild when modelConfig is an empty pool", () => {
     const { mesh, service } = setup();
     expect(() =>
-      service.spawnChild(
-        { charter: "work", provider: "", model: "claude-sonnet-4-6" },
-        "human:operator"
-      )
-    ).toThrow(/provider is required/);
-    expect(() =>
-      service.spawnChild({ charter: "work", provider: "agy", model: "" }, "human:operator")
-    ).toThrow(/model is required/);
-    expect(() =>
-      service.spawnChild(
-        { charter: "work", provider: "   ", model: "claude-sonnet-4-6" },
-        "human:operator"
-      )
-    ).toThrow(/provider is required/);
-    expect(() =>
-      service.spawnChild({ charter: "work", provider: "agy", model: "   " }, "human:operator")
-    ).toThrow(/model is required/);
+      service.spawnChild({ charter: "work", modelConfig: [] }, "human:operator")
+    ).toThrow(/modelConfig is required/);
     expect(mesh.spawn).not.toHaveBeenCalled();
   });
 
@@ -147,8 +129,7 @@ describe("RootControlService", () => {
     service.spawnChild(
       {
         charter: "research a treatment",
-        provider: "agy",
-        model: "gemini-3.5-flash-medium",
+        modelConfig: { provider: "agy", model: "gemini-3.5-flash-medium" },
         context: {
           type: "portable",
           mode: "ledger",
@@ -164,12 +145,14 @@ describe("RootControlService", () => {
       compactionModel: "gemini-custom",
     };
     expect(mesh.spawn).toHaveBeenCalledWith(
-      expect.objectContaining({ context, provider: "agy", model: "gemini-3.5-flash-medium" })
+      expect.objectContaining({
+        context,
+        modelConfig: { provider: "agy", model: "gemini-3.5-flash-medium" },
+      })
     );
     expect(JSON.parse(events[0].payload ?? "{}")).toMatchObject({
       context,
-      provider: "agy",
-      model: "gemini-3.5-flash-medium",
+      modelConfig: [{ provider: "agy", model: "gemini-3.5-flash-medium" }],
     });
   });
 

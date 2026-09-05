@@ -56,6 +56,18 @@ export function providerCapabilityName(providerName: string, config: RusaConfig)
 }
 
 /**
+ * The canonical provider-pacing lane key for a configured provider name — the
+ * shared identity used to fan multiple config keys aliasing the same CLI (or
+ * modelConfig pool entries) onto one pacer/quota lane. Antigravity's binary is
+ * `agy`, so it canonicalizes there even when `cliCommand` is left unset.
+ */
+export function providerThrottleKey(providerName: string, config: RusaConfig): string {
+  const cliCommand = config.providers[providerName]?.cliCommand;
+  const key = cliCommand ?? providerName;
+  return key === "antigravity" ? "agy" : key;
+}
+
+/**
  * The single config-aware validation and normalization boundary for a requested
  * provider/model/effort combination. Config ingress, spawn, live
  * reconfiguration, and provider construction all route through this function.

@@ -145,10 +145,9 @@ describe("legacy actor import", () => {
       providerCapabilityName: (provider) => (provider === "antigravity" ? "agy" : provider),
     });
 
-    expect(repositories.actors.get("root")).toMatchObject({
-      model: "gemini-3.7-flash",
-      effort: "high",
-    });
+    expect(repositories.actors.get("root")?.modelConfig).toEqual([
+      { provider: "antigravity", model: "gemini-3.7-flash", effort: "high" },
+    ]);
   });
 
   it("archives a matching source left behind after the database commit", () => {
