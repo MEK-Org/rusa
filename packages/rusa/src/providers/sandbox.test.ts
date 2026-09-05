@@ -11,7 +11,9 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { runMigrations } from "../db/migrations/runner.js";
 
 const execSyncMock = vi.fn();
 const execFileSyncMock = vi.fn();
@@ -1064,20 +1066,35 @@ describe("sandbox bwrap args", () => {
       return { home, mcHome, actorDir, secretsDir: join(mcHome, "secrets") };
     }
 
-    function writeActiveGrant(mcHome: string, actorId: string, capability: string) {
-      writeFileSync(
-        join(mcHome, "capability-grants.json"),
-        JSON.stringify({
-          grants: [
-            {
-              actorId,
-              capability,
-              grantedBy: "parent-1",
-              grantedAt: "2026-07-17T00:00:00Z",
-            },
-          ],
-        })
-      );
+    // Grants now live in `<mcHome>/data/mesh.db`'s `capability_grants` table
+    // (0036_capability_grants), not `capability-grants.json`. Resets the
+    // whole database on each call, mirroring the old helper's whole-file
+    // overwrite, so a test can seed a sequence of distinct grant states.
+    function seedGrant(
+      mcHome: string,
+      actorId: string,
+      capability: string,
+      opts: { revokedAt?: string } = {}
+    ) {
+      const dataDir = join(mcHome, "data");
+      rmSync(dataDir, { recursive: true, force: true });
+      mkdirSync(dataDir, { recursive: true });
+      const db = new Database(join(dataDir, "mesh.db"));
+      runMigrations(db);
+      db.pragma("foreign_keys = ON");
+      db.prepare(
+        "INSERT INTO actors (id, charter, parent_id, created_at) VALUES ('root', 'test actor', NULL, '2026-06-27T00:00:00Z')"
+      ).run();
+      if (actorId !== "root") {
+        db.prepare(
+          "INSERT INTO actors (id, charter, parent_id, created_at) VALUES (?, 'test actor', 'root', '2026-06-27T00:00:00Z')"
+        ).run(actorId);
+      }
+      db.prepare(
+        `INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at, revoked_at)
+         VALUES (?, ?, 'parent-1', '2026-07-17T00:00:00Z', ?)`
+      ).run(actorId, capability, opts.revokedAt ?? null);
+      db.close();
     }
 
     it("tmpfs-masks the whole secrets dir and scrubs GLASS_GOALS_PASSWORD for every sandboxed worker (no grant → no re-bind)", async () => {
@@ -1128,7 +1145,7 @@ describe("sandbox bwrap args", () => {
       const geminiKeyPath = join(secretsDir, "gemini-api-key");
       writeFileSync(geminiKeyPath, "AIza_SECRET\n", { mode: 0o600 });
       writeFileSync(join(secretsDir, "webhook-secret"), "hook_SECRET\n", { mode: 0o600 });
-      writeActiveGrant(mcHome, ACTOR_ID, "secret:gemini-api-key");
+      seedGrant(mcHome, ACTOR_ID, "secret:gemini-api-key");
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
       const { buildActorBwrapArgs } = await import("./sandbox.js");
@@ -1168,7 +1185,7 @@ describe("sandbox bwrap args", () => {
       const mistralKeyPath = `${secretsDir}/mistral-api-key`;
       const fixtureValue = "dummy-mistral-test-key";
       writeFileSync(mistralKeyPath, `${fixtureValue}\n`, { mode: 0o600 });
-      writeActiveGrant(mcHome, ACTOR_ID, "secret:mistral-api-key");
+      seedGrant(mcHome, ACTOR_ID, "secret:mistral-api-key");
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
       const { buildActorBwrapArgs, buildActorBwrapCommand } = await import("./sandbox.js");
@@ -1219,28 +1236,20 @@ describe("sandbox bwrap args", () => {
       };
 
       // Someone else's grant.
-      writeActiveGrant(mcHome, "some-other-actor", "secret:gemini-api-key");
+      seedGrant(mcHome, "some-other-actor", "secret:gemini-api-key");
       expectMasked();
 
       // The actor's own grant, revoked.
-      writeFileSync(
-        join(mcHome, "capability-grants.json"),
-        JSON.stringify({
-          grants: [
-            {
-              actorId: ACTOR_ID,
-              capability: "secret:gemini-api-key",
-              grantedBy: "parent-1",
-              grantedAt: "2026-07-17T00:00:00Z",
-              revokedAt: "2026-07-17T01:00:00Z",
-            },
-          ],
-        })
-      );
+      seedGrant(mcHome, ACTOR_ID, "secret:gemini-api-key", {
+        revokedAt: "2026-07-17T01:00:00Z",
+      });
       expectMasked();
 
-      // Corrupt store: a read/parse error means "no grant", never "leaked".
-      writeFileSync(join(mcHome, "capability-grants.json"), "{not json!!");
+      // Corrupt store: a read/open error means "no grant", never "leaked".
+      const dataDir = join(mcHome, "data");
+      rmSync(dataDir, { recursive: true, force: true });
+      mkdirSync(dataDir, { recursive: true });
+      writeFileSync(join(dataDir, "mesh.db"), "not a real sqlite file");
       expectMasked();
 
       warnSpy.mockRestore();
