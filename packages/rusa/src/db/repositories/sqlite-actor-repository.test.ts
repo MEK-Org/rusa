@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
 import { runMigrations } from "../migrations/runner.js";
+import { PrincipalRepository } from "./principal-repository.js";
 import { SqliteActorRepository } from "./sqlite-actor-repository.js";
 
 const root: ActorRecord = {
@@ -342,5 +343,66 @@ describe("SqliteActorRepository", () => {
     repository.upsert(portableWorker);
 
     expect(repository.get("worker")?.modelConfig).toEqual(portableWorker.modelConfig);
+  });
+  it("writes each actor's principal in the same transaction as its row", () => {
+    repository.upsert(root);
+
+    expect(
+      db.prepare("SELECT id, kind, actor_id, created_at FROM principals WHERE id = 'root'").get()
+    ).toEqual({
+      id: "root",
+      kind: "actor",
+      actor_id: "root",
+      created_at: root.createdAt,
+    });
+  });
+
+  it("rolls the principal back with the actor row when the write fails", () => {
+    repository.upsert(root);
+    expect(() =>
+      repository.upsert({
+        id: "worker",
+        charter: "Implement a slice",
+        parentId: "missing",
+        status: "active",
+        createdAt: "2026-09-03T13:01:00.000Z",
+      })
+    ).toThrow();
+
+    expect(repository.get("worker")).toBeUndefined();
+    expect(db.prepare("SELECT id FROM principals WHERE id = 'worker'").get()).toBeUndefined();
+  });
+
+  it("seeds an actor principal exactly once no matter how often the actor is written", () => {
+    repository.upsert(root);
+    repository.upsert({ ...root, title: "Renamed" });
+    repository.patch("root", { charter: "Own the mesh, still" });
+
+    expect(db.prepare("SELECT created_at FROM principals WHERE id = 'root'").all()).toEqual([
+      { created_at: root.createdAt },
+    ]);
+  });
+
+  it("keeps a retired actor's identity, and refuses to delete the actor under it", () => {
+    repository.upsert(root);
+    const worker: ActorRecord = {
+      id: "worker",
+      charter: "Implement a slice",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-09-03T13:01:00.000Z",
+    };
+    repository.upsert(worker);
+
+    repository.patch("worker", { status: "retired" });
+
+    expect(repository.get("worker")?.status).toBe("retired");
+    expect(new PrincipalRepository(db).get("worker")).toEqual({
+      kind: "actor",
+      id: "worker",
+      actorId: "worker",
+      createdAt: worker.createdAt,
+    });
+    expect(() => db.prepare("DELETE FROM actors WHERE id = 'worker'").run()).toThrow();
   });
 });

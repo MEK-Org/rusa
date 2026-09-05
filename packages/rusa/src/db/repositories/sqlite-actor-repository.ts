@@ -4,6 +4,7 @@ import type { ActorRecord } from "../../actor/actor-record.js";
 import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
 import type { ProviderModelConfig } from "../../providers/model-config.js";
 import type { ActorRepository } from "../../repositories/actor-repository.js";
+import { PrincipalRepository } from "./principal-repository.js";
 
 type ActorRow = {
   id: string;
@@ -193,11 +194,21 @@ type DesiredOverlayEntry = {
  * dispatch-time-apply semantics), so it lives in an instance-local overlay.
  * Every successful upsert fully replaces an actor's overlay entry when
  * `desiredModelConfig` is present as a key on the incoming record.
+ *
+ * Every actor row is accompanied by its principal row, written inside the same
+ * transaction. That coupling is what makes "every actor has an identity" a fact
+ * rather than a convention: an actor cannot exist unattributable, and a failed
+ * principal write takes the actor row down with it instead of leaving a half
+ * -identified actor behind. `upsert` is the single write path for both spawn
+ * and legacy import, so neither needs to remember to do it.
  */
 export class SqliteActorRepository implements ActorRepository {
   private readonly desiredOverlay = new Map<string, DesiredOverlayEntry>();
 
-  constructor(private readonly db: Database.Database) {}
+  constructor(
+    private readonly db: Database.Database,
+    private readonly principals: PrincipalRepository = new PrincipalRepository(db)
+  ) {}
 
   upsert(record: ActorRecord): void {
     const isRoot = record.isRoot === true;
@@ -240,6 +251,7 @@ export class SqliteActorRepository implements ActorRepository {
           retiredAt,
           record.createdAt
         );
+      this.principals.ensureActorPrincipal(record.id, record.createdAt);
       this.db.prepare("DELETE FROM actor_handles WHERE actor_id = ?").run(record.id);
       const addHandle = this.db.prepare(
         "INSERT INTO actor_handles (actor_id, target_id, role) VALUES (?, ?, ?)"
