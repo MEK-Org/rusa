@@ -4,9 +4,9 @@ import { type DestinationStream, destination, type Logger as PinoLogger, pino } 
  * Rusa's structured application logger.
  *
  * Pino supplies the parts a logger should not be reinvented for: level
- * filtering, child bindings, ISO timestamps, and one JSON object per line on a
- * synchronous destination. Two things sit on top of it here, because Pino does
- * not give them for free:
+ * filtering, ISO timestamps, and one JSON object per line on a synchronous
+ * destination. A few things sit on top of it here, because Pino does not give
+ * them for free:
  *
  * - **Value redaction.** Pino's `redact` option masks *paths*, so it cannot
  *   remove a configured secret that has leaked into an error message or a stack
@@ -19,6 +19,10 @@ import { type DestinationStream, destination, type Logger as PinoLogger, pino } 
  * - **Two presentations of one stream.** The record is the same object either
  *   way; only its rendering differs. A terminal gets a readable line, a pipe or
  *   a service manager gets JSON. See {@link resolveLogFormat}.
+ * - **Context merged, not layered.** Pino's child bindings append, so a child
+ *   that rebinds `component` emits the key twice. Context is merged into one
+ *   object instead, so each key is written once with stated precedence. See
+ *   {@link wrap}.
  *
  * See `docs/logging.md` for the conventions this module exists to support.
  */
@@ -362,20 +366,43 @@ function normalizeFields(fields: LogFields | undefined, secrets: readonly string
   return normalized;
 }
 
-function wrap(target: PinoLogger, readSecrets: () => readonly string[]): Logger {
+/**
+ * A logger carrying its accumulated context, which is merged into every record
+ * it writes rather than layered as Pino child bindings.
+ *
+ * Pino builds a child's bindings by appending the new layer to the parent's
+ * pre-serialized string, so a child that rebinds a key its parent already set
+ * emits both: a record from `start`'s `actor-run` child carried
+ * `"component":"start"` *and* `"component":"actor-run"`. Last-key-wins parsers
+ * hide that; a reader that rejects duplicate keys cannot use the record at all.
+ *
+ * Merging into one object first makes the outcome a single key with explicit
+ * precedence — innermost layer wins, and a per-call field beats every bound
+ * layer — which is also the precedence a reader would guess. The cost is
+ * re-serializing a small context per record instead of once per child; context
+ * is a handful of identifiers, and a record nobody can parse costs more.
+ */
+function wrap(
+  target: PinoLogger,
+  readSecrets: () => readonly string[],
+  context: LogContext
+): Logger {
   const emit =
     (level: LogLevel) =>
     (event: string, fields?: LogFields): void => {
       const secrets = readSecrets();
-      target[level](normalizeFields(fields, secrets), scrubText(event, secrets));
+      target[level]({ ...context, ...normalizeFields(fields, secrets) }, scrubText(event, secrets));
     };
   return {
     debug: emit("debug"),
     info: emit("info"),
     warn: emit("warn"),
     error: emit("error"),
-    child: (context) =>
-      wrap(target.child(redactValue(context, readSecrets()) as LogContext), readSecrets),
+    child: (layer) =>
+      wrap(target, readSecrets, {
+        ...context,
+        ...(redactValue(layer, readSecrets()) as LogContext),
+      }),
   };
 }
 
@@ -395,8 +422,10 @@ export function createLogger(options: CreateLoggerOptions = {}): Logger {
     {
       level: resolveLogLevel(options.level),
       // `pid`/`hostname` are journald's job, not the record's; dropping them
-      // keeps each line to the fields the event actually meant to carry.
-      base: options.context ?? { component: "rusa" },
+      // keeps each line to the fields the event actually meant to carry. Root
+      // context is not bound here either — `wrap` owns every context layer, so
+      // that one merge decides each key exactly once. See {@link wrap}.
+      base: null,
       formatters: { level: (label) => ({ level: label }) },
       // `err` arrives already flattened and scrubbed by `serializeError`.
       // Pino's own error serializer would re-serialize that plain object and
@@ -410,7 +439,7 @@ export function createLogger(options: CreateLoggerOptions = {}): Logger {
     // `pretty` reformats that same stream in place; it does not tee it.
     sink
   );
-  return wrap(root, readSecrets);
+  return wrap(root, readSecrets, options.context ?? { component: "rusa" });
 }
 
 /** A logger that discards everything, for callers with nothing to log to. */
