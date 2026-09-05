@@ -371,6 +371,18 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       throw new Error("config.yaml: observability.diskAlert.cooldownSeconds must be positive");
     }
   }
+  const loggingLevel = parsed.observability?.logging?.level;
+  if (loggingLevel !== undefined) {
+    // Validated here rather than clamped in the logger: a typo in config is a
+    // mistake worth failing boot over, while `RUSA_LOG_LEVEL` is an ad-hoc
+    // override that falls back to the default instead of killing the service.
+    const allowed = ["debug", "info", "warn", "error", "silent"];
+    if (typeof loggingLevel !== "string" || !allowed.includes(loggingLevel.trim().toLowerCase())) {
+      throw new Error(
+        `config.yaml: observability.logging.level must be one of ${allowed.join(", ")}`
+      );
+    }
+  }
   const chat = parsed.chat;
   if (chat !== undefined) {
     if (chat.gchat !== undefined) {

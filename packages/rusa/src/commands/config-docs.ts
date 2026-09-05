@@ -82,6 +82,8 @@ Minimal example:
     maxBytesPerInvocation: 209715200
 
   observability:
+    logging:
+      # level: info   # debug | info | warn | error | silent (RUSA_LOG_LEVEL overrides)
     diskAlert:
       # enabled: true
       # volume: "/"
@@ -207,6 +209,13 @@ invocationDebug:
                            Default: 30.
   maxBytesPerInvocation    Optional number. Hard cap in bytes across prompt, transcript, raw streams,
                            and failure patch for one invocation. Default: 209715200 (200 MB).
+
+observability.logging:
+
+  level                    Optional string. Minimum level the application logger records:
+                           debug, info (default), warn, error, or silent. The RUSA_LOG_LEVEL
+                           environment variable overrides it. Service records are one JSON
+                           object per line; see docs/logging.md.
 
 observability.diskAlert:
 

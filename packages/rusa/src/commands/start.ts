@@ -173,7 +173,10 @@ import {
 } from "../mcp/understanding-mcp.js";
 import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "../mcp/update-mcp.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
+import { composeActorOutputSinks } from "../observability/actor-output-sink.js";
 import { DiskUsageAlert } from "../observability/disk-alert.js";
+import { collectConfigSecrets, collectEnvSecrets } from "../observability/log-secrets.js";
+import { createLogger, type Logger } from "../observability/logger.js";
 import { antigravityScratchDir } from "../providers/antigravity.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
@@ -705,6 +708,30 @@ export async function compactPortableContext(input: {
 }
 
 /**
+ * Record one actor run's outcome.
+ *
+ * The level is the run's operational meaning rather than its shape: a capped run
+ * stopped on a limit the mesh set for itself and is degraded-but-expected, a
+ * failed run is something a human has to look at, and a clean run is an ordinary
+ * lifecycle transition. Only run metadata is recorded — the output itself is
+ * unbounded actor text with a transcript of its own.
+ */
+export function logRunEnd(logger: Logger, result: RunResult): void {
+  const fields = {
+    success: result.success,
+    exitCode: result.exitCode,
+    capped: result.capped ?? false,
+    cancelled: result.cancelled ?? false,
+    interrupted: result.interrupted ?? false,
+    yieldStatus: result.yieldStatus,
+    model: result.model,
+  };
+  if (result.success) logger.info("run_end", fields);
+  else if (result.capped) logger.warn("run_end", fields);
+  else logger.error("run_end", fields);
+}
+
+/**
  * Start rusa as the single **root actor** over an {@link ActorMesh}.
  *
  * Inbound GitHub webhooks and Google Chat messages wake the root, which runs the
@@ -719,11 +746,22 @@ export async function compactPortableContext(input: {
 export async function runStart(opts?: RunStartOptions): Promise<void> {
   const mcHome = resolveHome();
 
-  console.log(`\n🚀 Rusa v0.1.0 — root actor\n${"━".repeat(28)}\n`);
-  console.log(`Loading config from ${mcHome}/config.yaml`);
+  // The service logger. `rusa start` is a service, so its diagnostics are JSON
+  // records on stdout (journald's stream) rather than prose: a field says which
+  // component spoke and what happened, instead of a prefix a grep has to guess
+  // at. Pipe it through `pino-pretty` for a readable local run.
+  //
+  // Secrets are registered in two steps because the first records are written
+  // before there is a config to read: the environment is known now, and the
+  // config's own credentials are added the moment `loadConfig` returns.
+  const knownSecrets = new Set(collectEnvSecrets());
+  const readSecrets = () => [...knownSecrets];
+  const bootLog = createLogger({ secrets: readSecrets, context: { component: "start" } });
+
+  bootLog.info("service_starting", { version: "0.1.0", home: mcHome, profile: opts?.profile });
 
   if (opts?.deployOnMergeBranch) {
-    console.warn("[start] --deploy-on-merge-branch is not wired in root-actor mode yet; ignoring");
+    bootLog.warn("deploy_on_merge_branch_ignored", { reason: "not wired in root-actor mode" });
   }
 
   let config: RusaConfig;
@@ -734,10 +772,22 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       profile: opts?.profile as ConfigProfile | undefined,
     });
   } catch (err) {
-    console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+    // No config yet means no config-sourced secrets to scrub against, so this
+    // record carries the message only — a parse error can quote its input line.
+    bootLog.error("config_load_failed", {
+      reason: err instanceof Error ? err.message : String(err),
+    });
     process.exit(1);
     return;
   }
+  // Config is parsed: its credentials join the scrub set (which `bootLog` shares
+  // through the same closure) and its configured level takes effect.
+  for (const secret of collectConfigSecrets(config)) knownSecrets.add(secret);
+  const log = createLogger({
+    level: config.observability?.logging?.level,
+    secrets: readSecrets,
+    context: { component: "start" },
+  });
   const portableContextStore = new FilePortableContextStore(join(mcHome, "portable-context"));
   const portableContextApiKey = config.geminiApiKey?.trim() || null;
   const portableContextCompactors = new Map<string, PortableContextCompactor>();
@@ -757,29 +807,30 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     try {
       assertBwrapAvailable();
     } catch (err) {
-      console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+      log.error("sandbox_unavailable", { sandbox: config.sandbox ?? "bwrap", err });
       process.exit(1);
       return;
     }
   }
 
-  console.log("Initializing database...");
   const database = initDb(mcHome);
-  console.log("✓ Database ready");
+  log.info("database_ready", { home: mcHome });
 
   // One OS scheduler owns every cron/at mutation: recurring
   // actor wakes, recurring or interval obligations, and one-shot messages.
   const cronPreflight = preflightCron();
   if (!cronPreflight.ok) {
-    console.warn(
-      `[start] cron scheduling unavailable — schedule_wake and recurring obligations will fail until this is fixed: ${cronPreflight.issues.join("; ")}`
-    );
+    log.warn("cron_preflight_failed", {
+      issues: cronPreflight.issues,
+      impact: "schedule_wake and recurring obligations will fail",
+    });
   }
   const atPreflight = preflightAt();
   if (!atPreflight.ok) {
-    console.warn(
-      `[start] \`at\` scheduling unavailable — cron-only recurrences still work, but completion-interval obligations and scheduled messages will fail until this is fixed: ${atPreflight.issues.join("; ")}`
-    );
+    log.warn("at_preflight_failed", {
+      issues: atPreflight.issues,
+      impact: "completion-interval obligations and scheduled messages will fail",
+    });
   }
   const osScheduler = new DefaultOsScheduler(
     new CrontabMutator(execCrontabIo()),
@@ -799,17 +850,17 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     scheduledMessages: osScheduler,
   });
   if (legacyActorImport.importedActors > 0 || legacyActorImport.importedScheduledMessages > 0) {
-    console.log(
-      `[mesh] imported ${legacyActorImport.importedActors} actor(s) and ` +
-        `${legacyActorImport.importedScheduledMessages} scheduled message(s) into the host queue`
-    );
+    log.info("legacy_actor_state_imported", {
+      actors: legacyActorImport.importedActors,
+      scheduledMessages: legacyActorImport.importedScheduledMessages,
+    });
   }
 
   const recoveredOpenRuns = getRepositories().actorRuns.abandonOpen(
     "service restarted before run completion"
   );
   if (recoveredOpenRuns > 0) {
-    console.warn(`[mesh] recovered ${recoveredOpenRuns} unterminated actor run(s)`);
+    log.warn("unterminated_runs_recovered", { runs: recoveredOpenRuns });
   }
 
   const activeRunIds = new Map<string, string>();
@@ -915,7 +966,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     }
   }
 
-  console.log(`Authenticated as ${config.github.account}`);
+  log.info("github_identity_resolved", { account: config.github.account });
 
   // The root's configured identity : the display handle every
   // root-identity surface (signing byline, dashboard, avatar, commitment
@@ -1079,7 +1130,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const mcpHttp = new McpHttpServer({ servers });
   await mcpHttp.start();
   const sharedMcp = mcpHttp.urls();
-  console.log(`[mcp] serving ${sharedMcp.map((u) => u.name).join(", ")} on loopback`);
+  log.info("shared_mcp_serving", { servers: sharedMcp.map((u) => u.name) });
 
   // ── Provider + actor repository ──
   let provider: ReturnType<typeof resolveRootProvider>;
@@ -1107,26 +1158,46 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // After persisting, broadcast the stored row to any live dashboard SSE clients
   // (best-effort — fan-out must never break the recording or the mesh).
   const meshEmitter = new MeshEventEmitter();
+  // One child logger per actor run: `actorId` and `runId` ride every record the
+  // run boundary writes, so a run reads back by field instead of by matching
+  // prose across interleaved actors. The run's *output* never lands here — it is
+  // unbounded actor text, and it already has a transcript and an SSE stream.
+  const actorRunLog = log.child({ component: "actor-run" });
+  const runLogger = (actorId: string, runId?: string) =>
+    runId ? actorRunLog.child({ actorId, runId }) : actorRunLog.child({ actorId });
+
+  const meshEventLog = log.child({ component: "mesh-events" });
   const meshEvents: MeshEventSink = (e) => {
     const id = getRepositories().meshEvents.record(e);
     try {
       const stored = getRepositories().meshEvents.getById(id);
       if (stored) meshEmitter.emitMeshEvent(stored);
-    } catch {
-      // SSE fan-out is best-effort; the event is already durably recorded.
+    } catch (err) {
+      // SSE fan-out stays best-effort — the event is already durably recorded —
+      // but a silently dropped fan-out used to be indistinguishable from no
+      // dashboard client at all. Same control flow, now observable.
+      meshEventLog.debug("mesh_event_fanout_failed", { kind: e.kind, actorId: e.actorId, err });
     }
   };
 
-  // The actor output firehose: write to the console as before AND mirror each
-  // chunk to dashboard SSE clients viewing this actor. Wrapped so a dead browser
-  // tab can never throw back into the provider's synchronous onChunk callback.
+  // Where an actor's raw model output goes. Named sinks rather than an inline
+  // closure: raw agent prose is a different stream from the structured
+  // diagnostics above, and each destination it reaches should be a line someone
+  // chose. #192 owns retiring the stdout mirror, which is one entry from here.
+  const emitActorOutput = composeActorOutputSinks(
+    [
+      {
+        name: "service-stdout",
+        deliver: ({ text }) => {
+          process.stdout.write(text);
+        },
+      },
+      { name: "dashboard-live-output", deliver: (chunk) => meshEmitter.emitLiveOutput(chunk) },
+    ],
+    log.child({ component: "actor-output" })
+  );
   const makeFirehose = (actorId: string) => (chunk: string) => {
-    process.stdout.write(chunk);
-    try {
-      meshEmitter.emitLiveOutput({ actorId, text: chunk });
-    } catch {
-      // live_output fan-out is best-effort; never disturb the run.
-    }
+    emitActorOutput({ actorId, text: chunk });
   };
 
   // ── Mesh safety governors ──
@@ -2006,6 +2077,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             mesh.clearSelection(id);
             const providerName = providerThrottleKey(selected.provider, config);
             const runId = beginActorRun(id, providerName);
+            runLogger(id, runId).info("run_start", {
+              provider: providerName,
+              model: selected.model,
+              effort: selected.effort,
+              responsive,
+            });
             mesh.recordEvent({
               kind: "run_start",
               actorId: id,
@@ -2036,6 +2113,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           },
           onRunAbandoned: ({ reason, started }) => {
             if (started) abandonActorRun(id, reason);
+            runLogger(id).warn("run_abandoned", { reason, started });
             mesh.recordEvent({
               kind: "run_abandoned",
               actorId: id,
@@ -2045,6 +2123,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           },
           onRunEnd: async (result) => {
             const runId = completeActorRun(id, result);
+            logRunEnd(runLogger(id, runId), result);
             mesh.recordEvent({
               kind: "run_end",
               actorId: id,
@@ -2527,6 +2606,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         mesh.clearSelection(rootId);
         const providerName = providerThrottleKey(selected.provider, config);
         const runId = beginActorRun(rootId, providerName);
+        runLogger(rootId, runId).info("run_start", {
+          provider: providerName,
+          model: selected.model,
+          effort: selected.effort,
+          responsive,
+        });
         mesh.recordEvent({
           kind: "run_start",
           actorId: rootId,
@@ -2557,6 +2642,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       },
       onRunAbandoned: ({ reason, started }) => {
         if (started) abandonActorRun(rootId, reason);
+        runLogger(rootId).warn("run_abandoned", { reason, started });
         mesh.recordEvent({
           kind: "run_abandoned",
           actorId: rootId,
@@ -2567,6 +2653,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       onRunEnd: async (result) => {
         mesh.finishInboxRun(rootId);
         const runId = completeActorRun(rootId, result);
+        logRunEnd(runLogger(rootId, runId), result);
         mesh.recordEvent({
           kind: "run_end",
           actorId: rootId,
@@ -2861,8 +2948,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         secret: webhookSecret,
         onEvent,
         port: webhookPort,
+        logger: log,
         onNonWebhookRequest: noDashboardServer
-          ? createDashboardRequestHandler({ port: webhookPort, serveUi: false })
+          ? createDashboardRequestHandler({ port: webhookPort, serveUi: false, logger: log })
           : undefined,
       })
     : null;
@@ -2895,6 +2983,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     ? await startDashboardServer({
         port: dashboardPort,
         bindHost: dashboardBindHost,
+        logger: log,
         // Bind the live mesh so the dashboard Data API + SSE serve real data.
         mesh: {
           mesh,
@@ -2905,12 +2994,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           inbox: getRepositories().inbox,
           referenceCache: new ReferenceCacheService({
             repo: getRepositories().referenceCache,
-            logger: {
-              info: (event, data) =>
-                console.log(`[reference-cache] ${event}`, data ? JSON.stringify(data) : ""),
-              error: (event, data) =>
-                console.warn(`[reference-cache] error: ${event}`, data ? JSON.stringify(data) : ""),
-            },
+            logger: log.child({ component: "reference-cache" }),
           }),
           chatClient: chatClient ?? undefined,
           issueClient: issueClient,
@@ -3245,7 +3329,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     readyHeadSink = undefined;
     prerequisiteCancellationSink = undefined;
     closeDb();
-    console.log("✓ Goodbye!");
+    log.info("service_stopped", { reason });
     process.exit(getShutdownExitCode(reason));
   };
   process.on("SIGINT", () => void shutdown());

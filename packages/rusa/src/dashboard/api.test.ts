@@ -17,6 +17,7 @@ import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+import { createLogger } from "../observability/logger.js";
 import type { ReferenceCacheService } from "../references/cache-service.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { type DashboardDataDeps, handleMeshApiRequest } from "./api.js";
@@ -107,6 +108,25 @@ const UUID_A = "aaaaaaaa-0000-4000-8000-000000000001";
 const UUID_B = "bbbbbbbb-0000-4000-8000-000000000002";
 const UUID_C = "cccccccc-0000-4000-8000-000000000004";
 const UUID_RETIRED = "rrrrrrrr-0000-4000-8000-000000000003";
+
+/** A logger writing to memory, so a test can read the records the API wrote. */
+function recordingLogger() {
+  const lines: string[] = [];
+  const logger = createLogger({
+    destination: {
+      write: (chunk: string) => {
+        lines.push(chunk);
+      },
+    },
+  });
+  const records = (): Record<string, unknown>[] =>
+    lines
+      .join("")
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+  return { logger, records };
+}
 
 describe("handleMeshApiRequest", () => {
   let db: Database.Database;
@@ -1540,6 +1560,7 @@ describe("handleMeshApiRequest", () => {
 
     it("502s with a generic error and never relays the upstream Gemini response body to the client", async () => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const { logger, records } = recordingLogger();
       const secret = "sk-super-secret-upstream-token";
       const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
         ok: false,
@@ -1548,7 +1569,7 @@ describe("handleMeshApiRequest", () => {
       } as unknown as Response);
 
       try {
-        const generateDeps: DashboardDataDeps = { ...deps, geminiApiKey: "key" };
+        const generateDeps: DashboardDataDeps = { ...deps, geminiApiKey: "key", logger };
         const { res } = await call(generateDeps, "POST", `/api/mesh/avatar/${UUID_A}/generate`);
         await new Promise((resolve) => process.nextTick(resolve));
         await new Promise((resolve) => process.nextTick(resolve));
@@ -1557,20 +1578,22 @@ describe("handleMeshApiRequest", () => {
         expect(res.body).not.toContain(secret);
         expect(JSON.parse(res.body).error).toBe("avatar generation failed");
 
-        // Assert that the sentinel does not appear in the captured console.error mock calls
-        expect(errorSpy.mock.calls.length).toBeGreaterThan(0);
-        for (const callArgs of errorSpy.mock.calls) {
-          const joined = callArgs.map(String).join(" ");
-          expect(joined).not.toContain(secret);
-        }
+        // The failure is recorded, the upstream body is not — and it is a record
+        // on the application logger, never a line printed to the service console.
+        expect(records()).toEqual([
+          expect.objectContaining({ level: "error", msg: "avatar_generate_failed" }),
+        ]);
+        expect(JSON.stringify(records())).not.toContain(secret);
+        expect(errorSpy).not.toHaveBeenCalled();
       } finally {
         fetchMock.mockRestore();
         errorSpy.mockRestore();
       }
     });
 
-    it("502s with a generic error and excludes non-JSON success body (sentinel) from console.error when res.json() throws", async () => {
+    it("502s with a generic error and excludes the non-JSON success body (sentinel) from the record when res.json() throws", async () => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const { logger, records } = recordingLogger();
       const secret = "sk-super-secret-upstream-token";
       const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
         ok: true,
@@ -1581,7 +1604,7 @@ describe("handleMeshApiRequest", () => {
       } as unknown as Response);
 
       try {
-        const generateDeps: DashboardDataDeps = { ...deps, geminiApiKey: "key" };
+        const generateDeps: DashboardDataDeps = { ...deps, geminiApiKey: "key", logger };
         const { res } = await call(generateDeps, "POST", `/api/mesh/avatar/${UUID_A}/generate`);
         await new Promise((resolve) => process.nextTick(resolve));
         await new Promise((resolve) => process.nextTick(resolve));
@@ -1590,12 +1613,13 @@ describe("handleMeshApiRequest", () => {
         expect(res.body).not.toContain(secret);
         expect(JSON.parse(res.body).error).toBe("avatar generation failed");
 
-        // Assert that the sentinel does not appear in the captured console.error mock calls
-        expect(errorSpy.mock.calls.length).toBeGreaterThan(0);
-        for (const callArgs of errorSpy.mock.calls) {
-          const joined = callArgs.map(String).join(" ");
-          expect(joined).not.toContain(secret);
-        }
+        // The failure is recorded, the upstream body is not — and it is a record
+        // on the application logger, never a line printed to the service console.
+        expect(records()).toEqual([
+          expect.objectContaining({ level: "error", msg: "avatar_generate_failed" }),
+        ]);
+        expect(JSON.stringify(records())).not.toContain(secret);
+        expect(errorSpy).not.toHaveBeenCalled();
       } finally {
         fetchMock.mockRestore();
         errorSpy.mockRestore();

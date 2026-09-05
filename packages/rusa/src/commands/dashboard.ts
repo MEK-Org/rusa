@@ -5,6 +5,8 @@ import { resolveRootHandle } from "../actor/handle-generator.js";
 import { loadConfig, type RusaConfig, resolveHome } from "../config/index.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { getRepositories, initDb } from "../db/index.js";
+import { collectConfigSecrets, collectEnvSecrets } from "../observability/log-secrets.js";
+import { createLogger } from "../observability/logger.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { startDashboardServer } from "../webhook/server.js";
 
@@ -38,16 +40,18 @@ ${"━".repeat(26)}
   const dashboardBindHost = config.dashboard?.bindHost ?? "127.0.0.1";
   // Open the persisted database so the Data API serves real mesh data.
   initDb(mcHome);
+  // The banner above and the URL below are this command's contract with the
+  // person who ran it and stay on the console. Everything the server has to say
+  // about itself is a diagnostic and goes to the application logger.
+  const log = createLogger({
+    secrets: [...collectEnvSecrets(), ...collectConfigSecrets(config)],
+    context: { component: "dashboard-command" },
+  });
   // No provider clients run in this process, but the repository-backed cache
   // still serves fresh/stale rows a live `rusa start` process persisted.
   const referenceCache = new ReferenceCacheService({
     repo: getRepositories().referenceCache,
-    logger: {
-      info: (event, data) =>
-        console.log(`[reference-cache] ${event}`, data ? JSON.stringify(data) : ""),
-      error: (event, data) =>
-        console.warn(`[reference-cache] error: ${event}`, data ? JSON.stringify(data) : ""),
-    },
+    logger: log.child({ component: "reference-cache" }),
   });
   const actors = getRepositories().actors;
   const rootRecord = actors.list().find((record) => record.isRoot === true);
@@ -57,6 +61,7 @@ ${"━".repeat(26)}
   const dashboardServer = await startDashboardServer({
     port: dashboardPort,
     bindHost: dashboardBindHost,
+    logger: log,
     mesh: {
       actors,
       meshEvents: getRepositories().meshEvents,

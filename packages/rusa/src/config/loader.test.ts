@@ -1150,3 +1150,30 @@ describe("loadConfig antigravity effort", () => {
     warnSpy.mockRestore();
   });
 });
+
+describe("loadConfig observability.logging", () => {
+  it("loads a configured log level", () => {
+    const config = loadConfig(writeConfig({ observability: { logging: { level: "debug" } } }));
+    expect(config.observability?.logging?.level).toBe("debug");
+  });
+
+  it("leaves the level unset when the section is omitted, so the logger defaults", () => {
+    expect(loadConfig(writeConfig()).observability?.logging?.level).toBeUndefined();
+  });
+
+  it("rejects a level that is not a level — a config typo should fail boot", () => {
+    expect(() =>
+      loadConfig(writeConfig({ observability: { logging: { level: "verbose" } } }))
+    ).toThrow(/observability.logging.level must be one of debug, info, warn, error, silent/);
+    expect(() => loadConfig(writeConfig({ observability: { logging: { level: 3 } } }))).toThrow(
+      /observability.logging.level must be one of/
+    );
+  });
+
+  it("accepts a level written with stray case or spacing", () => {
+    expect(
+      loadConfig(writeConfig({ observability: { logging: { level: " WARN " } } })).observability
+        ?.logging?.level
+    ).toBe(" WARN ");
+  });
+});
