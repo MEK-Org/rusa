@@ -34,6 +34,7 @@ import { recurringObligations } from "./0035_recurring_obligations.js";
 import { capabilityGrants } from "./0036_capability_grants.js";
 import { obligationDependencies } from "./0037_obligation_dependencies.js";
 import { eventSources } from "./0038_event_sources.js";
+import { principals } from "./0039_principals.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -80,4 +81,5 @@ export const migrations: Migration[] = [
   capabilityGrants,
   obligationDependencies,
   eventSources,
+  principals,
 ];
