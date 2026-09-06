@@ -16,6 +16,7 @@ import {
   kimiSessionStoreDir,
   teardownFlutterOverlay,
 } from "./sandbox.js";
+import { sanitizeArgvText } from "./spawn-arguments.js";
 import { runSubprocess } from "./subprocess-execution.js";
 import {
   attributedTokenUsage,
@@ -159,7 +160,9 @@ export class KimiProvider implements CodingProvider {
 
     const args: string[] = [
       "-p",
-      opts.prompt,
+      // Assembled text, made spawnable before it enters argv (#206). The
+      // `--add-dir` path below is a host path and stays verbatim.
+      sanitizeArgvText(opts.prompt),
       "--output-format",
       "stream-json",
       "--add-dir",
