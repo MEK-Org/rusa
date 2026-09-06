@@ -1,8 +1,10 @@
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import Database from "better-sqlite3";
+import type { ActorRecord } from "../actor/actor-record.js";
 import { resolveHome } from "../config/index.js";
 import { planLegacyActorImport } from "../db/legacy-actor-import.js";
+import { planLegacyCapabilityGrantImport } from "../db/legacy-capability-grant-import.js";
 import { planLegacyEventSubscriptionImport } from "../db/legacy-event-subscription-import.js";
 import { planLegacyHostJobImport } from "../db/legacy-host-job-import.js";
 import { pendingMigrationIds, runMigrations } from "../db/migrations/runner.js";
@@ -13,8 +15,30 @@ export interface DbCheckResult {
   pendingMigrationIds: string[];
   plannedActors: number;
   plannedScheduledMessages: number;
+  plannedCapabilityGrants: number;
   plannedEventSourceOwnerships: number;
   plannedHostJobs: number;
+}
+
+/**
+ * The actor set the grant planner would see at boot. `start.ts` imports legacy
+ * actors before legacy grants, so by the time it plans grants the actors named
+ * by `capability-grants.json` are committed rows. Preflight plans both against
+ * one unchanged database, so a grant naming an actor that only exists in
+ * `threads.json` would look like a dangling reference unless the planned
+ * records are added to the committed ones here. The union is read-only: these
+ * records are the actor plan's own output, never written back.
+ *
+ * When the actor import plans nothing there is nothing to add, and when actors
+ * are already committed the actor planner has verified `threads.json` matches
+ * them exactly, so the union adds nothing either.
+ */
+function actorsVisibleToGrantPlan(committed: ActorRecord[], pending: ActorRecord[]): ActorRecord[] {
+  const byId = new Map(committed.map((record) => [record.id, record]));
+  for (const record of pending) {
+    if (!byId.has(record.id)) byId.set(record.id, record);
+  }
+  return [...byId.values()];
 }
 
 /** Resolve symlinks when the path exists on disk; otherwise just normalize it. */
@@ -61,11 +85,25 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
     const repositories = new Repositories(db);
     const plan = planLegacyActorImport({ mcHome: home, repositories });
 
-    // Both imports are planned against one un-mutated copy, so the actors a
-    // subscription references may still be pending rather than committed. The
-    // subscription plan is told about them explicitly instead of failing on an
-    // ordering that only exists because preflight plans and never applies.
+    // Every import is planned against one un-mutated copy, so an actor a grant,
+    // a subscription or a host job references may still be pending rather than
+    // committed. Each plan is told about those records explicitly instead of
+    // failing on an ordering that only exists because preflight plans and never
+    // applies.
     const pendingActors = plan.plan.kind === "import" ? plan.plan.records : [];
+
+    // The grant planner accepts only a read-only slice, so the substituted
+    // actor view cannot become a write: it can only be listed.
+    const grantPlan = planLegacyCapabilityGrantImport({
+      mcHome: home,
+      repositories: {
+        actors: {
+          list: () => actorsVisibleToGrantPlan(repositories.actors.list(), pendingActors),
+        },
+        capabilityGrants: repositories.capabilityGrants,
+      },
+    });
+
     // Parentless *is* the definition of root that boot's `resolveRootActorId`
     // uses, and neither side can hold two: the `actors` table carries a unique
     // index over `parent_id IS NULL`, and a legacy document with anything other
@@ -98,6 +136,7 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
       pendingMigrationIds: pending,
       plannedActors: plan.plannedActors,
       plannedScheduledMessages: plan.plannedScheduledMessages,
+      plannedCapabilityGrants: grantPlan.plan.kind === "import" ? grantPlan.plan.grants.length : 0,
       plannedEventSourceOwnerships: subscriptionPlan.plannedSubscriptions,
       plannedHostJobs: hostJobPlan.plannedJobs,
     };
@@ -118,6 +157,7 @@ export function runDbCheck(opts: { home: string }): void {
     console.log(
       `Legacy import plan: ${result.plannedActors} actor(s), ` +
         `${result.plannedScheduledMessages} scheduled message(s), ` +
+        `${result.plannedCapabilityGrants} capability grant(s), ` +
         `${result.plannedEventSourceOwnerships} event source ownership(s), ` +
         `${result.plannedHostJobs} host job(s)`
     );
