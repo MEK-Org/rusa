@@ -94,8 +94,18 @@ export class FollowerHub {
     });
     return host;
   }
+  /**
+   * The actor's whole capability set, as a set of bearer URLs.
+   *
+   * This is a reconciliation, not an accumulation: a spec still present keeps
+   * its URL, and a spec that has left the snapshot loses its route here — while
+   * the actor is still running. Revoking only at `exit` would leave a follower
+   * that cached the old URL able to reach a capability the leader has already
+   * taken away.
+   */
   toolUrls(followerId: string, actorId: string, specs: McpServerSpec[]): McpServerSpec[] {
-    return specs.map((spec) => {
+    const live = new Set<string>();
+    const urls = specs.map((spec) => {
       const url = new URL(spec.url);
       if (url.hostname !== "127.0.0.1" || !url.pathname.startsWith("/mcp/")) {
         throw new Error("Only leader-owned loopback MCP endpoints may be forwarded");
@@ -107,8 +117,14 @@ export class FollowerHub {
         key = randomBytes(32).toString("hex");
         this.routes.set(key, { followerId, actorId, target: spec.url });
       }
+      live.add(key);
       return { name: spec.name, url: `${this.origin}/mcp/${key}` };
     });
+    // Only this actor's routes; a sibling's capabilities are not this snapshot's
+    // business. A rejected spec threw above, so no partial set is reconciled.
+    for (const [key, route] of this.routes)
+      if (route.actorId === actorId && !live.has(key)) this.routes.delete(key);
+    return urls;
   }
   async close(): Promise<void> {
     clearInterval(this.sweep);

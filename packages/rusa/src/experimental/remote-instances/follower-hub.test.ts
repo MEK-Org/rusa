@@ -119,4 +119,50 @@ describe("leader follower gateway", () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
+  it("revokes a capability the moment it leaves the actor's snapshot, not at exit", async () => {
+    const h = await setup();
+    await h.register("mac");
+    h.hub.createHost("mac", "a");
+    const server = createServer((req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ path: req.url }));
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("No address");
+    const leader = `http://127.0.0.1:${address.port}`;
+    try {
+      const [mesh, revoked] = h.hub.toolUrls("mac", "a", [
+        { name: "mesh", url: `${leader}/mcp/mesh` },
+        { name: "scratch", url: `${leader}/mcp/scratch` },
+      ]);
+      expect((await fetch(mesh.url)).status).toBe(200);
+      expect((await fetch(revoked.url)).status).toBe(200);
+
+      // The next snapshot drops `scratch`. The actor is still alive and still
+      // holds the old bearer URL, so revocation has to happen on this refresh.
+      const [meshAgain] = h.hub.toolUrls("mac", "a", [{ name: "mesh", url: `${leader}/mcp/mesh` }]);
+      expect(meshAgain.url).toBe(mesh.url);
+      expect(h.hub.list().find((f) => f.id === "mac")?.actors).toEqual(["a"]);
+      expect((await fetch(revoked.url)).status).toBe(404);
+      expect((await fetch(mesh.url)).status).toBe(200);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("reconciles only the refreshed actor's routes", async () => {
+    const h = await setup();
+    await h.register("mac");
+    h.hub.createHost("mac", "a");
+    h.hub.createHost("mac", "b");
+    const [forB] = h.hub.toolUrls("mac", "b", [{ name: "mesh", url: "http://127.0.0.1:1/mcp/b" }]);
+    h.hub.toolUrls("mac", "a", [{ name: "mesh", url: "http://127.0.0.1:1/mcp/a" }]);
+    h.hub.toolUrls("mac", "a", []);
+    // Sibling capabilities survive another actor's refresh: 502 is the proxy
+    // failing to reach the (unbound) leader port, i.e. the route still resolves.
+    expect((await fetch(forB.url)).status).toBe(502);
+  });
 });

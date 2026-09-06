@@ -127,7 +127,8 @@ pnpm exec vitest run src/experimental/remote-instances
 
 The fixture provider is test-only. Tests cover instance registration/versioning,
 shared PID, actor-local sessions, fresh admission-time prompts, active retirement,
-initialization failure, disconnect, and MCP capability routing/revocation.
+initialization failure, disconnect, and MCP capability routing/revocation —
+both mid-life, when a grant leaves the snapshot, and at actor exit.
 
 For real work, use the existing control API and add `target`:
 
@@ -152,21 +153,23 @@ Provider factories are local code, never module paths supplied over the network.
 
 The leader keeps records, inboxes, prompt assembly, admission, accounting and
 MCP servers. Per-actor unguessable gateway URLs forward only assigned leader
-MCP endpoints, preserving streaming and session headers. Those capabilities
-are revoked when the actor exits. Control enrollment secrets are not included
-in actor tool URLs. Tailscale provides the encrypted network connection;
-the HTTP gateway is not intended for the public internet.
+MCP endpoints, preserving streaming and session headers. The URL set is
+reconciled against the actor's capabilities on every refresh, so a grant the
+leader withdraws stops resolving while the actor is still running, not only
+when it exits; exit revokes whatever is left. Control enrollment secrets are
+not included in actor tool URLs. Tailscale provides the encrypted network
+connection; the HTTP gateway is not intended for the public internet.
 
 `/mcp/<key>` is deliberately the one gateway path that does not check the
 enrollment bearer token: the 256-bit random path segment is itself the
 capability, and the gateway strips any inbound `authorization` header before
 proxying to the leader. That is the tradeoff this prototype accepts. It keeps
 the follower from ever holding the control secret — a compromised follower
-process can reach only the MCP endpoints already assigned to its own actors,
-and only until they exit — at the cost of putting a bearer capability in a URL,
-where request logs, proxies and process listings can capture it. The gateway
-therefore never logs request paths, and the routing table is in memory only,
-so a leader restart invalidates every outstanding capability. Adding a second
+process can reach only the MCP endpoints currently assigned to its own actors —
+at the cost of putting a bearer capability in a URL, where request logs, proxies
+and process listings can capture it. The gateway therefore never logs request
+paths, and the routing table is in memory only, so a leader restart invalidates
+every outstanding capability. Adding a second
 per-actor credential is deferred: it would need its own distribution and
 rotation path on the follower, which is federation work rather than
 connectivity work.
