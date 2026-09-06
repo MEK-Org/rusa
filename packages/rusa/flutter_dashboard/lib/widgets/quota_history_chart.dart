@@ -5,7 +5,14 @@ import 'package:flutter/material.dart';
 import '../models.dart';
 import '../theme.dart';
 
-const _seriesColors = <Color>[
+const _providerSeriesColors = <String, Color>{
+  'claude': Color(0xFFC15F3C),
+  'agy': Color(0xFF3B82F6),
+  'codex': Color(0xFF10B981),
+  'kimi': Color(0xFFA855F7),
+};
+
+const _fallbackSeriesColors = <Color>[
   MeshColors.accent,
   MeshColors.statusActive,
   MeshColors.statusIdle,
@@ -15,6 +22,11 @@ const _seriesColors = <Color>[
   Color(0xFF818CF8),
   Color(0xFFF97316),
 ];
+
+/// Keeps known provider colors stable when the API changes the series order.
+Color _quotaChartColorForProvider(String provider, int fallbackIndex) =>
+    _providerSeriesColors[provider] ??
+    _fallbackSeriesColors[fallbackIndex % _fallbackSeriesColors.length];
 
 String _providerTitle(String provider) => switch (provider) {
   'claude' => 'Claude',
@@ -211,7 +223,7 @@ class _ChartSection extends StatelessWidget {
             for (var i = 0; i < series.length; i++)
               _LegendItem(
                 series: series[i],
-                color: _seriesColors[i % _seriesColors.length],
+                color: _quotaChartColorForProvider(series[i].provider, i),
               ),
           ],
         ),
@@ -394,7 +406,7 @@ class QuotaPaceErrorChartPainter extends CustomPainter {
 
       if (segments.isEmpty) continue;
 
-      final color = _seriesColors[i % _seriesColors.length];
+      final color = _quotaChartColorForProvider(series[i].provider, i);
       final linePaint = Paint()
         ..color = color
         ..strokeWidth = 2
@@ -656,7 +668,7 @@ class QuotaThrottleIntervalChartPainter extends CustomPainter {
 
       if (segments.isEmpty) continue;
 
-      final color = _seriesColors[i % _seriesColors.length];
+      final color = _quotaChartColorForProvider(series[i].provider, i);
       final linePaint = Paint()
         ..color = color
         ..strokeWidth = 2
