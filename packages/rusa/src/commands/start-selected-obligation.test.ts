@@ -9,10 +9,18 @@ import { ObligationRepository } from "../db/repositories/obligation-repository.j
 import { createSelectedObligationForActor } from "./start.js";
 
 /**
- * The dashboard's "current work" reader, wired the way `runStart` wires it: the
- * leader's run ledger on one side, the durable focus and obligation stores on
- * the other. Stubbing either half hides the failure that matters here, which is
- * the two halves not being joined at all.
+ * The *semantics* of the dashboard's "current work" reader, against a real run
+ * ledger and real focus/obligation stores rather than a stub on either side.
+ *
+ * Scope is deliberate: this owns what the reader means, not where `runStart`
+ * binds it. That binding is a single call site covered by typecheck and review
+ * — passing a second, never-begun `RunAccounting` there would typecheck and
+ * leave these tests green.
+ *
+ * The load-bearing case is the restart one. Every other assertion here also
+ * holds for a "most recent open run row for this actor" reader, because
+ * `activeFocusPrimaryObligationId` already filters on `outcome IS NULL`; only
+ * an open row that this leader never claimed separates the two.
  */
 describe("createSelectedObligationForActor", () => {
   const ACTOR = "actor-a";
@@ -67,6 +75,23 @@ describe("createSelectedObligationForActor", () => {
     accounting.complete(ACTOR, { success: true, exitCode: 0, output: "" });
 
     expect(selectedObligationForActor(ACTOR)).toBeNull();
+  });
+
+  it("reports no current work for an open run this leader did not claim", () => {
+    select(accounting.begin(ACTOR, "claude"), "ob-1");
+
+    // A fresh leader over the same durable stores, as after a restart: the row
+    // is still open and still carries a focus, but no run is claimed in this
+    // process. "Open right now" is the leader's in-process claim, not the row.
+    const restarted = createSelectedObligationForActor(
+      createRunAccounting(() => runs),
+      () => ({
+        actorRuns: runs,
+        obligations,
+      })
+    );
+
+    expect(restarted(ACTOR)).toBeNull();
   });
 
   it("reports no current work when the open run selected nothing", () => {
