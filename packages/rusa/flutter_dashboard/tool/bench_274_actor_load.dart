@@ -8,6 +8,7 @@
 // It is intentionally a local CPU measurement, not a handset measurement.
 
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/mesh_stream.dart';
@@ -146,7 +147,7 @@ Future<void> main() async {
     store.dispose();
   }
 
-  print(
+  stdout.writeln(
     const JsonEncoder.withIndent('  ').convert({
       'dataset': {
         'actorCount': _actors,
