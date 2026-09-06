@@ -21,6 +21,7 @@ import {
   normalizeReasoningEffort,
 } from "./reasoning-effort.js";
 import { buildActorBwrapArgs, buildActorBwrapCommand, teardownFlutterOverlay } from "./sandbox.js";
+import { sanitizeArgvText } from "./spawn-arguments.js";
 import { runSubprocess } from "./subprocess-execution.js";
 import {
   agyGenerationCursor,
@@ -52,7 +53,14 @@ export interface AntigravityArgsOptions {
 
 /** Build the `agy` CLI args (pure; prompt is passed via `-p`). */
 export function buildAntigravityArgs(o: AntigravityArgsOptions): string[] {
-  const args = ["-p", o.prompt, "--dangerously-skip-permissions", "--output-format", "stream-json"];
+  // The prompt is assembled text, made spawnable before it enters argv (#206).
+  const args = [
+    "-p",
+    sanitizeArgvText(o.prompt),
+    "--dangerously-skip-permissions",
+    "--output-format",
+    "stream-json",
+  ];
   if (o.conversationId) args.push("--conversation", o.conversationId);
   if (o.logFile) args.push("--log-file", o.logFile);
   for (const dir of o.addDirs ?? []) {

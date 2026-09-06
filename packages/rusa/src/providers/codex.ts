@@ -17,6 +17,7 @@ import {
   codexRolloutStoreDir,
   teardownFlutterOverlay,
 } from "./sandbox.js";
+import { sanitizeArgvText } from "./spawn-arguments.js";
 import { runSubprocess } from "./subprocess-execution.js";
 import {
   attributedTokenUsage,
@@ -143,13 +144,15 @@ export function buildCodexArgs(o: CodexArgsOptions): string[] {
     const args = ["exec", "resume", "--dangerously-bypass-approvals-and-sandbox", "--json"];
     if (model) args.push("--model", model);
     for (const override of configOverrides) args.push("--config", override);
-    args.push(o.resumeSessionId, o.prompt);
+    // The session id is a configured value and stays verbatim; the prompt is
+    // assembled text, made spawnable before it enters argv (#206).
+    args.push(o.resumeSessionId, sanitizeArgvText(o.prompt));
     return args;
   }
   const args = ["exec", "--yolo", "--cd", o.cwd, "--json"];
   if (model) args.push("--model", model);
   for (const override of configOverrides) args.push("--config", override);
-  args.push(o.prompt);
+  args.push(sanitizeArgvText(o.prompt));
   return args;
 }
 
