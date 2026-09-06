@@ -192,6 +192,7 @@ import {
   providerCapabilityName,
   providerThrottleKey,
   resolveProvider,
+  resolveProviderWithSelection,
   resolveRootProvider,
 } from "../providers/registry.js";
 import { assertBwrapAvailable, teardownFlutterOverlay } from "../providers/sandbox.js";
@@ -2636,8 +2637,18 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       fallback: fallbackModels
         ? {
             models: fallbackModels,
-            resolveProvider: (selected) =>
-              resolveProvider(config, selected.provider, selected.model, selected.effort),
+            resolveProvider: (requested) => {
+              const resolved = resolveProviderWithSelection(
+                config,
+                requested.provider,
+                requested.model,
+                requested.effort
+              );
+              return {
+                provider: resolved.provider,
+                selection: { provider: requested.provider, ...resolved.selection },
+              };
+            },
             classify: classifyExhaustion,
           }
         : undefined,

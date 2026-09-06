@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { RusaConfig } from "../config/types.js";
-import { DEFAULT_ROOT_PROVIDER, resolveProvider, resolveRootProvider } from "./registry.js";
+import {
+  DEFAULT_ROOT_PROVIDER,
+  resolveProvider,
+  resolveProviderWithSelection,
+  resolveRootProvider,
+} from "./registry.js";
 
 // resolveRootProvider reads only providers / root / geminiApiKey and never the
 // DB, so a partial config is sufficient.
@@ -81,6 +86,13 @@ describe("resolveProvider", () => {
     expect(() => resolveProvider(configWith(), "claude", "claude-opus-4-8", "ultra")).toThrow(
       /reasoning effort validation failed/
     );
+  });
+
+  it("returns the normalized tuple alongside a fallback provider launch", () => {
+    const resolved = resolveProviderWithSelection(configWith(), "codex", "gpt-5.6-sol medium");
+    expect(resolved.selection).toEqual({ model: "gpt-5.6-sol", effort: "medium" });
+    expect(resolved.provider.model).toBe(resolved.selection.model);
+    expect(resolved.provider.effort).toBe(resolved.selection.effort);
   });
 
   it("uses the configured CLI capability family for logical provider aliases", () => {

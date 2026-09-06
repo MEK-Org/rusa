@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { generateHandle } from "./handle-generator.js";
-import { buildRootPrompt } from "./root-prompt.js";
-import { buildWorkerPrompt, signatureDiscipline } from "./worker-prompt.js";
+import { signatureDiscipline } from "./worker-prompt.js";
 
-describe("GitHub run attribution", () => {
+// This covers the structured GitHub signing contract only; the root and worker
+// prompt-assembly tombstones continue to exclude static prompt-prose tests.
+describe("GitHub signature discipline", () => {
   it.each([
     [
       { provider: "codex", model: "gpt-5.6-terra", effort: "xhigh" },
@@ -23,23 +23,5 @@ describe("GitHub run attribution", () => {
     expect(rendered).toContain(signature);
     expect(rendered).toContain(attribution);
     expect(rendered).not.toContain("codex");
-  });
-
-  it("renders the shared signature discipline in both root and worker prompts", () => {
-    const selected = { provider: "codex", model: "gpt-5.6-terra", effort: "xhigh" };
-    const workerId = "worker-attribution";
-    const expectedWorkerSignature = `*${generateHandle(workerId)} (gpt-5.6-terra, xhigh)*`;
-
-    expect(buildRootPrompt("root charter", "root-handle", undefined, selected)).toContain(
-      "*root-handle (gpt-5.6-terra, xhigh)*"
-    );
-    expect(
-      buildWorkerPrompt(
-        "worker charter",
-        { threadId: workerId, parentId: "parent-attribution" },
-        undefined,
-        selected
-      )
-    ).toContain(expectedWorkerSignature);
   });
 });

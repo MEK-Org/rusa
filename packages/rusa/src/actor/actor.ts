@@ -109,8 +109,11 @@ export interface ActorOptions {
   /** Optional model fallback for provider capacity/quota exhaustion. */
   fallback?: {
     models: string[];
-    /** Resolve the exact model/effort tuple a fallback attempt will launch. */
-    resolveProvider: (selected: RawProviderModelConfig) => CodingProvider;
+    /** Resolve the normalized tuple and provider a fallback attempt will launch. */
+    resolveProvider: (selected: RawProviderModelConfig) => {
+      provider: CodingProvider;
+      selection: RawProviderModelConfig;
+    };
     classify: ExhaustionClassifier;
   };
   /** Debounce window for coalescing wake bursts (default: TriggerRunner default). */
@@ -994,8 +997,8 @@ export class Actor {
 
     const primaryName = primary.model ?? primary.name;
     for (const model of fallback.models) {
-      const selection = { ...primarySelection, model };
-      const provider = fallback.resolveProvider(selection);
+      const requested = { ...primarySelection, model };
+      const { provider, selection } = fallback.resolveProvider(requested);
       this.opts.log?.(
         `\n[Fallback] primary ${primaryName} exhausted; continuing on fallback ${model}\n`
       );

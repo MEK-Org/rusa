@@ -4,7 +4,7 @@ import { FakeProvider } from "../providers/fake-provider.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import * as sandboxModule from "../providers/sandbox.js";
 import { formatSigtermResult } from "../providers/termination-attribution.js";
-import type { RunOptions, RunResult } from "../providers/types.js";
+import type { CodingProvider, RunOptions, RunResult } from "../providers/types.js";
 import {
   Actor,
   type ActorOptions,
@@ -755,7 +755,11 @@ describe("Actor", () => {
     const seen: RunResult[] = [];
     const actor = makeActor(
       {
-        fallback: { models: [], resolveProvider: () => provider, classify },
+        fallback: {
+          models: [],
+          resolveProvider: (selection) => ({ provider, selection }),
+          classify,
+        },
         onRunEnd: (result) => {
           seen.push(result);
         },
@@ -780,7 +784,7 @@ describe("Actor", () => {
       {
         fallback: {
           models: ["fallback-model"],
-          resolveProvider: () => fallbackProvider,
+          resolveProvider: (selection) => ({ provider: fallbackProvider, selection }),
           classify: async () => ({ exhausted: false }),
         },
         onRunEnd: (result) => {
@@ -818,7 +822,7 @@ describe("Actor", () => {
       {
         fallback: {
           models: ["backup-model"],
-          resolveProvider: () => fallbackProvider,
+          resolveProvider: (selection) => ({ provider: fallbackProvider, selection }),
           classify: async (result) => ({
             exhausted: /quota exhausted/i.test(result.output),
           }),
@@ -852,13 +856,16 @@ describe("Actor", () => {
       actor.declareYield();
       return { output: "fallback ok" };
     }, "fallback-model");
-    const resolveFallback = vi.fn(() => fallbackProvider);
+    const resolveFallback = vi.fn((_selection: RawProviderModelConfig) => fallbackProvider);
     actor = makeActor(
       {
         modelConfig: [{ provider: primary.providerName, model: "primary-model", effort: "high" }],
         fallback: {
           models: ["fallback-model"],
-          resolveProvider: resolveFallback,
+          resolveProvider: (selection) => ({
+            provider: resolveFallback(selection),
+            selection,
+          }),
           classify: async () => ({ exhausted: true }),
         },
         buildPrompt: (selected) => ({
@@ -880,6 +887,53 @@ describe("Actor", () => {
     });
   });
 
+  it("rebuilds the fallback prompt from the normalized model and effort it launches", async () => {
+    let actor!: Actor;
+    const primary = new FakeProvider(
+      () => ({ success: false, output: "quota exhausted", exitCode: 1 }),
+      "primary-model"
+    );
+    const fallbackCalls: RunOptions[] = [];
+    const fallbackProvider: CodingProvider = {
+      name: "gpt-5.6-sol @ medium (codex)",
+      providerName: "codex",
+      model: "gpt-5.6-sol",
+      effort: "medium",
+      async run(opts) {
+        fallbackCalls.push(opts);
+        actor.declareYield();
+        return { success: true, output: "fallback ok", exitCode: 0 };
+      },
+    };
+    const resolveFallback = vi.fn((_selection: RawProviderModelConfig) => fallbackProvider);
+    actor = makeActor(
+      {
+        modelConfig: [{ provider: primary.providerName, model: "primary-model" }],
+        fallback: {
+          models: ["gpt-5.6-sol medium"],
+          resolveProvider: (requested) => ({
+            provider: resolveFallback(requested),
+            selection: { provider: requested.provider, model: "gpt-5.6-sol", effort: "medium" },
+          }),
+          classify: async () => ({ exhausted: true }),
+        },
+        buildPrompt: (selected) => ({
+          prompt: `${selected.model}:${selected.effort ?? "none"}`,
+        }),
+      },
+      primary
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(resolveFallback).toHaveBeenCalledWith({
+      provider: primary.providerName,
+      model: "gpt-5.6-sol medium",
+    });
+    expect(fallbackCalls[0]?.prompt).toBe("gpt-5.6-sol:medium");
+  });
+
   it("falls back on the field-reproduced Claude session-limit exhaustion string", async () => {
     let actor!: Actor;
     const primary = new FakeProvider(
@@ -899,7 +953,7 @@ describe("Actor", () => {
       {
         fallback: {
           models: ["sonnet"],
-          resolveProvider: () => fallbackProvider,
+          resolveProvider: (selection) => ({ provider: fallbackProvider, selection }),
           classify: async (result) => ({
             exhausted: deterministicExhaustionFallback(result.output) === "quota",
           }),
@@ -939,7 +993,7 @@ describe("Actor", () => {
       {
         fallback: {
           models: ["fallback-model"],
-          resolveProvider: () => fallbackProvider,
+          resolveProvider: (selection) => ({ provider: fallbackProvider, selection }),
           classify: async () => ({ exhausted: true }),
         },
         onRunEnd: (r) => {
@@ -989,7 +1043,7 @@ describe("Actor", () => {
       {
         fallback: {
           models: ["fallback-model"],
-          resolveProvider: () => fallbackProvider,
+          resolveProvider: (selection) => ({ provider: fallbackProvider, selection }),
           // Primary classifies exhausted; the fallback's failure does not.
           classify: async (r: RunResult) => ({ exhausted: r.output.includes("RAW PRIMARY") }),
         },
@@ -2123,7 +2177,7 @@ describe("Actor", () => {
           yieldGraceMs: 5000,
           fallback: {
             models: ["fallback-model"],
-            resolveProvider: () => fallbackProvider,
+            resolveProvider: (selection) => ({ provider: fallbackProvider, selection }),
             classify,
           },
           onRunEnd,
