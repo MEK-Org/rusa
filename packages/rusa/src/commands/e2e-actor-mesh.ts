@@ -17,7 +17,12 @@ import type { QuotaApiDeps } from "../dashboard/quota-api.js";
 import { getRepositories } from "../db/index.js";
 import { FakeIssueClient } from "../e2e/fake-issue-client.js";
 import { LocalTracker } from "../e2e/local-tracker.js";
-import { PID_FILE, provisionE2EInstance, resumeE2EInstance } from "../e2e/provision.js";
+import {
+  E2E_RUNS_DIR_NAME,
+  PID_FILE,
+  provisionE2EInstance,
+  resumeE2EInstance,
+} from "../e2e/provision.js";
 import { startTrackerServer } from "../e2e/tracker-server.js";
 import { ActorHandle } from "../experimental/remote-instances/actor-handle.js";
 import { instanceWorkerFactory } from "../experimental/remote-instances/e2e-adapter.js";
@@ -140,7 +145,7 @@ export async function runActorMeshE2EUp(opts: {
   // under /tmp (the bare remote, the gitconfig with the clone `insteadOf`) is
   // invisible to a worker. Rooting under $HOME keeps it ro-bound and visible, so
   // a worker can clone the synthetic repo via the rewritten URL.
-  const runsDir = join(homedir(), ".rusa-e2e");
+  const runsDir = join(homedir(), E2E_RUNS_DIR_NAME);
   mkdirSync(runsDir, { recursive: true });
   if (opts.resume && !opts.root) {
     throw new Error("--resume requires --root");
