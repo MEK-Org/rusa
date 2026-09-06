@@ -115,8 +115,20 @@ describe("ProviderPacer", () => {
     });
 
     expect(pacer.getQueueSnapshot()).toEqual([
-      { threadId: "head-thread", position: 0, estimatedStartAt: base + 10_000 },
-      { threadId: "following-thread", position: 1, estimatedStartAt: base + 20_000 },
+      {
+        threadId: "head-thread",
+        position: 0,
+        estimatedStartAt: base + 10_000,
+        pacingIntervalMs: 10_000,
+        blocker: "provider-pacing",
+      },
+      {
+        threadId: "following-thread",
+        position: 1,
+        estimatedStartAt: base + 20_000,
+        pacingIntervalMs: 10_000,
+        blocker: "provider-pacing",
+      },
     ]);
   });
 
@@ -140,14 +152,32 @@ describe("ProviderPacer", () => {
     // The staged request can't become eligible until it actually starts and
     // recomputes nextAvailableAt, so every entry's ETA is unknown.
     expect(pacer.getQueueSnapshot()).toEqual([
-      { threadId: "staged-thread", position: 0, estimatedStartAt: null },
-      { threadId: "following-thread", position: 1, estimatedStartAt: null },
+      {
+        threadId: "staged-thread",
+        position: 0,
+        estimatedStartAt: null,
+        pacingIntervalMs: 10_000,
+        blocker: "mesh-concurrency",
+      },
+      {
+        threadId: "following-thread",
+        position: 1,
+        estimatedStartAt: null,
+        pacingIntervalMs: 10_000,
+        blocker: "provider-pacing",
+      },
     ]);
 
     release();
     await vi.advanceTimersByTimeAsync(0);
     expect(pacer.getQueueSnapshot()).toEqual([
-      { threadId: "following-thread", position: 0, estimatedStartAt: base + 10_000 },
+      {
+        threadId: "following-thread",
+        position: 0,
+        estimatedStartAt: base + 10_000,
+        pacingIntervalMs: 10_000,
+        blocker: "provider-pacing",
+      },
     ]);
 
     await vi.advanceTimersByTimeAsync(10_000);
@@ -166,7 +196,13 @@ describe("ProviderPacer", () => {
     });
 
     expect(pacer.getQueueSnapshot()).toEqual([
-      { threadId: "delayed-thread", position: 0, estimatedStartAt: base + 5_000 },
+      {
+        threadId: "delayed-thread",
+        position: 0,
+        estimatedStartAt: base + 5_000,
+        pacingIntervalMs: 0,
+        blocker: "provider-pacing",
+      },
     ]);
     await vi.advanceTimersByTimeAsync(4_999);
     expect(run.started).toBe(false);
