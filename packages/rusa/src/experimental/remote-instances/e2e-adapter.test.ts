@@ -12,6 +12,19 @@ const ACTOR_ID = "placed-actor";
 const TARGET = "test-follower";
 
 /**
+ * The adapter reads only `providers` and `rootActor`, but it takes the whole
+ * config, so the fixture is a real one rather than a cast off a fragment.
+ */
+function configWith(providers: RusaConfig["providers"]): RusaConfig {
+  return {
+    github: { account: "test-bot" },
+    webhook: { port: 0, secret: "test-secret" },
+    providers,
+    rootActor: { provider: "codex" },
+  };
+}
+
+/**
  * A connection failure is not a run outcome.
  *
  * The adapter used to synthesize a failed run end for every failure the handle
@@ -25,7 +38,7 @@ function place() {
     createHost: (_followerId: string, actorId: string) => remote.createHost(actorId),
     toolUrls: () => [],
   } as unknown as FollowerHub;
-  const config = { providers: { codex: {} }, rootActor: { provider: "codex" } } as RusaConfig;
+  const config = configWith({ codex: { cliCommand: "codex" } });
 
   const runEnds: RunResult[] = [];
   const context = {
@@ -91,8 +104,8 @@ describe("instanceWorkerFactory", () => {
       ],
     } as unknown as ActorOptions;
 
-    expect(() =>
-      instanceWorkerFactory({ providers: {} } as RusaConfig, hub)(context, options)
-    ).toThrow(/single declared provider\/model/);
+    expect(() => instanceWorkerFactory(configWith({}), hub)(context, options)).toThrow(
+      /single declared provider\/model/
+    );
   });
 });
