@@ -11,7 +11,9 @@ export function instanceWorkerFactory(
   return (context, options) => {
     const record = context.record;
     const target = context.executionTarget;
-    if (!target) return new Actor(options);
+    // Only an omitted target means "run here". A defined-but-unusable one falls
+    // through to the hub, which refuses it by name.
+    if (target === undefined) return new Actor(options);
     // The follower constructs exactly one provider from the bootstrap, so a
     // multi-candidate pool has no honest remote meaning yet. Refuse it rather
     // than silently running whichever candidate happens to be first.

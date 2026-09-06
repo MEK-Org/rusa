@@ -375,7 +375,12 @@ export function startRootControlServer(opts: {
       .then((body) => {
         if (url.pathname === "/actors") {
           const target = typeof body.target === "string" ? body.target : undefined;
-          if (target && !opts.followerHub?.list().some((follower) => follower.id === target)) {
+          // A supplied target must name a connected follower — a blank or
+          // unknown one is a refusal here, never a fall-through to a local run.
+          if (
+            target !== undefined &&
+            !opts.followerHub?.list().some((follower) => follower.id === target)
+          ) {
             send(res, 400, { error: "Requested follower is not connected" });
             return;
           }

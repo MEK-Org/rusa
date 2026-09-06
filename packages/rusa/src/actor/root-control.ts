@@ -91,7 +91,12 @@ export class RootControlService {
       return { provider: entry.provider, model, effort: entry.effort };
     });
     const id = this.options.mesh.spawn({
-      ...(request.executionTarget ? { executionTarget: request.executionTarget } : {}),
+      // Every *defined* target is forwarded, blank included: mesh.spawn is the
+      // fail-closed gate, and a target erased here would reach it as an
+      // omission, i.e. as "run locally".
+      ...(request.executionTarget !== undefined
+        ? { executionTarget: request.executionTarget }
+        : {}),
       charter,
       parentId: this.rootId,
       modelConfig: request.modelConfig,

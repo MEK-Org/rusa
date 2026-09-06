@@ -2238,7 +2238,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // placement request only ever reaches a remote runtime, never a local
         // Actor standing in silently for the instance that was asked for.
         const createWorkerActor = opts?.e2e?.createWorkerActor;
-        if (ctx.executionTarget && !createWorkerActor) {
+        if (ctx.executionTarget !== undefined && !createWorkerActor) {
           throw new Error(
             `actor ${id} requests executionTarget ${JSON.stringify(ctx.executionTarget)} but this runtime has no remote placement support`
           );

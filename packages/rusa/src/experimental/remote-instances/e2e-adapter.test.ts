@@ -86,6 +86,29 @@ describe("instanceWorkerFactory", () => {
     expect(runEnds).toEqual([]);
   });
 
+  it("sends a defined-but-blank target to the hub rather than running it locally", () => {
+    const hub = {
+      createHost: (followerId: string) => {
+        throw new Error(`Follower ${followerId} is not connected`);
+      },
+      toolUrls: () => [],
+    } as unknown as FollowerHub;
+    const context = {
+      executionTarget: "",
+      record: { id: ACTOR_ID },
+      getRecord: () => ({ id: ACTOR_ID }),
+    } as unknown as ActorFactoryContext;
+    const options = {
+      modelConfig: [{ provider: "codex", model: "gpt-5.5" }],
+    } as unknown as ActorOptions;
+
+    // Only an omitted target means "run here"; a blank one is a placement
+    // request the hub refuses by name.
+    expect(() => instanceWorkerFactory(configWith({}), hub)(context, options)).toThrow(
+      /is not connected/
+    );
+  });
+
   it("refuses to place an actor declaring more than one candidate", () => {
     const remote = new RemoteInstance(TARGET, process.platform, process.pid);
     const hub = {

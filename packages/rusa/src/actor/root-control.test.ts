@@ -50,6 +50,28 @@ describe("RootControlService", () => {
     });
   });
 
+  it("forwards every defined execution target, including a blank one, to the mesh", () => {
+    const { mesh, service } = setup();
+    service.spawnChild(
+      {
+        charter: "place me",
+        modelConfig: { provider: "claude", model: "claude-opus-5" },
+        executionTarget: "",
+      },
+      "e2e-controller"
+    );
+    // Erasing a blank target here would turn an explicit placement request into
+    // a silent local run; mesh.spawn is the gate that decides it, so it has to
+    // see what was asked for.
+    expect(mesh.spawn).toHaveBeenCalledWith(expect.objectContaining({ executionTarget: "" }));
+
+    service.spawnChild(
+      { charter: "run here", modelConfig: { provider: "claude", model: "claude-opus-5" } },
+      "e2e-controller"
+    );
+    expect(vi.mocked(mesh.spawn).mock.calls[1][0]).not.toHaveProperty("executionTarget");
+  });
+
   it("forwards and audits an independent effort setting", () => {
     const { mesh, events, service } = setup();
     service.spawnChild(
