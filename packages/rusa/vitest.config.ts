@@ -4,7 +4,8 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
-    exclude: ["**/node_modules/**", "src/v2/runs/**"],
+    // worker-prompt.test.ts is a deliberate comment-only tombstone (#179); it has no tests to run.
+    exclude: ["**/node_modules/**", "src/v2/runs/**", "src/actor/worker-prompt.test.ts"],
     deps: {
       external: ["open"],
     },

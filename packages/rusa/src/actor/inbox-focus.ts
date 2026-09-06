@@ -92,7 +92,10 @@ export class InboxFocusResolver {
       for (const id of this.focus.listEntryObligationIds(input.actorId, entry.id)) {
         if (live(this.obligations.get(id))) ids.add(id);
       }
-      if (entry.payload.type === "obligation.ready_head") {
+      if (
+        entry.payload.type === "obligation.ready_head" ||
+        entry.payload.type === "obligation.prerequisite_cancelled"
+      ) {
         const id = entry.payload.obligationId;
         if (typeof id === "string" && live(this.obligations.get(id))) {
           ids.add(id);

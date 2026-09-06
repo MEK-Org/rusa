@@ -1,3 +1,5 @@
+import type { ProviderModelConfig } from "../providers/model-config.js";
+
 export type ActorStatus = "active" | "retired";
 
 export interface NativeContextConfig {
@@ -25,13 +27,10 @@ export interface ActorRecord {
   charter: string;
   parentId: string | null;
   handles?: ActorHandle[];
-  provider?: string;
-  model?: string;
-  effort?: string;
-  /** Process-local staged model changes; deliberately not durable. */
-  desiredModel?: string;
-  desiredEffort?: string | null;
-  desiredProvider?: string;
+  /** Bounded, non-empty, validated pool of provider/model/effort candidates. */
+  modelConfig?: ProviderModelConfig[];
+  /** Process-local staged full-pool replacement; deliberately not durable. */
+  desiredModelConfig?: ProviderModelConfig[];
   sessionId?: string;
   context?: ContextConfig;
   title?: string;

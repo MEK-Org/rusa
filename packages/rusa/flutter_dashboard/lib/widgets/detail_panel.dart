@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
 import 'dart:async';
 import 'package:rxdart/rxdart.dart';
@@ -693,8 +694,75 @@ class _InfoViewState extends State<_InfoView> {
     ),
   );
 
+  /// The declared candidates, numbered and in configured order. Never
+  /// truncated and never ellipsised — showing every entry is the point, and
+  /// each line wraps so a long provider/model/effort triple stays readable at
+  /// phone width.
+  Widget _pool(String title, String note, List<ProviderModelConfig> entries) =>
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(
+              color: MeshColors.textPrimary,
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            note,
+            style: const TextStyle(
+              color: MeshColors.textMuted,
+              fontSize: 12,
+              height: 1.4,
+            ),
+          ),
+          const SizedBox(height: 8),
+          for (var i = 0; i < entries.length; i++)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 4),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SizedBox(
+                    width: 22,
+                    child: Text(
+                      '${i + 1}.',
+                      style: kMonoStyle.copyWith(
+                        fontSize: 13,
+                        color: MeshColors.textMuted,
+                      ),
+                    ),
+                  ),
+                  Expanded(
+                    child: Text(
+                      entries[i].label,
+                      style: kMonoStyle.copyWith(
+                        fontSize: 13,
+                        color: MeshColors.textSecondary,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      );
+
   @override
   Widget build(BuildContext context) {
+    final pool = actor.modelConfig;
+    final staged = actor.desiredModelConfig;
+    // A pool gets its own list instead of the single Provider/Model/Effort
+    // rows: those rows carry the server's first-entry compatibility view, and
+    // presenting one candidate of several as "the" model is the very claim
+    // the pool has no basis for.
+    final showPool = pool.length > 1 || (staged != null && staged.length > 1);
+    final stagedPool = showPool && staged != null && !listEquals(staged, pool)
+        ? staged
+        : null;
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(24, 20, 24, 24),
       child: Column(
@@ -705,7 +773,8 @@ class _InfoViewState extends State<_InfoView> {
             runSpacing: 12,
             children: [
               _meta('Parent', parentHandle),
-              if (actor.provider != null || actor.desiredProvider != null)
+              if (!showPool &&
+                  (actor.provider != null || actor.desiredProvider != null))
                 _meta(
                   'Provider',
                   actor.desiredProvider != null &&
@@ -713,7 +782,8 @@ class _InfoViewState extends State<_InfoView> {
                       ? '${actor.provider ?? "default"} → ${actor.desiredProvider} (applies after next run)'
                       : (actor.provider ?? "default"),
                 ),
-              if (actor.model != null || actor.desiredModel != null)
+              if (!showPool &&
+                  (actor.model != null || actor.desiredModel != null))
                 _meta(
                   'Model',
                   actor.desiredModel != null &&
@@ -721,7 +791,8 @@ class _InfoViewState extends State<_InfoView> {
                       ? '${actor.model ?? "default"} → ${actor.desiredModel} (applies after next run)'
                       : (actor.model ?? "default"),
                 ),
-              if (actor.effort != null || actor.effortChangePending)
+              if (!showPool &&
+                  (actor.effort != null || actor.effortChangePending))
                 _meta(
                   'Effort',
                   actor.effortChangePending &&
@@ -737,6 +808,24 @@ class _InfoViewState extends State<_InfoView> {
                 _meta('Retire expected', actor.ownerExpectsRetirement!.toString()),
             ],
           ),
+          if (showPool) ...[
+            const SizedBox(height: 20),
+            _pool(
+              'Configured models (${pool.length})',
+              'Declared candidates in configured order, tried '
+                  'earliest-available first. A run resolves one of these when '
+                  'it starts — the first entry is not a record of what ran.',
+              pool,
+            ),
+            if (stagedPool != null) ...[
+              const SizedBox(height: 16),
+              _pool(
+                'Staged for next run (${stagedPool.length})',
+                'Replaces the configured pool at the next run boundary.',
+                stagedPool,
+              ),
+            ],
+          ],
           const SizedBox(height: 24),
           const Text(
             'Charter',

@@ -298,42 +298,6 @@ function resolveResetAtIso(
   return undefined;
 }
 
-function validateParsedWindowsCompleteness(
-  output: string,
-  provider: "claude" | "codex" | "agy" | "kimi",
-  realWindows: LlmQuotaWindow[]
-): void {
-  // Scoped to Codex for Issue #53 where LLM row omission was observed.
-  if (provider === "codex") {
-    // Helper to ensure we only match provider-scoped windows (or default scope)
-    // so model-scoped windows (e.g. Spark weekly) do not satisfy provider limit requirements.
-    const hasProviderWindow = (predicate: (w: LlmQuotaWindow) => boolean) =>
-      realWindows.some((w) => (w.scope === "provider" || w.scope === undefined) && predicate(w));
-
-    // Codex /status panel renders provider limit rows with colons ('5h limit:' and 'Weekly limit:').
-    const has5hLimit = /(?:^|\n|\r|\s)5h\s+limit\s*:/i.test(output);
-    const hasWeeklyLimit = /(?:^|\n|\r|\s)Weekly\s+limit\s*:/i.test(output);
-
-    if (has5hLimit) {
-      const found = hasProviderWindow((w) => normalizeQuotaWindowKind(w.kind) === "five_hour");
-      if (!found) {
-        throw new Error(
-          "Quota parse incomplete: raw output contains '5h limit:' but parsed windows omitted a provider-scoped five_hour window (or emitted as unreadable placeholder)"
-        );
-      }
-    }
-
-    if (hasWeeklyLimit) {
-      const found = hasProviderWindow((w) => normalizeQuotaWindowKind(w.kind) === "weekly");
-      if (!found) {
-        throw new Error(
-          "Quota parse incomplete: raw output contains 'Weekly limit:' but parsed windows omitted a provider-scoped weekly window (or emitted as unreadable placeholder)"
-        );
-      }
-    }
-  }
-}
-
 async function parseQuotaWithLlm(
   output: string,
   apiKey: string,
@@ -458,8 +422,6 @@ async function parseQuotaWithLlm(
       : [];
     const status = parsed.status;
     const result: Partial<ProviderQuotaSnapshot> = { status };
-
-    validateParsedWindowsCompleteness(output, provider, realWindows);
 
     const limits: QuotaLimit[] = [];
     for (const w of realWindows) {

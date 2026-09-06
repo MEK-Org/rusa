@@ -47,6 +47,7 @@ describe("Database Migration System", () => {
       "run_token_records",
       "actor_runs",
       "obligations",
+      "obligation_prerequisites",
     ]) {
       expect(names.has(t)).toBe(true);
     }
@@ -91,6 +92,8 @@ describe("Database Migration System", () => {
       "0033_reference_cache",
       "0034_actor_runtime_state",
       "0035_recurring_obligations",
+      "0036_capability_grants",
+      "0037_obligation_dependencies",
     ]);
 
     const meshEventsColumns = (

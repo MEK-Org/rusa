@@ -46,7 +46,7 @@ export async function classifyRunExhaustion(
   try {
     const client = getGeminiClient(geminiApiKey);
     const response = await client.models.generateContent({
-      model: "gemini-3.1-flash-lite",
+      model: "gemini-3.5-flash-lite",
       contents:
         "Classify this failed coding-agent run. Return exhausted=true only when the failure " +
         "is caused by the selected model/provider capacity being unavailable or exhausted: " +

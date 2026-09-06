@@ -178,6 +178,22 @@ export function validateObligationTitle(title: string): string {
   return collapsed;
 }
 
+/**
+ * The exact-once key for one `(dependent, prerequisite)` prerequisite edge
+ * (#212).
+ *
+ * An obligation id is only required to be non-empty, so any delimiter is legal
+ * inside one and joining a pair on a fixed separator is lossy: `("a:b", "c")`
+ * and `("a", "b:c")` collapse to the same string. Both users of this key
+ * deduplicate a one-shot cancellation-repair notice, so a collision does not
+ * merely look untidy — it drops one dependent owner's prompt entirely.
+ * Length-prefixing each component keeps the pair recoverable from the
+ * encoding, so distinct pairs are always distinct keys.
+ */
+export function prerequisiteEdgeKey(dependentId: string, prerequisiteId: string): string {
+  return `${dependentId.length}:${dependentId}${prerequisiteId.length}:${prerequisiteId}`;
+}
+
 export function validateEntityId(id: EntityId): EntityId {
   if (!id.trim()) throw new ObligationValidationError("entity id is required");
   return id;

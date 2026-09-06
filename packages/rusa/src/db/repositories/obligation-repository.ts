@@ -19,6 +19,7 @@ import {
   ObligationValidationError,
   parseExternalRef,
   parseObligationReference,
+  prerequisiteEdgeKey,
   validateEntityId,
   validateObligationTitle,
 } from "../../obligations/obligation.js";
@@ -80,6 +81,20 @@ export interface CreateObligationInput {
     | { policy: "cron"; cronExpr: string }
     | { policy: "completion_interval"; intervalSeconds: number }
     | null;
+  /**
+   * Obligations this one must wait on. Accepted in the same transaction as
+   * creation (#212) so a blocked obligation can never exist as `ready`, even
+   * transiently: the row is inserted `waiting` from the start when any named
+   * prerequisite is not yet `done`.
+   */
+  blockedBy?: string[];
+}
+
+/** One entity blocked on, or unblocked by, another — see #212. */
+export interface PrerequisiteAttention {
+  dependentId: string;
+  dependentOwnerId: EntityId;
+  prerequisiteId: string;
 }
 
 export type PriorityScope = "subtree" | "self";
@@ -92,6 +107,15 @@ export interface ListObligationsOptions {
   ownerId?: EntityId;
   status?: ObligationStatus;
   rootsOnly?: boolean;
+  /**
+   * Drop terminal (done/cancelled) rows that carry no reason to keep
+   * surfacing them: not recurring, and no completion-ledger history. Used by
+   * the dashboard's default Work tab load (#241) so a stale `capture:*` stub
+   * doesn't cost a tree fetch just to be hidden client-side; recurring or
+   * historied terminal rows still come through since the UI shows those by
+   * default regardless of the "Show Done" toggle.
+   */
+  excludeQuietTerminalRoots?: boolean;
 }
 
 export interface ObligationPageOptions {
@@ -457,6 +481,80 @@ export class ObligationRepository {
   }
 
   /**
+   * Notified once per (dependent, prerequisite) edge left dangling by a
+   * prerequisite reaching `cancelled` (#212). Unlike ready-head, this is a
+   * one-shot fact rather than a continuously-recomputed transition — a
+   * cancellation happens exactly once — so it needs no sequence number, and a
+   * caller wanting restart-safe delivery should key its own durable side
+   * effect off `(dependentId, prerequisiteId)` and reconcile at boot from
+   * {@link listPrerequisiteCancellationAttention}.
+   */
+  private cancellationAttentionListener?: (attention: PrerequisiteAttention) => void;
+
+  /**
+   * Obligation ids whose prerequisite just landed on `cancelled` this
+   * transaction, pending listener delivery once it commits — mirrors
+   * {@link dirtyScheduleIds}: a cancellation is not undone by a rollback, and a
+   * later mutation in the same transaction cannot un-notify it, so recording
+   * the fact here and firing after commit is what keeps delivery matched to
+   * durable state instead of racing it.
+   */
+  private pendingCancellationAttention: PrerequisiteAttention[] = [];
+
+  /**
+   * `(dependentId, prerequisiteId)` keys whose cancellation-attention delivery
+   * threw on a previous {@link mutate} call (#212) — e.g. a transient inbox
+   * append failure. Kept only as keys, not the stale payload: the next
+   * mutation re-derives each one from current persisted truth via
+   * {@link listPrerequisiteCancellationAttention} before retrying, so a
+   * dependent's owner is repaired within this process rather than only after
+   * a restart, and a pair that stopped being live (edge removed, dependent
+   * went terminal) is dropped instead of retried forever.
+   */
+  private failedCancellationAttentionKeys = new Set<string>();
+
+  private cancellationAttentionKey(attention: PrerequisiteAttention): string {
+    return prerequisiteEdgeKey(attention.dependentId, attention.prerequisiteId);
+  }
+
+  setCancellationAttentionListener(
+    listener: ((attention: PrerequisiteAttention) => void) | undefined
+  ): void {
+    this.cancellationAttentionListener = listener;
+  }
+
+  /**
+   * Every live dependent currently blocked on a cancelled prerequisite,
+   * derived fresh from persisted state rather than a separate ledger — a
+   * cancellation is permanent, so "is this edge still dangling" is always just
+   * "does the prerequisite's row still say cancelled". Used to reconcile
+   * durable attention at boot, the same role {@link readyHeadTransitions} plays
+   * for ready-head attention.
+   */
+  listPrerequisiteCancellationAttention(): PrerequisiteAttention[] {
+    const rows = this.db
+      .prepare(
+        `SELECT op.dependent_id AS dependent_id, dependent.owner_id AS dependent_owner_id,
+                op.prerequisite_id AS prerequisite_id
+         FROM obligation_prerequisites op
+         JOIN obligations dependent ON dependent.id = op.dependent_id
+         JOIN obligations prerequisite ON prerequisite.id = op.prerequisite_id
+         WHERE prerequisite.status = 'cancelled'
+           AND dependent.status IN ('ready', 'waiting', 'scheduled')`
+      )
+      .all() as Array<{
+      dependent_id: string;
+      dependent_owner_id: string;
+      prerequisite_id: string;
+    }>;
+    return rows.map((row) => ({
+      dependentId: row.dependent_id,
+      dependentOwnerId: row.dependent_owner_id,
+      prerequisiteId: row.prerequisite_id,
+    }));
+  }
+
+  /**
    * Current ready head per owner, keyed by owner id.
    *
    * "Head" is the first row of the owner's ready queue, which must stay
@@ -533,6 +631,7 @@ export class ObligationRepository {
   private mutate<T>(work: () => T): T {
     const changes: ReadyHeadChange[] = [];
     this.dirtyScheduleIds.clear();
+    this.pendingCancellationAttention = [];
     const result = this.db.transaction(() => {
       const before = this.readyHeads();
       const res = work();
@@ -607,6 +706,47 @@ export class ObligationRepository {
         }
       }
     }
+
+    const cancellationAttentionListener = this.cancellationAttentionListener;
+    if (cancellationAttentionListener) {
+      const toDeliver = [...this.pendingCancellationAttention];
+      const queuedKeys = new Set(toDeliver.map((a) => this.cancellationAttentionKey(a)));
+
+      // A prior mutation's delivery may have thrown (e.g. a transient inbox
+      // append failure) — retry it here from current persisted truth rather
+      // than the stale payload that failed, so it is repaired within this
+      // process instead of only after a restart reconciles it.
+      if (this.failedCancellationAttentionKeys.size > 0) {
+        const stillFailing = new Set(this.failedCancellationAttentionKeys);
+        for (const attention of this.listPrerequisiteCancellationAttention()) {
+          const key = this.cancellationAttentionKey(attention);
+          if (!this.failedCancellationAttentionKeys.has(key) || queuedKeys.has(key)) continue;
+          toDeliver.push(attention);
+          queuedKeys.add(key);
+          stillFailing.delete(key);
+        }
+        // Anything left here no longer matches a live dangling edge — the
+        // edge was removed, or the dependent went terminal — so there is
+        // nothing left to retry.
+        for (const key of stillFailing) this.failedCancellationAttentionKeys.delete(key);
+      }
+
+      for (const attention of toDeliver) {
+        const key = this.cancellationAttentionKey(attention);
+        try {
+          cancellationAttentionListener(attention);
+          this.failedCancellationAttentionKeys.delete(key);
+        } catch (err) {
+          this.failedCancellationAttentionKeys.add(key);
+          console.warn(
+            `[obligations] cancellation-attention listener failed for ${attention.dependentId}: ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+        }
+      }
+    }
+    this.pendingCancellationAttention = [];
 
     // OS scheduler side effects run only now, against the state the
     // transaction actually committed — never inside it, where a later
@@ -691,11 +831,62 @@ export class ObligationRepository {
             : null
           : validatePriority(input.priority);
 
+      // Resolve and validate every declared prerequisite before writing
+      // anything (#212): a blocked obligation must be inserted `waiting`
+      // outright, never inserted `ready` and corrected a moment later, or a
+      // ready-head diff computed inside this same transaction could still
+      // observe it as ready.
+      const prerequisiteIds = [...new Set(input.blockedBy ?? [])];
+      if (recurrence != null && prerequisiteIds.length > 0) {
+        throw new ObligationValidationError(
+          "recurring or scheduled obligations cannot participate in prerequisite edges"
+        );
+      }
+      const prerequisites: Obligation[] = [];
+      for (const prerequisiteId of prerequisiteIds) {
+        if (prerequisiteId === id) {
+          throw new ObligationValidationError("obligation cannot be blocked by itself");
+        }
+        const prerequisite = this.get(prerequisiteId);
+        if (!prerequisite) {
+          throw new ObligationValidationError(
+            `prerequisite obligation not found: ${prerequisiteId}`
+          );
+        }
+        this.assertEligiblePrerequisite(prerequisite);
+        // The row being created doesn't exist yet, so it can't be reached by
+        // {@link wouldCreateCycle} directly — but once inserted it will add a
+        // parent-waits-for-child edge from `parentId`. Naming a prerequisite
+        // that can already reach `parentId` would close that loop the moment
+        // the insert below lands, so it is rejected before it can.
+        //
+        // `parentId === prerequisiteId` is the degenerate case of that same
+        // loop and needs its own check: {@link wouldCreateCycle} asks whether
+        // `parentId` is reachable *from* `prerequisiteId` by following edges
+        // out of it, which is never true of a node reaching itself unless a
+        // self-loop already exists — so naming the new parent as a
+        // prerequisite would otherwise slip through un-rejected.
+        if (parentId !== null && prerequisiteId === parentId) {
+          throw new ObligationValidationError(
+            `prerequisite would create a cycle in the wait-for graph: ${prerequisiteId}`
+          );
+        }
+        if (parentId !== null && this.wouldCreateCycle(parentId, prerequisiteId)) {
+          throw new ObligationValidationError(
+            `prerequisite would create a cycle in the wait-for graph: ${prerequisiteId}`
+          );
+        }
+        prerequisites.push(prerequisite);
+      }
+      const initialStatus: ObligationStatus = prerequisites.every((p) => p.status === "done")
+        ? "ready"
+        : "waiting";
+
       try {
         this.db
           .prepare(
             `INSERT INTO obligations (id, parent_id, owner_id, title, intent, external_ref, status, priority,
-                created_at, updated_at, creator_id, recurrence_policy, recurrence_cron, recurrence_interval_seconds) VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?)`
+                created_at, updated_at, creator_id, recurrence_policy, recurrence_cron, recurrence_interval_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           )
           .run(
             id,
@@ -704,6 +895,7 @@ export class ObligationRepository {
             title,
             input.intent ?? null,
             externalRef,
+            initialStatus,
             priority,
             stampedAt,
             stampedAt,
@@ -729,6 +921,21 @@ export class ObligationRepository {
         throw error;
       }
 
+      for (const prerequisite of prerequisites) {
+        this.db
+          .prepare(
+            `INSERT INTO obligation_prerequisites (dependent_id, prerequisite_id) VALUES (?, ?)`
+          )
+          .run(id, prerequisite.id);
+        if (prerequisite.status === "cancelled") {
+          this.pendingCancellationAttention.push({
+            dependentId: id,
+            dependentOwnerId: ownerId,
+            prerequisiteId: prerequisite.id,
+          });
+        }
+      }
+
       if (parentId !== null) {
         this.db
           .prepare(
@@ -739,6 +946,246 @@ export class ObligationRepository {
 
       return this.require(id);
     });
+  }
+
+  /** Reject a prerequisite v1 cannot yet express readiness against (#212). */
+  private assertEligiblePrerequisite(prerequisite: Obligation): void {
+    if (prerequisite.recurrencePolicy !== null) {
+      throw new ObligationValidationError(
+        "recurring or scheduled obligations cannot participate in prerequisite edges"
+      );
+    }
+  }
+
+  /**
+   * Reject a dependent v1 cannot yet express recurrence against (#212): a
+   * recurring/scheduled obligation re-arms itself on its own cycle, so also
+   * gating it on a prerequisite would mix two different "when is this ready
+   * again" mechanisms on one row.
+   */
+  private assertEligibleDependent(dependent: Obligation): void {
+    if (dependent.recurrencePolicy !== null) {
+      throw new ObligationValidationError(
+        "recurring or scheduled obligations cannot participate in prerequisite edges"
+      );
+    }
+  }
+
+  /**
+   * Reject enabling recurrence on `id` while it participates in the
+   * prerequisite graph on either side (#212) — as a prerequisite some live
+   * dependent already names, or as a dependent that already names its own.
+   */
+  private assertNotInDependencyGraph(id: string): void {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM obligation_prerequisites WHERE prerequisite_id = ? OR dependent_id = ?`
+      )
+      .get(id, id) as { count: number };
+    if (row.count > 0) {
+      throw new ObligationValidationError(
+        "recurring or scheduled obligations cannot participate in prerequisite edges"
+      );
+    }
+  }
+
+  /**
+   * Cancelled-prerequisite edges still dangling on `dependentId` — used to
+   * (re-)deliver cancellation-repair attention at an ownership boundary
+   * (reassign, retirement inheritance) so the *current* owner is prompted
+   * immediately rather than only after a restart reconciles from
+   * {@link listPrerequisiteCancellationAttention} (#212).
+   */
+  private cancelledPrerequisitesOf(dependentId: string): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT op.prerequisite_id AS prerequisite_id
+         FROM obligation_prerequisites op
+         JOIN obligations prerequisite ON prerequisite.id = op.prerequisite_id
+         WHERE op.dependent_id = ? AND prerequisite.status = 'cancelled'`
+      )
+      .all(dependentId) as Array<{ prerequisite_id: string }>;
+    return rows.map((row) => row.prerequisite_id);
+  }
+
+  /** True when every prerequisite `id` declares is `done` (vacuously true for none). */
+  private prerequisitesSatisfied(id: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM obligation_prerequisites op
+         JOIN obligations prerequisite ON prerequisite.id = op.prerequisite_id
+         WHERE op.dependent_id = ? AND prerequisite.status <> 'done'`
+      )
+      .get(id) as { count: number };
+    return row.count === 0;
+  }
+
+  /**
+   * Would naming `prerequisiteId` as a prerequisite of `dependentId` close a
+   * loop in the combined wait-for graph (#212)? That graph has two edge
+   * sources: explicit prerequisite edges, and the existing parent-waits-for-
+   * live-child relation — mixing them is what makes "make my parent depend on
+   * me" as much a cycle as a direct A-blocks-B-blocks-A chain.
+   *
+   * Checked by asking whether `dependentId` is already reachable *from*
+   * `prerequisiteId` by following wait-for edges forward: if the prospective
+   * prerequisite already (transitively) waits for the dependent, adding
+   * dependent-waits-for-prerequisite would close that loop.
+   */
+  private wouldCreateCycle(dependentId: string, prerequisiteId: string): boolean {
+    const row = this.db
+      .prepare(
+        `WITH RECURSIVE waits_for(src, dst) AS (
+           SELECT dependent_id, prerequisite_id FROM obligation_prerequisites
+           UNION
+           SELECT parent_id, id FROM obligations
+           WHERE parent_id IS NOT NULL AND status IN ('ready', 'waiting')
+         ),
+         reachable(node) AS (
+           SELECT dst FROM waits_for WHERE src = ?
+           UNION
+           SELECT waits_for.dst FROM waits_for JOIN reachable ON waits_for.src = reachable.node
+         )
+         SELECT COUNT(*) AS count FROM reachable WHERE node = ?`
+      )
+      .get(prerequisiteId, dependentId) as { count: number };
+    return row.count > 0;
+  }
+
+  /**
+   * Declare that `dependentId` waits on `prerequisiteId` (#212). Adding the
+   * same edge twice is a no-op, matching {@link attachArtifact}'s idempotence.
+   * Demotes an already-`ready` dependent back to `waiting` when the named
+   * prerequisite is not yet done — the mirror image of {@link tryRelease}.
+   */
+  addPrerequisite(dependentId: string, prerequisiteId: string): Obligation {
+    return this.mutate(() => {
+      if (dependentId === prerequisiteId) {
+        throw new ObligationValidationError("obligation cannot be blocked by itself");
+      }
+      const dependent = this.require(dependentId);
+      if (isTerminalObligationStatus(dependent.status)) {
+        throw new ObligationValidationError("terminal obligations cannot gain prerequisites");
+      }
+      const prerequisite = this.require(prerequisiteId);
+      this.assertEligiblePrerequisite(prerequisite);
+      this.assertEligibleDependent(dependent);
+
+      const existing = this.db
+        .prepare(
+          `SELECT 1 FROM obligation_prerequisites WHERE dependent_id = ? AND prerequisite_id = ?`
+        )
+        .get(dependentId, prerequisiteId);
+      if (existing) return dependent;
+
+      if (this.wouldCreateCycle(dependentId, prerequisiteId)) {
+        throw new ObligationValidationError(
+          "prerequisite would create a cycle in the wait-for graph"
+        );
+      }
+
+      this.db
+        .prepare(
+          `INSERT INTO obligation_prerequisites (dependent_id, prerequisite_id) VALUES (?, ?)`
+        )
+        .run(dependentId, prerequisiteId);
+
+      // Attention-queuing and demotion are independent facts about the named
+      // prerequisite — a cancelled prerequisite is also a non-done one, so
+      // both must run for it, not just one arm of an if/else-if.
+      if (prerequisite.status === "cancelled") {
+        this.pendingCancellationAttention.push({
+          dependentId,
+          dependentOwnerId: dependent.ownerId,
+          prerequisiteId,
+        });
+      }
+      if (prerequisite.status !== "done" && dependent.status === "ready") {
+        this.db
+          .prepare("UPDATE obligations SET status = 'waiting', updated_at = ? WHERE id = ?")
+          .run(this.stamp(), dependentId);
+      }
+
+      return this.require(dependentId);
+    });
+  }
+
+  /**
+   * Remove one prerequisite edge (#212) — the repair action for a dependent
+   * left permanently blocked by a cancelled prerequisite. Removing an edge
+   * that does not exist is a no-op. Releases the dependent immediately if
+   * this was its last unmet prerequisite and it has no live children.
+   */
+  removePrerequisite(dependentId: string, prerequisiteId: string): Obligation {
+    return this.mutate(() => {
+      const dependent = this.require(dependentId);
+      const result = this.db
+        .prepare(
+          `DELETE FROM obligation_prerequisites WHERE dependent_id = ? AND prerequisite_id = ?`
+        )
+        .run(dependentId, prerequisiteId);
+      if (result.changes === 0) return dependent;
+      this.tryRelease(dependentId);
+      return this.require(dependentId);
+    });
+  }
+
+  /**
+   * Bounded page of `id`'s own prerequisites, in `prerequisite_id` order.
+   *
+   * The edge carries no declaration timestamp, so declaration order is not a
+   * fact this table can serve; ordering by the id makes paging deterministic
+   * and stable across calls, which is what a cursor actually needs.
+   */
+  listBlockedByPage(id: string, options: ObligationPageOptions): ObligationPage {
+    const { limit, offset } = validatePage(options);
+    const rows = this.db
+      .prepare(
+        `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
+         JOIN obligation_prerequisites edge ON edge.prerequisite_id = obligation.id
+         WHERE edge.dependent_id = ?
+         ORDER BY edge.prerequisite_id
+         LIMIT ? OFFSET ?`
+      )
+      .all(id, limit + 1, offset) as ObligationRow[];
+    const total = (
+      this.db
+        .prepare(`SELECT COUNT(*) AS count FROM obligation_prerequisites WHERE dependent_id = ?`)
+        .get(id) as { count: number }
+    ).count;
+    return {
+      obligations: rows.slice(0, limit).map(toObligation),
+      total,
+      hasMore: rows.length > limit,
+    };
+  }
+
+  /**
+   * Bounded page of obligations `id` unblocks — the reverse of
+   * {@link listBlockedByPage}, ordered by `dependent_id` for the same reason.
+   */
+  listUnblocksPage(id: string, options: ObligationPageOptions): ObligationPage {
+    const { limit, offset } = validatePage(options);
+    const rows = this.db
+      .prepare(
+        `${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}
+         JOIN obligation_prerequisites edge ON edge.dependent_id = obligation.id
+         WHERE edge.prerequisite_id = ?
+         ORDER BY edge.dependent_id
+         LIMIT ? OFFSET ?`
+      )
+      .all(id, limit + 1, offset) as ObligationRow[];
+    const total = (
+      this.db
+        .prepare(`SELECT COUNT(*) AS count FROM obligation_prerequisites WHERE prerequisite_id = ?`)
+        .get(id) as { count: number }
+    ).count;
+    return {
+      obligations: rows.slice(0, limit).map(toObligation),
+      total,
+      hasMore: rows.length > limit,
+    };
   }
 
   get(id: string): Obligation | null {
@@ -891,6 +1338,13 @@ export class ObligationRepository {
     if (options.rootsOnly) {
       clauses.push("obligation.parent_id IS NULL");
     }
+    if (options.excludeQuietTerminalRoots) {
+      clauses.push(
+        `(obligation.status NOT IN ('done', 'cancelled')
+          OR obligation.recurrence_policy IS NOT NULL
+          OR EXISTS (SELECT 1 FROM obligation_completions WHERE obligation_id = obligation.id))`
+      );
+    }
     const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
@@ -916,22 +1370,78 @@ export class ObligationRepository {
   }
 
   getTree(rootId: string): ObligationTree {
-    const seen = new Set<string>();
-    const visit = (id: string): ObligationTree => {
-      if (seen.has(id)) throw new ObligationValidationError(`obligation cycle detected at: ${id}`);
-      seen.add(id);
-      const obligation = this.require(id);
-      const childObligations = this.listChildren(id);
-      const children = childObligations.map((child) => visit(child.id));
+    const [tree] = this.getForest([rootId]);
+    if (!tree) throw new ObligationValidationError(`obligation not found: ${rootId}`);
+    return tree;
+  }
+
+  /**
+   * Trees for several roots in one bulk read, in the order requested.
+   *
+   * A root and every one of its descendants used to cost one `require()` plus
+   * one `listChildren()` — each re-running the whole-table effective-priority
+   * CTE — for every node in the subtree (#241). An earlier version of this
+   * fix bounded the read to just the requested subtrees with a second
+   * recursive CTE; at this table's actual scale (a few hundred rows) that
+   * bound bought nothing measurable and added its own bug — a root whose
+   * descendant was *also* requested as a separate root reached that
+   * descendant via two seed paths, producing a duplicate row that
+   * `childrenByParent` (unlike `byId`) didn't dedupe, which surfaced as a
+   * false "cycle detected" error. Reading every row once, unfiltered, and
+   * assembling every tree from one in-memory parent→children index removes
+   * both the bound and the bug: each id appears exactly once (primary key),
+   * so no id can reach the assembly step twice.
+   */
+  getForest(rootIds: readonly string[]): ObligationTree[] {
+    if (rootIds.length === 0) return [];
+    const rows = this.db
+      .prepare(`${EFFECTIVE_PRIORITY_CTE} ${PROJECTED_OBLIGATION}`)
+      .all() as ObligationRow[];
+
+    const byId = new Map<string, ObligationRow>();
+    const childrenByParent = new Map<string, ObligationRow[]>();
+    for (const row of rows) {
+      byId.set(row.id, row);
+      if (row.parent_id !== null) {
+        const siblings = childrenByParent.get(row.parent_id);
+        if (siblings) siblings.push(row);
+        else childrenByParent.set(row.parent_id, [row]);
+      }
+    }
+    for (const siblings of childrenByParent.values()) {
+      siblings.sort((a, b) =>
+        a.effective_priority !== b.effective_priority
+          ? a.effective_priority - b.effective_priority
+          : a.id < b.id
+            ? -1
+            : a.id > b.id
+              ? 1
+              : 0
+      );
+    }
+
+    const visit = (row: ObligationRow, seen: Set<string>): ObligationTree => {
+      if (seen.has(row.id)) {
+        throw new ObligationValidationError(`obligation cycle detected at: ${row.id}`);
+      }
+      seen.add(row.id);
+      const childRows = childrenByParent.get(row.id) ?? [];
+      const childObligations = childRows.map(toObligation);
       return {
-        obligation,
-        children,
+        obligation: toObligation(row),
+        children: childRows.map((child) => visit(child, seen)),
         blockingChildren: childObligations.filter((child) =>
           isBlockingObligationStatus(child.status)
         ),
       };
     };
-    return visit(rootId);
+
+    const trees: ObligationTree[] = [];
+    for (const rootId of rootIds) {
+      const rootRow = byId.get(rootId);
+      if (rootRow) trees.push(visit(rootRow, new Set()));
+    }
+    return trees;
   }
 
   /** Apply an explicit priority using the v1 subtree/self inheritance contract. */
@@ -1078,6 +1588,18 @@ export class ObligationRepository {
       this.db
         .prepare("UPDATE obligations SET owner_id = ?, updated_at = ? WHERE id = ?")
         .run(ownerId, this.stamp(), id);
+
+      // Reassignment moves the standing block to a new owner who has never
+      // seen it — re-deliver cancellation-repair attention at the moment of
+      // transfer rather than leaving it to boot reconciliation (#212).
+      for (const prerequisiteId of this.cancelledPrerequisitesOf(id)) {
+        this.pendingCancellationAttention.push({
+          dependentId: id,
+          dependentOwnerId: ownerId,
+          prerequisiteId,
+        });
+      }
+
       return this.require(id);
     });
   }
@@ -1376,9 +1898,37 @@ export class ObligationRepository {
         if (obligation.recurrencePolicy !== null) {
           this.markScheduleDirty(id);
         }
+
+        if (status === "done") {
+          this.reevaluateDependents(id);
+        } else {
+          // Cancelling never satisfies a dependent (#212) — it forfeits the
+          // wait forever, so each dependent's owner needs durable attention
+          // to remove or replace this edge rather than a silent release.
+          // Matches {@link listPrerequisiteCancellationAttention}'s live-dependent
+          // filter: a dependent that already reached done/cancelled on its own
+          // has nothing left to repair, so it should not receive a prompt just
+          // because the now-dangling edge still names it.
+          const dependents = this.db
+            .prepare(
+              `SELECT op.dependent_id AS dependent_id, dependent.owner_id AS dependent_owner_id
+               FROM obligation_prerequisites op
+               JOIN obligations dependent ON dependent.id = op.dependent_id
+               WHERE op.prerequisite_id = ?
+                 AND dependent.status IN ('ready', 'waiting', 'scheduled')`
+            )
+            .all(id) as Array<{ dependent_id: string; dependent_owner_id: string }>;
+          for (const dependent of dependents) {
+            this.pendingCancellationAttention.push({
+              dependentId: dependent.dependent_id,
+              dependentOwnerId: dependent.dependent_owner_id,
+              prerequisiteId: id,
+            });
+          }
+        }
       }
 
-      if (obligation.parentId !== null) this.reReadyParentIfUnblocked(obligation.parentId);
+      if (obligation.parentId !== null) this.tryRelease(obligation.parentId);
       return this.require(id);
     });
   }
@@ -1408,6 +1958,13 @@ export class ObligationRepository {
       if (isTerminalObligationStatus(obligation.status)) {
         throw new ObligationValidationError("terminal obligations cannot be recurring");
       }
+      // v1 rejects a prerequisite edge with either endpoint recurring/
+      // scheduled at the edge itself (#212, {@link assertEligiblePrerequisite},
+      // {@link assertEligibleDependent}) — the same invariant must hold going
+      // the other direction: turning recurrence on for an obligation already
+      // participating in the graph on either side would let a prohibited edge
+      // exist anyway, just created in the opposite order.
+      if (recurrence !== null) this.assertNotInDependencyGraph(id);
 
       if (recurrence === null) {
         // Every state this row can be in — including `scheduled`, where the
@@ -1425,7 +1982,7 @@ export class ObligationRepository {
                WHERE id = ?`
             )
             .run(this.stamp(), id);
-          if (obligation.parentId !== null) this.reReadyParentIfUnblocked(obligation.parentId);
+          if (obligation.parentId !== null) this.tryRelease(obligation.parentId);
         } else {
           this.db
             .prepare(
@@ -1462,6 +2019,9 @@ export class ObligationRepository {
             const completedTime = Date.parse(lastCompletion.completed_at);
             const readyTime = completedTime + recurrence.intervalSeconds * 1000;
             if (readyTime <= this.now()) {
+              // A recurring/scheduled obligation can never itself be a
+              // dependent (#212, {@link assertNotInDependencyGraph}), so this
+              // direct scheduled→ready transition has no prerequisite to check.
               this.db
                 .prepare(
                   `UPDATE obligations SET status = 'ready', next_ready_at = NULL, recurrence_policy = 'completion_interval', recurrence_cron = NULL, recurrence_interval_seconds = ?, updated_at = ? WHERE id = ?`
@@ -1494,6 +2054,9 @@ export class ObligationRepository {
       const obligation = this.get(id);
       if (!obligation) return null;
       if (obligation.status !== "scheduled") return obligation;
+      // A recurring/scheduled obligation can never itself be a dependent
+      // (#212, {@link assertNotInDependencyGraph}), so this transition has no
+      // prerequisite to check.
       this.db
         .prepare(
           `UPDATE obligations SET status = 'ready', next_ready_at = NULL, updated_at = ? WHERE id = ?`
@@ -1541,6 +2104,15 @@ export class ObligationRepository {
             `cannot reparent obligation to its own descendant: ${newParentId}`
           );
         }
+        // Hierarchy-only cycles are caught above, but reparenting also adds a
+        // parent-waits-for-child edge from `newParentId` to `id` — if `id`
+        // already (transitively, via an explicit prerequisite chain) waits
+        // for `newParentId`, that new edge would close the loop (#212).
+        if (this.wouldCreateCycle(newParentId, id)) {
+          throw new ObligationValidationError(
+            `cannot reparent obligation: ${id} already waits for ${newParentId}`
+          );
+        }
       }
 
       const oldParentId = obligation.parentId;
@@ -1566,7 +2138,7 @@ export class ObligationRepository {
       }
 
       if (oldParentId !== null) {
-        this.reReadyParentIfUnblocked(oldParentId);
+        this.tryRelease(oldParentId);
       }
 
       return this.require(id);
@@ -1636,6 +2208,20 @@ export class ObligationRepository {
       .get(retiringActorId, status) as { count: number };
     if (source.count === 0) return 0;
 
+    // Captured before the transfer, while `dependent.owner_id` still names
+    // the retiring actor: the inheriting owner has never seen these dangling
+    // edges, so each gets fresh attention at this ownership boundary rather
+    // than waiting for boot reconciliation (#212).
+    const cancelledBlocked = this.db
+      .prepare(
+        `SELECT DISTINCT op.dependent_id AS dependent_id, op.prerequisite_id AS prerequisite_id
+         FROM obligation_prerequisites op
+         JOIN obligations dependent ON dependent.id = op.dependent_id
+         JOIN obligations prerequisite ON prerequisite.id = op.prerequisite_id
+         WHERE dependent.owner_id = ? AND dependent.status = ? AND prerequisite.status = 'cancelled'`
+      )
+      .all(retiringActorId, status) as Array<{ dependent_id: string; prerequisite_id: string }>;
+
     const result = this.db
       .prepare(
         `UPDATE obligations
@@ -1643,21 +2229,47 @@ export class ObligationRepository {
          WHERE owner_id = ? AND status = ?`
       )
       .run(parentActorId, this.stamp(), retiringActorId, status);
+
+    for (const { dependent_id: dependentId, prerequisite_id: prerequisiteId } of cancelledBlocked) {
+      this.pendingCancellationAttention.push({
+        dependentId,
+        dependentOwnerId: parentActorId,
+        prerequisiteId,
+      });
+    }
+
     return result.changes;
   }
 
-  private reReadyParentIfUnblocked(parentId: string): void {
-    const parent = this.require(parentId);
-    if (parent.status !== "waiting") return;
+  /**
+   * Re-ready `id` if it is `waiting` for no reason anymore (#212): neither a
+   * live child (the pre-existing rule) nor an unmet named prerequisite. Both
+   * conditions must clear — one relation cannot release a wait the other
+   * relation still holds.
+   */
+  private tryRelease(id: string): void {
+    const obligation = this.require(id);
+    if (obligation.status !== "waiting") return;
     const liveChildren = this.db
       .prepare(
         `SELECT COUNT(*) AS count FROM obligations
          WHERE parent_id = ? AND status IN ('ready', 'waiting')`
       )
-      .get(parentId) as { count: number };
+      .get(id) as { count: number };
     if (liveChildren.count !== 0) return;
+    if (!this.prerequisitesSatisfied(id)) return;
     this.db
       .prepare("UPDATE obligations SET status = 'ready', updated_at = ? WHERE id = ?")
-      .run(this.stamp(), parentId);
+      .run(this.stamp(), id);
+  }
+
+  /** Release every dependent that was only waiting on `prerequisiteId` (#212). */
+  private reevaluateDependents(prerequisiteId: string): void {
+    const dependents = this.db
+      .prepare(`SELECT dependent_id FROM obligation_prerequisites WHERE prerequisite_id = ?`)
+      .all(prerequisiteId) as Array<{ dependent_id: string }>;
+    for (const { dependent_id: dependentId } of dependents) {
+      this.tryRelease(dependentId);
+    }
   }
 }

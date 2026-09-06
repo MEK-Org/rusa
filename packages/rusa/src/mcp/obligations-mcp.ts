@@ -25,6 +25,10 @@ type ObligationServerRepository = Pick<
   | "setRecurrence"
   | "listCompletionsPage"
   | "require"
+  | "addPrerequisite"
+  | "removePrerequisite"
+  | "listBlockedByPage"
+  | "listUnblocksPage"
 >;
 
 export interface ObligationsMcpOptions {
@@ -43,16 +47,24 @@ export interface ObligationsMcpOptions {
   ) => { ok: true; ownerId: string } | { ok: false; error: string };
 
   isFenced?: () => boolean;
-  /** Whether this actor may make an owner-authorized mutation to an obligation. */
-  canManage?: (actorId: string, obligation: ReturnType<ObligationRepository["require"]>) => boolean;
+  /**
+   * Whether this actor may make an owner-authorized mutation to an obligation.
+   * Takes only `ownerId` — not the full obligation — so the same check also
+   * gates `blocked_by` at creation, before the obligation being authorized for
+   * exists as a row.
+   */
+  canManage?: (actorId: string, obligation: ManageableObligation) => boolean;
 }
+
+/** The one field {@link ObligationsMcpOptions.canManage} needs to decide. */
+type ManageableObligation = Pick<ReturnType<ObligationRepository["require"]>, "ownerId">;
 
 const DEFAULT_PAGE_LIMIT = 50;
 
 type PageCursor =
   | {
       v: 1;
-      scope: "children" | "blocking-children" | "completions";
+      scope: "children" | "blocking-children" | "completions" | "blocked-by" | "unblocks";
       obligationId: string;
       offset: number;
     }
@@ -75,7 +87,9 @@ function decodeCursor(cursor: string): PageCursor {
       parsed.v !== 1 ||
       !Number.isSafeInteger(parsed.offset) ||
       parsed.offset < 0 ||
-      !["children", "blocking-children", "owned", "completions"].includes(parsed.scope)
+      !["children", "blocking-children", "owned", "completions", "blocked-by", "unblocks"].includes(
+        parsed.scope
+      )
     ) {
       throw new Error("invalid cursor fields");
     }
@@ -87,7 +101,7 @@ function decodeCursor(cursor: string): PageCursor {
 
 function childOffset(
   cursor: string | undefined,
-  scope: "children" | "blocking-children" | "completions",
+  scope: "children" | "blocking-children" | "completions" | "blocked-by" | "unblocks",
   obligationId: string
 ): number {
   if (!cursor) return 0;
@@ -131,7 +145,7 @@ export function createObligationsMcpServer(
     { isFenced: options?.isFenced }
   );
   const ownerId = actorId;
-  const canManage = (obligation: ReturnType<ObligationRepository["require"]>): boolean =>
+  const canManage = (obligation: ManageableObligation): boolean =>
     options?.canManage ? options.canManage(actorId, obligation) : obligation.ownerId === actorId;
 
   server.registerTool(
@@ -146,9 +160,19 @@ export function createObligationsMcpServer(
         children_cursor: z.string().max(1_024).optional(),
         blocking_children_cursor: z.string().max(1_024).optional(),
         completions_cursor: z.string().max(1_024).optional(),
+        blocked_by_cursor: z.string().max(1_024).optional(),
+        unblocks_cursor: z.string().max(1_024).optional(),
       },
     },
-    async ({ id, limit, children_cursor, blocking_children_cursor, completions_cursor }) => {
+    async ({
+      id,
+      limit,
+      children_cursor,
+      blocking_children_cursor,
+      completions_cursor,
+      blocked_by_cursor,
+      unblocks_cursor,
+    }) => {
       try {
         const obligation = repository.get(id);
         if (!obligation) throw new Error("obligation not found");
@@ -165,6 +189,13 @@ export function createObligationsMcpServer(
           limit,
           offset: completionsOffset,
         });
+        const blockedByOffset = childOffset(blocked_by_cursor, "blocked-by", id);
+        const blockedByPage = repository.listBlockedByPage(id, {
+          limit,
+          offset: blockedByOffset,
+        });
+        const unblocksOffset = childOffset(unblocks_cursor, "unblocks", id);
+        const unblocksPage = repository.listUnblocksPage(id, { limit, offset: unblocksOffset });
         return toolOk({
           obligation,
           artifacts: repository.listArtifacts(id),
@@ -205,6 +236,32 @@ export function createObligationsMcpServer(
                   scope: "completions",
                   obligationId: id,
                   offset: completionsOffset + limit,
+                })
+              : null,
+          },
+          blockedBy: {
+            items: blockedByPage.obligations,
+            total: blockedByPage.total,
+            truncated: blockedByOffset > 0 || blockedByPage.hasMore,
+            nextCursor: blockedByPage.hasMore
+              ? encodeCursor({
+                  v: 1,
+                  scope: "blocked-by",
+                  obligationId: id,
+                  offset: blockedByOffset + limit,
+                })
+              : null,
+          },
+          unblocks: {
+            items: unblocksPage.obligations,
+            total: unblocksPage.total,
+            truncated: unblocksOffset > 0 || unblocksPage.hasMore,
+            nextCursor: unblocksPage.hasMore
+              ? encodeCursor({
+                  v: 1,
+                  scope: "unblocks",
+                  obligationId: id,
+                  offset: unblocksOffset + limit,
                 })
               : null,
           },
@@ -257,7 +314,7 @@ export function createObligationsMcpServer(
     {
       title: "Create a new obligation",
       description:
-        "Create a new obligation. `title` is the heading a queue shows; keep it to one short line and put the detail in `intent`. If parent_id is specified, the parent obligation transitions to waiting if it was ready.",
+        "Create a new obligation. `title` is the heading a queue shows; keep it to one short line and put the detail in `intent`. If parent_id is specified, the parent obligation transitions to waiting if it was ready. `blocked_by` names other obligations this one must wait on: it is created `waiting` outright unless every one of them is already `done`. Rejected if this obligation is itself recurring or scheduled, or if anything named in `blocked_by` is: recurrence and prerequisite edges cannot mix on either side.",
       inputSchema: {
         owner_id: z.string().trim().min(1),
         title: z.string().trim().min(1).max(OBLIGATION_TITLE_MAX),
@@ -275,12 +332,30 @@ export function createObligationsMcpServer(
           ])
           .nullable()
           .optional(),
+        blocked_by: z.array(z.string().trim().min(1)).max(50).optional(),
       },
     },
-    async ({ owner_id, title, parent_id, intent, external_ref, priority, recurrence }) => {
+    async ({
+      owner_id,
+      title,
+      parent_id,
+      intent,
+      external_ref,
+      priority,
+      recurrence,
+      blocked_by,
+    }) => {
       try {
         const owner = options?.resolveOwner?.(owner_id) ?? { ok: true as const, ownerId: owner_id };
         if (!owner.ok) return toolError(new Error(owner.error));
+        // `blocked_by` imposes wait edges on the obligation being created —
+        // the same decision `add_obligation_prerequisite` gates behind
+        // `canManage` on an existing row. The row doesn't exist yet here, so
+        // the same seam is checked against the owner it is about to be
+        // created for (#212).
+        if (blocked_by && blocked_by.length > 0 && !canManage({ ownerId: owner.ownerId })) {
+          throw new Error("not authorized to manage this obligation's prerequisites");
+        }
         const obligation = repository.create({
           ownerId: owner.ownerId,
           title,
@@ -289,6 +364,7 @@ export function createObligationsMcpServer(
           externalRef: external_ref ?? null,
           priority: priority ?? null,
           recurrence: recurrence ?? null,
+          blockedBy: blocked_by,
           // Bound by the server from this server's actor identity, exactly like
           // `owner` on list_owned. There is deliberately no `created_by` field
           // in inputSchema: #1671's trust boundary requires that attribution is
@@ -480,6 +556,56 @@ export function createObligationsMcpServer(
     async ({ id, parent_id }) => {
       try {
         const obligation = repository.reparent(id, parent_id ?? null);
+        return toolOk({ obligation });
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "add_obligation_prerequisite",
+    {
+      title: "Make an obligation wait on another",
+      description:
+        "Declare that `id` must wait for `prerequisite_id` to reach `done`. Idempotent: naming the same prerequisite twice is a no-op. Rejects a recurring or scheduled obligation on either side of the edge, and any cycle in the combined wait-for graph across explicit prerequisites and the parent/live-child relation.",
+      inputSchema: {
+        id: z.string().trim().min(1),
+        prerequisite_id: z.string().trim().min(1),
+      },
+    },
+    async ({ id, prerequisite_id }) => {
+      try {
+        const dependent = repository.require(id);
+        if (!canManage(dependent)) {
+          throw new Error("not authorized to manage this obligation's prerequisites");
+        }
+        const obligation = repository.addPrerequisite(id, prerequisite_id);
+        return toolOk({ obligation });
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "remove_obligation_prerequisite",
+    {
+      title: "Remove a prerequisite from an obligation",
+      description:
+        "Remove the wait on `prerequisite_id` from `id` — the repair action when a prerequisite was cancelled and the dependent's owner is replacing or dropping that wait. A no-op if the edge does not exist. Releases `id` immediately if this was its last unmet condition.",
+      inputSchema: {
+        id: z.string().trim().min(1),
+        prerequisite_id: z.string().trim().min(1),
+      },
+    },
+    async ({ id, prerequisite_id }) => {
+      try {
+        const dependent = repository.require(id);
+        if (!canManage(dependent)) {
+          throw new Error("not authorized to manage this obligation's prerequisites");
+        }
+        const obligation = repository.removePrerequisite(id, prerequisite_id);
         return toolOk({ obligation });
       } catch (err) {
         return toolError(err);

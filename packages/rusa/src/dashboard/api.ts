@@ -20,6 +20,8 @@ import type { ObligationRepository } from "../db/repositories/obligation-reposit
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { ObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
+import type { ProviderModelConfig } from "../providers/model-config.js";
 import { resolveReferenceSync } from "../references/resolve.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { SseHub } from "./sse.js";
@@ -27,6 +29,8 @@ import type { SseHub } from "./sse.js";
 /** Everything the mesh Data API needs, injected by the server wiring. */
 export interface DashboardDataDeps {
   actors: ActorRepository;
+  /** Application logger for route diagnostics. Absent → nothing is logged. */
+  logger?: Logger;
   meshEvents: MeshEventRepository;
   meshChat: MeshChatRepository;
   /** Durable obligation repository for task and dependency management. */
@@ -168,6 +172,7 @@ interface ThreadDto {
   handle: string;
   parentId: string | null;
   status: string;
+  /** The declared candidate pool's first (or only) entry — compat view of {@link modelConfig}. */
   provider: string | null;
   /** The single authoritative model for this actor, as configured in the registry. */
   model: string | null;
@@ -179,6 +184,22 @@ interface ThreadDto {
   desiredEffort?: string | null;
   /** Pending desired provider staged for next run boundary, or null if none. */
   desiredProvider?: string | null;
+  /** The declared candidate pool, in earliest-available order. */
+  modelConfig: ProviderModelConfig[];
+  /** Pending full-pool replacement staged for the next run boundary, if any. */
+  desiredModelConfig?: ProviderModelConfig[];
+  /**
+   * The reserved candidate for a genuinely queued run, or null when idle/running
+   * or nothing has been reserved yet. `selectedProvider` is the declared alias;
+   * `selectedLane` is the canonical pacing lane it resolves to — kept distinct
+   * so a configured alias is never silently overwritten by its lane.
+   */
+  selectedProvider?: string | null;
+  selectedLane?: string | null;
+  selectedModel?: string | null;
+  selectedEffort?: string | null;
+  /** Epoch-ms quote for when the reserved candidate becomes eligible to start. */
+  eligibleAt?: number | null;
   /**
    * The leading `CHARTER_PREVIEW_CHARS` characters of the charter, ellipsised
    * when clipped. The full text is detail data: `GET
@@ -396,29 +417,49 @@ function clampLimit(url: URL): number {
 
 /**
  * Inbox entries intentionally store lightweight pointers. The dashboard is the
- * presentation boundary, so resolve a mesh-message pointer here and never leak
- * its opaque id into the UI payload.
+ * presentation boundary, so resolve a mesh-message pointer, or a GitHub source
+ * (see `deriveGitHubInboxNotification` — its `source` is the exact reference
+ * the event was about), here and never leak an opaque id or an unlinked
+ * `github:` label into the UI payload.
+ *
+ * Google Chat sources are deliberately left alone: a chat event's `source` is
+ * the containing space (routing granularity), not the specific message, so
+ * resolving it here would show the wrong entity. Every other payload keeps
+ * its raw JSON, which is the honest rendering until that has a resolver.
  */
-function resolveInboxPage(page: InboxPage, deps: DashboardDataDeps): InboxPage {
-  const entries = page.entries.map((entry) => {
-    const { messageId, ...payload } = entry.payload as InboxPayload & {
-      messageId?: unknown;
-    };
-    if (typeof messageId !== "string") return entry;
-    // `content` is kept as-is so nothing that reads it today regresses;
-    // `reference` is the addition, so the dashboard can render an inbox item
-    // through the same widget as an obligation's cited artifacts. Only mesh
-    // chat resolves in v1 — every other payload keeps its raw JSON, which is
-    // the honest rendering until those sources have resolvers.
-    const reference = resolveReferenceSync(`mesh:messages/${messageId}`, {
-      meshChat: deps.meshChat,
-    });
-    return {
-      ...entry,
-      payload: reference.body !== null ? { ...payload, content: reference.body } : payload,
-      reference,
-    };
-  });
+async function resolveInboxPage(page: InboxPage, deps: DashboardDataDeps): Promise<InboxPage> {
+  const entries = await Promise.all(
+    page.entries.map(async (entry) => {
+      const { messageId, ...payload } = entry.payload as InboxPayload & {
+        messageId?: unknown;
+      };
+      if (typeof messageId === "string") {
+        // `content` is kept as-is so nothing that reads it today regresses;
+        // `reference` is the addition, so the dashboard can render an inbox item
+        // through the same widget as an obligation's cited artifacts.
+        const reference = resolveReferenceSync(`mesh:messages/${messageId}`, {
+          meshChat: deps.meshChat,
+        });
+        return {
+          ...entry,
+          payload: reference.body !== null ? { ...payload, content: reference.body } : payload,
+          reference,
+        };
+      }
+      if (entry.source.startsWith("github:")) {
+        // Same cache/resolver an obligation's cited artifacts use, so a
+        // GitHub-sourced inbox entry gets the identical rich preview and
+        // "open in new tab" link rather than a second rendering path.
+        const reference = deps.referenceCache
+          ? await deps.referenceCache
+              .get(entry.source, deps)
+              .catch(() => resolveReferenceSync(entry.source, { meshChat: deps.meshChat }))
+          : resolveReferenceSync(entry.source, { meshChat: deps.meshChat });
+        return { ...entry, reference };
+      }
+      return entry;
+    })
+  );
   return { ...page, entries };
 }
 
@@ -477,9 +518,11 @@ export async function handleMeshApiRequest(
             const id = deps.rootControl?.spawnChild(
               {
                 charter: typeof body.charter === "string" ? body.charter : "",
-                provider: typeof body.provider === "string" ? body.provider : "",
-                model: typeof body.model === "string" ? body.model : "",
-                effort: typeof body.effort === "string" ? body.effort : undefined,
+                modelConfig: {
+                  provider: typeof body.provider === "string" ? body.provider : "",
+                  model: typeof body.model === "string" ? body.model : "",
+                  effort: typeof body.effort === "string" ? body.effort : undefined,
+                },
                 title: typeof body.title === "string" ? body.title : undefined,
                 context,
               },
@@ -741,9 +784,14 @@ export async function handleMeshApiRequest(
           // handles error boundaries to ensure thrown errors are entirely body-free,
           // we can safely log the stable, locally-authored error message server-side
           // for debugging while returning a generic 502 status to the client.
-          console.error(
-            `avatar generate for ${targetId} failed: ${err instanceof Error ? err.message : "unknown error"}`
-          );
+          // Still message-only, never the raw error: `callGeminiImage` promises
+          // a locally-authored, body-free message, and passing the Error through
+          // would put a provider response body into the record.
+          (deps?.logger ?? nullLogger).error("avatar_generate_failed", {
+            component: "dashboard-api",
+            actorId: targetId,
+            reason: err instanceof Error ? err.message : "unknown error",
+          });
           sendJson(res, 502, { error: "avatar generation failed" });
         });
       return true;
@@ -1218,17 +1266,22 @@ export async function handleMeshApiRequest(
       } else if (queued.has(r.id)) {
         runState = "queued";
       }
+      const selection = runState === "queued" ? deps.mesh?.getSelection(r.id) : undefined;
       return {
         id: r.id,
         handle: r.isRoot === true ? rootHandle : generateHandle(r.id),
         parentId: r.parentId,
         status: r.status,
-        provider: r.provider ?? null,
-        model: r.model ?? null,
-        effort: r.effort ?? null,
-        desiredModel: r.desiredModel ?? null,
-        ...(r.desiredEffort !== undefined ? { desiredEffort: r.desiredEffort } : {}),
-        desiredProvider: r.desiredProvider ?? null,
+        provider: r.modelConfig?.[0]?.provider ?? null,
+        model: r.modelConfig?.[0]?.model ?? null,
+        effort: r.modelConfig?.[0]?.effort ?? null,
+        desiredModel: r.desiredModelConfig?.[0]?.model ?? null,
+        ...(r.desiredModelConfig !== undefined
+          ? { desiredEffort: r.desiredModelConfig[0]?.effort ?? null }
+          : {}),
+        desiredProvider: r.desiredModelConfig?.[0]?.provider ?? null,
+        modelConfig: r.modelConfig ?? [],
+        ...(r.desiredModelConfig !== undefined ? { desiredModelConfig: r.desiredModelConfig } : {}),
         charterPreview: charterPreview(r.charter),
         title: r.title ?? summarizeCharter(r.charter),
         createdAt: r.createdAt,
@@ -1237,6 +1290,11 @@ export async function handleMeshApiRequest(
         lastActiveAt: lastActiveByActor.get(r.id) ?? null,
         queuePosition: providerQueueSnapshots.get(r.id)?.position ?? null,
         estimatedStartAt: providerQueueSnapshots.get(r.id)?.estimatedStartAt ?? null,
+        selectedProvider: selection?.provider ?? null,
+        selectedLane: selection?.lane ?? null,
+        selectedModel: selection?.model ?? null,
+        selectedEffort: selection?.effort ?? null,
+        eligibleAt: selection?.eligibleAt ?? null,
       };
     });
     const schedulerHealth = deps.schedulerHealth?.();
@@ -1305,7 +1363,7 @@ export async function handleMeshApiRequest(
     sendJson(
       res,
       200,
-      resolveInboxPage(
+      await resolveInboxPage(
         deps.inbox.list(actorId, {
           status: status as "unhandled" | "handled" | "all" | undefined,
           limit: clampLimit(url),
@@ -1343,6 +1401,44 @@ export async function handleMeshApiRequest(
       offset,
     });
     sendJson(res, 200, page);
+    return true;
+  }
+
+  // GET /api/mesh/obligations/forest — one bounded page of root trees.
+  //
+  // Replaces the dashboard's former root-page-then-one-tree-request-per-root
+  // pattern (#241): that issued N+1 HTTP round trips, and each `/tree` call
+  // separately re-derived the root's own fields that the root page had
+  // already fetched. This returns the same root page metadata (`total`,
+  // `hasMore`) alongside every requested root's full tree in one response,
+  // computed by a single bulk repository read.
+  //
+  // Defaults to excluding quiet terminal roots (done/cancelled, not
+  // recurring, no completion history) — a production snapshot showed 48 of
+  // 50 returned roots in that state, each still costing a full tree fetch
+  // and parse purely to be filtered client-side. `includeTerminalRoots=true`
+  // (the Work tab's on-demand "Show Done" reload) restores the unfiltered
+  // page.
+  if (pathname === "/api/mesh/obligations/forest") {
+    if (!deps.obligations) {
+      sendJson(res, 503, { error: "obligations data unavailable" });
+      return true;
+    }
+    const limit = clampLimit(url);
+    const offset = parsePositiveInt(url, "offset") ?? 0;
+    const rawIncludeTerminalRoots =
+      url.searchParams.get("includeTerminalRoots") ??
+      url.searchParams.get("include_terminal_roots");
+    const includeTerminalRoots =
+      rawIncludeTerminalRoots === "true" || rawIncludeTerminalRoots === "1";
+    const page = deps.obligations.listPage({
+      rootsOnly: true,
+      excludeQuietTerminalRoots: !includeTerminalRoots,
+      limit,
+      offset,
+    });
+    const trees = deps.obligations.getForest(page.obligations.map((obligation) => obligation.id));
+    sendJson(res, 200, { trees, total: page.total, hasMore: page.hasMore });
     return true;
   }
 

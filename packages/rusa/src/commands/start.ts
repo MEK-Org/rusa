@@ -14,11 +14,7 @@ import { Actor } from "../actor/actor.js";
 import { ActorMesh, type MeshActor, type RetireCleanup } from "../actor/actor-mesh.js";
 import type { ActorRecord, PortableContextConfig } from "../actor/actor-record.js";
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
-import {
-  CAPABILITY_GRANTS_FILENAME,
-  FileCapabilityGrantStore,
-  PARENT_GRANTABLE_CAPABILITIES,
-} from "../actor/capability-grants.js";
+import { PARENT_GRANTABLE_CAPABILITIES } from "../actor/capability-grants.js";
 import { CoalescingNotifier } from "../actor/coalescing-notifier.js";
 import { assertSpawnContextSupported } from "../actor/context-selection.js";
 import { CrontabMutator, execCrontabIo, preflightCron } from "../actor/crontab.js";
@@ -81,7 +77,7 @@ import {
   FilePortableContextStore,
   type PortableContextStore,
 } from "../actor/portable-context-state.js";
-import { ProviderPacer } from "../actor/provider-pacer.js";
+import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "../actor/provider-pacer.js";
 import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-throttle-status.js";
 import { resolveRootActorId } from "../actor/root-actor-id.js";
 import { RootControlService } from "../actor/root-control.js";
@@ -116,7 +112,11 @@ import {
   finishDeferredRootSessionImport,
   importLegacyActorState,
 } from "../db/legacy-actor-import.js";
-import type { ReadyHeadChange } from "../db/repositories/obligation-repository.js";
+import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
+import type {
+  PrerequisiteAttention,
+  ReadyHeadChange,
+} from "../db/repositories/obligation-repository.js";
 import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
 import {
@@ -169,19 +169,29 @@ import {
   UNDERSTANDING_READ_MCP_NAME,
 } from "../mcp/understanding-mcp.js";
 import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "../mcp/update-mcp.js";
+import { isTerminalObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
+import { composeActorOutputSinks } from "../observability/actor-output-sink.js";
 import { DiskUsageAlert } from "../observability/disk-alert.js";
+import {
+  collectConfigSecretEntries,
+  collectEnvSecretEntries,
+  unscrubbableSecretSources,
+} from "../observability/log-secrets.js";
+import { createLogger, type Logger } from "../observability/logger.js";
 import { antigravityScratchDir } from "../providers/antigravity.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
+import type { RawProviderModelConfig } from "../providers/model-config.js";
+import { fillModelConfigFromCurrent, validateModelConfigPool } from "../providers/model-config.js";
 import { refreshConfiguredProviderModelCatalogs } from "../providers/model-scrape.js";
 import {
   DEFAULT_ROOT_PROVIDER,
   normalizeFallbackModel,
   providerCapabilityName,
+  providerThrottleKey,
   resolveProvider,
   resolveRootProvider,
-  validateProviderSelection,
 } from "../providers/registry.js";
 import { assertBwrapAvailable, teardownFlutterOverlay } from "../providers/sandbox.js";
 import type { McpServerSpec, RunResult } from "../providers/types.js";
@@ -333,13 +343,6 @@ function queuedReactionTarget(entry: InboxEntry): QueuedReactionTarget | null {
 
 function isQuotaThrottleProvider(value: string): value is QuotaThrottleProvider {
   return (QUOTA_THROTTLE_PROVIDERS as readonly string[]).includes(value);
-}
-
-/** Map configured provider names to the canonical quota-probe keys. */
-function providerThrottleKey(providerName: string, config: RusaConfig): string {
-  const cliCommand = config.providers[providerName]?.cliCommand;
-  const key = cliCommand ?? providerName;
-  return key === "antigravity" ? "agy" : key;
 }
 
 function configuredQuotaThrottleProviders(config: RusaConfig): QuotaThrottleProvider[] {
@@ -707,6 +710,30 @@ export async function compactPortableContext(input: {
 }
 
 /**
+ * Record one actor run's outcome.
+ *
+ * The level is the run's operational meaning rather than its shape: a capped run
+ * stopped on a limit the mesh set for itself and is degraded-but-expected, a
+ * failed run is something a human has to look at, and a clean run is an ordinary
+ * lifecycle transition. Only run metadata is recorded — the output itself is
+ * unbounded actor text with a transcript of its own.
+ */
+export function logRunEnd(logger: Logger, result: RunResult): void {
+  const fields = {
+    success: result.success,
+    exitCode: result.exitCode,
+    capped: result.capped ?? false,
+    cancelled: result.cancelled ?? false,
+    interrupted: result.interrupted ?? false,
+    yieldStatus: result.yieldStatus,
+    model: result.model,
+  };
+  if (result.success) logger.info("run_end", fields);
+  else if (result.capped) logger.warn("run_end", fields);
+  else logger.error("run_end", fields);
+}
+
+/**
  * Start rusa as the single **root actor** over an {@link ActorMesh}.
  *
  * Inbound GitHub webhooks and Google Chat messages wake the root, which runs the
@@ -721,11 +748,23 @@ export async function compactPortableContext(input: {
 export async function runStart(opts?: RunStartOptions): Promise<void> {
   const mcHome = resolveHome();
 
-  console.log(`\n🚀 Rusa v0.1.0 — root actor\n${"━".repeat(28)}\n`);
-  console.log(`Loading config from ${mcHome}/config.yaml`);
+  // The service logger. `rusa start` is a service, so its diagnostics are JSON
+  // records on stdout (journald's stream) rather than prose: a field says which
+  // component spoke and what happened, instead of a prefix a grep has to guess
+  // at. Pipe it through `pino-pretty` for a readable local run.
+  //
+  // Secrets are registered in two steps because the first records are written
+  // before there is a config to read: the environment is known now, and the
+  // config's own credentials are added the moment `loadConfig` returns.
+  const envSecretEntries = collectEnvSecretEntries();
+  const knownSecrets = new Set(envSecretEntries.map((entry) => entry.value));
+  const readSecrets = () => [...knownSecrets];
+  const bootLog = createLogger({ secrets: readSecrets, context: { component: "start" } });
+
+  bootLog.info("service_starting", { version: "0.1.0", home: mcHome, profile: opts?.profile });
 
   if (opts?.deployOnMergeBranch) {
-    console.warn("[start] --deploy-on-merge-branch is not wired in root-actor mode yet; ignoring");
+    bootLog.warn("deploy_on_merge_branch_ignored", { reason: "not wired in root-actor mode" });
   }
 
   let config: RusaConfig;
@@ -736,9 +775,36 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       profile: opts?.profile as ConfigProfile | undefined,
     });
   } catch (err) {
-    console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+    // No config yet means no config-sourced secrets to scrub against, so this
+    // record carries the message only — a parse error can quote its input line.
+    bootLog.error("config_load_failed", {
+      reason: err instanceof Error ? err.message : String(err),
+    });
     process.exit(1);
     return;
+  }
+  // Config is parsed: its credentials join the scrub set (which `bootLog` shares
+  // through the same closure) and its configured level takes effect.
+  const configSecretEntries = collectConfigSecretEntries(config);
+  for (const { value } of configSecretEntries) knownSecrets.add(value);
+  const log = createLogger({
+    level: config.observability?.logging?.level,
+    format: config.observability?.logging?.format,
+    secrets: readSecrets,
+    context: { component: "start" },
+  });
+
+  // A credential too short to scrub is the one gap value redaction has; say so
+  // by name while it is still cheap to lengthen, and never by value.
+  for (const { source, length } of unscrubbableSecretSources([
+    ...envSecretEntries,
+    ...configSecretEntries,
+  ])) {
+    log.warn("secret_not_scrubbable", {
+      source,
+      length,
+      impact: "too short to remove from log text; only credential-named fields are redacted",
+    });
   }
   const portableContextStore = new FilePortableContextStore(join(mcHome, "portable-context"));
   const portableContextApiKey = config.geminiApiKey?.trim() || null;
@@ -759,29 +825,30 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     try {
       assertBwrapAvailable();
     } catch (err) {
-      console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+      log.error("sandbox_unavailable", { sandbox: config.sandbox ?? "bwrap", err });
       process.exit(1);
       return;
     }
   }
 
-  console.log("Initializing database...");
   const database = initDb(mcHome);
-  console.log("✓ Database ready");
+  log.info("database_ready", { home: mcHome });
 
   // One OS scheduler owns every cron/at mutation: recurring
   // actor wakes, recurring or interval obligations, and one-shot messages.
   const cronPreflight = preflightCron();
   if (!cronPreflight.ok) {
-    console.warn(
-      `[start] cron scheduling unavailable — schedule_wake and recurring obligations will fail until this is fixed: ${cronPreflight.issues.join("; ")}`
-    );
+    log.warn("cron_preflight_failed", {
+      issues: cronPreflight.issues,
+      impact: "schedule_wake and recurring obligations will fail",
+    });
   }
   const atPreflight = preflightAt();
   if (!atPreflight.ok) {
-    console.warn(
-      `[start] \`at\` scheduling unavailable — cron-only recurrences still work, but completion-interval obligations and scheduled messages will fail until this is fixed: ${atPreflight.issues.join("; ")}`
-    );
+    log.warn("at_preflight_failed", {
+      issues: atPreflight.issues,
+      impact: "completion-interval obligations and scheduled messages will fail",
+    });
   }
   const osScheduler = new DefaultOsScheduler(
     new CrontabMutator(execCrontabIo()),
@@ -801,17 +868,28 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     scheduledMessages: osScheduler,
   });
   if (legacyActorImport.importedActors > 0 || legacyActorImport.importedScheduledMessages > 0) {
-    console.log(
-      `[mesh] imported ${legacyActorImport.importedActors} actor(s) and ` +
-        `${legacyActorImport.importedScheduledMessages} scheduled message(s) into the host queue`
-    );
+    log.info("legacy_actor_state_imported", {
+      actors: legacyActorImport.importedActors,
+      scheduledMessages: legacyActorImport.importedScheduledMessages,
+    });
+  }
+
+  const legacyCapabilityGrantImport = importLegacyCapabilityGrantState({
+    mcHome,
+    db: database,
+    repositories: getRepositories(),
+  });
+  if (legacyCapabilityGrantImport.importedGrants > 0) {
+    log.info("legacy_capability_grants_imported", {
+      grants: legacyCapabilityGrantImport.importedGrants,
+    });
   }
 
   const recoveredOpenRuns = getRepositories().actorRuns.abandonOpen(
     "service restarted before run completion"
   );
   if (recoveredOpenRuns > 0) {
-    console.warn(`[mesh] recovered ${recoveredOpenRuns} unterminated actor run(s)`);
+    log.warn("unterminated_runs_recovered", { runs: recoveredOpenRuns });
   }
 
   const activeRunIds = new Map<string, string>();
@@ -868,6 +946,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   let readyHeadSink: ((change: ReadyHeadChange) => void) | undefined;
   getRepositories().obligations.setReadyHeadListener((change) => readyHeadSink?.(change));
 
+  // #212 cancellation-repair attention: same deferred-sink shape as the
+  // ready-head listener above, and for the same reason — the mesh doesn't
+  // exist yet at this point in startup.
+  let prerequisiteCancellationSink: ((attention: PrerequisiteAttention) => void) | undefined;
+  getRepositories().obligations.setCancellationAttentionListener((attention) =>
+    prerequisiteCancellationSink?.(attention)
+  );
+
   try {
     populateModelCatalogsFromDb(getRepositories().modelScrapes);
   } catch (err) {
@@ -909,7 +995,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     }
   }
 
-  console.log(`Authenticated as ${config.github.account}`);
+  log.info("github_identity_resolved", { account: config.github.account });
 
   // The root's configured identity : the display handle every
   // root-identity surface (signing byline, dashboard, avatar, commitment
@@ -1073,7 +1159,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const mcpHttp = new McpHttpServer({ servers });
   await mcpHttp.start();
   const sharedMcp = mcpHttp.urls();
-  console.log(`[mcp] serving ${sharedMcp.map((u) => u.name).join(", ")} on loopback`);
+  log.info("shared_mcp_serving", { servers: sharedMcp.map((u) => u.name) });
 
   // ── Provider + actor repository ──
   let provider: ReturnType<typeof resolveRootProvider>;
@@ -1101,26 +1187,48 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // After persisting, broadcast the stored row to any live dashboard SSE clients
   // (best-effort — fan-out must never break the recording or the mesh).
   const meshEmitter = new MeshEventEmitter();
+  // One child logger per actor run: `actorId` and `runId` ride every record the
+  // run boundary writes, so a run reads back by field instead of by matching
+  // prose across interleaved actors. The run's *output* never lands here — it is
+  // unbounded actor text, and it already has a transcript and an SSE stream.
+  const actorRunLog = log.child({ component: "actor-run" });
+  const runLogger = (actorId: string, runId?: string) =>
+    runId ? actorRunLog.child({ actorId, runId }) : actorRunLog.child({ actorId });
+
+  const meshEventLog = log.child({ component: "mesh-events" });
   const meshEvents: MeshEventSink = (e) => {
     const id = getRepositories().meshEvents.record(e);
     try {
       const stored = getRepositories().meshEvents.getById(id);
       if (stored) meshEmitter.emitMeshEvent(stored);
-    } catch {
-      // SSE fan-out is best-effort; the event is already durably recorded.
+    } catch (err) {
+      // SSE fan-out stays best-effort — the event is already durably recorded —
+      // but a silently dropped fan-out used to be indistinguishable from no
+      // dashboard client at all. Same control flow, now observable.
+      meshEventLog.debug("mesh_event_fanout_failed", { kind: e.kind, actorId: e.actorId, err });
     }
   };
 
-  // The actor output firehose: write to the console as before AND mirror each
-  // chunk to dashboard SSE clients viewing this actor. Wrapped so a dead browser
-  // tab can never throw back into the provider's synchronous onChunk callback.
+  // Where an actor's raw model output goes. Named sinks rather than an inline
+  // closure: raw agent prose is a different stream from the structured
+  // diagnostics above, and each destination it reaches should be a line someone
+  // chose. #192 owns retiring the stdout mirror, which is one entry from here.
+  // Until it does, fd 1 carries both this raw prose and the logger's JSON lines;
+  // docs/logging.md says so where it tells an operator how to read the log.
+  const emitActorOutput = composeActorOutputSinks(
+    [
+      {
+        name: "service-stdout",
+        deliver: ({ text }) => {
+          process.stdout.write(text);
+        },
+      },
+      { name: "dashboard-live-output", deliver: (chunk) => meshEmitter.emitLiveOutput(chunk) },
+    ],
+    log.child({ component: "actor-output" })
+  );
   const makeFirehose = (actorId: string) => (chunk: string) => {
-    process.stdout.write(chunk);
-    try {
-      meshEmitter.emitLiveOutput({ actorId, text: chunk });
-    } catch {
-      // live_output fan-out is best-effort; never disturb the run.
-    }
+    emitActorOutput({ actorId, text: chunk });
   };
 
   // ── Mesh safety governors ──
@@ -1292,7 +1400,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // granted, and the factory is what `createActor` mounts for a grantee. Phase 1b
   // registers the glass-goals `understanding-write` server (claude FS isolation
   // ISSUE_NUM having landed); grantable-servers.test.ts locks the contents.
-  const capabilityGrants = new FileCapabilityGrantStore(join(mcHome, CAPABILITY_GRANTS_FILENAME));
+  const capabilityGrants = getRepositories().capabilityGrants;
   const persistentEventSubscriptions = new FileEventSubscriptionStore(
     join(mcHome, "event-subscriptions.json"),
     rootId
@@ -1512,18 +1620,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       assertSpawnContextSupported(req, {
         ledgerCompactionAvailable: portableContextApiKey !== null,
       });
-      const provider = req.provider?.trim();
-      if (!provider) throw new Error("provider is required");
-      const model = req.model?.trim();
-      if (!model) throw new Error("model is required");
-      return validateProviderSelection(config, provider, model, req.effort);
+      return validateModelConfigPool(config, req.modelConfig, {
+        portable: req.context?.type === "portable",
+      });
     },
-    validateModel: (record, newModel, newProvider, newEffort) => {
-      const effectiveProvider =
-        (newProvider?.trim() || record.provider) ??
-        config.rootActor?.provider ??
-        DEFAULT_ROOT_PROVIDER;
-      return validateProviderSelection(config, effectiveProvider, newModel, newEffort);
+    validateModel: (record, modelConfig) => {
+      const filled = fillModelConfigFromCurrent(modelConfig, record.modelConfig);
+      return validateModelConfigPool(config, filled, {
+        portable: record.context?.type === "portable",
+      });
     },
     events: meshEvents,
     recordChat: (opts) => getRepositories().meshChat.record(opts),
@@ -1546,6 +1651,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // here rather than at routing time hangs boot.
     obligations: {
       findLiveByExternalRef: (ref) => getRepositories().obligations.findLiveByExternalRef(ref),
+      // Retirement's fail-closed preflight (#191): every non-terminal obligation
+      // owned in the subtree is a blocker, so `scheduled` counts alongside
+      // `ready` and `waiting` — a recurrence that has not fired yet is still
+      // work somebody has to own after the actor is gone.
+      listLiveOwnedBy: (ownerId) =>
+        getRepositories()
+          .obligations.listOwned(ownerId)
+          .filter((obligation) => !isTerminalObligationStatus(obligation.status))
+          .map((obligation) => ({
+            id: obligation.id,
+            status: obligation.status,
+            title: obligation.title,
+          })),
     },
     inboxStore,
     onInboxEntriesSeen: (_actorId, entries) =>
@@ -1556,24 +1674,69 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // sandbox honors them instead (see injectSecretsMasking in sandbox.ts).
     grantableCapabilities: new Set([...grantableServers.keys(), ...PARENT_GRANTABLE_CAPABILITIES]),
     maxConcurrent: config.mesh?.maxConcurrent,
-    providerGate: (fn, providerName, request) => {
-      const key = providerThrottleKey(providerName, config);
-      return pacerFor(key).submit(fn, {
+    providerGate: (fn, candidates, request) => {
+      const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
+        config: c,
+        lane: providerThrottleKey(c.provider, config),
+        pacer: pacerFor(providerThrottleKey(c.provider, config)),
+      }));
+      // submitPoolGate owns both selection rules: normal requests quote every
+      // healthy lane and reserve the earliest (declaration order breaking
+      // ties); responsive requests bypass pacing and take the first healthy
+      // declared candidate, and its own `promote()` re-runs that same
+      // first-healthy-declared selection rather than merely promoting
+      // whichever lane was first reserved.
+      return submitPoolGate((selected) => fn(selected), lanes, {
         responsive: request.responsive,
         threadId: request.threadId,
         enqueueNormal: request.enqueueNormal,
-        // A staged provider change may land (via applyPendingModel) while this
-        // request sits in the mesh queue behind this lane's interval/capacity.
-        // Re-checking here, right before start, means a genuinely-queued swap
-        // is caught before it launches (and charges this lane's clock) under
-        // the wrong provider — see actor.ts's gate retry loop for the other
-        // half of this contract.
+        isHalted: (c) => isProviderHalted(c.provider),
+        onSelected: request.threadId
+          ? (selection) => {
+              const provider = selection.candidate.provider;
+              const model = selection.candidate.model ?? "";
+              const effort = selection.candidate.effort;
+              request.onSelected?.({
+                provider,
+                lane: selection.lane,
+                model,
+                effort,
+                declaredIndex: selection.declaredIndex,
+                eligibleAt: selection.eligibleAt,
+                responsive: selection.responsive,
+              });
+              mesh.recordEvent({
+                kind: "run_selected",
+                actorId: request.threadId as string,
+                payload: JSON.stringify({
+                  provider,
+                  lane: selection.lane,
+                  model,
+                  effort,
+                  declaredIndex: selection.declaredIndex,
+                  eligibleAt: new Date(selection.eligibleAt).toISOString(),
+                  responsive: selection.responsive,
+                }),
+              });
+            }
+          : undefined,
+        // A staged modelConfig swap may land (via applyPendingModel) while
+        // this request sits in its reserved lane's pacer queue.
+        // Re-checking here, right before start, means a genuinely-queued
+        // swap away from this lane is caught before it launches (and
+        // charges this lane's clock) under a pool the actor no longer
+        // declares — see actor.ts's gate retry loop for the other half of
+        // this contract (#199, extended to pools). A swap that keeps this
+        // lane in the live pool is not stale: V1 does not rebalance a
+        // reserved lane mid-queue merely because another pool member might
+        // now quote earlier.
         revalidateProvider: request.threadId
-          ? () => {
+          ? (c) => {
               mesh.applyPendingModel(request.threadId as string);
-              const liveProvider = mesh.get(request.threadId as string)?.getProvider?.();
-              if (!liveProvider) return true;
-              return providerThrottleKey(liveProvider.providerName, config) === key;
+              const liveConfigs = actors.get(request.threadId as string)?.modelConfig;
+              if (!liveConfigs) return true;
+              const lane = providerThrottleKey(c.provider, config);
+              return liveConfigs.some((lc) => providerThrottleKey(lc.provider, config) === lane);
             }
           : undefined,
       });
@@ -1624,23 +1787,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     onRetire: (record) => {
       teardownActorMcp(record.id);
     },
-    onModelSet: (actorId, _newModel, record) => {
+    onModelSet: (actorId, newModelConfig) => {
       try {
-        const effectiveProvider =
-          record.provider ?? config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER;
-        const updatedProvider = resolveProvider(
-          config,
-          effectiveProvider,
-          record.model,
-          record.effort
-        );
         const liveActor = mesh.get(actorId);
-        if (liveActor && typeof liveActor.setProvider === "function") {
-          liveActor.setProvider(updatedProvider);
+        if (liveActor && typeof liveActor.setModelConfig === "function") {
+          liveActor.setModelConfig(newModelConfig);
         }
       } catch (err) {
         console.warn(
-          `[mesh] failed to update live provider for ${actorId}: ${err instanceof Error ? err.message : String(err)}`
+          `[mesh] failed to update live modelConfig for ${actorId}: ${err instanceof Error ? err.message : String(err)}`
         );
       }
     },
@@ -1657,44 +1812,49 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     createActor: (ctx) => {
       const id = ctx.record.id;
       const rec = ctx.record;
-      // Provider/tier: run on the harness+model the spawn requested (e.g. a claude
-      // worker, or a stronger model for review). Resolve before registering MCP servers
-      // so resolution failures do not leave inert endpoints. Fall back to the root provider.
-      let workerProvider = provider;
-      if (rec.provider || rec.model) {
-        try {
-          workerProvider = resolveProvider(
-            config,
-            rec.provider ?? config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER,
-            rec.model,
-            rec.effort
-          );
-        } catch (err) {
-          const reason = err instanceof Error ? err.message : String(err);
-          const requestedProvider =
-            rec.provider ?? config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER;
-          const requestedModel = rec.model;
-          const errorMsg = `worker ${id} spawn failed: requested provider "${requestedProvider}" / model "${requestedModel ?? "default"}" could not be resolved: ${reason}`;
-          console.error(`[mesh] ${errorMsg}`);
-
-          teardownActorMcp(id);
-          actors.patch(id, { status: "retired" });
-
-          mesh.recordEvent({
-            kind: "run_end",
-            actorId: id,
-            success: false,
-            detail: "spawn failed",
-            body: errorMsg,
-          });
-
-          if (rec.parentId) {
-            failureSink.sendToParent(rec.parentId, `[spawn failed] ${errorMsg}`, id);
-          } else {
-            failureSink.postToErrorChat?.(`⚠️ ${errorMsg}`);
-          }
-          throw new Error(errorMsg);
+      // Provider/tier: run on the pool the spawn declared (e.g. a claude worker, or a
+      // stronger model for review), earliest-available first. Resolve every declared
+      // candidate before registering MCP servers so a resolution failure can't leave
+      // an inert endpoint mounted. A record without a pool (legacy/adopted) falls back
+      // to the root provider.
+      const modelConfigPool: readonly RawProviderModelConfig[] = rec.modelConfig ?? [
+        {
+          provider: config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER,
+          model: config.rootActor?.model,
+          effort: config.rootActor?.effort,
+        },
+      ];
+      try {
+        for (const candidate of modelConfigPool) {
+          resolveProvider(config, candidate.provider, candidate.model, candidate.effort);
         }
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        const poolDesc = modelConfigPool
+          .map(
+            (c) => `${c.provider}${c.model ? `:${c.model}` : ""}${c.effort ? ` @ ${c.effort}` : ""}`
+          )
+          .join(", ");
+        const errorMsg = `worker ${id} spawn failed: declared modelConfig [${poolDesc}] could not be resolved: ${reason}`;
+        console.error(`[mesh] ${errorMsg}`);
+
+        teardownActorMcp(id);
+        actors.patch(id, { status: "retired" });
+
+        mesh.recordEvent({
+          kind: "run_end",
+          actorId: id,
+          success: false,
+          detail: "spawn failed",
+          body: errorMsg,
+        });
+
+        if (rec.parentId) {
+          failureSink.sendToParent(rec.parentId, `[spawn failed] ${errorMsg}`, id);
+        } else {
+          failureSink.postToErrorChat?.(`⚠️ ${errorMsg}`);
+        }
+        throw new Error(errorMsg);
       }
 
       try {
@@ -1847,18 +2007,22 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // Workers run untrusted code, so isolating them from the privileged plane is
         // mandatory: a fresh tmpfs /tmp stops one actor reading another's MCP-config
         // endpoint token from shared /tmp (identity harvest), and the read-only `/`
-        // bind stops tampering with ~/.rusa runtime state and capability-grants.json.
+        // bind stops tampering with ~/.rusa runtime state, including mesh.db.
         // Root is NOT built here and stays unsandboxed — it is the trusted plane.
         // The Actor derives the sandbox (rooted at cwd, git+gh); each provider mounts
         // its own auth dir rw (see providerWritableStateDirs).
         const sandbox = config.sandbox !== "container-boundary";
         const understandingMountEnabled = Boolean(config.understanding?.mount?.enabled && sandbox);
 
-        let actor: Actor;
-        actor = new Actor({
+        // Which declared candidate actually ran, for the failure-notice label —
+        // set on each onRunStart, read back on that same run's onRunEnd.
+        let lastSelected: RawProviderModelConfig = modelConfigPool[0];
+        const actor: Actor = new Actor({
           id,
           cwd,
-          provider: workerProvider,
+          modelConfig: [...modelConfigPool],
+          resolveProvider: (selected) =>
+            resolveProvider(config, selected.provider, selected.model, selected.effort),
           mcpServers: workerMcp,
           addDirs: [],
           sandbox,
@@ -1923,6 +2087,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           // the exhaustion-classified onRun failure notice below).
           gate: ctx.gate,
           beforeRun: ctx.beforeRun,
+          onQueuedRunCancelled: ctx.onQueuedRunCancelled,
           // Compatibility only: Actor enforces one corrective yield prompt
           // regardless of this legacy cap value.
           maxContinuations: WORKER_MAX_CONTINUATIONS,
@@ -1949,13 +2114,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             });
           },
           onRuntimeStateChanged: ctx.onRuntimeStateChanged,
-          onRunStart: (responsive, injectRecord) => {
-            // Apply a tuple staged while this actor was queued/idle before its
-            // own run_start is recorded (#199), so this dispatch launches on the
-            // new provider/model/effort rather than the one it was queued on.
-            mesh.applyPendingModel(id);
-            const providerName = providerThrottleKey(actor.getProvider().providerName, config);
+          onRunStart: (responsive, injectRecord, selected) => {
+            lastSelected = selected;
+            // The run actually launched: the queued reservation this
+            // describes no longer exists to cancel or report on.
+            mesh.clearSelection(id);
+            const providerName = providerThrottleKey(selected.provider, config);
             const runId = beginActorRun(id, providerName);
+            runLogger(id, runId).info("run_start", {
+              provider: providerName,
+              model: selected.model,
+              effort: selected.effort,
+              responsive,
+            });
             mesh.recordEvent({
               kind: "run_start",
               actorId: id,
@@ -1965,8 +2136,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               body: injectRecord ? JSON.stringify(injectRecord) : undefined,
               payload: JSON.stringify({
                 provider: providerName,
-                model: actor.getProvider().model,
-                effort: actor.getProvider().effort,
+                model: selected.model,
+                effort: selected.effort,
                 responsive,
                 runId,
               }),
@@ -1986,6 +2157,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           },
           onRunAbandoned: ({ reason, started }) => {
             if (started) abandonActorRun(id, reason);
+            runLogger(id).warn("run_abandoned", { reason, started });
             mesh.recordEvent({
               kind: "run_abandoned",
               actorId: id,
@@ -1995,6 +2167,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           },
           onRunEnd: async (result) => {
             const runId = completeActorRun(id, result);
+            logRunEnd(runLogger(id, runId), result);
             mesh.recordEvent({
               kind: "run_end",
               actorId: id,
@@ -2018,7 +2191,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                 failureSink,
                 id,
                 result,
-                formatProviderLabel(actor.getProvider(), result.model)
+                formatProviderLabel(
+                  {
+                    providerName: lastSelected.provider,
+                    model: lastSelected.model,
+                    effort: lastSelected.effort,
+                  },
+                  result.model
+                )
               );
             }
           },
@@ -2045,6 +2225,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       previousHeadId,
       sequence
     );
+  };
+  prerequisiteCancellationSink = ({ dependentId, dependentOwnerId, prerequisiteId }) => {
+    mesh.deliverPrerequisiteCancelledAttention(dependentOwnerId, dependentId, prerequisiteId);
   };
 
   const rootControl = new RootControlService({
@@ -2349,13 +2532,31 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           mesh.actorRuntimeStateChanged(rootId, state)
         )
       : null;
+  // Which entry actually ran, for the failure-notice label — set on each
+  // onRunStart, read back on that same run's onRunEnd (mirrors the worker
+  // `lastSelected` pattern, since root's one entry can move too).
+  let rootLastSelected: RawProviderModelConfig = {
+    provider: provider.providerName,
+    model: provider.model,
+    effort: provider.effort,
+  };
   let root: MeshActor;
   root =
     externalRoot ??
     new Actor({
       id: rootId,
       cwd: rootAgentDir,
-      provider,
+      // Root's declared pool always has exactly one entry (it never draws
+      // from a multi-candidate pool at launch-time selection — that's a
+      // worker-only concept; `fallback` below is its own, separate degrade
+      // path), but that one entry can still be moved via `set_actor_model`
+      // (#199 amend gaps 1-2), so resolution must read the live entry rather
+      // than freeze the boot-time `resolveRootProvider` result.
+      modelConfig: [
+        { provider: provider.providerName, model: provider.model, effort: provider.effort },
+      ],
+      resolveProvider: (selected) =>
+        resolveProvider(config, selected.provider, selected.model, selected.effort),
       mcpServers: rootMcp,
       addDirs,
       sandbox: Boolean(opts?.e2e),
@@ -2398,9 +2599,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // Responsive human wakes bypass normal pacing/concurrency; background root
       // wakes use the same normal scheduling path as workers.
       beforeRun: ({ mode }): boolean => {
+        // Same dispatch-time apply as the worker beforeRun (#199, extended to
+        // pools): a pool staged while root was queued/idle must land before
+        // this run's own gate()/admission and run_start, not at the end of
+        // the run after. Root's declared pool is always fixed at one entry
+        // (see the `modelConfig` comment on root's Actor construction above).
+        mesh.applyPendingModel(rootId);
         const rootRecord = actors.get(rootId);
-        const launchProviderName =
-          rootRecord?.desiredProvider ?? rootRecord?.provider ?? rootProviderName;
+        const launchProviderName = rootRecord?.modelConfig?.[0]?.provider ?? rootProviderName;
         if (isProviderHalted(launchProviderName) || gracefulShutdown.isShuttingDown()) {
           return false;
         }
@@ -2412,7 +2618,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         }
         return inboxStore.countUnhandled(rootId) > 0;
       },
-      gate: (fn, providerName, responsive) => mesh.gateRun(fn, providerName, responsive, rootId),
+      gate: (fn, candidates, responsive) => mesh.gateRun(fn, candidates, responsive, rootId),
+      onQueuedRunCancelled: () => mesh.clearSelection(rootId),
       onContinue: (n) =>
         mesh.recordEvent({
           kind: "run_continued",
@@ -2436,18 +2643,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         });
       },
       onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
-      onRunStart: (responsive, injectRecord) => {
-        // Same dispatch-time apply as the worker onRunStart above (#199): a
-        // tuple staged while the root was queued/idle must land before this
-        // run's run_start rather than at the end of the run after.
-        mesh.applyPendingModel(rootId);
-        // Read live, not the closure `provider`: applyPendingModel above may
-        // have just called root.setProvider(...) via onModelSet, and this
-        // run must record/launch that new tuple, not the one root was built
-        // with.
-        const liveProvider = root.getProvider?.() ?? provider;
-        const providerName = providerThrottleKey(liveProvider.providerName, config);
+      onRunStart: (responsive, injectRecord, selected) => {
+        rootLastSelected = selected;
+        // The run actually launched: the queued reservation this describes
+        // no longer exists to cancel or report on.
+        mesh.clearSelection(rootId);
+        const providerName = providerThrottleKey(selected.provider, config);
         const runId = beginActorRun(rootId, providerName);
+        runLogger(rootId, runId).info("run_start", {
+          provider: providerName,
+          model: selected.model,
+          effort: selected.effort,
+          responsive,
+        });
         mesh.recordEvent({
           kind: "run_start",
           actorId: rootId,
@@ -2457,8 +2665,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           body: injectRecord ? JSON.stringify(injectRecord) : undefined,
           payload: JSON.stringify({
             provider: providerName,
-            model: liveProvider.model,
-            effort: liveProvider.effort,
+            model: selected.model,
+            effort: selected.effort,
             responsive,
             runId,
           }),
@@ -2478,6 +2686,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       },
       onRunAbandoned: ({ reason, started }) => {
         if (started) abandonActorRun(rootId, reason);
+        runLogger(rootId).warn("run_abandoned", { reason, started });
         mesh.recordEvent({
           kind: "run_abandoned",
           actorId: rootId,
@@ -2488,6 +2697,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       onRunEnd: async (result) => {
         mesh.finishInboxRun(rootId);
         const runId = completeActorRun(rootId, result);
+        logRunEnd(runLogger(rootId, runId), result);
         mesh.recordEvent({
           kind: "run_end",
           actorId: rootId,
@@ -2510,7 +2720,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             failureSink,
             rootId,
             result,
-            formatProviderLabel(provider, result.model)
+            formatProviderLabel(
+              {
+                providerName: rootLastSelected.provider,
+                model: rootLastSelected.model,
+                effort: rootLastSelected.effort,
+              },
+              result.model
+            )
           );
         }
       },
@@ -2521,9 +2738,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     charter: config.rootActor?.charter ?? DEFAULT_ROOT_CHARTER,
     parentId: null,
     isRoot: true,
-    provider: config.rootActor?.provider,
-    model: config.rootActor?.model,
-    effort: config.rootActor?.effort,
+    // Only recorded when a concrete model is actually declared — root's own
+    // scalar config may omit `model` to mean "the provider CLI's own
+    // default", which the durable modelConfig pool contract (#169) can't
+    // represent (it requires a concrete model on every entry). Omitting the
+    // field here leaves `launchProviderName`'s fallback (below) as the
+    // provider-only source of truth for a CLI-default root.
+    ...(provider.model
+      ? {
+          modelConfig: [
+            { provider: provider.providerName, model: provider.model, effort: provider.effort },
+          ],
+        }
+      : {}),
     context: config.rootActor?.context,
     sessionId:
       config.rootActor?.context?.type === "portable"
@@ -2590,6 +2817,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   getRepositories().obligations.reconcileScheduledObligations();
   try {
     mesh.reconcileReadyHeads(getRepositories().obligations);
+  } catch (_err) {
+    // Database may be closed during test shutdown/teardown races
+  }
+  try {
+    mesh.reconcileCancelledPrerequisiteAttention(getRepositories().obligations);
   } catch (_err) {
     // Database may be closed during test shutdown/teardown races
   }
@@ -2760,8 +2992,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         secret: webhookSecret,
         onEvent,
         port: webhookPort,
+        logger: log,
         onNonWebhookRequest: noDashboardServer
-          ? createDashboardRequestHandler({ port: webhookPort, serveUi: false })
+          ? createDashboardRequestHandler({ port: webhookPort, serveUi: false, logger: log })
           : undefined,
       })
     : null;
@@ -2794,6 +3027,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     ? await startDashboardServer({
         port: dashboardPort,
         bindHost: dashboardBindHost,
+        logger: log,
         // Bind the live mesh so the dashboard Data API + SSE serve real data.
         mesh: {
           mesh,
@@ -2804,12 +3038,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           inbox: getRepositories().inbox,
           referenceCache: new ReferenceCacheService({
             repo: getRepositories().referenceCache,
-            logger: {
-              info: (event, data) =>
-                console.log(`[reference-cache] ${event}`, data ? JSON.stringify(data) : ""),
-              error: (event, data) =>
-                console.warn(`[reference-cache] error: ${event}`, data ? JSON.stringify(data) : ""),
-            },
+            logger: log.child({ component: "reference-cache" }),
           }),
           chatClient: chatClient ?? undefined,
           issueClient: issueClient,
@@ -3142,8 +3371,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // clearing the sink rather than the listener avoids touching the database
     // on a shutdown path that is about to close it.
     readyHeadSink = undefined;
+    prerequisiteCancellationSink = undefined;
     closeDb();
-    console.log("✓ Goodbye!");
+    log.info("service_stopped", { reason });
     process.exit(getShutdownExitCode(reason));
   };
   process.on("SIGINT", () => void shutdown());

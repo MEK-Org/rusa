@@ -138,7 +138,7 @@ acting" is the unspoofable endpoint, not a tool argument the model fills in.
 
 | Primitive | What it does |
 | --- | --- |
-| `spawn_thread(charter, …)` | Create a child actor that owns `charter`, in its own session. Returns its `thread_id`; you become its parent. **Non-blocking** — the child runs asynchronously. `provider`/`model` pick the harness/tier, and optional `effort` sets its provider-native reasoning level. |
+| `spawn_thread(charter, …)` | Create a child actor that owns `charter`, in its own session. Returns its `thread_id`; you become its parent. **Non-blocking** — the child runs asynchronously. `model_config` is required and picks the harness/tier — one `{provider, model, effort?}` object, or an ordered pool of them for a portable (`ledger`/`tail`) child, tried earliest-available first. There is no default model; the parent chooses. |
 | `send_message(thread_id, body)` | Deliver a message to a thread's inbox (parent, child, or an introduced peer). The recipient wakes, sees who it came from, and may reply *later* as a new message. **Always async.** |
 | `introduce(holder, target, role?)` | Grant `holder` a handle to `target` so it can message it directly (e.g. let a coder reach a reviewer). The id *is* the capability (object-capability style). |
 | `list_threads()` | List the children you've spawned, with charter summaries and status — your org chart for deciding what to follow up on or retire. |

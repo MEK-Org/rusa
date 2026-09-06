@@ -267,6 +267,24 @@ export interface DiskAlertConfig {
 
 export interface ObservabilityConfig {
   diskAlert?: DiskAlertConfig;
+  logging?: LoggingConfig;
+}
+
+/** Application logger settings. See `docs/logging.md`. */
+export interface LoggingConfig {
+  /**
+   * Minimum level recorded: `debug`, `info` (default), `warn`, `error`, or
+   * `silent`. The `RUSA_LOG_LEVEL` environment variable overrides it, so an
+   * operator can raise verbosity for one run without editing config.
+   */
+  level?: string;
+  /**
+   * How records are rendered: `json`, `pretty`, or `auto` (the default —
+   * `pretty` when stdout is a terminal, `json` otherwise). This picks the
+   * presentation of the one record stream; it never duplicates a record.
+   * The `RUSA_LOG_FORMAT` environment variable overrides it.
+   */
+  format?: string;
 }
 
 export interface RootActorConfig {

@@ -2,7 +2,9 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { runMigrations } from "../db/migrations/runner.js";
 import { buildActorBwrapArgs, buildActorBwrapCommand, teardownFlutterOverlay } from "./sandbox.js";
 
 vi.mock("../config/loader.js", () => ({
@@ -52,19 +54,25 @@ describe.skipIf(!BWRAP_CAPABLE)("Mistral grant entrypoint (real bwrap)", () => {
     mkdirSync(actorDir, { recursive: true });
     mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
     writeFileSync(keyPath, `${fixtureValue}\n`, { mode: 0o600 });
-    writeFileSync(
-      join(mcHome, "capability-grants.json"),
-      JSON.stringify({
-        grants: [
-          {
-            actorId,
-            capability: "secret:mistral-api-key",
-            grantedBy: "parent-test",
-            grantedAt: "2026-08-12T00:00:00Z",
-          },
-        ],
-      })
-    );
+
+    // Grants live in `<mcHome>/data/mesh.db`'s `capability_grants` table
+    // (0036_capability_grants), not `capability-grants.json`.
+    const dataDir = join(mcHome, "data");
+    mkdirSync(dataDir, { recursive: true });
+    const db = new Database(join(dataDir, "mesh.db"));
+    runMigrations(db);
+    db.pragma("foreign_keys = ON");
+    db.prepare(
+      "INSERT INTO actors (id, charter, parent_id, created_at) VALUES ('root', 'test actor', NULL, '2026-06-27T00:00:00Z')"
+    ).run();
+    db.prepare(
+      "INSERT INTO actors (id, charter, parent_id, created_at) VALUES (?, 'test actor', 'root', '2026-06-27T00:00:00Z')"
+    ).run(actorId);
+    db.prepare(
+      `INSERT INTO capability_grants (actor_id, capability, granted_by, granted_at, revoked_at)
+       VALUES (?, 'secret:mistral-api-key', 'parent-test', '2026-08-12T00:00:00Z', NULL)`
+    ).run(actorId);
+    db.close();
 
     const result = buildActorBwrapArgs(actorDir, "antigravity");
     const argv = buildActorBwrapCommand(result, "/bin/sh", [

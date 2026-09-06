@@ -184,11 +184,11 @@ describe("DefaultOsScheduler", () => {
     expect(cronData).toBe("CRON_TZ=Europe/Paris\n4 * * * * user-job\n");
   });
 
-  it('restores CRON_TZ= (not CRON_TZ="") when no prior CRON_TZ was in effect', () => {
+  it('restores CRON_TZ="" (not bare CRON_TZ=) when no prior CRON_TZ was in effect', () => {
     scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" });
     const lines = cronData.trimEnd().split("\n");
     expect(lines[lines.length - 1]).toBe("# mc-obligation-activation-end:ob-1");
-    expect(lines[lines.length - 2]).toBe("CRON_TZ=");
+    expect(lines[lines.length - 2]).toBe('CRON_TZ=""');
   });
 
   it("restores the exact prior CRON_TZ line rather than blindly clearing it", () => {

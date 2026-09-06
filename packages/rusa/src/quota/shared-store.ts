@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 import type { QuotaScrape } from "../db/repositories/quota-scrape-repository.js";
 import { BUSY_TIMEOUT_MS, widenToWal } from "../db/wal.js";
 import type { ProviderQuotaSnapshot, QuotaWindowKind } from "../mcp/quota-mcp.js";
+import { isProviderScopedWindow } from "./window-scope.js";
 
 const SLOT_MS = 5 * 60 * 1000;
 export const QUOTA_RAW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -674,7 +675,7 @@ export class SharedQuotaStore {
     const provider = (storedProvider ?? state.provider).trim().toLocaleLowerCase("en-US");
     const seenKinds = new Set<string>();
     for (const limit of state.limits ?? []) {
-      if (limit.scope === "model" || !Number.isFinite(limit.percentLeft)) continue;
+      if (!isProviderScopedWindow(limit) || !Number.isFinite(limit.percentLeft)) continue;
       if (limit.percentLeft < 0 || limit.percentLeft > 100) continue;
       const kind = normalizeKind(limit.kind);
       if (seenKinds.has(kind)) continue;

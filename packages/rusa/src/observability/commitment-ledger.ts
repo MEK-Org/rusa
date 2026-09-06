@@ -194,11 +194,16 @@ const LEDGER_READS: Readonly<Record<MeshEventKind, LedgerRead>> = {
   message_received: "ignored",
   actor_reparented: "ignored",
   run_queued: "ignored",
+  run_selected: "ignored",
   run_first_chunk: "ignored",
   run_preempted: "ignored",
   portable_context_compacted: "ignored",
   run_coalesced: "ignored",
   stamp_invalid: "ignored",
+  // The decider's other events in the same run (`run_start`, `run_yielded`) are
+  // what say it was working; withdrawing one scheduled delivery neither opens
+  // nor closes a commitment this projection tracks.
+  scheduled_message_cancelled: "ignored",
   host_job_submitted: "ignored",
   host_job_stopped: "ignored",
   host_job_exited: "ignored",

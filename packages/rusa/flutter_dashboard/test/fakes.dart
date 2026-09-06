@@ -24,6 +24,8 @@ ThreadDto makeThread(
   String? desiredEffort,
   bool? effortChangePending,
   String? desiredProvider,
+  List<ProviderModelConfig> modelConfig = const [],
+  List<ProviderModelConfig>? desiredModelConfig,
   String? charterPreview,
   int? queuePosition,
   String? estimatedStartAt,
@@ -39,6 +41,8 @@ ThreadDto makeThread(
   desiredEffort: desiredEffort,
   effortChangePending: effortChangePending ?? desiredEffort != null,
   desiredProvider: desiredProvider,
+  modelConfig: modelConfig,
+  desiredModelConfig: desiredModelConfig,
   charterPreview: charterPreview ?? 'charter $id',
   title: title ?? 'charter $id',
   createdAt: created,
@@ -155,14 +159,7 @@ class FakeApi extends DashboardApi {
   final eventOrderCalls = <String?>[];
   List<String> rootControlProviders = ['agy', 'codex'];
   final rootSpawnCalls =
-      <
-        ({
-          String charter,
-          String? title,
-          String? provider,
-          String? model,
-        })
-      >[];
+      <({String charter, String? title, String? provider, String? model})>[];
   String spawnedRootChildId = 'spawned-child';
 
   /// When set, the NEXT fetchQuota awaits this instead of returning
@@ -601,6 +598,54 @@ class FakeApi extends DashboardApi {
     );
   }
 
+  final fetchObligationForestCalls = <({bool includeTerminalRoots})>[];
+
+  /// When non-empty, each fetchObligationForest call takes the next of these
+  /// instead of resolving immediately — lets a test hold multiple calls open
+  /// and complete them in whichever order it wants, to prove a stale response
+  /// can't overwrite a newer one. The result is computed from [obligationsResult]
+  /// as it stood when the call was made (matching a real request that read a
+  /// snapshot of the data and is merely slow to arrive), then held until the
+  /// gate completes — so mutating [obligationsResult] afterward does not change
+  /// what an already in-flight call returns.
+  final forestGates = <Completer<void>>[];
+
+  @override
+  Future<ObligationForest> fetchObligationForest({
+    int? limit,
+    int? offset,
+    bool includeTerminalRoots = false,
+  }) async {
+    fetchObligationForestCalls.add((
+      includeTerminalRoots: includeTerminalRoots,
+    ));
+    final page = await fetchObligations(
+      rootsOnly: true,
+      limit: limit,
+      offset: offset,
+    );
+    // Mirrors the server default (#241): quiet terminal roots (done/
+    // cancelled, not recurring, no completion history) are excluded unless
+    // explicitly requested.
+    final roots = includeTerminalRoots
+        ? page.obligations
+        : page.obligations
+              .where(
+                (o) => !o.isTerminal || o.isRecurring || o.hasCompletionHistory,
+              )
+              .toList();
+    final trees = await Future.wait(
+      roots.map((o) => fetchObligationTree(o.id)),
+    );
+    final forest = ObligationForest(
+      trees: trees,
+      total: includeTerminalRoots ? page.total : roots.length,
+      hasMore: includeTerminalRoots ? page.hasMore : false,
+    );
+    if (forestGates.isNotEmpty) await forestGates.removeAt(0).future;
+    return forest;
+  }
+
   @override
   Future<ObligationDto> createObligation({
     required String ownerId,
@@ -819,14 +864,17 @@ class FakeTreePreferencesCache implements TreePreferencesCache {
     this.storedCollapsed,
     this.storedShowRetired,
     this.storedActorOrder,
+    this.storedWorkExpanded,
   });
 
   Set<String>? storedCollapsed;
   bool? storedShowRetired;
   Map<String, List<String>>? storedActorOrder;
+  Set<String>? storedWorkExpanded;
   int saveCollapsedCount = 0;
   int saveShowRetiredCount = 0;
   int saveActorOrderCount = 0;
+  int saveWorkExpandedCount = 0;
   int clearCount = 0;
 
   @override
@@ -865,10 +913,20 @@ class FakeTreePreferencesCache implements TreePreferencesCache {
   }
 
   @override
+  Set<String>? loadWorkExpanded() => storedWorkExpanded;
+
+  @override
+  void saveWorkExpanded(Set<String> expanded) {
+    storedWorkExpanded = Set.of(expanded);
+    saveWorkExpandedCount++;
+  }
+
+  @override
   void clear() {
     storedCollapsed = null;
     storedShowRetired = null;
     storedActorOrder = null;
+    storedWorkExpanded = null;
     clearCount++;
   }
 }

@@ -634,15 +634,13 @@ async function runProviderContextABBody(
   const nativeId = mesh.spawn({
     charter: HARNESS_CHARTER,
     parentId: RIG_HOLDER_ID,
-    provider: chosenProvider,
-    model: chosenModel,
+    modelConfig: { provider: chosenProvider, model: chosenModel },
     title: "ab-native",
   });
   const portableId = mesh.spawn({
     charter: HARNESS_CHARTER,
     parentId: RIG_HOLDER_ID,
-    provider: chosenProvider,
-    model: chosenModel,
+    modelConfig: { provider: chosenProvider, model: chosenModel },
     context: { type: "portable", mode: "tail" },
     title: "ab-portable",
   });
@@ -1082,7 +1080,7 @@ async function runProviderContextABBody(
         variant,
         {
           actorId: id,
-          provider: rec?.provider ?? null,
+          provider: rec?.modelConfig?.[0]?.provider ?? null,
           // What the arm's runs REPORTED they ran on — the arm's ACTUAL models, which is
           // what a comparability claim rests on, and deliberately NOT the model the arm
           // was configured with. Empty on every provider but codex; `modelIdentity` below
