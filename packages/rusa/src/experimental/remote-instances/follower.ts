@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { createLogger } from "../../observability/logger.js";
 import type { FollowerCommand, FollowerEvent } from "./follower-hub.js";
 import { FollowerInstance } from "./follower-instance.js";
 import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
@@ -29,6 +30,10 @@ const leader = new URL(values.leader);
 if (leader.protocol !== "http:" && leader.protocol !== "https:")
   throw new Error("Invalid leader URL");
 const token = readFileSync(values["token-file"], "utf8").trim();
+// Everything this process has to say about itself is a diagnostic, so it goes
+// to the application logger like the leader's. The enrollment secret is
+// registered so it is scrubbed if it ever reaches an error message.
+const log = createLogger({ secrets: [token], context: { component: "follower", id: values.id } });
 const root = resolve(values.home);
 mkdirSync(join(root, "workers"), { recursive: true });
 // Instance-wide configuration is local; never mutate cwd/env for individual actors.
@@ -69,7 +74,7 @@ async function flush(): Promise<void> {
       await post("/events", { events: events.splice(0, 100) });
     }
   } catch (error) {
-    console.error(String(error));
+    log.error("follower_event_flush_failed", { err: error });
     await stop(1);
   } finally {
     sending = false;
@@ -105,14 +110,16 @@ try {
   session = registration.session;
   if (registration.protocolVersion !== INSTANCE_PROTOCOL_VERSION)
     throw new Error("Incompatible instance protocol; rebuild leader and follower");
-  console.log(
-    `Follower ${values.id} registered with ${leader.origin}; pid=${process.pid}; sandbox=${values.sandbox}`
-  );
+  log.info("follower_registered", {
+    leader: leader.origin,
+    pid: process.pid,
+    sandbox: values.sandbox,
+  });
   while (!stopped) {
     const commands = await post<FollowerCommand[]>("/poll", {});
     for (const command of commands) instance.dispatch(command);
   }
 } catch (error) {
-  console.error(String(error));
+  log.error("follower_stopped", { err: error });
   await stop(1);
 }

@@ -71,10 +71,12 @@ node packages/rusa/build/follower/follower.js \
   --sandbox none
 ```
 
-Leave this terminal running. `Follower <follower-name> registered` means enrollment
-succeeded; it does not yet mean an actor was spawned. No inbound Mac listener,
-Tailscale Serve configuration, or Mac Remote Login is needed. Outbound access
-from the Mac to the leader's TCP port 8290 must be allowed by the tailnet policy.
+Leave this terminal running. The follower writes its diagnostics through the
+application logger, so a `follower_registered` record naming the leader origin
+and the follower pid means enrollment succeeded; it does not yet mean an actor
+was spawned. No inbound Mac listener, Tailscale Serve configuration, or Mac
+Remote Login is needed. Outbound access from the Mac to the leader's TCP port
+8290 must be allowed by the tailnet policy.
 
 On macOS, `--sandbox none` runs provider CLIs with the local user's permissions.
 Workers are placed under the dedicated follower home's `workers/` directory;
