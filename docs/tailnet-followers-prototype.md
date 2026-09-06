@@ -30,19 +30,20 @@ Tailscale address (or loopback for testing), not the public interface.
 
 ## Mac setup
 
-Requires Node 20.19+ and pnpm. Clone the prototype branch with its submodule:
+Requires Node 20.19+ and pnpm. Clone the repository with its submodules:
 
 ```sh
-git clone --recurse-submodules --branch codex/tailnet-followers \
-  https://github.com/MEK-Org/rusa.git rusa-follower-prototype
-cd rusa-follower-prototype
+git clone --recurse-submodules https://github.com/MEK-Org/rusa.git rusa-follower
+cd rusa-follower
 pnpm install --frozen-lockfile
 pnpm --filter rusa run build:follower
 ```
 
-For an existing clone, fetch/check out the branch and run
-`git submodule update --init --recursive` before installing. The follower build
-does not build Flutter or start any leader services.
+For an existing clone, pull and run `git submodule update --init --recursive`
+before installing. Leader and follower must be built from the same commit —
+enrollment rejects a mismatched instance protocol version rather than
+negotiating one, so upgrade both ends together. The follower build does not
+build Flutter or start any leader services.
 
 Create a separate follower home, then copy the enrollment secret from the leader
 using your existing SSH access. All addresses, names and absolute paths below
@@ -154,12 +155,31 @@ are revoked when the actor exits. Control enrollment secrets are not included
 in actor tool URLs. Tailscale provides the encrypted network connection;
 the HTTP gateway is not intended for the public internet.
 
+`/mcp/<key>` is deliberately the one gateway path that does not check the
+enrollment bearer token: the 256-bit random path segment is itself the
+capability, and the gateway strips any inbound `authorization` header before
+proxying to the leader. That is the tradeoff this prototype accepts. It keeps
+the follower from ever holding the control secret — a compromised follower
+process can reach only the MCP endpoints already assigned to its own actors,
+and only until they exit — at the cost of putting a bearer capability in a URL,
+where request logs, proxies and process listings can capture it. The gateway
+therefore never logs request paths, and the routing table is in memory only,
+so a leader restart invalidates every outstanding capability. Adding a second
+per-actor credential is deferred: it would need its own distribution and
+rotation path on the follower, which is federation work rather than
+connectivity work.
+
 ## Limits
 
 This is a connectivity/lifecycle prototype, not durable federation. Placement
 and follower sessions are in memory. Start a fresh leader rather than resuming
 these instances. A connection failure stops the follower generation; automatic
-reconnect, command replay, actor migration and exactly-once effects are deferred.
+reconnect, command replay and actor migration are deferred. Leader run
+accounting is exactly-once for admitted runs: a dropped connection fails
+exactly one durable run when it interrupts a run the leader had admitted, and
+books nothing when the follower was idle or never finished starting. The work
+that run was performing is not resumed or replayed, so effects the provider
+already committed are not exactly-once.
 The leader expires unresponsive followers after 45 seconds. Provider process-tree
 cleanup after an abrupt crash still needs validation beyond this experiment.
 There is deliberately no per-actor Node crash isolation, matching the leader.
