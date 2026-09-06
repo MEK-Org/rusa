@@ -3,6 +3,7 @@
  */
 
 import type { ContextConfig } from "../actor/actor-record.js";
+import type { ProviderModelConfig } from "../providers/model-config.js";
 
 export const DEFAULT_DEPLOY_BRANCH = "master";
 export type SandboxMode = "container-boundary" | "bwrap";
@@ -395,6 +396,22 @@ export interface RusaConfig {
    * Prefer nesting under `understanding.glassGoals` . Retained as a compatibility fallback.
    */
   glassGoals?: GlassGoalsConfig;
+  /**
+   * Named model classes: an operator-defined label for a modelConfig pool, so a
+   * spawn can ask for `{ class: "fast" }` instead of restating a provider/model
+   * tuple. Optional and never implicit — a caller that omits `model_config`
+   * still gets no default, and editing a class here does not retro-apply to
+   * actors that already resolved it.
+   *
+   * Entries are the same {@link ProviderModelConfig} tuple a resolved pool is
+   * made of, deliberately shared rather than redeclared: a class is just a
+   * named pool, and config loading validates it through the very same
+   * `validateModelConfigPool` the runtime uses, so the two cannot drift as pool
+   * fields evolve. `model` is required for the same reason it is required at
+   * spawn — a class is an explicit, named selection and must never resolve to a
+   * provider's own default.
+   */
+  modelClasses?: Record<string, ProviderModelConfig[]>;
   /** Mesh safety/throughput controls (concurrency cap, provider rate limit). */
   mesh?: MeshConfig;
   /** Worker isolation mode. Defaults to "bwrap". */

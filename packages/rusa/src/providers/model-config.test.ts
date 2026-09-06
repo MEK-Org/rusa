@@ -1,8 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { RusaConfig } from "../config/types.js";
-import { MAX_MODEL_CONFIG_POOL_SIZE, validateModelConfigPool } from "./model-config.js";
+import {
+  MAX_MODEL_CONFIG_POOL_SIZE,
+  type ModelConfigInput,
+  type ProviderModelConfig,
+  resolveModelClasses,
+  validateModelConfigPool,
+} from "./model-config.js";
 
-function configWith(): RusaConfig {
+function configWith(modelClasses?: Record<string, ProviderModelConfig[]>): RusaConfig {
   return {
     providers: {
       antigravity: { cliCommand: "agy" },
@@ -10,6 +16,7 @@ function configWith(): RusaConfig {
       codex: { cliCommand: "codex" },
       kimi: { cliCommand: "kimi" },
     },
+    ...(modelClasses ? { modelClasses } : {}),
   } as unknown as RusaConfig;
 }
 
@@ -135,5 +142,128 @@ describe("validateModelConfigPool", () => {
         { portable: true }
       )
     ).toThrow(/model/);
+  });
+});
+
+describe("resolveModelClasses", () => {
+  it("returns a concrete single entry unchanged, by identity", () => {
+    const input = { provider: "claude", model: "claude-sonnet-5" };
+    expect(resolveModelClasses(configWith(), input)).toBe(input);
+  });
+
+  it("returns a concrete pool unchanged, by identity", () => {
+    const input = [
+      { provider: "claude", model: "claude-sonnet-5" },
+      { provider: "kimi", model: "kimi-for-coding" },
+    ];
+    expect(resolveModelClasses(configWith(), input)).toBe(input);
+  });
+
+  it("expands a class reference into its configured pool in declaration order", () => {
+    const config = configWith({
+      fast: [
+        { provider: "claude", model: "claude-sonnet-5" },
+        { provider: "kimi", model: "kimi-for-coding", effort: "high" },
+      ],
+    });
+    expect(resolveModelClasses(config, { class: "fast" })).toEqual([
+      { provider: "claude", model: "claude-sonnet-5" },
+      { provider: "kimi", model: "kimi-for-coding", effort: "high" },
+    ]);
+  });
+
+  it("rejects an unknown class by name rather than falling back to any default", () => {
+    const config = configWith({ fast: [{ provider: "claude", model: "claude-sonnet-5" }] });
+    expect(() => resolveModelClasses(config, { class: "nope" })).toThrow(
+      /unknown model class "nope"/
+    );
+  });
+
+  it("rejects a class reference when no classes are configured at all", () => {
+    expect(() => resolveModelClasses(configWith(), { class: "fast" })).toThrow(
+      /unknown model class "fast"/
+    );
+  });
+
+  it("rejects a class whose definition is empty", () => {
+    const config = configWith({ empty: [] });
+    expect(() => resolveModelClasses(config, { class: "empty" })).toThrow(
+      /model class "empty" is empty/
+    );
+  });
+
+  it("rejects a blank class name", () => {
+    expect(() => resolveModelClasses(configWith(), { class: "   " })).toThrow(
+      /model class reference is missing a class name/
+    );
+  });
+
+  it("rejects a class reference nested inside a pool — a reference is the whole value", () => {
+    const config = configWith({ fast: [{ provider: "claude", model: "claude-sonnet-5" }] });
+    expect(() =>
+      resolveModelClasses(config, [
+        { provider: "claude", model: "claude-sonnet-5" },
+        { class: "fast" },
+      ] as unknown as ModelConfigInput)
+    ).toThrow(/whole model_config value/);
+  });
+
+  it("returns a copy, so a caller cannot mutate the class definition in config", () => {
+    const config = configWith({ fast: [{ provider: "claude", model: "claude-sonnet-5" }] });
+    const resolved = resolveModelClasses(config, { class: "fast" }) as { model: string }[];
+    resolved[0].model = "tampered";
+    expect(config.modelClasses?.fast).toEqual([{ provider: "claude", model: "claude-sonnet-5" }]);
+  });
+});
+
+describe("validateModelConfigPool with model classes", () => {
+  it("rejects an unresolved class reference rather than repairing it", () => {
+    const config = configWith({ fast: [{ provider: "claude", model: "claude-sonnet-5" }] });
+    expect(() => validateModelConfigPool(config, { class: "fast" }, { portable: false })).toThrow(
+      /model class reference/
+    );
+  });
+
+  it("validates a resolved class pool through the same provider/model/effort checks", () => {
+    const config = configWith({
+      bogus: [{ provider: "not-configured", model: "x" }],
+    });
+    expect(() =>
+      validateModelConfigPool(config, resolveModelClasses(config, { class: "bogus" }), {
+        portable: false,
+      })
+    ).toThrow(/not configured/);
+  });
+
+  it("still requires a portable actor for a multi-entry class pool", () => {
+    const config = configWith({
+      wide: [
+        { provider: "claude", model: "claude-sonnet-5" },
+        { provider: "kimi", model: "kimi-for-coding" },
+      ],
+    });
+    expect(() =>
+      validateModelConfigPool(config, resolveModelClasses(config, { class: "wide" }), {
+        portable: false,
+      })
+    ).toThrow(/portable/);
+  });
+
+  it("snapshots the resolved pool: editing the class afterwards does not retro-apply", () => {
+    const config = configWith({ fast: [{ provider: "claude", model: "claude-sonnet-5" }] });
+    const snapshot = validateModelConfigPool(
+      config,
+      resolveModelClasses(config, { class: "fast" }),
+      { portable: false }
+    );
+    expect(snapshot).toEqual([{ provider: "claude", model: "claude-sonnet-5", effort: undefined }]);
+
+    // A later config edit changes what a *new* selection resolves to, and
+    // leaves the already-resolved pool exactly as it was.
+    config.modelClasses = { fast: [{ provider: "kimi", model: "kimi-for-coding" }] };
+    expect(snapshot).toEqual([{ provider: "claude", model: "claude-sonnet-5", effort: undefined }]);
+    expect(resolveModelClasses(config, { class: "fast" })).toEqual([
+      { provider: "kimi", model: "kimi-for-coding" },
+    ]);
   });
 });

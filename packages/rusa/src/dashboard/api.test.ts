@@ -18,6 +18,7 @@ import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { createLogger } from "../observability/logger.js";
+import { assertConcreteModelConfig } from "../providers/model-config.js";
 import type { ReferenceCacheService } from "../references/cache-service.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { type DashboardDataDeps, handleMeshApiRequest } from "./api.js";
@@ -296,7 +297,8 @@ describe("handleMeshApiRequest", () => {
     deps.rootControl = {
       providers: [],
       spawnChild: (req: RootChildRequest) => {
-        const modelConfig = Array.isArray(req.modelConfig) ? req.modelConfig[0] : req.modelConfig;
+        const concrete = assertConcreteModelConfig(req.modelConfig);
+        const modelConfig = Array.isArray(concrete) ? concrete[0] : concrete;
         if (!modelConfig?.provider) throw new Error("provider is required");
         return UUID_A;
       },

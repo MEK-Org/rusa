@@ -190,7 +190,11 @@ import { antigravityScratchDir } from "../providers/antigravity.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
-import { fillModelConfigFromCurrent, validateModelConfigPool } from "../providers/model-config.js";
+import {
+  fillModelConfigFromCurrent,
+  resolveModelClasses,
+  validateModelConfigPool,
+} from "../providers/model-config.js";
 import { refreshConfiguredProviderModelCatalogs } from "../providers/model-scrape.js";
 import {
   DEFAULT_ROOT_PROVIDER,
@@ -1663,12 +1667,18 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       assertSpawnContextSupported(req, {
         ledgerCompactionAvailable: portableContextApiKey !== null,
       });
-      return validateModelConfigPool(config, req.modelConfig, {
+      // Named model classes resolve here, before validation: spawns arriving
+      // via root control are already resolved, so this call is identity for
+      // them and expansion for every other spawn path.
+      return validateModelConfigPool(config, resolveModelClasses(config, req.modelConfig), {
         portable: req.context?.type === "portable",
       });
     },
     validateModel: (record, modelConfig) => {
-      const filled = fillModelConfigFromCurrent(modelConfig, record.modelConfig);
+      // Resolve before filling: fillModelConfigFromCurrent walks tuples, and a
+      // class reference would otherwise pass through it untouched.
+      const resolved = resolveModelClasses(config, modelConfig);
+      const filled = fillModelConfigFromCurrent(resolved, record.modelConfig);
       return validateModelConfigPool(config, filled, {
         portable: record.context?.type === "portable",
       });
@@ -2293,6 +2303,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     mesh,
     rootId: rootId,
     providers: Object.keys(config.providers),
+    resolveModelConfig: (input) => resolveModelClasses(config, input),
   });
 
   // Mechanical failure forwarding: a failed run goes to its parent's inbox, or —

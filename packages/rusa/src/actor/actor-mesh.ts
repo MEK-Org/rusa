@@ -2,10 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
 import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../mcp/stamp.js";
 import { prerequisiteEdgeKey } from "../obligations/obligation.js";
-import type {
-  ModelConfigInput,
-  ProviderModelConfig,
-  RawProviderModelConfig,
+import {
+  assertConcreteModelConfig,
+  type ModelConfigInput,
+  type ProviderModelConfig,
+  type RawProviderModelConfig,
 } from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
@@ -241,7 +242,10 @@ export class RetirementBlockedError extends Error {
  * resolve to a provider default (#169).
  */
 function normalizeModelConfigList(input: ModelConfigInput): ProviderModelConfig[] {
-  const list = Array.isArray(input) ? input : [input];
+  // No config in hand here, so a named class cannot be resolved — reject the
+  // reference rather than reading it as a tuple with a missing provider.
+  const concrete = assertConcreteModelConfig(input);
+  const list = Array.isArray(concrete) ? concrete : [concrete];
   return list.map((entry) => {
     const model = entry.model?.trim();
     if (!model) {

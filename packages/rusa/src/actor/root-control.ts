@@ -1,4 +1,9 @@
-import type { ModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
+import {
+  assertConcreteModelConfig,
+  type ConcreteModelConfigInput,
+  type ModelConfigInput,
+  type ProviderModelConfig,
+} from "../providers/model-config.js";
 import type { ActorHandle, ActorRecord, ContextConfig } from "./actor-record.js";
 
 export type RootControlPrincipal = "root-llm" | "human:operator" | "e2e-controller";
@@ -50,6 +55,12 @@ export interface RootControlOptions {
   mesh: RootControlMesh;
   rootId?: string;
   providers?: string[];
+  /**
+   * Resolves a named model class reference against config before anything else
+   * inspects the request. Wired in by the runtime, which holds the config;
+   * without it a class reference is rejected rather than silently mis-read.
+   */
+  resolveModelConfig?: (input: ModelConfigInput) => ConcreteModelConfigInput;
 }
 
 /**
@@ -69,9 +80,12 @@ export class RootControlService {
   spawnChild(request: RootChildRequest, principal: RootControlPrincipal): string {
     const charter = request.charter?.trim();
     if (!charter) throw new Error("charter is required");
-    const rawPool = Array.isArray(request.modelConfig)
-      ? request.modelConfig
-      : [request.modelConfig];
+    // Resolve named model classes first: the provider allowlist below, the
+    // audit record, and the mesh all have to see the same concrete pool.
+    const requested = this.options.resolveModelConfig
+      ? this.options.resolveModelConfig(request.modelConfig)
+      : assertConcreteModelConfig(request.modelConfig);
+    const rawPool = Array.isArray(requested) ? requested : [requested];
     if (rawPool.length === 0) throw new Error("modelConfig is required");
     if (this.providers.length > 0) {
       for (const { provider } of rawPool) {
@@ -99,7 +113,9 @@ export class RootControlService {
         : {}),
       charter,
       parentId: this.rootId,
-      modelConfig: request.modelConfig,
+      // Forward the resolved pool, not the request as written: resolution
+      // happens exactly once, here, and mesh-side validation sees only tuples.
+      modelConfig: requested,
       context: normalizeContext(request.context),
       conversationId: optionalTrimmed(request.conversationId),
       title: optionalTrimmed(request.title),
