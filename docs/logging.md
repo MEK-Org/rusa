@@ -198,3 +198,29 @@ Use the `-R` form until [#192](https://github.com/MEK-Org/rusa/issues/192)
 retires the stdout mirror; the actor output is already durable in the transcript
 and on the dashboard's SSE stream, so removing it there costs nothing here. Once
 it lands, stdout is JSON lines only and plain `jq` works.
+
+## MCP HTTP request timelines
+
+The MCP HTTP host uses the `mcp-http` component for request-path diagnostics.
+`mcp_server_added` and `mcp_server_removed` carry a safe service label plus an
+opaque `serverInstanceId`. The instance id changes when a mount is removed and
+added again, so two actor-mounted `inbox` services can be told apart without
+recording actor ids or capability URL tokens.
+
+Each request event carries one generated `requestId`, the safe server fields, a
+bounded `sessionId`, `sessionResolved`, and `elapsedMs`. `sessionResolved` is
+captured at arrival before the body is read; the full session header remains
+routing-only. After a JSON body is safely parsed, the records may add bounded
+`rpcMethod` and, for `tools/call`, `toolName`.
+
+The phases are `mcp_request_arrived`, `mcp_request_body_read`, session
+connect/create/close, `mcp_transport_dispatch`, and `mcp_transport_returned`.
+`mcp_transport_returned` only says the SDK handler returned. HTTP completion is
+separate: `mcp_http_response_finished` records Node's local writable completion;
+`mcp_http_response_closed` records a premature close. Both include `statusCode`,
+`headersSent`, `writableFinished`, and `responseWritten`. Neither proves that a
+client received the response. In particular, GET SSE streams can keep a
+transport dispatch active while their HTTP response remains deliberately open.
+
+These records intentionally omit capability URLs/tokens, authorization and
+credential headers, arguments, results, raw request bodies, and raw errors.

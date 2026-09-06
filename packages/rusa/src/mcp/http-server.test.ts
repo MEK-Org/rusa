@@ -1,15 +1,19 @@
-import { Agent, request } from "node:http";
+import { Agent, type IncomingMessage, request, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { encodeScheduledMessagePayload } from "../actor/os-scheduler.js";
 import { FakeChatClient } from "../chat/fake.js";
 import type { IssueClient } from "../gitops/issue-client.js";
+import type { LogFields, Logger } from "../observability/logger.js";
 import { createChatWriteMcpServer } from "./chat-mcp.js";
 import { type GrantableServerFactory, handleCapabilityRevoked } from "./grantable-servers.js";
 import { McpHttpServer } from "./http-server.js";
+import { toolOk } from "./result.js";
+import { createMcpServer } from "./strict-server.js";
 import { createTrackerMcpServer } from "./tracker-mcp.js";
 
 // Records `addLabel` rather than `postComment`: tracker.post_comment no longer
@@ -95,20 +99,37 @@ function getWithAgent(url: string, agent: Agent): Promise<Socket> {
   });
 }
 
+type LogRecord = { event: string; fields: LogFields | undefined };
+
+function recordingLogger(records: LogRecord[]): Logger {
+  const write = (event: string, fields?: LogFields) => records.push({ event, fields });
+  const logger: Logger = {
+    debug: write,
+    info: write,
+    warn: write,
+    error: write,
+    child: () => logger,
+  };
+  return logger;
+}
+
 describe("McpHttpServer", () => {
   let http: McpHttpServer;
   let labels: string[];
   let chat: FakeChatClient;
+  let requestLogs: LogRecord[];
 
   beforeEach(async () => {
     const issue = fakeIssueClient();
     labels = issue.labels;
     chat = new FakeChatClient();
+    requestLogs = [];
     http = new McpHttpServer({
       servers: {
         tracker: () => createTrackerMcpServer("test", issue.client),
         chat: () => createChatWriteMcpServer("test", chat, { allowedSpaces: ["*"] }),
       },
+      logger: recordingLogger(requestLogs),
     });
     await http.start();
   });
@@ -172,6 +193,287 @@ describe("McpHttpServer", () => {
     expect(res.isError).toBeFalsy();
     expect(labels).toEqual(["#7: from mcp over http"]);
     await client.close();
+  });
+
+  it("logs the initialize-to-tool timeline without request payloads or capability URLs", async () => {
+    const capabilityUrl = http.urls().find((url) => url.name === "tracker")?.url;
+    if (!capabilityUrl) throw new Error("tracker url missing");
+    const client = await connect("tracker");
+    const secret = "mcp-request-payload-secret";
+    await client.callTool({
+      name: "add_label",
+      arguments: { repo: "o/r", issueNumber: 7, label: secret },
+    });
+    await client.close();
+    await http.removeServer("tracker");
+
+    const events = requestLogs.map(({ event }) => event);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        "mcp_request_arrived",
+        "mcp_request_body_read",
+        "mcp_session_connecting",
+        "mcp_session_connected",
+        "mcp_session_created",
+        "mcp_transport_dispatch",
+        "mcp_transport_returned",
+        "mcp_http_response_finished",
+        "mcp_session_closed",
+      ])
+    );
+    expect(
+      requestLogs.find(({ event }) => event === "mcp_transport_dispatch")?.fields
+    ).toMatchObject({
+      server: "tracker",
+      rpcMethod: "initialize",
+    });
+    expect(
+      requestLogs.find(
+        ({ event, fields }) =>
+          event === "mcp_transport_dispatch" && fields?.rpcMethod === "tools/call"
+      )?.fields
+    ).toMatchObject({ server: "tracker", rpcMethod: "tools/call", toolName: "add_label" });
+    expect(
+      requestLogs.find(({ event }) => event === "mcp_http_response_finished")?.fields
+    ).toMatchObject({
+      responseWritten: true,
+      statusCode: 200,
+      headersSent: true,
+      writableFinished: true,
+      clientReceiptObserved: false,
+    });
+
+    const requestEvents = requestLogs.filter(({ event }) =>
+      [
+        "mcp_request_arrived",
+        "mcp_request_body_read",
+        "mcp_session_connecting",
+        "mcp_session_connected",
+        "mcp_session_created",
+        "mcp_transport_dispatch",
+        "mcp_transport_returned",
+        "mcp_http_response_finished",
+      ].includes(event)
+    );
+    expect(requestEvents).not.toHaveLength(0);
+    for (const { fields } of requestEvents) {
+      expect(fields?.requestId).toMatch(/^[0-9a-f-]{36}$/);
+    }
+
+    // Only the bounded routing metadata is recorded: neither arguments nor the
+    // unguessable capability URL appear in any event.
+    const records = JSON.stringify(requestLogs);
+    expect(records).not.toContain(secret);
+    expect(records).not.toContain("arguments");
+    expect(records).not.toContain(capabilityUrl);
+  });
+
+  it("logs an invalid session without recording the request payload", async () => {
+    const url = http.urls().find((entry) => entry.name === "tracker")?.url;
+    if (!url) throw new Error("tracker url missing");
+    const secret = "invalid-session-payload-secret";
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "mcp-session-id": "not-a-real-session",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "add_label", arguments: { credential: secret } },
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(requestLogs.find(({ event }) => event === "mcp_session_rejected")?.fields).toMatchObject(
+      {
+        server: "tracker",
+        sessionId: "not-a-real-session",
+        rpcMethod: "tools/call",
+        toolName: "add_label",
+      }
+    );
+    expect(
+      requestLogs.find(
+        ({ event, fields }) =>
+          event === "mcp_request_arrived" && fields?.sessionId === "not-a-real-session"
+      )?.fields
+    ).toMatchObject({ sessionResolved: false });
+    const records = JSON.stringify(requestLogs);
+    expect(records).not.toContain(secret);
+    expect(records).not.toContain("credential");
+  });
+
+  it("routes with the raw session header while bounding the logged session id", async () => {
+    const url = http.urls().find((entry) => entry.name === "tracker")?.url;
+    if (!url) throw new Error("tracker url missing");
+    const rawSessionId = `session-${"s".repeat(256)}`;
+    let dispatched = false;
+    const sessions = (
+      http as unknown as { sessions: Map<string, Map<string, StreamableHTTPServerTransport>> }
+    ).sessions.get("tracker");
+    if (!sessions) throw new Error("tracker session map missing");
+    sessions.set(rawSessionId, {
+      handleRequest: async (_req: IncomingMessage, res: ServerResponse) => {
+        dispatched = true;
+        res.writeHead(204);
+        res.end();
+      },
+    } as unknown as StreamableHTTPServerTransport);
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "mcp-session-id": rawSessionId,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "notifications/cancelled" }),
+    });
+
+    expect(response.status).toBe(204);
+    expect(dispatched).toBe(true);
+    expect(
+      requestLogs.find(
+        ({ event, fields }) =>
+          event === "mcp_transport_dispatch" && fields?.sessionId === rawSessionId.slice(0, 128)
+      )?.fields
+    ).toMatchObject({ sessionResolved: true });
+  });
+
+  it("correlates actor-mounted server lifecycle without recording mount identities", async () => {
+    const factory = () => createTrackerMcpServer("test", fakeIssueClient().client);
+    http.addServer("worker-one:inbox", factory);
+    http.addServer("worker-two:inbox", factory);
+
+    const added = requestLogs.filter(
+      ({ event, fields }) => event === "mcp_server_added" && fields?.server === "inbox"
+    );
+    const instanceIds = added.map(({ fields }) => fields?.serverInstanceId);
+    expect(instanceIds).toHaveLength(2);
+    expect(new Set(instanceIds).size).toBe(2);
+    for (const instanceId of instanceIds) expect(instanceId).toMatch(/^[0-9a-f-]{36}$/);
+
+    await http.removeServer("worker-one:inbox");
+    await http.removeServer("worker-two:inbox");
+    const removed = requestLogs.filter(
+      ({ event, fields }) => event === "mcp_server_removed" && fields?.server === "inbox"
+    );
+    expect(removed.map(({ fields }) => fields?.serverInstanceId).sort()).toEqual(
+      [...instanceIds].sort()
+    );
+    const records = JSON.stringify(requestLogs);
+    expect(records).not.toContain("worker-one");
+    expect(records).not.toContain("worker-two");
+  });
+
+  it("records a delayed handler's premature HTTP close separately from transport return", async () => {
+    let handlerStarted!: () => void;
+    let releaseHandler!: () => void;
+    const started = new Promise<void>((resolve) => {
+      handlerStarted = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      releaseHandler = resolve;
+    });
+    const url = http.addServer("slow", () => {
+      const server = createMcpServer({ name: "slow", version: "0.0.0" });
+      server.registerTool("wait_for_release", { inputSchema: {} }, async () => {
+        handlerStarted();
+        await released;
+        return toolOk({ ok: true });
+      });
+      return server;
+    });
+    const transport = new StreamableHTTPClientTransport(new URL(url));
+    const client = new Client({ name: "test", version: "0.0.0" });
+    await client.connect(transport);
+    const sessionId = transport.sessionId;
+    if (!sessionId) throw new Error("session id missing after initialize");
+
+    const controller = new AbortController();
+    const pending = fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "mcp-session-id": sessionId,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "wait_for_release", arguments: {} },
+      }),
+      signal: controller.signal,
+    });
+    await started;
+    controller.abort();
+    await expect(pending).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    releaseHandler();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await transport.terminateSession();
+    await client.close();
+
+    const prematureClose = requestLogs.find(
+      ({ event, fields }) =>
+        event === "mcp_http_response_closed" && fields?.toolName === "wait_for_release"
+    );
+    expect(prematureClose?.fields).toMatchObject({
+      responseWritten: false,
+      statusCode: 200,
+      headersSent: true,
+      writableFinished: false,
+      clientReceiptObserved: false,
+    });
+    expect(
+      requestLogs.some(
+        ({ event, fields }) =>
+          event === "mcp_transport_returned" && fields?.toolName === "wait_for_release"
+      )
+    ).toBe(true);
+  });
+
+  it("keeps a GET SSE response open while its transport dispatch is active", async () => {
+    const url = http.urls().find((entry) => entry.name === "tracker")?.url;
+    if (!url) throw new Error("tracker url missing");
+    const transport = new StreamableHTTPClientTransport(new URL(url));
+    const client = new Client({ name: "test", version: "0.0.0" });
+    await client.connect(transport);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // The SDK opens this stream during connect. The dispatch stays active for
+    // server notifications, so neither a transport return nor HTTP finish means
+    // a client receipt while the stream is open.
+    const dispatched = requestLogs.find(
+      ({ event, fields }) => event === "mcp_transport_dispatch" && fields?.httpMethod === "GET"
+    );
+    expect(dispatched?.fields?.requestId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(
+      requestLogs.some(
+        ({ event, fields }) =>
+          (event === "mcp_transport_returned" || event === "mcp_http_response_finished") &&
+          fields?.requestId === dispatched?.fields?.requestId
+      )
+    ).toBe(false);
+
+    await client.close();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const closed = requestLogs.find(
+      ({ event, fields }) =>
+        event === "mcp_http_response_closed" && fields?.requestId === dispatched?.fields?.requestId
+    );
+    expect(closed?.fields).toMatchObject({
+      statusCode: 200,
+      headersSent: true,
+      writableFinished: false,
+      responseWritten: false,
+      clientReceiptObserved: false,
+    });
   });
 
   it("serves the chat tools over HTTP independently", async () => {

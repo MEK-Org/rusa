@@ -1157,7 +1157,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient);
   }
 
-  const mcpHttp = new McpHttpServer({ servers });
+  const mcpHttp = new McpHttpServer({ servers, logger: log });
   await mcpHttp.start();
   const sharedMcp = mcpHttp.urls();
   log.info("shared_mcp_serving", { servers: sharedMcp.map((u) => u.name) });
