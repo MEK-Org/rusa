@@ -1660,6 +1660,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const mesh: ActorMesh = new ActorMesh({
     actors,
     rootId,
+    // Placement exists only while the experimental remote-instance seam is
+    // wired (the E2E rig supplies it). Production leaves it unset, so an
+    // `executionTarget` is rejected at the spawn choke point.
+    supportsExecutionTarget: opts?.e2e?.createWorkerActor ? () => true : undefined,
     validateSpawn: (req) => {
       // Portable-context refusals  live here, at the mesh's single spawn
       // choke point, so the MCP tool, root control, the dashboard and the A/B rig
@@ -2255,8 +2259,18 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           },
           log: makeFirehose(id), // firehose (4d: session-tag) → console + dashboard SSE
         };
-        const actor: MeshActor =
-          opts?.e2e?.createWorkerActor?.(ctx, actorOptions) ?? new Actor(actorOptions);
+        // Second fail-closed gate, covering rehydrate/adopt as well as spawn: a
+        // placement request only ever reaches a remote runtime, never a local
+        // Actor standing in silently for the instance that was asked for.
+        const createWorkerActor = opts?.e2e?.createWorkerActor;
+        if (ctx.executionTarget && !createWorkerActor) {
+          throw new Error(
+            `actor ${id} requests executionTarget ${JSON.stringify(ctx.executionTarget)} but this runtime has no remote placement support`
+          );
+        }
+        const actor: MeshActor = createWorkerActor
+          ? createWorkerActor(ctx, actorOptions)
+          : new Actor(actorOptions);
         liveWorkerMcp.set(id, workerMcp);
         return actor;
       } catch (err) {
