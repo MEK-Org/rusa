@@ -1165,6 +1165,12 @@ class DashboardStore {
         streamId: cursor.streamId,
         revision: delta.revision,
       );
+      if (delta.refreshThreadSnapshot) {
+        // Inbox selection changes do not alter the run state, so their delta
+        // is only a sequenced request to replace the thread snapshot and pick
+        // up (or clear) the active run's selected obligation.
+        unawaited(_requestRuntimeSync());
+      }
       return;
     }
     _bufferRuntimeState(delta);
@@ -1190,8 +1196,19 @@ class DashboardStore {
     final existing = cur.actors[delta.actorId];
     if (existing == null) return false;
     final updatedActors = Map<String, ActorViewState>.of(cur.actors);
+    // A durable inbox focus only belongs to an active run. Clearing it at the
+    // idle/queued lifecycle boundary prevents a just-finished run's card from
+    // appearing beneath the next provider reservation, without a second
+    // thread-list request on every queue admission.
+    final clearsSelectedObligation =
+        delta.runState == RunState.idle || delta.runState == RunState.queued;
     updatedActors[delta.actorId] = existing.copyWith(
-      thread: existing.thread.copyWith(runState: delta.runState),
+      thread: existing.thread.copyWith(
+        runState: delta.runState,
+        selectedObligation: clearsSelectedObligation
+            ? null
+            : existing.thread.selectedObligation,
+      ),
       runState: delta.runState,
     );
     _actorStates.add(
@@ -1260,6 +1277,7 @@ class DashboardStore {
       if (delta.revision != revision + 1 || !_applyRuntimeState(delta)) {
         return false;
       }
+      if (delta.refreshThreadSnapshot) _runtimeSyncAgain = true;
       revision = delta.revision;
     }
     _runtimeCursor = RuntimeCursor(

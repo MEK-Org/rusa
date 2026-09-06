@@ -2994,6 +2994,23 @@ describe("ActorMesh", () => {
     expect(mesh.selectedInboxEntries("root")).toEqual([entry.id]);
   });
 
+  it("emits a thread-snapshot refresh when inbox selection changes", () => {
+    const inboxStore = createMemoryInboxStore();
+    const { mesh } = setup({ inboxStore });
+    const [entry] = inboxStore.append([
+      { actorId: "root", source: "mesh:parent", payload: payload("mesh.message") },
+    ]);
+    const deltas: Array<{ actorId: string; refreshThreadSnapshot?: boolean }> = [];
+    mesh.onRuntimeStateDelta((delta) => deltas.push(delta));
+
+    mesh.selectInboxEntries("root", [entry.id]);
+
+    expect(deltas.at(-1)).toMatchObject({
+      actorId: "root",
+      refreshThreadSnapshot: true,
+    });
+  });
+
   it("reviveThread flips retired -> active, recreates the actor, keeps sessionId, and runs onRevive", async () => {
     const revived: string[] = [];
     const { mesh, registry, tick } = setup({

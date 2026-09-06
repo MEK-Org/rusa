@@ -3128,6 +3128,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                     : new Date(entry.estimatedStartAt).toISOString(),
               }))
             ),
+          // Current work is the durable inbox focus for this actor's active
+          // run. It deliberately reads through the run id map: a completed
+          // focus is history, not the next queued run's selected work.
+          selectedObligationForActor: (actorId) => {
+            const runId = activeRunIds.get(actorId);
+            if (!runId) return null;
+            const obligationId = getRepositories().actorRuns.activeFocusPrimaryObligationId(runId);
+            return obligationId ? getRepositories().obligations.get(obligationId) : null;
+          },
           rootControl,
           // The configured root identity  — display handle + avatar
           // override — so the dashboard shows this instance's own identity

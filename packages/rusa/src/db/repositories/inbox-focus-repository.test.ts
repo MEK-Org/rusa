@@ -64,6 +64,9 @@ describe("InboxFocusRepository", () => {
       primaryObligationId: "ob-2",
       entryIds: ["entry-1", "entry-2"],
     });
+    expect(runs.activeFocusPrimaryObligationId("run-1")).toBe("ob-2");
+    runs.complete("run-1", { success: true, exitCode: 0, output: "" });
+    expect(runs.activeFocusPrimaryObligationId("run-1")).toBeNull();
   });
 
   it("replaces one run's selection without deleting durable entry associations", () => {

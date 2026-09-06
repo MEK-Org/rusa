@@ -492,34 +492,13 @@ class _ActorRowState extends State<_ActorRow> {
         children: [
           _buildChevron(),
           const SizedBox(width: 4),
-          // Circular avatar with the live status dot as a corner badge, so
-          // run-state stays visible even before the image resolves .
-          SizedBox(
-            width: 52,
-            height: 52,
-            child: Stack(
-              clipBehavior: Clip.none,
-              children: [
-                ActorAvatar(
-                  id: thread.id,
-                  size: 52,
-                  retired: thread.isRetired,
-                  store: widget.store,
-                ),
-                Positioned(
-                  right: -1,
-                  bottom: -1,
-                  child: Container(
-                    padding: const EdgeInsets.all(1.5),
-                    decoration: const BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: MeshColors.bgSecondary,
-                    ),
-                    child: StatusDot(state: dot, size: 7),
-                  ),
-                ),
-              ],
-            ),
+          // Shared with overview rows so avatar status remains identical in
+          // the hierarchy and its active-work summary.
+          ActorAvatarWithStatus(
+            id: thread.id,
+            state: dot,
+            retired: thread.isRetired,
+            store: widget.store,
           ),
           const SizedBox(width: 12),
           Expanded(

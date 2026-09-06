@@ -813,6 +813,40 @@ describe("handleMeshApiRequest", () => {
     expect(byId("root").runState).toBe("idle");
   });
 
+  it("GET /api/mesh/threads projects active-run focus but never speculative queued focus", async () => {
+    actors.upsert(rec("root", null, "active"));
+    actors.upsert(rec(UUID_A, "root", "active"));
+    actors.upsert(rec(UUID_B, "root", "active"));
+    const runningFocus = obligations.create({
+      id: "running-focus",
+      ownerId: UUID_A,
+      title: "Current running work",
+      intent: "Finish the running task",
+    });
+    const queuedFocus = obligations.create({
+      id: "queued-focus",
+      ownerId: UUID_B,
+      title: "Must not appear before a run starts",
+    });
+    deps = {
+      ...deps,
+      runningThreadIds: () => new Set([UUID_A]),
+      queuedThreadIds: () => new Set([UUID_B]),
+      selectedObligationForActor: (actorId) =>
+        actorId === UUID_A ? runningFocus : actorId === UUID_B ? queuedFocus : null,
+    };
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const body = JSON.parse(res.body);
+    const byId = (id: string) => body.threads.find((thread: { id: string }) => thread.id === id);
+    expect(byId(UUID_A).selectedObligation).toMatchObject({
+      id: "running-focus",
+      title: "Current running work",
+    });
+    expect(byId(UUID_B).selectedObligation).toBeUndefined();
+    expect(byId("root").selectedObligation).toBeUndefined();
+  });
+
   it("GET /api/mesh/threads surfaces winding_down when a running actor is yielded", async () => {
     actors.upsert(rec("root", null, "active"));
     actors.upsert(rec(UUID_A, "root", "active"));

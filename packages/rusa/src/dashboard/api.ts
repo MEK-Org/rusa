@@ -18,7 +18,7 @@ import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
-import type { ObligationStatus } from "../obligations/obligation.js";
+import type { Obligation, ObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { type Logger, nullLogger } from "../observability/logger.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
@@ -84,6 +84,12 @@ export interface DashboardDataDeps {
     position: number;
     estimatedStartAt: string | null;
   }>;
+  /**
+   * Current selected obligation for an actor's active run. This is a
+   * projection of the durable inbox focus, not a second selection model; it
+   * returns null as soon as the run that selected it completes.
+   */
+  selectedObligationForActor?: (actorId: string) => Obligation | null;
   /**
    * This instance's configured root identity  — the resolved display
    * handle and avatar override, if `rootActor.handle`/`rootActor.avatar` are
@@ -200,6 +206,8 @@ interface ThreadDto {
   selectedEffort?: string | null;
   /** Epoch-ms quote for when the reserved candidate becomes eligible to start. */
   eligibleAt?: number | null;
+  /** The active run's selected inbox-focus obligation, when one exists. */
+  selectedObligation?: Obligation;
   /**
    * The leading `CHARTER_PREVIEW_CHARS` characters of the charter, ellipsised
    * when clipped. The full text is detail data: `GET
@@ -1267,6 +1275,13 @@ export async function handleMeshApiRequest(
         runState = "queued";
       }
       const selection = runState === "queued" ? deps.mesh?.getSelection(r.id) : undefined;
+      // Durable inbox focus is created only after a run starts. A queued
+      // reservation deliberately has no focus from the prior run (or a
+      // speculative next one) to project.
+      const selectedObligation =
+        runState === "running" || runState === "winding_down"
+          ? (deps.selectedObligationForActor?.(r.id) ?? null)
+          : null;
       return {
         id: r.id,
         handle: r.isRoot === true ? rootHandle : generateHandle(r.id),
@@ -1295,6 +1310,7 @@ export async function handleMeshApiRequest(
         selectedModel: selection?.model ?? null,
         selectedEffort: selection?.effort ?? null,
         eligibleAt: selection?.eligibleAt ?? null,
+        ...(selectedObligation ? { selectedObligation } : {}),
       };
     });
     const schedulerHealth = deps.schedulerHealth?.();
