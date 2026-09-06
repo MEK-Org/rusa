@@ -1173,8 +1173,9 @@ class _OverviewTabState extends State<OverviewTab> {
 
 String _formatPacingInterval(int milliseconds) {
   if (milliseconds == 0) return '0s';
-  if (milliseconds < 60 * 1000)
+  if (milliseconds < 60 * 1000) {
     return '${(milliseconds / 1000).toStringAsFixed(1)}s';
+  }
   if (milliseconds < 60 * 60 * 1000) {
     return '${(milliseconds / (60 * 1000)).toStringAsFixed(1)}m';
   }
