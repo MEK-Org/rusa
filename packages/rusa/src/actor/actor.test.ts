@@ -3,6 +3,7 @@ import { deterministicExhaustionFallback } from "../providers/exhaustion-classif
 import { FakeProvider } from "../providers/fake-provider.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import * as sandboxModule from "../providers/sandbox.js";
+import { formatSigtermResult } from "../providers/termination-attribution.js";
 import type { RunOptions, RunResult } from "../providers/types.js";
 import {
   Actor,
@@ -1998,6 +1999,89 @@ describe("Actor", () => {
           exitCode: 143,
         })
       );
+    });
+
+    // #257 arbiter: a supervisor grace-kill is a cleanup termination, not a
+    // capacity failure. Deleting the `graceKilled` short-circuit in
+    // `runWithFallback` turns this RED — the ladder classifies the killed run,
+    // relaunches on an already-aborted signal, and the run-end output becomes a
+    // both-tiers-exhausted summary with the real termination diagnostic gone.
+    it("does not spend the fallback ladder on a supervisor grace-kill", async () => {
+      let actor!: Actor;
+      const onRunEnd = vi.fn();
+      const classify = vi.fn(async () => ({ exhausted: true }));
+
+      const primary = new FakeProvider(
+        async (opts: RunOptions) =>
+          new Promise<Partial<RunResult>>((resolve) => {
+            actor.declareYield("complete", "work pushed");
+            opts.signal?.addEventListener("abort", () => {
+              // Exactly what a real provider builds on a SIGTERM path.
+              resolve({ success: false, ...formatSigtermResult("agent transcript", opts.signal) });
+            });
+          }),
+        "primary-model"
+      );
+      const fallbackProvider = new FakeProvider(undefined, "fallback-model");
+
+      actor = makeActor(
+        {
+          yieldGraceMs: 5000,
+          fallback: {
+            models: ["fallback-model"],
+            resolveProvider: () => fallbackProvider,
+            classify,
+          },
+          onRunEnd,
+        },
+        primary
+      );
+      actor.requestRun();
+      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(5000);
+      await flush();
+
+      expect(classify).not.toHaveBeenCalled();
+      expect(fallbackProvider.calls).toHaveLength(0);
+      expect(onRunEnd).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: true,
+          graceKilled: true,
+          yieldStatus: "complete",
+          yieldNote: "work pushed",
+          exitCode: 143,
+          // The raw termination diagnostic survives the run end.
+          output: expect.stringContaining(
+            "[Task killed by supervisor (yield grace period exceeded)]"
+          ),
+        })
+      );
+    });
+
+    it("still reports a post-yield failure that is not a cleanup termination", async () => {
+      let actor!: Actor;
+      const onRunEnd = vi.fn();
+
+      const provider = new FakeProvider(() => {
+        actor.declareYield("complete", "done");
+        // An unrelated error after the yield was accepted — no grace kill.
+        return { success: false, exitCode: 1, output: "post-yield MCP write failed" };
+      });
+
+      actor = makeActor({ onRunEnd }, provider);
+      actor.requestRun();
+      await vi.advanceTimersByTimeAsync(10);
+      await flush();
+
+      expect(onRunEnd).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: false,
+          exitCode: 1,
+          yieldStatus: "complete",
+          output: "post-yield MCP write failed",
+        })
+      );
+      expect(onRunEnd.mock.calls[0]?.[0]?.graceKilled).toBeUndefined();
     });
   });
 
