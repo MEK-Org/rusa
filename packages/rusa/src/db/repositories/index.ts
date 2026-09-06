@@ -1,11 +1,13 @@
 import type Database from "better-sqlite3";
 import type { CapabilityGrantStore } from "../../actor/capability-grants.js";
+import type { HostJobStore } from "../../actor/host-job-store.js";
 import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js";
 import type { ActorRepository } from "../../repositories/actor-repository.js";
 import { ActorRunRepository } from "./actor-run-repository.js";
 import { DbCapabilityGrantStore } from "./capability-grant-repository.js";
 import { DbEventSourceOwnerStore } from "./event-source-owner-repository.js";
 import { DbEventSourceSubscriptionStore } from "./event-source-subscription-repository.js";
+import { DbHostJobStore } from "./host-job-repository.js";
 import { InboxFocusRepository } from "./inbox-focus-repository.js";
 import { InboxRepository } from "./inbox-repository.js";
 import { LegacyImportReceiptRepository } from "./legacy-import-receipt-repository.js";
@@ -33,6 +35,7 @@ export class Repositories {
   readonly capabilityGrants: CapabilityGrantStore;
   readonly eventSourceOwners: DbEventSourceOwnerStore;
   readonly eventSourceSubscriptions: DbEventSourceSubscriptionStore;
+  readonly hostJobs: HostJobStore;
   readonly legacyImportReceipts: LegacyImportReceiptRepository;
   readonly meshEvents: MeshEventRepository;
   readonly rawInputs: RawInputRepository;
@@ -51,6 +54,7 @@ export class Repositories {
     this.capabilityGrants = new DbCapabilityGrantStore(db);
     this.eventSourceOwners = new DbEventSourceOwnerStore(db);
     this.eventSourceSubscriptions = new DbEventSourceSubscriptionStore(db);
+    this.hostJobs = new DbHostJobStore(db);
     this.legacyImportReceipts = new LegacyImportReceiptRepository(db);
     this.meshEvents = new MeshEventRepository(db);
     this.rawInputs = new RawInputRepository(db);
@@ -90,6 +94,7 @@ export type {
 export { ActorRunRepository } from "./actor-run-repository.js";
 export { DbEventSourceOwnerStore } from "./event-source-owner-repository.js";
 export { DbEventSourceSubscriptionStore } from "./event-source-subscription-repository.js";
+export { DbHostJobStore } from "./host-job-repository.js";
 export type { InboxFocusResolution, RunInboxFocus } from "./inbox-focus-repository.js";
 export { InboxFocusRepository } from "./inbox-focus-repository.js";
 export { InboxRepository } from "./inbox-repository.js";

@@ -1,4 +1,10 @@
-import { readFileSync, writeFileSync } from "node:fs";
+/**
+ * Basename of the retired host-job JSON under `$RUSA_HOME`. SQLite is
+ * authoritative for host jobs; this name survives only so the one-time legacy
+ * importer can find, import and archive a file left over from before the
+ * cutover.
+ */
+export const HOST_JOBS_FILENAME = "host-jobs.json";
 
 /**
  * A job's deny-by-default read-scope allow-list . Empty by default: a
@@ -51,14 +57,19 @@ function isActive(job: HostJobRecord): boolean {
 }
 
 /**
- * Persistence boundary for host jobs — mirrors {@link CapabilityGrantStore}: a
- * local JSON file in production ({@link FileHostJobStore}), in-memory for tests.
- * Every read/write is scoped by `actorId` so one actor's tools can never see or
+ * Persistence boundary for host jobs — mirrors {@link CapabilityGrantStore}:
+ * SQLite in production (`DbHostJobStore`), in-memory for tests. Every
+ * read/write is scoped by `actorId` so one actor's tools can never see or
  * mutate another actor's jobs (the per-actor namespace enforcement lives one
  * layer up, in `host-jobs-mcp.ts`, by only ever calling these methods with the
  * caller's own `selfId`).
  */
 export interface HostJobStore {
+  /**
+   * Record a newly submitted job. Insert-only: a stored record is durable audit
+   * history, so re-submitting an id throws rather than rewriting the ownership,
+   * artifact hash and terminal state already recorded under it.
+   */
   submit(job: HostJobRecord): void;
   recordStopRequested(id: string, at: string): void;
   recordExit(id: string, at: string, exitStatus: string, exitCode?: string): void;
@@ -70,12 +81,27 @@ export interface HostJobStore {
   activeCountFor(actorId: string): number;
 }
 
+/**
+ * Copy a record deeply enough that a caller holding one cannot reach back into
+ * stored state. `manifest` is the only nested value, and it is the job's
+ * read-scope allow-list, so a shared reference would let a holder of a returned
+ * record widen what a stored job claims to have been authorized to read.
+ */
+function copy(job: HostJobRecord): HostJobRecord {
+  return { ...job, manifest: { readPaths: [...job.manifest.readPaths] } };
+}
+
 /** In-memory host-job store — for tests. */
 export class InMemoryHostJobStore implements HostJobStore {
   private readonly jobs = new Map<string, HostJobRecord>();
 
   submit(job: HostJobRecord): void {
-    this.jobs.set(job.id, { ...job });
+    // Same refusal `host_jobs.id`'s primary key gives the SQLite store, so the
+    // two stores answer a duplicate id identically.
+    if (this.jobs.has(job.id)) {
+      throw new Error(`host-jobs: job '${job.id}' is already recorded`);
+    }
+    this.jobs.set(job.id, copy(job));
   }
 
   recordStopRequested(id: string, at: string): void {
@@ -92,18 +118,18 @@ export class InMemoryHostJobStore implements HostJobStore {
 
   get(id: string): HostJobRecord | undefined {
     const job = this.jobs.get(id);
-    return job ? { ...job } : undefined;
+    return job ? copy(job) : undefined;
   }
 
   findByUnitName(unitName: string): HostJobRecord | undefined {
     for (const job of this.jobs.values()) {
-      if (job.unitName === unitName) return { ...job };
+      if (job.unitName === unitName) return copy(job);
     }
     return undefined;
   }
 
   list(): HostJobRecord[] {
-    return [...this.jobs.values()].map((j) => ({ ...j }));
+    return [...this.jobs.values()].map(copy);
   }
 
   listFor(actorId: string): HostJobRecord[] {
@@ -112,77 +138,5 @@ export class InMemoryHostJobStore implements HostJobStore {
 
   activeCountFor(actorId: string): number {
     return this.listFor(actorId).filter(isActive).length;
-  }
-}
-
-/**
- * JSON-file-backed host-job store — mirrors {@link FileCapabilityGrantStore}:
- * rewrites the whole file on every mutation, refreshes from disk on every read
- * so a record written by another process is visible without a restart.
- */
-export class FileHostJobStore implements HostJobStore {
-  private mem = new InMemoryHostJobStore();
-
-  constructor(private readonly file: string) {
-    this.refreshFromDisk();
-  }
-
-  private refreshFromDisk(): void {
-    try {
-      const parsed = JSON.parse(readFileSync(this.file, "utf-8")) as { jobs?: HostJobRecord[] };
-      const next = new InMemoryHostJobStore();
-      for (const j of parsed.jobs ?? []) next.submit(j);
-      this.mem = next;
-    } catch {
-      /* missing / empty / invalid → keep the current in-memory view */
-    }
-  }
-
-  private flush(): void {
-    try {
-      writeFileSync(this.file, JSON.stringify({ jobs: this.mem.list() }, null, 2));
-    } catch {
-      /* best effort — in-memory copy remains authoritative for this process */
-    }
-  }
-
-  submit(job: HostJobRecord): void {
-    this.mem.submit(job);
-    this.flush();
-  }
-
-  recordStopRequested(id: string, at: string): void {
-    this.mem.recordStopRequested(id, at);
-    this.flush();
-  }
-
-  recordExit(id: string, at: string, exitStatus: string, exitCode?: string): void {
-    this.mem.recordExit(id, at, exitStatus, exitCode);
-    this.flush();
-  }
-
-  get(id: string): HostJobRecord | undefined {
-    this.refreshFromDisk();
-    return this.mem.get(id);
-  }
-
-  findByUnitName(unitName: string): HostJobRecord | undefined {
-    this.refreshFromDisk();
-    return this.mem.findByUnitName(unitName);
-  }
-
-  list(): HostJobRecord[] {
-    this.refreshFromDisk();
-    return this.mem.list();
-  }
-
-  listFor(actorId: string): HostJobRecord[] {
-    this.refreshFromDisk();
-    return this.mem.listFor(actorId);
-  }
-
-  activeCountFor(actorId: string): number {
-    this.refreshFromDisk();
-    return this.mem.activeCountFor(actorId);
   }
 }
