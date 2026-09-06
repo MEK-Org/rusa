@@ -1024,13 +1024,40 @@ describe("runStart webhook event routing (Phase 4)", () => {
         .entries.map((entry) => entry.payload?.note)
         .filter((note): note is string => typeof note === "string");
 
-    it("preserves the accepted outcome through history, run_end and the parent's inbox", async () => {
-      const workerId = "grace-kill-worker";
+    /**
+     * The parent-notification predicate fires only when the run selected work
+     * its parent sent, so give the worker exactly that. Appended and selected
+     * directly rather than routed as a live mesh message: delivery would also
+     * queue a provider run, and there is no CLI behind `agy` here.
+     */
+    const selectParentMessage = (mesh: ActorMesh, workerId: string): void => {
+      const [entry] = getRepositories().inbox.append([
+        {
+          actorId: workerId,
+          source: "mesh:root",
+          payload: { type: "mesh.message", messageId: `msg-${workerId}`, fromId: "root" },
+        },
+      ]);
+      if (!entry) throw new Error("parent message not appended");
+      mesh.selectInboxEntries(workerId, [entry.id]);
+    };
+
+    // #257 asks for complete *and* blocked to survive; both are accepted
+    // outcomes and only the blocked one tells a parent someone is waiting.
+    it.each([
+      { status: "complete", note: "branch pushed" },
+      { status: "blocked", note: "waiting on review" },
+    ])("preserves an accepted $status yield through history, run_end and the parent's inbox", async ({
+      status,
+      note,
+    }) => {
+      const workerId = `grace-kill-worker-${status}`;
       const mesh = await bootWithWorker(workerId);
       const opts = hooksFor(mesh, workerId);
 
       startRun(opts);
-      mesh.declareYield(workerId, "complete", "branch pushed");
+      selectParentMessage(mesh, workerId);
+      mesh.declareYield(workerId, status, note);
       // The result the Actor produces for a grace-kill that followed an accepted
       // yield: the yield's outcome, with the raw process exit kept as annotation.
       await opts.onRunEnd?.({
@@ -1039,8 +1066,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
         cancelled: true,
         exitCode: 143,
         output: "agent transcript\n[Task killed by supervisor (yield grace period exceeded)]",
-        yieldStatus: "complete",
-        yieldNote: "branch pushed",
+        yieldStatus: status,
+        yieldNote: note,
       });
 
       const [run] = getRepositories().actorRuns.listRecentCompleted(workerId, 5);
@@ -1048,8 +1075,8 @@ describe("runStart webhook event routing (Phase 4)", () => {
         outcome: "completed",
         success: true,
         exitCode: 143,
-        yieldStatus: "complete",
-        yieldNote: "branch pushed",
+        yieldStatus: status,
+        yieldNote: note,
       });
       // Raw process exit diagnostics stay recoverable from the persisted run.
       expect(run?.output).toContain("[Task killed by supervisor (yield grace period exceeded)]");
@@ -1062,12 +1089,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
       expect(end?.detail).toBe("exit 143");
       expect(JSON.parse(end?.payload ?? "{}")).toMatchObject({
         graceKilled: true,
-        yieldStatus: "complete",
+        yieldStatus: status,
       });
 
-      // The parent hears the yield it accepted, and no failure.
+      // The parent hears the yield it accepted — asserted positively, since an
+      // absent notification would satisfy the no-failure check on its own.
       const notes = mechanicalNotes("root");
-      expect(notes.some((note) => note.startsWith("[run failed]"))).toBe(false);
+      expect(notes.some((n) => n.startsWith(`[yield/${status}] ${workerId}: ${note}`))).toBe(true);
+      expect(notes.some((n) => n.startsWith("[run failed]"))).toBe(false);
     });
 
     it("still forwards a genuine failure on the same wiring", async () => {
