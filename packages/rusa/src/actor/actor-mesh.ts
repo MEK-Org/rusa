@@ -96,6 +96,13 @@ export interface ActorRuntimeStateSnapshot {
 }
 
 export interface SpawnRequest {
+  /**
+   * Experimental execution placement, not persisted on the record. A target is
+   * only admitted when the runtime declares placement support through
+   * {@link ActorMeshOptions.supportsExecutionTarget}; otherwise the spawn is
+   * rejected rather than quietly running the actor in this process.
+   */
+  executionTarget?: string;
   /** What the new actor owns — authored by the spawning message (B.5). */
   charter: string;
   /** The spawning actor's id (becomes the child's parent + gets a handle to the child). */
@@ -355,6 +362,7 @@ export interface QueuedSelection {
 
 /** What the mesh hands the factory to build a live {@link Actor} for a record. */
 export interface ActorFactoryContext {
+  executionTarget?: string;
   /** The record at spawn time. Use {@link getRecord} for the *current* state. */
   record: ActorRecord;
   /** Read the live record (charter + handles can change between wakes). */
@@ -452,6 +460,13 @@ export interface ActorMeshOptions {
    * above length one, validates each tuple, and rejects duplicates.
    */
   validateSpawn?: (req: SpawnRequest) => ProviderModelConfig[];
+  /**
+   * Experimental placement gate, consulted for every spawn that names an
+   * `executionTarget`. Fail-closed by omission: a runtime that cannot place
+   * actors elsewhere leaves this unset, and an explicit target is then refused
+   * instead of degrading into a silent local run on the leader.
+   */
+  supportsExecutionTarget?: (target: string) => boolean;
   /**
    * Synchronous, config-aware validator before staging an actor's
    * `desiredModelConfig` replacement.
@@ -643,6 +658,7 @@ export class ActorMesh {
   readonly actors: ActorRepository;
   private readonly createActor: ActorFactory;
   private readonly validateSpawn?: (req: SpawnRequest) => ProviderModelConfig[];
+  private readonly supportsExecutionTarget?: (target: string) => boolean;
   private readonly validateModel?: (
     record: ActorRecord,
     modelConfig: ModelConfigInput
@@ -740,6 +756,7 @@ export class ActorMesh {
     this.rootId = opts.rootId;
     this.createActor = opts.createActor;
     this.validateSpawn = opts.validateSpawn;
+    this.supportsExecutionTarget = opts.supportsExecutionTarget;
     this.validateModel = opts.validateModel;
     this.grants = opts.capabilityGrants ?? new InMemoryCapabilityGrantStore();
     this.eventSourceOwners = opts.eventSourceOwners ?? new InMemoryEventSourceOwnerStore();
@@ -1364,6 +1381,24 @@ export class ActorMesh {
   }
 
   /**
+   * Refuse an execution placement this runtime cannot honour.
+   *
+   * Called before the spawn id, the record, or the parent's handle exist, so a
+   * refused placement leaves nothing behind to clean up — and, more importantly,
+   * so a target the runtime does not understand can never fall through to a
+   * local Actor. Omitted target still means local; a supplied one means that
+   * instance or an error.
+   */
+  private assertPlacementSupported(executionTarget: string | undefined): void {
+    if (executionTarget === undefined) return;
+    const target = executionTarget.trim();
+    if (target && this.supportsExecutionTarget?.(target)) return;
+    throw new Error(
+      `executionTarget ${JSON.stringify(executionTarget)} is not available: this runtime has no remote placement support`
+    );
+  }
+
+  /**
    * Create a child actor (record + live instance) and return its id immediately.
    * Spawning is **not** an implicit message: the child is born idle with an empty
    * inbox and does **not** run. To put it to work, {@link sendMessage} it — that
@@ -1374,6 +1409,7 @@ export class ActorMesh {
   spawn(req: SpawnRequest): string {
     const charter = req.charter?.trim();
     if (!charter) throw new Error("charter is required");
+    this.assertPlacementSupported(req.executionTarget);
     const modelConfig = this.validateSpawn?.(req) ?? normalizeModelConfigList(req.modelConfig);
     if (modelConfig.length === 0) {
       throw new Error("modelConfig must declare at least one provider/model entry");
@@ -1401,7 +1437,10 @@ export class ActorMesh {
     this.grantHandle(parentId, { id });
     let actor: MeshActor;
     try {
-      actor = this.createActor(this.factoryContext(record));
+      actor = this.createActor({
+        ...this.factoryContext(record),
+        executionTarget: req.executionTarget,
+      });
     } catch (err) {
       this.revokeHandle(parentId, id);
       this.actors.patch(id, { status: "retired" });

@@ -65,6 +65,51 @@ describe("external root E2E control server", () => {
     expect(retireChild).toHaveBeenCalledWith("child-1", "e2e-controller");
   });
 
+  it("refuses a blank execution target at the HTTP boundary instead of running it locally", async () => {
+    const spawnChild = vi.fn(() => "child-1");
+    const handles = {
+      externalRoot: new ExternalRootDriver("root", vi.fn()),
+      rootControl: { spawnChild },
+      mesh: { list: () => [] },
+      inboxStore: { list: vi.fn(), markHandled: vi.fn() },
+    } as unknown as RunStartE2EHandles;
+    const followerHub = {
+      list: () => [{ id: "mac-follower" }],
+    } as unknown as Parameters<typeof startRootControlServer>[0]["followerHub"];
+    const server = startRootControlServer({ port: 0, handles, followerHub });
+    await new Promise<void>((resolve) => server.once("listening", resolve));
+    close = () =>
+      new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    const port = (server.address() as AddressInfo).port;
+    const spawn = (target: unknown) =>
+      fetch(`http://127.0.0.1:${port}/actors`, {
+        method: "POST",
+        body: JSON.stringify({
+          charter: "place me",
+          provider: "agy",
+          model: "gemini-3.5-flash-medium",
+          target,
+        }),
+      });
+
+    // `target: ""` is a request to place the actor, not an omission. It names no
+    // connected follower, so it is refused here rather than quietly becoming a
+    // local run in the leader's own process.
+    const blank = await spawn("");
+    expect(blank.status).toBe(400);
+    expect(await blank.json()).toEqual({ error: "Requested follower is not connected" });
+    expect((await spawn("   ")).status).toBe(400);
+    expect((await spawn("linux-follower")).status).toBe(400);
+    expect(spawnChild).not.toHaveBeenCalled();
+
+    const placed = await spawn("mac-follower");
+    expect(placed.status).toBe(201);
+    expect(spawnChild).toHaveBeenCalledWith(
+      expect.objectContaining({ executionTarget: "mac-follower" }),
+      "e2e-controller"
+    );
+  });
+
   it("enables portable ledger context through the shared spawn surface", async () => {
     const spawnChild = vi.fn(() => "child-ledger");
     const handles = {

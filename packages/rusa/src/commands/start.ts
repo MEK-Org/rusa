@@ -10,8 +10,13 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Actor } from "../actor/actor.js";
-import { ActorMesh, type MeshActor, type RetireCleanup } from "../actor/actor-mesh.js";
+import { Actor, type ActorOptions } from "../actor/actor.js";
+import {
+  type ActorFactoryContext,
+  ActorMesh,
+  type MeshActor,
+  type RetireCleanup,
+} from "../actor/actor-mesh.js";
 import type { ActorRecord, PortableContextConfig } from "../actor/actor-record.js";
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
 import { PARENT_GRANTABLE_CAPABILITIES } from "../actor/capability-grants.js";
@@ -81,6 +86,7 @@ import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-thro
 import { resolveRootActorId } from "../actor/root-actor-id.js";
 import { RootControlService } from "../actor/root-control.js";
 import { buildRootPrompt } from "../actor/root-prompt.js";
+import { createRunAccounting } from "../actor/run-accounting.js";
 import {
   ensureWakeToken,
   wakePortPath,
@@ -497,6 +503,8 @@ export interface RunStartE2EHandles {
  * The issue-client edge is swapped via the existing `setIssueClient` global.
  */
 export interface RunStartE2EHooks {
+  /** Experimental execution seam; production always constructs a local Actor. */
+  createWorkerActor?: (context: ActorFactoryContext, options: ActorOptions) => MeshActor;
   chatClient?: ChatClient;
   chatSource?: ChatSource;
   rootDriver?: "provider" | "external";
@@ -893,41 +901,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     log.warn("unterminated_runs_recovered", { runs: recoveredOpenRuns });
   }
 
-  const activeRunIds = new Map<string, string>();
+  const runAccounting = createRunAccounting(() => getRepositories().actorRuns);
   const inboxFocusResolver = new InboxFocusResolver(
     getRepositories().inboxFocus,
     getRepositories().obligations,
     getRepositories().meshChat
   );
-  const beginActorRun = (actorId: string, providerName: string): string => {
-    if (activeRunIds.has(actorId)) {
-      throw new Error(`actor already has an active durable run: ${actorId}`);
-    }
-    const runId = getRepositories().actorRuns.start({ actorId, provider: providerName });
-    activeRunIds.set(actorId, runId);
-    return runId;
-  };
-  const completeActorRun = (actorId: string, result: RunResult): string => {
-    const runId = activeRunIds.get(actorId);
-    if (!runId) throw new Error(`actor has no active durable run: ${actorId}`);
-    getRepositories().actorRuns.complete(runId, {
-      success: result.success,
-      exitCode: result.exitCode,
-      output: result.output,
-      yieldStatus: result.yieldStatus,
-      yieldNote: result.yieldNote,
-      model: result.model,
-    });
-    activeRunIds.delete(actorId);
-    return runId;
-  };
-  const abandonActorRun = (actorId: string, reason: string): string | null => {
-    const runId = activeRunIds.get(actorId);
-    if (!runId) return null;
-    getRepositories().actorRuns.abandon(runId, reason);
-    activeRunIds.delete(actorId);
-    return runId;
-  };
+  const beginActorRun = runAccounting.begin;
+  const completeActorRun = runAccounting.complete;
+  const abandonActorRun = runAccounting.abandon;
 
   // Capture the disposable audit projection while this startup unquestionably
   // owns an open DB handle. Some boot paths cross asynchronous probes before
@@ -1670,6 +1652,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const mesh: ActorMesh = new ActorMesh({
     actors,
     rootId,
+    // Placement exists only while the experimental remote-instance seam is
+    // wired (the E2E rig supplies it). Production leaves it unset, so an
+    // `executionTarget` is rejected at the spawn choke point.
+    supportsExecutionTarget: opts?.e2e?.createWorkerActor ? () => true : undefined,
     validateSpawn: (req) => {
       // Portable-context refusals  live here, at the mesh's single spawn
       // choke point, so the MCP tool, root control, the dashboard and the A/B rig
@@ -1692,7 +1678,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     scheduledMessages: osScheduler,
     withTransaction: (fn) => getDb().transaction(fn)(),
     recordRunYield: (actorId, status, note) => {
-      const runId = activeRunIds.get(actorId);
+      const runId = runAccounting.activeRunId(actorId);
       if (!runId) return null;
       getRepositories().actorRuns.recordYield(runId, status, note);
       return runId;
@@ -1932,7 +1918,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const inboxUrl = mcpHttp.addServer(`${id}:${INBOX_MCP_NAME}`, () =>
           createInboxMcpServer(inboxStore, id, {
             select: (entryIds, obligationId) => {
-              const runId = activeRunIds.get(id);
+              const runId = runAccounting.activeRunId(id);
               if (!runId) throw new Error(`actor has no active durable run: ${id}`);
               let focus: ResolvedInboxFocus | undefined;
               const entries = mesh.selectInboxEntries(id, entryIds, (selectedEntries) => {
@@ -2078,7 +2064,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // Which declared candidate actually ran, for the failure-notice label —
         // set on each onRunStart, read back on that same run's onRunEnd.
         let lastSelected: RawProviderModelConfig = modelConfigPool[0];
-        const actor: Actor = new Actor({
+        const actorOptions: ActorOptions = {
           id,
           cwd,
           modelConfig: [...modelConfigPool],
@@ -2264,7 +2250,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             }
           },
           log: makeFirehose(id), // firehose (4d: session-tag) → console + dashboard SSE
-        });
+        };
+        // Second fail-closed gate, covering rehydrate/adopt as well as spawn: a
+        // placement request only ever reaches a remote runtime, never a local
+        // Actor standing in silently for the instance that was asked for.
+        const createWorkerActor = opts?.e2e?.createWorkerActor;
+        if (ctx.executionTarget !== undefined && !createWorkerActor) {
+          throw new Error(
+            `actor ${id} requests executionTarget ${JSON.stringify(ctx.executionTarget)} but this runtime has no remote placement support`
+          );
+        }
+        const actor: MeshActor = createWorkerActor
+          ? createWorkerActor(ctx, actorOptions)
+          : new Actor(actorOptions);
         liveWorkerMcp.set(id, workerMcp);
         return actor;
       } catch (err) {
@@ -2403,7 +2401,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const rootInboxUrl = mcpHttp.addServer(`${rootId}:${INBOX_MCP_NAME}`, () =>
     createInboxMcpServer(inboxStore, rootId, {
       select: (entryIds, obligationId) => {
-        const runId = activeRunIds.get(rootId);
+        const runId = runAccounting.activeRunId(rootId);
         if (!runId) throw new Error(`actor has no active durable run: ${rootId}`);
         let focus: ResolvedInboxFocus | undefined;
         const entries = mesh.selectInboxEntries(rootId, entryIds, (selectedEntries) => {

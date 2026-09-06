@@ -19,6 +19,9 @@ import { FakeIssueClient } from "../e2e/fake-issue-client.js";
 import { LocalTracker } from "../e2e/local-tracker.js";
 import { PID_FILE, provisionE2EInstance, resumeE2EInstance } from "../e2e/provision.js";
 import { startTrackerServer } from "../e2e/tracker-server.js";
+import { ActorHandle } from "../experimental/remote-instances/actor-handle.js";
+import { instanceWorkerFactory } from "../experimental/remote-instances/e2e-adapter.js";
+import { FollowerHub } from "../experimental/remote-instances/follower-hub.js";
 import { setIssueClient } from "../gitops/issue-client.js";
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
@@ -113,9 +116,18 @@ export async function runActorMeshE2EUp(opts: {
   root?: string;
   baseConfigHome?: string;
   rootDriver?: "provider" | "external";
+  followerGateway?: { host: string; port: number; tokenFile: string };
+  portOffset?: number;
   rootControlPort?: number;
   resume?: boolean;
 }): Promise<void> {
+  const offset = opts.portOffset ?? 0;
+  if (!Number.isInteger(offset) || offset < 0 || ROOT_CONTROL_PORT + offset > 65535) {
+    throw new Error("--port-offset must be an integer between 0 and 57449");
+  }
+  const trackerPort = TRACKER_PORT + offset;
+  const chatPort = CHAT_CONTROL_PORT + offset;
+  const controlPort = opts.rootControlPort ?? ROOT_CONTROL_PORT + offset;
   try {
     assertBwrapAvailable();
   } catch (err) {
@@ -141,6 +153,7 @@ export async function runActorMeshE2EUp(opts: {
   const instance = opts.resume
     ? resumeE2EInstance(instanceRoot)
     : provisionE2EInstance({
+        dashboardPort: 8083 + offset,
         root: instanceRoot,
         baseConfigHome: opts.baseConfigHome,
         // External control does not invoke a root provider, but children still
@@ -190,7 +203,7 @@ export async function runActorMeshE2EUp(opts: {
   let emitGitHubEvent: RunStartE2EHandles["emitGitHubEvent"] | null = null;
   const tracker = new LocalTracker({
     repo,
-    baseUrl: `http://localhost:${TRACKER_PORT}`,
+    baseUrl: `http://localhost:${trackerPort}`,
     botAccount: bot,
     onEvent: async (event, payload) => {
       await emitGitHubEvent?.(event, payload);
@@ -203,6 +216,14 @@ export async function runActorMeshE2EUp(opts: {
   let trackerServer: { close: () => Promise<void> } | null = null;
   let chatServer: Server | null = null;
   let rootControlServer: Server | null = null;
+  const followerHub = opts.followerGateway
+    ? new FollowerHub(readFileSync(opts.followerGateway.tokenFile, "utf8").trim())
+    : undefined;
+  if (followerHub && opts.followerGateway) {
+    console.log(
+      `FOLLOWER_URL=${await followerHub.listen(opts.followerGateway.host, opts.followerGateway.port)}`
+    );
+  }
 
   // Fire-and-forget: runStart keeps the process alive (its mcp/control servers
   // are active handles). onReady fires once every edge is wired.
@@ -211,29 +232,31 @@ export async function runActorMeshE2EUp(opts: {
       chatClient,
       chatSource,
       rootDriver: opts.rootDriver,
+      createWorkerActor: followerHub ? instanceWorkerFactory(config, followerHub) : undefined,
       dashboard: true,
       quotaApi: createDashboardE2EQuotaApi(),
       remoteGitDir: instance.remotePath,
       onReady: (handles) => {
         emitGitHubEvent = handles.emitGitHubEvent;
-        void startTrackerServer({ port: TRACKER_PORT, tracker }).then((s) => {
+        void startTrackerServer({ port: trackerPort, tracker }).then((s) => {
           trackerServer = s;
         });
-        chatServer = startChatControlServer({ port: CHAT_CONTROL_PORT, chatSource, chatClient });
+        chatServer = startChatControlServer({ port: chatPort, chatSource, chatClient });
         if (handles.externalRoot) {
           rootControlServer = startRootControlServer({
-            port: opts.rootControlPort ?? ROOT_CONTROL_PORT,
+            followerHub,
+            port: controlPort,
             handles,
             home,
           });
         }
         printDriveHelp({
+          trackerPort,
+          chatPort,
           rootDir,
           repo,
           dashboardPort: config.dashboard?.port ?? 8083,
-          rootControlPort: handles.externalRoot
-            ? (opts.rootControlPort ?? ROOT_CONTROL_PORT)
-            : undefined,
+          rootControlPort: handles.externalRoot ? controlPort : undefined,
         });
       },
     },
@@ -242,6 +265,7 @@ export async function runActorMeshE2EUp(opts: {
   // Belt-and-suspenders: close our extra servers on shutdown (runStart's own
   // SIGTERM handler exits the process, which also frees them).
   const closeExtra = () => {
+    void followerHub?.close();
     void trackerServer?.close();
     chatServer?.close();
     rootControlServer?.close();
@@ -251,6 +275,7 @@ export async function runActorMeshE2EUp(opts: {
 
 /** HTTP controller for an externally driven root. Every mutation uses RootControlService. */
 export function startRootControlServer(opts: {
+  followerHub?: FollowerHub;
   port: number;
   handles: RunStartE2EHandles;
   home?: string;
@@ -270,6 +295,10 @@ export function startRootControlServer(opts: {
       send(res, 200, { actors: opts.handles.mesh.list() });
       return;
     }
+    if (req.method === "GET" && url.pathname === "/followers") {
+      send(res, 200, { followers: opts.followerHub?.list() ?? [] });
+      return;
+    }
     const actorMatch = url.pathname.match(/^\/actors\/([^/]+)$/);
     if (req.method === "GET" && actorMatch) {
       const id = decodeURIComponent(actorMatch[1]);
@@ -280,6 +309,15 @@ export function startRootControlServer(opts: {
       }
       send(res, 200, {
         ...record,
+        execution:
+          opts.handles.mesh.get(id) instanceof ActorHandle
+            ? {
+                runtime: "remote-instance",
+                coordinatorPid: process.pid,
+                instancePid: (opts.handles.mesh.get(id) as ActorHandle).channel.pid,
+                followerId: (opts.handles.mesh.get(id) as ActorHandle).channel.nodeId,
+              }
+            : { runtime: "in-process", coordinatorPid: process.pid },
         running: opts.handles.mesh.runningThreadIds().has(id),
         queued: opts.handles.mesh.queuedThreadIds().has(id),
       });
@@ -336,6 +374,16 @@ export function startRootControlServer(opts: {
     readJsonRequest(req)
       .then((body) => {
         if (url.pathname === "/actors") {
+          const target = typeof body.target === "string" ? body.target : undefined;
+          // A supplied target must name a connected follower — a blank or
+          // unknown one is a refusal here, never a fall-through to a local run.
+          if (
+            target !== undefined &&
+            !opts.followerHub?.list().some((follower) => follower.id === target)
+          ) {
+            send(res, 400, { error: "Requested follower is not connected" });
+            return;
+          }
           const contextMode = body.contextMode ?? "native";
           const compactionModel =
             typeof body.compactionModel === "string" && body.compactionModel.trim()
@@ -353,6 +401,7 @@ export function startRootControlServer(opts: {
           const id = opts.handles.rootControl.spawnChild(
             {
               charter: typeof body.charter === "string" ? body.charter : "",
+              executionTarget: target,
               modelConfig: {
                 provider: typeof body.provider === "string" ? body.provider : "",
                 model: typeof body.model === "string" ? body.model : "",
@@ -587,13 +636,15 @@ export function startChatControlServer(opts: {
 }
 
 function printDriveHelp(opts: {
+  trackerPort: number;
+  chatPort: number;
   rootDir: string;
   repo: string;
   dashboardPort: number;
   rootControlPort?: number;
 }): void {
-  const tracker = `http://localhost:${TRACKER_PORT}`;
-  const chat = `http://localhost:${CHAT_CONTROL_PORT}`;
+  const tracker = `http://localhost:${opts.trackerPort}`;
+  const chat = `http://localhost:${opts.chatPort}`;
   console.log(`TRACKER_URL=${tracker}`);
   console.log(`CHAT_CONTROL_URL=${chat}`);
   console.log(`DASHBOARD_URL=http://127.0.0.1:${opts.dashboardPort}`);

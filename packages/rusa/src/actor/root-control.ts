@@ -4,6 +4,7 @@ import type { ActorHandle, ActorRecord, ContextConfig } from "./actor-record.js"
 export type RootControlPrincipal = "root-llm" | "human:operator" | "e2e-controller";
 
 export interface RootChildRequest {
+  executionTarget?: string;
   charter: string;
   modelConfig: ModelConfigInput;
   context?: ContextConfig;
@@ -13,6 +14,7 @@ export interface RootChildRequest {
 
 export interface RootControlMesh {
   spawn(request: {
+    executionTarget?: string;
     charter: string;
     parentId: string;
     modelConfig: ModelConfigInput;
@@ -89,6 +91,12 @@ export class RootControlService {
       return { provider: entry.provider, model, effort: entry.effort };
     });
     const id = this.options.mesh.spawn({
+      // Every *defined* target is forwarded, blank included: mesh.spawn is the
+      // fail-closed gate, and a target erased here would reach it as an
+      // omission, i.e. as "run locally".
+      ...(request.executionTarget !== undefined
+        ? { executionTarget: request.executionTarget }
+        : {}),
       charter,
       parentId: this.rootId,
       modelConfig: request.modelConfig,
