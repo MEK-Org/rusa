@@ -179,6 +179,29 @@ describe("SqliteActorRepository", () => {
     });
   });
 
+  it("lists each actor with its newest durable human message", () => {
+    repository.upsert(root);
+    repository.upsert({
+      id: "worker",
+      charter: "Work",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-09-03T13:01:00.000Z",
+    });
+    const insert = db.prepare(
+      "INSERT INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id) VALUES (?, ?, ?, ?, ?, ?)"
+    );
+    insert.run("root-old", "2026-09-03T13:05:00.000Z", HUMAN_OPERATOR, "root", "old", "root-1");
+    insert.run("root-new", "2026-09-03T13:10:00.000Z", HUMAN_OPERATOR, "root", "new", "root-2");
+    insert.run("root-z", "2026-09-03T13:10:00.000Z", HUMAN_OPERATOR, "root", "tie", "root-3");
+    insert.run("worker", "2026-09-03T13:15:00.000Z", HUMAN_OPERATOR, "worker", "hello", null);
+
+    const byId = new Map(repository.list().map((record) => [record.id, record]));
+    expect(byId.get("root")).toMatchObject({ humanUnlocked: true, lastChatSessionId: "root-3" });
+    expect(byId.get("worker")).toMatchObject({ humanUnlocked: true });
+    expect(byId.get("worker")).not.toHaveProperty("lastChatSessionId");
+  });
+
   it("persists normalized records across a file-backed database reopen", () => {
     const directory = mkdtempSync(join(tmpdir(), "rusa-actor-repository-"));
     const file = join(directory, "mesh.db");

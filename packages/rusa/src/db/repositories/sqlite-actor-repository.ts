@@ -16,6 +16,10 @@ type ActorRow = {
   created_at: string;
 };
 
+type LastHumanMessage = {
+  session_id: string | null;
+};
+
 export const ACTOR_CONFIG_SCHEMA_VERSION = 1 as const;
 
 /** schemaVersion for a `model_config` document written before #169's pool contract. */
@@ -261,9 +265,26 @@ export class SqliteActorRepository implements ActorRepository {
   }
 
   list(): ActorRecord[] {
-    return (
-      this.db.prepare("SELECT * FROM actors ORDER BY created_at, id").all() as ActorRow[]
-    ).map((row) => this.fromRow(row));
+    const rows = this.db
+      .prepare("SELECT * FROM actors ORDER BY created_at, id")
+      .all() as ActorRow[];
+    const lastHumanMessageByRecipient = new Map<string, LastHumanMessage>();
+    // `/api/mesh/threads` lists every actor. Resolving the newest operator
+    // message in `fromRow` turned that request into one full mesh_chat scan per
+    // actor when no recipient index existed. One ordered pass has the same
+    // newest `(ts, id)` semantics and leaves the first row for each recipient
+    // in the map, without a schema migration or an N+1 query.
+    const newestHumanRows = this.db
+      .prepare(
+        "SELECT recipient_id, session_id FROM mesh_chat WHERE sender_id = ? ORDER BY recipient_id, ts DESC, id DESC"
+      )
+      .all(HUMAN_OPERATOR) as Array<{ recipient_id: string; session_id: string | null }>;
+    for (const message of newestHumanRows) {
+      if (!lastHumanMessageByRecipient.has(message.recipient_id)) {
+        lastHumanMessageByRecipient.set(message.recipient_id, { session_id: message.session_id });
+      }
+    }
+    return rows.map((row) => this.fromRow(row, lastHumanMessageByRecipient.get(row.id)));
   }
 
   children(parentId: string): ActorRecord[] {
@@ -287,15 +308,17 @@ export class SqliteActorRepository implements ActorRepository {
     }
   }
 
-  private fromRow(row: ActorRow): ActorRecord {
+  private fromRow(row: ActorRow, listedLastHumanMessage?: LastHumanMessage): ActorRecord {
     const handles = this.db
       .prepare("SELECT target_id, role FROM actor_handles WHERE actor_id = ? ORDER BY target_id")
       .all(row.id) as Array<{ target_id: string; role: string | null }>;
-    const lastHumanMessage = this.db
-      .prepare(
-        "SELECT session_id FROM mesh_chat WHERE recipient_id = ? AND sender_id = ? ORDER BY ts DESC, id DESC LIMIT 1"
-      )
-      .get(row.id, HUMAN_OPERATOR) as { session_id: string | null } | undefined;
+    const lastHumanMessage =
+      listedLastHumanMessage ??
+      (this.db
+        .prepare(
+          "SELECT session_id FROM mesh_chat WHERE recipient_id = ? AND sender_id = ? ORDER BY ts DESC, id DESC LIMIT 1"
+        )
+        .get(row.id, HUMAN_OPERATOR) as LastHumanMessage | undefined);
     return {
       id: row.id,
       charter: row.charter,
