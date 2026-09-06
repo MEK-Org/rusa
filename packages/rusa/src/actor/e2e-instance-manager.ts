@@ -632,15 +632,13 @@ export class E2EInstanceManager {
           "an operator must stop the orphaned unit before retrying"
       );
     }
-    // No valid holder record and no live unit: any surviving runtime directory
-    // or preserved run root is an orphan (its owning record is gone), not
-    // resumable state. Clear both before rebuilding mount targets so a stale
-    // file-vs-directory shape left by a prior run (e.g.
-    // runtime/home/.claude.json) can't reach bwrap.
-    this.clearOrphanState();
-
     const worktree = this.validateOwnedWorktree(actorId, requestedPath);
     this.prepareWorktree(worktree);
+    // No valid holder record and no live unit: any surviving runtime directory
+    // or preserved run root is an orphan (its owning record is gone), not
+    // resumable state. Only reclaim it after validating and preparing a viable
+    // replacement launch: an invalid caller request must leave state alone.
+    this.clearOrphanState();
     // Establish the exact root up front (rather than letting am-up pick one
     // internally) so a later resume can bind to it exactly, instead of merely
     // to "any structurally valid root under the runs area".
@@ -741,8 +739,7 @@ export class E2EInstanceManager {
     let liveStatus = this.liveStatus();
     while (Date.now() < deadline) {
       if (!this.isLive(liveStatus)) {
-        this.cleanupFailedStart(root, resume);
-        onFailure();
+        if (this.cleanupFailedStart(root, resume)) onFailure();
         throw new Error(
           `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} failed before port ${E2E_INSTANCE_PORT} became ready ` +
             `(active=${liveStatus.activeState}, sub=${liveStatus.subState}, result=${liveStatus.result})`
@@ -754,8 +751,7 @@ export class E2EInstanceManager {
       await this.delay(this.startupPollMs);
       liveStatus = this.liveStatus();
     }
-    this.cleanupFailedStart(root, resume);
-    onFailure();
+    if (this.cleanupFailedStart(root, resume)) onFailure();
     throw new Error(
       `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} did not open port ${E2E_INSTANCE_PORT} ` +
         `within ${this.startupTimeoutMs}ms (active=${liveStatus.activeState}, sub=${liveStatus.subState})`
@@ -851,14 +847,17 @@ export class E2EInstanceManager {
    * afterwards. A failed fresh launch instead discards its own brand-new root,
    * which no surviving record will ever name again.
    */
-  private cleanupFailedStart(root: string, preserve: boolean): void {
+  private cleanupFailedStart(root: string, preserve: boolean): boolean {
     const preserveRoot = preserve ? root : undefined;
     try {
       if (this.liveStatus().loadState !== "not-found") {
         this.exec("systemctl", ["--user", "stop", E2E_INSTANCE_UNIT_NAME]);
       }
     } catch {
-      // Best effort: preserve the original startup error for the caller.
+      // The original startup diagnostic remains the caller-facing error, but
+      // without a confirmed stop an active unit may still own every path this
+      // cleanup would remove. Keep its record, runtime, and root together.
+      return false;
     }
     teardownFlutterOverlay(this.runtimeDir);
     rmSync(this.stateFile, { force: true });
@@ -879,7 +878,7 @@ export class E2EInstanceManager {
         // If the root cannot be moved aside, skipping the runtime wipe keeps
         // it intact; leftover runtime junk is tolerable next to a destroyed
         // preserved instance.
-        return;
+        return true;
       }
     }
     rmSync(this.runtimeDir, { recursive: true, force: true });
@@ -895,5 +894,6 @@ export class E2EInstanceManager {
         // nothing here — the original startup error is what the caller sees.
       }
     }
+    return true;
   }
 }

@@ -315,6 +315,54 @@ describe("E2EInstanceManager", () => {
     expect(existsSync(runsDir) ? readdirSync(runsDir) : []).toEqual([]);
   });
 
+  it("keeps the holder record, runtime, and root when timeout cleanup cannot stop the unit", async () => {
+    const subject = new E2EInstanceManager({
+      mcHome,
+      workersDir,
+      hostHome: root,
+      toolchainPath: "/toolchain/bin",
+      corepackPath: "/toolchain/bin/corepack",
+      flutterRoot,
+      providerExecutables: {},
+      startupTimeoutMs: 0,
+      startupPollMs: 0,
+      isPortReady: async () => false,
+      delay: async () => {},
+      handleForId: (id) => `handle-${id}`,
+      exec: (file, args) => {
+        calls.push({ file, args });
+        if (file === "systemd-run") {
+          active = true;
+          return "";
+        }
+        if (file === "systemctl" && args.includes("stop")) {
+          throw new Error("systemctl unavailable");
+        }
+        return [
+          "LoadState=loaded",
+          `ActiveState=${active ? "active" : "inactive"}`,
+          `SubState=${active ? "running" : "dead"}`,
+          "Result=success",
+        ].join("\n");
+      },
+    });
+
+    await expect(subject.up("actor-a", actorWorktree)).rejects.toThrow(
+      /did not open port 8083 within 0ms/
+    );
+
+    // The unit may still be live because stop failed. Preserve its attribution
+    // and every bind-mounted state path rather than silently orphaning it.
+    const holder = subject.status().holder;
+    expect(holder?.actorId).toBe("actor-a");
+    expect(holder?.resumableRoot).toBeDefined();
+    expect(existsSync(join(mcHome, "e2e-instance", "runtime"))).toBe(true);
+    expect(existsSync(holder?.resumableRoot ?? "")).toBe(true);
+    expect(calls.some((call) => call.file === "systemctl" && call.args.includes("stop"))).toBe(
+      true
+    );
+  });
+
   it("stops only when the retiring actor holds the singleton", async () => {
     const subject = manager();
     await subject.up("actor-a", actorWorktree);
@@ -376,6 +424,25 @@ describe("E2EInstanceManager", () => {
     const freshRoot = subject.status().holder?.resumableRoot;
     if (!freshRoot) throw new Error("expected a persisted resumableRoot");
     expect(existsSync(freshRoot)).toBe(true);
+  });
+
+  it("does not reclaim an abandoned run root when the requested fresh launch cannot be prepared", async () => {
+    const subject = manager();
+    // A root with no record is eligible for reclamation, but only after the
+    // caller has supplied a worktree this manager can actually launch. A bad
+    // request must not turn validation/preparation into a destructive action.
+    const abandoned = join(mcHome, "e2e-instance", "runs", "run-abandoned");
+    const marker = join(abandoned, "home", "data", "mesh.db");
+    mkdirSync(dirname(marker), { recursive: true });
+    writeFileSync(marker, "preserve until a viable launch\n");
+    writeFileSync(join(actorWorktree, "package.json"), "{}\n");
+
+    await expect(subject.up("actor-a", actorWorktree)).rejects.toThrow(
+      /package.json must declare a pinned pnpm packageManager/
+    );
+
+    expect(readFileSync(marker, "utf8")).toBe("preserve until a viable launch\n");
+    expect(calls.some((call) => call.file === "systemd-run")).toBe(false);
   });
 
   it("preserves holder attribution when systemd refuses a stop", async () => {
