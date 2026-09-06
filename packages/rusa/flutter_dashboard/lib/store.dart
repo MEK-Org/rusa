@@ -180,6 +180,10 @@ class DashboardStore {
     if (savedActorOrder != null) {
       _customActorOrder.add(savedActorOrder);
     }
+    final savedWorkExpanded = _treePreferencesCache.loadWorkExpanded();
+    if (savedWorkExpanded != null) {
+      _workExpanded = Set.of(savedWorkExpanded);
+    }
   }
 
   final DashboardApi _api;
@@ -581,6 +585,26 @@ class DashboardStore {
         : (Set<String>.of(cur)..remove(id));
     _collapsed.add(updated);
     _treePreferencesCache.saveCollapsed(updated);
+  }
+
+  // ── Work tab expansion ──
+  //
+  // The Work tab owns the interactive state (it is a StatefulWidget that is
+  // rebuilt from scratch whenever the view switches away and back), so the
+  // store only holds the last set it was handed and persists it. Unlike the
+  // actor tree the Work tab defaults to collapsed, so this tracks the
+  // *expanded* obligation IDs.
+
+  Set<String> _workExpanded = {};
+
+  /// Expanded obligation IDs in the Work tab, seeded from persisted
+  /// preferences and updated by [saveWorkExpanded].
+  Set<String> get workExpanded => Set.of(_workExpanded);
+
+  /// Records and persists [expanded] as the Work tab's expanded obligation IDs.
+  void saveWorkExpanded(Set<String> expanded) {
+    _workExpanded = Set.of(expanded);
+    _treePreferencesCache.saveWorkExpanded(_workExpanded);
   }
 
   /// Reorders a child actor among its siblings under the same parent.

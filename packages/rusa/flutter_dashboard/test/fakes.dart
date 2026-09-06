@@ -155,14 +155,7 @@ class FakeApi extends DashboardApi {
   final eventOrderCalls = <String?>[];
   List<String> rootControlProviders = ['agy', 'codex'];
   final rootSpawnCalls =
-      <
-        ({
-          String charter,
-          String? title,
-          String? provider,
-          String? model,
-        })
-      >[];
+      <({String charter, String? title, String? provider, String? model})>[];
   String spawnedRootChildId = 'spawned-child';
 
   /// When set, the NEXT fetchQuota awaits this instead of returning
@@ -619,7 +612,9 @@ class FakeApi extends DashboardApi {
     int? offset,
     bool includeTerminalRoots = false,
   }) async {
-    fetchObligationForestCalls.add((includeTerminalRoots: includeTerminalRoots));
+    fetchObligationForestCalls.add((
+      includeTerminalRoots: includeTerminalRoots,
+    ));
     final page = await fetchObligations(
       rootsOnly: true,
       limit: limit,
@@ -865,14 +860,17 @@ class FakeTreePreferencesCache implements TreePreferencesCache {
     this.storedCollapsed,
     this.storedShowRetired,
     this.storedActorOrder,
+    this.storedWorkExpanded,
   });
 
   Set<String>? storedCollapsed;
   bool? storedShowRetired;
   Map<String, List<String>>? storedActorOrder;
+  Set<String>? storedWorkExpanded;
   int saveCollapsedCount = 0;
   int saveShowRetiredCount = 0;
   int saveActorOrderCount = 0;
+  int saveWorkExpandedCount = 0;
   int clearCount = 0;
 
   @override
@@ -911,10 +909,20 @@ class FakeTreePreferencesCache implements TreePreferencesCache {
   }
 
   @override
+  Set<String>? loadWorkExpanded() => storedWorkExpanded;
+
+  @override
+  void saveWorkExpanded(Set<String> expanded) {
+    storedWorkExpanded = Set.of(expanded);
+    saveWorkExpandedCount++;
+  }
+
+  @override
   void clear() {
     storedCollapsed = null;
     storedShowRetired = null;
     storedActorOrder = null;
+    storedWorkExpanded = null;
     clearCount++;
   }
 }
