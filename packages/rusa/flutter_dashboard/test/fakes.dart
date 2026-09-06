@@ -29,6 +29,7 @@ ThreadDto makeThread(
   String? charterPreview,
   int? queuePosition,
   String? estimatedStartAt,
+  ObligationDto? selectedObligation,
 }) => ThreadDto(
   id: id,
   handle: '$id-handle',
@@ -50,6 +51,7 @@ ThreadDto makeThread(
   runState: runState,
   queuePosition: queuePosition,
   estimatedStartAt: estimatedStartAt,
+  selectedObligation: selectedObligation,
 );
 
 MeshEvent makeEvent(

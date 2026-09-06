@@ -1165,6 +1165,12 @@ class DashboardStore {
         streamId: cursor.streamId,
         revision: delta.revision,
       );
+      if (delta.refreshThreadSnapshot) {
+        // Inbox selection changes do not alter the run state, so their delta
+        // is only a sequenced request to replace the thread snapshot and pick
+        // up (or clear) the active run's selected obligation.
+        unawaited(_requestRuntimeSync());
+      }
       return;
     }
     _bufferRuntimeState(delta);
@@ -1260,6 +1266,7 @@ class DashboardStore {
       if (delta.revision != revision + 1 || !_applyRuntimeState(delta)) {
         return false;
       }
+      if (delta.refreshThreadSnapshot) _runtimeSyncAgain = true;
       revision = delta.revision;
     }
     _runtimeCursor = RuntimeCursor(

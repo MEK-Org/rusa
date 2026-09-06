@@ -87,6 +87,12 @@ export interface ActorRuntimeStateDelta {
   revision: number;
   actorId: string;
   runState: ActorRuntimeState;
+  /**
+   * State-only deltas are patched in the dashboard without a list fetch. Set
+   * this when another thread-list field changed while the run state stayed the
+   * same, such as the current inbox focus selected by a running actor.
+   */
+  refreshThreadSnapshot?: boolean;
 }
 
 export interface ActorRuntimeStateSnapshot {
@@ -1125,6 +1131,12 @@ export class ActorMesh {
     } catch (err) {
       this.log(`onQueued(${actorId}) failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+    const actor = this.live.get(actorId);
+    if (actor) {
+      this.actorRuntimeStateChanged(actorId, this.runtimeStateOf(actor), {
+        refreshThreadSnapshot: true,
+      });
+    }
     return entries;
   }
 
@@ -1168,6 +1180,12 @@ export class ActorMesh {
     });
     beforeCommit?.(entries);
     this.selectedInboxEntryIds.set(actorId, unique);
+    const actor = this.live.get(actorId);
+    if (actor) {
+      this.actorRuntimeStateChanged(actorId, this.runtimeStateOf(actor), {
+        refreshThreadSnapshot: true,
+      });
+    }
     return entries;
   }
 
@@ -2672,12 +2690,17 @@ export class ActorMesh {
   }
 
   /** The sole revision authority for actor-published runtime transitions. */
-  actorRuntimeStateChanged(actorId: string, runState: ActorRuntimeState): void {
+  actorRuntimeStateChanged(
+    actorId: string,
+    runState: ActorRuntimeState,
+    options: { refreshThreadSnapshot?: boolean } = {}
+  ): void {
     const delta: ActorRuntimeStateDelta = {
       streamId: this.runtimeStreamId,
       revision: ++this.runtimeRevision,
       actorId,
       runState,
+      ...(options.refreshThreadSnapshot ? { refreshThreadSnapshot: true } : {}),
     };
     for (const listener of this.runtimeStateListeners) {
       try {

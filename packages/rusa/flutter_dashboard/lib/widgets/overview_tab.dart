@@ -11,7 +11,6 @@ import 'header.dart';
 import 'obligation_card.dart';
 import 'obligation_dialogs.dart';
 import 'quota_history_chart.dart';
-import 'status_dot.dart';
 
 /// Overview tab: displays quota history, my obligations queue, live workers, queued actors, and yields.
 class OverviewTab extends StatefulWidget {
@@ -687,61 +686,10 @@ class _OverviewTabState extends State<OverviewTab> {
                       runSpacing: 12,
                       children: [
                         for (final t in runningThreads)
-                          InkWell(
-                            onTap: () => _navigateToActor(t.id),
-                            borderRadius: BorderRadius.circular(6),
-                            child: Container(
-                              width: itemWidth,
-                              padding: const EdgeInsets.all(12),
-                              decoration: BoxDecoration(
-                                color: MeshColors.bgTertiary,
-                                borderRadius: BorderRadius.circular(6),
-                                border: Border.all(color: MeshColors.border),
-                              ),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Row(
-                                    children: [
-                                      StatusDot(state: t.dotState),
-                                      const SizedBox(width: 8),
-                                      Expanded(
-                                        child: Text(
-                                          t.handle,
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: kMonoStyle.copyWith(
-                                            color: MeshColors.textPrimary,
-                                            fontWeight: FontWeight.w700,
-                                            fontSize: 13,
-                                          ),
-                                        ),
-                                      ),
-                                      if (t.parentId != null)
-                                        Text(
-                                          'parent: ${t.parentId}',
-                                          style: kMonoStyle.copyWith(
-                                            color: MeshColors.textMuted,
-                                            fontSize: 11,
-                                          ),
-                                        ),
-                                    ],
-                                  ),
-                                  if (t.charterPreview.isNotEmpty) ...[
-                                    const SizedBox(height: 6),
-                                    Text(
-                                      t.charterPreview,
-                                      maxLines: 2,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                        color: MeshColors.textSecondary,
-                                        fontSize: 12,
-                                      ),
-                                    ),
-                                  ],
-                                ],
-                              ),
-                            ),
+                          _buildActorContextCard(
+                            t,
+                            width: itemWidth,
+                            showCharter: true,
                           ),
                       ],
                     );
@@ -801,48 +749,170 @@ class _OverviewTabState extends State<OverviewTab> {
                 )
               else
                 for (final actor in queued)
-                  InkWell(
-                    onTap: () => _navigateToActor(actor.id),
-                    borderRadius: BorderRadius.circular(6),
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 8),
-                      child: Row(
-                        children: [
-                          StatusDot(state: actor.dotState),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              actor.handle,
-                              style: kMonoStyle.copyWith(
-                                color: MeshColors.textPrimary,
-                                fontSize: 13,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                          ),
-                          Flexible(
-                            child: Text(
-                              actor.estimatedStartAt != null
-                                  ? 'Estimated start ${formatTs(actor.estimatedStartAt!)}'
-                                  : actor.waitingOn ??
-                                        (actor.queuePosition != null
-                                            ? 'Lane position ${actor.queuePosition! + 1}'
-                                            : 'Queued behind another provider request.'),
-                              textAlign: TextAlign.right,
-                              style: kMonoStyle.copyWith(
-                                color: MeshColors.textSecondary,
-                                fontSize: 11,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: _buildActorContextCard(
+                      actor,
+                      queueDetail: actor.estimatedStartAt != null
+                          ? 'Estimated start ${formatTs(actor.estimatedStartAt!)}'
+                          : actor.waitingOn ??
+                                (actor.queuePosition != null
+                                    ? 'Lane position ${actor.queuePosition! + 1}'
+                                    : 'Queued behind another provider request.'),
                     ),
                   ),
             ],
           ),
         );
       },
+    );
+  }
+
+  /// Shared actor context for the overview's running and queued sections.
+  /// The header remains the actor-navigation target; the optional obligation
+  /// row keeps its own Work-tab navigation rather than being swallowed by the
+  /// actor tap target.
+  Widget _buildActorContextCard(
+    ActorViewState actor, {
+    double? width,
+    String? queueDetail,
+    bool showCharter = false,
+  }) {
+    final selectedObligation = actor.selectedObligation;
+    return Container(
+      width: width,
+      decoration: BoxDecoration(
+        color: MeshColors.bgTertiary,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: MeshColors.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            onTap: () => _navigateToActor(actor.id),
+            borderRadius: BorderRadius.circular(6),
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  LayoutBuilder(
+                    builder: (context, constraints) {
+                      final identity = Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              actor.handle,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: kMonoStyle.copyWith(
+                                color: MeshColors.textPrimary,
+                                fontWeight: FontWeight.w700,
+                                fontSize: 13,
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              actor.title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: MeshColors.textSecondary,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                      final avatar = ActorAvatarWithStatus(
+                        id: actor.id,
+                        state: actor.dotState,
+                        size: 40,
+                        retired: actor.isRetired,
+                        store: widget.store,
+                      );
+                      final details = queueDetail == null
+                          ? null
+                          : Text(
+                              queueDetail,
+                              textAlign: TextAlign.right,
+                              style: kMonoStyle.copyWith(
+                                color: MeshColors.textSecondary,
+                                fontSize: 11,
+                              ),
+                            );
+                      if (constraints.maxWidth < 430 && details != null) {
+                        return Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                avatar,
+                                const SizedBox(width: 10),
+                                identity,
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            Align(
+                              alignment: Alignment.centerRight,
+                              child: details,
+                            ),
+                          ],
+                        );
+                      }
+                      return Row(
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        children: [
+                          avatar,
+                          const SizedBox(width: 10),
+                          identity,
+                          if (details != null) ...[
+                            const SizedBox(width: 12),
+                            Flexible(child: details),
+                          ],
+                        ],
+                      );
+                    },
+                  ),
+                  if (showCharter && actor.charterPreview.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      actor.charterPreview,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: MeshColors.textSecondary,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          if (selectedObligation != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: MeshColors.bgSecondary,
+                  borderRadius: BorderRadius.circular(5),
+                  border: Border.all(color: MeshColors.border),
+                ),
+                child: ObligationRow(
+                  obligation: selectedObligation,
+                  store: widget.store,
+                  showActions: false,
+                  contentPadding: const EdgeInsets.all(12),
+                  onSelectView: widget.onSelectView,
+                ),
+              ),
+            ),
+        ],
+      ),
     );
   }
 

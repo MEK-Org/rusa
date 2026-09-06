@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/util.dart';
+import 'package:rusa_dashboard/widgets/avatar.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/overview_tab.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
@@ -477,6 +478,154 @@ void main() {
         final unknownY = tester.getTopLeft(find.text('unknown-handle')).dy;
         expect(earlyY, lessThan(lateY));
         expect(lateY, lessThan(unknownY));
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'OverviewTab shows current selected obligations in running and queued cards and refreshes them live',
+    (tester) async {
+      await tester.runAsync(() async {
+        final initialRunning = makeObligation(
+          'running-focus',
+          ownerId: 'running',
+          title: 'Initial running focus',
+        );
+        final queuedFocus = makeObligation(
+          'queued-focus',
+          ownerId: 'queued',
+          title: 'Queued focus',
+        );
+        final api = FakeApi()
+          ..runtimeCursor = const RuntimeCursor(
+            streamId: 'overview-focus',
+            revision: 0,
+          )
+          ..threadsResult = [
+            makeThread('root', runState: RunState.idle),
+            makeThread(
+              'running',
+              parent: 'root',
+              title: 'Running actor title',
+              runState: RunState.running,
+              selectedObligation: initialRunning,
+            ),
+            makeThread(
+              'queued',
+              parent: 'root',
+              title: 'Queued actor title',
+              runState: RunState.queued,
+              queuePosition: 0,
+              selectedObligation: queuedFocus,
+            ),
+            makeThread(
+              'without-focus',
+              parent: 'root',
+              title: 'No current focus',
+              runState: RunState.running,
+            ),
+          ];
+        final stream = FakeStream();
+        final store = DashboardStore(api: api, stream: stream);
+        await store.init();
+
+        await tester.binding.setSurfaceSize(const Size(390, 844));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('running-handle'), findsOneWidget);
+        expect(find.text('Running actor title'), findsOneWidget);
+        expect(find.text('queued-handle'), findsOneWidget);
+        expect(find.text('Queued actor title'), findsOneWidget);
+        expect(find.text('Initial running focus'), findsOneWidget);
+        expect(find.text('Queued focus'), findsOneWidget);
+        expect(find.text('No current focus'), findsOneWidget);
+        expect(find.byType(ActorAvatarWithStatus), findsNWidgets(3));
+        expect(tester.takeException(), isNull);
+
+        final updatedRunning = makeObligation(
+          'updated-running-focus',
+          ownerId: 'running',
+          title: 'Updated running focus',
+        );
+        api.threadsResult = [
+          makeThread('root', runState: RunState.idle),
+          makeThread(
+            'running',
+            parent: 'root',
+            title: 'Running actor title',
+            runState: RunState.running,
+            selectedObligation: updatedRunning,
+          ),
+          makeThread(
+            'queued',
+            parent: 'root',
+            title: 'Queued actor title',
+            runState: RunState.queued,
+            queuePosition: 0,
+            selectedObligation: queuedFocus,
+          ),
+          makeThread(
+            'without-focus',
+            parent: 'root',
+            title: 'No current focus',
+            runState: RunState.running,
+          ),
+        ];
+        stream.runtimeStatesCtrl.add(
+          const ActorRuntimeStateDelta(
+            streamId: 'overview-focus',
+            revision: 1,
+            actorId: 'running',
+            runState: RunState.running,
+            refreshThreadSnapshot: true,
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(find.text('Updated running focus'), findsOneWidget);
+        expect(find.text('Initial running focus'), findsNothing);
+
+        api.threadsResult = [
+          makeThread('root', runState: RunState.idle),
+          makeThread(
+            'running',
+            parent: 'root',
+            title: 'Running actor title',
+            runState: RunState.running,
+          ),
+          makeThread(
+            'queued',
+            parent: 'root',
+            title: 'Queued actor title',
+            runState: RunState.queued,
+            queuePosition: 0,
+          ),
+          makeThread(
+            'without-focus',
+            parent: 'root',
+            title: 'No current focus',
+            runState: RunState.running,
+          ),
+        ];
+        stream.runtimeStatesCtrl.add(
+          const ActorRuntimeStateDelta(
+            streamId: 'overview-focus',
+            revision: 2,
+            actorId: 'running',
+            runState: RunState.running,
+            refreshThreadSnapshot: true,
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(find.text('Updated running focus'), findsNothing);
+        expect(find.text('Queued focus'), findsNothing);
+        expect(tester.takeException(), isNull);
+
         await store.dispose();
       });
     },

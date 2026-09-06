@@ -106,6 +106,7 @@ class ThreadDto {
     this.queuePosition,
     this.estimatedStartAt,
     this.ownerExpectsRetirement,
+    this.selectedObligation,
   });
 
   final String id;
@@ -174,6 +175,10 @@ class ThreadDto {
   final String? estimatedStartAt;
   final bool? ownerExpectsRetirement;
 
+  /// The active run's durable inbox focus, if it resolved to an obligation.
+  /// This is absent rather than a stale previous-run value once that run ends.
+  final ObligationDto? selectedObligation;
+
   bool get isRetired => status == 'retired';
 
   ThreadDto copyWith({
@@ -201,6 +206,7 @@ class ThreadDto {
     int? queuePosition,
     String? estimatedStartAt,
     bool? ownerExpectsRetirement,
+    ObligationDto? selectedObligation,
   }) => ThreadDto(
     id: id ?? this.id,
     handle: handle ?? this.handle,
@@ -237,6 +243,7 @@ class ThreadDto {
     estimatedStartAt: estimatedStartAt ?? this.estimatedStartAt,
     ownerExpectsRetirement:
         ownerExpectsRetirement ?? this.ownerExpectsRetirement,
+    selectedObligation: selectedObligation ?? this.selectedObligation,
   );
 
   factory ThreadDto.fromJson(Map<String, dynamic> j) => ThreadDto(
@@ -275,6 +282,11 @@ class ThreadDto {
     queuePosition: j['queuePosition'] as int?,
     estimatedStartAt: j['estimatedStartAt'] as String?,
     ownerExpectsRetirement: j['ownerExpectsRetirement'] as bool?,
+    selectedObligation: j['selectedObligation'] is Map
+        ? ObligationDto.fromJson(
+            (j['selectedObligation'] as Map).cast<String, dynamic>(),
+          )
+        : null,
   );
 }
 
@@ -340,12 +352,14 @@ class ActorRuntimeStateDelta {
     required this.revision,
     required this.actorId,
     required this.runState,
+    this.refreshThreadSnapshot = false,
   });
 
   final String streamId;
   final int revision;
   final String actorId;
   final RunState runState;
+  final bool refreshThreadSnapshot;
 
   factory ActorRuntimeStateDelta.fromJson(Map<String, dynamic> j) =>
       ActorRuntimeStateDelta(
@@ -353,6 +367,7 @@ class ActorRuntimeStateDelta {
         revision: j['revision'] as int,
         actorId: j['actorId'] as String,
         runState: runStateFromJson(j['runState']),
+        refreshThreadSnapshot: j['refreshThreadSnapshot'] as bool? ?? false,
       );
 }
 
@@ -383,6 +398,7 @@ class ActorViewState {
   int? get queuePosition => thread.queuePosition;
   String? get estimatedStartAt => thread.estimatedStartAt;
   bool? get ownerExpectsRetirement => thread.ownerExpectsRetirement;
+  ObligationDto? get selectedObligation => thread.selectedObligation;
 
   bool get isRunning => runState == RunState.running;
   bool get isWindingDown => runState == RunState.windingDown;
