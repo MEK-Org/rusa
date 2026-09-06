@@ -5,6 +5,24 @@ import 'package:rusa_dashboard/theme.dart';
 import 'package:rusa_dashboard/widgets/quota_history_chart.dart';
 
 void main() {
+  group('quota chart provider colors', () {
+    test('uses stable provider identity colors regardless of series order', () {
+      expect(quotaChartColorForProvider('claude', 3), const Color(0xFFC15F3C));
+      expect(quotaChartColorForProvider('agy', 2), const Color(0xFF3B82F6));
+      expect(
+        quotaChartColorForProvider('antigravity', 1),
+        const Color(0xFF3B82F6),
+      );
+      expect(quotaChartColorForProvider('codex', 0), const Color(0xFF10B981));
+      expect(quotaChartColorForProvider('kimi', 7), const Color(0xFFA855F7));
+    });
+
+    test('keeps the existing indexed palette for an unknown provider', () {
+      expect(quotaChartColorForProvider('unknown', 0), MeshColors.accent);
+      expect(quotaChartColorForProvider('unknown', 1), MeshColors.statusActive);
+    });
+  });
+
   const history = QuotaHistoryDto(
     generatedAt: '2026-07-26T20:00:00.000Z',
     historySince: '2026-07-23T20:00:00.000Z',
