@@ -300,7 +300,9 @@ export class E2EInstanceManager {
 
   /**
    * A resume root must match the exact root `up()` persisted for the current
-   * holder (`expectedRoot`). A legacy record predating that binding instead
+   * holder (`expectedRoot`), compared in canonical (realpath-resolved) form
+   * because the persisted string may traverse symlinks its resolver collapses.
+   * A legacy record predating that binding instead
    * falls back to confining the root to a preserved-runs area this helper
    * owns: either the runs sibling (`this.runsDir`) or the nested launch-home
    * area (`${runtimeDir}/home/.rusa-e2e`) a pre-change launch created its
@@ -323,10 +325,25 @@ export class E2EInstanceManager {
       throw new Error(`e2e-instance: resume root is not a directory: ${requestedPath}`);
     }
     if (expectedRoot !== undefined) {
-      if (root !== expectedRoot) {
+      // `root` is realpath-canonicalized above, but `expectedRoot` was
+      // persisted verbatim at up() time — possibly through a symlinked
+      // ancestry (e.g. macOS os.tmpdir()'s /var -> /private/var). Canonicalize
+      // the persisted value the same way before comparing, so a legitimate
+      // holder resume is not refused over a path-string difference. A
+      // persisted root that no longer exists is its own clear failure, not a
+      // mismatch against whatever root was requested.
+      let canonicalExpected: string;
+      try {
+        canonicalExpected = realpathSync(resolve(expectedRoot));
+      } catch {
+        throw new Error(
+          `e2e-instance: persisted resume root for this holder no longer exists: ${expectedRoot}`
+        );
+      }
+      if (root !== canonicalExpected) {
         throw new Error(
           `e2e-instance: REFUSED resume root ${root}; only the exact root persisted for this holder ` +
-            `(${expectedRoot}) may be resumed`
+            `(${canonicalExpected}) may be resumed`
         );
       }
     } else {

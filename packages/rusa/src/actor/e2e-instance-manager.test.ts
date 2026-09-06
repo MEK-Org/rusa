@@ -3,8 +3,10 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -456,6 +458,94 @@ describe("E2EInstanceManager", () => {
         join(mcHome, "e2e-instance", "runtime", "base-config"),
         "--watch",
       ]);
+    });
+
+    it("resumes the exact root up() persisted even when the helper home's ancestry contains a symlink", async () => {
+      // Synthetic stand-in for macOS os.tmpdir()'s /var -> /private/var: the
+      // helper home is reached through a symlink, so the raw path up()
+      // persisted and the canonical realpath of the same directory differ as
+      // strings. Resume must compare canonical forms, not refuse its own root.
+      const linkPath = join(root, "linked");
+      symlinkSync(root, linkPath);
+      const linkedMcHome = join(linkPath, "mc-home");
+      const subject = new E2EInstanceManager({
+        mcHome: linkedMcHome,
+        workersDir,
+        hostHome: root,
+        toolchainPath: "/toolchain/bin",
+        corepackPath: "/toolchain/bin/corepack",
+        flutterRoot,
+        providerExecutables: { claude: claudeExecutable },
+        isPortReady: async () => true,
+        delay: async () => {},
+        handleForId: (id) => `handle-${id}`,
+        now: () => "2026-08-08T00:00:00.000Z",
+        exec: (file, args) => {
+          calls.push({ file, args });
+          if (file === "systemd-run") {
+            active = true;
+            return "";
+          }
+          if (file === "systemctl" && args.includes("stop")) {
+            active = false;
+            return "";
+          }
+          return [
+            "LoadState=loaded",
+            `ActiveState=${active ? "active" : "inactive"}`,
+            `SubState=${active ? "running" : "dead"}`,
+            "Result=success",
+          ].join("\n");
+        },
+      });
+
+      await subject.up("actor-a", actorWorktree);
+      active = false; // externally stopped: the holder record survives
+      const persistedRoot = subject.status().holder?.resumableRoot;
+      if (!persistedRoot) throw new Error("expected a persisted resumableRoot");
+      expect(persistedRoot.startsWith(join(linkedMcHome, "e2e-instance", "runs", "run-"))).toBe(
+        true
+      );
+      writeResumableRootAt(persistedRoot);
+
+      const status = await subject.resume("actor-a", persistedRoot);
+
+      expect(status.state).toBe("up");
+      // The binding is stored and relaunched in canonical form.
+      const canonicalRoot = realpathSync(persistedRoot);
+      expect(status.holder?.resumableRoot).toBe(canonicalRoot);
+      const launches = calls.filter((call) => call.file === "systemd-run");
+      expect(launches).toHaveLength(2);
+      const resumeLaunch = launches[1];
+      const resumeRootIndex = resumeLaunch.args.indexOf("--root");
+      expect(resumeLaunch.args[resumeRootIndex + 1]).toBe(canonicalRoot);
+    });
+
+    it("reports clearly when the persisted resume root no longer exists", async () => {
+      const subject = manager();
+      await subject.up("actor-a", actorWorktree);
+      active = false;
+      // Simulate a record whose persisted root was deleted out from under it
+      // while another structurally valid root survives.
+      const missingRoot = join(mcHome, "e2e-instance", "runs", "run-gone");
+      writeFileSync(
+        join(mcHome, "e2e-instance.json"),
+        `${JSON.stringify({
+          actorId: "actor-a",
+          actorHandle: "handle-actor-a",
+          worktree: actorWorktree,
+          unitName: E2E_INSTANCE_UNIT_NAME,
+          startedAt: "2026-08-08T00:00:00.000Z",
+          resumableRoot: missingRoot,
+        })}\n`
+      );
+      const survivingRoot = join(mcHome, "e2e-instance", "runs", "run-survivor");
+      writeResumableRootAt(survivingRoot);
+
+      await expect(subject.resume("actor-a", survivingRoot)).rejects.toThrow(
+        /persisted resume root for this holder no longer exists: .*run-gone/
+      );
+      expect(calls.filter((call) => call.file === "systemd-run")).toHaveLength(1);
     });
 
     it("rejects resume from a caller who is not the recorded holder", async () => {
