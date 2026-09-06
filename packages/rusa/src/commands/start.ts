@@ -3142,6 +3142,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                   entry.estimatedStartAt === null
                     ? null
                     : new Date(entry.estimatedStartAt).toISOString(),
+                pacingIntervalMs: entry.pacingIntervalMs,
+                blocker: entry.blocker,
               }))
             ),
           // Current work is the durable inbox focus for this actor's active

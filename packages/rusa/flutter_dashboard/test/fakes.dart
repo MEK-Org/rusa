@@ -30,6 +30,8 @@ ThreadDto makeThread(
   int? queuePosition,
   String? estimatedStartAt,
   ObligationDto? selectedObligation,
+  int? pacingIntervalMs,
+  String? queueBlocker,
 }) => ThreadDto(
   id: id,
   handle: '$id-handle',
@@ -52,6 +54,8 @@ ThreadDto makeThread(
   queuePosition: queuePosition,
   estimatedStartAt: estimatedStartAt,
   selectedObligation: selectedObligation,
+  pacingIntervalMs: pacingIntervalMs,
+  queueBlocker: queueBlocker,
 );
 
 MeshEvent makeEvent(

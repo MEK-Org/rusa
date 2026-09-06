@@ -105,6 +105,8 @@ class ThreadDto {
     this.waitingOn,
     this.queuePosition,
     this.estimatedStartAt,
+    this.pacingIntervalMs,
+    this.queueBlocker,
     this.ownerExpectsRetirement,
     this.selectedObligation,
   });
@@ -173,6 +175,12 @@ class ThreadDto {
   /// ISO-8601 estimate of this actor's provider run start, or null when the
   /// scheduler can't honestly quote one yet (e.g. behind a staged run).
   final String? estimatedStartAt;
+
+  /// Current normal-start spacing for this actor's provider lane.
+  final int? pacingIntervalMs;
+
+  /// The live gate this request is waiting behind, when the scheduler knows it.
+  final String? queueBlocker;
   final bool? ownerExpectsRetirement;
 
   /// The active run's durable inbox focus, if it resolved to an obligation.
@@ -205,6 +213,8 @@ class ThreadDto {
     String? waitingOn,
     int? queuePosition,
     String? estimatedStartAt,
+    int? pacingIntervalMs,
+    String? queueBlocker,
     bool? ownerExpectsRetirement,
     Object? selectedObligation = _keepThreadField,
   }) => ThreadDto(
@@ -241,6 +251,8 @@ class ThreadDto {
     waitingOn: waitingOn ?? this.waitingOn,
     queuePosition: queuePosition ?? this.queuePosition,
     estimatedStartAt: estimatedStartAt ?? this.estimatedStartAt,
+    pacingIntervalMs: pacingIntervalMs ?? this.pacingIntervalMs,
+    queueBlocker: queueBlocker ?? this.queueBlocker,
     ownerExpectsRetirement:
         ownerExpectsRetirement ?? this.ownerExpectsRetirement,
     selectedObligation: identical(selectedObligation, _keepThreadField)
@@ -283,6 +295,8 @@ class ThreadDto {
     waitingOn: j['waitingOn'] as String?,
     queuePosition: j['queuePosition'] as int?,
     estimatedStartAt: j['estimatedStartAt'] as String?,
+    pacingIntervalMs: j['pacingIntervalMs'] as int?,
+    queueBlocker: j['queueBlocker'] as String?,
     ownerExpectsRetirement: j['ownerExpectsRetirement'] as bool?,
     selectedObligation: j['selectedObligation'] is Map
         ? ObligationDto.fromJson(
@@ -399,6 +413,8 @@ class ActorViewState {
   String? get waitingOn => thread.waitingOn;
   int? get queuePosition => thread.queuePosition;
   String? get estimatedStartAt => thread.estimatedStartAt;
+  int? get pacingIntervalMs => thread.pacingIntervalMs;
+  String? get queueBlocker => thread.queueBlocker;
   bool? get ownerExpectsRetirement => thread.ownerExpectsRetirement;
   ObligationDto? get selectedObligation => thread.selectedObligation;
 

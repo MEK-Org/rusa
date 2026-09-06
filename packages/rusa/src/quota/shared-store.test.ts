@@ -689,6 +689,57 @@ describe("SharedQuotaStore PID integral term", () => {
     }
   });
 
+  it("reduces the paced interval when a capped lane recovers to a smaller positive error", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-positive-recovery-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    const maxIntervalSeconds = 1450;
+    try {
+      store.configureController({ maxIntervalSeconds });
+      const reset = "2030-01-08T00:00:00.000Z";
+      const startedMs = Date.parse("2030-01-04T12:00:00.000Z");
+      const resetMs = Date.parse(reset);
+      const percentLeftForError = (observedMs: number, error: number) =>
+        ((resetMs - observedMs) / (7 * 24 * 60 * 60 * 1000)) * 100 - error;
+
+      // A standing burn well above the target fills the integral contribution
+      // only to the configured upper actuator bound.
+      for (let slot = 0; slot <= 3; slot += 1) {
+        const observedMs = startedMs + slot * 5 * 60 * 1000;
+        recordObservation(
+          store,
+          "synthetic-provider",
+          new Date(observedMs).toISOString(),
+          percentLeftForError(observedMs, 10),
+          reset
+        );
+      }
+      const capped = reasonedRows(store, "synthetic-provider").at(-1) as ReasonedRow;
+      expect(
+        QUOTA_KP_SECONDS_PER_POINT * capped.error +
+          QUOTA_KI_SECONDS_PER_POINT_SECOND * capped.integral +
+          QUOTA_KD_SECONDS_SQUARED_PER_POINT * capped.derivative
+      ).toBeCloseTo(maxIntervalSeconds, 6);
+
+      // Recovery need not cross below the target for the controller to stop
+      // requesting the old cap: a smaller positive error has a lower demand.
+      const recoveredMs = startedMs + 4 * 5 * 60 * 1000;
+      recordObservation(
+        store,
+        "synthetic-provider",
+        new Date(recoveredMs).toISOString(),
+        percentLeftForError(recoveredMs, 1),
+        reset
+      );
+      const recovered = reasonedRows(store, "synthetic-provider").at(-1) as ReasonedRow;
+      expect(recovered.error).toBeGreaterThan(0);
+      expect(recovered.uncapped).toBeLessThan(capped.uncapped);
+      expect(recovered.interval).toBeLessThan(capped.interval);
+    } finally {
+      store.close();
+    }
+  });
+
   it("resets the accumulator on window rollover instead of carrying the old cycle", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-shared-quota-integral-rollover-"));
     roots.push(root);

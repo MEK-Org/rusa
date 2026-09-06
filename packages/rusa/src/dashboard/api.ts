@@ -76,13 +76,17 @@ export interface DashboardDataDeps {
    * Read-only, per-lane FIFO snapshots from every live `ProviderPacer`,
    * flattened across lanes. `position` is 0-based within its own provider
    * lane (not globally comparable across lanes); `estimatedStartAt` is an
-   * ISO-8601 projection or `null` when it can't be honestly quoted yet —
-   * see `ProviderPacer.getQueueSnapshot` for the full contract this mirrors.
+   * ISO-8601 projection or `null` when it can't be honestly quoted yet.
+   * `pacingIntervalMs` and `blocker` explain whether the request remains
+   * behind normal provider pacing or has passed that gate and waits on mesh
+   * concurrency. See `ProviderPacer.getQueueSnapshot` for the full contract.
    */
   providerQueueSnapshots?: () => Array<{
     threadId: string;
     position: number;
     estimatedStartAt: string | null;
+    pacingIntervalMs?: number;
+    blocker?: "provider-pacing" | "mesh-concurrency";
   }>;
   /**
    * Current selected obligation for an actor's active run. This is a
@@ -239,6 +243,10 @@ interface ThreadDto {
    * live pacer state — never persisted, and shifts as pacing changes.
    */
   estimatedStartAt?: string | null;
+  /** Current normal-start spacing on this request's provider lane. */
+  pacingIntervalMs?: number | null;
+  /** The live gate this queued request is waiting behind. */
+  queueBlocker?: "provider-pacing" | "mesh-concurrency" | null;
 }
 
 /**
@@ -1305,6 +1313,8 @@ export async function handleMeshApiRequest(
         lastActiveAt: lastActiveByActor.get(r.id) ?? null,
         queuePosition: providerQueueSnapshots.get(r.id)?.position ?? null,
         estimatedStartAt: providerQueueSnapshots.get(r.id)?.estimatedStartAt ?? null,
+        pacingIntervalMs: providerQueueSnapshots.get(r.id)?.pacingIntervalMs ?? null,
+        queueBlocker: providerQueueSnapshots.get(r.id)?.blocker ?? null,
         selectedProvider: selection?.provider ?? null,
         selectedLane: selection?.lane ?? null,
         selectedModel: selection?.model ?? null,
