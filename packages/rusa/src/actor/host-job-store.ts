@@ -65,6 +65,11 @@ function isActive(job: HostJobRecord): boolean {
  * caller's own `selfId`).
  */
 export interface HostJobStore {
+  /**
+   * Record a newly submitted job. Insert-only: a stored record is durable audit
+   * history, so re-submitting an id throws rather than rewriting the ownership,
+   * artifact hash and terminal state already recorded under it.
+   */
   submit(job: HostJobRecord): void;
   recordStopRequested(id: string, at: string): void;
   recordExit(id: string, at: string, exitStatus: string, exitCode?: string): void;
@@ -91,6 +96,11 @@ export class InMemoryHostJobStore implements HostJobStore {
   private readonly jobs = new Map<string, HostJobRecord>();
 
   submit(job: HostJobRecord): void {
+    // Same refusal `host_jobs.id`'s primary key gives the SQLite store, so the
+    // two stores answer a duplicate id identically.
+    if (this.jobs.has(job.id)) {
+      throw new Error(`host-jobs: job '${job.id}' is already recorded`);
+    }
     this.jobs.set(job.id, copy(job));
   }
 

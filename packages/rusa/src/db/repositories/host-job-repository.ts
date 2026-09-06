@@ -93,10 +93,13 @@ export class DbHostJobStore implements HostJobStore {
   constructor(private readonly db: Database.Database) {}
 
   /**
-   * Insert the job, or replace an existing row with the same id. The overwrite
-   * mirrors the in-memory store, which keys jobs by id and lets a re-submit
-   * win; production ids are freshly minted per submit, so it is reachable only
-   * by a caller that reuses one deliberately.
+   * Insert-only. A host-job row is durable audit history — who submitted what,
+   * against which write-once artifact hash, and how it ended — so no write path
+   * here rewrites one. No production caller re-submits an id: ids are freshly
+   * minted per submit, and the legacy importer resolves repeated legacy ids to
+   * one final row before the transaction opens. A duplicate id is therefore a
+   * bug, and it gets the primary key's refusal instead of silently rewriting
+   * ownership, manifest, submission time and terminal state.
    */
   submit(job: HostJobRecord): void {
     this.db
@@ -105,20 +108,7 @@ export class DbHostJobStore implements HostJobStore {
            id, actor_id, unit_name, script_label, manifest,
            audit_artifact_path, audit_artifact_sha256, runtime_max_sec, submitted_at,
            stop_requested_at, completed_at, exit_status, exit_code
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
-           actor_id = excluded.actor_id,
-           unit_name = excluded.unit_name,
-           script_label = excluded.script_label,
-           manifest = excluded.manifest,
-           audit_artifact_path = excluded.audit_artifact_path,
-           audit_artifact_sha256 = excluded.audit_artifact_sha256,
-           runtime_max_sec = excluded.runtime_max_sec,
-           submitted_at = excluded.submitted_at,
-           stop_requested_at = excluded.stop_requested_at,
-           completed_at = excluded.completed_at,
-           exit_status = excluded.exit_status,
-           exit_code = excluded.exit_code`
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         job.id,

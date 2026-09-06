@@ -26,11 +26,27 @@ import type { Migration } from "./types.js";
  *
  * The host-job exit endpoint resolves a job by unit name alone when systemd's
  * ExecStopPost fires without a job id (`handleHostJobExit`), and that lookup
- * decides which actor gets woken. Unit names are `job-<handle>-<id>` and so are
- * unique by construction, but the retired JSON store only ever returned the
- * first match in insertion order — with duplicates present it would silently
- * wake whichever actor happened to be inserted first. Making the constraint
- * real turns that into a refusal at import time instead of a misdirected wake.
+ * decides which actor gets woken. This is the one place the durable store is
+ * deliberately stricter than the JSON store it replaces, so what motivates it
+ * is worth being exact about: no duplicate has been observed, and none is
+ * expected. Unit names are `job-<handle>-<8 hex chars of a v4 uuid>`, which is
+ * near-unique rather than unique by construction — 32 bits, minted per submit,
+ * with nothing before this constraint checking the result. The retired store
+ * returned the first insertion-order match from `findByUnitName`, so a
+ * collision there would have silently woken whichever actor was inserted
+ * first, with no trace. The constraint turns a silent misroute into a refusal:
+ * for a live submit, before the unit is launched (see `submit_job`), and for
+ * legacy data, at import time.
+ *
+ * Refusing the whole legacy import rather than quarantining the ambiguous rows
+ * is the same choice every shipped importer makes, for the same reason: the
+ * cheaper treatment has to drop one of two jobs that share a unit name, which
+ * makes "this actor never ran this job" durable and drops the pointer to that
+ * job's write-once audit artifact, while the surviving twin still answers an
+ * exit that may belong to the dropped one. Refusal is repairable in place —
+ * the file is untouched, the plan names both job ids and the unit, and the
+ * next boot re-plans — and only reachable through a hand-edited or merged
+ * legacy file, since nothing in the retired store ever wrote a duplicate.
  *
  * ## `manifest` is one versioned JSON document
  *
@@ -73,13 +89,15 @@ export const hostJobs: Migration = {
         exit_code             TEXT
       );
 
+      -- One index, on the only column anything filters by. Every host-job read
+      -- is per-actor (list, and the active-job count each submit consults), and
+      -- an actor's history is what that one actor has ever submitted while
+      -- capped at 5 concurrently active, so the completed_at IS NULL filter
+      -- runs over rows this index already located. A partial index for the
+      -- active count would be a second durable write-path construct bought
+      -- with no measurement; add it when real job volumes show the filter is
+      -- material.
       CREATE INDEX host_jobs_by_actor ON host_jobs (actor_id);
-
-      -- Every submit consults the submitting actor's active-job count before
-      -- admitting another, so the concurrency check gets its own partial index
-      -- rather than scanning that actor's whole job history each time.
-      CREATE INDEX host_jobs_active_by_actor
-        ON host_jobs (actor_id) WHERE completed_at IS NULL;
     `);
   },
 };

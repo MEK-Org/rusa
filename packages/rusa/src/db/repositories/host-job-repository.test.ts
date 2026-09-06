@@ -88,11 +88,13 @@ describe("DbHostJobStore (DB-specific)", () => {
     expect(() => store.get("job-1")).toThrow(/invalid manifest for host job 'job-1'/);
   });
 
-  it("re-submitting an id replaces the row rather than adding one", () => {
-    store.submit(job({ scriptLabel: "first" }));
-    store.submit(job({ scriptLabel: "second" }));
+  // The primary key, not application code, is what refuses this — the contract
+  // test pins the same refusal from the store side for both implementations.
+  it("leaves the first row intact when an id is submitted twice", () => {
+    store.submit(job({ scriptLabel: "first", unitName: "unit-1" }));
+    expect(() => store.submit(job({ scriptLabel: "second", unitName: "unit-2" }))).toThrow();
     expect(store.list()).toHaveLength(1);
-    expect(store.get("job-1")?.scriptLabel).toBe("second");
+    expect(store.get("job-1")?.scriptLabel).toBe("first");
   });
 });
 

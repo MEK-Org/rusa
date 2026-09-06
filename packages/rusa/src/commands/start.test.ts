@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
 import { Actor, type RunAbandon } from "../actor/actor.js";
@@ -3865,6 +3866,115 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const t2Record = mesh.actors.get("t2");
     expect(t2Record).toBeDefined();
     expect(t2Record?.status).toBe("active");
+  });
+
+  // The arbiter for the host-jobs cutover wiring : the importer, repository
+  // and db-check tests all pass against a store nothing production-facing is
+  // holding, so this boots the real thing from a legacy file and then drives
+  // the wired exit endpoint over its own socket. A dropped import call, or a
+  // second store constructed for one of the two consumers, fails here.
+  it("imports host jobs at boot and serves the exit endpoint from the same database", async () => {
+    const legacyPath = join(homeDir, "host-jobs.json");
+    const legacyBytes = JSON.stringify({
+      jobs: [
+        {
+          id: "job-legacy",
+          actorId: "root",
+          unitName: "job-root-legacy1",
+          scriptLabel: "echo legacy",
+          manifest: { readPaths: [] },
+          auditArtifactPath: join(homeDir, "host-jobs", "audit", "job-legacy.json"),
+          auditArtifactSha256: "a".repeat(64),
+          runtimeMaxSec: 3600,
+          submittedAt: "2026-07-01T00:00:00.000Z",
+        },
+      ],
+    });
+    writeFileSync(legacyPath, legacyBytes, "utf8");
+
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    await readyPromise;
+
+    // The legacy file became state and was archived, not deleted.
+    expect(existsSync(legacyPath)).toBe(false);
+    const backups = readdirSync(homeDir).filter(
+      (name) => name.startsWith("host-jobs.json.imported-") && name.endsWith(".bak")
+    );
+    expect(backups).toHaveLength(1);
+    expect(readFileSync(join(homeDir, backups[0] ?? ""), "utf8")).toBe(legacyBytes);
+
+    // A connection of this test's own — what the mesh committed, not what it
+    // happens to be holding in memory.
+    const probe = new Database(join(homeDir, "data", "mesh.db"));
+    try {
+      expect(probe.prepare("SELECT id, completed_at FROM host_jobs ORDER BY id").all()).toEqual([
+        { id: "job-legacy", completed_at: null },
+      ]);
+
+      // A job the booted mesh has never seen, written after boot by another
+      // connection. A store that snapshotted the file at startup cannot route
+      // this one's exit.
+      probe
+        .prepare(
+          `INSERT INTO host_jobs (
+             id, actor_id, unit_name, script_label, manifest,
+             audit_artifact_path, audit_artifact_sha256, runtime_max_sec, submitted_at
+           ) VALUES ('job-after-boot', 'root', 'job-root-afterboot', 'echo later',
+             '{"schemaVersion":1,"readPaths":[]}', '/tmp/after-boot.json', 'b', 60,
+             '2026-07-02T00:00:00.000Z')`
+        )
+        .run();
+
+      // Drive the real endpoint the way wake-on-exit.sh does: unit name only,
+      // no job id, bearer token and port read off the files start.ts published.
+      const token = readFileSync(join(homeDir, "wake-token"), "utf8").trim();
+      const port = readFileSync(join(homeDir, "wake-port"), "utf8").trim();
+      const response = await fetch(`http://127.0.0.1:${port}/host-jobs/exit`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          unitName: "job-root-afterboot",
+          actorId: "root",
+          result: "success",
+          exitStatus: "0",
+        }).toString(),
+      });
+      expect(response.status).toBe(200);
+
+      const rows = probe
+        .prepare("SELECT id, exit_status, exit_code FROM host_jobs ORDER BY id")
+        .all() as { id: string; exit_status: string | null; exit_code: string | null }[];
+      // The exit landed on the row it named, in this database — and the
+      // imported job, which did not exit, is untouched.
+      expect(rows).toEqual([
+        { id: "job-after-boot", exit_status: "success", exit_code: "0" },
+        { id: "job-legacy", exit_status: null, exit_code: null },
+      ]);
+
+      // The exit also went through the mesh the endpoint was wired to: the
+      // job-specific ledger event names the resolved job and its owner.
+      const exitEvents = probe
+        .prepare("SELECT actor_id, detail FROM mesh_events WHERE kind = 'host_job_exited'")
+        .all() as { actor_id: string | null; detail: string | null }[];
+      expect(exitEvents).toHaveLength(1);
+      expect(exitEvents[0]?.actor_id).toBe("root");
+      expect(exitEvents[0]?.detail).toContain("job-root-afterboot");
+      expect(exitEvents[0]?.detail).toContain("jobId=job-after-boot");
+    } finally {
+      probe.close();
+    }
   });
 
   it("provides unscoped chat-read MCP server to all spawned workers when chatClient is configured (#59)", async () => {

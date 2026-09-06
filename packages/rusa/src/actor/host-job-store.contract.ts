@@ -60,6 +60,18 @@ export function testHostJobStoreContract(name: string, makeStore: () => HostJobS
       expect(exited?.exitCode).toBeUndefined();
     });
 
+    // A stored record is durable audit history: it names the submitting actor
+    // and the sha256 of the write-once artifact proving what was authorized. A
+    // second submit under one id would rewrite all of that, so both stores
+    // refuse it rather than resolving it.
+    it("refuses a second submit of an id it already holds", () => {
+      const store = makeStore();
+      store.submit(job({ scriptLabel: "first" }));
+      expect(() => store.submit(job({ scriptLabel: "second", unitName: "unit-2" }))).toThrow();
+      expect(store.get("job-1")?.scriptLabel).toBe("first");
+      expect(store.list()).toHaveLength(1);
+    });
+
     it("returns undefined for an unknown job", () => {
       const store = makeStore();
       expect(store.get("no-such-job")).toBeUndefined();
