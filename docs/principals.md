@@ -54,8 +54,14 @@ authenticates. Specifically:
 
 ## Consumers the next slice must switch
 
-Each of these decides identity today by reading a string. They are the complete
-set that has to move onto `PrincipalRef`, and the reason this storage exists.
+Each of these decides identity today by reading a string, and each has to move
+onto `PrincipalRef`. This is the reason the storage exists. The list was derived
+by grepping for `HUMAN_OPERATOR`, `MESH_SYSTEM`, `isHumanOperator`,
+`isSystemActor` and the bare `human:operator` literal across `packages/rusa/src`
+and dropping the hits that are prose — a prompt string, JSDoc, and comments in
+`worker-prompt.ts`, `providers/types.ts`, `voice/wiring.ts` and
+`webhook/server.ts`. Re-run that grep before trusting it; it is accurate as of
+this branch, not permanently.
 
 **The id space itself**
 
@@ -79,6 +85,19 @@ set that has to move onto `PrincipalRef`, and the reason this storage exists.
   HUMAN_OPERATOR` on obligation creation.
 - `src/actor/actor-mesh.ts` — `fromId = HUMAN_OPERATOR` for operator-originated
   messages, and `MESH_SYSTEM` for dropped-delivery notices.
+- `src/actor/actor.ts` — `interrupt(by = "human:operator")` defaults the
+  interrupt's attribution to the literal, so an unattributed interrupt silently
+  becomes an operator-attributed one. A `PrincipalRef` parameter with no default
+  would make the caller say who it was.
+
+**A parallel principal vocabulary**
+
+- `src/actor/root-control.ts` — `RootControlPrincipal` is
+  `"root-llm" | "human:operator" | "e2e-controller"`, a hand-rolled union naming
+  who may drive the root. It is the closest thing in the tree to a typed
+  principal and it overlaps this one only at `human:operator`; the other two are
+  control-plane callers, not identities. Worth folding in deliberately rather
+  than by coincidence of a shared string.
 
 **Readers that compare against it**
 
