@@ -68,3 +68,48 @@ a much larger historical volume of operator messages increases the correction's
 materialized result and client-independent server memory. Any index or pagination
 change should be justified by a benchmark with observed volume/skew rather than
 inferred from this synthetic sweep.
+
+## Client-source CPU fixture
+
+`packages/rusa/flutter_dashboard/tool/bench_274_actor_load.dart` is a second,
+separate disposable fixture. It imports the dashboard's real
+`ThreadsSnapshot.fromJson`, `DashboardStore.refreshThreads`, and
+`DashboardStore.flattenedVisible` code, but supplies a synthetic snapshot and
+a no-op stream. It neither opens a listener nor reads a mesh database.
+
+Run it from the dashboard directory with the Dart binary bundled with the
+already-installed Flutter SDK (using that binary directly avoids the Flutter
+wrapper updating a shared SDK cache):
+
+```sh
+cd packages/rusa/flutter_dashboard
+/path/to/flutter/bin/cache/dart-sdk/bin/dart format --output=none --set-exit-if-changed tool/bench_274_actor_load.dart
+/path/to/flutter/bin/cache/dart-sdk/bin/dart run tool/bench_274_actor_load.dart
+```
+
+The source fixture is exactly 1,000 actors: one root and 999 direct children.
+Its JSON is 438,640 UTF-8 bytes and it reports seven sweeps each for parse,
+state replacement, two `flattenedVisible` calls, and the visible-row
+child-presence scan used by `ActorTree`. These are local CPU timings; they do
+not include HTTP, compression, transfer, a device CPU, widget layout, or
+rasterization.
+
+The 438,640-byte client fixture is intentionally not the 580,851-byte route
+fixture above. The client fixture directly constructs the DTO input needed for
+the parser/store/tree measurement, including its varied synthetic previews. The
+route harness instead serializes the actual route's full server DTO shape,
+including generated handles and fields that serialize as `null` or empty
+collections, from a separate concise-charter database seed. The two byte counts
+therefore describe different payloads; do not combine their timings or treat
+either as a production transfer measurement.
+
+## Inconclusive browser attempt
+
+An earlier disposable headless-browser attempt reported SwiftShader and timed
+out during its initial warm-up before observing a threads response. It is not a
+client timing: its SSE framing used literal backslash-n sequences and its timeout
+waited for a later request, so it could not attribute the timeout to rendering
+or another stage. The script and its run instructions are intentionally not
+published. The source CPU fixture above is the only successful client-side
+measurement here; browser/device transfer, Flutter update, layout, and
+rasterization remain unmeasured.
