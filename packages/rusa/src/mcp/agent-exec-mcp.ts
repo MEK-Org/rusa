@@ -10,7 +10,6 @@ import {
 import type { ActorWakeScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
-import { DEFAULT_CODER_POOL, type ModelConfigInput } from "../providers/model-config.js";
 import { githubBranchReference } from "../references/reference.js";
 import { toolError, toolOk } from "./result.js";
 import { HUMAN_OPERATOR, isHumanOperator } from "./stamp.js";
@@ -208,11 +207,9 @@ export function createAgentExecMcpServer(
           .describe(
             "What the new actor owns — its standing brief, authored by you. Include its full scope: the repo(s) to work in (it clones them itself), the deliverable, and whether it should open one PR or several."
           ),
-        model_config: modelConfigSchema
-          .optional()
-          .describe(
-            "Provider/model/effort choice(s) for the child, in earliest-available order. A single object pins one choice; pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review). An array declares a pool of acceptable choices, tried whichever is earliest-available first — requires context_mode 'ledger' or 'tail', since a native provider session can't move between candidates. Omit to use the standing default coder pool for a portable spawn (context_mode 'ledger' or 'tail'); a native spawn must declare a single model_config entry."
-          ),
+        model_config: modelConfigSchema.describe(
+          "Required. Provider/model/effort choice(s) for the child, in earliest-available order. A single object pins one choice; pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review). An array declares a pool of acceptable choices, tried whichever is earliest-available first — requires context_mode 'ledger' or 'tail', since a native provider session can't move between candidates. There is no default: choose the child's model deliberately, and a native spawn must declare exactly one entry."
+        ),
         conversation_id: z
           .string()
           .optional()
@@ -236,13 +233,12 @@ export function createAgentExecMcpServer(
     async ({ charter, model_config, conversation_id, title, context_mode }) => {
       try {
         const context = resolveContextSelection(context_mode);
-        const modelConfig: ModelConfigInput = model_config ?? [...DEFAULT_CODER_POOL];
         const id =
           selfId === rootId && options?.rootControl
             ? options.rootControl.spawnChild(
                 {
                   charter,
-                  modelConfig,
+                  modelConfig: model_config,
                   conversationId: conversation_id,
                   title,
                   context,
@@ -252,7 +248,7 @@ export function createAgentExecMcpServer(
             : mesh.spawn({
                 charter,
                 parentId: selfId,
-                modelConfig,
+                modelConfig: model_config,
                 conversationId: conversation_id,
                 title,
                 context,

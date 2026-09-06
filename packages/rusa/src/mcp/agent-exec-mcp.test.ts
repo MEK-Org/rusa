@@ -404,6 +404,20 @@ describe("agent-execution MCP server", () => {
     expect(result.isError).toBe(true);
   });
 
+  it("spawn_thread rejects an omitted model_config before any actor is created", async () => {
+    const { mesh, registry } = setup();
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+    const result = (await client.callTool({
+      name: "spawn_thread",
+      arguments: { charter: "work", context_mode: "ledger" },
+    })) as CallToolResult;
+    expect(result.isError).toBe(true);
+    // No standing default stands in for the caller's choice: the spawn is
+    // refused at the tool boundary, so root still has no children. #270
+    expect(registry.children("root")).toEqual([]);
+    expect(registry.list().map((r) => r.id)).toEqual(["root"]);
+  });
+
   it("introduce grants the holder a handle to the target (with optional role)", async () => {
     const { mesh, registry } = setup();
     const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
