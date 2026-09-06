@@ -314,6 +314,7 @@ class _InboxTabState extends State<InboxTab> {
       borderRadius: BorderRadius.circular(9),
     ),
     child: Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         for (var index = 0; index < items.length; index++) ...[
           _obligationCard(
@@ -531,6 +532,9 @@ class _InboxTabState extends State<InboxTab> {
       borderRadius: BorderRadius.circular(9),
     ),
     child: Column(
+      // Each card is only as wide as its own content, so without stretch a
+      // short entry sits centered in the panel instead of filling it.
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         for (var index = 0; index < entries.length; index++) ...[
           _entryCard(entries[index] as Map<String, dynamic>),

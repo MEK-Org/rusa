@@ -26,7 +26,7 @@ class _WorkTabState extends State<WorkTab> {
   bool _loading = true;
   String? _error;
   List<ObligationTreeDto> _rootTrees = [];
-  final Set<String> _expandedIds = {};
+  late final Set<String> _expandedIds = widget.store.workExpanded;
   String? _selectedObligationId;
   StreamSubscription<String?>? _focusSub;
   bool _showDone = false;
@@ -88,6 +88,7 @@ class _WorkTabState extends State<WorkTab> {
           _expandedIds.addAll(path.sublist(0, path.length - 1));
           _selectedObligationId = targetId;
         });
+        widget.store.saveWorkExpanded(_expandedIds);
         return true;
       }
     }
@@ -379,6 +380,9 @@ class _WorkTabState extends State<WorkTab> {
                                             );
                                           }
                                         });
+                                        widget.store.saveWorkExpanded(
+                                          _expandedIds,
+                                        );
                                       },
                                     )
                                   : null,

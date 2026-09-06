@@ -12,11 +12,25 @@ class WebTreePreferencesCache implements TreePreferencesCache {
   static const String _collapsedKey = 'rusa.dashboard.tree.collapsed.v1';
   static const String _showRetiredKey = 'rusa.dashboard.tree.show_retired.v1';
   static const String _actorOrderKey = 'rusa.dashboard.tree.actor_order.v1';
+  static const String _workExpandedKey = 'rusa.dashboard.work.expanded.v1';
 
   @override
-  Set<String>? loadCollapsed() {
+  Set<String>? loadCollapsed() => _loadIdSet(_collapsedKey);
+
+  @override
+  void saveCollapsed(Set<String> collapsed) =>
+      _saveIdSet(_collapsedKey, collapsed);
+
+  @override
+  Set<String>? loadWorkExpanded() => _loadIdSet(_workExpandedKey);
+
+  @override
+  void saveWorkExpanded(Set<String> expanded) =>
+      _saveIdSet(_workExpandedKey, expanded);
+
+  Set<String>? _loadIdSet(String key) {
     try {
-      final raw = web.window.localStorage.getItem(_collapsedKey);
+      final raw = web.window.localStorage.getItem(key);
       if (raw == null || raw.isEmpty) return null;
       final decoded = jsonDecode(raw);
       if (decoded is! List) return null;
@@ -26,10 +40,9 @@ class WebTreePreferencesCache implements TreePreferencesCache {
     }
   }
 
-  @override
-  void saveCollapsed(Set<String> collapsed) {
+  void _saveIdSet(String key, Set<String> ids) {
     try {
-      web.window.localStorage.setItem(_collapsedKey, jsonEncode(collapsed.toList()));
+      web.window.localStorage.setItem(key, jsonEncode(ids.toList()));
     } catch (_) {
       // Best-effort: failed write is swallowed.
     }
@@ -65,8 +78,9 @@ class WebTreePreferencesCache implements TreePreferencesCache {
       final result = <String, List<String>>{};
       for (final entry in decoded.entries) {
         if (entry.value is List) {
-          result[entry.key.toString()] =
-              (entry.value as List).map((e) => e.toString()).toList();
+          result[entry.key.toString()] = (entry.value as List)
+              .map((e) => e.toString())
+              .toList();
         }
       }
       return result;
@@ -90,6 +104,7 @@ class WebTreePreferencesCache implements TreePreferencesCache {
       web.window.localStorage.removeItem(_collapsedKey);
       web.window.localStorage.removeItem(_showRetiredKey);
       web.window.localStorage.removeItem(_actorOrderKey);
+      web.window.localStorage.removeItem(_workExpandedKey);
     } catch (_) {}
   }
 }

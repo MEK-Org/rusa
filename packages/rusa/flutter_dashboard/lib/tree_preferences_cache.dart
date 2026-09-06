@@ -1,5 +1,6 @@
 /// Interface for persisting actor tree UI preferences (expansion/collapse
-/// state and show-retired toggle) across browser sessions .
+/// state and show-retired toggle) and the Work tab's obligation expansion
+/// state across browser sessions.
 ///
 /// Implemented by `WebTreePreferencesCache` in `web_tree_preferences_cache.dart`
 /// via browser localStorage. The store depends only on this interface so it
@@ -23,6 +24,14 @@ abstract interface class TreePreferencesCache {
 
   /// Persists [order] as the custom sibling ordering map per parent ID.
   void saveActorOrder(Map<String, List<String>> order);
+
+  /// The set of expanded obligation IDs in the Work tab persisted from prior
+  /// sessions, or null on a cold start / unreadable store. The Work tab's
+  /// default is collapsed, so this is the inverse of [loadCollapsed].
+  Set<String>? loadWorkExpanded();
+
+  /// Persists [expanded] as the set of expanded obligation IDs in the Work tab.
+  void saveWorkExpanded(Set<String> expanded);
 
   /// Drops any persisted tree preferences.
   void clear();
@@ -50,6 +59,12 @@ class NoopTreePreferencesCache implements TreePreferencesCache {
 
   @override
   void saveActorOrder(Map<String, List<String>> order) {}
+
+  @override
+  Set<String>? loadWorkExpanded() => null;
+
+  @override
+  void saveWorkExpanded(Set<String> expanded) {}
 
   @override
   void clear() {}

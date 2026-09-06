@@ -198,6 +198,61 @@ void main() {
         expect(find.text('Ready Obligations'), findsOneWidget);
       },
     );
+
+    testWidgets('inbox and obligation cards fill their panel width', (
+      tester,
+    ) async {
+      // A short body and a short intent: without stretch each card would
+      // shrink-wrap to its text and sit centered in the panel.
+      final api = FakeApi()
+        ..inboxResultsByStatus['unhandled'] = {
+          'entries': [entry('entry-1')],
+        }
+        ..inboxResultsByStatus['handled'] = {'entries': []}
+        ..obligationsResult = [
+          makeObligation('ob-1', ownerId: 'actor-a', intent: 'Short'),
+        ];
+      final store = DashboardStore(
+        api: api,
+        stream: FakeStream(),
+        quotaCache: FakeQuotaCache(),
+        treePreferencesCache: FakeTreePreferencesCache(),
+      );
+
+      await _pump(tester, store, size: const Size(1200, 900));
+
+      final entryBody = find.text('Body of entry-1');
+      final inboxPanel = find.ancestor(
+        of: entryBody,
+        matching: find.byType(DecoratedBox),
+      );
+      final inboxCard = find.ancestor(
+        of: entryBody,
+        matching: find.byType(Opacity),
+      );
+      expect(
+        tester.getSize(inboxCard.first).width,
+        tester.getSize(inboxPanel.first).width,
+      );
+      expect(
+        tester.getTopLeft(inboxCard.first).dx,
+        tester.getTopLeft(inboxPanel.first).dx,
+      );
+
+      final obligationText = find.text('Short');
+      final obligationPanel = find.ancestor(
+        of: obligationText,
+        matching: find.byType(DecoratedBox),
+      );
+      final obligationCard = find.ancestor(
+        of: obligationText,
+        matching: find.byType(Padding),
+      );
+      expect(
+        tester.getSize(obligationCard.first).width,
+        tester.getSize(obligationPanel.first).width,
+      );
+    });
   });
 
   group('InboxTab external ref links', () {
