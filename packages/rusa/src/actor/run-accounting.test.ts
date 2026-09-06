@@ -43,12 +43,61 @@ describe("createRunAccounting", () => {
     expect(() => accounting.complete("actor-a", RESULT)).toThrow(/no active durable run/);
   });
 
-  it("completeIfActive reports whether there was anything to close", () => {
-    expect(accounting.completeIfActive("actor-a", RESULT)).toBeNull();
+  it("keeps the claim when the durable write fails, so the close can be retried", () => {
+    let failWrite = false;
+    const guard = () => {
+      if (failWrite) throw new Error("database is locked");
+    };
+    // Only the three methods the ledger actually calls; everything else is
+    // read straight off the real repository the assertions below inspect.
+    const flakyRuns = {
+      start: (opts: Parameters<ActorRunRepository["start"]>[0]) => runs.start(opts),
+      complete: (...args: Parameters<ActorRunRepository["complete"]>) => {
+        guard();
+        runs.complete(...args);
+      },
+      abandon: (...args: Parameters<ActorRunRepository["abandon"]>) => {
+        guard();
+        runs.abandon(...args);
+      },
+    } as unknown as ActorRunRepository;
+    const flaky = createRunAccounting(() => flakyRuns);
 
-    const runId = accounting.begin("actor-a", "codex");
-    expect(accounting.completeIfActive("actor-a", RESULT)).toBe(runId);
-    expect(accounting.completeIfActive("actor-a", RESULT)).toBeNull();
+    const runId = flaky.begin("actor-a", "codex");
+    failWrite = true;
+    expect(() => flaky.complete("actor-a", RESULT)).toThrow(/database is locked/);
+
+    // The row is still open, so the claim has to still name it: dropping the
+    // claim first would strand an open run with nothing left in memory able to
+    // close it, and would let a second run start over the top of it.
+    expect(runs.getById(runId)).toMatchObject({ outcome: null });
+    expect(flaky.activeRunId("actor-a")).toBe(runId);
+    expect(() => flaky.begin("actor-a", "codex")).toThrow(/already has an active durable run/);
+
+    failWrite = false;
+    expect(flaky.complete("actor-a", RESULT)).toBe(runId);
+    expect(runs.getById(runId)).toMatchObject({ outcome: "completed", success: true });
+  });
+
+  it("keeps the claim when an abandon write fails", () => {
+    let failWrite = false;
+    const flakyRuns = {
+      start: (opts: Parameters<ActorRunRepository["start"]>[0]) => runs.start(opts),
+      abandon: (...args: Parameters<ActorRunRepository["abandon"]>) => {
+        if (failWrite) throw new Error("database is locked");
+        runs.abandon(...args);
+      },
+    } as unknown as ActorRunRepository;
+    const flaky = createRunAccounting(() => flakyRuns);
+
+    const runId = flaky.begin("actor-a", "codex");
+    failWrite = true;
+    expect(() => flaky.abandon("actor-a", "coalesced")).toThrow(/database is locked/);
+    expect(flaky.activeRunId("actor-a")).toBe(runId);
+
+    failWrite = false;
+    expect(flaky.abandon("actor-a", "coalesced")).toBe(runId);
+    expect(runs.getById(runId)).toMatchObject({ outcome: "abandoned" });
   });
 
   it("abandons an open run and reports none when there is nothing open", () => {

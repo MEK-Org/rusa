@@ -20,11 +20,6 @@ export interface RunAccounting {
   abandon(actorId: string, reason: string): string | null;
   /** The run this actor currently has open, if any. */
   activeRunId(actorId: string): string | undefined;
-  /**
-   * Close an open run only if there is one, reporting whether it landed.
-   * The caller does not know whether the run it is unwinding was ever admitted.
-   */
-  completeIfActive(actorId: string, result: RunResult): string | null;
 }
 
 export function createRunAccounting(runs: () => ActorRunRepository): RunAccounting {
@@ -32,9 +27,11 @@ export function createRunAccounting(runs: () => ActorRunRepository): RunAccounti
   const complete = (actorId: string, result: RunResult): string => {
     const runId = activeRunIds.get(actorId);
     if (!runId) throw new Error(`actor has no active durable run: ${actorId}`);
-    // Drop the claim before the write, so a second terminal event racing this
-    // one finds nothing to close rather than double-counting the same run.
-    activeRunIds.delete(actorId);
+    // The write is synchronous, so nothing can interleave between it and the
+    // claim it closes: a second terminal event either precedes this one and
+    // finds a claim, or follows it and finds none. Writing first is what makes
+    // a failed write recoverable — the claim still names the open row, so the
+    // close can be retried and no new run can start over the top of it.
     runs().complete(runId, {
       success: result.success,
       exitCode: result.exitCode,
@@ -43,6 +40,7 @@ export function createRunAccounting(runs: () => ActorRunRepository): RunAccounti
       yieldNote: result.yieldNote,
       model: result.model,
     });
+    activeRunIds.delete(actorId);
     return runId;
   };
   return {
@@ -55,13 +53,11 @@ export function createRunAccounting(runs: () => ActorRunRepository): RunAccounti
       return runId;
     },
     complete,
-    completeIfActive: (actorId, result) =>
-      activeRunIds.has(actorId) ? complete(actorId, result) : null,
     abandon: (actorId, reason) => {
       const runId = activeRunIds.get(actorId);
       if (!runId) return null;
-      activeRunIds.delete(actorId);
       runs().abandon(runId, reason);
+      activeRunIds.delete(actorId);
       return runId;
     },
     activeRunId: (actorId) => activeRunIds.get(actorId),
