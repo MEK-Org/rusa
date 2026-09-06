@@ -319,6 +319,10 @@ export class Actor {
   private queued = false;
   /** Actor-level dirty state retained when /halt cancels a queued provider start. */
   private cancelledQueuedRun = false;
+  /** Scheduling metadata retained with a cancelled queued opportunity for its replay. */
+  private cancelledQueuedNudge?: RunNudge;
+  /** A model re-quote has cancelled its old reservation and is awaiting its one dirty-bit replay. */
+  private reschedulingQueuedRun = false;
   private preemptedQueuedRun = false;
   /**
    * Set within a run at the moment it commits to reporting its result through
@@ -454,19 +458,63 @@ export class Actor {
     this.killable = false;
   }
 
-  /** Cancel a provider start that is still queued, retaining one dirty flag. */
+  /** Cancel a provider start that is still queued, retaining its scheduling opportunity. */
   cancelQueuedRun(): boolean {
+    // A re-quote has already cancelled the provider reservation but has not
+    // unwound into its fresh admission yet. A halt in that window must claim
+    // the queued work and clear the dirty replay, otherwise the fresh
+    // beforeRun would skip it without leaving anything for /resume to replay.
+    if (this.reschedulingQueuedRun) {
+      this.cancelledQueuedNudge = this.runner.currentNudgeSnapshot();
+      this.reschedulingQueuedRun = false;
+      // A re-admission can be paused in beforeRun after the old reservation
+      // has unwound. Invalidate that admission too, so its eventual preflight
+      // result cannot proceed after this halt has parked the opportunity.
+      this.admissionEpoch++;
+      this.runner.cancelPending();
+      this.cancelledQueuedRun = true;
+      return true;
+    }
     if (!this.pendingStart?.cancel?.()) return false;
+    this.cancelledQueuedNudge = this.runner.currentNudgeSnapshot();
     this.cancelledQueuedRun = true;
     this.opts.onQueuedRunCancelled?.();
     return true;
   }
 
-  /** Replay the content-free dirty state retained by {@link cancelQueuedRun}. */
+  /**
+   * Replace a not-yet-started reservation after its next-run configuration
+   * changes. The runner is already single-flight, so request the replacement
+   * through its dirty bit: the cancelled opportunity unwinds first, then one
+   * fresh admission re-quotes the current candidate pool. Unlike a halt
+   * cancellation, this work is immediately eligible to run and must not wait
+   * for `resumeCancelledRun()`.
+   */
+  rescheduleQueuedRun(): boolean {
+    // Repeated model updates before the cancelled start unwinds share the
+    // already-recorded dirty replay; its beforeRun reads the final replacement
+    // pool, so another cancellation would only create duplicate bookkeeping.
+    if (this.reschedulingQueuedRun) return true;
+    if (!this.pendingStart?.cancel?.()) return false;
+    this.reschedulingQueuedRun = true;
+    this.opts.onQueuedRunCancelled?.();
+    this.runner.requeueCurrentRun();
+    return true;
+  }
+
+  /** Replay the content-free scheduling opportunity retained by {@link cancelQueuedRun}. */
   resumeCancelledRun(): boolean {
     if (!this.cancelledQueuedRun) return false;
+    const nudge = this.cancelledQueuedNudge ?? {};
     this.cancelledQueuedRun = false;
-    this.requestRun();
+    this.cancelledQueuedNudge = undefined;
+    if (nudge.mode !== "yield-elicitation") {
+      this.continuations = 0;
+    }
+    // Bypass Actor.requestRun's queued fast-path: a halt can lift while the
+    // cancelled gate is still unwinding, and TriggerRunner will coalesce this
+    // retained opportunity into that exact one replay.
+    this.runner.requestRun(nudge);
     return true;
   }
 
@@ -588,6 +636,15 @@ export class Actor {
     }
     const epoch = this.admissionEpoch;
     if (this.opts.beforeRun && !(await this.opts.beforeRun({ mode: nudge.mode ?? "ordinary" }))) {
+      // The replacement admission has reached its preflight after the old
+      // reservation unwound. A halt/shutdown that closes this gate must retain
+      // the same work for resume; otherwise its runner dirty bit would be
+      // consumed as a dropped wake with no cancelled-run record.
+      if (this.reschedulingQueuedRun) {
+        this.reschedulingQueuedRun = false;
+        this.cancelledQueuedNudge = this.runner.currentNudgeSnapshot();
+        this.cancelledQueuedRun = true;
+      }
       this.lastRunSkipped = true;
       return;
     }
@@ -596,6 +653,9 @@ export class Actor {
       this.lastRunSkipped = true;
       return;
     }
+    // The re-admission has passed its only preflight boundary. From this
+    // point a normal queued-start cancellation owns the fresh reservation.
+    this.reschedulingQueuedRun = false;
     this.lastRunSkipped = false;
     // A yield only counts for the run it was declared in; clear any prior flag.
     this.yielded = false;

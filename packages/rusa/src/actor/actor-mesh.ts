@@ -70,6 +70,8 @@ export interface MeshActor {
   readonly isQueued?: boolean;
   readonly isYielded?: boolean;
   cancelQueuedRun?(): boolean;
+  /** Cancel a queued reservation and re-admit its same work against current next-run config. */
+  rescheduleQueuedRun?(): boolean;
   resumeCancelledRun?(): boolean;
   preemptForResponsive():
     | { preempted: false }
@@ -3179,6 +3181,24 @@ export class ActorMesh {
     // applies atomically at its next dispatch, before run_start is recorded
     // and before launch (see {@link applyPendingModel}).
     this.actors.patch(id, { desiredModelConfig: validated });
+
+    // A queued reservation has already quoted one of the old pool's lanes.
+    // Replacing that pool must release the old quote now and pass the same
+    // single-flight work back through admission, rather than waiting until the
+    // stale lane eventually becomes available to discover the change. The
+    // actor's dirty bit coalesces repeated updates into exactly one replacement
+    // opportunity; a live provider run has no pending reservation, so it keeps
+    // its launched pool through its normal run boundary.
+    const liveActor = this.live.get(id);
+    // Do not turn a staged move onto an already-halted pool into a transient
+    // re-quote that `beforeRun` merely drops: retain the work through the
+    // existing halt/resume path instead. Partially healthy pools still
+    // re-quote normally, letting provider selection choose an eligible lane.
+    if (this.allCandidatesHalted(validated) || this.isShuttingDown()) {
+      if (liveActor?.cancelQueuedRun?.()) return;
+    } else if (liveActor?.rescheduleQueuedRun?.()) {
+      return;
+    }
 
     if (this.inboxStore && this.live.has(id) && this.activeRunState(id) === null) {
       const unhandled = this.inboxStore.list(id, { status: "unhandled" }).entries;
