@@ -1,8 +1,29 @@
 import { type ChildProcessByStdio, spawn } from "node:child_process";
 import type { Readable } from "node:stream";
-import { sanitizeArgv, toSpawnArgumentError } from "./spawn-arguments.js";
 import { formatSigtermResult, type TerminationAttribution } from "./termination-attribution.js";
 import type { RunResult } from "./types.js";
+
+/**
+ * Reduce a synchronous spawn rejection to what is safe to put in a run record.
+ *
+ * Node's own message quotes the rejected value (up to 128 inspected characters)
+ * and its stack repeats it, so for a provider launch the raw error can be a
+ * verbatim slice of the prompt. Only the actionable identifiers survive: the
+ * error class and Node's stable code. The original is deliberately NOT attached
+ * as `cause` either — a serializer that walks the cause chain would put the
+ * quoted value straight back into the record. Total, so an unrecognizable throw
+ * still settles the run as a stated launch failure rather than escaping into
+ * the generic terminal-failure path with its stack, argv and all (#206).
+ */
+function describeSpawnRejection(err: unknown): Error {
+  const errorClass = err instanceof Error ? err.name : typeof err;
+  const code = (err as { code?: unknown } | null)?.code;
+  const classification = typeof code === "string" ? `${errorClass} [${code}]` : errorClass;
+  return new Error(
+    "process-argument validation rejected this launch before the CLI started " +
+      `(${classification}); argument values withheld`
+  );
+}
 
 /**
  * Shared lifecycle for a detached, process-grouped subprocess run.
@@ -37,24 +58,21 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
   return new Promise<RunResult>((resolve) => {
     const chunks: string[] = [];
 
-    // The single launch boundary every provider funnels through, so argv is made
-    // spawnable HERE rather than in each adapter's own arg builder — an adapter
-    // cannot forget, and a sandboxed run's bwrap wrapper (which carries the same
-    // prompt after `--`) is covered by the same pass (#206).
+    // argv reaches `spawn` exactly as the adapter assembled it. Assembled text
+    // was already made spawnable where the prompt entered argv; everything left
+    // here is a configured value or a host path — under `bwrap` the provider
+    // executable and every bind/`--chdir` operand are argv too — and rewriting a
+    // character inside one of those would launch a different path instead of
+    // repairing anything. A NUL there is a configuration fault, which the catch
+    // below reports as one (#206).
     //
-    // `config.command` is deliberately NOT sanitized: it is a configured
-    // executable, not assembled text, and substituting a character inside a path
-    // would launch a different (wrong) binary or fail as ENOENT. A NUL there is a
-    // configuration fault, and the catch below reports it as one.
-    const args = sanitizeArgv(config.args);
-
     // `detached: true` makes the child its own process-group leader so we can
     // signal the whole group with `process.kill(-pid, ...)`, reaping any
     // grandchildren the CLI spawned (interactive shells, subprocesses, etc.).
     // Typed from the `stdio` triple below: stdin ignored, stdout/stderr piped.
     let child: ChildProcessByStdio<null, Readable, Readable>;
     try {
-      child = spawn(config.command, args, {
+      child = spawn(config.command, config.args, {
         cwd: config.cwd,
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
@@ -66,10 +84,10 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
       // spawn validates command, argv and options synchronously and throws
       // before a process exists: there is no 'error' event coming, no group to
       // kill and no timer or abort listener registered yet, so this settles the
-      // run directly. `toSpawnArgumentError` is what keeps the rejected value —
-      // the prompt, for an argv rejection — out of the resulting run record.
+      // run directly. `describeSpawnRejection` is what keeps the rejected value
+      // out of the resulting run record.
       config.cleanup?.();
-      resolve(config.buildSpawnErrorResult(toSpawnArgumentError(err)));
+      resolve(config.buildSpawnErrorResult(describeSpawnRejection(err)));
       return;
     }
 

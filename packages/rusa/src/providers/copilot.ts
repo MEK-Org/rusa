@@ -1,6 +1,7 @@
 import { rmSync } from "node:fs";
 import type { ProviderConfig } from "../config/types.js";
 import { buildActorBwrapArgs, buildActorBwrapCommand, teardownFlutterOverlay } from "./sandbox.js";
+import { sanitizeArgvText } from "./spawn-arguments.js";
 import { runSubprocess } from "./subprocess-execution.js";
 import type { CodingProvider, RunOptions, RunResult } from "./types.js";
 
@@ -24,7 +25,8 @@ export class CopilotProvider implements CodingProvider {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const command = this.config.cliCommand ?? "copilot";
 
-    const args = ["--allow-all-tools", "--prompt", opts.prompt];
+    // The prompt is assembled text, made spawnable before it enters argv (#206).
+    const args = ["--allow-all-tools", "--prompt", sanitizeArgvText(opts.prompt)];
 
     if (this.model) {
       args.push("--model", this.model);
