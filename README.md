@@ -163,25 +163,40 @@ to one pool, defined in `config.yaml` under `modelClasses`:
 providers:
   claude:
     cliCommand: claude
+  codex:
+    cliCommand: codex
+  antigravity:
+    cliCommand: agy
   kimi:
     cliCommand: kimi
 
 modelClasses:
   # Each class is a list of provider/model entries in earliest-available order —
   # the same shape and the same ordering rule as an inline model_config pool.
-  fast:
-    - provider: kimi
-      model: kimi-for-coding
-  review:
+  coder:
     - provider: claude
-      model: claude-opus-4-8
-      effort: max
+      model: claude-opus-5
+      effort: high
+    - provider: codex
+      model: gpt-5.6-terra
+      effort: xhigh
+    - provider: antigravity
+      model: gemini-3.8-flash
+      effort: high
+    - provider: kimi
+      model: kimi-code/kimi-for-coding
+  steward:
+    - provider: codex
+      model: gpt-5.6-sol
+      effort: xhigh
+    - provider: claude
+      model: claude-fable-5-1
 ```
 
 An actor then references a class as the **whole** `model_config` value:
 
 ```json
-{ "charter": "review the open PR", "model_config": { "class": "review" } }
+{ "charter": "fix the flaky test in packages/rusa", "model_config": { "class": "coder" } }
 ```
 
 Both `spawn_thread` and `set_actor_model` accept it. The rules:
@@ -191,11 +206,13 @@ Both `spawn_thread` and `set_actor_model` accept it. The rules:
   writes classes at runtime, so the file stays the single source of truth for
   what a class means.
 - **Every entry must name a configured provider and an explicit model.** Config
-  loading validates each entry through the same provider/model/effort checks a
-  spawn uses, so a typo fails at startup rather than at the first spawn.
+  loading validates a class through the same pool validation a spawn goes
+  through — provider/model/effort checks, the pool size bound, and duplicate
+  detection — so a typo or an unusable class fails at startup rather than at the
+  first spawn that names it.
 - **A class reference is the whole value**, not one entry inside a pool, and it
-  cannot nest inside another class. `{"class": "fast"}` is valid;
-  `[{"class": "fast"}, {...}]` and `{"class": "fast", "provider": "codex"}` are
+  cannot nest inside another class. `{"class": "coder"}` is valid;
+  `[{"class": "coder"}, {...}]` and `{"class": "coder", "provider": "codex"}` are
   both rejected at the tool boundary — a mixed shape is a mistake, never a
   tuple with the class quietly ignored.
 - **A reference still isn't a default.** Omitting `model_config` remains an
