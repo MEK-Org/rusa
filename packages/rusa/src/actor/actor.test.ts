@@ -418,6 +418,50 @@ describe("Actor", () => {
     expect(provider.calls[0]?.prompt).toBe("PROMPT: inbox work");
   });
 
+  it("requotes a queued run without changing its responsive corrective nudge", async () => {
+    const queued: Array<{ responsive: boolean; mode: string }> = [];
+    const gated: boolean[] = [];
+    const rejects: Array<(reason: unknown) => void> = [];
+    const actor = makeActor({
+      onQueued: (event) => queued.push(event),
+      gate: <T>(
+        _fn: (selected: RawProviderModelConfig) => Promise<T>,
+        _candidates: readonly RawProviderModelConfig[],
+        responsive: boolean
+      ): RunStartHandle<T> => {
+        gated.push(responsive);
+        return {
+          started: false,
+          promote: () => {},
+          cancel: () => {
+            rejects.shift()?.(new RunStartCancelledError());
+            return true;
+          },
+          result: new Promise<T>((_resolve, reject) => rejects.push(reject)),
+        };
+      },
+    });
+
+    actor.requestRun({ priority: "responsive", mode: "yield-elicitation" });
+    await flush();
+    expect(queued).toEqual([{ responsive: true, mode: "yield-elicitation" }]);
+    expect(gated).toEqual([true]);
+
+    expect(actor.rescheduleQueuedRun()).toBe(true);
+    await flush();
+
+    // A re-quote retries the same scheduling opportunity: it must remain a
+    // responsive corrective run rather than becoming a fresh ordinary wake.
+    expect(queued).toEqual([
+      { responsive: true, mode: "yield-elicitation" },
+      { responsive: true, mode: "yield-elicitation" },
+    ]);
+    expect(gated).toEqual([true, true]);
+
+    actor.close();
+    await flush();
+  });
+
   it("replaces a queued normal run with one responsive opportunity", async () => {
     const limiter = new ConcurrencyLimiter(1);
     let releaseBlocker!: () => void;

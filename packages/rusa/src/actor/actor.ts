@@ -319,6 +319,8 @@ export class Actor {
   private queued = false;
   /** Actor-level dirty state retained when /halt cancels a queued provider start. */
   private cancelledQueuedRun = false;
+  /** Scheduling metadata retained with a cancelled queued opportunity for its replay. */
+  private cancelledQueuedNudge?: RunNudge;
   /** A model re-quote has cancelled its old reservation and is awaiting its one dirty-bit replay. */
   private reschedulingQueuedRun = false;
   private preemptedQueuedRun = false;
@@ -456,19 +458,21 @@ export class Actor {
     this.killable = false;
   }
 
-  /** Cancel a provider start that is still queued, retaining one dirty flag. */
+  /** Cancel a provider start that is still queued, retaining its scheduling opportunity. */
   cancelQueuedRun(): boolean {
     // A re-quote has already cancelled the provider reservation but has not
     // unwound into its fresh admission yet. A halt in that window must claim
     // the queued work and clear the dirty replay, otherwise the fresh
     // beforeRun would skip it without leaving anything for /resume to replay.
     if (this.reschedulingQueuedRun) {
+      this.cancelledQueuedNudge = this.runner.currentNudgeSnapshot();
       this.reschedulingQueuedRun = false;
       this.runner.cancelPending();
       this.cancelledQueuedRun = true;
       return true;
     }
     if (!this.pendingStart?.cancel?.()) return false;
+    this.cancelledQueuedNudge = this.runner.currentNudgeSnapshot();
     this.cancelledQueuedRun = true;
     this.opts.onQueuedRunCancelled?.();
     return true;
@@ -490,15 +494,23 @@ export class Actor {
     if (!this.pendingStart?.cancel?.()) return false;
     this.reschedulingQueuedRun = true;
     this.opts.onQueuedRunCancelled?.();
-    this.runner.requestRun();
+    this.runner.requeueCurrentRun();
     return true;
   }
 
-  /** Replay the content-free dirty state retained by {@link cancelQueuedRun}. */
+  /** Replay the content-free scheduling opportunity retained by {@link cancelQueuedRun}. */
   resumeCancelledRun(): boolean {
     if (!this.cancelledQueuedRun) return false;
+    const nudge = this.cancelledQueuedNudge ?? {};
     this.cancelledQueuedRun = false;
-    this.requestRun();
+    this.cancelledQueuedNudge = undefined;
+    if (nudge.mode !== "yield-elicitation") {
+      this.continuations = 0;
+    }
+    // Bypass Actor.requestRun's queued fast-path: a halt can lift while the
+    // cancelled gate is still unwinding, and TriggerRunner will coalesce this
+    // retained opportunity into that exact one replay.
+    this.runner.requestRun(nudge);
     return true;
   }
 

@@ -3623,6 +3623,7 @@ describe("ActorMesh", () => {
     it("requotes a queued portable actor against its final replacement pool without stale launches", async () => {
       const launches: string[] = [];
       const completed: string[] = [];
+      const halted = new Set<string>();
       const pacers = new Map<string, ProviderPacer>();
       const pacerFor = (provider: string): ProviderPacer => {
         let pacer = pacers.get(provider);
@@ -3640,6 +3641,7 @@ describe("ActorMesh", () => {
 
       let mesh!: ActorMesh;
       const configured = setup({
+        isHalted: (provider) => (provider ? halted.has(provider) : false),
         onModelSet: (actorId, modelConfig) => mesh.get(actorId)?.setModelConfig?.(modelConfig),
         providerGate: (fn, candidates, request) =>
           submitPoolGate(
@@ -3725,14 +3727,36 @@ describe("ActorMesh", () => {
         ],
         "root"
       );
+
+      // Land a halt in the cancellation-to-requeue handoff, before the
+      // cancelled reservation unwinds into its fresh admission. This exercises
+      // Actor.cancelQueuedRun's rescheduling branch: the halt must retain this
+      // one opportunity, launch nothing, and replay it only once on resume.
+      halted.add("replacement-delayed-first");
+      halted.add("replacement-delayed-second");
+      expect(mesh.cancelHaltedQueuedRuns()).toEqual([worker]);
       await vi.advanceTimersByTimeAsync(0);
       expect(launches).toEqual([]);
+      expect(mesh.activeRunState(worker)).toBeNull();
+      expect(mesh.getSelection(worker)).toBeUndefined();
+
+      halted.clear();
+      expect(mesh.resumeCancelledRuns()).toEqual([worker]);
+      await tick();
       expect(mesh.activeRunState(worker)?.phase).toBe("queued");
       expect(mesh.getSelection(worker)?.provider).toBe("replacement-delayed-first");
 
-      // Re-pinning the still-queued work again must replace its reservation,
-      // not queue a second run. Its first healthy declared candidate receives
-      // the one resulting dispatch.
+      // Two updates before the first cancellation unwinds coalesce through the
+      // reschedule dirty bit. The intermediate pool must never reserve or
+      // launch; the one dispatch uses the final pool's first candidate.
+      mesh.setActorModel(
+        worker,
+        [
+          { provider: "available-intermediate", model: "intermediate" },
+          { provider: "available-intermediate-backup", model: "backup" },
+        ],
+        "root"
+      );
       mesh.setActorModel(
         worker,
         [
