@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { type RootControlMesh, RootControlService } from "./root-control.js";
+import {
+  type RootControlMesh,
+  type RootControlOptions,
+  RootControlService,
+} from "./root-control.js";
 
-function setup() {
+function setup(extra: Partial<RootControlOptions> = {}) {
   const events: Parameters<RootControlMesh["recordEvent"]>[0][] = [];
   const mesh: RootControlMesh = {
     spawn: vi.fn(() => "child-1"),
@@ -14,7 +18,11 @@ function setup() {
     recordEvent: (event) => events.push(event),
     list: vi.fn(() => []),
   };
-  return { mesh, events, service: new RootControlService({ mesh, providers: ["claude", "agy"] }) };
+  return {
+    mesh,
+    events,
+    service: new RootControlService({ mesh, providers: ["claude", "agy"], ...extra }),
+  };
 }
 
 describe("RootControlService", () => {
@@ -190,6 +198,52 @@ describe("RootControlService", () => {
       forceQueued: true,
     });
     expect(JSON.parse(events[2]?.payload ?? "{}")).toMatchObject({ forceQueued: true });
+  });
+
+  it("resolves a model class reference before the provider prewalk and forwards the resolved pool", () => {
+    const { mesh, events, service } = setup({
+      resolveModelConfig: (input) =>
+        typeof input === "object" && input !== null && "class" in input
+          ? [{ provider: "agy", model: "gemini-3.5-flash-medium", effort: "high" }]
+          : input,
+    });
+
+    const id = service.spawnChild(
+      { charter: "work", modelConfig: { class: "fast" } },
+      "human:operator"
+    );
+
+    expect(id).toBe("child-1");
+    // The mesh receives the resolved pool, not the reference: the config-aware
+    // validation downstream never has to re-resolve.
+    expect(mesh.spawn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        modelConfig: [{ provider: "agy", model: "gemini-3.5-flash-medium", effort: "high" }],
+      })
+    );
+    expect(JSON.parse(events[0].payload ?? "{}")).toMatchObject({
+      modelConfig: [{ provider: "agy", model: "gemini-3.5-flash-medium", effort: "high" }],
+    });
+  });
+
+  it("applies the provider allowlist to the resolved pool, not the reference", () => {
+    const { mesh, service } = setup({
+      resolveModelConfig: () => [{ provider: "missing", model: "some-model" }],
+    });
+
+    expect(() =>
+      service.spawnChild({ charter: "work", modelConfig: { class: "fast" } }, "human:operator")
+    ).toThrow(/unknown provider: missing/);
+    expect(mesh.spawn).not.toHaveBeenCalled();
+  });
+
+  it("rejects a class reference with a clear error when no resolver is wired in", () => {
+    const { mesh, service } = setup();
+
+    expect(() =>
+      service.spawnChild({ charter: "work", modelConfig: { class: "fast" } }, "human:operator")
+    ).toThrow(/model class reference/);
+    expect(mesh.spawn).not.toHaveBeenCalled();
   });
 
   it("interrupts a child in the root subtree and audits the action", () => {

@@ -358,6 +358,18 @@ export interface VoiceConfig {
   voiceName?: string;
 }
 
+/**
+ * One provider/model/effort entry inside a named model class. Structurally the
+ * same tuple {@link RusaConfig.rootActor} declares, and validated the same way
+ * at load: `model` is required here because a class is an explicit, named
+ * selection — it must never resolve to a provider's own default.
+ */
+export interface ModelClassEntryConfig {
+  provider: string;
+  model: string;
+  effort?: string;
+}
+
 export interface RusaConfig {
   /** Optional named config profile. "quickstart" enables the local quick-start profile. */
   profile?: string;
@@ -395,6 +407,14 @@ export interface RusaConfig {
    * Prefer nesting under `understanding.glassGoals` . Retained as a compatibility fallback.
    */
   glassGoals?: GlassGoalsConfig;
+  /**
+   * Named model classes: an operator-defined label for a modelConfig pool, so a
+   * spawn can ask for `{ class: "fast" }` instead of restating a provider/model
+   * tuple. Optional and never implicit — a caller that omits `model_config`
+   * still gets no default, and editing a class here does not retro-apply to
+   * actors that already resolved it.
+   */
+  modelClasses?: Record<string, ModelClassEntryConfig[]>;
   /** Mesh safety/throughput controls (concurrency cap, provider rate limit). */
   mesh?: MeshConfig;
   /** Worker isolation mode. Defaults to "bwrap". */

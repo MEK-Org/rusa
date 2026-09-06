@@ -8,7 +8,10 @@ import type { IssueClient } from "../gitops/issue-client.js";
 import { MESH_SYSTEM, resolveStampedAuthor } from "../mcp/stamp.js";
 import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
 import { FakeProvider } from "../providers/fake-provider.js";
-import type { RawProviderModelConfig } from "../providers/model-config.js";
+import {
+  assertConcreteModelConfig,
+  type RawProviderModelConfig,
+} from "../providers/model-config.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
@@ -783,6 +786,37 @@ describe("ActorMesh", () => {
     const spawnEvent = events.find((e) => e.kind === "actor_spawned" && e.actorId === id);
     expect(spawnEvent).toBeDefined();
     expect(spawnEvent?.body).toBe("modelConfig=antigravity:Gemini 3.7 Flash @ high");
+  });
+
+  it("refuses an unresolved model class reference when no validateSpawn hook is wired in", () => {
+    // Without config there is nothing to resolve a class name against, so the
+    // config-free fallback must reject the reference rather than treat it as a
+    // tuple with a missing provider.
+    const { rawSpawn } = setup();
+    expect(() =>
+      rawSpawn({
+        charter: "custom worker",
+        parentId: "root",
+        modelConfig: { class: "fast" },
+      })
+    ).toThrow(/model class reference/);
+  });
+
+  it("refuses an unresolved model class reference on setActorModel without a validateModel hook", () => {
+    const { mesh, rawSpawn } = setup();
+    const parent = rawSpawn({
+      charter: "parent",
+      parentId: "root",
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+    });
+    const child = rawSpawn({
+      charter: "child",
+      parentId: parent,
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+    });
+    expect(() => mesh.setActorModel(child, { class: "fast" }, parent)).toThrow(
+      /model class reference/
+    );
   });
 
   it("revokes parent handle and marks record retired when createActor throws on spawn", () => {
@@ -3032,7 +3066,8 @@ describe("ActorMesh", () => {
       onModelSet: (actorId, modelConfig) =>
         modelSets.push({ actorId, newModel: modelConfig[0]?.model }),
       validateModel: (_record, modelConfig) => {
-        const list = Array.isArray(modelConfig) ? modelConfig : [modelConfig];
+        const concrete = assertConcreteModelConfig(modelConfig);
+        const list = Array.isArray(concrete) ? concrete : [concrete];
         return list.map((entry) => {
           const model = entry.model?.trim();
           if (!model)
@@ -3117,7 +3152,8 @@ describe("ActorMesh", () => {
     const { mesh, registry, tick } = setup({
       events: (event) => events.push(event),
       validateModel: (_record, modelConfig) => {
-        const list = Array.isArray(modelConfig) ? modelConfig : [modelConfig];
+        const concrete = assertConcreteModelConfig(modelConfig);
+        const list = Array.isArray(concrete) ? concrete : [concrete];
         return list.map((entry) => {
           validations.push({ model: entry.model, effort: entry.effort });
           const model = entry.model?.trim();
@@ -3175,7 +3211,8 @@ describe("ActorMesh", () => {
     const validations: Array<{ model?: string; effort?: string }> = [];
     const { mesh, registry } = setup({
       validateModel: (_record, modelConfig) => {
-        const list = Array.isArray(modelConfig) ? modelConfig : [modelConfig];
+        const concrete = assertConcreteModelConfig(modelConfig);
+        const list = Array.isArray(concrete) ? concrete : [concrete];
         return list.map((entry) => {
           validations.push({ model: entry.model, effort: entry.effort });
           const model = entry.model?.trim();
@@ -3256,7 +3293,8 @@ describe("ActorMesh", () => {
     const { mesh, registry, tick } = setup({
       events: (event) => events.push(event),
       validateModel: (record, modelConfig) => {
-        const list = Array.isArray(modelConfig) ? modelConfig : [modelConfig];
+        const concrete = assertConcreteModelConfig(modelConfig);
+        const list = Array.isArray(concrete) ? concrete : [concrete];
         return list.map((entry) => {
           const provider = entry.provider ?? record.modelConfig?.[0]?.provider;
           validations.push({

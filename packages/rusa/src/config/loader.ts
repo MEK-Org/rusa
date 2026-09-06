@@ -16,6 +16,7 @@ import {
 import {
   DEFAULT_DEPLOY_BRANCH,
   type GitHubOrgConfig,
+  type ModelClassEntryConfig,
   type QuotaThrottleConfig,
   type RusaConfig,
 } from "./types.js";
@@ -85,6 +86,64 @@ function validateQuotaThrottle(quotaThrottle: QuotaThrottleConfig | undefined): 
       quotaThrottle.tickSeconds <= 0)
   ) {
     throw new Error("config.yaml: quota.throttle.tickSeconds must be a positive integer");
+  }
+}
+
+/**
+ * Structural + config-aware validation for named model classes. A class is an
+ * explicit selection, so every entry must name a configured provider and a
+ * model — the same contract spawn enforces — and an empty class is rejected
+ * rather than read as "no preference". Entries are normalized through
+ * {@link validateProviderSelection} here, at load, so a typo fails at boot
+ * instead of at the first spawn that references the class.
+ */
+function validateModelClasses(parsed: RusaConfig): void {
+  const modelClasses = parsed.modelClasses;
+  if (modelClasses === undefined) return;
+  if (typeof modelClasses !== "object" || modelClasses === null || Array.isArray(modelClasses)) {
+    throw new Error("config.yaml: modelClasses must be a mapping of class name to entry list");
+  }
+  for (const [name, entries] of Object.entries(modelClasses)) {
+    if (!name.trim()) {
+      throw new Error("config.yaml: modelClasses class names must be non-empty");
+    }
+    if (!Array.isArray(entries) || entries.length === 0) {
+      throw new Error(
+        `config.yaml: modelClasses."${name}" must be a non-empty list of provider/model entries`
+      );
+    }
+    modelClasses[name] = entries.map((entry, index) => {
+      const position = index + 1;
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+        throw new Error(
+          `config.yaml: modelClasses."${name}" entry ${position} must be a provider/model mapping`
+        );
+      }
+      const raw = entry as Partial<ModelClassEntryConfig>;
+      const provider = raw.provider?.trim();
+      if (!provider) {
+        throw new Error(
+          `config.yaml: modelClasses."${name}" entry ${position} must declare a provider`
+        );
+      }
+      // Required, exactly as at spawn: omitting it would silently select the
+      // provider's own default model behind the class name.
+      const model = raw.model?.trim();
+      if (!model) {
+        throw new Error(
+          `config.yaml: modelClasses."${name}" entry ${position} must declare a model`
+        );
+      }
+      let selection: ReturnType<typeof validateProviderSelection>;
+      try {
+        selection = validateProviderSelection(parsed, provider, model, raw.effort);
+      } catch (err) {
+        throw new Error(
+          `config.yaml: modelClasses."${name}" entry ${position}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+      return { provider, model: selection.model ?? model, effort: selection.effort };
+    });
   }
 }
 
@@ -262,6 +321,7 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     parsed.rootActor.model = selection.model;
     parsed.rootActor.effort = selection.effort;
   }
+  validateModelClasses(parsed);
   if (parsed.understanding?.rootNodeId !== undefined) {
     if (
       typeof parsed.understanding.rootNodeId !== "string" ||

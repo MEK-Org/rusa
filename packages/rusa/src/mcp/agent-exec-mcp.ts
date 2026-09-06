@@ -32,14 +32,30 @@ const providerModelConfigSchema = z.object({
 });
 
 /**
- * A single provider/model/effort choice, or an ordered pool of acceptable
- * choices tried earliest-available first. A pool longer than one entry
- * requires a portable (ledger/tail) actor — a native provider session can't
- * move between candidates.
+ * A reference to a named model class from config.yaml. Strict on purpose: a
+ * class reference is the whole model_config value, so a stray sibling field
+ * (`{ class, provider }`) is a mistake worth surfacing rather than dropping.
+ */
+const modelClassReferenceSchema = z.strictObject({
+  class: z
+    .string()
+    .min(1)
+    .describe(
+      "Name of a model class defined under `modelClasses` in config.yaml, e.g. 'fast'. Resolves to that class's provider/model/effort pool at selection time; an unknown class is an error, never a fallback."
+    ),
+});
+
+/**
+ * A single provider/model/effort choice, an ordered pool of acceptable choices
+ * tried earliest-available first, or a reference to a named model class that
+ * expands to such a pool. A pool longer than one entry requires a portable
+ * (ledger/tail) actor — a native provider session can't move between
+ * candidates.
  */
 const modelConfigSchema = z.union([
   providerModelConfigSchema,
   z.array(providerModelConfigSchema).min(1),
+  modelClassReferenceSchema,
 ]);
 
 /**
@@ -208,7 +224,7 @@ export function createAgentExecMcpServer(
             "What the new actor owns — its standing brief, authored by you. Include its full scope: the repo(s) to work in (it clones them itself), the deliverable, and whether it should open one PR or several."
           ),
         model_config: modelConfigSchema.describe(
-          "Required. Provider/model/effort choice(s) for the child, in earliest-available order. A single object pins one choice; pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review). An array declares a pool of acceptable choices, tried whichever is earliest-available first — requires context_mode 'ledger' or 'tail', since a native provider session can't move between candidates. There is no default: choose the child's model deliberately, and a native spawn must declare exactly one entry."
+          "Required. Provider/model/effort choice(s) for the child, in earliest-available order. A single object pins one choice; pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review). An array declares a pool of acceptable choices, tried whichever is earliest-available first — requires context_mode 'ledger' or 'tail', since a native provider session can't move between candidates. `{\"class\": \"<name>\"}` instead names a model class from config.yaml and expands to that class's pool (same portability rule). There is no default: choose the child's model deliberately, and a native spawn must declare exactly one entry."
         ),
         conversation_id: z
           .string()
@@ -636,7 +652,7 @@ export function createAgentExecMcpServer(
       inputSchema: {
         actor_id: z.string().describe("The actor's id to update."),
         model_config: modelConfigSchema.describe(
-          "The full replacement provider/model/effort choice(s), in earliest-available order — replaces the entire current pool."
+          'The full replacement provider/model/effort choice(s), in earliest-available order — replaces the entire current pool. `{"class": "<name>"}` names a model class from config.yaml and expands to that class\'s pool. A class reference always replaces the whole pool, so it cannot be used for an effort-only or model-only partial update.'
         ),
       },
     },

@@ -1195,3 +1195,105 @@ describe("loadConfig observability.logging", () => {
     );
   });
 });
+
+describe("loadConfig modelClasses", () => {
+  it("leaves modelClasses undefined when the block is omitted", () => {
+    expect(loadConfig(writeConfig()).modelClasses).toBeUndefined();
+  });
+
+  it("accepts a valid class and normalizes each entry's provider/model/effort", () => {
+    const config = loadConfig(
+      writeConfig({
+        modelClasses: {
+          fast: [{ provider: "codex", model: "gpt-5.6-sol", effort: "HIGH" }],
+        },
+      })
+    );
+    expect(config.modelClasses?.fast).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol", effort: "high" },
+    ]);
+  });
+
+  it("accepts a multi-entry class in declaration order", () => {
+    const config = loadConfig(
+      writeConfig({
+        providers: { codex: { cliCommand: "codex" }, kimi: { cliCommand: "kimi" } },
+        modelClasses: {
+          wide: [
+            { provider: "codex", model: "gpt-5.6-sol" },
+            { provider: "kimi", model: "kimi-for-coding" },
+          ],
+        },
+      })
+    );
+    expect(config.modelClasses?.wide.map((e) => e.provider)).toEqual(["codex", "kimi"]);
+  });
+
+  it("rejects modelClasses that is not a mapping", () => {
+    expect(() => loadConfig(writeConfig({ modelClasses: ["fast"] }))).toThrow(
+      /modelClasses must be a mapping/
+    );
+  });
+
+  it("rejects a blank class name", () => {
+    expect(() =>
+      loadConfig(writeConfig({ modelClasses: { "   ": [{ provider: "codex", model: "x" }] } }))
+    ).toThrow(/modelClasses class names must be non-empty/);
+  });
+
+  it("rejects an empty class definition rather than treating it as 'no preference'", () => {
+    expect(() => loadConfig(writeConfig({ modelClasses: { fast: [] } }))).toThrow(
+      /modelClasses\."fast" must be a non-empty list/
+    );
+  });
+
+  it("rejects a class definition that is not a list", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({ modelClasses: { fast: { provider: "codex", model: "gpt-5.6-sol" } } })
+      )
+    ).toThrow(/modelClasses\."fast" must be a non-empty list/);
+  });
+
+  it("rejects a class entry missing a provider", () => {
+    expect(() =>
+      loadConfig(writeConfig({ modelClasses: { fast: [{ model: "gpt-5.6-sol" }] } }))
+    ).toThrow(/modelClasses\."fast" entry 1 must declare a provider/);
+  });
+
+  it("rejects a class entry missing a model — no silent provider default", () => {
+    expect(() =>
+      loadConfig(writeConfig({ modelClasses: { fast: [{ provider: "codex" }] } }))
+    ).toThrow(/modelClasses\."fast" entry 1 must declare a model/);
+  });
+
+  it("rejects a nested class reference inside a class definition", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          modelClasses: {
+            inner: [{ provider: "codex", model: "gpt-5.6-sol" }],
+            outer: [{ class: "inner" }],
+          },
+        })
+      )
+    ).toThrow(/modelClasses\."outer" entry 1 must declare a provider/);
+  });
+
+  it("rejects a class entry naming an unconfigured provider", () => {
+    expect(() =>
+      loadConfig(writeConfig({ modelClasses: { fast: [{ provider: "nope", model: "x" }] } }))
+    ).toThrow(/not configured/);
+  });
+
+  it("rejects a class entry whose effort the provider does not support", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          providers: { kimi: { cliCommand: "kimi" } },
+          modelClasses: { fast: [{ provider: "kimi", model: "kimi-code", effort: "high" }] },
+        })
+      )
+    ).toThrow(/does not expose a reasoning-effort control/);
+  });
+});
