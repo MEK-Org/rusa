@@ -163,8 +163,25 @@ export function resolveProvider(
   model?: string,
   effort?: string
 ): CodingProvider {
+  return resolveProviderWithSelection(config, providerName, model, effort).provider;
+}
+
+/**
+ * Resolve a configured provider together with the canonical model/effort tuple
+ * passed to it. Callers that expose a launch selection to an actor prompt use
+ * this result instead of retaining a pre-normalization request.
+ */
+export function resolveProviderWithSelection(
+  config: RusaConfig,
+  providerName: string,
+  model?: string,
+  effort?: string
+): { provider: CodingProvider; selection: ModelEffortSelection } {
   const selection = validateProviderSelection(config, providerName, model, effort);
-  return instantiateProvider(providerName, selection.model, selection.effort, config);
+  return {
+    provider: instantiateProvider(providerName, selection.model, selection.effort, config),
+    selection,
+  };
 }
 
 /**
