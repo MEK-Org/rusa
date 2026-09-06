@@ -1,4 +1,6 @@
-import { spawn } from "node:child_process";
+import { type ChildProcessByStdio, spawn } from "node:child_process";
+import type { Readable } from "node:stream";
+import { sanitizeArgv, toSpawnArgumentError } from "./spawn-arguments.js";
 import { formatSigtermResult, type TerminationAttribution } from "./termination-attribution.js";
 import type { RunResult } from "./types.js";
 
@@ -35,17 +37,41 @@ export function runSubprocess(config: SubprocessRunConfig): Promise<RunResult> {
   return new Promise<RunResult>((resolve) => {
     const chunks: string[] = [];
 
+    // The single launch boundary every provider funnels through, so argv is made
+    // spawnable HERE rather than in each adapter's own arg builder — an adapter
+    // cannot forget, and a sandboxed run's bwrap wrapper (which carries the same
+    // prompt after `--`) is covered by the same pass (#206).
+    //
+    // `config.command` is deliberately NOT sanitized: it is a configured
+    // executable, not assembled text, and substituting a character inside a path
+    // would launch a different (wrong) binary or fail as ENOENT. A NUL there is a
+    // configuration fault, and the catch below reports it as one.
+    const args = sanitizeArgv(config.args);
+
     // `detached: true` makes the child its own process-group leader so we can
     // signal the whole group with `process.kill(-pid, ...)`, reaping any
     // grandchildren the CLI spawned (interactive shells, subprocesses, etc.).
-    const child = spawn(config.command, config.args, {
-      cwd: config.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: true,
-      // Do NOT pass `timeout:` here — Node's spawn timeout signals only the
-      // direct child, leaving the rest of the detached group alive. We own the
-      // timeout via `setTimeout` below instead.
-    });
+    // Typed from the `stdio` triple below: stdin ignored, stdout/stderr piped.
+    let child: ChildProcessByStdio<null, Readable, Readable>;
+    try {
+      child = spawn(config.command, args, {
+        cwd: config.cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
+        // Do NOT pass `timeout:` here — Node's spawn timeout signals only the
+        // direct child, leaving the rest of the detached group alive. We own the
+        // timeout via `setTimeout` below instead.
+      });
+    } catch (err) {
+      // spawn validates command, argv and options synchronously and throws
+      // before a process exists: there is no 'error' event coming, no group to
+      // kill and no timer or abort listener registered yet, so this settles the
+      // run directly. `toSpawnArgumentError` is what keeps the rejected value —
+      // the prompt, for an argv rejection — out of the resulting run record.
+      config.cleanup?.();
+      resolve(config.buildSpawnErrorResult(toSpawnArgumentError(err)));
+      return;
+    }
 
     const killGroup = () => {
       if (child.pid) {
