@@ -51,8 +51,7 @@ class _BenchStream implements MeshStreamSource {
 }
 
 String _preview(int actor) {
-  // Deterministic, varied, public-safe text. Varying previews avoid measuring
-  // an implausibly perfect compression case in the companion browser harness.
+  // Deterministic, varied, public-safe text for a non-uniform DTO fixture.
   var state = actor + 1;
   final out = StringBuffer('Synthetic benchmark actor $actor. ');
   for (var i = 0; i < 22; i++) {
@@ -91,8 +90,8 @@ double _median(List<double> values) {
 
 int _treeRowWork(DashboardStore store, List<ThreadDto> visible) {
   // This follows ActorTree's child-presence work for each visible row. The two
-  // flatten calls in its StreamBuilder and widget layout/raster are measured
-  // separately by this harness and the browser harness, respectively.
+  // flatten calls in its StreamBuilder are measured separately above. Widget
+  // layout and rasterization are outside this source-level harness.
   var childRows = 0;
   for (final thread in visible) {
     if (store.actorStates.value.actors.values.any(

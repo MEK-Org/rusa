@@ -103,36 +103,13 @@ collections, from a separate concise-charter database seed. The two byte counts
 therefore describe different payloads; do not combine their timings or treat
 either as a production transfer measurement.
 
-## Optional browser diagnostic
+## Inconclusive browser attempt
 
-`packages/rusa/scripts/bench-274-browser-load.mjs` is opt-in and has no
-production code path. In a browser-capable environment, it serves an existing
-release web build and a synthetic `/api/mesh/threads` response on loopback,
-then uses Playwright at a 390×844 CSS-pixel touch viewport. It applies 4×
-DevTools CPU emulation and explicitly paces only its synthetic gzip response
-at 1.6 Mbps after a 150 ms response-start delay. `RENDER_WAIT_MILLISECONDS`
-and `PAGE_LOAD_TIMEOUT_MILLISECONDS` bound each stage; `SWEEPS` is explicit.
-
-```sh
-cd packages/rusa/flutter_dashboard
-flutter build web --release --web-renderer canvaskit
-cd ../../..
-NODE_PATH=/path/to/global/node_modules ACTORS=1000 SWEEPS=1 \
-  RENDER_WAIT_MILLISECONDS=30000 PAGE_LOAD_TIMEOUT_MILLISECONDS=30000 \
-  node packages/rusa/scripts/bench-274-browser-load.mjs
-```
-
-It first accepts an empty snapshot to warm the Flutter engine, then uses an SSE
-runtime-state delta to request the large synthetic snapshot. The report contains
-the synthetic JSON/gzip bytes, per-sample status, resource timing, and the
-reported WebGL renderer. Two animation frames after response end are only a
-browser-visible paint opportunity, not an internal Flutter parse/state/render
-span.
-
-On the measurement environment for this change, headless Chrome reported
-`ANGLE ... SwiftShader ...` and a 100-actor, one-sweep run timed out at the
-`initial-empty-snapshot` stage after the configured 15 seconds. It therefore
-produced no `/api/mesh/threads` response timing. That is a software-renderer
-environment limitation, not a phone-latency observation. Run this diagnostic
-only where a hardware/browser setup can complete the warm-up; until then the
-source CPU fixture above is the only successful client-side measurement.
+An earlier disposable headless-browser attempt reported SwiftShader and timed
+out during its initial warm-up before observing a threads response. It is not a
+client timing: its SSE framing used literal backslash-n sequences and its timeout
+waited for a later request, so it could not attribute the timeout to rendering
+or another stage. The script and its run instructions are intentionally not
+published. The source CPU fixture above is the only successful client-side
+measurement here; browser/device transfer, Flutter update, layout, and
+rasterization remain unmeasured.
