@@ -753,12 +753,7 @@ class _OverviewTabState extends State<OverviewTab> {
                     padding: const EdgeInsets.only(bottom: 8),
                     child: _buildActorContextCard(
                       actor,
-                      queueDetail: actor.estimatedStartAt != null
-                          ? 'Estimated start ${formatTs(actor.estimatedStartAt!)}'
-                          : actor.waitingOn ??
-                                (actor.queuePosition != null
-                                    ? 'Lane position ${actor.queuePosition! + 1}'
-                                    : 'Queued behind another provider request.'),
+                      queueDetail: _queueWaitDetail(actor),
                     ),
                   ),
             ],
@@ -1150,4 +1145,39 @@ class _OverviewTabState extends State<OverviewTab> {
       ),
     );
   }
+
+  String _queueWaitDetail(ActorViewState actor) {
+    final pacing = actor.pacingIntervalMs == null
+        ? null
+        : _formatPacingInterval(actor.pacingIntervalMs!);
+    if (actor.estimatedStartAt != null) {
+      final estimate = 'Estimated start ${formatTs(actor.estimatedStartAt!)}';
+      return actor.queueBlocker == 'provider-pacing' && pacing != null
+          ? 'Provider pacing every $pacing; $estimate'
+          : estimate;
+    }
+    if (actor.queueBlocker == 'mesh-concurrency') {
+      return pacing == null
+          ? 'Waiting for mesh concurrency.'
+          : 'Waiting for mesh concurrency; provider pacing every $pacing.';
+    }
+    if (actor.queueBlocker == 'provider-pacing' && pacing != null) {
+      return 'Provider pacing every $pacing; next start pending.';
+    }
+    return actor.waitingOn ??
+        (actor.queuePosition != null
+            ? 'Lane position ${actor.queuePosition! + 1}'
+            : 'Queued behind another provider request.');
+  }
+}
+
+String _formatPacingInterval(int milliseconds) {
+  if (milliseconds == 0) return '0s';
+  if (milliseconds < 60 * 1000) {
+    return '${(milliseconds / 1000).toStringAsFixed(1)}s';
+  }
+  if (milliseconds < 60 * 60 * 1000) {
+    return '${(milliseconds / (60 * 1000)).toStringAsFixed(1)}m';
+  }
+  return '${(milliseconds / (60 * 60 * 1000)).toStringAsFixed(1)}h';
 }

@@ -326,6 +326,27 @@ void main() {
     });
   });
 
+  group('ThreadDto queue pacing', () {
+    test('deserializes the current pacing interval and live blocking gate', () {
+      final thread = ThreadDto.fromJson({
+        'id': 'synthetic-queued',
+        'handle': 'synthetic-queued',
+        'parentId': 'root',
+        'status': 'active',
+        'provider': 'synthetic-provider',
+        'model': 'synthetic-model',
+        'charterPreview': '',
+        'createdAt': '2026-01-01T00:00:00.000Z',
+        'runState': 'queued',
+        'pacingIntervalMs': 36000000,
+        'queueBlocker': 'provider-pacing',
+      });
+
+      expect(thread.pacingIntervalMs, 36000000);
+      expect(thread.queueBlocker, 'provider-pacing');
+    });
+  });
+
   group('ActorStateSnapshot.queuedActors ordering', () {
     ThreadDto queuedThread(
       String id, {
