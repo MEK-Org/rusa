@@ -960,6 +960,12 @@ export class Actor {
     const result = await runProvider(primary);
     const fallback = this.opts.fallback;
     if (result.success || !fallback || fallback.models.length === 0) return result;
+    // A supervisor grace-kill (#257) is cleanup after the actor already yielded,
+    // not a capacity failure, and there is nothing left to retry: the kill
+    // aborted this run's signal, so every fallback attempt would return
+    // instantly killed and the ladder would end by replacing the termination
+    // diagnostic with a both-tiers-exhausted summary that never happened.
+    if (result.graceKilled) return result;
 
     if (!(await fallback.classify(result)).exhausted) return result;
 

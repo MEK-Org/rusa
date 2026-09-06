@@ -24,7 +24,8 @@ import type { GitHubPollingIssueClient, IssueClient } from "../gitops/issue-clie
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { stampAuthor } from "../mcp/stamp.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
-import type { ProviderModelConfig } from "../providers/model-config.js";
+import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
+import type { RunResult } from "../providers/types.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
 
 const worktreeMock = vi.hoisted(() => ({
@@ -937,6 +938,162 @@ describe("runStart webhook event routing (Phase 4)", () => {
       started: false,
     });
     expect(abandoned).toContainEqual({ actorId: "root", detail: "coalesced", started: true });
+  });
+
+  describe("supervisor cleanup after an accepted yield (#257)", () => {
+    /**
+     * Boot the production wiring with one rehydrated worker and hand back the
+     * hooks `runStart` actually built for it. The Actor's own classification is
+     * covered in actor.test.ts; what is asserted here is everything downstream
+     * of it — durable history, the `run_end` a dashboard reads, and the
+     * mechanical notice a parent receives.
+     */
+    const bootWithWorker = async (workerId: string): Promise<ActorMesh> => {
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          github: { account: "mock-bot" },
+          providers: { antigravity: { cliCommand: "agy" } },
+          rootActor: { provider: "antigravity", effort: "high" },
+          // No geminiApiKey: the failure route's exhaustion classifier then takes
+          // its deterministic offline branch, so this test never leaves the box.
+        }),
+        "utf8"
+      );
+      writeFileSync(
+        join(homeDir, "threads.json"),
+        JSON.stringify({
+          threads: [
+            legacyRootThread,
+            {
+              id: workerId,
+              charter: "yield cleanup worker",
+              parentId: "root",
+              status: "active",
+              createdAt: "2026-09-06T00:00:00.000Z",
+            },
+          ],
+        }),
+        "utf8"
+      );
+
+      let mesh: ActorMesh | undefined;
+      await new Promise<void>((resolve) => {
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              mesh = handles.mesh;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+      if (!mesh) throw new Error("mesh not ready");
+      return mesh;
+    };
+
+    type RunHooks = {
+      opts: {
+        onRunStart?: (
+          responsive: boolean,
+          injectRecord: undefined,
+          selected: RawProviderModelConfig
+        ) => void;
+        onRunEnd?: (result: RunResult) => Promise<void> | void;
+      };
+    };
+
+    const hooksFor = (mesh: ActorMesh, workerId: string): RunHooks["opts"] => {
+      const worker = mesh.get(workerId);
+      if (!worker) throw new Error("worker not rehydrated");
+      return (worker as unknown as RunHooks).opts;
+    };
+
+    const startRun = (opts: RunHooks["opts"]): void => {
+      opts.onRunStart?.(false, undefined, {
+        provider: "antigravity",
+        model: "Gemini 3.7 Flash (High)",
+        effort: "high",
+      });
+    };
+
+    const mechanicalNotes = (actorId: string): string[] =>
+      getRepositories()
+        .inbox.list(actorId, { status: "all" })
+        .entries.map((entry) => entry.payload?.note)
+        .filter((note): note is string => typeof note === "string");
+
+    it("preserves the accepted outcome through history, run_end and the parent's inbox", async () => {
+      const workerId = "grace-kill-worker";
+      const mesh = await bootWithWorker(workerId);
+      const opts = hooksFor(mesh, workerId);
+
+      startRun(opts);
+      mesh.declareYield(workerId, "complete", "branch pushed");
+      // The result the Actor produces for a grace-kill that followed an accepted
+      // yield: the yield's outcome, with the raw process exit kept as annotation.
+      await opts.onRunEnd?.({
+        success: true,
+        graceKilled: true,
+        cancelled: true,
+        exitCode: 143,
+        output: "agent transcript\n[Task killed by supervisor (yield grace period exceeded)]",
+        yieldStatus: "complete",
+        yieldNote: "branch pushed",
+      });
+
+      const [run] = getRepositories().actorRuns.listRecentCompleted(workerId, 5);
+      expect(run).toMatchObject({
+        outcome: "completed",
+        success: true,
+        exitCode: 143,
+        yieldStatus: "complete",
+        yieldNote: "branch pushed",
+      });
+      // Raw process exit diagnostics stay recoverable from the persisted run.
+      expect(run?.output).toContain("[Task killed by supervisor (yield grace period exceeded)]");
+
+      const [end] = getRepositories().meshEvents.listEventsByActors([workerId], {
+        limit: 20,
+        kinds: ["run_end"],
+      }).events;
+      expect(end?.success).toBe(true);
+      expect(end?.detail).toBe("exit 143");
+      expect(JSON.parse(end?.payload ?? "{}")).toMatchObject({
+        graceKilled: true,
+        yieldStatus: "complete",
+      });
+
+      // The parent hears the yield it accepted, and no failure.
+      const notes = mechanicalNotes("root");
+      expect(notes.some((note) => note.startsWith("[run failed]"))).toBe(false);
+    });
+
+    it("still forwards a genuine failure on the same wiring", async () => {
+      const workerId = "genuine-failure-worker";
+      const mesh = await bootWithWorker(workerId);
+      const opts = hooksFor(mesh, workerId);
+
+      startRun(opts);
+      await opts.onRunEnd?.({
+        success: false,
+        exitCode: 1,
+        output: "worktree checkout failed",
+      });
+
+      const [run] = getRepositories().actorRuns.listRecentCompleted(workerId, 5);
+      expect(run).toMatchObject({ outcome: "completed", success: false, exitCode: 1 });
+
+      const [end] = getRepositories().meshEvents.listEventsByActors([workerId], {
+        limit: 20,
+        kinds: ["run_end"],
+      }).events;
+      expect(end?.success).toBe(false);
+
+      const notes = mechanicalNotes("root");
+      expect(notes.some((note) => note.startsWith("[run failed]"))).toBe(true);
+    });
   });
 
   it("mounts a live calendar-read grant for root on the next run", async () => {

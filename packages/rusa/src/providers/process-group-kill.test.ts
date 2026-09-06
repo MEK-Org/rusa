@@ -24,6 +24,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ProviderConfig } from "../config/types.js";
 import { CopilotProvider } from "./copilot.js";
+import { YIELD_GRACE_ABORT_REASON } from "./termination-attribution.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -128,6 +129,46 @@ describe("CopilotProvider — transitive process-group kill (ISSUE_NUM leg 2)", 
     // THE ARBITER ASSERTION:
     // With detached:true + process.kill(-pid, SIGKILL): grandchild is dead → false
     // Without detached:true: ESRCH on kill, grandchild survives → true → RED
+    expect(isAlive(grandchildPid)).toBe(false);
+  });
+
+  // #257: the supervisor's post-yield grace kill takes this same path, so the
+  // descendants of a CLI that outlived its yield are reaped too — and the run
+  // comes back attributed as a cleanup termination rather than a bare SIGTERM.
+  it("reaps the grandchild and attributes the kill when the yield grace period is exceeded", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "mc-pgkill-yield-"));
+    temps.push(tmp);
+
+    const grandchildPidFile = join(tmp, "grandchild.pid");
+    const script = join(tmp, "fake-copilot.sh");
+
+    writeFileSync(
+      script,
+      [
+        "#!/bin/bash",
+        `( echo $BASHPID > ${grandchildPidFile}; exec sleep 300 ) &`,
+        "sleep 0.15",
+        // The CLI that has already yielded but will not exit on its own.
+        "exec sleep 300",
+      ].join("\n")
+    );
+    chmodSync(script, 0o755);
+
+    const provider = new CopilotProvider("copilot", { cliCommand: script });
+    const controller = new AbortController();
+    const runPromise = provider.run({ prompt: "test", cwd: tmp, signal: controller.signal });
+
+    const grandchildPid = await waitForPidFile(grandchildPidFile);
+    expect(isAlive(grandchildPid)).toBe(true);
+
+    controller.abort(YIELD_GRACE_ABORT_REASON);
+
+    const result = await runPromise;
+    expect(result.graceKilled).toBe(true);
+    expect(result.exitCode).toBe(143);
+    expect(result.output).toContain("[Task killed by supervisor (yield grace period exceeded)]");
+
+    await new Promise((r) => setTimeout(r, 150));
     expect(isAlive(grandchildPid)).toBe(false);
   });
 });
