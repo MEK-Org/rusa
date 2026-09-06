@@ -2,6 +2,7 @@ import type { ActorOptions } from "../../actor/actor.js";
 import type { ActorFactoryContext, ActorRuntimeState, MeshActor } from "../../actor/actor-mesh.js";
 import type { RunStartHandle } from "../../actor/concurrency-limiter.js";
 import type { RunNudge } from "../../actor/trigger-runner.js";
+import type { RunResult } from "../../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
 import type { ActorEvent, Bootstrap, LeaderCommand, RunSnapshot } from "./protocol.js";
 
@@ -13,6 +14,11 @@ export interface ActorHandleOptions {
   snapshot: () => RunSnapshot;
   saveSession: (sessionId: string) => void;
   onEvent?: (event: ActorEvent) => void;
+  /**
+   * Connection/startup failure notice. Purely informational — terminal run
+   * accounting is the handle's own job, so a listener here must not synthesize
+   * a run end of its own.
+   */
   onFailure: (error: Error) => void;
   actorOptions?: ActorOptions;
 }
@@ -28,6 +34,8 @@ export class ActorHandle implements MeshActor {
   private closed = false;
   private gates = new Map<number, { handle: RunStartHandle<void>; release: () => void }>();
   private startupTimer: ReturnType<typeof setTimeout>;
+  /** True between the leader admitting a run and that same run's terminal accounting. */
+  private runOpen = false;
 
   constructor(private readonly opts: ActorHandleOptions) {
     this.id = opts.bootstrap.id;
@@ -124,6 +132,32 @@ export class ActorHandle implements MeshActor {
     if (this.closed) return;
     this.close();
     this.opts.onFailure(error);
+    // A connection or startup failure is not itself a run outcome. Only a run
+    // the leader actually admitted is terminated here, so an idle disconnect or
+    // a boot timeout books nothing.
+    void this.endRun({ success: false, output: error.message, exitCode: -1 });
+  }
+
+  /**
+   * Close out the admitted run exactly once.
+   *
+   * Leader accounting opens a durable run on `runStart` and closes it against
+   * that run id; closing one that was never opened throws, and closing one twice
+   * double-counts. Failures arrive on their own schedule — before admission,
+   * while idle, or racing a completion already in flight — so the open-run flag,
+   * not the trigger, decides whether anything ends. The flag is cleared before
+   * awaiting so a disconnect landing mid-completion finds nothing left to end.
+   */
+  private async endRun(result: RunResult): Promise<void> {
+    if (!this.runOpen) return;
+    this.runOpen = false;
+    try {
+      await this.opts.context.onRunEnd(result);
+    } catch (error) {
+      this.opts.actorOptions?.log?.(
+        `[remote-instance] run accounting failed: ${error instanceof Error ? error.message : String(error)}\n`
+      );
+    }
   }
 
   private send(message: LeaderCommand): void {
@@ -153,16 +187,22 @@ export class ActorHandle implements MeshActor {
         ctx.onQueued(message);
         break;
       case "result":
-        await ctx.onRunEnd(message.result);
+        await this.endRun(message.result);
         break;
       case "runStart":
+        // Mark open only once the leader's own run-start accounting has taken:
+        // a throw here leaves no run to close.
         hooks?.onRunStart?.(message.responsive, message.injectRecord, message.selected);
+        this.runOpen = true;
         break;
       case "firstChunk":
         hooks?.onFirstChunk?.();
         break;
       case "abandoned":
+        // An abandoned run is already terminal on the leader side; it has no
+        // run end left to record.
         hooks?.onRunAbandoned?.(message.abandon);
+        if (message.abandon.started) this.runOpen = false;
         break;
       case "continue":
         hooks?.onContinue?.(message.count);
@@ -204,7 +244,7 @@ export class ActorHandle implements MeshActor {
               break;
             case "complete":
               this.opts.onEvent?.({ type: "result", result: request.result });
-              await ctx.onRunEnd(request.result);
+              await this.endRun(request.result);
               this.send({ type: "reply", requestId });
               break;
             case "sendMessage":

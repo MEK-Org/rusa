@@ -70,9 +70,11 @@ export function instanceWorkerFactory(
           );
         }
       },
+      // Report the connection failure only. `ActorHandle` decides whether an
+      // admitted run needs terminating; synthesizing one here would book a
+      // failed run for an actor that was merely idle when its follower dropped.
       onFailure: (error) => {
         options.log?.(`[remote-instance] ${error.message}\n`);
-        void options.onRunEnd?.({ success: false, output: error.message, exitCode: -1 });
       },
     });
     return runtime;

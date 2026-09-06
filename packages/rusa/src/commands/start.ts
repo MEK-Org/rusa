@@ -87,6 +87,7 @@ import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-thro
 import { resolveRootActorId } from "../actor/root-actor-id.js";
 import { RootControlService } from "../actor/root-control.js";
 import { buildRootPrompt } from "../actor/root-prompt.js";
+import { createRunAccounting } from "../actor/run-accounting.js";
 import {
   ensureWakeToken,
   wakePortPath,
@@ -900,41 +901,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     log.warn("unterminated_runs_recovered", { runs: recoveredOpenRuns });
   }
 
-  const activeRunIds = new Map<string, string>();
+  const runAccounting = createRunAccounting(() => getRepositories().actorRuns);
   const inboxFocusResolver = new InboxFocusResolver(
     getRepositories().inboxFocus,
     getRepositories().obligations,
     getRepositories().meshChat
   );
-  const beginActorRun = (actorId: string, providerName: string): string => {
-    if (activeRunIds.has(actorId)) {
-      throw new Error(`actor already has an active durable run: ${actorId}`);
-    }
-    const runId = getRepositories().actorRuns.start({ actorId, provider: providerName });
-    activeRunIds.set(actorId, runId);
-    return runId;
-  };
-  const completeActorRun = (actorId: string, result: RunResult): string => {
-    const runId = activeRunIds.get(actorId);
-    if (!runId) throw new Error(`actor has no active durable run: ${actorId}`);
-    getRepositories().actorRuns.complete(runId, {
-      success: result.success,
-      exitCode: result.exitCode,
-      output: result.output,
-      yieldStatus: result.yieldStatus,
-      yieldNote: result.yieldNote,
-      model: result.model,
-    });
-    activeRunIds.delete(actorId);
-    return runId;
-  };
-  const abandonActorRun = (actorId: string, reason: string): string | null => {
-    const runId = activeRunIds.get(actorId);
-    if (!runId) return null;
-    getRepositories().actorRuns.abandon(runId, reason);
-    activeRunIds.delete(actorId);
-    return runId;
-  };
+  const beginActorRun = runAccounting.begin;
+  const completeActorRun = runAccounting.complete;
+  const abandonActorRun = runAccounting.abandon;
 
   // Capture the disposable audit projection while this startup unquestionably
   // owns an open DB handle. Some boot paths cross asynchronous probes before
@@ -1686,7 +1661,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     scheduledMessages: osScheduler,
     withTransaction: (fn) => getDb().transaction(fn)(),
     recordRunYield: (actorId, status, note) => {
-      const runId = activeRunIds.get(actorId);
+      const runId = runAccounting.activeRunId(actorId);
       if (!runId) return null;
       getRepositories().actorRuns.recordYield(runId, status, note);
       return runId;
@@ -1926,7 +1901,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const inboxUrl = mcpHttp.addServer(`${id}:${INBOX_MCP_NAME}`, () =>
           createInboxMcpServer(inboxStore, id, {
             select: (entryIds, obligationId) => {
-              const runId = activeRunIds.get(id);
+              const runId = runAccounting.activeRunId(id);
               if (!runId) throw new Error(`actor has no active durable run: ${id}`);
               let focus: ResolvedInboxFocus | undefined;
               const entries = mesh.selectInboxEntries(id, entryIds, (selectedEntries) => {
@@ -2409,7 +2384,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const rootInboxUrl = mcpHttp.addServer(`${rootId}:${INBOX_MCP_NAME}`, () =>
     createInboxMcpServer(inboxStore, rootId, {
       select: (entryIds, obligationId) => {
-        const runId = activeRunIds.get(rootId);
+        const runId = runAccounting.activeRunId(rootId);
         if (!runId) throw new Error(`actor has no active durable run: ${rootId}`);
         let focus: ResolvedInboxFocus | undefined;
         const entries = mesh.selectInboxEntries(rootId, entryIds, (selectedEntries) => {
