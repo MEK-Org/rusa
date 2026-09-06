@@ -46,7 +46,6 @@ import {
 } from "../actor/handle-generator.js";
 import { handleHostJobExit } from "../actor/host-job-exit.js";
 import { ensureWakeOnExitScript } from "../actor/host-job-runner.js";
-import { FileHostJobStore } from "../actor/host-job-store.js";
 import { InboxFocusResolver, type ResolvedInboxFocus } from "../actor/inbox-focus.js";
 import type { InboxEntry, InboxStore } from "../actor/inbox-store.js";
 import {
@@ -114,6 +113,7 @@ import {
 } from "../db/legacy-actor-import.js";
 import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
+import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
 import type {
   PrerequisiteAttention,
   ReadyHeadChange,
@@ -1434,8 +1434,25 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     configuredRoots
   );
   // Host-plane host-jobs capability : durable per-actor job records, keyed
-  // the same way capabilityGrants/event source owners are.
-  const hostJobStore = new FileHostJobStore(join(mcHome, "host-jobs.json"));
+  // the same way capabilityGrants/event source owners are. Durable in SQLite;
+  // `host-jobs.json` is only a legacy source, imported once and then archived.
+  const legacyHostJobImport = importLegacyHostJobState({
+    mcHome,
+    db: database,
+    repositories: getRepositories(),
+  });
+  if (legacyHostJobImport.importedJobs > 0) {
+    log.info("legacy_host_jobs_imported", { jobs: legacyHostJobImport.importedJobs });
+  } else if (legacyHostJobImport.backupFiles.length > 0) {
+    // A source file still present after the receipt committed is stale by
+    // construction — a failed archive rename, or one restored by hand. It is
+    // archived unread rather than replayed, and saying so is what stops an
+    // operator concluding the file they put back took effect. `warn`, not
+    // `info`: nothing is broken, but a document someone placed there did not
+    // become state, and the backup path is where to find it.
+    log.warn("legacy_host_jobs_archived_unread", { backups: legacyHostJobImport.backupFiles });
+  }
+  const hostJobStore = getRepositories().hostJobs;
   const e2eInstance = new E2EInstanceManager({
     mcHome,
     workersDir,

@@ -95,6 +95,7 @@ describe("Database Migration System", () => {
       "0036_capability_grants",
       "0037_obligation_dependencies",
       "0038_event_sources",
+      "0040_host_jobs",
     ]);
 
     const meshEventsColumns = (

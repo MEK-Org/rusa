@@ -256,6 +256,78 @@ describe("db-check", () => {
     consoleError.mockRestore();
   });
 
+  it("plans the host-job import against actors the same run has only planned", () => {
+    writeFileSync(
+      join(home, "threads.json"),
+      JSON.stringify({
+        threads: [
+          {
+            id: "root",
+            charter: "root charter",
+            parentId: null,
+            status: "active",
+            createdAt: "2026-01-01T00:00:00Z",
+          },
+          {
+            id: "worker",
+            charter: "worker charter",
+            parentId: "root",
+            status: "active",
+            createdAt: "2026-01-01T00:00:01Z",
+          },
+        ],
+      })
+    );
+    const jobs = JSON.stringify({
+      jobs: [
+        {
+          id: "job-1",
+          actorId: "worker",
+          unitName: "job-worker-12345678",
+          scriptLabel: "echo hi",
+          manifest: { readPaths: [] },
+          auditArtifactPath: "/tmp/audit/job-1.json",
+          auditArtifactSha256: "a".repeat(64),
+          runtimeMaxSec: 3600,
+          submittedAt: "2026-01-02T00:00:00.000Z",
+        },
+      ],
+    });
+    writeFileSync(join(home, "host-jobs.json"), jobs);
+
+    const result = runDbCheckAgainstHome(home);
+
+    expect(result.plannedActors).toBe(2);
+    expect(result.plannedHostJobs).toBe(1);
+
+    // Plan mode never archives the source or writes durable job rows.
+    expect(readFileSync(join(home, "host-jobs.json"), "utf8")).toBe(jobs);
+    const db = new Database(join(home, "data", "mesh.db"));
+    expect(new Repositories(db).hostJobs.list()).toEqual([]);
+    db.close();
+  });
+
+  it("reports no planned host jobs on a fresh home and creates no host-jobs file", () => {
+    const result = runDbCheckAgainstHome(home);
+
+    expect(result.plannedHostJobs).toBe(0);
+    expect(existsSync(join(home, "host-jobs.json"))).toBe(false);
+  });
+
+  it("exits non-zero when the legacy host-job file holds unresolved rows", () => {
+    writeFileSync(
+      join(home, "host-jobs.json"),
+      JSON.stringify({ jobs: [{ id: "job-1", actorId: "worker" }] })
+    );
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    runDbCheck({ home });
+
+    expect(process.exit).toHaveBeenCalledWith(1);
+    expect(consoleError).toHaveBeenCalledWith(expect.stringContaining("unresolved row(s)"));
+    consoleError.mockRestore();
+  });
+
   it("exits non-zero with the actionable underlying failure on invalid legacy state", () => {
     writeFileSync(
       join(home, "threads.json"),
@@ -294,6 +366,7 @@ describe("db-check", () => {
 
     expect(process.exit).not.toHaveBeenCalled();
     expect(consoleLog).toHaveBeenCalledWith(expect.stringContaining("0 event source ownership(s)"));
+    expect(consoleLog).toHaveBeenCalledWith(expect.stringContaining("0 host job(s)"));
     expect(consoleLog).toHaveBeenCalledWith("✓ db-check passed");
     consoleLog.mockRestore();
   });

@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import { resolveHome } from "../config/index.js";
 import { planLegacyActorImport } from "../db/legacy-actor-import.js";
 import { planLegacyEventSubscriptionImport } from "../db/legacy-event-subscription-import.js";
+import { planLegacyHostJobImport } from "../db/legacy-host-job-import.js";
 import { pendingMigrationIds, runMigrations } from "../db/migrations/runner.js";
 import { Repositories } from "../db/repositories/index.js";
 import { widenToWal } from "../db/wal.js";
@@ -13,6 +14,7 @@ export interface DbCheckResult {
   plannedActors: number;
   plannedScheduledMessages: number;
   plannedEventSourceOwnerships: number;
+  plannedHostJobs: number;
 }
 
 /** Resolve symlinks when the path exists on disk; otherwise just normalize it. */
@@ -84,11 +86,20 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
       pendingActorIds: pendingActors.map((actor) => actor.id),
     });
 
+    // Same pending-actor treatment as the subscription plan: a job's owning
+    // actor may still be planned rather than committed on this un-mutated copy.
+    const hostJobPlan = planLegacyHostJobImport({
+      mcHome: home,
+      repositories,
+      pendingActorIds: pendingActors.map((actor) => actor.id),
+    });
+
     return {
       pendingMigrationIds: pending,
       plannedActors: plan.plannedActors,
       plannedScheduledMessages: plan.plannedScheduledMessages,
       plannedEventSourceOwnerships: subscriptionPlan.plannedSubscriptions,
+      plannedHostJobs: hostJobPlan.plannedJobs,
     };
   } finally {
     db.close();
@@ -107,7 +118,8 @@ export function runDbCheck(opts: { home: string }): void {
     console.log(
       `Legacy import plan: ${result.plannedActors} actor(s), ` +
         `${result.plannedScheduledMessages} scheduled message(s), ` +
-        `${result.plannedEventSourceOwnerships} event source ownership(s)`
+        `${result.plannedEventSourceOwnerships} event source ownership(s), ` +
+        `${result.plannedHostJobs} host job(s)`
     );
     console.log("✓ db-check passed");
   } catch (err) {
