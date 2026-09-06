@@ -86,7 +86,7 @@ import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-thro
 import { resolveRootActorId } from "../actor/root-actor-id.js";
 import { RootControlService } from "../actor/root-control.js";
 import { buildRootPrompt } from "../actor/root-prompt.js";
-import { createRunAccounting } from "../actor/run-accounting.js";
+import { createRunAccounting, type RunAccounting } from "../actor/run-accounting.js";
 import {
   ensureWakeToken,
   wakePortPath,
@@ -120,7 +120,9 @@ import {
 import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
 import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
+import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import type {
+  ObligationRepository,
   PrerequisiteAttention,
   ReadyHeadChange,
 } from "../db/repositories/obligation-repository.js";
@@ -176,7 +178,7 @@ import {
   UNDERSTANDING_READ_MCP_NAME,
 } from "../mcp/understanding-mcp.js";
 import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "../mcp/update-mcp.js";
-import { isTerminalObligationStatus } from "../obligations/obligation.js";
+import { isTerminalObligationStatus, type Obligation } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { composeActorOutputSinks } from "../observability/actor-output-sink.js";
 import { DiskUsageAlert } from "../observability/disk-alert.js";
@@ -549,6 +551,31 @@ export function shouldBindDashboardServer(params: {
   return !params.noDashboardServer && (!params.e2eMode || params.e2eDashboard);
 }
 
+/**
+ * The dashboard's "current work" projection: the durable inbox focus selected by
+ * this actor's *active* run.
+ *
+ * It reads through the run ledger deliberately. A focus outlives the run that
+ * selected it, so resolving by actor alone would show a finished run's selected
+ * work as if it were current, and would attribute it to whatever run is queued
+ * next. The ledger is the only thing that knows which run is open right now, so
+ * an actor with no open run has no current work — not a stale one.
+ */
+export function createSelectedObligationForActor(
+  runAccounting: Pick<RunAccounting, "activeRunId">,
+  repos: () => {
+    actorRuns: Pick<ActorRunRepository, "activeFocusPrimaryObligationId">;
+    obligations: Pick<ObligationRepository, "get">;
+  }
+): (actorId: string) => Obligation | null {
+  return (actorId) => {
+    const runId = runAccounting.activeRunId(actorId);
+    if (!runId) return null;
+    const obligationId = repos().actorRuns.activeFocusPrimaryObligationId(runId);
+    return obligationId ? repos().obligations.get(obligationId) : null;
+  };
+}
+
 export function isLegacyWorktreeKey(key: string): boolean {
   return /^wt-\d+$/.test(key);
 }
@@ -910,6 +937,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     getRepositories().inboxFocus,
     getRepositories().obligations,
     getRepositories().meshChat
+  );
+  const selectedObligationForActor = createSelectedObligationForActor(
+    runAccounting,
+    getRepositories
   );
   const beginActorRun = runAccounting.begin;
   const completeActorRun = runAccounting.complete;
@@ -3145,14 +3176,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               }))
             ),
           // Current work is the durable inbox focus for this actor's active
-          // run. It deliberately reads through the run id map: a completed
-          // focus is history, not the next queued run's selected work.
-          selectedObligationForActor: (actorId) => {
-            const runId = activeRunIds.get(actorId);
-            if (!runId) return null;
-            const obligationId = getRepositories().actorRuns.activeFocusPrimaryObligationId(runId);
-            return obligationId ? getRepositories().obligations.get(obligationId) : null;
-          },
+          // run, resolved through the same run ledger the leader books runs in.
+          selectedObligationForActor,
           rootControl,
           // The configured root identity  — display handle + avatar
           // override — so the dashboard shows this instance's own identity
