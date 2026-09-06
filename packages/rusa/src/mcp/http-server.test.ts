@@ -370,6 +370,62 @@ describe("McpHttpServer", () => {
     expect(records).not.toContain("worker-two");
   });
 
+  it("keeps a request's original server instance id across removal and remount", async () => {
+    const factory = () => createTrackerMcpServer("test", fakeIssueClient().client);
+    const url = http.addServer("swap-actor:inbox", factory);
+    const originalInstanceId = requestLogs.find(
+      ({ event, fields }) => event === "mcp_server_added" && fields?.server === "inbox"
+    )?.fields?.serverInstanceId;
+    expect(originalInstanceId).toMatch(/^[0-9a-f-]{36}$/);
+
+    const transport = new StreamableHTTPClientTransport(new URL(url));
+    const client = new Client({ name: "test", version: "0.0.0" });
+    await client.connect(transport);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // The long-lived GET stream is still dispatched when the mount goes away.
+    const dispatched = requestLogs.find(
+      ({ event, fields }) =>
+        event === "mcp_transport_dispatch" &&
+        fields?.httpMethod === "GET" &&
+        fields?.server === "inbox"
+    );
+    expect(dispatched?.fields?.serverInstanceId).toBe(originalInstanceId);
+
+    // Removing the mount closes its sessions; remounting the same name mints a
+    // fresh instance id, so records that resolve the mount lazily would report
+    // the replacement (or nothing) for work the original mount served.
+    await http.removeServer("swap-actor:inbox");
+    http.addServer("swap-actor:inbox", factory);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const remountedInstanceId = requestLogs
+      .filter(({ event, fields }) => event === "mcp_server_added" && fields?.server === "inbox")
+      .at(-1)?.fields?.serverInstanceId;
+    expect(remountedInstanceId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(remountedInstanceId).not.toBe(originalInstanceId);
+
+    // Whichever way the stream terminated, its record belongs to the mount that
+    // served it.
+    const streamEnded = requestLogs.filter(
+      ({ event, fields }) =>
+        (event === "mcp_http_response_finished" ||
+          event === "mcp_http_response_closed" ||
+          event === "mcp_transport_returned") &&
+        fields?.requestId === dispatched?.fields?.requestId
+    );
+    expect(streamEnded.length).toBeGreaterThan(0);
+    for (const { fields } of streamEnded) {
+      expect(fields?.serverInstanceId).toBe(originalInstanceId);
+    }
+    const sessionClosed = requestLogs.find(
+      ({ event, fields }) => event === "mcp_session_closed" && fields?.server === "inbox"
+    );
+    expect(sessionClosed?.fields?.serverInstanceId).toBe(originalInstanceId);
+
+    await client.close();
+    await http.removeServer("swap-actor:inbox");
+    expect(JSON.stringify(requestLogs)).not.toContain("swap-actor");
+  });
+
   it("records a delayed handler's premature HTTP close separately from transport return", async () => {
     let handlerStarted!: () => void;
     let releaseHandler!: () => void;

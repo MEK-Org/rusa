@@ -205,7 +205,9 @@ The MCP HTTP host uses the `mcp-http` component for request-path diagnostics.
 `mcp_server_added` and `mcp_server_removed` carry a safe service label plus an
 opaque `serverInstanceId`. The instance id changes when a mount is removed and
 added again, so two actor-mounted `inbox` services can be told apart without
-recording actor ids or capability URL tokens.
+recording actor ids or capability URL tokens. A request snapshots these fields at
+arrival, so its later records — including a session close that outlives the mount
+— still name the instance that served it rather than a replacement mount.
 
 Each request event carries one generated `requestId`, the safe server fields, a
 bounded `sessionId`, `sessionResolved`, and `elapsedMs`. `sessionResolved` is

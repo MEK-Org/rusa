@@ -384,6 +384,11 @@ export class McpHttpServer {
     const sessionStarts = this.sessionStartedAt.get(name) as Map<string, number>;
     const requestStartedAt = performance.now();
     const requestId = randomUUID();
+    // Snapshot the mount identity once, at arrival. Every later record for this
+    // request — including the session-close closure, which can outlive the mount —
+    // reuses it, so a removeServer (or remove + re-add under the same name) still
+    // correlates back to the instance that actually served the request.
+    const serverFields = this.serverFields(name);
     // Routing must use the complete header. Its separately bounded form is for
     // diagnostics only: trimming before Map#get changes which session receives
     // a request.
@@ -397,7 +402,7 @@ export class McpHttpServer {
     let responseFinished = false;
     const requestFields = () => ({
       requestId,
-      ...this.serverFields(name),
+      ...serverFields,
       sessionId: loggedSessionId,
       sessionResolved: sessionResolvedAtArrival,
       ...metadata,
@@ -479,7 +484,7 @@ export class McpHttpServer {
             sessionStarts.delete(sid);
             if (startedAt !== undefined) {
               this.log.info("mcp_session_closed", {
-                ...this.serverFields(name),
+                ...serverFields,
                 sessionId: boundedMetadata(sid),
                 elapsedMs: elapsedMs(startedAt),
               });
