@@ -3620,6 +3620,139 @@ describe("ActorMesh", () => {
   // actor's next dispatch (before run_start / provider launch), not at the
   // end of the run it happens to land in.
   describe("setActorModel dispatch-time boundary (#199, extended to pools)", () => {
+    it("requotes a queued portable actor against its final replacement pool without stale launches", async () => {
+      const launches: string[] = [];
+      const completed: string[] = [];
+      const pacers = new Map<string, ProviderPacer>();
+      const pacerFor = (provider: string): ProviderPacer => {
+        let pacer = pacers.get(provider);
+        if (!pacer) {
+          pacer = new ProviderPacer(0);
+          pacers.set(provider, pacer);
+        }
+        return pacer;
+      };
+      // The original lane is deliberately unavailable for a minute. A re-pin
+      // must cancel this reservation instead of waiting to discover it stale.
+      pacerFor("delayed-old").deferUntil(Date.now() + 60_000);
+      pacerFor("replacement-delayed-first").deferUntil(Date.now() + 20_000);
+      pacerFor("replacement-delayed-second").deferUntil(Date.now() + 30_000);
+
+      let mesh!: ActorMesh;
+      const configured = setup({
+        onModelSet: (actorId, modelConfig) => mesh.get(actorId)?.setModelConfig?.(modelConfig),
+        providerGate: (fn, candidates, request) =>
+          submitPoolGate(
+            fn,
+            candidates.map((candidate) => ({
+              config: candidate,
+              lane: candidate.provider,
+              pacer: pacerFor(candidate.provider),
+            })),
+            {
+              responsive: request.responsive,
+              threadId: request.threadId,
+              enqueueNormal: request.enqueueNormal,
+              onSelected: request.onSelected
+                ? (selection) =>
+                    request.onSelected?.({
+                      provider: selection.candidate.provider,
+                      lane: selection.lane,
+                      model: selection.candidate.model ?? "",
+                      effort: selection.candidate.effort,
+                      declaredIndex: selection.declaredIndex,
+                      eligibleAt: selection.eligibleAt,
+                      responsive: selection.responsive,
+                    })
+                : undefined,
+            }
+          ),
+        createActor: (ctx) => {
+          let actor!: Actor;
+          actor = new Actor({
+            id: ctx.record.id,
+            cwd: `/tmp/${ctx.record.id}`,
+            modelConfig: ctx.record.modelConfig ?? [{ provider: "delayed-old", model: "old" }],
+            resolveProvider: (selected) => ({
+              name: selected.provider,
+              providerName: selected.provider,
+              run: async () => {
+                launches.push(selected.provider);
+                actor.declareYield();
+                return { success: true, exitCode: 0, output: selected.provider };
+              },
+            }),
+            mcpServers: [],
+            loadSessionId: () => undefined,
+            saveSessionId: () => {},
+            buildPrompt: () => ({ prompt: "work" }),
+            gate: ctx.gate,
+            beforeRun: ctx.beforeRun,
+            onQueued: ctx.onQueued,
+            onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+            onRunEnd: async (result) => {
+              completed.push(result.output);
+              ctx.onRunEnd(result);
+            },
+            onRuntimeStateChanged: ctx.onRuntimeStateChanged,
+            debounceMs: DEBOUNCE,
+          });
+          return actor;
+        },
+      });
+      mesh = configured.mesh;
+      const { registry, tick } = configured;
+      const worker = mesh.spawn({
+        charter: "worker",
+        parentId: "root",
+        modelConfig: { provider: "delayed-old", model: "old" },
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      mesh.sendMessage(worker, "work", "root");
+      await tick();
+      expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+      expect(mesh.getSelection(worker)?.provider).toBe("delayed-old");
+
+      // Every replacement candidate can still be delayed. Re-admission must
+      // retain that eligibility, choose the earlier quote, and never inherit
+      // the removed delayed-old reservation.
+      mesh.setActorModel(
+        worker,
+        [
+          { provider: "replacement-delayed-first", model: "first" },
+          { provider: "replacement-delayed-second", model: "second" },
+        ],
+        "root"
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(launches).toEqual([]);
+      expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+      expect(mesh.getSelection(worker)?.provider).toBe("replacement-delayed-first");
+
+      // Re-pinning the still-queued work again must replace its reservation,
+      // not queue a second run. Its first healthy declared candidate receives
+      // the one resulting dispatch.
+      mesh.setActorModel(
+        worker,
+        [
+          { provider: "available-final", model: "final" },
+          { provider: "available-backup", model: "backup" },
+        ],
+        "root"
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(launches).toEqual(["available-final"]);
+      expect(completed).toEqual(["available-final"]);
+      expect(registry.get(worker)?.modelConfig).toEqual([
+        { provider: "available-final", model: "final" },
+        { provider: "available-backup", model: "backup" },
+      ]);
+      expect(mesh.getSelection(worker)).toBeUndefined();
+      expect(mesh.activeRunState(worker)).toBeNull();
+    });
+
     it("applies a pool staged while idle to the very next run, before that run's provider launch", async () => {
       const events: MeshEventInput[] = [];
       const seenModelAtRunStart: string[] = [];

@@ -319,6 +319,8 @@ export class Actor {
   private queued = false;
   /** Actor-level dirty state retained when /halt cancels a queued provider start. */
   private cancelledQueuedRun = false;
+  /** A model re-quote has cancelled its old reservation and is awaiting its one dirty-bit replay. */
+  private reschedulingQueuedRun = false;
   private preemptedQueuedRun = false;
   /**
    * Set within a run at the moment it commits to reporting its result through
@@ -456,9 +458,39 @@ export class Actor {
 
   /** Cancel a provider start that is still queued, retaining one dirty flag. */
   cancelQueuedRun(): boolean {
+    // A re-quote has already cancelled the provider reservation but has not
+    // unwound into its fresh admission yet. A halt in that window must claim
+    // the queued work and clear the dirty replay, otherwise the fresh
+    // beforeRun would skip it without leaving anything for /resume to replay.
+    if (this.reschedulingQueuedRun) {
+      this.reschedulingQueuedRun = false;
+      this.runner.cancelPending();
+      this.cancelledQueuedRun = true;
+      return true;
+    }
     if (!this.pendingStart?.cancel?.()) return false;
     this.cancelledQueuedRun = true;
     this.opts.onQueuedRunCancelled?.();
+    return true;
+  }
+
+  /**
+   * Replace a not-yet-started reservation after its next-run configuration
+   * changes. The runner is already single-flight, so request the replacement
+   * through its dirty bit: the cancelled opportunity unwinds first, then one
+   * fresh admission re-quotes the current candidate pool. Unlike a halt
+   * cancellation, this work is immediately eligible to run and must not wait
+   * for `resumeCancelledRun()`.
+   */
+  rescheduleQueuedRun(): boolean {
+    // Repeated model updates before the cancelled start unwinds share the
+    // already-recorded dirty replay; its beforeRun reads the final replacement
+    // pool, so another cancellation would only create duplicate bookkeeping.
+    if (this.reschedulingQueuedRun) return true;
+    if (!this.pendingStart?.cancel?.()) return false;
+    this.reschedulingQueuedRun = true;
+    this.opts.onQueuedRunCancelled?.();
+    this.runner.requestRun();
     return true;
   }
 
@@ -628,6 +660,7 @@ export class Actor {
       this.currentRunStartTime = null;
       this.queued = false;
       this.executing = false;
+      this.reschedulingQueuedRun = false;
       this.publishRuntimeStateIfChanged();
       // Close the opportunity this `finally` just opened flags for. It lives here,
       // beside the flag clears, for the same reason they do: `executeTurn` has
