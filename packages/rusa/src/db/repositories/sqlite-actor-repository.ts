@@ -284,7 +284,10 @@ export class SqliteActorRepository implements ActorRepository {
         lastHumanMessageByRecipient.set(message.recipient_id, { session_id: message.session_id });
       }
     }
-    return rows.map((row) => this.fromRow(row, lastHumanMessageByRecipient.get(row.id)));
+    // `null` means this actor was resolved by the batch and has no matching
+    // human message. `undefined` remains reserved for callers such as `get()`
+    // and `children()`, which did not run the batch and must resolve one row.
+    return rows.map((row) => this.fromRow(row, lastHumanMessageByRecipient.get(row.id) ?? null));
   }
 
   children(parentId: string): ActorRecord[] {
@@ -308,17 +311,18 @@ export class SqliteActorRepository implements ActorRepository {
     }
   }
 
-  private fromRow(row: ActorRow, listedLastHumanMessage?: LastHumanMessage): ActorRecord {
+  private fromRow(row: ActorRow, listedLastHumanMessage?: LastHumanMessage | null): ActorRecord {
     const handles = this.db
       .prepare("SELECT target_id, role FROM actor_handles WHERE actor_id = ? ORDER BY target_id")
       .all(row.id) as Array<{ target_id: string; role: string | null }>;
     const lastHumanMessage =
-      listedLastHumanMessage ??
-      (this.db
-        .prepare(
-          "SELECT session_id FROM mesh_chat WHERE recipient_id = ? AND sender_id = ? ORDER BY ts DESC, id DESC LIMIT 1"
-        )
-        .get(row.id, HUMAN_OPERATOR) as LastHumanMessage | undefined);
+      listedLastHumanMessage === undefined
+        ? (this.db
+            .prepare(
+              "SELECT session_id FROM mesh_chat WHERE recipient_id = ? AND sender_id = ? ORDER BY ts DESC, id DESC LIMIT 1"
+            )
+            .get(row.id, HUMAN_OPERATOR) as LastHumanMessage | undefined)
+        : listedLastHumanMessage;
     return {
       id: row.id,
       charter: row.charter,

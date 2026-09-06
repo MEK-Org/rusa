@@ -22,19 +22,20 @@ actor count, materialized human-row count, and median for the retired per-actor
 query, the batched correction, and the hypothetical recipient index. Timings are
 local-machine observations, not an SLO.
 
-The reported command on this disposable fixture produced a median 6,567.8 ms
-per-actor sweep, 27.1 ms batched sweep, and 28.7 ms indexed per-actor sweep.
-The literal zero-human stress command below produced 7,041.0 ms, 5.8 ms, and
-31.6 ms respectively. The batched query retains the same newest `(ts, id)` row
-for each recipient while avoiding the actor-by-chat scan. Its trade-off is that
-it materializes every historical `human:operator` row: 20,000 rows per sweep in
-the default fixture, versus no rows in the zero-human case. Recipient/history
-skew and a production data distribution still need measurement before a new
-index is proposed.
+The latest local run of the default fixture produced median 7,516.1 ms
+per-actor, 41.2 ms batched, and 31.4 ms indexed sweeps. The literal zero-human
+stress command below produced 7,832.4 ms, 12.3 ms, and 35.7 ms respectively.
+These are individual local-machine observations, not stable product timings.
+The batched query retains the same newest `(ts, id)` row for each recipient
+while avoiding the actor-by-chat scan. Its trade-off is that it materializes
+every historical `human:operator` row: 20,000 rows per sweep in the default
+fixture, versus no rows in the zero-human case. Recipient/history skew and a
+production data distribution still need measurement before a new index is
+proposed.
 
 To exercise the real in-process `/api/mesh/threads` handler, its JSON
-serialization, and the `SqliteActorRepository` correction against the same
-disposable 1,000-actor/100,000-row fixture, run:
+serialization, and the `SqliteActorRepository` correction against disposable
+1,000-actor/100,000-row default and zero-human fixtures, run:
 
 ```sh
 RUSA_BENCH_274=1 pnpm --filter rusa exec vitest run src/dashboard/actor-load.benchmark.test.ts
@@ -43,8 +44,10 @@ RUSA_BENCH_274=1 pnpm --filter rusa exec vitest run src/dashboard/actor-load.ben
 That harness intentionally has no TCP listener, network shaping, browser, or
 Flutter runtime. It records handler wall time and uncompressed response bytes;
 it cannot measure transfer, mobile CPU, decoding/state work, or hierarchy
-rendering. The reported run took 91.8 ms median across three route-handler
-samples and produced a 580,851-byte JSON response.
+rendering. Its latest run measured a 65.9 ms median across three default
+route-handler samples and 25.3 ms across three zero-human samples; both
+responses were 580,851 uncompressed bytes. These are isolated request-path
+observations, not mobile timings or an SLO.
 
 The default is deliberately uniform: every actor has 100 inbound rows, 20 from
 `human:operator`. That prevents missing-human rows from accidentally measuring a

@@ -49,7 +49,11 @@ function median(values: number[]): number {
   return sorted[Math.floor(sorted.length / 2)];
 }
 
-function seed(db: Database.Database, actors: SqliteActorRepository): void {
+function seed(
+  db: Database.Database,
+  actors: SqliteActorRepository,
+  humanMessagesPerActor: number
+): void {
   for (let actor = 0; actor < ACTORS; actor++) {
     const record: ActorRecord = {
       id: `actor-${actor}`,
@@ -72,7 +76,7 @@ function seed(db: Database.Database, actors: SqliteActorRepository): void {
         insert.run(
           `chat-${ordinal}`,
           new Date(ordinal * 1000).toISOString(),
-          message < HUMAN_MESSAGES_PER_ACTOR ? "human:operator" : `peer-${message % 10}`,
+          message < humanMessagesPerActor ? "human:operator" : `peer-${message % 10}`,
           `actor-${actor}`,
           "synthetic",
           `session-${ordinal}`
@@ -103,38 +107,43 @@ async function requestThreads(
 describe.skipIf(process.env.RUSA_BENCH_274 !== "1")(
   "#274 disposable /api/mesh/threads benchmark",
   () => {
-    it("measures the actual route handler with the batched repository lookup", async () => {
+    async function measureRoute(humanMessagesPerActor: number) {
       const db = new Database(":memory:");
-      runMigrations(db);
-      const actorRepository = new SqliteActorRepository(db);
-      seed(db, actorRepository);
-      const deps: DashboardDataDeps = {
-        actors: actorRepository,
-        meshEvents: new MeshEventRepository(db),
-        meshChat: new MeshChatRepository(db),
-        sseHub: new SseHub(new MeshEventEmitter()),
-      };
-
-      const batched = [];
-      for (let sweep = 0; sweep < SWEEPS; sweep++) batched.push(await requestThreads(deps));
-
-      console.log(
-        JSON.stringify({
+      try {
+        runMigrations(db);
+        const actorRepository = new SqliteActorRepository(db);
+        seed(db, actorRepository, humanMessagesPerActor);
+        const deps: DashboardDataDeps = {
+          actors: actorRepository,
+          meshEvents: new MeshEventRepository(db),
+          meshChat: new MeshChatRepository(db),
+          sseHub: new SseHub(new MeshEventEmitter()),
+        };
+        const samples = [];
+        for (let sweep = 0; sweep < SWEEPS; sweep++) samples.push(await requestThreads(deps));
+        return {
           dataset: {
             actorCount: ACTORS,
             messagesPerActor: MESSAGES_PER_ACTOR,
-            humanMessagesPerActor: HUMAN_MESSAGES_PER_ACTOR,
+            humanMessagesPerActor,
             totalRows: ACTORS * MESSAGES_PER_ACTOR,
             sweeps: SWEEPS,
           },
           batched: {
-            milliseconds: batched.map((sample) => sample.milliseconds),
-            medianMilliseconds: median(batched.map((sample) => sample.milliseconds)),
-            responseBytes: batched[0]?.bytes,
+            milliseconds: samples.map((sample) => sample.milliseconds),
+            medianMilliseconds: median(samples.map((sample) => sample.milliseconds)),
+            responseBytes: samples[0]?.bytes,
           },
-        })
-      );
-      db.close();
+        };
+      } finally {
+        db.close();
+      }
+    }
+
+    it("measures the actual route handler with default and zero-human fixtures", async () => {
+      const defaultFixture = await measureRoute(HUMAN_MESSAGES_PER_ACTOR);
+      const zeroHumanFixture = await measureRoute(0);
+      console.log(JSON.stringify({ cases: [defaultFixture, zeroHumanFixture] }));
     });
   }
 );
