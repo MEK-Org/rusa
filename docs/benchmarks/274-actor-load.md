@@ -68,3 +68,71 @@ a much larger historical volume of operator messages increases the correction's
 materialized result and client-independent server memory. Any index or pagination
 change should be justified by a benchmark with observed volume/skew rather than
 inferred from this synthetic sweep.
+
+## Client-source CPU fixture
+
+`packages/rusa/flutter_dashboard/tool/bench_274_actor_load.dart` is a second,
+separate disposable fixture. It imports the dashboard's real
+`ThreadsSnapshot.fromJson`, `DashboardStore.refreshThreads`, and
+`DashboardStore.flattenedVisible` code, but supplies a synthetic snapshot and
+a no-op stream. It neither opens a listener nor reads a mesh database.
+
+Run it from the dashboard directory with the Dart binary bundled with the
+already-installed Flutter SDK (using that binary directly avoids the Flutter
+wrapper updating a shared SDK cache):
+
+```sh
+cd packages/rusa/flutter_dashboard
+/path/to/flutter/bin/cache/dart-sdk/bin/dart format --output=none --set-exit-if-changed tool/bench_274_actor_load.dart
+/path/to/flutter/bin/cache/dart-sdk/bin/dart run tool/bench_274_actor_load.dart
+```
+
+The source fixture is exactly 1,000 actors: one root and 999 direct children.
+Its JSON is 438,640 UTF-8 bytes and it reports seven sweeps each for parse,
+state replacement, two `flattenedVisible` calls, and the visible-row
+child-presence scan used by `ActorTree`. These are local CPU timings; they do
+not include HTTP, compression, transfer, a device CPU, widget layout, or
+rasterization.
+
+The 438,640-byte client fixture is intentionally not the 580,851-byte route
+fixture above. The client fixture directly constructs the DTO input needed for
+the parser/store/tree measurement, including its varied synthetic previews. The
+route harness instead serializes the actual route's full server DTO shape,
+including generated handles and fields that serialize as `null` or empty
+collections, from a separate concise-charter database seed. The two byte counts
+therefore describe different payloads; do not combine their timings or treat
+either as a production transfer measurement.
+
+## Optional browser diagnostic
+
+`packages/rusa/scripts/bench-274-browser-load.mjs` is opt-in and has no
+production code path. In a browser-capable environment, it serves an existing
+release web build and a synthetic `/api/mesh/threads` response on loopback,
+then uses Playwright at a 390×844 CSS-pixel touch viewport. It applies 4×
+DevTools CPU emulation and explicitly paces only its synthetic gzip response
+at 1.6 Mbps after a 150 ms response-start delay. `RENDER_WAIT_MILLISECONDS`
+and `PAGE_LOAD_TIMEOUT_MILLISECONDS` bound each stage; `SWEEPS` is explicit.
+
+```sh
+cd packages/rusa/flutter_dashboard
+flutter build web --release --web-renderer canvaskit
+cd ../../..
+NODE_PATH=/path/to/global/node_modules ACTORS=1000 SWEEPS=1 \
+  RENDER_WAIT_MILLISECONDS=30000 PAGE_LOAD_TIMEOUT_MILLISECONDS=30000 \
+  node packages/rusa/scripts/bench-274-browser-load.mjs
+```
+
+It first accepts an empty snapshot to warm the Flutter engine, then uses an SSE
+runtime-state delta to request the large synthetic snapshot. The report contains
+the synthetic JSON/gzip bytes, per-sample status, resource timing, and the
+reported WebGL renderer. Two animation frames after response end are only a
+browser-visible paint opportunity, not an internal Flutter parse/state/render
+span.
+
+On the measurement environment for this change, headless Chrome reported
+`ANGLE ... SwiftShader ...` and a 100-actor, one-sweep run timed out at the
+`initial-empty-snapshot` stage after the configured 15 seconds. It therefore
+produced no `/api/mesh/threads` response timing. That is a software-renderer
+environment limitation, not a phone-latency observation. Run this diagnostic
+only where a hardware/browser setup can complete the warm-up; until then the
+source CPU fixture above is the only successful client-side measurement.
