@@ -5,11 +5,14 @@ import { defineConfig } from "tsup";
 // atomic swap on a green build. Unset (CI/dev) → the normal `dist`.
 const outDir = process.env.RUSA_DIST_DIR ?? "dist";
 
+// The experimental follower is deliberately absent: `build:follower`
+// (tsup.follower.config.ts) is its authoritative build, and nothing in the
+// leader runtime execs that entrypoint, so the shipped distribution has no
+// reason to carry it.
 export default defineConfig({
   entry: {
     cli: "src/cli.ts",
     "commands/e2e.cli": "src/commands/e2e.cli.ts",
-    "commands/follower": "src/experimental/remote-instances/follower.ts",
   },
   format: ["esm"],
   target: "node20",
