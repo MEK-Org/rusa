@@ -4,10 +4,11 @@
  * Node validates argv synchronously: `child_process.spawn` throws
  * `ERR_INVALID_ARG_VALUE` ("must be a string without null bytes") before any
  * child exists, so one literal NUL anywhere in the assembled prompt kills the
- * run before the CLI starts. That is reachable through ordinary context — an
- * actor discussing or repairing a file that holds a stray NUL byte puts the byte
- * straight into its next prompt — so the text is repaired at the point it enters
- * argv rather than letting a normal run die at the launch (#206).
+ * run before the CLI starts. That is not hypothetical: a worker run was observed
+ * dying exactly this way, the rejected argv element carrying assembled charter
+ * text. Where the byte came from upstream was never established, so the repair
+ * is placed at the point assembled text enters argv — the boundary that is known
+ * to be crossed — rather than at a guessed source (#206).
  *
  * ONLY assembled text goes through here. Everything else a provider puts in
  * argv is a configured value or a host path — the CLI's own executable, and
