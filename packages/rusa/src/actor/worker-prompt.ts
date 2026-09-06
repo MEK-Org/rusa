@@ -1,3 +1,4 @@
+import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { ActorHandle } from "./actor-record.js";
 import { generateHandle } from "./handle-generator.js";
 
@@ -284,15 +285,29 @@ function renderAddressBook(ctx: WorkerPromptContext): string {
  * in the mesh wrote a given post. Parameterized by handle since each actor signs
  * with its own.
  */
-export function signatureDiscipline(handle: string): string {
+export function signatureDiscipline(handle: string, selected?: RawProviderModelConfig): string {
+  const model = selected?.model;
+  const signature = model
+    ? selected?.effort
+      ? `${handle} (${model}, ${selected.effort})`
+      : `${handle} (${model})`
+    : handle;
+  const attribution = model
+    ? selected?.effort
+      ? `This run launched as **${model}** at **${selected.effort}** effort.`
+      : `This run launched as **${model}** with no explicit effort.`
+    : "No model was resolved for this run; do not invent a model or effort value.";
   return `## Sign your GitHub posts
 
 You have a distinct identity in the mesh; your handle — your calling card — is
 **${handle}**. Whenever you write on GitHub — a comment on an issue or PR, **or
-the description (body) of a PR you open** — make the **last line** just your
-handle in italics, with nothing after it:
+the description (body) of a PR you open** — make the **last visible line** your
+italic signature, with nothing after it. Include the actual model that launched
+this run, and include effort only when it is explicit; omit the provider.
 
-*${handle}*
+${attribution}
+
+*${signature}*
 
 GitHub comments and PR descriptions only — not chat, not mesh messages to other
 actors, not code or commit messages.`;
@@ -358,7 +373,8 @@ export function buildWorkerPrompt(
    * part of the prompt, ahead of the volatile reason injection. Undefined for
    * normal (session-backed) actors, which changes nothing.
    */
-  priorContext?: string
+  priorContext?: string,
+  selected?: RawProviderModelConfig
 ): string {
   const shortId = ctx.threadId.slice(0, 8);
   const mountNotice = ctx.understandingMountEnabled
@@ -396,7 +412,7 @@ ${WRITING_FOR_AGENTS_DISCIPLINE}
 
 ${EXTERNAL_CONDUCT_POLICY}
 
-${signatureDiscipline(generateHandle(ctx.threadId))}${workingDir}
+${signatureDiscipline(generateHandle(ctx.threadId), selected)}${workingDir}
 
 ---
 ## Your charter

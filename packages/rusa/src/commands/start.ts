@@ -2112,7 +2112,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             if (actors.get(id)?.context?.type === "portable") return;
             actors.patch(id, { sessionId: sid });
           },
-          buildPrompt: () => {
+          buildPrompt: (selected) => {
             const r = actors.get(id);
             if (!r) return { prompt: "No active thread record." };
             const handles = resolveHandleLabels(r.handles, (hid) => actors.get(hid)?.charter);
@@ -2133,7 +2133,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                   handles,
                   understandingMountEnabled,
                 },
-                injection?.priorContext
+                injection?.priorContext,
+                selected
               ),
               injectRecord: injection?.injectRecord,
             };
@@ -2645,7 +2646,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         if (actors.get(rootId)?.context?.type === "portable") return;
         actors.patch(rootId, { sessionId: id });
       },
-      buildPrompt: () => {
+      buildPrompt: (selected) => {
         const record = actors.get(rootId);
         if (!record) return { prompt: "No active root thread record." };
         const injection = assembleConfiguredPortableInjection(
@@ -2654,7 +2655,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           portableContextStore
         );
         return {
-          prompt: buildRootPrompt(config.rootActor?.charter, rootHandle, injection?.priorContext),
+          prompt: buildRootPrompt(
+            config.rootActor?.charter,
+            rootHandle,
+            injection?.priorContext,
+            selected
+          ),
           injectRecord: injection?.injectRecord,
         };
       },
