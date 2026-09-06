@@ -467,6 +467,10 @@ export class Actor {
     if (this.reschedulingQueuedRun) {
       this.cancelledQueuedNudge = this.runner.currentNudgeSnapshot();
       this.reschedulingQueuedRun = false;
+      // A re-admission can be paused in beforeRun after the old reservation
+      // has unwound. Invalidate that admission too, so its eventual preflight
+      // result cannot proceed after this halt has parked the opportunity.
+      this.admissionEpoch++;
       this.runner.cancelPending();
       this.cancelledQueuedRun = true;
       return true;
@@ -632,6 +636,15 @@ export class Actor {
     }
     const epoch = this.admissionEpoch;
     if (this.opts.beforeRun && !(await this.opts.beforeRun({ mode: nudge.mode ?? "ordinary" }))) {
+      // The replacement admission has reached its preflight after the old
+      // reservation unwound. A halt/shutdown that closes this gate must retain
+      // the same work for resume; otherwise its runner dirty bit would be
+      // consumed as a dropped wake with no cancelled-run record.
+      if (this.reschedulingQueuedRun) {
+        this.reschedulingQueuedRun = false;
+        this.cancelledQueuedNudge = this.runner.currentNudgeSnapshot();
+        this.cancelledQueuedRun = true;
+      }
       this.lastRunSkipped = true;
       return;
     }
@@ -640,6 +653,9 @@ export class Actor {
       this.lastRunSkipped = true;
       return;
     }
+    // The re-admission has passed its only preflight boundary. From this
+    // point a normal queued-start cancellation owns the fresh reservation.
+    this.reschedulingQueuedRun = false;
     this.lastRunSkipped = false;
     // A yield only counts for the run it was declared in; clear any prior flag.
     this.yielded = false;
@@ -672,7 +688,6 @@ export class Actor {
       this.currentRunStartTime = null;
       this.queued = false;
       this.executing = false;
-      this.reschedulingQueuedRun = false;
       this.publishRuntimeStateIfChanged();
       // Close the opportunity this `finally` just opened flags for. It lives here,
       // beside the flag clears, for the same reason they do: `executeTurn` has

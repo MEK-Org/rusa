@@ -462,6 +462,73 @@ describe("Actor", () => {
     await flush();
   });
 
+  it("parks a requeue when halt arrives during its preflight, then resumes it once", async () => {
+    let actor!: Actor;
+    let preflightCalls = 0;
+    let releaseReplacementPreflight!: (allowed: boolean) => void;
+    let firstGateReject!: (reason: unknown) => void;
+    let gateCalls = 0;
+    const provider = new FakeProvider(() => {
+      actor.declareYield();
+      return {};
+    });
+    actor = makeActor(
+      {
+        beforeRun: () => {
+          preflightCalls++;
+          if (preflightCalls !== 2) return true;
+          return new Promise<boolean>((resolve) => {
+            releaseReplacementPreflight = resolve;
+          });
+        },
+        gate: <T>(
+          fn: (selected: RawProviderModelConfig) => Promise<T>,
+          candidates: readonly RawProviderModelConfig[]
+        ): RunStartHandle<T> | Promise<T> => {
+          gateCalls++;
+          const candidate = candidates[0];
+          if (!candidate) throw new Error("test gate expected a model candidate");
+          if (gateCalls !== 1) return Promise.resolve().then(() => fn(candidate));
+          return {
+            started: false,
+            promote: () => {},
+            cancel: () => {
+              firstGateReject(new RunStartCancelledError());
+              return true;
+            },
+            result: new Promise<T>((_resolve, reject) => {
+              firstGateReject = reject;
+            }),
+          };
+        },
+      },
+      provider
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(gateCalls).toBe(1);
+
+    // The old queued reservation has already rejected and its one requeue is
+    // now paused in the replacement preflight — the race a provider halt can
+    // otherwise use to consume the dirty bit without leaving a resume record.
+    expect(actor.rescheduleQueuedRun()).toBe(true);
+    await flush();
+    expect(preflightCalls).toBe(2);
+    expect(actor.cancelQueuedRun()).toBe(true);
+
+    releaseReplacementPreflight(true);
+    await flush();
+    expect(gateCalls).toBe(1);
+    expect(provider.calls).toHaveLength(0);
+
+    expect(actor.resumeCancelledRun()).toBe(true);
+    await vi.advanceTimersByTimeAsync(10);
+    await flush();
+    expect(gateCalls).toBe(2);
+    expect(provider.calls).toHaveLength(1);
+  });
+
   it("replaces a queued normal run with one responsive opportunity", async () => {
     const limiter = new ConcurrencyLimiter(1);
     let releaseBlocker!: () => void;
