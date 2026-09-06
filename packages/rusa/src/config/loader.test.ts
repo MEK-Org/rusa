@@ -1258,13 +1258,13 @@ describe("loadConfig modelClasses", () => {
   it("rejects a class entry missing a provider", () => {
     expect(() =>
       loadConfig(writeConfig({ modelClasses: { fast: [{ model: "gpt-5.6-sol" }] } }))
-    ).toThrow(/modelClasses\."fast" entry 1 must declare a provider/);
+    ).toThrow(/modelClasses\."fast": modelConfig entry is missing a provider/);
   });
 
   it("rejects a class entry missing a model — no silent provider default", () => {
     expect(() =>
       loadConfig(writeConfig({ modelClasses: { fast: [{ provider: "codex" }] } }))
-    ).toThrow(/modelClasses\."fast" entry 1 must declare a model/);
+    ).toThrow(/modelClasses\."fast": modelConfig entry for provider "codex" is missing a model/);
   });
 
   it("rejects a nested class reference inside a class definition", () => {
@@ -1277,7 +1277,46 @@ describe("loadConfig modelClasses", () => {
           },
         })
       )
-    ).toThrow(/modelClasses\."outer" entry 1 must declare a provider/);
+    ).toThrow(/modelClasses\."outer" entry 1 must not be a model class reference/);
+  });
+
+  it("rejects a class name with leading or trailing whitespace, which no reference could match", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({ modelClasses: { " review ": [{ provider: "codex", model: "gpt-5.6-sol" }] } })
+      )
+    ).toThrow(/modelClasses class name " review " must not have leading or trailing whitespace/);
+  });
+
+  it("rejects a class that exceeds the shared pool size bound at load, not at first use", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          providers: { codex: { cliCommand: "codex" } },
+          modelClasses: {
+            wide: Array.from({ length: 9 }, (_, i) => ({
+              provider: "codex",
+              model: `gpt-5.6-sol-${i}`,
+            })),
+          },
+        })
+      )
+    ).toThrow(/modelClasses\."wide": modelConfig may declare at most 8 entries/);
+  });
+
+  it("rejects a class with duplicate normalized entries at load, not at first use", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          modelClasses: {
+            dupe: [
+              { provider: "codex", model: "gpt-5.6-sol" },
+              { provider: "codex", model: "gpt-5.6-sol" },
+            ],
+          },
+        })
+      )
+    ).toThrow(/modelClasses\."dupe": modelConfig has a duplicate entry/);
   });
 
   it("rejects a class entry naming an unconfigured provider", () => {

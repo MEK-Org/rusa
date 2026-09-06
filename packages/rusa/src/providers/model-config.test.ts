@@ -1,13 +1,14 @@
 import { describe, expect, it } from "vitest";
-import type { ModelClassEntryConfig, RusaConfig } from "../config/types.js";
+import type { RusaConfig } from "../config/types.js";
 import {
   MAX_MODEL_CONFIG_POOL_SIZE,
   type ModelConfigInput,
+  type ProviderModelConfig,
   resolveModelClasses,
   validateModelConfigPool,
 } from "./model-config.js";
 
-function configWith(modelClasses?: Record<string, ModelClassEntryConfig[]>): RusaConfig {
+function configWith(modelClasses?: Record<string, ProviderModelConfig[]>): RusaConfig {
   return {
     providers: {
       antigravity: { cliCommand: "agy" },

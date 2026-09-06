@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { assertSpawnContextSupported, resolveContextConfig } from "../actor/context-selection.js";
+import { isModelClassReference, validateModelConfigPool } from "../providers/model-config.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import { providerCapabilityName, validateProviderSelection } from "../providers/registry.js";
 import {
@@ -16,7 +17,6 @@ import {
 import {
   DEFAULT_DEPLOY_BRANCH,
   type GitHubOrgConfig,
-  type ModelClassEntryConfig,
   type QuotaThrottleConfig,
   type RusaConfig,
 } from "./types.js";
@@ -90,12 +90,15 @@ function validateQuotaThrottle(quotaThrottle: QuotaThrottleConfig | undefined): 
 }
 
 /**
- * Structural + config-aware validation for named model classes. A class is an
- * explicit selection, so every entry must name a configured provider and a
- * model — the same contract spawn enforces — and an empty class is rejected
- * rather than read as "no preference". Entries are normalized through
- * {@link validateProviderSelection} here, at load, so a typo fails at boot
- * instead of at the first spawn that references the class.
+ * Structural validation for named model classes, plus a full pass through
+ * {@link validateModelConfigPool} — the same boundary a runtime selection goes
+ * through. A class is just a named pool, so it inherits that contract exactly
+ * (configured provider, required model, valid effort, no duplicates, bounded
+ * size) instead of a parallel copy that could drift. Running it here, at load,
+ * means a typo fails at boot rather than at the first spawn that names the
+ * class. Only the rules the pool validator cannot express — the mapping shape,
+ * an empty class, a nested class reference, a padded class name — are checked
+ * locally.
  */
 function validateModelClasses(parsed: RusaConfig): void {
   const modelClasses = parsed.modelClasses;
@@ -107,43 +110,48 @@ function validateModelClasses(parsed: RusaConfig): void {
     if (!name.trim()) {
       throw new Error("config.yaml: modelClasses class names must be non-empty");
     }
+    // A reference is matched against its trimmed name, so a padded key would be
+    // a class nothing can ever select. Reject it rather than canonicalizing
+    // silently: two keys that differ only by padding would then collide.
+    if (name !== name.trim()) {
+      throw new Error(
+        `config.yaml: modelClasses class name "${name}" must not have leading or trailing whitespace — a class reference is matched against the trimmed name`
+      );
+    }
     if (!Array.isArray(entries) || entries.length === 0) {
       throw new Error(
         `config.yaml: modelClasses."${name}" must be a non-empty list of provider/model entries`
       );
     }
-    modelClasses[name] = entries.map((entry, index) => {
+    entries.forEach((entry, index) => {
       const position = index + 1;
       if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
         throw new Error(
           `config.yaml: modelClasses."${name}" entry ${position} must be a provider/model mapping`
         );
       }
-      const raw = entry as Partial<ModelClassEntryConfig>;
-      const provider = raw.provider?.trim();
-      if (!provider) {
+      // A class already names a pool; nesting one inside another would make
+      // resolution recursive for no gain. The pool validator below can't say
+      // this, because by its types the input is already concrete.
+      if (isModelClassReference(entry)) {
         throw new Error(
-          `config.yaml: modelClasses."${name}" entry ${position} must declare a provider`
+          `config.yaml: modelClasses."${name}" entry ${position} must not be a model class reference — classes cannot nest`
         );
       }
-      // Required, exactly as at spawn: omitting it would silently select the
-      // provider's own default model behind the class name.
-      const model = raw.model?.trim();
-      if (!model) {
-        throw new Error(
-          `config.yaml: modelClasses."${name}" entry ${position} must declare a model`
-        );
-      }
-      let selection: ReturnType<typeof validateProviderSelection>;
-      try {
-        selection = validateProviderSelection(parsed, provider, model, raw.effort);
-      } catch (err) {
-        throw new Error(
-          `config.yaml: modelClasses."${name}" entry ${position}: ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
-      return { provider, model: selection.model ?? model, effort: selection.effort };
     });
+    // Validate the class through the very same boundary a runtime selection
+    // goes through, so size, duplicate, provider/model/effort and
+    // required-model rules cannot drift between "declared in config" and
+    // "requested at spawn". `portable: true` because at load there is no actor
+    // to judge portability against — the portable rule is enforced where it is
+    // decidable, when a class is actually selected for an actor.
+    try {
+      modelClasses[name] = validateModelConfigPool(parsed, entries, { portable: true });
+    } catch (err) {
+      throw new Error(
+        `config.yaml: modelClasses."${name}": ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
   }
 }
 

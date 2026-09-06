@@ -29,6 +29,16 @@ const providerModelConfigSchema = z.object({
     .describe(
       "Optional provider-native reasoning level (for example 'high' or 'xhigh'). Omit to preserve the provider/model default."
     ),
+  // `class` is banned here, not merely unexpected. z.object is non-strict and
+  // strips unknown keys, and a union takes the first arm that parses, so
+  // without this a mixed `{ class, provider }` would parse as this arm with
+  // `class` silently dropped — accepted as a plain tuple, the class ignored.
+  // Making the key impossible forces such input onto the strict class arm,
+  // which rejects it for the sibling field.
+  class: z
+    .never()
+    .optional()
+    .describe("Not allowed here: a model class reference must be the whole model_config value."),
 });
 
 /**
@@ -53,9 +63,9 @@ const modelClassReferenceSchema = z.strictObject({
  * candidates.
  */
 const modelConfigSchema = z.union([
+  modelClassReferenceSchema,
   providerModelConfigSchema,
   z.array(providerModelConfigSchema).min(1),
-  modelClassReferenceSchema,
 ]);
 
 /**

@@ -4,10 +4,23 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it, vi } from "vitest";
 import { Actor } from "../actor/actor.js";
-import { ActorMesh, type MeshObligationPort } from "../actor/actor-mesh.js";
+import {
+  ActorMesh,
+  type ActorMeshOptions,
+  type MeshObligationPort,
+  type SpawnRequest,
+} from "../actor/actor-mesh.js";
+import type { ActorRecord } from "../actor/actor-record.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
+import type { RusaConfig } from "../config/types.js";
 import { FakeProvider } from "../providers/fake-provider.js";
+import {
+  fillModelConfigFromCurrent,
+  type ModelConfigInput,
+  resolveModelClasses,
+  validateModelConfigPool,
+} from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { createAgentExecMcpServer } from "./agent-exec-mcp.js";
@@ -64,6 +77,8 @@ function setup(
     maxConcurrent?: number;
     scheduledMessages?: ScheduledMessageScheduler;
     obligations?: MeshObligationPort;
+    validateSpawn?: ActorMeshOptions["validateSpawn"];
+    validateModel?: ActorMeshOptions["validateModel"];
   } = {}
 ) {
   const registry = new InMemoryActorRepository();
@@ -77,6 +92,8 @@ function setup(
   let seq = 0;
   const mesh = new ActorMesh({
     actors: registry,
+    validateSpawn: opts.validateSpawn,
+    validateModel: opts.validateModel,
     maxConcurrent: opts.maxConcurrent,
     scheduledMessages: opts.scheduledMessages,
     obligations: opts.obligations,
@@ -1612,6 +1629,135 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     })) as CallToolResult;
     expect(res.isError).toBe(true);
     expect((res.content[0] as { text: string }).text).toMatch(/invalid cron/);
+  });
+
+  // The production wiring (commands/start.ts): named classes resolve at the
+  // boundary, and set_actor_model fills an omitted model from the actor's
+  // current pool before validating. Both MCP model-class tests below run
+  // against this, so a class reference that leaks through the schema is
+  // exercised on the same path an operator would hit.
+  const CONFIG_WITH_CLASSES = {
+    providers: {
+      claude: { cliCommand: "claude" },
+      codex: { cliCommand: "codex" },
+      kimi: { cliCommand: "kimi" },
+    },
+    modelClasses: {
+      review: [{ provider: "claude", model: "claude-opus-4-8", effort: "max" }],
+    },
+  } as unknown as RusaConfig;
+
+  const productionHooks = () => ({
+    validateSpawn: (req: SpawnRequest) =>
+      validateModelConfigPool(
+        CONFIG_WITH_CLASSES,
+        resolveModelClasses(CONFIG_WITH_CLASSES, req.modelConfig),
+        { portable: req.context?.type === "portable" }
+      ),
+    validateModel: (record: ActorRecord, modelConfig: ModelConfigInput) =>
+      validateModelConfigPool(
+        CONFIG_WITH_CLASSES,
+        fillModelConfigFromCurrent(
+          resolveModelClasses(CONFIG_WITH_CLASSES, modelConfig),
+          record.modelConfig
+        ),
+        { portable: record.context?.type === "portable" }
+      ),
+  });
+
+  it("spawn_thread expands a model class reference into its configured pool", async () => {
+    const { mesh, registry } = setup(productionHooks());
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+    const res = (await client.callTool({
+      name: "spawn_thread",
+      arguments: { charter: "review the PR", model_config: { class: "review" } },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    const id = (dataOf(res) as { thread_id: string }).thread_id;
+    expect(registry.get(id)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8", effort: "max" },
+    ]);
+  });
+
+  it("spawn_thread refuses a class reference carrying a sibling tuple field", async () => {
+    const { mesh, registry } = setup(productionHooks());
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+    // Both shapes must fail at the schema: `class` may not be silently dropped
+    // so the request degrades into a concrete tuple on the named provider.
+    for (const model_config of [
+      { class: "review", provider: "codex" },
+      { class: "review", provider: "codex", model: "gpt-5.6-sol" },
+    ]) {
+      const res = (await client.callTool({
+        name: "spawn_thread",
+        arguments: { charter: "review the PR", model_config },
+      })) as CallToolResult;
+      expect(res.isError).toBe(true);
+    }
+    expect(registry.list().filter((r) => r.id !== "root")).toEqual([]);
+  });
+
+  it("spawn_thread refuses a class reference nested inside a pool", async () => {
+    const { mesh, registry } = setup(productionHooks());
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+    const res = (await client.callTool({
+      name: "spawn_thread",
+      arguments: {
+        charter: "review the PR",
+        model_config: [{ provider: "codex", model: "gpt-5.6-sol" }, { class: "review" }],
+        context_mode: "ledger",
+      },
+    })) as CallToolResult;
+
+    expect(res.isError).toBe(true);
+    expect(registry.list().filter((r) => r.id !== "root")).toEqual([]);
+  });
+
+  it("set_actor_model refuses a class reference carrying a sibling provider, rather than filling it from the current pool", async () => {
+    const { mesh, registry } = setup(productionHooks());
+    const childId = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      modelConfig: { provider: "codex", model: "gpt-5.6-sol" },
+    });
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+    // The dangerous case: with `class` stripped, `{provider: "codex"}` would be
+    // completed from the actor's current codex entry and quietly succeed as a
+    // partial concrete update instead of resolving the named class.
+    const res = (await client.callTool({
+      name: "set_actor_model",
+      arguments: { actor_id: childId, model_config: { class: "review", provider: "codex" } },
+    })) as CallToolResult;
+
+    expect(res.isError).toBe(true);
+    expect(registry.get(childId)?.desiredModelConfig).toBeUndefined();
+    expect(registry.get(childId)?.modelConfig).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol" },
+    ]);
+  });
+
+  it("set_actor_model still fills an omitted model from the current pool for a concrete partial update", async () => {
+    const { mesh, registry } = setup(productionHooks());
+    registry.patch("root", {
+      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
+      context: { type: "portable", mode: "ledger" },
+    });
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+    const res = (await client.callTool({
+      name: "set_actor_model",
+      arguments: { actor_id: "root", model_config: { provider: "codex", effort: "xhigh" } },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    expect(registry.get("root")?.desiredModelConfig).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol", effort: "xhigh" },
+    ]);
   });
 
   it("set_actor_model stages a full modelConfig replacement via MCP tool", async () => {

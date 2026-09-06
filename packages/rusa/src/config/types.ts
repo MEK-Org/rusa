@@ -3,6 +3,7 @@
  */
 
 import type { ContextConfig } from "../actor/actor-record.js";
+import type { ProviderModelConfig } from "../providers/model-config.js";
 
 export const DEFAULT_DEPLOY_BRANCH = "master";
 export type SandboxMode = "container-boundary" | "bwrap";
@@ -358,18 +359,6 @@ export interface VoiceConfig {
   voiceName?: string;
 }
 
-/**
- * One provider/model/effort entry inside a named model class. Structurally the
- * same tuple {@link RusaConfig.rootActor} declares, and validated the same way
- * at load: `model` is required here because a class is an explicit, named
- * selection — it must never resolve to a provider's own default.
- */
-export interface ModelClassEntryConfig {
-  provider: string;
-  model: string;
-  effort?: string;
-}
-
 export interface RusaConfig {
   /** Optional named config profile. "quickstart" enables the local quick-start profile. */
   profile?: string;
@@ -413,8 +402,16 @@ export interface RusaConfig {
    * tuple. Optional and never implicit — a caller that omits `model_config`
    * still gets no default, and editing a class here does not retro-apply to
    * actors that already resolved it.
+   *
+   * Entries are the same {@link ProviderModelConfig} tuple a resolved pool is
+   * made of, deliberately shared rather than redeclared: a class is just a
+   * named pool, and config loading validates it through the very same
+   * `validateModelConfigPool` the runtime uses, so the two cannot drift as pool
+   * fields evolve. `model` is required for the same reason it is required at
+   * spawn — a class is an explicit, named selection and must never resolve to a
+   * provider's own default.
    */
-  modelClasses?: Record<string, ModelClassEntryConfig[]>;
+  modelClasses?: Record<string, ProviderModelConfig[]>;
   /** Mesh safety/throughput controls (concurrency cap, provider rate limit). */
   mesh?: MeshConfig;
   /** Worker isolation mode. Defaults to "bwrap". */

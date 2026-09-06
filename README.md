@@ -195,7 +195,9 @@ Both `spawn_thread` and `set_actor_model` accept it. The rules:
   spawn uses, so a typo fails at startup rather than at the first spawn.
 - **A class reference is the whole value**, not one entry inside a pool, and it
   cannot nest inside another class. `{"class": "fast"}` is valid;
-  `[{"class": "fast"}, {...}]` is rejected.
+  `[{"class": "fast"}, {...}]` and `{"class": "fast", "provider": "codex"}` are
+  both rejected at the tool boundary — a mixed shape is a mistake, never a
+  tuple with the class quietly ignored.
 - **A reference still isn't a default.** Omitting `model_config` remains an
   error, an unknown class name is an error, and an empty class definition is
   rejected at config load — nothing silently falls back to a provider default.
