@@ -67,24 +67,28 @@ afterEach(() => {
 });
 
 /**
- * A fake provider CLI that records the argv it was handed and exits 0. Written
- * as `/bin/sh` exec'ing this run's own node binary, so the shebang stays short
- * and the interpreter is guaranteed to exist wherever the suite runs.
+ * Separates the recorded arguments below: ASCII RS, which no prompt carries,
+ * unlike the newlines an assembled charter is full of.
+ */
+const ARGV_RECORD_SEPARATOR = "\u001e";
+
+/**
+ * A fake provider CLI that records the argv it was handed and exits 0. Plain
+ * `/bin/sh`, no interpreter to boot: five of these run per suite pass, and the
+ * only thing they have to do is echo their arguments back byte for byte.
  */
 function fakeCliRecordingArgv(): { command: string; readArgv: () => string[]; cwd: string } {
   const dir = mkdtempSync(join(tmpdir(), "rusa-launch-argv-"));
   temps.push(dir);
-  const dumpPath = join(dir, "argv.json");
+  const dumpPath = join(dir, "argv.txt");
   const command = join(dir, "fake-cli.sh");
   writeFileSync(
     command,
     [
       "#!/bin/sh",
-      // `--` matters: without it node claims a leading provider flag such as
-      // claude's `-p` as one of its own options and exits before running.
-      `exec ${JSON.stringify(process.execPath)} -e ${JSON.stringify(
-        `require("node:fs").writeFileSync(${JSON.stringify(dumpPath)}, JSON.stringify(process.argv.slice(1)))`
-      )} -- "$@"`,
+      // Octal in the format string, since only the format is escape-processed —
+      // an argument is written through %s exactly as it arrived.
+      `for a in "$@"; do printf '%s\\036' "$a"; done > ${JSON.stringify(dumpPath)}`,
       "",
     ].join("\n")
   );
@@ -92,7 +96,9 @@ function fakeCliRecordingArgv(): { command: string; readArgv: () => string[]; cw
   return {
     command,
     cwd: dir,
-    readArgv: () => JSON.parse(readFileSync(dumpPath, "utf8")) as string[],
+    // Every record is terminated rather than separated, so the split leaves one
+    // trailing empty entry to drop.
+    readArgv: () => readFileSync(dumpPath, "utf8").split(ARGV_RECORD_SEPARATOR).slice(0, -1),
   };
 }
 
