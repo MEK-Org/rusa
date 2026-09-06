@@ -28,20 +28,6 @@ export interface RawProviderModelConfig {
 export type ModelConfigInput = RawProviderModelConfig | RawProviderModelConfig[];
 
 /**
- * Standing default coder pool used by `spawn_thread` when the caller omits
- * `model_config` — earliest-available order. See MEK-Org/rusa#169. A pool of
- * this length requires a portable actor (`context_mode: "ledger" | "tail"`);
- * an omitted `model_config` on a native spawn still fails
- * {@link validateModelConfigPool}'s portable-only check, same as an explicit
- * multi-entry pool would.
- */
-export const DEFAULT_CODER_POOL: readonly ProviderModelConfig[] = [
-  { provider: "claude", model: "claude-opus-5" },
-  { provider: "kimi", model: "kimi-for-coding" },
-  { provider: "codex", model: "gpt-5.6-sol", effort: "high" },
-];
-
-/**
  * Bounds a modelConfig pool so a misconfigured actor can't fan a single spawn
  * out across an unbounded number of provider lanes.
  */
