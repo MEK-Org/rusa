@@ -77,6 +77,9 @@ function safeEqual(a: string, b: string): boolean {
 /** Wake bodies are tiny (actorId + reason); cap to bound a runaway/malicious body. */
 const MAX_WAKE_BODY_BYTES = 8 * 1024;
 const MAX_SCHEDULED_MESSAGE_BODY_BYTES = 256 * 1024;
+// Keep loopback MCP connections alive longer than the coding client's pooled idle window (MEK-Org/rusa#294).
+const MCP_KEEP_ALIVE_TIMEOUT_MS = 120_000;
+const MCP_HEADERS_TIMEOUT_MS = 121_000;
 
 function readTextBody(req: IncomingMessage, maxBytes = MAX_WAKE_BODY_BYTES): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -216,6 +219,9 @@ export class McpHttpServer {
     const server = createServer((req, res) => {
       void this.handle(req, res);
     });
+    server.keepAliveTimeout = MCP_KEEP_ALIVE_TIMEOUT_MS;
+    // Keep the headers timeout slightly above the chosen keep-alive timeout.
+    server.headersTimeout = MCP_HEADERS_TIMEOUT_MS;
     this.server = server;
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);

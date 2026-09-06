@@ -1,3 +1,5 @@
+import { Agent, request } from "node:http";
+import type { Socket } from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -76,6 +78,21 @@ function fakeIssueClient(): { client: IssueClient; labels: string[] } {
 function textOf(result: CallToolResult): string {
   const first = result.content[0];
   return first && first.type === "text" ? first.text : "";
+}
+
+function getWithAgent(url: string, agent: Agent): Promise<Socket> {
+  return new Promise((resolve, reject) => {
+    const req = request(url, { agent }, (res) => {
+      const socket = res.socket;
+      res.resume();
+      res.once("end", () => {
+        if (socket) resolve(socket);
+        else reject(new Error("response did not have a socket"));
+      });
+    });
+    req.once("error", reject);
+    req.end();
+  });
 }
 
 describe("McpHttpServer", () => {
@@ -183,6 +200,25 @@ describe("McpHttpServer", () => {
     });
     expect(resp.status).toBe(404);
   });
+
+  it("keeps an idle MCP HTTP connection beyond Node's former five-second default and closes it", async () => {
+    const agent = new Agent({ keepAlive: true });
+    try {
+      const url = http.urls()[0].url;
+      const firstSocket = await getWithAgent(url, agent);
+
+      await new Promise((resolve) => setTimeout(resolve, 5_100));
+
+      const secondSocket = await getWithAgent(url, agent);
+      expect(secondSocket).toBe(firstSocket);
+
+      const closed = new Promise<void>((resolve) => firstSocket.once("close", () => resolve()));
+      await http.close();
+      await closed;
+    } finally {
+      agent.destroy();
+    }
+  }, 15_000);
 
   it("hosts a server added after start, then stops routing once removed", async () => {
     const url = http.addServer("tracker2", () =>
