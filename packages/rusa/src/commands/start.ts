@@ -2636,13 +2636,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       fallback: fallbackModels
         ? {
             models: fallbackModels,
-            resolveProvider: (model) =>
-              resolveProvider(
-                config,
-                config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER,
-                model,
-                config.rootActor?.effort
-              ),
+            resolveProvider: (selected) =>
+              resolveProvider(config, selected.provider, selected.model, selected.effort),
             classify: classifyExhaustion,
           }
         : undefined,

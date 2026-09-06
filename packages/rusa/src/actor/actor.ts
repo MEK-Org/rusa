@@ -109,7 +109,8 @@ export interface ActorOptions {
   /** Optional model fallback for provider capacity/quota exhaustion. */
   fallback?: {
     models: string[];
-    resolveProvider: (model: string) => CodingProvider;
+    /** Resolve the exact model/effort tuple a fallback attempt will launch. */
+    resolveProvider: (selected: RawProviderModelConfig) => CodingProvider;
     classify: ExhaustionClassifier;
   };
   /** Debounce window for coalescing wake bursts (default: TriggerRunner default). */
@@ -741,9 +742,9 @@ export class Actor {
     // Assigned inside the try below (buildPrompt sits within the terminal-failure
     // boundary), then read by this closure when the gated invoke actually runs.
     let built: PromptBuild;
-    const runProvider = (provider: CodingProvider): Promise<RunResult> =>
+    const runProvider = (provider: CodingProvider, prompt: string): Promise<RunResult> =>
       provider.run({
-        prompt: built.prompt,
+        prompt,
         cwd: this.opts.cwd,
         // Continue this actor's own session (id undefined on first run → created).
         session: { id: sessionId },
@@ -806,7 +807,21 @@ export class Actor {
       // same run's outcome twice, here it is claiming a start nobody saw.)
       this.runStartReported = true;
       startWatchdogTimers();
-      return this.runWithFallback(this.opts.resolveProvider(selected), runProvider);
+      return this.runWithFallback(
+        this.opts.resolveProvider(selected),
+        selected,
+        (provider, attempt) =>
+          runProvider(
+            provider,
+            // A fallback is a new provider attempt. Rebuild its ordinary prompt
+            // from the tuple we will give its provider so public GitHub writing
+            // names that actual attempt, while keeping the run's single
+            // admission/start record and its primary inject record unchanged.
+            isCorrectiveRun || attempt === selected
+              ? built.prompt
+              : this.opts.buildPrompt(attempt).prompt
+          )
+      );
     };
 
     // The post-run hook is the single choke point for failure forwarding, so it
@@ -959,9 +974,10 @@ export class Actor {
 
   private async runWithFallback(
     primary: CodingProvider,
-    runProvider: (provider: CodingProvider) => Promise<RunResult>
+    primarySelection: RawProviderModelConfig,
+    runProvider: (provider: CodingProvider, selection: RawProviderModelConfig) => Promise<RunResult>
   ): Promise<RunResult> {
-    const result = await runProvider(primary);
+    const result = await runProvider(primary, primarySelection);
     const fallback = this.opts.fallback;
     if (result.success || !fallback || fallback.models.length === 0) return result;
     // A supervisor grace-kill (#257) is cleanup after the actor already yielded,
@@ -978,11 +994,12 @@ export class Actor {
 
     const primaryName = primary.model ?? primary.name;
     for (const model of fallback.models) {
-      const provider = fallback.resolveProvider(model);
+      const selection = { ...primarySelection, model };
+      const provider = fallback.resolveProvider(selection);
       this.opts.log?.(
         `\n[Fallback] primary ${primaryName} exhausted; continuing on fallback ${model}\n`
       );
-      const fallbackResult = await runProvider(provider);
+      const fallbackResult = await runProvider(provider, selection);
       if (fallbackResult.success) return fallbackResult;
       if (!(await fallback.classify(fallbackResult)).exhausted) {
         // We only reach here because the primary was classified exhausted, so

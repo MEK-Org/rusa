@@ -842,6 +842,44 @@ describe("Actor", () => {
     );
   });
 
+  it("rebuilds the fallback prompt from the model that actually attempts recovery", async () => {
+    let actor!: Actor;
+    const primary = new FakeProvider(
+      () => ({ success: false, output: "quota exhausted", exitCode: 1 }),
+      "primary-model"
+    );
+    const fallbackProvider = new FakeProvider(() => {
+      actor.declareYield();
+      return { output: "fallback ok" };
+    }, "fallback-model");
+    const resolveFallback = vi.fn(() => fallbackProvider);
+    actor = makeActor(
+      {
+        modelConfig: [{ provider: primary.providerName, model: "primary-model", effort: "high" }],
+        fallback: {
+          models: ["fallback-model"],
+          resolveProvider: resolveFallback,
+          classify: async () => ({ exhausted: true }),
+        },
+        buildPrompt: (selected) => ({
+          prompt: `${selected.model}:${selected.effort ?? "none"}`,
+        }),
+      },
+      primary
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(primary.calls[0]?.prompt).toBe("primary-model:high");
+    expect(fallbackProvider.calls[0]?.prompt).toBe("fallback-model:high");
+    expect(resolveFallback).toHaveBeenCalledWith({
+      provider: primary.providerName,
+      model: "fallback-model",
+      effort: "high",
+    });
+  });
+
   it("falls back on the field-reproduced Claude session-limit exhaustion string", async () => {
     let actor!: Actor;
     const primary = new FakeProvider(
