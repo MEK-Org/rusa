@@ -5,24 +5,6 @@ import 'package:rusa_dashboard/theme.dart';
 import 'package:rusa_dashboard/widgets/quota_history_chart.dart';
 
 void main() {
-  group('quota chart provider colors', () {
-    test('uses stable provider identity colors regardless of series order', () {
-      expect(quotaChartColorForProvider('claude', 3), const Color(0xFFC15F3C));
-      expect(quotaChartColorForProvider('agy', 2), const Color(0xFF3B82F6));
-      expect(
-        quotaChartColorForProvider('antigravity', 1),
-        const Color(0xFF3B82F6),
-      );
-      expect(quotaChartColorForProvider('codex', 0), const Color(0xFF10B981));
-      expect(quotaChartColorForProvider('kimi', 7), const Color(0xFFA855F7));
-    });
-
-    test('keeps the existing indexed palette for an unknown provider', () {
-      expect(quotaChartColorForProvider('unknown', 0), MeshColors.accent);
-      expect(quotaChartColorForProvider('unknown', 1), MeshColors.statusActive);
-    });
-  });
-
   const history = QuotaHistoryDto(
     generatedAt: '2026-07-26T20:00:00.000Z',
     historySince: '2026-07-23T20:00:00.000Z',
@@ -55,6 +37,71 @@ void main() {
       ),
     ],
   );
+
+  QuotaHistorySeriesDto weeklySeries(String provider, double remainingPercent) =>
+      QuotaHistorySeriesDto(
+        provider: provider,
+        windowId: 'weekly',
+        label: 'Weekly',
+        points: [
+          QuotaHistoryPointDto(
+            observedAt: '2026-07-26T19:00:00.000Z',
+            remainingPercent: remainingPercent,
+          ),
+        ],
+      );
+
+  final providerIdentityHistory = QuotaHistoryDto(
+    generatedAt: '2026-07-26T20:00:00.000Z',
+    historySince: '2026-07-23T20:00:00.000Z',
+    history: [
+      weeklySeries('claude', 80),
+      weeklySeries('agy', 70),
+      weeklySeries('codex', 60),
+      weeklySeries('kimi', 50),
+    ],
+  );
+
+  testWidgets('renders stable provider colors in both chart legends', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(900, 1200);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildMeshTheme(),
+        home: Scaffold(
+          body: SizedBox(
+            width: 900,
+            child: QuotaHistoryChart(history: providerIdentityHistory),
+          ),
+        ),
+      ),
+    );
+
+    final legendColors = tester
+        .widgetList<Container>(find.byType(Container))
+        .where(
+          (container) =>
+              container.constraints?.maxWidth == 18 &&
+              container.constraints?.maxHeight == 3,
+        )
+        .map((container) => (container.decoration! as BoxDecoration).color)
+        .toList();
+
+    expect(legendColors, const [
+      Color(0xFFC15F3C),
+      Color(0xFF3B82F6),
+      Color(0xFF10B981),
+      Color(0xFFA855F7),
+      Color(0xFFC15F3C),
+      Color(0xFF3B82F6),
+      Color(0xFF10B981),
+      Color(0xFFA855F7),
+    ]);
+  });
 
   testWidgets('plots weekly headroom and throttle period, each with a key', (
     tester,
