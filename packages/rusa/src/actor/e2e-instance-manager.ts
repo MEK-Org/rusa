@@ -13,7 +13,7 @@ import {
 import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { missingResumeRequirements } from "../e2e/provision.js";
+import { E2E_RUNS_DIR_NAME, missingResumeRequirements } from "../e2e/provision.js";
 import {
   addReadonlyBindIfExists,
   addWritableDirBindIfRealDir,
@@ -194,7 +194,7 @@ export class E2EInstanceManager {
     this.stateFile = join(opts.mcHome, "e2e-instance.json");
     this.runtimeDir = join(opts.mcHome, "e2e-instance", "runtime");
     this.runsDir = join(opts.mcHome, "e2e-instance", "runs");
-    this.legacyRunsDir = join(this.runtimeDir, "home", ".rusa-e2e");
+    this.legacyRunsDir = join(this.runtimeDir, "home", E2E_RUNS_DIR_NAME);
     this.now = opts.now ?? (() => new Date().toISOString());
     this.hostHome = opts.hostHome ?? homedir();
     this.flutterRoot = opts.flutterRoot ?? resolveHostFlutterRoot();
@@ -633,10 +633,11 @@ export class E2EInstanceManager {
       );
     }
     // No valid holder record and no live unit: any surviving runtime directory
-    // is an orphan (its owning record is gone), not preserved state. Clear it
-    // before rebuilding mount targets so a stale file-vs-directory shape left
-    // by a prior run (e.g. runtime/home/.claude.json) can't reach bwrap.
-    this.clearOrphanRuntime();
+    // or preserved run root is an orphan (its owning record is gone), not
+    // resumable state. Clear both before rebuilding mount targets so a stale
+    // file-vs-directory shape left by a prior run (e.g.
+    // runtime/home/.claude.json) can't reach bwrap.
+    this.clearOrphanState();
 
     const worktree = this.validateOwnedWorktree(actorId, requestedPath);
     this.prepareWorktree(worktree);
@@ -730,6 +731,9 @@ export class E2EInstanceManager {
         ...this.buildBwrapArgs(worktree, root, resume),
       ]);
     } catch (err) {
+      // A fresh launch that never started owns nothing worth keeping: its root
+      // is at most the empty directory the bwrap args just created.
+      if (!resume) this.discardRunRoot(root);
       onFailure();
       throw err;
     }
@@ -737,7 +741,7 @@ export class E2EInstanceManager {
     let liveStatus = this.liveStatus();
     while (Date.now() < deadline) {
       if (!this.isLive(liveStatus)) {
-        this.cleanupFailedStart(root);
+        this.cleanupFailedStart(root, resume);
         onFailure();
         throw new Error(
           `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} failed before port ${E2E_INSTANCE_PORT} became ready ` +
@@ -750,7 +754,7 @@ export class E2EInstanceManager {
       await this.delay(this.startupPollMs);
       liveStatus = this.liveStatus();
     }
-    this.cleanupFailedStart(root);
+    this.cleanupFailedStart(root, resume);
     onFailure();
     throw new Error(
       `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} did not open port ${E2E_INSTANCE_PORT} ` +
@@ -787,35 +791,68 @@ export class E2EInstanceManager {
   }
 
   /**
-   * Removes a runtime directory left behind with no owning holder record and
-   * no live unit — orphaned state, distinct from a preserved holder's runtime
-   * (which `up()` never reaches while a record exists) or a live singleton's
-   * runtime (torn down only via stopUnit/cleanupFailedStart).
+   * Removes a runtime directory and any preserved run roots left behind with
+   * no owning holder record and no live unit — orphaned state, distinct from a
+   * preserved holder's runtime and root (which `up()` never reaches while a
+   * record exists) or a live singleton's runtime (torn down only via
+   * stopUnit/cleanupFailedStart). Only the holder record makes a run root
+   * resumable, so without one every root under the runs area is dead weight.
    */
-  private clearOrphanRuntime(): void {
+  private clearOrphanState(): void {
     teardownFlutterOverlay(this.runtimeDir);
     rmSync(this.runtimeDir, { recursive: true, force: true });
+    rmSync(this.runsDir, { recursive: true, force: true });
+  }
+
+  /**
+   * Reclaims a run root this helper minted under its own runs area. Deliberate
+   * teardown and a failed fresh launch both drop the holder record, and a root
+   * no record names can never be resumed — leaving it would strand a whole
+   * instance tree (mesh.db, remote, scratch) on disk forever. Confined to
+   * `runsDir` so it can only ever remove state this helper created; a legacy
+   * root nested under `runtimeDir` is reclaimed by the runtime wipe instead.
+   */
+  private discardRunRoot(root: string | undefined): void {
+    if (!root) return;
+    let realRoot: string;
+    let realRunsDir: string;
+    try {
+      realRoot = realpathSync(resolve(root));
+      realRunsDir = realpathSync(this.runsDir);
+    } catch {
+      return; // Already gone, or no runs area at all: nothing to reclaim.
+    }
+    if (realRoot === realRunsDir || !isSelfOrDescendant(realRunsDir, realRoot)) return;
+    rmSync(realRoot, { recursive: true, force: true });
   }
 
   private stopUnit(): void {
+    const holder = this.readRecord();
     // Keep the holder record if systemctl fails: losing attribution while an
-    // active unit survives would permit a silent singleton takeover.
+    // active unit survives would permit a silent singleton takeover. The run
+    // root stays with it, since a surviving record can still resume it.
     if (this.liveStatus().loadState !== "not-found") {
       this.exec("systemctl", ["--user", "stop", E2E_INSTANCE_UNIT_NAME]);
     }
     teardownFlutterOverlay(this.runtimeDir);
     rmSync(this.stateFile, { force: true });
     rmSync(this.runtimeDir, { recursive: true, force: true });
+    // Deliberate teardown (down, retirement, mesh shutdown) discards the
+    // record, so the root it named is no longer resumable by anyone.
+    this.discardRunRoot(holder?.resumableRoot);
   }
 
   /**
-   * Best-effort cleanup after a failed launch. `preserveRoot` is the exact
-   * root the failed launch was using: a legacy root may live under
-   * `runtimeDir` (the pre-change launch HOME), and the wholesale runtime
-   * wipe would destroy the very preserved state a retry resumes from — so
-   * it is relocated aside for the wipe and moved back afterwards.
+   * Best-effort cleanup after a failed launch. `root` is the exact root the
+   * failed launch was using. A failed resume keeps it: the pre-resume record
+   * is restored and the caller can retry, and a legacy root may live under
+   * `runtimeDir` (the pre-change launch HOME) where the wholesale runtime wipe
+   * would destroy it — so it is relocated aside for the wipe and moved back
+   * afterwards. A failed fresh launch instead discards its own brand-new root,
+   * which no surviving record will ever name again.
    */
-  private cleanupFailedStart(preserveRoot?: string): void {
+  private cleanupFailedStart(root: string, preserve: boolean): void {
+    const preserveRoot = preserve ? root : undefined;
     try {
       if (this.liveStatus().loadState !== "not-found") {
         this.exec("systemctl", ["--user", "stop", E2E_INSTANCE_UNIT_NAME]);
@@ -846,6 +883,9 @@ export class E2EInstanceManager {
       }
     }
     rmSync(this.runtimeDir, { recursive: true, force: true });
+    // A fresh launch's root is a sibling of runtimeDir, so the wipe above
+    // never reaches it; discard it explicitly now that its record is gone.
+    if (!preserve) this.discardRunRoot(root);
     if (nestedRoot && preservedAside) {
       try {
         mkdirSync(dirname(nestedRoot), { recursive: true, mode: 0o700 });

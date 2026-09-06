@@ -2,6 +2,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -308,19 +309,73 @@ describe("E2EInstanceManager", () => {
       /failed before port 8083 became ready.+result=exit-code/
     );
     expect(existsSync(join(mcHome, "e2e-instance.json"))).toBe(false);
+    // The record this launch wrote is gone, so its run root can never be
+    // resumed; leaving it behind would leak an instance tree forever.
+    const runsDir = join(mcHome, "e2e-instance", "runs");
+    expect(existsSync(runsDir) ? readdirSync(runsDir) : []).toEqual([]);
   });
 
   it("stops only when the retiring actor holds the singleton", async () => {
     const subject = manager();
     await subject.up("actor-a", actorWorktree);
+    const runRoot = subject.status().holder?.resumableRoot;
+    if (!runRoot) throw new Error("expected a persisted resumableRoot");
     subject.stopForActorRetirement("actor-b");
     expect(active).toBe(true);
+    expect(existsSync(runRoot)).toBe(true);
 
     subject.stopForActorRetirement("actor-a");
     expect(active).toBe(false);
     expect(calls.some((call) => call.file === "systemctl" && call.args.includes("stop"))).toBe(
       true
     );
+    // Retirement drops the holder record, so the run root it named is
+    // unresumable state and comes down with the instance.
+    expect(existsSync(runRoot)).toBe(false);
+  });
+
+  it("reclaims the holder's run root on a deliberate down(), leaving nothing unresumable", async () => {
+    const subject = manager();
+    await subject.up("actor-a", actorWorktree);
+    const runRoot = subject.status().holder?.resumableRoot;
+    if (!runRoot) throw new Error("expected a persisted resumableRoot");
+    mkdirSync(join(runRoot, "home", "data"), { recursive: true });
+    writeFileSync(join(runRoot, "home", "data", "mesh.db"), "");
+
+    subject.down("actor-a");
+
+    expect(existsSync(runRoot)).toBe(false);
+    expect(existsSync(join(mcHome, "e2e-instance.json"))).toBe(false);
+  });
+
+  it("keeps the run root when a stop fails, since the holder record survives with it", async () => {
+    const subject = manager();
+    await subject.up("actor-a", actorWorktree);
+    const runRoot = subject.status().holder?.resumableRoot;
+    if (!runRoot) throw new Error("expected a persisted resumableRoot");
+    stopFails = true;
+
+    expect(() => subject.down("actor-a")).toThrow("systemctl unavailable");
+
+    // Attribution survived the refused stop, so the state it attributes must too.
+    expect(subject.status().holder?.resumableRoot).toBe(runRoot);
+    expect(existsSync(runRoot)).toBe(true);
+  });
+
+  it("clears run roots abandoned without a holder record before a fresh up()", async () => {
+    const subject = manager();
+    // A full instance tree left under the runs area with no record naming it
+    // (a crash, or a pre-fix teardown): nothing can ever resume it.
+    const abandoned = join(mcHome, "e2e-instance", "runs", "run-abandoned");
+    mkdirSync(join(abandoned, "home", "data"), { recursive: true });
+    writeFileSync(join(abandoned, "home", "data", "mesh.db"), "");
+
+    await subject.up("actor-a", actorWorktree);
+
+    expect(existsSync(abandoned)).toBe(false);
+    const freshRoot = subject.status().holder?.resumableRoot;
+    if (!freshRoot) throw new Error("expected a persisted resumableRoot");
+    expect(existsSync(freshRoot)).toBe(true);
   });
 
   it("preserves holder attribution when systemd refuses a stop", async () => {
@@ -824,11 +879,17 @@ describe("E2EInstanceManager", () => {
       const resumeRoot = subject.status().holder?.resumableRoot;
       if (!resumeRoot) throw new Error("expected a persisted resumableRoot");
       writeResumableRootAt(resumeRoot);
+      const preciousState = join(resumeRoot, "home", "data", "precious-state.db");
+      writeFileSync(preciousState, "do not lose me\n");
       nowValue = "2026-08-08T01:00:00.000Z";
 
       await expect(subject.resume("actor-a", resumeRoot)).rejects.toThrow(
         /failed before port 8083 became ready/
       );
+
+      // A failed resume is retriable, so the preserved root and its contents
+      // must survive the launch-failure cleanup untouched.
+      expect(readFileSync(preciousState, "utf8")).toBe("do not lose me\n");
 
       // The failed resume's own record (startedAt 01:00:00) must not stick;
       // the original up() record (00:00:00) is restored so the preserved
