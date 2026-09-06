@@ -4,8 +4,11 @@ import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js"
 import type { ActorRepository } from "../../repositories/actor-repository.js";
 import { ActorRunRepository } from "./actor-run-repository.js";
 import { DbCapabilityGrantStore } from "./capability-grant-repository.js";
+import { DbEventSourceOwnerStore } from "./event-source-owner-repository.js";
+import { DbEventSourceSubscriptionStore } from "./event-source-subscription-repository.js";
 import { InboxFocusRepository } from "./inbox-focus-repository.js";
 import { InboxRepository } from "./inbox-repository.js";
+import { LegacyImportReceiptRepository } from "./legacy-import-receipt-repository.js";
 import { MaintenanceRepository } from "./maintenance-repository.js";
 import { MeshChatRepository } from "./mesh-chat-repository.js";
 import { MeshEventRepository } from "./mesh-event-repository.js";
@@ -28,6 +31,9 @@ export class Repositories {
   readonly actorRuns: ActorRunRepository;
   readonly actors: ActorRepository;
   readonly capabilityGrants: CapabilityGrantStore;
+  readonly eventSourceOwners: DbEventSourceOwnerStore;
+  readonly eventSourceSubscriptions: DbEventSourceSubscriptionStore;
+  readonly legacyImportReceipts: LegacyImportReceiptRepository;
   readonly meshEvents: MeshEventRepository;
   readonly rawInputs: RawInputRepository;
   readonly maintenance: MaintenanceRepository;
@@ -43,6 +49,9 @@ export class Repositories {
     this.actorRuns = new ActorRunRepository(db);
     this.actors = new SqliteActorRepository(db);
     this.capabilityGrants = new DbCapabilityGrantStore(db);
+    this.eventSourceOwners = new DbEventSourceOwnerStore(db);
+    this.eventSourceSubscriptions = new DbEventSourceSubscriptionStore(db);
+    this.legacyImportReceipts = new LegacyImportReceiptRepository(db);
     this.meshEvents = new MeshEventRepository(db);
     this.rawInputs = new RawInputRepository(db);
     this.maintenance = new MaintenanceRepository(db);
@@ -79,9 +88,12 @@ export type {
   PortableLedgerSourceKind,
 } from "./actor-run-repository.js";
 export { ActorRunRepository } from "./actor-run-repository.js";
+export { DbEventSourceOwnerStore } from "./event-source-owner-repository.js";
+export { DbEventSourceSubscriptionStore } from "./event-source-subscription-repository.js";
 export type { InboxFocusResolution, RunInboxFocus } from "./inbox-focus-repository.js";
 export { InboxFocusRepository } from "./inbox-focus-repository.js";
 export { InboxRepository } from "./inbox-repository.js";
+export { LegacyImportReceiptRepository } from "./legacy-import-receipt-repository.js";
 export { MaintenanceRepository } from "./maintenance-repository.js";
 export type { MeshChat } from "./mesh-chat-repository.js";
 export { MeshChatRepository } from "./mesh-chat-repository.js";

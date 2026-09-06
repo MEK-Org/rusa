@@ -141,9 +141,18 @@ export type MeshEventKind =
   // (kind, detail) index answers "what happened to this message?"); `payload` =
   // { messageId, fromId, toId, deliverAt, cancelledBy, reason? }.
   | "scheduled_message_cancelled"
-  // Event source subscriptions (design ISSUE_NUM, phase 2)
+  // Event source ownership: exactly one actor holds a source at a time, and the
+  // claim governs delegation and bubbling. The verbs read
+  // "subscribed"/"unsubscribed" because that is what ownership was called when
+  // they were minted; they are the durable audit history a live mesh has
+  // already written, so they keep their spelling.
   | "event_source_subscribed"
   | "event_source_unsubscribed"
+  // Direct event source subscriptions: an actor added to a source's delivery
+  // list without owning it. `actorId` = the subscriber, `detail` = the resource
+  // key, `payload` = { subscribedBy } on the add.
+  | "event_source_subscriber_added"
+  | "event_source_subscriber_removed"
   | "stamp_invalid"
   // Host-plane `host-jobs` capability : a grantable systemd-run --user
   // runner for long host-side experiments. `actorId` = the submitting/owning

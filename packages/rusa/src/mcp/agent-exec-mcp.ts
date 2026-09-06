@@ -595,6 +595,59 @@ export function createAgentExecMcpServer(
     }
   );
 
+  // ── Direct subscriptions ── Distinct from delegation above: subscribing takes
+  // no ownership, competes with nobody, and only ever adds the CALLER. An actor
+  // may put itself on a source's direct-delivery list without displacing whoever
+  // owns it, which is the whole point — several actors watching one repo was
+  // previously only expressible by handing ownership around.
+  //
+  // Self-only by construction (`selfId`, not an argument): a subscription is a
+  // claim on your own attention, and letting one actor subscribe another would
+  // be a way to push work sideways without a handle or a grant.
+  server.registerTool(
+    "subscribe_event_source",
+    {
+      title: "Subscribe yourself to an event source",
+      description:
+        "Receive events from an event source directly, without owning it. Unlike delegation this takes no ownership away from anyone, many actors may subscribe to one source, and subscribed events never bubble to your parent — you get the source's own events and nothing else. The source must be within this instance's configured event sources.",
+      inputSchema: eventResourceInputSchema,
+    },
+    async ({ source, kind, org, repo, number, ref, space }) => {
+      try {
+        const resource = parseEventResource(
+          { source, kind, org, repo, number, ref, space },
+          "subscription"
+        );
+        mesh.addEventSourceSubscriber(resource, selfId, selfId);
+        return toolOk(`subscribed to ${resourceKey(resource)}`);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "unsubscribe_event_source",
+    {
+      title: "Unsubscribe yourself from an event source",
+      description:
+        "Stop receiving direct events from an event source you subscribed to. Does not affect ownership: a source you own keeps delivering to you.",
+      inputSchema: eventResourceInputSchema,
+    },
+    async ({ source, kind, org, repo, number, ref, space }) => {
+      try {
+        const resource = parseEventResource(
+          { source, kind, org, repo, number, ref, space },
+          "subscription"
+        );
+        mesh.removeEventSourceSubscriber(resource, selfId);
+        return toolOk(`unsubscribed from ${resourceKey(resource)}`);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
   // ── Capability grants (ISSUE_NUM phase 1a, relaxed for parent-grantable secrets in
   // ISSUE_NUM) ── Registered on EVERY endpoint: root can grant any grantable
   // capability to any actor (as before), and a non-root actor can grant/revoke
@@ -798,16 +851,23 @@ export function createAgentExecMcpServer(
     server.registerTool(
       "list_subscriptions",
       {
-        title: "List event source subscriptions (root-only)",
+        title: "List event source ownership and subscriptions (root-only)",
         description:
-          "List all event source subscriptions (active and inactive) — the audit/inspection view of subscription history. Root-only.",
+          "List every event source owner (active claims and released tombstones) and every direct subscriber — the audit/inspection view. Root-only.",
         inputSchema: {},
       },
       async () => {
         const denied = assertRoot();
         if (denied) return denied;
         try {
-          return toolOk(mesh.listSubscriptions());
+          // Both row classes in one response, under the tool's existing name.
+          // They answer one operator question ("who is getting this source's
+          // events, and why") and splitting them across two tools would make
+          // the ownership half read as the whole answer.
+          return toolOk({
+            owners: mesh.listSubscriptions(),
+            subscribers: mesh.listEventSourceSubscriptions(),
+          });
         } catch (err) {
           return toolError(err);
         }

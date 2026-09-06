@@ -176,6 +176,7 @@ function setup(
     createActor?: ActorMeshOptions["createActor"];
     rootId?: string;
     obligations?: ActorMeshOptions["obligations"];
+    configuredEventSources?: ActorMeshOptions["configuredEventSources"];
     providerGate?: ActorMeshOptions["providerGate"];
     scheduledMessages?: FakeScheduledMessageScheduler;
     actors?: InMemoryActorRepository;
@@ -203,6 +204,7 @@ function setup(
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
     inboxStore: opts.inboxStore ?? createMemoryInboxStore(),
     obligations: opts.obligations,
+    configuredEventSources: opts.configuredEventSources,
     scheduledMessages,
     withTransaction: opts.withTransaction,
     onInboxEntriesSeen: opts.onInboxEntriesSeen,
@@ -5605,7 +5607,7 @@ describe("ActorMesh", () => {
       it("suppresses only matching destination in fanned multi-destination", async () => {
         const { mesh, tick, fake, logs } = setup();
         // biome-ignore lint/suspicious/noExplicitAny: test helper mock
-        (mesh as any).eventSubscriptions.activeForResource = () => [
+        (mesh as any).eventSourceOwners.activeForResource = () => [
           {
             resource: "github:dummy-org",
             actorId: "root",
@@ -5693,7 +5695,7 @@ describe("ActorMesh", () => {
         const instanceId = "staging-instance";
         const { mesh, tick, fake, logs } = setup();
         // biome-ignore lint/suspicious/noExplicitAny: test helper mock
-        (mesh as any).eventSubscriptions.activeForResource = () =>
+        (mesh as any).eventSourceOwners.activeForResource = () =>
           ["root", "t1"].map((actorId) => ({
             resource: "github:dummy-org",
             actorId,
@@ -5741,7 +5743,7 @@ describe("ActorMesh", () => {
       it("withholds a verified system:* stamped event from every destination, including non-authors", async () => {
         const { mesh, tick, fake, logs } = setup();
         // biome-ignore lint/suspicious/noExplicitAny: test helper mock
-        (mesh as any).eventSubscriptions.activeForResource = () => [
+        (mesh as any).eventSourceOwners.activeForResource = () => [
           {
             resource: "github:dummy-org",
             actorId: "root",
@@ -5816,6 +5818,245 @@ describe("ActorMesh", () => {
 
         expect(fake("root").calls).toHaveLength(1);
         expect(fake("root").calls[0]?.prompt).toContain("Work from your inbox");
+      });
+    });
+  });
+
+  // Direct subscriptions, the second row class 0038 introduces. Ownership is
+  // one actor per source and governs delegation; a subscription is many actors
+  // per source, exact-source-only, and governs nothing. These tests fix the
+  // seam between them.
+  describe("direct event source subscriptions", () => {
+    const REPO_SOURCE = "github:dummy-org/dummy-repo";
+    const ISSUE = "github:dummy-org/dummy-repo/issues/5";
+
+    it("delivers to the owner and every live subscriber, once each", async () => {
+      const { mesh, tick, fake } = setup();
+      const owner = mesh.spawn({ charter: "owner", parentId: "root" });
+      const watcherA = mesh.spawn({ charter: "watcher a", parentId: "root" });
+      const watcherB = mesh.spawn({ charter: "watcher b", parentId: "root" });
+
+      mesh.subscribeEventSource(ISSUE, owner, "root");
+      mesh.addEventSourceSubscriber(ISSUE, watcherA, watcherA);
+      mesh.addEventSourceSubscriber(ISSUE, watcherB, watcherB);
+
+      mesh.deliverEvent(ISSUE, "issue event", { inboxPayload: payload("issues.opened") });
+      await tick();
+
+      expect(fake(owner).calls).toHaveLength(1);
+      expect(fake(watcherA).calls).toHaveLength(1);
+      expect(fake(watcherB).calls).toHaveLength(1);
+    });
+
+    it("does not double-deliver to an actor that both owns and subscribes", async () => {
+      const { mesh, tick, fake } = setup();
+      const owner = mesh.spawn({ charter: "owner", parentId: "root" });
+
+      mesh.subscribeEventSource(ISSUE, owner, "root");
+      mesh.addEventSourceSubscriber(ISSUE, owner, owner);
+
+      mesh.deliverEvent(ISSUE, "issue event", { inboxPayload: payload("issues.opened") });
+      await tick();
+
+      expect(fake(owner).calls).toHaveLength(1);
+    });
+
+    it("delivers to a subscriber even when nobody owns the source", async () => {
+      // An owner is not a precondition for a subscriber: the zero-destination
+      // drop must count subscribers before it decides the event is uncovered.
+      const { mesh, tick, fake } = setup();
+      const watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
+      mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+
+      mesh.deliverEvent(ISSUE, "issue event", { inboxPayload: payload("issues.opened") });
+      await tick();
+
+      expect(fake(watcher).calls).toHaveLength(1);
+    });
+
+    it("is exact-source only — it neither bubbles up nor reaches down", async () => {
+      const { mesh, tick, fake } = setup();
+      const upward = mesh.spawn({ charter: "subscribed to the issue", parentId: "root" });
+      const downward = mesh.spawn({ charter: "subscribed to the repo", parentId: "root" });
+      mesh.subscribeEventSource(REPO_SOURCE, "root", "root");
+      mesh.addEventSourceSubscriber(ISSUE, upward, upward);
+      mesh.addEventSourceSubscriber(REPO_SOURCE, downward, downward);
+
+      // A repo-level event: the issue subscriber must not hear it (no reaching
+      // down), the repo subscriber must (exact match).
+      mesh.deliverEvent(REPO_SOURCE, "repo event", { inboxPayload: payload("push") });
+      await tick();
+      expect(fake(upward).calls).toHaveLength(0);
+      expect(fake(downward).calls).toHaveLength(1);
+
+      // An issue-level event: the repo subscriber must not hear it. Ownership
+      // bubbles; a subscription is a claim on one source and only that source.
+      mesh.deliverEvent(ISSUE, "issue event", { inboxPayload: payload("issues.opened") });
+      await tick();
+      expect(fake(upward).calls).toHaveLength(1);
+      expect(fake(downward).calls).toHaveLength(1);
+    });
+
+    it("skips a subscriber that is not live", async () => {
+      const { mesh, tick, fake } = setup();
+      const owner = mesh.spawn({ charter: "owner", parentId: "root" });
+      const watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
+      mesh.subscribeEventSource(ISSUE, owner, "root");
+      mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+      mesh.retire(watcher);
+
+      mesh.deliverEvent(ISSUE, "issue event", { inboxPayload: payload("issues.opened") });
+      await tick();
+
+      expect(fake(owner).calls).toHaveLength(1);
+      expect(fake(watcher).calls).toHaveLength(0);
+    });
+
+    it("leaves a directed delivery directed", async () => {
+      // `mesh:deliver` addresses one actor on purpose. Fanning it out to the
+      // source's subscribers would turn every targeted hand-off into a broadcast.
+      const { mesh, tick, fake } = setup();
+      const target = mesh.spawn({ charter: "directed target", parentId: "root" });
+      const watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
+      mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+
+      mesh.deliverEvent(ISSUE, "issue event", {
+        directedTarget: target,
+        inboxPayload: payload("issues.opened"),
+      });
+      await tick();
+
+      expect(fake(target).calls).toHaveLength(1);
+      expect(fake(watcher).calls).toHaveLength(0);
+    });
+
+    it("still wakes a subscriber when the directive names a target that is not live", async () => {
+      // The exemption above belongs to a directive that *landed*, not to the
+      // presence of `directedTarget`. An ignored directive falls back to the
+      // ownership ladder, and a standing interest in this source's events is
+      // not defeated by someone else's failed hand-off.
+      const { mesh, tick, fake, logs } = setup();
+      const owner = mesh.spawn({ charter: "owner", parentId: "root" });
+      const watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
+      mesh.subscribeEventSource(ISSUE, owner, "root");
+      mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+
+      mesh.deliverEvent(ISSUE, "issue event", {
+        directedTarget: "not-live",
+        inboxPayload: payload("issues.opened"),
+      });
+      await tick();
+
+      expect(logs).toContain("mesh:deliver target not live: not-live — directive ignored");
+      expect(fake(owner).calls).toHaveLength(1);
+      expect(fake(watcher).calls).toHaveLength(1);
+    });
+
+    it("does not make a subscriber the effective owner", () => {
+      // The hazard this pins: `effectiveOwnerOf` reads the head of the ownership
+      // resolution, and delegate/reclaim are gated on it. A subscriber leaking
+      // into that result would let anyone who subscribed to a source hand it
+      // away or take it back.
+      const { mesh } = setup();
+      const owner = mesh.spawn({ charter: "owner", parentId: "root" });
+      const watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
+      const outsider = mesh.spawn({ charter: "outsider", parentId: "root" });
+
+      mesh.subscribeEventSource(ISSUE, owner, "root");
+      mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+
+      expect(() => mesh.delegateEventSource(ISSUE, outsider, watcher)).toThrow(
+        /current effective owner/
+      );
+      expect(() => mesh.reclaimEventSource(ISSUE, watcher)).toThrow();
+      // And the owner is unaffected by the subscription sitting alongside it.
+      expect(() => mesh.delegateEventSource(ISSUE, outsider, owner)).not.toThrow();
+    });
+
+    it("records an audit event for each add and removal", () => {
+      const events: MeshEventInput[] = [];
+      const { mesh } = setup({ events: (e: MeshEventInput) => events.push(e) });
+      const watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
+
+      mesh.addEventSourceSubscriber(ISSUE, watcher, "root");
+      mesh.removeEventSourceSubscriber(ISSUE, watcher);
+
+      expect(events.filter((e) => e.kind.startsWith("event_source_subscriber_"))).toEqual([
+        expect.objectContaining({
+          kind: "event_source_subscriber_added",
+          actorId: watcher,
+          detail: ISSUE,
+          payload: JSON.stringify({ subscribedBy: "root" }),
+        }),
+        expect.objectContaining({
+          kind: "event_source_subscriber_removed",
+          actorId: watcher,
+          detail: ISSUE,
+        }),
+      ]);
+    });
+
+    it("stops delivering once the subscription is removed", async () => {
+      const { mesh, tick, fake } = setup();
+      const watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
+      mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+      mesh.removeEventSourceSubscriber(ISSUE, watcher);
+      expect(mesh.listEventSourceSubscriptions()).toEqual([]);
+
+      mesh.deliverEvent(ISSUE, "issue event", { inboxPayload: payload("issues.opened") });
+      await tick();
+      expect(fake(watcher).calls).toHaveLength(0);
+    });
+
+    it("refuses to subscribe an unknown thread", () => {
+      const { mesh } = setup();
+      expect(() => mesh.addEventSourceSubscriber(ISSUE, "ghost", "root")).toThrow(
+        /cannot subscribe unknown thread/
+      );
+    });
+
+    it("retirement deletes the subscriptions while tombstoning the ownership", () => {
+      const { mesh } = setup();
+      const actorId = mesh.spawn({ charter: "worker", parentId: "root" });
+      mesh.subscribeEventSource(REPO_SOURCE, actorId, "root");
+      mesh.addEventSourceSubscriber(ISSUE, actorId, actorId);
+
+      mesh.retire(actorId);
+
+      expect(mesh.listSubscriptions().find((s) => s.actorId === actorId)?.unsubscribedAt).toBe(
+        "2026-01-01T00:00:00Z"
+      );
+      expect(mesh.listEventSourceSubscriptions()).toEqual([]);
+    });
+
+    describe("configured scope", () => {
+      it("refuses a subscription outside every configured event source", () => {
+        const { mesh } = setup({ configuredEventSources: [REPO_SOURCE] });
+        const watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
+
+        expect(() =>
+          mesh.addEventSourceSubscriber("github:other-org/elsewhere", watcher, watcher)
+        ).toThrow(/not anchored in a configured event source/);
+        // The strict ancestor is refused too: config narrows this instance, and
+        // subscribing to the whole org would widen it straight back out.
+        expect(() => mesh.addEventSourceSubscriber("github:dummy-org", watcher, watcher)).toThrow(
+          /not anchored in a configured event source/
+        );
+        expect(mesh.listEventSourceSubscriptions()).toEqual([]);
+      });
+
+      it("accepts the configured source itself and anything under it", () => {
+        const { mesh } = setup({ configuredEventSources: [REPO_SOURCE] });
+        const watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
+
+        mesh.addEventSourceSubscriber(REPO_SOURCE, watcher, watcher);
+        mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+        expect(
+          mesh
+            .listEventSourceSubscriptions()
+            .map((s) => s.resource)
+            .sort()
+        ).toEqual([ISSUE, REPO_SOURCE].sort());
       });
     });
   });
@@ -6677,6 +6918,28 @@ describe("ActorMesh", () => {
       expect(woken).not.toContain(delegate);
     });
 
+    // The obligation rung *returns* from inside the ownership ladder — it is a
+    // terminating answer, not one more candidate. Direct subscribers are
+    // therefore resolved outside the ladder entirely; resolve them inside it and
+    // the most authoritative routing case in the mesh would be the one case that
+    // silently starves them.
+    it("wakes a direct subscriber even when a live obligation terminates the ownership climb", async () => {
+      let owner = "";
+      let watcher = "";
+      const woken = await wokenBy(
+        owning({ [REF]: "t2" }),
+        (mesh) => {
+          watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
+          owner = mesh.spawn({ charter: "obligation owner", parentId: "root" });
+          mesh.addEventSourceSubscriber(issue, watcher, watcher);
+        },
+        issue
+      );
+
+      expect(owner).toBe("t2");
+      expect(woken.sort()).toEqual([owner, watcher].sort());
+    });
+
     it("falls back to subscriptions when no live obligation is linked", async () => {
       let delegate = "";
       const lookedUp: string[] = [];
@@ -6727,6 +6990,33 @@ describe("ActorMesh", () => {
       );
 
       expect(woken).toEqual([owner]);
+      expect(woken).not.toContain(directedTarget);
+    });
+
+    it("still wakes a subscriber when a live obligation overrides the directive", async () => {
+      // The obligation beats the directive, so the delivery never becomes
+      // `directed` and the subscriber is merged as usual. Worth pinning
+      // separately: this is the one directed path where ownership is decided by
+      // the obligation branch, and a future change that set `directed` as soon
+      // as a target was named would silently drop the subscriber here.
+      let owner = "";
+      let watcher = "";
+      let directedTarget = "";
+      const woken = await wokenBy(
+        owning({ [REF]: "t3" }),
+        (mesh) => {
+          watcher = mesh.spawn({ charter: "watcher", parentId: "root" });
+          directedTarget = mesh.spawn({ charter: "directed target", parentId: "root" });
+          owner = mesh.spawn({ charter: "obligation owner", parentId: "root" });
+          mesh.addEventSourceSubscriber(issue, watcher, watcher);
+        },
+        issue,
+        undefined,
+        () => ({ directedTarget })
+      );
+
+      expect(owner).toBe("t3");
+      expect(woken.sort()).toEqual([owner, watcher].sort());
       expect(woken).not.toContain(directedTarget);
     });
 

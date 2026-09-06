@@ -43,6 +43,11 @@ function dataOf(result: CallToolResult): unknown {
   }
 }
 
+/** The owner half of `list_subscriptions`, which reports owners and subscribers separately. */
+function ownersOf(result: CallToolResult): unknown {
+  return (dataOf(result) as { owners?: unknown }).owners;
+}
+
 /** A child-provider run that blocks until released — for in-flight-run assertions. */
 function heldRun(): { responder: () => Promise<Partial<RunResult>>; release: () => void } {
   const gates: Array<() => void> = [];
@@ -79,6 +84,7 @@ function setup(
     obligations?: MeshObligationPort;
     validateSpawn?: ActorMeshOptions["validateSpawn"];
     validateModel?: ActorMeshOptions["validateModel"];
+    configuredEventSources?: readonly string[];
   } = {}
 ) {
   const registry = new InMemoryActorRepository();
@@ -105,6 +111,7 @@ function setup(
     ]),
     idgen: () => `t${++seq}`,
     now: () => "2026-01-01T00:00:00Z",
+    configuredEventSources: opts.configuredEventSources,
     createActor: (ctx) =>
       new Actor({
         id: ctx.record.id,
@@ -172,6 +179,8 @@ describe("agent-execution MCP server", () => {
         "set_actor_model",
         "set_thread_title",
         "spawn_thread",
+        "subscribe_event_source",
+        "unsubscribe_event_source",
         "yield_run",
       ].sort()
     );
@@ -222,6 +231,8 @@ describe("agent-execution MCP server", () => {
         "send_message",
         "set_actor_model",
         "spawn_thread",
+        "subscribe_event_source",
+        "unsubscribe_event_source",
         "yield_run",
       ].sort()
     );
@@ -1146,13 +1157,17 @@ describe("agent-execution MCP server", () => {
     expect(names).not.toContain("revive_thread");
   });
 
-  it("does not expose runtime subscribe/unsubscribe/list tools on a non-root endpoint", async () => {
+  // The subscribe/unsubscribe tools are exposed on every endpoint, but they only
+  // ever act on the caller and never take ownership — the invariant this test
+  // protects is that a non-root actor still cannot inspect the whole mesh's
+  // routing, nor claim a source that config does not cover (asserted below).
+  it("exposes self-only subscribe/unsubscribe but not the root inspection tool on a non-root endpoint", async () => {
     const { mesh } = setup();
     const client = await connect(createAgentExecMcpServer(mesh, "worker-1", "root"));
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name);
-    expect(names).not.toContain("subscribe_event_source");
-    expect(names).not.toContain("unsubscribe_event_source");
+    expect(names).toContain("subscribe_event_source");
+    expect(names).toContain("unsubscribe_event_source");
     expect(names).not.toContain("list_subscriptions");
     expect(names).toContain("delegate_event_source");
     expect(names).toContain("reclaim_event_source");
@@ -1206,7 +1221,7 @@ describe("agent-execution MCP server", () => {
         name: "list_subscriptions",
         arguments: {},
       })) as CallToolResult;
-      expect(dataOf(listRes)).toEqual(
+      expect(ownersOf(listRes)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             actorId: "t2",
@@ -1227,7 +1242,7 @@ describe("agent-execution MCP server", () => {
         name: "list_subscriptions",
         arguments: {},
       })) as CallToolResult;
-      expect(dataOf(listRes)).toEqual(
+      expect(ownersOf(listRes)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             actorId: "t1",
@@ -1289,7 +1304,7 @@ describe("agent-execution MCP server", () => {
         name: "list_subscriptions",
         arguments: {},
       })) as CallToolResult;
-      expect(dataOf(listRes)).toEqual(
+      expect(ownersOf(listRes)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             actorId: "t2",
@@ -1349,7 +1364,7 @@ describe("agent-execution MCP server", () => {
         name: "list_subscriptions",
         arguments: {},
       })) as CallToolResult;
-      expect(dataOf(listRes)).toEqual(
+      expect(ownersOf(listRes)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             actorId: "t2",
@@ -1376,7 +1391,7 @@ describe("agent-execution MCP server", () => {
         name: "list_subscriptions",
         arguments: {},
       })) as CallToolResult;
-      expect(dataOf(listRes)).toEqual(
+      expect(ownersOf(listRes)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             actorId: "t1",
@@ -1472,7 +1487,7 @@ describe("agent-execution MCP server", () => {
         name: "list_subscriptions",
         arguments: {},
       })) as CallToolResult;
-      expect(dataOf(listRes)).toEqual(
+      expect(ownersOf(listRes)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             actorId: "root",
@@ -1486,6 +1501,137 @@ describe("agent-execution MCP server", () => {
           }),
         ])
       );
+    });
+  });
+
+  describe("Direct subscription tools", () => {
+    const REPO = "github:dummy-org/dummy-repo";
+    const ISSUE = "github:dummy-org/dummy-repo/issues/9";
+
+    it("subscribes and unsubscribes the caller, and only the caller", async () => {
+      const { mesh } = setup();
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      await rootClient.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "watcher",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      });
+      const watcherClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
+
+      const subscribed = (await watcherClient.callTool({
+        name: "subscribe_event_source",
+        arguments: { source: ISSUE },
+      })) as CallToolResult;
+      expect(subscribed.isError).toBeFalsy();
+      expect(dataOf(subscribed)).toContain(`subscribed to ${ISSUE}`);
+
+      // The tool takes no actor argument at all: a subscription is a claim on
+      // your own attention, so there is no shape of call that puts another
+      // actor on a source's delivery list.
+      expect(mesh.listEventSourceSubscriptions()).toEqual([
+        expect.objectContaining({ resource: ISSUE, actorId: "t1", subscribedBy: "t1" }),
+      ]);
+      const schema = (await watcherClient.listTools()).tools.find(
+        (tool) => tool.name === "subscribe_event_source"
+      )?.inputSchema;
+      expect(Object.keys(schema?.properties ?? {})).not.toContain("child_thread_id");
+
+      const unsubscribed = (await watcherClient.callTool({
+        name: "unsubscribe_event_source",
+        arguments: { source: ISSUE },
+      })) as CallToolResult;
+      expect(unsubscribed.isError).toBeFalsy();
+      expect(mesh.listEventSourceSubscriptions()).toEqual([]);
+    });
+
+    it("takes no ownership, so the owner keeps the source", async () => {
+      const { mesh } = setup();
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      await rootClient.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "watcher",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      });
+      mesh.subscribeEventSource(ISSUE, "root", "root");
+
+      const watcherClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
+      const res = (await watcherClient.callTool({
+        name: "subscribe_event_source",
+        arguments: { source: ISSUE },
+      })) as CallToolResult;
+
+      // Contrast with delegate_event_source, which would have to displace root.
+      expect(res.isError).toBeFalsy();
+      expect(
+        mesh.listSubscriptions().filter((s) => s.resource === ISSUE && !s.unsubscribedAt)
+      ).toEqual([expect.objectContaining({ actorId: "root" })]);
+    });
+
+    it("accepts the legacy kind/repo/number schema as delegation does", async () => {
+      const { mesh } = setup();
+      const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const res = (await client.callTool({
+        name: "subscribe_event_source",
+        arguments: { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 9 },
+      })) as CallToolResult;
+      expect(res.isError).toBeFalsy();
+      expect(mesh.listEventSourceSubscriptions().map((s) => s.resource)).toEqual([ISSUE]);
+    });
+
+    it("refuses a source outside this instance's configured scope", async () => {
+      const { mesh } = setup({ configuredEventSources: [REPO] });
+      const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+      const refused = (await client.callTool({
+        name: "subscribe_event_source",
+        arguments: { source: "github:other-org/elsewhere" },
+      })) as CallToolResult;
+      expect(refused.isError).toBeTruthy();
+      expect(String(dataOf(refused))).toContain("not anchored in a configured event source");
+      expect(mesh.listEventSourceSubscriptions()).toEqual([]);
+
+      const allowed = (await client.callTool({
+        name: "subscribe_event_source",
+        arguments: { source: ISSUE },
+      })) as CallToolResult;
+      expect(allowed.isError).toBeFalsy();
+    });
+
+    it("list_subscriptions reports owners and subscribers separately", async () => {
+      const { mesh } = setup();
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      await rootClient.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "watcher",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      });
+      mesh.subscribeEventSource(ISSUE, "root", "root");
+      await (await connect(createAgentExecMcpServer(mesh, "t1", "root"))).callTool({
+        name: "subscribe_event_source",
+        arguments: { source: ISSUE },
+      });
+
+      const listed = dataOf(
+        (await rootClient.callTool({
+          name: "list_subscriptions",
+          arguments: {},
+        })) as CallToolResult
+      ) as { owners: { actorId: string }[]; subscribers: { actorId: string }[] };
+
+      // One source, two different relationships to it — reporting only the
+      // owner half under this name would read as the whole answer.
+      expect(listed.owners).toEqual([
+        expect.objectContaining({ resource: ISSUE, actorId: "root" }),
+      ]);
+      expect(listed.subscribers).toEqual([
+        expect.objectContaining({ resource: ISSUE, actorId: "t1" }),
+      ]);
     });
   });
 });
