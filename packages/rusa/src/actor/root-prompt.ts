@@ -8,6 +8,7 @@
  * It deliberately doesn't enumerate exact tool names: the agent discovers them
  * from the MCP servers it's connected to at runtime.
  */
+import type { RawProviderModelConfig } from "../providers/model-config.js";
 import { generateHandle } from "./handle-generator.js";
 import {
   DELEGATION_DISCIPLINE,
@@ -62,7 +63,8 @@ woke you and whether it actually calls for a response.`;
 export function buildRootPrompt(
   charter: string = ROOT_ACTOR_CHARTER,
   rootHandle: string = generateHandle("root"),
-  priorContext?: string
+  priorContext?: string,
+  selected?: RawProviderModelConfig
 ): string {
   return `${charter}
 
@@ -78,7 +80,7 @@ ${WRITING_FOR_AGENTS_DISCIPLINE}
 
 ${EXTERNAL_CONDUCT_POLICY}
 
-${signatureDiscipline(rootHandle)}
+${signatureDiscipline(rootHandle, selected)}
 
 ${priorContext ? `---\n${priorContext.trim()}\n\n` : ""}Begin by listing work from the durable inbox.`;
 }

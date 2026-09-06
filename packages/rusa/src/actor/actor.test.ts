@@ -61,6 +61,62 @@ describe("Actor", () => {
     expect(provider.calls[0]?.prompt).toBe("PROMPT: inbox work");
   });
 
+  it("builds each prompt from the model and effort selected for that run", async () => {
+    let actor!: Actor;
+    const provider = new FakeProvider(() => {
+      actor.declareYield();
+      return {};
+    });
+    actor = makeActor(
+      {
+        modelConfig: [
+          { provider: provider.providerName, model: "gpt-5.6-sol", effort: "medium" },
+          { provider: provider.providerName, model: "gpt-5.6-terra" },
+        ],
+        gate: (fn, candidates) => fn(candidates[1]),
+        buildPrompt: (selected) => ({
+          prompt: `${selected.model}:${selected.effort ?? "none"}`,
+        }),
+      },
+      provider
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(provider.calls[0]?.prompt).toBe("gpt-5.6-terra:none");
+  });
+
+  it("keeps an active prompt on its launched model when a later model is staged", async () => {
+    let actor!: Actor;
+    const provider = new FakeProvider(() => {
+      actor.setModelConfig([
+        { provider: provider.providerName, model: "gpt-5.6-terra", effort: "high" },
+      ]);
+      actor.declareYield();
+      return {};
+    });
+    actor = makeActor(
+      {
+        modelConfig: [{ provider: provider.providerName, model: "gpt-5.6-sol", effort: "low" }],
+        buildPrompt: (selected) => ({
+          prompt: `${selected.model}:${selected.effort ?? "none"}`,
+        }),
+      },
+      provider
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(provider.calls.map((call) => call.prompt)).toEqual([
+      "gpt-5.6-sol:low",
+      "gpt-5.6-terra:high",
+    ]);
+  });
+
   it("publishes actor-owned runtime transitions and waits for outer flag clear before idle", async () => {
     let resolveProvider!: (result: Partial<RunResult>) => void;
     let resolveRunEnd!: () => void;

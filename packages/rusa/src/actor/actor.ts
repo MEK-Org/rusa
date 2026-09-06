@@ -97,9 +97,13 @@ export interface ActorOptions {
   saveSessionId: (id: string) => void;
   /**
    * Build the ordinary run prompt after scheduler admission. Called fresh so it
-   * can read the current charter, inbox contract, and portable context.
+   * can read the current charter, inbox contract, portable context, and the
+   * exact provider/model/effort tuple this run will launch. The tuple comes
+   * from the scheduler's selected pool entry, rather than the actor's declared
+   * pool, so an unavailable earlier candidate or a staged future replacement
+   * cannot misattribute this run's GitHub writing.
    */
-  buildPrompt: () => PromptBuild;
+  buildPrompt: (selected: RawProviderModelConfig) => PromptBuild;
   /** Firehose: receives the agent's streamed output. */
   log?: (chunk: string) => void;
   /** Optional model fallback for provider capacity/quota exhaustion. */
@@ -789,7 +793,7 @@ export class Actor {
               "End this run correctly now by calling yield_run with status complete or blocked. " +
               "Do not do additional work in this corrective run.",
           }
-        : this.opts.buildPrompt();
+        : this.opts.buildPrompt(selected);
       // Inside the gate: the provider is starting. The hook fires here rather than
       // beside onQueued so a run queued behind the concurrency cap is
       // distinguishable from one that started and went quiet — same reason the
