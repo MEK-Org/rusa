@@ -53,6 +53,12 @@ class ProviderModelConfig {
         effort: j['effort'] as String?,
       );
 
+  Map<String, dynamic> toJson() => {
+    'provider': provider,
+    'model': model,
+    'effort': effort,
+  };
+
   /// One candidate on one line — `provider · model · effort medium` — with
   /// the effort clause dropped when the server sent no explicit effort.
   String get label => [

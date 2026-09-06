@@ -15,6 +15,10 @@ class DashboardApi {
   final http.Client _client;
   final Uri _base;
 
+  /// The origin every request is resolved against. Exposed so the store can
+  /// scope persisted state to the server it actually came from.
+  Uri get base => _base;
+
   Uri _u(String path, [Map<String, String>? query]) => _base
       .resolve(path)
       .replace(queryParameters: query?.isEmpty ?? true ? null : query);

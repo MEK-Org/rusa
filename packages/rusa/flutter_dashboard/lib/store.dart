@@ -3,6 +3,7 @@ import 'dart:convert';
 
 import 'package:rxdart/rxdart.dart';
 
+import 'actor_hierarchy_cache.dart';
 import 'api.dart';
 import 'avatar_platform.dart';
 import 'mesh_stream.dart';
@@ -150,13 +151,17 @@ class DashboardStore {
     required MeshStreamSource stream,
     QuotaCache? quotaCache,
     TreePreferencesCache? treePreferencesCache,
+    ActorHierarchyCache? actorHierarchyCache,
     this.walkie,
     this.avatarFilePicker,
   }) : _api = api,
        _stream = stream,
        _quotaCache = quotaCache ?? const NoopQuotaCache(),
        _treePreferencesCache =
-           treePreferencesCache ?? const NoopTreePreferencesCache() {
+           treePreferencesCache ?? const NoopTreePreferencesCache(),
+       _actorHierarchyCache =
+           actorHierarchyCache ?? const NoopActorHierarchyCache(),
+       _hierarchyScope = cacheScopeFor(api.base) {
     // Seed the quota subject from the persisted snapshot BEFORE the first frame
     // (ISSUE_NUM ask 4): the header reads `store.quota.valueOrNull` as its
     // StreamBuilder initialData, so a value present here paints the last-known
@@ -184,12 +189,66 @@ class DashboardStore {
     if (savedWorkExpanded != null) {
       _workExpanded = Set.of(savedWorkExpanded);
     }
+    _seedActorsFromCache();
+  }
+
+  /// Paint the previous session's hierarchy before the first frame (#273): the
+  /// tree renders straight off `actorStates`, so seeding it here is what turns
+  /// a cold reload from an empty "No actors" panel into the tree the operator
+  /// last saw, with `init()`'s authoritative fetch revalidating behind it.
+  ///
+  /// The seed deliberately does NOT set `_runtimeCursor`. The cursor is the
+  /// only thing that lets a live runtime delta be applied in place, so leaving
+  /// it null keeps the store in its `uninitialized` phase: deltas that arrive
+  /// while the authoritative fetch is still in flight are buffered and replayed
+  /// against server truth instead of being applied to cached rows.
+  void _seedActorsFromCache() {
+    final cached = _actorHierarchyCache.load();
+    if (cached == null) return;
+    if (!cached.isUsableAt(scope: _hierarchyScope, now: DateTime.timestamp())) {
+      // Another server, or old enough that it would mislead rather than help.
+      _actorHierarchyCache.clear();
+      return;
+    }
+    if (cached.threads.isEmpty) return;
+    _updateActorStatesFromThreads(cached.threads);
+    _actorsStale.add(true);
+  }
+
+  /// The server boundary a persisted hierarchy belongs to, as
+  /// `scheme://host[:port]` of the API base.
+  ///
+  /// What this catches: the dashboard being pointed at a *different* API
+  /// origin than the one a capture was written against. `localStorage` is
+  /// already partitioned per page origin by the browser, but [DashboardApi] can
+  /// be given an explicit base, so the page origin is not necessarily the
+  /// mesh's — recording the API origin makes that boundary checkable instead of
+  /// assumed.
+  ///
+  /// What it does not catch: two different meshes served at the same origin at
+  /// different times (a fresh mesh on the same localhost port). Those compare
+  /// equal, so the previous mesh's tree paints for the length of one fetch,
+  /// marked `cached`, and is then replaced wholesale. That is survivable
+  /// precisely because nothing persisted asserts liveness — a restored row is
+  /// always a neutral dot — and no durable mesh identity is available to do
+  /// better: `runtimeStreamId` is regenerated per server process, so scoping to
+  /// it would miss on exactly the reload this feature exists for, and neither
+  /// the threads nor the config payload carries an installation id. Adding one
+  /// is server-side work, out of scope for #273.
+  ///
+  /// Built by hand rather than via `Uri.origin`, which throws on non-http
+  /// schemes (the VM and test hosts see a `file:` `Uri.base`).
+  static String cacheScopeFor(Uri base) {
+    final port = base.hasPort ? ':${base.port}' : '';
+    return '${base.scheme}://${base.host}$port';
   }
 
   final DashboardApi _api;
   final MeshStreamSource _stream;
   final QuotaCache _quotaCache;
   final TreePreferencesCache _treePreferencesCache;
+  final ActorHierarchyCache _actorHierarchyCache;
+  final String _hierarchyScope;
 
   DashboardApi get api => _api;
 
@@ -231,6 +290,13 @@ class DashboardStore {
   /// persisted (no localStorage), so it always starts false on a fresh load.
   final _quotaRefreshing = BehaviorSubject<bool>.seeded(false);
   final _quotaStale = BehaviorSubject<bool>.seeded(false);
+
+  /// True while the tree is showing a hierarchy restored from the persisted
+  /// cache rather than one the server just confirmed (#273). Flips to false on
+  /// the first successful `/api/mesh/threads` sync and stays false afterwards —
+  /// a later failed revalidation leaves the last *authoritative* snapshot on
+  /// screen, which is not the same kind of stale.
+  final _actorsStale = BehaviorSubject<bool>.seeded(false);
   final _quotaHistoryStale = BehaviorSubject<bool>.seeded(false);
   final _dashboardConfig = BehaviorSubject<DashboardConfigDto?>.seeded(null);
   final _error = BehaviorSubject<String?>.seeded(null);
@@ -284,6 +350,7 @@ class DashboardStore {
   ValueStream<List<MeshEvent>> get yieldEvents => _yieldEvents.stream;
   ValueStream<bool> get quotaRefreshing => _quotaRefreshing.stream;
   ValueStream<bool> get quotaStale => _quotaStale.stream;
+  ValueStream<bool> get actorsStale => _actorsStale.stream;
   ValueStream<bool> get quotaHistoryStale => _quotaHistoryStale.stream;
   ValueStream<DashboardConfigDto?> get dashboardConfig =>
       _dashboardConfig.stream;
@@ -1248,11 +1315,48 @@ class DashboardStore {
       _halted.add(snap.halted);
       _schedulerWarning.add(snap.schedulerWarning);
       _updateActorStatesFromThreads(snap.threads);
+      // Server truth has landed: the snapshot above REPLACED the seeded rows
+      // wholesale, so an actor the server no longer lists is gone from the tree
+      // by construction. What replacement can't undo on its own is a selection
+      // the operator made against a cached row that no longer exists, so drop
+      // those here (#273).
+      _pruneSelectionToKnownActors();
+      _actorsStale.add(false);
+      _persistActorHierarchy(snap.threads);
       _runtimeCursor = snap.runtimeCursor;
       _error.add(null);
       if (!_drainRuntimeBuffer()) _runtimeSyncAgain = true;
     }
     _runtimePhase = _RuntimePhase.live;
+  }
+
+  /// Write the authoritative hierarchy back for the next cold load (#273).
+  /// Runs on every successful sync — syncs are reconnect/mutation-driven, not
+  /// a poll — and the capture itself bounds what is written.
+  void _persistActorHierarchy(List<ThreadDto> threads) {
+    _actorHierarchyCache.save(
+      PersistedActorHierarchy.capture(
+        scope: _hierarchyScope,
+        threads: threads,
+        now: DateTime.timestamp(),
+      ),
+    );
+  }
+
+  /// Drops selected actors the authoritative snapshot doesn't contain, so the
+  /// detail panel is never bound to an actor that no longer exists.
+  void _pruneSelectionToKnownActors() {
+    final current = _selection.value;
+    if (current.isEmpty) return;
+    final known = _actorStates.value.actors;
+    final pruned = current.where(known.containsKey).toSet();
+    if (pruned.length == current.length) return;
+    _applySelection(
+      pruned,
+      primary: pruned.contains(_primary.value)
+          ? _primary.value
+          : pruned.lastOrNull,
+    );
   }
 
   bool _drainRuntimeBuffer() {
@@ -1406,6 +1510,7 @@ class DashboardStore {
       _yieldEvents.close(),
       _quotaRefreshing.close(),
       _quotaStale.close(),
+      _actorsStale.close(),
       _quotaHistoryStale.close(),
       _avatarEpoch.close(),
       _dashboardConfig.close(),
