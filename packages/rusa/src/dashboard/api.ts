@@ -1275,8 +1275,13 @@ export async function handleMeshApiRequest(
         runState = "queued";
       }
       const selection = runState === "queued" ? deps.mesh?.getSelection(r.id) : undefined;
+      // Durable inbox focus is created only after a run starts. A queued
+      // reservation deliberately has no focus from the prior run (or a
+      // speculative next one) to project.
       const selectedObligation =
-        runState === "idle" ? null : (deps.selectedObligationForActor?.(r.id) ?? null);
+        runState === "running" || runState === "winding_down"
+          ? (deps.selectedObligationForActor?.(r.id) ?? null)
+          : null;
       return {
         id: r.id,
         handle: r.isRoot === true ? rootHandle : generateHandle(r.id),

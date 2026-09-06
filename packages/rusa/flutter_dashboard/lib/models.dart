@@ -206,7 +206,7 @@ class ThreadDto {
     int? queuePosition,
     String? estimatedStartAt,
     bool? ownerExpectsRetirement,
-    ObligationDto? selectedObligation,
+    Object? selectedObligation = _keepThreadField,
   }) => ThreadDto(
     id: id ?? this.id,
     handle: handle ?? this.handle,
@@ -243,7 +243,9 @@ class ThreadDto {
     estimatedStartAt: estimatedStartAt ?? this.estimatedStartAt,
     ownerExpectsRetirement:
         ownerExpectsRetirement ?? this.ownerExpectsRetirement,
-    selectedObligation: selectedObligation ?? this.selectedObligation,
+    selectedObligation: identical(selectedObligation, _keepThreadField)
+        ? this.selectedObligation
+        : selectedObligation as ObligationDto?,
   );
 
   factory ThreadDto.fromJson(Map<String, dynamic> j) => ThreadDto(

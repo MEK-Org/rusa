@@ -813,7 +813,7 @@ describe("handleMeshApiRequest", () => {
     expect(byId("root").runState).toBe("idle");
   });
 
-  it("GET /api/mesh/threads projects current selected obligations for active overview rows", async () => {
+  it("GET /api/mesh/threads projects active-run focus but never speculative queued focus", async () => {
     actors.upsert(rec("root", null, "active"));
     actors.upsert(rec(UUID_A, "root", "active"));
     actors.upsert(rec(UUID_B, "root", "active"));
@@ -826,8 +826,7 @@ describe("handleMeshApiRequest", () => {
     const queuedFocus = obligations.create({
       id: "queued-focus",
       ownerId: UUID_B,
-      title: "Current queued work",
-      intent: "Wait for the provider slot",
+      title: "Must not appear before a run starts",
     });
     deps = {
       ...deps,
@@ -844,10 +843,7 @@ describe("handleMeshApiRequest", () => {
       id: "running-focus",
       title: "Current running work",
     });
-    expect(byId(UUID_B).selectedObligation).toMatchObject({
-      id: "queued-focus",
-      title: "Current queued work",
-    });
+    expect(byId(UUID_B).selectedObligation).toBeUndefined();
     expect(byId("root").selectedObligation).toBeUndefined();
   });
 

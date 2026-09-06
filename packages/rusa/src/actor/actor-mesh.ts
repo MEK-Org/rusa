@@ -1131,12 +1131,6 @@ export class ActorMesh {
     } catch (err) {
       this.log(`onQueued(${actorId}) failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-    const actor = this.live.get(actorId);
-    if (actor) {
-      this.actorRuntimeStateChanged(actorId, this.runtimeStateOf(actor), {
-        refreshThreadSnapshot: true,
-      });
-    }
     return entries;
   }
 

@@ -484,18 +484,13 @@ void main() {
   );
 
   testWidgets(
-    'OverviewTab shows current selected obligations in running and queued cards and refreshes them live',
+    'OverviewTab shows running actor context and live focus changes without a queued placeholder',
     (tester) async {
       await tester.runAsync(() async {
         final initialRunning = makeObligation(
           'running-focus',
           ownerId: 'running',
           title: 'Initial running focus',
-        );
-        final queuedFocus = makeObligation(
-          'queued-focus',
-          ownerId: 'queued',
-          title: 'Queued focus',
         );
         final api = FakeApi()
           ..runtimeCursor = const RuntimeCursor(
@@ -517,7 +512,6 @@ void main() {
               title: 'Queued actor title',
               runState: RunState.queued,
               queuePosition: 0,
-              selectedObligation: queuedFocus,
             ),
             makeThread(
               'without-focus',
@@ -541,7 +535,7 @@ void main() {
         expect(find.text('queued-handle'), findsOneWidget);
         expect(find.text('Queued actor title'), findsOneWidget);
         expect(find.text('Initial running focus'), findsOneWidget);
-        expect(find.text('Queued focus'), findsOneWidget);
+        expect(find.text('Queued focus'), findsNothing);
         expect(find.text('No current focus'), findsOneWidget);
         expect(find.byType(ActorAvatarWithStatus), findsNWidgets(3));
         expect(tester.takeException(), isNull);
@@ -566,7 +560,6 @@ void main() {
             title: 'Queued actor title',
             runState: RunState.queued,
             queuePosition: 0,
-            selectedObligation: queuedFocus,
           ),
           makeThread(
             'without-focus',
@@ -623,7 +616,6 @@ void main() {
         await tester.pump();
         await tester.pump();
         expect(find.text('Updated running focus'), findsNothing);
-        expect(find.text('Queued focus'), findsNothing);
         expect(tester.takeException(), isNull);
 
         await store.dispose();
