@@ -202,27 +202,34 @@ it lands, stdout is JSON lines only and plain `jq` works.
 ## MCP HTTP request timelines
 
 The MCP HTTP host uses the `mcp-http` component for request-path diagnostics.
-`mcp_server_added` and `mcp_server_removed` carry a safe service label plus an
-opaque `serverInstanceId`. The instance id changes when a mount is removed and
-added again, so two actor-mounted `inbox` services can be told apart without
-recording actor ids or capability URL tokens. A request snapshots these fields at
-arrival, so its later records — including a session close that outlives the mount
-— still name the instance that served it rather than a replacement mount.
+Every request event carries one generated `requestId`, a safe `server` label, a
+bounded `sessionId`, `sessionResolvedAtArrival`, and `elapsedMs`.
 
-Each request event carries one generated `requestId`, the safe server fields, a
-bounded `sessionId`, `sessionResolved`, and `elapsedMs`. `sessionResolved` is
-captured at arrival before the body is read; the full session header remains
-routing-only. After a JSON body is safely parsed, the records may add bounded
-`rpcMethod` and, for `tools/call`, `toolName`.
+The `server` label is fixed when a mount is registered, never inferred from the
+name's shape. A mounted actor capability is named `<actor-id>:<capability>` and
+logs only the capability (`inbox`); a bare mount is an actor's own mesh server
+and logs the constant `mesh`; a host service registered under a code-controlled
+name declares that name as its label. Actor ids and capability URL tokens are
+never recorded, whatever their shape.
+
+`sessionResolvedAtArrival` is captured before the body is read, so it answers
+whether the client presented a live session even if parsing or dispatch then
+stalls. It keeps that arrival-time value on every later record for the request —
+a successful `initialize` reports `false`, because no session existed on arrival.
+The full session header stays routing-only; only its bounded form is logged.
+After a JSON body is safely parsed, records may add bounded `rpcMethod` and, for
+`tools/call`, `toolName`.
 
 The phases are `mcp_request_arrived`, `mcp_request_body_read`, session
 connect/create/close, `mcp_transport_dispatch`, and `mcp_transport_returned`.
 `mcp_transport_returned` only says the SDK handler returned. HTTP completion is
 separate: `mcp_http_response_finished` records Node's local writable completion;
 `mcp_http_response_closed` records a premature close. Both include `statusCode`,
-`headersSent`, `writableFinished`, and `responseWritten`. Neither proves that a
-client received the response. In particular, GET SSE streams can keep a
-transport dispatch active while their HTTP response remains deliberately open.
+`headersSent`, and `writableFinished`. Nothing here observes client receipt:
+`writableFinished` is this host finishing its own writable side, and no field
+should be read as an acknowledgement that a client got the response. GET SSE
+streams in particular keep a transport dispatch active while their HTTP response
+stays deliberately open.
 
 These records intentionally omit capability URLs/tokens, authorization and
 credential headers, arguments, results, raw request bodies, and raw errors.

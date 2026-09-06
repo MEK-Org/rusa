@@ -92,18 +92,24 @@ function boundedMetadata(value: unknown): string | undefined {
   return typeof value === "string" ? value.slice(0, MAX_MCP_LOG_METADATA_LENGTH) : undefined;
 }
 
+/** The label recorded for a mount whose name is not known to be free of private identifiers. */
+const UNCLASSIFIED_SERVER_LABEL = "mesh";
+
 /**
- * A mounted server name can carry an actor id (`<actor-id>:inbox`). Record the
- * service name that identifies the request path without exposing that private
- * actor identifier. The bare UUID mount is the actor's mesh server.
+ * Derive the log label for a mount registered after start. A mounted actor
+ * capability is named `<actor-id>:<capability>`, so the capability suffix names
+ * the request path without the private actor id. A bare dynamic name is an
+ * actor's own mesh mount, and nothing about the string proves otherwise, so it
+ * is labelled conservatively rather than recorded. Callers that register a
+ * host service under a bare, code-controlled name pass `logLabel` to say so.
  */
-function loggedServerName(name: string): string | undefined {
+function derivedServerLabel(name: string): string {
   const separator = name.lastIndexOf(":");
-  if (separator >= 0) return boundedMetadata(name.slice(separator + 1));
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(name)) {
-    return "mesh";
+  if (separator >= 0) {
+    const capability = name.slice(separator + 1);
+    if (capability.length > 0) return capability.slice(0, MAX_MCP_LOG_METADATA_LENGTH);
   }
-  return boundedMetadata(name);
+  return UNCLASSIFIED_SERVER_LABEL;
 }
 
 /**
@@ -202,8 +208,8 @@ export class McpHttpServer {
   /** name -> unguessable URL path token, and the reverse for routing. */
   private readonly nameToToken = new Map<string, string>();
   private readonly tokenToName = new Map<string, string>();
-  /** Per mounted server: opaque correlation id, regenerated after removal. */
-  private readonly serverInstances = new Map<string, string>();
+  /** Per mounted server: the safe label recorded for it, never its raw name. */
+  private readonly serverLabels = new Map<string, string>();
   /** Per server-name: session id -> monotonic creation time for close diagnostics. */
   private readonly sessionStartedAt = new Map<string, Map<string, number>>();
   private readonly log: Logger;
@@ -225,8 +231,9 @@ export class McpHttpServer {
       this.sessions.set(name, new Map());
       this.sessionStartedAt.set(name, new Map());
       this.ensureToken(name);
-      this.serverInstances.set(name, randomUUID());
-      this.log.info("mcp_server_added", this.serverFields(name));
+      // Host services declared at startup carry code-controlled names, so the
+      // name itself is the safe label.
+      this.serverLabels.set(name, name.slice(0, MAX_MCP_LOG_METADATA_LENGTH));
     }
   }
 
@@ -308,14 +315,14 @@ export class McpHttpServer {
    * per-actor endpoint (e.g. the agent-execution server for one actor, with its
    * id baked in). Returns the loopback URL to hand the actor's provider.
    */
-  addServer(name: string, factory: () => McpServer): string {
+  addServer(name: string, factory: () => McpServer, opts?: { logLabel?: string }): string {
     this.factories[name] = factory;
     if (!this.sessions.has(name)) this.sessions.set(name, new Map());
     if (!this.sessionStartedAt.has(name)) this.sessionStartedAt.set(name, new Map());
-    if (!this.serverInstances.has(name)) {
-      this.serverInstances.set(name, randomUUID());
-      this.log.info("mcp_server_added", this.serverFields(name));
-    }
+    this.serverLabels.set(
+      name,
+      opts?.logLabel?.slice(0, MAX_MCP_LOG_METADATA_LENGTH) ?? derivedServerLabel(name)
+    );
     return this.urlFor(name);
   }
 
@@ -333,8 +340,7 @@ export class McpHttpServer {
       this.sessions.delete(name);
     }
     this.sessionStartedAt.delete(name);
-    this.log.info("mcp_server_removed", this.serverFields(name));
-    this.serverInstances.delete(name);
+    this.serverLabels.delete(name);
     delete this.factories[name];
     const token = this.nameToToken.get(name);
     if (token) {
@@ -352,9 +358,9 @@ export class McpHttpServer {
     return name && this.factories[name] ? name : undefined;
   }
 
-  /** Safe mount identity for lifecycle and request records; never includes the URL token or actor id. */
-  private serverFields(name: string): { server?: string; serverInstanceId?: string } {
-    return { server: loggedServerName(name), serverInstanceId: this.serverInstances.get(name) };
+  /** Safe mount label for request records; never the URL token, the raw name, or an actor id. */
+  private serverLabel(name: string): string | undefined {
+    return this.serverLabels.get(name);
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -384,11 +390,9 @@ export class McpHttpServer {
     const sessionStarts = this.sessionStartedAt.get(name) as Map<string, number>;
     const requestStartedAt = performance.now();
     const requestId = randomUUID();
-    // Snapshot the mount identity once, at arrival. Every later record for this
-    // request — including the session-close closure, which can outlive the mount —
-    // reuses it, so a removeServer (or remove + re-add under the same name) still
-    // correlates back to the instance that actually served the request.
-    const serverFields = this.serverFields(name);
+    // Read the mount label once, at arrival: a session close can outlive the
+    // mount, and every record for this request should name the mount that served it.
+    const server = this.serverLabel(name);
     // Routing must use the complete header. Its separately bounded form is for
     // diagnostics only: trimming before Map#get changes which session receives
     // a request.
@@ -402,20 +406,19 @@ export class McpHttpServer {
     let responseFinished = false;
     const requestFields = () => ({
       requestId,
-      ...serverFields,
+      server,
       sessionId: loggedSessionId,
-      sessionResolved: sessionResolvedAtArrival,
+      sessionResolvedAtArrival,
       ...metadata,
       elapsedMs: elapsedMs(requestStartedAt),
     });
+    // `writableFinished` is this host completing its own writable side — the
+    // closest observable local evidence that a response left here, and never a
+    // client receipt acknowledgement.
     const responseFields = () => ({
       statusCode: res.statusCode,
       headersSent: res.headersSent,
       writableFinished: res.writableFinished,
-      // The completed writable side is the closest observable evidence that a
-      // response left this host. It is still not a client receipt acknowledgement.
-      responseWritten: res.writableFinished,
-      clientReceiptObserved: false,
     });
     const logResponseFinished = () => {
       responseFinished = true;
@@ -484,7 +487,7 @@ export class McpHttpServer {
             sessionStarts.delete(sid);
             if (startedAt !== undefined) {
               this.log.info("mcp_session_closed", {
-                ...serverFields,
+                server,
                 sessionId: boundedMetadata(sid),
                 elapsedMs: elapsedMs(startedAt),
               });
