@@ -10,9 +10,18 @@ export function instanceWorkerFactory(
 ): NonNullable<RunStartE2EHooks["createWorkerActor"]> {
   return (context, options) => {
     const record = context.record;
-    const name = record.provider ?? config.rootActor?.provider ?? "antigravity";
     const target = context.executionTarget;
     if (!target) return new Actor(options);
+    // The follower constructs exactly one provider from the bootstrap, so a
+    // multi-candidate pool has no honest remote meaning yet. Refuse it rather
+    // than silently running whichever candidate happens to be first.
+    if (options.modelConfig.length > 1) {
+      throw new Error(
+        `actor ${record.id} declares ${options.modelConfig.length} candidates; remote placement supports a single declared provider/model`
+      );
+    }
+    const declared = options.modelConfig[0];
+    const name = declared?.provider ?? config.rootActor?.provider ?? "antigravity";
     const host = hub.createHost(target, record.id);
     const toolUrls = () => hub.toolUrls(target, record.id, options.mcpServers);
     const runtime = new ActorHandle({
@@ -21,11 +30,12 @@ export function instanceWorkerFactory(
         id: record.id,
         cwd: options.cwd,
         sessionId: options.loadSessionId(),
+        modelConfig: [...options.modelConfig],
         providerOptions: {
           providers: { [name]: config.providers[name] },
           name,
-          model: record.model,
-          effort: record.effort,
+          model: declared?.model,
+          effort: declared?.effort,
         },
         mcpServers: toolUrls(),
         actorOptions: {

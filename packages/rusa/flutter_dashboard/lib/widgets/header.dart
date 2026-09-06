@@ -128,7 +128,7 @@ class MeshHeader extends StatelessWidget {
                               ),
                               const SizedBox(width: 10),
                               const Text(
-                                'RUSA MESH',
+                                'RUSA',
                                 maxLines: 1,
                                 style: TextStyle(
                                   color: MeshColors.textPrimary,

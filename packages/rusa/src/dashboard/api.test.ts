@@ -17,6 +17,7 @@ import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
+import { createLogger } from "../observability/logger.js";
 import type { ReferenceCacheService } from "../references/cache-service.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { type DashboardDataDeps, handleMeshApiRequest } from "./api.js";
@@ -108,6 +109,26 @@ const UUID_B = "bbbbbbbb-0000-4000-8000-000000000002";
 const UUID_C = "cccccccc-0000-4000-8000-000000000004";
 const UUID_RETIRED = "rrrrrrrr-0000-4000-8000-000000000003";
 
+/** A logger writing to memory, so a test can read the records the API wrote. */
+function recordingLogger() {
+  const lines: string[] = [];
+  const logger = createLogger({
+    format: "json",
+    destination: {
+      write: (chunk: string) => {
+        lines.push(chunk);
+      },
+    },
+  });
+  const records = (): Record<string, unknown>[] =>
+    lines
+      .join("")
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+  return { logger, records };
+}
+
 describe("handleMeshApiRequest", () => {
   let db: Database.Database;
   let meshEvents: MeshEventRepository;
@@ -138,6 +159,7 @@ describe("handleMeshApiRequest", () => {
         });
         return { delivered: true };
       },
+      getSelection: () => undefined,
     };
     deps = {
       actors: actors,
@@ -206,9 +228,9 @@ describe("handleMeshApiRequest", () => {
         principal: "human:operator",
         request: {
           charter: "Investigate the flaky build",
-          provider: "agy",
-          model: "gemini-3.5-flash-medium",
+          modelConfig: { provider: "agy", model: "gemini-3.5-flash-medium", effort: undefined },
           title: "Build investigator",
+          context: undefined,
         },
       },
     ]);
@@ -231,8 +253,7 @@ describe("handleMeshApiRequest", () => {
 
     expect(res.statusCode).toBe(201);
     expect(rootSpawns[0]?.request).toMatchObject({
-      provider: "agy",
-      model: "gemini-3.5-flash-medium",
+      modelConfig: { provider: "agy", model: "gemini-3.5-flash-medium" },
       context: { type: "portable", mode: "ledger" },
     });
   });
@@ -270,13 +291,13 @@ describe("handleMeshApiRequest", () => {
     deps.rootControl = control;
   });
 
-  it("POST /api/mesh/actors rejects missing provider or model ", async () => {
+  it("POST /api/mesh/actors rejects a missing provider", async () => {
     const control = deps.rootControl;
     deps.rootControl = {
       providers: [],
       spawnChild: (req: RootChildRequest) => {
-        if (!req.provider) throw new Error("provider is required");
-        if (!req.model) throw new Error("model is required");
+        const modelConfig = Array.isArray(req.modelConfig) ? req.modelConfig[0] : req.modelConfig;
+        if (!modelConfig?.provider) throw new Error("provider is required");
         return UUID_A;
       },
     } as unknown as RootControlService;
@@ -291,17 +312,6 @@ describe("handleMeshApiRequest", () => {
     await new Promise((resolve) => process.nextTick(resolve));
     expect(res1?.statusCode).toBe(400);
     expect(JSON.parse(res1.body)).toEqual({ error: "provider is required" });
-
-    const { res: res2 } = await call(
-      deps,
-      "POST",
-      "/api/mesh/actors",
-      JSON.stringify({ charter: "work", provider: "claude" })
-    );
-    await new Promise((resolve) => process.nextTick(resolve));
-    await new Promise((resolve) => process.nextTick(resolve));
-    expect(res2?.statusCode).toBe(400);
-    expect(JSON.parse(res2.body)).toEqual({ error: "model is required" });
 
     deps.rootControl = control;
   });
@@ -505,10 +515,11 @@ describe("handleMeshApiRequest", () => {
   });
 
   it("GET /api/mesh/threads surfaces one model and does not leak a stale bound-model readback", async () => {
-    // A actors record that still carries the removed `boundModel` key. The cast is the
-    // point, not a workaround: the field is gone from `ActorRecord`, but the actors is
-    // a JSON file loaded with a cast and rewritten whole, so every record written before
-    // this change still carries the key on disk. This is that record.
+    // An actors record that still carries the removed `boundModel` key alongside a
+    // properly-shaped `modelConfig`. The cast is the point, not a workaround: the field
+    // is gone from `ActorRecord`, but the actors repository is a JSON file loaded with a
+    // cast and rewritten whole, so a record written before this key was retired can still
+    // carry it on disk. This is that record.
     //
     // It is the shape that produced the old "MODEL DIVERGED" badge — an actor moved off
     // codex, its codex readback outliving the move because nothing ever cleared it. The
@@ -516,8 +527,7 @@ describe("handleMeshApiRequest", () => {
     // compare it against.
     actors.upsert({
       ...rec(UUID_A, "root", "active"),
-      provider: "codex",
-      model: "gpt-5-codex",
+      modelConfig: [{ provider: "codex", model: "gpt-5-codex" }],
       boundModel: "gpt-5.5",
     } as ActorRecord);
 
@@ -534,12 +544,8 @@ describe("handleMeshApiRequest", () => {
   it("GET /api/mesh/threads surfaces pending desiredModel and desiredProvider when staged", async () => {
     actors.upsert({
       ...rec(UUID_A, "root", "active"),
-      provider: "claude",
-      model: "claude-sonnet-5",
-      effort: "medium",
-      desiredModel: "claude-opus-4-8",
-      desiredEffort: "max",
-      desiredProvider: "codex",
+      modelConfig: [{ provider: "claude", model: "claude-sonnet-5", effort: "medium" }],
+      desiredModelConfig: [{ provider: "codex", model: "claude-opus-4-8", effort: "max" }],
     });
 
     const { res } = await call(deps, "GET", "/api/mesh/threads");
@@ -558,16 +564,12 @@ describe("handleMeshApiRequest", () => {
   it("GET /api/mesh/threads distinguishes a pending effort clear from no pending change", async () => {
     actors.upsert({
       ...rec(UUID_A, "root", "active"),
-      provider: "codex",
-      model: "gpt-5.6-sol",
-      effort: "high",
-      desiredEffort: null,
+      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol", effort: "high" }],
+      desiredModelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
     });
     actors.upsert({
       ...rec(UUID_B, "root", "active"),
-      provider: "codex",
-      model: "gpt-5.6-sol",
-      effort: "high",
+      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol", effort: "high" }],
     });
 
     const { res } = await call(deps, "GET", "/api/mesh/threads");
@@ -1125,6 +1127,53 @@ describe("handleMeshApiRequest", () => {
     });
   });
 
+  it("GET /api/mesh/inbox resolves a GitHub-sourced entry's source into a linkable reference", async () => {
+    // Shaped like `deriveGitHubInboxNotification`'s output for an
+    // issue-comment webhook: no `messageId`, and `source` is the exact
+    // `github:<owner>/<repo>/issues/<n>` reference the event was about.
+    inbox.append([
+      {
+        id: "github-inbox-entry",
+        actorId: UUID_A,
+        source: "github:MEK-Org/rusa/issues/243",
+        payload: { type: "issue_comment.created", commentId: 1 },
+      },
+    ]);
+
+    const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
+    const entry = JSON.parse(res.body).entries[0];
+    // No issueClient/referenceCache is wired in this suite's deps, so this
+    // exercises the synchronous fallback — which still derives a real,
+    // clickable GitHub URL with no network access, because `referenceUrl` is
+    // pure. The rest of the tracker-backed content is covered by
+    // resolveReferenceSync's/referenceUrl's own unit tests.
+    expect(entry.reference).toMatchObject({
+      ref: "github:MEK-Org/rusa/issues/243",
+      scheme: "github",
+      url: "https://github.com/MEK-Org/rusa/issues/243",
+    });
+    // The raw payload is untouched — only mesh-message entries get rewritten.
+    expect(entry.payload).toEqual({ type: "issue_comment.created", commentId: 1 });
+  });
+
+  it("GET /api/mesh/inbox leaves a Google Chat space source unresolved (no per-message reference)", async () => {
+    // A chat event's `source` is the containing space (routing granularity),
+    // not the specific message — resolving it here would show the wrong
+    // entity, so this stays out of scope and keeps its raw payload.
+    inbox.append([
+      {
+        id: "gchat-inbox-entry",
+        actorId: UUID_A,
+        source: "gchat:spaces/AAAA123",
+        payload: { type: "gchat.message", messageName: "spaces/AAAA123/messages/BBBB" },
+      },
+    ]);
+
+    const { res } = await call(deps, "GET", `/api/mesh/inbox?actor=${UUID_A}&status=all`);
+    const entry = JSON.parse(res.body).entries[0];
+    expect(entry.reference).toBeUndefined();
+  });
+
   describe("POST /api/mesh/actors/:id/inbox/handled", () => {
     const post = async (actorId: string, body: unknown) => {
       const { res } = await call(
@@ -1559,6 +1608,7 @@ describe("handleMeshApiRequest", () => {
 
     it("502s with a generic error and never relays the upstream Gemini response body to the client", async () => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const { logger, records } = recordingLogger();
       const secret = "sk-super-secret-upstream-token";
       const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
         ok: false,
@@ -1567,7 +1617,7 @@ describe("handleMeshApiRequest", () => {
       } as unknown as Response);
 
       try {
-        const generateDeps: DashboardDataDeps = { ...deps, geminiApiKey: "key" };
+        const generateDeps: DashboardDataDeps = { ...deps, geminiApiKey: "key", logger };
         const { res } = await call(generateDeps, "POST", `/api/mesh/avatar/${UUID_A}/generate`);
         await new Promise((resolve) => process.nextTick(resolve));
         await new Promise((resolve) => process.nextTick(resolve));
@@ -1576,20 +1626,22 @@ describe("handleMeshApiRequest", () => {
         expect(res.body).not.toContain(secret);
         expect(JSON.parse(res.body).error).toBe("avatar generation failed");
 
-        // Assert that the sentinel does not appear in the captured console.error mock calls
-        expect(errorSpy.mock.calls.length).toBeGreaterThan(0);
-        for (const callArgs of errorSpy.mock.calls) {
-          const joined = callArgs.map(String).join(" ");
-          expect(joined).not.toContain(secret);
-        }
+        // The failure is recorded, the upstream body is not — and it is a record
+        // on the application logger, never a line printed to the service console.
+        expect(records()).toEqual([
+          expect.objectContaining({ level: "error", msg: "avatar_generate_failed" }),
+        ]);
+        expect(JSON.stringify(records())).not.toContain(secret);
+        expect(errorSpy).not.toHaveBeenCalled();
       } finally {
         fetchMock.mockRestore();
         errorSpy.mockRestore();
       }
     });
 
-    it("502s with a generic error and excludes non-JSON success body (sentinel) from console.error when res.json() throws", async () => {
+    it("502s with a generic error and excludes the non-JSON success body (sentinel) from the record when res.json() throws", async () => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const { logger, records } = recordingLogger();
       const secret = "sk-super-secret-upstream-token";
       const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
         ok: true,
@@ -1600,7 +1652,7 @@ describe("handleMeshApiRequest", () => {
       } as unknown as Response);
 
       try {
-        const generateDeps: DashboardDataDeps = { ...deps, geminiApiKey: "key" };
+        const generateDeps: DashboardDataDeps = { ...deps, geminiApiKey: "key", logger };
         const { res } = await call(generateDeps, "POST", `/api/mesh/avatar/${UUID_A}/generate`);
         await new Promise((resolve) => process.nextTick(resolve));
         await new Promise((resolve) => process.nextTick(resolve));
@@ -1609,12 +1661,13 @@ describe("handleMeshApiRequest", () => {
         expect(res.body).not.toContain(secret);
         expect(JSON.parse(res.body).error).toBe("avatar generation failed");
 
-        // Assert that the sentinel does not appear in the captured console.error mock calls
-        expect(errorSpy.mock.calls.length).toBeGreaterThan(0);
-        for (const callArgs of errorSpy.mock.calls) {
-          const joined = callArgs.map(String).join(" ");
-          expect(joined).not.toContain(secret);
-        }
+        // The failure is recorded, the upstream body is not — and it is a record
+        // on the application logger, never a line printed to the service console.
+        expect(records()).toEqual([
+          expect.objectContaining({ level: "error", msg: "avatar_generate_failed" }),
+        ]);
+        expect(JSON.stringify(records())).not.toContain(secret);
+        expect(errorSpy).not.toHaveBeenCalled();
       } finally {
         fetchMock.mockRestore();
         errorSpy.mockRestore();
@@ -1801,6 +1854,96 @@ describe("handleMeshApiRequest", () => {
         const noObligationsDeps = { ...deps, obligations: undefined };
         const { res } = await call(noObligationsDeps, "GET", "/api/mesh/obligations");
         expect(res.statusCode).toBe(503);
+      });
+    });
+
+    describe("GET /api/mesh/obligations/forest", () => {
+      it("returns one root page's trees, in root-page order, without a request per root", async () => {
+        obligations.create({ title: "root-1", id: "root-1", ownerId: "actor-1" });
+        obligations.create({
+          title: "child-1",
+          id: "child-1",
+          parentId: "root-1",
+          ownerId: "actor-1",
+        });
+        obligations.create({ title: "root-2", id: "root-2", ownerId: "actor-1" });
+        obligations.create({
+          title: "sub-child",
+          id: "sub-child",
+          parentId: "child-1",
+          ownerId: "actor-1",
+        });
+
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/forest");
+        expect(res.statusCode).toBe(200);
+        const data = JSON.parse(res.body);
+
+        expect(data.total).toBe(2);
+        expect(data.hasMore).toBe(false);
+        // root-1 has a child, so it is "waiting" and the root page (ready
+        // before waiting, same as the plain obligations list) orders root-2
+        // first — the forest preserves that page order rather than imposing
+        // its own.
+        expect(data.trees.map((t: { obligation: { id: string } }) => t.obligation.id)).toEqual([
+          "root-2",
+          "root-1",
+        ]);
+        const root1 = data.trees[1];
+        expect(root1.children).toHaveLength(1);
+        expect(root1.children[0].obligation.id).toBe("child-1");
+        expect(root1.children[0].children[0].obligation.id).toBe("sub-child");
+      });
+
+      it("honors limit/offset the same way the root page does", async () => {
+        obligations.create({ title: "root-1", id: "root-1", ownerId: "actor-1" });
+        obligations.create({ title: "root-2", id: "root-2", ownerId: "actor-1" });
+
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/forest?limit=1&offset=1");
+        expect(res.statusCode).toBe(200);
+        const data = JSON.parse(res.body);
+        expect(data.total).toBe(2);
+        expect(data.hasMore).toBe(false);
+        expect(data.trees.map((t: { obligation: { id: string } }) => t.obligation.id)).toEqual([
+          "root-2",
+        ]);
+      });
+
+      it("returns an empty forest when there are no roots", async () => {
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/forest");
+        expect(res.statusCode).toBe(200);
+        const data = JSON.parse(res.body);
+        expect(data.trees).toEqual([]);
+        expect(data.total).toBe(0);
+      });
+
+      it("503s when obligations data is unavailable", async () => {
+        const noObligationsDeps = { ...deps, obligations: undefined };
+        const { res } = await call(noObligationsDeps, "GET", "/api/mesh/obligations/forest");
+        expect(res.statusCode).toBe(503);
+      });
+
+      it("excludes quiet terminal roots by default, includes them with includeTerminalRoots=true (#241)", async () => {
+        obligations.create({ title: "live-root", id: "live-root", ownerId: "actor-1" });
+        obligations.create({ title: "quiet-done", id: "quiet-done", ownerId: "actor-1" });
+        obligations.setTerminalStatus("quiet-done", "done");
+
+        const { res: defaultRes } = await call(deps, "GET", "/api/mesh/obligations/forest");
+        const defaultData = JSON.parse(defaultRes.body);
+        expect(
+          defaultData.trees.map((t: { obligation: { id: string } }) => t.obligation.id)
+        ).toEqual(["live-root"]);
+        expect(defaultData.total).toBe(1);
+
+        const { res: includedRes } = await call(
+          deps,
+          "GET",
+          "/api/mesh/obligations/forest?includeTerminalRoots=true"
+        );
+        const includedData = JSON.parse(includedRes.body);
+        expect(
+          includedData.trees.map((t: { obligation: { id: string } }) => t.obligation.id).sort()
+        ).toEqual(["live-root", "quiet-done"]);
+        expect(includedData.total).toBe(2);
       });
     });
 

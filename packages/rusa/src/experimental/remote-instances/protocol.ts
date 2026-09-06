@@ -2,6 +2,7 @@ import type { ActorOptions, PromptBuild, RunAbandon } from "../../actor/actor.js
 import type { ActorRuntimeState } from "../../actor/actor-mesh.js";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import type { ActorRunMode, RunNudge } from "../../actor/trigger-runner.js";
+import type { RawProviderModelConfig } from "../../providers/model-config.js";
 import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/types.js";
 
 // Commands/events multiplexed by actor ID over the authenticated instance connection.
@@ -10,6 +11,12 @@ export interface Bootstrap {
   id: string;
   cwd: string;
   sessionId?: string;
+  /**
+   * The actor's declared candidate pool. Remote placement carries a single
+   * candidate today: the follower builds one provider from `providerOptions`,
+   * so a longer pool has nothing to resolve a second candidate with.
+   */
+  modelConfig?: RawProviderModelConfig[];
   providerOptions?: Record<string, unknown>;
   mcpServers?: McpServerSpec[];
   actorOptions?: Pick<
@@ -23,6 +30,8 @@ export interface RunSnapshot {
   prompt: string;
   promptBuild?: PromptBuild;
   mcpServers?: McpServerSpec[];
+  /** The candidate the leader's pacing gate reserved for this run. */
+  selected?: RawProviderModelConfig;
 }
 
 export interface ProviderBridge {
@@ -39,7 +48,7 @@ export type Request =
   | { op: "beforeRun"; mode: ActorRunMode }
   | { op: "prepareMount" }
   | { op: "complete"; result: RunResult }
-  | { op: "admit"; provider: string; responsive: boolean }
+  | { op: "admit"; candidates: RawProviderModelConfig[]; responsive: boolean }
   | { op: "sendMessage"; to: string; body: string };
 
 export type LeaderCommand =
@@ -58,7 +67,13 @@ export type ActorEvent =
   | { type: "session"; sessionId: string }
   | { type: "queued"; responsive: boolean; mode: ActorRunMode }
   | { type: "result"; result: RunResult }
-  | { type: "runStart"; responsive: boolean; injectRecord?: PromptBuild["injectRecord"] }
+  | {
+      type: "runStart";
+      responsive: boolean;
+      injectRecord?: PromptBuild["injectRecord"];
+      /** The candidate this run actually launched on, for leader-side accounting. */
+      selected: RawProviderModelConfig;
+    }
   | { type: "firstChunk" }
   | { type: "abandoned"; abandon: RunAbandon }
   | { type: "continue"; count: number }

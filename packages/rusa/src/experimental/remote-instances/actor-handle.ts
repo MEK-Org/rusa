@@ -2,7 +2,6 @@ import type { ActorOptions } from "../../actor/actor.js";
 import type { ActorFactoryContext, ActorRuntimeState, MeshActor } from "../../actor/actor-mesh.js";
 import type { RunStartHandle } from "../../actor/concurrency-limiter.js";
 import type { RunNudge } from "../../actor/trigger-runner.js";
-import type { CodingProvider } from "../../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
 import type { ActorEvent, Bootstrap, LeaderCommand, RunSnapshot } from "./protocol.js";
 
@@ -95,11 +94,6 @@ export class ActorHandle implements MeshActor {
     this.yielded = true;
     this.send({ type: "yield", status, note });
   }
-  getProvider(): CodingProvider {
-    if (!this.opts.actorOptions)
-      throw new Error("Provider metadata unavailable in standalone demo");
-    return this.opts.actorOptions.provider;
-  }
   markUnkillable(): void {
     this.send({ type: "unkillable" });
   }
@@ -162,7 +156,7 @@ export class ActorHandle implements MeshActor {
         await ctx.onRunEnd(message.result);
         break;
       case "runStart":
-        hooks?.onRunStart?.(message.responsive, message.injectRecord);
+        hooks?.onRunStart?.(message.responsive, message.injectRecord, message.selected);
         break;
       case "firstChunk":
         hooks?.onFirstChunk?.();
@@ -227,12 +221,18 @@ export class ActorHandle implements MeshActor {
                 release = resolve;
               });
               const handle = ctx.gate(
-                async () => {
+                async (selected) => {
                   if (this.closed) throw new Error("Actor closed before admission");
-                  this.send({ type: "reply", requestId, value: this.opts.snapshot() });
+                  // Selection is decided here and carried to the follower, so the
+                  // remote run uses the candidate the leader actually reserved.
+                  this.send({
+                    type: "reply",
+                    requestId,
+                    value: { ...this.opts.snapshot(), selected },
+                  });
                   await finished;
                 },
-                request.provider,
+                request.candidates,
                 request.responsive
               );
               this.gates.set(requestId, { handle, release });

@@ -272,9 +272,12 @@ function renderTopology(records: ActorRecord[], counts: Map<string, number>): st
   const renderNode = (r: ActorRecord): string => {
     const meta = [
       chip(r.status, statusChipClass(r.status)),
-      r.provider ? chip(r.provider, "muted-chip") : "",
-      r.model ? chip(r.model, "muted-chip") : "",
-      r.effort ? chip(`effort ${r.effort}`, "muted-chip") : "",
+      ...(r.modelConfig ?? []).map((c) =>
+        chip(
+          `${c.provider}${c.model ? `:${c.model}` : ""}${c.effort ? ` @ ${c.effort}` : ""}`,
+          "muted-chip"
+        )
+      ),
       counts.has(r.id) ? chip(`${counts.get(r.id)} events`, "muted-chip") : "",
     ]
       .filter(Boolean)

@@ -32,6 +32,7 @@ import {
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import { readBuildSentinel } from "../update/build-sentinel.js";
 import { handleVoiceApiRequest, type VoiceApiDeps } from "../voice/voice-api.js";
@@ -108,6 +109,8 @@ export interface WebhookServerOptions {
     deliveryId?: string
   ) => void | Promise<void>;
   onNonWebhookRequest?: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
+  /** Application logger for request diagnostics. Absent → nothing is logged. */
+  logger?: Logger;
 }
 
 /**
@@ -179,6 +182,8 @@ export interface DashboardServerOptions {
    * with walkie presence. Absent → those routes 503 with a clear error.
    */
   voice?: { service: VoiceService };
+  /** Application logger for request diagnostics. Absent → nothing is logged. */
+  logger?: Logger;
 }
 
 /**
@@ -242,6 +247,7 @@ export function createDashboardRequestHandler(
   voiceDeps: VoiceApiDeps | null = null
 ) {
   const { serveUi = true } = options;
+  const log = (options.logger ?? nullLogger).child({ component: "dashboard" });
   return async (req: IncomingMessage, res: ServerResponse) => {
     const requestUrl = new URL(req.url || "/", "http://localhost");
     const { pathname } = requestUrl;
@@ -349,7 +355,7 @@ export function createDashboardRequestHandler(
           res.end(html);
           return;
         } catch (err) {
-          console.error("[dashboard] Error rendering shell:", err);
+          log.error("dashboard_shell_render_failed", { path: pathname, err });
           res.writeHead(500, { "Content-Type": "text/plain" });
           res.end("Dashboard unavailable — assets may not be built yet.");
           return;
@@ -357,7 +363,7 @@ export function createDashboardRequestHandler(
       }
     }
 
-    console.log(`[dashboard] 404 Not Found: ${req.method} ${req.url}`);
+    log.debug("dashboard_route_not_found", { method: req.method, path: pathname });
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("Dashboard UI not found or invalid API route");
   };
@@ -368,6 +374,7 @@ export function createDashboardRequestHandler(
  */
 export function createWebhookRequestHandler(options: WebhookServerOptions) {
   const { secret, onEvent, onNonWebhookRequest } = options;
+  const log = (options.logger ?? nullLogger).child({ component: "webhook" });
   return async (req: IncomingMessage, res: ServerResponse) => {
     // Only accept POST to /webhook
     if (req.method !== "POST" || req.url !== "/webhook") {
@@ -385,7 +392,7 @@ export function createWebhookRequestHandler(options: WebhookServerOptions) {
     // Validate signature
     const signature = req.headers["x-hub-signature-256"] as string | undefined;
     if (!validateSignature(secret, body, signature)) {
-      console.log(`[webhook] ❌ Invalid signature, rejecting request`);
+      log.warn("webhook_signature_rejected", { signaturePresent: signature !== undefined });
       res.writeHead(401, { "Content-Type": "text/plain" });
       res.end("Invalid signature");
       return;
@@ -401,7 +408,7 @@ export function createWebhookRequestHandler(options: WebhookServerOptions) {
 
     // Handle ping (sent when webhook is first registered)
     if (eventType === "ping") {
-      console.log(`[webhook] 🏓 Ping received — webhook is active`);
+      log.info("webhook_ping_received");
       res.writeHead(200, { "Content-Type": "text/plain" });
       res.end("pong");
       return;
@@ -424,14 +431,16 @@ export function createWebhookRequestHandler(options: WebhookServerOptions) {
       return;
     }
 
-    // Dispatch event
-    console.log(`[webhook] 📥 Received ${eventType} event`);
+    // Dispatch event. The delivery id is GitHub's request id: binding it to a
+    // child logger ties every record from this delivery back to the request.
+    const deliveryLog = log.child({ deliveryId });
+    deliveryLog.debug("webhook_event_received", { event: eventType });
     try {
       await onEvent(eventType, payload, deliveryId);
       res.writeHead(200, { "Content-Type": "text/plain" });
       res.end("ok");
     } catch (err) {
-      console.error(`[webhook] ❌ Error handling ${eventType}:`, err);
+      deliveryLog.error("webhook_event_failed", { event: eventType, err });
       res.writeHead(500, { "Content-Type": "text/plain" });
       res.end("Internal error");
     }
@@ -446,6 +455,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
 }> {
   const { port } = options;
   const bindHost = options.bindHost ?? "127.0.0.1";
+  const log = (options.logger ?? nullLogger).child({ component: "dashboard" });
   // When a live mesh is bound, stand up the SSE fan-out hub and the Data API
   // deps; both are torn down with the server. Without it, the handler 503s the
   // mesh routes and only serves the static UI.
@@ -456,6 +466,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
     options.mesh && sseHub
       ? {
           actors: options.mesh.actors,
+          logger: options.logger,
           meshEvents: options.mesh.meshEvents,
           meshChat: options.mesh.meshChat,
           obligations: options.mesh.obligations,
@@ -485,7 +496,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           sseHub,
           mesh: options.mesh.mesh,
           service: options.voice?.service ?? null,
-          log: (line) => console.log(line),
+          log: (line) => log.debug("voice_route", { detail: line }),
         }
       : null;
   // Reply-TTS hook: observe the mesh-event emitter for replies to
@@ -503,13 +514,11 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
     // 127.0.0.1:<port> (see configureTailscaleDashboard / install-service).
     server.listen(port, bindHost, () => {
       server.removeListener("error", reject);
-      console.log(`[dashboard] 🌐 Listening on ${bindHost}:${port}`);
+      log.info("dashboard_listening", { bindHost, port });
       if (hasDashboardAsset("index.html")) {
-        console.log(`[dashboard] 🎨 Serving dashboard UI from ${getDashboardAssetDir()}`);
+        log.info("dashboard_ui_assets_ready", { assetDir: getDashboardAssetDir() });
       } else {
-        console.warn(
-          `[dashboard] ⚠️ Dashboard UI bundle missing at ${getDashboardAssetDir()} — requests to / will return 404.`
-        );
+        log.warn("dashboard_ui_assets_missing", { assetDir: getDashboardAssetDir() });
       }
       resolve();
     });
@@ -534,13 +543,14 @@ export async function startWebhookServer(options: WebhookServerOptions): Promise
   close: () => Promise<void>;
 }> {
   const { port } = options;
+  const log = (options.logger ?? nullLogger).child({ component: "webhook" });
   const server = createServer(createWebhookRequestHandler(options));
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, () => {
       server.removeListener("error", reject);
-      console.log(`[webhook] 🌐 Listening on port ${port}`);
+      log.info("webhook_listening", { port });
       resolve();
     });
   });

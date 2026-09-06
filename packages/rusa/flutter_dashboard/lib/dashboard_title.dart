@@ -14,7 +14,7 @@ library;
 
 /// Title for a shell that carries none of its own — an `index.html` served
 /// before the branding rewrite existed, or a non-web host.
-const String defaultDashboardTitle = 'rusa mesh';
+const String defaultDashboardTitle = 'rusa';
 
 /// The title to hand `MaterialApp`, given the document title the shell loaded
 /// with. Blank or whitespace-only means "the shell has nothing to say", not

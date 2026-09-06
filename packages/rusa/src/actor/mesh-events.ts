@@ -47,6 +47,16 @@ export type MeshEventKind =
   // coalesced into that queued opportunity do not emit duplicates. It remains
   // content-free so observability does not become a second worklist.
   | "run_queued"
+  // A queued run reserved a declared candidate from its modelConfig pool —
+  // the earliest-eligible canonical provider lane for a normal run, or the
+  // first healthy declared candidate for a responsive one. Fires once at
+  // initial reservation and again on any later reselection (e.g. a
+  // responsive promote reselecting an earlier-declared lane). `actorId` =
+  // the queued actor, `payload` = {@link RunSelectedPayload}. Distinct from
+  // `run_start`: this records what the run RESERVED, before it necessarily
+  // starts (it may still be cancelled by a HALT while queued); `run_start`
+  // records what actually launched.
+  | "run_selected"
   // For a provider-agnostic (mesh-owned) context actor (design ISSUE_NUM), `run_start`
   // also carries the injection facet: the mesh
   // assembled the actor's own recent run outputs into a fresh, stateless prompt,
@@ -124,9 +134,25 @@ export type MeshEventKind =
   // actor, `payload` = { from, messageId }. A wake whose
   // target wasn't live carries the dropped-message marker in `detail`.
   | "scheduled_wake"
-  // Event source subscriptions (design ISSUE_NUM, phase 2)
+  // An authorized actor cancelled a pending scheduled message before it was
+  // delivered — the disposition step retirement now requires (#191). `actorId` =
+  // the DECIDER, not either endpoint, because the event records a judgment
+  // rather than a delivery; `detail` = the cancelled message id (so the
+  // (kind, detail) index answers "what happened to this message?"); `payload` =
+  // { messageId, fromId, toId, deliverAt, cancelledBy, reason? }.
+  | "scheduled_message_cancelled"
+  // Event source ownership: exactly one actor holds a source at a time, and the
+  // claim governs delegation and bubbling. The verbs read
+  // "subscribed"/"unsubscribed" because that is what ownership was called when
+  // they were minted; they are the durable audit history a live mesh has
+  // already written, so they keep their spelling.
   | "event_source_subscribed"
   | "event_source_unsubscribed"
+  // Direct event source subscriptions: an actor added to a source's delivery
+  // list without owning it. `actorId` = the subscriber, `detail` = the resource
+  // key, `payload` = { subscribedBy } on the add.
+  | "event_source_subscriber_added"
+  | "event_source_subscriber_removed"
   | "stamp_invalid"
   // Host-plane `host-jobs` capability : a grantable systemd-run --user
   // runner for long host-side experiments. `actorId` = the submitting/owning

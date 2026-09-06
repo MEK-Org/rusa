@@ -46,6 +46,7 @@ const ALL_MESH_EVENT_KINDS = Object.keys({
   actor_charter_set: 0,
   actor_model_set: 0,
   run_queued: 0,
+  run_selected: 0,
   run_start: 0,
   run_first_chunk: 0,
   run_end: 0,
@@ -61,6 +62,7 @@ const ALL_MESH_EVENT_KINDS = Object.keys({
   scheduled_wake: 0,
   event_source_subscribed: 0,
   event_source_unsubscribed: 0,
+  scheduled_message_cancelled: 0,
   stamp_invalid: 0,
   host_job_submitted: 0,
   host_job_stopped: 0,
@@ -69,6 +71,8 @@ const ALL_MESH_EVENT_KINDS = Object.keys({
   calendar_read: 0,
   drive_read: 0,
   calendar_write: 0,
+  event_source_subscriber_added: 0,
+  event_source_subscriber_removed: 0,
 } satisfies Record<MeshEventKind, 0>) as MeshEventKind[];
 
 const IGNORED_KINDS = ALL_MESH_EVENT_KINDS.filter(

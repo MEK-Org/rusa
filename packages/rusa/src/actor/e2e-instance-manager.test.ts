@@ -1,4 +1,12 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -29,6 +37,10 @@ describe("E2EInstanceManager", () => {
     mkdirSync(dirname(claudeExecutable), { recursive: true });
     mkdirSync(join(root, ".claude"), { recursive: true });
     mkdirSync(join(root, ".codex"), { recursive: true });
+    mkdirSync(join(root, ".kimi-code", "credentials"), { recursive: true });
+    mkdirSync(join(root, ".kimi-code", "oauth"), { recursive: true });
+    writeFileSync(join(root, ".kimi-code", "config.toml"), "");
+    writeFileSync(join(root, ".kimi-code", "credentials", "kimi-code.json"), "{}");
     writeFileSync(
       join(actorWorktree, "package.json"),
       `${JSON.stringify({ packageManager: "pnpm@10.29.3" })}\n`
@@ -313,6 +325,173 @@ describe("E2EInstanceManager", () => {
     expect(() => subject.down("actor-a")).toThrow("systemctl unavailable");
     await expect(subject.up("actor-b", join(workersDir, "actor-b"))).rejects.toThrow(
       /already held by handle-actor-a \(actor-a\)/
+    );
+  });
+
+  it("rejects re-up after an external stop leaves holder+runtime intact, then rebuilds Claude mount targets once the holder brings it down", async () => {
+    writeFileSync(join(root, ".claude.json"), '{"marker":"file-v1"}\n');
+    const subject = manager();
+    const stateFile = join(mcHome, "e2e-instance.json");
+    const runtimeDir = join(mcHome, "e2e-instance", "runtime");
+    const claudeJsonTarget = join(runtimeDir, "home", ".claude.json");
+
+    await subject.up("actor-a", actorWorktree);
+    expect(statSync(claudeJsonTarget).isFile()).toBe(true);
+    const recordBefore = readFileSync(stateFile, "utf8");
+
+    // The incident: the transient unit is stopped outside down() (host
+    // restart, an operator's `systemctl stop`, a crash) while the holder
+    // record and runtime directory survive untouched.
+    active = false;
+
+    const callsBeforeReUp = calls.length;
+    await expect(subject.up("actor-b", join(workersDir, "actor-b"))).rejects.toThrow(
+      /already held by handle-actor-a \(actor-a\).+down\/stop.+retired.+mesh shuts down/
+    );
+    // Rejected before any worktree preparation or relaunch attempt.
+    expect(calls.slice(callsBeforeReUp).some((call) => call.file === "git")).toBe(false);
+    expect(calls.slice(callsBeforeReUp).some((call) => call.file === "systemd-run")).toBe(false);
+    // The preserved holder record and runtime were not mutated by the refusal.
+    expect(readFileSync(stateFile, "utf8")).toBe(recordBefore);
+    expect(statSync(claudeJsonTarget).isFile()).toBe(true);
+
+    // Only the holder can bring the dead unit state down.
+    subject.down("actor-a");
+    expect(existsSync(stateFile)).toBe(false);
+    expect(existsSync(runtimeDir)).toBe(false);
+
+    // The host's Claude state is now a differently-shaped path (a directory
+    // instead of a file). A fresh up() must build a mount target that
+    // matches this current shape, not reuse anything from the prior run.
+    rmSync(join(root, ".claude.json"), { force: true });
+    mkdirSync(join(root, ".claude.json"), { recursive: true });
+
+    await subject.up("actor-a", actorWorktree);
+    expect(statSync(claudeJsonTarget).isDirectory()).toBe(true);
+  });
+
+  it("clears a recordless orphan runtime before rebuilding mount targets, instead of reusing a stale shape", async () => {
+    writeFileSync(join(root, ".claude.json"), '{"marker":"file"}\n');
+    const subject = manager();
+    const runtimeDir = join(mcHome, "e2e-instance", "runtime");
+    const claudeJsonTarget = join(runtimeDir, "home", ".claude.json");
+
+    // No holder record and no live unit, but a leftover runtime tree whose
+    // Claude mount target is a stale directory even though the current host
+    // source is a plain file (e.g. state stranded by a crash before this
+    // manager could persist its own holder record).
+    mkdirSync(claudeJsonTarget, { recursive: true });
+    expect(statSync(claudeJsonTarget).isDirectory()).toBe(true);
+
+    await subject.up("actor-a", actorWorktree);
+
+    expect(statSync(claudeJsonTarget).isFile()).toBe(true);
+  });
+
+  it("projects Kimi credentials/oauth writable but config.toml read-only, never the whole ~/.kimi-code tree, on a clean up()", async () => {
+    // Deliberately NOT a stale-runtime scenario (that's #224's territory) — a plain
+    // first `up()` against a clean managed instance already hit issue #225's EROFS,
+    // because the outer projection bound the whole ~/.kimi-code tree read-only. A
+    // nested Kimi sandbox's own writable bind of credentials/ or oauth/ (see
+    // sandbox.ts) inherits the RDONLY flag of the outer mount its source lives
+    // under, so it stayed read-only no matter what the nested sandbox asked for.
+    const subject = manager();
+    await subject.up("actor-a", actorWorktree);
+
+    const launch = calls.find((call) => call.file === "systemd-run");
+    const runtimeKimiCodeDir = join(mcHome, "e2e-instance", "runtime", "home", ".kimi-code");
+    expect(launch?.args).toEqual(
+      expect.arrayContaining([
+        "--bind",
+        join(root, ".kimi-code", "credentials"),
+        join(runtimeKimiCodeDir, "credentials"),
+      ])
+    );
+    expect(launch?.args).toEqual(
+      expect.arrayContaining([
+        "--bind",
+        join(root, ".kimi-code", "oauth"),
+        join(runtimeKimiCodeDir, "oauth"),
+      ])
+    );
+    expect(launch?.args).toEqual(
+      expect.arrayContaining([
+        "--ro-bind",
+        join(root, ".kimi-code", "config.toml"),
+        join(runtimeKimiCodeDir, "config.toml"),
+      ])
+    );
+    // Never a single blanket bind (read-only OR writable) of the whole directory —
+    // that would either reproduce #225 (read-only) or over-grant nested actors
+    // authority over the entire host ~/.kimi-code tree (writable).
+    expect(launch?.args).not.toEqual(
+      expect.arrayContaining(["--ro-bind", join(root, ".kimi-code"), runtimeKimiCodeDir])
+    );
+    expect(launch?.args).not.toEqual(
+      expect.arrayContaining(["--bind", join(root, ".kimi-code"), runtimeKimiCodeDir])
+    );
+  });
+
+  it("keeps Kimi credentials/oauth writable across the externally-stopped-unit recovery shape", async () => {
+    // Mirrors "rejects re-up after an external stop..." above: the transient unit
+    // dies outside down() while the holder record survives, so a same-actor
+    // down() + up() is the only recovery path (#224's refusal/cleanup lifecycle).
+    // #225's regression is narrower — once that recovery completes, is the
+    // rebuilt runtime's Kimi projection still correctly writable?
+    const subject = manager();
+    const runtimeKimiCodeDir = join(mcHome, "e2e-instance", "runtime", "home", ".kimi-code");
+
+    await subject.up("actor-a", actorWorktree);
+    active = false; // external stop: host restart, operator systemctl stop, a crash
+    await expect(subject.up("actor-b", join(workersDir, "actor-b"))).rejects.toThrow(
+      /already held by handle-actor-a/
+    );
+
+    subject.down("actor-a");
+    await subject.up("actor-a", actorWorktree);
+
+    const relaunch = calls.filter((call) => call.file === "systemd-run").at(-1);
+    expect(relaunch?.args).toEqual(
+      expect.arrayContaining([
+        "--bind",
+        join(root, ".kimi-code", "credentials"),
+        join(runtimeKimiCodeDir, "credentials"),
+      ])
+    );
+    expect(relaunch?.args).toEqual(
+      expect.arrayContaining([
+        "--bind",
+        join(root, ".kimi-code", "oauth"),
+        join(runtimeKimiCodeDir, "oauth"),
+      ])
+    );
+  });
+
+  it("keeps Kimi credentials/oauth writable when a recordless orphan runtime is cleared before rebuilding", async () => {
+    // Same recordless-orphan precondition as "clears a recordless orphan runtime..."
+    // above (state stranded by a crash before a holder record was persisted) — here
+    // checking the Kimi projection specifically survives clearOrphanRuntime + rebuild.
+    const subject = manager();
+    const runtimeKimiCodeDir = join(mcHome, "e2e-instance", "runtime", "home", ".kimi-code");
+    mkdirSync(join(runtimeKimiCodeDir, "credentials"), { recursive: true });
+    writeFileSync(join(runtimeKimiCodeDir, "oauth"), "stale file, not a directory");
+
+    await subject.up("actor-a", actorWorktree);
+
+    const launch = calls.find((call) => call.file === "systemd-run");
+    expect(launch?.args).toEqual(
+      expect.arrayContaining([
+        "--bind",
+        join(root, ".kimi-code", "credentials"),
+        join(runtimeKimiCodeDir, "credentials"),
+      ])
+    );
+    expect(launch?.args).toEqual(
+      expect.arrayContaining([
+        "--bind",
+        join(root, ".kimi-code", "oauth"),
+        join(runtimeKimiCodeDir, "oauth"),
+      ])
     );
   });
 });

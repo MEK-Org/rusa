@@ -18,6 +18,18 @@ describe("config docs", () => {
     expect(CONFIG_DOCS).toContain("ember-familiar");
   });
 
+  it("documents the application log level and where to read the log", () => {
+    expect(CONFIG_DOCS).toContain("observability.logging:");
+    expect(CONFIG_DOCS).toContain("RUSA_LOG_LEVEL");
+    expect(CONFIG_DOCS).toContain("debug, info (default), warn, error, or silent");
+    expect(CONFIG_DOCS).toContain("docs/logging.md");
+  });
+
+  it("documents how an interactive run stays readable", () => {
+    expect(CONFIG_DOCS).toContain("RUSA_LOG_FORMAT");
+    expect(CONFIG_DOCS).toContain("auto is pretty when stdout is a terminal");
+  });
+
   it("documents the quickstart profile", () => {
     expect(CONFIG_DOCS).toContain("profile: quickstart");
     expect(CONFIG_DOCS).toContain("local git bridge delivery");

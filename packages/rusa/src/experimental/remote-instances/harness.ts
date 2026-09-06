@@ -58,6 +58,7 @@ export function createHarness(options: {
         bootstrap: {
           id: context.record.id,
           cwd: options.cwd,
+          modelConfig: context.record.modelConfig ? [...context.record.modelConfig] : undefined,
           providerOptions: { delayMs: options.delayMs },
           sessionId: context.record.sessionId,
         },
@@ -119,8 +120,7 @@ export function createHarness(options: {
       const id = mesh.spawn({
         charter,
         parentId: "root",
-        provider: "instance-fixture",
-        model: "scripted",
+        modelConfig: { provider: "instance-fixture", model: "scripted" },
       });
       mesh.sendMessage(id, "Begin your charter", "root");
       return id;

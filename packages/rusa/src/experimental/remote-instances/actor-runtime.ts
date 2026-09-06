@@ -56,11 +56,17 @@ export function createActorRuntime(
     );
     if (stopping) return;
     const mcpServers = bootstrap.mcpServers ?? [];
+    // One provider per remote actor: the bootstrap names the single declared
+    // candidate, so selection resolves back to it whatever the leader reserved.
+    const modelConfig = bootstrap.modelConfig?.length
+      ? [...bootstrap.modelConfig]
+      : [{ provider: provider.providerName ?? provider.name }];
     actor = new Actor({
       ...bootstrap.actorOptions,
       id: bootstrap.id,
       cwd: bootstrap.cwd,
-      provider,
+      modelConfig,
+      resolveProvider: () => provider,
       mcpServers,
       debounceMs: bootstrap.actorOptions?.debounceMs ?? 10,
       loadSessionId: () => sessionId,
@@ -78,9 +84,13 @@ export function createActorRuntime(
         sessionId = reply.sessionId;
         return reply.allowed;
       },
-      gate: async (fn, provider, responsive) => {
+      gate: async (fn, candidates, responsive) => {
         activeGates++;
-        const admission = request<RunSnapshot>({ op: "admit", provider, responsive });
+        const admission = request<RunSnapshot>({
+          op: "admit",
+          candidates: [...candidates],
+          responsive,
+        });
         try {
           snapshot = await admission.result;
           if (stopping) throw new Error("Actor stopped before admission");
@@ -89,7 +99,8 @@ export function createActorRuntime(
             // Actor holds the array by reference, matching the in-process tool refresh path.
             mcpServers.splice(0, mcpServers.length, ...snapshot.mcpServers);
           }
-          return await fn();
+          // The leader's pacing gate owns selection; the follower runs what it reserved.
+          return await fn(snapshot.selected ?? candidates[0]);
         } finally {
           send({ type: "release", requestId: admission.id });
           activeGates--;
@@ -99,8 +110,8 @@ export function createActorRuntime(
       onQueued: (context) => send({ type: "queued", ...context }),
       onRunEnd: (result) =>
         stopping ? Promise.resolve() : request<void>({ op: "complete", result }).result,
-      onRunStart: (responsive, injectRecord) =>
-        send({ type: "runStart", responsive, injectRecord }),
+      onRunStart: (responsive, injectRecord, selected) =>
+        send({ type: "runStart", responsive, injectRecord, selected }),
       onFirstChunk: () => send({ type: "firstChunk" }),
       onRunAbandoned: (abandon) => send({ type: "abandoned", abandon }),
       onContinue: (count) => send({ type: "continue", count }),

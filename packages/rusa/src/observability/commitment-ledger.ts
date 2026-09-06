@@ -136,6 +136,8 @@ const PROGRESS_KINDS: ReadonlySet<string> = new Set([
   "capability_revoked",
   "event_source_subscribed",
   "event_source_unsubscribed",
+  "event_source_subscriber_added",
+  "event_source_subscriber_removed",
 ]);
 
 /**
@@ -179,6 +181,8 @@ const LEDGER_READS: Readonly<Record<MeshEventKind, LedgerRead>> = {
   scheduled_wake: "fields",
   event_source_subscribed: "fields",
   event_source_unsubscribed: "fields",
+  event_source_subscriber_added: "fields",
+  event_source_subscriber_removed: "fields",
 
   // The two kinds whose prose is evidence: a yield note carries `waiting on`,
   // and a sent message carries the tracking/resolved lines.
@@ -194,11 +198,16 @@ const LEDGER_READS: Readonly<Record<MeshEventKind, LedgerRead>> = {
   message_received: "ignored",
   actor_reparented: "ignored",
   run_queued: "ignored",
+  run_selected: "ignored",
   run_first_chunk: "ignored",
   run_preempted: "ignored",
   portable_context_compacted: "ignored",
   run_coalesced: "ignored",
   stamp_invalid: "ignored",
+  // The decider's other events in the same run (`run_start`, `run_yielded`) are
+  // what say it was working; withdrawing one scheduled delivery neither opens
+  // nor closes a commitment this projection tracks.
+  scheduled_message_cancelled: "ignored",
   host_job_submitted: "ignored",
   host_job_stopped: "ignored",
   host_job_exited: "ignored",
@@ -330,15 +339,23 @@ export function projectOpenCommitments(opts: {
       lastYield?.detail === "complete" &&
       !hasLater(actorEvents, lastYield, (event) => event.kind === "run_start");
 
-    const eventSubscriptions = new Set<string>();
+    // Either relationship with an event source makes an actor event-driven: an
+    // owner is woken by events that reach it through the ownership ladder, a
+    // direct subscriber by events on the exact source it asked for.
+    const eventSources = new Set<string>();
     for (const event of actorEvents) {
-      if (event.kind === "event_source_subscribed" && event.detail) {
-        eventSubscriptions.add(event.detail);
-      } else if (event.kind === "event_source_unsubscribed" && event.detail) {
-        eventSubscriptions.delete(event.detail);
+      if (!event.detail) continue;
+      if (event.kind === "event_source_subscribed") {
+        eventSources.add(`owner\0${event.detail}`);
+      } else if (event.kind === "event_source_unsubscribed") {
+        eventSources.delete(`owner\0${event.detail}`);
+      } else if (event.kind === "event_source_subscriber_added") {
+        eventSources.add(`subscriber\0${event.detail}`);
+      } else if (event.kind === "event_source_subscriber_removed") {
+        eventSources.delete(`subscriber\0${event.detail}`);
       }
     }
-    const isEventDriven = eventSubscriptions.size > 0;
+    const isEventDriven = eventSources.size > 0;
 
     const lastBadRun = lastWhere(
       actorEvents,

@@ -3,6 +3,7 @@ import { join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import { resolveHome } from "../config/index.js";
 import { planLegacyActorImport } from "../db/legacy-actor-import.js";
+import { planLegacyEventSubscriptionImport } from "../db/legacy-event-subscription-import.js";
 import { pendingMigrationIds, runMigrations } from "../db/migrations/runner.js";
 import { Repositories } from "../db/repositories/index.js";
 import { widenToWal } from "../db/wal.js";
@@ -11,6 +12,7 @@ export interface DbCheckResult {
   pendingMigrationIds: string[];
   plannedActors: number;
   plannedScheduledMessages: number;
+  plannedEventSourceOwnerships: number;
 }
 
 /** Resolve symlinks when the path exists on disk; otherwise just normalize it. */
@@ -57,10 +59,36 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
     const repositories = new Repositories(db);
     const plan = planLegacyActorImport({ mcHome: home, repositories });
 
+    // Both imports are planned against one un-mutated copy, so the actors a
+    // subscription references may still be pending rather than committed. The
+    // subscription plan is told about them explicitly instead of failing on an
+    // ordering that only exists because preflight plans and never applies.
+    const pendingActors = plan.plan.kind === "import" ? plan.plan.records : [];
+    // Parentless *is* the definition of root that boot's `resolveRootActorId`
+    // uses, and neither side can hold two: the `actors` table carries a unique
+    // index over `parent_id IS NULL`, and a legacy document with anything other
+    // than exactly one root is refused while planning, above. So the first match
+    // is the only match, and preflight recognizes the same config-implied rows
+    // boot would. Boot mints a root id when both sides are empty; preflight
+    // cannot invent one, and does not need to — a minted id has never appeared
+    // in a legacy document, so it matches nothing either.
+    const rootId =
+      repositories.actors.list().find((actor) => actor.parentId === null)?.id ??
+      pendingActors.find((actor) => actor.parentId === null)?.id;
+    const subscriptionPlan = planLegacyEventSubscriptionImport({
+      mcHome: home,
+      repositories,
+      // With no root on either side there are no config-implied legacy rows to
+      // recognize, and no id can match one.
+      rootId: rootId ?? "",
+      pendingActorIds: pendingActors.map((actor) => actor.id),
+    });
+
     return {
       pendingMigrationIds: pending,
       plannedActors: plan.plannedActors,
       plannedScheduledMessages: plan.plannedScheduledMessages,
+      plannedEventSourceOwnerships: subscriptionPlan.plannedSubscriptions,
     };
   } finally {
     db.close();
@@ -77,7 +105,9 @@ export function runDbCheck(opts: { home: string }): void {
         : "Pending migrations: none"
     );
     console.log(
-      `Legacy import plan: ${result.plannedActors} actor(s), ${result.plannedScheduledMessages} scheduled message(s)`
+      `Legacy import plan: ${result.plannedActors} actor(s), ` +
+        `${result.plannedScheduledMessages} scheduled message(s), ` +
+        `${result.plannedEventSourceOwnerships} event source ownership(s)`
     );
     console.log("✓ db-check passed");
   } catch (err) {

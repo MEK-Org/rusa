@@ -128,6 +128,34 @@ describe("InboxFocusResolver", () => {
     });
   });
 
+  it("treats a prerequisite-cancelled entry as obligation-backed and infers its live dependent (#212)", () => {
+    const entries = append([
+      {
+        id: "prereq-cancelled",
+        source: "obligation:issue-work",
+        payload: {
+          type: "obligation.prerequisite_cancelled",
+          obligationId: "issue-work",
+          prerequisiteId: "some-prereq",
+        },
+      },
+    ]);
+    runs.start({ id: "run-prereq-cancelled", actorId: "actor-a" });
+
+    const result = resolver.select({
+      runId: "run-prereq-cancelled",
+      actorId: "actor-a",
+      entries,
+    });
+
+    expect(result).toMatchObject({
+      primaryObligationId: "issue-work",
+      resolution: "inferred",
+      related: true,
+      diagnostics: [],
+    });
+  });
+
   it("uses explicit focus for a general message and makes that association durable", () => {
     const [entry] = append([
       { id: "general", source: "mesh:root", payload: { type: "mesh.message" } },

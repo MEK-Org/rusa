@@ -11,6 +11,7 @@ import { obligationTerminalNote } from "../db/migrations/0026_obligation_termina
 import { obligationTitle } from "../db/migrations/0027_obligation_title.js";
 import { obligationArtifacts } from "../db/migrations/0028_obligation_artifacts.js";
 import { recurringObligations } from "../db/migrations/0035_recurring_obligations.js";
+import { obligationDependencies } from "../db/migrations/0037_obligation_dependencies.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { createObligationsMcpServer } from "./obligations-mcp.js";
@@ -42,18 +43,21 @@ describe("obligations MCP", () => {
     obligationTitle.up(db);
     obligationArtifacts.up(db);
     recurringObligations.up(db);
+    obligationDependencies.up(db);
     repository = new ObligationRepository(db);
   });
 
-  it("exposes all 10 obligation tools", async () => {
+  it("exposes all 12 obligation tools", async () => {
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
     const { tools } = await client.listTools();
     expect(tools.map((tool) => tool.name).sort()).toEqual([
+      "add_obligation_prerequisite",
       "attach_artifact",
       "create_obligation",
       "get_obligation",
       "list_owned",
       "reassign_obligation",
+      "remove_obligation_prerequisite",
       "reorder_obligation",
       "reparent_obligation",
       "set_external_ref",
@@ -702,5 +706,163 @@ describe("obligations MCP", () => {
       arguments: { id: "missing" },
     })) as CallToolResult;
     expect(result.isError).toBe(true);
+  });
+
+  it("accepts blocked_by on create_obligation and creates the dependent waiting", async () => {
+    repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+
+    const res = (await client.callTool({
+      name: "create_obligation",
+      arguments: {
+        title: "dependent",
+        owner_id: "actor-a",
+        blocked_by: ["prereq"],
+      },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    const { obligation } = dataOf(res) as { obligation: { status: string } };
+    expect(obligation.status).toBe("waiting");
+  });
+
+  it("rejects blocked_by on create_obligation for a non-owner target, and honors the owner-ancestor policy (#212)", async () => {
+    repository.create({ title: "prereq", id: "prereq", ownerId: "actor-b" });
+
+    const denied = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const deniedResult = (await denied.callTool({
+      name: "create_obligation",
+      arguments: {
+        title: "dependent",
+        owner_id: "actor-b",
+        blocked_by: ["prereq"],
+      },
+    })) as CallToolResult;
+    expect(deniedResult.isError).toBe(true);
+    expect(repository.get("dependent")).toBeNull();
+
+    const ancestor = await connect(
+      createObligationsMcpServer(repository, "actor-a", { canManage: () => true })
+    );
+    const ancestorResult = (await ancestor.callTool({
+      name: "create_obligation",
+      arguments: {
+        title: "dependent",
+        owner_id: "actor-b",
+        blocked_by: ["prereq"],
+      },
+    })) as CallToolResult;
+    expect(ancestorResult.isError).toBeFalsy();
+    const { obligation } = dataOf(ancestorResult) as { obligation: { status: string } };
+    expect(obligation.status).toBe("waiting");
+  });
+
+  it("adds and removes a prerequisite for the owner, and honors the owner-ancestor policy", async () => {
+    repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
+    repository.create({ title: "dependent", id: "dependent", ownerId: "actor-a" });
+    const owner = await connect(createObligationsMcpServer(repository, "actor-a"));
+
+    const added = (await owner.callTool({
+      name: "add_obligation_prerequisite",
+      arguments: { id: "dependent", prerequisite_id: "prereq" },
+    })) as CallToolResult;
+    expect(added.isError).toBeFalsy();
+    expect(repository.require("dependent").status).toBe("waiting");
+
+    const removed = (await owner.callTool({
+      name: "remove_obligation_prerequisite",
+      arguments: { id: "dependent", prerequisite_id: "prereq" },
+    })) as CallToolResult;
+    expect(removed.isError).toBeFalsy();
+    expect(repository.require("dependent").status).toBe("ready");
+  });
+
+  it("rejects add/remove prerequisite for a non-owner, and honors the owner-ancestor policy", async () => {
+    repository.create({ title: "prereq", id: "prereq", ownerId: "actor-b" });
+    repository.create({ title: "dependent", id: "dependent", ownerId: "actor-b" });
+
+    const denied = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const deniedResult = (await denied.callTool({
+      name: "add_obligation_prerequisite",
+      arguments: { id: "dependent", prerequisite_id: "prereq" },
+    })) as CallToolResult;
+    expect(deniedResult.isError).toBe(true);
+    expect(
+      repository.listBlockedByPage("dependent", { limit: 10, offset: 0 }).obligations
+    ).toHaveLength(0);
+
+    const ancestor = await connect(
+      createObligationsMcpServer(repository, "actor-a", { canManage: () => true })
+    );
+    const ancestorResult = (await ancestor.callTool({
+      name: "add_obligation_prerequisite",
+      arguments: { id: "dependent", prerequisite_id: "prereq" },
+    })) as CallToolResult;
+    expect(ancestorResult.isError).toBeFalsy();
+
+    const deniedRemove = (await denied.callTool({
+      name: "remove_obligation_prerequisite",
+      arguments: { id: "dependent", prerequisite_id: "prereq" },
+    })) as CallToolResult;
+    expect(deniedRemove.isError).toBe(true);
+
+    const ancestorRemove = (await ancestor.callTool({
+      name: "remove_obligation_prerequisite",
+      arguments: { id: "dependent", prerequisite_id: "prereq" },
+    })) as CallToolResult;
+    expect(ancestorRemove.isError).toBeFalsy();
+  });
+
+  it("returns paginated blockedBy and unblocks projections from get_obligation", async () => {
+    repository.create({ title: "p1", id: "p1", ownerId: "actor-a" });
+    repository.create({ title: "p2", id: "p2", ownerId: "actor-a" });
+    repository.create({
+      title: "dependent",
+      id: "dependent",
+      ownerId: "actor-a",
+      blockedBy: ["p1", "p2"],
+    });
+
+    const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+    const dependentRes = (await client.callTool({
+      name: "get_obligation",
+      arguments: { id: "dependent", limit: 1 },
+    })) as CallToolResult;
+    expect(dependentRes.isError).toBeFalsy();
+    const dependentData = dataOf(dependentRes) as {
+      blockedBy: {
+        items: Array<{ id: string }>;
+        total: number;
+        truncated: boolean;
+        nextCursor: string | null;
+      };
+    };
+    expect(dependentData.blockedBy.items.map((o) => o.id)).toEqual(["p1"]);
+    expect(dependentData.blockedBy.total).toBe(2);
+    expect(dependentData.blockedBy.truncated).toBe(true);
+    expect(dependentData.blockedBy.nextCursor).not.toBeNull();
+
+    const nextPage = (await client.callTool({
+      name: "get_obligation",
+      arguments: {
+        id: "dependent",
+        limit: 1,
+        blocked_by_cursor: dependentData.blockedBy.nextCursor,
+      },
+    })) as CallToolResult;
+    const nextData = dataOf(nextPage) as {
+      blockedBy: { items: Array<{ id: string }> };
+    };
+    expect(nextData.blockedBy.items.map((o) => o.id)).toEqual(["p2"]);
+
+    const prereqRes = (await client.callTool({
+      name: "get_obligation",
+      arguments: { id: "p1" },
+    })) as CallToolResult;
+    const prereqData = dataOf(prereqRes) as {
+      unblocks: { items: Array<{ id: string }>; total: number };
+    };
+    expect(prereqData.unblocks.items.map((o) => o.id)).toEqual(["dependent"]);
+    expect(prereqData.unblocks.total).toBe(1);
   });
 });

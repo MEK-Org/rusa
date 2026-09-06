@@ -1,11 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
 import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../mcp/stamp.js";
-import {
-  type ModelEffortSelection,
-  normalizeModelEffortSelection,
-} from "../providers/reasoning-effort.js";
-import type { CodingProvider, RunResult } from "../providers/types.js";
+import { prerequisiteEdgeKey } from "../obligations/obligation.js";
+import type {
+  ModelConfigInput,
+  ProviderModelConfig,
+  RawProviderModelConfig,
+} from "../providers/model-config.js";
+import type { RunResult } from "../providers/types.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./actor-record.js";
@@ -21,9 +23,13 @@ import {
 } from "./concurrency-limiter.js";
 import {
   type EventResource,
-  type EventSubscription,
-  type EventSubscriptionStore,
-  InMemoryEventSubscriptionStore,
+  type EventSourceOwnerStore,
+  type EventSourceOwnership,
+  type EventSourceSubscription,
+  type EventSourceSubscriptionStore,
+  InMemoryEventSourceOwnerStore,
+  InMemoryEventSourceSubscriptionStore,
+  isSubResourceOf,
   parentOf,
   resourceKey,
   sameResource,
@@ -71,8 +77,7 @@ export interface MeshActor {
   interrupt?(by?: string): { interrupted: boolean; runStartTime?: Date; wasQueued?: boolean };
   getInterruptedWatermark?(): Date | null;
   clearInterruptWatermark?(): void;
-  setProvider?(provider: CodingProvider): void;
-  getProvider?(): CodingProvider;
+  setModelConfig?(modelConfig: ProviderModelConfig[]): void;
 }
 
 export type ActorRuntimeState = "queued" | "running" | "winding_down" | "idle";
@@ -97,12 +102,11 @@ export interface SpawnRequest {
   charter: string;
   /** The spawning actor's id (becomes the child's parent + gets a handle to the child). */
   parentId: string;
-  /** Coding harness for the child (a `providers` key). Required . */
-  provider: string;
-  /** Model/tier id for the child's provider. Required . */
-  model: string;
-  /** Provider-native reasoning level. Omit to preserve the provider/model default. */
-  effort?: string;
+  /**
+   * The child's declared provider/model/effort pool — a single entry or a
+   * bounded, non-empty, portable-only-above-length-one array (design MEK-Org/rusa#169).
+   */
+  modelConfig: ModelConfigInput;
   /** Working-memory ownership and portable-context policy. Missing means native. */
   context?: ContextConfig;
   /** Peers to seed the child's address book with (introductions at birth). */
@@ -139,8 +143,13 @@ export interface ActiveRunState {
 
 export interface RetireOptions {
   /**
-   * Complete override: retire immediately even if a run in the subtree is actively running.
-   * Operator / root-control / internal teardown only.
+   * Run-guard override: retire immediately even if a run in the subtree is actively
+   * running. Operator / root-control only.
+   *
+   * Deliberately *not* an override for the undisposed-work preflight (#191). Force
+   * exists because a wedged actor must stay retirable, and a wedged run is the mesh's
+   * own problem to break; a live obligation or an undelivered message is somebody's
+   * work, and no flag turns "I could not wait for this run" into "throw that away".
    */
   force?: boolean;
   /**
@@ -150,7 +159,94 @@ export interface RetireOptions {
   forceQueued?: boolean;
 }
 
+/** One live obligation, in the detail a retirement refusal needs to name it. */
+export interface LiveObligationSummary {
+  id: string;
+  status: string;
+  title: string | null;
+}
+
+/**
+ * The narrow slice of the obligation store the mesh reads.
+ *
+ * `listLiveOwnedBy` is what lets retirement fail closed on unfinished work; a
+ * mesh wired without it — an isolated test, an embedder built before
+ * obligations existed — still retires on the run-in-flight guard alone.
+ */
+export interface MeshObligationPort {
+  findLiveByExternalRef(ref: string): { ownerId: string } | null;
+  listLiveOwnedBy?(ownerId: string): readonly LiveObligationSummary[];
+}
+
+/** One live obligation owned inside a retiring subtree (#191). */
+export interface ObligationRetirementBlocker {
+  obligationId: string;
+  ownerId: string;
+  status: string;
+  title: string | null;
+}
+
+/**
+ * One pending scheduled message with an endpoint inside a retiring subtree
+ * (#191). `direction` is stated relative to that subtree: `incoming` = awaiting
+ * delivery to it, `outgoing` = scheduled by it, `internal` = both.
+ */
+export interface MessageRetirementBlocker {
+  messageId: string;
+  fromId: string;
+  toId: string;
+  deliverAt: string;
+  direction: "incoming" | "outgoing" | "internal";
+}
+
+/** Everything a subtree must dispose of before it can retire — see {@link ActorMesh.retirementBlockers}. */
+export interface RetirementBlockers {
+  obligations: ObligationRetirementBlocker[];
+  messages: MessageRetirementBlocker[];
+}
+
+/**
+ * Retirement refused because the subtree still holds work someone has to decide
+ * about. Carries the blockers structurally as well as in the message, so a
+ * caller that wants to act on them doesn't have to parse prose back out.
+ */
+export class RetirementBlockedError extends Error {
+  constructor(
+    readonly blockers: RetirementBlockers,
+    message: string
+  ) {
+    super(message);
+    this.name = "RetirementBlockedError";
+  }
+}
+
 /** Human-readable subject line for a retire refusal — see {@link ActorMesh.retire}. */
+/**
+ * Bare object-or-array normalization for embedders that skip config-aware
+ * validation (tests). Still enforces the one invariant that must never be
+ * bypassed: a missing/blank model must fail loudly rather than silently
+ * resolve to a provider default (#169).
+ */
+function normalizeModelConfigList(input: ModelConfigInput): ProviderModelConfig[] {
+  const list = Array.isArray(input) ? input : [input];
+  return list.map((entry) => {
+    const model = entry.model?.trim();
+    if (!model) {
+      throw new Error(
+        `modelConfig entry for provider "${entry.provider}" is missing a model — omitted/blank models are not allowed, since that would silently select the provider's default`
+      );
+    }
+    return { provider: entry.provider, model, effort: entry.effort };
+  });
+}
+
+/** Human-readable pool summary for the spawn/model-set event log. */
+function describeModelConfigPool(pool: readonly ProviderModelConfig[]): string {
+  return pool
+    .map((c) => `${c.provider}${c.model ? `:${c.model}` : ""}${c.effort ? ` @ ${c.effort}` : ""}`)
+    .join(", ");
+}
+
 function describeActiveRuns(target: string, busy: readonly ActiveRunState[]): string {
   const named = busy.map((r) => `${r.actorId} (${r.phase})`).join(", ");
   const self = busy.find((r) => r.actorId === target);
@@ -162,6 +258,71 @@ function describeActiveRuns(target: string, busy: readonly ActiveRunState[]): st
   return `${busy.length} threads in its subtree have runs in flight — ${named}`;
 }
 
+/** How many blockers of each kind a refusal spells out before summarising the rest. */
+const LISTED_RETIREMENT_BLOCKERS = 10;
+
+function listWithOverflow<T>(items: readonly T[], render: (item: T) => string): string[] {
+  const lines = items.slice(0, LISTED_RETIREMENT_BLOCKERS).map(render);
+  if (items.length > LISTED_RETIREMENT_BLOCKERS) {
+    lines.push(`  …and ${items.length - LISTED_RETIREMENT_BLOCKERS} more`);
+  }
+  return lines;
+}
+
+/**
+ * The retirement refusal an actor actually reads. Every blocker is named by a
+ * stable id and paired with the operation that clears it, because the whole
+ * point of refusing is that the caller can then resolve each one and retry —
+ * a refusal that only says "there is pending work" leaves them nothing to do.
+ */
+function describeRetirementBlockers(target: string, blockers: RetirementBlockers): string {
+  const lines: string[] = [];
+  if (blockers.obligations.length > 0) {
+    lines.push(
+      `${blockers.obligations.length} live obligation(s) owned in its subtree — reassign or finish each:`
+    );
+    lines.push(
+      ...listWithOverflow(
+        blockers.obligations,
+        (o) =>
+          `  ${o.obligationId} [${o.status}] owned by ${o.ownerId}${o.title ? ` — ${o.title}` : ""}`
+      )
+    );
+  }
+  if (blockers.messages.length > 0) {
+    lines.push(
+      `${blockers.messages.length} pending scheduled message(s) touching its subtree — ` +
+        "cancel each with cancel_scheduled_message, re-sending any that still matter:"
+    );
+    lines.push(
+      ...listWithOverflow(
+        blockers.messages,
+        (m) => `  ${m.messageId} [${m.direction}] ${m.fromId} -> ${m.toId} at ${m.deliverAt}`
+      )
+    );
+  }
+  return [
+    `cannot retire ${target}: its subtree still holds work that needs an explicit decision.`,
+    ...lines,
+    "Nothing was retired. Resolve every blocker above, then retire again.",
+  ].join("\n");
+}
+
+/**
+ * Principals that act with operator authority rather than as a thread in the
+ * ownership tree: the root LLM's control surface, a human, and the e2e
+ * controller. Their scope is enforced by the surface that mints them, not by
+ * ancestry, since none of them is a node in the tree to begin with.
+ */
+function isTrustedControlPrincipal(by: string): boolean {
+  return (
+    by === "root-llm" ||
+    by === "human:operator" ||
+    by.startsWith("human:") ||
+    by === "e2e-controller"
+  );
+}
+
 export interface MechanicalInboxForensics {
   runId?: string;
   actorId?: string;
@@ -169,6 +330,29 @@ export interface MechanicalInboxForensics {
   pendingMessageId?: string;
   exitCode?: number;
   status?: string;
+}
+
+/**
+ * The declared tuple a queued run has actually reserved — populated the
+ * moment a `providerGate` implementation reports it via `onSelected`, kept
+ * only while the run is queued, and read by both HALT safety
+ * ({@link ActorMesh.cancelHaltedQueuedRuns}, which must cancel on the
+ * reserved lane, not the whole declared pool) and selection telemetry/queued
+ * dashboard state. `provider` is the declared alias as configured;
+ * `lane` is the canonical pacing/account key (`providerThrottleKey`) it
+ * resolves to — deliberately kept distinct so a configured alias is never
+ * silently erased.
+ */
+export interface QueuedSelection {
+  provider: string;
+  lane: string;
+  model: string;
+  effort?: string;
+  /** Index of this candidate within the actor's declared pool, in declaration order. */
+  declaredIndex: number;
+  /** Epoch-ms quote for when this reservation becomes eligible to start. */
+  eligibleAt: number;
+  responsive: boolean;
 }
 
 /** What the mesh hands the factory to build a live {@link Actor} for a record. */
@@ -181,10 +365,16 @@ export interface ActorFactoryContext {
   mesh: ActorMesh;
   /**
    * Wrap the provider run in the shared cross-actor concurrency gate. The
-   * actor supplies its provider; consumers that do not care can ignore it.
+   * actor supplies its declared candidate pool; the gate atomically selects
+   * (quotes/reserves) the earliest-eligible canonical provider pacing lane —
+   * declaration order breaks ties — and hands the selected tuple to `fn`.
    */
-  gate: <T>(fn: () => Promise<T>, provider: string, responsive: boolean) => RunStartHandle<T>;
-  /** Pre-run gate run before each wake; returns false (and drops the wake) when blocked. */
+  gate: <T>(
+    fn: (selected: RawProviderModelConfig) => Promise<T>,
+    candidates: readonly RawProviderModelConfig[],
+    responsive: boolean
+  ) => RunStartHandle<T>;
+  /** Lease check run before each wake; returns false (and retires) when exhausted. */
   beforeRun: (context: { mode: ActorRunMode }) => boolean;
   /** General lifecycle hook after the pre-run gate and before scheduler admission. */
   onQueued: (context: { responsive: boolean; mode: ActorRunMode }) => void;
@@ -192,6 +382,13 @@ export interface ActorFactoryContext {
   onRunEnd: (result: RunResult) => void;
   /** Forward the actor-owned runtime state to the mesh-wide sequencer. */
   onRuntimeStateChanged: (state: ActorRuntimeState) => void;
+  /**
+   * Fires when a genuinely queued (not yet started) run is cancelled —
+   * an operator HALT or an explicit interrupt — so the mesh can clear any
+   * recorded {@link QueuedSelection} for this actor. Never fires once the
+   * run has actually started; `onRunEnd` is the clearing point for that case.
+   */
+  onQueuedRunCancelled?: () => void;
 }
 
 export type ActorFactory = (ctx: ActorFactoryContext) => MeshActor;
@@ -252,15 +449,17 @@ export interface ActorMeshOptions {
   rootId?: string;
   /** Builds a live Actor for a thread record (resolves provider/cwd/mcp/session). */
   createActor: ActorFactory;
-  /** Synchronous gate run before a spawn id or durable record is created. */
-  validateSpawn?: (req: SpawnRequest) => ModelEffortSelection | undefined;
-  /** Synchronous validator before setting an actor's model in-place . */
-  validateModel?: (
-    record: ActorRecord,
-    newModel: string | undefined,
-    newProvider?: string,
-    newEffort?: string | null
-  ) => ModelEffortSelection | undefined;
+  /**
+   * Synchronous, config-aware normalization/validation gate run before a spawn
+   * id or durable record is created — bounds the pool, enforces portable-only
+   * above length one, validates each tuple, and rejects duplicates.
+   */
+  validateSpawn?: (req: SpawnRequest) => ProviderModelConfig[];
+  /**
+   * Synchronous, config-aware validator before staging an actor's
+   * `desiredModelConfig` replacement.
+   */
+  validateModel?: (record: ActorRecord, modelConfig: ModelConfigInput) => ProviderModelConfig[];
   /** Cross-actor concurrency cap for non-responsive runs (default 4). */
   maxConcurrent?: number;
   /**
@@ -268,15 +467,30 @@ export interface ActorMeshOptions {
    * {@link providerGate}; retained for embedders that do not need promotion.
    */
   rateLimit?: <T>(fn: () => Promise<T>, provider: string) => Promise<T>;
-  /** Provider pacing composed with the mesh's normal-run concurrency queue. */
+  /**
+   * Provider pacing composed with the mesh's normal-run concurrency queue.
+   * Given the actor's declared candidate pool, atomically selects (quotes and
+   * reserves) the earliest-eligible canonical provider lane — declaration
+   * order breaks ties — and invokes `fn` with the winning tuple. A responsive
+   * run bypasses pacing/concurrency and picks the first healthy declared
+   * candidate instead.
+   */
   providerGate?: <T>(
-    fn: () => Promise<T>,
-    provider: string,
+    fn: (selected: RawProviderModelConfig) => Promise<T>,
+    candidates: readonly RawProviderModelConfig[],
     opts: {
       responsive: boolean;
       /** Owning actor, retained only for scheduler observability. */
       threadId?: string;
       enqueueNormal: <R>(run: () => Promise<R>) => RunStartHandle<R>;
+      /**
+       * Report the reserved candidate — at initial reservation and again on
+       * any later reselection (e.g. a responsive promote) — so the mesh can
+       * track it for HALT safety and selection telemetry. A `providerGate`
+       * implementation that never calls this leaves the mesh without a
+       * recorded selection, which falls back to whole-pool HALT checks.
+       */
+      onSelected?: (selection: QueuedSelection) => void;
     }
   ) => RunStartHandle<T>;
   /**
@@ -353,7 +567,7 @@ export interface ActorMeshOptions {
    * Called after an actor's model is durably updated in the repository,
    * for live resource / provider updating on the active actor.
    */
-  onModelSet?: (actorId: string, newModel: string, record: ActorRecord) => void;
+  onModelSet?: (actorId: string, modelConfig: ProviderModelConfig[], record: ActorRecord) => void;
   /**
    * Per-actor durable-registration cleanup hooks run during retire. Each hook is
    * failure-isolated so one broken teardown cannot stop the rest of the cascade.
@@ -375,13 +589,21 @@ export interface ActorMeshOptions {
    * granted (see {@link grantableCapabilities}).
    */
   capabilityGrants?: CapabilityGrantStore;
-  eventSubscriptions?: EventSubscriptionStore;
+  eventSourceOwners?: EventSourceOwnerStore;
+  eventSourceSubscriptions?: EventSourceSubscriptionStore;
+  /**
+   * The event sources this instance is configured for. Direct subscriptions are
+   * refused outside them, which is what keeps a subscription from reopening the
+   * scope narrowing `config.yaml` closed. Omitted by meshes built without a
+   * config (tests, the e2e runner), where there is no scope to enforce.
+   */
+  configuredEventSources?: readonly EventResource[];
   /**
    * Ownership authority for issue/PR event sources. Optional: without
    * it, routing falls back entirely to subscriptions, which is what every mesh
    * built before obligations existed does.
    */
-  obligations?: { findLiveByExternalRef(ref: string): { ownerId: string } | null };
+  obligations?: MeshObligationPort;
   /** Durable actor inbox used for singleton wake recovery. Optional for isolated tests. */
   inboxStore?: InboxStore;
   /** General lifecycle hook matching onYield. */
@@ -423,15 +645,15 @@ export interface ActorMeshOptions {
 export class ActorMesh {
   readonly actors: ActorRepository;
   private readonly createActor: ActorFactory;
-  private readonly validateSpawn?: (req: SpawnRequest) => ModelEffortSelection | undefined;
+  private readonly validateSpawn?: (req: SpawnRequest) => ProviderModelConfig[];
   private readonly validateModel?: (
     record: ActorRecord,
-    newModel: string | undefined,
-    newProvider?: string,
-    newEffort?: string | null
-  ) => ModelEffortSelection | undefined;
+    modelConfig: ModelConfigInput
+  ) => ProviderModelConfig[];
   private readonly limiter: ConcurrencyLimiter;
   private readonly providerGate: NonNullable<ActorMeshOptions["providerGate"]>;
+  /** Reserved-lane state for genuinely queued runs; see {@link QueuedSelection}. */
+  private readonly selections = new Map<string, QueuedSelection>();
   private readonly isHalted: (provider?: string) => boolean;
   private readonly isShuttingDown: () => boolean;
   private readonly idgen: () => string;
@@ -451,7 +673,11 @@ export class ActorMesh {
     actorId: string,
     capability: string
   ) => Promise<void> | void;
-  private readonly onModelSet?: (actorId: string, newModel: string, record: ActorRecord) => void;
+  private readonly onModelSet?: (
+    actorId: string,
+    modelConfig: ProviderModelConfig[],
+    record: ActorRecord
+  ) => void;
   private readonly retireCleanups: RetireCleanup[];
   private readonly events: MeshEventSink;
   private readonly recordChat?: (opts: {
@@ -462,10 +688,10 @@ export class ActorMesh {
     sessionId?: string;
   }) => string;
   private readonly grants: CapabilityGrantStore;
-  private readonly eventSubscriptions: EventSubscriptionStore;
-  private readonly obligations?: {
-    findLiveByExternalRef(ref: string): { ownerId: string } | null;
-  };
+  private readonly eventSourceOwners: EventSourceOwnerStore;
+  private readonly eventSourceSubscriptions: EventSourceSubscriptionStore;
+  private readonly configuredEventSources: readonly EventResource[] | undefined;
+  private readonly obligations?: MeshObligationPort;
   private readonly inboxStore?: InboxStore;
   private readonly onQueued?: ActorMeshOptions["onQueued"];
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
@@ -519,7 +745,10 @@ export class ActorMesh {
     this.validateSpawn = opts.validateSpawn;
     this.validateModel = opts.validateModel;
     this.grants = opts.capabilityGrants ?? new InMemoryCapabilityGrantStore();
-    this.eventSubscriptions = opts.eventSubscriptions ?? new InMemoryEventSubscriptionStore();
+    this.eventSourceOwners = opts.eventSourceOwners ?? new InMemoryEventSourceOwnerStore();
+    this.eventSourceSubscriptions =
+      opts.eventSourceSubscriptions ?? new InMemoryEventSourceSubscriptionStore();
+    this.configuredEventSources = opts.configuredEventSources;
     this.obligations = opts.obligations;
     this.inboxStore = opts.inboxStore;
     this.onQueued = opts.onQueued;
@@ -528,15 +757,19 @@ export class ActorMesh {
     this.limiter = new ConcurrencyLimiter(opts.maxConcurrent ?? 4);
     this.providerGate =
       opts.providerGate ??
-      ((fn, provider, admissionOpts) => {
+      ((fn, candidates, admissionOpts) => {
+        // No real pacing wired (e.g. an isolated test mesh): declaration order
+        // is the whole policy, matching a fixed single-choice actor's behavior.
+        const selected = candidates[0];
+        const run = () => fn(selected);
         if (opts.rateLimit) {
           const result = opts.rateLimit(
-            () => (admissionOpts.responsive ? fn() : admissionOpts.enqueueNormal(fn).result),
-            provider
+            () => (admissionOpts.responsive ? run() : admissionOpts.enqueueNormal(run).result),
+            selected.provider
           );
           return { result, started: false, promote: () => {}, cancel: () => false };
         }
-        return admissionOpts.responsive ? immediateStart(fn) : admissionOpts.enqueueNormal(fn);
+        return admissionOpts.responsive ? immediateStart(run) : admissionOpts.enqueueNormal(run);
       });
     this.isHalted = opts.isHalted ?? (() => false);
     this.isShuttingDown = opts.isShuttingDown ?? (() => false);
@@ -1054,6 +1287,78 @@ export class ActorMesh {
     return true;
   }
 
+  /**
+   * Durable attention for a dependent left permanently blocked because a
+   * prerequisite was cancelled (#212). Unlike a ready head, this is a one-shot
+   * terminal fact rather than something that keeps changing while an actor
+   * runs — no sequence number is needed, only exact-once delivery of the one
+   * (dependent, prerequisite) pair.
+   */
+  deliverPrerequisiteCancelledAttention(
+    actorId: string,
+    dependentObligationId: string,
+    prerequisiteId: string
+  ): boolean {
+    if (!this.inboxStore) return false;
+    actorId = this.resolveThreadId(actorId);
+    const record = this.actors.get(actorId);
+    if (!record || record.status !== "active") return false;
+    const entryId = deduplicatedInboxEntryId(
+      `obligation-prereq-cancelled:${prerequisiteEdgeKey(dependentObligationId, prerequisiteId)}`,
+      actorId
+    );
+    const entries = this.inboxStore.append([
+      {
+        id: entryId,
+        actorId,
+        source: `obligation:${dependentObligationId}`,
+        payload: {
+          type: "obligation.prerequisite_cancelled",
+          obligationId: dependentObligationId,
+          prerequisiteId,
+        } as unknown as InboxPayload,
+      },
+    ]);
+    if (entries.length === 0) return false;
+    this.notifyInboxChanged(actorId);
+    return true;
+  }
+
+  /**
+   * Boot recovery for cancellation-repair attention (#212). The fact itself is
+   * always recoverable from obligation state (a live dependent whose named
+   * prerequisite is cancelled), so this simply replays that query through the
+   * same idempotent delivery path used at the moment of cancellation.
+   */
+  reconcileCancelledPrerequisiteAttention(obligations: {
+    listPrerequisiteCancellationAttention(): Iterable<{
+      dependentId: string;
+      dependentOwnerId: string;
+      prerequisiteId: string;
+    }>;
+  }): void {
+    if (!this.inboxStore) return;
+    try {
+      for (const {
+        dependentId,
+        dependentOwnerId,
+        prerequisiteId,
+      } of obligations.listPrerequisiteCancellationAttention()) {
+        if (dependentOwnerId.startsWith("human:") || dependentOwnerId.startsWith("system:")) {
+          continue;
+        }
+        const actorId = this.resolveThreadId(dependentOwnerId);
+        const record = this.actors.get(actorId);
+        if (!record || record.status !== "active") continue;
+        this.deliverPrerequisiteCancelledAttention(actorId, dependentId, prerequisiteId);
+      }
+    } catch (err) {
+      this.log(
+        `prerequisite-cancellation reconciliation failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
   inboxHandled(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
     if (this.inboxStore && this.inboxStore.countUnhandled(actorId) > 0) {
@@ -1072,28 +1377,17 @@ export class ActorMesh {
   spawn(req: SpawnRequest): string {
     const charter = req.charter?.trim();
     if (!charter) throw new Error("charter is required");
-    const provider = req.provider?.trim();
-    if (!provider) throw new Error("provider is required");
-    const initialSelection = normalizeModelEffortSelection(provider, req.model, req.effort);
-    const selection =
-      this.validateSpawn?.({
-        ...req,
-        provider,
-        model: initialSelection.model ?? "",
-        effort: initialSelection.effort,
-      }) ?? initialSelection;
-    const model = selection.model?.trim();
-    if (!model) throw new Error("model is required");
-    const effort = selection.effort;
+    const modelConfig = this.validateSpawn?.(req) ?? normalizeModelConfigList(req.modelConfig);
+    if (modelConfig.length === 0) {
+      throw new Error("modelConfig must declare at least one provider/model entry");
+    }
     const id = this.idgen();
     const parentId = this.resolveThreadId(req.parentId);
     const record: ActorRecord = {
       id,
       charter,
       parentId,
-      provider,
-      model,
-      effort,
+      modelConfig,
       context: req.context,
       handles: req.handles ? [...req.handles] : undefined,
       // Seed the session so the actor's first run resumes this conversation
@@ -1137,7 +1431,7 @@ export class ActorMesh {
       kind: "actor_spawned",
       actorId: id,
       detail: charter,
-      body: `provider=${provider} model=${model}${effort ? ` effort=${effort}` : ""}`,
+      body: `modelConfig=${describeModelConfigPool(modelConfig)}`,
       // TODO: Consider extracting the human or controller principal and storing it in payload.requestedBy
       payload: JSON.stringify({ parentId }),
     });
@@ -1361,12 +1655,24 @@ export class ActorMesh {
   }
 
   private activeSubscriptionHeldBy(actorId: string, resource: EventResource): boolean {
-    return this.eventSubscriptions
+    return this.eventSourceOwners
       .activeForResource(resource)
       .some((subscription) => subscription.actorId === actorId);
   }
 
-  private resolveLiveEventDestinations(
+  /**
+   * The live **owner** destinations for an event, walking the ownership ladder:
+   * a live obligation claiming the source, then an explicit ownership row, then
+   * (for bubble-eligible event classes) the same two questions of the parent
+   * resource.
+   *
+   * Ownership only. Direct subscribers are resolved by
+   * {@link liveDirectSubscribers} and merged by {@link deliverEvent}, never
+   * here — this function is also what {@link effectiveOwnerOf} answers with, so
+   * a subscriber appearing in its result would let anyone who subscribed to a
+   * source delegate or reclaim it.
+   */
+  private resolveLiveOwnerDestinations(
     resource: EventResource,
     opts: {
       ignoreExactResource?: EventResource;
@@ -1409,7 +1715,7 @@ export class ActorMesh {
         return destinations;
       }
 
-      const activeSubs = this.eventSubscriptions.activeForResource(current);
+      const activeSubs = this.eventSourceOwners.activeForResource(current);
       for (const sub of activeSubs) {
         if (
           opts.ignoreExactResource &&
@@ -1444,6 +1750,30 @@ export class ActorMesh {
   }
 
   /**
+   * The live actors directly subscribed to this **exact** resource.
+   *
+   * Deliberately not part of the ownership walk. Subscribers never receive
+   * bubbled events — bubbling exists so an important event is not missed by
+   * whoever is responsible for it, and a subscriber is interested rather than
+   * responsible — so there is no ancestor loop here and no event-class gate to
+   * apply.
+   *
+   * Computing this outside {@link resolveLiveOwnerDestinations} is what makes
+   * it reliable rather than a convenience. That walk returns from inside its
+   * obligation rung: a live obligation owned by a human, or by an actor that is
+   * not currently live, terminates the climb with an empty destination list.
+   * Adding subscribers as another push inside the loop would mean a subscriber
+   * silently received nothing on exactly the sources busy enough to carry an
+   * obligation.
+   */
+  private liveDirectSubscribers(resource: EventResource): string[] {
+    return this.eventSourceSubscriptions
+      .subscribersOf(resource)
+      .map((subscription) => subscription.actorId)
+      .filter((actorId) => this.live.has(actorId));
+  }
+
+  /**
    * The owner of the live obligation claiming this event source, if any.
    *
    * Returns an entity id, which may be a human — the caller decides what that
@@ -1461,7 +1791,7 @@ export class ActorMesh {
     resource: EventResource,
     opts: { ignoreExactResource?: EventResource } = {}
   ): string | undefined {
-    return this.resolveLiveEventDestinations(resource, opts)[0];
+    return this.resolveLiveOwnerDestinations(resource, opts)[0];
   }
 
   /**
@@ -1471,13 +1801,13 @@ export class ActorMesh {
   subscribeEventSource(resource: EventResource, actorId: string, subscribedBy: string): void {
     actorId = this.resolveThreadId(actorId);
     subscribedBy = this.resolveThreadId(subscribedBy);
-    const subscription: EventSubscription = {
+    const subscription: EventSourceOwnership = {
       resource: resourceKey(resource),
       actorId,
       subscribedBy,
       subscribedAt: this.now(),
     };
-    this.eventSubscriptions.subscribe(subscription);
+    this.eventSourceOwners.subscribe(subscription);
     this.recordEvent({
       kind: "event_source_subscribed",
       actorId,
@@ -1534,7 +1864,7 @@ export class ActorMesh {
       return;
     }
 
-    const current = this.eventSubscriptions.activeForResource(resource)[0];
+    const current = this.eventSourceOwners.activeForResource(resource)[0];
     if (!current) {
       throw new Error(`cannot reclaim ${resourceKey(resource)}: no active subscription`);
     }
@@ -1555,7 +1885,7 @@ export class ActorMesh {
    */
   unsubscribeEventSource(resource: EventResource, actorId: string, at: string): void {
     actorId = this.resolveThreadId(actorId);
-    this.eventSubscriptions.unsubscribe(resource, actorId, at);
+    this.eventSourceOwners.unsubscribe(resource, actorId, at);
     this.recordEvent({
       kind: "event_source_unsubscribed",
       actorId,
@@ -1565,10 +1895,66 @@ export class ActorMesh {
   }
 
   /**
-   * List all subscriptions (both active and inactive) for audit.
+   * List all ownership claims (both active and released) for audit.
    */
-  listSubscriptions(): EventSubscription[] {
-    return this.eventSubscriptions.list();
+  listSubscriptions(): EventSourceOwnership[] {
+    return this.eventSourceOwners.list();
+  }
+
+  /**
+   * Add a direct subscriber to an event source. Records an audit event.
+   *
+   * Unlike {@link subscribeEventSource} this takes no ownership and refuses
+   * nothing on contention: many actors may subscribe to one source, and a
+   * subscription neither displaces the owner nor competes for the source.
+   *
+   * It does refuse a resource outside {@link ActorMeshOptions.configuredEventSources},
+   * so subscribing cannot widen this instance past the scope `config.yaml`
+   * declares. `reconcileEventSourceSubscriptions` re-applies the same rule to
+   * durable rows at every boot, for the case where the config narrows later.
+   */
+  addEventSourceSubscriber(resource: EventResource, actorId: string, subscribedBy: string): void {
+    actorId = this.resolveThreadId(actorId);
+    subscribedBy = this.resolveThreadId(subscribedBy);
+    if (!this.actors.get(actorId)) {
+      throw new Error(`cannot subscribe unknown thread: ${actorId}`);
+    }
+    if (
+      this.configuredEventSources &&
+      !this.configuredEventSources.some((configured) => isSubResourceOf(resource, configured))
+    ) {
+      throw new Error(
+        `cannot subscribe to ${resourceKey(resource)}: not anchored in a configured event source`
+      );
+    }
+    this.eventSourceSubscriptions.subscribe({
+      resource: resourceKey(resource),
+      actorId,
+      subscribedBy,
+      subscribedAt: this.now(),
+    });
+    this.recordEvent({
+      kind: "event_source_subscriber_added",
+      actorId,
+      detail: resourceKey(resource),
+      payload: JSON.stringify({ subscribedBy }),
+    });
+  }
+
+  /** Remove a direct subscriber from an event source. Records an audit event. */
+  removeEventSourceSubscriber(resource: EventResource, actorId: string): void {
+    actorId = this.resolveThreadId(actorId);
+    this.eventSourceSubscriptions.unsubscribe(resource, actorId);
+    this.recordEvent({
+      kind: "event_source_subscriber_removed",
+      actorId,
+      detail: resourceKey(resource),
+    });
+  }
+
+  /** Every direct subscription — the audit/inspection view. */
+  listEventSourceSubscriptions(): EventSourceSubscription[] {
+    return this.eventSourceSubscriptions.list();
   }
 
   /**
@@ -1604,7 +1990,7 @@ export class ActorMesh {
           directed = true;
         } else {
           this.log(`mesh:deliver target not live: ${opts.directedTarget} — directive ignored`);
-          destinations = this.resolveLiveEventDestinations(resource, {
+          destinations = this.resolveLiveOwnerDestinations(resource, {
             enforceBubblingPolicy: true,
             eventPayload: opts.inboxPayload,
             exactObligationOwner: null,
@@ -1612,10 +1998,34 @@ export class ActorMesh {
         }
       }
     } else {
-      destinations = this.resolveLiveEventDestinations(resource, {
+      destinations = this.resolveLiveOwnerDestinations(resource, {
         enforceBubblingPolicy: true,
         eventPayload: opts.inboxPayload,
       });
+    }
+
+    // Direct subscribers are added to whatever ownership resolved to — the two
+    // relationships compose rather than compete. A subscriber is added even when
+    // ownership resolved to nobody (an obligation held by a human, an absent
+    // owner, a source no live actor owns), and never displaces the owner when it
+    // did. The exact resource only: a subscription does not bubble.
+    //
+    // A *successfully targeted* delivery is the one case where this does not
+    // apply. A verified bot directive names the single actor an event is for;
+    // fanning it out to subscribers would make `mesh:deliver` mean something
+    // other than what it says.
+    //
+    // Read `directed` precisely: it is set only on that happy path. A directive
+    // overridden by a live obligation, or one naming a target that is no longer
+    // live, resolves ownership normally and still reaches subscribers. That is
+    // deliberate rather than incidental — a standing interest in a source's
+    // direct events is not defeated by a directive aimed at someone else, or by
+    // one that failed to land. Those paths also leave `directed` false for the
+    // author-suppression exemption below, which only a landed directive earns.
+    if (!directed) {
+      for (const subscriber of this.liveDirectSubscribers(resource)) {
+        if (!destinations.includes(subscriber)) destinations.push(subscriber);
+      }
     }
 
     if (destinations.length === 0) {
@@ -2069,15 +2479,26 @@ export class ActorMesh {
    * were then reported as a comparison. Deferring the destructive cleanups (which the
    * mesh already does) makes that loss quieter, not smaller.
    *
-   * `force` exists for the operator's lever and for the mesh's own internal teardown —
-   * a wedged actor must stay retirable, and the subtree cascade must not re-check a
-   * subtree the entry call already cleared.
+   * `force` exists for the operator's lever — a wedged actor must stay retirable.
    *
    * `forceQueued` cancels queued runs in the subtree before retirement, but still refuses
    * if any thread in the subtree is actively running (inside the provider call). This is
-   * exposed to actors via the `retire_thread` MCP tool with `force: true` (an issue).
+   * the flag the `retire_thread` MCP tool passes, so an actor's `force: true` overrides
+   * only the *queued*-run refusal.
+   *
+   * **Also refuses while the subtree still holds undisposed work** — a live
+   * obligation, or a scheduled message in either direction (#191). That refusal
+   * names every blocker so the retirer can reassign, finish, or cancel each one
+   * and retry; nothing is dropped mechanically as a fallback, because a dropped
+   * delivery is a decision nobody made. **No flag passes it**, `force` included:
+   * the two refusals answer different questions, and overriding "someone is still
+   * working" was never a licence to destroy the work itself. The subtree cascade
+   * skips it by going through {@link retireUnchecked} instead — the entry call
+   * already cleared the whole subtree, and re-asking mid-teardown would only
+   * re-answer the same question against a tree that is already coming apart.
    *
    * @throws when the subtree has running runs (or queued runs without `force`/`forceQueued`).
+   * @throws {RetirementBlockedError} when the subtree holds live obligations or pending messages.
    */
   retire(id: string, opts: RetireOptions = {}): void {
     id = this.resolveThreadId(id);
@@ -2102,6 +2523,19 @@ export class ActorMesh {
         }
       }
     }
+    // Outside the `force` branch on purpose: see the doc comment above.
+    const blockers = this.retirementBlockers(id);
+    if (blockers.obligations.length > 0 || blockers.messages.length > 0) {
+      throw new RetirementBlockedError(blockers, describeRetirementBlockers(id, blockers));
+    }
+    this.retireUnchecked(id);
+  }
+
+  /**
+   * Tear down one thread with both retirement guards already answered — the
+   * subtree cascade's entry point, and never reachable from outside the mesh.
+   */
+  private retireUnchecked(id: string): void {
     // Marked before the child recursion: children retiring below us must be able
     // to see that we are on our way out, since the repository won't say so until
     // this call finishes. Cleared in the finally so a throwing cleanup can't
@@ -2135,12 +2569,7 @@ export class ActorMesh {
     // `root-llm` is a RootControlPrincipal, not a thread id. RootControlService
     // scopes its target to the injected rootId's subtree before calling here;
     // human/e2e principals are operator-level bypasses by design.
-    const isTrustedPrincipal =
-      by === "root-llm" ||
-      by === "human:operator" ||
-      by.startsWith("human:") ||
-      by === "e2e-controller";
-    if (!isTrustedPrincipal && !this.isAncestorOf(by, targetId)) {
+    if (!isTrustedControlPrincipal(by) && !this.isAncestorOf(by, targetId)) {
       throw new Error(
         `actor ${by} may only interrupt its descendants (cannot interrupt ${targetId})`
       );
@@ -2280,29 +2709,155 @@ export class ActorMesh {
   }
 
   /**
-   * Every thread at or below `id` with a run in flight — the retire guard's input, and
-   * what {@link listChildRunStates} reports.
+   * Every thread at or below `id`, the scope each whole-subtree retirement check
+   * shares. Whole-subtree because retire is whole-subtree: checking only the named
+   * thread would still let a retire two levels up tear down a busy grandchild, or
+   * one still holding a live obligation. The visited set is defensive insurance
+   * against a pre-corrupted cyclic tree, matching {@link reparentThread}'s cycle guard.
    *
-   * Whole-subtree because retire is whole-subtree: refusing only on the named thread
-   * would still let a retire two levels up tear down a busy grandchild. The visited set
-   * is defensive insurance against a pre-corrupted cyclic tree, matching
-   * {@link reparentThread}'s cycle guard.
+   * `includeRetired` chooses which question is being asked. A retired thread can
+   * never have a run in flight, so the run guard stops at active children. Work
+   * outlives its owner, though: a subtree retired before #191 landed can still hold
+   * live obligations and scheduled messages under a `retired` record, and skipping
+   * those rows would let an ancestor retire over exactly the orphans this preflight
+   * exists to catch.
    */
-  activeRunsInSubtree(id: string): ActiveRunState[] {
-    id = this.resolveThreadId(id);
-    const busy: ActiveRunState[] = [];
+  private subtreeActorIds(id: string, opts: { includeRetired?: boolean } = {}): string[] {
+    const ids: string[] = [];
     const seen = new Set<string>();
     const walk = (cursor: string): void => {
       if (seen.has(cursor)) return;
       seen.add(cursor);
-      const state = this.activeRunState(cursor);
-      if (state) busy.push(state);
+      ids.push(cursor);
       for (const child of this.actors.children(cursor)) {
-        if (child.status === "active") walk(child.id);
+        if (opts.includeRetired || child.status === "active") walk(child.id);
       }
     };
     walk(id);
+    return ids;
+  }
+
+  /**
+   * Every thread at or below `id` with a run in flight — the retire guard's input, and
+   * what {@link listChildRunStates} reports.
+   */
+  activeRunsInSubtree(id: string): ActiveRunState[] {
+    id = this.resolveThreadId(id);
+    const busy: ActiveRunState[] = [];
+    for (const actorId of this.subtreeActorIds(id)) {
+      const state = this.activeRunState(actorId);
+      if (state) busy.push(state);
+    }
     return busy;
+  }
+
+  /**
+   * Everything in `id`'s subtree that needs an explicit decision before it can
+   * retire: live obligations owned anywhere in it, and pending scheduled
+   * messages with either endpoint in it.
+   *
+   * Both message directions block by decision (#191). Inbound alone is the
+   * narrower rule, but it leaves a retired actor able to speak later with no
+   * live sender to answer for what it said or to handle a failed delivery. The
+   * alternative — letting the retirer name outgoing sends to preserve — is
+   * machinery for a case nobody has hit yet; if rescheduling a handoff turns out
+   * to be routine, that is the evidence for building it.
+   *
+   * The walk covers retired descendants as well as active ones. Ownership is a
+   * property of the work, not of whether its owner is still running, so an
+   * obligation or a send left behind by an already-retired child is still this
+   * subtree's to answer for — and answering for it is the whole point.
+   *
+   * Read-only, and safe to call before deciding to retire: the same list the
+   * refusal would print.
+   */
+  retirementBlockers(id: string): RetirementBlockers {
+    id = this.resolveThreadId(id);
+    const subtree = new Set(this.subtreeActorIds(id, { includeRetired: true }));
+    const obligations: ObligationRetirementBlocker[] = [];
+    for (const ownerId of subtree) {
+      for (const obligation of this.obligations?.listLiveOwnedBy?.(ownerId) ?? []) {
+        obligations.push({
+          obligationId: obligation.id,
+          ownerId,
+          status: obligation.status,
+          title: obligation.title,
+        });
+      }
+    }
+    const messages: MessageRetirementBlocker[] = [];
+    for (const message of this.scheduledMessages?.listMessageDeliveries() ?? []) {
+      const incoming = subtree.has(message.toId);
+      const outgoing = subtree.has(message.fromId);
+      if (!incoming && !outgoing) continue;
+      messages.push({
+        messageId: message.id,
+        fromId: message.fromId,
+        toId: message.toId,
+        deliverAt: message.deliverAt,
+        direction: incoming && outgoing ? "internal" : incoming ? "incoming" : "outgoing",
+      });
+    }
+    return { obligations, messages };
+  }
+
+  /**
+   * Cancel one pending scheduled message on the authority of an actor entitled
+   * to decide its fate: either endpoint, an ancestor of either (the same
+   * boundary retirement uses), or a trusted operator principal.
+   *
+   * The disposition half of the fail-closed retirement boundary (#191).
+   * Retirement refuses while a scheduled message touches the subtree; the
+   * retirer cancels what no longer matters and re-sends what does, and the
+   * `scheduled_message_cancelled` event records who decided — so a message that
+   * never arrives has a decider's name on it rather than a teardown's.
+   */
+  cancelScheduledMessage(
+    messageId: string,
+    by: string,
+    reason?: string
+  ): { messageId: string; fromId: string; toId: string; deliverAt: string } {
+    by = this.resolveThreadId(by);
+    const message = this.scheduledMessages
+      ?.listMessageDeliveries()
+      .find((entry) => entry.id === messageId);
+    if (!message) {
+      throw new Error(
+        `unknown pending message id: ${messageId} — it may have already been delivered or cancelled`
+      );
+    }
+    const authorized =
+      isTrustedControlPrincipal(by) ||
+      this.isAncestorOf(by, message.fromId) ||
+      this.isAncestorOf(by, message.toId);
+    if (!authorized) {
+      throw new Error(
+        `actor ${by} may only cancel scheduled messages it sent or receives, or that involve one of its descendants (cannot cancel ${messageId})`
+      );
+    }
+    this.scheduledMessages?.cancelMessageDelivery(messageId);
+    this.recordEvent({
+      kind: "scheduled_message_cancelled",
+      actorId: by,
+      detail: messageId,
+      payload: JSON.stringify({
+        messageId,
+        fromId: message.fromId,
+        toId: message.toId,
+        deliverAt: message.deliverAt,
+        cancelledBy: by,
+        ...(reason ? { reason } : {}),
+      }),
+    });
+    this.log(
+      `scheduled message ${messageId} (${message.fromId} -> ${message.toId} at ${message.deliverAt}) cancelled by ${by}`
+    );
+    return {
+      messageId,
+      fromId: message.fromId,
+      toId: message.toId,
+      deliverAt: message.deliverAt,
+    };
   }
 
   /**
@@ -2324,20 +2879,19 @@ export class ActorMesh {
 
   private retireInner(id: string): void {
     for (const child of this.actors.children(id)) {
-      // `force`: the entry call already cleared this whole subtree, and re-checking
-      // here would only re-answer the same question against a tree we're mid-teardown of.
-      if (child.status === "active") this.retire(child.id, { force: true });
+      if (child.status === "active") this.retireUnchecked(child.id);
     }
     const actor = this.live.get(id);
     actor?.close();
     this.live.delete(id);
     const record = this.actors.get(id);
-    for (const message of this.scheduledMessages
-      ?.listMessageDeliveries()
-      .filter((entry) => entry.toId === id) ?? []) {
-      this.notifyScheduledDeliveryDropped(id, message);
-      this.scheduledMessages?.cancelMessageDelivery(message.id);
-    }
+    // No mechanical drop of this thread's pending deliveries here (#191). Every
+    // entry into retirement now preflights the whole subtree for scheduled
+    // messages in either direction, so reaching teardown means someone already
+    // decided each one by name through `cancelScheduledMessage` — which is also
+    // the only place the `scheduled_message_cancelled` audit record is written.
+    // Dropping here would have been a second, unaudited way for a message to
+    // die, reachable only by racing a check that cannot actually be raced.
     if (record && this.onRetire) {
       try {
         this.onRetire(record);
@@ -2459,9 +3013,16 @@ export class ActorMesh {
 
   private retireEventSubscriptions(record: ActorRecord): void {
     const at = this.now();
-    for (const subscription of this.eventSubscriptions.list()) {
+    for (const subscription of this.eventSourceOwners.list()) {
       if (subscription.actorId !== record.id || subscription.unsubscribedAt) continue;
       this.unsubscribeEventSource(subscription.resource, record.id, at);
+    }
+    // Ownership is released into a tombstone because the record of who held a
+    // source outlives the holder. A subscription has no such record to keep —
+    // it is live routing for an actor that no longer runs — so it is removed.
+    for (const subscription of this.eventSourceSubscriptions.list()) {
+      if (subscription.actorId !== record.id) continue;
+      this.removeEventSourceSubscriber(subscription.resource, record.id);
     }
   }
 
@@ -2527,23 +3088,19 @@ export class ActorMesh {
   }
 
   /**
-   * Update an existing actor's model in-place in the actor repository.
+   * Stage a full replacement of an existing actor's declared modelConfig pool.
    * Root or parent-gated: root may set the model for any thread in its subtree;
    * root may also set its own model;
    * a non-root parent may only set the model for its own descendants (and never
    * raise its own tier).
-   * Optionally moves portable (ledger/tail) actors across providers.
-   * Takes effect at the end of the actor's current run if one is in flight;
-   * otherwise applies at the actor's next dispatch, before that run's
-   * run_start and launch.
+   * A pool of more than one entry, or a change of provider, requires a
+   * portable (ledger/tail) actor — a native provider session can't move.
+   * The replacement is atomic (the whole pool or nothing). Takes effect at the
+   * end of the actor's current run if one is in flight; otherwise applies at
+   * the actor's next dispatch, before that run's run_start and launch (see
+   * {@link applyPendingModel}).
    */
-  setActorModel(
-    id: string,
-    model: string | undefined,
-    requestedBy: string,
-    provider?: string,
-    effort?: string | null
-  ): void {
+  setActorModel(id: string, modelConfig: ModelConfigInput, requestedBy: string): void {
     id = this.resolveThreadId(id);
     requestedBy = this.resolveThreadId(requestedBy);
     const record = this.actors.get(id);
@@ -2561,52 +3118,34 @@ export class ActorMesh {
         );
       }
     }
-    const requestedModel = model?.trim();
-    if (model !== undefined && !requestedModel) {
-      throw new Error(`Cannot set an empty model on thread: ${id}`);
+    const validated =
+      this.validateModel?.(record, modelConfig) ?? normalizeModelConfigList(modelConfig);
+    if (validated.length === 0) {
+      throw new Error(`Cannot set an empty modelConfig on thread: ${id}`);
     }
-    const trimmedProvider = provider?.trim() || undefined;
-    if (model === undefined && effort === undefined && trimmedProvider === undefined) {
-      throw new Error(`Cannot set actor model: model, provider, or effort is required`);
+    const portable = record.context?.type === "portable";
+    if (validated.length > 1 && !portable) {
+      throw new Error(
+        `Cannot set a modelConfig pool of more than one entry on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail) actors can use a multi-candidate pool.`
+      );
     }
-    if (trimmedProvider !== undefined && trimmedProvider !== record.provider) {
-      if (record.context?.type !== "portable") {
-        throw new Error(
-          `Cannot change provider on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail) actors can be moved across providers.`
-        );
-      }
+    const currentProvider = record.modelConfig?.[0]?.provider;
+    if (
+      !portable &&
+      validated.length === 1 &&
+      currentProvider !== undefined &&
+      validated[0].provider !== currentProvider
+    ) {
+      throw new Error(
+        `Cannot change provider on non-portable actor ${id} (context mode: ${record.context?.type ?? "native"}). Only portable (ledger/tail) actors can be moved across providers.`
+      );
     }
-    const effectiveProvider = trimmedProvider ?? record.provider ?? "";
-    const initialSelection = normalizeModelEffortSelection(
-      effectiveProvider,
-      requestedModel,
-      effort
-    );
-    const nextModel = initialSelection.model ?? record.model;
-    const requestedEffort =
-      effort === null
-        ? null
-        : effort !== undefined || initialSelection.effort !== undefined
-          ? initialSelection.effort
-          : record.effort;
-    const selection =
-      this.validateModel?.(record, nextModel, trimmedProvider, requestedEffort) ??
-      normalizeModelEffortSelection(effectiveProvider, nextModel, requestedEffort);
-    const validatedModel = selection.model ?? nextModel;
-    const validatedEffort = selection.effort;
-    // Boundary contract: an in-flight run completes on its already-launched
-    // model, and the desired value applies at that run's end. An idle or
-    // queued actor has no launched run yet, so the desired value applies at
-    // its next dispatch, before run_start is recorded and before launch.
-    const patch: Partial<ActorRecord> = { desiredProvider: trimmedProvider };
-    if (model !== undefined) patch.desiredModel = validatedModel;
-    if (effort !== undefined || validatedEffort !== record.effort) {
-      if (effort === null) patch.desiredEffort = null;
-      else if (validatedEffort !== undefined) {
-        patch.desiredEffort = validatedEffort;
-      }
-    }
-    this.actors.patch(id, patch);
+    // Boundary contract (#199): an in-flight run completes on its
+    // already-launched pool, and the staged pool applies at that run's end.
+    // An idle or queued actor has no launched run yet, so the staged pool
+    // applies atomically at its next dispatch, before run_start is recorded
+    // and before launch (see {@link applyPendingModel}).
+    this.actors.patch(id, { desiredModelConfig: validated });
 
     if (this.inboxStore && this.live.has(id) && this.activeRunState(id) === null) {
       const unhandled = this.inboxStore.list(id, { status: "unhandled" }).entries;
@@ -2617,69 +3156,38 @@ export class ActorMesh {
   }
 
   /**
-   * Apply the pending model/provider change at whichever boundary the actor's
-   * current state puts it behind next: dispatch (queued/idle, called from the
-   * `onRunStart` wiring just before that run's `run_start` is recorded and its
-   * provider launches) or run end (mid-run, called from {@link finishInboxRun}).
+   * Apply the staged modelConfig replacement at whichever boundary the
+   * actor's current state puts it behind next: dispatch (queued/idle, called
+   * from the `onRunStart` wiring just before that run's `run_start` is
+   * recorded and its provider launches) or run end (mid-run, called from
+   * {@link finishInboxRun}).
    * Public — like {@link finishInboxRun} and {@link actorQueued} — because the
    * externally-constructed root actor wires its own `onRunStart`/`onRunEnd`
    * outside the `createActor` factory and must call this directly.
    * A no-op when nothing is staged, so calling it from both boundaries on the
-   * same run is safe: whichever fires first consumes the pending tuple.
+   * same run is safe: whichever fires first consumes the pending pool.
    */
   applyPendingModel(id: string): void {
     const record = this.actors.get(id);
-    if (
-      !record ||
-      (record.desiredModel === undefined &&
-        record.desiredProvider === undefined &&
-        record.desiredEffort === undefined)
-    )
-      return;
+    if (!record || record.desiredModelConfig === undefined) return;
 
-    const trimmedModel = record.desiredModel ?? record.model;
-    const trimmedProvider = record.desiredProvider;
-    const oldModel = record.model;
-    const oldProvider = record.provider;
-    const oldEffort = record.effort;
-    const nextEffort =
-      record.desiredEffort === null ? undefined : (record.desiredEffort ?? record.effort);
+    const oldModelConfig = record.modelConfig;
+    const newModelConfig = record.desiredModelConfig;
 
-    const patch: Partial<ActorRecord> = {
-      ...(record.desiredModel !== undefined ? { model: trimmedModel } : {}),
-      effort: nextEffort,
-      desiredModel: undefined,
-      desiredEffort: undefined,
-      desiredProvider: undefined,
-    };
-    if (trimmedProvider !== undefined) {
-      patch.provider = trimmedProvider;
-    }
-    this.actors.patch(id, patch);
+    this.actors.patch(id, { modelConfig: newModelConfig, desiredModelConfig: undefined });
 
     const verified = this.actors.get(id);
-    if (
-      verified?.model !== trimmedModel ||
-      verified?.effort !== nextEffort ||
-      (trimmedProvider !== undefined && verified?.provider !== trimmedProvider)
-    ) {
+    if (!verified) throw new Error(`Failed to reload thread after model update: ${id}`);
+    if (JSON.stringify(verified.modelConfig) !== JSON.stringify(newModelConfig)) {
       throw new Error(`Failed to verify deferred model update for thread: ${id}`);
     }
-    if (!verified) throw new Error(`Failed to reload thread after model update: ${id}`);
 
-    this.onModelSet?.(id, trimmedModel ?? "", verified);
-
-    const oldSelection = `${oldModel ?? "default"}${oldEffort ? ` @ ${oldEffort}` : ""}`;
-    const newSelection = `${trimmedModel ?? "default"}${nextEffort ? ` @ ${nextEffort}` : ""}`;
-    const detail =
-      trimmedProvider && trimmedProvider !== oldProvider
-        ? `${oldProvider ?? "default"}:${oldSelection} -> ${trimmedProvider}:${newSelection}`
-        : `${oldSelection} -> ${newSelection}`;
+    this.onModelSet?.(id, newModelConfig, verified);
 
     this.recordEvent({
       kind: "actor_model_set",
       actorId: id,
-      detail,
+      detail: `${oldModelConfig ? describeModelConfigPool(oldModelConfig) : "default"} -> ${describeModelConfigPool(newModelConfig)}`,
     });
   }
 
@@ -2826,18 +3334,38 @@ export class ActorMesh {
     return this.limiter.inFlight;
   }
 
-  /** Schedule a run through provider pacing and the normal-only mesh queue. */
+  /**
+   * Schedule a run through provider pacing and the normal-only mesh queue.
+   * Given the actor's declared candidate pool, atomically selects the
+   * earliest-eligible canonical provider lane (declaration order breaks
+   * ties) and invokes `fn` with the winning tuple.
+   */
   gateRun<T>(
-    fn: () => Promise<T>,
-    provider: string,
+    fn: (selected: RawProviderModelConfig) => Promise<T>,
+    candidates: readonly RawProviderModelConfig[],
     responsive = false,
     threadId?: string
   ): RunStartHandle<T> {
-    return this.providerGate(fn, provider, {
+    return this.providerGate(fn, candidates, {
       responsive,
       threadId,
       enqueueNormal: (run) => this.limiter.enqueue(run),
+      onSelected: threadId ? (selection) => this.selections.set(threadId, selection) : undefined,
     });
+  }
+
+  /**
+   * Read-only snapshot of the declared tuple a queued run has actually
+   * reserved, for MCP/dashboard exposure. `undefined` once the run starts,
+   * is cancelled, or ends — never a stale reservation.
+   */
+  getSelection(id: string): QueuedSelection | undefined {
+    return this.selections.get(id);
+  }
+
+  /** Clear a recorded selection at start/cancel/end so it never outlives the reservation it describes. */
+  clearSelection(id: string): void {
+    this.selections.delete(id);
   }
 
   /**
@@ -2873,32 +3401,54 @@ export class ActorMesh {
   }
 
   /**
-   * The provider a thread's next run will actually launch on: a staged
-   * `desiredProvider` has not been applied to `provider` yet (that happens in
-   * {@link applyPendingModel} at dispatch), so every halt-gate check must
-   * consult this instead of the record's current `provider` — otherwise a
-   * staged move to an already-halted provider slips through a still-open old
-   * provider's gate.
+   * The modelConfig pool a thread's next run will actually launch on: a
+   * staged `desiredModelConfig` has not been applied to `modelConfig` yet
+   * (that happens in {@link applyPendingModel} at dispatch), so every
+   * halt-gate check must consult this instead of the record's current
+   * `modelConfig` — otherwise a staged move to an already-halted pool slips
+   * through a still-open old pool's gate.
    */
-  private launchProvider(id: string): string | undefined {
+  private launchModelConfig(id: string): ProviderModelConfig[] | undefined {
     const rec = this.actors.get(id);
-    return rec?.desiredProvider ?? rec?.provider;
+    return rec?.desiredModelConfig ?? rec?.modelConfig;
   }
 
-  /** Cancel queued starts selected by provider-aware halt state. */
+  /** True only when every declared candidate in the pool is halted. */
+  private allCandidatesHalted(modelConfig: readonly ProviderModelConfig[] | undefined): boolean {
+    if (!modelConfig || modelConfig.length === 0) return false;
+    return modelConfig.every((c) => this.isHalted(c.provider));
+  }
+
+  /**
+   * Cancel queued starts whose *actual reserved lane* is halted — keys off
+   * the recorded {@link QueuedSelection}, not the whole declared pool, so a
+   * halt on one candidate never cancels a reservation already sitting on a
+   * different, still-healthy candidate in the same pool. Falls back to the
+   * whole-pool check only when no selection has been recorded (a
+   * `providerGate` that never wired `onSelected`, or a request gated before
+   * this reservation existed).
+   */
   cancelHaltedQueuedRuns(): string[] {
     const cancelled: string[] = [];
     for (const [id, actor] of this.live) {
-      if (this.isHalted(this.launchProvider(id)) && actor.cancelQueuedRun?.()) cancelled.push(id);
+      const selection = this.selections.get(id);
+      const halted = selection
+        ? this.isHalted(selection.provider)
+        : this.allCandidatesHalted(this.launchModelConfig(id));
+      if (halted && actor.cancelQueuedRun?.()) {
+        cancelled.push(id);
+      }
     }
     return cancelled;
   }
 
-  /** Replay starts canceled by a halt once their provider is no longer blocked. */
+  /** Replay starts canceled by a halt once at least one pool candidate is no longer blocked. */
   resumeCancelledRuns(): string[] {
     const resumed: string[] = [];
     for (const [id, actor] of this.live) {
-      if (!this.isHalted(this.launchProvider(id)) && actor.resumeCancelledRun?.()) resumed.push(id);
+      if (!this.allCandidatesHalted(this.launchModelConfig(id)) && actor.resumeCancelledRun?.()) {
+        resumed.push(id);
+      }
     }
     return resumed;
   }
@@ -2908,15 +3458,24 @@ export class ActorMesh {
       record,
       getRecord: () => this.actors.get(record.id),
       mesh: this,
-      gate: (fn, provider, responsive) => this.gateRun(fn, provider, responsive, record.id),
+      gate: (fn, candidates, responsive) => this.gateRun(fn, candidates, responsive, record.id),
       beforeRun: ({ mode }) => {
         const rec = this.actors.get(record.id);
         if (!rec || rec.status !== "active") {
           return false;
         }
-        if (this.isHalted(this.launchProvider(record.id)) || this.isShuttingDown()) {
+        // Halt gate consults the pool this dispatch will actually launch —
+        // desired-if-staged, else current (#169) — without yet committing
+        // it, so a staged move onto a halted provider never mutates
+        // `modelConfig` for a run that never launches.
+        if (this.allCandidatesHalted(this.launchModelConfig(record.id)) || this.isShuttingDown()) {
           return false;
         }
+        // Apply a pool staged while idle/queued before this dispatch's own
+        // gate()/admission reads the declared pool (#199, extended to pools):
+        // an in-flight run's beforeRun never re-fires for that same run, so
+        // this only ever lands on a fresh dispatch, never mid-run.
+        this.applyPendingModel(record.id);
         if (mode === "yield-elicitation") return true;
         if (!this.inboxStore) return true;
         const actor = this.live.get(record.id);
@@ -2933,8 +3492,12 @@ export class ActorMesh {
       onRunEnd: (result) => {
         this.finishInboxRun(record.id);
         this.accountRun(record.id, result);
+        // Safety net: the start/cancel hooks are the primary clearing
+        // points, but a selection must never survive past its run ending.
+        this.clearSelection(record.id);
       },
       onRuntimeStateChanged: (state) => this.actorRuntimeStateChanged(record.id, state),
+      onQueuedRunCancelled: () => this.clearSelection(record.id),
     };
   }
 
@@ -3060,13 +3623,24 @@ export class ActorMesh {
     target.requestRun();
   }
 
-  /** Scheduled messages visible to an actor, used by the MCP projection. */
-  listPendingMessagesFor(
-    actorId: string
-  ): Array<{ recipient: string; sender: string; deliverAt: string; body: string }> {
+  /**
+   * Scheduled messages visible to an actor, used by the MCP projection.
+   *
+   * The id leads: it is the only handle on a pending message, so an actor that
+   * has to cancel one — because retirement refused until it did (#191) — can
+   * name the exact message rather than describing it.
+   */
+  listPendingMessagesFor(actorId: string): Array<{
+    messageId: string;
+    recipient: string;
+    sender: string;
+    deliverAt: string;
+    body: string;
+  }> {
     return (this.scheduledMessages?.listMessageDeliveries() ?? [])
       .filter((message) => message.fromId === actorId || message.toId === actorId)
       .map((message) => ({
+        messageId: message.id,
         recipient: message.toId,
         sender: message.fromId,
         deliverAt: message.deliverAt,

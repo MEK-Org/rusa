@@ -12,9 +12,7 @@ const root: ActorRecord = {
   id: "root",
   charter: "Own the mesh",
   parentId: null,
-  provider: "codex",
-  model: "gpt-test",
-  effort: "high",
+  modelConfig: [{ provider: "codex", model: "gpt-test", effort: "high" }],
   sessionId: "session-1",
   context: { type: "native" },
   title: "Root",
@@ -68,10 +66,8 @@ describe("SqliteActorRepository", () => {
       {
         id: "root",
         modelConfig: {
-          schemaVersion: 1,
-          provider: "codex",
-          model: "gpt-test",
-          effort: "high",
+          schemaVersion: 2,
+          entries: [{ provider: "codex", model: "gpt-test", effort: "high" }],
         },
         contextConfig: { schemaVersion: 1, type: "native", sessionId: "session-1" },
       },
@@ -98,6 +94,9 @@ describe("SqliteActorRepository", () => {
       '{"schemaVersion":1}',
       '{"schemaVersion":1,"provider":123}',
       '{"schemaVersion":1,"provider":"codex","unknown":true}',
+      '{"schemaVersion":2,"entries":[]}',
+      '{"schemaVersion":2,"entries":[{"provider":"codex"}]}',
+      '{"schemaVersion":2,"entries":[{"model":"gpt-test"}]}',
     ]) {
       db.prepare("UPDATE actors SET model_config = ? WHERE id = 'root'").run(invalid);
       expect(() => repository.get("root")).toThrow(/invalid model_config for actor 'root'/);
@@ -236,58 +235,57 @@ describe("SqliteActorRepository", () => {
     ).toThrow();
   });
 
-  it("keeps staged desired model fields in process memory, not the durable document", () => {
+  it("keeps a staged desired modelConfig pool in process memory, not the durable document", () => {
     repository.upsert(root);
     repository.patch("root", {
-      desiredProvider: "claude",
-      desiredModel: "claude-opus",
-      desiredEffort: null,
+      desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
     });
 
     expect(repository.get("root")).toMatchObject({
-      desiredProvider: "claude",
-      desiredModel: "claude-opus",
-      desiredEffort: null,
+      desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
     });
     const row = db.prepare("SELECT model_config FROM actors WHERE id = 'root'").get() as {
       model_config: string;
     };
     expect(JSON.parse(row.model_config)).toEqual({
-      schemaVersion: 1,
-      provider: "codex",
-      model: "gpt-test",
-      effort: "high",
+      schemaVersion: 2,
+      entries: [{ provider: "codex", model: "gpt-test", effort: "high" }],
     });
   });
 
-  it("preserves staged model fields across unrelated patches and drops explicit clears", () => {
+  it("preserves a staged desired pool across unrelated patches and drops an explicit clear", () => {
     repository.upsert(root);
-    repository.patch("root", { desiredModel: "claude-opus" });
-    repository.patch("root", { title: "Renamed" });
-    expect(repository.get("root")).toMatchObject({ desiredModel: "claude-opus", title: "Renamed" });
-
     repository.patch("root", {
-      desiredModel: undefined,
-      desiredProvider: undefined,
-      desiredEffort: undefined,
+      desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
     });
-    expect(repository.get("root")?.desiredModel).toBeUndefined();
-    expect(repository.get("root")?.desiredProvider).toBeUndefined();
-    expect(repository.get("root")?.desiredEffort).toBeUndefined();
+    repository.patch("root", { title: "Renamed" });
+    expect(repository.get("root")).toMatchObject({
+      desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
+      title: "Renamed",
+    });
+
+    repository.patch("root", { desiredModelConfig: undefined });
+    expect(repository.get("root")?.desiredModelConfig).toBeUndefined();
   });
 
-  it("loses staged model fields across a repository reopen", () => {
+  it("loses a staged desired pool across a repository reopen", () => {
     repository.upsert(root);
-    repository.patch("root", { desiredModel: "claude-opus" });
-    expect(repository.get("root")?.desiredModel).toBe("claude-opus");
+    repository.patch("root", {
+      desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
+    });
+    expect(repository.get("root")?.desiredModelConfig).toEqual([
+      { provider: "claude", model: "claude-opus" },
+    ]);
 
     const reopened = new SqliteActorRepository(db);
-    expect(reopened.get("root")?.desiredModel).toBeUndefined();
+    expect(reopened.get("root")?.desiredModelConfig).toBeUndefined();
   });
 
   it("does not advance process memory when the SQLite write rolls back", () => {
     repository.upsert(root);
-    repository.patch("root", { desiredModel: "claude-opus" });
+    repository.patch("root", {
+      desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
+    });
     const worker: ActorRecord = {
       id: "worker",
       charter: "Implement a slice",
@@ -296,12 +294,53 @@ describe("SqliteActorRepository", () => {
       createdAt: "2026-09-03T13:01:00.000Z",
     };
     repository.upsert(worker);
-    repository.patch("worker", { desiredModel: "claude-sonnet" });
+    repository.patch("worker", {
+      desiredModelConfig: [{ provider: "claude", model: "claude-sonnet" }],
+    });
 
     expect(() =>
-      repository.upsert({ ...worker, parentId: "missing", desiredModel: "claude-haiku" })
+      repository.upsert({
+        ...worker,
+        parentId: "missing",
+        desiredModelConfig: [{ provider: "claude", model: "claude-haiku" }],
+      })
     ).toThrow();
-    expect(repository.get("worker")?.desiredModel).toBe("claude-sonnet");
-    expect(repository.get("root")?.desiredModel).toBe("claude-opus");
+    expect(repository.get("worker")?.desiredModelConfig).toEqual([
+      { provider: "claude", model: "claude-sonnet" },
+    ]);
+    expect(repository.get("root")?.desiredModelConfig).toEqual([
+      { provider: "claude", model: "claude-opus" },
+    ]);
+  });
+
+  it("migrates a pre-#169 singleton model_config document into a one-entry pool on read", () => {
+    repository.upsert(root);
+    db.prepare("UPDATE actors SET model_config = ? WHERE id = 'root'").run(
+      JSON.stringify({ schemaVersion: 1, provider: "codex", model: "gpt-legacy", effort: "high" })
+    );
+
+    expect(repository.get("root")?.modelConfig).toEqual([
+      { provider: "codex", model: "gpt-legacy", effort: "high" },
+    ]);
+  });
+
+  it("round-trips a multi-entry modelConfig pool in declaration order", () => {
+    const portableWorker: ActorRecord = {
+      id: "worker",
+      charter: "Implement a slice",
+      parentId: "root",
+      status: "active",
+      context: { type: "portable", mode: "ledger" },
+      modelConfig: [
+        { provider: "claude", model: "claude-sonnet-5" },
+        { provider: "kimi", model: "kimi-for-coding" },
+        { provider: "codex", model: "gpt-5.6-sol", effort: "high" },
+      ],
+      createdAt: "2026-09-03T13:01:00.000Z",
+    };
+    repository.upsert(root);
+    repository.upsert(portableWorker);
+
+    expect(repository.get("worker")?.modelConfig).toEqual(portableWorker.modelConfig);
   });
 });

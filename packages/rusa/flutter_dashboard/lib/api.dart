@@ -378,6 +378,28 @@ class DashboardApi {
     );
   }
 
+  /// One root page's full trees in a single request — see #241. Replaces the
+  /// former `fetchObligations(rootsOnly: true)` + one `fetchObligationTree`
+  /// per returned root.
+  ///
+  /// Excludes quiet terminal roots (done/cancelled, not recurring, no
+  /// completion history) by default; pass [includeTerminalRoots] for the
+  /// "Show Done" reload.
+  Future<ObligationForest> fetchObligationForest({
+    int? limit,
+    int? offset,
+    bool includeTerminalRoots = false,
+  }) async {
+    final q = <String, String>{
+      if (limit != null) 'limit': '$limit',
+      if (offset != null) 'offset': '$offset',
+      if (includeTerminalRoots) 'includeTerminalRoots': 'true',
+    };
+    return ObligationForest.fromJson(
+      await _getJson(_u('/api/mesh/obligations/forest', q)),
+    );
+  }
+
   // ── Obligations write routes ──
 
   Future<ObligationDto> createObligation({
