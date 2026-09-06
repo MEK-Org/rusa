@@ -50,10 +50,13 @@ import type { CodingProvider, RunResult } from "./types.js";
 const NUL = "\u0000";
 
 /**
- * The realistic arrival path from #206: an actor is asked to repair a file that
- * happens to hold a stray NUL, and the byte rides into the next prompt through
- * its charter — i.e. through assembled actor context, not through anything the
- * provider layer authored.
+ * The arrival path the observed failure took: the byte rides into the prompt
+ * through assembled actor context, so the rejected argv element is charter text
+ * rather than anything the provider layer authored.
+ *
+ * The file-repair wording is one plausible way a NUL lands in a charter, not a
+ * diagnosed one — the upstream origin was never established. Only the last leg
+ * is load-bearing here, and it is the leg this suite pins.
  */
 const CHARTER_WITH_NUL = `Repair the header of report.bin, which holds a stray byte here: [${NUL}] — leave the rest of the file alone.`;
 
