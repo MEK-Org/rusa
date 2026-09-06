@@ -113,6 +113,24 @@ function recordingLogger(records: LogRecord[]): Logger {
   return logger;
 }
 
+/**
+ * The SDK opens its GET stream on its own schedule, so a fixed tick is a race on
+ * a loaded machine. Poll the recorded log until the awaited record shows up.
+ */
+async function waitForRecord(
+  records: LogRecord[],
+  match: (record: LogRecord) => boolean,
+  what: string
+): Promise<LogRecord> {
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    const found = records.find(match);
+    if (found) return found;
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 describe("McpHttpServer", () => {
   let http: McpHttpServer;
   let labels: string[];
@@ -381,22 +399,22 @@ describe("McpHttpServer", () => {
     const transport = new StreamableHTTPClientTransport(new URL(url));
     const client = new Client({ name: "test", version: "0.0.0" });
     await client.connect(transport);
-    await new Promise((resolve) => setTimeout(resolve, 0));
     // The long-lived GET stream is still dispatched when the mount goes away.
-    const dispatched = requestLogs.find(
+    const dispatched = await waitForRecord(
+      requestLogs,
       ({ event, fields }) =>
         event === "mcp_transport_dispatch" &&
         fields?.httpMethod === "GET" &&
-        fields?.server === "inbox"
+        fields?.server === "inbox",
+      "the inbox GET stream dispatch"
     );
-    expect(dispatched?.fields?.serverInstanceId).toBe(originalInstanceId);
+    expect(dispatched.fields?.serverInstanceId).toBe(originalInstanceId);
 
     // Removing the mount closes its sessions; remounting the same name mints a
     // fresh instance id, so records that resolve the mount lazily would report
     // the replacement (or nothing) for work the original mount served.
     await http.removeServer("swap-actor:inbox");
     http.addServer("swap-actor:inbox", factory);
-    await new Promise((resolve) => setTimeout(resolve, 20));
     const remountedInstanceId = requestLogs
       .filter(({ event, fields }) => event === "mcp_server_added" && fields?.server === "inbox")
       .at(-1)?.fields?.serverInstanceId;
@@ -405,21 +423,22 @@ describe("McpHttpServer", () => {
 
     // Whichever way the stream terminated, its record belongs to the mount that
     // served it.
-    const streamEnded = requestLogs.filter(
-      ({ event, fields }) =>
-        (event === "mcp_http_response_finished" ||
-          event === "mcp_http_response_closed" ||
-          event === "mcp_transport_returned") &&
-        fields?.requestId === dispatched?.fields?.requestId
-    );
-    expect(streamEnded.length).toBeGreaterThan(0);
+    const endsStream = ({ event, fields }: LogRecord) =>
+      (event === "mcp_http_response_finished" ||
+        event === "mcp_http_response_closed" ||
+        event === "mcp_transport_returned") &&
+      fields?.requestId === dispatched.fields?.requestId;
+    await waitForRecord(requestLogs, endsStream, "the inbox GET stream to end");
+    const streamEnded = requestLogs.filter(endsStream);
     for (const { fields } of streamEnded) {
       expect(fields?.serverInstanceId).toBe(originalInstanceId);
     }
-    const sessionClosed = requestLogs.find(
-      ({ event, fields }) => event === "mcp_session_closed" && fields?.server === "inbox"
+    const sessionClosed = await waitForRecord(
+      requestLogs,
+      ({ event, fields }) => event === "mcp_session_closed" && fields?.server === "inbox",
+      "the inbox session close"
     );
-    expect(sessionClosed?.fields?.serverInstanceId).toBe(originalInstanceId);
+    expect(sessionClosed.fields?.serverInstanceId).toBe(originalInstanceId);
 
     await client.close();
     await http.removeServer("swap-actor:inbox");
@@ -469,17 +488,23 @@ describe("McpHttpServer", () => {
     await started;
     controller.abort();
     await expect(pending).rejects.toThrow();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    const prematureClose = await waitForRecord(
+      requestLogs,
+      ({ event, fields }) =>
+        event === "mcp_http_response_closed" && fields?.toolName === "wait_for_release",
+      "the aborted call's premature close"
+    );
     releaseHandler();
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await waitForRecord(
+      requestLogs,
+      ({ event, fields }) =>
+        event === "mcp_transport_returned" && fields?.toolName === "wait_for_release",
+      "the aborted call's transport return"
+    );
     await transport.terminateSession();
     await client.close();
 
-    const prematureClose = requestLogs.find(
-      ({ event, fields }) =>
-        event === "mcp_http_response_closed" && fields?.toolName === "wait_for_release"
-    );
-    expect(prematureClose?.fields).toMatchObject({
+    expect(prematureClose.fields).toMatchObject({
       responseWritten: false,
       statusCode: 200,
       headersSent: true,
@@ -500,30 +525,32 @@ describe("McpHttpServer", () => {
     const transport = new StreamableHTTPClientTransport(new URL(url));
     const client = new Client({ name: "test", version: "0.0.0" });
     await client.connect(transport);
-    await new Promise((resolve) => setTimeout(resolve, 0));
 
     // The SDK opens this stream during connect. The dispatch stays active for
     // server notifications, so neither a transport return nor HTTP finish means
     // a client receipt while the stream is open.
-    const dispatched = requestLogs.find(
-      ({ event, fields }) => event === "mcp_transport_dispatch" && fields?.httpMethod === "GET"
+    const dispatched = await waitForRecord(
+      requestLogs,
+      ({ event, fields }) => event === "mcp_transport_dispatch" && fields?.httpMethod === "GET",
+      "the GET stream dispatch"
     );
-    expect(dispatched?.fields?.requestId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(dispatched.fields?.requestId).toMatch(/^[0-9a-f-]{36}$/);
     expect(
       requestLogs.some(
         ({ event, fields }) =>
           (event === "mcp_transport_returned" || event === "mcp_http_response_finished") &&
-          fields?.requestId === dispatched?.fields?.requestId
+          fields?.requestId === dispatched.fields?.requestId
       )
     ).toBe(false);
 
     await client.close();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    const closed = requestLogs.find(
+    const closed = await waitForRecord(
+      requestLogs,
       ({ event, fields }) =>
-        event === "mcp_http_response_closed" && fields?.requestId === dispatched?.fields?.requestId
+        event === "mcp_http_response_closed" && fields?.requestId === dispatched.fields?.requestId,
+      "the GET stream close"
     );
-    expect(closed?.fields).toMatchObject({
+    expect(closed.fields).toMatchObject({
       statusCode: 200,
       headersSent: true,
       writableFinished: false,
