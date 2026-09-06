@@ -1143,7 +1143,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient);
   }
 
-  const mcpHttp = new McpHttpServer({ servers });
+  const mcpHttp = new McpHttpServer({ servers, logger: log });
   await mcpHttp.start();
   const sharedMcp = mcpHttp.urls();
   log.info("shared_mcp_serving", { servers: sharedMcp.map((u) => u.name) });
@@ -2575,8 +2575,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         log: (m) => console.log(m),
       },
     };
-    const updateUrl = mcpHttp.addServer(UPDATE_MCP_NAME, () =>
-      createUpdateMcpServer(updateToolDeps, rootId)
+    const updateUrl = mcpHttp.addServer(
+      UPDATE_MCP_NAME,
+      () => createUpdateMcpServer(updateToolDeps, rootId),
+      // A host service, not an actor mount: this name is safe to log.
+      { logLabel: UPDATE_MCP_NAME }
     );
     rootMcp.push({ name: UPDATE_MCP_NAME, url: updateUrl });
   } catch (err) {
@@ -2591,8 +2594,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     actors,
     runningThreadIds: () => mesh.activeRunThreadIds(),
   };
-  const pnpmHardlinksUrl = mcpHttp.addServer(PNPM_HARDLINKS_MCP_NAME, () =>
-    createPnpmHardlinksMcpServer(pnpmHardlinksDeps, rootId)
+  const pnpmHardlinksUrl = mcpHttp.addServer(
+    PNPM_HARDLINKS_MCP_NAME,
+    () => createPnpmHardlinksMcpServer(pnpmHardlinksDeps, rootId),
+    { logLabel: PNPM_HARDLINKS_MCP_NAME }
   );
   rootMcp.push({ name: PNPM_HARDLINKS_MCP_NAME, url: pnpmHardlinksUrl });
 

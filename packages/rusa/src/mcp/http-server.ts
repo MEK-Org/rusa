@@ -4,6 +4,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { decodeScheduledMessagePayload, type ScheduledMessage } from "../actor/os-scheduler.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
 import type { McpServerSpec } from "../providers/types.js";
 
 export interface McpHttpServerOptions {
@@ -22,6 +23,8 @@ export interface McpHttpServerOptions {
   wake?: WakeHandler;
   /** Optional host-jobs exit endpoint ; wired post-mesh via {@link setHostJobExitHandler}. */
   hostJobExit?: HostJobExitHandler;
+  /** Structured application logger for MCP request lifecycle diagnostics. */
+  logger?: Logger;
 }
 
 /**
@@ -80,6 +83,55 @@ const MAX_SCHEDULED_MESSAGE_BODY_BYTES = 256 * 1024;
 // Keep loopback MCP connections alive longer than the coding client's pooled idle window (MEK-Org/rusa#294).
 const MCP_KEEP_ALIVE_TIMEOUT_MS = 120_000;
 const MCP_HEADERS_TIMEOUT_MS = 121_000;
+
+/** Keep request-derived diagnostics useful without admitting unbounded client input. */
+const MAX_MCP_LOG_METADATA_LENGTH = 128;
+
+/** Return only a bounded scalar suitable for a diagnostic record. */
+function boundedMetadata(value: unknown): string | undefined {
+  return typeof value === "string" ? value.slice(0, MAX_MCP_LOG_METADATA_LENGTH) : undefined;
+}
+
+/** The label recorded for a mount whose name is not known to be free of private identifiers. */
+const UNCLASSIFIED_SERVER_LABEL = "mesh";
+
+/**
+ * Derive the log label for a mount registered after start. A mounted actor
+ * capability is named `<actor-id>:<capability>`, so the capability suffix names
+ * the request path without the private actor id. A bare dynamic name is an
+ * actor's own mesh mount, and nothing about the string proves otherwise, so it
+ * is labelled conservatively rather than recorded. Callers that register a
+ * host service under a bare, code-controlled name pass `logLabel` to say so.
+ */
+function derivedServerLabel(name: string): string {
+  const separator = name.lastIndexOf(":");
+  if (separator >= 0) {
+    const capability = name.slice(separator + 1);
+    if (capability.length > 0) return capability.slice(0, MAX_MCP_LOG_METADATA_LENGTH);
+  }
+  return UNCLASSIFIED_SERVER_LABEL;
+}
+
+/**
+ * Select the few routing fields useful for a request timeline. Arguments,
+ * results, capability URLs, credentials, and parse errors must never enter the
+ * application log.
+ */
+function requestMetadata(body: unknown): { rpcMethod?: string; toolName?: string } {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return {};
+  const request = body as Record<string, unknown>;
+  const rpcMethod = boundedMetadata(request.method);
+  const params = request.params;
+  const toolName =
+    rpcMethod === "tools/call" && params && typeof params === "object" && !Array.isArray(params)
+      ? boundedMetadata((params as Record<string, unknown>).name)
+      : undefined;
+  return { rpcMethod, toolName };
+}
+
+function elapsedMs(startedAt: number): number {
+  return Math.max(0, Math.round(performance.now() - startedAt));
+}
 
 function readTextBody(req: IncomingMessage, maxBytes = MAX_WAKE_BODY_BYTES): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -156,6 +208,11 @@ export class McpHttpServer {
   /** name -> unguessable URL path token, and the reverse for routing. */
   private readonly nameToToken = new Map<string, string>();
   private readonly tokenToName = new Map<string, string>();
+  /** Per mounted server: the safe label recorded for it, never its raw name. */
+  private readonly serverLabels = new Map<string, string>();
+  /** Per server-name: session id -> monotonic creation time for close diagnostics. */
+  private readonly sessionStartedAt = new Map<string, Map<string, number>>();
+  private readonly log: Logger;
   /** Cron-driven wake endpoint backend; null until {@link setWakeHandler} wires it. */
   private wake: WakeHandler | null;
   private wakeObligation?: WakeObligationHandler | null;
@@ -167,11 +224,16 @@ export class McpHttpServer {
     this.factories = opts.servers;
     this.host = opts.host ?? "127.0.0.1";
     this.port = opts.port ?? 0;
+    this.log = (opts.logger ?? nullLogger).child({ component: "mcp-http" });
     this.wake = opts.wake ?? null;
     this.hostJobExit = opts.hostJobExit ?? null;
     for (const name of Object.keys(this.factories)) {
       this.sessions.set(name, new Map());
+      this.sessionStartedAt.set(name, new Map());
       this.ensureToken(name);
+      // Host services declared at startup carry code-controlled names, so the
+      // name itself is the safe label.
+      this.serverLabels.set(name, name.slice(0, MAX_MCP_LOG_METADATA_LENGTH));
     }
   }
 
@@ -253,9 +315,14 @@ export class McpHttpServer {
    * per-actor endpoint (e.g. the agent-execution server for one actor, with its
    * id baked in). Returns the loopback URL to hand the actor's provider.
    */
-  addServer(name: string, factory: () => McpServer): string {
+  addServer(name: string, factory: () => McpServer, opts?: { logLabel?: string }): string {
     this.factories[name] = factory;
     if (!this.sessions.has(name)) this.sessions.set(name, new Map());
+    if (!this.sessionStartedAt.has(name)) this.sessionStartedAt.set(name, new Map());
+    this.serverLabels.set(
+      name,
+      opts?.logLabel?.slice(0, MAX_MCP_LOG_METADATA_LENGTH) ?? derivedServerLabel(name)
+    );
     return this.urlFor(name);
   }
 
@@ -272,6 +339,8 @@ export class McpHttpServer {
       }
       this.sessions.delete(name);
     }
+    this.sessionStartedAt.delete(name);
+    this.serverLabels.delete(name);
     delete this.factories[name];
     const token = this.nameToToken.get(name);
     if (token) {
@@ -287,6 +356,11 @@ export class McpHttpServer {
     if (!m) return undefined;
     const name = this.tokenToName.get(m[1]);
     return name && this.factories[name] ? name : undefined;
+  }
+
+  /** Safe mount label for request records; never the URL token, the raw name, or an actor id. */
+  private serverLabel(name: string): string | undefined {
+    return this.serverLabels.get(name);
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -313,17 +387,75 @@ export class McpHttpServer {
       return;
     }
     const transports = this.sessions.get(name) as Map<string, StreamableHTTPServerTransport>;
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const sessionStarts = this.sessionStartedAt.get(name) as Map<string, number>;
+    const requestStartedAt = performance.now();
+    const requestId = randomUUID();
+    // Read the mount label once, at arrival: a session close can outlive the
+    // mount, and every record for this request should name the mount that served it.
+    const server = this.serverLabel(name);
+    // Routing must use the complete header. Its separately bounded form is for
+    // diagnostics only: trimming before Map#get changes which session receives
+    // a request.
+    let sessionId =
+      typeof req.headers["mcp-session-id"] === "string" ? req.headers["mcp-session-id"] : undefined;
+    let loggedSessionId = boundedMetadata(sessionId);
+    // Capture this before body parsing so an arrival record answers whether the
+    // client presented a currently live session, even if parsing or dispatch stalls.
+    const sessionResolvedAtArrival = sessionId !== undefined && transports.has(sessionId);
+    let metadata: { rpcMethod?: string; toolName?: string } = {};
+    let responseFinished = false;
+    const requestFields = () => ({
+      requestId,
+      server,
+      sessionId: loggedSessionId,
+      sessionResolvedAtArrival,
+      ...metadata,
+      elapsedMs: elapsedMs(requestStartedAt),
+    });
+    // `writableFinished` is this host completing its own writable side — the
+    // closest observable local evidence that a response left here, and never a
+    // client receipt acknowledgement.
+    const responseFields = () => ({
+      statusCode: res.statusCode,
+      headersSent: res.headersSent,
+      writableFinished: res.writableFinished,
+    });
+    const logResponseFinished = () => {
+      responseFinished = true;
+      // `finish` means Node completed its side of the HTTP response. It is not
+      // a client receipt acknowledgement; streamable GET responses can remain
+      // open long after the transport has returned.
+      this.log.info("mcp_http_response_finished", {
+        ...requestFields(),
+        ...responseFields(),
+      });
+    };
+    const logResponseClosed = () => {
+      if (responseFinished) return;
+      this.log.warn("mcp_http_response_closed", {
+        ...requestFields(),
+        ...responseFields(),
+      });
+    };
+    res.once("finish", logResponseFinished);
+    res.once("close", logResponseClosed);
+    this.log.info("mcp_request_arrived", {
+      ...requestFields(),
+      httpMethod: boundedMetadata(req.method),
+    });
 
     try {
       if (req.method === "POST") {
         const body = await readJsonBody(req);
+        metadata = requestMetadata(body);
+        this.log.info("mcp_request_body_read", requestFields());
         const existing = sessionId ? transports.get(sessionId) : undefined;
         let transport: StreamableHTTPServerTransport;
         if (existing) {
           transport = existing;
         } else {
           if (!isInitializeRequest(body)) {
+            this.log.warn("mcp_session_rejected", requestFields());
             res.writeHead(400, { "content-type": "application/json" });
             res.end(
               JSON.stringify({
@@ -341,16 +473,34 @@ export class McpHttpServer {
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: (sid: string) => {
               transports.set(sid, newTransport);
+              sessionId = sid;
+              loggedSessionId = boundedMetadata(sid);
+              sessionStarts.set(sid, performance.now());
+              this.log.info("mcp_session_created", requestFields());
             },
           });
           newTransport.onclose = () => {
             const sid = newTransport.sessionId;
-            if (sid) transports.delete(sid);
+            if (!sid) return;
+            transports.delete(sid);
+            const startedAt = sessionStarts.get(sid);
+            sessionStarts.delete(sid);
+            if (startedAt !== undefined) {
+              this.log.info("mcp_session_closed", {
+                server,
+                sessionId: boundedMetadata(sid),
+                elapsedMs: elapsedMs(startedAt),
+              });
+            }
           };
+          this.log.info("mcp_session_connecting", requestFields());
           await this.factories[name]().connect(newTransport);
+          this.log.info("mcp_session_connected", requestFields());
           transport = newTransport;
         }
+        this.log.info("mcp_transport_dispatch", requestFields());
         await transport.handleRequest(req, res, body);
+        this.log.info("mcp_transport_returned", requestFields());
         return;
       }
 
@@ -361,13 +511,24 @@ export class McpHttpServer {
           res.end("invalid or missing session id");
           return;
         }
+        this.log.info("mcp_transport_dispatch", {
+          ...requestFields(),
+          httpMethod: boundedMetadata(req.method),
+        });
         await transport.handleRequest(req, res);
+        this.log.info("mcp_transport_returned", {
+          ...requestFields(),
+          httpMethod: boundedMetadata(req.method),
+        });
         return;
       }
 
       res.writeHead(405, { "content-type": "text/plain" });
       res.end("method not allowed");
-    } catch (_err) {
+    } catch {
+      // This is deliberately error-detail-free: request payloads and provider
+      // errors can contain credentials or other private data.
+      this.log.warn("mcp_request_failed", requestFields());
       if (!res.headersSent) {
         res.writeHead(500, { "content-type": "application/json" });
         res.end(
