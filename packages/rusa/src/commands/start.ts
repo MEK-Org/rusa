@@ -21,12 +21,12 @@ import { CrontabMutator, execCrontabIo, preflightCron } from "../actor/crontab.j
 import { E2EInstanceManager } from "../actor/e2e-instance-manager.js";
 import {
   type EventResource,
-  type EventSubscriptionAuditEvent,
-  type EventSubscriptionStore,
-  FileEventSubscriptionStore,
+  type EventSourceOwnerStore,
+  type EventSourceOwnershipAuditEvent,
   isSubResourceOf,
-  missingAuditedEventSubscriptions,
+  missingAuditedEventSourceOwnerships,
   normalizeEventResource,
+  reconcileEventSourceSubscriptions,
   reconcileEventSources,
   resourceKey,
 } from "../actor/event-subscriptions.js";
@@ -113,6 +113,7 @@ import {
   importLegacyActorState,
 } from "../db/legacy-actor-import.js";
 import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
+import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
 import type {
   PrerequisiteAttention,
   ReadyHeadChange,
@@ -567,12 +568,12 @@ export function mechanicallySubscribeCreatedResource(
  * The audit stream is diagnostic only: this never reconstructs routing state from events.
  */
 export function warnMissingConfiguredEventSubscriptionsAtBoot(
-  store: EventSubscriptionStore,
-  auditEvents: readonly EventSubscriptionAuditEvent[],
+  store: EventSourceOwnerStore,
+  auditEvents: readonly EventSourceOwnershipAuditEvent[],
   configuredRoots: readonly EventResource[],
   warn: (message: string) => void = console.warn
 ): Array<{ resource: EventResource; actorId: string }> {
-  const missing = missingAuditedEventSubscriptions(store, auditEvents).filter(({ resource }) =>
+  const missing = missingAuditedEventSourceOwnerships(store, auditEvents).filter(({ resource }) =>
     configuredRoots.some((configuredRoot) => isSubResourceOf(resource, configuredRoot))
   );
   if (missing.length === 0) return [];
@@ -1401,17 +1402,39 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // registers the glass-goals `understanding-write` server (claude FS isolation
   // ISSUE_NUM having landed); grantable-servers.test.ts locks the contents.
   const capabilityGrants = getRepositories().capabilityGrants;
-  const persistentEventSubscriptions = new FileEventSubscriptionStore(
-    join(mcHome, "event-subscriptions.json"),
-    rootId
-  );
+  // Explicit subscription ownership and its tombstones are durable in SQLite;
+  // `event-subscriptions.json` is only a legacy source, imported once and then
+  // archived. The config-implied seed is rebuilt in memory below, so nothing
+  // here recreates a JSON source of truth.
+  const legacyEventSubscriptionImport = importLegacyEventSubscriptionState({
+    mcHome,
+    db: database,
+    repositories: getRepositories(),
+    rootId,
+  });
+  if (legacyEventSubscriptionImport.importedSubscriptions > 0) {
+    log.info("legacy_event_subscriptions_imported", {
+      subscriptions: legacyEventSubscriptionImport.importedSubscriptions,
+    });
+  } else if (legacyEventSubscriptionImport.backupFiles.length > 0) {
+    // A source file still present after the receipt committed is stale by
+    // construction — a failed archive rename, or one restored by hand. It is
+    // archived unread rather than replayed, and saying so is what stops an
+    // operator concluding the file they put back took effect. `warn`, not
+    // `info`: nothing is broken, but a document someone placed there did not
+    // become state, and the backup path is where to find it.
+    log.warn("legacy_event_subscriptions_archived_unread", {
+      backups: legacyEventSubscriptionImport.backupFiles,
+    });
+  }
+  const persistentEventSourceOwners = getRepositories().eventSourceOwners;
   warnMissingConfiguredEventSubscriptionsAtBoot(
-    persistentEventSubscriptions,
+    persistentEventSourceOwners,
     eventSubscriptionAudit,
     configuredRoots
   );
   // Host-plane host-jobs capability : durable per-actor job records, keyed
-  // the same way capabilityGrants/eventSubscriptions are.
+  // the same way capabilityGrants/event source owners are.
   const hostJobStore = new FileHostJobStore(join(mcHome, "host-jobs.json"));
   const e2eInstance = new E2EInstanceManager({
     mcHome,
@@ -1419,16 +1442,33 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     handleForId: (id) => (id === rootId ? rootHandle : generateHandle(id)),
   });
   const rootSourceSync = reconcileEventSources(
-    persistentEventSubscriptions,
+    persistentEventSourceOwners,
     configuredRoots,
     rootId,
     () => new Date().toISOString()
   );
-  const eventSubscriptions = rootSourceSync.store;
+  const eventSourceOwners = rootSourceSync.store;
   if (rootSourceSync.droppedDelegations.length > 0) {
     console.log(
       `[mesh] reconciled root event sources: dropped ${rootSourceSync.droppedDelegations.length} orphaned delegations`
     );
+  }
+  // Subscriptions are re-anchored on every boot, not only at subscribe time.
+  // `config.yaml` is the scope boundary, and narrowing it between runs must
+  // actually narrow delivery — a durable row for a source the operator has
+  // since removed would otherwise keep feeding an actor from outside the
+  // configured scope with nothing in the config to explain why.
+  const eventSourceSubscriptions = getRepositories().eventSourceSubscriptions;
+  const droppedSubscriptions = reconcileEventSourceSubscriptions(
+    eventSourceSubscriptions,
+    configuredRoots
+  );
+  if (droppedSubscriptions.length > 0) {
+    log.info("event_source_subscriptions_unanchored", {
+      dropped: droppedSubscriptions.map(
+        (subscription) => `${subscription.resource} -> ${subscription.actorId}`
+      ),
+    });
   }
   // `const` so the closure below keeps the non-null narrowing (`chatClient` is a
   // reassignable `let` further up).
@@ -1641,7 +1681,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       return runId;
     },
     capabilityGrants,
-    eventSubscriptions,
+    eventSourceOwners,
+    eventSourceSubscriptions,
+    // The configured scope the mesh refuses new subscriptions outside of, so a
+    // `subscribe_event_source` call cannot reopen what the config closed.
+    configuredEventSources: configuredRoots,
     // Ownership authority for issue/PR event sources: a live
     // obligation's owner governs its linked source and supersedes any manual
     // delegation on it.

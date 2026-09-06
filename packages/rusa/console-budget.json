@@ -21,7 +21,6 @@
     "src/e2e/tracker-server.ts"
   ],
   "budgets": {
-    "src/actor/event-subscriptions.ts": 1,
     "src/commands/dashboard.ts": 6,
     "src/commands/start.ts": 69,
     "src/config/loader.ts": 4,

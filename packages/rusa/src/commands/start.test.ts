@@ -13,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
 import { Actor, type RunAbandon } from "../actor/actor.js";
 import type { ActorMesh } from "../actor/actor-mesh.js";
-import { InMemoryEventSubscriptionStore } from "../actor/event-subscriptions.js";
+import { InMemoryEventSourceOwnerStore } from "../actor/event-subscriptions.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
@@ -264,7 +264,7 @@ describe("start command tests", () => {
   });
 
   it("warns at boot with bounded identities only for configured missing subscriptions", () => {
-    const store = new InMemoryEventSubscriptionStore();
+    const store = new InMemoryEventSourceOwnerStore();
     store.subscribe({
       resource: "github:configured-org/repo/issues/2",
       actorId: "durable-actor",
@@ -307,7 +307,7 @@ describe("start command tests", () => {
   it("bounds boot consistency identities and reports the remainder", () => {
     const warn = vi.fn();
     const missing = warnMissingConfiguredEventSubscriptionsAtBoot(
-      new InMemoryEventSubscriptionStore(),
+      new InMemoryEventSourceOwnerStore(),
       Array.from({ length: 12 }, (_, index) => ({
         kind: "event_source_subscribed",
         actorId: `actor-${index}`,
@@ -3561,6 +3561,53 @@ describe("runStart webhook event routing (Phase 4)", () => {
         }),
       ])
     );
+  });
+
+  it("wires the mesh to the durable subscription store, scoped to configured sources", async () => {
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot", repos: ["custom-org/custom-repo"] },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity", effort: "high" },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    let mesh: ActorMesh | undefined;
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    await readyPromise;
+    if (!mesh) throw new Error("mesh not ready");
+
+    // Subscribing through the mesh must reach SQLite, not a per-process
+    // in-memory default — a subscription that evaporated on restart would be a
+    // routing decision the operator cannot see or rely on.
+    mesh.addEventSourceSubscriber("github:custom-org/custom-repo/issues/3", "root", "root");
+    expect(getRepositories().eventSourceSubscriptions.list()).toEqual([
+      expect.objectContaining({
+        resource: "github:custom-org/custom-repo/issues/3",
+        actorId: "root",
+        subscribedBy: "root",
+      }),
+    ]);
+
+    // And the configured sources reached the mesh, so subscribing cannot widen
+    // the instance past what config.yaml declares.
+    expect(() =>
+      mesh?.addEventSourceSubscriber("github:unconfigured-org/elsewhere", "root", "root")
+    ).toThrow(/not anchored in a configured event source/);
   });
 
   it("drops inbound chat messages from spaces listed in chat.excludedSpaces ", async () => {

@@ -71,6 +71,8 @@ const ALL_MESH_EVENT_KINDS = Object.keys({
   calendar_read: 0,
   drive_read: 0,
   calendar_write: 0,
+  event_source_subscriber_added: 0,
+  event_source_subscriber_removed: 0,
 } satisfies Record<MeshEventKind, 0>) as MeshEventKind[];
 
 const IGNORED_KINDS = ALL_MESH_EVENT_KINDS.filter(
