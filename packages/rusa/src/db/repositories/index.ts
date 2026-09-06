@@ -14,6 +14,7 @@ import { MeshChatRepository } from "./mesh-chat-repository.js";
 import { MeshEventRepository } from "./mesh-event-repository.js";
 import { ModelScrapeRepository } from "./model-scrape-repository.js";
 import { ObligationRepository } from "./obligation-repository.js";
+import { PrincipalRepository } from "./principal-repository.js";
 import { QuotaScrapeRepository } from "./quota-scrape-repository.js";
 import { RawInputRepository } from "./raw-input-repository.js";
 import { ReferenceCacheRepository } from "./reference-cache-repository.js";
@@ -43,11 +44,15 @@ export class Repositories {
   readonly quotaScrapes: QuotaScrapeRepository;
   readonly modelScrapes: ModelScrapeRepository;
   readonly obligations: ObligationRepository;
+  readonly principals: PrincipalRepository;
   readonly referenceCache: ReferenceCacheRepository;
 
   constructor(db: Database.Database) {
     this.actorRuns = new ActorRunRepository(db);
-    this.actors = new SqliteActorRepository(db);
+    // Constructed before the actor repository, which writes an actor's principal
+    // in the same transaction as the actor row.
+    this.principals = new PrincipalRepository(db);
+    this.actors = new SqliteActorRepository(db, this.principals);
     this.capabilityGrants = new DbCapabilityGrantStore(db);
     this.eventSourceOwners = new DbEventSourceOwnerStore(db);
     this.eventSourceSubscriptions = new DbEventSourceSubscriptionStore(db);
@@ -106,6 +111,8 @@ export type {
   ListOwnedObligationsOptions,
 } from "./obligation-repository.js";
 export { ObligationRepository } from "./obligation-repository.js";
+export type { CreateUserInput } from "./principal-repository.js";
+export { normalizeEmail, PrincipalRepository } from "./principal-repository.js";
 export { QuotaScrapeRepository } from "./quota-scrape-repository.js";
 export type { RawInput } from "./raw-input-repository.js";
 export { RawInputRepository } from "./raw-input-repository.js";
