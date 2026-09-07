@@ -110,7 +110,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 55,
           resetAtIso: "2026-07-13T02:59:00.000Z",
-          scope: undefined,
+          scope: "provider",
         },
       ]);
 
@@ -138,8 +138,11 @@ describe("quota MCP server", () => {
 
       const systemInstruction = lastSystemInstruction();
       expect(systemInstruction).toContain("You are a precise quota parser");
+      expect(systemInstruction).toContain("preserve all printed decimal precision");
       expect(systemInstruction).toContain("For Claude:");
       expect(systemInstruction).toContain("session/week usage windows");
+      expect(systemInstruction).toContain("'provider' is the only accepted scope");
+      expect(systemInstruction).toContain("Current week (Fable)");
       expect(systemInstruction).toContain("The current local time");
       expect(systemInstruction).not.toContain("For Codex:");
       expect(systemInstruction).not.toContain("For agy:");
@@ -199,9 +202,10 @@ describe("quota MCP server", () => {
       expect(systemInstruction).toContain("do NOT guess a number");
       expect(systemInstruction).toContain("do NOT fail the parse");
       expect(systemInstruction).toContain("do NOT emit an invented window");
-      expect(systemInstruction).toContain(
-        "Extract EVERY rendered limit row into `windows` — never drop or omit the Weekly row when 5h is present, and vice-versa."
-      );
+      expect(systemInstruction).toContain("'provider' is the only accepted scope");
+      expect(systemInstruction).toContain("gpt-reserve Weekly limit");
+      expect(systemInstruction).toContain("starts a model-specific subsection");
+      expect(systemInstruction).toContain("use the latest such panel");
       expect(systemInstruction).toContain("resets 02:10 on 27 Aug");
       expect(systemInstruction).toContain("15:11 on 1 Sep");
       expect(systemInstruction).toContain("The current local time");
@@ -274,10 +278,9 @@ describe("quota MCP server", () => {
         for (const key of required) {
           expect(properties).toHaveProperty(key);
         }
-        // `status` is the one required top-level reading — it must stay in the
-        // schema even though all other headline fields moved into `limits`.
-        expect(required).toEqual(["status"]);
+        expect(required).toEqual(["status", "windows"]);
         expect(properties.status).toBeDefined();
+        expect(properties.windows).toBeDefined();
       }
     });
 
@@ -311,8 +314,198 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 93,
           resetAtIso: "2026-07-14T12:34:00.000Z",
+          scope: "provider",
         },
       ]);
+    });
+
+    it("retries and fails closed when a provider row is malformed beside a valid weekly row", async () => {
+      // The 5h row is a provider reading, not an explicit placeholder or model
+      // allocation. Its missing usedPercent must reject the whole snapshot rather
+      // than silently preserving the Weekly row.
+      const incompleteSnapshot = {
+        status: "available",
+        windows: [
+          { label: "5h", kind: "five_hour", placeholder: false, scope: "provider" },
+          {
+            label: "Weekly",
+            kind: "weekly",
+            placeholder: false,
+            scope: "provider",
+            usedPercent: 42,
+            resetAtIso: "2026-09-14T00:00:00.000Z",
+          },
+        ],
+      };
+      mockGenerateContent.mockResolvedValue({ text: () => JSON.stringify(incompleteSnapshot) });
+
+      const parsed = await parseCodexQuota("synthetic incomplete provider panel", "test-key");
+
+      expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect(parsed.status).toBe("unknown");
+      expect(parsed.limits).toBeUndefined();
+      expect(parsed.message).toContain("invalid usedPercent");
+    });
+
+    it("retries a malformed provider snapshot and accepts a complete 5h and weekly replacement", async () => {
+      mockGenerateContent
+        .mockResolvedValueOnce({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [
+                { label: "5h", kind: "five_hour", scope: "provider" },
+                {
+                  label: "Weekly",
+                  kind: "weekly",
+                  scope: "provider",
+                  usedPercent: 42,
+                  resetAtIso: "2026-09-14T00:00:00.000Z",
+                },
+              ],
+            }),
+        })
+        .mockResolvedValueOnce({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [
+                {
+                  label: "5h",
+                  kind: "five_hour",
+                  scope: "provider",
+                  usedPercent: 10,
+                  resetAtIso: "2026-09-08T00:00:00.000Z",
+                },
+                {
+                  label: "Weekly",
+                  kind: "weekly",
+                  scope: "provider",
+                  usedPercent: 42,
+                  resetAtIso: "2026-09-14T00:00:00.000Z",
+                },
+              ],
+            }),
+        });
+
+      const parsed = await parseCodexQuota("synthetic provider panel", "test-key");
+
+      expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect(parsed).toMatchObject({ status: "available" });
+      expect(parsed.limits).toEqual([
+        {
+          label: "5h",
+          kind: "five_hour",
+          percentLeft: 90,
+          resetAtIso: "2026-09-08T00:00:00.000Z",
+          scope: "provider",
+        },
+        {
+          label: "Weekly",
+          kind: "weekly",
+          percentLeft: 58,
+          resetAtIso: "2026-09-14T00:00:00.000Z",
+          scope: "provider",
+        },
+      ]);
+    });
+
+    it("derives exhausted status from a validated exhausted provider window", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Weekly",
+                kind: "weekly",
+                scope: "provider",
+                usedPercent: 100,
+                resetAtIso: "2026-09-14T00:00:00.000Z",
+              },
+            ],
+          }),
+      });
+
+      const parsed = await parseCodexQuota("synthetic exhausted provider panel", "test-key");
+
+      expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+      expect(parsed.status).toBe("exhausted");
+      expect(parsed.limits).toHaveLength(1);
+    });
+
+    it("retries and fails closed when exhausted model status conflicts with available windows", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "exhausted",
+            windows: [
+              {
+                label: "Weekly",
+                kind: "weekly",
+                scope: "provider",
+                usedPercent: 0,
+                resetAtIso: "2026-09-14T00:00:00.000Z",
+              },
+            ],
+          }),
+      });
+
+      const parsed = await parseCodexQuota("synthetic conflicting provider panel", "test-key");
+
+      expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect(parsed.status).toBe("unknown");
+      expect(parsed.limits).toBeUndefined();
+      expect(parsed.message).toContain("status 'exhausted' disagrees");
+    });
+
+    it("keeps an explicit empty-window reading unknown", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () => JSON.stringify({ status: "unknown", windows: [] }),
+      });
+
+      const parsed = await parseCodexQuota("synthetic refresh placeholder", "test-key");
+
+      expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+      expect(parsed).toEqual({ status: "unknown", limits: [] });
+    });
+
+    it("derives exhausted status when an exhausted window accompanies an unknown summary", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "unknown",
+            windows: [
+              {
+                label: "Weekly",
+                kind: "weekly",
+                scope: "provider",
+                usedPercent: 100,
+                resetAtIso: "2026-09-14T00:00:00.000Z",
+              },
+            ],
+          }),
+      });
+
+      const parsed = await parseCodexQuota(
+        "synthetic exhausted window with unknown summary",
+        "test-key"
+      );
+
+      expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+      expect(parsed.status).toBe("exhausted");
+      expect(parsed.limits).toHaveLength(1);
+    });
+
+    it("preserves status exhausted when an exhausted summary has no limits", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () => JSON.stringify({ status: "exhausted", windows: [] }),
+      });
+
+      const parsed = await parseCodexQuota("synthetic empty exhausted panel", "test-key");
+
+      expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+      expect(parsed).toEqual({ status: "exhausted", limits: [] });
     });
 
     it("keys the mapped limit's kind off the LLM's classification, not the label wording ", async () => {
@@ -346,7 +539,7 @@ describe("quota MCP server", () => {
       expect(parsed.limits?.[1]).toMatchObject({ label: "Weekly", kind: "weekly" });
     });
 
-    it("drops an unrecognized/missing LLM kind to undefined rather than guessing ", async () => {
+    it("fails closed on an unrecognized LLM window kind", async () => {
       mockGenerateContent.mockResolvedValue({
         text: () =>
           JSON.stringify({
@@ -356,7 +549,8 @@ describe("quota MCP server", () => {
       });
 
       const parsed = await parseClaudeQuota("Claude output here", "test-key");
-      expect(parsed.limits?.[0]?.kind).toBeUndefined();
+      expect(parsed.status).toBe("unknown");
+      expect(parsed.message).toContain("invalid kind");
     });
 
     it("exposes resetInIso on the LLM per-window schema for relative reset durations", async () => {
@@ -415,7 +609,7 @@ describe("quota MCP server", () => {
       expect(windowSchema.required).toContain("kind");
     });
 
-    it("requires the LLM to classify each window's scope ", async () => {
+    it("accepts only provider-scoped windows in the LLM response schema ", async () => {
       mockGenerateContent.mockResolvedValue({
         text: () => JSON.stringify({ status: "unknown", windows: [] }),
       });
@@ -437,8 +631,45 @@ describe("quota MCP server", () => {
         };
       };
       const windowSchema = lastCallArgs.config.responseSchema.properties.windows.items;
-      expect(windowSchema.properties.scope?.enum).toEqual(["provider", "model"]);
+      expect(windowSchema.properties.scope?.enum).toEqual(["provider"]);
       expect(windowSchema.required).toContain("scope");
+    });
+
+    it("drops explicitly model-scoped windows for every provider", async () => {
+      for (const parse of [parseClaudeQuota, parseCodexQuota, parseAgyQuota, parseKimiQuota]) {
+        mockGenerateContent.mockReset();
+        mockGenerateContent.mockResolvedValue({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [
+                {
+                  label: "Weekly",
+                  kind: "weekly",
+                  usedPercent: 0,
+                  scope: "provider",
+                },
+                {
+                  label: "Named model weekly",
+                  kind: "weekly",
+                  usedPercent: 0,
+                  scope: "model",
+                },
+              ],
+            }),
+        });
+
+        const parsed = await parse("quota output", "test-key");
+        expect(parsed.limits).toEqual([
+          {
+            label: "Weekly",
+            kind: "weekly",
+            percentLeft: 100,
+            resetAtIso: undefined,
+            scope: "provider",
+          },
+        ]);
+      }
     });
 
     it("resolves LLM-extracted ISO durations for relative reset dialects", async () => {
@@ -484,7 +715,7 @@ describe("quota MCP server", () => {
               kind: "weekly",
               percentLeft: 93,
               resetAtIso: expected,
-              scope: undefined,
+              scope: "provider",
             },
           ]);
         }
@@ -501,7 +732,7 @@ describe("quota MCP server", () => {
         mockGenerateContent.mockResolvedValue({
           text: () =>
             JSON.stringify({
-              status: "available",
+              status: "exhausted",
               windows: [
                 {
                   label: "Weekly GEMINI MODELS",
@@ -515,7 +746,7 @@ describe("quota MCP server", () => {
         });
 
         const parsed = await parseAgyQuota("agy usage output here", "test-key");
-        expect(parsed.status).toBe("available");
+        expect(parsed.status).toBe("exhausted");
         expect(parsed).not.toHaveProperty("groups");
 
         expect(parsed.limits).toEqual([
@@ -540,7 +771,7 @@ describe("quota MCP server", () => {
       }
     });
 
-    it("parses agy quota fail-closed when windows are absent", async () => {
+    it("parses agy quota fail-closed when an available response has no provider windows", async () => {
       mockGenerateContent.mockResolvedValue({
         text: () =>
           JSON.stringify({
@@ -548,7 +779,7 @@ describe("quota MCP server", () => {
           }),
       });
       const parsed = await parseAgyQuota("agy usage output here", "test-key");
-      expect(parsed.status).toBe("available");
+      expect(parsed.status).toBe("unknown");
       expect(parsed.limits).toBeUndefined();
     });
 
@@ -561,9 +792,12 @@ describe("quota MCP server", () => {
 
       const systemInstruction = lastSystemInstruction();
       expect(systemInstruction).toContain("You are a precise quota parser");
+      expect(systemInstruction).toContain("'provider' is the only accepted scope");
       expect(systemInstruction).toContain("For agy:");
       expect(systemInstruction).toContain("reports quota REMAINING");
+      expect(systemInstruction).toContain("Use the more precise printed percentage");
       expect(systemInstruction).toContain("usedPercent = 100 - N");
+      expect(systemInstruction).toContain("Ignore every other named model or model-group section");
       expect(systemInstruction).toContain("The current local time");
       expect(systemInstruction).not.toContain("For Claude:");
       expect(systemInstruction).not.toContain("For Codex:");
@@ -608,10 +842,12 @@ describe("quota MCP server", () => {
 
       const systemInstruction = lastSystemInstruction();
       expect(systemInstruction).toContain("You are a precise quota parser");
+      expect(systemInstruction).toContain("'provider' is the only accepted scope");
       expect(systemInstruction).toContain("For Kimi:");
       expect(systemInstruction).toContain("interactive /usage panel");
-      expect(systemInstruction).toContain("reports quota LEFT/REMAINING");
+      expect(systemInstruction).toContain("either 'N% used' or 'N% left/remaining'");
       expect(systemInstruction).toContain("usedPercent = 100 - N");
+      expect(systemInstruction).toContain("Ignore every named-model or model-group limit");
       expect(systemInstruction).toContain("The current local time");
       expect(systemInstruction).not.toContain("For Claude:");
       expect(systemInstruction).not.toContain("For Codex:");
@@ -687,12 +923,14 @@ describe("quota MCP server", () => {
             kind: "five_hour",
             percentLeft: 72,
             resetAtIso: new Date(generatedAt.getTime() + (3 * 60 + 10) * 60_000).toISOString(),
+            scope: "provider",
           },
           {
             label: "Weekly",
             kind: "weekly",
             percentLeft: 50,
             resetAtIso: new Date(generatedAt.getTime() + (2 * 24 + 22) * 3_600_000).toISOString(),
+            scope: "provider",
           },
         ]);
       } finally {
@@ -758,7 +996,7 @@ describe("quota MCP server", () => {
       expect(parsed.message).toContain("percentLeft < 100");
     });
 
-    it("fail-loud gate: allows model-scope window with percentLeft < 100 missing reset when provider sibling has reset ", async () => {
+    it("drops a model-scoped window before validating provider reset times", async () => {
       mockGenerateContent.mockResolvedValue({
         text: () =>
           JSON.stringify({
@@ -791,17 +1029,10 @@ describe("quota MCP server", () => {
           resetAtIso: "2026-08-27T10:00:00.000Z",
           scope: "provider",
         },
-        {
-          label: "Sonnet (weekly)",
-          kind: "weekly",
-          percentLeft: 60,
-          resetAtIso: undefined,
-          scope: "model",
-        },
       ]);
     });
 
-    it("fail-loud gate: fails loud when model-scope window has percentLeft < 100 and no provider sibling has reset ", async () => {
+    it("fails closed when the LLM returns only a model-scoped window", async () => {
       mockGenerateContent.mockResolvedValue({
         text: () =>
           JSON.stringify({
@@ -819,7 +1050,7 @@ describe("quota MCP server", () => {
 
       const parsed = await parseClaudeQuota("Sonnet: 40% used", "test-key");
       expect(parsed.status).toBe("unknown");
-      expect(parsed.message).toContain("percentLeft < 100");
+      expect(parsed.message).toContain("no provider window was returned");
     });
 
     it("fail-loud gate: does NOT throw when window has percentLeft === 100 without reset ISO ", async () => {
@@ -839,7 +1070,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 100,
           resetAtIso: undefined,
-          scope: undefined,
+          scope: "provider",
         },
       ]);
     });
@@ -886,7 +1117,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 90,
           resetAtIso: "2026-07-14T12:34:00.000Z",
-          scope: undefined,
+          scope: "provider",
         },
       ]);
       expect(warnSpy).toHaveBeenCalledWith(
@@ -939,17 +1170,21 @@ describe("quota MCP server", () => {
       errorSpy.mockRestore();
     });
 
-    it("parses a redacted live Codex panel with a model heading and no provider 5h row as available (issue #232 regression)", async () => {
-      // Redacted live Codex /status panel shape: two provider-scoped weekly rows
-      // (no provider 5h row at all — a valid reading), followed by a model
-      // heading (`<name> limit:` line, no progress bar) whose own 5h/weekly
-      // rows are model-scoped and must not be treated as provider windows.
+    it("keeps only the provider window from a Codex panel containing named-model limits", async () => {
+      // The provider has no 5h row in this valid panel. A named reserve precedes
+      // its weekly row and a named-model section follows it; neither belongs in
+      // the provider quota snapshot.
       mockGenerateContent.mockResolvedValue({
         text: () =>
           JSON.stringify({
             status: "available",
             windows: [
-              { label: "Weekly limit", kind: "weekly", usedPercent: 0, scope: "provider" },
+              {
+                label: "gpt-reserve Weekly limit",
+                kind: "weekly",
+                usedPercent: 0,
+                scope: "model",
+              },
               {
                 label: "Weekly limit",
                 kind: "weekly",
@@ -971,16 +1206,20 @@ describe("quota MCP server", () => {
         "Weekly limit:                [████████████████████] 100% left (resets 16:11 on 7 Sep)";
 
       const parsed = await parseCodexQuota(rawCodexOutput, "test-key");
-      // A single clean attempt: no completeness gate exists to second-guess a
-      // clean LLM parse, so there is no retry.
       expect(mockGenerateContent).toHaveBeenCalledTimes(1);
       expect(parsed.status).toBe("available");
-      expect(parsed.limits).toHaveLength(4);
-      expect(parsed.limits?.filter((l) => l.scope === "provider")).toHaveLength(2);
-      expect(parsed.limits?.filter((l) => l.scope === "model")).toHaveLength(2);
+      expect(parsed.limits).toEqual([
+        {
+          label: "Weekly limit",
+          kind: "weekly",
+          percentLeft: 58,
+          resetAtIso: "2026-09-07T18:08:00.000Z",
+          scope: "provider",
+        },
+      ]);
     });
 
-    it("a reserve panel keeps its scopes end to end: the provider headline reads 48% used (#249)", async () => {
+    it("a reserve panel drops model scopes end to end: the provider headline reads 48% used", async () => {
       // Sanitized live panel from an operator report: a model reserve weekly at
       // 100% left, the provider's own weekly at 52% left, then a model heading
       // whose 5h and weekly rows are model-scoped too. Scopes in row order are
@@ -1031,7 +1270,7 @@ describe("quota MCP server", () => {
       });
 
       const parsed = await parseCodexQuota(rawCodexOutput, "test-key");
-      expect(parsed.limits?.map((l) => l.scope)).toEqual(["model", "provider", "model", "model"]);
+      expect(parsed.limits?.map((l) => l.scope)).toEqual(["provider"]);
 
       // `parseCodexQuota` answers a partial snapshot; the service names the
       // provider it probed, exactly as the cache hands it to the endpoint.
@@ -1076,6 +1315,7 @@ describe("quota MCP server", () => {
           kind: "weekly",
           percentLeft: 97,
           resetAtIso: "2026-07-13T09:59:00.000Z",
+          scope: "provider",
         },
       ]);
     });
@@ -1683,11 +1923,12 @@ describe("quota MCP server", () => {
             kind: "session",
             percentLeft: 23,
             resetAtIso: "2026-07-13T02:59:00.000Z",
+            scope: "provider",
           },
         ]);
       });
 
-      it("full pipeline: copies reset from provider-scope window to model-scope window and persists raw and inferred states ", async () => {
+      it("full pipeline: drops model-scoped windows before persistence", async () => {
         const scrapeStore = {
           recordRaw: vi.fn().mockReturnValue("scrape-multi-1"),
           recordParsed: vi.fn(),
@@ -1734,37 +1975,207 @@ describe("quota MCP server", () => {
 
         const parsed = JSON.parse(textOf(result));
         expect(parsed.status).toBe("available");
-        expect(parsed.limits).toHaveLength(2);
-        expect(parsed.limits[0]).toMatchObject({
-          label: "Weekly",
-          kind: "weekly",
-          percentLeft: 60,
-          resetAtIso: "2026-08-27T10:00:00.000Z",
-          scope: "provider",
-        });
-        expect(parsed.limits[1]).toMatchObject({
-          label: "Sonnet (weekly)",
-          kind: "weekly",
-          percentLeft: 50,
-          resetAtIso: "2026-08-27T10:00:00.000Z",
-          scope: "model",
-        });
-        expect(parsed.explanations).toEqual([
+        expect(parsed.limits).toEqual([
           {
-            window: "Sonnet (weekly)",
-            field: "resetAtIso",
-            rule: "sibling_window_copy",
-            detail: "copied from the provider-scope weekly in the same scrape",
+            label: "Weekly",
+            kind: "weekly",
+            percentLeft: 60,
+            resetAtIso: "2026-08-27T10:00:00.000Z",
+            scope: "provider",
           },
         ]);
+        expect(parsed.explanations).toEqual([]);
 
         expect(scrapeStore.recordParsed).toHaveBeenCalledOnce();
         const [scrapeId, rawStateArg, inferredStateArg] = scrapeStore.recordParsed.mock.calls[0];
         expect(scrapeId).toBe("scrape-multi-1");
-        // rawState has model window with undefined resetAtIso
-        expect(rawStateArg.limits[1].resetAtIso).toBeUndefined();
-        // inferredState has model window with copied resetAtIso
-        expect(inferredStateArg.limits[1].resetAtIso).toBe("2026-08-27T10:00:00.000Z");
+        expect(rawStateArg.limits).toHaveLength(1);
+        expect(inferredStateArg.limits).toHaveLength(1);
+      });
+
+      it("persists a malformed current Codex parse as unknown before carrying forward a prior reading", async () => {
+        const priorPanel = "synthetic prior Codex provider panel";
+        const malformedPanel = "synthetic malformed current Codex provider panel";
+        const scrapeStore = {
+          recordRaw: vi.fn().mockReturnValueOnce("scrape-prior").mockReturnValueOnce("scrape-bad"),
+          recordParsed: vi.fn(),
+          recordParseError: vi.fn(),
+        };
+        const scrapeCodexStatus = vi
+          .fn()
+          .mockResolvedValueOnce(priorPanel)
+          .mockResolvedValueOnce(malformedPanel);
+        mockGenerateContent
+          .mockResolvedValueOnce({
+            text: () =>
+              JSON.stringify({
+                status: "available",
+                windows: [
+                  {
+                    label: "Weekly",
+                    kind: "weekly",
+                    scope: "provider",
+                    usedPercent: 40,
+                    resetAtIso: "2030-01-01T00:00:00.000Z",
+                  },
+                ],
+              }),
+          })
+          .mockResolvedValue({
+            text: () =>
+              JSON.stringify({
+                status: "available",
+                windows: [
+                  { label: "5h", kind: "five_hour", scope: "provider" },
+                  {
+                    label: "Weekly",
+                    kind: "weekly",
+                    scope: "provider",
+                    usedPercent: 40,
+                    resetAtIso: "2030-01-01T00:00:00.000Z",
+                  },
+                ],
+              }),
+          });
+
+        const service = new QuotaService({
+          config: { ...mockConfig, geminiApiKey: "test-gemini-key" },
+          workersDir: "/tmp/workers",
+          scrapeCodexStatus,
+          scrapeStore,
+          ttlMs: 0,
+        });
+
+        await expect(service.getQuota("codex")).resolves.toMatchObject({ status: "available" });
+        const carriedForward = await service.getQuota("codex");
+
+        expect(scrapeCodexStatus).toHaveBeenCalledTimes(2);
+        expect(mockGenerateContent).toHaveBeenCalledTimes(3);
+        expect(scrapeStore.recordRaw).toHaveBeenNthCalledWith(1, {
+          provider: "codex",
+          scrapedAt: expect.any(String),
+          rawOutput: priorPanel,
+        });
+        expect(scrapeStore.recordRaw).toHaveBeenNthCalledWith(2, {
+          provider: "codex",
+          scrapedAt: expect.any(String),
+          rawOutput: malformedPanel,
+        });
+        expect(scrapeStore.recordParsed).toHaveBeenCalledTimes(2);
+
+        const [, rawCurrent, inferredCurrent] = scrapeStore.recordParsed.mock.calls[1];
+        expect(rawCurrent).toMatchObject({
+          provider: "codex",
+          status: "unknown",
+          raw: malformedPanel,
+        });
+        expect(rawCurrent.limits).toBeUndefined();
+        expect(rawCurrent.message).toContain("invalid usedPercent");
+        expect(inferredCurrent).toMatchObject({
+          provider: "codex",
+          status: "available",
+          raw: malformedPanel,
+          limits: [
+            {
+              label: "Weekly",
+              kind: "weekly",
+              percentLeft: 60,
+              resetAtIso: "2030-01-01T00:00:00.000Z",
+              scope: "provider",
+            },
+          ],
+        });
+        expect(inferredCurrent.explanations).toEqual(
+          expect.arrayContaining([expect.objectContaining({ rule: "carried_forward_bad_read" })])
+        );
+        expect(carriedForward).toEqual(inferredCurrent);
+      });
+
+      it("persists a malformed current Codex parse as unknown and fails closed without limits when prior reading has expired", async () => {
+        const priorPanel = "synthetic expired prior Codex provider panel";
+        const malformedPanel = "synthetic malformed current Codex provider panel";
+        const scrapeStore = {
+          recordRaw: vi.fn().mockReturnValueOnce("scrape-prior").mockReturnValueOnce("scrape-bad"),
+          recordParsed: vi.fn(),
+          recordParseError: vi.fn(),
+        };
+        const scrapeCodexStatus = vi
+          .fn()
+          .mockResolvedValueOnce(priorPanel)
+          .mockResolvedValueOnce(malformedPanel);
+        mockGenerateContent
+          .mockResolvedValueOnce({
+            text: () =>
+              JSON.stringify({
+                status: "available",
+                windows: [
+                  {
+                    label: "Weekly",
+                    kind: "weekly",
+                    scope: "provider",
+                    usedPercent: 40,
+                    resetAtIso: "2020-01-01T00:00:00.000Z",
+                  },
+                ],
+              }),
+          })
+          .mockResolvedValue({
+            text: () =>
+              JSON.stringify({
+                status: "available",
+                windows: [
+                  { label: "5h", kind: "five_hour", scope: "provider" },
+                  {
+                    label: "Weekly",
+                    kind: "weekly",
+                    scope: "provider",
+                    usedPercent: 40,
+                    resetAtIso: "2020-01-01T00:00:00.000Z",
+                  },
+                ],
+              }),
+          });
+
+        const service = new QuotaService({
+          config: { ...mockConfig, geminiApiKey: "test-gemini-key" },
+          workersDir: "/tmp/workers",
+          scrapeCodexStatus,
+          scrapeStore,
+          ttlMs: 0,
+        });
+
+        await expect(service.getQuota("codex")).resolves.toMatchObject({ status: "available" });
+        const failedClosed = await service.getQuota("codex");
+
+        expect(scrapeCodexStatus).toHaveBeenCalledTimes(2);
+        expect(mockGenerateContent).toHaveBeenCalledTimes(3);
+        expect(scrapeStore.recordRaw).toHaveBeenNthCalledWith(1, {
+          provider: "codex",
+          scrapedAt: expect.any(String),
+          rawOutput: priorPanel,
+        });
+        expect(scrapeStore.recordRaw).toHaveBeenNthCalledWith(2, {
+          provider: "codex",
+          scrapedAt: expect.any(String),
+          rawOutput: malformedPanel,
+        });
+        expect(scrapeStore.recordParsed).toHaveBeenCalledTimes(2);
+
+        const [, rawCurrent, inferredCurrent] = scrapeStore.recordParsed.mock.calls[1];
+        expect(rawCurrent).toMatchObject({
+          provider: "codex",
+          status: "unknown",
+          raw: malformedPanel,
+        });
+        expect(rawCurrent.limits).toBeUndefined();
+        expect(rawCurrent.message).toContain("invalid usedPercent");
+        expect(inferredCurrent).toMatchObject({
+          provider: "codex",
+          status: "unknown",
+          raw: malformedPanel,
+        });
+        expect(inferredCurrent.limits).toBeUndefined();
+        expect(failedClosed).toEqual(inferredCurrent);
       });
 
       it("codex probe uses the LLM parse when geminiApiKey is set", async () => {
@@ -1814,12 +2225,14 @@ describe("quota MCP server", () => {
             kind: "five_hour",
             percentLeft: 99,
             resetAtIso: "2026-07-14T23:32:00.000Z",
+            scope: "provider",
           },
           {
             label: "Weekly limit",
             kind: "weekly",
             percentLeft: 58,
             resetAtIso: "2026-07-14T12:34:00.000Z",
+            scope: "provider",
           },
         ]);
       });
@@ -2055,6 +2468,7 @@ describe("quota MCP server", () => {
             kind: "weekly",
             percentLeft: 0,
             resetAtIso: "2026-07-07T12:25:00.000Z",
+            scope: "provider",
           },
         ]);
       });

@@ -105,6 +105,7 @@ export interface ActorOptions {
   /** Optional model fallback for provider capacity/quota exhaustion. */
   fallback?: {
     models: string[];
+    /** Resolve one configured fallback model using the established fallback policy. */
     resolveProvider: (model: string) => CodingProvider;
     classify: ExhaustionClassifier;
   };
@@ -168,6 +169,13 @@ export interface ActorOptions {
     injectRecord: InjectRecord | undefined,
     selected: RawProviderModelConfig
   ) => void;
+  /**
+   * Called immediately before each provider attempt with the instance that will
+   * run. Unlike onRunStart, this includes fallbacks without changing run
+   * lifecycle accounting. Its model and effort are the instantiated values, not
+   * the pre-normalization request.
+   */
+  onProviderAttempt?: (provider: CodingProvider) => void;
   /**
    * Optional hook fired ONCE per run, on the first chunk the provider emits —
    * the moment it starts answering, as distinct from the moment we asked .
@@ -797,8 +805,9 @@ export class Actor {
     // Assigned inside the try below (buildPrompt sits within the terminal-failure
     // boundary), then read by this closure when the gated invoke actually runs.
     let built: PromptBuild;
-    const runProvider = (provider: CodingProvider): Promise<RunResult> =>
-      provider.run({
+    const runProvider = (provider: CodingProvider): Promise<RunResult> => {
+      this.opts.onProviderAttempt?.(provider);
+      return provider.run({
         prompt: built.prompt,
         cwd: this.opts.cwd,
         // Continue this actor's own session (id undefined on first run → created).
@@ -824,6 +833,7 @@ export class Actor {
           this.opts.log?.(chunk);
         },
       });
+    };
     const invoke = (selected: RawProviderModelConfig): Promise<RunResult> => {
       // Both queues have selected this run. From this point a later responsive
       // wake obeys per-actor serialization; v1 never cancels a live provider.

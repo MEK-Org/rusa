@@ -41,6 +41,14 @@ tracker tools rather than shelling \`gh\`. When you're unsure what actually
 happened, re-check with a tool or say so — never fill the gap with a plausible
 guess.`;
 
+/** GitHub writing is mechanically attributed at the tracker boundary. */
+export function trackerWritingGuidance(handle: string): string {
+  return `## GitHub writing
+Your actor handle is **${handle}**. Use tracker tools for every GitHub write; they
+mechanically add your visible run-model footer and authenticated hidden author
+stamp. Use \`gh\` only for read-only GitHub operations.`;
+}
+
 export const INBOX_DISCIPLINE = `## Work from your inbox
 Your inbox is the sole worklist for an ordinary run. Start with \`inbox.list\`.
 Items marked \`priority: "responsive"\` always take precedence over normal items;
@@ -279,26 +287,6 @@ function renderAddressBook(ctx: WorkerPromptContext): string {
 }
 
 /**
- * The GitHub-signing convention : every actor ends its GitHub comments and
- * PR descriptions with its own handle as a calling card, so it's clear which actor
- * in the mesh wrote a given post. Parameterized by handle since each actor signs
- * with its own.
- */
-export function signatureDiscipline(handle: string): string {
-  return `## Sign your GitHub posts
-
-You have a distinct identity in the mesh; your handle — your calling card — is
-**${handle}**. Whenever you write on GitHub — a comment on an issue or PR, **or
-the description (body) of a PR you open** — make the **last line** just your
-handle in italics, with nothing after it:
-
-*${handle}*
-
-GitHub comments and PR descriptions only — not chat, not mesh messages to other
-actors, not code or commit messages.`;
-}
-
-/**
  * The framework scaffolding wrapped around a worker's *authored* charter (the
  * `charter` the parent supplied to `spawn_thread`). It establishes worker
  * identity and reporting boundaries. Like the root prompt it doesn't enumerate
@@ -388,6 +376,8 @@ ${DELEGATION_DISCIPLINE}
 
 ${GROUNDING_DISCIPLINE}
 
+${trackerWritingGuidance(generateHandle(ctx.threadId))}
+
 ${INBOX_DISCIPLINE}
 
 ${OBLIGATION_DISCIPLINE}
@@ -395,8 +385,7 @@ ${OBLIGATION_DISCIPLINE}
 ${WRITING_FOR_AGENTS_DISCIPLINE}
 
 ${EXTERNAL_CONDUCT_POLICY}
-
-${signatureDiscipline(generateHandle(ctx.threadId))}${workingDir}
+${workingDir}
 
 ---
 ## Your charter
@@ -407,4 +396,4 @@ Begin by listing work from the durable inbox.`;
 }
 
 // Testing tombstone (PR ISSUE_NUM): do not add unit tests for static prompt-string
-// assembly. Keep tests for helper logic and runtime behavior instead.
+// assembly. Keep behavioral tests at the tracker and provider runtime boundaries.

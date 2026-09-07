@@ -9,6 +9,14 @@ import type { Logger } from "./logger.js";
  * sink turns what used to be an anonymous inline closure into a list that can be
  * added to, removed from, and tested — a destination is now a reviewed decision
  * rather than a line buried in a 3000-line boot function.
+ *
+ * The service's own stdout is deliberately not on that list. Actor prose is
+ * attacker-shaped text as far as the log is concerned: an actor that prints a
+ * source file containing a mesh log string, or that runs `journalctl` and echoes
+ * the result, injects lines indistinguishable from records the service wrote
+ * itself — prefix included, so a tighter grep does not help. The dashboard
+ * carries a bounded in-memory live tail, while the run boundary persists the
+ * durable transcript in `mesh_events`.
  */
 
 /** One chunk of streamed model output from a running actor. */

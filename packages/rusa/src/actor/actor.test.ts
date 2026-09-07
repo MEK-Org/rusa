@@ -61,6 +61,84 @@ describe("Actor", () => {
     expect(provider.calls[0]?.prompt).toBe("PROMPT: inbox work");
   });
 
+  it("reports the instantiated provider immediately before it runs", async () => {
+    let actor!: Actor;
+    const provider = new FakeProvider(
+      () => {
+        actor.declareYield();
+        return {};
+      },
+      "codex",
+      "gpt-5.6-terra"
+    );
+    const attempts: RawProviderModelConfig[] = [];
+    actor = makeActor(
+      {
+        modelConfig: [
+          { provider: provider.providerName, model: "gpt-5.6-sol", effort: "medium" },
+          { provider: provider.providerName, model: "gpt-5.6-terra" },
+        ],
+        gate: (fn, candidates) => fn(candidates[1]),
+        onProviderAttempt: (attempt) =>
+          attempts.push({
+            provider: attempt.providerName,
+            model: attempt.model,
+            effort: attempt.effort,
+          }),
+      },
+      provider
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(provider.calls[0]?.prompt).toBe("PROMPT: inbox work");
+    expect(attempts).toEqual([{ provider: provider.providerName, model: "gpt-5.6-terra" }]);
+  });
+
+  it("keeps active attempt attribution on its launched model when a later model is staged", async () => {
+    let actor!: Actor;
+    let runCount = 0;
+    const attempts: RawProviderModelConfig[] = [];
+    actor = makeActor(
+      {
+        modelConfig: [{ provider: "codex", model: "gpt-5.6-sol", effort: "low" }],
+        resolveProvider: (selected) =>
+          new FakeProvider(
+            () => {
+              if (runCount++ === 0) {
+                actor.setModelConfig([
+                  { provider: "codex", model: "gpt-5.6-terra", effort: "high" },
+                ]);
+              }
+              actor.declareYield();
+              return {};
+            },
+            selected.provider,
+            selected.model,
+            selected.effort
+          ),
+        onProviderAttempt: (attempt) =>
+          attempts.push({
+            provider: attempt.providerName,
+            model: attempt.model,
+            effort: attempt.effort,
+          }),
+      },
+      new FakeProvider()
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(attempts).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol", effort: "low" },
+      { provider: "codex", model: "gpt-5.6-terra", effort: "high" },
+    ]);
+  });
+
   it("publishes actor-owned runtime transitions and waits for outer flag clear before idle", async () => {
     let resolveProvider!: (result: Partial<RunResult>) => void;
     let resolveRunEnd!: () => void;
@@ -810,7 +888,11 @@ describe("Actor", () => {
     const seen: RunResult[] = [];
     const actor = makeActor(
       {
-        fallback: { models: [], resolveProvider: () => provider, classify },
+        fallback: {
+          models: [],
+          resolveProvider: () => provider,
+          classify,
+        },
         onRunEnd: (result) => {
           seen.push(result);
         },
@@ -895,6 +977,101 @@ describe("Actor", () => {
     expect(logs.join("")).toContain(
       "primary fable-5 exhausted; continuing on fallback backup-model"
     );
+  });
+
+  it("reports the fallback provider's actual model and effort before its attempt", async () => {
+    let actor!: Actor;
+    const primary = new FakeProvider(
+      () => ({ success: false, output: "quota exhausted", exitCode: 1 }),
+      "primary-provider",
+      "primary-model",
+      "high"
+    );
+    const fallbackProvider = new FakeProvider(
+      () => {
+        actor.declareYield();
+        return { output: "fallback ok" };
+      },
+      "fallback-provider",
+      "fallback-model",
+      "low"
+    );
+    const resolveFallback = vi.fn((_model: string) => fallbackProvider);
+    const attempts: RawProviderModelConfig[] = [];
+    actor = makeActor(
+      {
+        modelConfig: [{ provider: primary.providerName, model: "primary-model", effort: "high" }],
+        fallback: {
+          models: ["fallback-model"],
+          resolveProvider: resolveFallback,
+          classify: async () => ({ exhausted: true }),
+        },
+        onProviderAttempt: (attempt) =>
+          attempts.push({
+            provider: attempt.providerName,
+            model: attempt.model,
+            effort: attempt.effort,
+          }),
+      },
+      primary
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(primary.calls[0]?.prompt).toBe("PROMPT: inbox work");
+    expect(fallbackProvider.calls[0]?.prompt).toBe("PROMPT: inbox work");
+    expect(attempts).toEqual([
+      { provider: primary.providerName, model: "primary-model", effort: "high" },
+      { provider: fallbackProvider.providerName, model: "fallback-model", effort: "low" },
+    ]);
+    expect(resolveFallback).toHaveBeenCalledWith("fallback-model");
+  });
+
+  it("reports the fallback's normalized model and effort instead of its raw pin", async () => {
+    let actor!: Actor;
+    const primary = new FakeProvider(
+      () => ({ success: false, output: "quota exhausted", exitCode: 1 }),
+      "primary-provider",
+      "primary-model"
+    );
+    const fallbackProvider = new FakeProvider(
+      () => {
+        actor.declareYield();
+        return { output: "fallback ok" };
+      },
+      "codex",
+      "gpt-5.6-sol",
+      "medium"
+    );
+    const resolveFallback = vi.fn((_model: string) => fallbackProvider);
+    const attempts: RawProviderModelConfig[] = [];
+    actor = makeActor(
+      {
+        modelConfig: [{ provider: primary.providerName, model: "primary-model" }],
+        fallback: {
+          models: ["gpt-5.6-sol medium"],
+          resolveProvider: resolveFallback,
+          classify: async () => ({ exhausted: true }),
+        },
+        onProviderAttempt: (attempt) =>
+          attempts.push({
+            provider: attempt.providerName,
+            model: attempt.model,
+            effort: attempt.effort,
+          }),
+      },
+      primary
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(resolveFallback).toHaveBeenCalledWith("gpt-5.6-sol medium");
+    expect(attempts).toEqual([
+      { provider: primary.providerName, model: "primary-model" },
+      { provider: fallbackProvider.providerName, model: "gpt-5.6-sol", effort: "medium" },
+    ]);
   });
 
   it("falls back on the field-reproduced Claude session-limit exhaustion string", async () => {
