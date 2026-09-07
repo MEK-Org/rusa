@@ -10,6 +10,8 @@ import {
 import type { ActorWakeScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
+import type { ModelClassRepository } from "../db/repositories/model-class-repository.js";
+import type { ConcreteModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
 import { githubBranchReference } from "../references/reference.js";
 import { toolError, toolOk } from "./result.js";
 import { HUMAN_OPERATOR, isHumanOperator } from "./stamp.js";
@@ -42,7 +44,7 @@ const providerModelConfigSchema = z.object({
 });
 
 /**
- * A reference to a named model class from config.yaml. Strict on purpose: a
+ * A reference to a runtime-managed named model class. Strict on purpose: a
  * class reference is the whole model_config value, so a stray sibling field
  * (`{ class, provider }`) is a mistake worth surfacing rather than dropping.
  */
@@ -51,7 +53,7 @@ const modelClassReferenceSchema = z.strictObject({
     .string()
     .min(1)
     .describe(
-      "Name of a model class defined under `modelClasses` in config.yaml, e.g. 'fast'. Resolves to that class's provider/model/effort pool at selection time; an unknown class is an error, never a fallback."
+      "Name of a runtime-managed model class, e.g. 'fast'. Resolves to that class's currently committed provider/model/effort pool at selection time; an unknown class is an error, never a fallback."
     ),
 });
 
@@ -64,6 +66,12 @@ const modelClassReferenceSchema = z.strictObject({
  */
 const modelConfigSchema = z.union([
   modelClassReferenceSchema,
+  providerModelConfigSchema,
+  z.array(providerModelConfigSchema).min(1),
+]);
+
+/** A class definition is always concrete; classes cannot refer to classes. */
+const concreteModelConfigSchema = z.union([
   providerModelConfigSchema,
   z.array(providerModelConfigSchema).min(1),
 ]);
@@ -88,6 +96,10 @@ export function createAgentExecMcpServer(
     onWrite?: () => void;
     rootControl?: RootControlService;
     isFenced?: () => boolean;
+    /** Present only on the root runtime endpoint. */
+    modelClasses?: Pick<ModelClassRepository, "list" | "upsert" | "delete">;
+    /** Config-aware concrete tuple validation at the management boundary. */
+    validateModelClass?: (input: ConcreteModelConfigInput) => ProviderModelConfig[];
   }
 ): McpServer {
   const server = createMcpServer(
@@ -234,7 +246,7 @@ export function createAgentExecMcpServer(
             "What the new actor owns — its standing brief, authored by you. Include its full scope: the repo(s) to work in (it clones them itself), the deliverable, and whether it should open one PR or several."
           ),
         model_config: modelConfigSchema.describe(
-          "Required. Provider/model/effort choice(s) for the child, in earliest-available order. A single object pins one choice; pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review). An array declares a pool of acceptable choices, tried whichever is earliest-available first — requires context_mode 'ledger' or 'tail', since a native provider session can't move between candidates. `{\"class\": \"<name>\"}` instead names a model class from config.yaml and expands to that class's pool (same portability rule). There is no default: choose the child's model deliberately, and a native spawn must declare exactly one entry."
+          "Required. Provider/model/effort choice(s) for the child, in earliest-available order. A single object pins one choice; pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review). An array declares a pool of acceptable choices, tried whichever is earliest-available first — requires context_mode 'ledger' or 'tail', since a native provider session can't move between candidates. `{\"class\": \"<name>\"}` instead names a runtime-managed model class and expands to its currently committed pool (same portability rule). There is no default: choose the child's model deliberately, and a native spawn must declare exactly one entry."
         ),
         conversation_id: z
           .string()
@@ -715,7 +727,7 @@ export function createAgentExecMcpServer(
       inputSchema: {
         actor_id: z.string().describe("The actor's id to update."),
         model_config: modelConfigSchema.describe(
-          'The full replacement provider/model/effort choice(s), in earliest-available order — replaces the entire current pool. `{"class": "<name>"}` names a model class from config.yaml and expands to that class\'s pool. A class reference always replaces the whole pool, so it cannot be used for an effort-only or model-only partial update.'
+          'The full replacement provider/model/effort choice(s), in earliest-available order — replaces the entire current pool. `{"class": "<name>"}` names a runtime-managed model class and expands to its currently committed pool. A class reference always replaces the whole pool, so it cannot be used for an effort-only or model-only partial update.'
         ),
       },
     },
@@ -735,6 +747,114 @@ export function createAgentExecMcpServer(
   if (selfId === rootId) {
     const assertRoot = () =>
       selfId === rootId ? null : toolError(new Error("only the root may use this tool"));
+
+    // Definitions are root-only operational policy. The store is intentionally
+    // optional in test/minimal server construction, but production always wires
+    // it on root; workers never receive these tools at all.
+    if (options?.modelClasses && options.validateModelClass) {
+      const modelClasses = options.modelClasses;
+      const validateModelClass = options.validateModelClass;
+      const assertClassName = (name: string): string => {
+        const normalized = name.trim();
+        if (!normalized) throw new Error("model class name is required");
+        if (normalized !== name) {
+          throw new Error("model class name must not have leading or trailing whitespace");
+        }
+        return normalized;
+      };
+
+      server.registerTool(
+        "list_model_classes",
+        {
+          title: "List runtime model classes (root-only)",
+          description:
+            "List every model class currently committed in mesh.db. This is the live authority used by spawn_thread and set_actor_model. Root-only.",
+          inputSchema: {},
+        },
+        async () => {
+          const denied = assertRoot();
+          if (denied) return denied;
+          try {
+            return toolOk(
+              modelClasses.list().map((entry) => ({
+                name: entry.name,
+                model_config: entry.modelConfig,
+                created_at: entry.createdAt,
+                updated_at: entry.updatedAt,
+              }))
+            );
+          } catch (err) {
+            return toolError(err);
+          }
+        }
+      );
+
+      server.registerTool(
+        "set_model_class",
+        {
+          title: "Create or replace a runtime model class (root-only)",
+          description:
+            "Create a model class or replace its entire ordered concrete pool. The change is committed to mesh.db and affects the next spawn_thread or set_actor_model class reference immediately, without restart. Existing actors keep their already-resolved snapshots. A class definition cannot reference another class. Root-only.",
+          inputSchema: {
+            name: z.string().min(1).describe("Exact stable class name, e.g. 'review'."),
+            model_config: concreteModelConfigSchema.describe(
+              "One concrete provider/model/effort tuple or an ordered concrete pool. A class reference is not allowed here."
+            ),
+          },
+        },
+        async ({ name, model_config }) => {
+          const denied = assertRoot();
+          if (denied) return denied;
+          try {
+            const className = assertClassName(name);
+            const validated = validateModelClass(model_config as ConcreteModelConfigInput);
+            modelClasses.upsert(className, validated, new Date().toISOString());
+            mesh.recordEvent({
+              kind: "root_control_action",
+              actorId: rootId,
+              detail: "root-llm set_model_class",
+              payload: JSON.stringify({ name: className, entries: validated.length }),
+            });
+            options.onWrite?.();
+            return toolOk(`set runtime model class ${className}`);
+          } catch (err) {
+            return toolError(err);
+          }
+        }
+      );
+
+      server.registerTool(
+        "delete_model_class",
+        {
+          title: "Delete a runtime model class (root-only)",
+          description:
+            "Delete a model class from mesh.db. Future class references to it fail as unknown; existing actors keep their previously resolved pools. Root-only.",
+          inputSchema: {
+            name: z.string().min(1).describe("Exact class name to delete."),
+          },
+        },
+        async ({ name }) => {
+          const denied = assertRoot();
+          if (denied) return denied;
+          try {
+            const className = assertClassName(name);
+            const deleted = modelClasses.delete(className);
+            if (deleted) {
+              mesh.recordEvent({
+                kind: "root_control_action",
+                actorId: rootId,
+                detail: "root-llm delete_model_class",
+                payload: JSON.stringify({ name: className }),
+              });
+              options.onWrite?.();
+            }
+            return toolOk({ name: className, deleted });
+          } catch (err) {
+            return toolError(err);
+          }
+        }
+      );
+    }
 
     server.registerTool(
       "revive_thread",

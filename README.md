@@ -157,41 +157,10 @@ acting" is the unspoofable endpoint, not a tool argument the model fills in.
 
 Spelling out `{provider, model, effort}` at every `spawn_thread` couples every
 caller to specific model slugs. A **model class** gives an operator-chosen name
-to one pool, defined in `config.yaml` under `modelClasses`:
-
-```yaml
-providers:
-  claude:
-    cliCommand: claude
-  codex:
-    cliCommand: codex
-  antigravity:
-    cliCommand: agy
-  kimi:
-    cliCommand: kimi
-
-modelClasses:
-  # Each class is a list of provider/model entries in earliest-available order —
-  # the same shape and the same ordering rule as an inline model_config pool.
-  coder:
-    - provider: claude
-      model: claude-opus-5
-      effort: high
-    - provider: codex
-      model: gpt-5.6-terra
-      effort: xhigh
-    - provider: antigravity
-      model: gemini-3.8-flash
-      effort: high
-    - provider: kimi
-      model: kimi-code/kimi-for-coding
-  steward:
-    - provider: codex
-      model: gpt-5.6-sol
-      effort: xhigh
-    - provider: claude
-      model: claude-fable-5-1
-```
+to one ordered provider/model pool. Definitions live in the `model_classes`
+table in `data/mesh.db`, not in `config.yaml`: editing a class is a root-only
+runtime operation and the next selection sees the committed row without a mesh
+restart.
 
 An actor then references a class as the **whole** `model_config` value:
 
@@ -201,31 +170,35 @@ An actor then references a class as the **whole** `model_config` value:
 
 Both `spawn_thread` and `set_actor_model` accept it. The rules:
 
-- **Creating and editing classes is a `config.yaml` edit** — add, change, or
-  remove a key under `modelClasses` and restart rusa. There is no tool that
-  writes classes at runtime, so the file stays the single source of truth for
-  what a class means.
-- **Every entry must name a configured provider and an explicit model.** Config
-  loading validates a class through the same pool validation a spawn goes
-  through — provider/model/effort checks, the pool size bound, and duplicate
-  detection — so a typo or an unusable class fails at startup rather than at the
-  first spawn that names it.
+- **Use the root-only management surface.** `set_model_class(name,
+  model_config)` creates or wholly replaces a class, `list_model_classes()`
+  inspects the current rows, and `delete_model_class(name)` removes one. A
+  definition is one concrete tuple or an ordered pool, exactly like an inline
+  selection; it is never a patch and cannot reference another class.
+- **Every entry must name a configured provider and an explicit model.** The
+  runtime validates the whole concrete pool through the same provider/model/
+  effort, size, and duplicate checks a selection uses. Invalid definitions
+  commit nothing.
 - **A class reference is the whole value**, not one entry inside a pool, and it
   cannot nest inside another class. `{"class": "coder"}` is valid;
   `[{"class": "coder"}, {...}]` and `{"class": "coder", "provider": "codex"}` are
   both rejected at the tool boundary — a mixed shape is a mistake, never a
   tuple with the class quietly ignored.
 - **A reference still isn't a default.** Omitting `model_config` remains an
-  error, an unknown class name is an error, and an empty class definition is
-  rejected at config load — nothing silently falls back to a provider default.
+  error, an unknown class name is an error, and an empty definition cannot be
+  committed — nothing silently falls back to a provider default.
 - **Multi-entry classes follow the pool rule**: a class that resolves to more
   than one entry requires a portable (`ledger`/`tail`) actor.
 - **Selection snapshots the pool.** The class is resolved once, at the moment of
   the spawn or the `set_actor_model`, and the resolved provider/model/effort
   entries are what get validated and persisted on the actor. **Editing a class
-  in `config.yaml` never retro-applies to actors that already resolved it** —
-  it only changes what later selections resolve to. Move an existing actor onto
-  the new definition with `set_actor_model` if that's what you want.
+  never retro-applies to actors that already resolved it** — it only changes
+  what later selections resolve to. Move an existing actor onto the new
+  definition with `set_actor_model` if that's what you want.
+
+Migration `0041_model_classes` adds the durable store. Its `definition_json`
+is a versioned blob validated by its TypeScript consumer; it uses neither SQLite
+`json_*` functions nor `CHECK` validators.
 
 ---
 

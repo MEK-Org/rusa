@@ -26,10 +26,10 @@ export interface RawProviderModelConfig {
 }
 
 /**
- * A reference to a named model class defined under `modelClasses` in
- * config.yaml. It is deliberately the *whole* model_config value rather than an
- * entry inside a pool: a class already names a pool, so allowing it to sit
- * beside tuples would make "what did this actor actually ask for" ambiguous.
+ * A reference to a runtime-managed named model class. It is deliberately the
+ * *whole* model_config value rather than an entry inside a pool: a class
+ * already names a pool, so allowing it to sit beside tuples would make "what
+ * did this actor actually ask for" ambiguous.
  */
 export interface ModelClassReference {
   class: string;
@@ -40,11 +40,23 @@ export type ConcreteModelConfigInput = RawProviderModelConfig | RawProviderModel
 
 /**
  * Everything a caller may supply as model_config: concrete tuples, or a named
- * class reference resolved against config by {@link resolveModelClasses}.
+ * class reference resolved against the current committed class store by
+ * {@link resolveModelClasses}.
  * There is still no implicit default — omitting model_config entirely remains
  * an error at every entry point.
  */
 export type ModelConfigInput = ConcreteModelConfigInput | ModelClassReference;
+
+/**
+ * The read surface needed at class-resolution time. The production
+ * implementation queries `model_classes` on every call; keeping this small
+ * makes the resolver testable and prevents a boot-time config snapshot from
+ * becoming an accidental second authority.
+ */
+export interface ModelClassStore {
+  get(name: string): { modelConfig: ProviderModelConfig[] } | undefined;
+  list(): Array<{ name: string }>;
+}
 
 export function isModelClassReference(input: unknown): input is ModelClassReference {
   return typeof input === "object" && input !== null && !Array.isArray(input) && "class" in input;
@@ -60,25 +72,24 @@ export function isModelClassReference(input: unknown): input is ModelClassRefere
 export function assertConcreteModelConfig(input: ModelConfigInput): ConcreteModelConfigInput {
   if (isModelClassReference(input)) {
     throw new Error(
-      `modelConfig carries an unresolved model class reference ({ class: "${input.class}" }) — model classes are resolved against config.yaml and are not available here`
+      `modelConfig carries an unresolved model class reference ({ class: "${input.class}" }) — model classes are resolved against the runtime store and are not available here`
     );
   }
   return input;
 }
 
 /**
- * Resolve a named model class reference into the concrete pool config.yaml
- * declares for it, and pass concrete input through untouched (by identity, so
- * no path is silently renormalized). This is the single resolution boundary:
- * each ingress resolves once, up front, and everything downstream sees only
- * tuples.
+ * Resolve a named model class reference into the concrete pool committed in the
+ * runtime store, and pass concrete input through untouched (by identity, so no
+ * path is silently renormalized). This is the single resolution boundary: each
+ * ingress resolves once, up front, and everything downstream sees only tuples.
  *
  * The returned pool is a copy taken at resolution time — that copy is what gets
- * validated and persisted, so a later edit to the class in config.yaml changes
- * only what *new* selections resolve to.
+ * validated and persisted, so a later runtime edit changes only what *new*
+ * selections resolve to.
  */
 export function resolveModelClasses(
-  config: RusaConfig,
+  classes: ModelClassStore,
   input: ModelConfigInput
 ): ConcreteModelConfigInput {
   if (!isModelClassReference(input)) {
@@ -97,21 +108,27 @@ export function resolveModelClasses(
   if (!name) {
     throw new Error("model class reference is missing a class name");
   }
-  const defined = config.modelClasses?.[name];
+  if (name !== input.class) {
+    throw new Error("model class reference must not have leading or trailing whitespace");
+  }
+  const defined = classes.get(name);
   if (!defined) {
-    const known = Object.keys(config.modelClasses ?? {}).sort();
+    const known = classes
+      .list()
+      .map((entry) => entry.name)
+      .sort();
     throw new Error(
       known.length > 0
-        ? `unknown model class "${name}" — classes configured in config.yaml: ${known.join(", ")}`
-        : `unknown model class "${name}" — no modelClasses are configured in config.yaml`
+        ? `unknown model class "${name}" — runtime classes: ${known.join(", ")}`
+        : `unknown model class "${name}" — no runtime model classes are defined`
     );
   }
-  if (defined.length === 0) {
+  if (defined.modelConfig.length === 0) {
     throw new Error(
       `model class "${name}" is empty — a class must declare at least one provider/model entry`
     );
   }
-  return defined.map((entry) => ({ ...entry }));
+  return defined.modelConfig.map((entry) => ({ ...entry }));
 }
 
 /**

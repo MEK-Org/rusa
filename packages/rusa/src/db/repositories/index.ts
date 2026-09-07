@@ -14,6 +14,7 @@ import { LegacyImportReceiptRepository } from "./legacy-import-receipt-repositor
 import { MaintenanceRepository } from "./maintenance-repository.js";
 import { MeshChatRepository } from "./mesh-chat-repository.js";
 import { MeshEventRepository } from "./mesh-event-repository.js";
+import { ModelClassRepository } from "./model-class-repository.js";
 import { ModelScrapeRepository } from "./model-scrape-repository.js";
 import { ObligationRepository } from "./obligation-repository.js";
 import { QuotaScrapeRepository } from "./quota-scrape-repository.js";
@@ -45,6 +46,7 @@ export class Repositories {
   readonly meshChat: MeshChatRepository;
   readonly quotaScrapes: QuotaScrapeRepository;
   readonly modelScrapes: ModelScrapeRepository;
+  readonly modelClasses: ModelClassRepository;
   readonly obligations: ObligationRepository;
   readonly referenceCache: ReferenceCacheRepository;
 
@@ -64,6 +66,7 @@ export class Repositories {
     this.meshChat = new MeshChatRepository(db);
     this.quotaScrapes = new QuotaScrapeRepository(db);
     this.modelScrapes = new ModelScrapeRepository(db);
+    this.modelClasses = new ModelClassRepository(db);
     this.obligations = new ObligationRepository(db);
     this.referenceCache = new ReferenceCacheRepository(db);
   }
@@ -104,6 +107,8 @@ export type { MeshChat } from "./mesh-chat-repository.js";
 export { MeshChatRepository } from "./mesh-chat-repository.js";
 export type { MeshEvent, MeshEventKind } from "./mesh-event-repository.js";
 export { MeshEventRepository } from "./mesh-event-repository.js";
+export type { ModelClass } from "./model-class-repository.js";
+export { ModelClassRepository } from "./model-class-repository.js";
 export type { ModelScrape } from "./model-scrape-repository.js";
 export { ModelScrapeRepository } from "./model-scrape-repository.js";
 export type {

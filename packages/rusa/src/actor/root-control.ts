@@ -56,8 +56,8 @@ export interface RootControlOptions {
   rootId?: string;
   providers?: string[];
   /**
-   * Resolves a named model class reference against config before anything else
-   * inspects the request. Wired in by the runtime, which holds the config;
+   * Resolves a named model class reference against the runtime database before
+   * anything else inspects the request. Wired in by the runtime, which owns the store;
    * without it a class reference is rejected rather than silently mis-read.
    */
   resolveModelConfig?: (input: ModelConfigInput) => ConcreteModelConfigInput;

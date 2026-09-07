@@ -847,6 +847,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const database = initDb(mcHome);
   log.info("database_ready", { home: mcHome });
 
+  const modelClasses = getRepositories().modelClasses;
+
   // One OS scheduler owns every cron/at mutation: recurring
   // actor wakes, recurring or interval obligations, and one-shot messages.
   const cronPreflight = preflightCron();
@@ -1667,17 +1669,18 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       assertSpawnContextSupported(req, {
         ledgerCompactionAvailable: portableContextApiKey !== null,
       });
-      // Named model classes resolve here, before validation: spawns arriving
-      // via root control are already resolved, so this call is identity for
-      // them and expansion for every other spawn path.
-      return validateModelConfigPool(config, resolveModelClasses(config, req.modelConfig), {
+      // Named model classes resolve from the current committed database row
+      // here, before validation: spawns arriving via root control are already
+      // resolved, so this call is identity for them and expansion for every
+      // other spawn path.
+      return validateModelConfigPool(config, resolveModelClasses(modelClasses, req.modelConfig), {
         portable: req.context?.type === "portable",
       });
     },
     validateModel: (record, modelConfig) => {
       // Resolve before filling: fillModelConfigFromCurrent walks tuples, and a
       // class reference would otherwise pass through it untouched.
-      const resolved = resolveModelClasses(config, modelConfig);
+      const resolved = resolveModelClasses(modelClasses, modelConfig);
       const filled = fillModelConfigFromCurrent(resolved, record.modelConfig);
       return validateModelConfigPool(config, filled, {
         portable: record.context?.type === "portable",
@@ -2303,7 +2306,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     mesh,
     rootId: rootId,
     providers: Object.keys(config.providers),
-    resolveModelConfig: (input) => resolveModelClasses(config, input),
+    resolveModelConfig: (input) => resolveModelClasses(modelClasses, input),
   });
 
   // Mechanical failure forwarding: a failed run goes to its parent's inbox, or —
@@ -2404,6 +2407,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const rootMeshUrl = mcpHttp.addServer(rootId, () =>
     createAgentExecMcpServer(mesh, rootId, rootId, osScheduler, {
       rootControl,
+      modelClasses,
+      validateModelClass: (input) => validateModelConfigPool(config, input, { portable: true }),
       onWrite: () => {
         mesh.markUnkillable(rootId);
       },
