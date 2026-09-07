@@ -491,22 +491,7 @@ export function createAgentExecMcpServer(
       try {
         let childRecords = mesh.list().filter((r) => r.parentId === selfId);
         if (handle !== undefined) {
-          const normalized = handle.trim().toLowerCase();
-          if (!normalized) {
-            throw new Error("child handle must not be blank");
-          }
-          const matches = childRecords.filter(
-            (r) => mesh.handleForId(r.id).toLowerCase() === normalized
-          );
-          if (matches.length === 0) {
-            throw new Error(`unknown child handle: "${handle}"`);
-          }
-          if (matches.length > 1) {
-            throw new Error(
-              `ambiguous child handle "${handle}": matches multiple child threads (${matches.map((m) => m.id).join(", ")})`
-            );
-          }
-          childRecords = matches;
+          childRecords = [mesh.resolveDirectChildHandle(selfId, handle)];
         }
 
         const runStates = mesh.listChildRunStates(selfId);
@@ -515,7 +500,7 @@ export function createAgentExecMcpServer(
           const selection = runState === "queued" ? mesh.getSelection(r.id) : undefined;
           return {
             thread_id: r.id,
-            handle: mesh.handleForId(r.id),
+            handle: mesh.getActorHandle(r.id),
             charter: summarizeCharter(r.charter),
             status: r.status,
             run_state: runState,
@@ -524,7 +509,6 @@ export function createAgentExecMcpServer(
               ? { desired_model_config: r.desiredModelConfig }
               : {}),
             context: r.context ?? { type: "native" },
-            context_mode: r.context?.type === "portable" ? r.context.mode : "native",
             ...(selection
               ? {
                   selected_provider: selection.provider,
@@ -762,19 +746,8 @@ export function createAgentExecMcpServer(
         let targetId = actor_id;
         const resolvedTarget = targetId === "root" && rootId ? rootId : targetId;
         if (!mesh.actors.get(resolvedTarget)) {
-          const directReports = mesh.list().filter((r) => r.parentId === selfId);
-          const matches = directReports.filter(
-            (r) => mesh.handleForId(r.id).toLowerCase() === actor_id.trim().toLowerCase()
-          );
-          if (matches.length === 1) {
-            targetId = matches[0].id;
-          } else if (matches.length > 1) {
-            return toolError(
-              new Error(
-                `ambiguous child handle "${actor_id}": matches multiple child threads (${matches.map((m) => m.id).join(", ")})`
-              )
-            );
-          }
+          const child = mesh.resolveDirectChildHandle(selfId, actor_id);
+          targetId = child.id;
         }
         mesh.setActorModel(targetId, model_config, selfId);
         return toolOk(`staged modelConfig update for ${targetId}`);

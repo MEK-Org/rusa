@@ -683,7 +683,7 @@ export class ActorMesh {
   private readonly isShuttingDown: () => boolean;
   private readonly idgen: () => string;
   private readonly now: () => string;
-  readonly handleForId: (id: string) => string;
+  private readonly handleForId: (id: string) => string;
   private readonly rootId?: string;
   private readonly onRetire?: (record: ActorRecord) => void;
   private readonly onYield?: (
@@ -2931,6 +2931,37 @@ export class ActorMesh {
       states.set(child.id, this.activeRunState(child.id)?.phase ?? "idle");
     }
     return states;
+  }
+
+  /** Return the display handle for an actor thread id. */
+  getActorHandle(actorId: string): string {
+    return this.handleForId(this.resolveThreadId(actorId));
+  }
+
+  /**
+   * Resolve a direct child actor record by display handle for a given requester.
+   * Performs trim and case-insensitive matching against direct reports.
+   * Throws if handle is blank, unknown, or ambiguous.
+   */
+  resolveDirectChildHandle(requesterId: string, handle: string): ActorRecord {
+    requesterId = this.resolveThreadId(requesterId);
+    const normalized = handle.trim().toLowerCase();
+    if (!normalized) {
+      throw new Error("child handle must not be blank");
+    }
+    const directChildren = this.list().filter((r) => r.parentId === requesterId);
+    const matches = directChildren.filter(
+      (r) => this.handleForId(r.id).toLowerCase() === normalized
+    );
+    if (matches.length === 0) {
+      throw new Error(`unknown child handle: "${handle}"`);
+    }
+    if (matches.length > 1) {
+      throw new Error(
+        `ambiguous child handle "${handle}": matches multiple child threads (${matches.map((m) => m.id).join(", ")})`
+      );
+    }
+    return matches[0];
   }
 
   private retireInner(id: string): void {

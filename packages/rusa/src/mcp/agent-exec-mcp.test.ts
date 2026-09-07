@@ -2209,7 +2209,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         context: { type: "portable", mode: "ledger" },
       });
 
-      const childHandle = mesh.handleForId(childId);
+      const childHandle = mesh.getActorHandle(childId);
       const client = await connect(createAgentExecMcpServer(mesh, parentId, "root"));
 
       // 1. Handle lookup
@@ -2223,7 +2223,6 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         handle: string;
         model_config: Array<{ provider: string; model: string; effort?: string }>;
         context: { type: string; mode?: string };
-        context_mode: string;
       }>;
       expect(reports).toHaveLength(1);
       const child = reports[0];
@@ -2235,9 +2234,8 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         { provider: "claude", model: "claude-sonnet-4-6", effort: "high" },
       ]);
       expect(child.context).toMatchObject({ type: "portable", mode: "ledger" });
-      expect(child.context_mode).toBe("ledger");
 
-      // 3. Authorized update preserving existing choices and optional effort
+      // 3. Authorized update preserving existing choices and optional effort (by handle)
       const updatedPool = [
         ...child.model_config,
         { provider: "antigravity", model: "gemini-3.8-flash" },
@@ -2245,7 +2243,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       const updateRes = (await client.callTool({
         name: "set_actor_model",
         arguments: {
-          actor_id: child.thread_id,
+          actor_id: child.handle,
           model_config: updatedPool,
         },
       })) as CallToolResult;
@@ -2269,7 +2267,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         ],
         context: { type: "portable", mode: "tail" },
       });
-      const childHandle = mesh.handleForId(childId);
+      const childHandle = mesh.getActorHandle(childId);
 
       // Simulate a queued run selection
       vi.spyOn(mesh, "listChildRunStates").mockReturnValue(new Map([[childId, "queued"]]));
@@ -2299,11 +2297,12 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       // Run state and selection show currently-selected run lane
       expect(report.run_state).toBe("queued");
       expect(report.selected_provider).toBe("antigravity");
+      expect(report.selected_lane).toBe("antigravity:gemini-3.8-flash");
       expect(report.selected_model).toBe("gemini-3.8-flash");
-      expect(report.selected_effort).toBeUndefined();
+      expect(report.eligible_at).toBe(12345);
     });
 
-    it("delivers actionable portability refusal on native actors", async () => {
+    it("enforces native-session portability refusal with actionable message", async () => {
       const { mesh } = setup();
       const parentId = mesh.spawn({
         charter: "parent",
@@ -2311,11 +2310,11 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         modelConfig: { provider: "claude", model: "claude-sonnet-5" },
       });
       const nativeChildId = mesh.spawn({
-        charter: "native child",
+        charter: "native child worker",
         parentId: parentId,
         modelConfig: { provider: "claude", model: "claude-sonnet-5" },
       });
-      const nativeChildHandle = mesh.handleForId(nativeChildId);
+      const nativeChildHandle = mesh.getActorHandle(nativeChildId);
       const client = await connect(createAgentExecMcpServer(mesh, parentId, "root"));
 
       // Lookup and read confirm native context
@@ -2326,10 +2325,8 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       const [report] = dataOf(lookupRes) as Array<{
         thread_id: string;
         context: { type: string };
-        context_mode: string;
       }>;
       expect(report.context).toEqual({ type: "native" });
-      expect(report.context_mode).toBe("native");
 
       // Refusal 1: Multi-candidate pool on native actor
       const poolRefusal = (await client.callTool({
@@ -2338,13 +2335,16 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
           actor_id: report.thread_id,
           model_config: [
             { provider: "claude", model: "claude-sonnet-5" },
-            { provider: "claude", model: "claude-opus-4-8" },
+            { provider: "antigravity", model: "gemini-3.8-flash" },
           ],
         },
       })) as CallToolResult;
       expect(poolRefusal.isError).toBe(true);
       expect((poolRefusal.content[0] as { text: string }).text).toMatch(
-        /Cannot set a modelConfig pool of more than one entry on non-portable actor.*Only portable \(ledger\/tail\) actors can use a multi-candidate pool/
+        /Cannot set a modelConfig pool of more than one entry on non-portable actor/
+      );
+      expect((poolRefusal.content[0] as { text: string }).text).toMatch(
+        /Only portable \(ledger\/tail\) actors can use a multi-candidate pool/
       );
 
       // Refusal 2: Cross-provider move on native actor
@@ -2352,16 +2352,19 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         name: "set_actor_model",
         arguments: {
           actor_id: report.thread_id,
-          model_config: { provider: "antigravity", model: "gemini-3.7-flash" },
+          model_config: { provider: "antigravity", model: "gemini-3.8-flash" },
         },
       })) as CallToolResult;
       expect(providerRefusal.isError).toBe(true);
       expect((providerRefusal.content[0] as { text: string }).text).toMatch(
-        /Cannot change provider on non-portable actor.*Only portable \(ledger\/tail\) actors can be moved across providers/
+        /Cannot change provider on non-portable actor/
+      );
+      expect((providerRefusal.content[0] as { text: string }).text).toMatch(
+        /Only portable \(ledger\/tail\) actors can be moved across providers/
       );
     });
 
-    it("denies access to an unrelated actor", async () => {
+    it("denies access to unrelated actors (by thread id and handle)", async () => {
       const { mesh } = setup({
         handleForId: (id) => `handle-${id}`,
       });
@@ -2375,7 +2378,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         parentId: parentA,
         modelConfig: { provider: "claude", model: "claude-sonnet-5" },
       });
-      const childAHandle = mesh.handleForId(childA);
+      const childAHandle = mesh.getActorHandle(childA);
 
       const unrelatedParentB = mesh.spawn({
         charter: "unrelated parent B",
@@ -2416,7 +2419,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       })) as CallToolResult;
       expect(updateByHandleRes.isError).toBe(true);
       expect((updateByHandleRes.content[0] as { text: string }).text).toMatch(
-        /Cannot set model on unknown thread/
+        new RegExp(`unknown child handle: "${childAHandle}"`)
       );
     });
 
@@ -2437,11 +2440,11 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
       // Unknown handle
       const unknownRes = (await client.callTool({
         name: "list_threads",
-        arguments: { handle: "ghost-badger" },
+        arguments: { handle: "non-existent-handle" },
       })) as CallToolResult;
       expect(unknownRes.isError).toBe(true);
       expect((unknownRes.content[0] as { text: string }).text).toMatch(
-        /unknown child handle: "ghost-badger"/
+        /unknown child handle: "non-existent-handle"/
       );
 
       // Blank handle
@@ -2454,7 +2457,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         /child handle must not be blank/
       );
 
-      // Ambiguous handle: spawn two children that share a handle
+      // Ambiguous handle: two children with identical handle
       const child1 = mesh.spawn({
         charter: "child 1",
         parentId,
@@ -2465,8 +2468,8 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         parentId,
         modelConfig: { provider: "claude", model: "claude-sonnet-5" },
       });
-      expect(mesh.handleForId(child1)).toBe("twin-badger");
-      expect(mesh.handleForId(child2)).toBe("twin-badger");
+      expect(mesh.getActorHandle(child1)).toBe("twin-badger");
+      expect(mesh.getActorHandle(child2)).toBe("twin-badger");
 
       const ambigListRes = (await client.callTool({
         name: "list_threads",
@@ -2503,7 +2506,7 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         modelConfig: { provider: "claude", model: "claude-sonnet-5" },
         context: { type: "portable", mode: "ledger" },
       });
-      const childHandle = mesh.handleForId(childId);
+      const childHandle = mesh.getActorHandle(childId);
       const client = await connect(createAgentExecMcpServer(mesh, parentId, "root"));
 
       const updateRes = (await client.callTool({
