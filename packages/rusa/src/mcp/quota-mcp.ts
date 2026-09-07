@@ -497,9 +497,9 @@ async function parseQuotaWithLlm(
       });
     }
 
-    if (limits.length === 0 && parsed.status !== "unknown") {
+    if (limits.length === 0 && parsed.status === "available") {
       throw new Error(
-        `Quota parse failed: ${provider} status is ${parsed.status} but no provider window was returned`
+        `Quota parse failed: ${provider} status is available but no provider window was returned`
       );
     }
 
@@ -508,14 +508,22 @@ async function parseQuotaWithLlm(
     // model's summary says available. The inverse could be a partial panel
     // whose exhausted row was omitted, so send that disagreement through the
     // existing stronger-model retry rather than downgrade exhaustion.
-    if (parsed.status === "exhausted" && !hasExhaustedWindow) {
+    if (parsed.status === "exhausted" && limits.length > 0 && !hasExhaustedWindow) {
       throw new Error(
         "Quota parse failed: status 'exhausted' disagrees with available provider windows"
       );
     }
 
+    const status = hasExhaustedWindow
+      ? "exhausted"
+      : parsed.status === "unknown" || limits.length === 0
+        ? parsed.status === "exhausted"
+          ? "exhausted"
+          : "unknown"
+        : "available";
+
     return {
-      status: limits.length === 0 ? "unknown" : hasExhaustedWindow ? "exhausted" : "available",
+      status,
       limits,
     };
   };
