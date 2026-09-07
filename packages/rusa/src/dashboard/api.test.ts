@@ -543,6 +543,25 @@ describe("handleMeshApiRequest", () => {
     expect(actor.boundModel).toBeUndefined();
   });
 
+  it("GET /api/mesh/threads exposes class provenance only when the actor has it", async () => {
+    actors.upsert({
+      ...rec(UUID_A, "root", "active"),
+      modelConfig: [{ provider: "codex", model: "gpt-5-codex" }],
+      modelClass: "fast",
+    });
+    actors.upsert({
+      ...rec(UUID_B, "root", "active"),
+      modelConfig: [{ provider: "codex", model: "gpt-5-codex" }],
+    });
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const { threads } = JSON.parse(res.body);
+    const classConfigured = threads.find((t: { id: string }) => t.id === UUID_A);
+    const explicit = threads.find((t: { id: string }) => t.id === UUID_B);
+    expect(classConfigured.modelClass).toBe("fast");
+    expect(Object.hasOwn(explicit, "modelClass")).toBe(false);
+  });
+
   it("GET /api/mesh/threads surfaces pending desiredModel and desiredProvider when staged", async () => {
     actors.upsert({
       ...rec(UUID_A, "root", "active"),

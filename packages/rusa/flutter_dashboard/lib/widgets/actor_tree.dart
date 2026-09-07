@@ -74,9 +74,16 @@ class ActorTree extends StatelessWidget {
                   itemCount: visible.length,
                   itemBuilder: (_, i) {
                     final t = visible[i];
-                    final hasVisibleChildren = store.actorStates.value.actors.values.any(
-                      (c) => c.thread.parentId == t.id && store.isThreadVisible(c.thread),
-                    );
+                    final hasVisibleChildren = store
+                        .actorStates
+                        .value
+                        .actors
+                        .values
+                        .any(
+                          (c) =>
+                              c.thread.parentId == t.id &&
+                              store.isThreadVisible(c.thread),
+                        );
                     final isCollapsed = store.collapsed.value.contains(t.id);
                     return _ActorRow(
                       thread: t,
@@ -404,22 +411,27 @@ class _ActorRowState extends State<_ActorRow> {
     String text, {
     List<ProviderModelConfig>? pool,
     List<ProviderModelConfig>? staged,
+    String? modelClass,
+    String? desiredModelClass,
   }) {
     final label = Text(
       text,
       maxLines: 1,
       overflow: TextOverflow.ellipsis,
-      style: kMonoStyle.copyWith(
-        fontSize: 11,
-        color: MeshColors.textSecondary,
-      ),
+      style: kMonoStyle.copyWith(fontSize: 11, color: MeshColors.textSecondary),
     );
-    if (pool == null) return label;
+    if (pool == null && modelClass == null && desiredModelClass == null) {
+      return label;
+    }
     final lines = [
-      if (pool.isNotEmpty) ...[
-        'Configured candidates, in order:',
-        ...pool.map((e) => '• ${e.label}'),
+      if (modelClass != null) 'Configured model class: $modelClass',
+      if (pool?.isNotEmpty ?? false) ...[
+        modelClass == null
+            ? 'Configured candidates, in order:'
+            : 'Resolved candidates, in order:',
+        ...pool!.map((e) => '• ${e.label}'),
       ],
+      if (desiredModelClass != null) 'Staged model class: $desiredModelClass',
       if (staged != null && !listEquals(staged, pool)) ...[
         'Staged for next run:',
         ...staged.map((e) => '• ${e.label}'),
@@ -429,10 +441,7 @@ class _ActorRowState extends State<_ActorRow> {
     return Tooltip(message: lines.join('\n'), child: label);
   }
 
-  Widget _buildContent(
-    BuildContext context, {
-    bool isHoveredTarget = false,
-  }) {
+  Widget _buildContent(BuildContext context, {bool isHoveredTarget = false}) {
     final thread = widget.thread;
     final dot = widget.dot;
     final isRunning = !thread.isRetired && dot == DotState.active;
@@ -444,6 +453,8 @@ class _ActorRowState extends State<_ActorRow> {
     // list is in the Info panel, which is the readable surface on a phone.
     final pool = thread.modelConfig;
     final staged = thread.desiredModelConfig;
+    final modelClass = thread.modelClass;
+    final desiredModelClass = thread.desiredModelClass;
     // Both predicates read whole pools rather than the server's first-entry
     // compatibility fields, which describe a pool replacement only by
     // accident: `[a, b] → [a, c, d]` leaves `desiredModel` identical to
@@ -455,7 +466,11 @@ class _ActorRowState extends State<_ActorRow> {
     final staging = staged != null
         ? !listEquals(staged, pool)
         : thread.desiredModel != null && thread.desiredModel != thread.model;
-    final showModel = thread.model != null || thread.desiredModel != null;
+    final showModel =
+        thread.model != null ||
+        thread.desiredModel != null ||
+        modelClass != null ||
+        desiredModelClass != null;
     final showEffort =
         !isPool && (thread.effort != null || thread.effortChangePending);
     final current = thread.model ?? 'default';
@@ -467,6 +482,24 @@ class _ActorRowState extends State<_ActorRow> {
         ? '$current${_poolSuffix(pool.length)}'
               ' → $desired${_poolSuffix(staged?.length ?? 0)}'
         : '$current${_poolSuffix(pool.length)}';
+    // A named class is what the actor was configured with; its persisted pool
+    // is the snapshot it resolved to, not a substitute label. Explicit pools
+    // and older records have no provenance field and retain the existing text.
+    final currentText = modelClass != null
+        ? 'class $modelClass'
+        : (isPool
+              ? '$current${_poolSuffix(pool.length)}'
+              : (thread.model ?? ''));
+    final desiredText = desiredModelClass != null
+        ? 'class $desiredModelClass'
+        : (isPool
+              ? '$desired${_poolSuffix(staged?.length ?? 0)}'
+              : (thread.desiredModel ?? ''));
+    final displayedModel = staging
+        ? '$currentText → $desiredText'
+        : (modelClass != null ? currentText : (isPool ? poolText : singleText));
+    final tooltipPool =
+        modelClass != null || desiredModelClass != null || isPool ? pool : null;
 
     return Container(
       decoration: BoxDecoration(
@@ -539,14 +572,15 @@ class _ActorRowState extends State<_ActorRow> {
                       if (showModel)
                         Flexible(
                           child: _modelLabel(
-                            isPool ? poolText : singleText,
-                            pool: isPool ? pool : null,
+                            displayedModel,
+                            pool: tooltipPool,
                             staged: staged,
+                            modelClass: modelClass,
+                            desiredModelClass: desiredModelClass,
                           ),
                         ),
                       if (showEffort) ...[
-                        if (showModel)
-                          const SizedBox(width: 6),
+                        if (showModel) const SizedBox(width: 6),
                         Flexible(
                           child: Text(
                             thread.effortChangePending &&
@@ -563,8 +597,7 @@ class _ActorRowState extends State<_ActorRow> {
                         ),
                       ],
                       if (thread.commitmentKind != null) ...[
-                        if (showModel || showEffort)
-                          const SizedBox(width: 6),
+                        if (showModel || showEffort) const SizedBox(width: 6),
                         _WorkStateBadge(
                           kind: thread.commitmentKind!,
                           compact: true,
@@ -727,9 +760,7 @@ class _WorkStateBadge extends StatelessWidget {
       decoration: BoxDecoration(
         color: MeshColors.accent.withValues(alpha: 0.14),
         borderRadius: BorderRadius.circular(4),
-        border: Border.all(
-          color: MeshColors.accent.withValues(alpha: 0.65),
-        ),
+        border: Border.all(color: MeshColors.accent.withValues(alpha: 0.65)),
       ),
       child: Text(
         kind.toUpperCase(),

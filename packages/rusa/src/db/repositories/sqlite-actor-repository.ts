@@ -53,6 +53,10 @@ const modelConfigPoolSchema = z
   .object({
     schemaVersion: z.literal(MODEL_CONFIG_POOL_SCHEMA_VERSION),
     entries: z.array(modelConfigEntrySchema).min(1),
+    // A class resolves to this concrete snapshot at ingress. Retaining its
+    // name lets the dashboard distinguish that intentional class selection
+    // from an explicit pool without making the runtime re-resolve it later.
+    modelClass: z.string().min(1).optional(),
   })
   .strict();
 
@@ -98,7 +102,11 @@ function buildModelConfig(record: ActorRecord): string | null {
     model: entry.model,
     ...(entry.effort !== undefined ? { effort: entry.effort } : {}),
   }));
-  return JSON.stringify({ schemaVersion: MODEL_CONFIG_POOL_SCHEMA_VERSION, entries });
+  return JSON.stringify({
+    schemaVersion: MODEL_CONFIG_POOL_SCHEMA_VERSION,
+    entries,
+    ...(record.modelClass !== undefined ? { modelClass: record.modelClass } : {}),
+  });
 }
 
 /**
@@ -110,11 +118,17 @@ function buildModelConfig(record: ActorRecord): string | null {
  * they do for an actor with no configuration at all, rather than failing to
  * load the row.
  */
-function parseModelConfig(actorId: string, json: string | null): Pick<ActorRecord, "modelConfig"> {
+function parseModelConfig(
+  actorId: string,
+  json: string | null
+): Pick<ActorRecord, "modelConfig" | "modelClass"> {
   if (!json) return {};
   const parsed = parseDocument(actorId, "model_config", json, modelConfigDocumentSchema);
   if ("entries" in parsed) {
-    return { modelConfig: parsed.entries };
+    return {
+      modelConfig: parsed.entries,
+      ...(parsed.modelClass !== undefined ? { modelClass: parsed.modelClass } : {}),
+    };
   }
   if (parsed.provider !== undefined && parsed.model !== undefined) {
     return {
@@ -185,6 +199,7 @@ function parseContextConfig(
 /** A staged, not-yet-applied replacement for the actor's declared modelConfig pool. */
 type DesiredOverlayEntry = {
   desiredModelConfig?: ProviderModelConfig[];
+  desiredModelClass?: string;
 };
 
 /**
@@ -305,7 +320,10 @@ export class SqliteActorRepository implements ActorRepository {
 
   private storeDesiredOverlay(record: ActorRecord): void {
     if ("desiredModelConfig" in record) {
-      this.desiredOverlay.set(record.id, { desiredModelConfig: record.desiredModelConfig });
+      this.desiredOverlay.set(record.id, {
+        desiredModelConfig: record.desiredModelConfig,
+        ...("desiredModelClass" in record ? { desiredModelClass: record.desiredModelClass } : {}),
+      });
     } else {
       this.desiredOverlay.delete(record.id);
     }

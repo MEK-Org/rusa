@@ -241,6 +241,7 @@ describe("RootControlService", () => {
     expect(mesh.spawn).toHaveBeenCalledWith(
       expect.objectContaining({
         modelConfig: [{ provider: "agy", model: "gemini-3.5-flash-medium", effort: "high" }],
+        modelClass: "fast",
       })
     );
     expect(JSON.parse(events[0].payload ?? "{}")).toMatchObject({

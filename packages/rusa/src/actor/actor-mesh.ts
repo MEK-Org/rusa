@@ -4,6 +4,7 @@ import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../
 import { prerequisiteEdgeKey } from "../obligations/obligation.js";
 import {
   assertConcreteModelConfig,
+  isModelClassReference,
   type ModelConfigInput,
   type ProviderModelConfig,
   type RawProviderModelConfig,
@@ -121,6 +122,11 @@ export interface SpawnRequest {
    * bounded, non-empty, portable-only-above-length-one array (design MEK-Org/rusa#169).
    */
   modelConfig: ModelConfigInput;
+  /**
+   * Provenance retained when a caller already resolved a named class before
+   * reaching the mesh. Direct class references derive this from modelConfig.
+   */
+  modelClass?: string;
   /** Working-memory ownership and portable-context policy. Missing means native. */
   context?: ContextConfig;
   /** Peers to seed the child's address book with (introductions at birth). */
@@ -1434,11 +1440,19 @@ export class ActorMesh {
     }
     const id = this.idgen();
     const parentId = this.resolveThreadId(req.parentId);
+    // Normal ingress passes the class reference through to validateSpawn;
+    // root control resolves first so it can apply its provider allowlist, then
+    // carries the already-validated name here. Either path stores the resolved
+    // snapshot plus its provenance, never a live class pointer.
+    const modelClass = isModelClassReference(req.modelConfig)
+      ? req.modelConfig.class
+      : req.modelClass;
     const record: ActorRecord = {
       id,
       charter,
       parentId,
       modelConfig,
+      ...(modelClass !== undefined ? { modelClass } : {}),
       context: req.context,
       handles: req.handles ? [...req.handles] : undefined,
       // Seed the session so the actor's first run resumes this conversation
@@ -3201,7 +3215,12 @@ export class ActorMesh {
     // An idle or queued actor has no launched run yet, so the staged pool
     // applies atomically at its next dispatch, before run_start is recorded
     // and before launch (see {@link applyPendingModel}).
-    this.actors.patch(id, { desiredModelConfig: validated });
+    this.actors.patch(id, {
+      desiredModelConfig: validated,
+      // An explicit replacement deliberately clears any prior class label;
+      // equality with a class's current entries is not provenance.
+      desiredModelClass: isModelClassReference(modelConfig) ? modelConfig.class : undefined,
+    });
 
     // A queued reservation has already quoted one of the old pool's lanes.
     // Replacing that pool must release the old quote now and pass the same
@@ -3248,7 +3267,12 @@ export class ActorMesh {
     const oldModelConfig = record.modelConfig;
     const newModelConfig = record.desiredModelConfig;
 
-    this.actors.patch(id, { modelConfig: newModelConfig, desiredModelConfig: undefined });
+    this.actors.patch(id, {
+      modelConfig: newModelConfig,
+      modelClass: record.desiredModelClass,
+      desiredModelConfig: undefined,
+      desiredModelClass: undefined,
+    });
 
     const verified = this.actors.get(id);
     if (!verified) throw new Error(`Failed to reload thread after model update: ${id}`);

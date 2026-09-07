@@ -84,6 +84,21 @@ describe("SqliteActorRepository", () => {
     ]);
   });
 
+  it("round-trips model-class provenance without changing the actors table", () => {
+    const classConfigured = { ...root, modelClass: "fast" };
+    repository.upsert(classConfigured);
+
+    expect(repository.get("root")).toEqual(classConfigured);
+    const row = db.prepare("SELECT model_config FROM actors WHERE id = 'root'").get() as {
+      model_config: string;
+    };
+    expect(JSON.parse(row.model_config)).toEqual({
+      schemaVersion: 2,
+      entries: [{ provider: "codex", model: "gpt-test", effort: "high" }],
+      modelClass: "fast",
+    });
+  });
+
   it("validates model_config versions and shape when records are consumed", () => {
     repository.upsert(root);
 
@@ -313,6 +328,28 @@ describe("SqliteActorRepository", () => {
 
     repository.patch("root", { desiredModelConfig: undefined });
     expect(repository.get("root")?.desiredModelConfig).toBeUndefined();
+  });
+
+  it("keeps staged model-class provenance in the same process-local overlay", () => {
+    repository.upsert({ ...root, modelClass: "fast" });
+    repository.patch("root", {
+      desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
+      desiredModelClass: "careful",
+    });
+
+    expect(repository.get("root")).toMatchObject({
+      modelClass: "fast",
+      desiredModelConfig: [{ provider: "claude", model: "claude-opus" }],
+      desiredModelClass: "careful",
+    });
+    repository.patch("root", { title: "Renamed" });
+    expect(repository.get("root")?.desiredModelClass).toBe("careful");
+
+    repository.patch("root", {
+      desiredModelConfig: undefined,
+      desiredModelClass: undefined,
+    });
+    expect(repository.get("root")?.desiredModelClass).toBeUndefined();
   });
 
   it("loses a staged desired pool across a repository reopen", () => {

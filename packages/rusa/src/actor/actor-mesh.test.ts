@@ -10,6 +10,8 @@ import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import {
   assertConcreteModelConfig,
+  isModelClassReference,
+  type ProviderModelConfig,
   type RawProviderModelConfig,
 } from "../providers/model-config.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
@@ -820,6 +822,61 @@ describe("ActorMesh", () => {
     expect(() => mesh.setActorModel(child, { class: "fast" }, parent)).toThrow(
       /model class reference/
     );
+  });
+
+  it("retains named-class provenance beside the resolved actor snapshot", async () => {
+    const resolve = (input: SpawnRequest["modelConfig"]): ProviderModelConfig[] => {
+      if (isModelClassReference(input)) {
+        return [{ provider: "claude", model: `${input.class}-model` }];
+      }
+      const concrete = assertConcreteModelConfig(input);
+      const entries = Array.isArray(concrete) ? concrete : [concrete];
+      return entries.map((entry) => {
+        if (!entry.model) throw new Error("test model is required");
+        return { provider: entry.provider, model: entry.model, effort: entry.effort };
+      });
+    };
+    const { mesh, registry, tick } = setup({
+      validateSpawn: (request) => resolve(request.modelConfig),
+      validateModel: (_record, input) => resolve(input),
+    });
+
+    const classConfigured = mesh.spawn({
+      charter: "class-configured worker",
+      parentId: "root",
+      modelConfig: { class: "fast" },
+    });
+    const explicit = mesh.spawn({
+      charter: "explicit worker",
+      parentId: "root",
+      modelConfig: { provider: "claude", model: "fast-model" },
+    });
+
+    expect(registry.get(classConfigured)).toMatchObject({
+      modelConfig: [{ provider: "claude", model: "fast-model" }],
+      modelClass: "fast",
+    });
+    expect(registry.get(explicit)?.modelClass).toBeUndefined();
+
+    mesh.setActorModel(classConfigured, { class: "careful" }, "root");
+    expect(registry.get(classConfigured)).toMatchObject({
+      modelClass: "fast",
+      desiredModelConfig: [{ provider: "claude", model: "careful-model" }],
+      desiredModelClass: "careful",
+    });
+    mesh.sendMessage(classConfigured, "apply class", "root");
+    await tick();
+    expect(registry.get(classConfigured)).toMatchObject({
+      modelConfig: [{ provider: "claude", model: "careful-model" }],
+      modelClass: "careful",
+    });
+    expect(registry.get(classConfigured)?.desiredModelClass).toBeUndefined();
+
+    mesh.setActorModel(classConfigured, { provider: "claude", model: "pinned-model" }, "root");
+    expect(registry.get(classConfigured)?.desiredModelClass).toBeUndefined();
+    mesh.sendMessage(classConfigured, "apply explicit pin", "root");
+    await tick();
+    expect(registry.get(classConfigured)?.modelClass).toBeUndefined();
   });
 
   it("revokes parent handle and marks record retired when createActor throws on spawn", () => {

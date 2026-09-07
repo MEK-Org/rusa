@@ -192,8 +192,12 @@ interface ThreadDto {
   desiredProvider?: string | null;
   /** The declared candidate pool, in earliest-available order. */
   modelConfig: ProviderModelConfig[];
+  /** Named class that produced the declared snapshot, if it was class-configured. */
+  modelClass?: string;
   /** Pending full-pool replacement staged for the next run boundary, if any. */
   desiredModelConfig?: ProviderModelConfig[];
+  /** Named class that produced the pending snapshot, if it was class-configured. */
+  desiredModelClass?: string;
   /**
    * The reserved candidate for a genuinely queued run, or null when idle/running
    * or nothing has been reserved yet. `selectedProvider` is the declared alias;
@@ -1296,7 +1300,9 @@ export async function handleMeshApiRequest(
           : {}),
         desiredProvider: r.desiredModelConfig?.[0]?.provider ?? null,
         modelConfig: r.modelConfig ?? [],
+        ...(r.modelClass !== undefined ? { modelClass: r.modelClass } : {}),
         ...(r.desiredModelConfig !== undefined ? { desiredModelConfig: r.desiredModelConfig } : {}),
+        ...(r.desiredModelClass !== undefined ? { desiredModelClass: r.desiredModelClass } : {}),
         charterPreview: charterPreview(r.charter),
         title: r.title ?? summarizeCharter(r.charter),
         createdAt: r.createdAt,
