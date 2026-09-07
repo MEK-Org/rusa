@@ -397,19 +397,16 @@ export interface RusaConfig {
    */
   glassGoals?: GlassGoalsConfig;
   /**
-   * Named model classes: an operator-defined label for a modelConfig pool, so a
-   * spawn can ask for `{ class: "fast" }` instead of restating a provider/model
-   * tuple. Optional and never implicit — a caller that omits `model_config`
-   * still gets no default, and editing a class here does not retro-apply to
-   * actors that already resolved it.
+   * @deprecated One-time cutover input for model classes originally configured
+   * by #276. At the first boot with the DB-backed store this block is copied to
+   * `model_classes` with a receipt; after that it is ignored and can never
+   * overwrite a runtime edit on restart. New definitions are managed through
+   * the root-only runtime MCP tools, not config.yaml.
    *
-   * Entries are the same {@link ProviderModelConfig} tuple a resolved pool is
-   * made of, deliberately shared rather than redeclared: a class is just a
-   * named pool, and config loading validates it through the very same
-   * `validateModelConfigPool` the runtime uses, so the two cannot drift as pool
-   * fields evolve. `model` is required for the same reason it is required at
-   * spawn — a class is an explicit, named selection and must never resolve to a
-   * provider's own default.
+   * Its entries remain validated before the one-time copy, so no malformed
+   * legacy class is silently transferred. `model` is required for the same
+   * reason it is required at spawn — a class is an explicit selection and must
+   * never resolve to a provider's own default.
    */
   modelClasses?: Record<string, ProviderModelConfig[]>;
   /** Mesh safety/throughput controls (concurrency cap, provider rate limit). */

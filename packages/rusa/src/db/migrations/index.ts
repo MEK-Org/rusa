@@ -35,6 +35,7 @@ import { capabilityGrants } from "./0036_capability_grants.js";
 import { obligationDependencies } from "./0037_obligation_dependencies.js";
 import { eventSources } from "./0038_event_sources.js";
 import { hostJobs } from "./0040_host_jobs.js";
+import { modelClasses } from "./0041_model_classes.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -82,4 +83,5 @@ export const migrations: Migration[] = [
   obligationDependencies,
   eventSources,
   hostJobs,
+  modelClasses,
 ];

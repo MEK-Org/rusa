@@ -90,17 +90,15 @@ function validateQuotaThrottle(quotaThrottle: QuotaThrottleConfig | undefined): 
 }
 
 /**
- * Structural validation for named model classes, plus a full pass through
- * {@link validateModelConfigPool} — the same boundary a runtime selection goes
- * through. A class is just a named pool, so it inherits that contract exactly
- * (configured provider, required model, valid effort, no duplicates, bounded
- * size) instead of a parallel copy that could drift. Running it here, at load,
- * means a typo fails at boot rather than at the first spawn that names the
- * class. Only the rules the pool validator cannot express — the mapping shape,
- * an empty class, a nested class reference, a padded class name — are checked
- * locally.
+ * Structural validation for the one-time legacy `modelClasses` config cutover,
+ * plus a full pass through {@link validateModelConfigPool}. Runtime resolution
+ * never reads this field: start copies this validated legacy input to
+ * `model_classes` once, records a receipt, and ignores it thereafter. Keeping
+ * this strict lets that migration fail before it imports a malformed partial
+ * definition. Only rules the pool validator cannot express — mapping shape,
+ * an empty class, a nested class reference, a padded name — are checked locally.
  */
-function validateModelClasses(parsed: RusaConfig): void {
+export function validateLegacyModelClasses(parsed: RusaConfig): void {
   const modelClasses = parsed.modelClasses;
   if (modelClasses === undefined) return;
   if (typeof modelClasses !== "object" || modelClasses === null || Array.isArray(modelClasses)) {
@@ -329,7 +327,6 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     parsed.rootActor.model = selection.model;
     parsed.rootActor.effort = selection.effort;
   }
-  validateModelClasses(parsed);
   if (parsed.understanding?.rootNodeId !== undefined) {
     if (
       typeof parsed.understanding.rootNodeId !== "string" ||

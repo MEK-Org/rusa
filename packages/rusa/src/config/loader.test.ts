@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
-import { loadConfig } from "./loader.js";
+import { loadConfig, validateLegacyModelClasses } from "./loader.js";
 import { DEFAULT_DEPLOY_BRANCH } from "./types.js";
 
 function writeConfig(overrides: Record<string, unknown> = {}): string {
@@ -1196,13 +1196,19 @@ describe("loadConfig observability.logging", () => {
   });
 });
 
-describe("loadConfig modelClasses", () => {
+describe("legacy modelClasses cutover validation", () => {
+  const legacyConfig = (home: string) => {
+    const config = loadConfig(home);
+    validateLegacyModelClasses(config);
+    return config;
+  };
+
   it("leaves modelClasses undefined when the block is omitted", () => {
-    expect(loadConfig(writeConfig()).modelClasses).toBeUndefined();
+    expect(legacyConfig(writeConfig()).modelClasses).toBeUndefined();
   });
 
   it("accepts a valid class and normalizes each entry's provider/model/effort", () => {
-    const config = loadConfig(
+    const config = legacyConfig(
       writeConfig({
         modelClasses: {
           fast: [{ provider: "codex", model: "gpt-5.6-sol", effort: "HIGH" }],
@@ -1215,7 +1221,7 @@ describe("loadConfig modelClasses", () => {
   });
 
   it("accepts a multi-entry class in declaration order", () => {
-    const config = loadConfig(
+    const config = legacyConfig(
       writeConfig({
         providers: { codex: { cliCommand: "codex" }, kimi: { cliCommand: "kimi" } },
         modelClasses: {
@@ -1230,26 +1236,26 @@ describe("loadConfig modelClasses", () => {
   });
 
   it("rejects modelClasses that is not a mapping", () => {
-    expect(() => loadConfig(writeConfig({ modelClasses: ["fast"] }))).toThrow(
+    expect(() => legacyConfig(writeConfig({ modelClasses: ["fast"] }))).toThrow(
       /modelClasses must be a mapping/
     );
   });
 
   it("rejects a blank class name", () => {
     expect(() =>
-      loadConfig(writeConfig({ modelClasses: { "   ": [{ provider: "codex", model: "x" }] } }))
+      legacyConfig(writeConfig({ modelClasses: { "   ": [{ provider: "codex", model: "x" }] } }))
     ).toThrow(/modelClasses class names must be non-empty/);
   });
 
   it("rejects an empty class definition rather than treating it as 'no preference'", () => {
-    expect(() => loadConfig(writeConfig({ modelClasses: { fast: [] } }))).toThrow(
+    expect(() => legacyConfig(writeConfig({ modelClasses: { fast: [] } }))).toThrow(
       /modelClasses\."fast" must be a non-empty list/
     );
   });
 
   it("rejects a class definition that is not a list", () => {
     expect(() =>
-      loadConfig(
+      legacyConfig(
         writeConfig({ modelClasses: { fast: { provider: "codex", model: "gpt-5.6-sol" } } })
       )
     ).toThrow(/modelClasses\."fast" must be a non-empty list/);
@@ -1257,19 +1263,19 @@ describe("loadConfig modelClasses", () => {
 
   it("rejects a class entry missing a provider", () => {
     expect(() =>
-      loadConfig(writeConfig({ modelClasses: { fast: [{ model: "gpt-5.6-sol" }] } }))
+      legacyConfig(writeConfig({ modelClasses: { fast: [{ model: "gpt-5.6-sol" }] } }))
     ).toThrow(/modelClasses\."fast": modelConfig entry is missing a provider/);
   });
 
   it("rejects a class entry missing a model — no silent provider default", () => {
     expect(() =>
-      loadConfig(writeConfig({ modelClasses: { fast: [{ provider: "codex" }] } }))
+      legacyConfig(writeConfig({ modelClasses: { fast: [{ provider: "codex" }] } }))
     ).toThrow(/modelClasses\."fast": modelConfig entry for provider "codex" is missing a model/);
   });
 
   it("rejects a nested class reference inside a class definition", () => {
     expect(() =>
-      loadConfig(
+      legacyConfig(
         writeConfig({
           modelClasses: {
             inner: [{ provider: "codex", model: "gpt-5.6-sol" }],
@@ -1282,7 +1288,7 @@ describe("loadConfig modelClasses", () => {
 
   it("rejects a class name with leading or trailing whitespace, which no reference could match", () => {
     expect(() =>
-      loadConfig(
+      legacyConfig(
         writeConfig({ modelClasses: { " review ": [{ provider: "codex", model: "gpt-5.6-sol" }] } })
       )
     ).toThrow(/modelClasses class name " review " must not have leading or trailing whitespace/);
@@ -1290,7 +1296,7 @@ describe("loadConfig modelClasses", () => {
 
   it("rejects a class that exceeds the shared pool size bound at load, not at first use", () => {
     expect(() =>
-      loadConfig(
+      legacyConfig(
         writeConfig({
           providers: { codex: { cliCommand: "codex" } },
           modelClasses: {
@@ -1306,7 +1312,7 @@ describe("loadConfig modelClasses", () => {
 
   it("rejects a class with duplicate normalized entries at load, not at first use", () => {
     expect(() =>
-      loadConfig(
+      legacyConfig(
         writeConfig({
           modelClasses: {
             dupe: [
@@ -1321,13 +1327,13 @@ describe("loadConfig modelClasses", () => {
 
   it("rejects a class entry naming an unconfigured provider", () => {
     expect(() =>
-      loadConfig(writeConfig({ modelClasses: { fast: [{ provider: "nope", model: "x" }] } }))
+      legacyConfig(writeConfig({ modelClasses: { fast: [{ provider: "nope", model: "x" }] } }))
     ).toThrow(/not configured/);
   });
 
   it("rejects a class entry whose effort the provider does not support", () => {
     expect(() =>
-      loadConfig(
+      legacyConfig(
         writeConfig({
           providers: { kimi: { cliCommand: "kimi" } },
           modelClasses: { fast: [{ provider: "kimi", model: "kimi-code", effort: "high" }] },

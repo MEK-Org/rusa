@@ -120,6 +120,10 @@ import {
 import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
 import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
+import {
+  applyModelClassConfigCutover,
+  planModelClassConfigCutover,
+} from "../db/legacy-model-class-import.js";
 import type {
   PrerequisiteAttention,
   ReadyHeadChange,
@@ -846,6 +850,26 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
   const database = initDb(mcHome);
   log.info("database_ready", { home: mcHome });
+
+  // #271 initially put class definitions in config.yaml. This is the explicit
+  // one-time handoff to the runtime store: a receipt commits with the copied
+  // rows, so later boots cannot let the now-stale config block overwrite a
+  // live edit or deletion. The resolver below only ever reads model_classes.
+  const modelClassConfigCutover = applyModelClassConfigCutover(
+    planModelClassConfigCutover({ config, repositories: getRepositories() }),
+    { db: database, repositories: getRepositories() }
+  );
+  if (modelClassConfigCutover.importedDefinitions > 0) {
+    log.info("model_class_config_cutover_completed", {
+      importedDefinitions: modelClassConfigCutover.importedDefinitions,
+    });
+  }
+  if (modelClassConfigCutover.ignoredStaleConfig) {
+    log.warn("legacy_model_classes_config_ignored", {
+      impact: "model_classes in mesh.db are authoritative; remove modelClasses from config.yaml",
+    });
+  }
+  const modelClasses = getRepositories().modelClasses;
 
   // One OS scheduler owns every cron/at mutation: recurring
   // actor wakes, recurring or interval obligations, and one-shot messages.
@@ -1667,17 +1691,18 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       assertSpawnContextSupported(req, {
         ledgerCompactionAvailable: portableContextApiKey !== null,
       });
-      // Named model classes resolve here, before validation: spawns arriving
-      // via root control are already resolved, so this call is identity for
-      // them and expansion for every other spawn path.
-      return validateModelConfigPool(config, resolveModelClasses(config, req.modelConfig), {
+      // Named model classes resolve from the current committed database row
+      // here, before validation: spawns arriving via root control are already
+      // resolved, so this call is identity for them and expansion for every
+      // other spawn path.
+      return validateModelConfigPool(config, resolveModelClasses(modelClasses, req.modelConfig), {
         portable: req.context?.type === "portable",
       });
     },
     validateModel: (record, modelConfig) => {
       // Resolve before filling: fillModelConfigFromCurrent walks tuples, and a
       // class reference would otherwise pass through it untouched.
-      const resolved = resolveModelClasses(config, modelConfig);
+      const resolved = resolveModelClasses(modelClasses, modelConfig);
       const filled = fillModelConfigFromCurrent(resolved, record.modelConfig);
       return validateModelConfigPool(config, filled, {
         portable: record.context?.type === "portable",
@@ -2303,7 +2328,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     mesh,
     rootId: rootId,
     providers: Object.keys(config.providers),
-    resolveModelConfig: (input) => resolveModelClasses(config, input),
+    resolveModelConfig: (input) => resolveModelClasses(modelClasses, input),
   });
 
   // Mechanical failure forwarding: a failed run goes to its parent's inbox, or —
@@ -2404,6 +2429,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const rootMeshUrl = mcpHttp.addServer(rootId, () =>
     createAgentExecMcpServer(mesh, rootId, rootId, osScheduler, {
       rootControl,
+      modelClasses,
+      validateModelClass: (input) => validateModelConfigPool(config, input, { portable: true }),
       onWrite: () => {
         mesh.markUnkillable(rootId);
       },

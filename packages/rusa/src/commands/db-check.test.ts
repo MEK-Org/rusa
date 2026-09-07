@@ -79,6 +79,7 @@ describe("db-check", () => {
   it("applies pending migrations to the copied home's mesh.db and reports them", () => {
     const first = runDbCheckAgainstHome(home);
     expect(first.pendingMigrationIds.length).toBeGreaterThan(0);
+    expect(first.pendingMigrationIds).toContain("0041_model_classes");
 
     const dbPath = join(home, "data", "mesh.db");
     expect(existsSync(dbPath)).toBe(true);
@@ -87,6 +88,19 @@ describe("db-check", () => {
       .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='_migrations'`)
       .get();
     expect(migrationsTable).toBeDefined();
+    expect(
+      db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'model_classes'")
+        .get()
+    ).toBeDefined();
+    // db-check never reads config.yaml or performs the boot-only cutover.
+    expect(
+      db
+        .prepare(
+          "SELECT 1 FROM legacy_import_receipts WHERE source = 'config.yaml:modelClasses:v1'"
+        )
+        .get()
+    ).toBeUndefined();
     db.close();
 
     // A second run against the same copy has nothing left pending.

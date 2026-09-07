@@ -2,6 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { Actor } from "../actor/actor.js";
 import {
@@ -14,6 +15,8 @@ import type { ActorRecord } from "../actor/actor-record.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import type { RusaConfig } from "../config/types.js";
+import { runMigrations } from "../db/migrations/runner.js";
+import { ModelClassRepository } from "../db/repositories/model-class-repository.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import {
   fillModelConfigFromCurrent,
@@ -1636,6 +1639,131 @@ describe("agent-execution MCP server", () => {
   });
 });
 
+describe("runtime model-class management", () => {
+  const config = {
+    providers: {
+      claude: { cliCommand: "claude" },
+      codex: { cliCommand: "codex" },
+    },
+  } as unknown as RusaConfig;
+
+  function hooks(store: ModelClassRepository) {
+    return {
+      validateSpawn: (req: SpawnRequest) =>
+        validateModelConfigPool(config, resolveModelClasses(store, req.modelConfig), {
+          portable: req.context?.type === "portable",
+        }),
+      validateModel: (record: ActorRecord, modelConfig: ModelConfigInput) =>
+        validateModelConfigPool(
+          config,
+          fillModelConfigFromCurrent(resolveModelClasses(store, modelConfig), record.modelConfig),
+          { portable: record.context?.type === "portable" }
+        ),
+    };
+  }
+
+  function managementOptions(store: ModelClassRepository) {
+    return {
+      modelClasses: store,
+      validateModelClass: (input: ModelConfigInput) =>
+        validateModelConfigPool(config, input, { portable: true }),
+    };
+  }
+
+  it("updates a class then resolves its new committed definition without a restart", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new ModelClassRepository(db);
+    const { mesh, registry } = setup(hooks(store));
+    const root = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
+    );
+    const rootTools = (await root.listTools()).tools.map((tool) => tool.name);
+    expect(rootTools).toContain("list_model_classes");
+    expect(rootTools).toContain("set_model_class");
+    expect(rootTools).toContain("delete_model_class");
+
+    const firstSet = (await root.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "review",
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    })) as CallToolResult;
+    expect(firstSet.isError).toBeFalsy();
+    const firstSpawn = (await root.callTool({
+      name: "spawn_thread",
+      arguments: {
+        charter: "first",
+        model_config: { class: "review" },
+        context_mode: "ledger",
+      },
+    })) as CallToolResult;
+    const firstId = (dataOf(firstSpawn) as { thread_id: string }).thread_id;
+    expect(registry.get(firstId)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8", effort: undefined },
+    ]);
+
+    const update = (await root.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "review",
+        model_config: { provider: "codex", model: "gpt-5.6-sol" },
+      },
+    })) as CallToolResult;
+    expect(update.isError).toBeFalsy();
+    const setExisting = (await root.callTool({
+      name: "set_actor_model",
+      arguments: { actor_id: firstId, model_config: { class: "review" } },
+    })) as CallToolResult;
+    expect(setExisting.isError).toBeFalsy();
+    expect(registry.get(firstId)?.desiredModelConfig).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol", effort: undefined },
+    ]);
+    const secondSpawn = (await root.callTool({
+      name: "spawn_thread",
+      arguments: { charter: "second", model_config: { class: "review" } },
+    })) as CallToolResult;
+    const secondId = (dataOf(secondSpawn) as { thread_id: string }).thread_id;
+    expect(registry.get(secondId)?.modelConfig).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol", effort: undefined },
+    ]);
+    // The class edit is deliberately not late-bound into existing records.
+    expect(registry.get(firstId)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8", effort: undefined },
+    ]);
+    db.close();
+  });
+
+  it("rejects invalid definitions and unknown classes, and never exposes management to workers", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new ModelClassRepository(db);
+    const { mesh } = setup(hooks(store));
+    const root = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
+    );
+    const invalid = (await root.callTool({
+      name: "set_model_class",
+      arguments: { name: "bad", model_config: { provider: "claude" } },
+    })) as CallToolResult;
+    expect(invalid.isError).toBe(true);
+    const unknown = (await root.callTool({
+      name: "spawn_thread",
+      arguments: { charter: "work", model_config: { class: "missing" } },
+    })) as CallToolResult;
+    expect(unknown.isError).toBe(true);
+    const worker = await connect(
+      createAgentExecMcpServer(mesh, "worker-1", "root", undefined, managementOptions(store))
+    );
+    const names = (await worker.listTools()).tools.map((tool) => tool.name);
+    expect(names).not.toContain("set_model_class");
+    expect(names).not.toContain("delete_model_class");
+    expect(names).not.toContain("list_model_classes");
+    db.close();
+  });
+});
+
 class FakeWakeScheduler {
   entries: {
     actorId: string;
@@ -1777,34 +1905,37 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     expect((res.content[0] as { text: string }).text).toMatch(/invalid cron/);
   });
 
-  // The production wiring (commands/start.ts): named classes resolve at the
+  // The production wiring (commands/start.ts): named classes resolve from the
   // boundary, and set_actor_model fills an omitted model from the actor's
   // current pool before validating. Both MCP model-class tests below run
   // against this, so a class reference that leaks through the schema is
   // exercised on the same path an operator would hit.
-  const CONFIG_WITH_CLASSES = {
+  const CONFIG = {
     providers: {
       claude: { cliCommand: "claude" },
       codex: { cliCommand: "codex" },
       kimi: { cliCommand: "kimi" },
     },
-    modelClasses: {
-      review: [{ provider: "claude", model: "claude-opus-4-8", effort: "max" }],
-    },
   } as unknown as RusaConfig;
+
+  const CLASS_STORE = {
+    get: (name: string) =>
+      name === "review"
+        ? { modelConfig: [{ provider: "claude", model: "claude-opus-4-8", effort: "max" }] }
+        : undefined,
+    list: () => [{ name: "review" }],
+  };
 
   const productionHooks = () => ({
     validateSpawn: (req: SpawnRequest) =>
-      validateModelConfigPool(
-        CONFIG_WITH_CLASSES,
-        resolveModelClasses(CONFIG_WITH_CLASSES, req.modelConfig),
-        { portable: req.context?.type === "portable" }
-      ),
+      validateModelConfigPool(CONFIG, resolveModelClasses(CLASS_STORE, req.modelConfig), {
+        portable: req.context?.type === "portable",
+      }),
     validateModel: (record: ActorRecord, modelConfig: ModelConfigInput) =>
       validateModelConfigPool(
-        CONFIG_WITH_CLASSES,
+        CONFIG,
         fillModelConfigFromCurrent(
-          resolveModelClasses(CONFIG_WITH_CLASSES, modelConfig),
+          resolveModelClasses(CLASS_STORE, modelConfig),
           record.modelConfig
         ),
         { portable: record.context?.type === "portable" }
