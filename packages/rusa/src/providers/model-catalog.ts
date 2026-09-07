@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Type } from "@google/genai";
 import { parse as parseToml } from "smol-toml";
 import { extractGeminiText, getGeminiClient } from "../understanding/gemini-utils.js";
-import { parseCodexModel } from "./codex.js";
+import { parseCodexModel } from "./codex-model.js";
 
 /**
  * One model as presented by a provider and as identified underneath that
