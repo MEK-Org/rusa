@@ -20,6 +20,7 @@ import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
+import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { closeDb, getDb, getRepositories } from "../db/index.js";
 import type { GitHubPollingIssueClient, IssueClient } from "../gitops/issue-client.js";
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
@@ -473,6 +474,47 @@ describe("runStart webhook event routing (Phase 4)", () => {
       process.env.RUSA_HOME = originalEnv;
     } else {
       delete process.env.RUSA_HOME;
+    }
+  });
+
+  it("wires actor prose to dashboard SSE without writing it to service stdout", async () => {
+    let mesh: ActorMesh | undefined;
+    const ready = new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    await ready;
+    if (!mesh) throw new Error("mesh not ready");
+
+    const root = mesh.get("root") as unknown as { opts: { log?: (text: string) => void } };
+    const emitted = vi.spyOn(MeshEventEmitter.prototype, "emitLiveOutput");
+    const stdout: string[] = [];
+    const realStdout = process.stdout.write;
+    process.stdout.write = ((text: string | Uint8Array) => {
+      stdout.push(String(text));
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      root.opts.log?.("[mesh] forged line from an actor\n");
+    } finally {
+      process.stdout.write = realStdout;
+    }
+
+    try {
+      expect(stdout).toEqual([]);
+      expect(emitted).toHaveBeenCalledWith({
+        actorId: "root",
+        text: "[mesh] forged line from an actor\n",
+      });
+    } finally {
+      emitted.mockRestore();
     }
   });
 

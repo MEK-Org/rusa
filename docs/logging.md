@@ -166,11 +166,14 @@ whoever is already touching a module for another reason — not in one sweep.
 records are JSON:
 
 ```console
-$ journalctl --user -u rusa -o cat | jq -c 'select(.component == "actor-run")'
+$ journalctl --user -u rusa -o cat | jq -Rc 'fromjson? // empty | select(.component == "actor-run")'
 ```
 
-Every line on that stream is a record this logger wrote — actor output has its
-own stream (see below), so `jq` needs no `-R` guard against stray prose.
+Actor output no longer needs the tolerant raw-input guard: it has its own stream
+(see below). `start.ts` still has a pre-existing console-output backlog, however,
+so service-originated status lines can share the stream until that separate
+migration completes. Keep the guard for now; it discards those non-record lines
+without treating actor prose as a possible record.
 
 Run by hand in a terminal, the same records arrive as readable lines with no
 extra tooling:
@@ -188,9 +191,9 @@ out of a pipe.
 ## Reading actor output
 
 The service log and the actor stream are separate on purpose, and they are read
-different ways. `journalctl --user -u rusa` is the mesh describing what it did:
-one JSON record per line, nothing else, so `jq` works without `-R` and a
-`select` matches a field rather than a shape of prose.
+different ways. `journalctl --user -u rusa` is the mesh describing what it did;
+its logger records are JSON, while the existing service-console backlog remains
+visible as non-record lines until it is migrated.
 
 An actor's words never reach it. That is the point rather than an omission —
 actor output is arbitrary text, so an actor that prints a source file containing
@@ -199,12 +202,16 @@ records indistinguishable from the service's own. Grepping harder does not fix
 it, because the reflection carries the original prefix. Keeping the two streams
 apart does.
 
-What an actor said has two homes, both of which outlive the run:
+The only durable destination is the transcript written for a completed run; the
+other destination is a separate live tail:
 
-- **The transcript.** The run boundary records it in `mesh_events` at `run_end`;
-  `rusa report` reads a run back as a timeline.
-- **The live-output stream.** The dashboard subscribes to it over SSE while the
-  run is in flight, with a bounded replay buffer of recent chunks per actor.
+- **The transcript.** When a run reaches `run_end`, its boundary records the
+  output in `mesh_events`; `rusa report` reads it back as a timeline. An
+  abandoned run has no completed transcript.
+- **The live-output stream.** The dashboard subscribes over SSE while the run is
+  in flight, with at most 500 recent chunks per actor held in memory for replay.
+  Older chunks are dropped, and the buffer is cleared when the service stops;
+  it is not an archive.
 
 `rusa logs --actor <id>` follows that same live-output stream from a terminal:
 
@@ -214,9 +221,11 @@ $ rusa logs --actor worker-7
 
 It prints the actor's prose and nothing else — no heartbeats, no mesh events, no
 other actor's run — so it pipes and redirects cleanly, and shows the same bytes
-a dashboard tab is rendering off the same stream. It reaches the running
-service's dashboard port over loopback, so the service has to be up; without
-`--actor`, `rusa logs` still tails the service log.
+a dashboard tab is rendering off the same stream. It is a live tail with only
+that bounded recent replay; use `rusa report` for a completed run's durable
+transcript. It reaches the running service's dashboard port over loopback, so
+the service has to be up; without `--actor`, `rusa logs` still tails the service
+log.
 
 ## MCP HTTP request timelines
 

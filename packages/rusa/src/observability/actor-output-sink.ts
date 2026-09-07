@@ -14,9 +14,9 @@ import type { Logger } from "./logger.js";
  * attacker-shaped text as far as the log is concerned: an actor that prints a
  * source file containing a mesh log string, or that runs `journalctl` and echoes
  * the result, injects lines indistinguishable from records the service wrote
- * itself — prefix included, so a tighter grep does not help. Once the mirror is
- * gone, `journalctl -u rusa` is sound as an observation plane by construction,
- * and the prose keeps both of the durable homes it already had.
+ * itself — prefix included, so a tighter grep does not help. The dashboard
+ * carries a bounded in-memory live tail, while the run boundary persists the
+ * durable transcript in `mesh_events`.
  */
 
 /** One chunk of streamed model output from a running actor. */
@@ -59,20 +59,4 @@ export function composeActorOutputSinks(
       }
     }
   };
-}
-
-/**
- * The reviewed list of destinations actor output reaches.
- *
- * Two homes, both of which outlive the chunk: the dashboard's live-output SSE
- * fan-out (which `rusa logs --actor <id>` also follows, so a terminal tail and a
- * browser tab read the same bytes), and the run transcript recorded at `run_end`
- * in `mesh_events`. The transcript is written by the run boundary rather than by
- * a sink here, so it is not in this list — but it is the reason removing the
- * stdout mirror loses nothing.
- */
-export function actorOutputSinks(deps: {
-  emitLiveOutput: (chunk: ActorOutputChunk) => void;
-}): ActorOutputSink[] {
-  return [{ name: "dashboard-live-output", deliver: deps.emitLiveOutput }];
 }

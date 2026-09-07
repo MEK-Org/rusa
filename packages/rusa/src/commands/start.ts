@@ -178,7 +178,7 @@ import {
 import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "../mcp/update-mcp.js";
 import { isTerminalObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
-import { actorOutputSinks, composeActorOutputSinks } from "../observability/actor-output-sink.js";
+import { composeActorOutputSinks } from "../observability/actor-output-sink.js";
 import { DiskUsageAlert } from "../observability/disk-alert.js";
 import {
   collectConfigSecretEntries,
@@ -1199,13 +1199,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   };
 
   // Where an actor's raw model output goes. The service's own stdout is not one
-  // of the destinations: fd 1 carries the logger's records and nothing else, so
-  // an actor cannot forge or reflect a service log line by printing one. The
-  // prose is read through the dashboard's live-output SSE — `rusa logs --actor
-  // <id>` follows the same stream from a terminal — and through the transcript
-  // the run boundary records in `mesh_events`.
+  // of the destinations: an actor cannot forge or reflect a service log line by
+  // printing one. Existing service-originated console status lines remain their
+  // own migration. The prose is read through the dashboard's live-output SSE —
+  // `rusa logs --actor <id>` follows the same stream from a terminal — and
+  // through the transcript the run boundary records in `mesh_events`.
   const emitActorOutput = composeActorOutputSinks(
-    actorOutputSinks({ emitLiveOutput: (chunk) => meshEmitter.emitLiveOutput(chunk) }),
+    [{ name: "dashboard-live-output", deliver: (chunk) => meshEmitter.emitLiveOutput(chunk) }],
     log.child({ component: "actor-output" })
   );
   const makeFirehose = (actorId: string) => (chunk: string) => {

@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   type ActorOutputChunk,
   type ActorOutputSink,
-  actorOutputSinks,
   composeActorOutputSinks,
 } from "./actor-output-sink.js";
 import { createLogger, type Logger } from "./logger.js";
@@ -132,53 +131,5 @@ describe("composeActorOutputSinks", () => {
     )({ actorId: "worker-7", text: "a private deliberation" });
 
     expect(JSON.stringify(records()[0])).not.toContain("private deliberation");
-  });
-});
-
-/**
- * The point of the sink list is which destinations are on it. An actor's words
- * reaching the service's own stdout is what made `journalctl -u rusa`
- * unreadable as a record of the mesh — a run that prints a log line, or echoes
- * the journal back, forges service records — so "nothing writes to fd 1" is the
- * property under test, not an implementation detail.
- */
-describe("actorOutputSinks", () => {
-  it("does not carry actor prose to the service's own output", () => {
-    const { logger } = recordingLogger();
-    const dashboard: ActorOutputChunk[] = [];
-    const stdout: string[] = [];
-    const stderr: string[] = [];
-    const realStdout = process.stdout.write.bind(process.stdout);
-    const realStderr = process.stderr.write.bind(process.stderr);
-    process.stdout.write = ((text: string) => {
-      stdout.push(String(text));
-      return true;
-    }) as typeof process.stdout.write;
-    process.stderr.write = ((text: string) => {
-      stderr.push(String(text));
-      return true;
-    }) as typeof process.stderr.write;
-
-    try {
-      composeActorOutputSinks(
-        actorOutputSinks({ emitLiveOutput: (c) => dashboard.push(c) }),
-        logger
-      )({ actorId: "worker-7", text: "[mesh] forged line from an actor\n" });
-    } finally {
-      process.stdout.write = realStdout;
-      process.stderr.write = realStderr;
-    }
-
-    expect(stdout).toEqual([]);
-    expect(stderr).toEqual([]);
-    expect(dashboard).toEqual([
-      { actorId: "worker-7", text: "[mesh] forged line from an actor\n" },
-    ]);
-  });
-
-  it("keeps the dashboard live-output destination", () => {
-    expect(actorOutputSinks({ emitLiveOutput: () => {} }).map((sink) => sink.name)).toEqual([
-      "dashboard-live-output",
-    ]);
   });
 });

@@ -1,8 +1,5 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
 import { SseHub } from "../dashboard/sse.js";
@@ -12,7 +9,6 @@ import {
   actorStreamUrl,
   followActorOutput,
   frameLiveOutput,
-  readDashboardAddress,
   splitSseFrames,
 } from "./logs.js";
 
@@ -24,24 +20,15 @@ import {
  */
 
 describe("actorStreamUrl", () => {
-  it("dials loopback when the service binds the wildcard address", () => {
-    expect(actorStreamUrl({ port: 8080, bindHost: "0.0.0.0" }, "worker-7")).toBe(
-      "http://127.0.0.1:8080/api/mesh/stream?actors=worker-7"
-    );
-    expect(actorStreamUrl(undefined, "worker-7")).toBe(
+  it("adds the actor filter to the shared loopback-resolved dashboard URL", () => {
+    expect(actorStreamUrl("http://127.0.0.1:8080", "worker-7")).toBe(
       "http://127.0.0.1:8080/api/mesh/stream?actors=worker-7"
     );
   });
 
-  it("keeps a concrete bind host and port", () => {
-    expect(actorStreamUrl({ port: 9090, bindHost: "127.0.0.1" }, "worker-7")).toBe(
-      "http://127.0.0.1:9090/api/mesh/stream?actors=worker-7"
-    );
-  });
-
-  it("brackets an IPv6 bind host and escapes the actor id", () => {
-    expect(actorStreamUrl({ port: 8080, bindHost: "fd00::1" }, "a b/c")).toBe(
-      "http://[fd00::1]:8080/api/mesh/stream?actors=a%20b%2Fc"
+  it("keeps the base URL and escapes the actor id", () => {
+    expect(actorStreamUrl("http://[fd00::1]:9090", "a b/c")).toBe(
+      "http://[fd00::1]:9090/api/mesh/stream?actors=a%20b%2Fc"
     );
   });
 });
@@ -126,7 +113,7 @@ describe("followActorOutput", () => {
     });
     await new Promise<void>((resolve) => server?.listen(0, "127.0.0.1", resolve));
     const port = (server.address() as AddressInfo).port;
-    const url = actorStreamUrl({ port, bindHost: "127.0.0.1" }, "worker-7");
+    const url = actorStreamUrl(`http://127.0.0.1:${port}`, "worker-7");
 
     const controller = new AbortController();
     const printed: string[] = [];
@@ -180,7 +167,7 @@ describe("followActorOutput", () => {
     expect(dashboardProse).toBe(printed.join(""));
   });
 
-  it("prints only the requested actor even if the stream carries another's chunks", async () => {
+  it("reports a graceful stream EOF after printing only the requested actor", async () => {
     // The endpoint filters by `actors`, so this frame should never arrive. The
     // command's contract is a single actor's prose, and a contract that only
     // holds while a remote filter is correct is not one a pipe can rely on.
@@ -196,13 +183,16 @@ describe("followActorOutput", () => {
     const port = (server.address() as AddressInfo).port;
 
     const printed: string[] = [];
+    const notices: string[] = [];
     await followActorOutput({
-      url: actorStreamUrl({ port, bindHost: "127.0.0.1" }, "worker-7"),
+      url: actorStreamUrl(`http://127.0.0.1:${port}`, "worker-7"),
       actorId: "worker-7",
       write: (text) => printed.push(text),
+      notify: (text) => notices.push(text),
     });
 
     expect(printed.join("")).toBe("mine\n");
+    expect(notices).toEqual(["[rusa] actor output stream ended.\n"]);
   });
 
   it("ends the follow when the service drops the stream, rather than crashing", async () => {
@@ -219,7 +209,7 @@ describe("followActorOutput", () => {
     const printed: string[] = [];
     const notices: string[] = [];
     const following = followActorOutput({
-      url: actorStreamUrl({ port, bindHost: "127.0.0.1" }, "worker-7"),
+      url: actorStreamUrl(`http://127.0.0.1:${port}`, "worker-7"),
       write: (text) => printed.push(text),
       notify: (text) => notices.push(text),
     });
@@ -242,7 +232,7 @@ describe("followActorOutput", () => {
 
     await expect(
       followActorOutput({
-        url: actorStreamUrl({ port, bindHost: "127.0.0.1" }, "worker-7"),
+        url: actorStreamUrl(`http://127.0.0.1:${port}`, "worker-7"),
         write: () => {},
       })
     ).rejects.toThrow(ActorStreamUnavailable);
@@ -258,50 +248,9 @@ describe("followActorOutput", () => {
 
     await expect(
       followActorOutput({
-        url: actorStreamUrl({ port, bindHost: "127.0.0.1" }, "worker-7"),
+        url: actorStreamUrl(`http://127.0.0.1:${port}`, "worker-7"),
         write: () => {},
       })
     ).rejects.toThrow(/HTTP 404/);
-  });
-});
-
-/**
- * The address read is deliberately narrow. A tail of an actor's output is what
- * an operator reaches for when something is wrong, which is exactly when the
- * config file may be mid-edit — so an unrelated section it cannot validate must
- * not be what stops the tail.
- */
-describe("readDashboardAddress", () => {
-  function home(contents: string): string {
-    const dir = mkdtempSync(join(tmpdir(), "rusa-logs-"));
-    writeFileSync(join(dir, "config.yaml"), contents);
-    return dir;
-  }
-
-  it("reads the configured port and bind host", () => {
-    expect(readDashboardAddress(home("dashboard:\n  port: 9090\n  bindHost: 127.0.0.1\n"))).toEqual(
-      { port: 9090, bindHost: "127.0.0.1" }
-    );
-  });
-
-  it("falls through to the defaults for anything it cannot use", () => {
-    expect(readDashboardAddress(home("dashboard:\n  port: eight thousand\n"))).toEqual({
-      port: undefined,
-      bindHost: undefined,
-    });
-    expect(readDashboardAddress(home("providers:\n  claude: {}\n"))).toEqual({
-      port: undefined,
-      bindHost: undefined,
-    });
-  });
-
-  it("reads the address out of a file whose other sections would fail validation", () => {
-    expect(
-      readDashboardAddress(home("dashboard:\n  port: 9090\n\nquota: not-an-object\n"))
-    ).toEqual({ port: 9090, bindHost: undefined });
-  });
-
-  it("reports a home it cannot read at all", () => {
-    expect(readDashboardAddress(join(tmpdir(), "rusa-logs-does-not-exist"))).toBeNull();
   });
 });
