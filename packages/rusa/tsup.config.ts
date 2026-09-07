@@ -13,6 +13,8 @@ export default defineConfig({
   entry: {
     cli: "src/cli.ts",
     "commands/e2e.cli": "src/commands/e2e.cli.ts",
+    "mcp/quota-mcp": "src/mcp/quota-mcp.ts",
+    "quota/shared-store": "src/quota/shared-store.ts",
   },
   format: ["esm"],
   target: "node20",
