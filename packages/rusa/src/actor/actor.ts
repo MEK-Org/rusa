@@ -97,13 +97,9 @@ export interface ActorOptions {
   saveSessionId: (id: string) => void;
   /**
    * Build the ordinary run prompt after scheduler admission. Called fresh so it
-   * can read the current charter, inbox contract, portable context, and the
-   * exact provider/model/effort tuple this run will launch. The tuple comes
-   * from the scheduler's selected pool entry, rather than the actor's declared
-   * pool, so an unavailable earlier candidate or a staged future replacement
-   * cannot misattribute this run's GitHub writing.
+   * can read the current charter, inbox contract, and portable context.
    */
-  buildPrompt: (selected: RawProviderModelConfig) => PromptBuild;
+  buildPrompt: () => PromptBuild;
   /** Firehose: receives the agent's streamed output. */
   log?: (chunk: string) => void;
   /** Optional model fallback for provider capacity/quota exhaustion. */
@@ -176,6 +172,12 @@ export interface ActorOptions {
     injectRecord: InjectRecord | undefined,
     selected: RawProviderModelConfig
   ) => void;
+  /**
+   * Called immediately before each provider attempt with the normalized tuple
+   * that provider will run. Unlike onRunStart, this includes fallback attempts
+   * without changing run lifecycle accounting.
+   */
+  onProviderAttempt?: (selected: RawProviderModelConfig) => void;
   /**
    * Optional hook fired ONCE per run, on the first chunk the provider emits —
    * the moment it starts answering, as distinct from the moment we asked .
@@ -805,9 +807,13 @@ export class Actor {
     // Assigned inside the try below (buildPrompt sits within the terminal-failure
     // boundary), then read by this closure when the gated invoke actually runs.
     let built: PromptBuild;
-    const runProvider = (provider: CodingProvider, prompt: string): Promise<RunResult> =>
-      provider.run({
-        prompt,
+    const runProvider = (
+      provider: CodingProvider,
+      selection: RawProviderModelConfig
+    ): Promise<RunResult> => {
+      this.opts.onProviderAttempt?.(selection);
+      return provider.run({
+        prompt: built.prompt,
         cwd: this.opts.cwd,
         // Continue this actor's own session (id undefined on first run → created).
         session: { id: sessionId },
@@ -832,6 +838,7 @@ export class Actor {
           this.opts.log?.(chunk);
         },
       });
+    };
     const invoke = (selected: RawProviderModelConfig): Promise<RunResult> => {
       // Both queues have selected this run. From this point a later responsive
       // wake obeys per-actor serialization; v1 never cancels a live provider.
@@ -857,7 +864,7 @@ export class Actor {
               "End this run correctly now by calling yield_run with status complete or blocked. " +
               "Do not do additional work in this corrective run.",
           }
-        : this.opts.buildPrompt(selected);
+        : this.opts.buildPrompt();
       // Inside the gate: the provider is starting. The hook fires here rather than
       // beside onQueued so a run queued behind the concurrency cap is
       // distinguishable from one that started and went quiet — same reason the
@@ -873,17 +880,7 @@ export class Actor {
       return this.runWithFallback(
         this.opts.resolveProvider(selected),
         selected,
-        (provider, attempt) =>
-          runProvider(
-            provider,
-            // A fallback is a new provider attempt. Rebuild its ordinary prompt
-            // from the tuple we will give its provider so public GitHub writing
-            // names that actual attempt, while keeping the run's single
-            // admission/start record and its primary inject record unchanged.
-            isCorrectiveRun || attempt === selected
-              ? built.prompt
-              : this.opts.buildPrompt(attempt).prompt
-          )
+        (provider, attempt) => runProvider(provider, attempt)
       );
     };
 

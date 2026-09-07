@@ -230,6 +230,131 @@ describe("tracker MCP server", () => {
     expect(parseAuthor(body)).toBe("test-actor-1");
   });
 
+  it("reads the active selection at each write without exposing its provider", async () => {
+    const { client: backend, calls } = recordingIssueClient();
+    let selection: { provider: string; model?: string; effort?: string } | undefined = {
+      provider: "codex",
+      model: "gpt-5.6-terra",
+      effort: "xhigh",
+    };
+    const client = await connect(
+      createTrackerMcpServer("test-actor", backend, {
+        actorHandle: "actor-handle",
+        getRunSelection: () => selection,
+      })
+    );
+
+    await client.callTool({
+      name: "post_comment",
+      arguments: { repo: "owner/repo", issueNumber: 123, body: "first" },
+    });
+    selection = { provider: "codex", model: "gpt-5.6-sol" };
+    await client.callTool({
+      name: "post_comment",
+      arguments: { repo: "owner/repo", issueNumber: 123, body: "second" },
+    });
+    selection = undefined;
+    await client.callTool({
+      name: "post_comment",
+      arguments: { repo: "owner/repo", issueNumber: 123, body: "third" },
+    });
+
+    const first = calls[0]?.args[2] as string;
+    const second = calls[1]?.args[2] as string;
+    const third = calls[2]?.args[2] as string;
+    expect(first).toContain("*actor-handle (gpt-5.6-terra, xhigh)*");
+    expect(second).toContain("*actor-handle (gpt-5.6-sol)*");
+    expect(third).toContain("*actor-handle*");
+    expect(first).not.toContain("codex");
+    expect(second).not.toContain("codex");
+    expect(third).not.toContain("codex");
+  });
+
+  it("mechanically signs every GitHub body and keeps one footer on updates", async () => {
+    const { client: backend, calls } = recordingIssueClient();
+    const client = await connect(
+      createTrackerMcpServer("test-actor", backend, {
+        actorHandle: "actor-handle",
+        instanceId: "test-instance",
+        getRunSelection: () => ({
+          provider: "codex",
+          model: "gpt-5.6-terra",
+          effort: "xhigh",
+        }),
+      })
+    );
+
+    await client.callTool({
+      name: "create_issue",
+      arguments: { repo: "owner/repo", title: "Issue", body: "issue body" },
+    });
+    await client.callTool({
+      name: "create_pull_request",
+      arguments: {
+        repo: "owner/repo",
+        head: "feature",
+        title: "PR",
+        body: "pr body\n\n*other-actor (old-model, low)*",
+      },
+    });
+    await client.callTool({
+      name: "post_comment",
+      arguments: { repo: "owner/repo", issueNumber: 123, body: "comment body" },
+    });
+    await client.callTool({
+      name: "post_review",
+      arguments: {
+        repo: "owner/repo",
+        prNumber: 123,
+        event: "COMMENT",
+        body: "review body",
+        comments: [{ path: "src/file.ts", line: 1, body: "inline review body" }],
+      },
+    });
+    await client.callTool({
+      name: "create_pr_review_comment",
+      arguments: { repo: "owner/repo", prNumber: 123, inReplyTo: 99, body: "reply body" },
+    });
+    const oldStamp = stampAuthor("other-actor", "owner/repo", 123, "old-instance");
+    await client.callTool({
+      name: "update_body",
+      arguments: {
+        repo: "owner/repo",
+        issueNumber: 123,
+        body: `replacement body\n\n*other-actor (old-model, low)*\n\n${oldStamp}`,
+      },
+    });
+
+    const issue = calls.find((call) => call.method === "createIssue")
+      ?.args[0] as CreateIssueOptions;
+    const pr = calls.find((call) => call.method === "createPullRequest")
+      ?.args[0] as CreatePROptions;
+    const comment = calls.find((call) => call.method === "postComment")?.args[2] as string;
+    const review = calls.find((call) => call.method === "createPullRequestReview")
+      ?.args[0] as CreatePullRequestReviewOptions;
+    const reply = calls.find((call) => call.method === "createPrReviewComment")
+      ?.args[0] as CreatePrReviewCommentOptions;
+    const update = calls.find((call) => call.method === "updateIssueBody")?.args[2] as string;
+    const bodies = [
+      issue.body,
+      pr.body,
+      comment,
+      review.body,
+      review.comments?.[0]?.body ?? "",
+      reply.body,
+      update,
+    ];
+
+    for (const body of bodies) {
+      expect(body).toContain("*actor-handle (gpt-5.6-terra, xhigh)*");
+      expect(body).toMatch(/\*actor-handle \(gpt-5\.6-terra, xhigh\)\*\n\n<!-- mesh:author:v/);
+      expect(body).not.toContain("codex");
+    }
+    expect(pr.body).not.toContain("other-actor");
+    expect(update).not.toContain("other-actor");
+    expect(update.match(/\*[^*\r\n]+\*/g)).toEqual(["*actor-handle (gpt-5.6-terra, xhigh)*"]);
+  });
+
   it("creates issues with a pre-creation v3 stamp from the authenticated actor id", async () => {
     const { client: backend, calls } = recordingIssueClient();
     const client = await connect(

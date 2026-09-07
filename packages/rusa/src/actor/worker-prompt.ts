@@ -1,6 +1,4 @@
-import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { ActorHandle } from "./actor-record.js";
-import { generateHandle } from "./handle-generator.js";
 
 /** A handle resolved to its display label for the address book. */
 export interface ResolvedHandle {
@@ -280,40 +278,6 @@ function renderAddressBook(ctx: WorkerPromptContext): string {
 }
 
 /**
- * The GitHub-signing convention : every actor ends its GitHub comments and
- * PR descriptions with its own handle as a calling card, so it's clear which actor
- * in the mesh wrote a given post. Parameterized by handle since each actor signs
- * with its own.
- */
-export function signatureDiscipline(handle: string, selected?: RawProviderModelConfig): string {
-  const model = selected?.model;
-  const signature = model
-    ? selected?.effort
-      ? `${handle} (${model}, ${selected.effort})`
-      : `${handle} (${model})`
-    : handle;
-  const attribution = model
-    ? selected?.effort
-      ? `This run launched as **${model}** at **${selected.effort}** effort.`
-      : `This run launched as **${model}** with no explicit effort.`
-    : "No model was resolved for this run; do not invent a model or effort value.";
-  return `## Sign your GitHub posts
-
-You have a distinct identity in the mesh; your handle — your calling card — is
-**${handle}**. Whenever you write on GitHub — a comment on an issue or PR, **or
-the description (body) of a PR you open** — make the **last visible line** your
-italic signature, with nothing after it. Include the actual model that launched
-this run, and include effort only when it is explicit; omit the provider.
-
-${attribution}
-
-*${signature}*
-
-GitHub comments and PR descriptions only — not chat, not mesh messages to other
-actors, not code or commit messages.`;
-}
-
-/**
  * The framework scaffolding wrapped around a worker's *authored* charter (the
  * `charter` the parent supplied to `spawn_thread`). It establishes worker
  * identity and reporting boundaries. Like the root prompt it doesn't enumerate
@@ -373,8 +337,7 @@ export function buildWorkerPrompt(
    * part of the prompt, ahead of the volatile reason injection. Undefined for
    * normal (session-backed) actors, which changes nothing.
    */
-  priorContext?: string,
-  selected?: RawProviderModelConfig
+  priorContext?: string
 ): string {
   const shortId = ctx.threadId.slice(0, 8);
   const mountNotice = ctx.understandingMountEnabled
@@ -411,8 +374,7 @@ ${OBLIGATION_DISCIPLINE}
 ${WRITING_FOR_AGENTS_DISCIPLINE}
 
 ${EXTERNAL_CONDUCT_POLICY}
-
-${signatureDiscipline(generateHandle(ctx.threadId), selected)}${workingDir}
+${workingDir}
 
 ---
 ## Your charter
@@ -423,4 +385,4 @@ Begin by listing work from the durable inbox.`;
 }
 
 // Testing tombstone (PR ISSUE_NUM): do not add unit tests for static prompt-string
-// assembly. Keep tests for helper logic and runtime behavior instead.
+// assembly. Keep behavioral tests at the tracker and provider runtime boundaries.
