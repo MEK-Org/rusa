@@ -5,7 +5,7 @@ service contract, and defines the failure, compatibility and operational
 semantics that must hold before any code moves. Nothing here is implemented.
 No quota storage, schema, or pacing behaviour changes with this document.
 
-Every source citation below is against `origin/staging` at `5ee178f`. Paths are
+Every source citation below is against `origin/staging` at `aadfdb0`. Paths are
 repository-relative; line numbers are that commit's.
 
 ## What v1 is, in one paragraph
@@ -22,8 +22,10 @@ or holds a lease.
 §1.4. Two instances reading one published interval still both start immediately
 at boot, so the pool's effective normal-launch rate stays `N × 1/interval`
 rather than `1/interval`. That is a scope decision taken in review, not an
-oversight, and the machinery that would close it is kept intact in §11 for v2
-rather than discarded.
+oversight. Whether that gap ever needs closing is now itself a question to be
+answered by observation rather than by design: the operator's direction on this
+proposal is to ship v1 and wait and see. §11 keeps the invariants that work
+would have to respect, and nothing more.
 
 ## Revision log
 
@@ -37,10 +39,13 @@ rather than discarded.
   (§4.1), while noting that the processes which *consume* the shared account are
   a strictly larger set than the processes which pace it (A1a).
 - **Revisions 4 and 5** answered correctness findings against the reservation
-  machinery. Those findings are preserved with their provenance in §11, which is
-  where that machinery now lives.
+  machinery. Those findings survive as the invariant list in §11.2; the protocol
+  they corrected is not carried forward.
 - **Revision 6 is a scope change from review, not a correction.** Two directions
-  came back, and both narrow v1. First: the quota module should own its own
+  came back **from the operator's change request on this proposal**, submitted
+  against head `a4ef697a`, and both narrow v1. Neither is reviewer momentum, and
+  both supersede the corresponding wording in #178 — the issue predates them.
+  First: the quota module should own its own
   collection rather than depending on the systems it serves for the information
   it publishes — a module that is handed its inputs by its consumers is not the
   well-defined unit this effort is for. Second: cross-instance launch
@@ -53,11 +58,27 @@ rather than discarded.
   **read-only — six GETs and no mutating operation anywhere** (§5), which
   deletes client ingestion, the ingest receipts table, the observation replay
   buffer, and the whole reservation lifecycle from v1's surface. The v1 schema
-  addition shrinks to one singleton table (§7). §5.7 collapses, because a
+  addition shrinks to one singleton table, which revision 7 then removes
+  altogether. §5.7 collapses, because a
   service that gates nothing cannot fail closed. And §8.4's account of
   separability is rewritten: separable no longer means *collection stays where
   it is*, it means *collection lives behind a contract in its own deployable
   unit*.
+- **Revision 7 records the operator's decisions and answers a review round.**
+  Four questions this document had left open were settled directly on the
+  proposal: stage 1's temporary double scraping is acceptable and is in practice
+  a *transfer* rather than an addition (§8.3); the A/B harness stops being a
+  scraper and becomes a client (§1.7, Q10); the agent-facing `get_quota` tool
+  reads through the service (Q11); and #178 closes when the self-scraping,
+  read-only v1 ships, with cross-instance coordination deferred pending evidence
+  that it is needed (Q12). The earlier requirement that the collector admit
+  off-host observation *sources* is superseded and removed. Review of revision 6
+  also found five things wrong or unstated, all fixed here: the freshness rule
+  was ambiguous for a provider with several windows (§5.5), a client restarting
+  during an outage would have been unpaced (§5.7), the restart invariant ignored
+  the service's own in-memory inference state (§6.3), the new schema table was
+  mostly anticipatory and is now gone entirely (§7), and §11 carried a
+  168-line protocol for work that is not scheduled (§11).
 
 ## Contents
 
@@ -186,25 +207,25 @@ This is the gap v1 *does* close, and it is the one the module's ownership of
 collection closes structurally rather than by convention.
 
 `QuotaService` owns a TTL cache in a plain in-memory `Map`
-(`packages/rusa/src/mcp/quota-mcp.ts:697-701`), 5 min for claude/agy/kimi and
-30 min for codex (`:768-786`). One service per process
+(`packages/rusa/src/mcp/quota-mcp.ts:751-754`), 5 min for claude/agy/kimi and
+30 min for codex (`:822-842`). One service per process
 (`start.ts:1110-1114`), shared between the `get_quota` MCP tool and the
-dashboard endpoint (`quota-mcp.ts:1105-1109`). So *N* instances run *N*
+dashboard endpoint (`quota-mcp.ts:1161-1165`). So *N* instances run *N*
 independent PTY scrapes of the same provider panel — and those scrapes are
 expensive tmux-driven captures
 (`packages/rusa/src/providers/agy-usage-scrape.ts:43-100`).
 
 Parsing is an LLM call, not a regex, gated on `geminiApiKey`
-(`quota-mcp.ts:493-540`).
+(`quota-mcp.ts:543-595`).
 
 The disagreement risk is concrete, not hypothetical, and it has two independent
 mechanisms:
 
 1. **Inference is stateful in client memory.** `inferQuotaState` takes
-   `prevState` (`quota-mcp.ts:555`), and production passes the calling
-   process's own TTL-cache entry (`quota-mcp.ts:725`, consumed at `:733`).
+   `prevState` (`quota-mcp.ts:609`), and production passes the calling
+   process's own TTL-cache entry (`quota-mcp.ts:779`, consumed at `:787`).
    Rules like `carried_forward_bad_read` and `assumed_window_starts_now`
-   (`quota-mcp.ts:543-554`) therefore resolve differently in two instances that
+   (`quota-mcp.ts:597-608`) therefore resolve differently in two instances that
    happen to hold different previous readings. Two instances can write
    *different canonical observations* from the same provider panel.
 
@@ -233,8 +254,11 @@ reasoning is documented at length, including the failure it prevents
 refuses a diff whose two `scrapedAt` stamps are identical.
 
 That is a real second scraper against the shared account, it is not an instance,
-and "the module owns collection" has to say something about it. This design does
-not decide it; Q10 asks.
+and "the module owns collection" has to say something about it. **It is decided:
+the harness stops scraping and becomes a client of the service like everything
+else.** What that costs the rig is stated where the cost lands (§8.5), because
+`ttlMs: 0` exists for a reason and reading published observations does not
+reproduce it.
 
 ### 1.8 Topology as configured
 
@@ -274,14 +298,23 @@ recommendation, and §4.3 says what changes if it is wrong.
   before, and the new one is heavier. The service now runs the provider CLIs
   itself, so it must run somewhere those CLIs are authenticated — the same host
   and the same user account whose credentials the probes already use
-  (`quota-mcp.ts:898-901`). Moving the service off-host is therefore no longer
+  (`quota-mcp.ts:952-955`). Moving the service off-host is therefore no longer
   only a transport question. See A5a and §4.3.
 - **A1a — Provider *consumption* is not confined to that host, and this design
   does not change that.** A follower's provider CLI on another machine bills the
   same account (#237), and so does interactive human use on any other machine.
-  Neither is visible to the service's scrape. The pacing boundary, the
-  observation boundary and the consumption boundary are three different sizes.
-  §8.4 is written to that.
+
+  **What the scrape does and does not see, stated precisely, because an earlier
+  revision got this wrong.** The panel a probe reads is the *account's*, not the
+  process's: every window the parser is asked for is provider-scope — Claude's
+  session and week, Codex's 5h and Weekly, agy's GEMINI MODELS windows
+  (`quota-mcp.ts:342-391`). Consumption on another host under the same account
+  therefore *does* reach the service, as a lower `percentLeft` on the next
+  scrape, and the controller reacts to it exactly as it reacts to local
+  consumption. What the service cannot do is **attribute** that consumption, or
+  see it any sooner than the next scrape. Nothing today attributes it either.
+  The pacing boundary is smaller than the consumption boundary; the *observation*
+  boundary is the account, and it always was.
 - **A2 — Launch rate is low, and so is publication rate.** Normal starts are
   spaced by a controller interval capped at `maxIntervalSeconds`, default 3600
   (`config/types.ts:96`), and the sensor ticks every `tickSeconds`, default 300
@@ -300,10 +333,10 @@ recommendation, and §4.3 says what changes if it is wrong.
   **This is a relocation, not a redesign, and the code says so.** `executeProbe`
   already runs each probe in a directory of its own that belongs to no actor and
   no run — `join(workersDir, "quota-probe-<provider>")`, created on demand
-  (`quota-mcp.ts:876-881`) — under its own bwrap sandbox scoped to that directory
-  (`:898-901`). The probe's only dependencies on its host process are
+  (`quota-mcp.ts:930-935`) — under its own bwrap sandbox scoped to that directory
+  (`:952-955`). The probe's only dependencies on its host process are
   `workersDir` and `config`, both already injected through `QuotaMcpDeps`
-  (`quota-mcp.ts:110-141`). Nothing about a probe is entangled with the instance
+  (`quota-mcp.ts:110-142`). Nothing about a probe is entangled with the instance
   that happens to run it.
 
   **Consequence: N scrapes become 1, and N parses become 1.** See §3.1.
@@ -322,7 +355,7 @@ Two assumptions that earlier revisions carried have moved rather than gone. **A3
 (a reservation must survive a client crash) and **A7** (a client can bound the
 delay between deciding to spawn and the provider process actually starting) are
 assumptions about reservation machinery, which v1 does not have. Both are stated
-where that machinery now lives, in §11, so that v2 inherits them with their
+where that machinery now lives, in §11.1, so that v2 inherits them with their
 reasoning intact.
 
 ---
@@ -419,13 +452,13 @@ With collection in the service:
   per provider. The tmux-driven capture (`agy-usage-scrape.ts:43-100`) happens
   once per cadence for the pool rather than once per instance.
 - **LLM parses drop from N to 1**, since there is one scrape to parse
-  (`quota-mcp.ts:493-540`).
+  (`quota-mcp.ts:543-595`).
 - **The slot winner rule stops being a reconciliation and becomes a safety
   net.** `(provider, kind, observed_slot)` dedupe with its valid-reset-wins tie
   break (`shared-store.ts:705-710`) exists because two instances could write the
   same slot. With one writer there is normally nothing to reconcile. The rule is
-  retained unchanged — it still governs replayed history and anything Q10
-  decides about the A/B rig — but it is no longer load-bearing, and the trade
+  retained unchanged — it still governs replayed history — but it is no longer
+  load-bearing, and the trade
   revision 2 described (dedupe parses, but lose the two-reading comparison the
   winner rule needs) simply evaporates.
 - **The divergent-`prevState` mechanism in §1.6(1) becomes impossible**, because
@@ -499,9 +532,20 @@ It is worth stating on its own, because it is the property that makes the rest o
 the rollout cheap rather than merely tidy.
 
 - **Auth collapses to "can you open the socket".** With no mutating operation
-  there is no privilege to model beyond read access, and a compromised or buggy
+  there is no privilege to model beyond read access, and a conforming or buggy
   client cannot corrupt quota state, publish a wrong interval, or poison the
   controller's memory.
+
+  **This is a correctness boundary, not a security boundary, and the difference
+  matters.** Under A1 the service and its clients run as the same Unix user
+  against the same filesystem, so a *compromised* client process can open the
+  relocated database directly no matter what verbs the API offers. What the
+  read-only surface buys is that no client can do damage **through the
+  contract** — by accident, by a bug, or by a future endpoint added without
+  thinking. Making it a security boundary requires real process isolation, which
+  is Q6, and v1 does not claim it. Revision 7 removes `databasePath` from
+  `GET /v1/hello` accordingly (§5.2): no client needs the path, and publishing it
+  only assists a process that should not be opening the file.
 - **The canary becomes free.** An instance can read `GET /v1/throttle` and
   *compare* it against what it would have applied, logging the difference and
   applying nothing, for as long as anyone wants. There is no such thing as a
@@ -528,10 +572,12 @@ the rollout cheap rather than merely tidy.
   parsing, inference and publication while a thin same-host collector feeds it,
   which is exactly the ingestion endpoint v1 deleted. That is a real design, and
   it is the one to reach for if and only if A5a fails.
-- **A1a stops being tolerable** (unpaced, unobserved consumption from followers
-  or interactive use grows large enough that the controller cannot absorb it):
-  that is not an argument for Option 3, which would not help. It is an argument
-  for extending *observation* to those paths, which is Q9.
+- **A1a stops being tolerable** (unpaced consumption from followers or
+  interactive use grows large enough that the controller's reaction to it is too
+  slow): that is not an argument for Option 3, which would not help. The account
+  panel already carries that consumption (A1a), so the lever is cadence and
+  attribution, not topology — scrape more often, or teach the other paths to
+  report what they spent. Neither is a v1 requirement.
 - **A6 is unacceptable** (no write-quiesce is ever schedulable): §8.3's
   ownership flip needs redesign — probably a service that begins read-only and
   takes the write lock only when it observes no other writer for a full tick.
@@ -557,8 +603,8 @@ removed in the first place (`loader.ts:299-303`).
 
 An earlier revision threaded a `poolId` through every RPC and every new table so
 that one process could later serve several credential sets. That was
-anticipatory surface, and it was also incoherent: `quota_coordinator_meta` is a
-singleton, and the preserved `quota_observations` primary key
+anticipatory surface, and it was also incoherent: one file has one
+`user_version` (§7), and the preserved `quota_observations` primary key
 (`shared-store.ts:236`) has no pool dimension.
 
 Two credential sets therefore mean two services, two sockets and two
@@ -580,19 +626,25 @@ one published throttle, as they do now.
   `GET`.** Any other method on any v1 path is `405`, unconditionally, and that
   is a contract statement rather than an implementation detail (criterion 7).
 - **Handshake:** `GET /v1/hello` → `{ protocolMajor, protocolMinor,
-  serverVersion, schemaVersion, databasePath, providers, serverTime }`. Every
-  client calls it at startup and after every reconnect.
+  serverVersion, schemaVersion, providers, serverTime }`. Every client calls it
+  at startup and after every reconnect. **No `databasePath`.** Revision 6 had
+  one; nothing needs it — `GET /v1/history` exists precisely so that a client
+  never opens the file (§5.5) — and publishing it hands a location to the one
+  kind of process that should not have it (§4.2).
 - **Compatibility rule:** `protocolMajor` must match exactly; a mismatch is a
   hard refusal on both sides with a message naming both versions.
   `protocolMinor` is additive-only — a client ignores response fields it does
   not know, and the server treats absent optional query parameters as their
   documented defaults. No field is ever repurposed; removal requires a major
   bump.
-- **Schema guard:** the service refuses to open a database whose recorded
-  `schema_version` is *newer* than the version it knows, and exits non-zero with
-  that message. Note what this does and does not do: it stops a **rolled-back
-  service** from writing to a file a newer one has widened. It cannot stop a
-  pre-service build, which reads no version at all (§8.2).
+- **Schema guard:** the service refuses to open a database whose
+  `PRAGMA user_version` is *newer* than the version it knows, and exits non-zero
+  with that message. `user_version` is a SQLite header field rather than a table,
+  it is free to claim — nothing in the tree reads or writes `user_version` or
+  `application_id` on any database today — and it is the whole of v1's schema
+  addition (§7). Note what the guard does and does not do: it stops a
+  **rolled-back service** from writing to a file a newer one has widened. It
+  cannot stop a pre-service build, which reads no version at all (§8.2).
 
 ### 5.3 Authentication and scope
 
@@ -609,7 +661,7 @@ the answer is already "processes running as that user".
 both directions.**
 
 - The service must hold `geminiApiKey` in order to parse
-  (`quota-mcp.ts:493-540`). Instances cannot drop it in exchange, because they
+  (`quota-mcp.ts:543-595`). Instances cannot drop it in exchange, because they
   use the same key for unrelated features — dashboard avatar generation
   (`packages/rusa/src/dashboard/api.ts:760-765`), ledger compaction
   (`config/loader.ts:588`) and voice (`config/types.ts:385`). So the number of
@@ -633,7 +685,7 @@ decision — observation instants, controller stamps, staleness — is stamped b
 the service. Under v1 that is easier than it was under revision 5, because the
 service is also the only thing scraping: `scrapedAt` is now stamped by the
 process that ran the scrape rather than reported by a client
-(`quota-mcp.ts:714-717`).
+(`quota-mcp.ts:768-771`).
 
 Clients never compare their own `Date.now()` to a service timestamp for a
 decision. Freshness is expressed by the service as an **age in milliseconds**,
@@ -664,7 +716,13 @@ the server clock:
   "exhaustedUntil": null,
   "updatedAt": "2026-09-07T16:00:00.000Z",
   "buckets": [ /* unchanged shape */ ],
-  "freshness": { "ageMs": 240000, "stale": false, "hardStale": false },
+  "freshness": {
+    "ageMs": 900000,
+    "governingBucketAgeMs": 240000,
+    "buckets": { "claude:session": 240000, "claude:weekly": 900000 },
+    "stale": false,
+    "hardStale": false
+  },
   "serverTime": "2026-09-07T16:04:00.000Z"
 }
 ```
@@ -678,6 +736,21 @@ Notes on the shape, because the shape is the point:
 - `exhaustedUntil` is included and is not optional. It is what drives
   `pacer.deferUntil` when the window is expired (`start.ts:1289-1293`), and a
   publication that omitted it would silently drop the exhaustion gate.
+- **`freshness.ageMs` is the age of the *oldest* current bucket, not of the
+  newest observation.** A provider has several independently stored windows —
+  session and weekly for Claude, 5h and Weekly for Codex — each its own
+  `(provider, kind)` row, and a parse that omits one window leaves that kind's
+  previous row in place. `updatedAt` cannot carry this weight: it is computed as
+  the **newest** `observed_at` across kinds (`shared-store.ts:625-631`), so a
+  provider whose session window refreshes every tick would report itself fresh
+  indefinitely while its weekly window — possibly the governing one, since the
+  governing bucket is the widest required interval (`shared-store.ts:622-623`) —
+  went hours without an update. Defining provider freshness from the oldest
+  bucket makes staleness degrade toward slower (§5.7) in exactly the case that
+  should. `governingBucketAgeMs` and the per-bucket map are published alongside
+  so a reader can see *which* window is old rather than only that one is;
+  `updatedAt` keeps its current meaning and is display-only. Criterion 5a is the
+  failure test.
 - The dashboard's `QuotaThrottleStatus` view
   (`actor/quota-throttle-status.ts:10-20`) is a projection of this, unchanged,
   so `quotaApi.getThrottle` (`dashboard/quota-api.ts:158`) keeps its type.
@@ -702,13 +775,17 @@ MCP tool and the dashboard's `/api/quota` endpoint consume today
 
 **It never triggers a probe in the request path.** That is today's rule for the
 dashboard, stated in the code and motivated there
-(`start.ts:3203-3209`, `quota-mcp.ts:844`), and v1 makes it universal rather than
+(`start.ts:3203-3209`, `quota-mcp.ts:898`), and v1 makes it universal rather than
 per-caller: the probe loop is the only thing that probes, so no reader can cause
 one. A cold service answers with `"status": "unknown"` and a `freshness` block
 saying so, rather than blocking.
 
-Whether the agent-facing `get_quota` MCP tool should read through this endpoint
-or keep a local implementation is Q11.
+**The agent-facing `get_quota` MCP tool reads through this endpoint.** It shares
+one `QuotaService` with the dashboard today (`quota-mcp.ts:1161-1165`), and
+keeping a local probe path would reintroduce on this host exactly the second
+scraper v1 exists to remove. The cost is a changed failure mode for an
+agent-facing tool — "the service is cold" instead of "the probe timed out" — and
+it is why the cold answer above is a shape rather than an error.
 
 #### `GET /v1/history?provider=&since=`
 
@@ -775,6 +852,18 @@ launch. Nothing fails closed, because there is no closed to fail to.
 **Unavailable** — the socket is gone, the connection fails, or the handshake is
 refused:
 
+0. **A client that has never had a successful read starts at
+   `maxIntervalSeconds`.** This rule exists because rules 1 and 2 have nothing to
+   retain or to age when the outage covers the client's own startup, and the
+   default is not safe: `pacerFor` constructs `new ProviderPacer(0)`
+   (`start.ts:1267-1275`), and an interval of zero is *unpaced*, not
+   *conservative*. Today that never bites, because the boot-time apply reads the
+   shared database directly (`start.ts:1346-1348`) and a local file is always
+   there — and that read is exactly what §8.2 takes away. So the client sets
+   `maxIntervalSeconds` before its first successful read and narrows only when a
+   publication arrives. Cold-start-under-outage is part of criterion 6, because
+   a test that only removes the socket from an already-running client would pass
+   while this case failed.
 1. **The client keeps the interval it last applied.** Its `ProviderPacer` retains
    whatever `setInterval` last set (`provider-pacer.ts:136-142`); nothing needs
    to be re-derived and nothing is lost. This is exactly today's behaviour when a
@@ -894,17 +983,33 @@ sequenceDiagram
     A->>A: keep the applied interval, retry with backoff
     Note over A: launches continue, normal and responsive alike
     Note over S: back up
-    S->>D: open, check schema_version, resume the probe loop
+    S->>D: open, check user_version, hydrate prevState, resume the probe loop
     A->>S: GET /v1/hello, protocolMajor match
     A->>S: GET /v1/throttle
     S-->>A: intervalSeconds 612.4, from the same rows as before
     Note over A,S: no state was in flight, so none was lost
 ```
 
-**Invariant:** a restart costs freshness and nothing else. Every value the
-service publishes is derived from rows in the database, so there is no in-memory
-state whose loss changes an answer — which is a property v1 has and v2 will not,
-since a lease is exactly such state (§11).
+**Invariant:** a restart costs freshness and nothing else — **provided the
+service hydrates its inference state on boot.** Every value the service
+*publishes* is derived from rows in the database, so nothing a client can read is
+lost. But the service also *reasons*, and that part is not free: `inferQuotaState`
+takes `prevState` from an in-process cache (`quota-mcp.ts:779`, consumed at
+`:787`) which is constructed empty (`quota-mcp.ts:754`), so a service that
+restarts and then takes a bad or partial reading cannot continue the
+`carried_forward_bad_read` chain the surviving rows would have supported. Under
+revision 6 that loss was unstated; it is not acceptable to leave it unstated when
+one process is the only reasoner in the pool.
+
+**The repair is small, because the state is already persisted.**
+`recordParsed` writes the *inferred* snapshot as JSON into
+`quota_scrapes.parsed_state` (`shared-store.ts:318-333`), so hydration is: for
+each provider, read the newest scrape row with a non-null `parsed_state`, parse
+it, and seed the cache with it before the probe loop starts. That is an exact
+restoration of the value the cache would have held, not an approximation.
+Criterion 13 rehearses it. What remains genuinely lost on restart is the TTL
+timer, which only means the first post-restart probe may run early — harmless,
+and visible as one extra scrape.
 
 ### 6.4 The socket stays down
 
@@ -928,30 +1033,45 @@ sequenceDiagram
 
 ## 7. Storage schema
 
-**v1 adds one table.** `quota_scrapes` and `quota_observations` are
-**untouched** — the existing observation and controller columns keep their
-current meaning (`shared-store.ts:206-247`). There is no `pool_id` column
-anywhere, per §5.1.
+**v1 adds no table.** `quota_scrapes` and `quota_observations` are **untouched**
+— the existing observation and controller columns keep their current meaning
+(`shared-store.ts:206-247`). There is no `pool_id` column anywhere, per §5.1.
 
 ```sql
--- Single source of truth for what version this file is at and who owns it.
-CREATE TABLE IF NOT EXISTS quota_coordinator_meta (
-  singleton          INTEGER PRIMARY KEY CHECK (singleton = 1),
-  schema_version     INTEGER NOT NULL,
-  protocol_major     INTEGER NOT NULL,
-  owner_boot_id      TEXT,                 -- service instance identity
-  owner_started_at   TEXT
-);
+-- The entire v1 schema change.
+PRAGMA user_version = 1;
 ```
 
-That is the whole of it. Three tables an earlier revision proposed are gone with
-the operations that needed them, and the reason each one is gone is worth
-recording so v2 does not have to rediscover it:
+Revision 6 proposed a `quota_coordinator_meta` singleton, and review was right
+that it did not earn itself. Taking its four columns in turn:
+
+- **`schema_version`** is the only one with a job, and SQLite already has a field
+  for exactly this. Nothing in the tree reads or writes `user_version` or
+  `application_id` on any database, so the header field is unclaimed and a table
+  is a heavier way to store one integer.
+- **`protocol_major`** described the *binary*, not the file. Two services built
+  from different commits can open the same database; the wire version is settled
+  at `hello` between a client and a server (§5.2), where both ends are present.
+  Storing it in the file could only ever record which service wrote last.
+- **`owner_boot_id` and `owner_started_at`** had no defined read, no write
+  ordering, no fencing rule and no recovery path — they looked like a lease
+  without being one, which is worse than either having a lease or not. If a
+  second service ever has to be excluded, that is a real acquisition protocol
+  with crash recovery, and it belongs in the proposal that needs it. v1 has one
+  service by construction (§9.1) and excludes the old writer with the path, not
+  with a row (§8.2).
+
+Dropping the table also removes an inconsistency review caught: §8.2 described an
+`authoritative` flag that the schema did not contain. There is now no flag, and
+§8.2 says what actually guards misconfiguration.
+
+Three tables an earlier revision proposed are gone with the operations that
+needed them, and the reason each one is gone is worth recording:
 
 - **`quota_lanes` and `quota_leases`** held reservation state. v1 reserves
   nothing. Their design, including the partial unique index that made "at most
-  one hold per lane" a database invariant rather than handler logic, is kept in
-  §11.
+  one hold per lane" a database invariant rather than handler logic, survives as
+  an invariant in §11.2.
 - **`quota_ingest_receipts`** made a replayed client observation cost no LLM
   parse. v1 has no client observations to replay, because clients do not scrape
   and the service accepts nothing from them. The table's entire purpose was
@@ -990,24 +1110,23 @@ and byte-preserving; it is not a migration, and it is what buys the old-writer
 guarantee below.
 
 One asymmetry to record for the rollback path: while the service owns the file it
-creates `quota_coordinator_meta`, which a pre-service build never reads. Rolling
-back therefore leaves one unread table behind. That is harmless —
-`ensureSchema` is `CREATE TABLE IF NOT EXISTS` throughout
-(`shared-store.ts:206-247`) and no old code path selects from it — but it means a
-rollback is not quite byte-identical, and saying so is better than discovering it.
+sets `PRAGMA user_version`, which a pre-service build never reads. Rolling back
+therefore leaves a non-zero `user_version` behind in a four-byte header field
+that no old code path consults. That is harmless, and it is smaller than the
+leftover table revision 6 would have left, but it means a rollback is not quite
+byte-identical and saying so is better than discovering it.
 
 ### 8.2 No concurrent old and new writers
 
 An earlier revision claimed this was "enforced, not promised" via an
-`authoritative` flag in `quota_coordinator_meta`. **That claim was wrong, and it
-is withdrawn.** Only a build that already contains the check would consult that
-row; a genuinely old binary started by hand runs today's `ensureSchema()` and
-writes, having read no version and no flag at all — the current store reads no
-`user_version`, no `application_id` and no schema version of any kind
-(`shared-store.ts:182-192`, `:206-272`). A flag in the file cannot fence a
-writer that never looks at it. For the same reason, a "poison pill"
-`schema_version` bump does not work either: it fences rolled-back *services*
-(§5.2), not pre-service instances.
+`authoritative` flag in the file. **That claim was wrong, and it is withdrawn.**
+Only a build that already contains the check would consult it; a genuinely old
+binary started by hand runs today's `ensureSchema()` and writes, having read no
+version and no flag at all — the current store reads no `user_version`, no
+`application_id` and no schema version of any kind (`shared-store.ts:182-192`,
+`:206-272`). A marker in the file cannot fence a writer that never looks at it.
+For the same reason a "poison pill" version bump does not work either: it fences
+rolled-back *services* (§5.2), not pre-service instances.
 
 Filesystem permissions cannot fence it either, as the instances and the service
 run as the same user against the same path.
@@ -1036,16 +1155,19 @@ stray **scraper** as well as the stray writer, which matters more under A5 than
 it did before: two scrapers against one account produce quota consumption nobody
 scheduled, and unlike a stray write it leaves no row to notice afterwards.
 
-The `authoritative` flag is kept, demoted to what it honestly is: a clear, fast
-error for a **new** build misconfigured back into direct mode against the
-service's file. It is a usability guard, not a fence.
+What remains is a usability guard rather than a fence, and it needs no new
+storage: a **new** build misconfigured back into direct mode opens the file,
+reads a non-zero `user_version` (§7), and refuses with a message naming the
+socket it should have used. That helps the operator who mis-edits a config. It
+does nothing about an old binary, and it does not pretend to.
 
 If the operator wants ownership-level enforcement as well, the heavier
 alternative is to run the service as its own service user and `chown` the
 database `0600` to it, so any instance process gets `EACCES`. Revision 6 makes
 this materially harder rather than merely inconvenient: under A5a that user would
 also need its own provider CLI authentication context, which is a credential
-migration rather than a `chown`. It is Q6 in §13.
+migration rather than a `chown`. That is Q6 in §13, and v1's stated default is
+not to do it.
 
 ### 8.3 Canary and rollback
 
@@ -1057,16 +1179,21 @@ where that shows.
 | 0 | Install the unit; service runs against a **copy**, probe loop **off**. Instances unchanged. | Unit starts, socket appears with the right mode, `hello`/`healthz`/`readyz`, `GET /v1/throttle` matches what the file says, backups run, metrics appear | Stop and remove the unit. Nothing touched. |
 | 1 | Enable the probe loop, still against the copy. Instances still scraping. | **The probe works outside an instance process** — bwrap, tmux, provider CLI auth, LLM parse (A5, A5a). Compare the copy's observations against the live file's for the same slots. | Disable the probe loop, or stop the unit. |
 | 2 | Point one instance at the socket in **compare-only** mode: it reads `GET /v1/throttle`, logs the difference against its own `getProviderThrottle`, and applies nothing. | The wire shape and the client mapping, under real traffic, at zero behavioural risk | Config flag off. No state to unwind. |
-| 3 | The flip (A6). Back up. Stop all instances. Rename the database, create the blocking directory at the old path, point the service at the real file with the probe loop on, start it, start instances with `socketPath` and **no** `databasePath`. | Exactly one scrape per cadence pool-wide; the service's controller advances; each instance's applied interval tracks the publication; no instance opens the file | Stop instances, stop the service, remove the directory, rename back, restore `databasePath`, restart. The observation data never changed; see §8.1 on the leftover meta table. |
+| 3 | The flip (A6). Back up. Stop all instances. Rename the database, create the blocking directory at the old path, point the service at the real file with the probe loop on, start it, start instances with `socketPath` and **no** `databasePath`. | Exactly one scrape per cadence pool-wide; the service's controller advances; each instance's applied interval tracks the publication; no instance opens the file | Stop instances, stop the service, remove the directory, rename back, restore `databasePath`, restart. The observation data never changed; see §8.1 on the leftover `user_version`. |
 
-Two things about stage 1 that should be decided rather than discovered:
+Two things about stage 1, the first of which is settled:
 
-- **It doubles the scrape rate for its duration.** The service and the instances
-  both probe, against the same real account. Provider `/usage` panels are cheap,
-  but "cheap" is not "free", and the stage should be short and scheduled rather
-  than left running. The alternative — flipping straight from stage 0 to stage 3
-  — trades that cost for finding out whether the probe works at all during the
-  quiesce window, which is the wrong moment.
+- **It runs two scrapers against the real account for its duration, and that is
+  accepted.** The operator's guidance on this proposal is that this is close to
+  the status quo: production and staging already scrape the same account
+  independently (§1.8), so the stage adds a third scraper only briefly, and the
+  intended end state is that the service's deployment lands together with
+  staging's switch to consuming it — which *moves* one of the two existing
+  scrape consumers into the service rather than adding to them. The stage should
+  still be short and scheduled rather than left running, but it needs no
+  further approval. The alternative — flipping straight from stage 0 to stage 3
+  — would trade that cost for finding out whether the probe works at all during
+  the quiesce window, which is the wrong moment.
 - **The comparison it supports is narrower than it looks.** Compare
   *observations* — percent left, reset instants, inferred state — not controller
   integrals. The two files' controller histories diverge the instant they fork,
@@ -1103,7 +1230,7 @@ strongly:
 - **The contract hides the implementation completely.** No client knows that a
   scrape is a tmux-driven PTY capture of an interactive TUI
   (`agy-usage-scrape.ts:43-100`), or that parsing is an LLM call
-  (`quota-mcp.ts:493-540`). If a provider ever exposes quota through an API, the
+  (`quota-mcp.ts:543-595`). If a provider ever exposes quota through an API, the
   swap changes one process and no client, because nothing on the wire mentions a
   scrape.
 - **Consumers are not the source of what they consume.** This is the property
@@ -1113,23 +1240,60 @@ strongly:
 - **A read-only client needs one GET.** A dashboard, a report, or any future
   reader calls `GET /v1/throttle` or `GET /v1/quota` and nothing else.
 
-**What this costs, and it is a real cost.** Deleting ingestion deletes the relay
-path an earlier revision designed for A1a. The set of processes that consume the
-shared account is still larger than the set the service can see: a follower's
-provider CLI on another host bills the same account (#237), and so does
-interactive human use on any other machine. Under revision 5 a follower's
-observations *could* in principle have reached the service through its leader,
-because there was an endpoint to relay them to. Under v1 there is not — that
-consumption is not merely unimplemented, it is **unexpressible**.
+**What this costs, stated accurately.** An earlier revision claimed that deleting
+ingestion left the service blind to consumption it used to be able to receive by
+relay, and treated that as a narrowing. **That claim was wrong on the facts and
+is withdrawn.** The scrape is not host-scoped: the parse prompt asks for the
+provider's account-level windows explicitly (`quota-mcp.ts:342-391`), so
+consumption from another host under the same account, or from interactive human
+use anywhere, already arrives at the next scrape as a lower `percentLeft` on the
+same panel, and the controller reacts to it. That was true before this proposal
+and it stays true after it; the observation boundary is the account, and the
+relay path that revision 5 designed would have duplicated information the panel
+already carries.
 
-The controller only reacts to what it observes, so unseen consumption shows up
-later as an unexplained window exhaustion rather than as a widened interval.
-Interactive use on another machine is already this kind of blind spot today, and
-#237 implements no quota scraping or reporting on the follower side, so nothing
-regresses in practice. What changes is that closing the blind spot now requires
-a protocol addition rather than a client. That is Q9, and it is a genuine
-narrowing rather than a simplification, which is why it is written here in the
-section that would otherwise only carry good news.
+What is genuinely missing is narrower, and it is unchanged by v1: the service
+cannot **attribute** consumption to a source, and it cannot see a spend
+*between* scrapes — a burst inside one tick is only visible at the next. Neither
+of those is a v1 requirement, neither is made worse by deleting ingestion, and
+the levers for both are cadence and attribution rather than topology (§4.3).
+The earlier off-host observation-source requirement is superseded and is not
+carried forward.
+
+### 8.5 What the A/B harness gives up by becoming a client
+
+§1.7 settles that the harness stops running its own `QuotaService`. The cost
+lands here rather than there, because it is a real one and it should not be
+buried in the section that decides it.
+
+The rig's `ttlMs: 0` (`ab-context.ts:350-355`) exists so that the reading taken
+at the end of a run is a *fresh probe*, not the launch reading served back out of
+the cache — the failure it prevents is documented alongside it
+(`harness/quota-capture.ts:32-42`), and a second defence rejects a diff whose two
+`scrapedAt` stamps are equal. A client of the service cannot force a probe,
+because there is no endpoint that makes one happen (§5.5): every read is served
+from the service's own last observation.
+
+So the harness loses **resolution, not correctness**. Its measured delta is
+bounded below by the service's tick — a run shorter than one tick can land
+entirely between two scrapes and report a zero delta that is an artefact of
+sampling rather than a fact about the run. Three things keep that from being a
+regression in practice:
+
+- The existing equal-`scrapedAt` defence keeps working unchanged, and it is
+  exactly the right check: with the service as the source, an unchanged
+  `scrapedAt` across a run means "no new observation", which the rig must treat
+  as *no measurement* rather than as *no consumption*.
+- `GET /v1/throttle` and `GET /v1/quota` both carry the observation's
+  `scrapedAt` and the freshness block (§5.5), so the rig can report the sampling
+  interval it actually got instead of implying a precision it does not have.
+- The service's tick is configuration, not a constant (`start.ts:3509-3517`), so
+  a rig run that needs finer resolution is a scheduling problem — run the
+  service's cadence tighter for the duration — rather than a reason to keep a
+  second scraper against the shared account.
+
+Criterion 14 covers this: the harness reads through the service, takes no
+`databasePath`, and treats an unchanged `scrapedAt` as a missing measurement.
 
 ---
 
@@ -1149,11 +1313,11 @@ probe actually runs in:
 
 - the provider CLIs on `PATH`, with their authentication state readable;
 - `bwrap` available, since the probe sandboxes itself
-  (`quota-mcp.ts:898-901`);
+  (`quota-mcp.ts:952-955`);
 - `tmux` available, since the agy panel is only reachable through a PTY
   (`agy-usage-scrape.ts:43-100`);
 - a `workersDir` it may create `quota-probe-<provider>` under
-  (`quota-mcp.ts:876-881`);
+  (`quota-mcp.ts:930-935`);
 - `$XDG_RUNTIME_DIR` set, for both the tmux socket and the service's own
   listener.
 
@@ -1234,7 +1398,7 @@ observation per `(provider, kind)` is never pruned
 (`shared-store.ts:279-299`) — the controller's memory must not be deleted out
 from under it.
 
-v1 adds no retained table. `quota_coordinator_meta` is a single row.
+v1 adds no table and therefore nothing new to retain (§7).
 
 ### 9.5 Rollback drill
 
@@ -1287,6 +1451,19 @@ right foundation for 1 and 8.
 5. **Staleness degrades one way.** With observations aged past
    `hardStaleAfterMs`, the published interval is `maxIntervalSeconds` — never the
    last reasoned interval, never faster.
+   **5a. Freshness follows the oldest bucket, not the newest stamp.** Persist two
+   kinds for one provider, then re-observe only the narrow one repeatedly while
+   the wide one ages past `hardStaleAfterMs`. Assert that `freshness.ageMs` and
+   `freshness.governingBucketAgeMs` both reflect the **aged** bucket, that
+   `hardStale` is true, and that the published interval is `maxIntervalSeconds`.
+   This is the criterion that would fail today's shape:
+   `getProviderThrottle.updatedAt` is the newest `observed_at` across kinds
+   (`shared-store.ts:625-631`) while the governing interval comes from the widest
+   window (`:622-623`), so a provider whose narrow bucket keeps refreshing would
+   report fresh indefinitely with a stale governing bucket underneath. Assert on
+   `freshness`, and separately assert that `updatedAt` still carries its current
+   newest-stamp meaning, so the display field and the safety field cannot be
+   confused for each other.
 6. **Unavailability changes nothing dangerous.** Remove the socket. Assert:
    clients keep launching, normal and responsive alike; each client's applied
    interval is unchanged until `hardStaleAfterMs` since its own last successful
@@ -1294,6 +1471,14 @@ right foundation for 1 and 8.
    `quota_observations` row counts attributable to any client are **zero** for
    the whole window; `quota_client_service_connected` reads 0. Note what is
    deliberately *not* asserted: that anything stops. v1 gates nothing.
+   **Then restart a client while the socket is still absent**, which is the case
+   §5.7 rule 0 exists for: assert the fresh process launches at
+   `maxIntervalSeconds` and not unpaced. Today's lazy construction is
+   `new ProviderPacer(0)` (`start.ts:1267-1275`) and the in-process last-applied
+   interval does not survive the restart, so a client that has never had a
+   successful read has nothing to retain — this criterion fails without rule 0.
+   Run the same assertion for a service that is up but protocol-refuses the
+   client at `hello`, which reaches the same state by a different route.
 7. **The surface is read-only.** For every v1 path, `POST`, `PUT`, `PATCH` and
    `DELETE` all return 405, and no v1 path accepts a request body. Assert this by
    enumerating the served routes rather than by listing paths in the test, so a
@@ -1307,8 +1492,10 @@ right foundation for 1 and 8.
    Assert on the real failure and on the absent probe, not on a flag being read.
 9. **Protocol and schema guards.** A client whose `protocolMajor` differs is
    refused at `hello` and keeps its last applied interval rather than adopting
-   anything; a service whose known `schema_version` is lower than the file's
-   refuses to open it and exits non-zero.
+   anything (and then satisfies criterion 6's restart case); a service whose
+   supported schema version is lower than the file's `PRAGMA user_version` (§7)
+   refuses to open it and exits non-zero. Assert also that `hello` carries no
+   `databasePath`, so a client cannot learn the file's location from the wire.
 10. **Continuity across the flip.** Take a database with populated controller
     state, run the flip, and assert the first post-flip controller step reads the
     pre-flip `controller_integral` and `controller_derivative` rather than zero
@@ -1331,16 +1518,48 @@ right foundation for 1 and 8.
     a *single* sandboxed instance on a fixed port
     (`packages/rusa/src/actor/e2e-instance-manager.ts:28-29`), so building the
     second one is part of this criterion's cost, not a given.
+13. **A restart costs freshness and nothing else.** Drive a good reading, then a
+    bad one, so the provider is mid-`carried_forward_bad_read`. Restart the
+    service. Feed a second bad reading and assert the new observation continues
+    the same chain rather than starting a fresh one — which requires the service
+    to hydrate `prevState` from the latest persisted `quota_scrapes.parsed_state`
+    (`shared-store.ts:318-333`) at boot instead of leaving the cache empty
+    (`quota-mcp.ts:754`, read at `:779`). Assert alongside it that no
+    `quota_observations` row was rewritten by the restart and that the first
+    post-restart publication equals the last pre-restart one. Without hydration
+    this criterion fails while every row on disk is intact, which is exactly why
+    it is a criterion and not a note.
+14. **The A/B harness is a client.** The rig builds no `QuotaService` and is
+    given no `databasePath`; assert that a rig run performs zero probes of its
+    own and that its start and exit readings both come from the service. Assert
+    that a run whose two readings carry the same `scrapedAt` is reported as *no
+    measurement* rather than as a zero delta (§8.5), which is the existing
+    equal-stamp defence (`harness/quota-capture.ts:32-42`) kept intact against
+    the new source.
+15. **`get_quota` reads through the service.** With the socket present, the
+    agent-facing MCP tool answers from `GET /v1/quota` and triggers no probe; with
+    the service cold, it returns the `unknown` shape with a `freshness` block
+    rather than an error or a blocking probe (§5.5). Assert the probe count is
+    zero in both cases — this is the criterion that keeps a second scraper from
+    reappearing on the service's own host.
 
 ---
 
 ## 11. Deferred to v2 — cross-instance launch coordination
 
-**Nothing in this section is part of v1.** It is here because three rounds of
-review found real defects in this machinery and fixed them, and throwing that
-away would mean rediscovering the same defects later. What follows is the settled
-shape, compressed, with each finding attached to the thing it changed. It is a
-starting position for a v2 proposal, not a proposal.
+**Nothing in this section is part of v1, and v2 is not scheduled.** The operator's
+direction on this proposal is to wait and see whether cross-instance coordination
+turns out to be necessary at all, once the read-only coordinator is running and
+there is evidence rather than argument to decide on.
+
+Earlier revisions carried the full settled protocol here — tables, endpoints,
+lease lifecycle, roughly a hundred and seventy lines of a design explicitly out of
+scope. Review asked what v1 lost by cutting it to the lessons plus a successor
+issue, and the answer is: nothing that a v2 author would not re-derive from the
+list below in an afternoon. What follows is therefore the **gap**, the
+**invariants three rounds of review paid for**, and the **questions**. The
+protocol itself is deleted; a successor issue is filed with a pointer to this
+section (§12).
 
 ### 11.1 The gap, and what deferring it costs
 
@@ -1349,157 +1568,86 @@ starting position for a v2 proposal, not a proposal.
 *rate* but not the *clock*, so N instances each start immediately at boot and the
 pool's effective normal-launch rate is `N × 1/interval` (§1.5). v1 does not
 change this. Closing it is what "cross-instance throttling is not free" meant in
-#178, and until v2 lands, the pool's spacing promise is a per-process promise.
+#178, and until it is closed, the pool's spacing promise is a per-process
+promise.
 
-### 11.2 Assumptions this machinery needs, which v1 does not
+Two assumptions any v2 needs and v1 does not: **A3**, that a reservation survives
+a client crash, so its state is durable and self-healing rather than in-memory
+(*confidence: high*); and **A7**, that a client can bound the delay between
+deciding to spawn and the provider process actually starting (*confidence: medium
+on one host, unestablished across a leader-to-follower dispatch under #237*). A7
+is the weakest link in any spacing guarantee, because it is an obligation on the
+client rather than a property the coordinator can check.
 
-- **A3 — A reservation must survive a client crash.** An instance can die between
-  reserving and starting, so reservation state has to be durable and
-  self-healing, not in-memory. *Confidence: high.*
-- **A7 — A client can bound the delay between deciding to spawn and the provider
-  process actually starting.** This is what makes a launch deadline enforceable
-  rather than decorative, and it is the weakest link in any spacing guarantee:
-  it is an obligation on the client, not a property the coordinator can check.
-  *Confidence: medium on one host — the gap is an event-loop turn plus process
-  creation, but a loaded host or a slow sandbox widens it. Unestablished across a
-  #237 leader-to-follower dispatch — the last question in §11.5.*
+### 11.2 Invariants review has already paid for
 
-### 11.3 The settled design, and why each part is the way it is
+Each of these cost a review round to find. They are stated as constraints on a
+future design, not as a design:
 
-**A grant is an exclusive hold on a lane, not a clock advance.** At most one
-unconfirmed launch exists per lane at a time.
+1. **Stamp the lane clock at confirmation, not at grant.** Advancing at grant
+   does not bound spacing between *actual* starts — a client granted early may
+   spawn late while the next spawns immediately. Confirmation-stamping also
+   deletes rollback machinery entirely, because a cancel touches no clock.
+2. **Every clock advance is monotonic** (`max(current, now + interval)`), so a
+   late arrival cannot pull a lane backwards.
+3. **Expiry advances the clock from the lease's expiry, not from its grant**, on
+   the assumption that silence may mean "spawned, then died"; an explicit cancel
+   is trusted and does not advance. Prefer an idle lane to a double spend.
+4. **Idempotency belongs at the storage layer, keyed by a client-supplied request
+   id.** A retry into a live hold returns its *remaining* TTL (a hold cannot be
+   extended by retrying), a retry into a reaped one reports expiry rather than
+   resurrecting it, and a retry into a revoked one says so.
+5. **A launch deadline is a client obligation with a margin, not a coordinator
+   guarantee.** Anchor it to a *monotonic* reading taken when the request is
+   sent, so it survives a clock step and stays conservative. This does not make
+   check-and-spawn atomic; A7 is that residual, named rather than hidden.
+6. **Accept late confirmations and repair forward.** The provider is already
+   running; refusing the report only loses the information. The excursion is
+   bounded by the client's overshoot and does not compound.
+7. **The pre-spawn check must be an existing operation, not a new one.** An
+   idempotent re-send of the reservation *is* a read of the hold's current state.
+   It buys the stoppable half of the responsive exception and does not narrow the
+   check-to-spawn window.
+8. **State the spacing bound in three parts, not one.** At most one hold per lane
+   (a schema invariant, not handler logic); consecutive *normal* starts spaced
+   given the client obligation; **no** guarantee for any pair involving a
+   responsive start, which is unqueued and unheld by construction
+   (`provider-pacer.ts:173-175`) and never has been spaced.
+9. **There is no safe local degraded pacer.** A bounded local formula is
+   aggregate-safe only under a *total* outage; under a partial one the connected
+   clients keep consuming the full rate while the disconnected one adds to it. A
+   client with no grant does not start a normal run — refusal fails closed at
+   once, silence defers and then fails closed. Responsive launches are never
+   blocked.
+10. **v2 reintroduces three things v1 removed**, and they should be planned as
+    reintroductions rather than met as surprises: a mutating surface (so §5.3's
+    "the worst a client can do is read" ends, and authorization returns);
+    fail-closed semantics (turning a service outage from a freshness problem into
+    an availability one); and reservation in the launch path, which inverts
+    today's pacer-then-mesh-queue order (`provider-pacer.ts:238-269`).
 
-**The lane clock is stamped at confirmation, not at grant.** *Revision 2's
-finding.* Advancing at grant does not bound the spacing between *actual* starts:
-a client granted at `t=0` may not spawn until its lease is nearly expired, while
-the next becomes grantable at `t=interval` and spawns immediately, so two real
-starts land far closer than one interval. Stamping on confirmation is both
-simpler and correct, and it mirrors the in-process pacer
-(`provider-pacer.ts:285-292`). It also deletes the rollback machinery entirely —
-a cancel touches no clock because the grant touched none, so there is no
-`granted_lane_version` column and no "which value do we restore" problem.
+What v1 leaves in place for that work: the service process, the socket, the
+versioned handshake, the schema guard, the ownership flip and the operational
+packaging are all prerequisites, and all land in v1.
 
-**Every clock advance is monotonic:**
-`next_available_at = max(next_available_at, t + interval_ms)`. This is what stops
-a confirmation arriving after something else has moved the lane from pulling the
-clock backwards.
-
-**Expiry advances from `expires_at`, not from `granted_at`.** Silence is
-compatible with "the client spawned and then died", so a reap advances as if the
-launch happened at the last possible instant. A cancel is different: it is a
-client *telling* the pool it did not start, and it is trusted as such. The cost
-of expiry is bounded and worth stating as a tuning knob: a crash between grant
-and spawn leaves the lane idle for up to `leaseTtlMs` longer than necessary.
-**Prefer idle to double-spent.**
-
-**`requestId` makes reservation idempotent, at the storage layer.** A retry after
-a lost response returns the same ticket or the same lease, never a second one.
-Three details carry weight: a retry into a live lease returns its **remaining**
-TTL, never a fresh one, so a hold cannot be extended by retrying into it; a retry
-into a reaped lease returns `expired` rather than resurrecting it, so a lost
-response and a silent one resolve identically and conservatively; and a retry
-into an invalidated lease returns `invalidated`.
-
-**The launch deadline is a client obligation with a margin, not a fact.**
-*Revision 4's finding.* The coordinator hands out a duration and then sees
-nothing until the confirm, so it cannot enforce that a launch begins while its
-permission is live. The client records a **monotonic** timestamp when it *sends*
-each reservation attempt and derives
-`deadline = monotonicNow(at send) + leaseTtlMs - spawnMarginMs`. Anchoring at
-send is what makes it conservative — the server stamps `expires_at` strictly
-after the send — and a monotonic reading survives an NTP step. What it does not
-do is make check-and-spawn atomic; A7 names that residual rather than hiding it.
-
-**Late confirms are accepted and repaired forward.** *The other half of revision
-4's finding.* A confirm arriving after `expires_at` is recorded, counted as
-`late`, and used to move the clock forward from the real start. The excursion is
-bounded by the client's overshoot and does not compound. Refusing it would be
-strictly worse: the provider is already running.
-
-**The pre-spawn check is `reserveLaunch` re-sent with the same `requestId`.**
-*Revision 5's finding.* An earlier revision named a "pre-spawn check" the
-protocol did not have — `reserveLaunch` answered only `granted`, `queued` or
-`expired`, and `confirmLaunch` is by definition post-spawn — so a holder whose
-permission had been taken away had no way to learn it. The repair adds no
-endpoint: the idempotent retry *is* a read of the lease's current state, and
-`invalidated` becomes its fourth response. It buys the stoppable half of the
-responsive exception, which is the only half any mechanism can buy; it explicitly
-does *not* narrow the check-to-spawn window, and nothing leans on it doing so.
-
-**The spacing bound is narrower than "all starts are spaced", in three parts.**
-*Revision 4's finding.* Guaranteed by the schema: at most one hold per lane, via
-a partial unique index rather than handler logic. Guaranteed for *normal* starts
-given the client obligation: consecutive normal starts are at least
-`interval_ms` apart whether the first settled by confirm, by expiry, or not at
-all. **Not** guaranteed for any pair involving a responsive start: a responsive
-run is unqueued and unheld by construction
-(`provider-pacer.ts:173-175`), so it can land beside an outstanding hold. The
-exception is exactly one start per responsive launch — holds are exclusive, so
-there is at most one holder to invalidate — and it is not a regression, since
-responsive runs have never been spaced.
-
-**Unavailability defers and then fails closed; there is no local degraded
-pacer.** *Revision 4's finding, and the sharpest one.* A bounded local formula
-(`poolInstances × max(lastKnown, maxInterval)`) is aggregate-safe only under a
-*total* outage. Under a partial one — one instance refused at `hello` while the
-coordinator serves everyone else — the connected clients keep consuming the full
-lane rate and the disconnected one adds to it. The formula was answering a
-question the client cannot ask: *is anyone else still getting grants?* Rather
-than build a client registry and heartbeats to let it ask, the answer is that a
-client with no grant does not start a normal run. An answered refusal fails
-closed at once; silence defers and then fails closed after
-`unavailableGraceSeconds`. Responsive launches are never blocked.
-
-**The tables.** `quota_lanes` (the durable form of `ProviderPacer`'s fields) and
-`quota_leases` (tickets and holds as one row's lifecycle, so ordering and grant
-are decided in one transaction), with `UNIQUE (lane, request_id)` for
-idempotency, a partial index on `state = 'queued'` keyed by `enqueued_at` for
-FIFO, and a partial unique index on `state = 'granted'` making "one hold per
-lane" a database invariant.
-
-### 11.4 What v2 inherits from v1, and what it has to add back
-
-v1 is not a detour. The service process, the socket, the versioned handshake, the
-schema guard, the meta table, the ownership flip and the operational packaging
-are all prerequisites for v2 and all land in v1.
-
-Three things v2 must reintroduce, and it is worth being explicit that they are
-reintroductions rather than surprises:
-
-- **A mutating surface.** `reserveLaunch`, `confirmLaunch`, `cancelLaunch`,
-  `renewLaunch` and `recordLaunch` are all writes, so §5.3's "the worst a client
-  can do is read" ends with v2, and the authorization question comes back.
-- **Fail-closed semantics.** v1 cannot fail closed because it grants nothing;
-  v2 must, and that turns a service outage from a freshness problem into an
-  availability one (§5.7 becomes §11.3's last paragraph).
-- **Ordering in the launch path.** Reserving after mesh admission and immediately
-  before spawn inverts today's order (pacer first, then mesh queue —
-  `provider-pacer.ts:238-269`); it keeps holds short, at the cost of deciding
-  cross-instance fairness at arrival order rather than submission order. That
-  trade is the second question in §11.5.
-
-### 11.5 Open questions that belong to v2, not to v1
-
-Carried forward so they are not lost, and deliberately **not** asked of the
-operator now:
+### 11.3 Questions that belong to v2, and are deliberately not asked now
 
 - **Is an unbounded, unspaced responsive path acceptable?** Both consequences are
   policy: responsive launches keep working in every degraded state, and a
-  responsive start can land arbitrarily close to a normal one. Both would be
-  closed by the same decision — make responsive runs take a hold, and accept that
-  an urgent wake can be made to wait.
-- **Reserve after mesh admission, or before?** Short holds and coordinator-order
+  responsive start can land arbitrarily close to a normal one. One decision
+  closes both — make responsive runs take a hold, and accept that an urgent wake
+  can be made to wait.
+- **Reserve after mesh admission, or before?** Short holds and arrival-order
   fairness, against long heartbeated holds and submission-order fairness.
 - **How long should an instance wait for an absent coordinator before it fails
   runs?** Too short costs a failed run during routine maintenance; too long
   produces a queue of deferred runs that surface as silence.
-- **Who enforces the launch deadline when the process holding the lease is not
-  the process that spawns?** Under #237 the leader reserves and the follower
+- **Who enforces the launch deadline when the process holding the reservation is
+  not the process that spawns?** Under #237 the leader decides and the follower
   spawns, across a connection that can itself be delayed. Making the guarantee
   hold there needs a remaining-duration field on that dispatch and a follower
   that refuses a stale one. Neither exists, and inventing a field in another
-  component's protocol is exactly the kind of gap worth asking about rather than
-  filling.
+  component's protocol is the kind of gap worth asking about rather than filling.
 
 ---
 
@@ -1513,18 +1661,27 @@ approved — that is a human decision, not a mesh one.
    envelope, the schema guard. Covers criteria 2, 7 and 9.
 2. **Move collection into the service.** The per-provider probe loop on
    `tickSeconds`, reusing `QuotaService`'s probe/parse/infer path and its TTL as
-   a floor (`quota-mcp.ts:768-786`); the single `prevState`; `geminiApiKey` on
-   the service; controller advancement moved out of the instance tick. Covers 1,
-   4, 5 and 11.
+   a floor (`quota-mcp.ts:822-842`); the single `prevState`, **hydrated at boot
+   from the latest persisted `parsed_state`** (`shared-store.ts:318-333`);
+   `geminiApiKey` on the service; controller advancement moved out of the
+   instance tick; freshness computed from the oldest current bucket rather than
+   the newest stamp. Covers 1, 4, 5, 5a, 11 and 13.
 3. **Client read mode in the instance.** `quota.coordinator.socketPath`; the tick
    body loses its probe and its controller step and keeps its apply
    (`start.ts:1355-1360`); `SharedQuotaStore` construction goes away
    (`start.ts:1101-1106`); the boot-time apply reads through the client
-   (`start.ts:1346-1348`). Covers 3.
+   (`start.ts:1346-1348`); **the cold-start default becomes
+   `maxIntervalSeconds`** rather than the current `new ProviderPacer(0)`
+   (`start.ts:1267-1275`). Covers 3, and criterion 6's restart case.
 4. **Dashboard and `get_quota` read through the client.** `GET /v1/quota` and
    `GET /v1/history` replace the direct service and store reads
    (`start.ts:3210-3216`), keeping `quotaApi`'s existing dependency shape
-   (`dashboard/quota-api.ts:150-160`). Gated on Q11 for the MCP tool.
+   (`dashboard/quota-api.ts:150-160`). The MCP tool is included — that is
+   settled, not gated (§13). Covers 15.
+4b. **The A/B harness becomes a client.** Delete its own `QuotaService`
+   construction (`ab-context.ts:350-355`), read start and exit values from the
+   service, and keep the equal-`scrapedAt` defence as a *no measurement* signal
+   (§8.5). Covers 14.
 5. **Relocation and old-writer exclusion.** The rename, the blocking directory
    placeholder, and the misconfiguration guard. Covers 8 and 10.
 6. **Unavailability handling.** Reconnect backoff, retaining the last applied
@@ -1536,93 +1693,92 @@ approved — that is a human decision, not a mesh one.
    service is up and its probes are failing.
 8. **End-to-end two-instance check.** Covers 12, and includes building the
    two-instance fixture the current single-instance manager does not provide.
+9. **Successor issue for cross-instance launch coordination.** Not an
+   implementation issue — a tracking one, filed when #178 closes, pointing at
+   §11's invariants and questions so the three rounds of review that produced
+   them are not repeated. It stays unscheduled until there is evidence that
+   pool-wide launch spacing is actually needed.
 
 ---
 
 ## 13. Open questions
 
-Q1 is settled and is kept as a record. The rest need a decision before
-implementation issues are cut, and answers change the design rather than just the
-wording. None of them is a mesh decision; approval of the design as a whole is
-the operator's.
+Revision 7 sorts this section by **who can answer**, because review was right
+that the previous version outsourced author decisions as approval gates. Three
+groups: settled with the answer recorded; decided here with a default the
+operator can override; and genuinely operator-only because they are judgements
+about tolerance rather than about design.
 
 **On the numbering.** Q3, Q4 and Q5 are absent because all three asked about
-reservation machinery — the responsive path, where in the launch path to reserve,
-and how long to wait for an absent coordinator. They are carried unnumbered at
-the end of §11.5 rather than deleted. The surviving numbers are left where they
-are rather than closed up, so references to them in earlier review still resolve
-to the same questions. Q8 onward are new in revision 6.
+reservation machinery; they are carried unnumbered in §11.3. Q9 is withdrawn
+(below). Surviving numbers are left where they are rather than closed up, so
+references to them in earlier review still resolve to the same questions.
 
-**Q1 — Will every instance sharing provider credentials run on one host, under
-one user account, for the foreseeable roadmap? — SETTLED.** Yes. The only
-multi-host work on the roadmap is #237, and its remote instances are
-leader-authoritative: admission, scheduling and accounting stay with the leader,
-and followers only execute provider CLIs. Production and staging remain the
-complete set of clients, and Option 2 is adopted (§4.1). Revision 6 adds a second
-reason the answer has to stay yes: under A5a the service must run where the
-provider CLIs are authenticated, so "one host" is now a constraint on the service
-as well as on its clients.
+### 13.1 Settled — recorded, not asked again
 
-**Q2 — Is a fourth `systemd --user` unit acceptable operational weight?** The
-alternative is an opt-in "this instance also hosts the quota service" mode, which
-removes a unit but introduces a leader-election problem the moment that instance
-restarts — and, under A5, decides which instance owns scraping, which is exactly
-the coupling §8.4 is trying to remove. This proposal assumes the separate unit is
-the cheaper of the two.
+- **Q1 — Will every instance sharing provider credentials run on one host, under
+  one user account, for the foreseeable roadmap? Yes.** The only multi-host work
+  on the roadmap is #237, and its remote instances are leader-authoritative:
+  admission, scheduling and accounting stay with the leader, and followers only
+  execute provider CLIs. Production and staging remain the complete set of
+  clients, and Option 2 is adopted (§4.1). Under A5a the service must also run
+  where the provider CLIs are authenticated, so "one host" is now a constraint on
+  the service as well as on its clients.
+- **Q8 — Is stage 1's temporary double scraping acceptable? Yes.** Two scrapers
+  against the real account for the length of that stage is close to the status
+  quo, since production and staging already scrape independently, and the
+  intended deployment moves one of those consumers into the service rather than
+  adding a third permanently (§8.3).
+- **Q10 — What happens to the A/B harness? It becomes a client of the service
+  and keeps no scraper of its own.** The cost — resolution bounded by the
+  service's tick, not correctness — is stated in §8.5 and tested by criterion 14.
+- **Q11 — Should the agent-facing `get_quota` MCP tool read through the service?
+  Yes.** Keeping a probe path would reintroduce on the service's own host exactly
+  the second scraper v1 exists to remove. The changed failure mode ("the service
+  is cold" instead of "the probe timed out") is why `GET /v1/quota` answers with
+  an `unknown` shape rather than an error (§5.5), and criterion 15 asserts it.
+- **Q12 — Does #178 stay open for v2? No.** #178 closes when the self-scrape,
+  read-only coordinator ships; v2 is deferred until there is evidence that
+  cross-instance launch coordination is needed, and §12's item 9 files the
+  successor as a tracking issue rather than a scheduled one.
 
-**Q6 — Should the service run as its own service user?** §8.2's path relocation
-is sufficient to exclude old writers. A dedicated user with `0600` ownership
-would add defence in depth — but under A5a that user would also need its own
-provider CLI authentication context, which turns a `chown` into a credential
-migration. Worth it, or over-engineered for a single-operator host?
+**Q9 is withdrawn.** It asked who observes consumption the service cannot see now
+that there is no ingestion endpoint, and it rested on a false premise: the parse
+prompt asks for the provider's **account-level** windows
+(`quota-mcp.ts:342-391`), so consumption from another host or from interactive
+human use already arrives at the next scrape as a lower `percentLeft`, exactly as
+it does today. There is no new blind spot to assign an owner to. What remains —
+no attribution, and no visibility *between* ticks — is unchanged by this proposal
+and is covered as a trigger in §4.3 rather than as a question. The requirement to
+source observations off-host that an earlier revision recorded here is superseded
+and removed.
 
-**Q7 — Is the one scheduled write-quiesce in stage 3 acceptable?** It is the only
-moment in the rollout that requires every instance to be stopped at once, and it
-is what makes "no concurrent old and new writers" — and now "no concurrent
-scrapers" — a guarantee rather than a hope.
+### 13.2 Decided here, with a default — override if you disagree
 
-**Q8 — Is stage 1's temporary double scraping acceptable?** Validating that the
-probe works in the service's process context before the quiesce window means
-running both scrapers against the real account for the length of that stage
-(§8.3). The alternative is finding out during the flip. This is a judgement about
-the pool's own provider account, which is the operator's rather than the
-design's.
+These are author and steward calls. They are written as decisions with reasons so
+they can be disagreed with cheaply, rather than as questions that hold up issue
+cutting.
 
-**Q9 — Who observes consumption the service cannot see, now that there is no
-ingestion endpoint?** A follower's provider CLI on another host bills the shared
-account (#237), and so does interactive human use on any other machine. v1
-deleted the relay path that could in principle have carried a follower's
-observation, so closing this blind spot now requires a protocol addition rather
-than a client (§8.4). Nothing regresses today — #237 implements no scraping or
-reporting on the follower side — but the question is whether closing it belongs
-to #237, to a follow-up here, or nowhere yet.
+- **Q2 — Is a fourth `systemd --user` unit acceptable operational weight?
+  Default: yes, a separate unit.** The alternative is an opt-in "this instance
+  also hosts the quota service" mode, which removes a unit but introduces a
+  leader-election problem the moment that instance restarts, and under A5 decides
+  which instance owns scraping — the exact coupling §8.4 removes. A fourth unit
+  on a host that already runs three is the cheaper of the two.
+- **Q6 — Should the service run as its own service user? Default: no, not in
+  v1.** §8.2's path relocation is what excludes old writers, and it does not need
+  a separate user. A dedicated user with `0600` ownership would add defence in
+  depth, but under A5a that user needs its own provider CLI authentication
+  context, turning a `chown` into a credential migration — a disproportionate
+  cost on a single-operator host. §4.2 states plainly that this is a correctness
+  boundary rather than a security one, so v1 does not claim isolation it has not
+  built.
 
-**Q10 — What happens to the A/B harness, which is a second scraper by design?**
-It builds its own `QuotaService` with `ttlMs: 0` precisely so that its exit
-reading is a real probe rather than a cached one, and the reasoning is documented
-along with the failure it prevents (`commands/ab-context.ts:350-355`,
-`harness/quota-capture.ts:32-42`). Under "the module owns collection" there are
-three answers and this design does not pick one: leave it as a documented
-exception, in which case the pool sees scrapes it did not schedule; give the
-service a fresh-read route, which would be the only non-read operation on an
-otherwise read-only surface and would let any client force a probe; or have the
-rig read published observations and accept a coarser measurement. The first is
-cheapest, the second is the one that costs §4.2's main property, and the third
-changes what the rig measures.
+### 13.3 Operator tolerance — the one thing the design cannot decide
 
-**Q11 — Should the agent-facing `get_quota` MCP tool read through the service?**
-It shares one `QuotaService` with the dashboard today
-(`quota-mcp.ts:1105-1109`), so after the flip it either becomes a client of
-`GET /v1/quota` or keeps a probe path of its own — and keeping one would
-reintroduce a second scraper on the same host, which is the thing v1 exists to
-remove. Reading through the service is the consistent answer; it is asked rather
-than assumed because it changes an agent-facing tool's failure mode from "the
-probe timed out" to "the service is cold".
-
-**Q12 — Does #178 stay open for v2, or is a new issue cut?** This proposal now
-covers strictly less than #178 asks for: the contract, compatibility, operations
-and test criteria are all addressed, but the atomic cross-instance reservation is
-deferred to §11. Whether #178 stays open until v2 lands, or is narrowed to v1 with
-a successor filed for the launch coordination, is a tracking decision rather than
-a design one — but it should be made deliberately, because it determines what
-"done" means for the issue this proposal answers.
+- **Q7 — Is the one scheduled write-quiesce in stage 3 acceptable?** It is the
+  only moment in the rollout that requires every instance to be stopped at once,
+  and it is what makes "no concurrent old and new writers" — and "no concurrent
+  scrapers" — a guarantee rather than a hope. The design cannot weigh that
+  downtime against the pool's obligations; that is a judgement about the running
+  system.
