@@ -178,7 +178,7 @@ import {
 import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "../mcp/update-mcp.js";
 import { isTerminalObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
-import { composeActorOutputSinks } from "../observability/actor-output-sink.js";
+import { actorOutputSinks, composeActorOutputSinks } from "../observability/actor-output-sink.js";
 import { DiskUsageAlert } from "../observability/disk-alert.js";
 import {
   collectConfigSecretEntries,
@@ -1198,22 +1198,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     }
   };
 
-  // Where an actor's raw model output goes. Named sinks rather than an inline
-  // closure: raw agent prose is a different stream from the structured
-  // diagnostics above, and each destination it reaches should be a line someone
-  // chose. #192 owns retiring the stdout mirror, which is one entry from here.
-  // Until it does, fd 1 carries both this raw prose and the logger's JSON lines;
-  // docs/logging.md says so where it tells an operator how to read the log.
+  // Where an actor's raw model output goes. The service's own stdout is not one
+  // of the destinations: fd 1 carries the logger's records and nothing else, so
+  // an actor cannot forge or reflect a service log line by printing one. The
+  // prose is read through the dashboard's live-output SSE — `rusa logs --actor
+  // <id>` follows the same stream from a terminal — and through the transcript
+  // the run boundary records in `mesh_events`.
   const emitActorOutput = composeActorOutputSinks(
-    [
-      {
-        name: "service-stdout",
-        deliver: ({ text }) => {
-          process.stdout.write(text);
-        },
-      },
-      { name: "dashboard-live-output", deliver: (chunk) => meshEmitter.emitLiveOutput(chunk) },
-    ],
+    actorOutputSinks({ emitLiveOutput: (chunk) => meshEmitter.emitLiveOutput(chunk) }),
     log.child({ component: "actor-output" })
   );
   const makeFirehose = (actorId: string) => (chunk: string) => {
@@ -2262,7 +2254,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               );
             }
           },
-          log: makeFirehose(id), // firehose (4d: session-tag) → console + dashboard SSE
+          log: makeFirehose(id), // firehose (4d: session-tag) → dashboard SSE / `rusa logs --actor`
         };
         // Second fail-closed gate, covering rehydrate/adopt as well as spawn: a
         // placement request only ever reaches a remote runtime, never a local
@@ -2811,7 +2803,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           );
         }
       },
-      log: makeFirehose(rootId), // firehose → console + dashboard SSE
+      log: makeFirehose(rootId), // firehose → dashboard SSE / `rusa logs --actor`
     });
   const rootRecord: ActorRecord = {
     id: rootId,

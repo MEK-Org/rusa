@@ -6,8 +6,10 @@ Rusa has one structured application logger, in
 so a record can be selected by field instead of matched by prose.
 
 Actor output is a different stream and is not logged. What an actor *says* goes
-to the run transcript in `mesh_events` and to the dashboard's live-output SSE;
-the logger carries what the mesh *did*.
+to the run transcript in `mesh_events` and to the dashboard's live-output SSE —
+followable from a terminal with `rusa logs --actor <id>`; the logger carries
+what the mesh *did*. See "Reading actor output" for why the two never share a
+stream.
 
 ## Getting a logger
 
@@ -164,11 +166,11 @@ whoever is already touching a module for another reason — not in one sweep.
 records are JSON:
 
 ```console
-$ journalctl --user -u rusa -o cat | jq -Rc 'fromjson? // empty | select(.component == "actor-run")'
+$ journalctl --user -u rusa -o cat | jq -c 'select(.component == "actor-run")'
 ```
 
-`-R` is there because the stream carries raw actor output too — see the caveat
-at the end of this section.
+Every line on that stream is a record this logger wrote — actor output has its
+own stream (see below), so `jq` needs no `-R` guard against stray prose.
 
 Run by hand in a terminal, the same records arrive as readable lines with no
 extra tooling:
@@ -183,21 +185,38 @@ $ rusa start
 start | jq` for JSON in a terminal, `RUSA_LOG_FORMAT=pretty` for readable lines
 out of a pipe.
 
-### One caveat: stdout is not only JSON yet
+## Reading actor output
 
-`rusa start` still mirrors raw actor model output to stdout, alongside these
-records. That text is not JSON and is not a log record — it is the actor's own
-prose, and it predates this logger — so a strict reader fails on it:
+The service log and the actor stream are separate on purpose, and they are read
+different ways. `journalctl --user -u rusa` is the mesh describing what it did:
+one JSON record per line, nothing else, so `jq` works without `-R` and a
+`select` matches a field rather than a shape of prose.
+
+An actor's words never reach it. That is the point rather than an omission —
+actor output is arbitrary text, so an actor that prints a source file containing
+a log line, or that runs `journalctl` and echoes the result, would inject
+records indistinguishable from the service's own. Grepping harder does not fix
+it, because the reflection carries the original prefix. Keeping the two streams
+apart does.
+
+What an actor said has two homes, both of which outlive the run:
+
+- **The transcript.** The run boundary records it in `mesh_events` at `run_end`;
+  `rusa report` reads a run back as a timeline.
+- **The live-output stream.** The dashboard subscribes to it over SSE while the
+  run is in flight, with a bounded replay buffer of recent chunks per actor.
+
+`rusa logs --actor <id>` follows that same live-output stream from a terminal:
 
 ```console
-$ rusa start | jq -c 'select(.component == "actor-run")'   # dies on the first actor chunk
-$ rusa start | jq -Rc 'fromjson? // empty | select(.component == "actor-run")'   # skips it
+$ rusa logs --actor worker-7
 ```
 
-Use the `-R` form until [#192](https://github.com/MEK-Org/rusa/issues/192)
-retires the stdout mirror; the actor output is already durable in the transcript
-and on the dashboard's SSE stream, so removing it there costs nothing here. Once
-it lands, stdout is JSON lines only and plain `jq` works.
+It prints the actor's prose and nothing else — no heartbeats, no mesh events, no
+other actor's run — so it pipes and redirects cleanly, and shows the same bytes
+a dashboard tab is rendering off the same stream. It reaches the running
+service's dashboard port over loopback, so the service has to be up; without
+`--actor`, `rusa logs` still tails the service log.
 
 ## MCP HTTP request timelines
 
