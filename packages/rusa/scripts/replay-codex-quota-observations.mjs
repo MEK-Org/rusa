@@ -1,24 +1,12 @@
 import { copyFile, mkdir, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
-import { SharedQuotaStore } from "../dist/quota/shared-store.js";
-
-const OBSERVATION_COLUMNS = [
-  "provider",
-  "kind",
-  "observed_slot",
-  "label",
-  "observed_at",
-  "percent_left",
-  "reset_at_iso",
-  "window_ms",
-  "processed",
-  "controller_error",
-  "controller_derivative",
-  "controller_integral",
-  "uncapped_interval_seconds",
-  "interval_seconds",
-];
+import {
+  getObservationProjection,
+  OBSERVATION_COLUMNS,
+  SharedQuotaStore,
+} from "../dist/quota/shared-store.js";
 
 function usage() {
   return [
@@ -119,9 +107,10 @@ function snapshotMetadata(databasePath, since) {
          ORDER BY scraped_at ASC, rowid ASC`
       )
       .all(since);
+    const projection = getObservationProjection(db);
     const observations = db
       .prepare(
-        `SELECT ${OBSERVATION_COLUMNS.join(", ")}
+        `SELECT ${projection}
          FROM quota_observations
          WHERE provider = 'codex' AND observed_at >= ?
          ORDER BY observed_at ASC, rowid ASC`
@@ -240,6 +229,10 @@ function validateReplay(metadata, since) {
 }
 
 function applyReplay(databasePath, since, snapshot, rebuilt) {
+  // Ensure the target database is widened before inserting rebuilt observations
+  const store = new SharedQuotaStore(databasePath);
+  store.close();
+
   const db = new Database(databasePath, { fileMustExist: true });
   db.pragma("busy_timeout = 30000");
   try {
@@ -368,9 +361,13 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(
-    `[codex-observation-replay] ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`
-  );
-  process.exitCode = 1;
-});
+export { snapshotMetadata, OBSERVATION_COLUMNS, applyReplay, getObservationProjection };
+
+if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
+  main().catch((error) => {
+    process.stderr.write(
+      `[codex-observation-replay] ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`
+    );
+    process.exitCode = 1;
+  });
+}

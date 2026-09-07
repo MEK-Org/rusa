@@ -45,6 +45,19 @@ export const QUOTA_DERIVATIVE_TAU_SECONDS = 1800;
 export const QUOTA_ACTUATOR_SMOOTHING = 0.25;
 export const QUOTA_MAX_SLEW_SECONDS = 900;
 /**
+ * Number of consecutive persisted negative controller errors required before
+ * applying the recovery output credit overlay.
+ */
+export const QUOTA_RECOVERY_CONFIRMATIONS = 3;
+/**
+ * Wall-time half-life of the recovery output credit: two hours.
+ */
+export const QUOTA_RECOVERY_HALF_LIFE_SECONDS = 2 * 3600;
+/**
+ * Maximum elapsed wall time integrated in a single recovery credit update step (one hour).
+ */
+export const QUOTA_RECOVERY_MAX_ELAPSED_SECONDS = 3600;
+/**
  * A rise in remaining quota above this many points is read as a refill rather
  * than a measurement. Inside one window `percentLeft` only falls — consumption
  * is the only thing that moves it — so a genuine rise means the budget was
@@ -57,6 +70,39 @@ export const QUOTA_MAX_SLEW_SECONDS = 900;
  * of points at once — a weekly window returns to ~100 from single digits.
  */
 export const QUOTA_REFILL_EPSILON_POINTS = 2;
+
+export const OBSERVATION_COLUMNS = [
+  "provider",
+  "kind",
+  "observed_slot",
+  "label",
+  "observed_at",
+  "percent_left",
+  "reset_at_iso",
+  "window_ms",
+  "processed",
+  "controller_error",
+  "controller_derivative",
+  "controller_integral",
+  "uncapped_interval_seconds",
+  "interval_seconds",
+  "commanded_interval_seconds",
+  "commanded_uncapped_interval_seconds",
+  "recovery_credit_seconds",
+] as const;
+
+/**
+ * Returns a SQL SELECT column projection for `quota_observations` that dynamically falls back
+ * to `NULL AS <col>` for columns that have not yet been added to a pre-upgrade database schema.
+ */
+export function getObservationProjection(db: Database.Database): string {
+  const existing = new Set(
+    (db.prepare("PRAGMA table_info(quota_observations)").all() as Array<{ name: string }>).map(
+      (c) => c.name
+    )
+  );
+  return OBSERVATION_COLUMNS.map((col) => (existing.has(col) ? col : `NULL AS ${col}`)).join(", ");
+}
 
 export function resolveQuotaDatabasePath(configuredPath: string, rusaHome: string): string {
   const expanded =
@@ -153,11 +199,15 @@ interface ReasonedObservation {
   resetAtIso: string | null;
   intervalSeconds: number;
   uncappedIntervalSeconds: number;
+  commandedIntervalSeconds?: number | null;
+  commandedUncappedIntervalSeconds?: number | null;
+  recoveryCreditSeconds?: number | null;
   controllerError: number;
   controllerDerivative: number;
   controllerIntegral: number | null;
-  percentLeft: number;
   observedAt: string;
+  percentLeft: number;
+  windowMs?: number;
 }
 
 interface StoredScrapeRow {
@@ -233,6 +283,9 @@ export class SharedQuotaStore {
         controller_integral REAL,
         uncapped_interval_seconds REAL,
         interval_seconds REAL,
+        commanded_interval_seconds REAL,
+        commanded_uncapped_interval_seconds REAL,
+        recovery_credit_seconds REAL,
         PRIMARY KEY(provider, kind, observed_slot)
       );
       CREATE INDEX IF NOT EXISTS idx_quota_observations_provider_time
@@ -263,6 +316,17 @@ export class SharedQuotaStore {
       );
       if (!columns.has("controller_integral")) {
         this.db.exec("ALTER TABLE quota_observations ADD COLUMN controller_integral REAL");
+      }
+      if (!columns.has("commanded_interval_seconds")) {
+        this.db.exec("ALTER TABLE quota_observations ADD COLUMN commanded_interval_seconds REAL");
+      }
+      if (!columns.has("commanded_uncapped_interval_seconds")) {
+        this.db.exec(
+          "ALTER TABLE quota_observations ADD COLUMN commanded_uncapped_interval_seconds REAL"
+        );
+      }
+      if (!columns.has("recovery_credit_seconds")) {
+        this.db.exec("ALTER TABLE quota_observations ADD COLUMN recovery_credit_seconds REAL");
       }
     });
     // Every process acquires the write reservation before inspecting the
@@ -382,7 +446,8 @@ export class SharedQuotaStore {
       .prepare(
         `SELECT 'provider' AS scope, kind, label, observed_at AS observedAt,
                 percent_left AS percentLeft, reset_at_iso AS resetAtIso,
-                controller_error AS controllerError, interval_seconds AS intervalSeconds
+                controller_error AS controllerError,
+                COALESCE(commanded_interval_seconds, interval_seconds) AS intervalSeconds
          FROM quota_observations
          WHERE provider = ? AND observed_at >= ?
          ORDER BY observed_at ASC, rowid ASC`
@@ -423,29 +488,25 @@ export class SharedQuotaStore {
       return;
     }
 
-    const previous = this.db
+    const previousRows = this.db
       .prepare(
         `SELECT interval_seconds AS intervalSeconds,
+                uncapped_interval_seconds AS uncappedIntervalSeconds,
+                commanded_interval_seconds AS commandedIntervalSeconds,
+                commanded_uncapped_interval_seconds AS commandedUncappedIntervalSeconds,
+                recovery_credit_seconds AS recoveryCreditSeconds,
                 controller_error AS controllerError,
                 controller_derivative AS controllerDerivative,
                 controller_integral AS controllerIntegral,
                 observed_at AS observedAt, reset_at_iso AS resetAtIso,
-                percent_left AS percentLeft
+                percent_left AS percentLeft, window_ms AS windowMs
          FROM quota_observations
          WHERE provider = ? AND kind = ? AND interval_seconds IS NOT NULL
-         ORDER BY observed_at DESC, rowid DESC LIMIT 1`
+         ORDER BY observed_at DESC, rowid DESC LIMIT 2`
       )
-      .get(observation.provider, observation.kind) as
-      | {
-          intervalSeconds: number;
-          controllerError: number;
-          controllerDerivative: number;
-          controllerIntegral: number | null;
-          observedAt: string;
-          resetAtIso: string | null;
-          percentLeft: number;
-        }
-      | undefined;
+      .all(observation.provider, observation.kind) as ReasonedObservation[];
+    const previous = previousRows[0];
+    const previousPrevious = previousRows[1];
     const timeRemainingPct = Math.min(
       100,
       Math.max(0, ((resetMs - observedMs) / observation.windowMs) * 100)
@@ -474,6 +535,24 @@ export class SharedQuotaStore {
       previous != null &&
       observation.percentLeft - previous.percentLeft > QUOTA_REFILL_EPSILON_POINTS;
     const cycleChanged = resetMoved || quotaRefilled;
+
+    let prevCycleChanged = true;
+    if (previous && previousPrevious) {
+      const prevResetMs = previous.resetAtIso ? Date.parse(previous.resetAtIso) : Number.NaN;
+      const prevPrevResetMs = previousPrevious.resetAtIso
+        ? Date.parse(previousPrevious.resetAtIso)
+        : Number.NaN;
+      const prevWindowMs = previous.windowMs ?? observation.windowMs;
+
+      const prevResetMoved =
+        Number.isFinite(prevPrevResetMs) &&
+        Number.isFinite(prevResetMs) &&
+        Math.abs(prevPrevResetMs - prevResetMs) > Math.min(60 * 60 * 1000, prevWindowMs * 0.05);
+      const prevQuotaRefilled =
+        previous.percentLeft - previousPrevious.percentLeft > QUOTA_REFILL_EPSILON_POINTS;
+      prevCycleChanged = prevResetMoved || prevQuotaRefilled;
+    }
+
     const previousObservedMs = previous ? Date.parse(previous.observedAt) : Number.NaN;
     const dtSeconds = Number.isFinite(previousObservedMs)
       ? Math.max(1, (observedMs - previousObservedMs) / 1000)
@@ -510,8 +589,9 @@ export class SharedQuotaStore {
       integral = Math.max(candidateIntegral, Math.min(previousIntegral, lowerBound));
     }
     const uncappedCandidate = Math.max(0, rawInterval(integral));
-    // A rollover resets the controller memory, not the actuator. This resumes
-    // from the last reasoned period rather than treating the exhaustion wait as one.
+
+    // The legacy PID controller preserves the deliberate cap, smoothing, and
+    // slew rate unmodified as the protective actuator state.
     const previousInterval = previous?.intervalSeconds ?? 0;
     const smoothed =
       previousInterval + QUOTA_ACTUATOR_SMOOTHING * (uncappedCandidate - previousInterval);
@@ -524,11 +604,61 @@ export class SharedQuotaStore {
     );
     const interval = Math.min(opts.maxIntervalSeconds, uncappedInterval);
 
+    // Three-sample negative error gate derived from the preceding two persisted
+    // reasoned observations in the same cycle:
+    const isGateMet =
+      !cycleChanged &&
+      !prevCycleChanged &&
+      error < 0 &&
+      previous !== undefined &&
+      previous.controllerError < 0 &&
+      previousPrevious !== undefined &&
+      previousPrevious.controllerError < 0;
+
+    // Recovery credit overlay (MEK-Org/rusa#291):
+    // After three consecutive persisted negative errors, let a separate credit C
+    // approach the shadow integral contribution (Ki * I) with a 2-hour wall-time
+    // half-life, capping an elapsed gap at one hour. Command max(0, uncappedCandidate - C),
+    // subject to standard actuator smoothing and slew.
+    // On the first non-negative error, clear C and restore the shadow actuator output
+    // in that same update, bypassing upward smoothing/slew to restore protective pacing.
+    let credit = 0;
+    let commandedUncappedInterval: number;
+    let commandedInterval: number;
+
+    if (isGateMet) {
+      const previousCredit = cycleChanged ? 0 : (previous?.recoveryCreditSeconds ?? 0);
+      const creditDtSeconds = Math.min(dtSeconds, QUOTA_RECOVERY_MAX_ELAPSED_SECONDS);
+      const alpha = 1 - 2 ** (-creditDtSeconds / QUOTA_RECOVERY_HALF_LIFE_SECONDS);
+      credit =
+        previousCredit + alpha * (QUOTA_KI_SECONDS_PER_POINT_SECOND * integral - previousCredit);
+
+      const target = Math.max(0, uncappedCandidate - credit);
+      const previousCommanded =
+        previous?.commandedIntervalSeconds ?? previous?.intervalSeconds ?? 0;
+      const commandedSmoothed =
+        previousCommanded + QUOTA_ACTUATOR_SMOOTHING * (target - previousCommanded);
+      commandedUncappedInterval = Math.max(
+        0,
+        Math.min(
+          previousCommanded + QUOTA_MAX_SLEW_SECONDS,
+          Math.max(previousCommanded - QUOTA_MAX_SLEW_SECONDS, commandedSmoothed)
+        )
+      );
+      commandedInterval = Math.min(opts.maxIntervalSeconds, commandedUncappedInterval);
+    } else {
+      credit = 0;
+      commandedUncappedInterval = uncappedInterval;
+      commandedInterval = interval;
+    }
+
     this.db
       .prepare(
         `UPDATE quota_observations
          SET processed = 1, controller_error = ?, controller_derivative = ?,
-             controller_integral = ?, uncapped_interval_seconds = ?, interval_seconds = ?
+             controller_integral = ?, uncapped_interval_seconds = ?, interval_seconds = ?,
+             commanded_interval_seconds = ?, commanded_uncapped_interval_seconds = ?,
+             recovery_credit_seconds = ?
          WHERE provider = ? AND kind = ? AND observed_slot = ?`
       )
       .run(
@@ -537,6 +667,9 @@ export class SharedQuotaStore {
         integral,
         uncappedInterval,
         interval,
+        credit > 0 ? commandedInterval : null,
+        credit > 0 ? commandedUncappedInterval : null,
+        credit > 0 ? credit : null,
         observation.provider,
         observation.kind,
         observation.slot
@@ -583,6 +716,9 @@ export class SharedQuotaStore {
         `SELECT provider, kind, label, reset_at_iso AS resetAtIso,
                 interval_seconds AS intervalSeconds,
                 uncapped_interval_seconds AS uncappedIntervalSeconds,
+                commanded_interval_seconds AS commandedIntervalSeconds,
+                commanded_uncapped_interval_seconds AS commandedUncappedIntervalSeconds,
+                recovery_credit_seconds AS recoveryCreditSeconds,
                 controller_error AS controllerError,
                 controller_derivative AS controllerDerivative,
                 controller_integral AS controllerIntegral,
@@ -619,7 +755,11 @@ export class SharedQuotaStore {
       observedAt: string;
     }>;
     if (current.length === 0) return null;
-    reasoned.sort((a, b) => b.uncappedIntervalSeconds - a.uncappedIntervalSeconds);
+    reasoned.sort((a, b) => {
+      const uncappedB = b.commandedUncappedIntervalSeconds ?? b.uncappedIntervalSeconds;
+      const uncappedA = a.commandedUncappedIntervalSeconds ?? a.uncappedIntervalSeconds;
+      return uncappedB - uncappedA;
+    });
     const governing = reasoned[0];
     const currentByKind = new Map(current.map((row) => [row.kind, row]));
     const updatedAt =
@@ -628,13 +768,18 @@ export class SharedQuotaStore {
         .sort()
         .at(-1) ?? new Date(0).toISOString();
     const exhaustedUntil = this.getExhaustedUntil(provider);
+    const governingInterval = governing
+      ? (governing.commandedIntervalSeconds ?? governing.intervalSeconds)
+      : 0;
+    const governingUncapped = governing
+      ? (governing.commandedUncappedIntervalSeconds ?? governing.uncappedIntervalSeconds)
+      : 0;
     return {
       provider,
-      intervalSeconds: governing?.intervalSeconds ?? 0,
-      uncappedIntervalSeconds: governing?.uncappedIntervalSeconds ?? 0,
+      intervalSeconds: governingInterval,
+      uncappedIntervalSeconds: governingUncapped,
       governingBucketKey: governing ? `${provider}:${governing.kind}` : null,
-      capped:
-        governing !== undefined && governing.uncappedIntervalSeconds > governing.intervalSeconds,
+      capped: governing !== undefined && governingUncapped > governingInterval,
       expired: exhaustedUntil !== null,
       exhaustedUntil,
       updatedAt,
@@ -656,7 +801,7 @@ export class SharedQuotaStore {
               : 0,
           error: row.controllerError,
           derivative: row.controllerDerivative,
-          requiredIntervalSeconds: row.intervalSeconds,
+          requiredIntervalSeconds: row.commandedIntervalSeconds ?? row.intervalSeconds,
           resetAtIso: latest.resetAtIso,
           observedAt: latest.observedAt,
         };
