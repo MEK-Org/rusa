@@ -71,19 +71,11 @@ export class FakeIssueClient implements IssueClient {
       headRef: opts.head,
       title: opts.title,
       body: opts.body,
+      existingBody: opts.existingBody,
       ...(opts.base !== undefined ? { base: opts.base } : {}),
       author: this.botAccount,
     });
     return { number: pr.number, htmlUrl: pr.htmlUrl };
-  }
-
-  /** The PR `createPullRequest` above would upsert — the tracker's own head match. */
-  async findOpenPullRequestForHead(
-    _repo: string,
-    head: string
-  ): Promise<CreatedPullRequest | null> {
-    const pr = this.tracker.listPrs().find((p) => p.state === "open" && p.headRef === head);
-    return pr ? { number: pr.number, htmlUrl: pr.htmlUrl } : null;
   }
 
   async getOpenPullRequestsByAuthor(_repo: string, author: string): Promise<OpenPullRequest[]> {

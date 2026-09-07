@@ -27,7 +27,6 @@ function recordingIssueClient(
     createPullRequest: async () => ({ number: 1, htmlUrl: "" }),
     getOpenPullRequestsByAuthor: async () => [],
     getOpenPullRequests: async () => [],
-    findOpenPullRequestForHead: async () => null,
     listIssues: async () => [],
     getPullRequestDetails: async (repo, prNumber) => {
       calls.push({ method: "getPullRequestDetails", args: [repo, prNumber] });

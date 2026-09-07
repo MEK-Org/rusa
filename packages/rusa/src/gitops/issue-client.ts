@@ -20,6 +20,12 @@ export interface CreatePROptions {
   /** PR body/description */
   body: string;
   /**
+   * Alternative body to use when the client's existing-PR lookup selects an
+   * update rather than a creation. Keeping both variants at this seam makes
+   * that one lookup govern the body and PATCH/POST decision together.
+   */
+  existingBody?: string;
+  /**
    * GitHub username to request review from. Omit to open the PR with no
    * requested reviewer — the default, since a review is routed deliberately
    * rather than attached to every PR .
@@ -307,16 +313,6 @@ export interface IssueClient {
    * minus the author filter.
    */
   getOpenPullRequests(repo: string): Promise<OpenPullRequest[]>;
-  /**
-   * The single open PR {@link createPullRequest} would upsert for `head`, or
-   * null when that call would create a fresh one. Same owner-qualified question
-   * the upsert asks itself, so callers that need to know which branch they are
-   * on cannot drift from it — a fork's same-named branch is not this PR.
-   *
-   * Never throws: a failed lookup degrades to null ("treat as new"), so no
-   * caller turns a transient read error into a failed write.
-   */
-  findOpenPullRequestForHead(repo: string, head: string): Promise<CreatedPullRequest | null>;
   /** Query issues with optional state and label filters. */
   listIssues(repo: string, opts?: ListIssuesOptions): Promise<OpenIssue[]>;
   /** Fetch pull request details. */
@@ -538,13 +534,16 @@ export class GitHubIssueClient implements IssueClient {
   }
 
   async createPullRequest(opts: CreatePROptions): Promise<CreatedPullRequest> {
-    // Check if an open PR already exists for this head branch
+    // This one owner-qualified lookup selects both the HTTP verb and the body
+    // variant. Keeping that decision here prevents a separate caller precheck
+    // from disagreeing after a transient failure or concurrent PR change.
     const existing = await this.findOpenPullRequestForHead(opts.repo, opts.head);
+    const body = existing ? (opts.existingBody ?? opts.body) : opts.body;
     if (existing) {
       // Update the existing PR's title, body, and base (if provided), then return its number + URL
       await this.api("PATCH", `/repos/${opts.repo}/pulls/${existing.number}`, {
         title: opts.title,
-        body: opts.body,
+        body,
         ...(opts.base !== undefined ? { base: opts.base } : {}),
       });
       return existing;
@@ -555,7 +554,7 @@ export class GitHubIssueClient implements IssueClient {
     const pr = await this.api<{ number: number; html_url: string }>(
       "POST",
       `/repos/${opts.repo}/pulls`,
-      { title: opts.title, body: opts.body, head: opts.head, base }
+      { title: opts.title, body, head: opts.head, base }
     );
 
     // No reviewer means no review request at all — not a substituted default.
@@ -590,7 +589,10 @@ export class GitHubIssueClient implements IssueClient {
   /**
    * Check if an open PR already exists for a given head branch.
    */
-  async findOpenPullRequestForHead(repo: string, head: string): Promise<CreatedPullRequest | null> {
+  private async findOpenPullRequestForHead(
+    repo: string,
+    head: string
+  ): Promise<CreatedPullRequest | null> {
     try {
       const owner = repo.split("/")[0];
       const prs = await this.api<Array<{ number: number; html_url: string }>>(
@@ -1382,10 +1384,6 @@ export class GitBridgeIssueClient implements IssueClient, GitHubPollingIssueClie
 
   getOpenPullRequests(repo: string): Promise<OpenPullRequest[]> {
     return this.delegate.getOpenPullRequests(repo);
-  }
-
-  findOpenPullRequestForHead(repo: string, head: string): Promise<CreatedPullRequest | null> {
-    return this.delegate.findOpenPullRequestForHead(repo, head);
   }
 
   listIssues(repo: string, opts?: ListIssuesOptions): Promise<OpenIssue[]> {

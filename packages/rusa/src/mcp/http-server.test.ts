@@ -26,7 +26,6 @@ function fakeIssueClient(): { client: IssueClient; labels: string[] } {
     createPullRequest: async () => ({ number: 1, htmlUrl: "https://example.test/pr/1" }),
     getOpenPullRequestsByAuthor: async () => [],
     getOpenPullRequests: async () => [],
-    findOpenPullRequestForHead: async () => null,
     listIssues: async () => [],
     getPullRequestDetails: async (_repo, prNumber) => ({
       number: prNumber,

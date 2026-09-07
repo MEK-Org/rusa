@@ -153,22 +153,15 @@ export function createTrackerMcpServer(
         // `pull_request/opened` echo; authorship still resolves per-event via
         // authorStampBodyForWebhookPayload, so labeled/closed/merged never
         // borrow it.
-        // Ask the client the same owner-qualified question its own upsert asks,
-        // so a fresh PR stays append-only (including a quoted stamp) while an
-        // actual upsert replaces its prior footer/stamp pair — and a fork's
-        // same-named branch cannot be mistaken for either. The lookup already
-        // degrades to null on failure; the catch keeps that true for every
-        // implementation, because a cosmetic footer guard must never be the
-        // reason a PR is not created.
-        const existing = await issueClient
-          .findOpenPullRequestForHead(args.repo, args.head)
-          .catch(() => null);
         const pr = await issueClient.createPullRequest({
           ...args,
-          // A real upsert may receive its current tracker-stamped body. Replace
-          // only that paired footer/stamp; a fresh creation stays append-only.
-          body: appendPreCreationAuthorStamp(
-            (existing ? stripTrailingMechanicalFooter(args.body) : args.body).trimEnd(),
+          // The client makes the one existing-PR lookup that chooses PATCH vs.
+          // POST. Give it the matching variants so that same lookup also
+          // governs footer replacement: fresh creation is append-only, while
+          // an upsert replaces only its trailing mechanical pair.
+          body: appendPreCreationAuthorStamp(args.body.trimEnd(), args.repo),
+          existingBody: appendPreCreationAuthorStamp(
+            stripTrailingMechanicalFooter(args.body).trimEnd(),
             args.repo
           ),
         });

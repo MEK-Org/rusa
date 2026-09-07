@@ -68,10 +68,6 @@ function recordingIssueClient(): { client: IssueClient; calls: Call[] } {
         },
       ];
     },
-    findOpenPullRequestForHead: async (repo, head) => {
-      calls.push({ method: "findOpenPullRequestForHead", args: [repo, head] });
-      return null;
-    },
     listIssues: async (repo, opts) => {
       calls.push({ method: "listIssues", args: [repo, opts] });
       return [
@@ -361,10 +357,8 @@ describe("tracker MCP server", () => {
     expect(update.match(/\*[^*\r\n]+\*/g)).toEqual(["*actor-handle (gpt-5.6-terra, xhigh)*"]);
   });
 
-  it("preserves authored terminal italics and replaces a stamped PR footer pair", async () => {
+  it("prepares append-only and replacement PR body variants without a precheck", async () => {
     const { client: backend, calls } = recordingIssueClient();
-    backend.findOpenPullRequestForHead = async (_repo, head) =>
-      head === "existing" ? { number: 1, htmlUrl: "https://example.test/pr/1" } : null;
     const client = await connect(
       createTrackerMcpServer("test-actor", backend, {
         actorHandle: "actor-handle",
@@ -409,21 +403,20 @@ describe("tracker MCP server", () => {
     expect(fresh.body).toContain("The result was *surprising*");
     expect(fresh.body).toContain("*other-actor (old-model, low)*");
     expect(fresh.body).toContain(oldStamp);
-    expect(existing.body).not.toContain("other-actor");
-    expect(existing.body).toContain("*actor-handle (gpt-5.6-terra)*");
-    expect(existing.body.match(/\*[^*\r\n]+\*/g)).toEqual(["*actor-handle (gpt-5.6-terra)*"]);
-    expect(existing.body.match(/<!--\s*mesh:author/g)).toHaveLength(1);
+    expect(fresh.existingBody).not.toContain("other-actor");
+    expect(fresh.existingBody).toContain("*actor-handle (gpt-5.6-terra)*");
+    expect(existing.body).toContain("*other-actor (old-model, low)*");
+    expect(existing.existingBody).not.toContain("other-actor");
+    expect(existing.existingBody?.match(/\*[^*\r\n]+\*/g)).toEqual([
+      "*actor-handle (gpt-5.6-terra)*",
+    ]);
+    expect(existing.existingBody?.match(/<!--\s*mesh:author/g)).toHaveLength(1);
     expect(update).toContain("The conclusion remains *surprising*");
+    expect(calls.some((call) => call.method === "findOpenPullRequestForHead")).toBe(false);
   });
 
-  it("still creates the PR, append-only, when the existing-PR lookup fails", async () => {
+  it("passes an append-only fresh PR body alongside the replacement variant", async () => {
     const { client: backend, calls } = recordingIssueClient();
-    backend.findOpenPullRequestForHead = async () => {
-      throw new Error("HTTP 403: secondary rate limit");
-    };
-    backend.getOpenPullRequests = async () => {
-      throw new Error("HTTP 403: secondary rate limit");
-    };
     const client = await connect(
       createTrackerMcpServer("test-actor", backend, {
         actorHandle: "actor-handle",
@@ -442,55 +435,13 @@ describe("tracker MCP server", () => {
       },
     })) as CallToolResult;
 
-    // A read failure on a cosmetic footer guard must not cost the write.
     expect(res.isError).toBeFalsy();
     const created = calls.find((call) => call.method === "createPullRequest")
       ?.args[0] as CreatePROptions;
     expect(created.body).toContain("*other-actor (old-model, low)*");
     expect(created.body).toContain(oldStamp);
     expect(created.body).toContain("*actor-handle*");
-  });
-
-  it("does not treat a fork's same-named branch as an existing PR", async () => {
-    const { client: backend, calls } = recordingIssueClient();
-    // Owner-qualified: the fork's `fresh` is not this repo's `fresh`.
-    backend.findOpenPullRequestForHead = async () => null;
-    backend.getOpenPullRequests = async () => [
-      {
-        number: 7,
-        title: "Fork PR",
-        headRef: "fresh",
-        headRefName: "fresh",
-        htmlUrl: "https://example.test/pr/7",
-        body: "",
-        author: "outsider",
-        labels: [],
-        updatedAt: "2026-01-02T00:00:00Z",
-      },
-    ];
-    const client = await connect(
-      createTrackerMcpServer("test-actor", backend, {
-        actorHandle: "actor-handle",
-        instanceId: "test-instance",
-      })
-    );
-    const oldStamp = stampAuthor("other-actor", "owner/repo", undefined, "old-instance");
-
-    await client.callTool({
-      name: "create_pull_request",
-      arguments: {
-        repo: "owner/repo",
-        head: "fresh",
-        title: "Fresh",
-        body: `Quoting prior evidence:\n\n*other-actor (old-model, low)*\n\n${oldStamp}`,
-      },
-    });
-
-    const created = calls.find((call) => call.method === "createPullRequest")
-      ?.args[0] as CreatePROptions;
-    expect(created.body).toContain("*other-actor (old-model, low)*");
-    expect(created.body).toContain(oldStamp);
-    expect(calls.some((call) => call.method === "getOpenPullRequests")).toBe(false);
+    expect(created.existingBody).not.toContain("other-actor");
   });
 
   it("creates issues with a pre-creation v3 stamp from the authenticated actor id", async () => {
