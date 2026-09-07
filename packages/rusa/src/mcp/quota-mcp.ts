@@ -435,21 +435,21 @@ async function parseQuotaWithLlm(
       throw new Error(`Quota parse failed: invalid status '${String(parsed.status)}'`);
     }
 
-    const realWindows = Array.isArray(parsed.windows)
-      ? (parsed.windows as LlmQuotaWindow[]).filter(
-          (w) => !w.placeholder && typeof w.usedPercent === "number"
-        )
-      : [];
-    const status = parsed.status;
-    const result: Partial<ProviderQuotaSnapshot> = { status };
-
     const limits: QuotaLimit[] = [];
-    for (const w of realWindows) {
+    for (const rawWindow of parsed.windows) {
+      if (!rawWindow || typeof rawWindow !== "object") {
+        throw new Error("Quota parse failed: window is not an object");
+      }
+      const w = rawWindow as LlmQuotaWindow;
+
       // Model-specific allocations are not provider quota and are not
       // consumed by the dashboard or throttle controller. Dropping explicitly
       // scoped model rows here also keeps a model-only response from counting as
       // a successful provider read.
-      if (w.scope === "model") continue;
+      if (w.placeholder === true || w.scope === "model") continue;
+      if (w.placeholder !== undefined && w.placeholder !== false) {
+        throw new Error(`Quota parse failed: window '${String(w.label)}' has invalid placeholder`);
+      }
       if (w.scope !== undefined && w.scope !== "provider") {
         throw new Error(`Quota parse failed: window '${w.label}' has invalid scope`);
       }
@@ -497,23 +497,35 @@ async function parseQuotaWithLlm(
       });
     }
 
-    if (status === "available" && limits.length === 0) {
+    if (limits.length === 0 && parsed.status === "available") {
       throw new Error(
         `Quota parse failed: ${provider} status is available but no provider window was returned`
       );
     }
-    if (limits.length > 0) {
-      const exhausted = limits.some((limit) => limit.percentLeft <= 0);
-      if (status !== "unknown" && (status === "exhausted") !== exhausted) {
-        throw new Error(
-          `Quota parse failed: status '${String(status)}' disagrees with the provider windows`
-        );
-      }
+
+    const hasExhaustedWindow = limits.some((limit) => limit.percentLeft <= 0);
+    // A validated exhausted window is sufficient to fail closed even when the
+    // model's summary says available. The inverse could be a partial panel
+    // whose exhausted row was omitted, so send that disagreement through the
+    // existing stronger-model retry rather than downgrade exhaustion.
+    if (parsed.status === "exhausted" && limits.length > 0 && !hasExhaustedWindow) {
+      throw new Error(
+        "Quota parse failed: status 'exhausted' disagrees with available provider windows"
+      );
     }
 
-    result.limits = limits;
+    const status = hasExhaustedWindow
+      ? "exhausted"
+      : parsed.status === "unknown" || limits.length === 0
+        ? parsed.status === "exhausted"
+          ? "exhausted"
+          : "unknown"
+        : "available";
 
-    return result;
+    return {
+      status,
+      limits,
+    };
   };
 
   try {
