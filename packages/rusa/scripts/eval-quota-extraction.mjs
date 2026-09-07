@@ -6,7 +6,7 @@ import {
   parseClaudeQuota,
   parseCodexQuota,
   parseKimiQuota,
-} from "../dist/mcp/quota-mcp.js";
+} from "../build/maintenance/mcp/quota-mcp.js";
 
 const PROVIDERS = ["codex", "claude", "agy", "kimi"];
 

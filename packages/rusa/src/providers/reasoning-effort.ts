@@ -1,4 +1,4 @@
-import { parseCodexModel } from "./codex.js";
+import { parseCodexModel } from "./codex-model.js";
 
 /**
  * Provider-native reasoning level. This deliberately remains a string rather

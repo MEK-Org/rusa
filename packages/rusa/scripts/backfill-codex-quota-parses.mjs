@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import Database from "better-sqlite3";
-import { inferQuotaState, parseCodexQuota } from "../dist/mcp/quota-mcp.js";
+import { inferQuotaState, parseCodexQuota } from "../build/maintenance/mcp/quota-mcp.js";
 
 const HOUR_MS = 60 * 60 * 1000;
 

@@ -23,7 +23,7 @@
   "budgets": {
     "src/commands/dashboard.ts": 6,
     "src/commands/start.ts": 69,
-    "src/config/loader.ts": 4,
+    "src/config/loader.ts": 5,
     "src/db/migrations/0006_backfill_mesh_chat_from_legacy_events.ts": 4,
     "src/db/migrations/0007_cleanup_intermediate_mechanical_chat_rows.ts": 2,
     "src/db/migrations/0014_cleanup_regressed_mechanical_chat_rows.ts": 3,

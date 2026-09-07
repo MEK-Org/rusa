@@ -1,7 +1,7 @@
 import { copyFile, mkdir, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import Database from "better-sqlite3";
-import { SharedQuotaStore } from "../dist/quota/shared-store.js";
+import { SharedQuotaStore } from "../build/maintenance/quota/shared-store.js";
 
 const OBSERVATION_COLUMNS = [
   "provider",

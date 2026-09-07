@@ -1,37 +1,40 @@
 import type { ProviderConfig, RusaConfig } from "../config/types.js";
 import { AntigravityProvider } from "./antigravity.js";
 import { ClaudeProvider } from "./claude.js";
-import { CODEX_REASONING_EFFORTS, CodexProvider } from "./codex.js";
+import { CodexProvider } from "./codex.js";
 import { CopilotProvider } from "./copilot.js";
 import { FakeProvider } from "./fake-provider.js";
 import { KimiProvider } from "./kimi.js";
-import { isAntigravityGeminiModel, validateModelPin } from "./model-catalog.js";
-import type { ModelEffortSelection } from "./reasoning-effort.js";
-import { normalizeModelEffortSelection, validateReasoningEffort } from "./reasoning-effort.js";
+import {
+  DEFAULT_ROOT_EFFORT,
+  DEFAULT_ROOT_PROVIDER,
+  validateProviderSelection as validateProviderSelectionBase,
+} from "./provider-selection.js";
 import type { CodingProvider } from "./types.js";
+
+export {
+  DEFAULT_ROOT_EFFORT,
+  DEFAULT_ROOT_PROVIDER,
+  providerCapabilityName,
+} from "./provider-selection.js";
 
 // Keyed by CLI command (the `cliCommand` resolved in getProvider). Antigravity's
 // binary is `agy`, so it registers under "agy" while its provider name is
 // "antigravity".
 interface ProviderAdapter {
   create: (name: string, config: ProviderConfig, model?: string, effort?: string) => CodingProvider;
-  /** Provider-level native CLI vocabulary. Absent means no effort control. */
-  efforts?: readonly string[];
 }
 
 const providerAdapters: Readonly<Record<string, ProviderAdapter>> = {
   claude: {
     create: (name, config, model, effort) => new ClaudeProvider(name, config, model, effort),
-    efforts: ["low", "medium", "high", "xhigh", "max"],
   },
   codex: {
     create: (name, config, model, effort) => new CodexProvider(name, config, model, effort),
-    efforts: CODEX_REASONING_EFFORTS,
   },
   agy: {
     create: (name, config, model, effort) =>
       new AntigravityProvider(name, config, model, undefined, effort),
-    efforts: ["low", "medium", "high"],
   },
   kimi: { create: (name, config, model) => new KimiProvider(name, config, model) },
   copilot: { create: (name, config, model) => new CopilotProvider(name, config, model) },
@@ -46,13 +49,19 @@ function getEffectiveProviderConfig(
   return config.providers[providerName];
 }
 
-/** Default root provider when `config.rootActor` is unset — `agy` (Antigravity). */
-export const DEFAULT_ROOT_PROVIDER = "antigravity";
-export const DEFAULT_ROOT_EFFORT = "high";
-
-/** The native CLI capability family behind a logical provider config key. */
-export function providerCapabilityName(providerName: string, config: RusaConfig): string {
-  return getEffectiveProviderConfig(providerName, config)?.cliCommand?.trim() || providerName;
+/**
+ * Runtime provider resolution preserves the config-loader's unknown-catalog
+ * warning while keeping the shared selection module free of direct diagnostics.
+ */
+export function validateProviderSelection(
+  config: RusaConfig,
+  providerName: string,
+  model?: string,
+  effort?: string | null
+) {
+  return validateProviderSelectionBase(config, providerName, model, effort, {
+    onUnknownModelPin: (warning) => console.warn(`[model-catalog] ${warning}`),
+  });
 }
 
 /**
@@ -65,55 +74,6 @@ export function providerThrottleKey(providerName: string, config: RusaConfig): s
   const cliCommand = config.providers[providerName]?.cliCommand;
   const key = cliCommand ?? providerName;
   return key === "antigravity" ? "agy" : key;
-}
-
-/**
- * The single config-aware validation and normalization boundary for a requested
- * provider/model/effort combination. Config ingress, spawn, live
- * reconfiguration, and provider construction all route through this function.
- */
-export function validateProviderSelection(
-  config: RusaConfig,
-  providerName: string,
-  model?: string,
-  effort?: string | null
-): ModelEffortSelection {
-  const providerConfig = getEffectiveProviderConfig(providerName, config);
-  if (!providerConfig) {
-    throw new Error(
-      `provider "${providerName}" is not configured under "providers" in config.yaml`
-    );
-  }
-  const capabilityName = providerCapabilityName(providerName, config);
-  const selection = normalizeModelEffortSelection(capabilityName, model, effort);
-  if (model !== undefined && !selection.model) {
-    throw new Error(
-      `empty model slug requested for provider "${providerName}" — refusing to fall back to the provider's default model `
-    );
-  }
-  let allowedEfforts = providerAdapters[capabilityName]?.efforts;
-  if (selection.model) {
-    if (
-      (capabilityName === "agy" || capabilityName === "antigravity") &&
-      !isAntigravityGeminiModel(selection.model)
-    ) {
-      throw new Error(
-        `Antigravity supports Gemini models only; rejected model "${selection.model}" for provider "${providerName}"`
-      );
-    }
-    const validation = validateModelPin(capabilityName, selection.model);
-    if (validation.status === "unknown") {
-      console.warn(`[model-catalog] ${validation.warning}`);
-    } else if (
-      validation.status === "accepted" &&
-      validation.efforts &&
-      validation.efforts.length > 0
-    ) {
-      allowedEfforts = validation.efforts;
-    }
-  }
-  validateReasoningEffort(capabilityName, selection.model, selection.effort, allowedEfforts);
-  return selection;
 }
 
 /**
