@@ -435,21 +435,21 @@ async function parseQuotaWithLlm(
       throw new Error(`Quota parse failed: invalid status '${String(parsed.status)}'`);
     }
 
-    const realWindows = Array.isArray(parsed.windows)
-      ? (parsed.windows as LlmQuotaWindow[]).filter(
-          (w) => !w.placeholder && typeof w.usedPercent === "number"
-        )
-      : [];
-    const status = parsed.status;
-    const result: Partial<ProviderQuotaSnapshot> = { status };
-
     const limits: QuotaLimit[] = [];
-    for (const w of realWindows) {
+    for (const rawWindow of parsed.windows) {
+      if (!rawWindow || typeof rawWindow !== "object") {
+        throw new Error("Quota parse failed: window is not an object");
+      }
+      const w = rawWindow as LlmQuotaWindow;
+
       // Model-specific allocations are not provider quota and are not
       // consumed by the dashboard or throttle controller. Dropping explicitly
       // scoped model rows here also keeps a model-only response from counting as
       // a successful provider read.
-      if (w.scope === "model") continue;
+      if (w.placeholder === true || w.scope === "model") continue;
+      if (w.placeholder !== undefined && w.placeholder !== false) {
+        throw new Error(`Quota parse failed: window '${String(w.label)}' has invalid placeholder`);
+      }
       if (w.scope !== undefined && w.scope !== "provider") {
         throw new Error(`Quota parse failed: window '${w.label}' has invalid scope`);
       }
@@ -497,23 +497,21 @@ async function parseQuotaWithLlm(
       });
     }
 
-    if (status === "available" && limits.length === 0) {
+    if (limits.length === 0 && parsed.status !== "unknown") {
       throw new Error(
-        `Quota parse failed: ${provider} status is available but no provider window was returned`
+        `Quota parse failed: ${provider} status is ${parsed.status} but no provider window was returned`
       );
     }
-    if (limits.length > 0) {
-      const exhausted = limits.some((limit) => limit.percentLeft <= 0);
-      if (status !== "unknown" && (status === "exhausted") !== exhausted) {
-        throw new Error(
-          `Quota parse failed: status '${String(status)}' disagrees with the provider windows`
-        );
-      }
-    }
 
-    result.limits = limits;
-
-    return result;
+    return {
+      status:
+        limits.length === 0
+          ? "unknown"
+          : limits.some((limit) => limit.percentLeft <= 0)
+            ? "exhausted"
+            : "available",
+      limits,
+    };
   };
 
   try {

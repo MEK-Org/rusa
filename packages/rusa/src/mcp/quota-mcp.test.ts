@@ -284,7 +284,7 @@ describe("quota MCP server", () => {
       }
     });
 
-    it("maps per-window claude/codex readings into `limits`, dropping placeholder windows", async () => {
+    it("maps real windows into limits, drops placeholders, and derives their available status", async () => {
       mockGenerateContent.mockResolvedValue({
         text: () =>
           JSON.stringify({
@@ -305,9 +305,9 @@ describe("quota MCP server", () => {
         "Limits: refresh requested; run /status again shortly.",
         "test-key"
       );
-      expect(parsed.status).toBe("unknown");
+      expect(parsed.status).toBe("available");
       // The placeholder window (no number yet) is never fabricated into a limit row —
-      // only the real Weekly reading survives (ISSUE_NUM coordination point).
+      // the real Weekly reading survives and determines the available status.
       expect(parsed.limits).toEqual([
         {
           label: "Weekly",
@@ -317,6 +317,140 @@ describe("quota MCP server", () => {
           scope: "provider",
         },
       ]);
+    });
+
+    it("retries and fails closed when a provider row is malformed beside a valid weekly row", async () => {
+      // The 5h row is a provider reading, not an explicit placeholder or model
+      // allocation. Its missing usedPercent must reject the whole snapshot rather
+      // than silently preserving the Weekly row.
+      const incompleteSnapshot = {
+        status: "available",
+        windows: [
+          { label: "5h", kind: "five_hour", placeholder: false, scope: "provider" },
+          {
+            label: "Weekly",
+            kind: "weekly",
+            placeholder: false,
+            scope: "provider",
+            usedPercent: 42,
+            resetAtIso: "2026-09-14T00:00:00.000Z",
+          },
+        ],
+      };
+      mockGenerateContent.mockResolvedValue({ text: () => JSON.stringify(incompleteSnapshot) });
+
+      const parsed = await parseCodexQuota("synthetic incomplete provider panel", "test-key");
+
+      expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect(parsed.status).toBe("unknown");
+      expect(parsed.limits).toBeUndefined();
+      expect(parsed.message).toContain("invalid usedPercent");
+    });
+
+    it("retries a malformed provider snapshot and accepts a complete 5h and weekly replacement", async () => {
+      mockGenerateContent
+        .mockResolvedValueOnce({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [
+                { label: "5h", kind: "five_hour", scope: "provider" },
+                {
+                  label: "Weekly",
+                  kind: "weekly",
+                  scope: "provider",
+                  usedPercent: 42,
+                  resetAtIso: "2026-09-14T00:00:00.000Z",
+                },
+              ],
+            }),
+        })
+        .mockResolvedValueOnce({
+          text: () =>
+            JSON.stringify({
+              status: "available",
+              windows: [
+                {
+                  label: "5h",
+                  kind: "five_hour",
+                  scope: "provider",
+                  usedPercent: 10,
+                  resetAtIso: "2026-09-08T00:00:00.000Z",
+                },
+                {
+                  label: "Weekly",
+                  kind: "weekly",
+                  scope: "provider",
+                  usedPercent: 42,
+                  resetAtIso: "2026-09-14T00:00:00.000Z",
+                },
+              ],
+            }),
+        });
+
+      const parsed = await parseCodexQuota("synthetic provider panel", "test-key");
+
+      expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect(parsed).toMatchObject({ status: "available" });
+      expect(parsed.limits).toEqual([
+        {
+          label: "5h",
+          kind: "five_hour",
+          percentLeft: 90,
+          resetAtIso: "2026-09-08T00:00:00.000Z",
+          scope: "provider",
+        },
+        {
+          label: "Weekly",
+          kind: "weekly",
+          percentLeft: 58,
+          resetAtIso: "2026-09-14T00:00:00.000Z",
+          scope: "provider",
+        },
+      ]);
+    });
+
+    it("derives status from nonempty validated provider windows in both disagreement directions", async () => {
+      const cases = [
+        { modelStatus: "available", usedPercent: 100, expectedStatus: "exhausted" },
+        { modelStatus: "exhausted", usedPercent: 0, expectedStatus: "available" },
+      ] as const;
+
+      for (const { modelStatus, usedPercent, expectedStatus } of cases) {
+        mockGenerateContent.mockReset();
+        mockGenerateContent.mockResolvedValue({
+          text: () =>
+            JSON.stringify({
+              status: modelStatus,
+              windows: [
+                {
+                  label: "Weekly",
+                  kind: "weekly",
+                  scope: "provider",
+                  usedPercent,
+                  resetAtIso: "2026-09-14T00:00:00.000Z",
+                },
+              ],
+            }),
+        });
+
+        const parsed = await parseCodexQuota("synthetic status disagreement", "test-key");
+
+        expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+        expect(parsed.status).toBe(expectedStatus);
+        expect(parsed.limits).toHaveLength(1);
+      }
+    });
+
+    it("keeps an explicit empty-window reading unknown", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () => JSON.stringify({ status: "unknown", windows: [] }),
+      });
+
+      const parsed = await parseCodexQuota("synthetic refresh placeholder", "test-key");
+
+      expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+      expect(parsed).toEqual({ status: "unknown", limits: [] });
     });
 
     it("keys the mapped limit's kind off the LLM's classification, not the label wording ", async () => {
