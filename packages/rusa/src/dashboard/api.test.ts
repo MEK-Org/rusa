@@ -259,6 +259,85 @@ describe("handleMeshApiRequest", () => {
     });
   });
 
+  it("POST /api/mesh/actors forwards target to root control", async () => {
+    const { res } = await call(
+      deps,
+      "POST",
+      "/api/mesh/actors",
+      JSON.stringify({
+        charter: "Remote task",
+        provider: "agy",
+        model: "gemini-3.5-flash-medium",
+        target: "mac-mini",
+      })
+    );
+    await new Promise((resolve) => process.nextTick(resolve));
+    await new Promise((resolve) => process.nextTick(resolve));
+
+    expect(res.statusCode).toBe(201);
+    expect(rootSpawns[0]?.request).toMatchObject({
+      executionTarget: "mac-mini",
+    });
+  });
+
+  it("POST /api/mesh/actors 400s when target is refused by placement check", async () => {
+    const failingDeps: DashboardDataDeps = {
+      ...deps,
+      rootControl: {
+        providers: ["agy", "codex"],
+        spawnChild: () => {
+          throw new Error(
+            'executionTarget "unknown" is not available: this runtime has no remote placement support'
+          );
+        },
+      } as unknown as RootControlService,
+    };
+    const { res } = await call(
+      failingDeps,
+      "POST",
+      "/api/mesh/actors",
+      JSON.stringify({
+        charter: "Remote task",
+        provider: "agy",
+        model: "gemini-3.5-flash-medium",
+        target: "unknown",
+      })
+    );
+    await new Promise((resolve) => process.nextTick(resolve));
+    await new Promise((resolve) => process.nextTick(resolve));
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain('executionTarget "unknown" is not available');
+  });
+
+  it("GET /api/mesh/followers lists connected followers", async () => {
+    const followerDeps: DashboardDataDeps = {
+      ...deps,
+      getFollowers: () => [
+        {
+          id: "mac-mini",
+          platform: "darwin",
+          pid: 12345,
+          actors: ["thread-1"],
+          lastSeen: "2026-09-07T00:00:00.000Z",
+        },
+      ],
+    };
+    const { res } = await call(followerDeps, "GET", "/api/mesh/followers");
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({
+      followers: [
+        {
+          id: "mac-mini",
+          platform: "darwin",
+          pid: 12345,
+          actors: ["thread-1"],
+          lastSeen: "2026-09-07T00:00:00.000Z",
+        },
+      ],
+    });
+  });
+
   it("POST /api/mesh/actors 400s an unknown context selection instead of spawning native", async () => {
     // Silently falling back to native is the failure mode that matters here: the
     // operator would get an ordinary actor and believe it was portable.

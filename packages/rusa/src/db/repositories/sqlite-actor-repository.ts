@@ -20,7 +20,14 @@ type LastHumanMessage = {
   session_id: string | null;
 };
 
-export const ACTOR_CONFIG_SCHEMA_VERSION = 1 as const;
+/**
+ * `context_config` version emitted by this build. Version 2 adds the durable
+ * execution-placement field; the version must identify the exact strict
+ * document shape rather than merely its broad category.
+ */
+export const ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION = 2 as const;
+/** `context_config` shape emitted before durable remote placement (#301). */
+const LEGACY_ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION = 1 as const;
 
 /** schemaVersion for a `model_config` document written before #169's pool contract. */
 const LEGACY_MODEL_CONFIG_SCHEMA_VERSION = 1 as const;
@@ -58,24 +65,51 @@ const modelConfigPoolSchema = z
 
 const modelConfigDocumentSchema = z.union([modelConfigPoolSchema, legacyModelConfigSchema]);
 
-const contextConfigSchema = z.discriminatedUnion("type", [
+const legacyContextConfigSchema = z.discriminatedUnion("type", [
   z
     .object({
-      schemaVersion: z.literal(ACTOR_CONFIG_SCHEMA_VERSION),
+      schemaVersion: z.literal(LEGACY_ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
       type: z.literal("native"),
       sessionId: z.string().optional(),
     })
     .strict(),
   z
     .object({
-      schemaVersion: z.literal(ACTOR_CONFIG_SCHEMA_VERSION),
+      schemaVersion: z.literal(LEGACY_ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
       type: z.literal("portable"),
       mode: z.enum(["tail", "ledger"]),
       compactionModel: z.string().optional(),
     })
     .strict(),
 ]);
-type ContextConfigDocument = z.infer<typeof contextConfigSchema>;
+
+const currentContextConfigSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      schemaVersion: z.literal(ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
+      type: z.literal("native"),
+      sessionId: z.string().optional(),
+      executionTarget: z.string().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      schemaVersion: z.literal(ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
+      type: z.literal("portable"),
+      mode: z.enum(["tail", "ledger"]),
+      compactionModel: z.string().optional(),
+      executionTarget: z.string().optional(),
+    })
+    .strict(),
+]);
+/**
+ * Read both strict shapes. We write v2 only when executionTarget is set,
+ * keeping unplaced actors on v1 so rollback blast radius is strictly bounded
+ * to remotely-placed actors.
+ */
+const contextConfigSchema = z.union([legacyContextConfigSchema, currentContextConfigSchema]);
+type LegacyContextConfigDocument = z.infer<typeof legacyContextConfigSchema>;
+type CurrentContextConfigDocument = z.infer<typeof currentContextConfigSchema>;
 
 function parseDocument<T>(
   actorId: string,
@@ -138,8 +172,20 @@ function parseModelConfig(actorId: string, json: string | null): Pick<ActorRecor
  */
 function buildContextConfig(record: ActorRecord): string | null {
   if (record.context?.type === "portable") {
-    const config: ContextConfigDocument = {
-      schemaVersion: ACTOR_CONFIG_SCHEMA_VERSION,
+    if (record.executionTarget !== undefined) {
+      const config: CurrentContextConfigDocument = {
+        schemaVersion: ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
+        type: "portable",
+        mode: record.context.mode,
+        ...(record.context.compactionModel !== undefined
+          ? { compactionModel: record.context.compactionModel }
+          : {}),
+        executionTarget: record.executionTarget,
+      };
+      return JSON.stringify(config);
+    }
+    const config: LegacyContextConfigDocument = {
+      schemaVersion: LEGACY_ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
       type: "portable",
       mode: record.context.mode,
       ...(record.context.compactionModel !== undefined
@@ -148,9 +194,22 @@ function buildContextConfig(record: ActorRecord): string | null {
     };
     return JSON.stringify(config);
   }
-  if (record.context?.type === "native" || record.sessionId !== undefined) {
-    const config: ContextConfigDocument = {
-      schemaVersion: ACTOR_CONFIG_SCHEMA_VERSION,
+  if (
+    record.context?.type === "native" ||
+    record.sessionId !== undefined ||
+    record.executionTarget !== undefined
+  ) {
+    if (record.executionTarget !== undefined) {
+      const config: CurrentContextConfigDocument = {
+        schemaVersion: ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
+        type: "native",
+        ...(record.sessionId !== undefined ? { sessionId: record.sessionId } : {}),
+        executionTarget: record.executionTarget,
+      };
+      return JSON.stringify(config);
+    }
+    const config: LegacyContextConfigDocument = {
+      schemaVersion: LEGACY_ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
       type: "native",
       ...(record.sessionId !== undefined ? { sessionId: record.sessionId } : {}),
     };
@@ -162,9 +221,13 @@ function buildContextConfig(record: ActorRecord): string | null {
 function parseContextConfig(
   actorId: string,
   json: string | null
-): Pick<ActorRecord, "context" | "sessionId"> {
+): Pick<ActorRecord, "context" | "sessionId" | "executionTarget"> {
   if (!json) return {};
   const parsed = parseDocument(actorId, "context_config", json, contextConfigSchema);
+  const executionTarget =
+    "executionTarget" in parsed && parsed.executionTarget !== undefined
+      ? { executionTarget: parsed.executionTarget }
+      : {};
   if (parsed.type === "portable") {
     return {
       context: {
@@ -174,11 +237,13 @@ function parseContextConfig(
           ? { compactionModel: parsed.compactionModel }
           : {}),
       },
+      ...executionTarget,
     };
   }
   return {
     context: { type: "native" },
     ...(parsed.sessionId !== undefined ? { sessionId: parsed.sessionId } : {}),
+    ...executionTarget,
   };
 }
 

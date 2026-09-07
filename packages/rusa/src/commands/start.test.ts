@@ -7,6 +7,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -21,7 +22,8 @@ import { GeminiPortableContextCompactor } from "../actor/portable-context-compac
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
 import { type ParsedChatMessage, toChatMessage } from "../chat/normalize.js";
 import { MeshEventEmitter } from "../dashboard/mesh-event-emitter.js";
-import { closeDb, getDb, getRepositories } from "../db/index.js";
+import { closeDb, getDb, getRepositories, initDb } from "../db/index.js";
+import { INSTANCE_PROTOCOL_VERSION } from "../experimental/remote-instances/protocol.js";
 import type { GitHubPollingIssueClient, IssueClient } from "../gitops/issue-client.js";
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { stampAuthor } from "../mcp/stamp.js";
@@ -4094,6 +4096,170 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const t2Record = mesh.actors.get("t2");
     expect(t2Record).toBeDefined();
     expect(t2Record?.status).toBe("active");
+  });
+
+  it("rehydrates a persisted remote worker after its follower enrolls late", async () => {
+    const port = await new Promise<number>((resolve, reject) => {
+      const probe = createServer();
+      probe.once("error", reject);
+      probe.listen(0, "127.0.0.1", () => {
+        const address = probe.address();
+        if (!address || typeof address === "string") {
+          probe.close();
+          reject(new Error("could not reserve a loopback follower port"));
+          return;
+        }
+        probe.close((error) => (error ? reject(error) : resolve(address.port)));
+      });
+    });
+    const token = "a".repeat(32);
+    const tokenFile = join(homeDir, "follower-token");
+    writeFileSync(tokenFile, token, { mode: 0o600 });
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity", effort: "high" },
+        followers: { bind: "127.0.0.1", port, tokenFile },
+      }),
+      "utf8"
+    );
+
+    // Make SQLite, rather than the retired JSON importer, the source of the
+    // record that `runStart` restores. The follower is deliberately absent
+    // during rehydrateAll, which must leave this active record retryable.
+    rmSync(join(homeDir, "threads.json"));
+    initDb(homeDir);
+    getRepositories().actors.upsert({
+      id: "root",
+      charter: "root",
+      parentId: null,
+      isRoot: true,
+      status: "active",
+      createdAt: "2026-09-07T00:00:00.000Z",
+    });
+    getRepositories().actors.upsert({
+      id: "placed-worker",
+      charter: "wait for the Mac follower",
+      parentId: "root",
+      modelConfig: [{ provider: "antigravity", model: "Gemini 3.7 Flash (High)" }],
+      executionTarget: "mac-mini",
+      status: "active",
+      createdAt: "2026-09-07T00:01:00.000Z",
+    });
+    closeDb();
+
+    let mesh: ActorMesh | undefined;
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh) throw new Error("mesh not ready");
+
+    // `rehydrateAll` has run, but the unavailable target prevents a local
+    // substitute from being created. The durable row remains active for the
+    // registration callback below.
+    expect(mesh.get("placed-worker")).toBeUndefined();
+    expect(getRepositories().actors.get("placed-worker")?.status).toBe("active");
+
+    const registration = await fetch(`http://127.0.0.1:${port}/register`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "mac-mini",
+        platform: "darwin",
+        pid: 4242,
+        protocolVersion: INSTANCE_PROTOCOL_VERSION,
+      }),
+    });
+    expect(registration.status).toBe(200);
+    const enrollment = (await registration.json()) as { session: string };
+
+    await vi.waitFor(() => expect(mesh?.get("placed-worker")).toBeDefined());
+
+    // The late registration callback used the production worker factory to
+    // create an actor-addressed channel. Polling it receives the remote init
+    // command, proving the restored actor is reachable rather than merely
+    // present in the mesh map.
+    const poll = await fetch(`http://127.0.0.1:${port}/poll`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ id: "mac-mini", session: enrollment.session }),
+    });
+    expect(poll.status).toBe(200);
+    await expect(poll.json()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          actorId: "placed-worker",
+          message: expect.objectContaining({ type: "init" }),
+        }),
+      ])
+    );
+
+    // Upsert a retired worker targeting the follower; on reconnect, the leader
+    // must reconcile this by sending a stop command so the follower runtime is disposed.
+    getRepositories().actors.upsert({
+      id: "retired-worker",
+      charter: "finished prior to reconnect",
+      parentId: "root",
+      executionTarget: "mac-mini",
+      status: "retired",
+      createdAt: "2026-09-07T00:02:00.000Z",
+    });
+
+    const notifyInboxSpy = vi.spyOn(mesh, "notifyInboxChanged");
+
+    // Follower disconnects and re-registers to the same leader (same-leader reconnect)
+    await fetch(`http://127.0.0.1:${port}/unregister`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ id: "mac-mini", session: enrollment.session }),
+    });
+
+    const reconnect = await fetch(`http://127.0.0.1:${port}/register`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "mac-mini",
+        platform: "darwin",
+        pid: 4242,
+        protocolVersion: INSTANCE_PROTOCOL_VERSION,
+      }),
+    });
+    expect(reconnect.status).toBe(200);
+    const reconnected = (await reconnect.json()) as { session: string };
+
+    // Same-leader reattach nudges inbox recovery on the existing actor
+    expect(notifyInboxSpy).toHaveBeenCalledWith("placed-worker");
+
+    // The follower's poll receives both the re-attached actor's fresh init
+    // and the retired actor's stop command to prevent runtime orphaning
+    const reconnectPoll = await fetch(`http://127.0.0.1:${port}/poll`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ id: "mac-mini", session: reconnected.session }),
+    });
+    expect(reconnectPoll.status).toBe(200);
+    await expect(reconnectPoll.json()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          actorId: "placed-worker",
+          message: expect.objectContaining({ type: "init" }),
+        }),
+        expect.objectContaining({
+          actorId: "retired-worker",
+          message: expect.objectContaining({ type: "stop" }),
+        }),
+      ])
+    );
   });
 
   // The arbiter for the host-jobs cutover wiring : the importer, repository

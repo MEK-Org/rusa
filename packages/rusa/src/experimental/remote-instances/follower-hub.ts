@@ -5,19 +5,34 @@ import {
   request as proxyRequest,
   type ServerResponse,
 } from "node:http";
+import { type Logger, nullLogger } from "../../observability/logger.js";
 import type { McpServerSpec } from "../../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
 import type { ActorEvent, LeaderCommand } from "./protocol.js";
 import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
-import { RemoteInstance } from "./remote-instance.js";
+import { FollowerDedupeTracker, RemoteInstance } from "./remote-instance.js";
+import { isSafeFollowerBind } from "./safe-bind.js";
+
+export interface FollowerInfo {
+  id: string;
+  platform: string;
+  pid: number;
+  actors: string[];
+  lastSeen: string;
+}
 
 export interface FollowerCommand {
   actorId: string;
   message: LeaderCommand;
 }
 export interface FollowerEvent {
+  eventId: string;
   actorId: string;
   message: ActorEvent | { type: "exit"; code: number | null; signal: NodeJS.Signals | null };
+}
+
+export interface FollowerHubOptions {
+  logger?: Logger;
 }
 
 async function readJson(req: IncomingMessage): Promise<unknown> {
@@ -40,11 +55,22 @@ function reply(res: ServerResponse, status: number, value: unknown): void {
  * Control requests use an enrollment secret; MCP URLs are per-actor capabilities.
  */
 export class FollowerHub {
+  readonly leaderToken = randomBytes(16).toString("hex");
+  private static readonly MAX_TRACKED_FOLLOWERS = 128;
+  private readonly log: Logger;
+  private readonly dedupeTrackers = new Map<string, FollowerDedupeTracker>();
   private followers = new Map<string, RemoteInstance>();
   private routes = new Map<string, { followerId: string; actorId: string; target: string }>();
+  private onRegisterCallback?: (follower: RemoteInstance) => void;
   private sweep = setInterval(() => {
+    const now = Date.now();
     for (const follower of this.followers.values()) {
-      if (Date.now() - follower.seen > 45_000) this.drop(follower);
+      if (now - follower.seen > 45_000) this.drop(follower, "expired");
+    }
+    for (const [id, tracker] of this.dedupeTrackers) {
+      if (!this.followers.has(id) && now - tracker.lastSeen > 3600_000) {
+        this.dedupeTrackers.delete(id);
+      }
     }
   }, 5000);
   private server = createServer((req, res) => {
@@ -54,13 +80,21 @@ export class FollowerHub {
     });
   });
   private origin = "";
-  constructor(private readonly token: string) {
+  constructor(
+    private readonly token: string,
+    opts?: FollowerHubOptions
+  ) {
     if (token.length < 32) throw new Error("Follower token must be at least 32 characters");
+    this.log = (opts?.logger ?? nullLogger).child({ component: "follower-gateway" });
     this.sweep.unref();
+  }
+
+  onRegister(callback: (follower: RemoteInstance) => void): void {
+    this.onRegisterCallback = callback;
   }
   async listen(host: string, port: number): Promise<string> {
     // Never accidentally expose the prototype on every public interface.
-    if (host !== "127.0.0.1" && !/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+$/.test(host)) {
+    if (!isSafeFollowerBind(host)) {
       throw new Error("Bind the follower gateway to loopback or a Tailscale IPv4 address");
     }
     await new Promise<void>((resolve, reject) => {
@@ -75,7 +109,7 @@ export class FollowerHub {
     this.origin = `http://${host}:${address.port}`;
     return this.origin;
   }
-  list() {
+  list(): FollowerInfo[] {
     return [...this.followers.values()].map((f) => ({
       id: f.id,
       platform: f.platform,
@@ -93,6 +127,14 @@ export class FollowerHub {
         if (route.actorId === actorId) this.routes.delete(key);
     });
     return host;
+  }
+  stopActor(followerId: string, actorId: string): void {
+    const follower = this.followers.get(followerId);
+    if (!follower) return;
+    follower.stopActor(actorId);
+    for (const [key, route] of this.routes) {
+      if (route.actorId === actorId) this.routes.delete(key);
+    }
   }
   /**
    * The actor's whole capability set, as a set of bearer URLs.
@@ -132,9 +174,41 @@ export class FollowerHub {
     this.server.closeAllConnections();
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
   }
-  private drop(follower: RemoteInstance): void {
+  private drop(
+    follower: RemoteInstance,
+    reason: "disconnected" | "expired" = "disconnected"
+  ): void {
     this.followers.delete(follower.id);
     follower.close();
+    if (reason === "expired") {
+      this.log.warn("follower_expired", {
+        followerId: follower.id,
+        lastSeen: new Date(follower.seen).toISOString(),
+      });
+    } else {
+      this.log.info("follower_disconnected", {
+        followerId: follower.id,
+        platform: follower.platform,
+        pid: follower.pid,
+      });
+    }
+  }
+
+  private getDedupeTracker(followerId: string): FollowerDedupeTracker {
+    let tracker = this.dedupeTrackers.get(followerId);
+    if (tracker) {
+      this.dedupeTrackers.delete(followerId);
+      this.dedupeTrackers.set(followerId, tracker);
+      tracker.touch();
+      return tracker;
+    }
+    if (this.dedupeTrackers.size >= FollowerHub.MAX_TRACKED_FOLLOWERS) {
+      const oldestKey = this.dedupeTrackers.keys().next().value;
+      if (oldestKey) this.dedupeTrackers.delete(oldestKey);
+    }
+    tracker = new FollowerDedupeTracker();
+    this.dedupeTrackers.set(followerId, tracker);
+    return tracker;
   }
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const path = new URL(req.url ?? "/", "http://localhost").pathname;
@@ -192,9 +266,20 @@ export class FollowerHub {
         reply(res, 409, { error: "Follower already connected" });
         return;
       }
-      const follower = new RemoteInstance(body.id, body.platform, body.pid);
+      const tracker = this.getDedupeTracker(body.id);
+      const follower = new RemoteInstance(body.id, body.platform, body.pid, tracker);
       this.followers.set(follower.id, follower);
-      reply(res, 200, { session: follower.session, protocolVersion: INSTANCE_PROTOCOL_VERSION });
+      this.log.info("follower_connected", {
+        followerId: follower.id,
+        platform: follower.platform,
+        pid: follower.pid,
+      });
+      this.onRegisterCallback?.(follower);
+      reply(res, 200, {
+        session: follower.session,
+        protocolVersion: INSTANCE_PROTOCOL_VERSION,
+        leaderToken: this.leaderToken,
+      });
       return;
     }
     const follower = typeof body.id === "string" ? this.followers.get(body.id) : undefined;
@@ -204,7 +289,7 @@ export class FollowerHub {
     }
     follower.seen = Date.now();
     if (path === "/unregister") {
-      this.drop(follower);
+      this.drop(follower, "disconnected");
       reply(res, 200, {});
       return;
     }
@@ -227,18 +312,41 @@ export class FollowerHub {
       return;
     }
     if (path === "/events") {
+      if (typeof body.batchId !== "string" || !body.batchId.trim()) {
+        reply(res, 400, { error: "Missing or invalid batchId" });
+        return;
+      }
+      const batchId = body.batchId.trim();
+      if (follower.hasBatch(batchId)) {
+        this.log.debug?.("follower_events_duplicate_batch_ignored", {
+          followerId: follower.id,
+          batchId,
+        });
+        reply(res, 200, {});
+        return;
+      }
       const events = body.events as FollowerEvent[];
-      if (!Array.isArray(events) || events.length > 1000) throw new Error("Invalid events");
+      if (!Array.isArray(events) || events.length > 1000) {
+        reply(res, 400, { error: "Invalid events" });
+        return;
+      }
       for (const event of events) {
         if (
           !event ||
+          typeof event.eventId !== "string" ||
+          !event.eventId.trim() ||
           typeof event.actorId !== "string" ||
           !event.message ||
           typeof event.message.type !== "string"
-        )
-          throw new Error("Invalid event");
+        ) {
+          reply(res, 400, { error: "Invalid event shape or missing eventId" });
+          return;
+        }
+        if (follower.hasEvent(event.eventId)) continue;
+        follower.recordEvent(event.eventId);
         follower.receive(event);
       }
+      follower.recordBatch(batchId);
       reply(res, 200, {});
       return;
     }

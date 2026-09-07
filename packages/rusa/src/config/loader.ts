@@ -1,8 +1,10 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { assertSpawnContextSupported, resolveContextConfig } from "../actor/context-selection.js";
+import { isSafeFollowerBind } from "../experimental/remote-instances/safe-bind.js";
 import {
   providerCapabilityName,
   validateProviderSelection,
@@ -581,6 +583,38 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     parsed.gitBridgeBindHost = parsed.gitBridgeBindHost.trim();
   } else {
     parsed.gitBridgeBindHost = "127.0.0.1";
+  }
+
+  const followers = parsed.followers;
+  if (followers !== undefined) {
+    if (typeof followers !== "object" || followers === null || Array.isArray(followers)) {
+      throw new Error("config.yaml: followers must be a mapping when set");
+    }
+    if (typeof followers.bind !== "string" || !followers.bind.trim()) {
+      throw new Error("config.yaml: followers.bind must be a non-empty string when set");
+    }
+    followers.bind = followers.bind.trim();
+    if (!isSafeFollowerBind(followers.bind)) {
+      throw new Error(
+        `config.yaml: followers.bind must be an explicit loopback (127.0.0.1) or Tailscale IPv4 address (100.64.0.0/10), got ${JSON.stringify(followers.bind)}`
+      );
+    }
+    if (
+      typeof followers.port !== "number" ||
+      !Number.isInteger(followers.port) ||
+      followers.port <= 0 ||
+      followers.port > 65535
+    ) {
+      throw new Error("config.yaml: followers.port must be a valid port integer (1-65535)");
+    }
+    if (typeof followers.tokenFile !== "string" || !followers.tokenFile.trim()) {
+      throw new Error("config.yaml: followers.tokenFile must be a non-empty string when set");
+    }
+    const rawTokenFile = followers.tokenFile.trim();
+    followers.tokenFile =
+      rawTokenFile === "~" || rawTokenFile.startsWith("~/")
+        ? join(homedir(), rawTokenFile.slice(2))
+        : rawTokenFile;
   }
 
   applySecretFiles(parsed, mcHome);

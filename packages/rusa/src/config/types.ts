@@ -405,6 +405,18 @@ export interface RusaConfig {
   gitBridgePort?: number;
   /** Host/interface the local Git HTTP server binds to (default: 127.0.0.1). */
   gitBridgeBindHost?: string;
+  /** Follower gateway configuration for remote worker placement. Off by default. */
+  followers?: FollowerGatewayConfig;
+}
+
+/** Configuration for hosting remote followers on a persistent leader instance. */
+export interface FollowerGatewayConfig {
+  /** Tailscale IPv4 address or loopback to bind the follower gateway to. Never public/0.0.0.0. */
+  bind: string;
+  /** TCP port for the follower gateway HTTP server (e.g. 8190). */
+  port: number;
+  /** Path to the enrollment token secret file. */
+  tokenFile: string;
 }
 
 /** Tunables for the actor mesh's safety governors; all fields optional. */

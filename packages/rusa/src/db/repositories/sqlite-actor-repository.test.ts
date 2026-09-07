@@ -109,11 +109,13 @@ describe("SqliteActorRepository", () => {
     for (const invalid of [
       "not-json",
       '{"type":"native"}',
-      '{"schemaVersion":2,"type":"native"}',
+      '{"schemaVersion":3,"type":"native"}',
       '{"schemaVersion":1,"type":"legacy"}',
       '{"schemaVersion":1,"type":"portable"}',
       '{"schemaVersion":1,"type":"portable","mode":"tail","sessionId":"s1"}',
       '{"schemaVersion":1,"type":"native","mode":"tail"}',
+      '{"schemaVersion":1,"type":"native","executionTarget":"mac-mini"}',
+      '{"schemaVersion":2,"type":"native","unknown":true}',
     ]) {
       db.prepare("UPDATE actors SET context_config = ? WHERE id = 'root'").run(invalid);
       expect(() => repository.get("root")).toThrow(/invalid context_config for actor 'root'/);
@@ -389,5 +391,83 @@ describe("SqliteActorRepository", () => {
     repository.upsert(portableWorker);
 
     expect(repository.get("worker")?.modelConfig).toEqual(portableWorker.modelConfig);
+  });
+
+  it("persists executionTarget across repository reopen", () => {
+    const remoteWorker: ActorRecord = {
+      id: "worker-remote",
+      charter: "Run remotely on macOS",
+      parentId: "root",
+      status: "active",
+      executionTarget: "mac-mini-follower",
+      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
+      createdAt: "2026-09-07T12:00:00.000Z",
+    };
+    repository.upsert(root);
+    repository.upsert(remoteWorker);
+
+    const stored = db
+      .prepare("SELECT context_config FROM actors WHERE id = 'worker-remote'")
+      .get() as {
+      context_config: string;
+    };
+    expect(JSON.parse(stored.context_config)).toEqual({
+      schemaVersion: 2,
+      type: "native",
+      executionTarget: "mac-mini-follower",
+    });
+
+    expect(repository.get("worker-remote")?.executionTarget).toBe("mac-mini-follower");
+
+    // Verify persistence across repository reopen with same db
+    const reopened = new SqliteActorRepository(db);
+    expect(reopened.get("worker-remote")?.executionTarget).toBe("mac-mini-follower");
+  });
+
+  it("reads the strict v1 context document while emitting the v2 placement shape", () => {
+    repository.upsert(root);
+    db.prepare("UPDATE actors SET context_config = ? WHERE id = 'root'").run(
+      JSON.stringify({ schemaVersion: 1, type: "native", sessionId: "legacy-session" })
+    );
+
+    expect(repository.get("root")).toMatchObject({
+      context: { type: "native" },
+      sessionId: "legacy-session",
+    });
+
+    repository.patch("root", { executionTarget: "mac-mini-follower" });
+    const stored = db.prepare("SELECT context_config FROM actors WHERE id = 'root'").get() as {
+      context_config: string;
+    };
+    expect(JSON.parse(stored.context_config)).toEqual({
+      schemaVersion: 2,
+      type: "native",
+      sessionId: "legacy-session",
+      executionTarget: "mac-mini-follower",
+    });
+  });
+
+  it("emits v1 for unplaced actors to keep rollback blast radius strictly bounded", () => {
+    repository.upsert(root);
+    const unplacedWorker: ActorRecord = {
+      id: "worker-local",
+      charter: "local test charter",
+      parentId: "root",
+      status: "active",
+      sessionId: "local-session-123",
+      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
+      createdAt: "2026-09-07T12:00:00.000Z",
+    };
+    repository.upsert(unplacedWorker);
+    const stored = db
+      .prepare("SELECT context_config FROM actors WHERE id = 'worker-local'")
+      .get() as {
+      context_config: string;
+    };
+    expect(JSON.parse(stored.context_config)).toEqual({
+      schemaVersion: 1,
+      type: "native",
+      sessionId: "local-session-123",
+    });
   });
 });

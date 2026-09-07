@@ -11,6 +11,7 @@ import type { ActorWakeScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import type { ModelClassRepository } from "../db/repositories/model-class-repository.js";
+import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
 import type { ConcreteModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
 import { githubBranchReference } from "../references/reference.js";
 import { toolError, toolOk } from "./result.js";
@@ -100,6 +101,8 @@ export function createAgentExecMcpServer(
     modelClasses?: Pick<ModelClassRepository, "list" | "upsert" | "delete">;
     /** Config-aware concrete tuple validation at the management boundary. */
     validateModelClass?: (input: ConcreteModelConfigInput) => ProviderModelConfig[];
+    /** List of connected followers available for remote placement. */
+    getFollowers?: () => FollowerInfo[];
   }
 ): McpServer {
   const server = createMcpServer(
@@ -266,15 +269,22 @@ export function createAgentExecMcpServer(
           .describe(
             "Who owns the child's memory between runs. Omit (or 'native') for the default: the provider keeps the session and resumes it. 'ledger' and 'tail' hand ownership to the mesh — the child is called FRESH every run with its own recent history injected into the prompt, so it survives provider quota exhaustion and can be re-mounted on a different harness. 'ledger' keeps a rolling compacted digest plus recent messages and is the one to reach for; 'tail' is a raw window that never compacts. Incompatible with conversation_id."
           ),
+        target: z
+          .string()
+          .optional()
+          .describe(
+            "Execution follower/instance to run this actor on (e.g. 'mac-mini'). Omit to execute locally on this machine."
+          ),
       },
     },
-    async ({ charter, model_config, conversation_id, title, context_mode }) => {
+    async ({ charter, model_config, conversation_id, title, context_mode, target }) => {
       try {
         const context = resolveContextSelection(context_mode);
         const id =
           selfId === rootId && options?.rootControl
             ? options.rootControl.spawnChild(
                 {
+                  executionTarget: target,
                   charter,
                   modelConfig: model_config,
                   conversationId: conversation_id,
@@ -284,6 +294,7 @@ export function createAgentExecMcpServer(
                 "root-llm"
               )
             : mesh.spawn({
+                executionTarget: target,
                 charter,
                 parentId: selfId,
                 modelConfig: model_config,
@@ -295,6 +306,26 @@ export function createAgentExecMcpServer(
       } catch (err) {
         return toolError(err);
       }
+    }
+  );
+
+  server.registerTool(
+    "list_followers",
+    {
+      title: "List connected followers",
+      description:
+        "List all connected follower instances available for remote actor placement via spawn_thread target.",
+      inputSchema: {},
+    },
+    async () => {
+      const followers = (options?.getFollowers?.() ?? []).map((f) => ({
+        id: f.id,
+        platform: f.platform,
+        pid: f.pid,
+        actors: [...f.actors],
+        lastSeen: f.lastSeen,
+      }));
+      return toolOk({ followers });
     }
   );
 

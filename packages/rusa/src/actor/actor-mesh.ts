@@ -1445,6 +1445,7 @@ export class ActorMesh {
       // instead of creating a fresh one (loadSessionId reads record.sessionId).
       sessionId: req.conversationId,
       title: req.title,
+      executionTarget: req.executionTarget,
       status: "active",
       createdAt: this.now(),
     };
@@ -3531,6 +3532,7 @@ export class ActorMesh {
     return {
       record,
       getRecord: () => this.actors.get(record.id),
+      executionTarget: record.executionTarget,
       mesh: this,
       gate: (fn, candidates, responsive) => this.gateRun(fn, candidates, responsive, record.id),
       beforeRun: ({ mode }) => {
