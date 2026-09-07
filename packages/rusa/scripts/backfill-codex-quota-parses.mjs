@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { inferQuotaState, parseCodexQuota } from "../dist/mcp/quota-mcp.js";
 
@@ -177,6 +178,44 @@ function renderReport(summary) {
   );
 }
 
+export function applyBackfill(writable, replacements, since, through) {
+  const update = writable.prepare(
+    `UPDATE quota_scrapes
+     SET parsed_state = ?, parse_error = NULL
+     WHERE id = ? AND provider = 'codex' AND scraped_at = ?
+       AND parsed_state IS ? AND parse_error IS ?`
+  );
+  const apply = writable.transaction(() => {
+    if (since && through) {
+      const sinceIso = since instanceof Date ? since.toISOString() : since;
+      const throughIso = through instanceof Date ? through.toISOString() : through;
+      const currentCount = writable
+        .prepare(
+          `SELECT COUNT(*) AS count
+           FROM quota_scrapes
+           WHERE provider = 'codex' AND scraped_at >= ? AND scraped_at <= ?`
+        )
+        .get(sinceIso, throughIso).count;
+      if (currentCount !== replacements.length) {
+        throw new Error("live Codex scrape count changed during backfill");
+      }
+    }
+    for (const replacement of replacements) {
+      const result = update.run(
+        replacement.serialized,
+        replacement.id,
+        replacement.scrapedAt,
+        replacement.parsedState ?? null,
+        replacement.parseError ?? null
+      );
+      if (result.changes !== 1) {
+        throw new Error(`row ${shortHash(replacement.id)} changed during the backfill`);
+      }
+    }
+  });
+  apply.immediate();
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   if (args.help) {
@@ -195,7 +234,7 @@ async function main() {
   try {
     rows = db
       .prepare(
-        `SELECT id, scraped_at AS scrapedAt, raw_output AS rawOutput, parsed_state AS parsedState
+        `SELECT id, scraped_at AS scrapedAt, raw_output AS rawOutput, parsed_state AS parsedState, parse_error AS parseError
          FROM quota_scrapes
          WHERE provider = 'codex' AND scraped_at >= ? AND scraped_at <= ?
          ORDER BY scraped_at ASC, rowid ASC`
@@ -250,20 +289,7 @@ async function main() {
     const writable = new Database(args.database, { fileMustExist: true });
     writable.pragma("busy_timeout = 30000");
     try {
-      const update = writable.prepare(
-        `UPDATE quota_scrapes
-         SET parsed_state = ?, parse_error = NULL
-         WHERE id = ? AND provider = 'codex' AND scraped_at = ?`
-      );
-      const apply = writable.transaction(() => {
-        for (const replacement of replacements) {
-          const result = update.run(replacement.serialized, replacement.id, replacement.scrapedAt);
-          if (result.changes !== 1) {
-            throw new Error(`row ${shortHash(replacement.id)} changed during the backfill`);
-          }
-        }
-      });
-      apply.immediate();
+      applyBackfill(writable, replacements, since, through);
     } finally {
       writable.close();
     }
@@ -287,9 +313,11 @@ async function main() {
   );
 }
 
-main().catch((error) => {
-  process.stderr.write(
-    `[codex-backfill] ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`
-  );
-  process.exitCode = 1;
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    process.stderr.write(
+      `[codex-backfill] ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`
+    );
+    process.exitCode = 1;
+  });
+}

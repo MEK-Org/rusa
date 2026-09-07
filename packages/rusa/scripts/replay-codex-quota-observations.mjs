@@ -1,9 +1,10 @@
 import { copyFile, mkdir, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { SharedQuotaStore } from "../dist/quota/shared-store.js";
 
-const OBSERVATION_COLUMNS = [
+export const OBSERVATION_COLUMNS = [
   "provider",
   "kind",
   "observed_slot",
@@ -108,15 +109,15 @@ async function onlineBackup(sourcePath, destinationPath) {
   }
 }
 
-function snapshotMetadata(databasePath, since) {
+export function snapshotMetadata(databasePath, since) {
   const db = new Database(databasePath, { readonly: true, fileMustExist: true });
   try {
     const scrapes = db
       .prepare(
-        `SELECT id, scraped_at AS scrapedAt, parsed_state AS parsedState
+        `SELECT id, scraped_at AS scrapedAt, raw_output AS rawOutput, parsed_state AS parsedState, parse_error AS parseError
          FROM quota_scrapes
          WHERE provider = 'codex' AND scraped_at >= ?
-         ORDER BY scraped_at ASC, rowid ASC`
+         ORDER BY scraped_at ASC, id ASC`
       )
       .all(since);
     const observations = db
@@ -124,7 +125,7 @@ function snapshotMetadata(databasePath, since) {
         `SELECT ${OBSERVATION_COLUMNS.join(", ")}
          FROM quota_observations
          WHERE provider = 'codex' AND observed_at >= ?
-         ORDER BY observed_at ASC, rowid ASC`
+         ORDER BY observed_at ASC, kind ASC, observed_slot ASC`
       )
       .all(since);
     return {
@@ -239,7 +240,7 @@ function validateReplay(metadata, since) {
   }
 }
 
-function applyReplay(databasePath, since, snapshot, rebuilt) {
+export function applyReplay(databasePath, since, snapshot, rebuilt) {
   const db = new Database(databasePath, { fileMustExist: true });
   db.pragma("busy_timeout = 30000");
   try {
@@ -266,10 +267,71 @@ function applyReplay(databasePath, since, snapshot, rebuilt) {
             )
             .get().value ?? null,
       };
-      if (JSON.stringify(current) !== JSON.stringify(snapshot)) {
+      if (
+        current.totalCodexScrapes !== snapshot.totalCodexScrapes ||
+        current.totalCodexObservations !== snapshot.totalCodexObservations ||
+        current.latestScrapeAt !== snapshot.latestScrapeAt ||
+        current.latestObservationAt !== snapshot.latestObservationAt
+      ) {
         throw new Error(
           "live Codex quota data changed during replay; no observations were replaced"
         );
+      }
+      if (snapshot.scrapes) {
+        const currentScrapes = db
+          .prepare(
+            `SELECT id, scraped_at AS scrapedAt, raw_output AS rawOutput, parsed_state AS parsedState, parse_error AS parseError
+             FROM quota_scrapes
+             WHERE provider = 'codex' AND scraped_at >= ?
+             ORDER BY scraped_at ASC, id ASC`
+          )
+          .all(since);
+        if (currentScrapes.length !== snapshot.scrapes.length) {
+          throw new Error(
+            "live Codex quota data changed during replay; no observations were replaced"
+          );
+        }
+        for (let i = 0; i < currentScrapes.length; i++) {
+          const c = currentScrapes[i];
+          const s = snapshot.scrapes[i];
+          if (
+            c.id !== s.id ||
+            c.scrapedAt !== s.scrapedAt ||
+            c.rawOutput !== s.rawOutput ||
+            c.parsedState !== s.parsedState ||
+            c.parseError !== s.parseError
+          ) {
+            throw new Error(
+              "live Codex quota data changed during replay; no observations were replaced"
+            );
+          }
+        }
+      }
+      if (snapshot.observations) {
+        const currentObservations = db
+          .prepare(
+            `SELECT ${OBSERVATION_COLUMNS.join(", ")}
+             FROM quota_observations
+             WHERE provider = 'codex' AND observed_at >= ?
+             ORDER BY observed_at ASC, kind ASC, observed_slot ASC`
+          )
+          .all(since);
+        if (currentObservations.length !== snapshot.observations.length) {
+          throw new Error(
+            "live Codex quota data changed during replay; no observations were replaced"
+          );
+        }
+        for (let i = 0; i < currentObservations.length; i++) {
+          const c = currentObservations[i];
+          const s = snapshot.observations[i];
+          for (const col of OBSERVATION_COLUMNS) {
+            if (c[col] !== s[col]) {
+              throw new Error(
+                "live Codex quota data changed during replay; no observations were replaced"
+              );
+            }
+          }
+        }
       }
       db.prepare(
         "DELETE FROM quota_observations WHERE provider = 'codex' AND observed_at >= ?"
@@ -333,17 +395,7 @@ async function main() {
 
     const changed = countChanged(snapshot.observations, rebuilt.observations);
     if (args.apply) {
-      applyReplay(
-        args.database,
-        args.since,
-        {
-          totalCodexScrapes: snapshot.totalCodexScrapes,
-          totalCodexObservations: snapshot.totalCodexObservations,
-          latestScrapeAt: snapshot.latestScrapeAt,
-          latestObservationAt: snapshot.latestObservationAt,
-        },
-        rebuilt.observations
-      );
+      applyReplay(args.database, args.since, snapshot, rebuilt.observations);
     }
 
     const summary = {
@@ -368,9 +420,11 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(
-    `[codex-observation-replay] ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`
-  );
-  process.exitCode = 1;
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    process.stderr.write(
+      `[codex-observation-replay] ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`
+    );
+    process.exitCode = 1;
+  });
+}
