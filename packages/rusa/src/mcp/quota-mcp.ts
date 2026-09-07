@@ -165,6 +165,8 @@ interface LlmQuotaWindow {
   scope?: "provider" | "model";
 }
 
+export type QuotaLlmProvider = "claude" | "codex" | "agy" | "kimi";
+
 /** The valid `QuotaWindowKind` values, for validating the LLM's `kind` output. */
 const QUOTA_WINDOW_KINDS: readonly QuotaWindowKind[] = ["session", "five_hour", "weekly", "other"];
 
@@ -196,7 +198,12 @@ const LLM_WINDOW_ITEM_SCHEMA = {
     },
     usedPercent: {
       type: Type.NUMBER,
-      description: "Percentage of this window's quota used, 0-100. Omit when placeholder is true.",
+      description:
+        "Percentage of this window's quota used, 0-100. Copy the source number, or convert it " +
+        "when the source says left/remaining, exactly and preserve every printed decimal place. " +
+        "Use numeric text, never the apparent length of a progress bar. For example, 100% left " +
+        "is usedPercent 0 exactly, never an approximation such as 0.0001. " +
+        "Omit when placeholder is true.",
     },
     resetAtIso: {
       type: Type.STRING,
@@ -224,9 +231,9 @@ const LLM_WINDOW_ITEM_SCHEMA = {
     },
     scope: {
       type: Type.STRING,
-      enum: ["provider", "model"],
+      enum: ["provider"],
       description:
-        "Scope of this limit. 'provider' for a whole-account/provider-wide limit; 'model' for a limit tied to a specific model or model-group.",
+        "The only accepted scope is 'provider'. Omit model-specific and model-group limits instead of returning them.",
     },
   },
   required: ["label", "kind", "placeholder", "scope"],
@@ -301,11 +308,11 @@ function resolveResetAtIso(
 async function parseQuotaWithLlm(
   output: string,
   apiKey: string,
-  provider: "claude" | "codex" | "agy" | "kimi"
+  provider: QuotaLlmProvider,
+  generatedAtMs = Date.now()
 ): Promise<Partial<ProviderQuotaSnapshot>> {
   const client = getGeminiClient(apiKey);
   const isAgy = provider === "agy";
-  const generatedAtMs = Date.now();
 
   const properties: Record<string, unknown> = {
     status: {
@@ -335,6 +342,7 @@ async function parseQuotaWithLlm(
   const providerClause =
     provider === "claude"
       ? "For Claude: it will show session/week usage windows with percentage used and reset times (e.g. 'resets in 4 hours 12 minutes' or 'resets Jul 13, 2:59am (UTC)'). " +
+        "Ignore named-model quota rows such as 'Current week (Fable)'; do not emit them and do not use them to determine status. " +
         "If any provider-wide window is 100% used or the output says 'rate limit exceeded' or 'limit exceeded', " +
         "status is 'exhausted'. Set scope to 'provider'.\n"
       : provider === "codex"
@@ -349,42 +357,47 @@ async function parseQuotaWithLlm(
           // anyway, so emitting one would only force the model to guess label/kind).
           "For Codex: a real reading contains limit rows (e.g. '5h limit:', 'Weekly limit:') " +
           "or an explicit exhaustion message (\"You've hit your usage limit\" / 'hit your usage limit'). " +
-          "Extract EVERY rendered limit row into `windows` — never drop or omit the Weekly row when 5h is present, and vice-versa. " +
+          "Return ONLY the provider-wide quota shared by ordinary Codex models. Extract every provider-wide 5h and Weekly limit row into `windows`. " +
+          "Ignore all named-model, model-family, reserve, and special-allocation limits; do not emit them and do not use them to determine status. " +
+          "An inline label containing a model or reserve name before 'Weekly limit' is model-specific (for example 'gpt-reserve Weekly limit'). " +
+          "A standalone '<model name> limit:' heading starts a model-specific subsection; any 5h or Weekly rows beneath that heading are model-specific too (for example rows beneath a Codex Spark heading). " +
+          "Generic top-level rows labeled only '5h limit:' or 'Weekly limit:' are provider-wide. Every returned Codex window must therefore have scope='provider'. " +
+          "Codex percentages say LEFT. Convert the printed N% left to usedPercent = 100 - N exactly. " +
           `If it contains "You've hit your usage limit" or "hit your usage limit", ` +
-          "status is 'exhausted'; extract per-window (5h, Weekly) percentages and reset times (including from 'try again at <date/time>'). " +
+          "status is 'exhausted' only when that message applies to the provider-wide quota; extract provider-wide percentages and reset times (including from 'try again at <date/time>'). " +
           'KNOWN PENDING STATE: codex\'s /status can render "Limits: refresh requested; run /status again shortly" ' +
           '(or "run /status again") — codex\'s async-refresh placeholder, NOT a reading and NOT a parse error. ' +
           "When that placeholder is all that renders, return status='unknown' and windows=[] — do NOT guess a number, do NOT fail the parse, and do NOT emit an invented window for it. " +
           "Likewise, if the output contains none of the above — no limit rows, no exhaustion message, no refresh placeholder — return status='unknown' and windows=[]. " +
-          "For standard 5h and Weekly limits, scope is 'provider'. " +
-          "For specific model limits (e.g. GPT-5.3-Codex-Spark limit), scope is 'model'.\n"
+          "A terminal capture can contain repeated panels, an earlier refresh placeholder, or stale warning text. When at least one fully rendered provider-wide limit panel is present, use the latest such panel and ignore placeholder/warning remnants. " +
+          "The pending-state rule applies only when no rendered provider-wide limit row or provider-wide exhaustion message appears anywhere in the capture.\n"
         : provider === "agy"
           ? "For agy: locate the 'GEMINI MODELS' section, which has a Weekly Limit and a " +
             "Five Hour Limit window. " +
-            "CRITICAL — unlike Claude/Codex, agy's TUI reports quota REMAINING, not used: " +
-            "a window reads 'N% remaining' (and its progress bar shows the remaining fraction). " +
-            "'usedPercent' must still be the USED percentage, so emit usedPercent = 100 - N " +
+            "Only the shared GEMINI MODELS section is provider-wide. Ignore every other named model or model-group section; do not emit those rows and do not use them to determine status. " +
+            "CRITICAL — unlike Claude, agy's TUI reports quota REMAINING, not used. It can print a precise decimal percentage beside the bar and a rounded whole-number summary for the same window. Use the more precise printed percentage, preserve all its decimals, and ignore the apparent progress-bar length. " +
+            "'usedPercent' must still be the USED percentage, so emit usedPercent = 100 - N exactly " +
             "(e.g. '0.00% remaining' or '[░░░ …] 0.00%' → usedPercent 100; '3% remaining' → usedPercent 97; '48% remaining' → usedPercent 52). " +
             "A window showing 'Quota available' with a full (100%) bar is fully available: " +
             "emit usedPercent 0. If a window says 'Disabled: You have hit your weekly limit, the 5-hour limit does not currently apply. Your weekly limit will fully refresh in <duration>', " +
             "emit this window with usedPercent 100 (exhausted) and extract the reset duration, or if indeterminate emit with placeholder: true. " +
             'Emit the GEMINI MODELS Weekly Limit and Five Hour Limit at top level in `windows`, each with `scope: "provider"`. ' +
             "Omit every other section (e.g. CLAUDE AND GPT MODELS) from `windows` entirely. If weekly limit is at 100% used (0% remaining), status is 'exhausted'.\n"
-          : "For Kimi: the interactive /usage panel shows Kimi Code platform quota with " +
-            "progress bars and remaining percentages, commonly including 5h/five-hour and " +
-            "weekly windows. CRITICAL — Kimi reports quota LEFT/REMAINING, not used: a " +
-            "window reads 'N% left' or 'N% remaining'. 'usedPercent' must still be the USED " +
-            "percentage, so emit usedPercent = 100 - N (e.g. '0% left' → usedPercent 100; " +
-            "'88% left' → usedPercent 12; '50% left' → usedPercent 50). Extract every visible quota window and set kind " +
+          : "For Kimi: the interactive /usage panel shows Kimi Code platform quota, commonly including 5h/five-hour and weekly windows. " +
+            "Kimi can print either 'N% used' or 'N% left/remaining'. Copy N exactly for 'used'; for 'left/remaining', emit usedPercent = 100 - N exactly " +
+            "(e.g. '63% used' → usedPercent 63; '0% left' → usedPercent 100; '88% left' → usedPercent 12). " +
+            "Always use the numeric percentage text and preserve its decimals; never estimate from a progress bar. Ignore every named-model or model-group limit; do not emit those rows and do not use them to determine status. Extract every visible provider-wide quota window and set kind " +
             "to 'five_hour', 'weekly', 'session', or 'other' with scope 'provider'. If any provider window is 100% used (0% left), status is 'exhausted'. " +
             "If the screen is a login/auth/error state rather than a quota display, return status 'unknown' and no fabricated windows.\n";
   const systemInstruction =
     "You are a precise quota parser. Analyze the raw CLI or TUI output of a provider's " +
     "usage/status check and extract the quota state.\n" +
     "Return a JSON object matching the schema.\n" +
+    "OUTPUT SCOPE CONTRACT: 'provider' is the only accepted scope. Return only quota shared across the provider/account. Omit every model-specific, named-model, model-family, reserve, or special-allocation limit, even when it has the same window label as a provider limit. Every emitted window must have scope='provider'.\n" +
     "GROUNDING REQUIREMENT: You MUST ONLY report windows and statuses that are physically printed in the provided output. " +
     "If the output contains ONLY a welcome banner, splash screen, prompt menu, login error, or does NOT contain rendered quota/status limit rows or an explicit exhaustion message, " +
-    "you MUST return status='unknown' with windows=[]. NEVER invent, hallucinate, or assume 100% remaining / 0% used when quota limit information is absent from the text.\n" +
+    "you MUST return status='unknown' with windows=[]. NEVER invent, hallucinate, approximate, or assume 100% remaining / 0% used when quota limit information is absent from the text.\n" +
+    "PERCENTAGE REQUIREMENT: Read the explicit numeric percentage text, preserve all printed decimal precision, and never infer a value from progress-bar artwork. If the source reports USED, copy it exactly. If it reports LEFT or REMAINING, calculate usedPercent = 100 - N exactly.\n" +
     providerClause +
     "The current local time — in the SAME timezone the TUI's clock is printed in (its " +
     `offset is included below) — is ${formatLocalIsoWithOffset(generatedAtMs)}. ` +
@@ -406,7 +419,7 @@ async function parseQuotaWithLlm(
         responseSchema: {
           type: Type.OBJECT,
           properties,
-          required: ["status"],
+          required: ["status", "windows"],
         },
         systemInstruction,
       },
@@ -414,6 +427,13 @@ async function parseQuotaWithLlm(
 
     const text = await extractGeminiText(response);
     const parsed = JSON.parse(text);
+
+    if (!Array.isArray(parsed.windows)) {
+      throw new Error("Quota parse failed: response omitted the required windows array");
+    }
+    if (!(["available", "exhausted", "unknown"] as const).includes(parsed.status)) {
+      throw new Error(`Quota parse failed: invalid status '${String(parsed.status)}'`);
+    }
 
     const realWindows = Array.isArray(parsed.windows)
       ? (parsed.windows as LlmQuotaWindow[]).filter(
@@ -425,43 +445,73 @@ async function parseQuotaWithLlm(
 
     const limits: QuotaLimit[] = [];
     for (const w of realWindows) {
-      const percentLeft = 100 - (w.usedPercent as number);
+      // Model-specific allocations are not provider quota and are not
+      // consumed by the dashboard or throttle controller. Dropping explicitly
+      // scoped model rows here also keeps a model-only response from counting as
+      // a successful provider read.
+      if (w.scope === "model") continue;
+      if (w.scope !== undefined && w.scope !== "provider") {
+        throw new Error(`Quota parse failed: window '${w.label}' has invalid scope`);
+      }
+      if (typeof w.label !== "string" || !w.label.trim()) {
+        throw new Error("Quota parse failed: window label is missing");
+      }
+      const usedPercent = w.usedPercent;
+      if (
+        typeof usedPercent !== "number" ||
+        !Number.isFinite(usedPercent) ||
+        usedPercent < 0 ||
+        usedPercent > 100
+      ) {
+        throw new Error(
+          `Quota parse failed: window '${w.label}' has invalid usedPercent ${String(w.usedPercent)}`
+        );
+      }
+      const kind = normalizeQuotaWindowKind(w.kind);
+      if (!kind) {
+        throw new Error(`Quota parse failed: window '${w.label}' has invalid kind`);
+      }
+      const percentLeft = 100 - usedPercent;
       const resetAtIso = resolveResetAtIso(w.resetAtIso, w.resetInIso, generatedAtMs);
 
-      // Fail-loud gate : Fail loud ONLY on windows with neither field AND percentLeft < 100.
-      // Model-scope windows missing a reset are permitted when a provider-scope sibling of the
-      // same kind in the same scrape provides a resolvable reset (copied downstream via sibling_window_copy).
-      if (percentLeft < 100 && !resetAtIso) {
-        const kind = normalizeQuotaWindowKind(w.kind);
-        const hasSiblingProviderReset =
-          w.scope === "model" &&
-          kind !== undefined &&
-          realWindows.some(
-            (other) =>
-              (other.scope === "provider" || other.scope === undefined) &&
-              normalizeQuotaWindowKind(other.kind) === kind &&
-              Boolean(resolveResetAtIso(other.resetAtIso, other.resetInIso, generatedAtMs))
-          );
+      if (resetAtIso && !Number.isFinite(Date.parse(resetAtIso))) {
+        throw new Error(
+          `Quota parse failed: window '${w.label}' has invalid reset ISO '${resetAtIso}'`
+        );
+      }
 
-        if (!hasSiblingProviderReset) {
-          throw new Error(
-            `Quota parse failed: window '${w.label}' has percentLeft < 100 (${percentLeft}%) but no resolvable reset ISO`
-          );
-        }
+      // A partially consumed provider window needs a reset so downstream pacing
+      // does not act on an unbounded quota reading.
+      if (percentLeft < 100 && !resetAtIso) {
+        throw new Error(
+          `Quota parse failed: window '${w.label}' has percentLeft < 100 (${percentLeft}%) but no resolvable reset ISO`
+        );
       }
 
       limits.push({
         label: w.label,
-        kind: normalizeQuotaWindowKind(w.kind),
+        kind,
         percentLeft,
         resetAtIso,
-        scope: w.scope as "provider" | "model" | undefined,
+        scope: "provider",
       });
     }
 
-    if (Array.isArray(parsed.windows)) {
-      result.limits = limits;
+    if (status === "available" && limits.length === 0) {
+      throw new Error(
+        `Quota parse failed: ${provider} status is available but no provider window was returned`
+      );
     }
+    if (limits.length > 0) {
+      const exhausted = limits.some((limit) => limit.percentLeft <= 0);
+      if (status !== "unknown" && (status === "exhausted") !== exhausted) {
+        throw new Error(
+          `Quota parse failed: status '${String(status)}' disagrees with the provider windows`
+        );
+      }
+    }
+
+    result.limits = limits;
 
     return result;
   };
@@ -492,11 +542,12 @@ async function parseQuotaWithLlm(
 
 export async function parseClaudeQuota(
   output: string,
-  apiKey?: string
+  apiKey?: string,
+  generatedAtMs = Date.now()
 ): Promise<Partial<ProviderQuotaSnapshot>> {
   // Ratified: parse TUI output with an LLM, not regex — TUIs drift. No-key = fail-closed unknown, never a regex guess.
   if (apiKey) {
-    return parseQuotaWithLlm(output, apiKey, "claude");
+    return parseQuotaWithLlm(output, apiKey, "claude", generatedAtMs);
   }
   return {
     status: "unknown",
@@ -506,11 +557,12 @@ export async function parseClaudeQuota(
 
 export async function parseCodexQuota(
   output: string,
-  apiKey?: string
+  apiKey?: string,
+  generatedAtMs = Date.now()
 ): Promise<Partial<ProviderQuotaSnapshot>> {
   // Ratified: parse TUI output with an LLM, not regex — TUIs drift. No-key = fail-closed unknown, never a regex guess.
   if (apiKey) {
-    return parseQuotaWithLlm(output, apiKey, "codex");
+    return parseQuotaWithLlm(output, apiKey, "codex", generatedAtMs);
   }
   return {
     status: "unknown",
@@ -520,11 +572,12 @@ export async function parseCodexQuota(
 
 export async function parseAgyQuota(
   output: string,
-  apiKey?: string
+  apiKey?: string,
+  generatedAtMs = Date.now()
 ): Promise<Partial<ProviderQuotaSnapshot>> {
   // Ratified: parse TUI output with an LLM, not regex — TUIs drift. No-key = fail-closed unknown, never a regex guess.
   if (apiKey) {
-    return parseQuotaWithLlm(output, apiKey, "agy");
+    return parseQuotaWithLlm(output, apiKey, "agy", generatedAtMs);
   }
   return {
     status: "unknown",
@@ -534,10 +587,11 @@ export async function parseAgyQuota(
 
 export async function parseKimiQuota(
   output: string,
-  apiKey: string
+  apiKey: string,
+  generatedAtMs = Date.now()
 ): Promise<Partial<ProviderQuotaSnapshot>> {
   // Ratified: parse new TUI output with an LLM, not regex — TUIs drift.
-  return parseQuotaWithLlm(output, apiKey, "kimi");
+  return parseQuotaWithLlm(output, apiKey, "kimi", generatedAtMs);
 }
 
 /**
@@ -931,7 +985,7 @@ export class QuotaService {
           scrapedAt,
         };
       }
-      const parsed = await parseClaudeQuota(output, apiKey);
+      const parsed = await parseClaudeQuota(output, apiKey, Date.parse(scrapedAt));
       return {
         provider: "claude",
         status: parsed.status || "unknown",
@@ -981,7 +1035,7 @@ export class QuotaService {
           scrapedAt,
         };
       }
-      const parsed = await parseCodexQuota(raw, apiKey);
+      const parsed = await parseCodexQuota(raw, apiKey, Date.parse(scrapedAt));
       return {
         provider: "codex",
         status: parsed.status ?? "unknown",
@@ -1019,7 +1073,7 @@ export class QuotaService {
     return this.parsePersistedScrape("agy", raw, scrapedAt, async () => {
       const apiKey = this.deps.config.geminiApiKey?.trim();
       if (apiKey) {
-        const parsed = await parseAgyQuota(raw, apiKey);
+        const parsed = await parseAgyQuota(raw, apiKey, Date.parse(scrapedAt));
         return {
           provider: "agy",
           status: parsed.status ?? "unknown",
@@ -1080,7 +1134,7 @@ export class QuotaService {
 
     const scrapedAt = this.scrapedAtNow();
     return this.parsePersistedScrape("kimi", raw, scrapedAt, async () => {
-      const parsed = await parseKimiQuota(raw, apiKey);
+      const parsed = await parseKimiQuota(raw, apiKey, Date.parse(scrapedAt));
       return {
         provider: "kimi",
         status: parsed.status ?? "unknown",
