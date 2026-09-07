@@ -7,7 +7,7 @@ import {
   type ObligationActivationRecord,
   type ObligationActivationScheduler,
 } from "../../actor/os-scheduler.js";
-import type { Obligation } from "../../obligations/obligation.js";
+import { OBLIGATION_CHECKPOINT_MAX, type Obligation } from "../../obligations/obligation.js";
 import { asGitHubIssue } from "../../references/reference.js";
 import { obligations } from "../migrations/0016_obligations.js";
 import { obligationPriority } from "../migrations/0017_obligation_priority.js";
@@ -2991,17 +2991,16 @@ describe("ObligationRepository", () => {
     it("refuses a checkpoint longer than the cap", () => {
       repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
 
-      expect(() => repository.setCheckpoint("arc", "x".repeat(2_001), "actor-a")).toThrow(
-        /cannot exceed 2000 characters/
-      );
+      expect(() =>
+        repository.setCheckpoint("arc", "x".repeat(OBLIGATION_CHECKPOINT_MAX + 1), "actor-a")
+      ).toThrow(new RegExp(`cannot exceed ${OBLIGATION_CHECKPOINT_MAX} characters`));
       expect(repository.require("arc").checkpoint).toBeNull();
-      expect(() => repository.setCheckpoint("arc", "x".repeat(2_000), "actor-a")).not.toThrow();
+      expect(() =>
+        repository.setCheckpoint("arc", "x".repeat(OBLIGATION_CHECKPOINT_MAX), "actor-a")
+      ).not.toThrow();
     });
 
-    it("freezes a terminal obligation's account of itself", () => {
-      // Consistent with reassign/setExternalRef/reparent: what a settled
-      // obligation said about itself is part of the record, and why it settled
-      // is what the terminal note carries.
+    it("clears the standing on a terminal transition, then freezes the terminal row", () => {
       repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
       repository.setCheckpoint("arc", HEAD_STANDING, "actor-a");
       repository.setTerminalStatus("arc", "done", "shipped");
@@ -3010,7 +3009,42 @@ describe("ObligationRepository", () => {
         /terminal obligations cannot change their checkpoint/
       );
       expect(() => repository.setCheckpoint("arc", null, "actor-a")).toThrow();
-      expect(repository.require("arc").checkpoint).toBe(HEAD_STANDING);
+      expect(repository.require("arc")).toMatchObject({
+        checkpoint: null,
+        checkpointAt: null,
+        checkpointBy: null,
+      });
+    });
+
+    it("clears the finished cycle's standing when recurrence moves it to scheduled", () => {
+      repository.create({ title: "recurring arc", id: "recurring", ownerId: "actor-a" });
+      repository.setRecurrence("recurring", { policy: "cron", cronExpr: "0 * * * *" });
+      repository.setCheckpoint("recurring", HEAD_STANDING, "actor-a");
+
+      const scheduled = repository.setTerminalStatus("recurring", "done", "cycle complete");
+
+      expect(scheduled).toMatchObject({
+        status: "scheduled",
+        checkpoint: null,
+        checkpointAt: null,
+        checkpointBy: null,
+      });
+    });
+
+    it("clears a scheduled checkpoint when disabling recurrence finalizes the obligation", () => {
+      repository.create({ title: "recurring arc", id: "recurring", ownerId: "actor-a" });
+      repository.setRecurrence("recurring", { policy: "cron", cronExpr: "0 * * * *" });
+      repository.setTerminalStatus("recurring", "done", "cycle complete");
+      repository.setCheckpoint("recurring", "next run waits on the cron wake", "actor-a");
+
+      const finalized = repository.setRecurrence("recurring", null);
+
+      expect(finalized).toMatchObject({
+        status: "done",
+        checkpoint: null,
+        checkpointAt: null,
+        checkpointBy: null,
+      });
     });
 
     it("refuses to write against an obligation that does not exist", () => {
@@ -3041,6 +3075,7 @@ describe("multi-instance crontab reconciliation (#304)", () => {
     obligationArtifacts.up(d);
     recurringObligations.up(d);
     obligationDependencies.up(d);
+    obligationCheckpoint.up(d);
     return d;
   };
 

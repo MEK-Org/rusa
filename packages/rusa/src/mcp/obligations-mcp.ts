@@ -3,11 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { MeshEventSink } from "../actor/mesh-events.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
-import {
-  OBLIGATION_CHECKPOINT_MAX,
-  OBLIGATION_TITLE_MAX,
-  type ObligationStatus,
-} from "../obligations/obligation.js";
+import { OBLIGATION_TITLE_MAX, type ObligationStatus } from "../obligations/obligation.js";
 import { REFERENCE_SCHEMES } from "../references/reference.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
@@ -61,11 +57,12 @@ export interface ObligationsMcpOptions {
    */
   canManage?: (actorId: string, obligation: ManageableObligation) => boolean;
   /**
-   * Where this server's observable moments go. Injected rather than imported
-   * for the same reason the mesh's own sink is a bare function type: this
-   * module has no storage dependency, and absent a sink the tools still work —
-   * they are simply unobserved, which is how every test that constructs this
-   * server directly runs.
+   * Best-effort notification that a committed checkpoint changed. Injected
+   * rather than imported for the same reason the mesh's own sink is a bare
+   * function type: this module has no storage dependency. This is deliberately
+   * not an audit receipt or part of the repository transaction — a sink may be
+   * absent or fail after the write, while the returned obligation remains the
+   * authoritative durable result.
    */
   recordEvent?: MeshEventSink;
 }
@@ -480,10 +477,14 @@ export function createObligationsMcpServer(
     {
       title: "Rewrite where this obligation stands",
       description:
-        "Replace this obligation's checkpoint: where the work actually stands right now, so the next wake reads its standing off the tree instead of reconstructing it from message history. Replace semantics, not append — the previous value is gone, because the field is the *current* standing. Pass null to clear. Only the owner, or an actor above the owner, may write it, and a terminal obligation's is frozen. An arc-level checkpoint states exact head, what is in flight, which gates cleared with refs, and the next action; evidence about the work still belongs in attach_artifact.",
+        "Replace this obligation's checkpoint: where the work actually stands right now, so the next wake reads its standing off the tree instead of reconstructing it from message history. Replace semantics, not append — the previous value is gone, because the field is the *current* standing. Pass null to clear. Only the owner, or an actor above the owner, may write it. A terminal transition clears its standing, and terminal obligations cannot then be edited. An arc-level checkpoint states exact head, what is in flight, which gates cleared with refs, and the next action; evidence about the work still belongs in attach_artifact.",
       inputSchema: {
         id: z.string().trim().min(1),
-        checkpoint: z.string().max(OBLIGATION_CHECKPOINT_MAX).nullable(),
+        // The repository trims before applying the legibility cap. Keeping
+        // that as the only length boundary means a trailing newline neither
+        // changes accept/reject behavior nor hides its useful remediation
+        // message behind a schema error.
+        checkpoint: z.string().nullable(),
       },
     },
     async ({ id, checkpoint }) => {
@@ -493,17 +494,23 @@ export function createObligationsMcpServer(
           throw new Error("not authorized to set this obligation's checkpoint");
         }
         const obligation = repository.setCheckpoint(id, checkpoint, actorId);
-        // Recorded only once the write committed, so the log never claims a
-        // standing changed that a validation error rejected. The author is
-        // bound from this server's identity like every other attribution here,
-        // and the checkpoint text is deliberately absent: the event says the
-        // standing moved, the obligation says what it is now.
-        options?.recordEvent?.({
-          kind: "obligation_checkpoint_set",
-          actorId,
-          detail: id,
-          payload: JSON.stringify({ obligationId: id }),
-        });
+        // This event is a best-effort invalidation/observability signal, not
+        // an audit receipt. The write committed above is the only durable
+        // contract this tool reports; a missing or failing optional sink must
+        // not turn that successful write into a misleading tool error.
+        try {
+          options?.recordEvent?.({
+            kind: "obligation_checkpoint_set",
+            actorId,
+            detail: id,
+            // `detail` already carries the obligation id. The payload adds
+            // only the transition fact readers cannot recover from it.
+            payload: JSON.stringify({ cleared: obligation.checkpoint === null }),
+          });
+        } catch {
+          // ActorMesh already isolates its production event sink. This keeps
+          // direct embedders on the same honest contract.
+        }
         return toolOk({ obligation });
       } catch (err) {
         return toolError(err);

@@ -1,5 +1,6 @@
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
+import type { Obligation } from "./obligation.js";
 
 /**
  * Resolve a requested obligation owner to one this mesh can actually route to.
@@ -27,4 +28,18 @@ export function resolveObligationOwner(
     return { ok: false, error: `obligation owner is not active: ${ownerId}` };
   }
   return { ok: true, ownerId };
+}
+
+/**
+ * The owner-or-ancestor write policy used by the obligation MCP surface.
+ *
+ * Keep the topology query injected: obligations do not own actor traversal,
+ * while wiring and tests can use ActorMesh's real ancestry relation directly.
+ */
+export function canManageObligation(
+  actorId: string,
+  obligation: Pick<Obligation, "ownerId">,
+  isAncestorOf: (ancestorId: string, actorId: string) => boolean
+): boolean {
+  return isAncestorOf(actorId, obligation.ownerId);
 }

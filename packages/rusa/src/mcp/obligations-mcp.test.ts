@@ -16,7 +16,7 @@ import { obligationDependencies } from "../db/migrations/0037_obligation_depende
 import { obligationCheckpoint } from "../db/migrations/0043_obligation_checkpoint.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { OBLIGATION_CHECKPOINT_MAX } from "../obligations/obligation.js";
-import { resolveObligationOwner } from "../obligations/owner.js";
+import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
 import { createObligationsMcpServer } from "./obligations-mcp.js";
 
 async function connect(server: McpServer): Promise<Client> {
@@ -953,10 +953,18 @@ describe("obligations MCP", () => {
       expect(deniedResult.isError).toBe(true);
       expect(repository.require("foreign").checkpoint).toBeNull();
 
-      // An ancestor owner may write it: standing is exactly what a steward
-      // above the owner reads and corrects.
+      // The topology-specific cases live in actor-mesh.test.ts. This verifies
+      // the MCP seam accepts a production-policy grant rather than an
+      // unconditional allow callback.
       const ancestor = await connect(
-        createObligationsMcpServer(repository, "actor-a", { canManage: () => true })
+        createObligationsMcpServer(repository, "actor-a", {
+          canManage: (callerId, obligation) =>
+            canManageObligation(
+              callerId,
+              obligation,
+              (ancestorId, actorId) => ancestorId === "actor-a" && actorId === "actor-b"
+            ),
+        })
       );
       const ancestorResult = (await ancestor.callTool({
         name: "set_checkpoint",
@@ -985,12 +993,55 @@ describe("obligations MCP", () => {
           kind: "obligation_checkpoint_set",
           actorId: "actor-a",
           detail: "arc",
-          payload: JSON.stringify({ obligationId: "arc" }),
+          payload: JSON.stringify({ cleared: false }),
         },
       ]);
       // Replace semantics is the design; an event log quoting each value would
       // be the append-only history this field exists to stop anyone replaying.
       expect(JSON.stringify(events)).not.toContain("8bdc01d");
+    });
+
+    it("marks a clear without putting checkpoint prose in the event", async () => {
+      repository.create({ title: "Persistence Arc", id: "arc", ownerId: "actor-a" });
+      const events: MeshEventInput[] = [];
+      const client = await connect(
+        createObligationsMcpServer(repository, "actor-a", {
+          recordEvent: (event) => events.push(event),
+        })
+      );
+
+      await client.callTool({
+        name: "set_checkpoint",
+        arguments: { id: "arc", checkpoint: null },
+      });
+
+      expect(events).toEqual([
+        {
+          kind: "obligation_checkpoint_set",
+          actorId: "actor-a",
+          detail: "arc",
+          payload: JSON.stringify({ cleared: true }),
+        },
+      ]);
+    });
+
+    it("keeps the committed checkpoint successful when an optional event sink fails", async () => {
+      repository.create({ title: "Persistence Arc", id: "arc", ownerId: "actor-a" });
+      const client = await connect(
+        createObligationsMcpServer(repository, "actor-a", {
+          recordEvent: () => {
+            throw new Error("event store unavailable");
+          },
+        })
+      );
+
+      const res = (await client.callTool({
+        name: "set_checkpoint",
+        arguments: { id: "arc", checkpoint: STANDING },
+      })) as CallToolResult;
+
+      expect(res.isError).toBeFalsy();
+      expect(repository.require("arc").checkpoint).toBe(STANDING);
     });
 
     it("emits nothing when the write was refused", async () => {
@@ -1026,8 +1077,25 @@ describe("obligations MCP", () => {
       })) as CallToolResult;
 
       expect(res.isError).toBe(true);
+      expect(JSON.stringify(res)).toContain(
+        "a checkpoint is where the work stands, not the record of how it got there"
+      );
       expect(repository.require("arc").checkpoint).toBeNull();
       expect(events).toEqual([]);
+    });
+
+    it("applies the repository's trimmed cap instead of a different raw schema cap", async () => {
+      repository.create({ title: "Persistence Arc", id: "arc", ownerId: "actor-a" });
+      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+      const atCap = "x".repeat(OBLIGATION_CHECKPOINT_MAX);
+
+      const res = (await client.callTool({
+        name: "set_checkpoint",
+        arguments: { id: "arc", checkpoint: `${atCap}\n` },
+      })) as CallToolResult;
+
+      expect(res.isError).toBeFalsy();
+      expect(repository.require("arc").checkpoint).toBe(atCap);
     });
 
     it("reports a missing obligation as an error rather than creating one", async () => {

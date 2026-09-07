@@ -1672,19 +1672,16 @@ export class ObligationRepository {
    * Replace semantics, deliberately: the previous value is gone, because the
    * field *is* the current standing. An append-only record of standing is what
    * the tree already had — thirty-odd artifact labels an arc's owner had to
-   * replay in order — and replaying is the cost this removes. The `mesh_events`
-   * log carries that a change happened and who made it, so nothing about the
-   * change is unauditable; only the superseded prose is gone, which is the
-   * point.
+   * replay in order — and replaying is the cost this removes. The optional
+   * `mesh_events` signal invalidates current readers; it is not a history or
+   * audit receipt for the superseded prose.
    *
    * `null` (or blank) clears all three columns together. A cleared checkpoint
    * is "no standing recorded", not "standing recorded as nothing", so leaving
    * the stamp behind would claim currency for an absence.
    *
-   * Terminal obligations are frozen, consistent with {@link reassign},
-   * {@link setExternalRef} and `reparent`: a settled obligation's account of
-   * itself is part of the record, and *why* it settled is what `terminal_note`
-   * is for.
+   * A terminal obligation cannot be edited. Terminal transitions clear the
+   * block in their own statement, so a done card never claims in-flight work.
    *
    * Authorization is the caller's, exactly as it is for {@link setExternalRef}:
    * this boundary records who wrote, and the MCP seam decides who may.
@@ -1929,7 +1926,8 @@ export class ObligationRepository {
         this.db
           .prepare(
             `UPDATE obligations
-           SET status = 'scheduled', next_ready_at = ?, updated_at = ?
+           SET status = 'scheduled', next_ready_at = ?, updated_at = ?,
+               checkpoint = NULL, checkpoint_at = NULL, checkpoint_by = NULL
            WHERE id = ?`
           )
           .run(nextReadyAt, completedAt, id);
@@ -1947,7 +1945,8 @@ export class ObligationRepository {
             `UPDATE obligations
              SET status = ?, terminal_note = ?, resolution_ref = ?, updated_at = ?,
                  next_ready_at = NULL, recurrence_policy = NULL, recurrence_cron = NULL,
-                 recurrence_interval_seconds = NULL
+                 recurrence_interval_seconds = NULL,
+                 checkpoint = NULL, checkpoint_at = NULL, checkpoint_by = NULL
              WHERE id = ?`
           )
           .run(status, normalizeTerminalNote(note), resolution, completedAt, id);
@@ -2040,7 +2039,9 @@ export class ObligationRepository {
             .prepare(
               `UPDATE obligations
                SET status = 'done', recurrence_policy = NULL, recurrence_cron = NULL,
-                   recurrence_interval_seconds = NULL, next_ready_at = NULL, updated_at = ?
+                   recurrence_interval_seconds = NULL, next_ready_at = NULL,
+                   checkpoint = NULL, checkpoint_at = NULL, checkpoint_by = NULL,
+                   updated_at = ?
                WHERE id = ?`
             )
             .run(this.stamp(), id);

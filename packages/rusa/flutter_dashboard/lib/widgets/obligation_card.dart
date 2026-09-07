@@ -321,20 +321,16 @@ class ObligationRow extends StatelessWidget {
 
 /// Who last said where this obligation stands, and when — `handle · timestamp`.
 ///
-/// Both halves are shown because they answer different questions: the time
-/// says whether the standing is stale, and the author says whose account of it
-/// this is when an actor above the owner has also been writing. Either half
-/// missing degrades to the other rather than to a half-empty separator.
+/// Both halves are present whenever a checkpoint is present: the database
+/// coherence constraint and single write statement make a partial stamp
+/// unrepresentable on this API.
 String checkpointStampLabel(
   ObligationDto obligation,
   String? Function(String id) lookupHandle,
 ) {
-  final by = obligation.checkpointBy;
-  final at = obligation.checkpointAt;
-  final author = by == null ? null : actorDisplayLabel(by, lookupHandle);
-  final when = at == null ? null : formatTs(at);
-  if (author != null && when != null) return '$author · $when';
-  return author ?? when ?? 'stamp missing';
+  final author = actorDisplayLabel(obligation.checkpointBy!, lookupHandle);
+  final when = formatTs(obligation.checkpointAt!);
+  return '$author · $when';
 }
 
 /// The owner's account of where this obligation's work stands.

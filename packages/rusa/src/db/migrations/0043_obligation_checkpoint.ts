@@ -14,9 +14,9 @@ import type { Migration } from "./types.js";
  *
  * **Replace, not append.** The checkpoint is the *current* standing, so a write
  * discards the previous value. That is the whole design: a field you have to
- * reconstruct by replaying is the thing being replaced. The `mesh_events` log
- * records that a change happened and who made it, which is why no history
- * table is added here.
+ * reconstruct by replaying is the thing being replaced. The optional
+ * `mesh_events` notification lets current readers refresh, while the durable
+ * obligation row remains the source of truth; no history table is added here.
  *
  * The stamp is two columns rather than one because both halves are read for
  * different reasons — `checkpoint_at` says whether the standing is stale, and

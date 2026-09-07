@@ -41,9 +41,6 @@ void main() {
 
       expect(dto.checkpoint, isNull);
       expect(dto.hasCheckpoint, isFalse);
-      // A blank is the same fact as an absent one, and neither is a standing
-      // worth giving a panel to.
-      expect(makeObligation('blank', checkpoint: '   ').hasCheckpoint, isFalse);
     });
   });
 
@@ -71,18 +68,6 @@ void main() {
       );
 
       expect(checkpointStampLabel(ob, (id) => null), startsWith('Operator · '));
-    });
-
-    test('degrades to whichever half exists rather than a bare separator', () {
-      const bare = ObligationDto(
-        id: 'arc',
-        ownerId: 'actor-a',
-        status: 'ready',
-        effectivePriority: 1.0,
-        checkpoint: standing,
-      );
-
-      expect(checkpointStampLabel(bare, (id) => null), 'stamp missing');
     });
   });
 
@@ -180,6 +165,71 @@ void main() {
       // Opened, the same standing carries its author and time.
       expect(find.text('Standing'), findsOneWidget);
       expect(find.textContaining('root-handle · '), findsOneWidget);
+
+      await store.dispose();
+    });
+  });
+
+  testWidgets('a mounted Work tab reloads when a checkpoint rewrite arrives', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      const oldStanding =
+          'head 0f8372e; review in flight; next: answer questions';
+      const newStanding = 'head 71d5bca; amendment pushed; next: wait for CI';
+      final api = FakeApi()
+        ..threadsResult = [makeThread('root')]
+        ..obligationsResult = [
+          makeObligation(
+            'arc',
+            ownerId: 'root',
+            intent: 'Persistence arc',
+            checkpoint: oldStanding,
+            checkpointBy: 'root',
+          ),
+        ];
+      final stream = FakeStream();
+      final store = DashboardStore(api: api, stream: stream);
+      await store.init();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: WorkTab(store: store, onSelectView: (_) {}),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+      expect(find.text(oldStanding), findsOneWidget);
+
+      api.obligationsResult = [
+        makeObligation(
+          'arc',
+          ownerId: 'root',
+          intent: 'Persistence arc',
+          checkpoint: newStanding,
+          checkpointBy: 'root',
+        ),
+      ];
+      stream.meshCtrl.add(
+        const MeshEvent(
+          id: 'checkpoint-rewrite',
+          ts: '2026-09-07T12:30:00.000Z',
+          kind: 'obligation_checkpoint_set',
+          actorId: 'root',
+          detail: 'arc',
+          body: null,
+          payload: '{"cleared":false}',
+          success: null,
+        ),
+      );
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 10));
+      }
+
+      expect(api.fetchObligationForestCalls, hasLength(2));
+      expect(find.text(newStanding), findsOneWidget);
+      expect(find.text(oldStanding), findsNothing);
 
       await store.dispose();
     });

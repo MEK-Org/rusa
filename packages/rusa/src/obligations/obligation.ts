@@ -205,10 +205,12 @@ export function validateObligationTitle(title: string): string {
  * representation invariants the store must never disagree with its writers
  * about, while a length limit is a judgment about what stays legible — and
  * `list_owned` returns whole obligations on every wake, so an unbounded
- * standing field would be paid for in every reader's context. Keeping it here
- * means retuning it is an edit, not a table rebuild.
+ * standing field would be paid for in every reader's context. 500 characters
+ * is intentionally enough for the concrete head/gates/refs/next-action shape,
+ * not a scratchpad: even a default 50-item page is bounded to 25,000 characters.
+ * Keeping it here means retuning it is an edit, not a table rebuild.
  */
-export const OBLIGATION_CHECKPOINT_MAX = 2_000;
+export const OBLIGATION_CHECKPOINT_MAX = 500;
 
 /**
  * Normalize a checkpoint write: prose, or nothing.

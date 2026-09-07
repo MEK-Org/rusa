@@ -1311,10 +1311,10 @@ class ObligationDto {
   bool get isTerminal => status == 'done' || status == 'cancelled';
   bool get isRecurring => recurrencePolicy != null;
 
-  /// Whether there is a standing worth rendering. Reads the field rather than
-  /// trusting the stamp, so a row that somehow carries one without the other
-  /// still shows what it has instead of vanishing.
-  bool get hasCheckpoint => (checkpoint?.trim().isNotEmpty ?? false);
+  /// The database coherence constraint makes a checkpoint and its stamp appear
+  /// together, and rejects blank checkpoints. The client can trust that API
+  /// invariant rather than inventing a partial-record fallback.
+  bool get hasCheckpoint => checkpoint != null;
 
   factory ObligationDto.fromJson(Map<String, dynamic> j) {
     // The server sends a parsed reference object; older rows and some fixtures

@@ -181,7 +181,7 @@ import {
 } from "../mcp/understanding-mcp.js";
 import { createUpdateMcpServer, UPDATE_MCP_NAME, type UpdateToolDeps } from "../mcp/update-mcp.js";
 import { isTerminalObligationStatus } from "../obligations/obligation.js";
-import { resolveObligationOwner } from "../obligations/owner.js";
+import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
 import { composeActorOutputSinks } from "../observability/actor-output-sink.js";
 import { DiskUsageAlert } from "../observability/disk-alert.js";
 import {
@@ -2010,7 +2010,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           createObligationsMcpServer(getRepositories().obligations, id, {
             isFenced,
             resolveOwner: (raw) => resolveObligationOwner(actors, raw),
-            canManage: (callerId, obligation) => mesh.isAncestorOf(callerId, obligation.ownerId),
+            canManage: (callerId, obligation) =>
+              canManageObligation(callerId, obligation, mesh.isAncestorOf.bind(mesh)),
             recordEvent: (event) => mesh.recordEvent(event),
           })
         );

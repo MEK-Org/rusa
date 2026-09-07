@@ -39,6 +39,7 @@ class _WorkTabState extends State<WorkTab> {
   late final Set<String> _expandedIds = widget.store.workExpanded;
   String? _selectedObligationId;
   StreamSubscription<String?>? _focusSub;
+  StreamSubscription<void>? _checkpointSub;
   bool _showDone = false;
   bool _fetchedTerminalRoots = false;
 
@@ -127,11 +128,15 @@ class _WorkTabState extends State<WorkTab> {
         _expandAncestors(focusedId);
       }
     });
+    _checkpointSub = widget.store.obligationRefreshes.listen((_) {
+      _loadRoots();
+    });
   }
 
   @override
   void dispose() {
     _focusSub?.cancel();
+    _checkpointSub?.cancel();
     super.dispose();
   }
 
