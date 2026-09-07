@@ -61,10 +61,16 @@ export function createTrackerMcpServer(
   };
   const appendSignature = (body: string) =>
     body ? `${body}\n\n${formatSignature()}` : formatSignature();
-  // update_body may receive the current body (including an older mechanical
-  // footer), so remove one terminal visible footer before appending the new
-  // writer's. Creation paths stay append-only to preserve quoted evidence.
-  const stripTrailingSignature = (body: string) => body.replace(/\n{0,2}\*[^*\r\n]+\*\s*$/, "");
+  // A footer is removable only as a pair with the tracker author stamp it
+  // produced. This preserves terminal italics in authored Markdown and leaves
+  // quoted stamps alone unless they are the actual terminal footer/stamp pair.
+  const trailingAuthorStamp =
+    /\n\n<!--\s*mesh:author(?:\s+[^\s<>]+|:v1\s+[^\s<>]+\s+\d+\s+[0-9a-f]+|:v[23]\s+[^\s<>]+\s+[^\s<>]+\s+\d+\s+[0-9a-f]+)\s*-->\s*$/i;
+  const trailingVisibleSignature = /\n\n\*[^*\r\n]+\*\s*$/;
+  const stripTrailingMechanicalFooter = (body: string) => {
+    const withoutStamp = body.replace(trailingAuthorStamp, "");
+    return withoutStamp === body ? body : withoutStamp.replace(trailingVisibleSignature, "");
+  };
 
   const appendAuthorStamp = (body: string, repo: string, issueNumber: number) => {
     const signed = appendSignature(body);
@@ -85,7 +91,11 @@ export function createTrackerMcpServer(
    * edit the author's content to no benefit (the appended stamp already wins last-index).
    */
   const restampAuthor = (body: string, repo: string, issueNumber: number) =>
-    appendAuthorStamp(stripTrailingSignature(stripAuthorStamps(body)).trimEnd(), repo, issueNumber);
+    appendAuthorStamp(
+      stripAuthorStamps(stripTrailingMechanicalFooter(body)).trimEnd(),
+      repo,
+      issueNumber
+    );
 
   const notifyResourceCreated = (resource: EventResource) => {
     try {
@@ -145,11 +155,10 @@ export function createTrackerMcpServer(
         // borrow it.
         const pr = await issueClient.createPullRequest({
           ...args,
-          // The client upserts an existing PR for the same head. Treat its body
-          // as an update for visible-footer idempotence while preserving the
-          // established append-only hidden v3 stamp behavior.
+          // An upsert may receive its current tracker-stamped body. Replace only
+          // that paired footer/stamp; a terminal authored italic stays intact.
           body: appendPreCreationAuthorStamp(
-            stripTrailingSignature(args.body).trimEnd(),
+            stripTrailingMechanicalFooter(args.body).trimEnd(),
             args.repo
           ),
         });

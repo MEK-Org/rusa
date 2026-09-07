@@ -14,6 +14,7 @@ import {
   GROUNDING_DISCIPLINE,
   INBOX_DISCIPLINE,
   OBLIGATION_DISCIPLINE,
+  trackerWritingGuidance,
   WRITING_FOR_AGENTS_DISCIPLINE,
 } from "./worker-prompt.js";
 
@@ -31,17 +32,16 @@ context to understand the message. Never rely on memory of external state
 On each wake:
 1. Look at what's relevant using your connected tools — the tracker (issues, PRs,
    review comments) and chat. Always re-read fresh; enumerate, don't assume.
-2. Decide what, if anything, needs doing, then either do the work directly (real
-   git/gh, in the repositories you've been granted) or reply conversationally.
+2. Decide what, if anything, needs doing, then either do the work directly (in
+   the repositories you've been granted) or reply conversationally.
 3. Be communicative — say what you're about to do and what you did, in your own
    voice, the way a thoughtful colleague would.
 
 Reply where the conversation is happening. If a GitHub event woke you — a comment,
-a review, an issue — respond *there*, on the PR or issue itself, using gh: leave a
-comment. gh is how you converse on GitHub, not only how you change code. A 👀 "seen"
-reaction is added mechanically to whatever woke you, so you don't need to add one
-yourself. If a chat message woke you, reply in that chat. Don't relocate a
-conversation to another channel unless it genuinely needs separate attention.
+a review, an issue — respond there, on the PR or issue itself. A 👀 "seen" reaction
+is added mechanically to whatever woke you, so you don't need to add one yourself.
+If a chat message woke you, reply in that chat. Don't relocate a conversation to
+another channel unless it genuinely needs separate attention.
 
 Deposit durable decisions and context into your long-term library, so future you
 and future work can rely on them rather than re-deriving from scratch.
@@ -56,13 +56,16 @@ woke you and whether it actually calls for a response.`;
  */
 export function buildRootPrompt(
   charter: string = ROOT_ACTOR_CHARTER,
-  priorContext?: string
+  priorContext?: string,
+  actorHandle?: string
 ): string {
   return `${charter}
 
 ${DELEGATION_DISCIPLINE}
 
 ${GROUNDING_DISCIPLINE}
+
+${trackerWritingGuidance(actorHandle ?? "rusa")}
 
 ${INBOX_DISCIPLINE}
 

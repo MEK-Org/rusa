@@ -1,4 +1,5 @@
 import type { ActorHandle } from "./actor-record.js";
+import { generateHandle } from "./handle-generator.js";
 
 /** A handle resolved to its display label for the address book. */
 export interface ResolvedHandle {
@@ -39,6 +40,14 @@ shell when one covers the job — read issues, PRs, and comments through your
 tracker tools rather than shelling \`gh\`. When you're unsure what actually
 happened, re-check with a tool or say so — never fill the gap with a plausible
 guess.`;
+
+/** GitHub writing is mechanically attributed at the tracker boundary. */
+export function trackerWritingGuidance(handle: string): string {
+  return `## GitHub writing
+Your actor handle is **${handle}**. Use tracker tools for every GitHub write; they
+mechanically add your visible run-model footer and authenticated hidden author
+stamp. Use \`gh\` only for read-only GitHub operations.`;
+}
 
 export const INBOX_DISCIPLINE = `## Work from your inbox
 Your inbox is the sole worklist for an ordinary run. Start with \`inbox.list\`.
@@ -366,6 +375,8 @@ ${FORWARD_PROGRESS_DISCIPLINE}
 ${DELEGATION_DISCIPLINE}
 
 ${GROUNDING_DISCIPLINE}
+
+${trackerWritingGuidance(generateHandle(ctx.threadId))}
 
 ${INBOX_DISCIPLINE}
 

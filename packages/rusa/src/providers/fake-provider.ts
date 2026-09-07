@@ -23,7 +23,6 @@ interface ScriptedRunResult extends Partial<RunResult> {
 export class FakeProvider implements CodingProvider {
   readonly name: string;
   readonly providerName: string;
-  readonly model: undefined;
   readonly calls: RunOptions[] = [];
   private created = 0;
 
@@ -31,7 +30,9 @@ export class FakeProvider implements CodingProvider {
     private readonly responder?: (
       opts: RunOptions
     ) => Partial<RunResult> | Promise<Partial<RunResult>>,
-    name = "fake"
+    name = "fake",
+    public readonly model?: string,
+    public readonly effort?: string
   ) {
     this.name = name;
     this.providerName = name;

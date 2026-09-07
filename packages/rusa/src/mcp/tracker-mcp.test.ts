@@ -350,9 +350,62 @@ describe("tracker MCP server", () => {
       expect(body).toMatch(/\*actor-handle \(gpt-5\.6-terra, xhigh\)\*\n\n<!-- mesh:author:v/);
       expect(body).not.toContain("codex");
     }
-    expect(pr.body).not.toContain("other-actor");
+    // A creation input has no authenticated trailing stamp, so its terminal
+    // italic is authored content, not an old mechanical footer.
+    expect(pr.body).toContain("*other-actor (old-model, low)*");
     expect(update).not.toContain("other-actor");
     expect(update.match(/\*[^*\r\n]+\*/g)).toEqual(["*actor-handle (gpt-5.6-terra, xhigh)*"]);
+  });
+
+  it("preserves authored terminal italics and replaces a stamped PR footer pair", async () => {
+    const { client: backend, calls } = recordingIssueClient();
+    const client = await connect(
+      createTrackerMcpServer("test-actor", backend, {
+        actorHandle: "actor-handle",
+        instanceId: "test-instance",
+        getRunSelection: () => ({ provider: "codex", model: "gpt-5.6-terra" }),
+      })
+    );
+    const oldStamp = stampAuthor("other-actor", "owner/repo", undefined, "old-instance");
+
+    await client.callTool({
+      name: "create_pull_request",
+      arguments: {
+        repo: "owner/repo",
+        head: "fresh",
+        title: "Fresh",
+        body: "The result was *surprising*",
+      },
+    });
+    await client.callTool({
+      name: "create_pull_request",
+      arguments: {
+        repo: "owner/repo",
+        head: "existing",
+        title: "Existing",
+        body: `Current body\n\n*other-actor (old-model, low)*\n\n${oldStamp}`,
+      },
+    });
+    await client.callTool({
+      name: "update_body",
+      arguments: {
+        repo: "owner/repo",
+        issueNumber: 123,
+        body: "The conclusion remains *surprising*",
+      },
+    });
+
+    const [fresh, existing] = calls
+      .filter((call) => call.method === "createPullRequest")
+      .map((call) => call.args[0] as CreatePROptions);
+    const update = calls.find((call) => call.method === "updateIssueBody")?.args[2] as string;
+
+    expect(fresh.body).toContain("The result was *surprising*");
+    expect(existing.body).not.toContain("other-actor");
+    expect(existing.body).toContain("*actor-handle (gpt-5.6-terra)*");
+    expect(existing.body.match(/\*[^*\r\n]+\*/g)).toEqual(["*actor-handle (gpt-5.6-terra)*"]);
+    expect(existing.body.match(/<!--\s*mesh:author/g)).toHaveLength(1);
+    expect(update).toContain("The conclusion remains *surprising*");
   });
 
   it("creates issues with a pre-creation v3 stamp from the authenticated actor id", async () => {

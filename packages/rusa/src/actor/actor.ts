@@ -105,11 +105,8 @@ export interface ActorOptions {
   /** Optional model fallback for provider capacity/quota exhaustion. */
   fallback?: {
     models: string[];
-    /** Resolve the normalized tuple and provider a fallback attempt will launch. */
-    resolveProvider: (selected: RawProviderModelConfig) => {
-      provider: CodingProvider;
-      selection: RawProviderModelConfig;
-    };
+    /** Resolve one configured fallback model using the established fallback policy. */
+    resolveProvider: (model: string) => CodingProvider;
     classify: ExhaustionClassifier;
   };
   /** Debounce window for coalescing wake bursts (default: TriggerRunner default). */
@@ -173,11 +170,12 @@ export interface ActorOptions {
     selected: RawProviderModelConfig
   ) => void;
   /**
-   * Called immediately before each provider attempt with the normalized tuple
-   * that provider will run. Unlike onRunStart, this includes fallback attempts
-   * without changing run lifecycle accounting.
+   * Called immediately before each provider attempt with the instance that will
+   * run. Unlike onRunStart, this includes fallbacks without changing run
+   * lifecycle accounting. Its model and effort are the instantiated values, not
+   * the pre-normalization request.
    */
-  onProviderAttempt?: (selected: RawProviderModelConfig) => void;
+  onProviderAttempt?: (provider: CodingProvider) => void;
   /**
    * Optional hook fired ONCE per run, on the first chunk the provider emits —
    * the moment it starts answering, as distinct from the moment we asked .
@@ -807,11 +805,8 @@ export class Actor {
     // Assigned inside the try below (buildPrompt sits within the terminal-failure
     // boundary), then read by this closure when the gated invoke actually runs.
     let built: PromptBuild;
-    const runProvider = (
-      provider: CodingProvider,
-      selection: RawProviderModelConfig
-    ): Promise<RunResult> => {
-      this.opts.onProviderAttempt?.(selection);
+    const runProvider = (provider: CodingProvider): Promise<RunResult> => {
+      this.opts.onProviderAttempt?.(provider);
       return provider.run({
         prompt: built.prompt,
         cwd: this.opts.cwd,
@@ -877,11 +872,7 @@ export class Actor {
       // same run's outcome twice, here it is claiming a start nobody saw.)
       this.runStartReported = true;
       startWatchdogTimers();
-      return this.runWithFallback(
-        this.opts.resolveProvider(selected),
-        selected,
-        (provider, attempt) => runProvider(provider, attempt)
-      );
+      return this.runWithFallback(this.opts.resolveProvider(selected), runProvider);
     };
 
     // The post-run hook is the single choke point for failure forwarding, so it
@@ -1034,10 +1025,9 @@ export class Actor {
 
   private async runWithFallback(
     primary: CodingProvider,
-    primarySelection: RawProviderModelConfig,
-    runProvider: (provider: CodingProvider, selection: RawProviderModelConfig) => Promise<RunResult>
+    runProvider: (provider: CodingProvider) => Promise<RunResult>
   ): Promise<RunResult> {
-    const result = await runProvider(primary, primarySelection);
+    const result = await runProvider(primary);
     const fallback = this.opts.fallback;
     if (result.success || !fallback || fallback.models.length === 0) return result;
     // A supervisor grace-kill (#257) is cleanup after the actor already yielded,
@@ -1054,12 +1044,11 @@ export class Actor {
 
     const primaryName = primary.model ?? primary.name;
     for (const model of fallback.models) {
-      const requested = { ...primarySelection, model };
-      const { provider, selection } = fallback.resolveProvider(requested);
+      const provider = fallback.resolveProvider(model);
       this.opts.log?.(
         `\n[Fallback] primary ${primaryName} exhausted; continuing on fallback ${model}\n`
       );
-      const fallbackResult = await runProvider(provider, selection);
+      const fallbackResult = await runProvider(provider);
       if (fallbackResult.success) return fallbackResult;
       if (!(await fallback.classify(fallbackResult)).exhausted) {
         // We only reach here because the primary was classified exhausted, so

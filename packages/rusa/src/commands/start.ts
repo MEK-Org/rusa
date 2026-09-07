@@ -202,7 +202,6 @@ import {
   providerCapabilityName,
   providerThrottleKey,
   resolveProvider,
-  resolveProviderWithSelection,
   resolveRootProvider,
 } from "../providers/registry.js";
 import { assertBwrapAvailable, teardownFlutterOverlay } from "../providers/sandbox.js";
@@ -2204,8 +2203,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               }),
             });
           },
-          onProviderAttempt: (selected) => {
-            activeRunSelection = selected;
+          onProviderAttempt: (attempt) => {
+            activeRunSelection = {
+              provider: attempt.providerName,
+              model: attempt.model,
+              effort: attempt.effort,
+            };
           },
           onFirstChunk: () =>
             mesh.recordEvent({
@@ -2666,25 +2669,23 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           portableContextStore
         );
         return {
-          prompt: buildRootPrompt(config.rootActor?.charter, injection?.priorContext),
+          prompt: buildRootPrompt(config.rootActor?.charter, injection?.priorContext, rootHandle),
           injectRecord: injection?.injectRecord,
         };
       },
       fallback: fallbackModels
         ? {
             models: fallbackModels,
-            resolveProvider: (requested) => {
-              const resolved = resolveProviderWithSelection(
+            // Keep the long-standing fallback launch policy. Attribution below
+            // reads the provider instance this resolves, so it cannot relabel a
+            // fallback with the primary request.
+            resolveProvider: (model) =>
+              resolveProvider(
                 config,
-                requested.provider,
-                requested.model,
-                requested.effort
-              );
-              return {
-                provider: resolved.provider,
-                selection: { provider: requested.provider, ...resolved.selection },
-              };
-            },
+                config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER,
+                model,
+                config.rootActor?.effort
+              ),
             classify: classifyExhaustion,
           }
         : undefined,
@@ -2765,8 +2766,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           }),
         });
       },
-      onProviderAttempt: (selected) => {
-        rootRunSelection = selected;
+      onProviderAttempt: (attempt) => {
+        rootRunSelection = {
+          provider: attempt.providerName,
+          model: attempt.model,
+          effort: attempt.effort,
+        };
       },
       onFirstChunk: () =>
         mesh.recordEvent({
