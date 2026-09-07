@@ -683,7 +683,7 @@ export class ActorMesh {
   private readonly isShuttingDown: () => boolean;
   private readonly idgen: () => string;
   private readonly now: () => string;
-  private readonly handleForId: (id: string) => string;
+  readonly handleForId: (id: string) => string;
   private readonly rootId?: string;
   private readonly onRetire?: (record: ActorRecord) => void;
   private readonly onYield?: (

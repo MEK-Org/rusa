@@ -474,42 +474,68 @@ export function createAgentExecMcpServer(
     {
       title: "List your direct reports",
       description:
-        "List the child threads you've spawned, with their charter summary, status, and " +
+        "List the child threads you've spawned, with their charter summary, status, handle, declared model pool, context portability, and " +
         "whether each one has a run in flight right now — your org chart for deciding what " +
-        "to follow up on or retire. A child whose run_state is 'running', 'winding_down', or 'queued' is " +
+        "to follow up on, inspect, or retire. Supply `handle` to resolve a specific direct child. A child whose run_state is 'running', 'winding_down', or 'queued' is " +
         "mid-work: retiring it would abandon that run, and the attempt will be refused.",
-      inputSchema: {},
+      inputSchema: {
+        handle: z
+          .string()
+          .optional()
+          .describe(
+            "Optional direct-child handle to resolve. When provided, returns only the matching direct report, or fails if the handle is unknown or ambiguous."
+          ),
+      },
     },
-    async () => {
+    async ({ handle }) => {
       try {
-        // `run_state` is here because its absence is half of what caused ISSUE_NUM: a parent
-        // deciding which of two look-alike children to retire could see their charters
-        // and their status, but nothing that distinguished a thread mid-build from an
-        // idle one. The retire refusal is the guard; this is the information that stops
-        // the parent forming the intent in the first place.
+        let childRecords = mesh.list().filter((r) => r.parentId === selfId);
+        if (handle !== undefined) {
+          const normalized = handle.trim().toLowerCase();
+          if (!normalized) {
+            throw new Error("child handle must not be blank");
+          }
+          const matches = childRecords.filter(
+            (r) => mesh.handleForId(r.id).toLowerCase() === normalized
+          );
+          if (matches.length === 0) {
+            throw new Error(`unknown child handle: "${handle}"`);
+          }
+          if (matches.length > 1) {
+            throw new Error(
+              `ambiguous child handle "${handle}": matches multiple child threads (${matches.map((m) => m.id).join(", ")})`
+            );
+          }
+          childRecords = matches;
+        }
+
         const runStates = mesh.listChildRunStates(selfId);
-        const children = mesh
-          .list()
-          .filter((r) => r.parentId === selfId)
-          .map((r) => {
-            const runState = runStates.get(r.id) ?? "idle";
-            const selection = runState === "queued" ? mesh.getSelection(r.id) : undefined;
-            return {
-              thread_id: r.id,
-              charter: summarizeCharter(r.charter),
-              status: r.status,
-              run_state: runState,
-              ...(selection
-                ? {
-                    selected_provider: selection.provider,
-                    selected_lane: selection.lane,
-                    selected_model: selection.model,
-                    selected_effort: selection.effort,
-                    eligible_at: selection.eligibleAt,
-                  }
-                : {}),
-            };
-          });
+        const children = childRecords.map((r) => {
+          const runState = runStates.get(r.id) ?? "idle";
+          const selection = runState === "queued" ? mesh.getSelection(r.id) : undefined;
+          return {
+            thread_id: r.id,
+            handle: mesh.handleForId(r.id),
+            charter: summarizeCharter(r.charter),
+            status: r.status,
+            run_state: runState,
+            model_config: r.modelConfig ?? [],
+            ...(r.desiredModelConfig !== undefined
+              ? { desired_model_config: r.desiredModelConfig }
+              : {}),
+            context: r.context ?? { type: "native" },
+            context_mode: r.context?.type === "portable" ? r.context.mode : "native",
+            ...(selection
+              ? {
+                  selected_provider: selection.provider,
+                  selected_lane: selection.lane,
+                  selected_model: selection.model,
+                  selected_effort: selection.effort,
+                  eligible_at: selection.eligibleAt,
+                }
+              : {}),
+          };
+        });
         return toolOk(children);
       } catch (err) {
         return toolError(err);
@@ -725,7 +751,7 @@ export function createAgentExecMcpServer(
         "A pool of more than one entry, or a change of provider, is only permitted for portable (ledger/tail) actors. " +
         "Preserves the actor's accumulated context and session history.",
       inputSchema: {
-        actor_id: z.string().describe("The actor's id to update."),
+        actor_id: z.string().describe("The actor's thread id (or direct child handle) to update."),
         model_config: modelConfigSchema.describe(
           'The full replacement provider/model/effort choice(s), in earliest-available order — replaces the entire current pool. `{"class": "<name>"}` names a runtime-managed model class and expands to its currently committed pool. A class reference always replaces the whole pool, so it cannot be used for an effort-only or model-only partial update.'
         ),
@@ -733,8 +759,25 @@ export function createAgentExecMcpServer(
     },
     async ({ actor_id, model_config }) => {
       try {
-        mesh.setActorModel(actor_id, model_config, selfId);
-        return toolOk(`staged modelConfig update for ${actor_id}`);
+        let targetId = actor_id;
+        const resolvedTarget = targetId === "root" && rootId ? rootId : targetId;
+        if (!mesh.actors.get(resolvedTarget)) {
+          const directReports = mesh.list().filter((r) => r.parentId === selfId);
+          const matches = directReports.filter(
+            (r) => mesh.handleForId(r.id).toLowerCase() === actor_id.trim().toLowerCase()
+          );
+          if (matches.length === 1) {
+            targetId = matches[0].id;
+          } else if (matches.length > 1) {
+            return toolError(
+              new Error(
+                `ambiguous child handle "${actor_id}": matches multiple child threads (${matches.map((m) => m.id).join(", ")})`
+              )
+            );
+          }
+        }
+        mesh.setActorModel(targetId, model_config, selfId);
+        return toolOk(`staged modelConfig update for ${targetId}`);
       } catch (err) {
         return toolError(err);
       }

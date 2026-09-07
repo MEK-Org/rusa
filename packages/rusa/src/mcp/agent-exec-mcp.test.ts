@@ -88,6 +88,7 @@ function setup(
     validateSpawn?: ActorMeshOptions["validateSpawn"];
     validateModel?: ActorMeshOptions["validateModel"];
     configuredEventSources?: readonly string[];
+    handleForId?: (id: string) => string;
   } = {}
 ) {
   const registry = new InMemoryActorRepository();
@@ -115,6 +116,7 @@ function setup(
     idgen: () => `t${++seq}`,
     now: () => "2026-01-01T00:00:00Z",
     configuredEventSources: opts.configuredEventSources,
+    handleForId: opts.handleForId,
     createActor: (ctx) =>
       new Actor({
         id: ctx.record.id,
@@ -2190,5 +2192,331 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     expect(registry.get(nativeChild)?.modelConfig).toEqual([
       { provider: "claude", model: "claude-sonnet-5" },
     ]);
+  });
+
+  describe("child handle discovery and model inspection (#323)", () => {
+    it("lookup → read → update preserving pool choices and optional effort", async () => {
+      const { mesh, registry } = setup();
+      const parentId = mesh.spawn({
+        charter: "parent worker",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const childId = mesh.spawn({
+        charter: "portable child worker",
+        parentId: parentId,
+        modelConfig: [{ provider: "claude", model: "claude-sonnet-4-6", effort: "high" }],
+        context: { type: "portable", mode: "ledger" },
+      });
+
+      const childHandle = mesh.handleForId(childId);
+      const client = await connect(createAgentExecMcpServer(mesh, parentId, "root"));
+
+      // 1. Handle lookup
+      const lookupRes = (await client.callTool({
+        name: "list_threads",
+        arguments: { handle: childHandle },
+      })) as CallToolResult;
+      expect(lookupRes.isError).toBeFalsy();
+      const reports = dataOf(lookupRes) as Array<{
+        thread_id: string;
+        handle: string;
+        model_config: Array<{ provider: string; model: string; effort?: string }>;
+        context: { type: string; mode?: string };
+        context_mode: string;
+      }>;
+      expect(reports).toHaveLength(1);
+      const child = reports[0];
+      expect(child.thread_id).toBe(childId);
+      expect(child.handle).toBe(childHandle);
+
+      // 2. Configuration read
+      expect(child.model_config).toEqual([
+        { provider: "claude", model: "claude-sonnet-4-6", effort: "high" },
+      ]);
+      expect(child.context).toMatchObject({ type: "portable", mode: "ledger" });
+      expect(child.context_mode).toBe("ledger");
+
+      // 3. Authorized update preserving existing choices and optional effort
+      const updatedPool = [
+        ...child.model_config,
+        { provider: "antigravity", model: "gemini-3.8-flash" },
+      ];
+      const updateRes = (await client.callTool({
+        name: "set_actor_model",
+        arguments: {
+          actor_id: child.thread_id,
+          model_config: updatedPool,
+        },
+      })) as CallToolResult;
+      expect(updateRes.isError).toBeFalsy();
+
+      // Verify staged replacement preserves the first entry's effort and appends the second
+      expect(registry.get(childId)?.desiredModelConfig).toEqual([
+        { provider: "claude", model: "claude-sonnet-4-6", effort: "high" },
+        { provider: "antigravity", model: "gemini-3.8-flash" },
+      ]);
+    });
+
+    it("distinguishes declared choices from queued selected run model", async () => {
+      const { mesh } = setup();
+      const childId = mesh.spawn({
+        charter: "multi-model worker",
+        parentId: "root",
+        modelConfig: [
+          { provider: "claude", model: "claude-opus-4-8", effort: "high" },
+          { provider: "antigravity", model: "gemini-3.8-flash" },
+        ],
+        context: { type: "portable", mode: "tail" },
+      });
+      const childHandle = mesh.handleForId(childId);
+
+      // Simulate a queued run selection
+      vi.spyOn(mesh, "listChildRunStates").mockReturnValue(new Map([[childId, "queued"]]));
+      vi.spyOn(mesh, "getSelection").mockReturnValue({
+        provider: "antigravity",
+        lane: "antigravity:gemini-3.8-flash",
+        model: "gemini-3.8-flash",
+        effort: undefined,
+        declaredIndex: 1,
+        eligibleAt: 12345,
+        responsive: false,
+      });
+
+      const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const res = (await client.callTool({
+        name: "list_threads",
+        arguments: { handle: childHandle },
+      })) as CallToolResult;
+      expect(res.isError).toBeFalsy();
+      const [report] = dataOf(res) as Array<Record<string, unknown>>;
+
+      // Declared pool is intact with all choices and effort
+      expect(report.model_config).toEqual([
+        { provider: "claude", model: "claude-opus-4-8", effort: "high" },
+        { provider: "antigravity", model: "gemini-3.8-flash" },
+      ]);
+      // Run state and selection show currently-selected run lane
+      expect(report.run_state).toBe("queued");
+      expect(report.selected_provider).toBe("antigravity");
+      expect(report.selected_model).toBe("gemini-3.8-flash");
+      expect(report.selected_effort).toBeUndefined();
+    });
+
+    it("delivers actionable portability refusal on native actors", async () => {
+      const { mesh } = setup();
+      const parentId = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const nativeChildId = mesh.spawn({
+        charter: "native child",
+        parentId: parentId,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const nativeChildHandle = mesh.handleForId(nativeChildId);
+      const client = await connect(createAgentExecMcpServer(mesh, parentId, "root"));
+
+      // Lookup and read confirm native context
+      const lookupRes = (await client.callTool({
+        name: "list_threads",
+        arguments: { handle: nativeChildHandle },
+      })) as CallToolResult;
+      const [report] = dataOf(lookupRes) as Array<{
+        thread_id: string;
+        context: { type: string };
+        context_mode: string;
+      }>;
+      expect(report.context).toEqual({ type: "native" });
+      expect(report.context_mode).toBe("native");
+
+      // Refusal 1: Multi-candidate pool on native actor
+      const poolRefusal = (await client.callTool({
+        name: "set_actor_model",
+        arguments: {
+          actor_id: report.thread_id,
+          model_config: [
+            { provider: "claude", model: "claude-sonnet-5" },
+            { provider: "claude", model: "claude-opus-4-8" },
+          ],
+        },
+      })) as CallToolResult;
+      expect(poolRefusal.isError).toBe(true);
+      expect((poolRefusal.content[0] as { text: string }).text).toMatch(
+        /Cannot set a modelConfig pool of more than one entry on non-portable actor.*Only portable \(ledger\/tail\) actors can use a multi-candidate pool/
+      );
+
+      // Refusal 2: Cross-provider move on native actor
+      const providerRefusal = (await client.callTool({
+        name: "set_actor_model",
+        arguments: {
+          actor_id: report.thread_id,
+          model_config: { provider: "antigravity", model: "gemini-3.7-flash" },
+        },
+      })) as CallToolResult;
+      expect(providerRefusal.isError).toBe(true);
+      expect((providerRefusal.content[0] as { text: string }).text).toMatch(
+        /Cannot change provider on non-portable actor.*Only portable \(ledger\/tail\) actors can be moved across providers/
+      );
+    });
+
+    it("denies access to an unrelated actor", async () => {
+      const { mesh } = setup({
+        handleForId: (id) => `handle-${id}`,
+      });
+      const parentA = mesh.spawn({
+        charter: "parent A",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const childA = mesh.spawn({
+        charter: "child A",
+        parentId: parentA,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const childAHandle = mesh.handleForId(childA);
+
+      const unrelatedParentB = mesh.spawn({
+        charter: "unrelated parent B",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+
+      const clientB = await connect(createAgentExecMcpServer(mesh, unrelatedParentB, "root"));
+
+      // 1. Lookup of unrelated child by handle is refused / unknown to caller B
+      const lookupRes = (await clientB.callTool({
+        name: "list_threads",
+        arguments: { handle: childAHandle },
+      })) as CallToolResult;
+      expect(lookupRes.isError).toBe(true);
+      expect((lookupRes.content[0] as { text: string }).text).toMatch(
+        new RegExp(`unknown child handle: "${childAHandle}"`)
+      );
+
+      // 2. Model update on unrelated child by thread id is denied
+      const updateByIdRes = (await clientB.callTool({
+        name: "set_actor_model",
+        arguments: {
+          actor_id: childA,
+          model_config: { provider: "claude", model: "claude-opus-4-8" },
+        },
+      })) as CallToolResult;
+      expect(updateByIdRes.isError).toBe(true);
+      expect((updateByIdRes.content[0] as { text: string }).text).toMatch(/is not an ancestor/);
+
+      // 3. Model update on unrelated child by handle is denied
+      const updateByHandleRes = (await clientB.callTool({
+        name: "set_actor_model",
+        arguments: {
+          actor_id: childAHandle,
+          model_config: { provider: "claude", model: "claude-opus-4-8" },
+        },
+      })) as CallToolResult;
+      expect(updateByHandleRes.isError).toBe(true);
+      expect((updateByHandleRes.content[0] as { text: string }).text).toMatch(
+        /Cannot set model on unknown thread/
+      );
+    });
+
+    it("fails clearly on unknown, blank, or ambiguous handles", async () => {
+      const { mesh } = setup({
+        handleForId: (id) => {
+          if (id === "t2" || id === "t3") return "twin-badger";
+          return id;
+        },
+      });
+      const parentId = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const client = await connect(createAgentExecMcpServer(mesh, parentId, "root"));
+
+      // Unknown handle
+      const unknownRes = (await client.callTool({
+        name: "list_threads",
+        arguments: { handle: "ghost-badger" },
+      })) as CallToolResult;
+      expect(unknownRes.isError).toBe(true);
+      expect((unknownRes.content[0] as { text: string }).text).toMatch(
+        /unknown child handle: "ghost-badger"/
+      );
+
+      // Blank handle
+      const blankRes = (await client.callTool({
+        name: "list_threads",
+        arguments: { handle: "   " },
+      })) as CallToolResult;
+      expect(blankRes.isError).toBe(true);
+      expect((blankRes.content[0] as { text: string }).text).toMatch(
+        /child handle must not be blank/
+      );
+
+      // Ambiguous handle: spawn two children that share a handle
+      const child1 = mesh.spawn({
+        charter: "child 1",
+        parentId,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const child2 = mesh.spawn({
+        charter: "child 2",
+        parentId,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      expect(mesh.handleForId(child1)).toBe("twin-badger");
+      expect(mesh.handleForId(child2)).toBe("twin-badger");
+
+      const ambigListRes = (await client.callTool({
+        name: "list_threads",
+        arguments: { handle: "twin-badger" },
+      })) as CallToolResult;
+      expect(ambigListRes.isError).toBe(true);
+      expect((ambigListRes.content[0] as { text: string }).text).toMatch(
+        /ambiguous child handle "twin-badger": matches multiple child threads/
+      );
+
+      const ambigUpdateRes = (await client.callTool({
+        name: "set_actor_model",
+        arguments: {
+          actor_id: "twin-badger",
+          model_config: { provider: "claude", model: "claude-opus-4-8" },
+        },
+      })) as CallToolResult;
+      expect(ambigUpdateRes.isError).toBe(true);
+      expect((ambigUpdateRes.content[0] as { text: string }).text).toMatch(
+        /ambiguous child handle "twin-badger": matches multiple child threads/
+      );
+    });
+
+    it("allows set_actor_model by direct child handle", async () => {
+      const { mesh, registry } = setup();
+      const parentId = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const childId = mesh.spawn({
+        charter: "portable child",
+        parentId,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+        context: { type: "portable", mode: "ledger" },
+      });
+      const childHandle = mesh.handleForId(childId);
+      const client = await connect(createAgentExecMcpServer(mesh, parentId, "root"));
+
+      const updateRes = (await client.callTool({
+        name: "set_actor_model",
+        arguments: {
+          actor_id: childHandle,
+          model_config: { provider: "antigravity", model: "gemini-3.7-flash", effort: "high" },
+        },
+      })) as CallToolResult;
+      expect(updateRes.isError).toBeFalsy();
+      expect(registry.get(childId)?.desiredModelConfig).toEqual([
+        { provider: "antigravity", model: "gemini-3.7-flash", effort: "high" },
+      ]);
+    });
   });
 });
