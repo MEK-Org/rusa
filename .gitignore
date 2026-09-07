@@ -32,6 +32,7 @@ e2e-reports/
 
 .env
 runs/
+.built-cli-config-*/
 # Quickstart artifacts
 quickstart-output*.txt
 quickstart-server*.log

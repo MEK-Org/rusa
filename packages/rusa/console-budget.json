@@ -40,7 +40,7 @@
     "src/providers/exhaustion-classifier.ts": 3,
     "src/providers/model-catalog.ts": 4,
     "src/providers/model-scrape.ts": 3,
-    "src/providers/registry.ts": 1,
+    "src/providers/provider-selection.ts": 1,
     "src/providers/sandbox.ts": 2,
     "src/understanding/distill.ts": 1,
     "src/understanding/gemini-utils.ts": 1,
