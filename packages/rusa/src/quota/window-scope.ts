@@ -1,13 +1,11 @@
 import type { QuotaLimit } from "../mcp/quota-mcp.js";
 
 /**
- * `gpt-reserve` is an internal Codex allocation, not usable provider quota.
- * Scope is LLM-provided metadata and older extracts may have marked this row as
- * provider-scoped or left it unscoped, so consumers identify its source label
- * directly. Callers apply this only to Codex windows.
+ * Remove only the observed `gpt-reserve <limit>` row from the parser input.
+ * Raw scrape evidence is retained unchanged before this helper is invoked.
  */
-export function isCodexGptReserveWindow(limit: Pick<QuotaLimit, "label">): boolean {
-  return /\bgpt[-\s]?reserve\b/i.test(limit.label);
+export function stripCodexGptReserveLines(output: string): string {
+  return output.replace(/^[\t ]*gpt-reserve(?=[\t ])[^\r\n]*(?:\r?\n|$)/gim, "");
 }
 
 /**

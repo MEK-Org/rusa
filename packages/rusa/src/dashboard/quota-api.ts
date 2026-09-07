@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { QuotaThrottleStatus } from "../actor/quota-throttle-status.js";
 import type { ProviderQuotaSnapshot } from "../mcp/quota-mcp.js";
-import { isCodexGptReserveWindow, isProviderScopedWindow } from "../quota/window-scope.js";
+import { isProviderScopedWindow } from "../quota/window-scope.js";
 
 /**
  * Server-side cached per-provider quota endpoint for the dashboard header (ISSUE_NUM,
@@ -307,10 +307,7 @@ function windowsForProvider(
 ): QuotaWindowDto[] {
   const providerScoped: ProviderQuotaSnapshot = {
     ...state,
-    limits: state.limits?.filter(
-      (limit) =>
-        isProviderScopedWindow(limit) && (provider !== "codex" || !isCodexGptReserveWindow(limit))
-    ),
+    limits: state.limits?.filter(isProviderScopedWindow),
   };
   return provider === "claude"
     ? claudeWindows(providerScoped)
@@ -334,7 +331,6 @@ export function buildQuotaHistory(
     .filter((point) => {
       const observedMs = Date.parse(point.observedAt);
       return (
-        (provider !== "codex" || !isCodexGptReserveWindow(point)) &&
         point.scope === "provider" &&
         point.kind === "weekly" &&
         Number.isFinite(observedMs) &&
@@ -371,7 +367,6 @@ function latestStateFromHistory(
   nowMs: number
 ): ProviderQuotaSnapshot | null {
   const eligible = history.filter((point) => {
-    if (provider === "codex" && isCodexGptReserveWindow(point)) return false;
     const observedMs = Date.parse(point.observedAt);
     const ageMs = nowMs - observedMs;
     return Number.isFinite(observedMs) && ageMs >= 0 && ageMs <= MAX_FALLBACK_HOLD_MS;

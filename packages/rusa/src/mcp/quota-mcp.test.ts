@@ -199,8 +199,6 @@ describe("quota MCP server", () => {
       expect(systemInstruction).toContain("do NOT guess a number");
       expect(systemInstruction).toContain("do NOT fail the parse");
       expect(systemInstruction).toContain("do NOT emit an invented window");
-      expect(systemInstruction).toContain("Completely ignore every `gpt-reserve` row");
-      expect(systemInstruction).toContain("all non-reserve model rows");
       expect(systemInstruction).toContain(
         "Extract EVERY rendered limit row into `windows` — never drop or omit the Weekly row when 5h is present, and vice-versa."
       );
@@ -941,9 +939,8 @@ describe("quota MCP server", () => {
       errorSpy.mockRestore();
     });
 
-    it("drops gpt-reserve even when the extractor incorrectly marks it provider-scoped", async () => {
-      // Redacted live Codex /status panel shape: a gpt-reserve row followed by
-      // the provider's real 5h and weekly rows, then a model
+    it("removes the raw gpt-reserve row before Codex LLM parsing (#310)", async () => {
+      // The deterministic raw filter leaves the provider's real rows and model
       // heading (`<name> limit:` line, no progress bar) whose own 5h/weekly
       // rows are model-scoped and must not be treated as provider windows.
       mockGenerateContent.mockResolvedValue({
@@ -951,12 +948,6 @@ describe("quota MCP server", () => {
           JSON.stringify({
             status: "available",
             windows: [
-              {
-                label: "gpt-reserve Weekly limit",
-                kind: "weekly",
-                usedPercent: 0,
-                scope: "provider",
-              },
               {
                 label: "5h limit",
                 kind: "five_hour",
@@ -989,15 +980,55 @@ describe("quota MCP server", () => {
       // A single clean attempt: no completeness gate exists to second-guess a
       // clean LLM parse, so there is no retry.
       expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+      expect((mockGenerateContent.mock.calls[0][0] as { contents: string }).contents).not.toContain(
+        "gpt-reserve"
+      );
       expect(parsed.status).toBe("available");
       expect(parsed.limits).toHaveLength(4);
       expect(parsed.limits?.filter((l) => l.scope === "provider")).toHaveLength(2);
       expect(parsed.limits?.filter((l) => l.scope === "model")).toHaveLength(2);
     });
 
-    it("removes a reserve-first row with absent scope while retaining provider and model rows (#310)", async () => {
-      // Sanitized live panel from the #249 report: gpt-reserve is first, the
-      // provider's own weekly follows, then another model's 5h/weekly windows.
+    it("keeps the #232 no-provider-5h Codex panel regression", async () => {
+      // A valid panel may have provider weekly rows but no provider 5h row;
+      // model rows following the heading remain model-scoped.
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              { label: "Weekly limit", kind: "weekly", usedPercent: 0, scope: "provider" },
+              {
+                label: "Weekly limit",
+                kind: "weekly",
+                usedPercent: 42,
+                resetAtIso: "2026-09-07T18:08:00.000Z",
+                scope: "provider",
+              },
+              { label: "5h limit", kind: "five_hour", usedPercent: 0, scope: "model" },
+              { label: "Weekly limit", kind: "weekly", usedPercent: 0, scope: "model" },
+            ],
+          }),
+      });
+
+      const parsed = await parseCodexQuota(
+        "gpt-reserve Weekly limit:    [████████████████████] 100% left (resets 10:25 on 12 Sep)\n" +
+          "Weekly limit:                [████████████░░░░░░░░] 58% left (resets 18:08 on 7 Sep)\n" +
+          "GPT-5.3-Codex-Spark limit:\n" +
+          "5h limit:                    [████████████████████] 100% left (resets 15:25)\n" +
+          "Weekly limit:                [████████████████████] 100% left (resets 16:11 on 7 Sep)",
+        "test-key"
+      );
+
+      expect(parsed.status).toBe("available");
+      expect(parsed.limits).toHaveLength(4);
+      expect(parsed.limits?.filter((limit) => limit.scope === "provider")).toHaveLength(2);
+      expect(parsed.limits?.filter((limit) => limit.scope === "model")).toHaveLength(2);
+    });
+
+    it("a reserve panel keeps its scopes end to end: the provider headline reads 48% used (#249)", async () => {
+      // #249's recorded extract has a model reserve weekly row, then the
+      // provider weekly, then model 5h/weekly rows.
       const rawCodexOutput =
         "gpt-reserve Weekly limit:    [████████████████████] 100% left (resets 14:56 on 12 Sep)\n" +
         "Weekly limit:                [██████████░░░░░░░░░░] 52% left (resets 18:08 on 7 Sep)\n" +
@@ -1011,10 +1042,11 @@ describe("quota MCP server", () => {
             status: "available",
             windows: [
               {
-                label: "gpt-reserve Weekly limit",
+                label: "Weekly limit",
                 kind: "weekly",
                 usedPercent: 0,
                 resetAtIso: "2026-09-12T14:56:00.000Z",
+                scope: "model",
               },
               {
                 label: "Weekly limit",
@@ -1042,7 +1074,7 @@ describe("quota MCP server", () => {
       });
 
       const parsed = await parseCodexQuota(rawCodexOutput, "test-key");
-      expect(parsed.limits?.map((l) => l.scope)).toEqual(["provider", "model", "model"]);
+      expect(parsed.limits?.map((l) => l.scope)).toEqual(["model", "provider", "model", "model"]);
 
       // `parseCodexQuota` answers a partial snapshot; the service names the
       // provider it probed, exactly as the cache hands it to the endpoint.
@@ -1064,13 +1096,16 @@ describe("quota MCP server", () => {
       ]);
     });
 
-    it("returns no limits for a reserve-only panel (#310)", async () => {
+    it.each([
+      "available",
+      "exhausted",
+    ] as const)("normalizes a reserve-only %s extractor status to unknown (#310)", async (extractorStatus) => {
       const rawCodexOutput =
         "gpt-reserve Weekly limit:    [████████████████████] 100% left (resets 14:56 on 12 Sep)";
       mockGenerateContent.mockResolvedValue({
         text: () =>
           JSON.stringify({
-            status: "available",
+            status: extractorStatus,
             windows: [
               {
                 label: "gpt-reserve Weekly limit",
@@ -1084,8 +1119,84 @@ describe("quota MCP server", () => {
 
       const parsed = await parseCodexQuota(rawCodexOutput, "test-key");
 
-      expect(parsed.status).toBe("available");
+      expect(parsed.status).toBe("unknown");
       expect(parsed.limits).toEqual([]);
+      expect((mockGenerateContent.mock.calls[0][0] as { contents: string }).contents).not.toContain(
+        "gpt-reserve"
+      );
+
+      const noPrevious = inferQuotaState(
+        { provider: "codex", status: parsed.status ?? "unknown", limits: parsed.limits },
+        undefined,
+        "2030-01-01T00:00:00.000Z"
+      );
+      const withPrevious = inferQuotaState(
+        { provider: "codex", status: parsed.status ?? "unknown", limits: parsed.limits },
+        {
+          provider: "codex",
+          status: "available",
+          limits: [
+            {
+              label: "Weekly limit",
+              kind: "weekly",
+              scope: "provider",
+              percentLeft: 52,
+              resetAtIso: "2030-01-08T00:00:00.000Z",
+            },
+          ],
+        },
+        "2030-01-01T00:00:00.000Z"
+      );
+      expect(noPrevious).toMatchObject({ status: "unknown", limits: [] });
+      expect(withPrevious).toMatchObject({
+        status: "available",
+        limits: [{ label: "Weekly limit" }],
+      });
+    });
+
+    it("keeps an explicit Codex exhaustion message after reserve filtering (#310)", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "exhausted",
+            windows: [],
+          }),
+      });
+
+      const parsed = await parseCodexQuota(
+        "You've hit your usage limit\ngpt-reserve Weekly limit: [░░░░░░░░░░] 0% left",
+        "test-key"
+      );
+
+      expect(parsed.status).toBe("exhausted");
+      expect(parsed.limits).toEqual([]);
+    });
+
+    it("does not overwrite explicit Codex exhaustion with a prior available reserve-free state", () => {
+      const inferred = inferQuotaState(
+        {
+          provider: "codex",
+          status: "exhausted",
+          limits: [],
+        },
+        {
+          provider: "codex",
+          status: "available",
+          limits: [
+            {
+              label: "Weekly limit",
+              kind: "weekly",
+              scope: "provider",
+              percentLeft: 50,
+              resetAtIso: "2030-01-08T00:00:00.000Z",
+            },
+          ],
+        },
+        "2030-01-01T00:00:00.000Z"
+      );
+
+      expect(inferred.status).toBe("exhausted");
+      expect(inferred.limits).toEqual([]);
     });
 
     it("threads an LLM-emitted resetAtIso through unchanged to the resulting limits ", async () => {
