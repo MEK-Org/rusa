@@ -222,7 +222,7 @@ describe("RootControlService", () => {
     expect(JSON.parse(events[2]?.payload ?? "{}")).toMatchObject({ forceQueued: true });
   });
 
-  it("resolves a model class reference before the provider prewalk and forwards the resolved pool", () => {
+  it("uses the resolved class pool for the provider prewalk while forwarding its declaration", () => {
     const { mesh, events, service } = setup({
       resolveModelConfig: (input) =>
         typeof input === "object" && input !== null && "class" in input
@@ -236,12 +236,13 @@ describe("RootControlService", () => {
     );
 
     expect(id).toBe("child-1");
-    // The mesh receives the resolved pool, not the reference: the config-aware
-    // validation downstream never has to re-resolve.
+    // Root control needs the resolved pool for its provider allowlist, but it
+    // keeps the original declaration for mesh.spawn. The mesh's authoritative
+    // validation boundary resolves it and records class provenance directly
+    // from that class reference — no sideband class field is caller-settable.
     expect(mesh.spawn).toHaveBeenCalledWith(
       expect.objectContaining({
-        modelConfig: [{ provider: "agy", model: "gemini-3.5-flash-medium", effort: "high" }],
-        modelClass: "fast",
+        modelConfig: { class: "fast" },
       })
     );
     expect(JSON.parse(events[0].payload ?? "{}")).toMatchObject({

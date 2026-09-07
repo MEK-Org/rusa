@@ -74,16 +74,9 @@ class ActorTree extends StatelessWidget {
                   itemCount: visible.length,
                   itemBuilder: (_, i) {
                     final t = visible[i];
-                    final hasVisibleChildren = store
-                        .actorStates
-                        .value
-                        .actors
-                        .values
-                        .any(
-                          (c) =>
-                              c.thread.parentId == t.id &&
-                              store.isThreadVisible(c.thread),
-                        );
+                    final hasVisibleChildren = store.actorStates.value.actors.values.any(
+                      (c) => c.thread.parentId == t.id && store.isThreadVisible(c.thread),
+                    );
                     final isCollapsed = store.collapsed.value.contains(t.id);
                     return _ActorRow(
                       thread: t,
@@ -418,7 +411,10 @@ class _ActorRowState extends State<_ActorRow> {
       text,
       maxLines: 1,
       overflow: TextOverflow.ellipsis,
-      style: kMonoStyle.copyWith(fontSize: 11, color: MeshColors.textSecondary),
+      style: kMonoStyle.copyWith(
+        fontSize: 11,
+        color: MeshColors.textSecondary,
+      ),
     );
     if (pool == null && modelClass == null && desiredModelClass == null) {
       return label;
@@ -432,7 +428,8 @@ class _ActorRowState extends State<_ActorRow> {
         ...pool!.map((e) => '• ${e.label}'),
       ],
       if (desiredModelClass != null) 'Staged model class: $desiredModelClass',
-      if (staged != null && !listEquals(staged, pool)) ...[
+      if (staged != null &&
+          (!listEquals(staged, pool) || desiredModelClass != modelClass)) ...[
         'Staged for next run:',
         ...staged.map((e) => '• ${e.label}'),
       ],
@@ -441,7 +438,10 @@ class _ActorRowState extends State<_ActorRow> {
     return Tooltip(message: lines.join('\n'), child: label);
   }
 
-  Widget _buildContent(BuildContext context, {bool isHoveredTarget = false}) {
+  Widget _buildContent(
+    BuildContext context, {
+    bool isHoveredTarget = false,
+  }) {
     final thread = widget.thread;
     final dot = widget.dot;
     final isRunning = !thread.isRetired && dot == DotState.active;
@@ -464,8 +464,9 @@ class _ActorRowState extends State<_ActorRow> {
     // fallback for a payload predating the full field.
     final isPool = pool.length > 1 || (staged?.length ?? 0) > 1;
     final staging = staged != null
-        ? !listEquals(staged, pool)
-        : thread.desiredModel != null && thread.desiredModel != thread.model;
+        ? !listEquals(staged, pool) || desiredModelClass != modelClass
+        : desiredModelClass != null ||
+              (thread.desiredModel != null && thread.desiredModel != thread.model);
     final showModel =
         thread.model != null ||
         thread.desiredModel != null ||
@@ -580,7 +581,8 @@ class _ActorRowState extends State<_ActorRow> {
                           ),
                         ),
                       if (showEffort) ...[
-                        if (showModel) const SizedBox(width: 6),
+                        if (showModel)
+                          const SizedBox(width: 6),
                         Flexible(
                           child: Text(
                             thread.effortChangePending &&
@@ -597,7 +599,8 @@ class _ActorRowState extends State<_ActorRow> {
                         ),
                       ],
                       if (thread.commitmentKind != null) ...[
-                        if (showModel || showEffort) const SizedBox(width: 6),
+                        if (showModel || showEffort)
+                          const SizedBox(width: 6),
                         _WorkStateBadge(
                           kind: thread.commitmentKind!,
                           compact: true,
@@ -760,7 +763,9 @@ class _WorkStateBadge extends StatelessWidget {
       decoration: BoxDecoration(
         color: MeshColors.accent.withValues(alpha: 0.14),
         borderRadius: BorderRadius.circular(4),
-        border: Border.all(color: MeshColors.accent.withValues(alpha: 0.65)),
+        border: Border.all(
+          color: MeshColors.accent.withValues(alpha: 0.65),
+        ),
       ),
       child: Text(
         kind.toUpperCase(),

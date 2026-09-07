@@ -824,10 +824,10 @@ describe("ActorMesh", () => {
     );
   });
 
-  it("retains named-class provenance beside the resolved actor snapshot", async () => {
+  it("derives named-class provenance from the declaration across equal-pool transitions", async () => {
     const resolve = (input: SpawnRequest["modelConfig"]): ProviderModelConfig[] => {
       if (isModelClassReference(input)) {
-        return [{ provider: "claude", model: `${input.class}-model` }];
+        return [{ provider: "claude", model: "shared-model" }];
       }
       const concrete = assertConcreteModelConfig(input);
       const entries = Array.isArray(concrete) ? concrete : [concrete];
@@ -853,30 +853,58 @@ describe("ActorMesh", () => {
     });
 
     expect(registry.get(classConfigured)).toMatchObject({
-      modelConfig: [{ provider: "claude", model: "fast-model" }],
+      modelConfig: [{ provider: "claude", model: "shared-model" }],
       modelClass: "fast",
     });
     expect(registry.get(explicit)?.modelClass).toBeUndefined();
 
+    // Equal pools do not make equivalent provenance: switching named classes
+    // must remain staged and visible even though their current snapshots match.
     mesh.setActorModel(classConfigured, { class: "careful" }, "root");
     expect(registry.get(classConfigured)).toMatchObject({
       modelClass: "fast",
-      desiredModelConfig: [{ provider: "claude", model: "careful-model" }],
+      desiredModelConfig: [{ provider: "claude", model: "shared-model" }],
       desiredModelClass: "careful",
     });
     mesh.sendMessage(classConfigured, "apply class", "root");
     await tick();
     expect(registry.get(classConfigured)).toMatchObject({
-      modelConfig: [{ provider: "claude", model: "careful-model" }],
+      modelConfig: [{ provider: "claude", model: "shared-model" }],
       modelClass: "careful",
     });
     expect(registry.get(classConfigured)?.desiredModelClass).toBeUndefined();
 
-    mesh.setActorModel(classConfigured, { provider: "claude", model: "pinned-model" }, "root");
+    // An identical explicit pin clears class provenance; pool equality is not
+    // used as evidence that the class declaration still applies.
+    mesh.setActorModel(classConfigured, { provider: "claude", model: "shared-model" }, "root");
     expect(registry.get(classConfigured)?.desiredModelClass).toBeUndefined();
     mesh.sendMessage(classConfigured, "apply explicit pin", "root");
     await tick();
     expect(registry.get(classConfigured)?.modelClass).toBeUndefined();
+  });
+
+  it("ignores an untyped modelClass sidecar on an explicit spawn request", () => {
+    const { mesh, registry } = setup({
+      validateSpawn: (request) => {
+        const concrete = assertConcreteModelConfig(request.modelConfig);
+        const entries = Array.isArray(concrete) ? concrete : [concrete];
+        return entries.map((entry) => ({
+          provider: entry.provider,
+          model: entry.model ?? "required-model",
+          effort: entry.effort,
+        }));
+      },
+    });
+    const id = mesh.spawn({
+      charter: "explicit worker",
+      parentId: "root",
+      modelConfig: { provider: "claude", model: "shared-model" },
+      // JavaScript callers can still append unknown properties. ActorMesh must
+      // ignore this one instead of persisting false class provenance.
+      modelClass: "invented",
+    } as SpawnRequest & { modelClass: string });
+
+    expect(registry.get(id)?.modelClass).toBeUndefined();
   });
 
   it("revokes parent handle and marks record retired when createActor throws on spawn", () => {

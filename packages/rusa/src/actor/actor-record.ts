@@ -32,7 +32,9 @@ export interface ActorRecord {
   /**
    * Named runtime model class that produced [modelConfig]'s resolved snapshot.
    * Omitted for an explicitly declared tuple or pool, including records written
-   * before class provenance was retained.
+   * before class provenance was retained. The original class cannot be
+   * truthfully recovered from a historical resolved pool, so those records
+   * remain on the explicit-pool dashboard fallback until reconfigured.
    */
   modelClass?: string;
   /** Process-local staged full-pool replacement; deliberately not durable. */

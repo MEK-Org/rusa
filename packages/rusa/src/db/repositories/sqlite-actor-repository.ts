@@ -26,6 +26,8 @@ export const ACTOR_CONFIG_SCHEMA_VERSION = 1 as const;
 const LEGACY_MODEL_CONFIG_SCHEMA_VERSION = 1 as const;
 /** schemaVersion for a `model_config` document holding a `ProviderModelConfig[]` pool. */
 const MODEL_CONFIG_POOL_SCHEMA_VERSION = 2 as const;
+/** schemaVersion for a pool with declared model-class provenance. */
+const MODEL_CONFIG_CLASS_SCHEMA_VERSION = 3 as const;
 
 const legacyModelConfigSchema = z
   .object({
@@ -53,14 +55,28 @@ const modelConfigPoolSchema = z
   .object({
     schemaVersion: z.literal(MODEL_CONFIG_POOL_SCHEMA_VERSION),
     entries: z.array(modelConfigEntrySchema).min(1),
-    // A class resolves to this concrete snapshot at ingress. Retaining its
-    // name lets the dashboard distinguish that intentional class selection
-    // from an explicit pool without making the runtime re-resolve it later.
-    modelClass: z.string().min(1).optional(),
   })
   .strict();
 
-const modelConfigDocumentSchema = z.union([modelConfigPoolSchema, legacyModelConfigSchema]);
+const modelConfigClassSchema = z
+  .object({
+    schemaVersion: z.literal(MODEL_CONFIG_CLASS_SCHEMA_VERSION),
+    entries: z.array(modelConfigEntrySchema).min(1),
+    // A class resolves to this concrete snapshot at ingress. Retaining its
+    // name lets the dashboard distinguish that intentional class selection
+    // from an explicit pool without making the runtime re-resolve it later.
+    modelClass: z.string().min(1),
+  })
+  .strict();
+
+// v1 and v2 remain readable so existing records stay valid. New class-bearing
+// documents are v3; a v2 parser therefore never mistakes them for malformed
+// v2 records with an unrecognized member.
+const modelConfigDocumentSchema = z.union([
+  modelConfigClassSchema,
+  modelConfigPoolSchema,
+  legacyModelConfigSchema,
+]);
 
 const contextConfigSchema = z.discriminatedUnion("type", [
   z
@@ -102,11 +118,15 @@ function buildModelConfig(record: ActorRecord): string | null {
     model: entry.model,
     ...(entry.effort !== undefined ? { effort: entry.effort } : {}),
   }));
-  return JSON.stringify({
-    schemaVersion: MODEL_CONFIG_POOL_SCHEMA_VERSION,
-    entries,
-    ...(record.modelClass !== undefined ? { modelClass: record.modelClass } : {}),
-  });
+  return JSON.stringify(
+    record.modelClass === undefined
+      ? { schemaVersion: MODEL_CONFIG_POOL_SCHEMA_VERSION, entries }
+      : {
+          schemaVersion: MODEL_CONFIG_CLASS_SCHEMA_VERSION,
+          entries,
+          modelClass: record.modelClass,
+        }
+  );
 }
 
 /**
@@ -127,7 +147,7 @@ function parseModelConfig(
   if ("entries" in parsed) {
     return {
       modelConfig: parsed.entries,
-      ...(parsed.modelClass !== undefined ? { modelClass: parsed.modelClass } : {}),
+      ...("modelClass" in parsed ? { modelClass: parsed.modelClass } : {}),
     };
   }
   if (parsed.provider !== undefined && parsed.model !== undefined) {

@@ -55,8 +55,11 @@ class ProviderModelConfig {
 
   /// One candidate on one line — `provider · model · effort medium` — with
   /// the effort clause dropped when the server sent no explicit effort.
-  String get label =>
-      [provider, model, if (effort != null) 'effort $effort'].join(' · ');
+  String get label => [
+    provider,
+    model,
+    if (effort != null) 'effort $effort',
+  ].join(' · ');
 
   @override
   bool operator ==(Object other) =>
@@ -1229,8 +1232,7 @@ class ObligationDto {
   final String? updatedAt;
   final String? intent;
   final String? externalRef;
-  final String
-  status; // "ready" | "waiting" | "done" | "cancelled" | "scheduled"
+  final String status; // "ready" | "waiting" | "done" | "cancelled" | "scheduled"
   final double? priority;
   final double effectivePriority;
   final String? prioritySourceId;
@@ -1384,13 +1386,14 @@ class ObligationForest {
   final int total;
   final bool hasMore;
 
-  factory ObligationForest.fromJson(Map<String, dynamic> j) => ObligationForest(
-    trees: (j['trees'] as List<dynamic>? ?? const [])
-        .map((e) => ObligationTreeDto.fromJson(e as Map<String, dynamic>))
-        .toList(),
-    total: j['total'] as int? ?? 0,
-    hasMore: j['hasMore'] as bool? ?? false,
-  );
+  factory ObligationForest.fromJson(Map<String, dynamic> j) =>
+      ObligationForest(
+        trees: (j['trees'] as List<dynamic>? ?? const [])
+            .map((e) => ObligationTreeDto.fromJson(e as Map<String, dynamic>))
+            .toList(),
+        total: j['total'] as int? ?? 0,
+        hasMore: j['hasMore'] as bool? ?? false,
+      );
 }
 
 class ObligationListPage {

@@ -53,7 +53,6 @@ export interface RunStartPayload {
   responsive: boolean;
   /** The concrete candidate that actually crossed the launch gate, absent on historical rows. */
   model?: string;
-  effort?: string;
   /** Durable actor_runs identity for this execution. */
   runId?: string;
 }

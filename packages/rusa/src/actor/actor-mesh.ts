@@ -122,11 +122,6 @@ export interface SpawnRequest {
    * bounded, non-empty, portable-only-above-length-one array (design MEK-Org/rusa#169).
    */
   modelConfig: ModelConfigInput;
-  /**
-   * Provenance retained when a caller already resolved a named class before
-   * reaching the mesh. Direct class references derive this from modelConfig.
-   */
-  modelClass?: string;
   /** Working-memory ownership and portable-context policy. Missing means native. */
   context?: ContextConfig;
   /** Peers to seed the child's address book with (introductions at birth). */
@@ -1440,13 +1435,10 @@ export class ActorMesh {
     }
     const id = this.idgen();
     const parentId = this.resolveThreadId(req.parentId);
-    // Normal ingress passes the class reference through to validateSpawn;
-    // root control resolves first so it can apply its provider allowlist, then
-    // carries the already-validated name here. Either path stores the resolved
-    // snapshot plus its provenance, never a live class pointer.
-    const modelClass = isModelClassReference(req.modelConfig)
-      ? req.modelConfig.class
-      : req.modelClass;
+    // Store provenance only when the caller declared a class in modelConfig.
+    // The validation gate resolves that reference to this concrete snapshot;
+    // an explicit tuple/pool cannot attach an arbitrary class label.
+    const modelClass = isModelClassReference(req.modelConfig) ? req.modelConfig.class : undefined;
     const record: ActorRecord = {
       id,
       charter,

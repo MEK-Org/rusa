@@ -92,75 +92,66 @@ void main() {
       expect(dto.externalRef, null);
     });
 
-    test(
-      'deserializes recurrence fields and derives isScheduled/isRecurring',
-      () {
-        final json = {
-          'id': 'ob-cron',
-          'parentId': null,
-          'ownerId': 'test-actor',
-          'intent': 'Nightly sweep',
-          'externalRef': null,
-          'status': 'scheduled',
-          'priority': 50.0,
-          'effectivePriority': 50.0,
-          'prioritySourceId': 'ob-cron',
-          'recurrencePolicy': 'cron',
-          'recurrenceCron': '0 3 * * *',
-          'recurrenceIntervalSeconds': null,
-          'nextReadyAt': '2026-09-03T03:00:00.000Z',
-        };
+    test('deserializes recurrence fields and derives isScheduled/isRecurring', () {
+      final json = {
+        'id': 'ob-cron',
+        'parentId': null,
+        'ownerId': 'test-actor',
+        'intent': 'Nightly sweep',
+        'externalRef': null,
+        'status': 'scheduled',
+        'priority': 50.0,
+        'effectivePriority': 50.0,
+        'prioritySourceId': 'ob-cron',
+        'recurrencePolicy': 'cron',
+        'recurrenceCron': '0 3 * * *',
+        'recurrenceIntervalSeconds': null,
+        'nextReadyAt': '2026-09-03T03:00:00.000Z',
+      };
 
-        final dto = ObligationDto.fromJson(json);
-        expect(dto.recurrencePolicy, 'cron');
-        expect(dto.recurrenceCron, '0 3 * * *');
-        expect(dto.recurrenceIntervalSeconds, null);
-        expect(dto.nextReadyAt, '2026-09-03T03:00:00.000Z');
-        expect(dto.isScheduled, true);
-        expect(dto.isRecurring, true);
-        expect(dto.isTerminal, false);
-      },
-    );
+      final dto = ObligationDto.fromJson(json);
+      expect(dto.recurrencePolicy, 'cron');
+      expect(dto.recurrenceCron, '0 3 * * *');
+      expect(dto.recurrenceIntervalSeconds, null);
+      expect(dto.nextReadyAt, '2026-09-03T03:00:00.000Z');
+      expect(dto.isScheduled, true);
+      expect(dto.isRecurring, true);
+      expect(dto.isTerminal, false);
+    });
 
-    test(
-      'a non-recurring ready obligation reports isScheduled/isRecurring false',
-      () {
-        final json = {
-          'id': 'ob-plain',
-          'parentId': null,
-          'ownerId': 'test-actor',
-          'intent': 'One-off task',
-          'externalRef': null,
-          'status': 'ready',
-          'priority': 50.0,
-          'effectivePriority': 50.0,
-          'prioritySourceId': 'ob-plain',
-        };
+    test('a non-recurring ready obligation reports isScheduled/isRecurring false', () {
+      final json = {
+        'id': 'ob-plain',
+        'parentId': null,
+        'ownerId': 'test-actor',
+        'intent': 'One-off task',
+        'externalRef': null,
+        'status': 'ready',
+        'priority': 50.0,
+        'effectivePriority': 50.0,
+        'prioritySourceId': 'ob-plain',
+      };
 
-        final dto = ObligationDto.fromJson(json);
-        expect(dto.recurrencePolicy, null);
-        expect(dto.nextReadyAt, null);
-        expect(dto.isScheduled, false);
-        expect(dto.isRecurring, false);
-        expect(dto.hasCompletionHistory, false);
-      },
-    );
+      final dto = ObligationDto.fromJson(json);
+      expect(dto.recurrencePolicy, null);
+      expect(dto.nextReadyAt, null);
+      expect(dto.isScheduled, false);
+      expect(dto.isRecurring, false);
+      expect(dto.hasCompletionHistory, false);
+    });
 
-    test(
-      'deserializes retained completion-history existence without an exact count',
-      () {
-        final dto = ObligationDto.fromJson({
-          'id': 'ob-formerly-recurring',
-          'ownerId': 'test-actor',
-          'status': 'done',
-          'effectivePriority': 50.0,
-          'hasCompletionHistory': true,
-        });
+    test('deserializes retained completion-history existence without an exact count', () {
+      final dto = ObligationDto.fromJson({
+        'id': 'ob-formerly-recurring',
+        'ownerId': 'test-actor',
+        'status': 'done',
+        'effectivePriority': 50.0,
+        'hasCompletionHistory': true,
+      });
 
-        expect(dto.isRecurring, false);
-        expect(dto.hasCompletionHistory, true);
-      },
-    );
+      expect(dto.isRecurring, false);
+      expect(dto.hasCompletionHistory, true);
+    });
   });
 
   group('ObligationDetailSnapshot.fromJson', () {
@@ -203,28 +194,25 @@ void main() {
       expect(snapshot.completionsHasMore, true);
     });
 
-    test(
-      'defaults completion fields when absent (non-recurring obligations)',
-      () {
-        final json = {
-          'obligation': {
-            'id': 'ob-plain',
-            'ownerId': 'test-actor',
-            'status': 'ready',
-            'effectivePriority': 50.0,
-          },
-          'parent': null,
-          'children': [],
-          'blockingChildren': [],
-          'artifacts': [],
-        };
+    test('defaults completion fields when absent (non-recurring obligations)', () {
+      final json = {
+        'obligation': {
+          'id': 'ob-plain',
+          'ownerId': 'test-actor',
+          'status': 'ready',
+          'effectivePriority': 50.0,
+        },
+        'parent': null,
+        'children': [],
+        'blockingChildren': [],
+        'artifacts': [],
+      };
 
-        final snapshot = ObligationDetailSnapshot.fromJson(json);
-        expect(snapshot.completions, isEmpty);
-        expect(snapshot.completionsTotal, 0);
-        expect(snapshot.completionsHasMore, false);
-      },
-    );
+      final snapshot = ObligationDetailSnapshot.fromJson(json);
+      expect(snapshot.completions, isEmpty);
+      expect(snapshot.completionsTotal, 0);
+      expect(snapshot.completionsHasMore, false);
+    });
   });
 
   group('ActorViewState', () {

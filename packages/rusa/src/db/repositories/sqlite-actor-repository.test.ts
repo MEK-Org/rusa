@@ -84,7 +84,7 @@ describe("SqliteActorRepository", () => {
     ]);
   });
 
-  it("round-trips model-class provenance without changing the actors table", () => {
+  it("round-trips model-class provenance in the v3 document without changing the actors table", () => {
     const classConfigured = { ...root, modelClass: "fast" };
     repository.upsert(classConfigured);
 
@@ -93,10 +93,25 @@ describe("SqliteActorRepository", () => {
       model_config: string;
     };
     expect(JSON.parse(row.model_config)).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       entries: [{ provider: "codex", model: "gpt-test", effort: "high" }],
       modelClass: "fast",
     });
+  });
+
+  it("continues to read strict v2 pools without class provenance", () => {
+    repository.upsert(root);
+    db.prepare("UPDATE actors SET model_config = ? WHERE id = 'root'").run(
+      JSON.stringify({
+        schemaVersion: 2,
+        entries: [{ provider: "codex", model: "gpt-v2", effort: "medium" }],
+      })
+    );
+
+    expect(repository.get("root")).toMatchObject({
+      modelConfig: [{ provider: "codex", model: "gpt-v2", effort: "medium" }],
+    });
+    expect(repository.get("root")?.modelClass).toBeUndefined();
   });
 
   it("validates model_config versions and shape when records are consumed", () => {
@@ -112,6 +127,8 @@ describe("SqliteActorRepository", () => {
       '{"schemaVersion":2,"entries":[]}',
       '{"schemaVersion":2,"entries":[{"provider":"codex"}]}',
       '{"schemaVersion":2,"entries":[{"model":"gpt-test"}]}',
+      '{"schemaVersion":2,"entries":[{"provider":"codex","model":"gpt-test"}],"modelClass":"fast"}',
+      '{"schemaVersion":3,"entries":[{"provider":"codex","model":"gpt-test"}]}',
     ]) {
       db.prepare("UPDATE actors SET model_config = ? WHERE id = 'root'").run(invalid);
       expect(() => repository.get("root")).toThrow(/invalid model_config for actor 'root'/);

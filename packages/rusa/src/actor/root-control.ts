@@ -1,7 +1,6 @@
 import {
   assertConcreteModelConfig,
   type ConcreteModelConfigInput,
-  isModelClassReference,
   type ModelConfigInput,
   type ProviderModelConfig,
 } from "../providers/model-config.js";
@@ -24,7 +23,6 @@ export interface RootControlMesh {
     charter: string;
     parentId: string;
     modelConfig: ModelConfigInput;
-    modelClass?: string;
     context?: ContextConfig;
     conversationId?: string;
     title?: string;
@@ -87,9 +85,6 @@ export class RootControlService {
     const requested = this.options.resolveModelConfig
       ? this.options.resolveModelConfig(request.modelConfig)
       : assertConcreteModelConfig(request.modelConfig);
-    const modelClass = isModelClassReference(request.modelConfig)
-      ? request.modelConfig.class
-      : undefined;
     const rawPool = Array.isArray(requested) ? requested : [requested];
     if (rawPool.length === 0) throw new Error("modelConfig is required");
     if (this.providers.length > 0) {
@@ -118,10 +113,11 @@ export class RootControlService {
         : {}),
       charter,
       parentId: this.rootId,
-      // Forward the resolved pool, not the request as written: resolution
-      // happens exactly once, here, and mesh-side validation sees only tuples.
-      modelConfig: requested,
-      ...(modelClass !== undefined ? { modelClass } : {}),
+      // Keep the original declaration for mesh.spawn. Root control uses the
+      // resolved snapshot above only for its provider allowlist; mesh is the
+      // authoritative resolution/validation boundary and derives provenance
+      // from this original class reference rather than a caller-settable field.
+      modelConfig: request.modelConfig,
       context: normalizeContext(request.context),
       conversationId: optionalTrimmed(request.conversationId),
       title: optionalTrimmed(request.title),
