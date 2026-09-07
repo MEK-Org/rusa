@@ -209,6 +209,7 @@ import type { McpServerSpec, RunResult } from "../providers/types.js";
 import { resolveQuotaDatabasePath, SharedQuotaStore } from "../quota/shared-store.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
+import { createActorRuntime } from "../runtime/actor-runtime.js";
 import { createCommitmentPolarityEvaluator } from "../understanding/commitment-polarity.js";
 import {
   DistillerCursorStore,
@@ -2077,7 +2078,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // Which declared candidate actually ran, for the failure-notice label —
         // set on each onRunStart, read back on that same run's onRunEnd.
         let lastSelected: RawProviderModelConfig = modelConfigPool[0];
-        const actorOptions: ActorOptions = {
+        const actorOptions: Omit<ActorOptions, "onRunEnd"> = {
           id,
           cwd,
           modelConfig: [...modelConfigPool],
@@ -2225,43 +2226,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               payload: JSON.stringify({ started } satisfies RunAbandonedPayload),
             });
           },
-          onRunEnd: async (result) => {
-            const runId = completeActorRun(id, result);
-            logRunEnd(runLogger(id, runId), result);
-            mesh.recordEvent({
-              kind: "run_end",
-              actorId: id,
-              success: result.success,
-              detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
-              body: result.output,
-              payload: runEndPayload({ ...result, runId }),
-            });
-            ctx.onRunEnd(result);
-            const compacted = await compactPortableActorAfterRun(id);
-            if (compacted) {
-              mesh.recordEvent({
-                kind: "portable_context_compacted",
-                actorId: id,
-                detail: describeCompaction(compacted),
-                body: JSON.stringify(compacted),
-              });
-            }
-            if (!result.success && !result.capped) {
-              await routeRunFailure(
-                failureSink,
-                id,
-                result,
-                formatProviderLabel(
-                  {
-                    providerName: lastSelected.provider,
-                    model: lastSelected.model,
-                    effort: lastSelected.effort,
-                  },
-                  result.model
-                )
-              );
-            }
-          },
           log: makeFirehose(id), // firehose (4d: session-tag) → console + dashboard SSE
         };
         // Second fail-closed gate, covering rehydrate/adopt as well as spawn: a
@@ -2273,9 +2237,53 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             `actor ${id} requests executionTarget ${JSON.stringify(ctx.executionTarget)} but this runtime has no remote placement support`
           );
         }
-        const actor: MeshActor = createWorkerActor
-          ? createWorkerActor(ctx, actorOptions)
-          : new Actor(actorOptions);
+        const actor: MeshActor = createActorRuntime(
+          {
+            identity: { actorId: id, role: "worker" },
+            options: actorOptions,
+            terminal: {
+              completeRun: (result) => completeActorRun(id, result),
+              logRunEnd: (runId, result) => logRunEnd(runLogger(id, runId), result),
+              recordRunEnd: (runId, result) => {
+                mesh.recordEvent({
+                  kind: "run_end",
+                  actorId: id,
+                  success: result.success,
+                  detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
+                  body: result.output,
+                  payload: runEndPayload({ ...result, runId }),
+                });
+              },
+              afterTerminal: ctx.onRunEnd,
+              compact: async () => {
+                const compacted = await compactPortableActorAfterRun(id);
+                if (compacted) {
+                  mesh.recordEvent({
+                    kind: "portable_context_compacted",
+                    actorId: id,
+                    detail: describeCompaction(compacted),
+                    body: JSON.stringify(compacted),
+                  });
+                }
+              },
+              routeFailure: (result) =>
+                routeRunFailure(
+                  failureSink,
+                  id,
+                  result,
+                  formatProviderLabel(
+                    {
+                      providerName: lastSelected.provider,
+                      model: lastSelected.model,
+                      effort: lastSelected.effort,
+                    },
+                    result.model
+                  )
+                ),
+            },
+          },
+          (options) => (createWorkerActor ? createWorkerActor(ctx, options) : new Actor(options))
+        );
         liveWorkerMcp.set(id, workerMcp);
         return actor;
       } catch (err) {
@@ -2623,196 +2631,209 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   let root: MeshActor;
   root =
     externalRoot ??
-    new Actor({
-      id: rootId,
-      cwd: rootAgentDir,
-      // Root's declared pool always has exactly one entry (it never draws
-      // from a multi-candidate pool at launch-time selection — that's a
-      // worker-only concept; `fallback` below is its own, separate degrade
-      // path), but that one entry can still be moved via `set_actor_model`
-      // (#199 amend gaps 1-2), so resolution must read the live entry rather
-      // than freeze the boot-time `resolveRootProvider` result.
-      modelConfig: [
-        { provider: provider.providerName, model: provider.model, effort: provider.effort },
-      ],
-      resolveProvider: (selected) =>
-        resolveProvider(config, selected.provider, selected.model, selected.effort),
-      mcpServers: rootMcp,
-      addDirs,
-      sandbox: Boolean(opts?.e2e),
-      isE2eRoot: Boolean(opts?.e2e),
-      e2eWritableRemoteDir: opts?.e2e?.remoteGitDir,
-      loadSessionId: () =>
-        actors.get(rootId)?.context?.type === "portable"
-          ? undefined
-          : (actors.get(rootId)?.sessionId ?? legacyActorImport.deferredRootSessionId),
-      saveSessionId: (id) => {
-        if (actors.get(rootId)?.context?.type === "portable") return;
-        actors.patch(rootId, { sessionId: id });
-      },
-      buildPrompt: () => {
-        const record = actors.get(rootId);
-        if (!record) return { prompt: "No active root thread record." };
-        const injection = assembleConfiguredPortableInjection(
-          record,
-          portableContextApiKey,
-          portableContextStore
-        );
-        return {
-          prompt: buildRootPrompt(config.rootActor?.charter, rootHandle, injection?.priorContext),
-          injectRecord: injection?.injectRecord,
-        };
-      },
-      fallback: fallbackModels
-        ? {
-            models: fallbackModels,
-            resolveProvider: (model) =>
-              resolveProvider(
-                config,
-                config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER,
-                model,
-                config.rootActor?.effort
+    createActorRuntime(
+      {
+        identity: { actorId: rootId, role: "root" },
+        options: {
+          id: rootId,
+          cwd: rootAgentDir,
+          // Root's declared pool always has exactly one entry (it never draws
+          // from a multi-candidate pool at launch-time selection — that's a
+          // worker-only concept; `fallback` below is its own, separate degrade
+          // path), but that one entry can still be moved via `set_actor_model`
+          // (#199 amend gaps 1-2), so resolution must read the live entry rather
+          // than freeze the boot-time `resolveRootProvider` result.
+          modelConfig: [
+            { provider: provider.providerName, model: provider.model, effort: provider.effort },
+          ],
+          resolveProvider: (selected) =>
+            resolveProvider(config, selected.provider, selected.model, selected.effort),
+          mcpServers: rootMcp,
+          addDirs,
+          sandbox: Boolean(opts?.e2e),
+          isE2eRoot: Boolean(opts?.e2e),
+          e2eWritableRemoteDir: opts?.e2e?.remoteGitDir,
+          loadSessionId: () =>
+            actors.get(rootId)?.context?.type === "portable"
+              ? undefined
+              : (actors.get(rootId)?.sessionId ?? legacyActorImport.deferredRootSessionId),
+          saveSessionId: (id) => {
+            if (actors.get(rootId)?.context?.type === "portable") return;
+            actors.patch(rootId, { sessionId: id });
+          },
+          buildPrompt: () => {
+            const record = actors.get(rootId);
+            if (!record) return { prompt: "No active root thread record." };
+            const injection = assembleConfiguredPortableInjection(
+              record,
+              portableContextApiKey,
+              portableContextStore
+            );
+            return {
+              prompt: buildRootPrompt(
+                config.rootActor?.charter,
+                rootHandle,
+                injection?.priorContext
               ),
-            classify: classifyExhaustion,
-          }
-        : undefined,
-      // Responsive human wakes bypass normal pacing/concurrency; background root
-      // wakes use the same normal scheduling path as workers.
-      beforeRun: ({ mode }): boolean => {
-        // Same dispatch-time apply as the worker beforeRun (#199, extended to
-        // pools): a pool staged while root was queued/idle must land before
-        // this run's own gate()/admission and run_start, not at the end of
-        // the run after. Root's declared pool is always fixed at one entry
-        // (see the `modelConfig` comment on root's Actor construction above).
-        mesh.applyPendingModel(rootId);
-        const rootRecord = actors.get(rootId);
-        const launchProviderName = rootRecord?.modelConfig?.[0]?.provider ?? rootProviderName;
-        if (isProviderHalted(launchProviderName) || gracefulShutdown.isShuttingDown()) {
-          return false;
-        }
-        if (mode === "yield-elicitation") return true;
-        const watermark = root.getInterruptedWatermark?.();
-        if (watermark) {
-          const entries = inboxStore.list(rootId, { status: "unhandled" }).entries;
-          return entries.some((e) => e.deliveredAt > watermark);
-        }
-        return inboxStore.countUnhandled(rootId) > 0;
-      },
-      gate: (fn, candidates, responsive) => mesh.gateRun(fn, candidates, responsive, rootId),
-      onQueuedRunCancelled: () => mesh.clearSelection(rootId),
-      onContinue: (n) =>
-        mesh.recordEvent({
-          kind: "run_continued",
-          actorId: rootId,
-          detail: `yield-elicitation ${n}/1`,
-        }),
-      onContinuationCapped: (n) => {
-        mesh.recordEvent({
-          kind: "continuation_capped",
-          actorId: rootId,
-          detail: `yield-elicitation exhausted after ${n} corrective run(s)`,
-        });
-        routeContinuationCapped(failureSink, rootId, n);
-      },
-      onQueued: (context) => {
-        mesh.actorQueued(rootId, context);
-        mesh.recordEvent({
-          kind: "run_queued",
-          actorId: rootId,
-          detail: context.mode,
-        });
-      },
-      onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
-      onRunStart: (responsive, injectRecord, selected) => {
-        rootLastSelected = selected;
-        // The run actually launched: the queued reservation this describes
-        // no longer exists to cancel or report on.
-        mesh.clearSelection(rootId);
-        const providerName = providerThrottleKey(selected.provider, config);
-        const runId = beginActorRun(rootId, providerName);
-        runLogger(rootId, runId).info("run_start", {
-          provider: providerName,
-          model: selected.model,
-          effort: selected.effort,
-          responsive,
-        });
-        mesh.recordEvent({
-          kind: "run_start",
-          actorId: rootId,
-          detail: injectRecord
-            ? `ctx ${injectRecord.bytes}B/${injectRecord.runCount}r/${injectRecord.hash.slice(0, 12)}`
+              injectRecord: injection?.injectRecord,
+            };
+          },
+          fallback: fallbackModels
+            ? {
+                models: fallbackModels,
+                resolveProvider: (model) =>
+                  resolveProvider(
+                    config,
+                    config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER,
+                    model,
+                    config.rootActor?.effort
+                  ),
+                classify: classifyExhaustion,
+              }
             : undefined,
-          body: injectRecord ? JSON.stringify(injectRecord) : undefined,
-          payload: JSON.stringify({
-            provider: providerName,
-            model: selected.model,
-            effort: selected.effort,
-            responsive,
-            runId,
-          }),
-        });
+          // Responsive human wakes bypass normal pacing/concurrency; background root
+          // wakes use the same normal scheduling path as workers.
+          beforeRun: ({ mode }): boolean => {
+            // Same dispatch-time apply as the worker beforeRun (#199, extended to
+            // pools): a pool staged while root was queued/idle must land before
+            // this run's own gate()/admission and run_start, not at the end of
+            // the run after. Root's declared pool is always fixed at one entry
+            // (see the `modelConfig` comment on root's Actor construction above).
+            mesh.applyPendingModel(rootId);
+            const rootRecord = actors.get(rootId);
+            const launchProviderName = rootRecord?.modelConfig?.[0]?.provider ?? rootProviderName;
+            if (isProviderHalted(launchProviderName) || gracefulShutdown.isShuttingDown()) {
+              return false;
+            }
+            if (mode === "yield-elicitation") return true;
+            const watermark = root.getInterruptedWatermark?.();
+            if (watermark) {
+              const entries = inboxStore.list(rootId, { status: "unhandled" }).entries;
+              return entries.some((e) => e.deliveredAt > watermark);
+            }
+            return inboxStore.countUnhandled(rootId) > 0;
+          },
+          gate: (fn, candidates, responsive) => mesh.gateRun(fn, candidates, responsive, rootId),
+          onQueuedRunCancelled: () => mesh.clearSelection(rootId),
+          onContinue: (n) =>
+            mesh.recordEvent({
+              kind: "run_continued",
+              actorId: rootId,
+              detail: `yield-elicitation ${n}/1`,
+            }),
+          onContinuationCapped: (n) => {
+            mesh.recordEvent({
+              kind: "continuation_capped",
+              actorId: rootId,
+              detail: `yield-elicitation exhausted after ${n} corrective run(s)`,
+            });
+            routeContinuationCapped(failureSink, rootId, n);
+          },
+          onQueued: (context) => {
+            mesh.actorQueued(rootId, context);
+            mesh.recordEvent({
+              kind: "run_queued",
+              actorId: rootId,
+              detail: context.mode,
+            });
+          },
+          onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
+          onRunStart: (responsive, injectRecord, selected) => {
+            rootLastSelected = selected;
+            // The run actually launched: the queued reservation this describes
+            // no longer exists to cancel or report on.
+            mesh.clearSelection(rootId);
+            const providerName = providerThrottleKey(selected.provider, config);
+            const runId = beginActorRun(rootId, providerName);
+            runLogger(rootId, runId).info("run_start", {
+              provider: providerName,
+              model: selected.model,
+              effort: selected.effort,
+              responsive,
+            });
+            mesh.recordEvent({
+              kind: "run_start",
+              actorId: rootId,
+              detail: injectRecord
+                ? `ctx ${injectRecord.bytes}B/${injectRecord.runCount}r/${injectRecord.hash.slice(0, 12)}`
+                : undefined,
+              body: injectRecord ? JSON.stringify(injectRecord) : undefined,
+              payload: JSON.stringify({
+                provider: providerName,
+                model: selected.model,
+                effort: selected.effort,
+                responsive,
+                runId,
+              }),
+            });
+          },
+          onFirstChunk: () =>
+            mesh.recordEvent({
+              kind: "run_first_chunk",
+              actorId: rootId,
+            }),
+          onCoalesceAborted: (count, ageMs) => {
+            mesh.recordEvent({
+              kind: "run_coalesced",
+              actorId: rootId,
+              detail: `count=${count} age=${ageMs}ms`,
+            });
+          },
+          onRunAbandoned: ({ reason, started }) => {
+            if (started) abandonActorRun(rootId, reason);
+            runLogger(rootId).warn("run_abandoned", { reason, started });
+            mesh.recordEvent({
+              kind: "run_abandoned",
+              actorId: rootId,
+              detail: reason,
+              payload: JSON.stringify({ started } satisfies RunAbandonedPayload),
+            });
+          },
+          log: makeFirehose(rootId), // firehose → console + dashboard SSE
+        },
+        terminal: {
+          finishInboxRun: () => mesh.finishInboxRun(rootId),
+          completeRun: (result) => completeActorRun(rootId, result),
+          logRunEnd: (runId, result) => logRunEnd(runLogger(rootId, runId), result),
+          recordRunEnd: (runId, result) => {
+            mesh.recordEvent({
+              kind: "run_end",
+              actorId: rootId,
+              success: result.success,
+              detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
+              body: result.output,
+              payload: runEndPayload({ ...result, runId }),
+            });
+          },
+          compact: async () => {
+            const compacted = await compactPortableActorAfterRun(rootId);
+            if (compacted) {
+              mesh.recordEvent({
+                kind: "portable_context_compacted",
+                actorId: rootId,
+                detail: describeCompaction(compacted),
+                body: JSON.stringify(compacted),
+              });
+            }
+          },
+          routeFailure: (result) =>
+            routeRunFailure(
+              failureSink,
+              rootId,
+              result,
+              formatProviderLabel(
+                {
+                  providerName: rootLastSelected.provider,
+                  model: rootLastSelected.model,
+                  effort: rootLastSelected.effort,
+                },
+                result.model
+              )
+            ),
+        },
       },
-      onFirstChunk: () =>
-        mesh.recordEvent({
-          kind: "run_first_chunk",
-          actorId: rootId,
-        }),
-      onCoalesceAborted: (count, ageMs) => {
-        mesh.recordEvent({
-          kind: "run_coalesced",
-          actorId: rootId,
-          detail: `count=${count} age=${ageMs}ms`,
-        });
-      },
-      onRunAbandoned: ({ reason, started }) => {
-        if (started) abandonActorRun(rootId, reason);
-        runLogger(rootId).warn("run_abandoned", { reason, started });
-        mesh.recordEvent({
-          kind: "run_abandoned",
-          actorId: rootId,
-          detail: reason,
-          payload: JSON.stringify({ started } satisfies RunAbandonedPayload),
-        });
-      },
-      onRunEnd: async (result) => {
-        mesh.finishInboxRun(rootId);
-        const runId = completeActorRun(rootId, result);
-        logRunEnd(runLogger(rootId, runId), result);
-        mesh.recordEvent({
-          kind: "run_end",
-          actorId: rootId,
-          success: result.success,
-          detail: result.exitCode == null ? undefined : `exit ${result.exitCode}`,
-          body: result.output,
-          payload: runEndPayload({ ...result, runId }),
-        });
-        const compacted = await compactPortableActorAfterRun(rootId);
-        if (compacted) {
-          mesh.recordEvent({
-            kind: "portable_context_compacted",
-            actorId: rootId,
-            detail: describeCompaction(compacted),
-            body: JSON.stringify(compacted),
-          });
-        }
-        if (!result.success && !result.capped) {
-          await routeRunFailure(
-            failureSink,
-            rootId,
-            result,
-            formatProviderLabel(
-              {
-                providerName: rootLastSelected.provider,
-                model: rootLastSelected.model,
-                effort: rootLastSelected.effort,
-              },
-              result.model
-            )
-          );
-        }
-      },
-      log: makeFirehose(rootId), // firehose → console + dashboard SSE
-    });
+      (options) => new Actor(options)
+    );
   const rootRecord: ActorRecord = {
     id: rootId,
     charter: config.rootActor?.charter ?? DEFAULT_ROOT_CHARTER,
