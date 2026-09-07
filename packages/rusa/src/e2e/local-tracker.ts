@@ -276,6 +276,7 @@ export class LocalTracker {
     headRef: string;
     title: string;
     body: string;
+    existingBody?: string;
     base?: string | null;
     author: string;
   }): TrackerPr {
@@ -285,7 +286,7 @@ export class LocalTracker {
     const now = new Date().toISOString();
     if (existing) {
       existing.title = opts.title;
-      existing.body = opts.body;
+      existing.body = opts.existingBody ?? opts.body;
       if (opts.base !== undefined) {
         existing.base = opts.base;
       }

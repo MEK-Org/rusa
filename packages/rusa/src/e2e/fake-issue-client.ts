@@ -71,6 +71,7 @@ export class FakeIssueClient implements IssueClient {
       headRef: opts.head,
       title: opts.title,
       body: opts.body,
+      existingBody: opts.existingBody,
       ...(opts.base !== undefined ? { base: opts.base } : {}),
       author: this.botAccount,
     });

@@ -20,6 +20,12 @@ export interface CreatePROptions {
   /** PR body/description */
   body: string;
   /**
+   * Alternative body to use when the client's existing-PR lookup selects an
+   * update rather than a creation. Keeping both variants at this seam makes
+   * that one lookup govern the body and PATCH/POST decision together.
+   */
+  existingBody?: string;
+  /**
    * GitHub username to request review from. Omit to open the PR with no
    * requested reviewer — the default, since a review is routed deliberately
    * rather than attached to every PR .
@@ -528,16 +534,19 @@ export class GitHubIssueClient implements IssueClient {
   }
 
   async createPullRequest(opts: CreatePROptions): Promise<CreatedPullRequest> {
-    // Check if an open PR already exists for this head branch
-    const existing = await this.findExistingPR(opts.repo, opts.head);
+    // This one owner-qualified lookup selects both the HTTP verb and the body
+    // variant. Keeping that decision here prevents a separate caller precheck
+    // from disagreeing after a transient failure or concurrent PR change.
+    const existing = await this.findOpenPullRequestForHead(opts.repo, opts.head);
+    const body = existing ? (opts.existingBody ?? opts.body) : opts.body;
     if (existing) {
       // Update the existing PR's title, body, and base (if provided), then return its number + URL
       await this.api("PATCH", `/repos/${opts.repo}/pulls/${existing.number}`, {
         title: opts.title,
-        body: opts.body,
+        body,
         ...(opts.base !== undefined ? { base: opts.base } : {}),
       });
-      return { number: existing.number, htmlUrl: existing.url };
+      return existing;
     }
 
     // Unlike `gh pr create`, the REST endpoint requires an explicit base.
@@ -545,7 +554,7 @@ export class GitHubIssueClient implements IssueClient {
     const pr = await this.api<{ number: number; html_url: string }>(
       "POST",
       `/repos/${opts.repo}/pulls`,
-      { title: opts.title, body: opts.body, head: opts.head, base }
+      { title: opts.title, body, head: opts.head, base }
     );
 
     // No reviewer means no review request at all — not a substituted default.
@@ -580,10 +589,10 @@ export class GitHubIssueClient implements IssueClient {
   /**
    * Check if an open PR already exists for a given head branch.
    */
-  private async findExistingPR(
+  private async findOpenPullRequestForHead(
     repo: string,
     head: string
-  ): Promise<{ number: number; url: string } | null> {
+  ): Promise<CreatedPullRequest | null> {
     try {
       const owner = repo.split("/")[0];
       const prs = await this.api<Array<{ number: number; html_url: string }>>(
@@ -591,7 +600,7 @@ export class GitHubIssueClient implements IssueClient {
         `/repos/${repo}/pulls?head=${encodeURIComponent(`${owner}:${head}`)}&state=open&per_page=1`
       );
       const pr = prs[0];
-      return pr ? { number: pr.number, url: pr.html_url } : null;
+      return pr ? { number: pr.number, htmlUrl: pr.html_url } : null;
     } catch {
       return null;
     }

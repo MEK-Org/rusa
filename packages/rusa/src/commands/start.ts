@@ -1919,6 +1919,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
       try {
         const isFenced = () => mesh.isYielded(id);
+        let activeRunSelection: RawProviderModelConfig | undefined;
         // A per-actor agent-execution endpoint, with this actor's identity baked in.
         const meshUrl = mcpHttp.addServer(id, () =>
           createAgentExecMcpServer(mesh, id, rootId, undefined, {
@@ -1983,6 +1984,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             },
             onWrite: () => webhookSilenceDetector?.recordOutboundWrite(),
             instanceId: rootHandle,
+            getRunSelection: () => activeRunSelection,
             isFenced,
             // Mechanically hand the created issue/PR's exact event source to its
             // creator : follow-up events route here, not the repo/org
@@ -2176,6 +2178,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           onRuntimeStateChanged: ctx.onRuntimeStateChanged,
           onRunStart: (responsive, injectRecord, selected) => {
             lastSelected = selected;
+            activeRunSelection = selected;
             // The run actually launched: the queued reservation this
             // describes no longer exists to cancel or report on.
             mesh.clearSelection(id);
@@ -2203,6 +2206,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               }),
             });
           },
+          onProviderAttempt: (attempt) => {
+            activeRunSelection = {
+              provider: attempt.providerName,
+              model: attempt.model,
+              effort: attempt.effort,
+            };
+          },
           onFirstChunk: () =>
             mesh.recordEvent({
               kind: "run_first_chunk",
@@ -2216,6 +2226,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             });
           },
           onRunAbandoned: ({ reason, started }) => {
+            if (started) activeRunSelection = undefined;
             if (started) abandonActorRun(id, reason);
             runLogger(id).warn("run_abandoned", { reason, started });
             mesh.recordEvent({
@@ -2226,6 +2237,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             });
           },
           onRunEnd: async (result) => {
+            activeRunSelection = undefined;
             const runId = completeActorRun(id, result);
             logRunEnd(runLogger(id, runId), result);
             mesh.recordEvent({
@@ -2461,11 +2473,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       instanceId: rootHandle,
     })
   );
+  let rootRunSelection: RawProviderModelConfig | undefined;
   const rootTrackerUrl = mcpHttp.addServer(`${rootId}:${TRACKER_MCP_NAME}`, () =>
     createTrackerMcpServer(rootId, issueClient, {
       gitBridge: config.gitBridge ? { port: gitBridgePort } : undefined,
       onWrite: () => webhookSilenceDetector?.recordOutboundWrite(),
       instanceId: rootHandle,
+      actorHandle: rootHandle,
+      getRunSelection: () => rootRunSelection,
       // Uniform rule : the root gets mechanical subscriptions for what
       // it creates too, and can delegate them onward.
       onResourceCreated: (resource) => {
@@ -2659,13 +2674,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           portableContextStore
         );
         return {
-          prompt: buildRootPrompt(config.rootActor?.charter, rootHandle, injection?.priorContext),
+          prompt: buildRootPrompt(config.rootActor?.charter, injection?.priorContext, rootHandle),
           injectRecord: injection?.injectRecord,
         };
       },
       fallback: fallbackModels
         ? {
             models: fallbackModels,
+            // Keep the long-standing fallback launch policy. Attribution below
+            // reads the provider instance this resolves, so it cannot relabel a
+            // fallback with the primary request.
             resolveProvider: (model) =>
               resolveProvider(
                 config,
@@ -2725,6 +2743,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
       onRunStart: (responsive, injectRecord, selected) => {
         rootLastSelected = selected;
+        rootRunSelection = selected;
         // The run actually launched: the queued reservation this describes
         // no longer exists to cancel or report on.
         mesh.clearSelection(rootId);
@@ -2752,6 +2771,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           }),
         });
       },
+      onProviderAttempt: (attempt) => {
+        rootRunSelection = {
+          provider: attempt.providerName,
+          model: attempt.model,
+          effort: attempt.effort,
+        };
+      },
       onFirstChunk: () =>
         mesh.recordEvent({
           kind: "run_first_chunk",
@@ -2765,6 +2791,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         });
       },
       onRunAbandoned: ({ reason, started }) => {
+        if (started) rootRunSelection = undefined;
         if (started) abandonActorRun(rootId, reason);
         runLogger(rootId).warn("run_abandoned", { reason, started });
         mesh.recordEvent({
@@ -2775,6 +2802,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         });
       },
       onRunEnd: async (result) => {
+        rootRunSelection = undefined;
         mesh.finishInboxRun(rootId);
         const runId = completeActorRun(rootId, result);
         logRunEnd(runLogger(rootId, runId), result);

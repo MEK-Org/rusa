@@ -220,7 +220,8 @@ describe("GitHubIssueClient", () => {
       repo: REPO,
       head: "mc/issue-9",
       title: "Updated title",
-      body: "Updated body.",
+      body: "Fresh PR body.",
+      existingBody: "Updated body.",
       reviewer: "operator",
       base: "staging",
     });
@@ -234,6 +235,149 @@ describe("GitHubIssueClient", () => {
     expect(patch?.body).toEqual({
       title: "Updated title",
       body: "Updated body.",
+      base: "staging",
+    });
+  });
+
+  it("selects the existing body from its one lookup even if a later read would disagree", async () => {
+    const lookupPath = `/repos/${REPO}/pulls?head=${encodeURIComponent("test-org:mc/issue-9")}&state=open&per_page=1`;
+    const requests: RecordedRequest[] = [];
+    let lookupReads = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL, init?: RequestInit) => {
+        const path = String(url).replace("https://api.github.com", "");
+        const method = init?.method ?? "GET";
+        requests.push({
+          method,
+          path,
+          headers: (init?.headers ?? {}) as Record<string, string>,
+          body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
+        });
+        if (method === "GET" && path === lookupPath) {
+          lookupReads++;
+          // A second read would observe a concurrent close. The first result
+          // must still select both the update and its matching body.
+          return new Response(
+            JSON.stringify(
+              lookupReads === 1
+                ? [{ number: 12, html_url: "https://github.com/test-org/test-repo/pull/12" }]
+                : []
+            )
+          );
+        }
+        if (method === "PATCH" && path === `/repos/${REPO}/pulls/12`) {
+          return new Response("{}");
+        }
+        return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+      })
+    );
+
+    await new GitHubIssueClient().createPullRequest({
+      repo: REPO,
+      head: "mc/issue-9",
+      title: "Updated title",
+      body: "Fresh stamped body.",
+      existingBody: "Replacement stamped body.",
+    });
+
+    expect(lookupReads).toBe(1);
+    expect(requests.find((request) => request.method === "PATCH")?.body).toEqual({
+      title: "Updated title",
+      body: "Replacement stamped body.",
+    });
+    expect(requests.some((request) => request.method === "POST")).toBe(false);
+  });
+
+  it("uses the fresh body after its only lookup fails", async () => {
+    const lookupPath = `/repos/${REPO}/pulls?head=${encodeURIComponent("test-org:mc/issue-9")}&state=open&per_page=1`;
+    const requests: RecordedRequest[] = [];
+    let lookupReads = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL, init?: RequestInit) => {
+        const path = String(url).replace("https://api.github.com", "");
+        const method = init?.method ?? "GET";
+        requests.push({
+          method,
+          path,
+          headers: (init?.headers ?? {}) as Record<string, string>,
+          body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
+        });
+        if (method === "GET" && path === lookupPath) {
+          lookupReads++;
+          // A hypothetical retry would find a PR, but the original failed
+          // lookup is the only decision this call is allowed to make.
+          return new Response(
+            JSON.stringify(
+              lookupReads === 1
+                ? { message: "secondary rate limit" }
+                : [{ number: 12, html_url: "https://github.com/test-org/test-repo/pull/12" }]
+            ),
+            { status: lookupReads === 1 ? 403 : 200 }
+          );
+        }
+        if (method === "GET" && path === `/repos/${REPO}`) {
+          return new Response(JSON.stringify({ default_branch: "staging" }));
+        }
+        if (method === "POST" && path === `/repos/${REPO}/pulls`) {
+          return new Response(
+            JSON.stringify({
+              number: 13,
+              html_url: "https://github.com/test-org/test-repo/pull/13",
+            }),
+            { status: 201 }
+          );
+        }
+        return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+      })
+    );
+
+    await new GitHubIssueClient().createPullRequest({
+      repo: REPO,
+      head: "mc/issue-9",
+      title: "Fresh title",
+      body: "Fresh stamped body.",
+      existingBody: "Replacement stamped body.",
+    });
+
+    expect(lookupReads).toBe(1);
+    expect(requests.find((request) => request.method === "POST")?.body).toEqual({
+      title: "Fresh title",
+      body: "Fresh stamped body.",
+      head: "mc/issue-9",
+      base: "staging",
+    });
+  });
+
+  it("keeps fresh authored content when the owner-qualified lookup excludes a same-named fork", async () => {
+    const requests = installFetch({
+      [`GET /repos/${REPO}/pulls?head=${encodeURIComponent("test-org:mc/issue-9")}&state=open&per_page=1`]:
+        // An identically named branch in another owner is deliberately absent
+        // from this query. It must not select the replacement body.
+        { json: [] },
+      [`POST /repos/${REPO}/pulls`]: {
+        status: 201,
+        json: { number: 13, html_url: "https://github.com/test-org/test-repo/pull/13" },
+      },
+    });
+
+    await new GitHubIssueClient().createPullRequest({
+      repo: REPO,
+      head: "mc/issue-9",
+      title: "Fresh title",
+      body: "Fresh authored body.",
+      existingBody: "Replacement body for an existing PR.",
+      base: "staging",
+    });
+
+    expect(requests[0].path).toBe(
+      `/repos/${REPO}/pulls?head=${encodeURIComponent("test-org:mc/issue-9")}&state=open&per_page=1`
+    );
+    expect(requests.find((request) => request.method === "POST")?.body).toEqual({
+      title: "Fresh title",
+      body: "Fresh authored body.",
+      head: "mc/issue-9",
       base: "staging",
     });
   });

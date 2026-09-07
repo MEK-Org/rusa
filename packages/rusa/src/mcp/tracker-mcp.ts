@@ -1,11 +1,13 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { EventResource } from "../actor/event-subscriptions.js";
+import { generateHandle } from "../actor/handle-generator.js";
 import {
   buildGitBridgeDeliverable,
   formatGitBridgePullRequestResult,
 } from "../gitops/git-bridge-deliverable.js";
 import type { IssueClient } from "../gitops/issue-client.js";
+import type { RawProviderModelConfig } from "../providers/model-config.js";
 import { toolError, toolOk } from "./result.js";
 import { stampAuthor, stripAuthorStamps } from "./stamp.js";
 import { createMcpServer } from "./strict-server.js";
@@ -17,6 +19,10 @@ export interface TrackerMcpOptions {
   gitBridge?: { port: number };
   onGitBridgeDeliverable?: (actorId: string, instructions: string) => void;
   instanceId?: string;
+  /** Display name for this actor's visible GitHub footer. */
+  actorHandle?: string;
+  /** The exact normalized selection for the provider attempt currently writing. */
+  getRunSelection?: () => RawProviderModelConfig | undefined;
   /**
    * Invoked after `create_issue` / `create_pull_request` succeeds, with the
    * created thread's exact event resource, so the mesh can mechanically
@@ -29,9 +35,9 @@ export interface TrackerMcpOptions {
 
 /**
  * In-process MCP server exposing the issue/PR tracker (the {@link IssueClient}
- * seam) and conversation write tools with actor identity stamping.
+ * seam) and conversation write tools with mechanical author/footer stamping.
  * Each actor gets their own instance of this server with their `selfId` baked in.
- * Writes are stamped with `<!-- mesh:author ... -->` before being sent to GitHub.
+ * Writes carry a visible actor footer followed by `<!-- mesh:author ... -->`.
  */
 export function createTrackerMcpServer(
   selfId: string,
@@ -43,15 +49,38 @@ export function createTrackerMcpServer(
     { isFenced: options.isFenced }
   );
 
-  const appendAuthorStamp = (body: string, repo: string, issueNumber: number) =>
-    body
-      ? `${body}\n\n${stampAuthor(selfId, repo, issueNumber, options.instanceId)}`
-      : stampAuthor(selfId, repo, issueNumber, options.instanceId);
+  const actorHandle = options.actorHandle ?? generateHandle(selfId);
+  const formatSignature = () => {
+    const selection = options.getRunSelection?.();
+    const signature = selection?.model
+      ? selection.effort
+        ? `${actorHandle} (${selection.model}, ${selection.effort})`
+        : `${actorHandle} (${selection.model})`
+      : actorHandle;
+    return `*${signature}*`;
+  };
+  const appendSignature = (body: string) =>
+    body ? `${body}\n\n${formatSignature()}` : formatSignature();
+  // A footer is removable only as a pair with the tracker author stamp it
+  // produced. This preserves terminal italics in authored Markdown and leaves
+  // quoted stamps alone unless they are the actual terminal footer/stamp pair.
+  const trailingAuthorStamp =
+    /\n\n<!--\s*mesh:author(?:\s+[^\s<>]+|:v1\s+[^\s<>]+\s+\d+\s+[0-9a-f]+|:v[23]\s+[^\s<>]+\s+[^\s<>]+\s+\d+\s+[0-9a-f]+)\s*-->\s*$/i;
+  const trailingVisibleSignature = /\n\n\*[^*\r\n]+\*\s*$/;
+  const stripTrailingMechanicalFooter = (body: string) => {
+    const withoutStamp = body.replace(trailingAuthorStamp, "");
+    return withoutStamp === body ? body : withoutStamp.replace(trailingVisibleSignature, "");
+  };
 
-  const appendPreCreationAuthorStamp = (body: string, repo: string) =>
-    body
-      ? `${body}\n\n${stampAuthor(selfId, repo, undefined, options.instanceId)}`
-      : stampAuthor(selfId, repo, undefined, options.instanceId);
+  const appendAuthorStamp = (body: string, repo: string, issueNumber: number) => {
+    const signed = appendSignature(body);
+    return `${signed}\n\n${stampAuthor(selfId, repo, issueNumber, options.instanceId)}`;
+  };
+
+  const appendPreCreationAuthorStamp = (body: string, repo: string) => {
+    const signed = appendSignature(body);
+    return `${signed}\n\n${stampAuthor(selfId, repo, undefined, options.instanceId)}`;
+  };
 
   /**
    * Replaces any stamps already in the body with exactly one naming this actor.
@@ -62,7 +91,11 @@ export function createTrackerMcpServer(
    * edit the author's content to no benefit (the appended stamp already wins last-index).
    */
   const restampAuthor = (body: string, repo: string, issueNumber: number) =>
-    appendAuthorStamp(stripAuthorStamps(body), repo, issueNumber);
+    appendAuthorStamp(
+      stripAuthorStamps(stripTrailingMechanicalFooter(body)).trimEnd(),
+      repo,
+      issueNumber
+    );
 
   const notifyResourceCreated = (resource: EventResource) => {
     try {
@@ -122,7 +155,15 @@ export function createTrackerMcpServer(
         // borrow it.
         const pr = await issueClient.createPullRequest({
           ...args,
-          body: appendPreCreationAuthorStamp(args.body, args.repo),
+          // The client makes the one existing-PR lookup that chooses PATCH vs.
+          // POST. Give it the matching variants so that same lookup also
+          // governs footer replacement: fresh creation is append-only, while
+          // an upsert replaces only its trailing mechanical pair.
+          body: appendPreCreationAuthorStamp(args.body.trimEnd(), args.repo),
+          existingBody: appendPreCreationAuthorStamp(
+            stripTrailingMechanicalFooter(args.body).trimEnd(),
+            args.repo
+          ),
         });
         options.onWrite?.();
         notifyResourceCreated(`github:${args.repo}/pulls/${pr.number}`);
