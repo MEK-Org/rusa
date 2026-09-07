@@ -3,8 +3,11 @@ import { join } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { assertSpawnContextSupported, resolveContextConfig } from "../actor/context-selection.js";
+import {
+  providerCapabilityName,
+  validateProviderSelection,
+} from "../providers/provider-selection.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
-import { providerCapabilityName, validateProviderSelection } from "../providers/registry.js";
 import {
   GEMINI_API_KEY_SECRET_FILENAME,
   MISTRAL_API_KEY_SECRET_FILENAME,
