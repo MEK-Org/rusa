@@ -1,8 +1,13 @@
 import { Buffer } from "node:buffer";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import type { MeshEventSink } from "../actor/mesh-events.js";
 import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
-import { OBLIGATION_TITLE_MAX, type ObligationStatus } from "../obligations/obligation.js";
+import {
+  OBLIGATION_CHECKPOINT_MAX,
+  OBLIGATION_TITLE_MAX,
+  type ObligationStatus,
+} from "../obligations/obligation.js";
 import { REFERENCE_SCHEMES } from "../references/reference.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
@@ -17,6 +22,7 @@ type ObligationServerRepository = Pick<
   | "create"
   | "setTerminalStatus"
   | "setExternalRef"
+  | "setCheckpoint"
   | "attachArtifact"
   | "listArtifacts"
   | "movePriorityInternal"
@@ -54,6 +60,14 @@ export interface ObligationsMcpOptions {
    * exists as a row.
    */
   canManage?: (actorId: string, obligation: ManageableObligation) => boolean;
+  /**
+   * Where this server's observable moments go. Injected rather than imported
+   * for the same reason the mesh's own sink is a bare function type: this
+   * module has no storage dependency, and absent a sink the tools still work —
+   * they are simply unobserved, which is how every test that constructs this
+   * server directly runs.
+   */
+  recordEvent?: MeshEventSink;
 }
 
 /** The one field {@link ObligationsMcpOptions.canManage} needs to decide. */
@@ -455,6 +469,42 @@ export function createObligationsMcpServer(
         if (!current) throw new Error("obligation not found");
         if (!canManage(current)) throw new Error("not authorized to change this obligation's ref");
         return toolOk({ obligation: repository.setExternalRef(id, external_ref ?? null) });
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "set_checkpoint",
+    {
+      title: "Rewrite where this obligation stands",
+      description:
+        "Replace this obligation's checkpoint: where the work actually stands right now, so the next wake reads its standing off the tree instead of reconstructing it from message history. Replace semantics, not append — the previous value is gone, because the field is the *current* standing. Pass null to clear. Only the owner, or an actor above the owner, may write it, and a terminal obligation's is frozen. An arc-level checkpoint states exact head, what is in flight, which gates cleared with refs, and the next action; evidence about the work still belongs in attach_artifact.",
+      inputSchema: {
+        id: z.string().trim().min(1),
+        checkpoint: z.string().max(OBLIGATION_CHECKPOINT_MAX).nullable(),
+      },
+    },
+    async ({ id, checkpoint }) => {
+      try {
+        const current = repository.require(id);
+        if (!canManage(current)) {
+          throw new Error("not authorized to set this obligation's checkpoint");
+        }
+        const obligation = repository.setCheckpoint(id, checkpoint, actorId);
+        // Recorded only once the write committed, so the log never claims a
+        // standing changed that a validation error rejected. The author is
+        // bound from this server's identity like every other attribution here,
+        // and the checkpoint text is deliberately absent: the event says the
+        // standing moved, the obligation says what it is now.
+        options?.recordEvent?.({
+          kind: "obligation_checkpoint_set",
+          actorId,
+          detail: id,
+          payload: JSON.stringify({ obligationId: id }),
+        });
+        return toolOk({ obligation });
       } catch (err) {
         return toolError(err);
       }

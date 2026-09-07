@@ -17,6 +17,7 @@ import { obligationTitle } from "../migrations/0027_obligation_title.js";
 import { obligationArtifacts } from "../migrations/0028_obligation_artifacts.js";
 import { recurringObligations } from "../migrations/0035_recurring_obligations.js";
 import { obligationDependencies } from "../migrations/0037_obligation_dependencies.js";
+import { obligationCheckpoint } from "../migrations/0043_obligation_checkpoint.js";
 import { ObligationRepository } from "./obligation-repository.js";
 
 /** Records every scheduler call instead of touching the OS, for assertions. */
@@ -58,6 +59,7 @@ describe("ObligationRepository", () => {
     obligationArtifacts.up(db);
     recurringObligations.up(db);
     obligationDependencies.up(db);
+    obligationCheckpoint.up(db);
     now = 1_000;
     repository = new ObligationRepository(
       db,
@@ -2911,6 +2913,118 @@ describe("ObligationRepository", () => {
       repository.create({ title: "dependent", id: "dependent", ownerId: "actor-a" });
       repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
       expect(() => repository.removePrerequisite("dependent", "prereq")).not.toThrow();
+    });
+  });
+
+  describe("checkpoint", () => {
+    const HEAD_STANDING =
+      "head 8bdc01d; migration 0043 in flight; CI green; next: operator schema approval";
+
+    it("records the standing with who wrote it and when", () => {
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+
+      const updated = repository.setCheckpoint("arc", HEAD_STANDING, "actor-a");
+
+      expect(updated.checkpoint).toBe(HEAD_STANDING);
+      expect(updated.checkpointBy).toBe("actor-a");
+      expect(updated.checkpointAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+      expect(repository.require("arc").checkpoint).toBe(HEAD_STANDING);
+    });
+
+    it("replaces rather than accumulating, and restamps the write", () => {
+      // The whole point of the field: reading it is reading the current
+      // standing, never a sequence to replay.
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+      const first = repository.setCheckpoint("arc", HEAD_STANDING, "actor-a");
+
+      const second = repository.setCheckpoint(
+        "arc",
+        "head c5b256a; PR open; next: review",
+        "actor-b"
+      );
+
+      expect(second.checkpoint).toBe("head c5b256a; PR open; next: review");
+      expect(second.checkpoint).not.toContain("8bdc01d");
+      expect(second.checkpointBy).toBe("actor-b");
+      expect(second.checkpointAt).not.toBe(first.checkpointAt);
+    });
+
+    it("clears the standing and its stamp together", () => {
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+      repository.setCheckpoint("arc", HEAD_STANDING, "actor-a");
+
+      const cleared = repository.setCheckpoint("arc", null, "actor-b");
+
+      // A cleared checkpoint is "no standing recorded", so a stamp left behind
+      // would date an absence.
+      expect(cleared.checkpoint).toBeNull();
+      expect(cleared.checkpointAt).toBeNull();
+      expect(cleared.checkpointBy).toBeNull();
+    });
+
+    it("treats a blank write as a clear rather than a stored blank", () => {
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+      repository.setCheckpoint("arc", HEAD_STANDING, "actor-a");
+
+      expect(repository.setCheckpoint("arc", "  \n\t ", "actor-a").checkpoint).toBeNull();
+    });
+
+    it("trims the stored standing", () => {
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+
+      expect(repository.setCheckpoint("arc", `  ${HEAD_STANDING}\n`, "actor-a").checkpoint).toBe(
+        HEAD_STANDING
+      );
+    });
+
+    it("advances updatedAt on both a write and a clear", async () => {
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+      const created = repository.require("arc");
+
+      const written = repository.setCheckpoint("arc", HEAD_STANDING, "actor-a");
+      expect(written.updatedAt).not.toBe(created.updatedAt);
+
+      const cleared = repository.setCheckpoint("arc", null, "actor-a");
+      expect(cleared.updatedAt).not.toBe(written.updatedAt);
+    });
+
+    it("refuses a checkpoint longer than the cap", () => {
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+
+      expect(() => repository.setCheckpoint("arc", "x".repeat(2_001), "actor-a")).toThrow(
+        /cannot exceed 2000 characters/
+      );
+      expect(repository.require("arc").checkpoint).toBeNull();
+      expect(() => repository.setCheckpoint("arc", "x".repeat(2_000), "actor-a")).not.toThrow();
+    });
+
+    it("freezes a terminal obligation's account of itself", () => {
+      // Consistent with reassign/setExternalRef/reparent: what a settled
+      // obligation said about itself is part of the record, and why it settled
+      // is what the terminal note carries.
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+      repository.setCheckpoint("arc", HEAD_STANDING, "actor-a");
+      repository.setTerminalStatus("arc", "done", "shipped");
+
+      expect(() => repository.setCheckpoint("arc", "reopened", "actor-a")).toThrow(
+        /terminal obligations cannot change their checkpoint/
+      );
+      expect(() => repository.setCheckpoint("arc", null, "actor-a")).toThrow();
+      expect(repository.require("arc").checkpoint).toBe(HEAD_STANDING);
+    });
+
+    it("refuses to write against an obligation that does not exist", () => {
+      expect(() => repository.setCheckpoint("missing", HEAD_STANDING, "actor-a")).toThrow();
+    });
+
+    it("carries the standing into the read paths a wake actually uses", () => {
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+      repository.setCheckpoint("arc", HEAD_STANDING, "actor-a");
+
+      const owned = repository.listOwnedPage("actor-a", { limit: 10, offset: 0 });
+      expect(owned.obligations.find((o) => o.id === "arc")?.checkpoint).toBe(HEAD_STANDING);
+      expect(repository.get("arc")?.checkpoint).toBe(HEAD_STANDING);
+      expect(repository.getTree("arc").obligation.checkpoint).toBe(HEAD_STANDING);
     });
   });
 });

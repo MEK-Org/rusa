@@ -113,6 +113,9 @@ ObligationDto makeObligation(
   String? recurrenceCron,
   int? recurrenceIntervalSeconds,
   String? nextReadyAt,
+  String? checkpoint,
+  String? checkpointAt,
+  String? checkpointBy,
   bool hasCompletionHistory = false,
 }) => ObligationDto(
   id: id,
@@ -134,6 +137,11 @@ ObligationDto makeObligation(
   recurrenceCron: recurrenceCron,
   recurrenceIntervalSeconds: recurrenceIntervalSeconds,
   nextReadyAt: nextReadyAt,
+  checkpoint: checkpoint,
+  // A checkpoint's stamp is set with it server-side, so a fixture that names a
+  // standing without one would exercise a state the store cannot produce.
+  checkpointAt: checkpoint == null ? null : (checkpointAt ?? '2026-09-07T11:00:00.000Z'),
+  checkpointBy: checkpoint == null ? null : (checkpointBy ?? ownerId),
   hasCompletionHistory: hasCompletionHistory,
 );
 

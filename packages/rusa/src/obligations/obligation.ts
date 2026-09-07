@@ -90,6 +90,25 @@ export interface Obligation {
    * obligations citing the same message.
    */
   resolutionRef: string | null;
+  /**
+   * Where this obligation's work actually stands right now, in its owner's
+   * words. Owner-rewritten and replace-only: reading it is reading the current
+   * standing, never a history to replay (#302).
+   *
+   * `null` means no standing has been recorded — an obligation nobody has
+   * checkpointed yet, one written before the field existed, or one whose owner
+   * cleared it. All three are the same fact, and the store cannot tell them
+   * apart.
+   *
+   * {@link checkpointAt} and {@link checkpointBy} are non-null exactly when
+   * this is: a stamp with nothing stamped would say a standing exists when it
+   * does not.
+   */
+  checkpoint: string | null;
+  /** When the current checkpoint was written (ISO-8601); null with it. */
+  checkpointAt: string | null;
+  /** Which entity wrote the current checkpoint; null with it. */
+  checkpointBy: EntityId | null;
   recurrencePolicy: "completion_interval" | "cron" | null;
   recurrenceCron: string | null;
   recurrenceIntervalSeconds: number | null;
@@ -176,6 +195,41 @@ export function validateObligationTitle(title: string): string {
     );
   }
   return collapsed;
+}
+
+/**
+ * Longest a checkpoint may be.
+ *
+ * Deliberately a write-boundary rule rather than a column CHECK, unlike
+ * {@link OBLIGATION_TITLE_MAX}: blankness and stamp coherence are
+ * representation invariants the store must never disagree with its writers
+ * about, while a length limit is a judgment about what stays legible — and
+ * `list_owned` returns whole obligations on every wake, so an unbounded
+ * standing field would be paid for in every reader's context. Keeping it here
+ * means retuning it is an edit, not a table rebuild.
+ */
+export const OBLIGATION_CHECKPOINT_MAX = 2_000;
+
+/**
+ * Normalize a checkpoint write: prose, or nothing.
+ *
+ * Whitespace-only collapses to `null` — the same coercion a terminal note
+ * gets, so "no standing recorded" has exactly one representation and a caller
+ * clearing with a blank string is understood rather than handed a constraint
+ * error.
+ */
+export function normalizeCheckpoint(checkpoint: string | null | undefined): string | null {
+  if (checkpoint == null) return null;
+  const trimmed = checkpoint.trim();
+  if (!trimmed) return null;
+  if (trimmed.length > OBLIGATION_CHECKPOINT_MAX) {
+    throw new ObligationValidationError(
+      `obligation checkpoint cannot exceed ${OBLIGATION_CHECKPOINT_MAX} characters; ` +
+        "a checkpoint is where the work stands, not the record of how it got there — " +
+        "cite the detail as an artifact instead"
+    );
+  }
+  return trimmed;
 }
 
 /**

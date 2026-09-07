@@ -420,6 +420,26 @@ class _WorkTabState extends State<WorkTab> {
                                           : FontWeight.normal,
                                     ),
                                   ),
+                                  // One line of standing in the tree, so a
+                                  // steward scanning the arc sees where each
+                                  // node stands without opening it. Truncated
+                                  // rather than wrapped: the tree is an index,
+                                  // and the whole checkpoint is one tap away.
+                                  if (node.obligation.hasCheckpoint)
+                                    Padding(
+                                      padding: const EdgeInsets.only(top: 2),
+                                      child: Text(
+                                        node.obligation.checkpoint!
+                                            .trim()
+                                            .replaceAll(RegExp(r'\s+'), ' '),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                          color: MeshColors.textMuted,
+                                          fontSize: 11,
+                                        ),
+                                      ),
+                                    ),
                                 ],
                               ),
                             ),
@@ -599,6 +619,14 @@ class _DetailViewState extends State<_DetailView> {
                   fontSize: 13.5,
                   height: 1.5,
                 ),
+              ),
+            ],
+            if (o.hasCheckpoint) ...[
+              const SizedBox(height: 16),
+              ObligationCheckpointPanel(
+                obligation: o,
+                lookupHandle: (id) => store.actor(id)?.handle,
+                selectable: true,
               ),
             ],
             const SizedBox(height: 24),

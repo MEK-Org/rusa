@@ -2011,6 +2011,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             isFenced,
             resolveOwner: (raw) => resolveObligationOwner(actors, raw),
             canManage: (callerId, obligation) => mesh.isAncestorOf(callerId, obligation.ownerId),
+            recordEvent: (event) => mesh.recordEvent(event),
           })
         );
         const meshChatUrl = mcpHttp.addServer(`${id}:${MESH_CHAT_MCP_NAME}`, () =>
@@ -2539,6 +2540,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     createObligationsMcpServer(getRepositories().obligations, rootId, {
       canManage: () => true,
       resolveOwner: (raw) => resolveObligationOwner(actors, raw),
+      recordEvent: (event) => mesh.recordEvent(event),
     })
   );
   const rootPnpmInstallUrl = mcpHttp.addServer(`${rootId}:${PNPM_INSTALL_MCP_NAME}`, () =>

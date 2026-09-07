@@ -208,6 +208,10 @@ const LEDGER_READS: Readonly<Record<MeshEventKind, LedgerRead>> = {
   // what say it was working; withdrawing one scheduled delivery neither opens
   // nor closes a commitment this projection tracks.
   scheduled_message_cancelled: "ignored",
+  // An owner restating where its work stands is not a commitment opening or
+  // closing: the obligation tree already holds that standing, and the run that
+  // wrote it is bracketed by events this projection does read.
+  obligation_checkpoint_set: "ignored",
   host_job_submitted: "ignored",
   host_job_stopped: "ignored",
   host_job_exited: "ignored",

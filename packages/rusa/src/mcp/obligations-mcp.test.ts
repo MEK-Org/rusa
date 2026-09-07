@@ -4,6 +4,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
+import type { MeshEventInput } from "../actor/mesh-events.js";
 import { obligations } from "../db/migrations/0016_obligations.js";
 import { obligationPriority } from "../db/migrations/0017_obligation_priority.js";
 import { obligationTimestamps } from "../db/migrations/0025_obligation_timestamps.js";
@@ -12,7 +13,9 @@ import { obligationTitle } from "../db/migrations/0027_obligation_title.js";
 import { obligationArtifacts } from "../db/migrations/0028_obligation_artifacts.js";
 import { recurringObligations } from "../db/migrations/0035_recurring_obligations.js";
 import { obligationDependencies } from "../db/migrations/0037_obligation_dependencies.js";
+import { obligationCheckpoint } from "../db/migrations/0043_obligation_checkpoint.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import { OBLIGATION_CHECKPOINT_MAX } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
 import { createObligationsMcpServer } from "./obligations-mcp.js";
 
@@ -44,10 +47,11 @@ describe("obligations MCP", () => {
     obligationArtifacts.up(db);
     recurringObligations.up(db);
     obligationDependencies.up(db);
+    obligationCheckpoint.up(db);
     repository = new ObligationRepository(db);
   });
 
-  it("exposes all 12 obligation tools", async () => {
+  it("exposes all 13 obligation tools", async () => {
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
     const { tools } = await client.listTools();
     expect(tools.map((tool) => tool.name).sort()).toEqual([
@@ -60,6 +64,7 @@ describe("obligations MCP", () => {
       "remove_obligation_prerequisite",
       "reorder_obligation",
       "reparent_obligation",
+      "set_checkpoint",
       "set_external_ref",
       "set_obligation_recurrence",
       "set_obligation_status",
@@ -864,5 +869,174 @@ describe("obligations MCP", () => {
     };
     expect(prereqData.unblocks.items.map((o) => o.id)).toEqual(["dependent"]);
     expect(prereqData.unblocks.total).toBe(1);
+  });
+
+  describe("set_checkpoint", () => {
+    const STANDING =
+      "head 8bdc01d; migration 0043 in flight; CI green; next: operator schema approval";
+
+    it("records the standing, stamps this server's actor as its author, and reads it back", async () => {
+      repository.create({ title: "Persistence Arc", id: "arc", ownerId: "actor-a" });
+      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+
+      const res = (await client.callTool({
+        name: "set_checkpoint",
+        arguments: { id: "arc", checkpoint: STANDING },
+      })) as CallToolResult;
+      expect(res.isError).toBeFalsy();
+
+      // The read paths a wake actually uses: the whole point is that the next
+      // run reads standing off the tree instead of the thread.
+      const detail = dataOf(
+        (await client.callTool({
+          name: "get_obligation",
+          arguments: { id: "arc" },
+        })) as CallToolResult
+      ) as { obligation: { checkpoint: string; checkpointBy: string; checkpointAt: string } };
+      expect(detail.obligation.checkpoint).toBe(STANDING);
+      expect(detail.obligation.checkpointBy).toBe("actor-a");
+      expect(detail.obligation.checkpointAt).toEqual(expect.any(String));
+
+      const owned = dataOf(
+        (await client.callTool({ name: "list_owned", arguments: {} })) as CallToolResult
+      ) as { obligations: Array<{ id: string; checkpoint: string | null }> };
+      expect(owned.obligations.find((o) => o.id === "arc")?.checkpoint).toBe(STANDING);
+    });
+
+    it("replaces the previous standing instead of accumulating one", async () => {
+      repository.create({ title: "Persistence Arc", id: "arc", ownerId: "actor-a" });
+      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+
+      await client.callTool({
+        name: "set_checkpoint",
+        arguments: { id: "arc", checkpoint: STANDING },
+      });
+      await client.callTool({
+        name: "set_checkpoint",
+        arguments: { id: "arc", checkpoint: "head c5b256a; PR open; next: two skeptic seats" },
+      });
+
+      const obligation = repository.require("arc");
+      expect(obligation.checkpoint).toBe("head c5b256a; PR open; next: two skeptic seats");
+      expect(obligation.checkpoint).not.toContain("8bdc01d");
+    });
+
+    it("clears the standing and its stamp when passed null", async () => {
+      repository.create({ title: "Persistence Arc", id: "arc", ownerId: "actor-a" });
+      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+      await client.callTool({
+        name: "set_checkpoint",
+        arguments: { id: "arc", checkpoint: STANDING },
+      });
+
+      const res = (await client.callTool({
+        name: "set_checkpoint",
+        arguments: { id: "arc", checkpoint: null },
+      })) as CallToolResult;
+
+      expect(res.isError).toBeFalsy();
+      expect(repository.require("arc")).toMatchObject({
+        checkpoint: null,
+        checkpointAt: null,
+        checkpointBy: null,
+      });
+    });
+
+    it("rejects a non-owner, and honors the owner-ancestor policy", async () => {
+      repository.create({ title: "Someone else's arc", id: "foreign", ownerId: "actor-b" });
+
+      const denied = await connect(createObligationsMcpServer(repository, "actor-a"));
+      const deniedResult = (await denied.callTool({
+        name: "set_checkpoint",
+        arguments: { id: "foreign", checkpoint: STANDING },
+      })) as CallToolResult;
+      expect(deniedResult.isError).toBe(true);
+      expect(repository.require("foreign").checkpoint).toBeNull();
+
+      // An ancestor owner may write it: standing is exactly what a steward
+      // above the owner reads and corrects.
+      const ancestor = await connect(
+        createObligationsMcpServer(repository, "actor-a", { canManage: () => true })
+      );
+      const ancestorResult = (await ancestor.callTool({
+        name: "set_checkpoint",
+        arguments: { id: "foreign", checkpoint: STANDING },
+      })) as CallToolResult;
+      expect(ancestorResult.isError).toBeFalsy();
+      expect(repository.require("foreign").checkpointBy).toBe("actor-a");
+    });
+
+    it("emits obligation_checkpoint_set with the id and author, and never the standing itself", async () => {
+      repository.create({ title: "Persistence Arc", id: "arc", ownerId: "actor-a" });
+      const events: MeshEventInput[] = [];
+      const client = await connect(
+        createObligationsMcpServer(repository, "actor-a", {
+          recordEvent: (event) => events.push(event),
+        })
+      );
+
+      await client.callTool({
+        name: "set_checkpoint",
+        arguments: { id: "arc", checkpoint: STANDING },
+      });
+
+      expect(events).toEqual([
+        {
+          kind: "obligation_checkpoint_set",
+          actorId: "actor-a",
+          detail: "arc",
+          payload: JSON.stringify({ obligationId: "arc" }),
+        },
+      ]);
+      // Replace semantics is the design; an event log quoting each value would
+      // be the append-only history this field exists to stop anyone replaying.
+      expect(JSON.stringify(events)).not.toContain("8bdc01d");
+    });
+
+    it("emits nothing when the write was refused", async () => {
+      repository.create({ title: "Someone else's arc", id: "foreign", ownerId: "actor-b" });
+      const events: MeshEventInput[] = [];
+      const client = await connect(
+        createObligationsMcpServer(repository, "actor-a", {
+          recordEvent: (event) => events.push(event),
+        })
+      );
+
+      const res = (await client.callTool({
+        name: "set_checkpoint",
+        arguments: { id: "foreign", checkpoint: STANDING },
+      })) as CallToolResult;
+
+      expect(res.isError).toBe(true);
+      expect(events).toEqual([]);
+    });
+
+    it("refuses a standing longer than the cap without recording anything", async () => {
+      repository.create({ title: "Persistence Arc", id: "arc", ownerId: "actor-a" });
+      const events: MeshEventInput[] = [];
+      const client = await connect(
+        createObligationsMcpServer(repository, "actor-a", {
+          recordEvent: (event) => events.push(event),
+        })
+      );
+
+      const res = (await client.callTool({
+        name: "set_checkpoint",
+        arguments: { id: "arc", checkpoint: "x".repeat(OBLIGATION_CHECKPOINT_MAX + 1) },
+      })) as CallToolResult;
+
+      expect(res.isError).toBe(true);
+      expect(repository.require("arc").checkpoint).toBeNull();
+      expect(events).toEqual([]);
+    });
+
+    it("reports a missing obligation as an error rather than creating one", async () => {
+      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+      const res = (await client.callTool({
+        name: "set_checkpoint",
+        arguments: { id: "nope", checkpoint: STANDING },
+      })) as CallToolResult;
+      expect(res.isError).toBe(true);
+    });
   });
 });

@@ -12,6 +12,7 @@ import {
   type EntityId,
   isBlockingObligationStatus,
   isTerminalObligationStatus,
+  normalizeCheckpoint,
   type Obligation,
   type ObligationArtifact,
   type ObligationStatus,
@@ -43,6 +44,9 @@ interface ObligationRow {
   creator_id: string | null;
   terminal_note: string | null;
   title: string | null;
+  checkpoint: string | null;
+  checkpoint_at: string | null;
+  checkpoint_by: string | null;
   resolution_ref: string | null;
   recurrence_policy: "completion_interval" | "cron" | null;
   recurrence_cron: string | null;
@@ -275,6 +279,9 @@ function toObligation(row: ObligationRow): Obligation {
     creatorId: row.creator_id,
     terminalNote: row.terminal_note,
     title: row.title,
+    checkpoint: row.checkpoint,
+    checkpointAt: row.checkpoint_at,
+    checkpointBy: row.checkpoint_by,
     resolutionRef: row.resolution_ref,
     recurrencePolicy: row.recurrence_policy,
     recurrenceCron: row.recurrence_cron,
@@ -1655,6 +1662,54 @@ export class ObligationRepository {
         }
         throw error;
       }
+      return this.require(id);
+    });
+  }
+
+  /**
+   * Rewrite where this obligation stands, in the writing entity's words (#302).
+   *
+   * Replace semantics, deliberately: the previous value is gone, because the
+   * field *is* the current standing. An append-only record of standing is what
+   * the tree already had — thirty-odd artifact labels an arc's owner had to
+   * replay in order — and replaying is the cost this removes. The `mesh_events`
+   * log carries that a change happened and who made it, so nothing about the
+   * change is unauditable; only the superseded prose is gone, which is the
+   * point.
+   *
+   * `null` (or blank) clears all three columns together. A cleared checkpoint
+   * is "no standing recorded", not "standing recorded as nothing", so leaving
+   * the stamp behind would claim currency for an absence.
+   *
+   * Terminal obligations are frozen, consistent with {@link reassign},
+   * {@link setExternalRef} and `reparent`: a settled obligation's account of
+   * itself is part of the record, and *why* it settled is what `terminal_note`
+   * is for.
+   *
+   * Authorization is the caller's, exactly as it is for {@link setExternalRef}:
+   * this boundary records who wrote, and the MCP seam decides who may.
+   */
+  setCheckpoint(id: string, checkpoint: string | null, by: EntityId): Obligation {
+    return this.mutate(() => {
+      const obligation = this.require(id);
+      if (isTerminalObligationStatus(obligation.status)) {
+        throw new ObligationValidationError("terminal obligations cannot change their checkpoint");
+      }
+      const next = normalizeCheckpoint(checkpoint);
+      const checkpointBy = validateEntityId(by);
+      const now = this.stamp();
+
+      this.db
+        .prepare(
+          `UPDATE obligations
+           SET checkpoint = ?,
+               checkpoint_at = ?,
+               checkpoint_by = ?,
+               updated_at = ?
+           WHERE id = ?`
+        )
+        .run(next, next === null ? null : now, next === null ? null : checkpointBy, now, id);
+
       return this.require(id);
     });
   }
