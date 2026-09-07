@@ -1,14 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { ActorOptions } from "../actor/actor.js";
 import type { RunResult } from "../providers/types.js";
-import { composeActorRuntime } from "./actor-runtime.js";
+import { composeActorRuntime, createActorRuntime } from "./actor-runtime.js";
 
 const failedResult: RunResult = { success: false, output: "failed", exitCode: 1 };
 
-function baseOptions(): Omit<ActorOptions, "onRunEnd"> {
+function baseOptions(): Omit<ActorOptions, "id" | "cwd" | "sandbox" | "onRunEnd"> {
   return {
-    id: "actor-1",
-    cwd: "/tmp/actor-1",
     modelConfig: [{ provider: "test", model: "test-model" }],
     resolveProvider: () => ({
       name: "test",
@@ -23,10 +21,38 @@ function baseOptions(): Omit<ActorOptions, "onRunEnd"> {
 }
 
 describe("composeActorRuntime", () => {
-  it("runs the explicit root terminal stages in their current order", async () => {
+  it("injects actor and workspace inputs into the selected driver", () => {
+    let received: ActorOptions | undefined;
+
+    createActorRuntime({
+      actor: { id: "actor-1", parentId: null },
+      capabilities: new Set(["inbox"]),
+      workspace: { path: "/tmp/actor-1", sandboxed: false },
+      driver: {
+        kind: "local",
+        instantiate: (actorOptions) => {
+          received = actorOptions;
+          return actorOptions;
+        },
+      },
+      options: baseOptions(),
+      terminal: {
+        completeRun: () => "run-1",
+        logRunEnd: () => {},
+        recordRunEnd: () => {},
+      },
+    });
+
+    expect(received).toMatchObject({ id: "actor-1", cwd: "/tmp/actor-1", sandbox: false });
+  });
+
+  it("runs explicitly injected terminal stages in their current order", async () => {
     const stages: string[] = [];
     const options = composeActorRuntime({
-      identity: { actorId: "actor-1", role: "root" },
+      actor: { id: "actor-1", parentId: null },
+      capabilities: new Set(["inbox"]),
+      workspace: { path: "/tmp/actor-1", sandboxed: false },
+      driver: { kind: "local", instantiate: (actorOptions) => actorOptions },
       options: baseOptions(),
       terminal: {
         finishInboxRun: () => stages.push("finish-inbox"),
@@ -57,10 +83,13 @@ describe("composeActorRuntime", () => {
     ]);
   });
 
-  it("keeps worker bookkeeping explicit and does not route capped outcomes", async () => {
+  it("keeps terminal bookkeeping explicit and does not route capped outcomes", async () => {
     const stages: string[] = [];
     const options = composeActorRuntime({
-      identity: { actorId: "actor-1", role: "worker" },
+      actor: { id: "actor-1", parentId: "parent-1" },
+      capabilities: new Set(["inbox", "worker-tool"]),
+      workspace: { path: "/tmp/actor-1", sandboxed: true },
+      driver: { kind: "external", instantiate: (actorOptions) => actorOptions },
       options: baseOptions(),
       terminal: {
         completeRun: () => {

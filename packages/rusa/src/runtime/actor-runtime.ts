@@ -1,17 +1,31 @@
 import type { ActorOptions } from "../actor/actor.js";
 import type { RunResult } from "../providers/types.js";
 
+/** The construction target supplied by command composition. */
+export interface ActorRuntimeDriver<TActor> {
+  kind: "local" | "external";
+  instantiate: (options: ActorOptions) => TActor;
+}
+
 /**
- * The explicitly selected behavior of an actor runtime. Role describes the
- * actor to reviewers; it does not grant authority or select hidden defaults.
- * Callers provide workspace, driver, MCP, scheduling, and lifecycle inputs.
+ * The explicitly selected inputs of an actor runtime. An actor is identified
+ * by its id and relationship, not a root/worker role. The command composition
+ * root supplies the configured-root routing and chooses the driver; this
+ * profile only receives the resulting inputs.
  */
-export interface ActorRuntimeProfile {
-  identity: {
-    actorId: string;
-    role: "root" | "worker";
+export interface ActorRuntimeProfile<TActor> {
+  actor: {
+    id: string;
+    parentId: string | null;
   };
-  options: Omit<ActorOptions, "onRunEnd">;
+  /** Effective capabilities selected by composition; policy remains above this seam. */
+  capabilities: ReadonlySet<string>;
+  workspace: {
+    path: string;
+    sandboxed: boolean;
+  };
+  driver: ActorRuntimeDriver<TActor>;
+  options: Omit<ActorOptions, "id" | "cwd" | "sandbox" | "onRunEnd">;
   terminal: ActorTerminalLifecycle;
 }
 
@@ -41,11 +55,14 @@ export interface ActorTerminalLifecycle {
  * logging policy, persistence implementations, or MCP mounting out of the
  * command composition root. Those concerns remain injected above this seam.
  */
-export function composeActorRuntime(profile: ActorRuntimeProfile): ActorOptions {
-  const { options, terminal } = profile;
+export function composeActorRuntime<TActor>(profile: ActorRuntimeProfile<TActor>): ActorOptions {
+  const { actor, workspace, options, terminal } = profile;
 
   return {
     ...options,
+    id: actor.id,
+    cwd: workspace.path,
+    sandbox: workspace.sandboxed,
     onRunEnd: async (result) => {
       terminal.finishInboxRun?.();
       const runId = terminal.completeRun(result);
@@ -62,9 +79,6 @@ export function composeActorRuntime(profile: ActorRuntimeProfile): ActorOptions 
  * Construct an actor through the shared profile while allowing the command to
  * retain its existing local-vs-E2E driver decision.
  */
-export function createActorRuntime<TActor>(
-  profile: ActorRuntimeProfile,
-  instantiate: (options: ActorOptions) => TActor
-): TActor {
-  return instantiate(composeActorRuntime(profile));
+export function createActorRuntime<TActor>(profile: ActorRuntimeProfile<TActor>): TActor {
+  return profile.driver.instantiate(composeActorRuntime(profile));
 }
