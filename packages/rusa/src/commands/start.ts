@@ -3145,10 +3145,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               }))
             ),
           // Current work is the durable inbox focus for this actor's active
-          // run. It deliberately reads through the run id map: a completed
+          // run. It deliberately reads through the run ledger: a completed
           // focus is history, not the next queued run's selected work.
           selectedObligationForActor: (actorId) => {
-            const runId = activeRunIds.get(actorId);
+            const runId = runAccounting.activeRunId(actorId);
             if (!runId) return null;
             const obligationId = getRepositories().actorRuns.activeFocusPrimaryObligationId(runId);
             return obligationId ? getRepositories().obligations.get(obligationId) : null;
