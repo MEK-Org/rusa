@@ -1,15 +1,10 @@
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import Database from "better-sqlite3";
-import { loadConfig, resolveHome } from "../config/index.js";
+import { resolveHome } from "../config/index.js";
 import { planLegacyActorImport } from "../db/legacy-actor-import.js";
 import { planLegacyEventSubscriptionImport } from "../db/legacy-event-subscription-import.js";
 import { planLegacyHostJobImport } from "../db/legacy-host-job-import.js";
-import {
-  type ModelClassConfigCutoverPreflight,
-  planModelClassConfigCutover,
-  preflightModelClassConfigCutover,
-} from "../db/legacy-model-class-import.js";
 import { pendingMigrationIds, runMigrations } from "../db/migrations/runner.js";
 import { Repositories } from "../db/repositories/index.js";
 import { widenToWal } from "../db/wal.js";
@@ -20,9 +15,6 @@ export interface DbCheckResult {
   plannedScheduledMessages: number;
   plannedEventSourceOwnerships: number;
   plannedHostJobs: number;
-  modelClassConfigCutover:
-    | ModelClassConfigCutoverPreflight
-    | { disposition: "no-config-file"; durableDefinitions: number };
 }
 
 /** Resolve symlinks when the path exists on disk; otherwise just normalize it. */
@@ -67,22 +59,6 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
     runMigrations(db);
 
     const repositories = new Repositories(db);
-    // Config is a one-shot migration input for model classes, not a runtime
-    // authority. On a copied home db-check plans that exact boot handoff but
-    // deliberately does not apply it: neither model_classes nor its receipt is
-    // written here. Homes with no config.yaml predate this source and retain the
-    // existing db-check behavior while reporting that there was no input to plan.
-    const configPath = join(home, "config.yaml");
-    const modelClassConfigCutover = existsSync(configPath)
-      ? (() => {
-          const config = loadConfig(home);
-          const planResult = planModelClassConfigCutover({ config, repositories });
-          return preflightModelClassConfigCutover({ config, planResult, repositories });
-        })()
-      : {
-          disposition: "no-config-file" as const,
-          durableDefinitions: repositories.modelClasses.list().length,
-        };
     const plan = planLegacyActorImport({ mcHome: home, repositories });
 
     // Both imports are planned against one un-mutated copy, so the actors a
@@ -124,7 +100,6 @@ export function runDbCheckAgainstHome(home: string): DbCheckResult {
       plannedScheduledMessages: plan.plannedScheduledMessages,
       plannedEventSourceOwnerships: subscriptionPlan.plannedSubscriptions,
       plannedHostJobs: hostJobPlan.plannedJobs,
-      modelClassConfigCutover,
     };
   } finally {
     db.close();
@@ -146,22 +121,6 @@ export function runDbCheck(opts: { home: string }): void {
         `${result.plannedEventSourceOwnerships} event source ownership(s), ` +
         `${result.plannedHostJobs} host job(s)`
     );
-    const modelClassPlan = result.modelClassConfigCutover;
-    if (modelClassPlan.disposition === "no-config-file") {
-      console.log(
-        `Legacy model-class import plan: no config.yaml input; ${modelClassPlan.durableDefinitions} durable definition(s)`
-      );
-    } else {
-      const legacyDefinitions =
-        modelClassPlan.legacyConfigDefinitions === null
-          ? "unreadable stale legacy"
-          : `${modelClassPlan.legacyConfigDefinitions} legacy`;
-      console.log(
-        `Legacy model-class import plan: ${modelClassPlan.disposition}; ` +
-          `${legacyDefinitions} definition(s), ${modelClassPlan.durableDefinitions} durable definition(s), ` +
-          `divergence ${modelClassPlan.legacyConfigDivergesFromDurable ? "detected" : "none"}`
-      );
-    }
     console.log("✓ db-check passed");
   } catch (err) {
     console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);

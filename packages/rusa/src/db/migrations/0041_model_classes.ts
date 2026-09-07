@@ -9,10 +9,6 @@ import type { Migration } from "./types.js";
  * consumer, ModelClassRepository, before a definition can be resolved. Keeping
  * that validation at the application boundary makes upgrades explicit and lets
  * a corrupt/manual row fail closed instead of being partly interpreted by SQL.
- *
- * The existing `legacy_import_receipts` table records the one-time
- * config.yaml:modelClasses cutover. The receipt is what prevents a stale
- * `modelClasses` block from reappearing as an authority on a later restart.
  */
 export const modelClasses: Migration = {
   id: "0041_model_classes",

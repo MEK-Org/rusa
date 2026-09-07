@@ -768,7 +768,7 @@ export function createAgentExecMcpServer(
         {
           title: "List runtime model classes (root-only)",
           description:
-            "List every model class currently committed in mesh.db. This is the live authority used by spawn_thread and set_actor_model; config.yaml does not override these rows after cutover. Root-only.",
+            "List every model class currently committed in mesh.db. This is the live authority used by spawn_thread and set_actor_model. Root-only.",
           inputSchema: {},
         },
         async () => {

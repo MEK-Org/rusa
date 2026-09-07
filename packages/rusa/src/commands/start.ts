@@ -120,10 +120,6 @@ import {
 import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
 import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
 import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
-import {
-  applyModelClassConfigCutover,
-  planModelClassConfigCutover,
-} from "../db/legacy-model-class-import.js";
 import type {
   PrerequisiteAttention,
   ReadyHeadChange,
@@ -851,24 +847,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const database = initDb(mcHome);
   log.info("database_ready", { home: mcHome });
 
-  // #271 initially put class definitions in config.yaml. This is the explicit
-  // one-time handoff to the runtime store: a receipt commits with the copied
-  // rows, so later boots cannot let the now-stale config block overwrite a
-  // live edit or deletion. The resolver below only ever reads model_classes.
-  const modelClassConfigCutover = applyModelClassConfigCutover(
-    planModelClassConfigCutover({ config, repositories: getRepositories() }),
-    { db: database, repositories: getRepositories() }
-  );
-  if (modelClassConfigCutover.importedDefinitions > 0) {
-    log.info("model_class_config_cutover_completed", {
-      importedDefinitions: modelClassConfigCutover.importedDefinitions,
-    });
-  }
-  if (modelClassConfigCutover.ignoredStaleConfig) {
-    log.warn("legacy_model_classes_config_ignored", {
-      impact: "model_classes in mesh.db are authoritative; remove modelClasses from config.yaml",
-    });
-  }
   const modelClasses = getRepositories().modelClasses;
 
   // One OS scheduler owns every cron/at mutation: recurring

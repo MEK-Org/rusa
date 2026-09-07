@@ -3,7 +3,6 @@
  */
 
 import type { ContextConfig } from "../actor/actor-record.js";
-import type { ProviderModelConfig } from "../providers/model-config.js";
 
 export const DEFAULT_DEPLOY_BRANCH = "master";
 export type SandboxMode = "container-boundary" | "bwrap";
@@ -396,19 +395,6 @@ export interface RusaConfig {
    * Prefer nesting under `understanding.glassGoals` . Retained as a compatibility fallback.
    */
   glassGoals?: GlassGoalsConfig;
-  /**
-   * @deprecated One-time cutover input for model classes originally configured
-   * by #276. At the first boot with the DB-backed store this block is copied to
-   * `model_classes` with a receipt; after that it is ignored and can never
-   * overwrite a runtime edit on restart. New definitions are managed through
-   * the root-only runtime MCP tools, not config.yaml.
-   *
-   * Its entries remain validated before the one-time copy, so no malformed
-   * legacy class is silently transferred. `model` is required for the same
-   * reason it is required at spawn — a class is an explicit selection and must
-   * never resolve to a provider's own default.
-   */
-  modelClasses?: Record<string, ProviderModelConfig[]>;
   /** Mesh safety/throughput controls (concurrency cap, provider rate limit). */
   mesh?: MeshConfig;
   /** Worker isolation mode. Defaults to "bwrap". */

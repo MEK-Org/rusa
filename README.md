@@ -196,23 +196,9 @@ Both `spawn_thread` and `set_actor_model` accept it. The rules:
   what later selections resolve to. Move an existing actor onto the new
   definition with `set_actor_model` if that's what you want.
 
-#### Config cutover from #276
-
-`modelClasses` in an older `config.yaml` is a one-time migration input, not a
-second authority. On the first start after this version, rusa validates and
-copies that block into `model_classes` in one SQLite transaction with a durable
-cutover receipt. Remove the block after that start. If it remains, rusa warns
-and ignores it on every later start; it cannot overwrite a live edit or revive
-a deleted class. A pre-existing durable class with no receipt aborts startup
-rather than guessing which definition should win.
-
-For a dry run, copy the instance home and run `rusa db-check --home <copy>`.
-It applies migration `0041_model_classes` to the copy and reports it among
-pending migrations, but deliberately does **not** read `config.yaml`, import
-model classes, or write the cutover receipt. The actual service start performs
-that explicit handoff. The table's `definition_json` uses a versioned blob
-validated by its TypeScript consumer; it uses neither SQLite `json_*` functions
-nor `CHECK` validators.
+Migration `0041_model_classes` adds the durable store. Its `definition_json`
+is a versioned blob validated by its TypeScript consumer; it uses neither SQLite
+`json_*` functions nor `CHECK` validators.
 
 ---
 

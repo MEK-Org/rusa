@@ -11,26 +11,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { stringify as toYaml } from "yaml";
-import { MODEL_CLASSES_CONFIG_CUTOVER_SOURCE } from "../db/legacy-model-class-import.js";
 import { Repositories } from "../db/repositories/index.js";
 import { runDbCheck, runDbCheckAgainstHome } from "./db-check.js";
-
-function writeDbCheckConfig(home: string, modelClasses?: unknown): void {
-  writeFileSync(
-    join(home, "config.yaml"),
-    toYaml({
-      github: { account: "db-check", pollIntervalSeconds: 300 },
-      providers: {
-        claude: { cliCommand: "claude" },
-        codex: { cliCommand: "codex" },
-      },
-      webhook: { port: 9742, secret: "test-secret" },
-      ...(modelClasses === undefined ? {} : { modelClasses }),
-    }),
-    "utf8"
-  );
-}
 
 describe("db-check", () => {
   let home: string;
@@ -97,11 +79,6 @@ describe("db-check", () => {
   it("applies pending migrations to the copied home's mesh.db and reports them", () => {
     const first = runDbCheckAgainstHome(home);
     expect(first.pendingMigrationIds.length).toBeGreaterThan(0);
-    expect(first.pendingMigrationIds).toContain("0041_model_classes");
-    expect(first.modelClassConfigCutover).toEqual({
-      disposition: "no-config-file",
-      durableDefinitions: 0,
-    });
 
     const dbPath = join(home, "data", "mesh.db");
     expect(existsSync(dbPath)).toBe(true);
@@ -110,118 +87,11 @@ describe("db-check", () => {
       .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='_migrations'`)
       .get();
     expect(migrationsTable).toBeDefined();
-    expect(
-      db
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'model_classes'")
-        .get()
-    ).toBeDefined();
-    // With no config source there is no class import to plan; db-check never
-    // performs the boot-only cutover or records its receipt.
-    expect(
-      db
-        .prepare(
-          "SELECT 1 FROM legacy_import_receipts WHERE source = 'config.yaml:modelClasses:v1'"
-        )
-        .get()
-    ).toBeUndefined();
     db.close();
 
     // A second run against the same copy has nothing left pending.
     const second = runDbCheckAgainstHome(home);
     expect(second.pendingMigrationIds).toEqual([]);
-  });
-
-  it("plans the validated legacy model-class import without writing classes or its receipt", () => {
-    writeDbCheckConfig(home, {
-      review: [{ provider: "claude", model: "claude-opus-4-8" }],
-      fast: [{ provider: "codex", model: "gpt-5.6-sol" }],
-    });
-
-    const result = runDbCheckAgainstHome(home);
-
-    expect(result.modelClassConfigCutover).toEqual({
-      disposition: "would-import",
-      legacyConfigDefinitions: 2,
-      durableDefinitions: 0,
-      legacyConfigDivergesFromDurable: false,
-    });
-
-    const db = new Database(join(home, "data", "mesh.db"));
-    expect(new Repositories(db).modelClasses.list()).toEqual([]);
-    expect(
-      db
-        .prepare("SELECT 1 FROM legacy_import_receipts WHERE source = ?")
-        .get(MODEL_CLASSES_CONFIG_CUTOVER_SOURCE)
-    ).toBeUndefined();
-    db.close();
-  });
-
-  it("uses boot's model-class validation while planning the copied config", () => {
-    writeDbCheckConfig(home, {
-      review: [{ provider: "codex" }],
-    });
-
-    expect(() => runDbCheckAgainstHome(home)).toThrow(
-      /modelClasses\."review": modelConfig entry for provider "codex" is missing a model/
-    );
-
-    const db = new Database(join(home, "data", "mesh.db"));
-    expect(new Repositories(db).modelClasses.list()).toEqual([]);
-    expect(
-      db
-        .prepare("SELECT 1 FROM legacy_import_receipts WHERE source = ?")
-        .get(MODEL_CLASSES_CONFIG_CUTOVER_SOURCE)
-    ).toBeUndefined();
-    db.close();
-  });
-
-  it("reports post-cutover config divergence without changing runtime definitions or its receipt", () => {
-    writeDbCheckConfig(home, {
-      review: [{ provider: "claude", model: "claude-opus-4-8" }],
-    });
-    // First preflight only establishes the copy's schema. Seed the already
-    // cut-over runtime state directly so the second preflight can prove it is
-    // read-only even when stale config differs from the durable class.
-    runDbCheckAgainstHome(home);
-    const dbPath = join(home, "data", "mesh.db");
-    const db = new Database(dbPath);
-    const repositories = new Repositories(db);
-    repositories.modelClasses.upsert(
-      "review",
-      [{ provider: "codex", model: "gpt-5.6-sol" }],
-      "2026-09-07T10:00:00.000Z"
-    );
-    repositories.legacyImportReceipts.record(
-      MODEL_CLASSES_CONFIG_CUTOVER_SOURCE,
-      "2026-09-07T10:00:00.000Z",
-      1
-    );
-    const before = db
-      .prepare("SELECT definition_json FROM model_classes WHERE name = 'review'")
-      .get() as { definition_json: string };
-    const receiptBefore = db
-      .prepare("SELECT imported_at, row_count FROM legacy_import_receipts WHERE source = ?")
-      .get(MODEL_CLASSES_CONFIG_CUTOVER_SOURCE);
-    db.close();
-
-    const result = runDbCheckAgainstHome(home);
-    expect(result.modelClassConfigCutover).toEqual({
-      disposition: "already-cut-over",
-      legacyConfigDefinitions: 1,
-      durableDefinitions: 1,
-      legacyConfigDivergesFromDurable: true,
-    });
-
-    const verifyDb = new Database(dbPath);
-    expect(
-      verifyDb.prepare("SELECT definition_json FROM model_classes WHERE name = 'review'").get()
-    ).toEqual(before);
-    expect(
-      verifyDb
-        .prepare("SELECT imported_at, row_count FROM legacy_import_receipts WHERE source = ?")
-        .get(MODEL_CLASSES_CONFIG_CUTOVER_SOURCE)
-    ).toEqual(receiptBefore);
-    verifyDb.close();
   });
 
   it("plans a legacy import with an ISO-8601 UTC offset timestamp without writing or archiving", () => {
@@ -490,9 +360,6 @@ describe("db-check", () => {
   });
 
   it("prints the pending migration and legacy import plan on success", () => {
-    writeDbCheckConfig(home, {
-      review: [{ provider: "codex", model: "gpt-5.6-sol" }],
-    });
     const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
 
     runDbCheck({ home });
@@ -500,9 +367,6 @@ describe("db-check", () => {
     expect(process.exit).not.toHaveBeenCalled();
     expect(consoleLog).toHaveBeenCalledWith(expect.stringContaining("0 event source ownership(s)"));
     expect(consoleLog).toHaveBeenCalledWith(expect.stringContaining("0 host job(s)"));
-    expect(consoleLog).toHaveBeenCalledWith(
-      "Legacy model-class import plan: would-import; 1 legacy definition(s), 0 durable definition(s), divergence none"
-    );
     expect(consoleLog).toHaveBeenCalledWith("✓ db-check passed");
     consoleLog.mockRestore();
   });
