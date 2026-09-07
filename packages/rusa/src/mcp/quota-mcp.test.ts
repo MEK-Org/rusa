@@ -410,36 +410,53 @@ describe("quota MCP server", () => {
       ]);
     });
 
-    it("derives status from nonempty validated provider windows in both disagreement directions", async () => {
-      const cases = [
-        { modelStatus: "available", usedPercent: 100, expectedStatus: "exhausted" },
-        { modelStatus: "exhausted", usedPercent: 0, expectedStatus: "available" },
-      ] as const;
+    it("derives exhausted status from a validated exhausted provider window", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "available",
+            windows: [
+              {
+                label: "Weekly",
+                kind: "weekly",
+                scope: "provider",
+                usedPercent: 100,
+                resetAtIso: "2026-09-14T00:00:00.000Z",
+              },
+            ],
+          }),
+      });
 
-      for (const { modelStatus, usedPercent, expectedStatus } of cases) {
-        mockGenerateContent.mockReset();
-        mockGenerateContent.mockResolvedValue({
-          text: () =>
-            JSON.stringify({
-              status: modelStatus,
-              windows: [
-                {
-                  label: "Weekly",
-                  kind: "weekly",
-                  scope: "provider",
-                  usedPercent,
-                  resetAtIso: "2026-09-14T00:00:00.000Z",
-                },
-              ],
-            }),
-        });
+      const parsed = await parseCodexQuota("synthetic exhausted provider panel", "test-key");
 
-        const parsed = await parseCodexQuota("synthetic status disagreement", "test-key");
+      expect(mockGenerateContent).toHaveBeenCalledTimes(1);
+      expect(parsed.status).toBe("exhausted");
+      expect(parsed.limits).toHaveLength(1);
+    });
 
-        expect(mockGenerateContent).toHaveBeenCalledTimes(1);
-        expect(parsed.status).toBe(expectedStatus);
-        expect(parsed.limits).toHaveLength(1);
-      }
+    it("retries and fails closed when exhausted model status conflicts with available windows", async () => {
+      mockGenerateContent.mockResolvedValue({
+        text: () =>
+          JSON.stringify({
+            status: "exhausted",
+            windows: [
+              {
+                label: "Weekly",
+                kind: "weekly",
+                scope: "provider",
+                usedPercent: 0,
+                resetAtIso: "2026-09-14T00:00:00.000Z",
+              },
+            ],
+          }),
+      });
+
+      const parsed = await parseCodexQuota("synthetic conflicting provider panel", "test-key");
+
+      expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+      expect(parsed.status).toBe("unknown");
+      expect(parsed.limits).toBeUndefined();
+      expect(parsed.message).toContain("status 'exhausted' disagrees");
     });
 
     it("keeps an explicit empty-window reading unknown", async () => {
@@ -1936,6 +1953,104 @@ describe("quota MCP server", () => {
         expect(scrapeId).toBe("scrape-multi-1");
         expect(rawStateArg.limits).toHaveLength(1);
         expect(inferredStateArg.limits).toHaveLength(1);
+      });
+
+      it("persists a malformed current Codex parse as unknown before carrying forward a prior reading", async () => {
+        const priorPanel = "synthetic prior Codex provider panel";
+        const malformedPanel = "synthetic malformed current Codex provider panel";
+        const scrapeStore = {
+          recordRaw: vi.fn().mockReturnValueOnce("scrape-prior").mockReturnValueOnce("scrape-bad"),
+          recordParsed: vi.fn(),
+          recordParseError: vi.fn(),
+        };
+        const scrapeCodexStatus = vi
+          .fn()
+          .mockResolvedValueOnce(priorPanel)
+          .mockResolvedValueOnce(malformedPanel);
+        mockGenerateContent
+          .mockResolvedValueOnce({
+            text: () =>
+              JSON.stringify({
+                status: "available",
+                windows: [
+                  {
+                    label: "Weekly",
+                    kind: "weekly",
+                    scope: "provider",
+                    usedPercent: 40,
+                    resetAtIso: "2030-01-01T00:00:00.000Z",
+                  },
+                ],
+              }),
+          })
+          .mockResolvedValue({
+            text: () =>
+              JSON.stringify({
+                status: "available",
+                windows: [
+                  { label: "5h", kind: "five_hour", scope: "provider" },
+                  {
+                    label: "Weekly",
+                    kind: "weekly",
+                    scope: "provider",
+                    usedPercent: 40,
+                    resetAtIso: "2030-01-01T00:00:00.000Z",
+                  },
+                ],
+              }),
+          });
+
+        const service = new QuotaService({
+          config: { ...mockConfig, geminiApiKey: "test-gemini-key" },
+          workersDir: "/tmp/workers",
+          scrapeCodexStatus,
+          scrapeStore,
+          ttlMs: 0,
+        });
+
+        await expect(service.getQuota("codex")).resolves.toMatchObject({ status: "available" });
+        const carriedForward = await service.getQuota("codex");
+
+        expect(scrapeCodexStatus).toHaveBeenCalledTimes(2);
+        expect(mockGenerateContent).toHaveBeenCalledTimes(3);
+        expect(scrapeStore.recordRaw).toHaveBeenNthCalledWith(1, {
+          provider: "codex",
+          scrapedAt: expect.any(String),
+          rawOutput: priorPanel,
+        });
+        expect(scrapeStore.recordRaw).toHaveBeenNthCalledWith(2, {
+          provider: "codex",
+          scrapedAt: expect.any(String),
+          rawOutput: malformedPanel,
+        });
+        expect(scrapeStore.recordParsed).toHaveBeenCalledTimes(2);
+
+        const [, rawCurrent, inferredCurrent] = scrapeStore.recordParsed.mock.calls[1];
+        expect(rawCurrent).toMatchObject({
+          provider: "codex",
+          status: "unknown",
+          raw: malformedPanel,
+        });
+        expect(rawCurrent.limits).toBeUndefined();
+        expect(rawCurrent.message).toContain("invalid usedPercent");
+        expect(inferredCurrent).toMatchObject({
+          provider: "codex",
+          status: "available",
+          raw: malformedPanel,
+          limits: [
+            {
+              label: "Weekly",
+              kind: "weekly",
+              percentLeft: 60,
+              resetAtIso: "2030-01-01T00:00:00.000Z",
+              scope: "provider",
+            },
+          ],
+        });
+        expect(inferredCurrent.explanations).toEqual(
+          expect.arrayContaining([expect.objectContaining({ rule: "carried_forward_bad_read" })])
+        );
+        expect(carriedForward).toEqual(inferredCurrent);
       });
 
       it("codex probe uses the LLM parse when geminiApiKey is set", async () => {

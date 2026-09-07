@@ -503,13 +503,19 @@ async function parseQuotaWithLlm(
       );
     }
 
+    const hasExhaustedWindow = limits.some((limit) => limit.percentLeft <= 0);
+    // A validated exhausted window is sufficient to fail closed even when the
+    // model's summary says available. The inverse could be a partial panel
+    // whose exhausted row was omitted, so send that disagreement through the
+    // existing stronger-model retry rather than downgrade exhaustion.
+    if (parsed.status === "exhausted" && !hasExhaustedWindow) {
+      throw new Error(
+        "Quota parse failed: status 'exhausted' disagrees with available provider windows"
+      );
+    }
+
     return {
-      status:
-        limits.length === 0
-          ? "unknown"
-          : limits.some((limit) => limit.percentLeft <= 0)
-            ? "exhausted"
-            : "available",
+      status: limits.length === 0 ? "unknown" : hasExhaustedWindow ? "exhausted" : "available",
       limits,
     };
   };
