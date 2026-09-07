@@ -12,7 +12,7 @@ import { runActorMeshE2EUp } from "./commands/e2e-actor-mesh.js";
 import { runForwardWebhooks } from "./commands/forward-webhooks.js";
 import { runInit } from "./commands/init.js";
 import { runInstallService } from "./commands/install-service.js";
-import { runLogs } from "./commands/logs.js";
+import { runActorLogs, runLogs } from "./commands/logs.js";
 import { runQuickstart, runQuickstartConfigure } from "./commands/quickstart.js";
 import { runReport } from "./commands/report.js";
 import { runServiceRestart, runServiceStatus, runServiceStop } from "./commands/service-control.js";
@@ -196,9 +196,17 @@ program
 
 program
   .command("logs")
-  .description("Tail the log file")
+  .description("Tail the service log, or one actor's raw output with --actor")
   .option("--environment <environment>", "Service environment: production or staging", "production")
-  .action(async (opts: { environment: ServiceEnvironment }) => {
+  .option(
+    "--actor <id>",
+    "Follow this actor's raw model output (the dashboard's live-output stream) instead of the service log"
+  )
+  .action(async (opts: { environment: ServiceEnvironment; actor?: string }) => {
+    if (opts.actor) {
+      await runActorLogs({ actorId: opts.actor, environment: opts.environment });
+      return;
+    }
     await runLogs({ environment: opts.environment });
   });
 

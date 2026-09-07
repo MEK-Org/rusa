@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { dashboardBaseUrl } from "./chat.js";
 import { resolveServiceInstance, type ServiceEnvironment } from "./service-instance.js";
 
 function hasCommand(command: string): boolean {
@@ -54,4 +55,172 @@ export async function runLogs(opts?: { environment?: ServiceEnvironment }): Prom
 
   console.log(`Following ${logPath} (no history). Press Ctrl-C to stop.\n`);
   await follow("tail", ["-n", "0", "-F", logPath]);
+}
+
+/**
+ * `rusa logs --actor <id>`: a raw tail of one actor's model output.
+ *
+ * The service log and the actor stream are different things read different
+ * ways. `journalctl -u rusa` is the mesh describing what it did; an actor's
+ * prose never reaches it, so this mode does not read the journal at all. It
+ * follows the same dashboard live-output SSE stream a browser tab subscribes
+ * to, which is why a terminal tail and the dashboard show the same bytes.
+ */
+
+/** The actor-filtered dashboard stream for an already-resolved local base URL. */
+export function actorStreamUrl(baseUrl: string, actorId: string): string {
+  return `${baseUrl}/api/mesh/stream?actors=${encodeURIComponent(actorId)}`;
+}
+
+/** Split a read buffer into complete SSE frames, keeping the partial tail. */
+export function splitSseFrames(buffer: string): { frames: string[]; rest: string } {
+  const parts = buffer.split("\n\n");
+  const rest = parts.pop() ?? "";
+  return { frames: parts.filter((frame) => frame.length > 0), rest };
+}
+
+/** The payload of one SSE frame, or null for comments and other channels. */
+export function frameLiveOutput(frame: string): { actorId: string; text: string } | null {
+  let event: string | null = null;
+  const data: string[] = [];
+  for (const line of frame.split("\n")) {
+    if (line.startsWith(":")) continue; // heartbeat / connection comment
+    if (line.startsWith("event:")) event = line.slice("event:".length).trim();
+    else if (line.startsWith("data:")) {
+      const value = line.slice("data:".length);
+      data.push(value.startsWith(" ") ? value.slice(1) : value);
+    }
+  }
+  if (event !== "live_output" || data.length === 0) return null;
+  try {
+    const parsed = JSON.parse(data.join("\n")) as { actorId?: unknown; text?: unknown };
+    if (typeof parsed.text !== "string" || typeof parsed.actorId !== "string") return null;
+    return { actorId: parsed.actorId, text: parsed.text };
+  } catch {
+    // A frame we cannot parse is not the actor's words; dropping it keeps the
+    // tail faithful to what the dashboard renders.
+    return null;
+  }
+}
+
+/**
+ * The stream could not be opened at all — nothing to tail, so the command
+ * reports the reason and exits rather than printing a transport stack trace.
+ */
+export class ActorStreamUnavailable extends Error {
+  readonly name = "ActorStreamUnavailable";
+}
+
+export interface FollowActorOutputOptions {
+  url: string;
+  /**
+   * The dashboard endpoint normally filters by `actors`; repeat that cheap
+   * check locally so malformed or custom SSE responses cannot put another
+   * actor's prose in this command's stdout. It is defense in depth, not a
+   * workaround for the dashboard filter.
+   */
+  actorId?: string;
+  /** Where the actor's prose goes — process.stdout in the command. */
+  write: (text: string) => void;
+  /** Out-of-band notices (elisions, connection state) that must not pollute the prose. */
+  notify?: (text: string) => void;
+  signal?: AbortSignal;
+}
+
+/**
+ * Follow one actor's live output until the stream ends or `signal` aborts.
+ *
+ * Prose is written verbatim and nothing else joins it on that channel, so
+ * `rusa logs --actor <id> > run.txt` captures exactly what the actor said. The
+ * hub drops the oldest frames rather than growing an unbounded buffer for a
+ * slow reader; when it does it says so, and that gap is reported out of band
+ * instead of being passed off as silence.
+ */
+export async function followActorOutput(opts: FollowActorOutputOptions): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(opts.url, {
+      headers: { Accept: "text/event-stream" },
+      signal: opts.signal,
+    });
+  } catch (err) {
+    // The usual reason a tail cannot start is that nothing is listening — the
+    // service is down, or the dashboard is on a different port than the config
+    // being read. Say that, rather than letting a transport error surface as an
+    // undici stack trace over a one-line CLI.
+    throw new ActorStreamUnavailable(
+      `Could not reach the actor output stream at ${opts.url}: ${
+        err instanceof Error ? err.message : String(err)
+      }. Is the service running, and is its dashboard on that address?`
+    );
+  }
+  if (!response.ok || !response.body) {
+    throw new ActorStreamUnavailable(
+      `Actor output stream returned HTTP ${response.status} from ${opts.url}. Is the service running?`
+    );
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    for await (const bytes of response.body as unknown as AsyncIterable<Uint8Array>) {
+      buffer += decoder.decode(bytes, { stream: true });
+      const { frames, rest } = splitSseFrames(buffer);
+      buffer = rest;
+      for (const frame of frames) {
+        const chunk = frameLiveOutput(frame);
+        if (chunk) {
+          if (opts.actorId === undefined || chunk.actorId === opts.actorId) opts.write(chunk.text);
+        } else if (frame.startsWith("event: elided")) {
+          opts.notify?.("[rusa] some output was dropped (reader too slow)\n");
+        }
+      }
+    }
+    // A graceful `res.end()` is an expected service-restart path, but it is
+    // still useful to say why a tail stopped. It remains a successful follow:
+    // stdout has already received every complete frame before the EOF.
+    if (!opts.signal?.aborted) opts.notify?.("[rusa] actor output stream ended.\n");
+  } catch (err) {
+    // A tail ends when its source goes away — a service restart, a Ctrl-C, a
+    // dropped socket. That is the end of the follow, not a crash to raise a
+    // stack trace over; a stream that never opened at all still throws above.
+    if (opts.signal?.aborted) return;
+    opts.notify?.(
+      `[rusa] actor output stream ended: ${err instanceof Error ? err.message : String(err)}\n`
+    );
+  }
+}
+
+export async function runActorLogs(opts: {
+  actorId: string;
+  environment?: ServiceEnvironment;
+}): Promise<void> {
+  const instance = resolveServiceInstance(opts.environment ?? "production");
+  // Use the same validated config and wildcard-to-loopback resolution as
+  // `rusa chat`; a tail must dial exactly the dashboard address the rest of the
+  // CLI uses, not a second, subtly different YAML interpretation.
+  const url = actorStreamUrl(dashboardBaseUrl({ home: instance.mcHome }), opts.actorId);
+
+  // Everything this command says about itself goes to stderr, so stdout carries
+  // the actor's words and only those: `rusa logs --actor <id> > run.txt` is the
+  // transcript of the run, not a transcript with a banner on top.
+  console.error(
+    `Following output for actor ${opts.actorId} (the same stream the dashboard shows). Press Ctrl-C to stop.\n`
+  );
+  try {
+    await followActorOutput({
+      url,
+      actorId: opts.actorId,
+      write: (text) => {
+        process.stdout.write(text);
+      },
+      notify: (text) => {
+        process.stderr.write(text);
+      },
+    });
+  } catch (err) {
+    if (!(err instanceof ActorStreamUnavailable)) throw err;
+    console.error(err.message);
+    process.exitCode = 1;
+  }
 }

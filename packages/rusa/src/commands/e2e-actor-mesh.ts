@@ -677,7 +677,10 @@ function printDriveHelp(opts: {
   console.log(
     `  curl -s -XPOST ${tracker}/repos/${opts.repo}/issues -d '{"title":"...","body":"..."}'`
   );
-  console.log(`\nObserve: tail this process's stdout (the actor firehose),`);
+  console.log(`\nObserve an actor's output (this process's stdout is the service log):`);
+  console.log(
+    `  curl -sN http://127.0.0.1:${opts.dashboardPort}/api/mesh/stream?actors=<id>  # what the dashboard shows`
+  );
   console.log(`  inspect ${join(opts.rootDir, "home", "data", "mesh.db")}, or query ${tracker}.`);
   console.log(`\nTear down:  pnpm e2e am-down --root ${opts.rootDir}\n`);
   console.log(`Instance ready. Ctrl-C for graceful shutdown (root kept; am-down removes it).\n`);

@@ -40,22 +40,22 @@ const chunk: ActorOutputChunk = { actorId: "worker-7", text: "thinking out loud"
 
 describe("composeActorOutputSinks", () => {
   it("delivers each chunk to every sink, so dashboard streaming survives the refactor", () => {
-    const stdout: ActorOutputChunk[] = [];
+    const second: ActorOutputChunk[] = [];
     const dashboard: ActorOutputChunk[] = [];
     const { logger } = recordingLogger();
 
     const emit = composeActorOutputSinks(
       [
-        collectingSink("service-stdout", stdout),
         collectingSink("dashboard-live-output", dashboard),
+        collectingSink("second-destination", second),
       ],
       logger
     );
     emit(chunk);
     emit({ actorId: "worker-7", text: " and again" });
 
-    expect(stdout).toEqual([chunk, { actorId: "worker-7", text: " and again" }]);
-    expect(dashboard).toEqual(stdout);
+    expect(second).toEqual([chunk, { actorId: "worker-7", text: " and again" }]);
+    expect(dashboard).toEqual(second);
   });
 
   it("passes actor output through untouched — it is prose, not a structured record", () => {
@@ -80,7 +80,7 @@ describe("composeActorOutputSinks", () => {
             throw new Error("write after end");
           },
         },
-        collectingSink("service-stdout", survivor),
+        collectingSink("second-destination", survivor),
       ],
       logger
     );

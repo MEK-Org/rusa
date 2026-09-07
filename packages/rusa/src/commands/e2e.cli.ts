@@ -12,8 +12,9 @@ import { runE2EHydrate } from "./e2e-hydrate.js";
  *
  * The v2 `up`/`report` subcommands (scheduler + dashboard + orchestrator run
  * report) were removed with the v2 orchestrator; the actor mesh is exercised via
- * `am-up` and torn down via `am-down`/`down`. Observe a run by tailing the actor
- * firehose (the runner's stdout) or via `rusa report`.
+ * `am-up` and torn down via `am-down`/`down`. Observe a run through the
+ * dashboard, `rusa logs --actor <id>`, or `rusa report` — the runner's own
+ * stdout carries the service log, not the actors' output.
  */
 const program = new Command();
 
