@@ -307,6 +307,16 @@ export interface IssueClient {
    * minus the author filter.
    */
   getOpenPullRequests(repo: string): Promise<OpenPullRequest[]>;
+  /**
+   * The single open PR {@link createPullRequest} would upsert for `head`, or
+   * null when that call would create a fresh one. Same owner-qualified question
+   * the upsert asks itself, so callers that need to know which branch they are
+   * on cannot drift from it — a fork's same-named branch is not this PR.
+   *
+   * Never throws: a failed lookup degrades to null ("treat as new"), so no
+   * caller turns a transient read error into a failed write.
+   */
+  findOpenPullRequestForHead(repo: string, head: string): Promise<CreatedPullRequest | null>;
   /** Query issues with optional state and label filters. */
   listIssues(repo: string, opts?: ListIssuesOptions): Promise<OpenIssue[]>;
   /** Fetch pull request details. */
@@ -529,7 +539,7 @@ export class GitHubIssueClient implements IssueClient {
 
   async createPullRequest(opts: CreatePROptions): Promise<CreatedPullRequest> {
     // Check if an open PR already exists for this head branch
-    const existing = await this.findExistingPR(opts.repo, opts.head);
+    const existing = await this.findOpenPullRequestForHead(opts.repo, opts.head);
     if (existing) {
       // Update the existing PR's title, body, and base (if provided), then return its number + URL
       await this.api("PATCH", `/repos/${opts.repo}/pulls/${existing.number}`, {
@@ -537,7 +547,7 @@ export class GitHubIssueClient implements IssueClient {
         body: opts.body,
         ...(opts.base !== undefined ? { base: opts.base } : {}),
       });
-      return { number: existing.number, htmlUrl: existing.url };
+      return existing;
     }
 
     // Unlike `gh pr create`, the REST endpoint requires an explicit base.
@@ -580,10 +590,7 @@ export class GitHubIssueClient implements IssueClient {
   /**
    * Check if an open PR already exists for a given head branch.
    */
-  private async findExistingPR(
-    repo: string,
-    head: string
-  ): Promise<{ number: number; url: string } | null> {
+  async findOpenPullRequestForHead(repo: string, head: string): Promise<CreatedPullRequest | null> {
     try {
       const owner = repo.split("/")[0];
       const prs = await this.api<Array<{ number: number; html_url: string }>>(
@@ -591,7 +598,7 @@ export class GitHubIssueClient implements IssueClient {
         `/repos/${repo}/pulls?head=${encodeURIComponent(`${owner}:${head}`)}&state=open&per_page=1`
       );
       const pr = prs[0];
-      return pr ? { number: pr.number, url: pr.html_url } : null;
+      return pr ? { number: pr.number, htmlUrl: pr.html_url } : null;
     } catch {
       return null;
     }
@@ -1375,6 +1382,10 @@ export class GitBridgeIssueClient implements IssueClient, GitHubPollingIssueClie
 
   getOpenPullRequests(repo: string): Promise<OpenPullRequest[]> {
     return this.delegate.getOpenPullRequests(repo);
+  }
+
+  findOpenPullRequestForHead(repo: string, head: string): Promise<CreatedPullRequest | null> {
+    return this.delegate.findOpenPullRequestForHead(repo, head);
   }
 
   listIssues(repo: string, opts?: ListIssuesOptions): Promise<OpenIssue[]> {
