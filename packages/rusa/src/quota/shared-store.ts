@@ -6,7 +6,7 @@ import Database from "better-sqlite3";
 import type { QuotaScrape } from "../db/repositories/quota-scrape-repository.js";
 import { BUSY_TIMEOUT_MS, widenToWal } from "../db/wal.js";
 import type { ProviderQuotaSnapshot, QuotaWindowKind } from "../mcp/quota-mcp.js";
-import { isProviderScopedWindow } from "./window-scope.js";
+import { isCodexGptReserveWindow, isProviderScopedWindow } from "./window-scope.js";
 
 const SLOT_MS = 5 * 60 * 1000;
 export const QUOTA_RAW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -88,6 +88,15 @@ function parsedSnapshot(value: string | null): ProviderQuotaSnapshot | null {
   } catch {
     return null;
   }
+}
+
+/** Filter historic parsed states as they leave storage, without altering raw evidence. */
+function normalizedSnapshot(state: ProviderQuotaSnapshot | null): ProviderQuotaSnapshot | null {
+  if (!state || state.provider !== "codex" || !state.limits) return state;
+  return {
+    ...state,
+    limits: state.limits.filter((limit) => !isCodexGptReserveWindow(limit)),
+  };
 }
 
 export interface CanonicalQuotaObservation {
@@ -320,7 +329,8 @@ export class SharedQuotaStore {
     _rawParsed: ProviderQuotaSnapshot,
     inferredParsed: ProviderQuotaSnapshot
   ): void {
-    const { raw: _raw, ...inferredState } = inferredParsed;
+    const normalizedParsed = normalizedSnapshot(inferredParsed) ?? inferredParsed;
+    const { raw: _raw, ...inferredState } = normalizedParsed;
     const scrape = this.db
       .prepare("SELECT provider, scraped_at FROM quota_scrapes WHERE id = ?")
       .get(id) as { provider: string; scraped_at: string } | undefined;
@@ -328,7 +338,7 @@ export class SharedQuotaStore {
       this.db
         .prepare("UPDATE quota_scrapes SET parsed_state = ?, parse_error = NULL WHERE id = ?")
         .run(JSON.stringify(inferredState), id);
-      this.insertObservations(inferredParsed, scrape?.scraped_at, scrape?.provider);
+      this.insertObservations(normalizedParsed, scrape?.scraped_at, scrape?.provider);
     })();
     if (this.controllerOptions) {
       this.advancePendingController(this.controllerOptions, inferredParsed.provider);
@@ -351,7 +361,7 @@ export class SharedQuotaStore {
       )
       .all(provider, sinceIso) as StoredScrapeRow[];
     return rows.map((row) => {
-      const state = parsedSnapshot(row.parsed_state);
+      const state = normalizedSnapshot(parsedSnapshot(row.parsed_state));
       return {
         id: row.id,
         provider: row.provider,
@@ -365,7 +375,7 @@ export class SharedQuotaStore {
   }
 
   listCanonicalSince(provider: string, sinceIso: string): CanonicalQuotaObservation[] {
-    return this.db
+    const observations = this.db
       .prepare(
         `SELECT provider, kind, label,
                 observed_at AS observedAt, percent_left AS percentLeft,
@@ -375,10 +385,13 @@ export class SharedQuotaStore {
          ORDER BY observed_at ASC, rowid ASC`
       )
       .all(provider, sinceIso) as CanonicalQuotaObservation[];
+    return provider === "codex"
+      ? observations.filter((observation) => !isCodexGptReserveWindow(observation))
+      : observations;
   }
 
   listHistorySince(provider: string, sinceIso: string): QuotaHistoryRecord[] {
-    return this.db
+    const history = this.db
       .prepare(
         `SELECT 'provider' AS scope, kind, label, observed_at AS observedAt,
                 percent_left AS percentLeft, reset_at_iso AS resetAtIso,
@@ -388,6 +401,9 @@ export class SharedQuotaStore {
          ORDER BY observed_at ASC, rowid ASC`
       )
       .all(provider, sinceIso) as QuotaHistoryRecord[];
+    return provider === "codex"
+      ? history.filter((observation) => !isCodexGptReserveWindow(observation))
+      : history;
   }
 
   /** Advance every unprocessed observation exactly once across all connections. */
@@ -675,6 +691,7 @@ export class SharedQuotaStore {
     const provider = (storedProvider ?? state.provider).trim().toLocaleLowerCase("en-US");
     const seenKinds = new Set<string>();
     for (const limit of state.limits ?? []) {
+      if (provider === "codex" && isCodexGptReserveWindow(limit)) continue;
       if (!isProviderScopedWindow(limit) || !Number.isFinite(limit.percentLeft)) continue;
       if (limit.percentLeft < 0 || limit.percentLeft > 100) continue;
       const kind = normalizeKind(limit.kind);

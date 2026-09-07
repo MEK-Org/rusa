@@ -24,6 +24,7 @@ import {
 } from "../providers/model-catalog.js";
 import { resolveProvider } from "../providers/registry.js";
 import type { CodingProvider, RunResult, SandboxOptions } from "../providers/types.js";
+import { isCodexGptReserveWindow } from "../quota/window-scope.js";
 import { extractGeminiText, getGeminiClient } from "../understanding/gemini-utils.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
@@ -176,6 +177,20 @@ const QUOTA_WINDOW_KINDS: readonly QuotaWindowKind[] = ["session", "five_hour", 
  */
 function normalizeQuotaWindowKind(raw: string | undefined): QuotaWindowKind | undefined {
   return QUOTA_WINDOW_KINDS.find((k) => k === raw);
+}
+
+/**
+ * Normalize parsed limits at the cache boundary. Codex's `gpt-reserve` row is
+ * an internal allocation, never a quota window Rusa can consume. Its scope is
+ * unreliable because earlier extracts marked it provider-scoped or omitted it.
+ */
+function normalizedQuotaLimits(
+  provider: string,
+  limits: readonly QuotaLimit[] | undefined
+): QuotaLimit[] | undefined {
+  return limits
+    ?.filter((limit) => provider !== "codex" || !isCodexGptReserveWindow(limit))
+    .map((limit) => ({ ...limit }));
 }
 
 const LLM_WINDOW_ITEM_SCHEMA = {
@@ -349,6 +364,9 @@ async function parseQuotaWithLlm(
           // anyway, so emitting one would only force the model to guess label/kind).
           "For Codex: a real reading contains limit rows (e.g. '5h limit:', 'Weekly limit:') " +
           "or an explicit exhaustion message (\"You've hit your usage limit\" / 'hit your usage limit'). " +
+          "Completely ignore every `gpt-reserve` row: it is an internal reserve, not usable quota. " +
+          "Do not emit it in `windows` regardless of its percentage or apparent scope; retain real provider " +
+          "5h/Weekly rows and all non-reserve model rows. " +
           "Extract EVERY rendered limit row into `windows` — never drop or omit the Weekly row when 5h is present, and vice-versa. " +
           `If it contains "You've hit your usage limit" or "hit your usage limit", ` +
           "status is 'exhausted'; extract per-window (5h, Weekly) percentages and reset times (including from 'try again at <date/time>'). " +
@@ -417,7 +435,10 @@ async function parseQuotaWithLlm(
 
     const realWindows = Array.isArray(parsed.windows)
       ? (parsed.windows as LlmQuotaWindow[]).filter(
-          (w) => !w.placeholder && typeof w.usedPercent === "number"
+          (w) =>
+            !w.placeholder &&
+            typeof w.usedPercent === "number" &&
+            (provider !== "codex" || !isCodexGptReserveWindow(w))
         )
       : [];
     const status = parsed.status;
@@ -563,9 +584,8 @@ export function inferQuotaState(
 
   let status = rawState.status;
   let message = rawState.message;
-  let limits: QuotaLimit[] | undefined = rawState.limits
-    ? rawState.limits.map((l) => ({ ...l }))
-    : undefined;
+  let limits = normalizedQuotaLimits(rawState.provider, rawState.limits);
+  const previousLimits = normalizedQuotaLimits(rawState.provider, prevState?.limits);
 
   const isAssumedReset = (prevSnapshot: ProviderQuotaSnapshot, label: string) => {
     return prevSnapshot.explanations?.some(
@@ -577,8 +597,8 @@ export function inferQuotaState(
   // Step 1: Bad read full-fallback (Rule: carried_forward_bad_read)
   // If the whole current parse returned status unknown or empty limits (bad read),
   // carry forward previous assessment's active unexpired limits with non-assumed resetAtIso.
-  if ((status === "unknown" || !limits || limits.length === 0) && prevState?.limits) {
-    const activeUnexpiredLimits = prevState.limits.filter((limit) => {
+  if ((status === "unknown" || !limits || limits.length === 0) && previousLimits && prevState) {
+    const activeUnexpiredLimits = previousLimits.filter((limit) => {
       if (!limit.resetAtIso) return false;
       const resetMs = Date.parse(limit.resetAtIso);
       if (!Number.isFinite(resetMs) || resetMs <= scrapedAtMs) return false;
@@ -628,10 +648,10 @@ export function inferQuotaState(
   // Step 3: Bad read partial-fallback (Rule: carried_forward_bad_read)
   // The current parse extracted windows, but some window missed resetAtIso
   // while the previous scrape had an unexpired valid non-assumed resetAtIso.
-  if (limits && limits.length > 0 && prevState?.limits) {
+  if (limits && limits.length > 0 && previousLimits && prevState) {
     for (const limit of limits) {
       if (limit.resetAtIso) continue;
-      const prevMatch = prevState.limits.find(
+      const prevMatch = previousLimits.find(
         (p) =>
           (p.scope ?? "provider") === (limit.scope ?? "provider") &&
           ((limit.kind !== undefined && p.kind === limit.kind) || p.label === limit.label) &&
@@ -735,8 +755,9 @@ export class QuotaService {
       return inferredState;
     } catch (error) {
       if (id) this.deps.scrapeStore?.recordParseError(id, error);
-      if (prevState?.limits && prevState.limits.length > 0) {
-        const hasUnexpired = prevState.limits.some(
+      const previousLimits = normalizedQuotaLimits(provider, prevState?.limits);
+      if (previousLimits && previousLimits.length > 0 && prevState) {
+        const hasUnexpired = previousLimits.some(
           (l) =>
             l.resetAtIso &&
             Date.parse(l.resetAtIso) > Date.parse(scrapedAt) &&

@@ -156,11 +156,11 @@ const codexReservePanelState: ProviderQuotaSnapshot = {
   status: "available",
   limits: [
     {
-      label: "Weekly limit",
+      label: "gpt-reserve Weekly limit",
       kind: "weekly",
       percentLeft: 100,
       resetAtIso: "2026-09-12T14:56:00.000Z",
-      scope: "model",
+      scope: "provider",
     },
     {
       label: "Weekly limit",
@@ -450,7 +450,7 @@ describe("dashboard quota snapshot", () => {
     expect(codex?.usedPercent).toBe(7);
   });
 
-  it("codex: reports the provider's own weekly, not a model reserve at 100% left (#249)", async () => {
+  it("codex: drops gpt-reserve even if a legacy parse calls it provider-scoped (#310)", async () => {
     const { deps } = fakeDeps({ codex: codexReservePanelState });
     const snapshot = await buildQuotaSnapshot(deps);
     const codex = snapshot.providers.find((p) => p.provider === "codex");
@@ -506,6 +506,30 @@ describe("dashboard quota snapshot", () => {
     });
 
     expect(snapshot.providers[0].windows.map((w) => w.usedPercent)).toEqual([48]);
+    expect(snapshot.providers[0].usedPercent).toBe(48);
+  });
+
+  it("codex: the durable fallback rejects legacy gpt-reserve rows even with provider scope (#310)", async () => {
+    const now = Date.parse("2026-09-05T20:00:00.000Z");
+    const snapshot = await buildQuotaSnapshot({
+      getQuota: async () => ({ provider: "codex", status: "unknown" }),
+      providers: ["codex"],
+      now: () => now,
+      listHistory: () => [
+        historyPoint({
+          label: "gpt-reserve Weekly limit",
+          observedAt: "2026-09-05T19:00:00.000Z",
+          percentLeft: 100,
+        }),
+        historyPoint({
+          label: "Weekly limit",
+          observedAt: "2026-09-05T19:00:00.000Z",
+          percentLeft: 52,
+        }),
+      ],
+    });
+
+    expect(snapshot.providers[0].windows.map((window) => window.label)).toEqual(["Weekly limit"]);
     expect(snapshot.providers[0].usedPercent).toBe(48);
   });
 
