@@ -180,6 +180,23 @@ export class ActorRunRepository {
     return row ? toActorRun(row) : null;
   }
 
+  /**
+   * The current inbox focus for an active run, if it resolved to one
+   * obligation. Completed history intentionally does not participate: a
+   * dashboard surface asking what an actor is working on must clear with the
+   * run, rather than carrying its last task into the next queue wait.
+   */
+  activeFocusPrimaryObligationId(runId: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT focus_primary_obligation_id
+         FROM actor_runs
+         WHERE id = ? AND outcome IS NULL AND focus_resolution IS NOT NULL`
+      )
+      .get(runId) as { focus_primary_obligation_id: string | null } | undefined;
+    return row?.focus_primary_obligation_id ?? null;
+  }
+
   /** Completed run outputs, newest first, for the bounded portable tail. */
   listRecentCompleted(actorId: string, limit: number): ActorRun[] {
     assertLimit(limit);

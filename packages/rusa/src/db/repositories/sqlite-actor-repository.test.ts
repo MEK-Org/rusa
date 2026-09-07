@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
 import { runMigrations } from "../migrations/runner.js";
@@ -177,6 +177,53 @@ describe("SqliteActorRepository", () => {
       humanUnlocked: true,
       lastChatSessionId: "chat-2",
     });
+  });
+
+  it("lists mixed human/no-human actors without per-actor mesh_chat lookups", () => {
+    repository.upsert(root);
+    repository.upsert({
+      id: "worker",
+      charter: "Work",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-09-03T13:01:00.000Z",
+    });
+    repository.upsert({
+      id: "no-human",
+      charter: "Work without a human message",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-09-03T13:02:00.000Z",
+    });
+    const insert = db.prepare(
+      "INSERT INTO mesh_chat (id, ts, sender_id, recipient_id, body, session_id) VALUES (?, ?, ?, ?, ?, ?)"
+    );
+    insert.run("root-old", "2026-09-03T13:05:00.000Z", HUMAN_OPERATOR, "root", "old", "root-1");
+    insert.run("root-new", "2026-09-03T13:10:00.000Z", HUMAN_OPERATOR, "root", "new", "root-2");
+    insert.run("root-z", "2026-09-03T13:10:00.000Z", HUMAN_OPERATOR, "root", "tie", "root-3");
+    insert.run("worker", "2026-09-03T13:15:00.000Z", HUMAN_OPERATOR, "worker", "hello", null);
+
+    const prepare = vi.spyOn(db, "prepare");
+    const byId = new Map(repository.list().map((record) => [record.id, record]));
+    expect(byId.get("root")).toMatchObject({ humanUnlocked: true, lastChatSessionId: "root-3" });
+    expect(byId.get("worker")).toMatchObject({ humanUnlocked: true });
+    expect(byId.get("worker")).not.toHaveProperty("lastChatSessionId");
+    expect(byId.get("no-human")).not.toHaveProperty("humanUnlocked");
+    expect(byId.get("no-human")).not.toHaveProperty("lastChatSessionId");
+    expect(
+      prepare.mock.calls.filter(
+        ([sql]) =>
+          typeof sql === "string" &&
+          sql.includes("WHERE recipient_id = ? AND sender_id = ? ORDER BY ts DESC, id DESC LIMIT 1")
+      )
+    ).toHaveLength(0);
+    expect(
+      prepare.mock.calls.filter(
+        ([sql]) =>
+          typeof sql === "string" &&
+          sql.includes("WHERE sender_id = ? ORDER BY recipient_id, ts DESC, id DESC")
+      )
+    ).toHaveLength(1);
   });
 
   it("persists normalized records across a file-backed database reopen", () => {

@@ -399,6 +399,48 @@ describe("commitment ledger projection", () => {
     expect(report.rows).toEqual([]);
   });
 
+  it("counts a direct subscriber as event-driven too, not only an owner", () => {
+    // Ownership is not the only way an actor is fed by events: a direct
+    // subscriber is woken by its source just the same, so reading only the
+    // ownership kinds would flag every subscriber-only watcher as silent.
+    const report = projectOpenCommitments({
+      now: NOW,
+      threads: [thread("sleepy-topi")],
+      events: [
+        event("e1", "sleepy-topi", "event_source_subscriber_added", "2026-06-29T00:00:00.000Z", {
+          detail: "repo:invoice-machine",
+        }),
+        event("e2", "sleepy-topi", "run_yielded", "2026-06-29T01:00:00.000Z", {
+          detail: "complete",
+        }),
+      ],
+    });
+
+    expect(report.rows).toEqual([]);
+  });
+
+  it("stops counting a subscriber as event-driven once it unsubscribes", () => {
+    const report = projectOpenCommitments({
+      now: NOW,
+      threads: [thread("sleepy-topi")],
+      events: [
+        event("e1", "sleepy-topi", "event_source_subscriber_added", "2026-06-29T00:00:00.000Z", {
+          detail: "repo:invoice-machine",
+        }),
+        event("e2", "sleepy-topi", "run_yielded", "2026-06-29T01:00:00.000Z", {
+          detail: "complete",
+        }),
+        event("e3", "sleepy-topi", "event_source_subscriber_removed", "2026-06-29T02:00:00.000Z", {
+          detail: "repo:invoice-machine",
+        }),
+      ],
+    });
+
+    expect(report.rows).toEqual([
+      expect.objectContaining({ kind: "silent_actor", subject_actor_id: "sleepy-topi" }),
+    ]);
+  });
+
   it("keeps and flags request commitments with unresolvable owners", () => {
     const report = projectOpenCommitments({
       now: NOW,

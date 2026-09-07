@@ -2,10 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
 import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../mcp/stamp.js";
 import { prerequisiteEdgeKey } from "../obligations/obligation.js";
-import type {
-  ModelConfigInput,
-  ProviderModelConfig,
-  RawProviderModelConfig,
+import {
+  assertConcreteModelConfig,
+  type ModelConfigInput,
+  type ProviderModelConfig,
+  type RawProviderModelConfig,
 } from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
@@ -23,9 +24,13 @@ import {
 } from "./concurrency-limiter.js";
 import {
   type EventResource,
-  type EventSubscription,
-  type EventSubscriptionStore,
-  InMemoryEventSubscriptionStore,
+  type EventSourceOwnerStore,
+  type EventSourceOwnership,
+  type EventSourceSubscription,
+  type EventSourceSubscriptionStore,
+  InMemoryEventSourceOwnerStore,
+  InMemoryEventSourceSubscriptionStore,
+  isSubResourceOf,
   parentOf,
   resourceKey,
   sameResource,
@@ -66,6 +71,8 @@ export interface MeshActor {
   readonly isQueued?: boolean;
   readonly isYielded?: boolean;
   cancelQueuedRun?(): boolean;
+  /** Cancel a queued reservation and re-admit its same work against current next-run config. */
+  rescheduleQueuedRun?(): boolean;
   resumeCancelledRun?(): boolean;
   preemptForResponsive():
     | { preempted: false }
@@ -83,6 +90,12 @@ export interface ActorRuntimeStateDelta {
   revision: number;
   actorId: string;
   runState: ActorRuntimeState;
+  /**
+   * State-only deltas are patched in the dashboard without a list fetch. Set
+   * this when another thread-list field changed while the run state stayed the
+   * same, such as the current inbox focus selected by a running actor.
+   */
+  refreshThreadSnapshot?: boolean;
 }
 
 export interface ActorRuntimeStateSnapshot {
@@ -92,6 +105,13 @@ export interface ActorRuntimeStateSnapshot {
 }
 
 export interface SpawnRequest {
+  /**
+   * Experimental execution placement, not persisted on the record. A target is
+   * only admitted when the runtime declares placement support through
+   * {@link ActorMeshOptions.supportsExecutionTarget}; otherwise the spawn is
+   * rejected rather than quietly running the actor in this process.
+   */
+  executionTarget?: string;
   /** What the new actor owns — authored by the spawning message (B.5). */
   charter: string;
   /** The spawning actor's id (becomes the child's parent + gets a handle to the child). */
@@ -222,7 +242,10 @@ export class RetirementBlockedError extends Error {
  * resolve to a provider default (#169).
  */
 function normalizeModelConfigList(input: ModelConfigInput): ProviderModelConfig[] {
-  const list = Array.isArray(input) ? input : [input];
+  // No config in hand here, so a named class cannot be resolved — reject the
+  // reference rather than reading it as a tuple with a missing provider.
+  const concrete = assertConcreteModelConfig(input);
+  const list = Array.isArray(concrete) ? concrete : [concrete];
   return list.map((entry) => {
     const model = entry.model?.trim();
     if (!model) {
@@ -351,6 +374,7 @@ export interface QueuedSelection {
 
 /** What the mesh hands the factory to build a live {@link Actor} for a record. */
 export interface ActorFactoryContext {
+  executionTarget?: string;
   /** The record at spawn time. Use {@link getRecord} for the *current* state. */
   record: ActorRecord;
   /** Read the live record (charter + handles can change between wakes). */
@@ -448,6 +472,13 @@ export interface ActorMeshOptions {
    * above length one, validates each tuple, and rejects duplicates.
    */
   validateSpawn?: (req: SpawnRequest) => ProviderModelConfig[];
+  /**
+   * Experimental placement gate, consulted for every spawn that names an
+   * `executionTarget`. Fail-closed by omission: a runtime that cannot place
+   * actors elsewhere leaves this unset, and an explicit target is then refused
+   * instead of degrading into a silent local run on the leader.
+   */
+  supportsExecutionTarget?: (target: string) => boolean;
   /**
    * Synchronous, config-aware validator before staging an actor's
    * `desiredModelConfig` replacement.
@@ -582,7 +613,15 @@ export interface ActorMeshOptions {
    * granted (see {@link grantableCapabilities}).
    */
   capabilityGrants?: CapabilityGrantStore;
-  eventSubscriptions?: EventSubscriptionStore;
+  eventSourceOwners?: EventSourceOwnerStore;
+  eventSourceSubscriptions?: EventSourceSubscriptionStore;
+  /**
+   * The event sources this instance is configured for. Direct subscriptions are
+   * refused outside them, which is what keeps a subscription from reopening the
+   * scope narrowing `config.yaml` closed. Omitted by meshes built without a
+   * config (tests, the e2e runner), where there is no scope to enforce.
+   */
+  configuredEventSources?: readonly EventResource[];
   /**
    * Ownership authority for issue/PR event sources. Optional: without
    * it, routing falls back entirely to subscriptions, which is what every mesh
@@ -631,6 +670,7 @@ export class ActorMesh {
   readonly actors: ActorRepository;
   private readonly createActor: ActorFactory;
   private readonly validateSpawn?: (req: SpawnRequest) => ProviderModelConfig[];
+  private readonly supportsExecutionTarget?: (target: string) => boolean;
   private readonly validateModel?: (
     record: ActorRecord,
     modelConfig: ModelConfigInput
@@ -673,7 +713,9 @@ export class ActorMesh {
     sessionId?: string;
   }) => string;
   private readonly grants: CapabilityGrantStore;
-  private readonly eventSubscriptions: EventSubscriptionStore;
+  private readonly eventSourceOwners: EventSourceOwnerStore;
+  private readonly eventSourceSubscriptions: EventSourceSubscriptionStore;
+  private readonly configuredEventSources: readonly EventResource[] | undefined;
   private readonly obligations?: MeshObligationPort;
   private readonly inboxStore?: InboxStore;
   private readonly onQueued?: ActorMeshOptions["onQueued"];
@@ -726,9 +768,13 @@ export class ActorMesh {
     this.rootId = opts.rootId;
     this.createActor = opts.createActor;
     this.validateSpawn = opts.validateSpawn;
+    this.supportsExecutionTarget = opts.supportsExecutionTarget;
     this.validateModel = opts.validateModel;
     this.grants = opts.capabilityGrants ?? new InMemoryCapabilityGrantStore();
-    this.eventSubscriptions = opts.eventSubscriptions ?? new InMemoryEventSubscriptionStore();
+    this.eventSourceOwners = opts.eventSourceOwners ?? new InMemoryEventSourceOwnerStore();
+    this.eventSourceSubscriptions =
+      opts.eventSourceSubscriptions ?? new InMemoryEventSourceSubscriptionStore();
+    this.configuredEventSources = opts.configuredEventSources;
     this.obligations = opts.obligations;
     this.inboxStore = opts.inboxStore;
     this.onQueued = opts.onQueued;
@@ -1151,6 +1197,12 @@ export class ActorMesh {
     });
     beforeCommit?.(entries);
     this.selectedInboxEntryIds.set(actorId, unique);
+    const actor = this.live.get(actorId);
+    if (actor) {
+      this.actorRuntimeStateChanged(actorId, this.runtimeStateOf(actor), {
+        refreshThreadSnapshot: true,
+      });
+    }
     return entries;
   }
 
@@ -1347,6 +1399,24 @@ export class ActorMesh {
   }
 
   /**
+   * Refuse an execution placement this runtime cannot honour.
+   *
+   * Called before the spawn id, the record, or the parent's handle exist, so a
+   * refused placement leaves nothing behind to clean up — and, more importantly,
+   * so a target the runtime does not understand can never fall through to a
+   * local Actor. Omitted target still means local; a supplied one means that
+   * instance or an error.
+   */
+  private assertPlacementSupported(executionTarget: string | undefined): void {
+    if (executionTarget === undefined) return;
+    const target = executionTarget.trim();
+    if (target && this.supportsExecutionTarget?.(target)) return;
+    throw new Error(
+      `executionTarget ${JSON.stringify(executionTarget)} is not available: this runtime has no remote placement support`
+    );
+  }
+
+  /**
    * Create a child actor (record + live instance) and return its id immediately.
    * Spawning is **not** an implicit message: the child is born idle with an empty
    * inbox and does **not** run. To put it to work, {@link sendMessage} it — that
@@ -1357,6 +1427,7 @@ export class ActorMesh {
   spawn(req: SpawnRequest): string {
     const charter = req.charter?.trim();
     if (!charter) throw new Error("charter is required");
+    this.assertPlacementSupported(req.executionTarget);
     const modelConfig = this.validateSpawn?.(req) ?? normalizeModelConfigList(req.modelConfig);
     if (modelConfig.length === 0) {
       throw new Error("modelConfig must declare at least one provider/model entry");
@@ -1384,7 +1455,10 @@ export class ActorMesh {
     this.grantHandle(parentId, { id });
     let actor: MeshActor;
     try {
-      actor = this.createActor(this.factoryContext(record));
+      actor = this.createActor({
+        ...this.factoryContext(record),
+        executionTarget: req.executionTarget,
+      });
     } catch (err) {
       this.revokeHandle(parentId, id);
       this.actors.patch(id, { status: "retired" });
@@ -1632,12 +1706,24 @@ export class ActorMesh {
   }
 
   private activeSubscriptionHeldBy(actorId: string, resource: EventResource): boolean {
-    return this.eventSubscriptions
+    return this.eventSourceOwners
       .activeForResource(resource)
       .some((subscription) => subscription.actorId === actorId);
   }
 
-  private resolveLiveEventDestinations(
+  /**
+   * The live **owner** destinations for an event, walking the ownership ladder:
+   * a live obligation claiming the source, then an explicit ownership row, then
+   * (for bubble-eligible event classes) the same two questions of the parent
+   * resource.
+   *
+   * Ownership only. Direct subscribers are resolved by
+   * {@link liveDirectSubscribers} and merged by {@link deliverEvent}, never
+   * here — this function is also what {@link effectiveOwnerOf} answers with, so
+   * a subscriber appearing in its result would let anyone who subscribed to a
+   * source delegate or reclaim it.
+   */
+  private resolveLiveOwnerDestinations(
     resource: EventResource,
     opts: {
       ignoreExactResource?: EventResource;
@@ -1680,7 +1766,7 @@ export class ActorMesh {
         return destinations;
       }
 
-      const activeSubs = this.eventSubscriptions.activeForResource(current);
+      const activeSubs = this.eventSourceOwners.activeForResource(current);
       for (const sub of activeSubs) {
         if (
           opts.ignoreExactResource &&
@@ -1715,6 +1801,30 @@ export class ActorMesh {
   }
 
   /**
+   * The live actors directly subscribed to this **exact** resource.
+   *
+   * Deliberately not part of the ownership walk. Subscribers never receive
+   * bubbled events — bubbling exists so an important event is not missed by
+   * whoever is responsible for it, and a subscriber is interested rather than
+   * responsible — so there is no ancestor loop here and no event-class gate to
+   * apply.
+   *
+   * Computing this outside {@link resolveLiveOwnerDestinations} is what makes
+   * it reliable rather than a convenience. That walk returns from inside its
+   * obligation rung: a live obligation owned by a human, or by an actor that is
+   * not currently live, terminates the climb with an empty destination list.
+   * Adding subscribers as another push inside the loop would mean a subscriber
+   * silently received nothing on exactly the sources busy enough to carry an
+   * obligation.
+   */
+  private liveDirectSubscribers(resource: EventResource): string[] {
+    return this.eventSourceSubscriptions
+      .subscribersOf(resource)
+      .map((subscription) => subscription.actorId)
+      .filter((actorId) => this.live.has(actorId));
+  }
+
+  /**
    * The owner of the live obligation claiming this event source, if any.
    *
    * Returns an entity id, which may be a human — the caller decides what that
@@ -1732,7 +1842,7 @@ export class ActorMesh {
     resource: EventResource,
     opts: { ignoreExactResource?: EventResource } = {}
   ): string | undefined {
-    return this.resolveLiveEventDestinations(resource, opts)[0];
+    return this.resolveLiveOwnerDestinations(resource, opts)[0];
   }
 
   /**
@@ -1742,13 +1852,13 @@ export class ActorMesh {
   subscribeEventSource(resource: EventResource, actorId: string, subscribedBy: string): void {
     actorId = this.resolveThreadId(actorId);
     subscribedBy = this.resolveThreadId(subscribedBy);
-    const subscription: EventSubscription = {
+    const subscription: EventSourceOwnership = {
       resource: resourceKey(resource),
       actorId,
       subscribedBy,
       subscribedAt: this.now(),
     };
-    this.eventSubscriptions.subscribe(subscription);
+    this.eventSourceOwners.subscribe(subscription);
     this.recordEvent({
       kind: "event_source_subscribed",
       actorId,
@@ -1805,7 +1915,7 @@ export class ActorMesh {
       return;
     }
 
-    const current = this.eventSubscriptions.activeForResource(resource)[0];
+    const current = this.eventSourceOwners.activeForResource(resource)[0];
     if (!current) {
       throw new Error(`cannot reclaim ${resourceKey(resource)}: no active subscription`);
     }
@@ -1826,7 +1936,7 @@ export class ActorMesh {
    */
   unsubscribeEventSource(resource: EventResource, actorId: string, at: string): void {
     actorId = this.resolveThreadId(actorId);
-    this.eventSubscriptions.unsubscribe(resource, actorId, at);
+    this.eventSourceOwners.unsubscribe(resource, actorId, at);
     this.recordEvent({
       kind: "event_source_unsubscribed",
       actorId,
@@ -1836,10 +1946,66 @@ export class ActorMesh {
   }
 
   /**
-   * List all subscriptions (both active and inactive) for audit.
+   * List all ownership claims (both active and released) for audit.
    */
-  listSubscriptions(): EventSubscription[] {
-    return this.eventSubscriptions.list();
+  listSubscriptions(): EventSourceOwnership[] {
+    return this.eventSourceOwners.list();
+  }
+
+  /**
+   * Add a direct subscriber to an event source. Records an audit event.
+   *
+   * Unlike {@link subscribeEventSource} this takes no ownership and refuses
+   * nothing on contention: many actors may subscribe to one source, and a
+   * subscription neither displaces the owner nor competes for the source.
+   *
+   * It does refuse a resource outside {@link ActorMeshOptions.configuredEventSources},
+   * so subscribing cannot widen this instance past the scope `config.yaml`
+   * declares. `reconcileEventSourceSubscriptions` re-applies the same rule to
+   * durable rows at every boot, for the case where the config narrows later.
+   */
+  addEventSourceSubscriber(resource: EventResource, actorId: string, subscribedBy: string): void {
+    actorId = this.resolveThreadId(actorId);
+    subscribedBy = this.resolveThreadId(subscribedBy);
+    if (!this.actors.get(actorId)) {
+      throw new Error(`cannot subscribe unknown thread: ${actorId}`);
+    }
+    if (
+      this.configuredEventSources &&
+      !this.configuredEventSources.some((configured) => isSubResourceOf(resource, configured))
+    ) {
+      throw new Error(
+        `cannot subscribe to ${resourceKey(resource)}: not anchored in a configured event source`
+      );
+    }
+    this.eventSourceSubscriptions.subscribe({
+      resource: resourceKey(resource),
+      actorId,
+      subscribedBy,
+      subscribedAt: this.now(),
+    });
+    this.recordEvent({
+      kind: "event_source_subscriber_added",
+      actorId,
+      detail: resourceKey(resource),
+      payload: JSON.stringify({ subscribedBy }),
+    });
+  }
+
+  /** Remove a direct subscriber from an event source. Records an audit event. */
+  removeEventSourceSubscriber(resource: EventResource, actorId: string): void {
+    actorId = this.resolveThreadId(actorId);
+    this.eventSourceSubscriptions.unsubscribe(resource, actorId);
+    this.recordEvent({
+      kind: "event_source_subscriber_removed",
+      actorId,
+      detail: resourceKey(resource),
+    });
+  }
+
+  /** Every direct subscription — the audit/inspection view. */
+  listEventSourceSubscriptions(): EventSourceSubscription[] {
+    return this.eventSourceSubscriptions.list();
   }
 
   /**
@@ -1875,7 +2041,7 @@ export class ActorMesh {
           directed = true;
         } else {
           this.log(`mesh:deliver target not live: ${opts.directedTarget} — directive ignored`);
-          destinations = this.resolveLiveEventDestinations(resource, {
+          destinations = this.resolveLiveOwnerDestinations(resource, {
             enforceBubblingPolicy: true,
             eventPayload: opts.inboxPayload,
             exactObligationOwner: null,
@@ -1883,10 +2049,34 @@ export class ActorMesh {
         }
       }
     } else {
-      destinations = this.resolveLiveEventDestinations(resource, {
+      destinations = this.resolveLiveOwnerDestinations(resource, {
         enforceBubblingPolicy: true,
         eventPayload: opts.inboxPayload,
       });
+    }
+
+    // Direct subscribers are added to whatever ownership resolved to — the two
+    // relationships compose rather than compete. A subscriber is added even when
+    // ownership resolved to nobody (an obligation held by a human, an absent
+    // owner, a source no live actor owns), and never displaces the owner when it
+    // did. The exact resource only: a subscription does not bubble.
+    //
+    // A *successfully targeted* delivery is the one case where this does not
+    // apply. A verified bot directive names the single actor an event is for;
+    // fanning it out to subscribers would make `mesh:deliver` mean something
+    // other than what it says.
+    //
+    // Read `directed` precisely: it is set only on that happy path. A directive
+    // overridden by a live obligation, or one naming a target that is no longer
+    // live, resolves ownership normally and still reaches subscribers. That is
+    // deliberate rather than incidental — a standing interest in a source's
+    // direct events is not defeated by a directive aimed at someone else, or by
+    // one that failed to land. Those paths also leave `directed` false for the
+    // author-suppression exemption below, which only a landed directive earns.
+    if (!directed) {
+      for (const subscriber of this.liveDirectSubscribers(resource)) {
+        if (!destinations.includes(subscriber)) destinations.push(subscriber);
+      }
     }
 
     if (destinations.length === 0) {
@@ -2539,12 +2729,17 @@ export class ActorMesh {
   }
 
   /** The sole revision authority for actor-published runtime transitions. */
-  actorRuntimeStateChanged(actorId: string, runState: ActorRuntimeState): void {
+  actorRuntimeStateChanged(
+    actorId: string,
+    runState: ActorRuntimeState,
+    options: { refreshThreadSnapshot?: boolean } = {}
+  ): void {
     const delta: ActorRuntimeStateDelta = {
       streamId: this.runtimeStreamId,
       revision: ++this.runtimeRevision,
       actorId,
       runState,
+      ...(options.refreshThreadSnapshot ? { refreshThreadSnapshot: true } : {}),
     };
     for (const listener of this.runtimeStateListeners) {
       try {
@@ -2874,9 +3069,16 @@ export class ActorMesh {
 
   private retireEventSubscriptions(record: ActorRecord): void {
     const at = this.now();
-    for (const subscription of this.eventSubscriptions.list()) {
+    for (const subscription of this.eventSourceOwners.list()) {
       if (subscription.actorId !== record.id || subscription.unsubscribedAt) continue;
       this.unsubscribeEventSource(subscription.resource, record.id, at);
+    }
+    // Ownership is released into a tombstone because the record of who held a
+    // source outlives the holder. A subscription has no such record to keep —
+    // it is live routing for an actor that no longer runs — so it is removed.
+    for (const subscription of this.eventSourceSubscriptions.list()) {
+      if (subscription.actorId !== record.id) continue;
+      this.removeEventSourceSubscriber(subscription.resource, record.id);
     }
   }
 
@@ -3000,6 +3202,24 @@ export class ActorMesh {
     // applies atomically at its next dispatch, before run_start is recorded
     // and before launch (see {@link applyPendingModel}).
     this.actors.patch(id, { desiredModelConfig: validated });
+
+    // A queued reservation has already quoted one of the old pool's lanes.
+    // Replacing that pool must release the old quote now and pass the same
+    // single-flight work back through admission, rather than waiting until the
+    // stale lane eventually becomes available to discover the change. The
+    // actor's dirty bit coalesces repeated updates into exactly one replacement
+    // opportunity; a live provider run has no pending reservation, so it keeps
+    // its launched pool through its normal run boundary.
+    const liveActor = this.live.get(id);
+    // Do not turn a staged move onto an already-halted pool into a transient
+    // re-quote that `beforeRun` merely drops: retain the work through the
+    // existing halt/resume path instead. Partially healthy pools still
+    // re-quote normally, letting provider selection choose an eligible lane.
+    if (this.allCandidatesHalted(validated) || this.isShuttingDown()) {
+      if (liveActor?.cancelQueuedRun?.()) return;
+    } else if (liveActor?.rescheduleQueuedRun?.()) {
+      return;
+    }
 
     if (this.inboxStore && this.live.has(id) && this.activeRunState(id) === null) {
       const unhandled = this.inboxStore.list(id, { status: "unhandled" }).entries;

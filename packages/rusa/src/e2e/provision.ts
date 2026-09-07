@@ -25,6 +25,8 @@ const E2E_BOT = "rusa-e2e-bot";
 export const E2E_IU_ROOT_NODE_ID = "e2eIUroot0000000000000";
 /** Pidfile (under the instance root) recording the running instance's PID. */
 export const PID_FILE = "instance.pid";
+/** Host-home-relative directory holding disposable/preserved e2e instance roots. */
+export const E2E_RUNS_DIR_NAME = ".rusa-e2e";
 
 /**
  * A provisioned, self-contained e2e instance. Everything mutable lives under
@@ -52,6 +54,7 @@ export interface E2EInstance {
  * minimal-but-valid shape otherwise.
  */
 export function buildE2EConfig(opts: {
+  dashboardPort?: number;
   scratchPath: string;
   baseConfig?: RusaConfig | null;
   /** Actor-mesh root config (provider/charter). */
@@ -75,7 +78,7 @@ export function buildE2EConfig(opts: {
     geminiApiKey: base?.geminiApiKey ?? "MISSING",
     // Required by the schema; the e2e instance never starts a webhook server.
     webhook: { port: 0, secret: "" },
-    dashboard: { port: E2E_DASHBOARD_PORT },
+    dashboard: { port: opts.dashboardPort ?? E2E_DASHBOARD_PORT },
     understanding: { rootNodeId: E2E_IU_ROOT_NODE_ID },
     // Capture full prompts/transcripts so an agent can inspect what happened.
     invocationDebug: { enabled: true },
@@ -93,6 +96,7 @@ export function buildE2EConfig(opts: {
  * agent's writes to its worktree, which lives under RUSA_HOME=root.
  */
 export function provisionE2EInstance(opts: {
+  dashboardPort?: number;
   root?: string;
   baseConfigHome?: string;
   rootActor?: RusaConfig["rootActor"];
@@ -154,6 +158,7 @@ export function provisionE2EInstance(opts: {
   }
 
   const config = buildE2EConfig({
+    dashboardPort: opts.dashboardPort,
     scratchPath,
     baseConfig,
     rootActor: opts.rootActor,
@@ -164,6 +169,26 @@ export function provisionE2EInstance(opts: {
   return { root, home, remotePath, scratchPath, config, repo: E2E_REPO };
 }
 
+/**
+ * Paths a resumable e2e root must have, relative to `root`, missing from it.
+ * Shared by `resumeE2EInstance` and the e2e-instance helper's own resume
+ * validation so the two structural checks cannot drift apart.
+ */
+export function missingResumeRequirements(root: string): string[] {
+  const home = join(root, "home");
+  const remotePath = join(root, "remote", "repo.git");
+  const scratchPath = join(root, "scratch");
+  const gitConfigGlobal = join(root, "gitconfig");
+  const required = [
+    join(home, "config.yaml"),
+    join(home, "data", "mesh.db"),
+    join(remotePath, "HEAD"),
+    join(scratchPath, ".git"),
+    gitConfigGlobal,
+  ];
+  return required.filter((path) => !existsSync(path));
+}
+
 /** Reopen a previously provisioned E2E root without rewriting any durable state. */
 export function resumeE2EInstance(root: string): E2EInstance {
   const home = join(root, "home");
@@ -172,14 +197,7 @@ export function resumeE2EInstance(root: string): E2EInstance {
   const gitConfigGlobal = join(root, "gitconfig");
   const xdg = join(root, "xdg");
   const tmp = join(root, "tmp");
-  const required = [
-    join(home, "config.yaml"),
-    join(home, "data", "mesh.db"),
-    join(remotePath, "HEAD"),
-    join(scratchPath, ".git"),
-    gitConfigGlobal,
-  ];
-  const missing = required.filter((path) => !existsSync(path));
+  const missing = missingResumeRequirements(root);
   if (missing.length > 0) {
     throw new Error(`cannot resume E2E instance; missing: ${missing.join(", ")}`);
   }

@@ -138,7 +138,7 @@ acting" is the unspoofable endpoint, not a tool argument the model fills in.
 
 | Primitive | What it does |
 | --- | --- |
-| `spawn_thread(charter, …)` | Create a child actor that owns `charter`, in its own session. Returns its `thread_id`; you become its parent. **Non-blocking** — the child runs asynchronously. `model_config` is required and picks the harness/tier — one `{provider, model, effort?}` object, or an ordered pool of them for a portable (`ledger`/`tail`) child, tried earliest-available first. There is no default model; the parent chooses. |
+| `spawn_thread(charter, …)` | Create a child actor that owns `charter`, in its own session. Returns its `thread_id`; you become its parent. **Non-blocking** — the child runs asynchronously. `model_config` is required and picks the harness/tier — one `{provider, model, effort?}` object, an ordered pool of them for a portable (`ledger`/`tail`) child tried earliest-available first, or `{class: "<name>"}` naming a [model class](#named-model-classes). There is no default model; the parent chooses. |
 | `send_message(thread_id, body)` | Deliver a message to a thread's inbox (parent, child, or an introduced peer). The recipient wakes, sees who it came from, and may reply *later* as a new message. **Always async.** |
 | `introduce(holder, target, role?)` | Grant `holder` a handle to `target` so it can message it directly (e.g. let a coder reach a reviewer). The id *is* the capability (object-capability style). |
 | `list_threads()` | List the children you've spawned, with charter summaries and status — your org chart for deciding what to follow up on or retire. |
@@ -152,6 +152,53 @@ acting" is the unspoofable endpoint, not a tool argument the model fills in.
 2. **Delegation is asynchronous.** A parent must *never block* waiting on a child
    — it would waste a run and can deadlock the mesh. You fire a message and end
    your turn; the reply arrives as a fresh wake.
+
+### Named model classes
+
+Spelling out `{provider, model, effort}` at every `spawn_thread` couples every
+caller to specific model slugs. A **model class** gives an operator-chosen name
+to one ordered provider/model pool. Definitions live in the `model_classes`
+table in `data/mesh.db`, not in `config.yaml`: editing a class is a root-only
+runtime operation and the next selection sees the committed row without a mesh
+restart.
+
+An actor then references a class as the **whole** `model_config` value:
+
+```json
+{ "charter": "fix the flaky test in packages/rusa", "model_config": { "class": "coder" } }
+```
+
+Both `spawn_thread` and `set_actor_model` accept it. The rules:
+
+- **Use the root-only management surface.** `set_model_class(name,
+  model_config)` creates or wholly replaces a class, `list_model_classes()`
+  inspects the current rows, and `delete_model_class(name)` removes one. A
+  definition is one concrete tuple or an ordered pool, exactly like an inline
+  selection; it is never a patch and cannot reference another class.
+- **Every entry must name a configured provider and an explicit model.** The
+  runtime validates the whole concrete pool through the same provider/model/
+  effort, size, and duplicate checks a selection uses. Invalid definitions
+  commit nothing.
+- **A class reference is the whole value**, not one entry inside a pool, and it
+  cannot nest inside another class. `{"class": "coder"}` is valid;
+  `[{"class": "coder"}, {...}]` and `{"class": "coder", "provider": "codex"}` are
+  both rejected at the tool boundary — a mixed shape is a mistake, never a
+  tuple with the class quietly ignored.
+- **A reference still isn't a default.** Omitting `model_config` remains an
+  error, an unknown class name is an error, and an empty definition cannot be
+  committed — nothing silently falls back to a provider default.
+- **Multi-entry classes follow the pool rule**: a class that resolves to more
+  than one entry requires a portable (`ledger`/`tail`) actor.
+- **Selection snapshots the pool.** The class is resolved once, at the moment of
+  the spawn or the `set_actor_model`, and the resolved provider/model/effort
+  entries are what get validated and persisted on the actor. **Editing a class
+  never retro-applies to actors that already resolved it** — it only changes
+  what later selections resolve to. Move an existing actor onto the new
+  definition with `set_actor_model` if that's what you want.
+
+Migration `0041_model_classes` adds the durable store. Its `definition_json`
+is a versioned blob validated by its TypeScript consumer; it uses neither SQLite
+`json_*` functions nor `CHECK` validators.
 
 ---
 

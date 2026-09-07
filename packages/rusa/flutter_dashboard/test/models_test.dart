@@ -457,4 +457,46 @@ void main() {
       ]);
     });
   });
+
+  group('ThreadDto selected obligation', () {
+    test(
+      'parses the optional active-run focus and leaves an absent focus null',
+      () {
+        final withFocus = ThreadDto.fromJson({
+          'id': 'actor-1',
+          'handle': 'actor-1-handle',
+          'parentId': 'root',
+          'status': 'active',
+          'provider': null,
+          'model': null,
+          'charterPreview': 'charter',
+          'createdAt': '2026-09-06T00:00:00.000Z',
+          'runState': 'running',
+          'selectedObligation': {
+            'id': 'focus-1',
+            'ownerId': 'actor-1',
+            'title': 'Current work',
+            'intent': 'Finish the dashboard card',
+            'status': 'ready',
+            'effectivePriority': 1,
+          },
+        });
+        final withoutFocus = ThreadDto.fromJson({
+          'id': 'actor-2',
+          'handle': 'actor-2-handle',
+          'parentId': 'root',
+          'status': 'active',
+          'provider': null,
+          'model': null,
+          'charterPreview': 'charter',
+          'createdAt': '2026-09-06T00:00:00.000Z',
+          'runState': 'queued',
+        });
+
+        expect(withFocus.selectedObligation?.id, 'focus-1');
+        expect(withFocus.selectedObligation?.heading, 'Current work');
+        expect(withoutFocus.selectedObligation, isNull);
+      },
+    );
+  });
 }

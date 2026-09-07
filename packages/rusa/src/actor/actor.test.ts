@@ -3,6 +3,7 @@ import { deterministicExhaustionFallback } from "../providers/exhaustion-classif
 import { FakeProvider } from "../providers/fake-provider.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import * as sandboxModule from "../providers/sandbox.js";
+import { formatSigtermResult } from "../providers/termination-attribution.js";
 import type { RunOptions, RunResult } from "../providers/types.js";
 import {
   Actor,
@@ -415,6 +416,117 @@ describe("Actor", () => {
     await vi.advanceTimersByTimeAsync(10);
     await flush();
     expect(provider.calls[0]?.prompt).toBe("PROMPT: inbox work");
+  });
+
+  it("requotes a queued run without changing its responsive corrective nudge", async () => {
+    const queued: Array<{ responsive: boolean; mode: string }> = [];
+    const gated: boolean[] = [];
+    const rejects: Array<(reason: unknown) => void> = [];
+    const actor = makeActor({
+      onQueued: (event) => queued.push(event),
+      gate: <T>(
+        _fn: (selected: RawProviderModelConfig) => Promise<T>,
+        _candidates: readonly RawProviderModelConfig[],
+        responsive: boolean
+      ): RunStartHandle<T> => {
+        gated.push(responsive);
+        return {
+          started: false,
+          promote: () => {},
+          cancel: () => {
+            rejects.shift()?.(new RunStartCancelledError());
+            return true;
+          },
+          result: new Promise<T>((_resolve, reject) => rejects.push(reject)),
+        };
+      },
+    });
+
+    actor.requestRun({ priority: "responsive", mode: "yield-elicitation" });
+    await flush();
+    expect(queued).toEqual([{ responsive: true, mode: "yield-elicitation" }]);
+    expect(gated).toEqual([true]);
+
+    expect(actor.rescheduleQueuedRun()).toBe(true);
+    await flush();
+
+    // A re-quote retries the same scheduling opportunity: it must remain a
+    // responsive corrective run rather than becoming a fresh ordinary wake.
+    expect(queued).toEqual([
+      { responsive: true, mode: "yield-elicitation" },
+      { responsive: true, mode: "yield-elicitation" },
+    ]);
+    expect(gated).toEqual([true, true]);
+
+    actor.close();
+    await flush();
+  });
+
+  it("parks a requeue when halt arrives during its preflight, then resumes it once", async () => {
+    let actor!: Actor;
+    let preflightCalls = 0;
+    let releaseReplacementPreflight!: (allowed: boolean) => void;
+    let firstGateReject!: (reason: unknown) => void;
+    let gateCalls = 0;
+    const provider = new FakeProvider(() => {
+      actor.declareYield();
+      return {};
+    });
+    actor = makeActor(
+      {
+        beforeRun: () => {
+          preflightCalls++;
+          if (preflightCalls !== 2) return true;
+          return new Promise<boolean>((resolve) => {
+            releaseReplacementPreflight = resolve;
+          });
+        },
+        gate: <T>(
+          fn: (selected: RawProviderModelConfig) => Promise<T>,
+          candidates: readonly RawProviderModelConfig[]
+        ): RunStartHandle<T> | Promise<T> => {
+          gateCalls++;
+          const candidate = candidates[0];
+          if (!candidate) throw new Error("test gate expected a model candidate");
+          if (gateCalls !== 1) return Promise.resolve().then(() => fn(candidate));
+          return {
+            started: false,
+            promote: () => {},
+            cancel: () => {
+              firstGateReject(new RunStartCancelledError());
+              return true;
+            },
+            result: new Promise<T>((_resolve, reject) => {
+              firstGateReject = reject;
+            }),
+          };
+        },
+      },
+      provider
+    );
+
+    actor.requestRun();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(gateCalls).toBe(1);
+
+    // The old queued reservation has already rejected and its one requeue is
+    // now paused in the replacement preflight — the race a provider halt can
+    // otherwise use to consume the dirty bit without leaving a resume record.
+    expect(actor.rescheduleQueuedRun()).toBe(true);
+    await flush();
+    expect(preflightCalls).toBe(2);
+    expect(actor.cancelQueuedRun()).toBe(true);
+
+    releaseReplacementPreflight(true);
+    await flush();
+    expect(gateCalls).toBe(1);
+    expect(provider.calls).toHaveLength(0);
+
+    expect(actor.resumeCancelledRun()).toBe(true);
+    await vi.advanceTimersByTimeAsync(10);
+    await flush();
+    expect(gateCalls).toBe(2);
+    expect(provider.calls).toHaveLength(1);
   });
 
   it("replaces a queued normal run with one responsive opportunity", async () => {
@@ -1998,6 +2110,89 @@ describe("Actor", () => {
           exitCode: 143,
         })
       );
+    });
+
+    // #257 arbiter: a supervisor grace-kill is a cleanup termination, not a
+    // capacity failure. Deleting the `graceKilled` short-circuit in
+    // `runWithFallback` turns this RED — the ladder classifies the killed run,
+    // relaunches on an already-aborted signal, and the run-end output becomes a
+    // both-tiers-exhausted summary with the real termination diagnostic gone.
+    it("does not spend the fallback ladder on a supervisor grace-kill", async () => {
+      let actor!: Actor;
+      const onRunEnd = vi.fn();
+      const classify = vi.fn(async () => ({ exhausted: true }));
+
+      const primary = new FakeProvider(
+        async (opts: RunOptions) =>
+          new Promise<Partial<RunResult>>((resolve) => {
+            actor.declareYield("complete", "work pushed");
+            opts.signal?.addEventListener("abort", () => {
+              // Exactly what a real provider builds on a SIGTERM path.
+              resolve({ success: false, ...formatSigtermResult("agent transcript", opts.signal) });
+            });
+          }),
+        "primary-model"
+      );
+      const fallbackProvider = new FakeProvider(undefined, "fallback-model");
+
+      actor = makeActor(
+        {
+          yieldGraceMs: 5000,
+          fallback: {
+            models: ["fallback-model"],
+            resolveProvider: () => fallbackProvider,
+            classify,
+          },
+          onRunEnd,
+        },
+        primary
+      );
+      actor.requestRun();
+      await vi.advanceTimersByTimeAsync(10);
+      await vi.advanceTimersByTimeAsync(5000);
+      await flush();
+
+      expect(classify).not.toHaveBeenCalled();
+      expect(fallbackProvider.calls).toHaveLength(0);
+      expect(onRunEnd).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: true,
+          graceKilled: true,
+          yieldStatus: "complete",
+          yieldNote: "work pushed",
+          exitCode: 143,
+          // The raw termination diagnostic survives the run end.
+          output: expect.stringContaining(
+            "[Task killed by supervisor (yield grace period exceeded)]"
+          ),
+        })
+      );
+    });
+
+    it("still reports a post-yield failure that is not a cleanup termination", async () => {
+      let actor!: Actor;
+      const onRunEnd = vi.fn();
+
+      const provider = new FakeProvider(() => {
+        actor.declareYield("complete", "done");
+        // An unrelated error after the yield was accepted — no grace kill.
+        return { success: false, exitCode: 1, output: "post-yield MCP write failed" };
+      });
+
+      actor = makeActor({ onRunEnd }, provider);
+      actor.requestRun();
+      await vi.advanceTimersByTimeAsync(10);
+      await flush();
+
+      expect(onRunEnd).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: false,
+          exitCode: 1,
+          yieldStatus: "complete",
+          output: "post-yield MCP write failed",
+        })
+      );
+      expect(onRunEnd.mock.calls[0]?.[0]?.graceKilled).toBeUndefined();
     });
   });
 

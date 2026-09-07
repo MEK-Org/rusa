@@ -9,11 +9,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
 import { Actor, type RunAbandon } from "../actor/actor.js";
 import type { ActorMesh } from "../actor/actor-mesh.js";
-import { InMemoryEventSubscriptionStore } from "../actor/event-subscriptions.js";
+import { InMemoryEventSourceOwnerStore } from "../actor/event-subscriptions.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
@@ -24,7 +25,8 @@ import type { GitHubPollingIssueClient, IssueClient } from "../gitops/issue-clie
 import { resetIssueClient, setIssueClient } from "../gitops/issue-client.js";
 import { stampAuthor } from "../mcp/stamp.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
-import type { ProviderModelConfig } from "../providers/model-config.js";
+import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
+import type { RunResult } from "../providers/types.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
 
 const worktreeMock = vi.hoisted(() => ({
@@ -264,7 +266,7 @@ describe("start command tests", () => {
   });
 
   it("warns at boot with bounded identities only for configured missing subscriptions", () => {
-    const store = new InMemoryEventSubscriptionStore();
+    const store = new InMemoryEventSourceOwnerStore();
     store.subscribe({
       resource: "github:configured-org/repo/issues/2",
       actorId: "durable-actor",
@@ -307,7 +309,7 @@ describe("start command tests", () => {
   it("bounds boot consistency identities and reports the remainder", () => {
     const warn = vi.fn();
     const missing = warnMissingConfiguredEventSubscriptionsAtBoot(
-      new InMemoryEventSubscriptionStore(),
+      new InMemoryEventSourceOwnerStore(),
       Array.from({ length: 12 }, (_, index) => ({
         kind: "event_source_subscribed",
         actorId: `actor-${index}`,
@@ -937,6 +939,191 @@ describe("runStart webhook event routing (Phase 4)", () => {
       started: false,
     });
     expect(abandoned).toContainEqual({ actorId: "root", detail: "coalesced", started: true });
+  });
+
+  describe("supervisor cleanup after an accepted yield (#257)", () => {
+    /**
+     * Boot the production wiring with one rehydrated worker and hand back the
+     * hooks `runStart` actually built for it. The Actor's own classification is
+     * covered in actor.test.ts; what is asserted here is everything downstream
+     * of it — durable history, the `run_end` a dashboard reads, and the
+     * mechanical notice a parent receives.
+     */
+    const bootWithWorker = async (workerId: string): Promise<ActorMesh> => {
+      writeFileSync(
+        join(homeDir, "config.yaml"),
+        toYaml({
+          github: { account: "mock-bot" },
+          providers: { antigravity: { cliCommand: "agy" } },
+          rootActor: { provider: "antigravity", effort: "high" },
+          // No geminiApiKey: the failure route's exhaustion classifier then takes
+          // its deterministic offline branch, so this test never leaves the box.
+        }),
+        "utf8"
+      );
+      writeFileSync(
+        join(homeDir, "threads.json"),
+        JSON.stringify({
+          threads: [
+            legacyRootThread,
+            {
+              id: workerId,
+              charter: "yield cleanup worker",
+              parentId: "root",
+              status: "active",
+              createdAt: "2026-09-06T00:00:00.000Z",
+            },
+          ],
+        }),
+        "utf8"
+      );
+
+      let mesh: ActorMesh | undefined;
+      await new Promise<void>((resolve) => {
+        runStart({
+          e2e: {
+            onReady: (handles) => {
+              mesh = handles.mesh;
+              shutdownFn = handles.shutdown;
+              resolve();
+            },
+          },
+        });
+      });
+      if (!mesh) throw new Error("mesh not ready");
+      return mesh;
+    };
+
+    type RunHooks = {
+      opts: {
+        onRunStart?: (
+          responsive: boolean,
+          injectRecord: undefined,
+          selected: RawProviderModelConfig
+        ) => void;
+        onRunEnd?: (result: RunResult) => Promise<void> | void;
+      };
+    };
+
+    const hooksFor = (mesh: ActorMesh, workerId: string): RunHooks["opts"] => {
+      const worker = mesh.get(workerId);
+      if (!worker) throw new Error("worker not rehydrated");
+      return (worker as unknown as RunHooks).opts;
+    };
+
+    const startRun = (opts: RunHooks["opts"]): void => {
+      opts.onRunStart?.(false, undefined, {
+        provider: "antigravity",
+        model: "Gemini 3.7 Flash (High)",
+        effort: "high",
+      });
+    };
+
+    const mechanicalNotes = (actorId: string): string[] =>
+      getRepositories()
+        .inbox.list(actorId, { status: "all" })
+        .entries.map((entry) => entry.payload?.note)
+        .filter((note): note is string => typeof note === "string");
+
+    /**
+     * The parent-notification predicate fires only when the run selected work
+     * its parent sent, so give the worker exactly that. Appended and selected
+     * directly rather than routed as a live mesh message: delivery would also
+     * queue a provider run, and there is no CLI behind `agy` here.
+     */
+    const selectParentMessage = (mesh: ActorMesh, workerId: string): void => {
+      const [entry] = getRepositories().inbox.append([
+        {
+          actorId: workerId,
+          source: "mesh:root",
+          payload: { type: "mesh.message", messageId: `msg-${workerId}`, fromId: "root" },
+        },
+      ]);
+      if (!entry) throw new Error("parent message not appended");
+      mesh.selectInboxEntries(workerId, [entry.id]);
+    };
+
+    // #257 asks for complete *and* blocked to survive; both are accepted
+    // outcomes and only the blocked one tells a parent someone is waiting.
+    it.each([
+      { status: "complete", note: "branch pushed" },
+      { status: "blocked", note: "waiting on review" },
+    ])("preserves an accepted $status yield through history, run_end and the parent's inbox", async ({
+      status,
+      note,
+    }) => {
+      const workerId = `grace-kill-worker-${status}`;
+      const mesh = await bootWithWorker(workerId);
+      const opts = hooksFor(mesh, workerId);
+
+      startRun(opts);
+      selectParentMessage(mesh, workerId);
+      mesh.declareYield(workerId, status, note);
+      // The result the Actor produces for a grace-kill that followed an accepted
+      // yield: the yield's outcome, with the raw process exit kept as annotation.
+      await opts.onRunEnd?.({
+        success: true,
+        graceKilled: true,
+        cancelled: true,
+        exitCode: 143,
+        output: "agent transcript\n[Task killed by supervisor (yield grace period exceeded)]",
+        yieldStatus: status,
+        yieldNote: note,
+      });
+
+      const [run] = getRepositories().actorRuns.listRecentCompleted(workerId, 5);
+      expect(run).toMatchObject({
+        outcome: "completed",
+        success: true,
+        exitCode: 143,
+        yieldStatus: status,
+        yieldNote: note,
+      });
+      // Raw process exit diagnostics stay recoverable from the persisted run.
+      expect(run?.output).toContain("[Task killed by supervisor (yield grace period exceeded)]");
+
+      const [end] = getRepositories().meshEvents.listEventsByActors([workerId], {
+        limit: 20,
+        kinds: ["run_end"],
+      }).events;
+      expect(end?.success).toBe(true);
+      expect(end?.detail).toBe("exit 143");
+      expect(JSON.parse(end?.payload ?? "{}")).toMatchObject({
+        graceKilled: true,
+        yieldStatus: status,
+      });
+
+      // The parent hears the yield it accepted — asserted positively, since an
+      // absent notification would satisfy the no-failure check on its own.
+      const notes = mechanicalNotes("root");
+      expect(notes.some((n) => n.startsWith(`[yield/${status}] ${workerId}: ${note}`))).toBe(true);
+      expect(notes.some((n) => n.startsWith("[run failed]"))).toBe(false);
+    });
+
+    it("still forwards a genuine failure on the same wiring", async () => {
+      const workerId = "genuine-failure-worker";
+      const mesh = await bootWithWorker(workerId);
+      const opts = hooksFor(mesh, workerId);
+
+      startRun(opts);
+      await opts.onRunEnd?.({
+        success: false,
+        exitCode: 1,
+        output: "worktree checkout failed",
+      });
+
+      const [run] = getRepositories().actorRuns.listRecentCompleted(workerId, 5);
+      expect(run).toMatchObject({ outcome: "completed", success: false, exitCode: 1 });
+
+      const [end] = getRepositories().meshEvents.listEventsByActors([workerId], {
+        limit: 20,
+        kinds: ["run_end"],
+      }).events;
+      expect(end?.success).toBe(false);
+
+      const notes = mechanicalNotes("root");
+      expect(notes.some((note) => note.startsWith("[run failed]"))).toBe(true);
+    });
   });
 
   it("mounts a live calendar-read grant for root on the next run", async () => {
@@ -3563,6 +3750,53 @@ describe("runStart webhook event routing (Phase 4)", () => {
     );
   });
 
+  it("wires the mesh to the durable subscription store, scoped to configured sources", async () => {
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot", repos: ["custom-org/custom-repo"] },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity", effort: "high" },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    let mesh: ActorMesh | undefined;
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+
+    await readyPromise;
+    if (!mesh) throw new Error("mesh not ready");
+
+    // Subscribing through the mesh must reach SQLite, not a per-process
+    // in-memory default — a subscription that evaporated on restart would be a
+    // routing decision the operator cannot see or rely on.
+    mesh.addEventSourceSubscriber("github:custom-org/custom-repo/issues/3", "root", "root");
+    expect(getRepositories().eventSourceSubscriptions.list()).toEqual([
+      expect.objectContaining({
+        resource: "github:custom-org/custom-repo/issues/3",
+        actorId: "root",
+        subscribedBy: "root",
+      }),
+    ]);
+
+    // And the configured sources reached the mesh, so subscribing cannot widen
+    // the instance past what config.yaml declares.
+    expect(() =>
+      mesh?.addEventSourceSubscriber("github:unconfigured-org/elsewhere", "root", "root")
+    ).toThrow(/not anchored in a configured event source/);
+  });
+
   it("drops inbound chat messages from spaces listed in chat.excludedSpaces ", async () => {
     const chatClient = new FakeChatClient();
     const chatSource = new FakeChatSource();
@@ -3818,6 +4052,115 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const t2Record = mesh.actors.get("t2");
     expect(t2Record).toBeDefined();
     expect(t2Record?.status).toBe("active");
+  });
+
+  // The arbiter for the host-jobs cutover wiring : the importer, repository
+  // and db-check tests all pass against a store nothing production-facing is
+  // holding, so this boots the real thing from a legacy file and then drives
+  // the wired exit endpoint over its own socket. A dropped import call, or a
+  // second store constructed for one of the two consumers, fails here.
+  it("imports host jobs at boot and serves the exit endpoint from the same database", async () => {
+    const legacyPath = join(homeDir, "host-jobs.json");
+    const legacyBytes = JSON.stringify({
+      jobs: [
+        {
+          id: "job-legacy",
+          actorId: "root",
+          unitName: "job-root-legacy1",
+          scriptLabel: "echo legacy",
+          manifest: { readPaths: [] },
+          auditArtifactPath: join(homeDir, "host-jobs", "audit", "job-legacy.json"),
+          auditArtifactSha256: "a".repeat(64),
+          runtimeMaxSec: 3600,
+          submittedAt: "2026-07-01T00:00:00.000Z",
+        },
+      ],
+    });
+    writeFileSync(legacyPath, legacyBytes, "utf8");
+
+    const readyPromise = new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          onReady: (handles) => {
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    await readyPromise;
+
+    // The legacy file became state and was archived, not deleted.
+    expect(existsSync(legacyPath)).toBe(false);
+    const backups = readdirSync(homeDir).filter(
+      (name) => name.startsWith("host-jobs.json.imported-") && name.endsWith(".bak")
+    );
+    expect(backups).toHaveLength(1);
+    expect(readFileSync(join(homeDir, backups[0] ?? ""), "utf8")).toBe(legacyBytes);
+
+    // A connection of this test's own — what the mesh committed, not what it
+    // happens to be holding in memory.
+    const probe = new Database(join(homeDir, "data", "mesh.db"));
+    try {
+      expect(probe.prepare("SELECT id, completed_at FROM host_jobs ORDER BY id").all()).toEqual([
+        { id: "job-legacy", completed_at: null },
+      ]);
+
+      // A job the booted mesh has never seen, written after boot by another
+      // connection. A store that snapshotted the file at startup cannot route
+      // this one's exit.
+      probe
+        .prepare(
+          `INSERT INTO host_jobs (
+             id, actor_id, unit_name, script_label, manifest,
+             audit_artifact_path, audit_artifact_sha256, runtime_max_sec, submitted_at
+           ) VALUES ('job-after-boot', 'root', 'job-root-afterboot', 'echo later',
+             '{"schemaVersion":1,"readPaths":[]}', '/tmp/after-boot.json', 'b', 60,
+             '2026-07-02T00:00:00.000Z')`
+        )
+        .run();
+
+      // Drive the real endpoint the way wake-on-exit.sh does: unit name only,
+      // no job id, bearer token and port read off the files start.ts published.
+      const token = readFileSync(join(homeDir, "wake-token"), "utf8").trim();
+      const port = readFileSync(join(homeDir, "wake-port"), "utf8").trim();
+      const response = await fetch(`http://127.0.0.1:${port}/host-jobs/exit`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          unitName: "job-root-afterboot",
+          actorId: "root",
+          result: "success",
+          exitStatus: "0",
+        }).toString(),
+      });
+      expect(response.status).toBe(200);
+
+      const rows = probe
+        .prepare("SELECT id, exit_status, exit_code FROM host_jobs ORDER BY id")
+        .all() as { id: string; exit_status: string | null; exit_code: string | null }[];
+      // The exit landed on the row it named, in this database — and the
+      // imported job, which did not exit, is untouched.
+      expect(rows).toEqual([
+        { id: "job-after-boot", exit_status: "success", exit_code: "0" },
+        { id: "job-legacy", exit_status: null, exit_code: null },
+      ]);
+
+      // The exit also went through the mesh the endpoint was wired to: the
+      // job-specific ledger event names the resolved job and its owner.
+      const exitEvents = probe
+        .prepare("SELECT actor_id, detail FROM mesh_events WHERE kind = 'host_job_exited'")
+        .all() as { actor_id: string | null; detail: string | null }[];
+      expect(exitEvents).toHaveLength(1);
+      expect(exitEvents[0]?.actor_id).toBe("root");
+      expect(exitEvents[0]?.detail).toContain("job-root-afterboot");
+      expect(exitEvents[0]?.detail).toContain("jobId=job-after-boot");
+    } finally {
+      probe.close();
+    }
   });
 
   it("provides unscoped chat-read MCP server to all spawned workers when chatClient is configured (#59)", async () => {

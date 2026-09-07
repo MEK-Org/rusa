@@ -2,12 +2,28 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import { Actor } from "../actor/actor.js";
-import { ActorMesh, type MeshObligationPort } from "../actor/actor-mesh.js";
+import {
+  ActorMesh,
+  type ActorMeshOptions,
+  type MeshObligationPort,
+  type SpawnRequest,
+} from "../actor/actor-mesh.js";
+import type { ActorRecord } from "../actor/actor-record.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
+import type { RusaConfig } from "../config/types.js";
+import { runMigrations } from "../db/migrations/runner.js";
+import { ModelClassRepository } from "../db/repositories/model-class-repository.js";
 import { FakeProvider } from "../providers/fake-provider.js";
+import {
+  fillModelConfigFromCurrent,
+  type ModelConfigInput,
+  resolveModelClasses,
+  validateModelConfigPool,
+} from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { createAgentExecMcpServer } from "./agent-exec-mcp.js";
@@ -28,6 +44,11 @@ function dataOf(result: CallToolResult): unknown {
   } catch {
     return text;
   }
+}
+
+/** The owner half of `list_subscriptions`, which reports owners and subscribers separately. */
+function ownersOf(result: CallToolResult): unknown {
+  return (dataOf(result) as { owners?: unknown }).owners;
 }
 
 /** A child-provider run that blocks until released — for in-flight-run assertions. */
@@ -64,6 +85,9 @@ function setup(
     maxConcurrent?: number;
     scheduledMessages?: ScheduledMessageScheduler;
     obligations?: MeshObligationPort;
+    validateSpawn?: ActorMeshOptions["validateSpawn"];
+    validateModel?: ActorMeshOptions["validateModel"];
+    configuredEventSources?: readonly string[];
   } = {}
 ) {
   const registry = new InMemoryActorRepository();
@@ -77,6 +101,8 @@ function setup(
   let seq = 0;
   const mesh = new ActorMesh({
     actors: registry,
+    validateSpawn: opts.validateSpawn,
+    validateModel: opts.validateModel,
     maxConcurrent: opts.maxConcurrent,
     scheduledMessages: opts.scheduledMessages,
     obligations: opts.obligations,
@@ -88,6 +114,7 @@ function setup(
     ]),
     idgen: () => `t${++seq}`,
     now: () => "2026-01-01T00:00:00Z",
+    configuredEventSources: opts.configuredEventSources,
     createActor: (ctx) =>
       new Actor({
         id: ctx.record.id,
@@ -155,6 +182,8 @@ describe("agent-execution MCP server", () => {
         "set_actor_model",
         "set_thread_title",
         "spawn_thread",
+        "subscribe_event_source",
+        "unsubscribe_event_source",
         "yield_run",
       ].sort()
     );
@@ -205,6 +234,8 @@ describe("agent-execution MCP server", () => {
         "send_message",
         "set_actor_model",
         "spawn_thread",
+        "subscribe_event_source",
+        "unsubscribe_event_source",
         "yield_run",
       ].sort()
     );
@@ -1129,13 +1160,17 @@ describe("agent-execution MCP server", () => {
     expect(names).not.toContain("revive_thread");
   });
 
-  it("does not expose runtime subscribe/unsubscribe/list tools on a non-root endpoint", async () => {
+  // The subscribe/unsubscribe tools are exposed on every endpoint, but they only
+  // ever act on the caller and never take ownership — the invariant this test
+  // protects is that a non-root actor still cannot inspect the whole mesh's
+  // routing, nor claim a source that config does not cover (asserted below).
+  it("exposes self-only subscribe/unsubscribe but not the root inspection tool on a non-root endpoint", async () => {
     const { mesh } = setup();
     const client = await connect(createAgentExecMcpServer(mesh, "worker-1", "root"));
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name);
-    expect(names).not.toContain("subscribe_event_source");
-    expect(names).not.toContain("unsubscribe_event_source");
+    expect(names).toContain("subscribe_event_source");
+    expect(names).toContain("unsubscribe_event_source");
     expect(names).not.toContain("list_subscriptions");
     expect(names).toContain("delegate_event_source");
     expect(names).toContain("reclaim_event_source");
@@ -1189,7 +1224,7 @@ describe("agent-execution MCP server", () => {
         name: "list_subscriptions",
         arguments: {},
       })) as CallToolResult;
-      expect(dataOf(listRes)).toEqual(
+      expect(ownersOf(listRes)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             actorId: "t2",
@@ -1210,7 +1245,7 @@ describe("agent-execution MCP server", () => {
         name: "list_subscriptions",
         arguments: {},
       })) as CallToolResult;
-      expect(dataOf(listRes)).toEqual(
+      expect(ownersOf(listRes)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             actorId: "t1",
@@ -1272,7 +1307,7 @@ describe("agent-execution MCP server", () => {
         name: "list_subscriptions",
         arguments: {},
       })) as CallToolResult;
-      expect(dataOf(listRes)).toEqual(
+      expect(ownersOf(listRes)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             actorId: "t2",
@@ -1332,7 +1367,7 @@ describe("agent-execution MCP server", () => {
         name: "list_subscriptions",
         arguments: {},
       })) as CallToolResult;
-      expect(dataOf(listRes)).toEqual(
+      expect(ownersOf(listRes)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             actorId: "t2",
@@ -1359,7 +1394,7 @@ describe("agent-execution MCP server", () => {
         name: "list_subscriptions",
         arguments: {},
       })) as CallToolResult;
-      expect(dataOf(listRes)).toEqual(
+      expect(ownersOf(listRes)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             actorId: "t1",
@@ -1455,7 +1490,7 @@ describe("agent-execution MCP server", () => {
         name: "list_subscriptions",
         arguments: {},
       })) as CallToolResult;
-      expect(dataOf(listRes)).toEqual(
+      expect(ownersOf(listRes)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
             actorId: "root",
@@ -1470,6 +1505,262 @@ describe("agent-execution MCP server", () => {
         ])
       );
     });
+  });
+
+  describe("Direct subscription tools", () => {
+    const REPO = "github:dummy-org/dummy-repo";
+    const ISSUE = "github:dummy-org/dummy-repo/issues/9";
+
+    it("subscribes and unsubscribes the caller, and only the caller", async () => {
+      const { mesh } = setup();
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      await rootClient.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "watcher",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      });
+      const watcherClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
+
+      const subscribed = (await watcherClient.callTool({
+        name: "subscribe_event_source",
+        arguments: { source: ISSUE },
+      })) as CallToolResult;
+      expect(subscribed.isError).toBeFalsy();
+      expect(dataOf(subscribed)).toContain(`subscribed to ${ISSUE}`);
+
+      // The tool takes no actor argument at all: a subscription is a claim on
+      // your own attention, so there is no shape of call that puts another
+      // actor on a source's delivery list.
+      expect(mesh.listEventSourceSubscriptions()).toEqual([
+        expect.objectContaining({ resource: ISSUE, actorId: "t1", subscribedBy: "t1" }),
+      ]);
+      const schema = (await watcherClient.listTools()).tools.find(
+        (tool) => tool.name === "subscribe_event_source"
+      )?.inputSchema;
+      expect(Object.keys(schema?.properties ?? {})).not.toContain("child_thread_id");
+
+      const unsubscribed = (await watcherClient.callTool({
+        name: "unsubscribe_event_source",
+        arguments: { source: ISSUE },
+      })) as CallToolResult;
+      expect(unsubscribed.isError).toBeFalsy();
+      expect(mesh.listEventSourceSubscriptions()).toEqual([]);
+    });
+
+    it("takes no ownership, so the owner keeps the source", async () => {
+      const { mesh } = setup();
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      await rootClient.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "watcher",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      });
+      mesh.subscribeEventSource(ISSUE, "root", "root");
+
+      const watcherClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
+      const res = (await watcherClient.callTool({
+        name: "subscribe_event_source",
+        arguments: { source: ISSUE },
+      })) as CallToolResult;
+
+      // Contrast with delegate_event_source, which would have to displace root.
+      expect(res.isError).toBeFalsy();
+      expect(
+        mesh.listSubscriptions().filter((s) => s.resource === ISSUE && !s.unsubscribedAt)
+      ).toEqual([expect.objectContaining({ actorId: "root" })]);
+    });
+
+    it("accepts the legacy kind/repo/number schema as delegation does", async () => {
+      const { mesh } = setup();
+      const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const res = (await client.callTool({
+        name: "subscribe_event_source",
+        arguments: { kind: "github_issue", repo: "dummy-org/dummy-repo", number: 9 },
+      })) as CallToolResult;
+      expect(res.isError).toBeFalsy();
+      expect(mesh.listEventSourceSubscriptions().map((s) => s.resource)).toEqual([ISSUE]);
+    });
+
+    it("refuses a source outside this instance's configured scope", async () => {
+      const { mesh } = setup({ configuredEventSources: [REPO] });
+      const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+      const refused = (await client.callTool({
+        name: "subscribe_event_source",
+        arguments: { source: "github:other-org/elsewhere" },
+      })) as CallToolResult;
+      expect(refused.isError).toBeTruthy();
+      expect(String(dataOf(refused))).toContain("not anchored in a configured event source");
+      expect(mesh.listEventSourceSubscriptions()).toEqual([]);
+
+      const allowed = (await client.callTool({
+        name: "subscribe_event_source",
+        arguments: { source: ISSUE },
+      })) as CallToolResult;
+      expect(allowed.isError).toBeFalsy();
+    });
+
+    it("list_subscriptions reports owners and subscribers separately", async () => {
+      const { mesh } = setup();
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      await rootClient.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "watcher",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      });
+      mesh.subscribeEventSource(ISSUE, "root", "root");
+      await (await connect(createAgentExecMcpServer(mesh, "t1", "root"))).callTool({
+        name: "subscribe_event_source",
+        arguments: { source: ISSUE },
+      });
+
+      const listed = dataOf(
+        (await rootClient.callTool({
+          name: "list_subscriptions",
+          arguments: {},
+        })) as CallToolResult
+      ) as { owners: { actorId: string }[]; subscribers: { actorId: string }[] };
+
+      // One source, two different relationships to it — reporting only the
+      // owner half under this name would read as the whole answer.
+      expect(listed.owners).toEqual([
+        expect.objectContaining({ resource: ISSUE, actorId: "root" }),
+      ]);
+      expect(listed.subscribers).toEqual([
+        expect.objectContaining({ resource: ISSUE, actorId: "t1" }),
+      ]);
+    });
+  });
+});
+
+describe("runtime model-class management", () => {
+  const config = {
+    providers: {
+      claude: { cliCommand: "claude" },
+      codex: { cliCommand: "codex" },
+    },
+  } as unknown as RusaConfig;
+
+  function hooks(store: ModelClassRepository) {
+    return {
+      validateSpawn: (req: SpawnRequest) =>
+        validateModelConfigPool(config, resolveModelClasses(store, req.modelConfig), {
+          portable: req.context?.type === "portable",
+        }),
+      validateModel: (record: ActorRecord, modelConfig: ModelConfigInput) =>
+        validateModelConfigPool(
+          config,
+          fillModelConfigFromCurrent(resolveModelClasses(store, modelConfig), record.modelConfig),
+          { portable: record.context?.type === "portable" }
+        ),
+    };
+  }
+
+  function managementOptions(store: ModelClassRepository) {
+    return {
+      modelClasses: store,
+      validateModelClass: (input: ModelConfigInput) =>
+        validateModelConfigPool(config, input, { portable: true }),
+    };
+  }
+
+  it("updates a class then resolves its new committed definition without a restart", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new ModelClassRepository(db);
+    const { mesh, registry } = setup(hooks(store));
+    const root = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
+    );
+    const rootTools = (await root.listTools()).tools.map((tool) => tool.name);
+    expect(rootTools).toContain("list_model_classes");
+    expect(rootTools).toContain("set_model_class");
+    expect(rootTools).toContain("delete_model_class");
+
+    const firstSet = (await root.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "review",
+        model_config: { provider: "claude", model: "claude-opus-4-8" },
+      },
+    })) as CallToolResult;
+    expect(firstSet.isError).toBeFalsy();
+    const firstSpawn = (await root.callTool({
+      name: "spawn_thread",
+      arguments: {
+        charter: "first",
+        model_config: { class: "review" },
+        context_mode: "ledger",
+      },
+    })) as CallToolResult;
+    const firstId = (dataOf(firstSpawn) as { thread_id: string }).thread_id;
+    expect(registry.get(firstId)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8", effort: undefined },
+    ]);
+
+    const update = (await root.callTool({
+      name: "set_model_class",
+      arguments: {
+        name: "review",
+        model_config: { provider: "codex", model: "gpt-5.6-sol" },
+      },
+    })) as CallToolResult;
+    expect(update.isError).toBeFalsy();
+    const setExisting = (await root.callTool({
+      name: "set_actor_model",
+      arguments: { actor_id: firstId, model_config: { class: "review" } },
+    })) as CallToolResult;
+    expect(setExisting.isError).toBeFalsy();
+    expect(registry.get(firstId)?.desiredModelConfig).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol", effort: undefined },
+    ]);
+    const secondSpawn = (await root.callTool({
+      name: "spawn_thread",
+      arguments: { charter: "second", model_config: { class: "review" } },
+    })) as CallToolResult;
+    const secondId = (dataOf(secondSpawn) as { thread_id: string }).thread_id;
+    expect(registry.get(secondId)?.modelConfig).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol", effort: undefined },
+    ]);
+    // The class edit is deliberately not late-bound into existing records.
+    expect(registry.get(firstId)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8", effort: undefined },
+    ]);
+    db.close();
+  });
+
+  it("rejects invalid definitions and unknown classes, and never exposes management to workers", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const store = new ModelClassRepository(db);
+    const { mesh } = setup(hooks(store));
+    const root = await connect(
+      createAgentExecMcpServer(mesh, "root", "root", undefined, managementOptions(store))
+    );
+    const invalid = (await root.callTool({
+      name: "set_model_class",
+      arguments: { name: "bad", model_config: { provider: "claude" } },
+    })) as CallToolResult;
+    expect(invalid.isError).toBe(true);
+    const unknown = (await root.callTool({
+      name: "spawn_thread",
+      arguments: { charter: "work", model_config: { class: "missing" } },
+    })) as CallToolResult;
+    expect(unknown.isError).toBe(true);
+    const worker = await connect(
+      createAgentExecMcpServer(mesh, "worker-1", "root", undefined, managementOptions(store))
+    );
+    const names = (await worker.listTools()).tools.map((tool) => tool.name);
+    expect(names).not.toContain("set_model_class");
+    expect(names).not.toContain("delete_model_class");
+    expect(names).not.toContain("list_model_classes");
+    db.close();
   });
 });
 
@@ -1612,6 +1903,138 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
     })) as CallToolResult;
     expect(res.isError).toBe(true);
     expect((res.content[0] as { text: string }).text).toMatch(/invalid cron/);
+  });
+
+  // The production wiring (commands/start.ts): named classes resolve from the
+  // boundary, and set_actor_model fills an omitted model from the actor's
+  // current pool before validating. Both MCP model-class tests below run
+  // against this, so a class reference that leaks through the schema is
+  // exercised on the same path an operator would hit.
+  const CONFIG = {
+    providers: {
+      claude: { cliCommand: "claude" },
+      codex: { cliCommand: "codex" },
+      kimi: { cliCommand: "kimi" },
+    },
+  } as unknown as RusaConfig;
+
+  const CLASS_STORE = {
+    get: (name: string) =>
+      name === "review"
+        ? { modelConfig: [{ provider: "claude", model: "claude-opus-4-8", effort: "max" }] }
+        : undefined,
+    list: () => [{ name: "review" }],
+  };
+
+  const productionHooks = () => ({
+    validateSpawn: (req: SpawnRequest) =>
+      validateModelConfigPool(CONFIG, resolveModelClasses(CLASS_STORE, req.modelConfig), {
+        portable: req.context?.type === "portable",
+      }),
+    validateModel: (record: ActorRecord, modelConfig: ModelConfigInput) =>
+      validateModelConfigPool(
+        CONFIG,
+        fillModelConfigFromCurrent(
+          resolveModelClasses(CLASS_STORE, modelConfig),
+          record.modelConfig
+        ),
+        { portable: record.context?.type === "portable" }
+      ),
+  });
+
+  it("spawn_thread expands a model class reference into its configured pool", async () => {
+    const { mesh, registry } = setup(productionHooks());
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+    const res = (await client.callTool({
+      name: "spawn_thread",
+      arguments: { charter: "review the PR", model_config: { class: "review" } },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    const id = (dataOf(res) as { thread_id: string }).thread_id;
+    expect(registry.get(id)?.modelConfig).toEqual([
+      { provider: "claude", model: "claude-opus-4-8", effort: "max" },
+    ]);
+  });
+
+  it("spawn_thread refuses a class reference carrying a sibling tuple field", async () => {
+    const { mesh, registry } = setup(productionHooks());
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+    // Both shapes must fail at the schema: `class` may not be silently dropped
+    // so the request degrades into a concrete tuple on the named provider.
+    for (const model_config of [
+      { class: "review", provider: "codex" },
+      { class: "review", provider: "codex", model: "gpt-5.6-sol" },
+    ]) {
+      const res = (await client.callTool({
+        name: "spawn_thread",
+        arguments: { charter: "review the PR", model_config },
+      })) as CallToolResult;
+      expect(res.isError).toBe(true);
+    }
+    expect(registry.list().filter((r) => r.id !== "root")).toEqual([]);
+  });
+
+  it("spawn_thread refuses a class reference nested inside a pool", async () => {
+    const { mesh, registry } = setup(productionHooks());
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+    const res = (await client.callTool({
+      name: "spawn_thread",
+      arguments: {
+        charter: "review the PR",
+        model_config: [{ provider: "codex", model: "gpt-5.6-sol" }, { class: "review" }],
+        context_mode: "ledger",
+      },
+    })) as CallToolResult;
+
+    expect(res.isError).toBe(true);
+    expect(registry.list().filter((r) => r.id !== "root")).toEqual([]);
+  });
+
+  it("set_actor_model refuses a class reference carrying a sibling provider, rather than filling it from the current pool", async () => {
+    const { mesh, registry } = setup(productionHooks());
+    const childId = mesh.spawn({
+      charter: "worker",
+      parentId: "root",
+      modelConfig: { provider: "codex", model: "gpt-5.6-sol" },
+    });
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+    // The dangerous case: with `class` stripped, `{provider: "codex"}` would be
+    // completed from the actor's current codex entry and quietly succeed as a
+    // partial concrete update instead of resolving the named class.
+    const res = (await client.callTool({
+      name: "set_actor_model",
+      arguments: { actor_id: childId, model_config: { class: "review", provider: "codex" } },
+    })) as CallToolResult;
+
+    expect(res.isError).toBe(true);
+    expect(registry.get(childId)?.desiredModelConfig).toBeUndefined();
+    expect(registry.get(childId)?.modelConfig).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol" },
+    ]);
+  });
+
+  it("set_actor_model still fills an omitted model from the current pool for a concrete partial update", async () => {
+    const { mesh, registry } = setup(productionHooks());
+    registry.patch("root", {
+      modelConfig: [{ provider: "codex", model: "gpt-5.6-sol" }],
+      context: { type: "portable", mode: "ledger" },
+    });
+    const client = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+    const res = (await client.callTool({
+      name: "set_actor_model",
+      arguments: { actor_id: "root", model_config: { provider: "codex", effort: "xhigh" } },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    expect(registry.get("root")?.desiredModelConfig).toEqual([
+      { provider: "codex", model: "gpt-5.6-sol", effort: "xhigh" },
+    ]);
   });
 
   it("set_actor_model stages a full modelConfig replacement via MCP tool", async () => {

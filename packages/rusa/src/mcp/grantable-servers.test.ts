@@ -70,6 +70,7 @@ const STUB_DEPS: GrantableServerDeps = {
   e2eInstance: {
     manager: {
       up: () => ({ state: "up", port: 8083 }),
+      resume: () => ({ state: "up", port: 8083 }),
       down: () => ({ state: "down", port: 8083 }),
       status: () => ({ state: "down", port: 8083 }),
     },

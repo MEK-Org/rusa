@@ -135,6 +135,8 @@ export function createHostJobsServer(
         // or spawns a process; any failure in this window must purge whatever
         // was already materialized so nothing orphans (ISSUE_NUM's write-then-fail
         // window covers script/audit writes, not just the spawn call itself).
+        const submittedAt = now();
+        let durablyRecorded = false;
         let auditArtifact: { path: string; sha256: string };
         try {
           const scriptPath = writeHostJobScript(scratchDir, script);
@@ -155,28 +157,49 @@ export function createHostJobsServer(
             scriptPath,
             scriptArgs: args,
           });
+          // Durable record BEFORE the launch, never after. The store is SQLite
+          // now, so `submit` can fail (constraint, busy, I/O) where the retired
+          // file store swallowed the write and kept an in-process copy. Ordered
+          // the other way, a failed write would leave a unit systemd had already
+          // accepted with no row to list, stop or route its exit through. Here
+          // the failure lands before anything is running.
+          deps.store.submit({
+            id,
+            actorId: selfId,
+            unitName,
+            scriptLabel: scriptLabelFor(script),
+            manifest,
+            auditArtifactPath: auditArtifact.path,
+            auditArtifactSha256: auditArtifact.sha256,
+            runtimeMaxSec: resolvedRuntimeMaxSec,
+            submittedAt,
+          });
+          durablyRecorded = true;
           spawnHostJob(argv);
         } catch (err) {
           // The job never actually started — purge what we may have written
           // so it doesn't linger as an orphan .
-          rmSync(auditArtifactPath, { force: true });
           rmSync(scratchDir, { recursive: true, force: true });
+          if (durablyRecorded) {
+            // A row exists for a launch that failed. Close it out instead of
+            // deleting it: the record of an attempted submit is audit history
+            // like any other, and leaving it open would hold one of the actor's
+            // concurrency slots against a unit that does not exist. Its audit
+            // artifact stays on disk so the pointer the row carries resolves.
+            // If this compensating write fails too, the original failure is
+            // still what the caller is told, and the row stays visible and
+            // stoppable rather than silently gone.
+            try {
+              deps.store.recordExit(id, now(), "launch-failed");
+            } catch {
+              /* best effort — the original error below is the one that matters */
+            }
+          } else {
+            rmSync(auditArtifactPath, { force: true });
+          }
           throw err;
         }
 
-        const scriptLabel = scriptLabelFor(script);
-        const submittedAt = now();
-        deps.store.submit({
-          id,
-          actorId: selfId,
-          unitName,
-          scriptLabel,
-          manifest,
-          auditArtifactPath: auditArtifact.path,
-          auditArtifactSha256: auditArtifact.sha256,
-          runtimeMaxSec: resolvedRuntimeMaxSec,
-          submittedAt,
-        });
         deps.recordEvent({
           kind: "host_job_submitted",
           actorId: selfId,

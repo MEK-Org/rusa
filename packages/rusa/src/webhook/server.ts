@@ -142,6 +142,8 @@ export interface DashboardMeshRefs {
   queuedThreadIds?: () => Set<string>;
   /** Per-lane provider queue snapshots; see `DashboardDataDeps`. */
   providerQueueSnapshots?: DashboardDataDeps["providerQueueSnapshots"];
+  /** Active-run inbox focus projection; see `DashboardDataDeps`. */
+  selectedObligationForActor?: DashboardDataDeps["selectedObligationForActor"];
   /** This instance's configured root identity ; see `DashboardDataDeps`. */
   rootIdentity?: DashboardDataDeps["rootIdentity"];
   /** Gemini API key, for on-demand avatar generation ; see `DashboardDataDeps`. */
@@ -479,6 +481,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           runningThreadIds: options.mesh.runningThreadIds,
           queuedThreadIds: options.mesh.queuedThreadIds,
           providerQueueSnapshots: options.mesh.providerQueueSnapshots,
+          selectedObligationForActor: options.mesh.selectedObligationForActor,
           rootIdentity: options.mesh.rootIdentity,
           geminiApiKey: options.mesh.geminiApiKey,
           referenceCache: options.mesh.referenceCache,

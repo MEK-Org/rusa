@@ -20,11 +20,13 @@ ActorRuntimeStateDelta _runtime(
   String actorId,
   RunState runState, {
   String streamId = 'stream-a',
+  bool refreshThreadSnapshot = false,
 }) => ActorRuntimeStateDelta(
   streamId: streamId,
   revision: revision,
   actorId: actorId,
   runState: runState,
+  refreshThreadSnapshot: refreshThreadSnapshot,
 );
 
 void main() {
@@ -38,6 +40,40 @@ void main() {
     expect(cleared.desiredModel, isNull);
     expect(cleared.desiredProvider, isNull);
   });
+
+  test(
+    'runtime queued and idle transitions clear an active-run focus locally',
+    () async {
+      final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
+        ..threadsResult = [
+          makeThread(
+            'a',
+            runState: RunState.running,
+            selectedObligation: makeObligation(
+              'active-focus',
+              ownerId: 'a',
+              title: 'Active focus',
+            ),
+          ),
+        ];
+      final stream = FakeStream();
+      final store = await _booted(api, stream);
+
+      stream.runtimeStatesCtrl.add(_runtime(1, 'a', RunState.queued));
+      await pumpEventQueue();
+      expect(store.actor('a')?.runState, RunState.queued);
+      expect(store.actor('a')?.selectedObligation, isNull);
+      expect(api.threadsCallCount, 1);
+
+      stream.runtimeStatesCtrl.add(_runtime(2, 'a', RunState.idle));
+      await pumpEventQueue();
+      expect(store.actor('a')?.runState, RunState.idle);
+      expect(store.actor('a')?.selectedObligation, isNull);
+      expect(api.threadsCallCount, 1);
+      await store.dispose();
+    },
+  );
 
   test('init loads dashboard quota provider config', () async {
     final api = FakeApi()
@@ -890,6 +926,80 @@ void main() {
       await pumpEventQueue();
       expect(store.actor('a')?.runState, RunState.windingDown);
       expect(api.threadsCallCount, 2);
+      await store.dispose();
+    },
+  );
+
+  test(
+    'focus refreshes received during an in-flight fetch drain in revision order and finish cleared',
+    () async {
+      final staleFocus = makeObligation(
+        'stale-focus',
+        ownerId: 'a',
+        title: 'Stale focus',
+      );
+      final updatedFocus = makeObligation(
+        'updated-focus',
+        ownerId: 'a',
+        title: 'Updated focus',
+      );
+      final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
+        ..threadsResult = [
+          makeThread(
+            'a',
+            runState: RunState.running,
+            selectedObligation: staleFocus,
+          ),
+        ];
+      final stream = FakeStream();
+      final store = await _booted(api, stream);
+      final firstRefresh = Completer<ThreadsSnapshot>();
+      final clearRefresh = Completer<ThreadsSnapshot>();
+      api.threadSnapshotGates.add(firstRefresh);
+
+      // Revision 1 starts a focus refresh. Revisions 2 and 3 arrive before
+      // its response; 3 is a second focus refresh buffered behind an ordinary
+      // runtime change.
+      stream.runtimeStatesCtrl.add(
+        _runtime(1, 'a', RunState.running, refreshThreadSnapshot: true),
+      );
+      await pumpEventQueue();
+      expect(api.threadsCallCount, 2);
+      stream.runtimeStatesCtrl
+        ..add(_runtime(2, 'a', RunState.windingDown))
+        ..add(_runtime(3, 'a', RunState.running, refreshThreadSnapshot: true));
+      await pumpEventQueue();
+
+      api.threadSnapshotGates.add(clearRefresh);
+      firstRefresh.complete(
+        ThreadsSnapshot(
+          halted: false,
+          runtimeCursor: const RuntimeCursor(streamId: 'stream-a', revision: 1),
+          threads: [
+            makeThread(
+              'a',
+              runState: RunState.running,
+              selectedObligation: updatedFocus,
+            ),
+          ],
+        ),
+      );
+      await pumpEventQueue();
+
+      expect(api.threadsCallCount, 3);
+      expect(store.actor('a')?.runState, RunState.running);
+      expect(store.actor('a')?.selectedObligation?.id, updatedFocus.id);
+
+      clearRefresh.complete(
+        ThreadsSnapshot(
+          halted: false,
+          runtimeCursor: const RuntimeCursor(streamId: 'stream-a', revision: 3),
+          threads: [makeThread('a', runState: RunState.running)],
+        ),
+      );
+      await pumpEventQueue();
+      expect(store.actor('a')?.selectedObligation, isNull);
       await store.dispose();
     },
   );

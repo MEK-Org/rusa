@@ -155,6 +155,25 @@ export class TriggerRunner {
     this.pendingNudge = null;
   }
 
+  /**
+   * Return a copy of the scheduling metadata for the run currently awaiting
+   * completion. Callers that cancel a queued admission use this to retain the
+   * opportunity's priority and mode for a later replay.
+   */
+  currentNudgeSnapshot(): RunNudge {
+    return this.currentNudge ? { ...this.currentNudge } : {};
+  }
+
+  /**
+   * Re-admit the in-progress scheduling opportunity once its current attempt
+   * unwinds. This keeps its original priority and mode instead of manufacturing
+   * a fresh ordinary nudge.
+   */
+  requeueCurrentRun(): void {
+    this.pendingNudge = mergeNudges(this.pendingNudge, this.currentNudge);
+    this.dirty = true;
+  }
+
   private async startRun(): Promise<void> {
     if (this.running) {
       this.dirty = true;

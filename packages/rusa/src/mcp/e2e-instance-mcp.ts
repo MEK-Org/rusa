@@ -8,6 +8,7 @@ export const E2E_INSTANCE_MCP_NAME = "e2e-instance";
 
 export interface E2EInstanceController {
   up(actorId: string, worktree: string): E2EInstanceStatus | Promise<E2EInstanceStatus>;
+  resume(actorId: string, root: string): E2EInstanceStatus | Promise<E2EInstanceStatus>;
   down(actorId: string): E2EInstanceStatus;
   status(): E2EInstanceStatus;
 }
@@ -29,6 +30,13 @@ export function createE2EInstanceServer(
   const up = async ({ worktree }: { worktree: string }) => {
     try {
       return toolOk(await deps.manager.up(selfId, worktree));
+    } catch (err) {
+      return toolError(err);
+    }
+  };
+  const resume = async ({ root }: { root: string }) => {
+    try {
+      return toolOk(await deps.manager.resume(selfId, root));
     } catch (err) {
       return toolError(err);
     }
@@ -63,6 +71,23 @@ export function createE2EInstanceServer(
       },
     },
     up
+  );
+  server.registerTool(
+    "resume",
+    {
+      title: "Resume my preserved live e2e instance",
+      description:
+        "Resume a preserved actor-mesh e2e root I previously held, via `am-up --root <path> --resume` " +
+        "instead of provisioning fresh state. Requires my own preserved, currently-inactive holder " +
+        "record and a root that is structurally resumable.",
+      inputSchema: {
+        root: z
+          .string()
+          .min(1)
+          .describe("Absolute path to the preserved e2e instance root to resume."),
+      },
+    },
+    resume
   );
   server.registerTool(
     "status",

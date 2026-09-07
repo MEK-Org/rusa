@@ -10,8 +10,13 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { Actor } from "../actor/actor.js";
-import { ActorMesh, type MeshActor, type RetireCleanup } from "../actor/actor-mesh.js";
+import { Actor, type ActorOptions } from "../actor/actor.js";
+import {
+  type ActorFactoryContext,
+  ActorMesh,
+  type MeshActor,
+  type RetireCleanup,
+} from "../actor/actor-mesh.js";
 import type { ActorRecord, PortableContextConfig } from "../actor/actor-record.js";
 import { execAtIo, preflightAt, unavailableAtIo } from "../actor/at-queue.js";
 import { PARENT_GRANTABLE_CAPABILITIES } from "../actor/capability-grants.js";
@@ -21,12 +26,12 @@ import { CrontabMutator, execCrontabIo, preflightCron } from "../actor/crontab.j
 import { E2EInstanceManager } from "../actor/e2e-instance-manager.js";
 import {
   type EventResource,
-  type EventSubscriptionAuditEvent,
-  type EventSubscriptionStore,
-  FileEventSubscriptionStore,
+  type EventSourceOwnerStore,
+  type EventSourceOwnershipAuditEvent,
   isSubResourceOf,
-  missingAuditedEventSubscriptions,
+  missingAuditedEventSourceOwnerships,
   normalizeEventResource,
+  reconcileEventSourceSubscriptions,
   reconcileEventSources,
   resourceKey,
 } from "../actor/event-subscriptions.js";
@@ -46,7 +51,6 @@ import {
 } from "../actor/handle-generator.js";
 import { handleHostJobExit } from "../actor/host-job-exit.js";
 import { ensureWakeOnExitScript } from "../actor/host-job-runner.js";
-import { FileHostJobStore } from "../actor/host-job-store.js";
 import { InboxFocusResolver, type ResolvedInboxFocus } from "../actor/inbox-focus.js";
 import type { InboxEntry, InboxStore } from "../actor/inbox-store.js";
 import {
@@ -82,6 +86,7 @@ import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-thro
 import { resolveRootActorId } from "../actor/root-actor-id.js";
 import { RootControlService } from "../actor/root-control.js";
 import { buildRootPrompt } from "../actor/root-prompt.js";
+import { createRunAccounting } from "../actor/run-accounting.js";
 import {
   ensureWakeToken,
   wakePortPath,
@@ -113,6 +118,8 @@ import {
   importLegacyActorState,
 } from "../db/legacy-actor-import.js";
 import { importLegacyCapabilityGrantState } from "../db/legacy-capability-grant-import.js";
+import { importLegacyEventSubscriptionState } from "../db/legacy-event-subscription-import.js";
+import { importLegacyHostJobState } from "../db/legacy-host-job-import.js";
 import type {
   PrerequisiteAttention,
   ReadyHeadChange,
@@ -183,7 +190,11 @@ import { antigravityScratchDir } from "../providers/antigravity.js";
 import { createExhaustionClassifier } from "../providers/exhaustion-classifier.js";
 import { ingestKimiHostModels, populateModelCatalogsFromDb } from "../providers/model-catalog.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
-import { fillModelConfigFromCurrent, validateModelConfigPool } from "../providers/model-config.js";
+import {
+  fillModelConfigFromCurrent,
+  resolveModelClasses,
+  validateModelConfigPool,
+} from "../providers/model-config.js";
 import { refreshConfiguredProviderModelCatalogs } from "../providers/model-scrape.js";
 import {
   DEFAULT_ROOT_PROVIDER,
@@ -496,6 +507,8 @@ export interface RunStartE2EHandles {
  * The issue-client edge is swapped via the existing `setIssueClient` global.
  */
 export interface RunStartE2EHooks {
+  /** Experimental execution seam; production always constructs a local Actor. */
+  createWorkerActor?: (context: ActorFactoryContext, options: ActorOptions) => MeshActor;
   chatClient?: ChatClient;
   chatSource?: ChatSource;
   rootDriver?: "provider" | "external";
@@ -567,12 +580,12 @@ export function mechanicallySubscribeCreatedResource(
  * The audit stream is diagnostic only: this never reconstructs routing state from events.
  */
 export function warnMissingConfiguredEventSubscriptionsAtBoot(
-  store: EventSubscriptionStore,
-  auditEvents: readonly EventSubscriptionAuditEvent[],
+  store: EventSourceOwnerStore,
+  auditEvents: readonly EventSourceOwnershipAuditEvent[],
   configuredRoots: readonly EventResource[],
   warn: (message: string) => void = console.warn
 ): Array<{ resource: EventResource; actorId: string }> {
-  const missing = missingAuditedEventSubscriptions(store, auditEvents).filter(({ resource }) =>
+  const missing = missingAuditedEventSourceOwnerships(store, auditEvents).filter(({ resource }) =>
     configuredRoots.some((configuredRoot) => isSubResourceOf(resource, configuredRoot))
   );
   if (missing.length === 0) return [];
@@ -834,6 +847,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const database = initDb(mcHome);
   log.info("database_ready", { home: mcHome });
 
+  const modelClasses = getRepositories().modelClasses;
+
   // One OS scheduler owns every cron/at mutation: recurring
   // actor wakes, recurring or interval obligations, and one-shot messages.
   const cronPreflight = preflightCron();
@@ -892,41 +907,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     log.warn("unterminated_runs_recovered", { runs: recoveredOpenRuns });
   }
 
-  const activeRunIds = new Map<string, string>();
+  const runAccounting = createRunAccounting(() => getRepositories().actorRuns);
   const inboxFocusResolver = new InboxFocusResolver(
     getRepositories().inboxFocus,
     getRepositories().obligations,
     getRepositories().meshChat
   );
-  const beginActorRun = (actorId: string, providerName: string): string => {
-    if (activeRunIds.has(actorId)) {
-      throw new Error(`actor already has an active durable run: ${actorId}`);
-    }
-    const runId = getRepositories().actorRuns.start({ actorId, provider: providerName });
-    activeRunIds.set(actorId, runId);
-    return runId;
-  };
-  const completeActorRun = (actorId: string, result: RunResult): string => {
-    const runId = activeRunIds.get(actorId);
-    if (!runId) throw new Error(`actor has no active durable run: ${actorId}`);
-    getRepositories().actorRuns.complete(runId, {
-      success: result.success,
-      exitCode: result.exitCode,
-      output: result.output,
-      yieldStatus: result.yieldStatus,
-      yieldNote: result.yieldNote,
-      model: result.model,
-    });
-    activeRunIds.delete(actorId);
-    return runId;
-  };
-  const abandonActorRun = (actorId: string, reason: string): string | null => {
-    const runId = activeRunIds.get(actorId);
-    if (!runId) return null;
-    getRepositories().actorRuns.abandon(runId, reason);
-    activeRunIds.delete(actorId);
-    return runId;
-  };
+  const beginActorRun = runAccounting.begin;
+  const completeActorRun = runAccounting.complete;
+  const abandonActorRun = runAccounting.abandon;
 
   // Capture the disposable audit projection while this startup unquestionably
   // owns an open DB handle. Some boot paths cross asynchronous probes before
@@ -1156,7 +1145,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     servers[CHAT_READ_MCP_NAME] = () => createChatReadMcpServer(chatClient);
   }
 
-  const mcpHttp = new McpHttpServer({ servers });
+  const mcpHttp = new McpHttpServer({ servers, logger: log });
   await mcpHttp.start();
   const sharedMcp = mcpHttp.urls();
   log.info("shared_mcp_serving", { servers: sharedMcp.map((u) => u.name) });
@@ -1401,34 +1390,90 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // registers the glass-goals `understanding-write` server (claude FS isolation
   // ISSUE_NUM having landed); grantable-servers.test.ts locks the contents.
   const capabilityGrants = getRepositories().capabilityGrants;
-  const persistentEventSubscriptions = new FileEventSubscriptionStore(
-    join(mcHome, "event-subscriptions.json"),
-    rootId
-  );
+  // Explicit subscription ownership and its tombstones are durable in SQLite;
+  // `event-subscriptions.json` is only a legacy source, imported once and then
+  // archived. The config-implied seed is rebuilt in memory below, so nothing
+  // here recreates a JSON source of truth.
+  const legacyEventSubscriptionImport = importLegacyEventSubscriptionState({
+    mcHome,
+    db: database,
+    repositories: getRepositories(),
+    rootId,
+  });
+  if (legacyEventSubscriptionImport.importedSubscriptions > 0) {
+    log.info("legacy_event_subscriptions_imported", {
+      subscriptions: legacyEventSubscriptionImport.importedSubscriptions,
+    });
+  } else if (legacyEventSubscriptionImport.backupFiles.length > 0) {
+    // A source file still present after the receipt committed is stale by
+    // construction — a failed archive rename, or one restored by hand. It is
+    // archived unread rather than replayed, and saying so is what stops an
+    // operator concluding the file they put back took effect. `warn`, not
+    // `info`: nothing is broken, but a document someone placed there did not
+    // become state, and the backup path is where to find it.
+    log.warn("legacy_event_subscriptions_archived_unread", {
+      backups: legacyEventSubscriptionImport.backupFiles,
+    });
+  }
+  const persistentEventSourceOwners = getRepositories().eventSourceOwners;
   warnMissingConfiguredEventSubscriptionsAtBoot(
-    persistentEventSubscriptions,
+    persistentEventSourceOwners,
     eventSubscriptionAudit,
     configuredRoots
   );
   // Host-plane host-jobs capability : durable per-actor job records, keyed
-  // the same way capabilityGrants/eventSubscriptions are.
-  const hostJobStore = new FileHostJobStore(join(mcHome, "host-jobs.json"));
+  // the same way capabilityGrants/event source owners are. Durable in SQLite;
+  // `host-jobs.json` is only a legacy source, imported once and then archived.
+  const legacyHostJobImport = importLegacyHostJobState({
+    mcHome,
+    db: database,
+    repositories: getRepositories(),
+  });
+  if (legacyHostJobImport.importedJobs > 0) {
+    log.info("legacy_host_jobs_imported", { jobs: legacyHostJobImport.importedJobs });
+  } else if (legacyHostJobImport.backupFiles.length > 0) {
+    // A source file still present after the receipt committed is stale by
+    // construction — a failed archive rename, or one restored by hand. It is
+    // archived unread rather than replayed, and saying so is what stops an
+    // operator concluding the file they put back took effect. `warn`, not
+    // `info`: nothing is broken, but a document someone placed there did not
+    // become state, and the backup path is where to find it.
+    log.warn("legacy_host_jobs_archived_unread", { backups: legacyHostJobImport.backupFiles });
+  }
+  const hostJobStore = getRepositories().hostJobs;
   const e2eInstance = new E2EInstanceManager({
     mcHome,
     workersDir,
     handleForId: (id) => (id === rootId ? rootHandle : generateHandle(id)),
   });
   const rootSourceSync = reconcileEventSources(
-    persistentEventSubscriptions,
+    persistentEventSourceOwners,
     configuredRoots,
     rootId,
     () => new Date().toISOString()
   );
-  const eventSubscriptions = rootSourceSync.store;
+  const eventSourceOwners = rootSourceSync.store;
   if (rootSourceSync.droppedDelegations.length > 0) {
     console.log(
       `[mesh] reconciled root event sources: dropped ${rootSourceSync.droppedDelegations.length} orphaned delegations`
     );
+  }
+  // Subscriptions are re-anchored on every boot, not only at subscribe time.
+  // `config.yaml` is the scope boundary, and narrowing it between runs must
+  // actually narrow delivery — a durable row for a source the operator has
+  // since removed would otherwise keep feeding an actor from outside the
+  // configured scope with nothing in the config to explain why.
+  const eventSourceSubscriptions = getRepositories().eventSourceSubscriptions;
+  const droppedSubscriptions = reconcileEventSourceSubscriptions(
+    eventSourceSubscriptions,
+    configuredRoots
+  );
+  if (droppedSubscriptions.length > 0) {
+    log.info("event_source_subscriptions_unanchored", {
+      dropped: droppedSubscriptions.map(
+        (subscription) => `${subscription.resource} -> ${subscription.actorId}`
+      ),
+    });
   }
   // `const` so the closure below keeps the non-null narrowing (`chatClient` is a
   // reassignable `let` further up).
@@ -1613,6 +1658,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const mesh: ActorMesh = new ActorMesh({
     actors,
     rootId,
+    // Placement exists only while the experimental remote-instance seam is
+    // wired (the E2E rig supplies it). Production leaves it unset, so an
+    // `executionTarget` is rejected at the spawn choke point.
+    supportsExecutionTarget: opts?.e2e?.createWorkerActor ? () => true : undefined,
     validateSpawn: (req) => {
       // Portable-context refusals  live here, at the mesh's single spawn
       // choke point, so the MCP tool, root control, the dashboard and the A/B rig
@@ -1620,12 +1669,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       assertSpawnContextSupported(req, {
         ledgerCompactionAvailable: portableContextApiKey !== null,
       });
-      return validateModelConfigPool(config, req.modelConfig, {
+      // Named model classes resolve from the current committed database row
+      // here, before validation: spawns arriving via root control are already
+      // resolved, so this call is identity for them and expansion for every
+      // other spawn path.
+      return validateModelConfigPool(config, resolveModelClasses(modelClasses, req.modelConfig), {
         portable: req.context?.type === "portable",
       });
     },
     validateModel: (record, modelConfig) => {
-      const filled = fillModelConfigFromCurrent(modelConfig, record.modelConfig);
+      // Resolve before filling: fillModelConfigFromCurrent walks tuples, and a
+      // class reference would otherwise pass through it untouched.
+      const resolved = resolveModelClasses(modelClasses, modelConfig);
+      const filled = fillModelConfigFromCurrent(resolved, record.modelConfig);
       return validateModelConfigPool(config, filled, {
         portable: record.context?.type === "portable",
       });
@@ -1635,13 +1691,17 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     scheduledMessages: osScheduler,
     withTransaction: (fn) => getDb().transaction(fn)(),
     recordRunYield: (actorId, status, note) => {
-      const runId = activeRunIds.get(actorId);
+      const runId = runAccounting.activeRunId(actorId);
       if (!runId) return null;
       getRepositories().actorRuns.recordYield(runId, status, note);
       return runId;
     },
     capabilityGrants,
-    eventSubscriptions,
+    eventSourceOwners,
+    eventSourceSubscriptions,
+    // The configured scope the mesh refuses new subscriptions outside of, so a
+    // `subscribe_event_source` call cannot reopen what the config closed.
+    configuredEventSources: configuredRoots,
     // Ownership authority for issue/PR event sources: a live
     // obligation's owner governs its linked source and supersedes any manual
     // delegation on it.
@@ -1871,7 +1931,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         const inboxUrl = mcpHttp.addServer(`${id}:${INBOX_MCP_NAME}`, () =>
           createInboxMcpServer(inboxStore, id, {
             select: (entryIds, obligationId) => {
-              const runId = activeRunIds.get(id);
+              const runId = runAccounting.activeRunId(id);
               if (!runId) throw new Error(`actor has no active durable run: ${id}`);
               let focus: ResolvedInboxFocus | undefined;
               const entries = mesh.selectInboxEntries(id, entryIds, (selectedEntries) => {
@@ -2017,7 +2077,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // Which declared candidate actually ran, for the failure-notice label —
         // set on each onRunStart, read back on that same run's onRunEnd.
         let lastSelected: RawProviderModelConfig = modelConfigPool[0];
-        const actor: Actor = new Actor({
+        const actorOptions: ActorOptions = {
           id,
           cwd,
           modelConfig: [...modelConfigPool],
@@ -2203,7 +2263,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             }
           },
           log: makeFirehose(id), // firehose (4d: session-tag) → console + dashboard SSE
-        });
+        };
+        // Second fail-closed gate, covering rehydrate/adopt as well as spawn: a
+        // placement request only ever reaches a remote runtime, never a local
+        // Actor standing in silently for the instance that was asked for.
+        const createWorkerActor = opts?.e2e?.createWorkerActor;
+        if (ctx.executionTarget !== undefined && !createWorkerActor) {
+          throw new Error(
+            `actor ${id} requests executionTarget ${JSON.stringify(ctx.executionTarget)} but this runtime has no remote placement support`
+          );
+        }
+        const actor: MeshActor = createWorkerActor
+          ? createWorkerActor(ctx, actorOptions)
+          : new Actor(actorOptions);
         liveWorkerMcp.set(id, workerMcp);
         return actor;
       } catch (err) {
@@ -2234,6 +2306,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     mesh,
     rootId: rootId,
     providers: Object.keys(config.providers),
+    resolveModelConfig: (input) => resolveModelClasses(modelClasses, input),
   });
 
   // Mechanical failure forwarding: a failed run goes to its parent's inbox, or —
@@ -2334,6 +2407,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const rootMeshUrl = mcpHttp.addServer(rootId, () =>
     createAgentExecMcpServer(mesh, rootId, rootId, osScheduler, {
       rootControl,
+      modelClasses,
+      validateModelClass: (input) => validateModelConfigPool(config, input, { portable: true }),
       onWrite: () => {
         mesh.markUnkillable(rootId);
       },
@@ -2342,7 +2417,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const rootInboxUrl = mcpHttp.addServer(`${rootId}:${INBOX_MCP_NAME}`, () =>
     createInboxMcpServer(inboxStore, rootId, {
       select: (entryIds, obligationId) => {
-        const runId = activeRunIds.get(rootId);
+        const runId = runAccounting.activeRunId(rootId);
         if (!runId) throw new Error(`actor has no active durable run: ${rootId}`);
         let focus: ResolvedInboxFocus | undefined;
         const entries = mesh.selectInboxEntries(rootId, entryIds, (selectedEntries) => {
@@ -2505,8 +2580,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         log: (m) => console.log(m),
       },
     };
-    const updateUrl = mcpHttp.addServer(UPDATE_MCP_NAME, () =>
-      createUpdateMcpServer(updateToolDeps, rootId)
+    const updateUrl = mcpHttp.addServer(
+      UPDATE_MCP_NAME,
+      () => createUpdateMcpServer(updateToolDeps, rootId),
+      // A host service, not an actor mount: this name is safe to log.
+      { logLabel: UPDATE_MCP_NAME }
     );
     rootMcp.push({ name: UPDATE_MCP_NAME, url: updateUrl });
   } catch (err) {
@@ -2521,8 +2599,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     actors,
     runningThreadIds: () => mesh.activeRunThreadIds(),
   };
-  const pnpmHardlinksUrl = mcpHttp.addServer(PNPM_HARDLINKS_MCP_NAME, () =>
-    createPnpmHardlinksMcpServer(pnpmHardlinksDeps, rootId)
+  const pnpmHardlinksUrl = mcpHttp.addServer(
+    PNPM_HARDLINKS_MCP_NAME,
+    () => createPnpmHardlinksMcpServer(pnpmHardlinksDeps, rootId),
+    { logLabel: PNPM_HARDLINKS_MCP_NAME }
   );
   rootMcp.push({ name: PNPM_HARDLINKS_MCP_NAME, url: pnpmHardlinksUrl });
 
@@ -3069,6 +3149,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                     : new Date(entry.estimatedStartAt).toISOString(),
               }))
             ),
+          // Current work is the durable inbox focus for this actor's active
+          // run. It deliberately reads through the run ledger: a completed
+          // focus is history, not the next queued run's selected work.
+          selectedObligationForActor: (actorId) => {
+            const runId = runAccounting.activeRunId(actorId);
+            if (!runId) return null;
+            const obligationId = getRepositories().actorRuns.activeFocusPrimaryObligationId(runId);
+            return obligationId ? getRepositories().obligations.get(obligationId) : null;
+          },
           rootControl,
           // The configured root identity  — display handle + avatar
           // override — so the dashboard shows this instance's own identity

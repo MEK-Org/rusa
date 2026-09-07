@@ -38,6 +38,8 @@ export const SUBSTANTIVE_EVENT_KINDS: readonly MeshEventKind[] = [
   "capability_revoked",
   "event_source_subscribed",
   "event_source_unsubscribed",
+  "event_source_subscriber_added",
+  "event_source_subscriber_removed",
 ];
 
 /**

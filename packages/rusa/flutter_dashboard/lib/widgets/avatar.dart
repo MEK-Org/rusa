@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 
 import '../store.dart';
 import '../theme.dart';
+import 'status_dot.dart';
 
 /// A circular per-actor avatar .
 ///
@@ -119,6 +120,50 @@ class ActorAvatar extends StatelessWidget {
       id == 'human:operator' ? Icons.person : Icons.pets,
       size: size * 0.55,
       color: MeshColors.textMuted,
+    ),
+  );
+}
+
+/// The hierarchy's actor identity marker: a circular avatar with its live run
+/// state overlaid at the lower-right corner. Overview rows use this same widget
+/// so the two views never disagree about which actor is active or queued.
+class ActorAvatarWithStatus extends StatelessWidget {
+  const ActorAvatarWithStatus({
+    super.key,
+    required this.id,
+    required this.state,
+    this.size = 52,
+    this.retired = false,
+    this.store,
+  });
+
+  final String id;
+  final DotState state;
+  final double size;
+  final bool retired;
+  final DashboardStore? store;
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+    width: size,
+    height: size,
+    child: Stack(
+      clipBehavior: Clip.none,
+      children: [
+        ActorAvatar(id: id, size: size, retired: retired, store: store),
+        Positioned(
+          right: -1,
+          bottom: -1,
+          child: Container(
+            padding: const EdgeInsets.all(1.5),
+            decoration: const BoxDecoration(
+              shape: BoxShape.circle,
+              color: MeshColors.bgSecondary,
+            ),
+            child: StatusDot(state: state, size: 7),
+          ),
+        ),
+      ],
     ),
   );
 }

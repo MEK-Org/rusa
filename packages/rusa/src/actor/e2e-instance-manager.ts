@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -12,6 +13,7 @@ import {
 import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { E2E_RUNS_DIR_NAME, missingResumeRequirements } from "../e2e/provision.js";
 import {
   addReadonlyBindIfExists,
   addWritableDirBindIfRealDir,
@@ -34,6 +36,14 @@ export interface E2EInstanceRecord {
   worktree: string;
   unitName: string;
   startedAt: string;
+  /**
+   * The exact e2e root `up()` established and passed as `--root` for this
+   * holder's launch. Absent only on a record written before this binding
+   * existed; resume then falls back to confining the root to this helper's
+   * own preserved-runs areas (the runs sibling, or the nested launch-home
+   * area a pre-change launch created its root under).
+   */
+  resumableRoot?: string;
 }
 
 export interface E2EInstanceLiveStatus {
@@ -152,6 +162,21 @@ function isLoopbackPortReady(port: number): Promise<boolean> {
 export class E2EInstanceManager {
   private readonly stateFile: string;
   private readonly runtimeDir: string;
+  /**
+   * Preserved e2e roots live here, as a SIBLING of `runtimeDir` — never
+   * inside it. `runtimeDir` is wiped wholesale on every teardown/failed
+   * launch (stopUnit/cleanupFailedStart); nesting a preserved root under it
+   * would delete the very state a resume needs to retry from.
+   */
+  private readonly runsDir: string;
+  /**
+   * Where a pre-change helper's launches created their roots: inside bwrap,
+   * HOME was `${runtimeDir}/home`, so am-up chose `${legacyRunsDir}/run-*`.
+   * Legacy holder records without a persisted `resumableRoot` may resume a
+   * structurally valid root here — it is still wholly helper-owned, and
+   * cleanupFailedStart preserves it across the runtime wipe.
+   */
+  private readonly legacyRunsDir: string;
   private readonly now: () => string;
   private readonly hostHome: string;
   private readonly toolchainPath: string;
@@ -168,6 +193,8 @@ export class E2EInstanceManager {
   constructor(private readonly opts: E2EInstanceManagerOptions) {
     this.stateFile = join(opts.mcHome, "e2e-instance.json");
     this.runtimeDir = join(opts.mcHome, "e2e-instance", "runtime");
+    this.runsDir = join(opts.mcHome, "e2e-instance", "runs");
+    this.legacyRunsDir = join(this.runtimeDir, "home", E2E_RUNS_DIR_NAME);
     this.now = opts.now ?? (() => new Date().toISOString());
     this.hostHome = opts.hostHome ?? homedir();
     this.flutterRoot = opts.flutterRoot ?? resolveHostFlutterRoot();
@@ -271,7 +298,86 @@ export class E2EInstanceManager {
     return worktree;
   }
 
-  private buildBwrapArgs(worktree: string): string[] {
+  /**
+   * A resume root must match the exact root `up()` persisted for the current
+   * holder (`expectedRoot`), compared in canonical (realpath-resolved) form
+   * because the persisted string may traverse symlinks its resolver collapses.
+   * A legacy record predating that binding instead
+   * falls back to confining the root to a preserved-runs area this helper
+   * owns: either the runs sibling (`this.runsDir`) or the nested launch-home
+   * area (`${runtimeDir}/home/.rusa-e2e`) a pre-change launch created its
+   * root under, since that helper set HOME there before invoking am-up.
+   * Either way the root must structurally look like something
+   * `rusa-e2e am-up --resume` can reopen, per {@link missingResumeRequirements}.
+   */
+  private validateResumableRoot(requestedPath: string, expectedRoot: string | undefined): string {
+    if (!requestedPath.trim()) throw new Error("e2e-instance: resume root path is required");
+    if (!isAbsolute(requestedPath)) {
+      throw new Error(`e2e-instance: resume root path must be absolute: ${requestedPath}`);
+    }
+    let root: string;
+    try {
+      root = realpathSync(resolve(requestedPath));
+    } catch {
+      throw new Error(`e2e-instance: resume root does not exist: ${requestedPath}`);
+    }
+    if (!statSync(root).isDirectory()) {
+      throw new Error(`e2e-instance: resume root is not a directory: ${requestedPath}`);
+    }
+    if (expectedRoot !== undefined) {
+      // `root` is realpath-canonicalized above, but `expectedRoot` was
+      // persisted verbatim at up() time — possibly through a symlinked
+      // ancestry (e.g. macOS os.tmpdir()'s /var -> /private/var). Canonicalize
+      // the persisted value the same way before comparing, so a legitimate
+      // holder resume is not refused over a path-string difference. A
+      // persisted root that no longer exists is its own clear failure, not a
+      // mismatch against whatever root was requested.
+      let canonicalExpected: string;
+      try {
+        canonicalExpected = realpathSync(resolve(expectedRoot));
+      } catch {
+        throw new Error(
+          `e2e-instance: persisted resume root for this holder no longer exists: ${expectedRoot}`
+        );
+      }
+      if (root !== canonicalExpected) {
+        throw new Error(
+          `e2e-instance: REFUSED resume root ${root}; only the exact root persisted for this holder ` +
+            `(${canonicalExpected}) may be resumed`
+        );
+      }
+    } else {
+      const preservedAreas = [this.runsDir, this.legacyRunsDir]
+        .map((area) => {
+          try {
+            return realpathSync(area);
+          } catch {
+            return undefined;
+          }
+        })
+        .filter((area): area is string => area !== undefined);
+      if (preservedAreas.length === 0) {
+        throw new Error(
+          `e2e-instance: no preserved e2e runs exist under ${this.runsDir} or ${this.legacyRunsDir}`
+        );
+      }
+      if (!preservedAreas.some((area) => isSelfOrDescendant(area, root))) {
+        throw new Error(
+          `e2e-instance: REFUSED foreign resume root ${root}; it must be a preserved instance under ` +
+            preservedAreas.join(" or ")
+        );
+      }
+    }
+    const missing = missingResumeRequirements(root);
+    if (missing.length > 0) {
+      throw new Error(
+        `e2e-instance: ${root} is not a resumable e2e root (missing ${missing.join(", ")})`
+      );
+    }
+    return root;
+  }
+
+  private buildBwrapArgs(worktree: string, root: string, resume: boolean): string[] {
     const runtimeHome = join(this.runtimeDir, "home");
     const providerBin = join(this.runtimeDir, "provider-bin");
     const baseConfigHome = join(this.runtimeDir, "base-config");
@@ -280,6 +386,10 @@ export class E2EInstanceManager {
     mkdirSync(this.pubCache, { recursive: true, mode: 0o700 });
     mkdirSync(providerBin, { recursive: true, mode: 0o700 });
     mkdirSync(baseConfigHome, { recursive: true, mode: 0o700 });
+    // `--bind` requires the source to exist on the host. A fresh (non-resume)
+    // root is a bare directory `up()` has not created yet; a resume root
+    // already exists (validateResumableRoot required it), so this is a no-op.
+    mkdirSync(root, { recursive: true, mode: 0o700 });
     const realHostHome = realpathIfExists(this.hostHome);
     const realMcHome = realpathIfExists(this.opts.mcHome);
     const realRuntime = realpathIfExists(this.runtimeDir);
@@ -326,7 +436,7 @@ export class E2EInstanceManager {
       const result = setupFlutterOverlay(args, this.flutterRoot, realRuntime);
       wrapperDir = result.wrapperDir;
     }
-    for (const path of [realRuntime, worktree]) {
+    for (const path of [realRuntime, worktree, root]) {
       ensureTargetParentDirs(args, path);
       args.push("--bind", path, path);
     }
@@ -447,6 +557,9 @@ export class E2EInstanceManager {
       "run",
       "e2e",
       "am-up",
+      "--root",
+      root,
+      ...(resume ? ["--resume"] : []),
       "--root-driver",
       "external",
       ...(hasBaseConfig ? ["--base-config-home", baseConfigHome] : []),
@@ -519,21 +632,85 @@ export class E2EInstanceManager {
           "an operator must stop the orphaned unit before retrying"
       );
     }
-    // No valid holder record and no live unit: any surviving runtime directory
-    // is an orphan (its owning record is gone), not preserved state. Clear it
-    // before rebuilding mount targets so a stale file-vs-directory shape left
-    // by a prior run (e.g. runtime/home/.claude.json) can't reach bwrap.
-    this.clearOrphanRuntime();
-
     const worktree = this.validateOwnedWorktree(actorId, requestedPath);
     this.prepareWorktree(worktree);
+    // No valid holder record and no live unit: any surviving runtime directory
+    // or preserved run root is an orphan (its owning record is gone), not
+    // resumable state. Only reclaim it after validating and preparing a viable
+    // replacement launch: an invalid caller request must leave state alone.
+    this.clearOrphanState();
+    // Establish the exact root up front (rather than letting am-up pick one
+    // internally) so a later resume can bind to it exactly, instead of merely
+    // to "any structurally valid root under the runs area".
+    const resumableRoot = join(this.runsDir, `run-${randomUUID()}`);
     const record: E2EInstanceRecord = {
       actorId,
       actorHandle: this.opts.handleForId(actorId),
       worktree,
       unitName: E2E_INSTANCE_UNIT_NAME,
       startedAt: this.now(),
+      resumableRoot,
     };
+    return this.launchAndAwaitPort(worktree, resumableRoot, false, record, () =>
+      rmSync(this.stateFile, { force: true })
+    );
+  }
+
+  /**
+   * Resume a preserved e2e root this actor previously held: reuse its
+   * recorded, re-validated worktree and pass the caller's requested root
+   * straight through to `am-up --root <root> --resume`, never provisioning
+   * fresh instance state. A failed resume restores the pre-resume holder
+   * record instead of discarding it, so the preserved root's attribution
+   * survives a retry.
+   */
+  async resume(actorId: string, requestedRoot: string): Promise<E2EInstanceStatus> {
+    const existing = this.readRecord();
+    const existingStatus = this.liveStatus();
+    if (this.isLive(existingStatus)) {
+      throw new Error(
+        existing
+          ? `e2e-instance: already held by ${existing.actorHandle} (${existing.actorId}) serving ${existing.worktree}; ` +
+              "it comes down only when that actor calls down/stop, that actor is retired, or the mesh shuts down"
+          : `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} is already active but its holder record is missing; ` +
+              "an operator must stop the orphaned unit before retrying"
+      );
+    }
+    if (!existing) {
+      throw new Error(
+        "e2e-instance: no preserved holder record to resume; call up() to provision a fresh instance"
+      );
+    }
+    if (existing.actorId !== actorId) {
+      throw new Error(
+        `e2e-instance: held by ${existing.actorHandle} (${existing.actorId}); only the holder may resume`
+      );
+    }
+
+    const resumeRoot = this.validateResumableRoot(requestedRoot, existing.resumableRoot);
+    const worktree = this.validateOwnedWorktree(actorId, existing.worktree);
+    const record: E2EInstanceRecord = {
+      actorId,
+      actorHandle: existing.actorHandle,
+      worktree,
+      unitName: E2E_INSTANCE_UNIT_NAME,
+      startedAt: this.now(),
+      // Backfills the exact-root binding for a legacy record that resumed
+      // via the runs-area fallback, so its NEXT resume is exact-bound too.
+      resumableRoot: resumeRoot,
+    };
+    return this.launchAndAwaitPort(worktree, resumeRoot, true, record, () =>
+      this.writeRecord(existing)
+    );
+  }
+
+  private async launchAndAwaitPort(
+    worktree: string,
+    root: string,
+    resume: boolean,
+    record: E2EInstanceRecord,
+    onFailure: () => void
+  ): Promise<E2EInstanceStatus> {
     this.writeRecord(record);
     try {
       this.exec("systemd-run", [
@@ -549,17 +726,20 @@ export class E2EInstanceManager {
         "--property=TimeoutStopSec=30s",
         "--",
         "bwrap",
-        ...this.buildBwrapArgs(worktree),
+        ...this.buildBwrapArgs(worktree, root, resume),
       ]);
     } catch (err) {
-      rmSync(this.stateFile, { force: true });
+      // A fresh launch that never started owns nothing worth keeping: its root
+      // is at most the empty directory the bwrap args just created.
+      if (!resume) this.discardRunRoot(root);
+      onFailure();
       throw err;
     }
     const deadline = Date.now() + this.startupTimeoutMs;
     let liveStatus = this.liveStatus();
     while (Date.now() < deadline) {
       if (!this.isLive(liveStatus)) {
-        this.cleanupFailedStart();
+        if (this.cleanupFailedStart(root, resume)) onFailure();
         throw new Error(
           `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} failed before port ${E2E_INSTANCE_PORT} became ready ` +
             `(active=${liveStatus.activeState}, sub=${liveStatus.subState}, result=${liveStatus.result})`
@@ -571,7 +751,7 @@ export class E2EInstanceManager {
       await this.delay(this.startupPollMs);
       liveStatus = this.liveStatus();
     }
-    this.cleanupFailedStart();
+    if (this.cleanupFailedStart(root, resume)) onFailure();
     throw new Error(
       `e2e-instance: ${E2E_INSTANCE_UNIT_NAME} did not open port ${E2E_INSTANCE_PORT} ` +
         `within ${this.startupTimeoutMs}ms (active=${liveStatus.activeState}, sub=${liveStatus.subState})`
@@ -607,37 +787,113 @@ export class E2EInstanceManager {
   }
 
   /**
-   * Removes a runtime directory left behind with no owning holder record and
-   * no live unit — orphaned state, distinct from a preserved holder's runtime
-   * (which `up()` never reaches while a record exists) or a live singleton's
-   * runtime (torn down only via stopUnit/cleanupFailedStart).
+   * Removes a runtime directory and any preserved run roots left behind with
+   * no owning holder record and no live unit — orphaned state, distinct from a
+   * preserved holder's runtime and root (which `up()` never reaches while a
+   * record exists) or a live singleton's runtime (torn down only via
+   * stopUnit/cleanupFailedStart). Only the holder record makes a run root
+   * resumable, so without one every root under the runs area is dead weight.
    */
-  private clearOrphanRuntime(): void {
+  private clearOrphanState(): void {
     teardownFlutterOverlay(this.runtimeDir);
     rmSync(this.runtimeDir, { recursive: true, force: true });
+    rmSync(this.runsDir, { recursive: true, force: true });
+  }
+
+  /**
+   * Reclaims a run root this helper minted under its own runs area. Deliberate
+   * teardown and a failed fresh launch both drop the holder record, and a root
+   * no record names can never be resumed — leaving it would strand a whole
+   * instance tree (mesh.db, remote, scratch) on disk forever. Confined to
+   * `runsDir` so it can only ever remove state this helper created; a legacy
+   * root nested under `runtimeDir` is reclaimed by the runtime wipe instead.
+   */
+  private discardRunRoot(root: string | undefined): void {
+    if (!root) return;
+    let realRoot: string;
+    let realRunsDir: string;
+    try {
+      realRoot = realpathSync(resolve(root));
+      realRunsDir = realpathSync(this.runsDir);
+    } catch {
+      return; // Already gone, or no runs area at all: nothing to reclaim.
+    }
+    if (realRoot === realRunsDir || !isSelfOrDescendant(realRunsDir, realRoot)) return;
+    rmSync(realRoot, { recursive: true, force: true });
   }
 
   private stopUnit(): void {
+    const holder = this.readRecord();
     // Keep the holder record if systemctl fails: losing attribution while an
-    // active unit survives would permit a silent singleton takeover.
+    // active unit survives would permit a silent singleton takeover. The run
+    // root stays with it, since a surviving record can still resume it.
     if (this.liveStatus().loadState !== "not-found") {
       this.exec("systemctl", ["--user", "stop", E2E_INSTANCE_UNIT_NAME]);
     }
     teardownFlutterOverlay(this.runtimeDir);
     rmSync(this.stateFile, { force: true });
     rmSync(this.runtimeDir, { recursive: true, force: true });
+    // Deliberate teardown (down, retirement, mesh shutdown) discards the
+    // record, so the root it named is no longer resumable by anyone.
+    this.discardRunRoot(holder?.resumableRoot);
   }
 
-  private cleanupFailedStart(): void {
+  /**
+   * Best-effort cleanup after a failed launch. `root` is the exact root the
+   * failed launch was using. A failed resume keeps it: the pre-resume record
+   * is restored and the caller can retry, and a legacy root may live under
+   * `runtimeDir` (the pre-change launch HOME) where the wholesale runtime wipe
+   * would destroy it — so it is relocated aside for the wipe and moved back
+   * afterwards. A failed fresh launch instead discards its own brand-new root,
+   * which no surviving record will ever name again.
+   */
+  private cleanupFailedStart(root: string, preserve: boolean): boolean {
+    const preserveRoot = preserve ? root : undefined;
     try {
       if (this.liveStatus().loadState !== "not-found") {
         this.exec("systemctl", ["--user", "stop", E2E_INSTANCE_UNIT_NAME]);
       }
     } catch {
-      // Best effort: preserve the original startup error for the caller.
+      // The original startup diagnostic remains the caller-facing error, but
+      // without a confirmed stop an active unit may still own every path this
+      // cleanup would remove. Keep its record, runtime, and root together.
+      return false;
     }
     teardownFlutterOverlay(this.runtimeDir);
     rmSync(this.stateFile, { force: true });
+    let nestedRoot: string | undefined;
+    let preservedAside: string | undefined;
+    let realRuntimeDir = this.runtimeDir;
+    try {
+      realRuntimeDir = realpathSync(this.runtimeDir);
+    } catch {
+      // runtimeDir is about to be wiped anyway.
+    }
+    if (preserveRoot && isSelfOrDescendant(realRuntimeDir, preserveRoot)) {
+      nestedRoot = preserveRoot;
+      try {
+        preservedAside = join(dirname(this.runtimeDir), `.preserved-${randomUUID()}`);
+        renameSync(nestedRoot, preservedAside);
+      } catch {
+        // If the root cannot be moved aside, skipping the runtime wipe keeps
+        // it intact; leftover runtime junk is tolerable next to a destroyed
+        // preserved instance.
+        return true;
+      }
+    }
     rmSync(this.runtimeDir, { recursive: true, force: true });
+    // A fresh launch's root is a sibling of runtimeDir, so the wipe above
+    // never reaches it; discard it explicitly now that its record is gone.
+    if (!preserve) this.discardRunRoot(root);
+    if (nestedRoot && preservedAside) {
+      try {
+        mkdirSync(dirname(nestedRoot), { recursive: true, mode: 0o700 });
+        renameSync(preservedAside, nestedRoot);
+      } catch {
+        // The wipe happened and the root could not be restored; surface
+        // nothing here — the original startup error is what the caller sees.
+      }
+    }
+    return true;
   }
 }

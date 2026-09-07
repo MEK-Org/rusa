@@ -10,6 +10,8 @@ import {
 import type { ActorWakeScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
+import type { ModelClassRepository } from "../db/repositories/model-class-repository.js";
+import type { ConcreteModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
 import { githubBranchReference } from "../references/reference.js";
 import { toolError, toolOk } from "./result.js";
 import { HUMAN_OPERATOR, isHumanOperator } from "./stamp.js";
@@ -29,15 +31,47 @@ const providerModelConfigSchema = z.object({
     .describe(
       "Optional provider-native reasoning level (for example 'high' or 'xhigh'). Omit to preserve the provider/model default."
     ),
+  // `class` is banned here, not merely unexpected. z.object is non-strict and
+  // strips unknown keys, and a union takes the first arm that parses, so
+  // without this a mixed `{ class, provider }` would parse as this arm with
+  // `class` silently dropped — accepted as a plain tuple, the class ignored.
+  // Making the key impossible forces such input onto the strict class arm,
+  // which rejects it for the sibling field.
+  class: z
+    .never()
+    .optional()
+    .describe("Not allowed here: a model class reference must be the whole model_config value."),
 });
 
 /**
- * A single provider/model/effort choice, or an ordered pool of acceptable
- * choices tried earliest-available first. A pool longer than one entry
- * requires a portable (ledger/tail) actor — a native provider session can't
- * move between candidates.
+ * A reference to a runtime-managed named model class. Strict on purpose: a
+ * class reference is the whole model_config value, so a stray sibling field
+ * (`{ class, provider }`) is a mistake worth surfacing rather than dropping.
+ */
+const modelClassReferenceSchema = z.strictObject({
+  class: z
+    .string()
+    .min(1)
+    .describe(
+      "Name of a runtime-managed model class, e.g. 'fast'. Resolves to that class's currently committed provider/model/effort pool at selection time; an unknown class is an error, never a fallback."
+    ),
+});
+
+/**
+ * A single provider/model/effort choice, an ordered pool of acceptable choices
+ * tried earliest-available first, or a reference to a named model class that
+ * expands to such a pool. A pool longer than one entry requires a portable
+ * (ledger/tail) actor — a native provider session can't move between
+ * candidates.
  */
 const modelConfigSchema = z.union([
+  modelClassReferenceSchema,
+  providerModelConfigSchema,
+  z.array(providerModelConfigSchema).min(1),
+]);
+
+/** A class definition is always concrete; classes cannot refer to classes. */
+const concreteModelConfigSchema = z.union([
   providerModelConfigSchema,
   z.array(providerModelConfigSchema).min(1),
 ]);
@@ -62,6 +96,10 @@ export function createAgentExecMcpServer(
     onWrite?: () => void;
     rootControl?: RootControlService;
     isFenced?: () => boolean;
+    /** Present only on the root runtime endpoint. */
+    modelClasses?: Pick<ModelClassRepository, "list" | "upsert" | "delete">;
+    /** Config-aware concrete tuple validation at the management boundary. */
+    validateModelClass?: (input: ConcreteModelConfigInput) => ProviderModelConfig[];
   }
 ): McpServer {
   const server = createMcpServer(
@@ -208,7 +246,7 @@ export function createAgentExecMcpServer(
             "What the new actor owns — its standing brief, authored by you. Include its full scope: the repo(s) to work in (it clones them itself), the deliverable, and whether it should open one PR or several."
           ),
         model_config: modelConfigSchema.describe(
-          "Required. Provider/model/effort choice(s) for the child, in earliest-available order. A single object pins one choice; pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review). An array declares a pool of acceptable choices, tried whichever is earliest-available first — requires context_mode 'ledger' or 'tail', since a native provider session can't move between candidates. There is no default: choose the child's model deliberately, and a native spawn must declare exactly one entry."
+          "Required. Provider/model/effort choice(s) for the child, in earliest-available order. A single object pins one choice; pick a different harness/tier than yourself when the work calls for it (e.g. a stronger model for review). An array declares a pool of acceptable choices, tried whichever is earliest-available first — requires context_mode 'ledger' or 'tail', since a native provider session can't move between candidates. `{\"class\": \"<name>\"}` instead names a runtime-managed model class and expands to its currently committed pool (same portability rule). There is no default: choose the child's model deliberately, and a native spawn must declare exactly one entry."
         ),
         conversation_id: z
           .string()
@@ -569,6 +607,59 @@ export function createAgentExecMcpServer(
     }
   );
 
+  // ── Direct subscriptions ── Distinct from delegation above: subscribing takes
+  // no ownership, competes with nobody, and only ever adds the CALLER. An actor
+  // may put itself on a source's direct-delivery list without displacing whoever
+  // owns it, which is the whole point — several actors watching one repo was
+  // previously only expressible by handing ownership around.
+  //
+  // Self-only by construction (`selfId`, not an argument): a subscription is a
+  // claim on your own attention, and letting one actor subscribe another would
+  // be a way to push work sideways without a handle or a grant.
+  server.registerTool(
+    "subscribe_event_source",
+    {
+      title: "Subscribe yourself to an event source",
+      description:
+        "Receive events from an event source directly, without owning it. Unlike delegation this takes no ownership away from anyone, many actors may subscribe to one source, and subscribed events never bubble to your parent — you get the source's own events and nothing else. The source must be within this instance's configured event sources.",
+      inputSchema: eventResourceInputSchema,
+    },
+    async ({ source, kind, org, repo, number, ref, space }) => {
+      try {
+        const resource = parseEventResource(
+          { source, kind, org, repo, number, ref, space },
+          "subscription"
+        );
+        mesh.addEventSourceSubscriber(resource, selfId, selfId);
+        return toolOk(`subscribed to ${resourceKey(resource)}`);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "unsubscribe_event_source",
+    {
+      title: "Unsubscribe yourself from an event source",
+      description:
+        "Stop receiving direct events from an event source you subscribed to. Does not affect ownership: a source you own keeps delivering to you.",
+      inputSchema: eventResourceInputSchema,
+    },
+    async ({ source, kind, org, repo, number, ref, space }) => {
+      try {
+        const resource = parseEventResource(
+          { source, kind, org, repo, number, ref, space },
+          "subscription"
+        );
+        mesh.removeEventSourceSubscriber(resource, selfId);
+        return toolOk(`unsubscribed from ${resourceKey(resource)}`);
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
   // ── Capability grants (ISSUE_NUM phase 1a, relaxed for parent-grantable secrets in
   // ISSUE_NUM) ── Registered on EVERY endpoint: root can grant any grantable
   // capability to any actor (as before), and a non-root actor can grant/revoke
@@ -636,7 +727,7 @@ export function createAgentExecMcpServer(
       inputSchema: {
         actor_id: z.string().describe("The actor's id to update."),
         model_config: modelConfigSchema.describe(
-          "The full replacement provider/model/effort choice(s), in earliest-available order — replaces the entire current pool."
+          'The full replacement provider/model/effort choice(s), in earliest-available order — replaces the entire current pool. `{"class": "<name>"}` names a runtime-managed model class and expands to its currently committed pool. A class reference always replaces the whole pool, so it cannot be used for an effort-only or model-only partial update.'
         ),
       },
     },
@@ -656,6 +747,114 @@ export function createAgentExecMcpServer(
   if (selfId === rootId) {
     const assertRoot = () =>
       selfId === rootId ? null : toolError(new Error("only the root may use this tool"));
+
+    // Definitions are root-only operational policy. The store is intentionally
+    // optional in test/minimal server construction, but production always wires
+    // it on root; workers never receive these tools at all.
+    if (options?.modelClasses && options.validateModelClass) {
+      const modelClasses = options.modelClasses;
+      const validateModelClass = options.validateModelClass;
+      const assertClassName = (name: string): string => {
+        const normalized = name.trim();
+        if (!normalized) throw new Error("model class name is required");
+        if (normalized !== name) {
+          throw new Error("model class name must not have leading or trailing whitespace");
+        }
+        return normalized;
+      };
+
+      server.registerTool(
+        "list_model_classes",
+        {
+          title: "List runtime model classes (root-only)",
+          description:
+            "List every model class currently committed in mesh.db. This is the live authority used by spawn_thread and set_actor_model. Root-only.",
+          inputSchema: {},
+        },
+        async () => {
+          const denied = assertRoot();
+          if (denied) return denied;
+          try {
+            return toolOk(
+              modelClasses.list().map((entry) => ({
+                name: entry.name,
+                model_config: entry.modelConfig,
+                created_at: entry.createdAt,
+                updated_at: entry.updatedAt,
+              }))
+            );
+          } catch (err) {
+            return toolError(err);
+          }
+        }
+      );
+
+      server.registerTool(
+        "set_model_class",
+        {
+          title: "Create or replace a runtime model class (root-only)",
+          description:
+            "Create a model class or replace its entire ordered concrete pool. The change is committed to mesh.db and affects the next spawn_thread or set_actor_model class reference immediately, without restart. Existing actors keep their already-resolved snapshots. A class definition cannot reference another class. Root-only.",
+          inputSchema: {
+            name: z.string().min(1).describe("Exact stable class name, e.g. 'review'."),
+            model_config: concreteModelConfigSchema.describe(
+              "One concrete provider/model/effort tuple or an ordered concrete pool. A class reference is not allowed here."
+            ),
+          },
+        },
+        async ({ name, model_config }) => {
+          const denied = assertRoot();
+          if (denied) return denied;
+          try {
+            const className = assertClassName(name);
+            const validated = validateModelClass(model_config as ConcreteModelConfigInput);
+            modelClasses.upsert(className, validated, new Date().toISOString());
+            mesh.recordEvent({
+              kind: "root_control_action",
+              actorId: rootId,
+              detail: "root-llm set_model_class",
+              payload: JSON.stringify({ name: className, entries: validated.length }),
+            });
+            options.onWrite?.();
+            return toolOk(`set runtime model class ${className}`);
+          } catch (err) {
+            return toolError(err);
+          }
+        }
+      );
+
+      server.registerTool(
+        "delete_model_class",
+        {
+          title: "Delete a runtime model class (root-only)",
+          description:
+            "Delete a model class from mesh.db. Future class references to it fail as unknown; existing actors keep their previously resolved pools. Root-only.",
+          inputSchema: {
+            name: z.string().min(1).describe("Exact class name to delete."),
+          },
+        },
+        async ({ name }) => {
+          const denied = assertRoot();
+          if (denied) return denied;
+          try {
+            const className = assertClassName(name);
+            const deleted = modelClasses.delete(className);
+            if (deleted) {
+              mesh.recordEvent({
+                kind: "root_control_action",
+                actorId: rootId,
+                detail: "root-llm delete_model_class",
+                payload: JSON.stringify({ name: className }),
+              });
+              options.onWrite?.();
+            }
+            return toolOk({ name: className, deleted });
+          } catch (err) {
+            return toolError(err);
+          }
+        }
+      );
+    }
 
     server.registerTool(
       "revive_thread",
@@ -772,16 +971,23 @@ export function createAgentExecMcpServer(
     server.registerTool(
       "list_subscriptions",
       {
-        title: "List event source subscriptions (root-only)",
+        title: "List event source ownership and subscriptions (root-only)",
         description:
-          "List all event source subscriptions (active and inactive) — the audit/inspection view of subscription history. Root-only.",
+          "List every event source owner (active claims and released tombstones) and every direct subscriber — the audit/inspection view. Root-only.",
         inputSchema: {},
       },
       async () => {
         const denied = assertRoot();
         if (denied) return denied;
         try {
-          return toolOk(mesh.listSubscriptions());
+          // Both row classes in one response, under the tool's existing name.
+          // They answer one operator question ("who is getting this source's
+          // events, and why") and splitting them across two tools would make
+          // the ownership half read as the whole answer.
+          return toolOk({
+            owners: mesh.listSubscriptions(),
+            subscribers: mesh.listEventSourceSubscriptions(),
+          });
         } catch (err) {
           return toolError(err);
         }
