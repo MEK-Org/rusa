@@ -359,6 +359,19 @@ describe("tracker MCP server", () => {
 
   it("preserves authored terminal italics and replaces a stamped PR footer pair", async () => {
     const { client: backend, calls } = recordingIssueClient();
+    backend.getOpenPullRequests = async () => [
+      {
+        number: 1,
+        title: "Existing",
+        headRef: "existing",
+        headRefName: "existing",
+        htmlUrl: "https://example.test/pr/1",
+        body: "",
+        author: "bot",
+        labels: [],
+        updatedAt: "2026-01-02T00:00:00Z",
+      },
+    ];
     const client = await connect(
       createTrackerMcpServer("test-actor", backend, {
         actorHandle: "actor-handle",
@@ -374,7 +387,7 @@ describe("tracker MCP server", () => {
         repo: "owner/repo",
         head: "fresh",
         title: "Fresh",
-        body: "The result was *surprising*",
+        body: `The result was *surprising*\n\n*other-actor (old-model, low)*\n\n${oldStamp}`,
       },
     });
     await client.callTool({
@@ -401,6 +414,8 @@ describe("tracker MCP server", () => {
     const update = calls.find((call) => call.method === "updateIssueBody")?.args[2] as string;
 
     expect(fresh.body).toContain("The result was *surprising*");
+    expect(fresh.body).toContain("*other-actor (old-model, low)*");
+    expect(fresh.body).toContain(oldStamp);
     expect(existing.body).not.toContain("other-actor");
     expect(existing.body).toContain("*actor-handle (gpt-5.6-terra)*");
     expect(existing.body.match(/\*[^*\r\n]+\*/g)).toEqual(["*actor-handle (gpt-5.6-terra)*"]);
@@ -485,10 +500,10 @@ describe("tracker MCP server", () => {
 
     expect(res.isError).toBeFalsy();
     expect(textOf(res)).toBe("https://example.test/pr/1");
-    expect(calls).toHaveLength(1);
-    expect(calls[0].method).toBe("createPullRequest");
+    expect(calls.filter((call) => call.method === "createPullRequest")).toHaveLength(1);
 
-    const opts = calls[0].args[0] as CreatePROptions;
+    const opts = calls.find((call) => call.method === "createPullRequest")
+      ?.args[0] as CreatePROptions;
     expect(opts.repo).toBe("owner/repo");
     expect(opts.head).toBe("feature-branch");
     expect(opts.title).toBe("PR Title");

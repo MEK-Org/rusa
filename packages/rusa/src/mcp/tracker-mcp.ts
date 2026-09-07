@@ -153,12 +153,19 @@ export function createTrackerMcpServer(
         // `pull_request/opened` echo; authorship still resolves per-event via
         // authorStampBodyForWebhookPayload, so labeled/closed/merged never
         // borrow it.
+        // The client discovers an existing PR internally, but does not expose
+        // that branch before it receives the body. Mirror that narrow lookup
+        // here so a fresh PR stays append-only (including a quoted stamp), while
+        // an actual upsert replaces its prior footer/stamp pair.
+        const existing = (await issueClient.getOpenPullRequests(args.repo)).some(
+          (candidate) => candidate.headRef === args.head
+        );
         const pr = await issueClient.createPullRequest({
           ...args,
-          // An upsert may receive its current tracker-stamped body. Replace only
-          // that paired footer/stamp; a terminal authored italic stays intact.
+          // A real upsert may receive its current tracker-stamped body. Replace
+          // only that paired footer/stamp; a fresh creation stays append-only.
           body: appendPreCreationAuthorStamp(
-            stripTrailingMechanicalFooter(args.body).trimEnd(),
+            (existing ? stripTrailingMechanicalFooter(args.body) : args.body).trimEnd(),
             args.repo
           ),
         });
