@@ -62,7 +62,8 @@ export class FollowerHub {
   private followers = new Map<string, RemoteInstance>();
   private routes = new Map<string, { followerId: string; actorId: string; target: string }>();
   private onRegisterCallback?: (follower: RemoteInstance) => void;
-  private sweep = setInterval(() => {
+  private sweep = setInterval(() => this.sweepFollowers(), 5000);
+  private sweepFollowers(): void {
     const now = Date.now();
     for (const follower of this.followers.values()) {
       if (now - follower.seen > 45_000) this.drop(follower, "expired");
@@ -72,7 +73,7 @@ export class FollowerHub {
         this.dedupeTrackers.delete(id);
       }
     }
-  }, 5000);
+  }
   private server = createServer((req, res) => {
     void this.handle(req, res).catch((error) => {
       if (!res.headersSent) reply(res, 400, { error: String(error) });

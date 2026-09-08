@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { createServer } from "node:http";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { FollowerHub } from "./follower-hub.js";
 import { INSTANCE_PROTOCOL_VERSION } from "./protocol.js";
 
@@ -412,5 +412,61 @@ describe("leader follower gateway", () => {
     expect(res3.status).toBe(200);
     expect(received).toHaveLength(2);
     expect(received[1]).toEqual({ type: "ready", pid: 789 });
+  });
+
+  it("keeps a long-lived follower's just-processed replay fence through expiry and replacement", async () => {
+    const start = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(start);
+    try {
+      const h = await setup();
+      const identity1 = await h.register("mac");
+      const firstHost = h.hub.createHost("mac", "actor-1");
+      const received: unknown[] = [];
+      firstHost.on("message", (message) => received.push(message));
+
+      // This follower has been connected for over an hour. It now processes a
+      // batch whose acknowledgement is assumed lost, so it may replay after
+      // the expiry-driven generation replacement below.
+      clock.mockReturnValue(start + 3601_000);
+      const first = await h.post("/events", {
+        ...identity1,
+        batchId: "long-lived-batch",
+        events: [
+          {
+            eventId: "long-lived-event",
+            actorId: "actor-1",
+            message: { type: "ready", pid: 456 },
+          },
+        ],
+      });
+      expect(first.status).toBe(200);
+      expect(received).toEqual([{ type: "ready", pid: 456 }]);
+
+      // The connection expires 46 seconds after the accepted batch. Running
+      // the real sweep is deterministic here; with stale tracker freshness it
+      // would delete the fence in this same sweep.
+      clock.mockReturnValue(start + 3601_000 + 46_000);
+      (h.hub as unknown as { sweepFollowers(): void }).sweepFollowers();
+      expect(h.hub.list()).toEqual([]);
+
+      const identity2 = await h.register("mac");
+      const replacementHost = h.hub.createHost("mac", "actor-1");
+      replacementHost.on("message", (message) => received.push(message));
+      const replay = await h.post("/events", {
+        ...identity2,
+        batchId: "long-lived-batch",
+        events: [
+          {
+            eventId: "long-lived-event",
+            actorId: "actor-1",
+            message: { type: "ready", pid: 456 },
+          },
+        ],
+      });
+      expect(replay.status).toBe(200);
+      expect(received).toEqual([{ type: "ready", pid: 456 }]);
+    } finally {
+      clock.mockRestore();
+    }
   });
 });

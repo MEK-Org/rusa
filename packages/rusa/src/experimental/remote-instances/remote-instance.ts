@@ -24,6 +24,10 @@ export class FollowerDedupeTracker {
   }
 
   recordBatch(batchId: string): void {
+    // The tracker must survive a follower generation replacement after a
+    // response-lost retry. Recording the just-accepted batch is meaningful
+    // activity even when the instance has been connected for a long time.
+    this.touch();
     if (this.processedBatches.has(batchId)) return;
     this.processedBatches.add(batchId);
     this.batchOrder.push(batchId);
@@ -38,6 +42,9 @@ export class FollowerDedupeTracker {
   }
 
   recordEvent(eventId: string): void {
+    // Keep the follower's replay fence fresh for individual event processing
+    // too, in case a batch is interrupted before it reaches recordBatch().
+    this.touch();
     if (this.processedEvents.has(eventId)) return;
     this.processedEvents.add(eventId);
     this.eventOrder.push(eventId);

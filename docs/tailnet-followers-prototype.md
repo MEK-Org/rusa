@@ -18,7 +18,7 @@ Leader Node process                       Follower Node process
 ```
 
 The earlier local-process demo, per-actor Node entrypoint, and `--worker-runtime`
-mode have been removed. Protocol version 2 requires rebuilding both ends;
+mode have been removed. Protocol version 3 requires rebuilding both ends;
 old followers are rejected at enrollment. Existing running instances are not
 automatically upgraded or restarted.
 
