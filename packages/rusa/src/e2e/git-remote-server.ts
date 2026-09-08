@@ -1,6 +1,9 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import { basename, dirname, join } from "node:path";
+import { createLogger } from "../observability/logger.js";
+
+const log = createLogger({ context: { component: "e2e-git-remote" } });
 
 /**
  * Serves the e2e harness's one disposable bare remote over loopback smart
@@ -118,7 +121,7 @@ export async function startE2EGitRemoteServer(
       child.stderr.resume();
       child.stdout.on("end", () => res.end());
       child.on("error", (err) => {
-        console.error("[e2e git-remote] git http-backend process error:", err);
+        log.error("git_http_backend_process_failed", { err });
         if (!res.headersSent) res.writeHead(500, { "content-type": "text/plain" });
         res.end("Internal Server Error");
       });
@@ -129,7 +132,7 @@ export async function startE2EGitRemoteServer(
       req.on("data", (chunk: Buffer) => chunks.push(chunk));
       req.on("end", () => runBackend(Buffer.concat(chunks)));
       req.on("error", (err) => {
-        console.error("[e2e git-remote] request stream error:", err);
+        log.error("git_http_request_failed", { err });
         if (!res.headersSent) res.writeHead(500, { "content-type": "text/plain" });
         res.end("Internal Server Error");
       });
