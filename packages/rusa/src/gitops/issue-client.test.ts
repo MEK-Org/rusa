@@ -264,7 +264,7 @@ describe("GitHubIssueClient", () => {
   });
 
   it("surfaces reviewer request errors when updating an existing PR", async () => {
-    installFetch({
+    const requests = installFetch({
       [`GET /repos/${REPO}/pulls?head=${encodeURIComponent("test-org:mc/issue-9")}&state=open&per_page=1`]:
         { json: [{ number: 12, html_url: "https://github.com/test-org/test-repo/pull/12" }] },
       [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
@@ -283,6 +283,23 @@ describe("GitHubIssueClient", () => {
         reviewer: "operator",
       })
     ).rejects.toThrow(GitHubApiError);
+    expect(requests.map(({ method, path, body }) => ({ method, path, body }))).toEqual([
+      {
+        method: "GET",
+        path: `/repos/${REPO}/pulls?head=${encodeURIComponent("test-org:mc/issue-9")}&state=open&per_page=1`,
+        body: undefined,
+      },
+      {
+        method: "PATCH",
+        path: `/repos/${REPO}/pulls/12`,
+        body: { title: "Updated title", body: "Updated body." },
+      },
+      {
+        method: "POST",
+        path: `/repos/${REPO}/pulls/12/requested_reviewers`,
+        body: { reviewers: ["operator"] },
+      },
+    ]);
   });
 
   it("selects the existing body from its one lookup even if a later read would disagree", async () => {
@@ -433,6 +450,7 @@ describe("GitHubIssueClient", () => {
       [`GET /repos/${REPO}/pulls?head=${encodeURIComponent("test-org:mc/issue-9")}&state=open&per_page=1`]:
         { json: [{ number: 12, html_url: "https://github.com/test-org/test-repo/pull/12" }] },
       [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
+      [`POST /repos/${REPO}/pulls/12/requested_reviewers`]: { status: 201, json: {} },
     });
 
     const pr = await new GitHubIssueClient().createPullRequest({
@@ -440,15 +458,17 @@ describe("GitHubIssueClient", () => {
       head: "mc/issue-9",
       title: "Updated title",
       body: "Updated body.",
+      reviewer: "operator",
     });
 
     expect(pr).toEqual({
       number: 12,
       htmlUrl: "https://github.com/test-org/test-repo/pull/12",
     });
-    expect(requests.some((r) => r.method === "POST")).toBe(false);
     const patch = requests.find((r) => r.method === "PATCH");
     expect(patch?.body).toEqual({ title: "Updated title", body: "Updated body." });
+    const reviewers = requests.find((r) => r.path.endsWith("/requested_reviewers"));
+    expect(reviewers?.body).toEqual({ reviewers: ["operator"] });
   });
 
   it("surfaces error when retargeting PR base fails on GitHub", async () => {
