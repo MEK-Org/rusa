@@ -634,6 +634,11 @@ class _DetailViewState extends State<_DetailView> {
               _completionsPanel(),
               const SizedBox(height: 24),
             ],
+            if (data.parent != null) ...[
+              _SectionHeader('PARENT'),
+              _parentPanel(data.parent!),
+              const SizedBox(height: 24),
+            ],
             _SectionHeader('CHILDREN'),
             _childrenPanel(context, data),
             const SizedBox(height: 28),
@@ -990,6 +995,27 @@ class _DetailViewState extends State<_DetailView> {
           ),
           ?edit,
         ],
+      ),
+    );
+  }
+
+  Widget _parentPanel(ObligationDto parent) {
+    return Container(
+      decoration: BoxDecoration(
+        color: MeshColors.bgSecondary,
+        border: Border.all(color: MeshColors.border),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: ObligationRow(
+        obligation: parent,
+        store: store,
+        showOwner: true,
+        showActions: false,
+        onSelectView: onSelectView,
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 12,
+        ),
       ),
     );
   }
