@@ -1589,6 +1589,34 @@ describe("Actor", () => {
       expect(provider.calls).toHaveLength(0);
     });
 
+    it("turns an onRunStart failure into a failed result without invoking the provider", async () => {
+      const results: RunResult[] = [];
+      const provider = new FakeProvider();
+      const actor = makeActor(
+        {
+          onRunStart: () => {
+            throw new Error("launch configuration rejected");
+          },
+          onRunEnd: (result) => {
+            results.push(result);
+          },
+        },
+        provider
+      );
+
+      actor.requestRun();
+      await vi.advanceTimersByTimeAsync(10);
+      await flush();
+
+      expect(provider.calls).toHaveLength(0);
+      expect(results).toHaveLength(1);
+      expect(results[0]).toMatchObject({
+        success: false,
+        exitCode: 1,
+        output: expect.stringContaining("launch configuration rejected"),
+      });
+    });
+
     // The third timestamp : start says the provider was invoked, the
     // first chunk says it started ANSWERING. Without the pair, "started and
     // silent" and "answered then stopped" are the same shape on the timeline —

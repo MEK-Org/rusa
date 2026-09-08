@@ -173,7 +173,10 @@ export async function runActorMeshE2EUp(opts: {
         baseConfigHome: opts.baseConfigHome,
         // External control does not invoke a root provider, but children still
         // use the real provider catalog and credentials seeded below.
-        rootActor: { provider: opts.rootDriver === "external" ? "fake" : "claude" },
+        rootActor: {
+          provider: opts.rootDriver === "external" ? "fake" : "claude",
+          model: opts.rootDriver === "external" ? "fake-model" : "claude-sonnet-5",
+        },
         chat: {
           projectId: "e2e",
           subscription: "e2e",

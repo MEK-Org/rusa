@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
+import {
+  type ActorRunModelConfig,
+  parseActorRunModelConfig,
+  serializeActorRunModelConfig,
+} from "./actor-run-model-config.js";
 
 export type ActorRunOutcome = "completed" | "abandoned";
 
@@ -15,6 +20,9 @@ export interface ActorRun {
   yieldStatus: string | null;
   yieldNote: string | null;
   yieldedAt: string | null;
+  /** Immutable validated launch document, or null for a pre-0042 row. */
+  modelConfig: ActorRunModelConfig | null;
+  /** Compatibility projection from modelConfig, falling back to historical columns. */
   provider: string | null;
   model: string | null;
   abandonReason: string | null;
@@ -34,6 +42,7 @@ interface ActorRunRow {
   yielded_at: string | null;
   provider: string | null;
   model: string | null;
+  model_config?: string | null;
   abandon_reason: string | null;
 }
 
@@ -82,19 +91,28 @@ export function captureRunOutput(output: string | null | undefined): string | nu
 export class ActorRunRepository {
   constructor(private readonly db: Database.Database) {}
 
+  /**
+   * Open a run and durably record its launch configuration up front, so a run
+   * that fails or gets interrupted before `complete()` still retains what was
+   * actually launched (design #184).
+   *
+   * New writes contain one validated versioned model-config document. A null
+   * document is reserved for rows written before migration 0042.
+   */
   start(opts: {
     id?: string;
     actorId: string;
     startedAt?: string;
-    provider?: string | null;
+    modelConfig: ActorRunModelConfig;
   }): string {
     const id = opts.id ?? randomUUID();
+    const modelConfig = serializeActorRunModelConfig(opts.modelConfig);
     this.db
       .prepare(
-        `INSERT INTO actor_runs (id, actor_id, started_at, provider)
+        `INSERT INTO actor_runs (id, actor_id, started_at, model_config)
          VALUES (?, ?, ?, ?)`
       )
-      .run(id, opts.actorId, opts.startedAt ?? new Date().toISOString(), opts.provider ?? null);
+      .run(id, opts.actorId, opts.startedAt ?? new Date().toISOString(), modelConfig);
     return id;
   }
 
@@ -109,6 +127,13 @@ export class ActorRunRepository {
     if (result.changes !== 1) throw new Error(`active actor run not found: ${id}`);
   }
 
+  /**
+   * The launch modelConfig is fixed by `start()` — `complete()` never touches
+   * it. A provider's post-hoc read-back of what it ran on
+   * (`RunResult.model`) is a narrower, best-effort-reported concept (see its
+   * doc in providers/types.ts) that belongs on the `run_end` mesh event, not
+   * here; conflating the two was design #184's bug.
+   */
   complete(
     id: string,
     opts: {
@@ -118,7 +143,6 @@ export class ActorRunRepository {
       output: string;
       yieldStatus?: string;
       yieldNote?: string;
-      model?: string | null;
     }
   ): void {
     const endedAt = opts.endedAt ?? new Date().toISOString();
@@ -132,8 +156,7 @@ export class ActorRunRepository {
              yielded_at = CASE
                WHEN COALESCE(?, yield_status) IS NOT NULL THEN COALESCE(yielded_at, ?)
                ELSE yielded_at
-             END,
-             model = ?
+             END
          WHERE id = ? AND outcome IS NULL`
       )
       .run(
@@ -145,7 +168,6 @@ export class ActorRunRepository {
         yieldNote,
         opts.yieldStatus ?? null,
         endedAt,
-        opts.model ?? null,
         id
       );
     if (result.changes !== 1) throw new Error(`active actor run not found: ${id}`);
@@ -306,6 +328,7 @@ function assertLimit(limit: number): void {
 }
 
 function toActorRun(row: ActorRunRow): ActorRun {
+  const modelConfig = parseActorRunModelConfig(row.model_config);
   return {
     id: row.id,
     actorId: row.actor_id,
@@ -318,8 +341,9 @@ function toActorRun(row: ActorRunRow): ActorRun {
     yieldStatus: row.yield_status,
     yieldNote: row.yield_note,
     yieldedAt: row.yielded_at,
-    provider: row.provider,
-    model: row.model,
+    modelConfig,
+    provider: modelConfig?.provider ?? row.provider,
+    model: modelConfig?.model ?? row.model,
     abandonReason: row.abandon_reason,
   };
 }

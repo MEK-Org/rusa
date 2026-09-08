@@ -58,15 +58,15 @@ describe("buildE2EConfig", () => {
     expect(loaded.glassGoals).toBeUndefined();
   });
 
-  it("omits rootActor/chat by default but threads them when given", () => {
+  it("uses an explicit fake root by default and threads a supplied selection", () => {
     const bare = buildE2EConfig({ scratchPath: "/some/scratch", baseConfig: null });
-    expect(bare.rootActor).toBeUndefined();
+    expect(bare.rootActor).toEqual({ provider: "fake", model: "fake-model" });
     expect(bare.chat).toBeUndefined();
 
     const am = buildE2EConfig({
       scratchPath: "/some/scratch",
       baseConfig: null,
-      rootActor: { provider: "antigravity", effort: "high" },
+      rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
       chat: { projectId: "e2e", subscription: "e2e", pubsubKeyPath: "/dev/null" },
     });
     expect(am.rootActor?.provider).toBe("antigravity");

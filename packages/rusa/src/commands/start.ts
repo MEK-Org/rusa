@@ -87,7 +87,7 @@ import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-thro
 import { resolveRootActorId } from "../actor/root-actor-id.js";
 import { RootControlService } from "../actor/root-control.js";
 import { buildRootPrompt } from "../actor/root-prompt.js";
-import { createRunAccounting } from "../actor/run-accounting.js";
+import { createRunAccounting, projectActorRunLaunchConfig } from "../actor/run-accounting.js";
 import {
   ensureWakeToken,
   wakePortPath,
@@ -200,7 +200,6 @@ import {
 } from "../providers/model-config.js";
 import { refreshConfiguredProviderModelCatalogs } from "../providers/model-scrape.js";
 import {
-  DEFAULT_ROOT_PROVIDER,
   normalizeFallbackModel,
   providerCapabilityName,
   providerThrottleKey,
@@ -791,6 +790,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     process.exit(1);
     return;
   }
+  const rootActor = config.rootActor;
+  if (!rootActor) {
+    throw new Error("config loader returned no rootActor after validating root configuration");
+  }
   // Config is parsed: its credentials join the scrub set (which `bootLog` shares
   // through the same closure) and its configured level takes effect.
   const configSecretEntries = collectConfigSecretEntries(config);
@@ -1211,7 +1214,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // Emergency brake: the single source of truth is the sentinel file. Halt by
   // hand (`touch ~/.rusa/HALT`), by chat (`/halt`), or pull the plug.
   const haltSwitch = new HaltSwitch(join(mcHome, "HALT"));
-  const rootProviderName = config.rootActor?.provider?.trim() || DEFAULT_ROOT_PROVIDER;
+  const rootProviderName = rootActor.provider;
   const isProviderHalted = (providerName?: string) =>
     haltSwitch.isHalted(providerName ?? rootProviderName);
   let haltExpiryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1924,9 +1927,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // to the root provider.
       const modelConfigPool: readonly RawProviderModelConfig[] = rec.modelConfig ?? [
         {
-          provider: config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER,
-          model: config.rootActor?.model,
-          effort: config.rootActor?.effort,
+          provider: rootActor.provider,
+          model: rootActor.model,
+          effort: rootActor.effort,
         },
       ];
       try {
@@ -2225,12 +2228,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             // The run actually launched: the queued reservation this
             // describes no longer exists to cancel or report on.
             mesh.clearSelection(id);
-            const providerName = providerThrottleKey(selected.provider, config);
-            const runId = beginActorRun(id, providerName);
+            const launchConfig = projectActorRunLaunchConfig(selected);
+            const runId = beginActorRun(id, launchConfig);
             runLogger(id, runId).info("run_start", {
-              provider: providerName,
-              model: selected.model,
-              effort: selected.effort,
+              provider: launchConfig.provider,
+              model: launchConfig.model,
+              effort: launchConfig.effort,
               responsive,
             });
             mesh.recordEvent({
@@ -2241,9 +2244,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                 : undefined,
               body: injectRecord ? JSON.stringify(injectRecord) : undefined,
               payload: JSON.stringify({
-                provider: providerName,
-                model: selected.model,
-                effort: selected.effort,
+                provider: launchConfig.provider,
+                model: launchConfig.model,
+                effort: launchConfig.effort,
                 responsive,
                 runId,
               }),
@@ -2749,7 +2752,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           portableContextStore
         );
         return {
-          prompt: buildRootPrompt(config.rootActor?.charter, injection?.priorContext, rootHandle),
+          prompt: buildRootPrompt(rootActor.charter, injection?.priorContext, rootHandle),
           injectRecord: injection?.injectRecord,
         };
       },
@@ -2760,12 +2763,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             // reads the provider instance this resolves, so it cannot relabel a
             // fallback with the primary request.
             resolveProvider: (model) =>
-              resolveProvider(
-                config,
-                config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER,
-                model,
-                config.rootActor?.effort
-              ),
+              resolveProvider(config, rootActor.provider, model, rootActor.effort),
             classify: classifyExhaustion,
           }
         : undefined,
@@ -2821,12 +2819,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // The run actually launched: the queued reservation this describes
         // no longer exists to cancel or report on.
         mesh.clearSelection(rootId);
-        const providerName = providerThrottleKey(selected.provider, config);
-        const runId = beginActorRun(rootId, providerName);
+        const launchConfig = projectActorRunLaunchConfig(selected);
+        const runId = beginActorRun(rootId, launchConfig);
         runLogger(rootId, runId).info("run_start", {
-          provider: providerName,
-          model: selected.model,
-          effort: selected.effort,
+          provider: launchConfig.provider,
+          model: launchConfig.model,
+          effort: launchConfig.effort,
           responsive,
         });
         mesh.recordEvent({
@@ -2837,9 +2835,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             : undefined,
           body: injectRecord ? JSON.stringify(injectRecord) : undefined,
           payload: JSON.stringify({
-            provider: providerName,
-            model: selected.model,
-            effort: selected.effort,
+            provider: launchConfig.provider,
+            model: launchConfig.model,
+            effort: launchConfig.effort,
             responsive,
             runId,
           }),
@@ -2917,25 +2915,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     });
   const rootRecord: ActorRecord = {
     id: rootId,
-    charter: config.rootActor?.charter ?? DEFAULT_ROOT_CHARTER,
+    charter: rootActor.charter ?? DEFAULT_ROOT_CHARTER,
     parentId: null,
     isRoot: true,
-    // Only recorded when a concrete model is actually declared — root's own
-    // scalar config may omit `model` to mean "the provider CLI's own
-    // default", which the durable modelConfig pool contract (#169) can't
-    // represent (it requires a concrete model on every entry). Omitting the
-    // field here leaves `launchProviderName`'s fallback (below) as the
-    // provider-only source of truth for a CLI-default root.
-    ...(provider.model
-      ? {
-          modelConfig: [
-            { provider: provider.providerName, model: provider.model, effort: provider.effort },
-          ],
-        }
-      : {}),
-    context: config.rootActor?.context,
+    modelConfig: [
+      {
+        provider: rootActor.provider,
+        model: rootActor.model,
+        ...(rootActor.effort === undefined ? {} : { effort: rootActor.effort }),
+      },
+    ],
+    context: rootActor.context,
     sessionId:
-      config.rootActor?.context?.type === "portable"
+      rootActor.context?.type === "portable"
         ? undefined
         : (actors.get(rootId)?.sessionId ?? legacyActorImport.deferredRootSessionId),
     status: "active",
@@ -2976,7 +2968,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     rootControl.recordDriverAttached("e2e-controller");
     console.log(`[root] driver=external tools=${rootMcp.map((u) => u.name).join(",")}`);
   } else {
-    const rootContext = config.rootActor?.context;
+    const rootContext = rootActor.context;
     const sessionDescription =
       rootContext?.type === "portable"
         ? `portable/${rootContext.mode} (stateless)`
@@ -3277,7 +3269,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           // The configured root identity  — display handle + avatar
           // override — so the dashboard shows this instance's own identity
           // instead of the default root-actor.
-          rootIdentity: { id: rootId, handle: rootHandle, avatarPath: config.rootActor?.avatar },
+          rootIdentity: { id: rootId, handle: rootHandle, avatarPath: rootActor.avatar },
           // On-demand avatar generation  reuses the same key the
           // walkie-talkie transcription/TTS calls above already gate on.
           geminiApiKey,

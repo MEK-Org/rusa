@@ -510,7 +510,10 @@ async function runProviderContextABBody(
   const instance = provisionE2EInstance({
     root: instanceRoot,
     baseConfigHome: opts.baseConfigHome,
-    rootActor: { provider: rootProvider },
+    rootActor: {
+      provider: rootProvider,
+      model: rootProvider === "kimi" ? "kimi-for-coding" : "claude-sonnet-5",
+    },
     chat: {
       projectId: "ab",
       subscription: "ab",
