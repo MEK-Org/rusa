@@ -5,16 +5,16 @@
 // burn, and quota burn sets the error the controller sees next. Nothing here
 // runs in production and nothing here reads production data.
 //
-// Plant elements and calibrations:
-//   * model runs with execution duration and quota cost (calibrated baseline
-//     plus variable-cost and completion-lag sensitivity);
+// Plant elements and evidence accounting:
+//   * model runs with modeled execution duration and normalized quota cost,
+//     plus variable-cost and completion-lag sensitivity;
 //   * run arrivals split into responsive and external work;
 //   * daytime activity shaping the arrival rate;
 //   * applied throttling through a faithful copy of ProviderPacer's
 //     start-to-start gate, staging pipeline, and ConcurrencyLimiter interaction;
 //   * weekly quota window with rollover, refill, and exhaustion;
-//   * observation cadence calibrated to the 300 s production slot (SLOT_MS),
-//     avoiding the step-bound integral clamping truncation of earlier 600 s models.
+//   * a modeled 300 s observation cadence matching the production slot width
+//     (SLOT_MS); actual polling timing is not public telemetry.
 
 import { advance, makeRandom, REFILL_EPSILON_POINTS } from "./controller.mjs";
 
@@ -23,10 +23,10 @@ export const HORIZON_SECONDS = 8 * 24 * 60 * 60;
 export const OBSERVATION_PERIOD_SECONDS = 300;
 
 /**
- * Baseline uses fixed quota cost per completed run, so the weekly budget is a
- * run count. 2,000 runs per week is the calibration point; it makes the
- * perfectly paced spacing 302 s, which sits well inside the 36,000 s cap and
- * keeps the actuator in its informative range rather than pinned at a bound.
+ * This normalized baseline uses fixed quota cost per completed run, so the
+ * weekly budget is a run count. 2,000 runs per week makes perfectly paced
+ * spacing 302 s, keeping the modeled actuator away from its bounds. It is not
+ * an observation of provider quota cost or throughput.
  */
 export const BUDGET_RUNS_PER_WEEK = 2_000;
 export const QUOTA_COST_PER_RUN_POINTS = 100 / BUDGET_RUNS_PER_WEEK;
@@ -85,6 +85,17 @@ export function generateArrivals({ seed, externalRunsPerWeek, responsiveRunsPerW
     for (let index = 0; index < external; index++) arrivals.push({ at: t, responsive: false });
     for (let index = 0; index < responsive; index++) arrivals.push({ at: t, responsive: true });
   }
+  // Cost is an exogenous property of a generated request, never a consequence
+  // of its start order. Full groups preserve the exact unit mean; a short final
+  // group stays at 1× so the entire prepared scenario has the same total cost
+  // as the fixed-cost case.
+  for (let index = 0; index < arrivals.length; index += 3) {
+    const groupLength = Math.min(3, arrivals.length - index);
+    const multipliers = groupLength === 3 ? [1.8, 0.6, 0.6] : Array(groupLength).fill(1);
+    for (let offset = 0; offset < groupLength; offset++) {
+      arrivals[index + offset].costMultiplier = multipliers[offset];
+    }
+  }
   return arrivals;
 }
 
@@ -129,15 +140,13 @@ export function simulate(scenario, candidate, plant = {}) {
   const exhausted = () => quotaPct <= 0;
   const externalRunning = () => running.filter((run) => !run.responsive).length;
 
-  let runSequence = 0;
   const startRun = (request, responsive) => {
     lastStartedAt = now;
     nextAvailableAt = now + controller.interval;
-    // Bimodal deterministic variance preserving the exact mean cost (1.8x / 0.6x / 0.6x = 1.0x mean)
+    // Each generated request carries its deterministic, mean-preserving cost
+    // multiplier, so every candidate sees an identical exogenous cost trace.
     const cost = variableCost
-      ? runSequence++ % 3 === 0
-        ? QUOTA_COST_PER_RUN_POINTS * 1.8
-        : QUOTA_COST_PER_RUN_POINTS * 0.6
+      ? QUOTA_COST_PER_RUN_POINTS * (request.costMultiplier ?? 1)
       : QUOTA_COST_PER_RUN_POINTS;
     running.push({ completesAt: now + runDurationSeconds, responsive, cost });
     running.sort((a, b) => a.completesAt - b.completesAt);
@@ -165,10 +174,6 @@ export function simulate(scenario, candidate, plant = {}) {
       // pacing and normal concurrency, but re-bases lastStartedAt and nextAvailableAt.
       if (responsiveQueue.length > 0 && !exhausted()) {
         startRun(responsiveQueue.shift(), true);
-        if (staged !== null && now < nextAvailableAt) {
-          externalQueue.unshift(staged);
-          staged = null;
-        }
         progressed = true;
       }
       // ProviderPacer stages external head request once pacing interval elapses

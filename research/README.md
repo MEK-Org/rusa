@@ -65,14 +65,16 @@ The historical fixture is the 55-observation sanitized trace from [#291 comment 
 
 ### High-fidelity simulator calibration and evidence accounting
 
-The closed-loop simulation accounts for the eight elements identified in #291:
+The closed-loop simulation audits eight modeler-selected coverage categories. Public
+#291 establishes the evidence-first, analysis-only boundary; it does not enumerate
+this list.
 
-1. **Applied throttling (Calibrated):** Faithful implementation of `ProviderPacer`'s two-stage staging pipeline (`packages/rusa/src/actor/provider-pacer.ts`). External runs stage behind the interval clock, then wait for `ConcurrencyLimiter` slots. Selection-time revalidation returns staged requests to the queue if the interval increases or responsive runs start. Interval lengthening rebases pending wait on `lastStartedAt`.
-2. **Observation cadence (Calibrated):** Calibrated to the production 300 s slot cadence (`SLOT_MS = 5 * 60 * 1000` in `packages/rusa/src/quota/shared-store.ts`). This resolves the integral step-bound truncation in earlier 600 s models where `QUOTA_INTEGRAL_MAX_STEP_SECONDS = 300` clipped half the accumulated error.
-3. **Execution duration and concurrency (Calibrated baseline + Sensitivity):** 240 s duration and 4 concurrent slots (matching default mesh configuration), varied across 30 s/240 s/600 s and 1/4 slots.
-4. **Quota reset behavior (Calibrated):** Exact match with `shared-store.ts` cycle rollover at 7 days, 100% refill, integral/derivative zeroing, and post-reset slew/smoothing.
-5. **Responsive and external demand (Calibrated gating, uncalibrated split):** Responsive runs bypass pacing and mesh concurrency while updating the interval clock. Demand split is an explicit assumption.
-6. **Quota usage (Calibrated baseline + Sensitivity):** Fixed 0.050 points per run baseline (2,000 runs/week budget), with deterministic bimodal variance sensitivity (1.8× and 0.6×). Per-token usage telemetry is unobserved in public data.
+1. **Applied throttling (Source-backed mechanism):** One `ProviderPacer` lane stages one external request behind the interval clock, then waits for `ConcurrencyLimiter` selection. The staged request remains in that queue until selection-time revalidation; interval lengthening rebases pending pacing on `lastStartedAt`.
+2. **Observation cadence (Source-backed slot width; modeled timing):** The baseline uses the store's 300 s `SLOT_MS` width. Exact 300 s simulation steps avoid the earlier 600 s model's `QUOTA_INTEGRAL_MAX_STEP_SECONDS = 300` integration clipping; live jitter and skipped slots are uncalibrated.
+3. **Execution duration and concurrency (Modeled duration; source-backed default capacity):** 240 s is a modeled duration baseline. Four concurrent normal slots match the mesh configuration default; 30/240/600 s and 1/4 slots are sensitivity cases.
+4. **Quota reset behavior (Source-backed mechanism):** The model mirrors `shared-store.ts` cycle rollover at 7 days, 100% refill, integral/derivative zeroing, and post-reset slew/smoothing.
+5. **Responsive and external demand (Source-backed gating; modeled split):** Responsive runs bypass pacing and mesh concurrency while updating the interval clock. Demand split is an explicit assumption.
+6. **Quota usage (Modeled normalization + sensitivity):** Fixed 0.050 points per run and the derived 2,000-run weekly budget are normalized model inputs, not observed usage. The deterministic 1.8×/0.6×/0.6× sensitivity is attached to generated arrivals so every candidate receives the same exogenous cost trace; it is not a real token-cost distribution.
 7. **Model-run arrivals (Uncalibrated assumption):** Deterministic thinned-Poisson draws (no public arrival telemetry).
 8. **Daytime activity (Uncalibrated assumption):** Raised half-sine across a 14-hour day over a 0.15 night floor (synthetic profile).
 
@@ -82,5 +84,6 @@ metrics, while the deterministic scripts remain the reproducible recipe for ever
 plotted sample.
 
 Absolute run counts and hours carry no operational meaning; only comparisons
-between candidates on identical demand do. Failures, retries, cancellations,
-multi-bucket interaction, and the five-hour window remain out of scope.
+between candidates on identical demand and arrival-attached cost do. Failures,
+retries, cancellations, multi-provider/multi-bucket interaction, and the
+five-hour window remain out of scope.

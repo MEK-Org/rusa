@@ -8,18 +8,18 @@ The companion fixed-input study replays a supplied error sequence. That is a val
 
 This study closes the loop: commanded wait throttles run starts, started runs complete and burn quota, and the resulting quota level produces the next controller error. Demand is generated once per scenario from a fixed seed and replayed identically for every candidate, so differences between candidates are caused only by the weights.
 
-Starting from merged PR #341 (closed-loop v1), this study calibrates the simulation against production architecture across the eight elements requested in #291 and establishes an explicit accounting of what is calibrated by evidence versus what remains an uncalibrated assumption.
+Starting from merged PR #341 (closed-loop v1), this study audits eight modeler-selected coverage categories against public source and explicitly distinguishes source-backed mechanics from modeled assumptions. Public #291 establishes the evidence-first analysis boundary; it does not enumerate this category list.
 
-## Calibrated plant model and evidence accounting
+## Plant model and evidence accounting
 
-The eight elements identified for high-fidelity simulation are accounted for as follows:
+The eight modeler-selected coverage categories are accounted for as follows:
 
-1. **Applied throttling (Calibrated):** Faithful implementation of `ProviderPacer`'s two-stage staging pipeline (`packages/rusa/src/actor/provider-pacer.ts`). External runs first stage behind the commanded start-to-start interval clock, then wait for available `ConcurrencyLimiter` capacity. Selection-time revalidation ensures that if the interval lengthens or responsive runs start while staged, the request is returned to queue and re-delayed. Raising the interval re-bases the pending wait on the last actual start (`lastStartedAt`), exactly as production `setInterval` does.
-2. **Observation cadence (Calibrated):** Calibrated to the production 300 s slot cadence (`SLOT_MS = 5 * 60 * 1000` in `packages/rusa/src/quota/shared-store.ts`). Earlier 600 s models suffered from an integration truncation flaw: because `QUOTA_INTEGRAL_MAX_STEP_SECONDS = 300`, setting observation cadence to 600 s clipped `Math.min(dt, 300)` to 300 s every single step, discarding half the accrued integral error! At 300 s, the controller integrates the full elapsed time.
-3. **Execution duration and concurrency (Calibrated baseline + Sensitivity):** Baseline uses 240 s run duration and 4 concurrent normal runs (matching default production mesh concurrency). Completion lags of 30 s, 240 s, and 600 s across 1 and 4 slots are evaluated in the sensitivity matrix.
-4. **Quota reset behavior (Calibrated):** Faithful reproduction of `shared-store.ts` (staging revision `04a8b99228a5d6baa2992d3d0776fa75b060021a`) cycle rollover at 7 days (604,800 s), quota refill to 100%, integral and derivative reset to 0, and post-reset actuator smoothing (0.25) and slew limiting (±900 s).
-5. **Responsive and external demand (Calibrated gating, uncalibrated split):** Responsive work bypasses pacing and normal concurrency limits but re-bases the interval clock (`lastStartedAt`), exactly matching `ProviderPacer`. The demand mix (~23% responsive in nominal/burst, ~64% in responsive-heavy) is an explicit modeler assumption, as public traces do not record priority breakdown.
-6. **Quota usage (Calibrated baseline + Sensitivity):** Baseline uses a fixed 0.050 points per completed run (budget of 2,000 runs/week, ideal spacing 302 s). Variable quota cost is evaluated via deterministic bimodal variance (1.8× and 0.6×) preserving identical mean burn. Per-token / per-prompt usage telemetry is unobserved in public data.
+1. **Applied throttling (Source-backed mechanism):** The model follows `ProviderPacer`'s one-staged-request-per-lane pipeline (`packages/rusa/src/actor/provider-pacer.ts`): an external request clears the start-to-start gate, then waits for mesh concurrency. It remains staged until the concurrency callback selects it; that callback revalidates `nextAvailableAt` and returns it to the provider queue if the interval lengthened while it waited. Raising the interval re-bases pending pacing on `lastStartedAt`, as production `setInterval` does. This is a one-provider-lane model, not a multi-provider claim.
+2. **Observation cadence (Source-backed slot width; modeled timing):** `SLOT_MS = 5 * 60 * 1000` in `packages/rusa/src/quota/shared-store.ts`, so the baseline uses a 300 s slot width. Earlier 600 s models made the update rule's `Math.min(dt, 300)` guard discard half of every simulated 600 s integration step. Exact 300 s steps avoid that artifact; live observation jitter or skipped slots remain uncalibrated and are not modeled as a distribution.
+3. **Execution duration and concurrency (Modeled duration; source-backed default capacity):** The 240 s duration is a modeled baseline. Four normal slots match the mesh configuration default. Completion lags of 30 s, 240 s, and 600 s across 1 and 4 slots are sensitivity cases, not measured execution telemetry.
+4. **Quota reset behavior (Source-backed mechanism):** The model reproduces `shared-store.ts` (staging revision `04a8b99228a5d6baa2992d3d0776fa75b060021a`) cycle rollover at 7 days (604,800 s), quota refill to 100%, integral and derivative reset to 0, and post-reset actuator smoothing (0.25) and slew limiting (±900 s).
+5. **Responsive and external demand (Source-backed gating; modeled mix):** Responsive work bypasses pacing and normal concurrency limits but re-bases the interval clock (`lastStartedAt`), matching `ProviderPacer`. The demand mix (~23% responsive in nominal/burst, ~64% in responsive-heavy) is a modeler assumption; public traces do not record the priority split. The reported pending-external-work metric is a simulator count, not a claim about dashboard queued-versus-in-flight classification.
+6. **Quota usage (Modeled normalization + bounded sensitivity):** Fixed 0.050 points per completed run (a normalized 2,000-run weekly budget; ideal spacing 302 s) is not observed quota usage. The primary comparison uses this fixed cost. A deterministic [1.8×, 0.6×, 0.6×] pattern is attached to generated arrivals, not starts, so each candidate receives the same exogenous mean-preserving cost trace. It does not represent higher moments of real token usage.
 7. **Model-run arrivals (Uncalibrated assumption):** Deterministic thinned-Poisson arrival draws. No empirical arrival logs exist in public records, so arrivals are synthetic.
 8. **Daytime activity (Uncalibrated assumption):** Raised half-sine across a 14-hour working day over a 0.15 night floor. Documented as a synthetic profile rather than measured telemetry.
 
@@ -75,9 +75,10 @@ Each cell is mean recovery hours; the parenthesis is seeds faster than current. 
 
 The high-fidelity closed loop reinforces and clarifies the core control findings:
 
-- **Cadence calibration accelerates recovery without changing controller rankings:** Calibrating observation cadence from 600 s to the native 300 s production slot resolves the integral step-bound truncation. Under 300 s sampling, burst recovery for the current controller improves from 11.0 h to 7.7 h.
-- **The derivative term remains inert at production cadence:** Across every scenario and candidate the largest derivative contribution to the command was 2.32 s, against commands in the thousands of seconds. Over the burst-recovery resampled sweep, `Kd 900` and `Kd 3600` never moved the applied wait more than 32 s away from current weights and reproduced identical recovery times on every seed. Quota moves slowly and smoothly relative to the 300 s slot, so there is negligible slope for the derivative to act upon. **A stronger derivative is not a recovery lever in this plant.**
-- **The weaker-integral direction remains strictly worse on recovery:** `Kp 80` (10.4 h mean recovery vs current's 7.7 h, 0/8 seeds faster; 6 of 32 runs against current's 5); `Ti 2h` (9.9 h mean recovery vs current's 7.7 h, 0/8 seeds faster; the same 5 of 32 runs as current); `Ti 2h + Kd 3600` (9.9 h mean recovery vs current's 7.7 h, 0/8 seeds faster; the same 5 of 32 runs as current). A longer integral time requires a proportionally larger accumulated integral to sustain a command, so unwinding against positive error takes substantially longer.
+- **Using the source's 300 s slot width removes a simulator artifact:** The earlier 600 s model clipped each integration step to 300 s. Under exact 300 s modeled sampling, burst recovery for the current controller changes from 11.0 h to 7.7 h without changing the tested ranking. This is a model comparison, not measured operational recovery.
+- **The derivative term remains inert in these modeled plants:** Across every scenario and candidate the largest derivative contribution to the command was 2.32 s, against commands in the thousands of seconds. Over the burst-recovery resampled sweep, `Kd 900` and `Kd 3600` never moved the applied wait more than 32 s away from current weights and reproduced identical recovery times on every seed. The source update divides error change by elapsed time and filters it with a 1,800 s time constant; the slow modeled quota slopes across 300 s slots therefore leave little derivative contribution. **A stronger derivative is not a recovery lever in this plant.**
+- **The Ti axis is slower on recovery:** `Ti 2h` recovered in 9.9 h on average versus current's 7.7 h, with 0/8 seeds faster and the same 5 of 32 runs as current. A longer integral time requires a proportionally larger accumulated integral to sustain a command, so unwinding against positive error takes longer in this model.
+- **The Kp axis is separate:** `Kp 80` likewise had 0/8 seeds faster (10.4 h mean recovery), but Ti is unchanged there; it is a distinct proportional-gain result and supports no integral-mechanics attribution.
 - **The combined proposal inherits that weakness:** `Ti 2h + Kd 3600` recovered in 9.9 h on average against the current controller's 7.7 h, was slower on 8 of 8 seeds, and derivative action failed to offset the integral delay.
 - **Moving the opposite way improves recovery:** `Kp 160` recovered faster than current on all 8 seeds (5.8 h mean vs 7.7 h) and exhausted quota in 4 of 32 runs against current's 5; `Ti 0.5h` recovered faster than current on all 8 seeds (5.0 h mean vs 7.7 h) and exhausted quota in 7 of 32 runs against current's 5. Both achieve faster recovery by commanding a higher peak wait (up to 2971 s higher at peak, external wait p95 moving by at most 1.96 h), unwinding earlier when demand subsides.
 
@@ -95,28 +96,28 @@ To evaluate the sensitivity of the findings to uncalibrated plant parameters, th
 | 240s-4-slot | 240 s | 4 | 300 s | fixed | 6.3 | 10.6 | 6.3 | 2.31 | 28 |
 | 600s-1-slot | 600 s | 1 | 300 s | fixed | 2.5 | 3.8 | 2.5 | 1.40 | 1 |
 | 600s-4-slot | 600 s | 4 | 300 s | fixed | 7.0 | 10.6 | 7.0 | 1.21 | 20 |
-| varcost-4-slot | 240 s | 4 | 300 s | bimodal | 5.7 | 10.4 | 5.7 | 2.22 | 36 |
+| varcost-4-slot | 240 s | 4 | 300 s | bimodal | 5.5 | 10.4 | 5.5 | 2.22 | 21 |
 | obs-600s-4-slot | 240 s | 4 | 600 s | fixed | 11.0 | 13.8 | 11.0 | 2.18 | 36 |
 
 Across all variants:
-- The largest derivative contribution never exceeds 2.39 s, confirming that derivative inertness is an intrinsic feature of the observation timescale, not a plant lag artifact.
+- The largest derivative contribution never exceeds 2.39 s in this bounded sensitivity matrix; this does not establish behavior for unobserved demand slopes or other sampling schedules.
 - Weaker integral (`Ti 2h`) remains uniformly slower across every variant.
-- Variable quota cost introduces micro-scale variance but leaves recovery dynamics and candidate rankings identical.
+- This one exogenous, mean-preserving cost pattern introduces micro-scale variance while leaving the reported recovery rankings unchanged; it does not bound other cost distributions.
 
 ## Assumptions, limits, and missing telemetry
 
 While fidelity has been improved to match the production runtime architecture, remaining gaps are documented:
 
-- **Missing empirical token burn:** Telemetry on per-run token consumption distribution is unavailable in public records. Fixed mean with bimodal sensitivity bounds the effect, but true multi-modal token distribution requires production telemetry.
-- **Missing arrival telemetry:** Arrival rates and responsive/external ratios are plausible synthetic models rather than observed empirical traces.
-- **Scope bounds:** Single provider bucket on a weekly window. Multi-bucket interactions and the 5-hour rolling window are not modeled.
+- **Missing empirical token burn:** Sanitized per-run quota delta or token-cost buckets are needed to calibrate the distribution; the fixed mean and one deterministic perturbation do not bound it.
+- **Missing arrival and state-transition telemetry:** Sanitized arrival, paced, concurrency-selected, started, completed, cancelled/retried timestamps; responsive/normal class; provider/bucket identity; and quota observation/reset timestamps are needed to calibrate timing, queue state, priority split, and observation jitter. Prompt content is unnecessary for this purpose.
+- **Scope bounds:** Single provider lane and weekly bucket. Retries, cancellations, multi-provider/multi-bucket contention, and the five-hour rolling window are not modeled.
 
 ## Recommendation
 
 The high-fidelity simulation confirms the previous conclusion with greater precision: **do not retune production weights from this evidence alone**.
 
-1. **Derivative action is inert at production sampling rates:** Raising `Kd` does not speed recovery and does not warrant deployment.
-2. **Weaker integral is counter-productive:** Increasing `Ti` delays recovery and increases exhaustion risk.
+1. **Derivative action is inert in these modeled 300 s slot-based runs:** Raising `Kd` does not speed recovery here and does not warrant deployment.
+2. **Weaker integral is slower in the modeled recovery sweep:** Increasing `Ti` delays recovery and did not improve exhaustion frequency in this sweep; this study does not establish a broader exhaustion-risk ordering.
 3. **Pacing dials should remain untouched:** Until empirical token distributions and arrival traces are gathered from production telemetry, the production controller weights should remain at their current baseline.
 
 ## Artifacts
