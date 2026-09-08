@@ -53,11 +53,9 @@ export interface ActorOptions {
   cwd: string;
   /**
    * The declared candidate pool this actor runs on (design MEK-Org/rusa#169).
-   * A single fixed-model actor still declares a one-element pool. `model` is
-   * optional here (unlike the validated {@link ProviderModelConfig} pool
-   * contract) solely for root's own scalar config, which may omit a model to
-   * mean "the provider CLI's own default" — a worker's pool always carries
-   * concrete models, enforced upstream by `validateModelConfigPool`.
+   * A single fixed-model actor still declares a one-element pool. In-process
+   * actors receive validated entries; the raw shape remains at this transport
+   * boundary so a remote actor can report a malformed selection as a run fault.
    */
   modelConfig: RawProviderModelConfig[];
   /** Resolve one declared candidate into the coding provider that will run it. */

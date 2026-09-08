@@ -62,6 +62,7 @@ describe("0030_actor_runs", () => {
       yieldNote: "waiting on review",
       provider: "codex",
       model: "gpt-5.5",
+      modelConfig: null,
     });
 
     db.exec("DELETE FROM mesh_events");

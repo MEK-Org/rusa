@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
+import {
+  type ActorRunModelConfig,
+  parseActorRunModelConfig,
+  serializeActorRunModelConfig,
+} from "./actor-run-model-config.js";
 
 export type ActorRunOutcome = "completed" | "abandoned";
 
@@ -15,17 +20,11 @@ export interface ActorRun {
   yieldStatus: string | null;
   yieldNote: string | null;
   yieldedAt: string | null;
+  /** Immutable validated launch document, or null for a pre-0042 row. */
+  modelConfig: ActorRunModelConfig | null;
+  /** Compatibility projection from modelConfig, falling back to historical columns. */
   provider: string | null;
   model: string | null;
-  /** Provider-native reasoning level actually passed at launch, when the provider supports one. */
-  effort: string | null;
-  /**
-   * Whether effort applicability was recorded at launch: `true` for an
-   * effort-capable provider, `false` as an explicit "not applicable" for a
-   * provider without effort control, `null` for a row that predates this
-   * column (a recording omission, not a recorded absence).
-   */
-  effortIsApplicable: boolean | null;
   abandonReason: string | null;
 }
 
@@ -43,8 +42,7 @@ interface ActorRunRow {
   yielded_at: string | null;
   provider: string | null;
   model: string | null;
-  effort: string | null;
-  effort_is_applicable: number | null;
+  model_config?: string | null;
   abandon_reason: string | null;
 }
 
@@ -98,51 +96,23 @@ export class ActorRunRepository {
    * that fails or gets interrupted before `complete()` still retains what was
    * actually launched (design #184).
    *
-   * `model` is required — pass the exact pin handed to the provider, or `null`
-   * when the provider was launched with no explicit pin (an operator-configured
-   * "use the provider's own default" — see `ProviderConfig.model`'s doc). An
-   * empty string is always a mistake (a caller that meant `null`), so it throws.
-   *
-   * `effortApplicable` records whether the provider exposes a native effort
-   * control at all, independent of whether an override `effort` value was
-   * actually chosen for this run. It is required for every new row: only a
-   * historical row that predates this migration may read as unassessed (null).
+   * New writes contain one validated versioned model-config document. A null
+   * document is reserved for rows written before migration 0042.
    */
   start(opts: {
     id?: string;
     actorId: string;
     startedAt?: string;
-    provider?: string | null;
-    model: string | null;
-    effortApplicable: boolean;
-    effort?: string | null;
+    modelConfig: ActorRunModelConfig;
   }): string {
-    if (opts.model !== null && !opts.model.trim()) {
-      throw new Error("actor run model must not be an empty string; pass null for no explicit pin");
-    }
-    if (typeof opts.effortApplicable !== "boolean") {
-      throw new Error("actor run effort applicability must be recorded explicitly");
-    }
-    if (!opts.effortApplicable && opts.effort != null) {
-      throw new Error("actor run effort must be absent when effort is not supported");
-    }
     const id = opts.id ?? randomUUID();
-    const effortIsApplicable = opts.effortApplicable ? 1 : 0;
-    const effort = opts.effortApplicable ? (opts.effort ?? null) : null;
+    const modelConfig = serializeActorRunModelConfig(opts.modelConfig);
     this.db
       .prepare(
-        `INSERT INTO actor_runs (id, actor_id, started_at, provider, model, effort, effort_is_applicable)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO actor_runs (id, actor_id, started_at, model_config)
+         VALUES (?, ?, ?, ?)`
       )
-      .run(
-        id,
-        opts.actorId,
-        opts.startedAt ?? new Date().toISOString(),
-        opts.provider ?? null,
-        opts.model,
-        effort,
-        effortIsApplicable
-      );
+      .run(id, opts.actorId, opts.startedAt ?? new Date().toISOString(), modelConfig);
     return id;
   }
 
@@ -158,8 +128,8 @@ export class ActorRunRepository {
   }
 
   /**
-   * `model`/`effort` are launch config, fixed by `start()` — `complete()` never
-   * touches them. A provider's post-hoc read-back of what it ran on
+   * The launch modelConfig is fixed by `start()` — `complete()` never touches
+   * it. A provider's post-hoc read-back of what it ran on
    * (`RunResult.model`) is a narrower, best-effort-reported concept (see its
    * doc in providers/types.ts) that belongs on the `run_end` mesh event, not
    * here; conflating the two was design #184's bug.
@@ -358,6 +328,7 @@ function assertLimit(limit: number): void {
 }
 
 function toActorRun(row: ActorRunRow): ActorRun {
+  const modelConfig = parseActorRunModelConfig(row.model_config);
   return {
     id: row.id,
     actorId: row.actor_id,
@@ -370,10 +341,9 @@ function toActorRun(row: ActorRunRow): ActorRun {
     yieldStatus: row.yield_status,
     yieldNote: row.yield_note,
     yieldedAt: row.yielded_at,
-    provider: row.provider,
-    model: row.model,
-    effort: row.effort,
-    effortIsApplicable: row.effort_is_applicable === null ? null : row.effort_is_applicable === 1,
+    modelConfig,
+    provider: modelConfig?.provider ?? row.provider,
+    model: modelConfig?.model ?? row.model,
     abandonReason: row.abandon_reason,
   };
 }

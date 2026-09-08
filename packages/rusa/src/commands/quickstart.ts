@@ -50,6 +50,13 @@ export const PROVIDER_CLI_COMMANDS: Record<string, string> = {
   kimi: "kimi",
 };
 
+const QUICKSTART_ROOT_MODELS: Record<string, string> = {
+  claude: "claude-sonnet-5",
+  codex: "gpt-5.6-sol",
+  antigravity: "Gemini 3.7 Flash",
+  kimi: "kimi-for-coding",
+};
+
 const UNSUPPORTED_QUICKSTART_LOGIN_PROVIDERS = new Set(["kimi"]);
 
 export interface QuickstartOptions {
@@ -355,6 +362,14 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
     default: suggestedRootHandle,
   });
   const rootHandle = rootHandleAnswer.trim() || suggestedRootHandle;
+  const rootProvider = providers[0];
+  const rootModel = (
+    await input({
+      message: `Exact root model pin for ${rootProvider}:`,
+      default: QUICKSTART_ROOT_MODELS[rootProvider],
+      validate: (value) => (value.trim() ? true : "Root model is required"),
+    })
+  ).trim();
 
   const config: RusaConfig = {
     profile: "quickstart",
@@ -366,9 +381,10 @@ export async function runQuickstartConfigure(opts: QuickstartConfigureOptions = 
       providers.map((provider) => [provider, { cliCommand: PROVIDER_CLI_COMMANDS[provider] }])
     ),
     rootActor: {
-      provider: providers[0],
+      provider: rootProvider,
+      model: rootModel,
       handle: rootHandle,
-      ...(providers[0] === "antigravity" ? { effort: "high" } : {}),
+      ...(rootProvider === "antigravity" ? { effort: "high" } : {}),
     },
     webhook: {
       port: QUICKSTART_WEBHOOK_PORT,

@@ -32,16 +32,6 @@ export function isProviderCommand(command: string): command is ProviderCommand {
   return command in PROVIDER_CAPABILITIES;
 }
 
-/**
- * Whether the native adapter behind this capability exposes a reasoning-effort
- * control. This is derived from the same registry metadata used for selection
- * validation, so run recording cannot drift onto a second provider catalog.
- */
-export function providerSupportsEffort(capabilityName: string): boolean {
-  if (!isProviderCommand(capabilityName)) return false;
-  return "efforts" in PROVIDER_CAPABILITIES[capabilityName];
-}
-
 /** Default root provider when `config.rootActor` is unset — `agy` (Antigravity). */
 export const DEFAULT_ROOT_PROVIDER = "antigravity";
 export const DEFAULT_ROOT_EFFORT = "high";

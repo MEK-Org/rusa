@@ -5,6 +5,7 @@ import type { ActorFactoryContext } from "../../actor/actor-mesh.js";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { createRunAccounting } from "../../actor/run-accounting.js";
 import { runMigrations } from "../../db/migrations/runner.js";
+import { createActorRunModelConfig } from "../../db/repositories/actor-run-model-config.js";
 import { ActorRunRepository } from "../../db/repositories/actor-run-repository.js";
 import type { RunResult } from "../../providers/types.js";
 import { ActorHandle } from "./actor-handle.js";
@@ -81,12 +82,14 @@ describe("remote actor run accounting", () => {
         _inject: unknown,
         selected: { provider: string; model: string; effort?: string }
       ) => {
-        accounting.begin(ACTOR_ID, {
-          provider: selected.provider,
-          model: selected.model,
-          effortApplicable: true,
-          effort: selected.effort ?? null,
-        });
+        accounting.begin(
+          ACTOR_ID,
+          createActorRunModelConfig({
+            provider: selected.provider,
+            model: selected.model,
+            ...(selected.effort === undefined ? {} : { effort: selected.effort }),
+          })
+        );
       },
       log: (chunk: string) => {
         if (chunk.includes("run accounting failed")) accountingErrors.push(chunk);

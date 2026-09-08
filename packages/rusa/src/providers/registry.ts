@@ -6,8 +6,6 @@ import { CopilotProvider } from "./copilot.js";
 import { FakeProvider } from "./fake-provider.js";
 import { KimiProvider } from "./kimi.js";
 import {
-  DEFAULT_ROOT_EFFORT,
-  DEFAULT_ROOT_PROVIDER,
   isProviderCommand,
   type ProviderCommand,
   validateProviderSelection,
@@ -18,7 +16,6 @@ export {
   DEFAULT_ROOT_EFFORT,
   DEFAULT_ROOT_PROVIDER,
   providerCapabilityName,
-  providerSupportsEffort,
   validateProviderSelection,
 } from "./provider-selection.js";
 
@@ -71,19 +68,17 @@ export function providerThrottleKey(providerName: string, config: RusaConfig): s
 /**
  * Resolve the provider the root actor runs on. Config-driven and intentionally
  * independent of the DB enabled-models / persona quota routing — the root model
- * is just config ("default cheap (agy), Claude escape-hatch"; see the actor-mesh
- * design). Defaults to agy; honors an optional `root.model` override. Throws if
- * `root.provider` isn't declared under `providers`.
+ * is just config. Config loading passes this same selection through the shared model
+ * config validator. Throws if the provider or model is blank.
  */
 export function resolveRootProvider(config: RusaConfig): CodingProvider {
-  const providerName = config.rootActor?.provider?.trim() || DEFAULT_ROOT_PROVIDER;
-  const isDefaultRoot = !config.rootActor?.provider?.trim();
-  const selection = validateProviderSelection(
-    config,
-    providerName,
-    config.rootActor?.model,
-    config.rootActor?.effort ?? (isDefaultRoot ? DEFAULT_ROOT_EFFORT : undefined)
-  );
+  const rootActor = config.rootActor;
+  if (!rootActor) throw new Error("rootActor must specify an explicit provider and model");
+  const providerName = typeof rootActor.provider === "string" ? rootActor.provider.trim() : "";
+  if (!providerName) throw new Error("rootActor.provider must be a non-empty string");
+  const model = typeof rootActor.model === "string" ? rootActor.model.trim() : "";
+  if (!model) throw new Error("rootActor.model must be a non-empty string");
+  const selection = validateProviderSelection(config, providerName, model, rootActor.effort);
   return instantiateProvider(providerName, selection.model, selection.effort, config);
 }
 

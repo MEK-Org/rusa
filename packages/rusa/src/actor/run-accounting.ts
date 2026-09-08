@@ -1,33 +1,21 @@
+import {
+  type ActorRunModelConfig,
+  createActorRunModelConfig,
+} from "../db/repositories/actor-run-model-config.js";
 import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
 
-/** The provider configuration durably attached to the run at launch. */
-export interface ActorRunLaunchConfig {
-  provider: string;
-  model: string | null;
-  /** Whether this provider exposes a native effort control. */
-  effortApplicable: boolean;
-  effort: string | null;
-}
-
 /**
- * Project the exact tuple selected for a launch into the durable run schema.
- * The caller resolves provider naming and effort capability from the provider
- * registry; keeping this projection here makes the run ledger and its
- * provider-matrix contract share one boundary.
+ * Project the exact validated tuple selected for a launch into the durable run
+ * document. Production and the provider-matrix test share this boundary.
  */
-export function projectActorRunLaunchConfig(
-  selected: RawProviderModelConfig,
-  provider: string,
-  effortApplicable: boolean
-): ActorRunLaunchConfig {
-  return {
-    provider,
-    model: selected.model ?? null,
-    effortApplicable,
-    effort: selected.effort ?? null,
-  };
+export function projectActorRunLaunchConfig(selected: RawProviderModelConfig): ActorRunModelConfig {
+  return createActorRunModelConfig({
+    provider: selected.provider,
+    model: selected.model ?? "",
+    ...(selected.effort === undefined ? {} : { effort: selected.effort }),
+  });
 }
 
 /**
@@ -42,7 +30,7 @@ export function projectActorRunLaunchConfig(
  */
 export interface RunAccounting {
   /** Open this actor's durable run. Throws if one is already open. */
-  begin(actorId: string, launchConfig: ActorRunLaunchConfig): string;
+  begin(actorId: string, modelConfig: ActorRunModelConfig): string;
   /** Close this actor's open run. Throws if the actor has none. */
   complete(actorId: string, result: RunResult): string;
   /** Close this actor's open run as abandoned, or report there was none. */
@@ -72,11 +60,11 @@ export function createRunAccounting(runs: () => ActorRunRepository): RunAccounti
     return runId;
   };
   return {
-    begin: (actorId, launchConfig) => {
+    begin: (actorId, modelConfig) => {
       if (activeRunIds.has(actorId)) {
         throw new Error(`actor already has an active durable run: ${actorId}`);
       }
-      const runId = runs().start({ actorId, ...launchConfig });
+      const runId = runs().start({ actorId, modelConfig });
       activeRunIds.set(actorId, runId);
       return runId;
     },

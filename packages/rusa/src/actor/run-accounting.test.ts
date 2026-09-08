@@ -1,27 +1,25 @@
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
 import { runMigrations } from "../db/migrations/runner.js";
+import {
+  type ActorRunModelConfig,
+  createActorRunModelConfig,
+} from "../db/repositories/actor-run-model-config.js";
 import { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
 import type { RunResult } from "../providers/types.js";
-import {
-  type ActorRunLaunchConfig,
-  createRunAccounting,
-  type RunAccounting,
-} from "./run-accounting.js";
+import { createRunAccounting, type RunAccounting } from "./run-accounting.js";
 
 const RESULT: RunResult = { success: true, output: "done", exitCode: 0 };
-const CODEX_LAUNCH = {
+const CODEX_LAUNCH: ActorRunModelConfig = createActorRunModelConfig({
   provider: "codex",
   model: "gpt-5.6-sol",
-  effortApplicable: true,
   effort: "high",
-} satisfies ActorRunLaunchConfig;
-const CLAUDE_LAUNCH = {
+});
+const CLAUDE_LAUNCH: ActorRunModelConfig = createActorRunModelConfig({
   provider: "claude",
   model: "claude-sonnet-5",
-  effortApplicable: true,
   effort: "medium",
-} satisfies ActorRunLaunchConfig;
+});
 
 describe("createRunAccounting", () => {
   let db: Database.Database;
@@ -44,10 +42,7 @@ describe("createRunAccounting", () => {
     expect(runs.getById(runId)).toMatchObject({
       outcome: "completed",
       success: true,
-      provider: CODEX_LAUNCH.provider,
-      model: CODEX_LAUNCH.model,
-      effort: CODEX_LAUNCH.effort,
-      effortIsApplicable: true,
+      modelConfig: CODEX_LAUNCH,
     });
   });
 

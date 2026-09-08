@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
 import { runMigrations } from "../migrations/runner.js";
+import { createActorRunModelConfig } from "./actor-run-model-config.js";
 import { ActorRunRepository } from "./actor-run-repository.js";
 import { InboxFocusRepository } from "./inbox-focus-repository.js";
 import { InboxRepository } from "./inbox-repository.js";
@@ -36,7 +37,11 @@ describe("InboxFocusRepository", () => {
   });
 
   it("persists the selected set, primary obligation, diagnostics, and associations", () => {
-    runs.start({ id: "run-1", actorId: "actor-a", model: "test-model", effortApplicable: false });
+    runs.start({
+      id: "run-1",
+      actorId: "actor-a",
+      modelConfig: createActorRunModelConfig({ provider: "fake", model: "test-model" }),
+    });
     const associations = new Map<string, readonly string[]>([
       ["entry-1", ["ob-1", "ob-2"]],
       ["entry-2", ["ob-2"]],
@@ -70,7 +75,11 @@ describe("InboxFocusRepository", () => {
   });
 
   it("replaces one run's selection without deleting durable entry associations", () => {
-    runs.start({ id: "run-1", actorId: "actor-a", model: "test-model", effortApplicable: false });
+    runs.start({
+      id: "run-1",
+      actorId: "actor-a",
+      modelConfig: createActorRunModelConfig({ provider: "fake", model: "test-model" }),
+    });
     focus.recordSelection({
       runId: "run-1",
       actorId: "actor-a",
@@ -96,7 +105,11 @@ describe("InboxFocusRepository", () => {
   });
 
   it("rejects foreign inbox entries, mismatched runs, and completed runs", () => {
-    runs.start({ id: "run-a", actorId: "actor-a", model: "test-model", effortApplicable: false });
+    runs.start({
+      id: "run-a",
+      actorId: "actor-a",
+      modelConfig: createActorRunModelConfig({ provider: "fake", model: "test-model" }),
+    });
     expect(() =>
       focus.recordSelection({
         runId: "run-a",

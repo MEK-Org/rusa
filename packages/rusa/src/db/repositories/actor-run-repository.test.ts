@@ -7,11 +7,19 @@ import { ClaudeProvider } from "../../providers/claude.js";
 import { CodexProvider } from "../../providers/codex.js";
 import { CopilotProvider } from "../../providers/copilot.js";
 import { KimiProvider } from "../../providers/kimi.js";
-import { providerSupportsEffort } from "../../providers/registry.js";
 import type { CodingProvider } from "../../providers/types.js";
 import { runMigrations } from "../migrations/runner.js";
+import { createActorRunModelConfig } from "./actor-run-model-config.js";
 import { ACTOR_RUN_OUTPUT_MAX_CHARS, ActorRunRepository } from "./actor-run-repository.js";
 import { MeshChatRepository } from "./mesh-chat-repository.js";
+
+function launch(provider: string, model: string, effort?: string) {
+  return createActorRunModelConfig({
+    provider,
+    model,
+    ...(effort === undefined ? {} : { effort }),
+  });
+}
 
 describe("ActorRunRepository", () => {
   let db: Database.Database;
@@ -30,10 +38,7 @@ describe("ActorRunRepository", () => {
       id: "run-1",
       actorId: "actor-a",
       startedAt: "2026-08-30T00:00:01.000Z",
-      provider: "codex",
-      model: "gpt-5.5",
-      effortApplicable: true,
-      effort: "high",
+      modelConfig: launch("codex", "gpt-5.5", "high"),
     });
     runs.recordYield(id, "complete", "shipped", "2026-08-30T00:00:02.000Z");
     runs.complete(id, {
@@ -49,10 +54,7 @@ describe("ActorRunRepository", () => {
       output: "final output",
       yieldStatus: "complete",
       yieldNote: "shipped",
-      provider: "codex",
-      model: "gpt-5.5",
-      effort: "high",
-      effortIsApplicable: true,
+      modelConfig: { version: 1, provider: "codex", model: "gpt-5.5", effort: "high" },
     });
   });
 
@@ -60,19 +62,14 @@ describe("ActorRunRepository", () => {
     const id = runs.start({
       id: "run-failed",
       actorId: "actor-a",
-      provider: "claude",
-      model: "claude-opus-5",
-      effortApplicable: true,
-      effort: "max",
+      modelConfig: launch("claude", "claude-opus-5", "max"),
     });
     runs.complete(id, { success: false, exitCode: 1, output: "boom" });
 
     expect(runs.getById(id)).toMatchObject({
       outcome: "completed",
       success: false,
-      model: "claude-opus-5",
-      effort: "max",
-      effortIsApplicable: true,
+      modelConfig: { version: 1, provider: "claude", model: "claude-opus-5", effort: "max" },
     });
   });
 
@@ -80,83 +77,89 @@ describe("ActorRunRepository", () => {
     const id = runs.start({
       id: "run-interrupted",
       actorId: "actor-a",
-      provider: "antigravity",
-      model: "gemini-3-pro",
-      effortApplicable: true,
-      effort: "high",
+      modelConfig: launch("antigravity", "gemini-3-pro", "high"),
     });
     runs.abandon(id, "process killed");
 
     expect(runs.getById(id)).toMatchObject({
       outcome: "abandoned",
       abandonReason: "process killed",
-      model: "gemini-3-pro",
-      effort: "high",
-      effortIsApplicable: true,
+      modelConfig: { version: 1, provider: "antigravity", model: "gemini-3-pro", effort: "high" },
     });
   });
 
-  it("records an explicit absent effort for a provider with no effort control, distinguishable from historical omission", () => {
+  it("records a complete model document without effort, distinguishable from historical omission", () => {
     const withoutControl = runs.start({
       id: "run-kimi",
       actorId: "actor-a",
-      provider: "kimi",
-      model: "kimi-k3",
-      effortApplicable: false,
+      modelConfig: launch("kimi", "kimi-k3"),
     });
     expect(runs.getById(withoutControl)).toMatchObject({
-      model: "kimi-k3",
-      effort: null,
-      effortIsApplicable: false,
+      modelConfig: { version: 1, provider: "kimi", model: "kimi-k3" },
     });
 
-    // A row that predates this migration has no assessment at all, so it
-    // remains readable as omission (null), not an explicit "not applicable"
-    // (false). New starts must supply applicability and cannot create this
-    // shape.
+    // A row that predates this migration has no document at all, while a new
+    // Kimi row has a complete document with no optional effort key.
     db.prepare(
       `INSERT INTO actor_runs (id, actor_id, started_at, provider, model)
        VALUES (?, ?, ?, ?, ?)`
     ).run("run-historical", "actor-a", "2026-08-30T00:00:00.000Z", "kimi", "kimi-k3");
     const omitted = "run-historical";
     expect(runs.getById(omitted)).toMatchObject({
-      effort: null,
-      effortIsApplicable: null,
+      modelConfig: null,
     });
   });
 
-  it("requires explicit effort applicability and rejects effort for unsupported providers", () => {
-    expect(() =>
-      runs.start({ actorId: "actor-a", provider: "kimi", model: "kimi-k3" } as never)
-    ).toThrow(/applicability/i);
+  it("rejects invalid new-run model documents", () => {
     expect(() =>
       runs.start({
         actorId: "actor-a",
-        provider: "kimi",
-        model: "kimi-k3",
-        effortApplicable: false,
-        effort: "high",
+        modelConfig: { version: 1, provider: "", model: "kimi-k3" },
       })
-    ).toThrow(/effort.*absent/i);
+    ).toThrow(/provider/i);
+    expect(() =>
+      runs.start({
+        actorId: "actor-a",
+        modelConfig: { version: 1, provider: "kimi", model: "kimi-k3", effort: "   " },
+      })
+    ).toThrow(/effort/i);
+    expect(() =>
+      runs.start({
+        actorId: "actor-a",
+        modelConfig: { version: 1, provider: "codex", model: "o3", efort: "high" } as never,
+      })
+    ).toThrow(/unexpected property/i);
   });
 
-  it("rejects an empty new-run model", () => {
+  it("rejects an empty new-run provider or model", () => {
     expect(() =>
-      runs.start({ actorId: "actor-a", provider: "codex", model: "", effortApplicable: true })
+      runs.start({
+        actorId: "actor-a",
+        modelConfig: { version: 1, provider: "", model: "gpt-5.6-sol" },
+      })
+    ).toThrow(/provider/i);
+    expect(() =>
+      runs.start({ actorId: "actor-a", modelConfig: { version: 1, provider: "codex", model: "" } })
     ).toThrow(/model/i);
     expect(() =>
-      runs.start({ actorId: "actor-a", provider: "codex", model: "   ", effortApplicable: true })
+      runs.start({
+        actorId: "actor-a",
+        modelConfig: { version: 1, provider: "codex", model: "   " },
+      })
     ).toThrow(/model/i);
   });
 
-  it("accepts a null model for a provider run with no explicit pin configured", () => {
-    const id = runs.start({
-      actorId: "actor-a",
-      provider: "antigravity",
-      model: null,
-      effortApplicable: true,
-    });
-    expect(runs.getById(id)).toMatchObject({ model: null });
+  it("rejects an unknown document version and malformed stored documents", () => {
+    expect(() =>
+      runs.start({
+        actorId: "actor-a",
+        modelConfig: { version: 2, provider: "codex", model: "gpt-5.6-sol" } as never,
+      })
+    ).toThrow(/version/i);
+    db.prepare(
+      `INSERT INTO actor_runs (id, actor_id, started_at, model_config) VALUES (?, ?, ?, ?)`
+    ).run("run-invalid", "actor-a", "2026-08-30T00:00:00.000Z", "not-json");
+    expect(() => runs.getById("run-invalid")).toThrow(/invalid JSON/i);
   });
 
   it("interleaves durable inbound chat and yield notes with a stable source cursor", () => {
@@ -171,8 +174,7 @@ describe("ActorRunRepository", () => {
       id: "run-1",
       actorId: "actor-a",
       startedAt: "2026-08-30T00:00:02.000Z",
-      model: "test-model",
-      effortApplicable: false,
+      modelConfig: launch("fake", "test-model"),
     });
     runs.recordYield(runId, "blocked", "second", "2026-08-30T00:00:02.000Z");
     runs.complete(runId, {
@@ -201,7 +203,10 @@ describe("ActorRunRepository", () => {
   });
 
   it("keeps the useful tail of oversized output", () => {
-    const id = runs.start({ actorId: "actor-a", model: "test-model", effortApplicable: false });
+    const id = runs.start({
+      actorId: "actor-a",
+      modelConfig: launch("fake", "test-model"),
+    });
     runs.complete(id, {
       success: true,
       exitCode: 0,
@@ -217,8 +222,7 @@ describe("ActorRunRepository", () => {
       id: "interrupted-run",
       actorId: "actor-a",
       startedAt: "2026-08-30T00:00:01.000Z",
-      model: "test-model",
-      effortApplicable: false,
+      modelConfig: launch("fake", "test-model"),
     });
     runs.recordYield(id, "blocked", "waiting", "2026-08-30T00:00:02.000Z");
 
@@ -240,76 +244,73 @@ describe("ActorRunRepository", () => {
 
     // This invokes the projection used by commands/start.ts's onRunStart, so
     // the provider matrix cannot stay green if production launch capture drifts.
-    function captureLaunch(
-      provider: CodingProvider,
-      capabilityName: string,
-      actorId: string,
-      runId: string
-    ): void {
+    function captureLaunch(provider: CodingProvider, actorId: string, runId: string): void {
       runs.start({
         id: runId,
         actorId,
-        ...projectActorRunLaunchConfig(
-          {
-            provider: provider.providerName,
-            model: provider.model,
-            effort: provider.effort,
-          },
-          provider.providerName,
-          providerSupportsEffort(capabilityName)
-        ),
+        modelConfig: projectActorRunLaunchConfig({
+          provider: provider.name,
+          model: provider.model,
+          effort: provider.effort,
+        }),
       });
     }
 
     it("captures a non-empty launch model and native effort for every effort-capable provider", () => {
-      const providers: Array<{ provider: CodingProvider; capabilityName: string }> = [
-        {
-          provider: new ClaudeProvider("claude", config, "claude-opus-5", "high"),
-          capabilityName: "claude",
-        },
-        {
-          provider: new CodexProvider("codex", config, "gpt-5.6-sol", "medium"),
-          capabilityName: "codex",
-        },
-        {
-          provider: new AntigravityProvider(
-            "antigravity",
-            config,
-            "gemini-3-pro",
-            undefined,
-            "low"
-          ),
-          capabilityName: "agy",
-        },
+      const providers: CodingProvider[] = [
+        new ClaudeProvider("claude", config, "claude-opus-5", "high"),
+        new CodexProvider("codex", config, "gpt-5.6-sol", "medium"),
+        new AntigravityProvider("antigravity", config, "gemini-3-pro", undefined, "low"),
       ];
 
-      for (const { provider, capabilityName } of providers) {
-        const runId = `run-${provider.providerName}`;
-        captureLaunch(provider, capabilityName, "actor-a", runId);
+      for (const provider of providers) {
+        const runId = `run-${provider.name}`;
+        captureLaunch(provider, "actor-a", runId);
         const row = runs.getById(runId);
-        expect(row?.provider).toBe(provider.providerName);
+        expect(row?.provider).toBe(provider.name);
         expect(row?.model).toBeTruthy();
         expect(row?.model).toBe(provider.model);
-        expect(row?.effortIsApplicable).toBe(true);
-        expect(row?.effort).toBe(provider.effort);
+        expect(row?.modelConfig).toEqual({
+          version: 1,
+          provider: provider.name,
+          model: provider.model,
+          effort: provider.effort,
+        });
       }
     });
 
+    it("preserves configured provider alias without collapsing to cliCommand or throttle key", () => {
+      const aliasProvider = new ClaudeProvider("fast-claude", config, "claude-opus-5", "low");
+      const runId = "run-alias";
+      captureLaunch(aliasProvider, "actor-a", runId);
+      const row = runs.getById(runId);
+      expect(row?.provider).toBe("fast-claude");
+      expect(row?.modelConfig).toEqual({
+        version: 1,
+        provider: "fast-claude",
+        model: "claude-opus-5",
+        effort: "low",
+      });
+    });
+
     it("captures a non-empty launch model and an explicit absent effort for providers without effort control", () => {
-      const providers: Array<{ provider: CodingProvider; capabilityName: string }> = [
-        { provider: new KimiProvider("kimi", config, "kimi-k3"), capabilityName: "kimi" },
-        { provider: new CopilotProvider("copilot", config, "gpt-5.6"), capabilityName: "copilot" },
+      const providers: CodingProvider[] = [
+        new KimiProvider("kimi", config, "kimi-k3"),
+        new CopilotProvider("copilot", config, "gpt-5.6"),
       ];
 
-      for (const { provider, capabilityName } of providers) {
-        const runId = `run-${provider.providerName}`;
-        captureLaunch(provider, capabilityName, "actor-a", runId);
+      for (const provider of providers) {
+        const runId = `run-${provider.name}`;
+        captureLaunch(provider, "actor-a", runId);
         const row = runs.getById(runId);
-        expect(row?.provider).toBe(provider.providerName);
+        expect(row?.provider).toBe(provider.name);
         expect(row?.model).toBeTruthy();
         expect(row?.model).toBe(provider.model);
-        expect(row?.effortIsApplicable).toBe(false);
-        expect(row?.effort).toBeNull();
+        expect(row?.modelConfig).toEqual({
+          version: 1,
+          provider: provider.name,
+          model: provider.model,
+        });
       }
     });
   });

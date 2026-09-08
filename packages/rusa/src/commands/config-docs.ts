@@ -42,10 +42,10 @@ Minimal example:
   # Branch used by the root self-update tool (optional; defaults to master).
   deployBranch: master
 
-  # Which provider/model the root actor runs on (optional; defaults to agy).
+  # The explicit provider/model pin the root actor runs on.
   rootActor:
     provider: antigravity
-    # model: "Gemini 3.1 Pro (High)"   # optional; omit for the provider default
+    model: "Gemini 3.1 Pro (High)"
     # effort: high                    # optional provider-native reasoning level
     # context:                       # optional; omit for native provider sessions
     #   type: portable
@@ -104,8 +104,8 @@ Top-level fields:
   geminiApiKey             Optional. Enables Gemini features (quota-error classification, avatar generation, understanding retrieval/distill); each skips gracefully when absent.
   deployBranch             Optional. Branch the root self-update tool deploys from. Defaults to master.
   webhook                  Required. Local webhook listener settings.
-  rootActor                Optional. Provider/model the root actor runs on and its display identity. Provider
-                           defaults to agy (antigravity); identity defaults to root-actor.
+  rootActor                Required. Explicit provider/model pin the root actor runs on; identity defaults to
+                           root-actor.
   chat                     Optional. Google Chat Workspace Events ingestion and REST write settings.
   dashboard                Optional. Dashboard listener and Tailscale settings.
   voice                    Optional. Walkie-talkie transcription/TTS model and voice overrides .
@@ -148,10 +148,10 @@ quota.throttle:
 rootActor:
 
   provider                 Required. Provider key (in providers) the root actor runs on.
-  model                    Optional. Model id passed to the provider CLI's --model. Provider default if omitted.
+  model                    Required nonblank model id passed to the provider CLI's --model.
   effort                   Required for antigravity (agy); optional otherwise. Provider-native reasoning
                            level (e.g. "low", "high"), stored independently from model. Omit for other providers
-                           to preserve the provider/model default.
+                           when no effort is passed to the provider.
   fallbackModel            Optional string or list. Model(s) the root actor falls back to when the primary
                            model is overloaded or unavailable, tried in order via a freshly resolved
                            provider (root-only — ISSUE_NUM; providers.<name>.fallbackModel is rejected).

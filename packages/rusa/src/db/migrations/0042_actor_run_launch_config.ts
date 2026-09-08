@@ -2,24 +2,16 @@ import type { Database } from "better-sqlite3";
 import type { Migration } from "./types.js";
 
 /**
- * `actor_runs.model` was already writable, but the only path that ever wrote it
- * was `complete()` copying the provider's post-hoc read-back (`RunResult.model`,
- * populated only by `codex.ts`) — so every other provider's rows landed with an
- * empty model despite a real pin having been passed at launch (design #184).
- * `effort` has no prior column at all.
- *
- * `effort_is_applicable` is a launch-time fact: a provider with no native
- * effort control gets an explicit `0`, not a bare NULL, so it reads as
- * "recorded — not applicable" rather than being indistinguishable from a
- * historical row that predates this column (NULL) or a future bug that fails
- * to record at all.
+ * Store the immutable launch selection in one versioned JSON document. It is
+ * nullable only for rows written before this migration; consuming code parses
+ * and validates non-null documents, rather than coupling SQLite to a JSON
+ * shape with json_* checks.
  */
 export const actorRunLaunchConfig: Migration = {
   id: "0042_actor_run_launch_config",
   up: (db: Database) => {
     db.exec(`
-      ALTER TABLE actor_runs ADD COLUMN effort TEXT;
-      ALTER TABLE actor_runs ADD COLUMN effort_is_applicable INTEGER CHECK (effort_is_applicable IN (0, 1));
+      ALTER TABLE actor_runs ADD COLUMN model_config TEXT;
     `);
   },
 };

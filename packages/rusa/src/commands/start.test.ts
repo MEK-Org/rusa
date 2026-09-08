@@ -433,6 +433,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       },
       rootActor: {
         provider: "antigravity",
+        model: "Gemini 3.7 Flash",
         effort: "high",
       },
       geminiApiKey: "fake-gemini-key",
@@ -535,6 +536,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         rootActor: {
           // Root retains its own fallback (ISSUE_NUM keeps this root-only).
           provider: "claude",
+          model: "claude-sonnet-5",
           fallbackModel: "claude-sonnet-5",
         },
         geminiApiKey: "fake-key",
@@ -757,7 +759,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
         chat: { errorChat: "spaces/operator-dm" },
       }),
@@ -794,7 +796,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
         chat: { errorChat: "spaces/operator-dm" },
       }),
@@ -1002,7 +1004,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         toYaml({
           github: { account: "mock-bot" },
           providers: { antigravity: { cliCommand: "agy" } },
-          rootActor: { provider: "antigravity", effort: "high" },
+          rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
           // No geminiApiKey: the failure route's exhaustion classifier then takes
           // its deterministic offline branch, so this test never leaves the box.
         }),
@@ -1347,7 +1349,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
         gitBridge: true,
         gitBridgePort: 9097,
@@ -1409,7 +1411,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
         sandbox: "container-boundary",
       }),
@@ -1564,7 +1566,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           orgs: [{ org: "dummy-org", excludedRepos: ["dummy-org/private-repo"] }],
         },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
@@ -1604,7 +1606,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
         chat: { errorChat: "spaces/operator-dm" },
         observability: {
@@ -1656,7 +1658,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         observability: { diskAlert: { enabled: false } },
       }),
       "utf8"
@@ -1784,7 +1786,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           claude: { cliCommand: "claude" },
           codex: { cliCommand: "codex" },
         },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: {
           projectId: "test",
           subscription: "test",
@@ -1853,7 +1855,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         claude: { cliCommand: "claude" },
         codex: { cliCommand: "codex" },
       },
-      rootActor: { provider: "antigravity", effort: "high" },
+      rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
       chat: {
         projectId: "test",
         subscription: "test",
@@ -1917,7 +1919,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const config = {
       github: { account: "mock-bot" },
       providers: { antigravity: { cliCommand: "agy" } },
-      rootActor: { provider: "antigravity", effort: "high" },
+      rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
       geminiApiKey: "fake-gemini-key",
     };
     writeFileSync(join(homeDir, "config.yaml"), toYaml(config), "utf8");
@@ -1955,6 +1957,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         providers: { antigravity: { cliCommand: "agy" } },
         rootActor: {
           provider: "antigravity",
+          model: "Gemini 3.7 Flash",
           effort: "high",
           context: { type: "portable", mode: "tail" },
         },
@@ -2021,7 +2024,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
       readdirSync(rootAgentDir).some((name) => name.startsWith("session.json.imported-"))
     ).toBe(true);
 
-    actorOpts.onRunStart?.(false, undefined, { provider: "antigravity", effort: "high" });
+    actorOpts.onRunStart?.(false, undefined, {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
     await actorOpts.onRunEnd?.({
       success: true,
       output: "PORTABLE_ROOT_CONTEXT_MARKER",
@@ -2041,6 +2048,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         providers: { antigravity: { cliCommand: "agy" } },
         rootActor: {
           provider: "antigravity",
+          model: "Gemini 3.7 Flash",
           effort: "high",
           context: { type: "portable", mode: "ledger" },
         },
@@ -2099,6 +2107,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         providers: { antigravity: { cliCommand: "agy" } },
         rootActor: {
           provider: "antigravity",
+          model: "Gemini 3.7 Flash",
           effort: "high",
           context: { type: "portable", mode: "ledger" },
         },
@@ -2144,7 +2153,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
         };
       }
     ).opts;
-    actorOpts.onRunStart?.(false, undefined, { provider: "antigravity", effort: "high" });
+    actorOpts.onRunStart?.(false, undefined, {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
     await actorOpts.onRunEnd?.({ success: true, output: "root completed", exitCode: 0 });
 
     expect(compactSpy).toHaveBeenCalledOnce();
@@ -2176,7 +2189,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
       recipientId: "root",
       body: "Fold this after truncation.",
     });
-    actorOpts.onRunStart?.(false, undefined, { provider: "antigravity", effort: "high" });
+    actorOpts.onRunStart?.(false, undefined, {
+      provider: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
     await actorOpts.onRunEnd?.({ success: true, output: "second run", exitCode: 0 });
     expect(compactSpy).toHaveBeenCalledTimes(2);
     const advancedState = JSON.parse(
@@ -2204,7 +2221,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot", ingestionMode: "poll", pollIntervalSeconds: 300 },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
@@ -2253,7 +2270,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           repos: ["custom-owner/custom-repo"],
         },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
@@ -2308,7 +2325,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
           repos: ["extra-org/extra-repo"],
         },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
@@ -2354,7 +2371,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot", ingestionMode: "poll", pollIntervalSeconds: 300 },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
@@ -2392,6 +2409,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       },
       rootActor: {
         provider: "antigravity",
+        model: "Gemini 3.7 Flash",
         effort: "high",
       },
       chat: {
@@ -3228,6 +3246,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       },
       rootActor: {
         provider: "antigravity",
+        model: "Gemini 3.7 Flash",
         effort: "high",
       },
       geminiApiKey: "fake-gemini-key",
@@ -3497,10 +3516,14 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(payload.model).not.toBe(originalModel);
     expect(payload.runId).toBeTruthy();
     expect(getRepositories().actorRuns.getById(payload.runId ?? "")).toMatchObject({
-      provider: "agy",
+      provider: "antigravity",
       model: "Gemini 4.1 Ultra",
-      effort: "high",
-      effortIsApplicable: true,
+      modelConfig: {
+        version: 1,
+        provider: "antigravity",
+        model: "Gemini 4.1 Ultra",
+        effort: "high",
+      },
     });
   });
 
@@ -3581,7 +3604,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         providers: {
           antigravity: { cliCommand: "agy" },
         },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: {
           projectId: "test",
           subscription: "test",
@@ -3663,7 +3686,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         providers: {
           antigravity: { cliCommand: "agy" },
         },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: {
           projectId: "test",
           subscription: "test",
@@ -3735,7 +3758,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot", repos: ["custom-org/custom-repo"] },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         geminiApiKey: "fake-gemini-key",
       }),
       "utf8"
@@ -3786,7 +3809,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         providers: {
           antigravity: { cliCommand: "agy" },
         },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: {
           projectId: "test",
           subscription: "test",
@@ -3856,7 +3879,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: {
           projectId: "test",
           subscription: "test",
@@ -3925,7 +3948,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: { projectId: "test", subscription: "test", pubsubKeyPath: "/dev/null", gchat: "all" },
         geminiApiKey: "fake-gemini-key",
       }),
@@ -4055,7 +4078,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         followers: { bind: "127.0.0.1", port, tokenFile },
       }),
       "utf8"
@@ -4315,7 +4338,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
         providers: {
           antigravity: { cliCommand: "agy" },
         },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: {
           projectId: "test",
           subscription: "test",
@@ -4387,7 +4410,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
       toYaml({
         github: { account: "mock-bot" },
         providers: { antigravity: { cliCommand: "agy" } },
-        rootActor: { provider: "antigravity", effort: "high" },
+        rootActor: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
         chat: {
           projectId: "test",
           subscription: "test",

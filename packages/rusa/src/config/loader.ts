@@ -5,10 +5,8 @@ import { config as loadDotenv } from "dotenv";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { assertSpawnContextSupported, resolveContextConfig } from "../actor/context-selection.js";
 import { isSafeFollowerBind } from "../experimental/remote-instances/safe-bind.js";
-import {
-  providerCapabilityName,
-  validateProviderSelection,
-} from "../providers/provider-selection.js";
+import { validateModelConfigPool } from "../providers/model-config.js";
+import { providerCapabilityName } from "../providers/provider-selection.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import {
   GEMINI_API_KEY_SECRET_FILENAME,
@@ -231,7 +229,10 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   if (!parsed.providers || Object.keys(parsed.providers).length === 0) {
     throw new Error("config.yaml: at least one provider is required");
   }
-  if (parsed.rootActor?.context !== undefined) {
+  if (!parsed.rootActor) {
+    throw new Error("config.yaml: rootActor must specify an explicit provider and model");
+  }
+  if (parsed.rootActor.context !== undefined) {
     try {
       parsed.rootActor.context = resolveContextConfig(parsed.rootActor.context);
     } catch (err) {
@@ -240,33 +241,32 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       );
     }
   }
-  if (parsed.rootActor) {
-    const provider = parsed.rootActor.provider?.trim();
-    if (!provider) throw new Error("config.yaml: rootActor.provider must be a non-empty string");
-    const capabilityName = providerCapabilityName(provider, parsed);
-    if (capabilityName === "agy" && parsed.rootActor.effort === undefined) {
-      const { effort: parsedEffort } = normalizeModelEffortSelection(
-        capabilityName,
-        parsed.rootActor.model,
-        undefined
-      );
-      if (parsedEffort === undefined) {
-        console.warn(
-          `[migration] defaulting omitted config rootActor effort to "high" for antigravity model "${parsed.rootActor.model || "default"}"`
-        );
-        parsed.rootActor.effort = "high";
-      }
-    }
-    const selection = validateProviderSelection(
-      parsed,
-      provider,
-      parsed.rootActor.model,
-      parsed.rootActor.effort
+  const rootActor = parsed.rootActor;
+  const provider = rootActor.provider?.trim();
+  if (!provider) throw new Error("config.yaml: rootActor.provider must be a non-empty string");
+  const capabilityName = providerCapabilityName(provider, parsed);
+  if (capabilityName === "agy" && rootActor.effort === undefined) {
+    const { effort: parsedEffort } = normalizeModelEffortSelection(
+      capabilityName,
+      rootActor.model,
+      undefined
     );
-    parsed.rootActor.provider = provider;
-    parsed.rootActor.model = selection.model;
-    parsed.rootActor.effort = selection.effort;
+    if (parsedEffort === undefined) {
+      console.warn(
+        `[migration] defaulting omitted config rootActor effort to "high" for antigravity model "${rootActor.model || ""}"`
+      );
+      rootActor.effort = "high";
+    }
   }
+  const [selection] = validateModelConfigPool(
+    parsed,
+    { provider, model: rootActor.model, effort: rootActor.effort },
+    { portable: rootActor.context?.type === "portable" }
+  );
+  if (!selection) throw new Error("config.yaml: rootActor requires one provider/model entry");
+  rootActor.provider = selection.provider;
+  rootActor.model = selection.model;
+  rootActor.effort = selection.effort;
   if (parsed.understanding?.rootNodeId !== undefined) {
     if (
       typeof parsed.understanding.rootNodeId !== "string" ||
