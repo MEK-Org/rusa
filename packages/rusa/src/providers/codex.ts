@@ -779,8 +779,7 @@ export class CodexProvider implements CodingProvider {
           "codex",
           mcpConfigSource,
           opts.sandbox.isE2eRoot,
-          opts.sandbox.understandingMount,
-          opts.sandbox.e2eWritableRemoteDir
+          opts.sandbox.understandingMount
         );
         bwrapResult = bResult;
         spawnCommand = "bwrap";
