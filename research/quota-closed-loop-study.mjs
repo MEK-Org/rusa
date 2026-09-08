@@ -463,10 +463,14 @@ function baselineCharts({ scenarios, results }) {
         format: secondsFormat,
         series: [
           {
+            // Drawn on top and dashed: the cap is never reached in these
+            // scenarios, so commanded sits exactly under applied and would
+            // otherwise be an invisible legend entry.
             label: "commanded",
             color: "#d97706",
             points: seriesFor(samples, boxes[1], wait.maxY, "uncappedInterval"),
             dash: "4 3",
+            onTop: true,
           },
           {
             label: "applied (capped)",
