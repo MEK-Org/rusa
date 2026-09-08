@@ -689,7 +689,6 @@ class _OverviewTabState extends State<OverviewTab> {
                           _buildActorContextCard(
                             t,
                             width: itemWidth,
-                            showCharter: true,
                           ),
                       ],
                     );
@@ -776,7 +775,6 @@ class _OverviewTabState extends State<OverviewTab> {
     ActorViewState actor, {
     double? width,
     String? queueDetail,
-    bool showCharter = false,
   }) {
     final selectedObligation = actor.selectedObligation;
     return Container(
@@ -877,18 +875,6 @@ class _OverviewTabState extends State<OverviewTab> {
                       );
                     },
                   ),
-                  if (showCharter && actor.charterPreview.isNotEmpty) ...[
-                    const SizedBox(height: 8),
-                    Text(
-                      actor.charterPreview,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: MeshColors.textSecondary,
-                        fontSize: 12,
-                      ),
-                    ),
-                  ],
                 ],
               ),
             ),

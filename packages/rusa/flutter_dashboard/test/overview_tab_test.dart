@@ -532,6 +532,7 @@ void main() {
 
         expect(find.text('running-handle'), findsOneWidget);
         expect(find.text('Running actor title'), findsOneWidget);
+        expect(find.text('charter running'), findsNothing);
         expect(find.text('queued-handle'), findsOneWidget);
         expect(find.text('Queued actor title'), findsOneWidget);
         expect(find.text('Initial running focus'), findsOneWidget);
@@ -617,6 +618,42 @@ void main() {
         await tester.pump();
         expect(find.text('Updated running focus'), findsNothing);
         expect(tester.takeException(), isNull);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'OverviewTab renders running actor title without charter preview in running section',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [
+            makeThread('root', runState: RunState.idle),
+            makeThread(
+              'worker-1',
+              parent: 'root',
+              title: 'Worker One Title',
+              charterPreview: 'Worker One Charter Preview Body Text',
+              runState: RunState.running,
+            ),
+          ];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('Running Mesh Workers'), findsOneWidget);
+        expect(find.text('1 running'), findsOneWidget);
+        expect(find.text('worker-1-handle'), findsOneWidget);
+        expect(find.text('Worker One Title'), findsOneWidget);
+        expect(
+          find.text('Worker One Charter Preview Body Text'),
+          findsNothing,
+        );
 
         await store.dispose();
       });
