@@ -23,6 +23,7 @@ class FakeCrontab implements CrontabIo {
 const OPTS = {
   tokenFile: "/home/sf/.rusa/wake-token",
   portFile: "/home/sf/.rusa/wake-port",
+  instanceId: "test-instance",
 };
 const make = (content = "") => {
   const io = new FakeCrontab(content);
