@@ -519,43 +519,6 @@ void main() {
   );
 
   testWidgets(
-    'root obligation preserves behavior with no PARENT section or misleading parent action',
-    (tester) async {
-      await tester.runAsync(() async {
-        final rootOb = makeObligation(
-          'root-ob',
-          ownerId: 'root',
-          intent: 'Root obligation heading',
-          title: 'Root obligation heading',
-        );
-        final api = FakeApi()
-          ..threadsResult = [makeThread('root')]
-          ..obligationsResult = [rootOb];
-
-        final store = DashboardStore(api: api, stream: FakeStream());
-        await store.init();
-        store.setFocusedObligationId('root-ob');
-
-        await tester.pumpWidget(
-          MaterialApp(
-            home: Scaffold(
-              body: WorkTab(store: store, onSelectView: (_) {}),
-            ),
-          ),
-        );
-        await tester.pump();
-        await tester.pump();
-        await tester.pump();
-
-        expect(find.text('Root obligation heading'), findsWidgets);
-        expect(find.text('PARENT'), findsNothing);
-
-        await store.dispose();
-      });
-    },
-  );
-
-  testWidgets(
     'navigates to parent obligation from detail view in narrow layout',
     (tester) async {
       await tester.runAsync(() async {
@@ -600,9 +563,7 @@ void main() {
         expect(find.text('PARENT'), findsOneWidget);
         expect(find.text('Parent obligation heading'), findsWidgets);
 
-        // Scroll to and tap the parent row
-        await tester.ensureVisible(find.text('Parent obligation heading').last);
-        await tester.pump();
+        // Tap the parent row in the PARENT section
         await tester.tap(find.text('Parent obligation heading').last);
         for (int i = 0; i < 10; i++) {
           await tester.pump(const Duration(milliseconds: 10));

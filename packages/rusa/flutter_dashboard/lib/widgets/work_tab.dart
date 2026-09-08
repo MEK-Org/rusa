@@ -548,7 +548,6 @@ class _DetailViewState extends State<_DetailView> {
         final o = data.obligation;
 
         return ListView(
-          key: ValueKey(widget.obligationId),
           padding: const EdgeInsets.all(24),
           children: [
             Row(
@@ -637,7 +636,7 @@ class _DetailViewState extends State<_DetailView> {
             ],
             if (data.parent != null) ...[
               _SectionHeader('PARENT'),
-              _parentPanel(context, data.parent!),
+              _parentPanel(data.parent!),
               const SizedBox(height: 24),
             ],
             _SectionHeader('CHILDREN'),
@@ -1000,7 +999,7 @@ class _DetailViewState extends State<_DetailView> {
     );
   }
 
-  Widget _parentPanel(BuildContext context, ObligationDto parent) {
+  Widget _parentPanel(ObligationDto parent) {
     return Container(
       decoration: BoxDecoration(
         color: MeshColors.bgSecondary,
