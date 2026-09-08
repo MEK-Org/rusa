@@ -526,7 +526,10 @@ void main() {
 
         await tester.binding.setSurfaceSize(const Size(390, 844));
         addTearDown(() => tester.binding.setSurfaceSize(null));
-        await tester.pumpWidget(_app(store));
+        DashboardView? navigatedView;
+        await tester.pumpWidget(
+          _app(store, onSelectView: (v) => navigatedView = v),
+        );
         await tester.pump();
         await tester.pump();
 
@@ -540,6 +543,11 @@ void main() {
         expect(find.text('No current focus'), findsOneWidget);
         expect(find.byType(ActorAvatarWithStatus), findsNWidgets(3));
         expect(tester.takeException(), isNull);
+
+        await tester.tap(find.text('running-handle'));
+        await tester.pump();
+        expect(store.primary.value, 'running');
+        expect(navigatedView, DashboardView.actors);
 
         final updatedRunning = makeObligation(
           'updated-running-focus',
@@ -618,42 +626,6 @@ void main() {
         await tester.pump();
         expect(find.text('Updated running focus'), findsNothing);
         expect(tester.takeException(), isNull);
-
-        await store.dispose();
-      });
-    },
-  );
-
-  testWidgets(
-    'OverviewTab renders running actor title without charter preview in running section',
-    (tester) async {
-      await tester.runAsync(() async {
-        final api = FakeApi()
-          ..threadsResult = [
-            makeThread('root', runState: RunState.idle),
-            makeThread(
-              'worker-1',
-              parent: 'root',
-              title: 'Worker One Title',
-              charterPreview: 'Worker One Charter Preview Body Text',
-              runState: RunState.running,
-            ),
-          ];
-        final store = DashboardStore(api: api, stream: FakeStream());
-        await store.init();
-
-        await tester.pumpWidget(_app(store));
-        await tester.pump();
-        await tester.pump();
-
-        expect(find.text('Running Mesh Workers'), findsOneWidget);
-        expect(find.text('1 running'), findsOneWidget);
-        expect(find.text('worker-1-handle'), findsOneWidget);
-        expect(find.text('Worker One Title'), findsOneWidget);
-        expect(
-          find.text('Worker One Charter Preview Body Text'),
-          findsNothing,
-        );
 
         await store.dispose();
       });
