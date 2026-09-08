@@ -546,6 +546,7 @@ export class GitHubIssueClient implements IssueClient {
         body,
         ...(opts.base !== undefined ? { base: opts.base } : {}),
       });
+      await this.requestReviewer(opts.repo, existing.number, opts.reviewer);
       return existing;
     }
 
@@ -557,15 +558,19 @@ export class GitHubIssueClient implements IssueClient {
       { title: opts.title, body, head: opts.head, base }
     );
 
-    // No reviewer means no review request at all — not a substituted default.
-    // Requesting one is a deliberate routing act .
-    if (opts.reviewer) {
-      await this.api("POST", `/repos/${opts.repo}/pulls/${pr.number}/requested_reviewers`, {
-        reviewers: [opts.reviewer],
-      });
-    }
+    await this.requestReviewer(opts.repo, pr.number, opts.reviewer);
 
     return { number: pr.number, htmlUrl: pr.html_url };
+  }
+
+  private async requestReviewer(repo: string, prNumber: number, reviewer?: string): Promise<void> {
+    // No reviewer means no review request at all — not a substituted default.
+    // Requesting one is a deliberate routing act.
+    if (reviewer) {
+      await this.api("POST", `/repos/${repo}/pulls/${prNumber}/requested_reviewers`, {
+        reviewers: [reviewer],
+      });
+    }
   }
 
   async createIssue(opts: CreateIssueOptions): Promise<CreatedIssue> {

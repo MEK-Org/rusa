@@ -209,11 +209,12 @@ describe("GitHubIssueClient", () => {
     expect(requests.some((r) => r.path.endsWith("/requested_reviewers"))).toBe(false);
   });
 
-  it("updates the existing PR including base retarget instead of creating a second one", async () => {
+  it("updates the existing PR, requests its supplied reviewer, and avoids a second PR", async () => {
     const requests = installFetch({
       [`GET /repos/${REPO}/pulls?head=${encodeURIComponent("test-org:mc/issue-9")}&state=open&per_page=1`]:
         { json: [{ number: 12, html_url: "https://github.com/test-org/test-repo/pull/12" }] },
       [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
+      [`POST /repos/${REPO}/pulls/12/requested_reviewers`]: { status: 201, json: {} },
     });
 
     const pr = await new GitHubIssueClient().createPullRequest({
@@ -230,13 +231,58 @@ describe("GitHubIssueClient", () => {
       number: 12,
       htmlUrl: "https://github.com/test-org/test-repo/pull/12",
     });
-    expect(requests.some((r) => r.method === "POST")).toBe(false);
+    expect(requests.some((r) => r.method === "POST" && r.path === `/repos/${REPO}/pulls`)).toBe(
+      false
+    );
     const patch = requests.find((r) => r.method === "PATCH");
     expect(patch?.body).toEqual({
       title: "Updated title",
       body: "Updated body.",
       base: "staging",
     });
+    const reviewers = requests.find((r) => r.path.endsWith("/requested_reviewers"));
+    expect(reviewers?.body).toEqual({ reviewers: ["operator"] });
+  });
+
+  it("requests no reviewer when updating an existing PR without one", async () => {
+    // Deliberately does NOT stub requested_reviewers: no routing should occur
+    // when the caller omitted a reviewer.
+    const requests = installFetch({
+      [`GET /repos/${REPO}/pulls?head=${encodeURIComponent("test-org:mc/issue-9")}&state=open&per_page=1`]:
+        { json: [{ number: 12, html_url: "https://github.com/test-org/test-repo/pull/12" }] },
+      [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
+    });
+
+    await new GitHubIssueClient().createPullRequest({
+      repo: REPO,
+      head: "mc/issue-9",
+      title: "Updated title",
+      body: "Updated body.",
+    });
+
+    expect(requests.some((r) => r.path.endsWith("/requested_reviewers"))).toBe(false);
+  });
+
+  it("surfaces reviewer request errors when updating an existing PR", async () => {
+    installFetch({
+      [`GET /repos/${REPO}/pulls?head=${encodeURIComponent("test-org:mc/issue-9")}&state=open&per_page=1`]:
+        { json: [{ number: 12, html_url: "https://github.com/test-org/test-repo/pull/12" }] },
+      [`PATCH /repos/${REPO}/pulls/12`]: { json: {} },
+      [`POST /repos/${REPO}/pulls/12/requested_reviewers`]: {
+        status: 422,
+        json: { message: "Validation Failed" },
+      },
+    });
+
+    await expect(
+      new GitHubIssueClient().createPullRequest({
+        repo: REPO,
+        head: "mc/issue-9",
+        title: "Updated title",
+        body: "Updated body.",
+        reviewer: "operator",
+      })
+    ).rejects.toThrow(GitHubApiError);
   });
 
   it("selects the existing body from its one lookup even if a later read would disagree", async () => {
@@ -394,7 +440,6 @@ describe("GitHubIssueClient", () => {
       head: "mc/issue-9",
       title: "Updated title",
       body: "Updated body.",
-      reviewer: "operator",
     });
 
     expect(pr).toEqual({
