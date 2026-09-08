@@ -2521,5 +2521,106 @@ describe("agent-execution MCP server — wake schedule (root-only, ISSUE_NUM 1c)
         { provider: "antigravity", model: "gemini-3.7-flash", effort: "high" },
       ]);
     });
+
+    it("differentiates unknown thread IDs from unknown child handles", async () => {
+      const { mesh } = setup();
+      const parentId = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const client = await connect(createAgentExecMcpServer(mesh, parentId, "root"));
+
+      // Passing a non-existent UUID gives an unknown thread error
+      const unknownUuid = "11111111-2222-3333-4444-555555555555";
+      const idRes = (await client.callTool({
+        name: "set_actor_model",
+        arguments: {
+          actor_id: unknownUuid,
+          model_config: { provider: "claude", model: "claude-opus-4-8" },
+        },
+      })) as CallToolResult;
+      expect(idRes.isError).toBe(true);
+      expect((idRes.content[0] as { text: string }).text).toMatch(
+        new RegExp(`Cannot set model on unknown thread: ${unknownUuid}`)
+      );
+
+      // Passing a non-UUID non-existent handle gives an unknown child handle error
+      const handleRes = (await client.callTool({
+        name: "set_actor_model",
+        arguments: {
+          actor_id: "non-existent-handle",
+          model_config: { provider: "claude", model: "claude-opus-4-8" },
+        },
+      })) as CallToolResult;
+      expect(handleRes.isError).toBe(true);
+      expect((handleRes.content[0] as { text: string }).text).toMatch(
+        /unknown child handle: "non-existent-handle"/
+      );
+    });
+
+    it("refuses set_actor_model on retired child thread", async () => {
+      const { mesh } = setup();
+      const parentId = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const childId = mesh.spawn({
+        charter: "child",
+        parentId,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const client = await connect(createAgentExecMcpServer(mesh, parentId, "root"));
+
+      mesh.retire(childId);
+
+      const updateRes = (await client.callTool({
+        name: "set_actor_model",
+        arguments: {
+          actor_id: childId,
+          model_config: { provider: "claude", model: "claude-opus-4-8" },
+        },
+      })) as CallToolResult;
+      expect(updateRes.isError).toBe(true);
+      expect((updateRes.content[0] as { text: string }).text).toMatch(
+        new RegExp(`Cannot set model on retired thread: ${childId}`)
+      );
+    });
+
+    it("resolves active child by handle when retired sibling collides on handle", async () => {
+      const { mesh } = setup({
+        handleForId: (id) => {
+          if (id === "t2" || id === "t3") return "twin-badger";
+          return id;
+        },
+      });
+      const parentId = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const child1 = mesh.spawn({
+        charter: "child 1",
+        parentId,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const child2 = mesh.spawn({
+        charter: "child 2",
+        parentId,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      mesh.retire(child1);
+
+      const client = await connect(createAgentExecMcpServer(mesh, parentId, "root"));
+      const listRes = (await client.callTool({
+        name: "list_threads",
+        arguments: { handle: "twin-badger" },
+      })) as CallToolResult;
+      expect(listRes.isError).toBeFalsy();
+      const reports = dataOf(listRes) as Array<{ thread_id: string; handle: string }>;
+      expect(reports).toHaveLength(1);
+      expect(reports[0].thread_id).toBe(child2);
+    });
   });
 });

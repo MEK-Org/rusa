@@ -2949,7 +2949,9 @@ export class ActorMesh {
     if (!normalized) {
       throw new Error("child handle must not be blank");
     }
-    const directChildren = this.list().filter((r) => r.parentId === requesterId);
+    const directChildren = this.list().filter(
+      (r) => r.parentId === requesterId && r.status === "active"
+    );
     const matches = directChildren.filter(
       (r) => this.handleForId(r.id).toLowerCase() === normalized
     );
@@ -3193,6 +3195,9 @@ export class ActorMesh {
     const record = this.actors.get(id);
     if (!record) {
       throw new Error(`Cannot set model on unknown thread: ${id}`);
+    }
+    if (record.status === "retired") {
+      throw new Error(`Cannot set model on retired thread: ${id}`);
     }
     const isRoot = this.isRootActor(requestedBy);
     if (!isRoot) {

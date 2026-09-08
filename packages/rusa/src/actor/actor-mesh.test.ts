@@ -7663,5 +7663,53 @@ describe("ActorMesh", () => {
         /ambiguous child handle "twin-badger": matches multiple child threads/
       );
     });
+
+    it("ignores retired children so handle collisions with retired siblings do not cause ambiguity", () => {
+      const { mesh, registry } = setup({
+        handleForId: (id) => {
+          if (id === "t2" || id === "t3") return "twin-badger";
+          return id;
+        },
+      });
+
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child1 = mesh.spawn({ charter: "child 1", parentId: parent });
+      const child2 = mesh.spawn({ charter: "child 2", parentId: parent });
+      expect(mesh.getActorHandle(child1)).toBe("twin-badger");
+      expect(mesh.getActorHandle(child2)).toBe("twin-badger");
+
+      // When child1 is retired, resolving "twin-badger" resolves cleanly to active child2
+      mesh.retire(child1);
+      expect(registry.get(child1)?.status).toBe("retired");
+      expect(registry.get(child2)?.status).toBe("active");
+
+      const resolved = mesh.resolveDirectChildHandle(parent, "twin-badger");
+      expect(resolved.id).toBe(child2);
+
+      // When child2 is also retired, resolving "twin-badger" throws unknown child handle
+      mesh.retire(child2);
+      expect(() => mesh.resolveDirectChildHandle(parent, "twin-badger")).toThrow(
+        /unknown child handle: "twin-badger"/
+      );
+    });
+
+    it("refuses setActorModel on retired threads", () => {
+      const { mesh } = setup();
+      const parent = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const child = mesh.spawn({
+        charter: "child",
+        parentId: parent,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+
+      mesh.retire(child);
+      expect(() =>
+        mesh.setActorModel(child, { provider: "claude", model: "claude-opus-4-8" }, parent)
+      ).toThrow(new RegExp(`Cannot set model on retired thread: ${child}`));
+    });
   });
 });

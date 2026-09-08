@@ -76,6 +76,8 @@ const concreteModelConfigSchema = z.union([
   z.array(providerModelConfigSchema).min(1),
 ]);
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * The agent-execution MCP server — the actor mesh's primitive (design B.4)
  * exposed as tools: spawn children, message any thread you hold a handle to,
@@ -744,12 +746,24 @@ export function createAgentExecMcpServer(
     async ({ actor_id, model_config }) => {
       try {
         let targetId = actor_id;
-        const resolvedTarget = targetId === "root" && rootId ? rootId : targetId;
-        if (!mesh.actors.get(resolvedTarget)) {
-          const child = mesh.resolveDirectChildHandle(selfId, actor_id);
-          targetId = child.id;
+        try {
+          mesh.setActorModel(targetId, model_config, selfId);
+        } catch (err) {
+          if (
+            err instanceof Error &&
+            err.message.startsWith("Cannot set model on unknown thread")
+          ) {
+            if (!UUID_REGEX.test(actor_id)) {
+              const child = mesh.resolveDirectChildHandle(selfId, actor_id);
+              targetId = child.id;
+              mesh.setActorModel(targetId, model_config, selfId);
+            } else {
+              throw err;
+            }
+          } else {
+            throw err;
+          }
         }
-        mesh.setActorModel(targetId, model_config, selfId);
         return toolOk(`staged modelConfig update for ${targetId}`);
       } catch (err) {
         return toolError(err);
