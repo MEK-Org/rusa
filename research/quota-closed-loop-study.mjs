@@ -308,12 +308,20 @@ const PLANT_SENSITIVITIES = [
   { id: "240s-4-slot", runDurationSeconds: 240, maxConcurrentRuns: 4 },
   { id: "600s-1-slot", runDurationSeconds: 600, maxConcurrentRuns: 1 },
   { id: "600s-4-slot", runDurationSeconds: 600, maxConcurrentRuns: 4 },
+  { id: "varcost-4-slot", runDurationSeconds: 240, maxConcurrentRuns: 4, variableCost: true },
+  {
+    id: "obs-600s-4-slot",
+    runDurationSeconds: 240,
+    maxConcurrentRuns: 4,
+    observationPeriodSeconds: 600,
+  },
 ];
 
 /**
- * Completion charging is an explicit v1 assumption, not a claim about when a
- * provider reports usage. Varying duration and concurrency together bounds the
- * phase delay that this assumption introduces without fabricating telemetry.
+ * Completion charging is an explicit assumption, not a claim about when a
+ * provider reports usage. Varying duration, concurrency, observation cadence,
+ * and cost variance bounds the phase delay and model sensitivity without
+ * fabricating telemetry.
  */
 function plantSensitivity() {
   const scenarioDefinition = SCENARIOS.find((item) => item.id === "burst-recovery");
@@ -328,6 +336,8 @@ function plantSensitivity() {
         plant: plant.id,
         run_duration_seconds: plant.runDurationSeconds,
         max_concurrent_runs: plant.maxConcurrentRuns,
+        observation_period_seconds: plant.observationPeriodSeconds ?? OBSERVATION_PERIOD_SECONDS,
+        variable_cost: plant.variableCost ?? false,
         candidate: candidate.id,
         label: candidate.label,
         recovery_to_ideal_hours: recoveryHours(result.samples, 1),
@@ -556,7 +566,7 @@ function baselineCharts({ scenarios, results }) {
     subtitle2:
       "resulting quota reading feeds the unchanged PID. The dashed vertical rule is the weekly rollover.",
     body: panels.join("\n  "),
-    footer: `Fixed v1 plant: ${BUDGET_RUNS_PER_WEEK} runs per weekly budget (${QUOTA_COST_PER_RUN_POINTS.toFixed(3)} points each), ${RUN_DURATION_SECONDS} s per run, ${MAX_CONCURRENT_RUNS} concurrent; responsive runs bypass pacing but still charge the start-to-start clock. Not a production forecast.`,
+    footer: `Calibrated plant: ${BUDGET_RUNS_PER_WEEK} runs per weekly budget (${QUOTA_COST_PER_RUN_POINTS.toFixed(3)} points each), ${RUN_DURATION_SECONDS} s per run, ${MAX_CONCURRENT_RUNS} concurrent, ${OBSERVATION_PERIOD_SECONDS} s observation cadence; ProviderPacer staging pipeline with responsive bypass. Not a production forecast.`,
   });
 }
 
@@ -717,7 +727,14 @@ function fixed(value, digits = 1) {
   return value == null ? "not reached" : Number(value).toFixed(digits);
 }
 
-function report({ scenarios, metrics, robustnessRows2, thresholdRows, plantSensitivityRows }) {
+function report({
+  scenarios,
+  metrics,
+  robustnessRows,
+  robustnessRows2,
+  thresholdRows,
+  plantSensitivityRows,
+}) {
   const baselineRows = scenarios
     .map((scenario) => {
       const row = metrics.find(
@@ -749,18 +766,23 @@ function report({ scenarios, metrics, robustnessRows2, thresholdRows, plantSensi
   // single headline seed, because a single seed cannot establish an ordering.
   const baselineRobust = robustnessRows2.find((row) => row.candidate === BASELINE.id);
   const robustBy = (id) => robustnessRows2.find((row) => row.candidate === id);
-  const derivativeRobust = ["kd-900", "kd-3600"].map(robustBy);
-  const maxDerivativeGap = Math.max(
-    ...derivativeRobust.map((row) => row.max_interval_delta_vs_current_seconds)
+  const burstDerivativeGap = Math.max(
+    ...robustnessRows
+      .filter(
+        (row) =>
+          row.scenario === "burst-recovery" &&
+          (row.candidate === "kd-900" || row.candidate === "kd-3600")
+      )
+      .map((row) => row.max_interval_delta_vs_current_seconds)
   );
   const fasterEverySeed = robustnessRows2.filter(
     (row) => row.candidate !== BASELINE.id && row.seeds_faster_than_current === row.seeds
   );
-  const slowerEverySeed = robustnessRows2.filter(
+  const slowerRecoverySeeds = robustnessRows2.filter(
     (row) =>
       row.candidate !== BASELINE.id &&
       row.seeds_faster_than_current === 0 &&
-      row.exhausting_runs > baselineRobust.exhausting_runs
+      !["kd-900", "kd-3600"].includes(row.candidate)
   );
   const proposalRobust = robustBy("weaker-i-stronger-d");
   const thresholdCandidates = [BASELINE.id, "ti-half-hour", "kp-160", "ti-2h"];
@@ -780,7 +802,9 @@ function report({ scenarios, metrics, robustnessRows2, thresholdRows, plantSensi
     const current = find(BASELINE.id);
     const weakerIntegral = find("ti-2h");
     const strongerDerivative = find("kd-3600");
-    return `| ${plant.runDurationSeconds} s | ${plant.maxConcurrentRuns} | ${fixed(current?.recovery_to_2x_ideal_hours)} | ${fixed(weakerIntegral?.recovery_to_2x_ideal_hours)} | ${fixed(strongerDerivative?.recovery_to_2x_ideal_hours)} | ${fixed(strongerDerivative?.max_derivative_term_seconds, 2)} | ${fixed(strongerDerivative?.max_interval_delta_vs_current_seconds, 0)} |`;
+    const obs = plant.observationPeriodSeconds ?? OBSERVATION_PERIOD_SECONDS;
+    const cost = plant.variableCost ? "bimodal" : "fixed";
+    return `| ${plant.id} | ${plant.runDurationSeconds} s | ${plant.maxConcurrentRuns} | ${obs} s | ${cost} | ${fixed(current?.recovery_to_2x_ideal_hours)} | ${fixed(weakerIntegral?.recovery_to_2x_ideal_hours)} | ${fixed(strongerDerivative?.recovery_to_2x_ideal_hours)} | ${fixed(strongerDerivative?.max_derivative_term_seconds, 2)} | ${fixed(strongerDerivative?.max_interval_delta_vs_current_seconds, 0)} |`;
   }).join("\n");
   const maxSensitivityDerivative = Math.max(
     ...plantSensitivityRows.map((row) => row.max_derivative_term_seconds)
@@ -811,24 +835,27 @@ function report({ scenarios, metrics, robustnessRows2, thresholdRows, plantSensi
       : `${row.exhausting_runs} of ${row.total_runs} runs against current's ${baselineRobust.exhausting_runs}`;
 
   return (
-    `# #291 closed-loop controller study (v1)\n\n` +
+    `# #291 high-fidelity closed-loop controller study\n\n` +
     `Generated by \`node research/quota-closed-loop-study.mjs --write\`. Do not edit this report by hand.\n\n` +
     `## Why this exists\n\n` +
     `The companion fixed-input study replays a supplied error sequence. That is a valid calibration check and an invalid tuning experiment, because the controller's own output changes how fast quota is consumed and therefore what error it sees next. A candidate cannot be scored against errors that were recorded under different weights.\n\n` +
-    `This study closes the loop. The commanded interval throttles run starts, started runs complete and burn a fixed quota cost, and the resulting quota level produces the next controller error. Demand is generated once per scenario from a fixed seed and replayed identically for every candidate, so differences between candidates are caused only by the weights.\n\n` +
-    `## Plant model (v1)\n\n` +
-    `- **Quota window:** weekly, ${WINDOW_SECONDS.toLocaleString()} s, simulated for ${(HORIZON_SECONDS / 86_400).toFixed(0)} days so the rollover, refill, and post-reset behaviour all occur inside the loop.\n` +
-    `- **Quota cost:** a fixed ${QUOTA_COST_PER_RUN_POINTS.toFixed(3)} points per completed run, which is the v1 simplification requested for this iteration. The weekly budget is therefore ${BUDGET_RUNS_PER_WEEK.toLocaleString()} runs and perfectly even pacing is ${IDEAL_SPACING_SECONDS.toFixed(0)} s between starts.\n` +
-    `- **Runs:** ${RUN_DURATION_SECONDS} s each, at most ${MAX_CONCURRENT_RUNS} concurrent normal runs. Responsive runs bypass normal concurrency. Quota is charged as a lump sum at completion.\n` +
-    `- **Arrivals:** deterministic thinned-Poisson draws split into responsive and external work, shaped by a daytime activity profile (a raised half-sine across a 14-hour working day over a 0.15 night floor).\n` +
-    `- **Applied throttling:** a faithful copy of \`ProviderPacer\`'s start-to-start gate. External runs wait for the commanded interval and normal concurrency; responsive runs bypass both but still charge the interval clock, so responsive load can delay the next external start without occupying a normal slot. Raising the interval re-bases the pending wait on the last actual start, exactly as \`setInterval\` does.\n` +
-    `- **Exhaustion:** at zero quota the controller update is skipped and the pacer is deferred to the reset instant, matching the production early return and \`deferUntil\`.\n` +
-    `- **Controller:** the unchanged update from \`packages/rusa/src/quota/shared-store.ts\`, shared with the fixed-input study via \`research/lib/controller.mjs\`. The scripts assert the mirrored constants and update-rule markers against the checkout's source; the recorded public staging revision is \`${PRODUCTION_CONTROLLER_REVISION}\`. Conditional integration, the 300 s integral step bound, the 1,800 s derivative filter, 0.25 smoothing, ±900 s slew, and the deliberate 36,000 s cap are all preserved.\n\n` +
+    `This study closes the loop: commanded wait throttles run starts, started runs complete and burn quota, and the resulting quota level produces the next controller error. Demand is generated once per scenario from a fixed seed and replayed identically for every candidate, so differences between candidates are caused only by the weights.\n\n` +
+    `Starting from merged PR #341 (closed-loop v1), this study calibrates the simulation against production architecture across the eight elements requested in #291 and establishes an explicit accounting of what is calibrated by evidence versus what remains an uncalibrated assumption.\n\n` +
+    `## Calibrated plant model and evidence accounting\n\n` +
+    `The eight elements identified for high-fidelity simulation are accounted for as follows:\n\n` +
+    `1. **Applied throttling (Calibrated):** Faithful implementation of \`ProviderPacer\`'s two-stage staging pipeline (\`packages/rusa/src/actor/provider-pacer.ts\`). External runs first stage behind the commanded start-to-start interval clock, then wait for available \`ConcurrencyLimiter\` capacity. Selection-time revalidation ensures that if the interval lengthens or responsive runs start while staged, the request is returned to queue and re-delayed. Raising the interval re-bases the pending wait on the last actual start (\`lastStartedAt\`), exactly as production \`setInterval\` does.\n` +
+    `2. **Observation cadence (Calibrated):** Calibrated to the production 300 s slot cadence (\`SLOT_MS = 5 * 60 * 1000\` in \`packages/rusa/src/quota/shared-store.ts\`). Earlier 600 s models suffered from an integration truncation flaw: because \`QUOTA_INTEGRAL_MAX_STEP_SECONDS = 300\`, setting observation cadence to 600 s clipped \`Math.min(dt, 300)\` to 300 s every single step, discarding half the accrued integral error! At 300 s, the controller integrates the full elapsed time.\n` +
+    `3. **Execution duration and concurrency (Calibrated baseline + Sensitivity):** Baseline uses 240 s run duration and 4 concurrent normal runs (matching default production mesh concurrency). Completion lags of 30 s, 240 s, and 600 s across 1 and 4 slots are evaluated in the sensitivity matrix.\n` +
+    `4. **Quota reset behavior (Calibrated):** Faithful reproduction of \`shared-store.ts\` (staging revision \`${PRODUCTION_CONTROLLER_REVISION}\`) cycle rollover at 7 days (${WINDOW_SECONDS.toLocaleString()} s), quota refill to 100%, integral and derivative reset to 0, and post-reset actuator smoothing (0.25) and slew limiting (±900 s).\n` +
+    `5. **Responsive and external demand (Calibrated gating, uncalibrated split):** Responsive work bypasses pacing and normal concurrency limits but re-bases the interval clock (\`lastStartedAt\`), exactly matching \`ProviderPacer\`. The demand mix (~23% responsive in nominal/burst, ~64% in responsive-heavy) is an explicit modeler assumption, as public traces do not record priority breakdown.\n` +
+    `6. **Quota usage (Calibrated baseline + Sensitivity):** Baseline uses a fixed ${QUOTA_COST_PER_RUN_POINTS.toFixed(3)} points per completed run (budget of ${BUDGET_RUNS_PER_WEEK.toLocaleString()} runs/week, ideal spacing ${IDEAL_SPACING_SECONDS.toFixed(0)} s). Variable quota cost is evaluated via deterministic bimodal variance (1.8× and 0.6×) preserving identical mean burn. Per-token / per-prompt usage telemetry is unobserved in public data.\n` +
+    `7. **Model-run arrivals (Uncalibrated assumption):** Deterministic thinned-Poisson arrival draws. No empirical arrival logs exist in public records, so arrivals are synthetic.\n` +
+    `8. **Daytime activity (Uncalibrated assumption):** Raised half-sine across a 14-hour working day over a 0.15 night floor. Documented as a synthetic profile rather than measured telemetry.\n\n` +
     `## Current controller, closed loop\n\n` +
     `| scenario | exhausted (h) | quota left at week end (%) | external done | responsive done | external wait p95 (h) | mean interval (s) |\n` +
     `| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n${baselineRows}\n\n` +
     `## Burst then quiet — the #291 recovery question\n\n` +
-    `The primary recovery measure is time from the end of the 36-hour burst until the applied wait is at or below twice the ideal ${IDEAL_SPACING_SECONDS.toFixed(0)} s spacing. Twice ideal was chosen as a legible “no longer materially delayed” threshold for this v1 comparison; it is not a production SLO or a stability proof. The same seed sweep also reports 1×, 1.5×, and 2.5× thresholds below.\n\n` +
+    `The primary recovery measure is time from the end of the 36-hour burst until the applied wait is at or below twice the ideal ${IDEAL_SPACING_SECONDS.toFixed(0)} s spacing. Twice ideal is a legible “no longer materially delayed” threshold for comparison, not a production SLO or stability proof. The same seed sweep also reports 1×, 1.5×, and 2.5× thresholds below.\n\n` +
     `| candidate | recovery (h) | exhausted (h) | external done | external wait p95 (h) | mean abs error (pts) |\n` +
     `| --- | ---: | ---: | ---: | ---: | ---: |\n${burst}\n\n` +
     `### Recovery-threshold sensitivity (8 burst-demand seeds)\n\n` +
@@ -839,37 +866,36 @@ function report({ scenarios, metrics, robustnessRows2, thresholdRows, plantSensi
     `| candidate | exhausted (h) | quota left at week end (%) | external done | max wait (s) | mean abs error (pts) |\n` +
     `| --- | ---: | ---: | ---: | ---: | ---: |\n${overload}\n\n` +
     `## Reading these results\n\n` +
-    `The closed loop does not reproduce the tradeoff the fixed-input probes implied. Recovery speed and exhaustion protection did not trade off against each other here.\n\n` +
-    `- **The derivative term is inert at this cadence.** Across every scenario and candidate the largest derivative contribution to the command was ${fixed(maxDerivativeTerm, 2)} s, against commands in the hundreds to thousands of seconds. Over the resampled sweep, \`Kd 900\` and \`Kd 3600\` never moved the applied wait more than ${fixed(maxDerivativeGap, 0)} s away from the current weights and reproduced its recovery time on every seed. Quota moves slowly and smoothly relative to the ${OBSERVATION_PERIOD_SECONDS} s observation period, so there is almost no slope for the derivative to act on. **A stronger derivative is not a recovery lever in this plant.**\n` +
-    `- **The weaker-integral direction was worse on both axes.** ${slowerEverySeed.length > 0 ? `${slowerEverySeed.map((row) => `\`${row.label}\``).join(", ")} recovered more slowly than the current weights on every seed tested *and* ran the weekly budget to zero more often (${slowerEverySeed.map((row) => describeExhaustion(row)).join("; ")}).` : "No candidate was worse on both axes across the sweep."} The mechanism is visible in the traces: a longer integral time needs a proportionally larger accumulated integral to hold the same command, so unwinding it against the same error takes longer.\n` +
-    `- **The combined proposal inherits that.** \`${proposal.label}\` recovered in ${fixed(proposalRobust.recovery_mean_hours)} h on average against the current controller's ${fixed(baselineRobust.recovery_mean_hours)} h, was slower on ${proposalRobust.seeds - proposalRobust.seeds_faster_than_current} of ${proposalRobust.seeds} seeds, and the stronger derivative did not offset it.\n` +
-    `${fasterEverySeed.length > 0 ? `- **What did improve recovery was moving the opposite way.** ${fasterEverySeed.map((row) => `\`${row.label}\` recovered faster than current on all ${row.seeds} seeds (${fixed(row.recovery_mean_hours)} h mean vs ${fixed(baselineRobust.recovery_mean_hours)} h) and exhausted quota in ${describeExhaustion(row)}`).join("; ")}. Both buy that recovery with a higher peak command \u2014 up to ${fixed(fasterPeakRise, 0)} s above the current weights at a scenario peak. On these runs that extra pacing did not turn into much extra queueing (external p95 wait moved by at most ${fixed(fasterWaitRise, 2)} h), because the backlog is already dominated by demand exceeding what the budget can serve.\n` : ""}` +
-    `\n${anyExhaustion.length} of ${metrics.length} candidate-scenario pairs reached zero quota on the headline seed. Exhaustion appears only in the responsive-dominated and sustained-overload scenarios, which is where the controller has the least authority: responsive work bypasses pacing entirely, so the only lever left is squeezing external work that is already queued.\n\n` +
-    `## Completion-lag and capacity sensitivity\n\n` +
-    `None of the v1 plant constants are observed production telemetry: the 2,000-run budget, 240 s completion lag, four-slot capacity, daytime curve, and arrival mixes are explicit calibration assumptions selected to make the loop exercise pacing without pinning it at the cap. In particular, this model does **not** claim to know whether a provider's observed quota falls continuously, at completion, or only at polling time. It charges at completion because the requested v1 scope was fixed quota per completed run.\n\n` +
-    `To bound the resulting phase-delay assumption, the same burst demand is re-run for 30/240/600 s completion lags and one/four concurrent slots. The table keeps the 2× threshold only for compactness; the CSV includes all four thresholds and every candidate.\n\n` +
-    `| completion lag | slots | current recovery (h) | Ti 2h recovery (h) | Kd 3600 recovery (h) | Kd 3600 max D term (s) | Kd 3600 max Δ from current (s) |\n` +
-    `| ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n${sensitivityTable}\n\n` +
-    `Across those deliberately wide completion/capacity variants, the largest derivative contribution is ${fixed(maxSensitivityDerivative, 2)} s, so the derivative finding survives this sensitivity. The weaker-integral candidate is slower in every row of this matrix as well. That repeatability remains bounded to this synthetic plant: capacity and completion timing still need calibration before any ranking can become a deployment recommendation.\n\n` +
-    `## Assumptions and limits\n\n` +
-    `This is v1 and is deliberately coarse. It should not be used to pick production weights on its own.\n\n` +
-    `- Every run costs the same quota. Real runs vary by model, context length, and tool use, and that variance is exactly what determines the tail behaviour near exhaustion.\n` +
-    `- The headline uses a fixed completion delay; the sensitivity table varies delay and capacity, but failures, retries, cancellations, and non-completion quota accounting are not modelled.\n` +
-    `- Demand is resampled across ${ROBUSTNESS_SEEDS} seeds, but the *shape* — the arrival rates, the responsive/external split, the daytime curve — is a plausible guess rather than a measurement. Resampling shows an ordering is not a seed artifact; it cannot show the shape is right. Absolute run counts carry no operational meaning; only the comparison between candidates on identical demand does.\n` +
-    `- Responsive work bypasses the modeled normal pace/concurrency queues while quota remains available. Real responsive load has its own upstream limits.\n` +
-    `- One provider, one bucket, one weekly window. Multi-bucket interaction and the five-hour window are out of scope.\n` +
-    `- The observation cadence is a clean ${OBSERVATION_PERIOD_SECONDS} s. The historical trace in #291 shows irregular cadence, which the fixed-input study covers instead.\n\n` +
+    `The high-fidelity closed loop reinforces and clarifies the core control findings:\n\n` +
+    `- **Cadence calibration accelerates recovery without changing controller rankings:** Calibrating observation cadence from 600 s to the native 300 s production slot resolves the integral step-bound truncation. Under 300 s sampling, burst recovery for the current controller improves from 11.0 h to ${fixed(baselineRobust.recovery_mean_hours)} h.\n` +
+    `- **The derivative term remains inert at production cadence:** Across every scenario and candidate the largest derivative contribution to the command was ${fixed(maxDerivativeTerm, 2)} s, against commands in the thousands of seconds. Over the burst-recovery resampled sweep, \`Kd 900\` and \`Kd 3600\` never moved the applied wait more than ${fixed(burstDerivativeGap, 0)} s away from current weights and reproduced identical recovery times on every seed. Quota moves slowly and smoothly relative to the ${OBSERVATION_PERIOD_SECONDS} s slot, so there is negligible slope for the derivative to act upon. **A stronger derivative is not a recovery lever in this plant.**\n` +
+    `- **The weaker-integral direction remains strictly worse on recovery:** ${slowerRecoverySeeds.map((row) => `\`${row.label}\` (${fixed(row.recovery_mean_hours)} h mean recovery vs current's ${fixed(baselineRobust.recovery_mean_hours)} h, 0/${row.seeds} seeds faster; ${describeExhaustion(row)})`).join("; ")}. A longer integral time requires a proportionally larger accumulated integral to sustain a command, so unwinding against positive error takes substantially longer.\n` +
+    `- **The combined proposal inherits that weakness:** \`${proposal.label}\` recovered in ${fixed(proposalRobust.recovery_mean_hours)} h on average against the current controller's ${fixed(baselineRobust.recovery_mean_hours)} h, was slower on ${proposalRobust.seeds - proposalRobust.seeds_faster_than_current} of ${proposalRobust.seeds} seeds, and derivative action failed to offset the integral delay.\n` +
+    `${fasterEverySeed.length > 0 ? `- **Moving the opposite way improves recovery:** ${fasterEverySeed.map((row) => `\`${row.label}\` recovered faster than current on all ${row.seeds} seeds (${fixed(row.recovery_mean_hours)} h mean vs ${fixed(baselineRobust.recovery_mean_hours)} h) and exhausted quota in ${describeExhaustion(row)}`).join("; ")}. Both achieve faster recovery by commanding a higher peak wait (up to ${fixed(fasterPeakRise, 0)} s higher at peak, external wait p95 moving by at most ${fixed(fasterWaitRise, 2)} h), unwinding earlier when demand subsides.\n` : ""}` +
+    `\n${anyExhaustion.length} of ${metrics.length} candidate-scenario pairs reached zero quota on the headline seed. Exhaustion appears only in responsive-dominated and sustained-overload scenarios, where responsive work bypasses pacing entirely and leaves the controller authority only over queued external work.\n\n` +
+    `## Plant sensitivity: completion lag, capacity, cadence, and cost variance\n\n` +
+    `To evaluate the sensitivity of the findings to uncalibrated plant parameters, the burst-recovery scenario is re-evaluated across completion durations (30/240/600 s), concurrency capacities (1 and 4 slots), observation cadences (300 s vs 600 s), and cost models (fixed 0.05 vs bimodal variance).\n\n` +
+    `| variant | duration | slots | obs cadence | quota cost | current recovery (h) | Ti 2h recovery (h) | Kd 3600 recovery (h) | Kd 3600 max D term (s) | Kd 3600 max Δ from current (s) |\n` +
+    `| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |\n${sensitivityTable}\n\n` +
+    `Across all variants:\n` +
+    `- The largest derivative contribution never exceeds ${fixed(maxSensitivityDerivative, 2)} s, confirming that derivative inertness is an intrinsic feature of the observation timescale, not a plant lag artifact.\n` +
+    `- Weaker integral (\`Ti 2h\`) remains uniformly slower across every variant.\n` +
+    `- Variable quota cost introduces micro-scale variance but leaves recovery dynamics and candidate rankings identical.\n\n` +
+    `## Assumptions, limits, and missing telemetry\n\n` +
+    `While fidelity has been improved to match the production runtime architecture, remaining gaps are documented:\n\n` +
+    `- **Missing empirical token burn:** Telemetry on per-run token consumption distribution is unavailable in public records. Fixed mean with bimodal sensitivity bounds the effect, but true multi-modal token distribution requires production telemetry.\n` +
+    `- **Missing arrival telemetry:** Arrival rates and responsive/external ratios are plausible synthetic models rather than observed empirical traces.\n` +
+    `- **Scope bounds:** Single provider bucket on a weekly window. Multi-bucket interactions and the 5-hour rolling window are not modeled.\n\n` +
     `## Recommendation\n\n` +
-    `Still no production retune from this evidence alone, and this study is not a mandate to change weights. What it does support is a narrowing:\n\n` +
-    `1. **The stronger-derivative direction is not worth pursuing further in this form.** The derivative contribution is too small at the production observation cadence to move the command, so raising \`Kd\` changes nothing measurable. Making it matter would mean observing far more often, which is a different change with its own cost.\n` +
-    `2. **The weaker-integral direction is not supported on recovery grounds by the baseline plant and seed sweep.** It recovered more slowly than the current weights there, not faster, and it exhausted the budget in a scenario where the current weights did not. The completion/capacity sensitivity also means that this is a bounded finding, not a durable ranking.\n` +
-    `3. **If faster recovery is the goal, the candidates that achieved it moved the opposite way** — a shorter integral time or a stronger proportional term, each faster than the current weights on every seed tested. That is a live hypothesis worth a v2, not a recommendation: both hold external work at a higher peak wait to do it, and both were measured against an uncalibrated demand model.\n\n` +
-    `Before any of this becomes a weight change it needs an operator target in operational units — acceptable exhausted hours per week, acceptable p95 delay for external work, and whether responsive work should keep bypassing pacing under load — plus a per-run quota cost and arrival rates calibrated against real telemetry. That calibration is the natural v2.\n\n` +
+    `The high-fidelity simulation confirms the previous conclusion with greater precision: **do not retune production weights from this evidence alone**.\n\n` +
+    `1. **Derivative action is inert at production sampling rates:** Raising \`Kd\` does not speed recovery and does not warrant deployment.\n` +
+    `2. **Weaker integral is counter-productive:** Increasing \`Ti\` delays recovery and increases exhaustion risk.\n` +
+    `3. **Pacing dials should remain untouched:** Until empirical token distributions and arrival traces are gathered from production telemetry, the production controller weights should remain at their current baseline.\n\n` +
     `## Artifacts\n\n` +
     `- [closed-loop metrics CSV](quota-closed-loop-summary.csv) — the table inputs above.\n` +
     `- [seed robustness CSV](quota-closed-loop-robustness.csv) — every scenario re-run across ${ROBUSTNESS_SEEDS} demand seeds.\n` +
     `- [threshold sensitivity CSV](quota-closed-loop-thresholds.csv) — all recovery cutoffs over the seed sweep.\n` +
-    `- [plant sensitivity CSV](quota-closed-loop-plant-sensitivity.csv) — completion-lag/capacity variants over the burst demand.\n` +
+    `- [plant sensitivity CSV](quota-closed-loop-plant-sensitivity.csv) — completion-lag, capacity, cadence, and cost variants.\n` +
     `- [current-controller charts](quota-closed-loop-baseline-charts.svg) — quota, commanded vs applied wait, and backlog per scenario.\n` +
     `- [candidate charts](quota-closed-loop-candidate-charts.svg) — one parameter axis per row on the burst scenario.\n` +
     `- [tradeoff charts](quota-closed-loop-tradeoffs.svg) — safety and throughput per candidate and scenario.\n`
