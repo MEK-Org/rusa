@@ -113,9 +113,11 @@ export class RootControlService {
         : {}),
       charter,
       parentId: this.rootId,
-      // Forward the resolved pool, not the request as written: resolution
-      // happens exactly once, here, and mesh-side validation sees only tuples.
-      modelConfig: requested,
+      // Keep the original declaration for mesh.spawn. Root control uses the
+      // resolved snapshot above only for its provider allowlist; mesh is the
+      // authoritative resolution/validation boundary and derives provenance
+      // from this original class reference rather than a caller-settable field.
+      modelConfig: request.modelConfig,
       context: normalizeContext(request.context),
       conversationId: optionalTrimmed(request.conversationId),
       title: optionalTrimmed(request.title),

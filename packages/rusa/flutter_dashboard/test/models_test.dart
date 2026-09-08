@@ -2,6 +2,32 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 
 void main() {
+  group('MeshEvent.resolvedRunModel', () {
+    test('uses launch metadata and leaves historical run_start rows blank', () {
+      final launched = MeshEvent.fromJson({
+        'id': 'launch',
+        'kind': 'run_start',
+        'actorId': 'a',
+        'detail': null,
+        'body': null,
+        'payload': '{"provider":"codex","model":"gpt-5.6-sol"}',
+        'success': null,
+      });
+      final historical = MeshEvent.fromJson({
+        'id': 'historical',
+        'kind': 'run_start',
+        'actorId': 'a',
+        'detail': null,
+        'body': null,
+        'payload': '{"provider":"codex"}',
+        'success': null,
+      });
+
+      expect(launched.resolvedRunModel, 'gpt-5.6-sol');
+      expect(historical.resolvedRunModel, isNull);
+    });
+  });
+
   group('ObligationDto.fromJson', () {
     test(
       'deserializes externalRef when it is a nested map (server format)',

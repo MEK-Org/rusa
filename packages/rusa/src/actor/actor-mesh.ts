@@ -4,6 +4,7 @@ import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../
 import { prerequisiteEdgeKey } from "../obligations/obligation.js";
 import {
   assertConcreteModelConfig,
+  isModelClassReference,
   type ModelConfigInput,
   type ProviderModelConfig,
   type RawProviderModelConfig,
@@ -1434,11 +1435,16 @@ export class ActorMesh {
     }
     const id = this.idgen();
     const parentId = this.resolveThreadId(req.parentId);
+    // Store provenance only when the caller declared a class in modelConfig.
+    // The validation gate resolves that reference to this concrete snapshot;
+    // an explicit tuple/pool cannot attach an arbitrary class label.
+    const modelClass = isModelClassReference(req.modelConfig) ? req.modelConfig.class : undefined;
     const record: ActorRecord = {
       id,
       charter,
       parentId,
       modelConfig,
+      ...(modelClass !== undefined ? { modelClass } : {}),
       context: req.context,
       handles: req.handles ? [...req.handles] : undefined,
       // Seed the session so the actor's first run resumes this conversation
@@ -3202,7 +3208,12 @@ export class ActorMesh {
     // An idle or queued actor has no launched run yet, so the staged pool
     // applies atomically at its next dispatch, before run_start is recorded
     // and before launch (see {@link applyPendingModel}).
-    this.actors.patch(id, { desiredModelConfig: validated });
+    this.actors.patch(id, {
+      desiredModelConfig: validated,
+      // An explicit replacement deliberately clears any prior class label;
+      // equality with a class's current entries is not provenance.
+      desiredModelClass: isModelClassReference(modelConfig) ? modelConfig.class : undefined,
+    });
 
     // A queued reservation has already quoted one of the old pool's lanes.
     // Replacing that pool must release the old quote now and pass the same
@@ -3249,7 +3260,12 @@ export class ActorMesh {
     const oldModelConfig = record.modelConfig;
     const newModelConfig = record.desiredModelConfig;
 
-    this.actors.patch(id, { modelConfig: newModelConfig, desiredModelConfig: undefined });
+    this.actors.patch(id, {
+      modelConfig: newModelConfig,
+      modelClass: record.desiredModelClass,
+      desiredModelConfig: undefined,
+      desiredModelClass: undefined,
+    });
 
     const verified = this.actors.get(id);
     if (!verified) throw new Error(`Failed to reload thread after model update: ${id}`);

@@ -478,6 +478,41 @@ void main() {
     },
   );
 
+  testWidgets('renders the actual selected model on run-start rows', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final api = FakeApi()
+        ..threadsResult = [makeThread('a', created: 't0')]
+        ..eventPages = [
+          EventPage(
+            events: [
+              makeEvent(
+                'launch',
+                'run_start',
+                actor: 'a',
+                payload:
+                    '{"provider": "codex", "model": "gpt-5.6-sol", "responsive": false}',
+              ),
+            ],
+            nextCursor: null,
+          ),
+        ];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      await store.init();
+      await tester.pumpWidget(_harness(store));
+      await tester.tap(find.text('a-handle'));
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.tap(find.byIcon(Icons.terminal));
+      for (int i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+
+      expect(find.text('resolved model: gpt-5.6-sol'), findsOneWidget);
+      await store.dispose();
+    });
+  });
+
   testWidgets('the Info tab swaps the charter preview for the full charter', (
     tester,
   ) async {

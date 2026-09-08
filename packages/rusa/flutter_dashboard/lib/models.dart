@@ -94,7 +94,9 @@ class ThreadDto {
     this.effortChangePending = false,
     this.desiredProvider,
     this.modelConfig = const [],
+    this.modelClass,
     this.desiredModelConfig,
+    this.desiredModelClass,
     required this.charterPreview,
     this.title = '',
     required this.createdAt,
@@ -141,10 +143,17 @@ class ThreadDto {
   /// and not evidence of what any run selected.
   final List<ProviderModelConfig> modelConfig;
 
+  /// Named class that produced [modelConfig]'s stored resolved snapshot. Null
+  /// means this actor has an explicit pool or predates class provenance.
+  final String? modelClass;
+
   /// A whole-pool replacement staged for the next run boundary, or null when
   /// nothing is staged. Never empty when present: the server rejects an empty
   /// pool, so a staged replacement always names at least one candidate.
   final List<ProviderModelConfig>? desiredModelConfig;
+
+  /// Named class that produced the staged snapshot, if any.
+  final String? desiredModelClass;
 
   /// The leading slice of the charter the server sends with the list — enough
   /// for the two-line excerpt in the overview, never the whole text. The full
@@ -194,7 +203,9 @@ class ThreadDto {
     bool? effortChangePending,
     Object? desiredProvider = _keepThreadField,
     List<ProviderModelConfig>? modelConfig,
+    Object? modelClass = _keepThreadField,
     Object? desiredModelConfig = _keepThreadField,
+    Object? desiredModelClass = _keepThreadField,
     String? charterPreview,
     String? title,
     String? createdAt,
@@ -228,9 +239,15 @@ class ThreadDto {
         ? this.desiredProvider
         : desiredProvider as String?,
     modelConfig: modelConfig ?? this.modelConfig,
+    modelClass: identical(modelClass, _keepThreadField)
+        ? this.modelClass
+        : modelClass as String?,
     desiredModelConfig: identical(desiredModelConfig, _keepThreadField)
         ? this.desiredModelConfig
         : desiredModelConfig as List<ProviderModelConfig>?,
+    desiredModelClass: identical(desiredModelClass, _keepThreadField)
+        ? this.desiredModelClass
+        : desiredModelClass as String?,
     charterPreview: charterPreview ?? this.charterPreview,
     title: title ?? this.title,
     createdAt: createdAt ?? this.createdAt,
@@ -261,6 +278,7 @@ class ThreadDto {
     effortChangePending: j.containsKey('desiredEffort'),
     desiredProvider: j['desiredProvider'] as String?,
     modelConfig: _modelConfigFromJson(j['modelConfig']),
+    modelClass: j['modelClass'] as String?,
     // Keyed on a non-null value, not key presence: the server emits this key
     // only when something is staged (`...(r.desiredModelConfig !== undefined ?
     // {...} : {})`), and a staged pool is always non-empty because
@@ -273,6 +291,7 @@ class ThreadDto {
     desiredModelConfig: j['desiredModelConfig'] != null
         ? _modelConfigFromJson(j['desiredModelConfig'])
         : null,
+    desiredModelClass: j['desiredModelClass'] as String?,
     charterPreview: j['charterPreview'] as String? ?? '',
     title: j['title'] as String? ?? '',
     createdAt: j['createdAt'] as String? ?? '',
@@ -616,6 +635,19 @@ class MeshEvent {
       } catch (_) {}
     }
     return null;
+  }
+
+  /// The concrete model that actually started this run. Older run_start rows
+  /// predate launch metadata and deliberately return null rather than guessing
+  /// from the actor's current configuration.
+  String? get resolvedRunModel {
+    if (kind != 'run_start' || payload == null) return null;
+    try {
+      final model = (jsonDecode(payload!) as Map<String, dynamic>)['model'];
+      return model is String && model.isNotEmpty ? model : null;
+    } catch (_) {
+      return null;
+    }
   }
 }
 
