@@ -12,19 +12,19 @@ This study closes the loop. The commanded interval throttles run starts, started
 
 - **Quota window:** weekly, 604,800 s, simulated for 8 days so the rollover, refill, and post-reset behaviour all occur inside the loop.
 - **Quota cost:** a fixed 0.050 points per completed run, which is the v1 simplification requested for this iteration. The weekly budget is therefore 2,000 runs and perfectly even pacing is 302 s between starts.
-- **Runs:** 240 s each, at most 4 concurrent. Quota is charged as a lump sum at completion.
+- **Runs:** 240 s each, at most 4 concurrent normal runs. Responsive runs bypass normal concurrency. Quota is charged as a lump sum at completion.
 - **Arrivals:** deterministic thinned-Poisson draws split into responsive and external work, shaped by a daytime activity profile (a raised half-sine across a 14-hour working day over a 0.15 night floor).
-- **Applied throttling:** a faithful copy of `ProviderPacer`'s start-to-start gate. External runs wait for the commanded interval; responsive runs bypass the wait but still charge the interval clock, so responsive load displaces external work instead of adding to it. Raising the interval re-bases the pending wait on the last actual start, exactly as `setInterval` does.
+- **Applied throttling:** a faithful copy of `ProviderPacer`'s start-to-start gate. External runs wait for the commanded interval and normal concurrency; responsive runs bypass both but still charge the interval clock, so responsive load can delay the next external start without occupying a normal slot. Raising the interval re-bases the pending wait on the last actual start, exactly as `setInterval` does.
 - **Exhaustion:** at zero quota the controller update is skipped and the pacer is deferred to the reset instant, matching the production early return and `deferUntil`.
-- **Controller:** the unchanged update from `packages/rusa/src/quota/shared-store.ts`, shared with the fixed-input study via `research/lib/controller.mjs`. Conditional integration, the 300 s integral step bound, the 1,800 s derivative filter, 0.25 smoothing, ±900 s slew, and the deliberate 36,000 s cap are all preserved.
+- **Controller:** the unchanged update from `packages/rusa/src/quota/shared-store.ts`, shared with the fixed-input study via `research/lib/controller.mjs`. The scripts assert the mirrored constants and update-rule markers against the checkout's source; the recorded public staging revision is `04a8b99228a5d6baa2992d3d0776fa75b060021a`. Conditional integration, the 300 s integral step bound, the 1,800 s derivative filter, 0.25 smoothing, ±900 s slew, and the deliberate 36,000 s cap are all preserved.
 
 ## Current controller, closed loop
 
-| scenario | exhausted (h) | quota left at week end (%) | external done | responsive done | external wait p95 (h) | mean wait (s) |
+| scenario | exhausted (h) | quota left at week end (%) | external done | responsive done | external wait p95 (h) | mean interval (s) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Nominal week (85% of budget) | 0.0 | 20.5 | 1379 | 444 | 0.00 | 0 |
-| Sustained overload (250% of budget) | 0.0 | 0.4 | 1087 | 1168 | 128.41 | 735 |
-| 36 h burst, then quiet | 0.0 | 6.9 | 1496 | 465 | 78.22 | 587 |
+| Sustained overload (250% of budget) | 0.0 | 0.4 | 1088 | 1168 | 128.52 | 737 |
+| 36 h burst, then quiet | 0.0 | 6.9 | 1496 | 465 | 78.45 | 597 |
 | Responsive-dominated load | 0.0 | 3.0 | 455 | 1808 | 103.28 | 1494 |
 
 ## Burst then quiet — the #291 recovery question
@@ -33,13 +33,13 @@ The primary recovery measure is time from the end of the 36-hour burst until the
 
 | candidate | recovery (h) | exhausted (h) | external done | external wait p95 (h) | mean abs error (pts) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| current (120 / 1h / 1800) | 10.8 | 0.0 | 1496 | 78.22 | 0.99 |
+| current (120 / 1h / 1800) | 11.0 | 0.0 | 1496 | 78.45 | 1.01 |
 | Kp 80 | 15.2 | 0.0 | 1496 | 78.41 | 1.28 |
-| Kp 160 | 8.0 | 0.0 | 1496 | 78.31 | 0.87 |
+| Kp 160 | 8.3 | 0.0 | 1496 | 78.31 | 0.88 |
 | Ti 2h | 13.8 | 0.0 | 1496 | 78.18 | 1.17 |
-| Ti 0.5h | 6.8 | 0.0 | 1496 | 78.58 | 0.89 |
-| Kd 900 | 10.8 | 0.0 | 1496 | 78.23 | 0.99 |
-| Kd 3600 | 10.8 | 0.0 | 1496 | 78.31 | 1.00 |
+| Ti 0.5h | 6.8 | 0.0 | 1496 | 78.61 | 0.89 |
+| Kd 900 | 11.0 | 0.0 | 1496 | 78.31 | 1.01 |
+| Kd 3600 | 11.0 | 0.0 | 1496 | 78.31 | 1.01 |
 | Ti 2h + Kd 3600 | 13.5 | 0.0 | 1496 | 78.18 | 1.16 |
 
 ### Recovery-threshold sensitivity (8 burst-demand seeds)
@@ -48,32 +48,32 @@ Each cell is mean recovery hours; the parenthesis is seeds faster than current. 
 
 | threshold | current | Ti 0.5h | Kp 160 | Ti 2h |
 | --- | ---: | ---: | ---: | ---: |
-| 1× | 11.6 h (0/8 faster) | 8.9 h (8/8 faster) | 9.3 h (8/8 faster) | 14.2 h (0/8 faster) |
-| 1.5× | 11.3 h (0/8 faster) | 8.7 h (8/8 faster) | 8.9 h (8/8 faster) | 13.3 h (0/8 faster) |
+| 1× | 11.7 h (0/8 faster) | 8.9 h (8/8 faster) | 9.3 h (8/8 faster) | 14.2 h (0/8 faster) |
+| 1.5× | 11.3 h (0/8 faster) | 8.7 h (8/8 faster) | 9.0 h (8/8 faster) | 13.4 h (0/8 faster) |
 | 2× | 10.8 h (0/8 faster) | 8.4 h (8/8 faster) | 8.6 h (8/8 faster) | 12.5 h (0/8 faster) |
-| 2.5× | 10.3 h (0/8 faster) | 8.1 h (8/8 faster) | 8.2 h (8/8 faster) | 11.7 h (1/8 faster) |
+| 2.5× | 10.4 h (0/8 faster) | 8.1 h (8/8 faster) | 8.2 h (8/8 faster) | 11.7 h (0/8 faster) |
 
 ## Sustained overload — the safety side of the same choice
 
 | candidate | exhausted (h) | quota left at week end (%) | external done | max wait (s) | mean abs error (pts) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| current (120 / 1h / 1800) | 0.0 | 0.4 | 1087 | 2323 | 1.18 |
-| Kp 80 | 0.4 | 0.0 | 1105 | 1947 | 1.31 |
-| Kp 160 | 0.0 | 0.8 | 1081 | 2480 | 1.04 |
-| Ti 2h | 0.0 | 0.1 | 1111 | 1385 | 1.00 |
-| Ti 0.5h | 0.0 | 1.3 | 1072 | 3657 | 1.34 |
-| Kd 900 | 0.0 | 0.5 | 1086 | 2323 | 1.18 |
+| current (120 / 1h / 1800) | 0.0 | 0.4 | 1088 | 2323 | 1.19 |
+| Kp 80 | 0.6 | 0.0 | 1103 | 1948 | 1.30 |
+| Kp 160 | 0.0 | 0.8 | 1082 | 2480 | 1.04 |
+| Ti 2h | 0.0 | 0.1 | 1113 | 1386 | 1.01 |
+| Ti 0.5h | 0.0 | 1.4 | 1070 | 3657 | 1.28 |
+| Kd 900 | 0.0 | 0.4 | 1088 | 2323 | 1.19 |
 | Kd 3600 | 0.0 | 0.4 | 1087 | 2323 | 1.18 |
-| Ti 2h + Kd 3600 | 0.0 | 0.1 | 1111 | 1385 | 1.00 |
+| Ti 2h + Kd 3600 | 0.0 | 0.1 | 1113 | 1385 | 1.01 |
 
 ## Reading these results
 
 The closed loop does not reproduce the tradeoff the fixed-input probes implied. Recovery speed and exhaustion protection did not trade off against each other here.
 
-- **The derivative term is inert at this cadence.** Across every scenario and candidate the largest derivative contribution to the command was 2.16 s, against commands in the hundreds to thousands of seconds. Over the resampled sweep, `Kd 900` and `Kd 3600` never moved the applied wait more than 124 s away from the current weights and reproduced its recovery time on every seed. Quota moves slowly and smoothly relative to the 600 s observation period, so there is almost no slope for the derivative to act on. **A stronger derivative is not a recovery lever in this plant.**
+- **The derivative term is inert at this cadence.** Across every scenario and candidate the largest derivative contribution to the command was 2.18 s, against commands in the hundreds to thousands of seconds. Over the resampled sweep, `Kd 900` and `Kd 3600` never moved the applied wait more than 124 s away from the current weights and reproduced its recovery time on every seed. Quota moves slowly and smoothly relative to the 600 s observation period, so there is almost no slope for the derivative to act on. **A stronger derivative is not a recovery lever in this plant.**
 - **The weaker-integral direction was worse on both axes.** `Kp 80`, `Ti 2h`, `Ti 2h + Kd 3600` recovered more slowly than the current weights on every seed tested *and* ran the weekly budget to zero more often (12 of 32 runs against current's 3; 6 of 32 runs against current's 3; 6 of 32 runs against current's 3). The mechanism is visible in the traces: a longer integral time needs a proportionally larger accumulated integral to hold the same command, so unwinding it against the same error takes longer.
 - **The combined proposal inherits that.** `Ti 2h + Kd 3600` recovered in 12.5 h on average against the current controller's 10.8 h, was slower on 8 of 8 seeds, and the stronger derivative did not offset it.
-- **What did improve recovery was moving the opposite way.** `Kp 160` recovered faster than current on all 8 seeds (8.6 h mean vs 10.8 h) and exhausted quota in 4 of 32 runs against current's 3; `Ti 0.5h` recovered faster than current on all 8 seeds (8.4 h mean vs 10.8 h) and exhausted quota in the same 3 of 32 runs as current. Both buy that recovery with a higher peak command — up to 3041 s above the current weights at a scenario peak. On these runs that extra pacing did not turn into much extra queueing (external p95 wait moved by at most 1.36 h), because the backlog is already dominated by demand exceeding what the budget can serve.
+- **What did improve recovery was moving the opposite way.** `Kp 160` recovered faster than current on all 8 seeds (8.6 h mean vs 10.8 h) and exhausted quota in 4 of 32 runs against current's 3; `Ti 0.5h` recovered faster than current on all 8 seeds (8.4 h mean vs 10.8 h) and exhausted quota in the same 3 of 32 runs as current. Both buy that recovery with a higher peak command — up to 3848 s above the current weights at a scenario peak. On these runs that extra pacing did not turn into much extra queueing (external p95 wait moved by at most 1.23 h), because the backlog is already dominated by demand exceeding what the budget can serve.
 
 4 of 32 candidate-scenario pairs reached zero quota on the headline seed. Exhaustion appears only in the responsive-dominated and sustained-overload scenarios, which is where the controller has the least authority: responsive work bypasses pacing entirely, so the only lever left is squeezing external work that is already queued.
 
@@ -85,14 +85,14 @@ To bound the resulting phase-delay assumption, the same burst demand is re-run f
 
 | completion lag | slots | current recovery (h) | Ti 2h recovery (h) | Kd 3600 recovery (h) | Kd 3600 max D term (s) | Kd 3600 max Δ from current (s) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 30 s | 1 | 10.5 | 13.3 | 10.5 | 2.30 | 15 |
+| 30 s | 1 | 10.7 | 13.3 | 10.7 | 2.25 | 18 |
 | 30 s | 4 | 10.7 | 13.3 | 10.7 | 2.25 | 18 |
-| 240 s | 1 | 6.8 | 6.5 | 6.8 | 0.59 | 10 |
-| 240 s | 4 | 10.8 | 13.8 | 10.8 | 2.16 | 31 |
-| 600 s | 1 | 0.0 | 0.0 | 0.0 | 0.30 | 0 |
-| 600 s | 4 | 11.2 | 13.2 | 11.2 | 0.60 | 12 |
+| 240 s | 1 | 11.0 | 12.8 | 11.0 | 1.04 | 2 |
+| 240 s | 4 | 11.0 | 13.8 | 11.0 | 2.18 | 36 |
+| 600 s | 1 | 4.8 | 6.7 | 4.8 | 1.40 | 0 |
+| 600 s | 4 | 11.8 | 13.7 | 11.8 | 1.16 | 8 |
 
-Across those deliberately wide completion/capacity variants, the largest derivative contribution is 2.30 s, so the derivative finding survives this sensitivity. The weaker-integral result deliberately does **not** claim that robustness: the 240 s / one-slot row reverses its recovery relation, while the 600 s / one-slot plant is already below every recovery cutoff at the end of the burst. This is evidence that capacity and completion timing must be calibrated before treating any integral ranking as durable.
+Across those deliberately wide completion/capacity variants, the largest derivative contribution is 2.25 s, so the derivative finding survives this sensitivity. The weaker-integral candidate is slower in every row of this matrix as well. That repeatability remains bounded to this synthetic plant: capacity and completion timing still need calibration before any ranking can become a deployment recommendation.
 
 ## Assumptions and limits
 
@@ -101,7 +101,7 @@ This is v1 and is deliberately coarse. It should not be used to pick production 
 - Every run costs the same quota. Real runs vary by model, context length, and tool use, and that variance is exactly what determines the tail behaviour near exhaustion.
 - The headline uses a fixed completion delay; the sensitivity table varies delay and capacity, but failures, retries, cancellations, and non-completion quota accounting are not modelled.
 - Demand is resampled across 8 seeds, but the *shape* — the arrival rates, the responsive/external split, the daytime curve — is a plausible guess rather than a measurement. Resampling shows an ordering is not a seed artifact; it cannot show the shape is right. Absolute run counts carry no operational meaning; only the comparison between candidates on identical demand does.
-- Responsive work is assumed to be admitted unconditionally. Real responsive load has its own upstream limits.
+- Responsive work bypasses the modeled normal pace/concurrency queues while quota remains available. Real responsive load has its own upstream limits.
 - One provider, one bucket, one weekly window. Multi-bucket interaction and the five-hour window are out of scope.
 - The observation cadence is a clean 600 s. The historical trace in #291 shows irregular cadence, which the fixed-input study covers instead.
 

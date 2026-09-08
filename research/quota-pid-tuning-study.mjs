@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   advance,
+  assertProductionParity,
   BASE_KI,
   BASELINE,
   CANDIDATES,
@@ -387,6 +388,9 @@ function validateStudy(scenarios, metrics) {
 }
 
 function buildStudy() {
+  assertProductionParity(
+    readFileSync(join(HERE, "../packages/rusa/src/quota/shared-store.ts"), "utf8")
+  );
   const scenarios = {
     historical: new Map(),
     recovery: new Map(),

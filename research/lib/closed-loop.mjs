@@ -88,9 +88,10 @@ export function generateArrivals({ seed, externalRunsPerWeek, responsiveRunsPerW
 /**
  * Run the closed loop for one candidate against one prepared scenario.
  *
- * The pacer copy is faithful on the detail that matters most to this study:
- * a responsive run skips the interval wait but still charges the start-to-start
- * clock, so responsive load displaces external work rather than adding to it.
+ * The pacer copy keeps the production queue boundary: a responsive run skips
+ * the normal interval and normal-concurrency queues, but still charges the
+ * start-to-start clock. Responsive work can therefore change quota burn and
+ * delay the next external start without occupying a normal-concurrency slot.
  */
 export function simulate(scenario, candidate, plant = {}) {
   // These overrides exist only for the deterministic sensitivity study. The
@@ -120,6 +121,7 @@ export function simulate(scenario, candidate, plant = {}) {
   let responsiveCompleted = 0;
 
   const exhausted = () => quotaPct <= 0;
+  const externalRunning = () => running.filter((run) => !run.responsive).length;
 
   const startRun = (request, responsive) => {
     lastStartedAt = now;
@@ -146,13 +148,15 @@ export function simulate(scenario, candidate, plant = {}) {
         else externalCompleted++;
         progressed = true;
       }
-      // A responsive run bypasses the interval wait but not concurrency.
-      if (responsiveQueue.length > 0 && running.length < maxConcurrentRuns && !exhausted()) {
+      // ProviderPacer starts responsive work directly. It can consume quota
+      // and charge the next normal start, but it never consumes normal mesh
+      // concurrency that would otherwise block an external request.
+      if (responsiveQueue.length > 0 && !exhausted()) {
         startRun(responsiveQueue.shift(), true);
         progressed = true;
       } else if (
         externalQueue.length > 0 &&
-        running.length < maxConcurrentRuns &&
+        externalRunning() < maxConcurrentRuns &&
         !exhausted() &&
         now >= nextAvailableAt
       ) {
@@ -210,7 +214,7 @@ export function simulate(scenario, candidate, plant = {}) {
     const candidates = [nextObservationAt, resetAt, HORIZON_SECONDS];
     if (arrivalIndex < arrivals.length) candidates.push(arrivals[arrivalIndex].at);
     if (running.length > 0) candidates.push(running[0].completesAt);
-    if (externalQueue.length > 0 && running.length < maxConcurrentRuns && !exhausted()) {
+    if (externalQueue.length > 0 && externalRunning() < maxConcurrentRuns && !exhausted()) {
       candidates.push(Math.max(now, nextAvailableAt));
     }
     const next = Math.min(...candidates.filter((value) => value > now));

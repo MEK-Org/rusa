@@ -12,6 +12,11 @@ export const ACTUATOR_SMOOTHING = 0.25;
 export const MAX_SLEW_SECONDS = 900;
 export const REFILL_EPSILON_POINTS = 2;
 
+// This is the public staging revision whose controller source was read while
+// preparing this study. The scripts also run the marker check below against the
+// checkout's source, so a changed equation or constant fails regeneration.
+export const PRODUCTION_CONTROLLER_REVISION = "04a8b99228a5d6baa2992d3d0776fa75b060021a";
+
 export const BASELINE = {
   id: "current",
   label: "current (120 / 1h / 1800)",
@@ -49,6 +54,36 @@ export function parameters(candidate) {
 }
 
 export const BASE_KI = parameters(BASELINE).ki;
+
+/**
+ * Keep the handwritten, dependency-free study mirror honest about the source
+ * it models. Importing the production store would pull database/runtime
+ * dependencies into a deterministic research script, so this compact parity
+ * check intentionally pins its constants and update-rule markers instead.
+ */
+export function assertProductionParity(source) {
+  const required = [
+    "export const QUOTA_KP_SECONDS_PER_POINT = 120;",
+    "export const QUOTA_KD_SECONDS_SQUARED_PER_POINT = 1800;",
+    "export const QUOTA_INTEGRAL_TIME_SECONDS = 3600;",
+    "export const QUOTA_DERIVATIVE_TAU_SECONDS = 1800;",
+    "export const QUOTA_ACTUATOR_SMOOTHING = 0.25;",
+    "export const QUOTA_MAX_SLEW_SECONDS = 900;",
+    "export const QUOTA_REFILL_EPSILON_POINTS = 2;",
+    "const cycleChanged = resetMoved || quotaRefilled;",
+    "Math.min(dtSeconds, QUOTA_INTEGRAL_MAX_STEP_SECONDS)",
+    "Math.min(candidateIntegral, Math.max(previousIntegral, upperBound))",
+    "Math.max(candidateIntegral, Math.min(previousIntegral, lowerBound))",
+    "previousInterval + QUOTA_ACTUATOR_SMOOTHING * (uncappedCandidate - previousInterval)",
+    "previousInterval + QUOTA_MAX_SLEW_SECONDS",
+  ];
+  const missing = required.filter((fragment) => !source.includes(fragment));
+  if (missing.length > 0) {
+    throw new Error(
+      `production controller parity changed since ${PRODUCTION_CONTROLLER_REVISION}: ${missing.join("; ")}`
+    );
+  }
+}
 
 /** Exact fixed-weight update from shared-store.ts, parameterized only for study. */
 export function advance(previous, input, candidate) {

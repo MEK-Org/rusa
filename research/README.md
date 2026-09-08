@@ -20,6 +20,10 @@ be compared against demand they are allowed to change.
 
 The public workflow context is [#291 comment 5583079033](https://github.com/MEK-Org/rusa/issues/291#issuecomment-5583079033): the follow-up is evidence-first and analysis-only, with deterministic simulations explicitly labeled as such. It is not telemetry or authorization to select weights. The historical input remains the separately published sanitized trace below.
 
+That public context specifies the analysis boundary, not the plant constants. The
+budget, completion lag, capacity, arrival mix, and daytime/burst shapes are all
+modeler assumptions, explicitly varied or limited where the artifacts say so.
+
 Run either study from the repository root. `--write` regenerates the checked-in
 artifacts, `--check` fails if regeneration would change them:
 
@@ -34,7 +38,9 @@ node research/quota-closed-loop-study.mjs --check
 `research/lib/controller.mjs` holds the single copy of the simulated controller
 and the candidate list that both studies import, so the two cannot drift apart.
 `research/lib/closed-loop.mjs` holds the plant model used only by the closed-loop
-study.
+study. The scripts also assert the mirrored controller constants and update-rule
+markers against the checkout's production source; the recorded staging revision is
+`04a8b99228a5d6baa2992d3d0776fa75b060021a`.
 
 ## Fixed-input artifacts
 
@@ -63,8 +69,8 @@ The v1 plant models run arrivals split into responsive and external work, a
 daytime activity curve, admission through the pacing interval, a fixed quota cost
 per completed run, and the resulting quota observations fed back into the
 controller. Throttling is applied the way `ProviderPacer` applies it: responsive
-runs bypass the interval wait but still charge the interval clock, and a changed
-interval re-bases the pending wait on the last actual start.
+runs bypass the normal pace and concurrency queues but still charge the interval
+clock, and a changed interval re-bases the pending wait on the last actual start.
 
 Demand is generated from a seeded arrival process before the controller runs, so
 every candidate faces byte-identical demand; only the controller's response to it

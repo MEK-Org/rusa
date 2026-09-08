@@ -27,7 +27,15 @@ import {
   simulate,
   WINDOW_SECONDS,
 } from "./lib/closed-loop.mjs";
-import { BASELINE, CANDIDATES, csv, MAX_INTERVAL_SECONDS, percentile } from "./lib/controller.mjs";
+import {
+  assertProductionParity,
+  BASELINE,
+  CANDIDATES,
+  csv,
+  MAX_INTERVAL_SECONDS,
+  PRODUCTION_CONTROLLER_REVISION,
+  percentile,
+} from "./lib/controller.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const GENERATED = join(HERE, "generated");
@@ -184,6 +192,9 @@ function metricRow(scenario, candidate, result, referenceSamples) {
 }
 
 function runStudy() {
+  assertProductionParity(
+    readFileSync(join(HERE, "../packages/rusa/src/quota/shared-store.ts"), "utf8")
+  );
   const scenarios = buildScenarios();
   const results = new Map();
   const metrics = [];
@@ -808,13 +819,13 @@ function report({ scenarios, metrics, robustnessRows2, thresholdRows, plantSensi
     `## Plant model (v1)\n\n` +
     `- **Quota window:** weekly, ${WINDOW_SECONDS.toLocaleString()} s, simulated for ${(HORIZON_SECONDS / 86_400).toFixed(0)} days so the rollover, refill, and post-reset behaviour all occur inside the loop.\n` +
     `- **Quota cost:** a fixed ${QUOTA_COST_PER_RUN_POINTS.toFixed(3)} points per completed run, which is the v1 simplification requested for this iteration. The weekly budget is therefore ${BUDGET_RUNS_PER_WEEK.toLocaleString()} runs and perfectly even pacing is ${IDEAL_SPACING_SECONDS.toFixed(0)} s between starts.\n` +
-    `- **Runs:** ${RUN_DURATION_SECONDS} s each, at most ${MAX_CONCURRENT_RUNS} concurrent. Quota is charged as a lump sum at completion.\n` +
+    `- **Runs:** ${RUN_DURATION_SECONDS} s each, at most ${MAX_CONCURRENT_RUNS} concurrent normal runs. Responsive runs bypass normal concurrency. Quota is charged as a lump sum at completion.\n` +
     `- **Arrivals:** deterministic thinned-Poisson draws split into responsive and external work, shaped by a daytime activity profile (a raised half-sine across a 14-hour working day over a 0.15 night floor).\n` +
-    `- **Applied throttling:** a faithful copy of \`ProviderPacer\`'s start-to-start gate. External runs wait for the commanded interval; responsive runs bypass the wait but still charge the interval clock, so responsive load displaces external work instead of adding to it. Raising the interval re-bases the pending wait on the last actual start, exactly as \`setInterval\` does.\n` +
+    `- **Applied throttling:** a faithful copy of \`ProviderPacer\`'s start-to-start gate. External runs wait for the commanded interval and normal concurrency; responsive runs bypass both but still charge the interval clock, so responsive load can delay the next external start without occupying a normal slot. Raising the interval re-bases the pending wait on the last actual start, exactly as \`setInterval\` does.\n` +
     `- **Exhaustion:** at zero quota the controller update is skipped and the pacer is deferred to the reset instant, matching the production early return and \`deferUntil\`.\n` +
-    `- **Controller:** the unchanged update from \`packages/rusa/src/quota/shared-store.ts\`, shared with the fixed-input study via \`research/lib/controller.mjs\`. Conditional integration, the 300 s integral step bound, the 1,800 s derivative filter, 0.25 smoothing, ±900 s slew, and the deliberate 36,000 s cap are all preserved.\n\n` +
+    `- **Controller:** the unchanged update from \`packages/rusa/src/quota/shared-store.ts\`, shared with the fixed-input study via \`research/lib/controller.mjs\`. The scripts assert the mirrored constants and update-rule markers against the checkout's source; the recorded public staging revision is \`${PRODUCTION_CONTROLLER_REVISION}\`. Conditional integration, the 300 s integral step bound, the 1,800 s derivative filter, 0.25 smoothing, ±900 s slew, and the deliberate 36,000 s cap are all preserved.\n\n` +
     `## Current controller, closed loop\n\n` +
-    `| scenario | exhausted (h) | quota left at week end (%) | external done | responsive done | external wait p95 (h) | mean wait (s) |\n` +
+    `| scenario | exhausted (h) | quota left at week end (%) | external done | responsive done | external wait p95 (h) | mean interval (s) |\n` +
     `| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n${baselineRows}\n\n` +
     `## Burst then quiet — the #291 recovery question\n\n` +
     `The primary recovery measure is time from the end of the 36-hour burst until the applied wait is at or below twice the ideal ${IDEAL_SPACING_SECONDS.toFixed(0)} s spacing. Twice ideal was chosen as a legible “no longer materially delayed” threshold for this v1 comparison; it is not a production SLO or a stability proof. The same seed sweep also reports 1×, 1.5×, and 2.5× thresholds below.\n\n` +
@@ -839,13 +850,13 @@ function report({ scenarios, metrics, robustnessRows2, thresholdRows, plantSensi
     `To bound the resulting phase-delay assumption, the same burst demand is re-run for 30/240/600 s completion lags and one/four concurrent slots. The table keeps the 2× threshold only for compactness; the CSV includes all four thresholds and every candidate.\n\n` +
     `| completion lag | slots | current recovery (h) | Ti 2h recovery (h) | Kd 3600 recovery (h) | Kd 3600 max D term (s) | Kd 3600 max Δ from current (s) |\n` +
     `| ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n${sensitivityTable}\n\n` +
-    `Across those deliberately wide completion/capacity variants, the largest derivative contribution is ${fixed(maxSensitivityDerivative, 2)} s, so the derivative finding survives this sensitivity. The weaker-integral result deliberately does **not** claim that robustness: the 240 s / one-slot row reverses its recovery relation, while the 600 s / one-slot plant is already below every recovery cutoff at the end of the burst. This is evidence that capacity and completion timing must be calibrated before treating any integral ranking as durable.\n\n` +
+    `Across those deliberately wide completion/capacity variants, the largest derivative contribution is ${fixed(maxSensitivityDerivative, 2)} s, so the derivative finding survives this sensitivity. The weaker-integral candidate is slower in every row of this matrix as well. That repeatability remains bounded to this synthetic plant: capacity and completion timing still need calibration before any ranking can become a deployment recommendation.\n\n` +
     `## Assumptions and limits\n\n` +
     `This is v1 and is deliberately coarse. It should not be used to pick production weights on its own.\n\n` +
     `- Every run costs the same quota. Real runs vary by model, context length, and tool use, and that variance is exactly what determines the tail behaviour near exhaustion.\n` +
     `- The headline uses a fixed completion delay; the sensitivity table varies delay and capacity, but failures, retries, cancellations, and non-completion quota accounting are not modelled.\n` +
     `- Demand is resampled across ${ROBUSTNESS_SEEDS} seeds, but the *shape* — the arrival rates, the responsive/external split, the daytime curve — is a plausible guess rather than a measurement. Resampling shows an ordering is not a seed artifact; it cannot show the shape is right. Absolute run counts carry no operational meaning; only the comparison between candidates on identical demand does.\n` +
-    `- Responsive work is assumed to be admitted unconditionally. Real responsive load has its own upstream limits.\n` +
+    `- Responsive work bypasses the modeled normal pace/concurrency queues while quota remains available. Real responsive load has its own upstream limits.\n` +
     `- One provider, one bucket, one weekly window. Multi-bucket interaction and the five-hour window are out of scope.\n` +
     `- The observation cadence is a clean ${OBSERVATION_PERIOD_SECONDS} s. The historical trace in #291 shows irregular cadence, which the fixed-input study covers instead.\n\n` +
     `## Recommendation\n\n` +
