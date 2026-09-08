@@ -390,6 +390,20 @@ export class SharedQuotaStore {
       .all(provider, sinceIso) as QuotaHistoryRecord[];
   }
 
+  getLatestSnapshot(provider: string): ProviderQuotaSnapshot | null {
+    const row = this.db
+      .prepare(
+        `SELECT parsed_state
+         FROM quota_scrapes
+         WHERE provider = ? AND parsed_state IS NOT NULL
+         ORDER BY scraped_at DESC, rowid DESC
+         LIMIT 1`
+      )
+      .get(provider) as { parsed_state: string } | undefined;
+    if (!row) return null;
+    return parsedSnapshot(row.parsed_state);
+  }
+
   /** Advance every unprocessed observation exactly once across all connections. */
   advancePendingController(opts: QuotaControllerOptions, provider?: string): void {
     const run = this.db.transaction(() => {

@@ -14,6 +14,7 @@ import { runInit } from "./commands/init.js";
 import { runInstallService } from "./commands/install-service.js";
 import { runActorLogs, runLogs } from "./commands/logs.js";
 import { runQuickstart, runQuickstartConfigure } from "./commands/quickstart.js";
+import { runQuotaCoordinator } from "./commands/quota-coordinator.js";
 import { runReport } from "./commands/report.js";
 import { runServiceRestart, runServiceStatus, runServiceStop } from "./commands/service-control.js";
 import { runStart } from "./commands/start.js";
@@ -329,6 +330,20 @@ program
       host: opts.host,
       port: opts.port,
       targets: opts.target,
+    });
+  });
+
+program
+  .command("quota-coordinator")
+  .description("Start the shared quota coordinator service")
+  .option("--home <path>", "Override RUSA_HOME for this coordinator")
+  .option("--socket <path>", "Override socket path")
+  .option("--database <path>", "Override quota database path")
+  .action(async (opts: { home?: string; socket?: string; database?: string }) => {
+    await runQuotaCoordinator({
+      home: opts.home,
+      socketPath: opts.socket,
+      databasePath: opts.database,
     });
   });
 

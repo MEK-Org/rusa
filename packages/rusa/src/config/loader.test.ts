@@ -745,6 +745,38 @@ describe("loadConfig shared quota store", () => {
       loadConfig(writeConfig({ quota: { databasePath: "/srv/rusa/quota.db", poolId: "shared" } }))
     ).toThrow(/quota.poolId has been removed/);
   });
+
+  it("accepts and trims quota.coordinator configuration", () => {
+    const config = loadConfig(
+      writeConfig({
+        quota: {
+          coordinator: {
+            socketPath: "  /run/rusa/coord.sock  ",
+            databasePath: "  /srv/rusa/quota-coordinator.db  ",
+          },
+        },
+      })
+    );
+    expect(config.quota?.coordinator).toEqual({
+      socketPath: "/run/rusa/coord.sock",
+      databasePath: "/srv/rusa/quota-coordinator.db",
+    });
+  });
+
+  it("rejects invalid quota.coordinator types", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          quota: {
+            coordinator: "not-a-mapping" as unknown as Record<string, unknown>,
+          },
+        })
+      )
+    ).toThrow(/quota.coordinator must be a mapping/);
+    expect(() =>
+      loadConfig(writeConfig({ quota: { coordinator: { socketPath: "   " } } }))
+    ).toThrow(/quota.coordinator.socketPath must be a non-empty string/);
+  });
 });
 
 describe("loadConfig understanding root", () => {

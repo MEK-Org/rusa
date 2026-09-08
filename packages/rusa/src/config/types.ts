@@ -98,6 +98,13 @@ export interface QuotaThrottleConfig {
   tickSeconds?: number;
 }
 
+export interface QuotaCoordinatorConfig {
+  /** Unix domain socket path for the quota coordinator listener. */
+  socketPath?: string;
+  /** Relocated database path owned exclusively by the coordinator. */
+  databasePath?: string;
+}
+
 /** Shared quota evidence, controller state, and launch pacing. */
 export interface QuotaConfig {
   /**
@@ -108,6 +115,8 @@ export interface QuotaConfig {
   databasePath?: string;
   /** Closed-loop launch pacing configuration. */
   throttle?: QuotaThrottleConfig;
+  /** Shared quota coordinator service configuration. */
+  coordinator?: QuotaCoordinatorConfig;
 }
 
 export type DashboardQuotaProvidersConfig = Partial<
