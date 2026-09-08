@@ -130,13 +130,16 @@ function buildModelConfig(record: ActorRecord): string | null {
 }
 
 /**
- * Parses the `model_config` document. A document written before #169's pool
- * contract (`schemaVersion: 1`, a single optional provider/model/effort) is
- * migrated on read into a one-entry pool. A legacy document missing either
- * `provider` or `model` predates the required-model contract and can't form a
- * valid entry — `modelConfig` is left unset so callers fall back the same way
- * they do for an actor with no configuration at all, rather than failing to
- * load the row.
+ * Parses the `model_config` document. Versioned documents (v2 explicit pools,
+ * v3 class-bearing records) are validated strictly; an invalid versioned
+ * payload throws fail-closed so corrupted configuration is never silently
+ * executed.
+ *
+ * For unversioned legacy documents predating #169: a single optional
+ * provider/model/effort is migrated on read into a one-entry pool. A legacy
+ * document missing either `provider` or `model` predates the required-model
+ * contract and leaves `modelConfig` unset so callers fall back the same way
+ * they do for an unconfigured actor, rather than failing to load the row.
  */
 function parseModelConfig(
   actorId: string,

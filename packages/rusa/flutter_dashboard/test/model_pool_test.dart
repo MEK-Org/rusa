@@ -279,6 +279,44 @@ void main() {
     },
   );
 
+  testWidgets(
+    'the hierarchy shows default -> desiredModel for an actor with null current model and staged replacement',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [
+            makeThread('root', created: 't0'),
+            makeThread(
+              'null-current-staged',
+              parent: 'root',
+              created: 't1',
+              model: null,
+              desiredModel: 'gpt-5.6-sol',
+              modelConfig: const [],
+              desiredModelConfig: const [
+                ProviderModelConfig(provider: 'codex', model: 'gpt-5.6-sol'),
+              ],
+            ),
+            makeThread(
+              'null-current-unstaged',
+              parent: 'root',
+              created: 't2',
+              model: null,
+              desiredModel: null,
+              modelConfig: const [],
+            ),
+          ];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await tester.pumpWidget(_harness(store));
+        await tester.pump(const Duration(milliseconds: 50));
+
+        expect(find.text('default → gpt-5.6-sol'), findsOneWidget);
+        await store.dispose();
+      });
+    },
+  );
+
   testWidgets('detail panel lists every configured candidate in order', (
     tester,
   ) async {

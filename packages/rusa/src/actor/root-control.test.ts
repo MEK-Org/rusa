@@ -1,4 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+import { assertConcreteModelConfig, isModelClassReference } from "../providers/model-config.js";
+import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import type { Actor } from "./actor.js";
+import { ActorMesh } from "./actor-mesh.js";
 import {
   type RootControlMesh,
   type RootControlOptions,
@@ -268,6 +272,40 @@ describe("RootControlService", () => {
       service.spawnChild({ charter: "work", modelConfig: { class: "fast" } }, "human:operator")
     ).toThrow(/model class reference/);
     expect(mesh.spawn).not.toHaveBeenCalled();
+  });
+
+  it("spawns a class against a real ActorMesh and persists resolved pool plus provenance", () => {
+    const actors = new InMemoryActorRepository();
+    const mesh = new ActorMesh({
+      actors,
+      rootId: "root",
+      createActor: () => ({ run: vi.fn() }) as unknown as Actor,
+      validateSpawn: (request) => {
+        if (isModelClassReference(request.modelConfig) && request.modelConfig.class === "fast") {
+          return [{ provider: "agy", model: "gemini-3.5-flash-medium", effort: "high" }];
+        }
+        throw new Error("unexpected modelConfig");
+      },
+    });
+    const service = new RootControlService({
+      mesh,
+      providers: ["agy"],
+      resolveModelConfig: (input) =>
+        isModelClassReference(input) && input.class === "fast"
+          ? [{ provider: "agy", model: "gemini-3.5-flash-medium", effort: "high" }]
+          : assertConcreteModelConfig(input),
+    });
+
+    const id = service.spawnChild(
+      { charter: "work", modelConfig: { class: "fast" } },
+      "human:operator"
+    );
+
+    const record = actors.get(id);
+    expect(record).toMatchObject({
+      modelClass: "fast",
+      modelConfig: [{ provider: "agy", model: "gemini-3.5-flash-medium", effort: "high" }],
+    });
   });
 
   it("interrupts a child in the root subtree and audits the action", () => {

@@ -1662,9 +1662,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         ledgerCompactionAvailable: portableContextApiKey !== null,
       });
       // Named model classes resolve from the current committed database row
-      // here, before validation: spawns arriving via root control are already
-      // resolved, so this call is identity for them and expansion for every
-      // other spawn path.
+      // here, before validation. Spawns arriving via root control retain their
+      // original declaration so the mesh can derive class provenance directly,
+      // and this call expands that declaration alongside every other spawn path.
       return validateModelConfigPool(config, resolveModelClasses(modelClasses, req.modelConfig), {
         portable: req.context?.type === "portable",
       });

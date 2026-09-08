@@ -474,31 +474,19 @@ class _ActorRowState extends State<_ActorRow> {
         desiredModelClass != null;
     final showEffort =
         !isPool && (thread.effort != null || thread.effortChangePending);
-    final current = thread.model ?? 'default';
-    final desired = thread.desiredModel ?? 'default';
-    final singleText = staging ? '$current → $desired' : (thread.model ?? '');
-    // Both sides carry their own count, so a staged pool replacement never
-    // reads as one model becoming one other model.
-    final poolText = staging
-        ? '$current${_poolSuffix(pool.length)}'
-              ' → $desired${_poolSuffix(staged?.length ?? 0)}'
-        : '$current${_poolSuffix(pool.length)}';
-    // A named class is what the actor was configured with; its persisted pool
-    // is the snapshot it resolved to, not a substitute label. Explicit pools
-    // and older records have no provenance field and retain the existing text.
+    final currentModel = thread.model ?? (staging ? 'default' : '');
     final currentText = modelClass != null
         ? 'class $modelClass'
         : (isPool
-              ? '$current${_poolSuffix(pool.length)}'
-              : (thread.model ?? ''));
+              ? '$currentModel${_poolSuffix(pool.length)}'
+              : currentModel);
+    final desiredModel = thread.desiredModel ?? 'default';
     final desiredText = desiredModelClass != null
         ? 'class $desiredModelClass'
         : (isPool
-              ? '$desired${_poolSuffix(staged?.length ?? 0)}'
-              : (thread.desiredModel ?? ''));
-    final displayedModel = staging
-        ? '$currentText → $desiredText'
-        : (modelClass != null ? currentText : (isPool ? poolText : singleText));
+              ? '$desiredModel${_poolSuffix(staged?.length ?? 0)}'
+              : desiredModel);
+    final displayedModel = staging ? '$currentText → $desiredText' : currentText;
     final tooltipPool =
         modelClass != null || desiredModelClass != null || isPool ? pool : null;
 
