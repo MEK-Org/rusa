@@ -495,10 +495,10 @@ export interface ActorMeshOptions {
   /**
    * Provider pacing composed with the mesh's normal-run concurrency queue.
    * Given the actor's declared candidate pool, atomically selects (quotes and
-   * reserves) the earliest-eligible canonical provider lane — declaration
-   * order breaks ties — and invokes `fn` with the winning tuple. A responsive
-   * run bypasses pacing/concurrency and picks the first healthy declared
-   * candidate instead.
+   * reserves) the earliest-eligible canonical provider lane — with
+   * declaration order breaking unresolvable ties — and invokes `fn` with the
+   * winning tuple. A responsive run uses that same selection, then bypasses
+   * pacing/concurrency after its candidate is reserved.
    */
   providerGate?: <T>(
     fn: (selected: RawProviderModelConfig) => Promise<T>,

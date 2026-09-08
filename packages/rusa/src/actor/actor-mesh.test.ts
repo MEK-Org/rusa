@@ -4667,34 +4667,28 @@ describe("ActorMesh", () => {
     });
   });
 
-  // #169 responsive promotion reselects: a normal request that queued behind
-  // mesh capacity on a later-declared lane (because the earlier-declared one
-  // quoted later) must, on a responsive delivery, reselect onto the first
-  // healthy *declared* candidate — not merely bypass pacing on the lane it
-  // happened to already be queued on.
-  describe("responsive promotion reselects onto the earliest healthy declared lane (#169)", () => {
-    it("promotes a queued run from a later-declared lane onto an earlier-declared one, with exactly one immediate run", async () => {
+  // #347 responsive promotion retains the normal admission choice. A queued
+  // normal run selected on a later-declared lane because it quoted sooner must
+  // use that same lane when promoted; responsive priority only bypasses queues.
+  describe("responsive promotion retains normal pool selection (#347)", () => {
+    it("promotes a queued run on its next-available lane, with exactly one immediate run", async () => {
       const poolARuns: string[] = [];
       const poolBRuns: string[] = [];
       const liveActors = new Map<string, Actor>();
       const blockerDeferred = deferredProvider();
-      // pool-a's run blocks until released, so the reselected-but-not-yet-
+      // pool-b's run blocks until released, so the promoted-but-not-yet-
       // finished state can be inspected before the run completes.
-      const poolAGates: Array<() => void> = [];
+      const poolBGates: Array<() => void> = [];
       const providerByName = new Map<string, CodingProvider>([
         [
           "pool-a",
           {
             name: "pool-a",
             providerName: "pool-a",
-            run: (runOpts) => {
+            run: async (runOpts) => {
               poolARuns.push(runOpts.cwd);
-              return new Promise((resolve) => {
-                poolAGates.push(() => {
-                  liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
-                  resolve({ success: true, exitCode: 0, output: "a" });
-                });
-              });
+              liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
+              return { success: true, exitCode: 0, output: "a" };
             },
           },
         ],
@@ -4703,10 +4697,14 @@ describe("ActorMesh", () => {
           {
             name: "pool-b",
             providerName: "pool-b",
-            run: async (runOpts) => {
+            run: (runOpts) => {
               poolBRuns.push(runOpts.cwd);
-              liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
-              return { success: true, exitCode: 0, output: "b" };
+              return new Promise((resolve) => {
+                poolBGates.push(() => {
+                  liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
+                  resolve({ success: true, exitCode: 0, output: "b" });
+                });
+              });
             },
           },
         ],
@@ -4721,8 +4719,8 @@ describe("ActorMesh", () => {
         return pacer;
       };
       // pool-a is declared first but quotes later than pool-b, so the initial
-      // normal selection reserves pool-b — the exact setup a responsive
-      // promotion must correct.
+      // normal selection reserves pool-b — the selection responsive promotion
+      // must preserve.
       pacerFor("pool-a").deferUntil(Date.now() + 20_000);
 
       const { mesh, registry, tick } = setup({
@@ -4818,27 +4816,25 @@ describe("ActorMesh", () => {
       expect(mesh.activeRunState(worker)?.phase).toBe("queued");
       expect(mesh.getSelection(worker)?.provider).toBe("pool-b");
 
-      // A responsive delivery must reselect onto pool-a — the first healthy
-      // declared candidate — cancelling the stale pool-b reservation, and
-      // bypass pacing/concurrency entirely (blocker still holds the mesh's
-      // only slot).
+      // A responsive delivery preserves pool-b, while bypassing
+      // pacing/concurrency entirely (blocker still holds the mesh's only slot).
       mesh.sendHumanMessage(worker, "urgent", "human-session");
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(poolARuns).toEqual([`/tmp/${worker}`]);
-      expect(poolBRuns).toEqual([]);
-      expect(mesh.getSelection(worker)?.provider).toBe("pool-a");
+      expect(poolARuns).toEqual([]);
+      expect(poolBRuns).toEqual([`/tmp/${worker}`]);
+      expect(mesh.getSelection(worker)?.provider).toBe("pool-b");
       expect(mesh.getSelection(worker)?.responsive).toBe(true);
       expect(mesh.runningThreadIds()).toEqual(new Set([blocker, worker]));
 
-      poolAGates.splice(0).forEach((release) => {
+      poolBGates.splice(0).forEach((release) => {
         release();
       });
       blockerDeferred.releaseAll();
       await tick();
 
-      expect(poolARuns).toEqual([`/tmp/${worker}`]);
-      expect(poolBRuns).toEqual([]);
+      expect(poolARuns).toEqual([]);
+      expect(poolBRuns).toEqual([`/tmp/${worker}`]);
       expect(mesh.runningThreadIds()).toEqual(new Set());
       expect(mesh.queuedThreadIds()).toEqual(new Set());
     });

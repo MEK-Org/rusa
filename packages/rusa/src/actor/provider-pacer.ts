@@ -310,12 +310,56 @@ export interface PoolLaneCandidate<C> {
   config: C;
   lane: string;
   pacer: ProviderPacer;
+  /**
+   * The latest provider-wide weekly quota observation, when one is available
+   * from the shared quota state. It is optional because model pools also run
+   * without quota probing configured.
+   */
+  weeklyQuota?: WeeklyQuotaObservation;
+}
+
+/** The provider-wide weekly reading used only to break an immediate-lane tie. */
+export interface WeeklyQuotaObservation {
+  /** Percentage of the weekly quota still available, from 0 through 100. */
+  percentLeft: number;
+  /** When this reading was scraped, as an ISO-8601 instant. */
+  observedAt: string;
+  /** The weekly window's next reset, as an ISO-8601 instant. */
+  resetAtIso: string;
+}
+
+const WEEKLY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+// This matches the longest existing quota-service cache lifetime (Codex).
+// Older readings remain useful for dashboard history, but not for admission.
+const MAX_WEEKLY_QUOTA_AGE_MS = 30 * 60 * 1000;
+
+/**
+ * Return a candidate's weekly headroom relative to the remaining weekly
+ * window, or `undefined` unless the quota evidence is safe to compare.
+ */
+function weeklyQuotaHeadroom(
+  observation: WeeklyQuotaObservation | undefined,
+  now: number
+): number | undefined {
+  if (!observation || !Number.isFinite(observation.percentLeft)) return undefined;
+  if (observation.percentLeft < 0 || observation.percentLeft > 100) return undefined;
+
+  const observedAt = Date.parse(observation.observedAt);
+  const resetAt = Date.parse(observation.resetAtIso);
+  if (!Number.isFinite(observedAt) || !Number.isFinite(resetAt)) return undefined;
+  if (observedAt > now || now - observedAt > MAX_WEEKLY_QUOTA_AGE_MS) return undefined;
+  if (resetAt <= now || resetAt > now + WEEKLY_WINDOW_MS) return undefined;
+
+  const windowRemainingPct = ((resetAt - now) / WEEKLY_WINDOW_MS) * 100;
+  return windowRemainingPct > 0 ? observation.percentLeft / windowRemainingPct : undefined;
 }
 
 /**
  * Pick the earliest-available declared candidate across canonical provider
  * lanes, by comparing each lane's side-effect-free {@link ProviderPacer.quote}.
- * Ties go to the earlier-declared candidate (strict `<` keeps the first seen).
+ * When multiple lanes are available now, trustworthy weekly quota headroom
+ * breaks that zero-delay tie. Otherwise, declaration order remains the stable
+ * fallback (including unknown, stale, invalid, or tied quota evidence).
  * Callers must reserve the winning lane (via `submit`) synchronously, with no
  * `await` between calling this and reserving — JS's single-threaded execution
  * is what keeps concurrent wakes from double-booking the same slot.
@@ -326,14 +370,28 @@ export function selectPoolLane<C>(
 ): PoolLaneCandidate<C> | undefined {
   let best: PoolLaneCandidate<C> | undefined;
   let bestQuote = Number.POSITIVE_INFINITY;
+  const immediatelyAvailable: PoolLaneCandidate<C>[] = [];
   for (const candidate of candidates) {
     const quote = candidate.pacer.quote(now);
     if (quote < bestQuote) {
       bestQuote = quote;
       best = candidate;
     }
+    if (quote <= now) immediatelyAvailable.push(candidate);
   }
-  return best;
+  if (!best || immediatelyAvailable.length < 2) return best;
+
+  let bestHeadroom: number | undefined;
+  let headroomWinner: PoolLaneCandidate<C> | undefined;
+  for (const candidate of immediatelyAvailable) {
+    const headroom = weeklyQuotaHeadroom(candidate.weeklyQuota, now);
+    if (headroom === undefined) continue;
+    if (bestHeadroom === undefined || headroom > bestHeadroom) {
+      bestHeadroom = headroom;
+      headroomWinner = candidate;
+    }
+  }
+  return headroomWinner ?? best;
 }
 
 export interface PoolGateSelection<C> {
@@ -363,17 +421,14 @@ export interface SubmitPoolGateOptions<C>
  * Reserve the earliest-available declared candidate across multiple provider
  * lanes as a single composed {@link RunStartHandle}. A normal request paces
  * through the winning lane's `ProviderPacer`, chosen by {@link selectPoolLane}
- * (earliest quote, ties to declaration order) among non-halted candidates. A
- * responsive request skips pacing entirely and reserves the first healthy
- * declared candidate, ignoring quotes.
+ * among non-halted candidates. Responsive priority preserves that selection,
+ * but skips pacing once its selected lane has been reserved.
  *
- * `promote()` does not merely promote whichever lane happened to be reserved
- * first — it re-runs that same first-healthy-declared selection, so a
- * responsive wake always lands on the earliest declared candidate even when
- * the original normal reservation is on a later one. When that reselects a
- * different lane, the stale reservation is cancelled; a `generation` counter
- * on the outer handle ignores the stale lane's now-asynchronous cancellation
- * rejection so it can never clobber the freshly reserved lane's later result.
+ * `promote()` re-runs the normal selection rule before bypassing pacing. When
+ * the newly selected lane differs, the stale reservation is cancelled; a
+ * `generation` counter on the outer handle ignores the stale lane's
+ * now-asynchronous cancellation rejection so it can never clobber the freshly
+ * reserved lane's later result.
  */
 export function submitPoolGate<C, T>(
   fn: (config: C) => Promise<T>,
@@ -443,7 +498,7 @@ export function submitPoolGate<C, T>(
   };
 
   const responsive = opts.responsive === true;
-  const initial = responsive ? healthy()[0] : selectPoolLane(healthy(), now());
+  const initial = selectPoolLane(healthy(), now());
   reserve(initial ?? candidates[0], responsive);
 
   return {
@@ -453,7 +508,7 @@ export function submitPoolGate<C, T>(
     },
     promote: () => {
       if (settled || inner?.started) return;
-      const target = healthy()[0] ?? candidates[0];
+      const target = selectPoolLane(healthy(), now()) ?? candidates[0];
       if (currentCandidate === target) {
         inner?.promote();
         return;

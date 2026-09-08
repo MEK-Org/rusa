@@ -290,7 +290,7 @@ describe("ProviderPacer", () => {
       pacer: new ProviderPacer(intervalMs, () => Date.now()),
     });
 
-    it("excludes a halted candidate from selection", async () => {
+    it("excludes a halted candidate from responsive selection", async () => {
       const mesh = new ConcurrencyLimiter(1);
       const a = laneFor("a");
       const b = laneFor("b");
@@ -302,6 +302,7 @@ describe("ProviderPacer", () => {
         },
         [a, b],
         {
+          responsive: true,
           isHalted: (config) => config === "a",
           enqueueNormal: (fn) => mesh.enqueue(fn),
         }
@@ -311,12 +312,12 @@ describe("ProviderPacer", () => {
       expect(started).toEqual(["b"]);
     });
 
-    it("responsive requests bypass pacing and reserve the first healthy declared candidate, ignoring quotes", async () => {
+    it("responsive requests choose the same earliest available healthy candidate as normal admission while bypassing pacing", async () => {
       const mesh = new ConcurrencyLimiter(1);
       const a = laneFor("a", 10_000);
       const b = laneFor("b", 10_000);
-      // Make "a" quote later than "b" so a naive earliest-quote pick would
-      // choose "b" — responsive must still land on "a", the first declared.
+      // Make "a" quote later than "b". Responsive priority changes its
+      // pacing, not the model/provider lane selected for the run.
       await a.pacer.submit(async () => "prior", { enqueueNormal: (fn) => mesh.enqueue(fn) }).result;
 
       const handle = submitPoolGate(async (config: string) => config, [a, b], {
@@ -324,7 +325,119 @@ describe("ProviderPacer", () => {
         enqueueNormal: (fn) => mesh.enqueue(fn),
       });
       await vi.advanceTimersByTimeAsync(0);
-      await expect(handle.result).resolves.toBe("a");
+      await expect(handle.result).resolves.toBe("b");
+    });
+
+    it("prefers greater trustworthy weekly headroom when healthy lanes are immediately available", () => {
+      const now = Date.now();
+      const a = laneFor("a");
+      const b = laneFor("b");
+      const winner = selectPoolLane(
+        [
+          {
+            ...a,
+            weeklyQuota: {
+              percentLeft: 40,
+              observedAt: new Date(now).toISOString(),
+              resetAtIso: new Date(now + 4 * 24 * 60 * 60 * 1000).toISOString(),
+            },
+          },
+          {
+            ...b,
+            weeklyQuota: {
+              percentLeft: 30,
+              observedAt: new Date(now).toISOString(),
+              resetAtIso: new Date(now + 24 * 60 * 60 * 1000).toISOString(),
+            },
+          },
+        ],
+        now
+      );
+
+      expect(winner?.config).toBe("b");
+    });
+
+    it("falls back to declared order when weekly headroom is unknown or stale", () => {
+      const now = Date.now();
+      const a = laneFor("a");
+      const b = laneFor("b");
+      const winner = selectPoolLane(
+        [
+          { ...a },
+          {
+            ...b,
+            weeklyQuota: {
+              percentLeft: 99,
+              observedAt: new Date(now - 31 * 60 * 1000).toISOString(),
+              resetAtIso: new Date(now + 24 * 60 * 60 * 1000).toISOString(),
+            },
+          },
+        ],
+        now
+      );
+
+      expect(winner?.config).toBe("a");
+    });
+
+    it("falls back to declared order when weekly headroom is invalid", () => {
+      const now = Date.now();
+      const a = laneFor("a");
+      const b = laneFor("b");
+      const winner = selectPoolLane(
+        [
+          { ...a },
+          {
+            ...b,
+            weeklyQuota: {
+              percentLeft: 101,
+              observedAt: new Date(now).toISOString(),
+              resetAtIso: new Date(now + 24 * 60 * 60 * 1000).toISOString(),
+            },
+          },
+        ],
+        now
+      );
+
+      expect(winner?.config).toBe("a");
+    });
+
+    it("does not let unknown weekly quota evidence outrank a known immediate candidate", () => {
+      const now = Date.now();
+      const a = laneFor("a");
+      const b = laneFor("b");
+      const winner = selectPoolLane(
+        [
+          { ...a },
+          {
+            ...b,
+            weeklyQuota: {
+              percentLeft: 30,
+              observedAt: new Date(now).toISOString(),
+              resetAtIso: new Date(now + 24 * 60 * 60 * 1000).toISOString(),
+            },
+          },
+        ],
+        now
+      );
+
+      expect(winner?.config).toBe("b");
+    });
+
+    it("falls back to declared order when trustworthy weekly headroom is tied", () => {
+      const now = Date.now();
+      const a = laneFor("a");
+      const b = laneFor("b");
+      const resetAtIso = new Date(now + 24 * 60 * 60 * 1000).toISOString();
+      const observedAt = new Date(now).toISOString();
+      const winner = selectPoolLane(
+        [
+          { ...a, weeklyQuota: { percentLeft: 30, observedAt, resetAtIso } },
+          { ...b, weeklyQuota: { percentLeft: 30, observedAt, resetAtIso } },
+        ],
+        now
+      );
+
+      expect(winner?.config).toBe("a");
     });
 
     it("breaks quote ties by declaration order", async () => {
@@ -362,7 +475,7 @@ describe("ProviderPacer", () => {
       expect(selections).toEqual(["a"]);
     });
 
-    it("promote() reselects onto an earlier-declared healthy lane, cancelling the stale reservation, with exactly one invocation", async () => {
+    it("promote() keeps the same next-available lane as normal admission, with exactly one invocation", async () => {
       const mesh = new ConcurrencyLimiter(1);
       let release!: () => void;
       void mesh.run(() => new Promise<void>((resolve) => (release = resolve)));
@@ -388,17 +501,17 @@ describe("ProviderPacer", () => {
       );
       expect(selections).toEqual(["b"]);
 
-      // Responsive input arrives while queued on "b": must reselect to "a",
-      // the earliest declared healthy candidate, cancelling "b"'s reservation.
+      // Responsive input arrives while queued on "b": it bypasses pacing and
+      // mesh concurrency, but preserves normal admission's selection of "b".
       handle.promote();
-      expect(selections).toEqual(["b", "a"]);
+      expect(selections).toEqual(["b"]);
 
       await vi.advanceTimersByTimeAsync(0);
       release();
-      await expect(handle.result).resolves.toBe("a");
-      expect(started).toEqual(["a"]);
+      await expect(handle.result).resolves.toBe("b");
+      expect(started).toEqual(["b"]);
 
-      // "b"'s lane must not have been charged/left with a stranded ticket.
+      // Promotion bypasses the mesh queue without stranding its selected lane.
       expect(b.pacer.waiting).toBe(0);
     });
 
