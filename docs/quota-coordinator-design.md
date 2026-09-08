@@ -56,7 +56,7 @@ would have to respect, and nothing more.
   What that changed. A5 reverses (§2): collection moves into the service. The
   scrape-reduction claim withdrawn in revision 2 comes back (§3.1), because A5
   was the only reason it was withdrawn. The v1 wire contract becomes
-  **read-only — five GETs and no mutating operation anywhere** (§5), which
+  **read-only — six GETs and no mutating operation anywhere** (§5), which
   deletes client ingestion, the ingest receipts table, the observation replay
   buffer, and the whole reservation lifecycle from v1's surface. The v1 schema
   addition shrinks to one singleton table, which revision 7 then removes
@@ -103,6 +103,13 @@ would have to respect, and nothing more.
   previously only implied, is written out and pinned by criterion 16. Review
   also made two retentions argue for themselves rather than be assumed: the
   throttle history endpoint (§5.5) and the published `stale`/`hardStale` flags.
+  A second pass on this revision fixed the transformation it introduced: `capped`
+  is now *derived* from the published interval by the store's own strict
+  inequality rather than asserted `true`, which removes the one boundary
+  (`uncappedIntervalSeconds === maxIntervalSeconds`) where the field had two
+  defensible values, and the hard-stale widening takes the wider of the stored
+  and configured intervals so that a lowered `maxIntervalSeconds` cannot make a
+  stale provider publish faster (§5.7, criterion 2).
 
 ## Contents
 
@@ -651,8 +658,9 @@ one published throttle, as they do now.
   is a contract statement rather than an implementation detail (criterion 7).
 - **Versioning rides on every response, and there is no handshake path.**
   Every v1 response carries `"service": { "protocolMajor", "protocolMinor",
-  "serverVersion", "serverTime" }`. Revision 7 removes the separate
-  `GET /v1/hello` that revision 6 had, for two reasons review made plain. First,
+  "serverVersion", "serverTime" }`. Revision 8 removes the separate
+  `GET /v1/hello` that revisions 6 and 7 had, for two reasons review made plain.
+  First,
   a handshake that takes no client version cannot refuse anything: `hello` had
   no client-version header, query or body, so the "hard refusal on both sides"
   it promised was not implementable and the server-side `protocol_mismatch`
@@ -669,7 +677,7 @@ one published throttle, as they do now.
   ignores response fields it does not know, and the server treats absent
   optional query parameters as their documented defaults. No field is ever
   repurposed; removal requires a major bump.
-- **`databasePath` is published nowhere.** Revision 6's `hello` carried it;
+- **`databasePath` is published nowhere.** The deleted `hello` carried it;
   nothing needs it — `GET /v1/history` exists precisely so that a client never
   opens the file (§5.5) — and publishing it hands a location to the one kind of
   process that should not have it (§4.2).
@@ -904,7 +912,7 @@ One error envelope: `{ "error": { "code": "...", "message": "...", "retryable": 
 | `not_ready` | Service is up but cold — no observation for this provider yet | Keep the last applied interval, or `maxIntervalSeconds` if there has never been one (§5.7 rule 0); retry next tick |
 | `provider_unknown` | Provider not configured on this service | Refuse; this is a configuration error, not a runtime one |
 
-**Two codes, and revision 7 deleted three.** Each deletion is a claim that the
+**Two codes, and revision 8 deleted three.** Each deletion is a claim that the
 code could not fire, so each is worth its sentence:
 
 - **`protocol_mismatch` is not a server error at all.** With no handshake taking
@@ -965,19 +973,51 @@ launch. Nothing fails closed, because there is no closed to fail to.
 because two criteria depend on knowing exactly where it happens. Define:
 
 ```
-publishedThrottle(p) = stored(p)                             when not hardStale
-publishedThrottle(p) = { ...stored(p),
-                         intervalSeconds: maxIntervalSeconds,
-                         capped: true }                      when hardStale
+publishedThrottle(p).intervalSeconds
+    = stored(p).intervalSeconds                            when not hardStale
+    = max(stored(p).intervalSeconds, maxIntervalSeconds)   when hardStale
+
+publishedThrottle(p).capped
+    = stored(p).uncappedIntervalSeconds > publishedThrottle(p).intervalSeconds
+
+every other field is stored(p)'s, unchanged
 ```
 
-`stored(p)` is `getProviderThrottle(p)` unchanged (`shared-store.ts:580`).
-`uncappedIntervalSeconds` is **not** rewritten: it keeps its store meaning — what
-the controller derived for the governing bucket before any cap — so the pair
-stays readable as "this is what reasoning produced, this is what is being
-applied". `capped` therefore means `intervalSeconds !== uncappedIntervalSeconds`
-whatever the cause, and `freshness.hardStale` in the same object says which cause
-it was, so no `cappedReason` field is needed to tell the two apart. Criterion 2
+`stored(p)` is `getProviderThrottle(p)` unchanged (`shared-store.ts:580`). Three
+things this pins, and the first two are corrections review earned:
+
+- **`capped` is derived from the published interval, not asserted.** The store's
+  meaning is a strict inequality — `uncappedIntervalSeconds > intervalSeconds`
+  (`shared-store.ts:636-637`) — so setting `capped: true` unconditionally broke
+  it at exactly one boundary: a hard-stale provider whose
+  `uncappedIntervalSeconds` already equals `maxIntervalSeconds` would publish
+  `intervalSeconds === uncappedIntervalSeconds` and `capped: true` in the same
+  object, and criterion 2 would have had two defensible expected values there.
+  Applying the store's own formula to the value actually on the wire gives the
+  field one meaning in both branches, with no second rule to remember and no
+  boundary to special-case.
+- **The widening takes the wider of the two, rather than assigning.** Every
+  bucket's `interval_seconds` is already clamped at record time by
+  `Math.min(maxIntervalSeconds, uncappedInterval)` (`shared-store.ts:525`), so in
+  the steady case `stored(p).intervalSeconds ≤ maxIntervalSeconds` and the `max`
+  is simply `maxIntervalSeconds`. It earns its keep only after a config edit
+  lowers `maxIntervalSeconds` beneath a value already recorded — a real
+  possibility, since that setting is operator-editable and rows outlive edits
+  (`commitment-ledger.ts:60-68` notes the same hazard from the other side). A
+  plain assignment would then make a hard-stale provider publish *faster* than
+  its own stored interval, which is precisely what "the degradation is always
+  toward slower, never faster" forbids.
+- **`uncappedIntervalSeconds` is never rewritten.** It keeps its store meaning —
+  what the controller derived for the governing bucket before any cap — so the
+  pair stays readable as "this is what reasoning produced, this is what is being
+  applied".
+
+`freshness.hardStale` in the same object is what says a widening happened, and it
+is now the *only* thing that says so. That is a narrowing of `capped`, not a loss:
+`capped` answers "is the ceiling binding below what reasoning wanted?", and under
+an ordinary hard-stale widening the honest answer is no — reasoning wanted
+something *narrower*. No `cappedReason` field is needed to tell the two apart,
+because the two are no longer competing for the same field. Criterion 2
 compares the endpoint against `publishedThrottle`, not against the raw store
 read; criterion 5 exercises the second branch. Without naming this, the two
 criteria contradict each other for a hard-stale provider — the store still
@@ -1576,13 +1616,25 @@ right foundation for 1 and 8.
    provider at any instant, `GET /v1/throttle` returns exactly
    `publishedThrottle(provider)` as defined in §5.7 — which is
    `getProviderThrottle` (`shared-store.ts:580`) field for field when not
-   hard-stale, and that read with `intervalSeconds = maxIntervalSeconds` and
-   `capped = true` when it is — plus the `freshness` and `service` blocks. State
+   hard-stale, and that read with `intervalSeconds` widened to
+   `max(intervalSeconds, maxIntervalSeconds)` and `capped` recomputed against the
+   widened value when it is — plus the `freshness` and `service` blocks. State
    it against `publishedThrottle` rather than against the raw store read, or this
    criterion and criterion 5 cannot both pass for the same provider at the same
    instant. Assert the `freshness` block field for field too, including `stale`
    and `hardStale`: they are published deliberately (§5.5), so they are part of
    the contract a future change is committed to keeping.
+   **Pin the boundary, because it is where two readings of `capped` disagree.**
+   Assert `capped === (uncappedIntervalSeconds > intervalSeconds)` on every
+   response, and assert it specifically for a hard-stale provider whose
+   `uncappedIntervalSeconds` equals `maxIntervalSeconds`, where the one expected
+   response is `intervalSeconds === uncappedIntervalSeconds` **and
+   `capped === false`**. Assert the neighbouring case in the same test — a
+   hard-stale provider with `uncappedIntervalSeconds > maxIntervalSeconds`
+   publishes `capped === true` — so the test pins the inequality rather than a
+   single point on it. This is the assertion that fails against an unconditional
+   `capped: true`, and it is the reason the transformation derives the field
+   instead of stating it.
 3. **The client applies what is published.** After a tick, the client's
    `ProviderPacer` interval equals `intervalSeconds * 1000`
    (`provider-pacer.ts:136-142`), and when the published value has
