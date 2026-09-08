@@ -760,16 +760,6 @@ function buildMeshActorBwrapArgs(o: {
   mcpConfigPath?: string;
   isE2eRoot?: boolean;
   understandingMount?: string;
-  /**
-   * E2E-only: the disposable bare-remote git dir (or its narrowly scoped
-   * shared git directory) provisioned by the actor-mesh e2e harness. Undefined
-   * for every production spawn — only `e2e am-up` sets this. When present, it
-   * is re-bound WRITABLE in place over the read-only `/` view so a sandboxed
-   * e2e actor's `git push` to the local scratch remote succeeds; bubblewrap
-   * otherwise exposes the whole host read-only, and the harness's remote lives
-   * outside any actor's own writable worktree.
-   */
-  e2eWritableRemoteDir?: string;
 }): ActorBwrapResult {
   const pnpmStore = realpathIfExists(resolvePnpmStorePath());
   mkdirSync(pnpmStore, { recursive: true });
@@ -855,12 +845,6 @@ function buildMeshActorBwrapArgs(o: {
   for (const dir of providerWritableStateDirs(o.authMode)) {
     addWritableBindIfExists(args, dir, dir);
   }
-  // Write scope (e2e-only): the harness's disposable bare remote, at its real
-  // path. Absent in production — only set by the e2e actor-mesh runner.
-  if (o.e2eWritableRemoteDir) {
-    addWritableBindIfExists(args, o.e2eWritableRemoteDir, o.e2eWritableRemoteDir);
-  }
-
   // Topology guard (not secrecy): the root's real agy mcp_config carries the chat
   // server; a sandboxed worker must report to its parent, not talk to humans. Pin
   // the per-invocation config over both known paths (after the rw ~/.gemini bind,
@@ -1094,8 +1078,7 @@ export function buildActorBwrapArgs(
   authMode?: SandboxAuthMode,
   mcpConfigPath?: string,
   isE2eRoot?: boolean,
-  understandingMount?: string,
-  e2eWritableRemoteDir?: string
+  understandingMount?: string
 ): ActorBwrapResult {
   return buildMeshActorBwrapArgs({
     actorDir,
@@ -1103,7 +1086,6 @@ export function buildActorBwrapArgs(
     mcpConfigPath,
     isE2eRoot,
     understandingMount,
-    e2eWritableRemoteDir,
   });
 }
 
