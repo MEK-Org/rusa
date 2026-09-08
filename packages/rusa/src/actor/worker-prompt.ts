@@ -41,12 +41,9 @@ tracker tools rather than shelling \`gh\`. When you're unsure what actually
 happened, re-check with a tool or say so — never fill the gap with a plausible
 guess.`;
 
-/** GitHub writing is mechanically attributed at the tracker boundary. */
+/** Tell actors their handle without asking them to add a visible byline. */
 export function trackerWritingGuidance(handle: string): string {
-  return `## GitHub writing
-Your actor handle is **${handle}**. Use tracker tools for every GitHub write; they
-mechanically add your visible run-model footer and authenticated hidden author
-stamp. Use \`gh\` only for read-only GitHub operations.`;
+  return `Your actor handle is **${handle}**. Do not sign your own name.`;
 }
 
 export const INBOX_DISCIPLINE = `## Work from your inbox
