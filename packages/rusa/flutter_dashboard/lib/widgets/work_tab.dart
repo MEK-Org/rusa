@@ -548,6 +548,7 @@ class _DetailViewState extends State<_DetailView> {
         final o = data.obligation;
 
         return ListView(
+          key: ValueKey(widget.obligationId),
           padding: const EdgeInsets.all(24),
           children: [
             Row(
@@ -632,6 +633,11 @@ class _DetailViewState extends State<_DetailView> {
             if (o.isRecurring || o.hasCompletionHistory) ...[
               _SectionHeader('COMPLETION HISTORY'),
               _completionsPanel(),
+              const SizedBox(height: 24),
+            ],
+            if (data.parent != null) ...[
+              _SectionHeader('PARENT'),
+              _parentPanel(context, data.parent!),
               const SizedBox(height: 24),
             ],
             _SectionHeader('CHILDREN'),
@@ -990,6 +996,27 @@ class _DetailViewState extends State<_DetailView> {
           ),
           ?edit,
         ],
+      ),
+    );
+  }
+
+  Widget _parentPanel(BuildContext context, ObligationDto parent) {
+    return Container(
+      decoration: BoxDecoration(
+        color: MeshColors.bgSecondary,
+        border: Border.all(color: MeshColors.border),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: ObligationRow(
+        obligation: parent,
+        store: store,
+        showOwner: true,
+        showActions: false,
+        onSelectView: onSelectView,
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 12,
+        ),
       ),
     );
   }

@@ -279,10 +279,7 @@ void main() {
           api.fetchObligationForestCalls.last.includeTerminalRoots,
           isTrue,
         );
-        expect(
-          find.text('Focused child under a quiet root'),
-          findsWidgets,
-        );
+        expect(find.text('Focused child under a quiet root'), findsWidgets);
 
         await store.dispose();
       });
@@ -454,6 +451,175 @@ void main() {
 
         expect(find.text('Live root A'), findsOneWidget);
         expect(find.text('Live root B'), findsOneWidget);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'shows parent link when obligation has a parent and navigates on tap in wide layout',
+    (tester) async {
+      await tester.runAsync(() async {
+        final parent = makeObligation(
+          'parent-ob',
+          ownerId: 'root',
+          intent: 'Parent obligation heading',
+          title: 'Parent obligation heading',
+        );
+        final child = makeObligation(
+          'child-ob',
+          parentId: 'parent-ob',
+          ownerId: 'root',
+          intent: 'Child obligation heading',
+          title: 'Child obligation heading',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [parent, child];
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        store.setFocusedObligationId('child-ob');
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        // Child detail view is shown
+        expect(find.text('Child obligation heading'), findsWidgets);
+        expect(find.text('PARENT'), findsOneWidget);
+        expect(find.text('Parent obligation heading'), findsWidgets);
+
+        // Scroll to and tap the parent row in the PARENT section
+        await tester.ensureVisible(find.text('Parent obligation heading').last);
+        await tester.pump();
+        await tester.tap(find.text('Parent obligation heading').last);
+        for (int i = 0; i < 10; i++) {
+          await tester.pump(const Duration(milliseconds: 10));
+        }
+
+        // Verified that focusedObligationId was updated
+        expect(store.focusedObligationId.value, 'parent-ob');
+        // Parent detail view is now shown
+        expect(find.text('Parent obligation heading'), findsWidgets);
+        // Parent is a root obligation, so it should not show a PARENT section or misleading parent action
+        expect(find.text('PARENT'), findsNothing);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'root obligation preserves behavior with no PARENT section or misleading parent action',
+    (tester) async {
+      await tester.runAsync(() async {
+        final rootOb = makeObligation(
+          'root-ob',
+          ownerId: 'root',
+          intent: 'Root obligation heading',
+          title: 'Root obligation heading',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [rootOb];
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        store.setFocusedObligationId('root-ob');
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('Root obligation heading'), findsWidgets);
+        expect(find.text('PARENT'), findsNothing);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'navigates to parent obligation from detail view in narrow layout',
+    (tester) async {
+      await tester.runAsync(() async {
+        await tester.binding.setSurfaceSize(const Size(500, 800));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final parent = makeObligation(
+          'parent-ob',
+          ownerId: 'root',
+          intent: 'Parent obligation heading',
+          title: 'Parent obligation heading',
+        );
+        final child = makeObligation(
+          'child-ob',
+          parentId: 'parent-ob',
+          ownerId: 'root',
+          intent: 'Child obligation heading',
+          title: 'Child obligation heading',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [parent, child];
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        store.setFocusedObligationId('child-ob');
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.pump();
+
+        // In narrow layout, child detail view is displayed with the back bar
+        expect(find.text('Back to List'), findsOneWidget);
+        expect(find.text('Child obligation heading'), findsWidgets);
+        expect(find.text('PARENT'), findsOneWidget);
+        expect(find.text('Parent obligation heading'), findsWidgets);
+
+        // Scroll to and tap the parent row
+        await tester.ensureVisible(find.text('Parent obligation heading').last);
+        await tester.pump();
+        await tester.tap(find.text('Parent obligation heading').last);
+        for (int i = 0; i < 10; i++) {
+          await tester.pump(const Duration(milliseconds: 10));
+        }
+
+        // Focused obligation updated and parent detail view displayed in narrow mode
+        expect(store.focusedObligationId.value, 'parent-ob');
+        expect(find.text('Parent obligation heading'), findsWidgets);
+        expect(find.text('PARENT'), findsNothing);
+        expect(find.text('Back to List'), findsOneWidget);
+
+        // Tap Back to List icon returns to sidebar list
+        await tester.tap(find.byIcon(Icons.arrow_back));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('WORK QUEUE'), findsOneWidget);
 
         await store.dispose();
       });
