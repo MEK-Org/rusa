@@ -539,33 +539,36 @@ export class GitHubIssueClient implements IssueClient {
     // from disagreeing after a transient failure or concurrent PR change.
     const existing = await this.findOpenPullRequestForHead(opts.repo, opts.head);
     const body = existing ? (opts.existingBody ?? opts.body) : opts.body;
+    let pr: CreatedPullRequest;
     if (existing) {
-      // Update the existing PR's title, body, and base (if provided), then return its number + URL
+      // Update the existing PR's title, body, and base (if provided).
       await this.api("PATCH", `/repos/${opts.repo}/pulls/${existing.number}`, {
         title: opts.title,
         body,
         ...(opts.base !== undefined ? { base: opts.base } : {}),
       });
-      return existing;
+      pr = existing;
+    } else {
+      // Unlike `gh pr create`, the REST endpoint requires an explicit base.
+      const base = opts.base ?? (await this.getDefaultBranch(opts.repo));
+      const created = await this.api<{ number: number; html_url: string }>(
+        "POST",
+        `/repos/${opts.repo}/pulls`,
+        { title: opts.title, body, head: opts.head, base }
+      );
+      pr = { number: created.number, htmlUrl: created.html_url };
     }
 
-    // Unlike `gh pr create`, the REST endpoint requires an explicit base.
-    const base = opts.base ?? (await this.getDefaultBranch(opts.repo));
-    const pr = await this.api<{ number: number; html_url: string }>(
-      "POST",
-      `/repos/${opts.repo}/pulls`,
-      { title: opts.title, body, head: opts.head, base }
-    );
-
-    // No reviewer means no review request at all — not a substituted default.
-    // Requesting one is a deliberate routing act .
+    // Both creation and update are complete before this separate GitHub API
+    // request. If it fails, preserve that API error so callers can retry the
+    // requested review rather than treating the operation as fully successful.
     if (opts.reviewer) {
       await this.api("POST", `/repos/${opts.repo}/pulls/${pr.number}/requested_reviewers`, {
         reviewers: [opts.reviewer],
       });
     }
 
-    return { number: pr.number, htmlUrl: pr.html_url };
+    return pr;
   }
 
   async createIssue(opts: CreateIssueOptions): Promise<CreatedIssue> {
