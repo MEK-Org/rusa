@@ -107,7 +107,11 @@ export interface DashboardDataDeps {
   referenceCache?: import("../references/cache-service.js").ReferenceCacheService;
   chatClient?: import("../chat/types.js").ChatClient;
   issueClient?: import("../references/resolve.js").ReferenceResolverDeps["issueClient"];
+  getFollowers?: () => FollowerInfo[];
 }
+
+import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
+export type { FollowerInfo };
 
 /** Route prefix for the per-actor avatar endpoint . */
 const AVATAR_PREFIX = "/api/mesh/avatar/";
@@ -178,6 +182,7 @@ interface ThreadDto {
   handle: string;
   parentId: string | null;
   status: string;
+  executionTarget?: string | null;
   /** The declared candidate pool's first (or only) entry — compat view of {@link modelConfig}. */
   provider: string | null;
   /** The single authoritative model for this actor, as configured in the registry. */
@@ -523,8 +528,10 @@ export async function handleMeshApiRequest(
               compactionModel:
                 typeof body.compactionModel === "string" ? body.compactionModel : undefined,
             });
+            const target = typeof body.target === "string" ? body.target : undefined;
             const id = deps.rootControl?.spawnChild(
               {
+                ...(target !== undefined ? { executionTarget: target } : {}),
                 charter: typeof body.charter === "string" ? body.charter : "",
                 modelConfig: {
                   provider: typeof body.provider === "string" ? body.provider : "",
@@ -1247,6 +1254,13 @@ export async function handleMeshApiRequest(
     return true;
   }
 
+  // GET /api/mesh/followers — list connected followers
+  if (pathname === "/api/mesh/followers") {
+    const followers = deps?.getFollowers ? deps.getFollowers() : [];
+    sendJson(res, 200, { followers });
+    return true;
+  }
+
   // GET /api/mesh/threads — every thread (active + retired), handle up front.
   if (pathname === "/api/mesh/threads") {
     const runtime =
@@ -1287,6 +1301,7 @@ export async function handleMeshApiRequest(
         handle: r.isRoot === true ? rootHandle : generateHandle(r.id),
         parentId: r.parentId,
         status: r.status,
+        executionTarget: r.executionTarget ?? null,
         provider: r.modelConfig?.[0]?.provider ?? null,
         model: r.modelConfig?.[0]?.model ?? null,
         effort: r.modelConfig?.[0]?.effort ?? null,

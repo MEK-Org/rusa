@@ -2,11 +2,13 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ActorOptions } from "../../actor/actor.js";
 import type { ActorFactoryContext } from "../../actor/actor-mesh.js";
+import type { ActorRecord } from "../../actor/actor-record.js";
 import { createRunAccounting } from "../../actor/run-accounting.js";
 import { runMigrations } from "../../db/migrations/runner.js";
 import { ActorRunRepository } from "../../db/repositories/actor-run-repository.js";
 import type { RunResult } from "../../providers/types.js";
 import { ActorHandle } from "./actor-handle.js";
+import type { LeaderCommand } from "./protocol.js";
 import { RemoteInstance } from "./remote-instance.js";
 
 /**
@@ -158,5 +160,52 @@ describe("remote actor run accounting", () => {
 
     expect(allRuns()).toEqual([{ outcome: "completed", success: 0 }]);
     expect(accountingErrors).toEqual([]);
+  });
+
+  it("preserves updated session on attachHost rather than resetting to bootstrap session", async () => {
+    const currentSession = "session-S1";
+    const remote2 = new RemoteInstance("test-follower-2", process.platform, process.pid);
+    const host2 = remote2.createHost(ACTOR_ID);
+    let capturedInit: (LeaderCommand & { type: "init" }) | undefined;
+    host2.send = (msg: LeaderCommand, cb: (err: Error | null) => void) => {
+      if (msg.type === "init") capturedInit = msg;
+      cb(null);
+      return true;
+    };
+
+    const handleWithOptions = new ActorHandle({
+      host: remote.createHost("actor-with-session"),
+      bootstrap: { id: "actor-with-session", cwd: "/tmp/actor", sessionId: "session-S0" },
+      context: {
+        executionTarget: "test-follower",
+        record: { id: "actor-with-session" },
+        getRecord: () => ({ id: "actor-with-session" }),
+        onRunEnd: () => {},
+        onRuntimeStateChanged: () => {},
+        onQueued: () => {},
+      } as unknown as ActorFactoryContext,
+      snapshot: () => ({
+        record: {
+          id: "actor-with-session",
+          sessionId: currentSession,
+        } as unknown as ActorRecord,
+        prompt: "test",
+        mcpServers: [{ name: "test-mcp", url: "http://127.0.0.1:9999/mcp/tool" }],
+      }),
+      saveSession: () => {},
+      onFailure: () => {},
+    });
+
+    try {
+      handleWithOptions.attachHost(host2);
+      if (!capturedInit) throw new Error("capturedInit undefined");
+      expect(capturedInit.bootstrap.sessionId).toBe("session-S1");
+      expect(capturedInit.bootstrap.mcpServers).toEqual([
+        { name: "test-mcp", url: "http://127.0.0.1:9999/mcp/tool" },
+      ]);
+    } finally {
+      handleWithOptions.close();
+      remote2.close();
+    }
   });
 });

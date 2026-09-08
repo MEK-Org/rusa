@@ -109,4 +109,39 @@ describe("monolithic follower instance", () => {
     expect(h.follower.actorIds).toEqual([b]);
     expect(h.failures).toEqual([]);
   });
+
+  it("rejects duplicate actor init without reconnect flag but permits reconnect", async () => {
+    const h = setup();
+    const id = h.spawn("Duplicate test");
+    await expect(h.runtime(id).ready).resolves.toBe(process.pid);
+
+    // Attempting duplicate init without reconnect flag throws
+    expect(() =>
+      h.follower.dispatch({
+        actorId: id,
+        message: {
+          type: "init",
+          bootstrap: {
+            id,
+            cwd: "/tmp",
+          },
+        },
+      })
+    ).toThrow("Actor already exists on follower");
+
+    // Reconnect flag permits re-initialization
+    expect(() =>
+      h.follower.dispatch({
+        actorId: id,
+        message: {
+          type: "init",
+          bootstrap: {
+            id,
+            cwd: "/tmp",
+            reconnect: true,
+          },
+        },
+      })
+    ).not.toThrow();
+  });
 });

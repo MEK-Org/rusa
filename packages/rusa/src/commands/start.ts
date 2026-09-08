@@ -3,6 +3,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -126,6 +127,8 @@ import type {
 } from "../db/repositories/obligation-repository.js";
 import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
+import { instanceWorkerFactory } from "../experimental/remote-instances/e2e-adapter.js";
+import { FollowerHub } from "../experimental/remote-instances/follower-hub.js";
 import {
   checkSuiteWakesAnyone,
   deriveGitHubInboxNotification,
@@ -1646,14 +1649,52 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     }
   };
 
+  // ── Follower gateway: persistent remote execution nodes ──
+  let followerHub: FollowerHub | undefined;
+  if (config.followers) {
+    const tokenFile = config.followers.tokenFile;
+    let token: string;
+    try {
+      if (process.platform !== "win32") {
+        const stats = statSync(tokenFile);
+        if ((stats.mode & 0o077) !== 0) {
+          log.warn("follower_token_file_insecure_permissions", {
+            tokenFile,
+            mode: (stats.mode & 0o777).toString(8),
+            hint: "tokenFile should be readable only by its owner (e.g. chmod 0600)",
+          });
+        }
+      }
+      token = readFileSync(tokenFile, "utf8").trim();
+    } catch (err) {
+      throw new Error(
+        `Failed to read follower tokenFile '${tokenFile}': ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    followerHub = new FollowerHub(token, { logger: log });
+    await followerHub.listen(config.followers.bind, config.followers.port);
+    log.info("follower_gateway_started", {
+      bind: config.followers.bind,
+      port: config.followers.port,
+    });
+  }
+
+  const followerWorkerFactory = followerHub
+    ? instanceWorkerFactory(config, followerHub, { logger: log })
+    : undefined;
+  const createWorkerActor = opts?.e2e?.createWorkerActor ?? followerWorkerFactory;
+
   // ── Actor mesh: the root plus any worker threads it spawns ──
   const mesh: ActorMesh = new ActorMesh({
     actors,
     rootId,
-    // Placement exists only while the experimental remote-instance seam is
-    // wired (the E2E rig supplies it). Production leaves it unset, so an
-    // `executionTarget` is rejected at the spawn choke point.
-    supportsExecutionTarget: opts?.e2e?.createWorkerActor ? () => true : undefined,
+    // Placement exists when an experimental remote-instance seam or follower gateway
+    // is wired. Unknown or disconnected targets fail closed.
+    supportsExecutionTarget: opts?.e2e?.createWorkerActor
+      ? () => true
+      : followerHub
+        ? (target: string) => followerHub.list().some((f) => f.id === target)
+        : undefined,
     validateSpawn: (req) => {
       // Portable-context refusals  live here, at the mesh's single spawn
       // choke point, so the MCP tool, root control, the dashboard and the A/B rig
@@ -1919,6 +1960,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               mesh.markUnkillable(id);
             },
             isFenced,
+            getFollowers: () => (followerHub ? followerHub.list() : []),
           })
         );
         const inboxUrl = mcpHttp.addServer(`${id}:${INBOX_MCP_NAME}`, () =>
@@ -2271,7 +2313,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // Second fail-closed gate, covering rehydrate/adopt as well as spawn: a
         // placement request only ever reaches a remote runtime, never a local
         // Actor standing in silently for the instance that was asked for.
-        const createWorkerActor = opts?.e2e?.createWorkerActor;
         if (ctx.executionTarget !== undefined && !createWorkerActor) {
           throw new Error(
             `actor ${id} requests executionTarget ${JSON.stringify(ctx.executionTarget)} but this runtime has no remote placement support`
@@ -2288,6 +2329,38 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }
     },
   });
+
+  if (followerHub) {
+    followerHub.onRegister((follower) => {
+      for (const record of actors.list()) {
+        if (record.executionTarget !== follower.id) continue;
+        if (record.status !== "active") {
+          followerHub.stopActor(follower.id, record.id);
+          continue;
+        }
+        const existing = mesh.get(record.id);
+        if (!existing) {
+          mesh.rehydrate(record);
+          mesh.notifyInboxChanged(record.id);
+        } else if (
+          "attachHost" in existing &&
+          typeof (existing as { attachHost?: (host: unknown) => void }).attachHost === "function"
+        ) {
+          try {
+            const newHost = followerHub.createHost(follower.id, record.id);
+            (existing as { attachHost: (host: unknown) => void }).attachHost(newHost);
+            mesh.notifyInboxChanged(record.id);
+          } catch (err) {
+            log.warn("follower_reconnect_attach_failed", {
+              actorId: record.id,
+              followerId: follower.id,
+              err,
+            });
+          }
+        }
+      }
+    });
+  }
   // Route head changes as soon as the mesh exists — ahead of rehydration, which
   // is what registers the per-actor obligations MCP servers, and well ahead of
   // the dashboard binding its port. A head change cannot commit into a sink
@@ -2416,6 +2489,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       onWrite: () => {
         mesh.markUnkillable(rootId);
       },
+      getFollowers: () => (followerHub ? followerHub.list() : []),
     })
   );
   const rootInboxUrl = mcpHttp.addServer(`${rootId}:${INBOX_MCP_NAME}`, () =>
@@ -2930,6 +3004,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     console.log(`[mesh] rehydrated ${restored.length} active actor(s) from the repository`);
   }
 
+  if (followerHub) {
+    const pendingReconnect = actors
+      .list()
+      .filter((r) => r.status === "active" && r.executionTarget !== undefined && !mesh.get(r.id));
+    for (const record of pendingReconnect) {
+      log.warn("follower_actor_pending_reconnect", {
+        actorId: record.id,
+        target: record.executionTarget,
+        hint: `Follower '${record.executionTarget}' is not connected; actor will rehydrate when the follower enrolls`,
+      });
+    }
+  }
+
   // One-time avatar backfill : generate a cached avatar for every currently
   // live actor that lacks one, so existing actors get an avatar without waiting to
   // respawn. Strictly fire-and-forget — the root and already-cached handles are
@@ -3186,6 +3273,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           // On-demand avatar generation  reuses the same key the
           // walkie-talkie transcription/TTS calls above already gate on.
           geminiApiKey,
+          getFollowers: () => (followerHub ? followerHub.list() : []),
         },
         // The IU calibration view's server half (ISSUE_NUM 2b): a read-only paginated
         // op-getter over the distiller's LOCAL would-be-graph files (baseline + ops-log),
@@ -3462,6 +3550,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       await mcpHttp.close();
     } catch {
       /* already closed */
+    }
+    if (followerHub) {
+      try {
+        await followerHub.close();
+      } catch {
+        /* already closed */
+      }
     }
     if (gitBridgeServer) {
       try {

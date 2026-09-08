@@ -1,5 +1,5 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
@@ -1193,5 +1193,80 @@ describe("loadConfig observability.logging", () => {
     expect(() => loadConfig(writeConfig({ observability: { logging: { format: 1 } } }))).toThrow(
       /observability.logging.format must be one of/
     );
+  });
+
+  describe("followers gateway config", () => {
+    it("loads valid followers config with loopback bind", () => {
+      const config = loadConfig(
+        writeConfig({
+          followers: {
+            bind: "127.0.0.1",
+            port: 8190,
+            tokenFile: "/path/to/token",
+          },
+        })
+      );
+      expect(config.followers).toEqual({
+        bind: "127.0.0.1",
+        port: 8190,
+        tokenFile: "/path/to/token",
+      });
+    });
+
+    it("loads valid followers config with tailscale bind", () => {
+      const config = loadConfig(
+        writeConfig({
+          followers: {
+            bind: "100.100.50.25",
+            port: 8190,
+            tokenFile: "/path/to/token",
+          },
+        })
+      );
+      expect(config.followers?.bind).toBe("100.100.50.25");
+    });
+
+    it("expands ~ in tokenFile path", () => {
+      const config = loadConfig(
+        writeConfig({
+          followers: {
+            bind: "127.0.0.1",
+            port: 8190,
+            tokenFile: "~/.config/rusa/token",
+          },
+        })
+      );
+      expect(config.followers?.tokenFile).toBe(join(homedir(), ".config/rusa/token"));
+    });
+
+    it("rejects public or wildcard bind address (0.0.0.0)", () => {
+      expect(() =>
+        loadConfig(
+          writeConfig({
+            followers: {
+              bind: "0.0.0.0",
+              port: 8190,
+              tokenFile: "/path/to/token",
+            },
+          })
+        )
+      ).toThrow(
+        /followers\.bind must be an explicit loopback \(127\.0\.0\.1\) or Tailscale IPv4 address/
+      );
+    });
+
+    it("rejects invalid port", () => {
+      expect(() =>
+        loadConfig(
+          writeConfig({
+            followers: {
+              bind: "127.0.0.1",
+              port: 70000,
+              tokenFile: "/path/to/token",
+            },
+          })
+        )
+      ).toThrow(/followers\.port must be a valid port integer/);
+    });
   });
 });

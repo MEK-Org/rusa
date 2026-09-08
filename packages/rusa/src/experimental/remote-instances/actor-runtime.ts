@@ -1,4 +1,5 @@
 import { Actor } from "../../actor/actor.js";
+import type { McpServerSpec } from "../../providers/types.js";
 import type {
   ActorEvent,
   Bootstrap,
@@ -19,6 +20,9 @@ export function createActorRuntime(
   let stopping = false;
   let activeGates = 0;
   let closed = false;
+  let sessionId: string | undefined;
+  let lastRuntimeState: "queued" | "running" | "winding_down" | "idle" = "idle";
+  const mcpServers: McpServerSpec[] = [];
   function finishClose(): void {
     if (stopping && !closed && activeGates === 0) {
       closed = true;
@@ -42,8 +46,21 @@ export function createActorRuntime(
 
   async function initialize(bootstrap: Bootstrap): Promise<void> {
     if (stopping) return;
+    if (actor) {
+      for (const call of pending.values()) call.reject(new Error("Coordinator reconnected"));
+      pending.clear();
+      if (bootstrap.mcpServers) {
+        mcpServers.splice(0, mcpServers.length, ...bootstrap.mcpServers);
+      }
+      if (bootstrap.sessionId) {
+        sessionId = bootstrap.sessionId;
+      }
+      send({ type: "ready", pid: process.pid });
+      send({ type: "state", state: lastRuntimeState, yielded: actor.isYielded });
+      return;
+    }
     let snapshot: RunSnapshot;
-    let sessionId = bootstrap.sessionId;
+    sessionId = bootstrap.sessionId;
     const provider = await createProvider(
       {
         sendMessage: (to, body) => request({ op: "sendMessage", to, body }).result,
@@ -55,7 +72,7 @@ export function createActorRuntime(
       bootstrap.providerOptions ?? {}
     );
     if (stopping) return;
-    const mcpServers = bootstrap.mcpServers ?? [];
+    mcpServers.splice(0, mcpServers.length, ...(bootstrap.mcpServers ?? []));
     // One provider per remote actor: the bootstrap names the single declared
     // candidate, so selection resolves back to it whatever the leader reserved.
     const modelConfig = bootstrap.modelConfig?.length
@@ -117,8 +134,10 @@ export function createActorRuntime(
       onContinue: (count) => send({ type: "continue", count }),
       onContinuationCapped: (count) => send({ type: "capped", count }),
       onCoalesceAborted: (count, ageMs) => send({ type: "coalesced", count, ageMs }),
-      onRuntimeStateChanged: (state) =>
-        send({ type: "state", state, yielded: actor?.isYielded ?? false }),
+      onRuntimeStateChanged: (state) => {
+        lastRuntimeState = state;
+        send({ type: "state", state, yielded: actor?.isYielded ?? false });
+      },
       log: (chunk) => send({ type: "log", chunk }),
     });
     send({ type: "ready", pid: process.pid });

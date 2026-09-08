@@ -151,6 +151,7 @@ export interface DashboardMeshRefs {
   referenceCache?: DashboardDataDeps["referenceCache"];
   chatClient?: DashboardDataDeps["chatClient"];
   issueClient?: DashboardDataDeps["issueClient"];
+  getFollowers?: DashboardDataDeps["getFollowers"];
 }
 
 export interface DashboardServerOptions {
@@ -487,6 +488,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           referenceCache: options.mesh.referenceCache,
           chatClient: options.mesh.chatClient,
           issueClient: options.mesh.issueClient,
+          getFollowers: options.mesh.getFollowers,
         }
       : null;
   // Walkie-talkie deps : routes need the registry/mesh/hub either way so
