@@ -17,6 +17,7 @@ let distillerState: DistillerState = {
 const STUB_DEPS: GrantableServerDeps = {
   gmailClient: { sendEmail: async () => ({ id: "message-1" }) },
   onEmailSend: () => {},
+  getRunSelectionForActor: () => undefined,
   driveClients: {
     listChildren: async () => [],
     getFileMetadata: async () => ({ id: "", name: "", mimeType: "" }),
