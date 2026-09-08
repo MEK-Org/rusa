@@ -23,7 +23,6 @@ import {
   INTEGRAL_MAX_STEP_SECONDS,
   MAX_INTERVAL_SECONDS,
   matchedState,
-  parameters,
   percentile,
 } from "./lib/controller.mjs";
 

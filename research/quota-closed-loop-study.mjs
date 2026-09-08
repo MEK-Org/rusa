@@ -688,7 +688,6 @@ function report({ scenarios, metrics, robustnessRows2 }) {
     .join("\n");
   const anyExhaustion = metrics.filter((row) => row.exhausted_hours > 0);
   const burstMetrics = metrics.filter((row) => row.scenario === "burst-recovery");
-  const baselineBurst = burstMetrics.find((row) => row.candidate === BASELINE.id);
   const maxDerivativeTerm = Math.max(...metrics.map((row) => row.max_derivative_term_seconds));
   const proposal = burstMetrics.find((row) => row.candidate === "weaker-i-stronger-d");
 
