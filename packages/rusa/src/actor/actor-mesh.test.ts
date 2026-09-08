@@ -183,6 +183,7 @@ function setup(
     scheduledMessages?: FakeScheduledMessageScheduler;
     actors?: InMemoryActorRepository;
     withTransaction?: ActorMeshOptions["withTransaction"];
+    handleForId?: (id: string) => string;
   } = {}
 ) {
   const registry = opts.actors ?? new InMemoryActorRepository();
@@ -195,6 +196,7 @@ function setup(
   const mesh = new ActorMesh({
     actors: registry,
     rootId: opts.rootId ?? "root",
+    handleForId: opts.handleForId,
     validateSpawn: opts.validateSpawn,
     validateModel: opts.validateModel,
     onModelSet: opts.onModelSet,
@@ -7682,4 +7684,117 @@ describe("ActorMesh", () => {
   // and persistence of a canonicalized modelConfig across a restart is
   // covered in actor-mesh-restart-persistence.test.ts. Removed rather than
   // rewritten.
+
+  describe("resolveDirectChildHandle and getActorHandle (#323)", () => {
+    it("resolves a direct child by handle case-insensitively and with trimming", () => {
+      const { mesh } = setup();
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      const handle = mesh.getActorHandle(child);
+
+      const resolved = mesh.resolveDirectChildHandle(parent, `  ${handle.toUpperCase()}  `);
+      expect(resolved.id).toBe(child);
+      expect(resolved.parentId).toBe(parent);
+    });
+
+    it("fails when resolving with a blank or whitespace-only handle", () => {
+      const { mesh } = setup();
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      mesh.spawn({ charter: "child", parentId: parent });
+
+      expect(() => mesh.resolveDirectChildHandle(parent, "   ")).toThrow(
+        /child handle must not be blank/
+      );
+    });
+
+    it("fails when resolving an unknown child handle", () => {
+      const { mesh } = setup();
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      mesh.spawn({ charter: "child", parentId: parent });
+
+      expect(() => mesh.resolveDirectChildHandle(parent, "non-existent-handle")).toThrow(
+        /unknown child handle: "non-existent-handle"/
+      );
+    });
+
+    it("refuses to resolve children belonging to a different parent", () => {
+      const { mesh } = setup();
+      const parentA = mesh.spawn({ charter: "parent A", parentId: "root" });
+      const childA = mesh.spawn({ charter: "child A", parentId: parentA });
+      const handleA = mesh.getActorHandle(childA);
+
+      const parentB = mesh.spawn({ charter: "parent B", parentId: "root" });
+
+      expect(() => mesh.resolveDirectChildHandle(parentB, handleA)).toThrow(
+        new RegExp(`unknown child handle: "${handleA}"`)
+      );
+    });
+
+    it("fails when direct children have ambiguous duplicate handles", () => {
+      const { mesh } = setup({
+        handleForId: (id) => {
+          if (id === "t2" || id === "t3") return "twin-badger";
+          return id;
+        },
+      });
+
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child1 = mesh.spawn({ charter: "child 1", parentId: parent });
+      const child2 = mesh.spawn({ charter: "child 2", parentId: parent });
+      expect(mesh.getActorHandle(child1)).toBe("twin-badger");
+      expect(mesh.getActorHandle(child2)).toBe("twin-badger");
+
+      expect(() => mesh.resolveDirectChildHandle(parent, "twin-badger")).toThrow(
+        /ambiguous child handle "twin-badger": matches multiple child threads/
+      );
+    });
+
+    it("ignores retired children so handle collisions with retired siblings do not cause ambiguity", () => {
+      const { mesh, registry } = setup({
+        handleForId: (id) => {
+          if (id === "t2" || id === "t3") return "twin-badger";
+          return id;
+        },
+      });
+
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child1 = mesh.spawn({ charter: "child 1", parentId: parent });
+      const child2 = mesh.spawn({ charter: "child 2", parentId: parent });
+      expect(mesh.getActorHandle(child1)).toBe("twin-badger");
+      expect(mesh.getActorHandle(child2)).toBe("twin-badger");
+
+      // When child1 is retired, resolving "twin-badger" resolves cleanly to active child2
+      mesh.retire(child1);
+      expect(registry.get(child1)?.status).toBe("retired");
+      expect(registry.get(child2)?.status).toBe("active");
+
+      const resolved = mesh.resolveDirectChildHandle(parent, "twin-badger");
+      expect(resolved.id).toBe(child2);
+
+      // When child2 is also retired, resolving "twin-badger" throws unknown child handle
+      mesh.retire(child2);
+      expect(() => mesh.resolveDirectChildHandle(parent, "twin-badger")).toThrow(
+        /unknown child handle: "twin-badger"/
+      );
+    });
+
+    it("refuses setActorModel on retired threads", () => {
+      const { mesh } = setup();
+      const parent = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const child = mesh.spawn({
+        charter: "child",
+        parentId: parent,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+
+      mesh.retire(child);
+      expect(() =>
+        mesh.setActorModel(child, { provider: "claude", model: "claude-opus-4-8" }, parent)
+      ).toThrow(new RegExp(`Cannot set model on retired thread: ${child}`));
+    });
+  });
 });

@@ -2940,6 +2940,39 @@ export class ActorMesh {
     return states;
   }
 
+  /** Return the display handle for an actor thread id. */
+  getActorHandle(actorId: string): string {
+    return this.handleForId(this.resolveThreadId(actorId));
+  }
+
+  /**
+   * Resolve a direct child actor record by display handle for a given requester.
+   * Performs trim and case-insensitive matching against direct reports.
+   * Throws if handle is blank, unknown, or ambiguous.
+   */
+  resolveDirectChildHandle(requesterId: string, handle: string): ActorRecord {
+    requesterId = this.resolveThreadId(requesterId);
+    const normalized = handle.trim().toLowerCase();
+    if (!normalized) {
+      throw new Error("child handle must not be blank");
+    }
+    const directChildren = this.list().filter(
+      (r) => r.parentId === requesterId && r.status === "active"
+    );
+    const matches = directChildren.filter(
+      (r) => this.handleForId(r.id).toLowerCase() === normalized
+    );
+    if (matches.length === 0) {
+      throw new Error(`unknown child handle: "${handle}"`);
+    }
+    if (matches.length > 1) {
+      throw new Error(
+        `ambiguous child handle "${handle}": matches multiple child threads (${matches.map((m) => m.id).join(", ")})`
+      );
+    }
+    return matches[0];
+  }
+
   private retireInner(id: string): void {
     for (const child of this.actors.children(id)) {
       if (child.status === "active") this.retireUnchecked(child.id);
@@ -3169,6 +3202,9 @@ export class ActorMesh {
     const record = this.actors.get(id);
     if (!record) {
       throw new Error(`Cannot set model on unknown thread: ${id}`);
+    }
+    if (record.status === "retired") {
+      throw new Error(`Cannot set model on retired thread: ${id}`);
     }
     const isRoot = this.isRootActor(requestedBy);
     if (!isRoot) {
