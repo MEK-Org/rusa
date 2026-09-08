@@ -1540,6 +1540,16 @@ export async function handleMeshApiRequest(
           : resolveReferenceSync(artifact.ref, { meshChat: deps.meshChat }),
       }))
     );
+    const externalRefKey = obligation.externalRef?.key;
+    const externalReference = externalRefKey
+      ? deps.referenceCache
+        ? await deps.referenceCache.get(externalRefKey, deps).catch(() => ({
+            ...resolveReferenceSync(externalRefKey, { meshChat: deps.meshChat }),
+            unavailable: "could not load context",
+            cacheState: "unavailable",
+          }))
+        : resolveReferenceSync(externalRefKey, { meshChat: deps.meshChat })
+      : null;
     sendJson(res, 200, {
       obligation,
       parent,
@@ -1549,6 +1559,7 @@ export async function handleMeshApiRequest(
       completionsTotal: completions.total,
       completionsHasMore: completions.hasMore,
       artifacts,
+      externalReference,
     });
     return true;
   }

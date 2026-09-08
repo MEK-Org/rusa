@@ -713,5 +713,43 @@ void main() {
       );
       expect(find.text('No attached contents.'), findsNothing);
     });
+
+    testWidgets(
+      'renders trailing action widget at the trailing edge of header row when supplied',
+      (tester) async {
+        var actionTapped = false;
+        await tester.pumpWidget(
+          _host(
+            ReferencePreview(
+              reference: const ReferenceDto(
+                ref: 'github:MEK-Org/rusa/issues/345',
+                scheme: 'github',
+                title: 'Reference Card Title',
+                url: 'https://github.com/MEK-Org/rusa/issues/345',
+              ),
+              attachedBy: 'raw-actor-id',
+              lookupActorHandle: (_) => 'operator-handle',
+              action: IconButton(
+                icon: const Icon(Icons.edit_outlined),
+                tooltip: 'Change or unlink',
+                onPressed: () => actionTapped = true,
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.byTooltip('Change or unlink'), findsOneWidget);
+        final labelX = tester.getCenter(find.text('Reference Card Title')).dx;
+        final citedByX = tester.getCenter(find.text('cited by operator-handle')).dx;
+        final actionX = tester.getCenter(find.byTooltip('Change or unlink')).dx;
+
+        expect(labelX, lessThan(citedByX));
+        expect(citedByX, lessThan(actionX));
+
+        await tester.tap(find.byTooltip('Change or unlink'));
+        expect(actionTapped, isTrue);
+      },
+    );
   });
 }

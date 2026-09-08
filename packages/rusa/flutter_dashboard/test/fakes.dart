@@ -478,6 +478,7 @@ class FakeApi extends DashboardApi {
   // ── Obligations routes ──
   List<ObligationDto> obligationsResult = [];
   Map<String, ObligationDetailSnapshot> obligationDetails = {};
+  Map<String, ReferenceDto?> obExternalReferences = {};
 
   /// When set, computes the detail snapshot per call instead of the static
   /// [obligationDetails] map — needed to fake a paginated completions field
@@ -571,6 +572,7 @@ class FakeApi extends DashboardApi {
                 o.status != 'cancelled',
           )
           .toList(),
+      externalReference: obExternalReferences[id],
     );
   }
 

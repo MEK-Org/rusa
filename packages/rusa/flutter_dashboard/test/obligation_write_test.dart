@@ -8,6 +8,7 @@ import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/widgets/inbox_tab.dart';
 import 'package:rusa_dashboard/widgets/obligation_card.dart';
+import 'package:rusa_dashboard/widgets/reference_preview.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
 
 import 'fakes.dart';
@@ -594,7 +595,7 @@ void main() {
       await tester.tap(find.text('Finished work'));
       await tester.pumpAndSettle();
 
-      expect(find.text('github:MEK-Org/rusa'), findsOneWidget);
+      expect(find.byType(ReferencePreview), findsOneWidget);
       expect(find.byTooltip('Change or unlink'), findsNothing);
       expect(find.byTooltip('Link an issue, PR or repo'), findsNothing);
     });

@@ -1460,6 +1460,7 @@ class ObligationDetailSnapshot {
     this.completions = const [],
     this.completionsTotal = 0,
     this.completionsHasMore = false,
+    this.externalReference,
   });
 
   final ObligationDto obligation;
@@ -1470,6 +1471,7 @@ class ObligationDetailSnapshot {
   final List<ObligationCompletionDto> completions;
   final int completionsTotal;
   final bool completionsHasMore;
+  final ReferenceDto? externalReference;
 
   factory ObligationDetailSnapshot.fromJson(
     Map<String, dynamic> j,
@@ -1511,5 +1513,8 @@ class ObligationDetailSnapshot {
         .toList(),
     completionsTotal: j['completionsTotal'] as int? ?? 0,
     completionsHasMore: j['completionsHasMore'] as bool? ?? false,
+    externalReference: j['externalReference'] is Map<String, dynamic>
+        ? ReferenceDto.fromJson(j['externalReference'] as Map<String, dynamic>)
+        : null,
   );
 }
