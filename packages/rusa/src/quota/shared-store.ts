@@ -48,7 +48,7 @@ export const QUOTA_MAX_SLEW_SECONDS = 900;
  * Number of consecutive persisted negative controller errors required before
  * applying the recovery output credit overlay.
  */
-export const QUOTA_RECOVERY_CONFIRMATIONS = 3;
+const QUOTA_RECOVERY_CONFIRMATIONS = 3;
 /**
  * Wall-time half-life of the recovery output credit: two hours.
  */
@@ -488,6 +488,7 @@ export class SharedQuotaStore {
       return;
     }
 
+    const priorObservationsForGate = Math.max(1, QUOTA_RECOVERY_CONFIRMATIONS - 1);
     const previousRows = this.db
       .prepare(
         `SELECT interval_seconds AS intervalSeconds,
@@ -502,11 +503,14 @@ export class SharedQuotaStore {
                 percent_left AS percentLeft, window_ms AS windowMs
          FROM quota_observations
          WHERE provider = ? AND kind = ? AND interval_seconds IS NOT NULL
-         ORDER BY observed_at DESC, rowid DESC LIMIT 2`
+         ORDER BY observed_at DESC, rowid DESC LIMIT ?`
       )
-      .all(observation.provider, observation.kind) as ReasonedObservation[];
+      .all(
+        observation.provider,
+        observation.kind,
+        priorObservationsForGate
+      ) as ReasonedObservation[];
     const previous = previousRows[0];
-    const previousPrevious = previousRows[1];
     const timeRemainingPct = Math.min(
       100,
       Math.max(0, ((resetMs - observedMs) / observation.windowMs) * 100)
@@ -535,23 +539,6 @@ export class SharedQuotaStore {
       previous != null &&
       observation.percentLeft - previous.percentLeft > QUOTA_REFILL_EPSILON_POINTS;
     const cycleChanged = resetMoved || quotaRefilled;
-
-    let prevCycleChanged = true;
-    if (previous && previousPrevious) {
-      const prevResetMs = previous.resetAtIso ? Date.parse(previous.resetAtIso) : Number.NaN;
-      const prevPrevResetMs = previousPrevious.resetAtIso
-        ? Date.parse(previousPrevious.resetAtIso)
-        : Number.NaN;
-      const prevWindowMs = previous.windowMs ?? observation.windowMs;
-
-      const prevResetMoved =
-        Number.isFinite(prevPrevResetMs) &&
-        Number.isFinite(prevResetMs) &&
-        Math.abs(prevPrevResetMs - prevResetMs) > Math.min(60 * 60 * 1000, prevWindowMs * 0.05);
-      const prevQuotaRefilled =
-        previous.percentLeft - previousPrevious.percentLeft > QUOTA_REFILL_EPSILON_POINTS;
-      prevCycleChanged = prevResetMoved || prevQuotaRefilled;
-    }
 
     const previousObservedMs = previous ? Date.parse(previous.observedAt) : Number.NaN;
     const dtSeconds = Number.isFinite(previousObservedMs)
@@ -604,16 +591,36 @@ export class SharedQuotaStore {
     );
     const interval = Math.min(opts.maxIntervalSeconds, uncappedInterval);
 
-    // Three-sample negative error gate derived from the preceding two persisted
-    // reasoned observations in the same cycle:
-    const isGateMet =
+    // Recovery output credit gate: requires QUOTA_RECOVERY_CONFIRMATIONS consecutive
+    // persisted negative controller errors in the same budgeting cycle (no reset instant
+    // movements or quota refills between adjacent samples).
+    let isGateMet =
       !cycleChanged &&
-      !prevCycleChanged &&
       error < 0 &&
-      previous !== undefined &&
-      previous.controllerError < 0 &&
-      previousPrevious !== undefined &&
-      previousPrevious.controllerError < 0;
+      previousRows.length >= QUOTA_RECOVERY_CONFIRMATIONS - 1 &&
+      previousRows
+        .slice(0, QUOTA_RECOVERY_CONFIRMATIONS - 1)
+        .every((row) => row.controllerError < 0);
+
+    if (isGateMet) {
+      for (let i = 0; i < QUOTA_RECOVERY_CONFIRMATIONS - 2; i += 1) {
+        const later = previousRows[i];
+        const earlier = previousRows[i + 1];
+        const earlierResetMs = earlier.resetAtIso ? Date.parse(earlier.resetAtIso) : Number.NaN;
+        const laterResetMs = later.resetAtIso ? Date.parse(later.resetAtIso) : Number.NaN;
+        const windowMs = earlier.windowMs ?? observation.windowMs;
+        const resetMovedBetween =
+          Number.isFinite(earlierResetMs) &&
+          Number.isFinite(laterResetMs) &&
+          Math.abs(earlierResetMs - laterResetMs) > Math.min(60 * 60 * 1000, windowMs * 0.05);
+        const refilledBetween =
+          later.percentLeft - earlier.percentLeft > QUOTA_REFILL_EPSILON_POINTS;
+        if (resetMovedBetween || refilledBetween) {
+          isGateMet = false;
+          break;
+        }
+      }
+    }
 
     // Recovery credit overlay (MEK-Org/rusa#291):
     // After three consecutive persisted negative errors, let a separate credit C

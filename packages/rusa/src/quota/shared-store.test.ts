@@ -18,7 +18,6 @@ import {
   QUOTA_MAX_SLEW_SECONDS,
   QUOTA_OBSERVATION_RETENTION_MS,
   QUOTA_RAW_RETENTION_MS,
-  QUOTA_RECOVERY_CONFIRMATIONS,
   QUOTA_RECOVERY_HALF_LIFE_SECONDS,
   QUOTA_RECOVERY_MAX_ELAPSED_SECONDS,
   SharedQuotaStore,
@@ -1186,8 +1185,6 @@ describe("SharedQuotaStore PID recovery output credit overlay", () => {
     const windowMs = 7 * 24 * 60 * 60 * 1000;
 
     try {
-      expect(QUOTA_RECOVERY_CONFIRMATIONS).toBe(3);
-
       // Seed initial positive accumulated integral (100,000) and zero credit
       seedObservation(store, "claude", new Date(baseMs).toISOString(), 50, reset, {
         integral: 100_000,

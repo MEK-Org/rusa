@@ -1,6 +1,5 @@
 import { copyFile, mkdir, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import {
   getObservationProjection,
@@ -361,13 +360,9 @@ async function main() {
   }
 }
 
-export { snapshotMetadata, OBSERVATION_COLUMNS, applyReplay, getObservationProjection };
-
-if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
-  main().catch((error) => {
-    process.stderr.write(
-      `[codex-observation-replay] ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`
-    );
-    process.exitCode = 1;
-  });
-}
+main().catch((error) => {
+  process.stderr.write(
+    `[codex-observation-replay] ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`
+  );
+  process.exitCode = 1;
+});
