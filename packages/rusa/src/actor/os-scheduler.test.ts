@@ -51,12 +51,14 @@ describe("DefaultOsScheduler", () => {
 
   it("schedules a cron activation", () => {
     scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" });
-    expect(cronData).toContain("# mc-obligation-activation:test-instance:ob-1");
+    expect(cronData).toContain("# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ");
     expect(cronData).toContain("*/5 * * * *");
     expect(cronData).toContain("/wake-obligation");
 
     scheduler.cancelObligationActivation("ob-1");
-    expect(cronData).not.toContain("# mc-obligation-activation:test-instance:ob-1");
+    expect(cronData).not.toContain(
+      "# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ"
+    );
   });
 
   it("schedules an at activation", () => {
@@ -164,14 +166,14 @@ describe("DefaultOsScheduler", () => {
 
   it("strips cron blocks without disturbing adjacent user jobs", () => {
     cronData =
-      '1 * * * * user-job-1\n# mc-obligation-activation:test-instance:ob-1\nCRON_TZ=UTC\n*/5 * * * * curl wake-obligation\nCRON_TZ=""\n# mc-obligation-activation-end:test-instance:ob-1\n2 * * * * user-job-2\n';
+      '1 * * * * user-job-1\n# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ\nCRON_TZ=UTC\n*/5 * * * * curl wake-obligation\nCRON_TZ=""\n# mc-obligation-activation-instance-end:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ\n2 * * * * user-job-2\n';
     scheduler.cancelObligationActivation("ob-1");
     expect(cronData).toBe("1 * * * * user-job-1\n2 * * * * user-job-2\n");
   });
 
   it("does not delete an adjacent unmanaged job whose command merely mentions wake-obligation/wake-message", () => {
     cronData =
-      '1 * * * * user-job-1\n# mc-obligation-activation:test-instance:ob-1\nCRON_TZ=UTC\n*/5 * * * * curl wake-obligation\nCRON_TZ=""\n# mc-obligation-activation-end:test-instance:ob-1\n3 * * * * /usr/bin/wake-message-backup --dry-run\n2 * * * * user-job-2\n';
+      '1 * * * * user-job-1\n# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ\nCRON_TZ=UTC\n*/5 * * * * curl wake-obligation\nCRON_TZ=""\n# mc-obligation-activation-instance-end:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ\n3 * * * * /usr/bin/wake-message-backup --dry-run\n2 * * * * user-job-2\n';
     scheduler.cancelObligationActivation("ob-1");
     expect(cronData).toBe(
       "1 * * * * user-job-1\n3 * * * * /usr/bin/wake-message-backup --dry-run\n2 * * * * user-job-2\n"
@@ -180,7 +182,7 @@ describe("DefaultOsScheduler", () => {
 
   it("does not delete an adjacent unmanaged CRON_TZ= line beyond the block's own restore line", () => {
     cronData =
-      "# mc-obligation-activation:test-instance:ob-1\nCRON_TZ=UTC\n*/5 * * * * curl wake-obligation\nCRON_TZ=\n# mc-obligation-activation-end:test-instance:ob-1\nCRON_TZ=Europe/Paris\n4 * * * * user-job\n";
+      "# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ\nCRON_TZ=UTC\n*/5 * * * * curl wake-obligation\nCRON_TZ=\n# mc-obligation-activation-instance-end:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ\nCRON_TZ=Europe/Paris\n4 * * * * user-job\n";
     scheduler.cancelObligationActivation("ob-1");
     expect(cronData).toBe("CRON_TZ=Europe/Paris\n4 * * * * user-job\n");
   });
@@ -188,7 +190,9 @@ describe("DefaultOsScheduler", () => {
   it('restores CRON_TZ="" (not bare CRON_TZ=) when no prior CRON_TZ was in effect', () => {
     scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" });
     const lines = cronData.trimEnd().split("\n");
-    expect(lines[lines.length - 1]).toBe("# mc-obligation-activation-end:test-instance:ob-1");
+    expect(lines[lines.length - 1]).toBe(
+      "# mc-obligation-activation-instance-end:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ"
+    );
     expect(lines[lines.length - 2]).toBe('CRON_TZ=""');
   });
 
@@ -196,7 +200,9 @@ describe("DefaultOsScheduler", () => {
     cronData = "CRON_TZ=America/New_York\n1 * * * * user-job\n";
     scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" });
     const lines = cronData.trimEnd().split("\n");
-    expect(lines[lines.length - 1]).toBe("# mc-obligation-activation-end:test-instance:ob-1");
+    expect(lines[lines.length - 1]).toBe(
+      "# mc-obligation-activation-instance-end:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ"
+    );
     expect(lines[lines.length - 2]).toBe("CRON_TZ=America/New_York");
     expect(cronData).toContain("1 * * * * user-job");
   });
@@ -206,11 +212,17 @@ describe("DefaultOsScheduler", () => {
     scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" });
     scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "0 6 * * *" });
     const lines = cronData.trimEnd().split("\n");
-    expect(lines[lines.length - 1]).toBe("# mc-obligation-activation-end:test-instance:ob-1");
+    expect(lines[lines.length - 1]).toBe(
+      "# mc-obligation-activation-instance-end:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ"
+    );
     expect(lines[lines.length - 2]).toBe("CRON_TZ=America/New_York");
     expect(cronData).toContain("1 * * * * user-job");
-    expect(cronData.match(/# mc-obligation-activation:test-instance:ob-1/g)).toHaveLength(1);
-    expect(cronData.match(/# mc-obligation-activation-end:test-instance:ob-1/g)).toHaveLength(1);
+    expect(
+      cronData.match(/# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ/g)
+    ).toHaveLength(1);
+    expect(
+      cronData.match(/# mc-obligation-activation-instance-end:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ/g)
+    ).toHaveLength(1);
     expect(cronData).toContain("0 6 * * *");
     expect(cronData).not.toContain("*/5 * * * *");
   });
@@ -221,14 +233,15 @@ describe("DefaultOsScheduler", () => {
     // guess which adjacent line belongs to it: fail with a named error and
     // perform no write at all, rather than dropping just the orphaned tag.
     const original =
-      "1 * * * * user-job-1\n# mc-obligation-activation:test-instance:ob-1\n2 * * * * user-job-2\n";
+      "1 * * * * user-job-1\n# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ\n2 * * * * user-job-2\n";
     cronData = original;
     expect(() => scheduler.cancelObligationActivation("ob-1")).toThrow(TruncatedCronBlockError);
     expect(cronData).toBe(original);
   });
 
   it("scheduling over a truncated/damaged block fails closed with no write rather than guessing the boundary", () => {
-    const original = "# mc-obligation-activation:test-instance:ob-1\n5 * * * * user-job\n";
+    const original =
+      "# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ\n5 * * * * user-job\n";
     cronData = original;
     expect(() =>
       scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" })
@@ -237,7 +250,8 @@ describe("DefaultOsScheduler", () => {
   });
 
   it("switching a truncated cron block to an at-kind (interval) activation also fails closed with no write", () => {
-    const original = "# mc-obligation-activation:test-instance:ob-1\n5 * * * * user-job\n";
+    const original =
+      "# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ\n5 * * * * user-job\n";
     cronData = original;
     expect(() =>
       scheduler.scheduleObligationActivation("ob-1", { kind: "at", date: new Date() })
@@ -261,7 +275,10 @@ describe("DefaultOsScheduler", () => {
 
   it("installs the replacement cron block before stale at cleanup, retaining it on cleanup failure", () => {
     vi.mocked(at.list).mockReturnValue([
-      { id: "old-at", script: "# mc-obligation-activation:test-instance:ob-1\nold" },
+      {
+        id: "old-at",
+        script: "# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ\nold",
+      },
     ]);
     vi.mocked(at.remove).mockImplementation(() => {
       throw new Error("atrm failed");
@@ -270,12 +287,17 @@ describe("DefaultOsScheduler", () => {
     expect(() =>
       scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" })
     ).toThrow("atrm failed");
-    expect(cronData).toContain("# mc-obligation-activation:test-instance:ob-1");
+    expect(cronData).toContain("# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ");
   });
 
   it("installs a replacement at job before removing stale at jobs", () => {
     const calls: string[] = [];
-    const jobs = [{ id: "old-at", script: "# mc-obligation-activation:test-instance:ob-1\nold" }];
+    const jobs = [
+      {
+        id: "old-at",
+        script: "# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ\nold",
+      },
+    ];
     vi.mocked(at.list).mockReturnValue(jobs);
     vi.mocked(at.schedule).mockImplementation(() => {
       calls.push("schedule");
@@ -329,8 +351,10 @@ describe("one OS scheduler for actor wakes and obligations", () => {
     scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" });
     await scheduler.schedule("actor-a", "0 4 * * *", "daily digest");
 
-    expect(cronData).toContain("# mc-obligation-activation:test-instance:ob-1");
-    expect(cronData).toContain("# mc-obligation-activation-end:test-instance:ob-1");
+    expect(cronData).toContain("# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ");
+    expect(cronData).toContain(
+      "# mc-obligation-activation-instance-end:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ"
+    );
     expect(cronData).toContain("# mc-wake:actor-a");
     // Every foreign line — the unrelated backup job, the foreign mc-wake
     // block, and the heartbeat job — is preserved byte-for-byte.
@@ -342,7 +366,9 @@ describe("one OS scheduler for actor wakes and obligations", () => {
     // removes only its own block, leaving the other writer's entry and all
     // foreign content intact until it too is cancelled.
     scheduler.cancelObligationActivation("ob-1");
-    expect(cronData).not.toContain("# mc-obligation-activation:test-instance:ob-1");
+    expect(cronData).not.toContain(
+      "# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ"
+    );
     expect(cronData).toContain("# mc-wake:actor-a");
 
     await scheduler.cancel("actor-a");
@@ -467,10 +493,12 @@ describe("DefaultOsScheduler with an unavailable `at` facility", () => {
     expect(() =>
       scheduler.scheduleObligationActivation("ob-1", { kind: "cron", cronExpr: "*/5 * * * *" })
     ).not.toThrow();
-    expect(cronData).toContain("# mc-obligation-activation:test-instance:ob-1");
+    expect(cronData).toContain("# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ");
 
     expect(() => scheduler.cancelObligationActivation("ob-1")).not.toThrow();
-    expect(cronData).not.toContain("# mc-obligation-activation:test-instance:ob-1");
+    expect(cronData).not.toContain(
+      "# mc-obligation-activation-instance:v1:dGVzdC1pbnN0YW5jZQ:b2ItMQ"
+    );
   });
 
   it("fails a completion-interval (at-kind) activation with the named prerequisite error", () => {
@@ -481,6 +509,7 @@ describe("DefaultOsScheduler with an unavailable `at` facility", () => {
       {
         tokenFile: "/token",
         portFile: "/port",
+        instanceId: "test-instance",
       }
     );
 
@@ -584,16 +613,16 @@ describe("DefaultOsScheduler instance-scoped obligation activations (#304)", () 
       "0 1 * * * /usr/bin/user-job\n" +
       "# mc-wake:act-1\n" +
       "0 2 * * * curl /wake\n" +
-      "# mc-obligation-activation:/home/sf/.rusa-prod:ob-prod-1\n" +
+      "# mc-obligation-activation-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:b2ItcHJvZC0x\n" +
       "CRON_TZ=UTC\n" +
       "45 8 * * * curl /wake-obligation -d 'id=ob-prod-1'\n" +
       'CRON_TZ=""\n' +
-      "# mc-obligation-activation-end:/home/sf/.rusa-prod:ob-prod-1\n" +
-      "# mc-obligation-activation:/home/sf/.rusa-staging:ob-staging-1\n" +
+      "# mc-obligation-activation-instance-end:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:b2ItcHJvZC0x\n" +
+      "# mc-obligation-activation-instance:v1:L2hvbWUvc2YvLnJ1c2Etc3RhZ2luZw:b2Itc3RhZ2luZy0x\n" +
       "CRON_TZ=UTC\n" +
       "0 12 * * * curl /wake-obligation -d 'id=ob-staging-1'\n" +
       'CRON_TZ=""\n' +
-      "# mc-obligation-activation-end:/home/sf/.rusa-staging:ob-staging-1\n" +
+      "# mc-obligation-activation-instance-end:v1:L2hvbWUvc2YvLnJ1c2Etc3RhZ2luZw:b2Itc3RhZ2luZy0x\n" +
       "# mc-obligation-activation:legacy-ob-1\n" +
       "CRON_TZ=UTC\n" +
       "30 3 * * * curl /wake-obligation -d 'id=legacy-ob-1'\n" +
@@ -610,7 +639,8 @@ describe("DefaultOsScheduler instance-scoped obligation activations (#304)", () 
     const atJobs = [
       {
         id: "1",
-        script: "# mc-obligation-activation:/home/sf/.rusa-prod:at-prod-1\ncurl /wake-obligation\n",
+        script:
+          "# mc-obligation-activation-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:YXQtcHJvZC0x\ncurl /wake-obligation\n",
       },
       { id: "2", script: "# mc-obligation-activation:legacy-at-1\ncurl /wake-obligation\n" },
       { id: "3", script: "# mc-message-delivery:msg-1\ncurl /wake-message\n" },
@@ -641,20 +671,65 @@ describe("DefaultOsScheduler instance-scoped obligation activations (#304)", () 
     expect(activations).toHaveLength(5);
   });
 
+  it("round-trips delimiter-bearing ids without adopting legacy tags", () => {
+    const instanceId = "/srv/rusa-prod";
+    const id = "a:b";
+    const atId = "at:a:b";
+    const legacyTag = "# mc-obligation-activation:a:b";
+    let cronData = `${legacyTag}\n0 1 * * * legacy-command\n`;
+    const cron: CrontabIo = {
+      read: () => cronData,
+      write: (data) => {
+        cronData = data;
+      },
+    };
+    const at: AtIo = {
+      schedule: vi.fn(),
+      // The host-facing list can contain a wrapper/preamble before our exact
+      // tag. Listing scans every line but accepts only the versioned format.
+      list: vi.fn(() => [
+        {
+          id: "wrapped-at",
+          script:
+            "# at wrapper\n# mc-obligation-activation-instance:v1:L3Nydi9ydXNhLXByb2Q:YXQ6YTpi\ncurl /wake-obligation\n",
+        },
+      ]),
+      remove: vi.fn(),
+    };
+    const scheduler = new DefaultOsScheduler(new CrontabMutator(cron), at, {
+      tokenFile: "/token",
+      portFile: "/port",
+      instanceId,
+    });
+
+    scheduler.scheduleObligationActivation(id, { kind: "cron", cronExpr: "0 2 * * *" });
+
+    expect(scheduler.listObligationActivations()).toEqual(
+      expect.arrayContaining([{ id, instanceId }, { id: atId, instanceId }, { id }])
+    );
+    expect(cronData).toContain("# mc-obligation-activation-instance:v1:L3Nydi9ydXNhLXByb2Q:YTpi");
+
+    scheduler.cancelObligationActivation(id);
+    expect(cronData).toContain(legacyTag);
+    expect(cronData).not.toContain(
+      "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhLXByb2Q:YTpi"
+    );
+  });
+
   it("cancelObligationActivation leaves foreign-instance blocks and legacy blocks byte-for-byte untouched", () => {
     const foreignProdBlock =
-      "# mc-obligation-activation:/home/sf/.rusa-prod:shared-ob-id\n" +
+      "# mc-obligation-activation-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:c2hhcmVkLW9iLWlk\n" +
       "CRON_TZ=UTC\n" +
       "45 8 * * * curl /wake-obligation -d 'id=shared-ob-id'\n" +
       'CRON_TZ=""\n' +
-      "# mc-obligation-activation-end:/home/sf/.rusa-prod:shared-ob-id\n";
+      "# mc-obligation-activation-instance-end:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:c2hhcmVkLW9iLWlk\n";
 
     const foreignStagingBlock =
-      "# mc-obligation-activation:/home/sf/.rusa-staging:shared-ob-id\n" +
+      "# mc-obligation-activation-instance:v1:L2hvbWUvc2YvLnJ1c2Etc3RhZ2luZw:c2hhcmVkLW9iLWlk\n" +
       "CRON_TZ=UTC\n" +
       "0 12 * * * curl /wake-obligation -d 'id=shared-ob-id'\n" +
       'CRON_TZ=""\n' +
-      "# mc-obligation-activation-end:/home/sf/.rusa-staging:shared-ob-id\n";
+      "# mc-obligation-activation-instance-end:v1:L2hvbWUvc2YvLnJ1c2Etc3RhZ2luZw:c2hhcmVkLW9iLWlk\n";
 
     const legacyBlock =
       "# mc-obligation-activation:legacy-ob-1\n" +
@@ -678,11 +753,13 @@ describe("DefaultOsScheduler instance-scoped obligation activations (#304)", () 
       list: vi.fn().mockReturnValue([
         {
           id: "at-prod",
-          script: "# mc-obligation-activation:/home/sf/.rusa-prod:shared-ob-id\ncurl /wake\n",
+          script:
+            "# mc-obligation-activation-instance:v1:L2hvbWUvc2YvLnJ1c2EtcHJvZA:c2hhcmVkLW9iLWlk\ncurl /wake\n",
         },
         {
           id: "at-staging",
-          script: "# mc-obligation-activation:/home/sf/.rusa-staging:shared-ob-id\ncurl /wake\n",
+          script:
+            "# mc-obligation-activation-instance:v1:L2hvbWUvc2YvLnJ1c2Etc3RhZ2luZw:c2hhcmVkLW9iLWlk\ncurl /wake\n",
         },
         { id: "at-legacy", script: "# mc-obligation-activation:legacy-ob-1\ncurl /wake\n" },
       ]),

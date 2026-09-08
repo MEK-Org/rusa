@@ -1,10 +1,16 @@
-import { resolveHome } from "../config/secrets.js";
 import type { AtIo } from "./at-queue.js";
 import { assertCronExprCanFire } from "./cron-expression.js";
 import type { CrontabMutator } from "./crontab.js";
 
 const DEFAULT_CURL = "/usr/bin/curl";
 const WAKE_TAG_PREFIX = "# mc-wake:";
+// This distinct prefix is intentional: every old `mc-obligation-activation:`
+// tag, including one whose id contains a colon, remains legacy/foreign. A
+// version marker under the old prefix would still be ambiguous with a legal
+// legacy obligation id such as `v1:abc`.
+const SCOPED_ACTIVATION_TAG_PREFIX = "# mc-obligation-activation-instance:v1:";
+const SCOPED_ACTIVATION_END_TAG_PREFIX = "# mc-obligation-activation-instance-end:v1:";
+const LEGACY_ACTIVATION_TAG_PREFIX = "# mc-obligation-activation:";
 
 /**
  * The actor-facing recurring-wake slice of the host scheduler.
@@ -28,7 +34,8 @@ export interface ObligationActivationRecord {
 
 /** The obligation-facing slice of the host scheduler. */
 export interface ObligationActivationScheduler {
-  readonly instanceId?: string;
+  /** Stable identity of the configured instance that owns this scheduler. */
+  readonly instanceId: string;
   scheduleObligationActivation(
     id: string,
     time: { kind: "cron"; cronExpr: string } | { kind: "at"; date: Date }
@@ -69,7 +76,8 @@ export interface OsSchedulerOptions {
   portFile: string;
   host?: string;
   curlPath?: string;
-  instanceId?: string;
+  /** Stable identity supplied by the composition root for activation ownership. */
+  instanceId: string;
 }
 
 export interface WakeEntry {
@@ -82,6 +90,52 @@ export interface WakeEntry {
 /** Actor ids and suffixed wake slots accepted in managed crontab tags. */
 export function isValidActorId(actorId: string): boolean {
   return /^[A-Za-z0-9._-]+(:[A-Za-z0-9._-]+)*$/.test(actorId);
+}
+
+/** Encode one tag component so arbitrary legal entity IDs cannot delimit a tag. */
+function encodeActivationTagComponent(value: string): string {
+  return Buffer.from(value, "utf8").toString("base64url");
+}
+
+/** Decode only the canonical base64url values emitted by this scheduler. */
+function decodeActivationTagComponent(value: string): string | null {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  const decoded = Buffer.from(value, "base64url").toString("utf8");
+  return encodeActivationTagComponent(decoded) === value ? decoded : null;
+}
+
+function scopedActivationTag(instanceId: string, id: string): string {
+  return `${SCOPED_ACTIVATION_TAG_PREFIX}${encodeActivationTagComponent(instanceId)}:${encodeActivationTagComponent(id)}`;
+}
+
+function scopedActivationEndTag(instanceId: string, id: string): string {
+  return `${SCOPED_ACTIVATION_END_TAG_PREFIX}${encodeActivationTagComponent(instanceId)}:${encodeActivationTagComponent(id)}`;
+}
+
+function parseObligationActivationTag(line: string): ObligationActivationRecord | null {
+  const trimmed = line.trim();
+  if (trimmed.startsWith(SCOPED_ACTIVATION_TAG_PREFIX)) {
+    const components = trimmed.slice(SCOPED_ACTIVATION_TAG_PREFIX.length).split(":");
+    if (components.length !== 2) return null;
+    const instanceId = decodeActivationTagComponent(components[0]);
+    const id = decodeActivationTagComponent(components[1]);
+    return instanceId && id ? { instanceId, id } : null;
+  }
+
+  // Tags written before scoped ownership are never adopted: a legacy id may
+  // contain any delimiter, so it cannot be safely distinguished from a raw
+  // instance/id format. Treat it as foreign and leave it untouched.
+  if (trimmed.startsWith(LEGACY_ACTIVATION_TAG_PREFIX)) {
+    const id = trimmed.slice(LEGACY_ACTIVATION_TAG_PREFIX.length).trim();
+    return id ? { id } : null;
+  }
+  return null;
+}
+
+function activationRecordKey(record: ObligationActivationRecord): string {
+  // Length/encoding-safe key: entity IDs permit every delimiter, so raw
+  // concatenation could collapse two distinct records during deduplication.
+  return `${record.instanceId === undefined ? "legacy" : "scoped"}:${encodeActivationTagComponent(record.instanceId ?? "")}:${encodeActivationTagComponent(record.id)}`;
 }
 
 /** Single-quote a value for a cron command, then escape cron's `%` newline. */
@@ -180,11 +234,8 @@ export class DefaultOsScheduler implements OsScheduler {
     private readonly atIo: AtIo,
     private readonly opts: OsSchedulerOptions
   ) {
-    const rawInstanceId = opts.instanceId?.trim();
-    this.instanceId = rawInstanceId && rawInstanceId.length > 0 ? rawInstanceId : resolveHome();
-    if (this.instanceId.includes("\n") || this.instanceId.includes("\r")) {
-      throw new Error(`instanceId must not contain newlines: ${this.instanceId}`);
-    }
+    if (!opts.instanceId.trim()) throw new Error("instanceId is required");
+    this.instanceId = opts.instanceId;
   }
 
   /** Build the complete cron line for an actor wake. */
@@ -382,8 +433,8 @@ export class DefaultOsScheduler implements OsScheduler {
   /** The tag/end-tag pair bounding one obligation's managed cron block, scoped to this instance. */
   private activationTags(id: string): { tag: string; endTag: string } {
     return {
-      tag: `# mc-obligation-activation:${this.instanceId}:${id}`,
-      endTag: `# mc-obligation-activation-end:${this.instanceId}:${id}`,
+      tag: scopedActivationTag(this.instanceId, id),
+      endTag: scopedActivationEndTag(this.instanceId, id),
     };
   }
 
@@ -447,41 +498,18 @@ export class DefaultOsScheduler implements OsScheduler {
 
   listObligationActivations(): ObligationActivationRecord[] {
     const entries = new Map<string, ObligationActivationRecord>();
-    const parseTag = (tagContent: string): ObligationActivationRecord | null => {
-      const trimmed = tagContent.trim();
-      if (!trimmed) return null;
-      const lastColon = trimmed.lastIndexOf(":");
-      if (lastColon === -1) {
-        return { id: trimmed };
-      }
-      const instanceId = trimmed.slice(0, lastColon).trim();
-      const id = trimmed.slice(lastColon + 1).trim();
-      if (!id) return null;
-      if (!instanceId) return { id };
-      return { instanceId, id };
+    const add = (line: string): void => {
+      const record = parseObligationActivationTag(line);
+      if (record) entries.set(activationRecordKey(record), record);
     };
 
     const current = this.mutator.read();
     for (const line of current.split("\n")) {
-      const m = line.match(/^# mc-obligation-activation:(.+)$/);
-      if (m) {
-        const record = parseTag(m[1]);
-        if (record) {
-          const key = `${record.instanceId ?? ""}:${record.id}`;
-          entries.set(key, record);
-        }
-      }
+      add(line);
     }
     for (const job of this.atIo.list()) {
       for (const line of job.script.split("\n")) {
-        const m = line.match(/^# mc-obligation-activation:(.+)$/);
-        if (m) {
-          const record = parseTag(m[1]);
-          if (record) {
-            const key = `${record.instanceId ?? ""}:${record.id}`;
-            entries.set(key, record);
-          }
-        }
+        add(line);
       }
     }
     return Array.from(entries.values());

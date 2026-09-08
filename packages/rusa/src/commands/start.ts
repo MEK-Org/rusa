@@ -4,6 +4,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -869,7 +870,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     {
       tokenFile: wakeTokenPath(mcHome),
       portFile: wakePortPath(mcHome),
-      instanceId: mcHome,
+      // Database initialization above creates the home when needed; resolving
+      // it here makes relative spellings and symlink aliases one owner.
+      instanceId: realpathSync(mcHome),
     }
   );
   const wakeToken = ensureWakeToken(mcHome);

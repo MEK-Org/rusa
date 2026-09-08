@@ -443,17 +443,15 @@ export class ObligationRepository {
 
     try {
       const schedulerInstanceId = this.scheduler.instanceId;
-      if (schedulerInstanceId) {
-        for (const entry of this.scheduler.listObligationActivations()) {
-          // Positively scope ownership: foreign-instance entries and legacy unscoped
-          // entries (with no instanceId) are never read as candidates, so they cannot
-          // be cancelled on a shared crontab.
-          if (entry.instanceId !== schedulerInstanceId) {
-            continue;
-          }
-          if (!validIds.has(entry.id)) {
-            this.scheduler.cancelObligationActivation(entry.id);
-          }
+      for (const entry of this.scheduler.listObligationActivations()) {
+        // Positively scope ownership: foreign-instance entries and legacy unscoped
+        // entries (with no instanceId) are never read as candidates, so they cannot
+        // be cancelled on a shared crontab.
+        if (entry.instanceId !== schedulerInstanceId) {
+          continue;
+        }
+        if (!validIds.has(entry.id)) {
+          this.scheduler.cancelObligationActivation(entry.id);
         }
       }
     } catch (err) {

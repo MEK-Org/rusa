@@ -3054,31 +3054,35 @@ describe("multi-instance crontab reconciliation (#304)", () => {
     // Add stale at-jobs
     sharedAtJobs.push({
       id: "prod-at-stale",
-      script: "# mc-obligation-activation:/srv/rusa-prod:prod-at-stale\ncurl wake\n",
+      script:
+        "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhLXByb2Q:cHJvZC1hdC1zdGFsZQ\ncurl wake\n",
       date: new Date(now + 200000),
     });
     sharedAtJobs.push({
       id: "staging-at-stale",
-      script: "# mc-obligation-activation:/srv/rusa-staging:staging-at-stale\ncurl wake\n",
+      script:
+        "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhLXN0YWdpbmc:c3RhZ2luZy1hdC1zdGFsZQ\ncurl wake\n",
       date: new Date(now + 300000),
     });
 
     const prodActiveBlock =
-      "# mc-obligation-activation:/srv/rusa-prod:prod-active\n" +
+      "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhLXByb2Q:cHJvZC1hY3RpdmU\n" +
       "CRON_TZ=UTC\n" +
       '45 8 * * * /usr/bin/curl -fsS -H "Authorization: Bearer $(cat /prod/token)" "http://127.0.0.1:$(cat /prod/port)/wake-obligation" -d \'id=prod-active\'\n' +
       'CRON_TZ=""\n' +
-      "# mc-obligation-activation-end:/srv/rusa-prod:prod-active";
+      "# mc-obligation-activation-instance-end:v1:L3Nydi9ydXNhLXByb2Q:cHJvZC1hY3RpdmU";
 
     const stagingActiveBlock =
-      "# mc-obligation-activation:/srv/rusa-staging:staging-active\n" +
+      "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhLXN0YWdpbmc:c3RhZ2luZy1hY3RpdmU\n" +
       "CRON_TZ=UTC\n" +
       '0 12 * * * /usr/bin/curl -fsS -H "Authorization: Bearer $(cat /staging/token)" "http://127.0.0.1:$(cat /staging/port)/wake-obligation" -d \'id=staging-active\'\n' +
       'CRON_TZ=""\n' +
-      "# mc-obligation-activation-end:/srv/rusa-staging:staging-active";
+      "# mc-obligation-activation-instance-end:v1:L3Nydi9ydXNhLXN0YWdpbmc:c3RhZ2luZy1hY3RpdmU";
 
-    const prodStaleTag = "# mc-obligation-activation:/srv/rusa-prod:prod-stale";
-    const stagingStaleTag = "# mc-obligation-activation:/srv/rusa-staging:staging-stale";
+    const prodStaleTag =
+      "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhLXByb2Q:cHJvZC1zdGFsZQ";
+    const stagingStaleTag =
+      "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhLXN0YWdpbmc:c3RhZ2luZy1zdGFsZQ";
 
     return {
       prodRepo,
@@ -3098,109 +3102,63 @@ describe("multi-instance crontab reconciliation (#304)", () => {
     };
   };
 
-  it("exercises reconcile order 1: prod reconciles first, then staging reconciles", () => {
+  const cronBlock = (crontab: string, tag: string): string => {
+    const endTag = tag.replace(
+      "# mc-obligation-activation-instance:",
+      "# mc-obligation-activation-instance-end:"
+    );
+    const start = crontab.indexOf(tag);
+    const end = crontab.indexOf(endTag, start);
+    if (start === -1 || end === -1) throw new Error(`missing test cron block ${tag}`);
+    return crontab.slice(start, end + endTag.length);
+  };
+
+  it.each([
+    ["prod then staging", "prod", "staging"],
+    ["staging then prod", "staging", "prod"],
+  ] as const)("preserves foreign blocks and removes own stale work: %s", (_order, firstName, secondName) => {
     const f = createFixture();
+    const instance = (name: "prod" | "staging") =>
+      name === "prod"
+        ? {
+            repo: f.prodRepo,
+            activeBlock: f.prodActiveBlock,
+            staleTag: f.prodStaleTag,
+            staleAtId: "prod-at-stale",
+          }
+        : {
+            repo: f.stagingRepo,
+            activeBlock: f.stagingActiveBlock,
+            staleTag: f.stagingStaleTag,
+            staleAtId: "staging-at-stale",
+          };
+    const first = instance(firstName);
+    const second = instance(secondName);
+    const initialAtScripts = new Map(f.getAtJobs().map((job) => [job.id, job.script]));
+    const commonForeignBlocks = [f.userLine1, f.wakeLine, f.legacyBlock, f.userLine2];
+    const foreignStaleBlock = cronBlock(f.getCrontab(), second.staleTag);
+    const assertBlocksUnchanged = (blocks: string[]) => {
+      for (const block of blocks) expect(f.getCrontab()).toContain(block);
+    };
+    const assertAtUnchanged = (id: string) => {
+      expect(f.getAtJobs().find((job) => job.id === id)?.script).toBe(initialAtScripts.get(id));
+    };
 
-    // Verify initial state has everything
-    expect(f.getCrontab()).toContain(f.prodActiveBlock);
-    expect(f.getCrontab()).toContain(f.stagingActiveBlock);
-    expect(f.getCrontab()).toContain(f.prodStaleTag);
-    expect(f.getCrontab()).toContain(f.stagingStaleTag);
-    expect(f.getCrontab()).toContain(f.legacyBlock);
-    expect(f.getCrontab()).toContain(f.wakeLine);
-    expect(f.getCrontab()).toContain(f.userLine1);
-    expect(f.getCrontab()).toContain(f.userLine2);
+    first.repo.reconcileScheduledObligations();
 
-    // Step 1: Prod reconciles
-    f.prodRepo.reconcileScheduledObligations();
+    expect(f.getCrontab()).not.toContain(first.staleTag);
+    expect(f.getCrontab()).toContain(first.activeBlock);
+    assertBlocksUnchanged([...commonForeignBlocks, second.activeBlock, foreignStaleBlock]);
+    expect(f.getAtJobs().some((job) => job.id === first.staleAtId)).toBe(false);
+    assertAtUnchanged(second.staleAtId);
+    assertAtUnchanged("legacy-at-1");
 
-    // Prod removes its own stale block
-    expect(f.getCrontab()).not.toContain(f.prodStaleTag);
-    // Prod's own active block is still intact
-    expect(f.getCrontab()).toContain(f.prodActiveBlock);
+    second.repo.reconcileScheduledObligations();
 
-    // Staging's active AND stale blocks are BYTE-FOR-BYTE IDENTICAL
-    expect(f.getCrontab()).toContain(f.stagingActiveBlock);
-    expect(f.getCrontab()).toContain(f.stagingStaleTag);
-
-    // Legacy block, wake lines, and user lines are BYTE-FOR-BYTE IDENTICAL
-    expect(f.getCrontab()).toContain(f.legacyBlock);
-    expect(f.getCrontab()).toContain(f.wakeLine);
-    expect(f.getCrontab()).toContain(f.userLine1);
-    expect(f.getCrontab()).toContain(f.userLine2);
-
-    // Check at jobs
-    expect(f.getAtJobs().some((j) => j.id === "prod-at-stale")).toBe(false);
-    expect(f.getAtJobs().some((j) => j.id === "staging-at-stale")).toBe(true);
-    expect(f.getAtJobs().some((j) => j.id === "legacy-at-1")).toBe(true);
-
-    // Step 2: Staging reconciles
-    f.stagingRepo.reconcileScheduledObligations();
-
-    // Staging removes its own stale block
-    expect(f.getCrontab()).not.toContain(f.stagingStaleTag);
-    // Staging's own active block is still intact
-    expect(f.getCrontab()).toContain(f.stagingActiveBlock);
-
-    // Prod's active block remains BYTE-FOR-BYTE IDENTICAL
-    expect(f.getCrontab()).toContain(f.prodActiveBlock);
-
-    // Legacy block, wake lines, and user lines are BYTE-FOR-BYTE IDENTICAL
-    expect(f.getCrontab()).toContain(f.legacyBlock);
-    expect(f.getCrontab()).toContain(f.wakeLine);
-    expect(f.getCrontab()).toContain(f.userLine1);
-    expect(f.getCrontab()).toContain(f.userLine2);
-
-    // Staging at job removed, legacy at job intact
-    expect(f.getAtJobs().some((j) => j.id === "staging-at-stale")).toBe(false);
-    expect(f.getAtJobs().some((j) => j.id === "legacy-at-1")).toBe(true);
-  });
-
-  it("exercises reconcile order 2: staging reconciles first, then prod reconciles", () => {
-    const f = createFixture();
-
-    // Step 1: Staging reconciles first
-    f.stagingRepo.reconcileScheduledObligations();
-
-    // Staging removes its own stale block
-    expect(f.getCrontab()).not.toContain(f.stagingStaleTag);
-    // Staging's own active block is still intact
-    expect(f.getCrontab()).toContain(f.stagingActiveBlock);
-
-    // Prod's active AND stale blocks are BYTE-FOR-BYTE IDENTICAL
-    expect(f.getCrontab()).toContain(f.prodActiveBlock);
-    expect(f.getCrontab()).toContain(f.prodStaleTag);
-
-    // Legacy block, wake lines, and user lines are BYTE-FOR-BYTE IDENTICAL
-    expect(f.getCrontab()).toContain(f.legacyBlock);
-    expect(f.getCrontab()).toContain(f.wakeLine);
-    expect(f.getCrontab()).toContain(f.userLine1);
-    expect(f.getCrontab()).toContain(f.userLine2);
-
-    // Staging at job removed, prod stale and legacy at jobs intact
-    expect(f.getAtJobs().some((j) => j.id === "staging-at-stale")).toBe(false);
-    expect(f.getAtJobs().some((j) => j.id === "prod-at-stale")).toBe(true);
-    expect(f.getAtJobs().some((j) => j.id === "legacy-at-1")).toBe(true);
-
-    // Step 2: Prod reconciles second
-    f.prodRepo.reconcileScheduledObligations();
-
-    // Prod removes its own stale block
-    expect(f.getCrontab()).not.toContain(f.prodStaleTag);
-    // Prod's active block is intact
-    expect(f.getCrontab()).toContain(f.prodActiveBlock);
-
-    // Staging's active block remains BYTE-FOR-BYTE IDENTICAL
-    expect(f.getCrontab()).toContain(f.stagingActiveBlock);
-
-    // Legacy block, wake lines, and user lines are BYTE-FOR-BYTE IDENTICAL
-    expect(f.getCrontab()).toContain(f.legacyBlock);
-    expect(f.getCrontab()).toContain(f.wakeLine);
-    expect(f.getCrontab()).toContain(f.userLine1);
-    expect(f.getCrontab()).toContain(f.userLine2);
-
-    // Prod at job removed, legacy at job intact
-    expect(f.getAtJobs().some((j) => j.id === "prod-at-stale")).toBe(false);
-    expect(f.getAtJobs().some((j) => j.id === "legacy-at-1")).toBe(true);
+    expect(f.getCrontab()).not.toContain(second.staleTag);
+    expect(f.getCrontab()).toContain(second.activeBlock);
+    assertBlocksUnchanged([...commonForeignBlocks, first.activeBlock]);
+    expect(f.getAtJobs().some((job) => job.id === second.staleAtId)).toBe(false);
+    assertAtUnchanged("legacy-at-1");
   });
 });
