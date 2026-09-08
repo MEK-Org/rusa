@@ -12,7 +12,7 @@ This study closes the loop. The commanded interval throttles run starts, started
 
 - **Quota window:** weekly, 604,800 s, simulated for 8 days so the rollover, refill, and post-reset behaviour all occur inside the loop.
 - **Quota cost:** a fixed 0.050 points per completed run, which is the v1 simplification requested for this iteration. The weekly budget is therefore 2,000 runs and perfectly even pacing is 302 s between starts.
-- **Runs:** 240 s each, at most 4 concurrent. Quota is charged at completion.
+- **Runs:** 240 s each, at most 4 concurrent. Quota is charged as a lump sum at completion.
 - **Arrivals:** deterministic thinned-Poisson draws split into responsive and external work, shaped by a daytime activity profile (a raised half-sine across a 14-hour working day over a 0.15 night floor).
 - **Applied throttling:** a faithful copy of `ProviderPacer`'s start-to-start gate. External runs wait for the commanded interval; responsive runs bypass the wait but still charge the interval clock, so responsive load displaces external work instead of adding to it. Raising the interval re-bases the pending wait on the last actual start, exactly as `setInterval` does.
 - **Exhaustion:** at zero quota the controller update is skipped and the pacer is deferred to the reset instant, matching the production early return and `deferUntil`.
@@ -29,7 +29,7 @@ This study closes the loop. The commanded interval throttles run starts, started
 
 ## Burst then quiet — the #291 recovery question
 
-Recovery is measured as the time from the end of the 36-hour burst until the applied wait returns to twice the ideal 302 s spacing.
+The primary recovery measure is time from the end of the 36-hour burst until the applied wait is at or below twice the ideal 302 s spacing. Twice ideal was chosen as a legible “no longer materially delayed” threshold for this v1 comparison; it is not a production SLO or a stability proof. The same seed sweep also reports 1×, 1.5×, and 2.5× thresholds below.
 
 | candidate | recovery (h) | exhausted (h) | external done | external wait p95 (h) | mean abs error (pts) |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -41,6 +41,17 @@ Recovery is measured as the time from the end of the 36-hour burst until the app
 | Kd 900 | 10.8 | 0.0 | 1496 | 78.23 | 0.99 |
 | Kd 3600 | 10.8 | 0.0 | 1496 | 78.31 | 1.00 |
 | Ti 2h + Kd 3600 | 13.5 | 0.0 | 1496 | 78.18 | 1.16 |
+
+### Recovery-threshold sensitivity (8 burst-demand seeds)
+
+Each cell is mean recovery hours; the parenthesis is seeds faster than current. The rankings used for the bounded recommendation are visible rather than inferred from the 2× cutoff alone.
+
+| threshold | current | Ti 0.5h | Kp 160 | Ti 2h |
+| --- | ---: | ---: | ---: | ---: |
+| 1× | 11.6 h (0/8 faster) | 8.9 h (8/8 faster) | 9.3 h (8/8 faster) | 14.2 h (0/8 faster) |
+| 1.5× | 11.3 h (0/8 faster) | 8.7 h (8/8 faster) | 8.9 h (8/8 faster) | 13.3 h (0/8 faster) |
+| 2× | 10.8 h (0/8 faster) | 8.4 h (8/8 faster) | 8.6 h (8/8 faster) | 12.5 h (0/8 faster) |
+| 2.5× | 10.3 h (0/8 faster) | 8.1 h (8/8 faster) | 8.2 h (8/8 faster) | 11.7 h (1/8 faster) |
 
 ## Sustained overload — the safety side of the same choice
 
@@ -66,12 +77,29 @@ The closed loop does not reproduce the tradeoff the fixed-input probes implied. 
 
 4 of 32 candidate-scenario pairs reached zero quota on the headline seed. Exhaustion appears only in the responsive-dominated and sustained-overload scenarios, which is where the controller has the least authority: responsive work bypasses pacing entirely, so the only lever left is squeezing external work that is already queued.
 
+## Completion-lag and capacity sensitivity
+
+None of the v1 plant constants are observed production telemetry: the 2,000-run budget, 240 s completion lag, four-slot capacity, daytime curve, and arrival mixes are explicit calibration assumptions selected to make the loop exercise pacing without pinning it at the cap. In particular, this model does **not** claim to know whether a provider's observed quota falls continuously, at completion, or only at polling time. It charges at completion because the requested v1 scope was fixed quota per completed run.
+
+To bound the resulting phase-delay assumption, the same burst demand is re-run for 30/240/600 s completion lags and one/four concurrent slots. The table keeps the 2× threshold only for compactness; the CSV includes all four thresholds and every candidate.
+
+| completion lag | slots | current recovery (h) | Ti 2h recovery (h) | Kd 3600 recovery (h) | Kd 3600 max D term (s) | Kd 3600 max Δ from current (s) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 30 s | 1 | 10.5 | 13.3 | 10.5 | 2.30 | 15 |
+| 30 s | 4 | 10.7 | 13.3 | 10.7 | 2.25 | 18 |
+| 240 s | 1 | 6.8 | 6.5 | 6.8 | 0.59 | 10 |
+| 240 s | 4 | 10.8 | 13.8 | 10.8 | 2.16 | 31 |
+| 600 s | 1 | 0.0 | 0.0 | 0.0 | 0.30 | 0 |
+| 600 s | 4 | 11.2 | 13.2 | 11.2 | 0.60 | 12 |
+
+Across those deliberately wide completion/capacity variants, the largest derivative contribution is 2.30 s, so the derivative finding survives this sensitivity. The weaker-integral result deliberately does **not** claim that robustness: the 240 s / one-slot row reverses its recovery relation, while the 600 s / one-slot plant is already below every recovery cutoff at the end of the burst. This is evidence that capacity and completion timing must be calibrated before treating any integral ranking as durable.
+
 ## Assumptions and limits
 
 This is v1 and is deliberately coarse. It should not be used to pick production weights on its own.
 
 - Every run costs the same quota. Real runs vary by model, context length, and tool use, and that variance is exactly what determines the tail behaviour near exhaustion.
-- Run duration is fixed and failures, retries, and cancellations are not modelled.
+- The headline uses a fixed completion delay; the sensitivity table varies delay and capacity, but failures, retries, cancellations, and non-completion quota accounting are not modelled.
 - Demand is resampled across 8 seeds, but the *shape* — the arrival rates, the responsive/external split, the daytime curve — is a plausible guess rather than a measurement. Resampling shows an ordering is not a seed artifact; it cannot show the shape is right. Absolute run counts carry no operational meaning; only the comparison between candidates on identical demand does.
 - Responsive work is assumed to be admitted unconditionally. Real responsive load has its own upstream limits.
 - One provider, one bucket, one weekly window. Multi-bucket interaction and the five-hour window are out of scope.
@@ -82,16 +110,17 @@ This is v1 and is deliberately coarse. It should not be used to pick production 
 Still no production retune from this evidence alone, and this study is not a mandate to change weights. What it does support is a narrowing:
 
 1. **The stronger-derivative direction is not worth pursuing further in this form.** The derivative contribution is too small at the production observation cadence to move the command, so raising `Kd` changes nothing measurable. Making it matter would mean observing far more often, which is a different change with its own cost.
-2. **The weaker-integral direction should not be adopted on recovery grounds.** In closed loop it recovered more slowly than the current weights, not faster, and it exhausted the budget in a scenario where the current weights did not.
+2. **The weaker-integral direction is not supported on recovery grounds by the baseline plant and seed sweep.** It recovered more slowly than the current weights there, not faster, and it exhausted the budget in a scenario where the current weights did not. The completion/capacity sensitivity also means that this is a bounded finding, not a durable ranking.
 3. **If faster recovery is the goal, the candidates that achieved it moved the opposite way** — a shorter integral time or a stronger proportional term, each faster than the current weights on every seed tested. That is a live hypothesis worth a v2, not a recommendation: both hold external work at a higher peak wait to do it, and both were measured against an uncalibrated demand model.
 
 Before any of this becomes a weight change it needs an operator target in operational units — acceptable exhausted hours per week, acceptable p95 delay for external work, and whether responsive work should keep bypassing pacing under load — plus a per-run quota cost and arrival rates calibrated against real telemetry. That calibration is the natural v2.
 
 ## Artifacts
 
-- [closed-loop traces CSV](quota-closed-loop-traces.csv) — every simulated observation for every candidate and scenario.
 - [closed-loop metrics CSV](quota-closed-loop-summary.csv) — the table inputs above.
 - [seed robustness CSV](quota-closed-loop-robustness.csv) — every scenario re-run across 8 demand seeds.
+- [threshold sensitivity CSV](quota-closed-loop-thresholds.csv) — all recovery cutoffs over the seed sweep.
+- [plant sensitivity CSV](quota-closed-loop-plant-sensitivity.csv) — completion-lag/capacity variants over the burst demand.
 - [current-controller charts](quota-closed-loop-baseline-charts.svg) — quota, commanded vs applied wait, and backlog per scenario.
 - [candidate charts](quota-closed-loop-candidate-charts.svg) — one parameter axis per row on the burst scenario.
 - [tradeoff charts](quota-closed-loop-tradeoffs.svg) — safety and throughput per candidate and scenario.

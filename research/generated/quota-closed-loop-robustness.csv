@@ -1,257 +1,257 @@
-scenario,seed_offset,candidate,label,exhausted_hours,external_completed,quota_left_week_end_pct,recovery_to_2x_ideal_hours,max_interval_delta_vs_current_seconds
-nominal,0,current,current (120 / 1h / 1800),0,1379,20.45,0,0
-nominal,0,kp-80,Kp 80,0,1379,20.45,0,0
-nominal,0,kp-160,Kp 160,0,1379,20.45,0,0
-nominal,0,ti-2h,Ti 2h,0,1379,20.45,0,0
-nominal,0,ti-half-hour,Ti 0.5h,0,1379,20.45,0,0
-nominal,0,kd-900,Kd 900,0,1379,20.45,0,0
-nominal,0,kd-3600,Kd 3600,0,1379,20.45,0,0
-nominal,0,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1379,20.45,0,0
-nominal,1,current,current (120 / 1h / 1800),0,1440,15.3,0,0
-nominal,1,kp-80,Kp 80,0,1440,15.3,0,14.74233
-nominal,1,kp-160,Kp 160,0,1440,15.3,0,14.74233
-nominal,1,ti-2h,Ti 2h,0,1440,15.3,0,10.62805
-nominal,1,ti-half-hour,Ti 0.5h,0,1440,15.3,0,21.559139
-nominal,1,kd-900,Kd 900,0,1440,15.3,0,0.088714
-nominal,1,kd-3600,Kd 3600,0,1440,15.3,0,0.177427
-nominal,1,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1440,15.3,0,10.676757
-nominal,2,current,current (120 / 1h / 1800),0,1506,13.6,0,0
-nominal,2,kp-80,Kp 80,0,1506,13.6,0,4.385109
-nominal,2,kp-160,Kp 160,0,1506,13.6,0,4.385109
-nominal,2,ti-2h,Ti 2h,0,1506,13.6,0,2.028841
-nominal,2,ti-half-hour,Ti 0.5h,0,1506,13.6,0,4.127019
-nominal,2,kd-900,Kd 900,0,1506,13.6,0,0.064606
-nominal,2,kd-3600,Kd 3600,0,1506,13.6,0,0.129212
-nominal,2,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1506,13.6,0,1.994164
-nominal,3,current,current (120 / 1h / 1800),0,1477,16.8,0,0
-nominal,3,kp-80,Kp 80,0,1477,16.8,0,0
-nominal,3,kp-160,Kp 160,0,1477,16.8,0,0
-nominal,3,ti-2h,Ti 2h,0,1477,16.8,0,0
-nominal,3,ti-half-hour,Ti 0.5h,0,1477,16.8,0,0
-nominal,3,kd-900,Kd 900,0,1477,16.8,0,0
-nominal,3,kd-3600,Kd 3600,0,1477,16.8,0,0
-nominal,3,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1477,16.8,0,0
-nominal,4,current,current (120 / 1h / 1800),0,1485,14.4,0,0
-nominal,4,kp-80,Kp 80,0,1485,14.4,0,0
-nominal,4,kp-160,Kp 160,0,1485,14.4,0,0
-nominal,4,ti-2h,Ti 2h,0,1485,14.4,0,0
-nominal,4,ti-half-hour,Ti 0.5h,0,1485,14.4,0,0
-nominal,4,kd-900,Kd 900,0,1485,14.4,0,0
-nominal,4,kd-3600,Kd 3600,0,1485,14.4,0,0
-nominal,4,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1485,14.4,0,0
-nominal,5,current,current (120 / 1h / 1800),0,1529,14.05,0,0
-nominal,5,kp-80,Kp 80,0,1529,14.05,0,0
-nominal,5,kp-160,Kp 160,0,1529,14.05,0,0
-nominal,5,ti-2h,Ti 2h,0,1529,14.05,0,0
-nominal,5,ti-half-hour,Ti 0.5h,0,1529,14.05,0,0
-nominal,5,kd-900,Kd 900,0,1529,14.05,0,0
-nominal,5,kd-3600,Kd 3600,0,1529,14.05,0,0
-nominal,5,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1529,14.05,0,0
-nominal,6,current,current (120 / 1h / 1800),0,1456,16.4,0,0
-nominal,6,kp-80,Kp 80,0,1456,16.4,0,2.447917
-nominal,6,kp-160,Kp 160,0,1456,16.4,0,2.447917
-nominal,6,ti-2h,Ti 2h,0,1456,16.4,0,0.816158
-nominal,6,ti-half-hour,Ti 0.5h,0,1456,16.4,0,1.632316
-nominal,6,kd-900,Kd 900,0,1456,16.4,0,0.03681
-nominal,6,kd-3600,Kd 3600,0,1456,16.4,0,0.07362
-nominal,6,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1456,16.4,0,0.765107
-nominal,7,current,current (120 / 1h / 1800),0,1549,12.55,0,0
-nominal,7,kp-80,Kp 80,0,1549,12.55,0,8.78665
-nominal,7,kp-160,Kp 160,0,1549,12.55,0,8.78665
-nominal,7,ti-2h,Ti 2h,0,1549,12.55,0,6.860104
-nominal,7,ti-half-hour,Ti 0.5h,0,1549,12.55,0,13.861585
-nominal,7,kd-900,Kd 900,0,1549,12.55,0,0.043957
-nominal,7,kd-3600,Kd 3600,0,1549,12.55,0,0.087914
-nominal,7,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1549,12.55,0,6.889284
-overload,0,current,current (120 / 1h / 1800),0,1087,0.4,1.833333,0
-overload,0,kp-80,Kp 80,0.374505,1105,0,8.166667,674.161632
-overload,0,kp-160,Kp 160,0,1081,0.8,0,763.452843
-overload,0,ti-2h,Ti 2h,0,1111,0.05,4.5,941.823281
-overload,0,ti-half-hour,Ti 0.5h,0,1072,1.3,0,1349.519165
-overload,0,kd-900,Kd 900,0,1086,0.45,1.833333,16.945436
-overload,0,kd-3600,Kd 3600,0,1087,0.4,1.833333,2.602668
-overload,0,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1111,0.05,4.5,942.025063
-overload,1,current,current (120 / 1h / 1800),0,1148,0.4,0,0
-overload,1,kp-80,Kp 80,0.416667,1168,0,0.333333,637.132031
-overload,1,kp-160,Kp 160,0,1142,0.8,0,536.982316
-overload,1,ti-2h,Ti 2h,0,1174,0.05,0,619.614363
-overload,1,ti-half-hour,Ti 0.5h,0,1143,1.25,0,1231.785666
-overload,1,kd-900,Kd 900,0,1149,0.4,0,56.413004
-overload,1,kd-3600,Kd 3600,0,1149,0.4,0,57.656349
-overload,1,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1174,0.05,0,619.800737
-overload,2,current,current (120 / 1h / 1800),0,1128,0.5,0,0
-overload,2,kp-80,Kp 80,0,1145,0.15,0,646.495235
-overload,2,kp-160,Kp 160,0,1114,0.95,0,423.844437
-overload,2,ti-2h,Ti 2h,0,1149,0.15,0,595.909867
-overload,2,ti-half-hour,Ti 0.5h,0,1102,1.45,16,850.781318
-overload,2,kd-900,Kd 900,0,1127,0.55,0,28.030018
-overload,2,kd-3600,Kd 3600,0,1128,0.5,0,32.852368
-overload,2,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1149,0.15,0,581.732727
-overload,3,current,current (120 / 1h / 1800),0,1077,0.25,0,0
-overload,3,kp-80,Kp 80,0.247494,1096,0,1.833333,570.806958
-overload,3,kp-160,Kp 160,0,1068,0.6,0,535.815794
-overload,3,ti-2h,Ti 2h,0,1103,0.05,0,654.970238
-overload,3,ti-half-hour,Ti 0.5h,0,1055,0.75,0,1461.069036
-overload,3,kd-900,Kd 900,0,1078,0.2,0,45.075223
-overload,3,kd-3600,Kd 3600,0,1077,0.25,0,0.483611
-overload,3,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1103,0.05,0,655.1918
-overload,4,current,current (120 / 1h / 1800),0.665666,1167,0,0,0
-overload,4,kp-80,Kp 80,1.15,1179,0,0,602.132857
-overload,4,kp-160,Kp 160,0,1161,0.15,0,574.452232
-overload,4,ti-2h,Ti 2h,0,1184,0.1,0,665.779697
-overload,4,ti-half-hour,Ti 0.5h,0,1150,0.25,14.666667,1467.831399
-overload,4,kd-900,Kd 900,0.665639,1167,0,0,1.4285
-overload,4,kd-3600,Kd 3600,1.016667,1167,0,0,94.100571
-overload,4,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1185,0.05,0,698.468923
-overload,5,current,current (120 / 1h / 1800),0,1101,0.45,0,0
-overload,5,kp-80,Kp 80,0,1122,0,0,580.060454
-overload,5,kp-160,Kp 160,0,1090,0.9,0,367.451325
-overload,5,ti-2h,Ti 2h,0,1121,0.3,0,540.177197
-overload,5,ti-half-hour,Ti 0.5h,0,1079,1.05,0,1110.675497
-overload,5,kd-900,Kd 900,0,1102,0.45,0,66.183544
-overload,5,kd-3600,Kd 3600,0,1102,0.45,0,53.823817
-overload,5,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1123,0.25,0,536.533717
-overload,6,current,current (120 / 1h / 1800),0,1095,0.8,0,0
-overload,6,kp-80,Kp 80,0,1119,0.1,0.833333,601.25775
-overload,6,kp-160,Kp 160,0,1090,1.15,0,593.394136
-overload,6,ti-2h,Ti 2h,0,1125,0.25,0,576.725659
-overload,6,ti-half-hour,Ti 0.5h,0,1079,1.8,0,1685.487554
-overload,6,kd-900,Kd 900,0,1095,0.8,0,85.814645
-overload,6,kd-3600,Kd 3600,0,1096,0.75,0,23.98098
-overload,6,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1123,0.3,0,576.938614
-overload,7,current,current (120 / 1h / 1800),0,1168,0.25,0,0
-overload,7,kp-80,Kp 80,0.555963,1185,0,1,611.927274
-overload,7,kp-160,Kp 160,0,1152,0.75,0,545.246725
-overload,7,ti-2h,Ti 2h,0,1190,0,0,689.973687
-overload,7,ti-half-hour,Ti 0.5h,0,1135,1.2,0,1007.475649
-overload,7,kd-900,Kd 900,0,1168,0.25,0,0.306092
-overload,7,kd-3600,Kd 3600,0,1167,0.25,0,27.043462
-overload,7,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1190,0,0,690.163286
-burst-recovery,0,current,current (120 / 1h / 1800),0,1496,6.9,10.833333,0
-burst-recovery,0,kp-80,Kp 80,0,1496,6.9,15.166667,1172.556237
-burst-recovery,0,kp-160,Kp 160,0,1496,6.9,8,961.840774
-burst-recovery,0,ti-2h,Ti 2h,0,1496,6.9,13.833333,972.539809
-burst-recovery,0,ti-half-hour,Ti 0.5h,0,1496,6.9,6.833333,1350.137163
-burst-recovery,0,kd-900,Kd 900,0,1496,6.9,10.833333,14.170266
-burst-recovery,0,kd-3600,Kd 3600,0,1496,6.9,10.833333,30.933057
-burst-recovery,0,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1496,6.9,13.5,1003.262079
-burst-recovery,1,current,current (120 / 1h / 1800),0,1562,5.8,6,0
-burst-recovery,1,kp-80,Kp 80,0,1562,5.8,10.833333,1088.312283
-burst-recovery,1,kp-160,Kp 160,0,1562,5.8,3.666667,670.270016
-burst-recovery,1,ti-2h,Ti 2h,0,1562,5.8,9.333333,875.436154
-burst-recovery,1,ti-half-hour,Ti 0.5h,0,1562,5.8,3,1423.013769
-burst-recovery,1,kd-900,Kd 900,0,1562,5.8,6,22.519004
-burst-recovery,1,kd-3600,Kd 3600,0,1562,5.8,6,23.630031
-burst-recovery,1,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1562,5.8,9.333333,875.685117
-burst-recovery,2,current,current (120 / 1h / 1800),0,1562,4.55,7,0
-burst-recovery,2,kp-80,Kp 80,0,1562,4.55,11.166667,975.312064
-burst-recovery,2,kp-160,Kp 160,0,1562,4.55,5,610.106228
-burst-recovery,2,ti-2h,Ti 2h,0,1562,4.55,10.833333,818.681477
-burst-recovery,2,ti-half-hour,Ti 0.5h,0,1562,4.55,3,1135.728231
-burst-recovery,2,kd-900,Kd 900,0,1562,4.55,7,22.121413
-burst-recovery,2,kd-3600,Kd 3600,0,1562,4.55,7,16.856588
-burst-recovery,2,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1562,4.55,10.833333,818.889423
-burst-recovery,3,current,current (120 / 1h / 1800),0,1461,8.1,15.333333,0
-burst-recovery,3,kp-80,Kp 80,0,1461,8.1,17.833333,1028.529236
-burst-recovery,3,kp-160,Kp 160,0,1461,8.1,12.666667,1249.971061
-burst-recovery,3,ti-2h,Ti 2h,0,1461,8.1,15.666667,1848.315427
-burst-recovery,3,ti-half-hour,Ti 0.5h,0,1461,8.1,13.333333,2668.869974
-burst-recovery,3,kd-900,Kd 900,0,1461,8.1,15.333333,22.517106
-burst-recovery,3,kd-3600,Kd 3600,0,1461,8.1,15.333333,20.827998
-burst-recovery,3,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1461,8.1,15.666667,1848.467727
-burst-recovery,4,current,current (120 / 1h / 1800),0,1489,7.55,10.166667,0
-burst-recovery,4,kp-80,Kp 80,0,1489,7.55,13.5,1037.319874
-burst-recovery,4,kp-160,Kp 160,0,1489,7.55,8,834.660813
-burst-recovery,4,ti-2h,Ti 2h,0,1489,7.55,10.833333,1504.36601
-burst-recovery,4,ti-half-hour,Ti 0.5h,0,1489,7.55,8.833333,2516.024511
-burst-recovery,4,kd-900,Kd 900,0,1489,7.55,10.166667,12.904067
-burst-recovery,4,kd-3600,Kd 3600,0,1489,7.55,10.166667,2.513073
-burst-recovery,4,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1489,7.55,10.833333,1504.56972
-burst-recovery,5,current,current (120 / 1h / 1800),0,1476,7.8,13,0
-burst-recovery,5,kp-80,Kp 80,0,1476,7.8,17.166667,1305.224543
-burst-recovery,5,kp-160,Kp 160,0,1476,7.8,11.166667,803.438063
-burst-recovery,5,ti-2h,Ti 2h,0,1476,7.8,15,1302.312989
-burst-recovery,5,ti-half-hour,Ti 0.5h,0,1476,7.8,10.5,1997.9341
-burst-recovery,5,kd-900,Kd 900,0,1476,7.8,13,13.450439
-burst-recovery,5,kd-3600,Kd 3600,0,1476,7.8,13,2.642508
-burst-recovery,5,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1476,7.8,15,1302.525537
-burst-recovery,6,current,current (120 / 1h / 1800),0,1528,5.9,15.166667,0
-burst-recovery,6,kp-80,Kp 80,0,1528,5.9,18,1032.504849
-burst-recovery,6,kp-160,Kp 160,0,1528,5.9,13.166667,1009.631852
-burst-recovery,6,ti-2h,Ti 2h,0,1528,5.9,15.333333,1912.275062
-burst-recovery,6,ti-half-hour,Ti 0.5h,0,1528,5.9,14,3106.003474
-burst-recovery,6,kd-900,Kd 900,0,1528,5.9,15.166667,16.669377
-burst-recovery,6,kd-3600,Kd 3600,0,1528,5.9,15,123.825785
-burst-recovery,6,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1528,5.9,15.333333,1912.466312
-burst-recovery,7,current,current (120 / 1h / 1800),0,1485,9.9,8.833333,0
-burst-recovery,7,kp-80,Kp 80,0,1485,9.9,12.5,1028.659348
-burst-recovery,7,kp-160,Kp 160,0,1485,9.9,6.833333,749.227192
-burst-recovery,7,ti-2h,Ti 2h,0,1485,9.9,9.333333,1342.035091
-burst-recovery,7,ti-half-hour,Ti 0.5h,0,1485,9.9,7.5,2308.242674
-burst-recovery,7,kd-900,Kd 900,0,1485,9.9,8.833333,15.002203
-burst-recovery,7,kd-3600,Kd 3600,0,1485,9.9,8.833333,11.962518
-burst-recovery,7,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1485,9.9,9.333333,1342.267991
-responsive-heavy,0,current,current (120 / 1h / 1800),0,455,2.95,17.166667,0
-responsive-heavy,0,kp-80,Kp 80,5.216667,531,0,24,3270.126735
-responsive-heavy,0,kp-160,Kp 160,0,440,3.25,0,1361.190184
-responsive-heavy,0,ti-2h,Ti 2h,2.216667,535,0,24.5,3046.397645
-responsive-heavy,0,ti-half-hour,Ti 0.5h,0,460,1.6,0.333333,3060.970658
-responsive-heavy,0,kd-900,Kd 900,0,455,2.95,17.166667,0.245183
-responsive-heavy,0,kd-3600,Kd 3600,0,455,2.95,17.166667,0.490365
-responsive-heavy,0,weaker-i-stronger-d,Ti 2h + Kd 3600,2.216667,535,0,24.5,3041.796777
-responsive-heavy,1,current,current (120 / 1h / 1800),0,426,0.15,22.833333,0
-responsive-heavy,1,kp-80,Kp 80,3.497853,442,0,42.166667,1313.158001
-responsive-heavy,1,kp-160,Kp 160,0,404,0.95,19.5,4082.585871
-responsive-heavy,1,ti-2h,Ti 2h,0,432,0.6,43.333333,1556.913273
-responsive-heavy,1,ti-half-hour,Ti 0.5h,4.766667,421,0,18.5,8414.849383
-responsive-heavy,1,kd-900,Kd 900,0,426,0.15,22.833333,0.249814
-responsive-heavy,1,kd-3600,Kd 3600,0,425,0.15,22.833333,64.733041
-responsive-heavy,1,weaker-i-stronger-d,Ti 2h + Kd 3600,0,432,0.6,43.333333,1557.049607
-responsive-heavy,2,current,current (120 / 1h / 1800),0,467,0.35,0,0
-responsive-heavy,2,kp-80,Kp 80,0,467,0.9,20.5,2968.429386
-responsive-heavy,2,kp-160,Kp 160,0.983333,470,0,0,3106.118606
-responsive-heavy,2,ti-2h,Ti 2h,0,470,0.75,21.166667,2953.890748
-responsive-heavy,2,ti-half-hour,Ti 0.5h,0,463,0.1,0,4614.791416
-responsive-heavy,2,kd-900,Kd 900,0,467,0.35,0,1.370297
-responsive-heavy,2,kd-3600,Kd 3600,0,467,0.35,0,0.897128
-responsive-heavy,2,weaker-i-stronger-d,Ti 2h + Kd 3600,0,470,0.75,21.166667,2954.032254
-responsive-heavy,3,current,current (120 / 1h / 1800),0.554732,411,0,16.5,0
-responsive-heavy,3,kp-80,Kp 80,6.416667,420,0,22.166667,2726.003
-responsive-heavy,3,kp-160,Kp 160,6.283333,398,0,14.166667,2114.01434
-responsive-heavy,3,ti-2h,Ti 2h,5.216667,427,0,21.333333,2743.50682
-responsive-heavy,3,ti-half-hour,Ti 0.5h,6.833333,388,0,14.666667,6037.642899
-responsive-heavy,3,kd-900,Kd 900,0.554641,411,0,16.5,0.352118
-responsive-heavy,3,kd-3600,Kd 3600,0.554913,411,0,16.5,1.285228
-responsive-heavy,3,weaker-i-stronger-d,Ti 2h + Kd 3600,5.216667,427,0,21.333333,2743.632045
-responsive-heavy,4,current,current (120 / 1h / 1800),0,473,1,41.5,0
-responsive-heavy,4,kp-80,Kp 80,4.533333,503,0,50.333333,2134.104428
-responsive-heavy,4,kp-160,Kp 160,0,457,1.3,37,907.548148
-responsive-heavy,4,ti-2h,Ti 2h,1.033333,507,0,59.166667,2129.425152
-responsive-heavy,4,ti-half-hour,Ti 0.5h,0,453,1,26.333333,2314.102284
-responsive-heavy,4,kd-900,Kd 900,0,473,1,41.5,1.506627
-responsive-heavy,4,kd-3600,Kd 3600,0,473,1,41.5,0.689195
-responsive-heavy,4,weaker-i-stronger-d,Ti 2h + Kd 3600,0.683333,507,0,59.166667,2130.35586
-responsive-heavy,5,current,current (120 / 1h / 1800),0,534,0.35,0,0
-responsive-heavy,5,kp-80,Kp 80,3.366667,557,0,19.666667,2406.651196
-responsive-heavy,5,kp-160,Kp 160,2.566491,539,0,0,2638.191919
-responsive-heavy,5,ti-2h,Ti 2h,0.788597,561,0,20.166667,2540.292521
-responsive-heavy,5,ti-half-hour,Ti 0.5h,0,481,2.55,0,3873.491969
-responsive-heavy,5,kd-900,Kd 900,0,534,0.35,0,1.443214
-responsive-heavy,5,kd-3600,Kd 3600,0,534,0.35,0,1.555633
-responsive-heavy,5,weaker-i-stronger-d,Ti 2h + Kd 3600,0.789119,561,0,20.166667,2540.377941
-responsive-heavy,6,current,current (120 / 1h / 1800),7.233333,453,0,36.333333,0
-responsive-heavy,6,kp-80,Kp 80,5.883333,467,0,43.5,2391.450624
-responsive-heavy,6,kp-160,Kp 160,7.166667,445,0,25,1384.096562
-responsive-heavy,6,ti-2h,Ti 2h,5.566667,473,0,42.833333,3043.92762
-responsive-heavy,6,ti-half-hour,Ti 0.5h,6.766667,437,0,25.166667,3830.487441
-responsive-heavy,6,kd-900,Kd 900,7.233333,453,0,36.333333,20.575606
-responsive-heavy,6,kd-3600,Kd 3600,7.233333,453,0,36.333333,9.809711
-responsive-heavy,6,weaker-i-stronger-d,Ti 2h + Kd 3600,5.733333,470,0,42.833333,3019.801144
-responsive-heavy,7,current,current (120 / 1h / 1800),0,462,0.55,16.666667,0
-responsive-heavy,7,kp-80,Kp 80,6.283333,478,0,21.5,2450.8524
-responsive-heavy,7,kp-160,Kp 160,0,444,0.95,0.666667,1166.808649
-responsive-heavy,7,ti-2h,Ti 2h,5.65,483,0,21.833333,2334.087806
-responsive-heavy,7,ti-half-hour,Ti 0.5h,0,444,0.95,1,3829.213043
-responsive-heavy,7,kd-900,Kd 900,0,462,0.55,16.666667,0.28259
-responsive-heavy,7,kd-3600,Kd 3600,0,464,0.5,16.666667,121.274628
-responsive-heavy,7,weaker-i-stronger-d,Ti 2h + Kd 3600,5.566667,486,0,21.833333,2326.388105
+scenario,seed_offset,candidate,label,exhausted_hours,external_completed,quota_left_week_end_pct,recovery_to_ideal_hours,recovery_to_1_5x_ideal_hours,recovery_to_2x_ideal_hours,recovery_to_2_5x_ideal_hours,max_interval_delta_vs_current_seconds
+nominal,0,current,current (120 / 1h / 1800),0,1379,20.45,0,0,0,0,0
+nominal,0,kp-80,Kp 80,0,1379,20.45,0,0,0,0,0
+nominal,0,kp-160,Kp 160,0,1379,20.45,0,0,0,0,0
+nominal,0,ti-2h,Ti 2h,0,1379,20.45,0,0,0,0,0
+nominal,0,ti-half-hour,Ti 0.5h,0,1379,20.45,0,0,0,0,0
+nominal,0,kd-900,Kd 900,0,1379,20.45,0,0,0,0,0
+nominal,0,kd-3600,Kd 3600,0,1379,20.45,0,0,0,0,0
+nominal,0,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1379,20.45,0,0,0,0,0
+nominal,1,current,current (120 / 1h / 1800),0,1440,15.3,0,0,0,0,0
+nominal,1,kp-80,Kp 80,0,1440,15.3,0,0,0,0,14.74233
+nominal,1,kp-160,Kp 160,0,1440,15.3,0,0,0,0,14.74233
+nominal,1,ti-2h,Ti 2h,0,1440,15.3,0,0,0,0,10.62805
+nominal,1,ti-half-hour,Ti 0.5h,0,1440,15.3,0,0,0,0,21.559139
+nominal,1,kd-900,Kd 900,0,1440,15.3,0,0,0,0,0.088714
+nominal,1,kd-3600,Kd 3600,0,1440,15.3,0,0,0,0,0.177427
+nominal,1,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1440,15.3,0,0,0,0,10.676757
+nominal,2,current,current (120 / 1h / 1800),0,1506,13.6,0,0,0,0,0
+nominal,2,kp-80,Kp 80,0,1506,13.6,0,0,0,0,4.385109
+nominal,2,kp-160,Kp 160,0,1506,13.6,0,0,0,0,4.385109
+nominal,2,ti-2h,Ti 2h,0,1506,13.6,0,0,0,0,2.028841
+nominal,2,ti-half-hour,Ti 0.5h,0,1506,13.6,0,0,0,0,4.127019
+nominal,2,kd-900,Kd 900,0,1506,13.6,0,0,0,0,0.064606
+nominal,2,kd-3600,Kd 3600,0,1506,13.6,0,0,0,0,0.129212
+nominal,2,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1506,13.6,0,0,0,0,1.994164
+nominal,3,current,current (120 / 1h / 1800),0,1477,16.8,0,0,0,0,0
+nominal,3,kp-80,Kp 80,0,1477,16.8,0,0,0,0,0
+nominal,3,kp-160,Kp 160,0,1477,16.8,0,0,0,0,0
+nominal,3,ti-2h,Ti 2h,0,1477,16.8,0,0,0,0,0
+nominal,3,ti-half-hour,Ti 0.5h,0,1477,16.8,0,0,0,0,0
+nominal,3,kd-900,Kd 900,0,1477,16.8,0,0,0,0,0
+nominal,3,kd-3600,Kd 3600,0,1477,16.8,0,0,0,0,0
+nominal,3,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1477,16.8,0,0,0,0,0
+nominal,4,current,current (120 / 1h / 1800),0,1485,14.4,0,0,0,0,0
+nominal,4,kp-80,Kp 80,0,1485,14.4,0,0,0,0,0
+nominal,4,kp-160,Kp 160,0,1485,14.4,0,0,0,0,0
+nominal,4,ti-2h,Ti 2h,0,1485,14.4,0,0,0,0,0
+nominal,4,ti-half-hour,Ti 0.5h,0,1485,14.4,0,0,0,0,0
+nominal,4,kd-900,Kd 900,0,1485,14.4,0,0,0,0,0
+nominal,4,kd-3600,Kd 3600,0,1485,14.4,0,0,0,0,0
+nominal,4,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1485,14.4,0,0,0,0,0
+nominal,5,current,current (120 / 1h / 1800),0,1529,14.05,0,0,0,0,0
+nominal,5,kp-80,Kp 80,0,1529,14.05,0,0,0,0,0
+nominal,5,kp-160,Kp 160,0,1529,14.05,0,0,0,0,0
+nominal,5,ti-2h,Ti 2h,0,1529,14.05,0,0,0,0,0
+nominal,5,ti-half-hour,Ti 0.5h,0,1529,14.05,0,0,0,0,0
+nominal,5,kd-900,Kd 900,0,1529,14.05,0,0,0,0,0
+nominal,5,kd-3600,Kd 3600,0,1529,14.05,0,0,0,0,0
+nominal,5,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1529,14.05,0,0,0,0,0
+nominal,6,current,current (120 / 1h / 1800),0,1456,16.4,0,0,0,0,0
+nominal,6,kp-80,Kp 80,0,1456,16.4,0,0,0,0,2.447917
+nominal,6,kp-160,Kp 160,0,1456,16.4,0,0,0,0,2.447917
+nominal,6,ti-2h,Ti 2h,0,1456,16.4,0,0,0,0,0.816158
+nominal,6,ti-half-hour,Ti 0.5h,0,1456,16.4,0,0,0,0,1.632316
+nominal,6,kd-900,Kd 900,0,1456,16.4,0,0,0,0,0.03681
+nominal,6,kd-3600,Kd 3600,0,1456,16.4,0,0,0,0,0.07362
+nominal,6,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1456,16.4,0,0,0,0,0.765107
+nominal,7,current,current (120 / 1h / 1800),0,1549,12.55,0,0,0,0,0
+nominal,7,kp-80,Kp 80,0,1549,12.55,0,0,0,0,8.78665
+nominal,7,kp-160,Kp 160,0,1549,12.55,0,0,0,0,8.78665
+nominal,7,ti-2h,Ti 2h,0,1549,12.55,0,0,0,0,6.860104
+nominal,7,ti-half-hour,Ti 0.5h,0,1549,12.55,0,0,0,0,13.861585
+nominal,7,kd-900,Kd 900,0,1549,12.55,0,0,0,0,0.043957
+nominal,7,kd-3600,Kd 3600,0,1549,12.55,0,0,0,0,0.087914
+nominal,7,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1549,12.55,0,0,0,0,6.889284
+overload,0,current,current (120 / 1h / 1800),0,1087,0.4,4.166667,3,1.833333,0.666667,0
+overload,0,kp-80,Kp 80,0.374505,1105,0,10.666667,9.5,8.166667,6.666667,674.161632
+overload,0,kp-160,Kp 160,0,1081,0.8,0,0,0,0,763.452843
+overload,0,ti-2h,Ti 2h,0,1111,0.05,10.333333,7.833333,4.5,0,941.823281
+overload,0,ti-half-hour,Ti 0.5h,0,1072,1.3,0,0,0,0,1349.519165
+overload,0,kd-900,Kd 900,0,1086,0.45,4.166667,3,1.833333,0.666667,16.945436
+overload,0,kd-3600,Kd 3600,0,1087,0.4,4.166667,3,1.833333,0.666667,2.602668
+overload,0,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1111,0.05,10.333333,7.833333,4.5,0,942.025063
+overload,1,current,current (120 / 1h / 1800),0,1148,0.4,0,0,0,0,0
+overload,1,kp-80,Kp 80,0.416667,1168,0,3.333333,1.833333,0.333333,0,637.132031
+overload,1,kp-160,Kp 160,0,1142,0.8,17.5,0,0,0,536.982316
+overload,1,ti-2h,Ti 2h,0,1174,0.05,2.166667,0,0,0,619.614363
+overload,1,ti-half-hour,Ti 0.5h,0,1143,1.25,19,0,0,0,1231.785666
+overload,1,kd-900,Kd 900,0,1149,0.4,0,0,0,0,56.413004
+overload,1,kd-3600,Kd 3600,0,1149,0.4,0,0,0,0,57.656349
+overload,1,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1174,0.05,2.166667,0,0,0,619.800737
+overload,2,current,current (120 / 1h / 1800),0,1128,0.5,0,0,0,0,0
+overload,2,kp-80,Kp 80,0,1145,0.15,0.5,0,0,0,646.495235
+overload,2,kp-160,Kp 160,0,1114,0.95,16.5,15.666667,0,0,423.844437
+overload,2,ti-2h,Ti 2h,0,1149,0.15,17.666667,0,0,0,595.909867
+overload,2,ti-half-hour,Ti 0.5h,0,1102,1.45,16.833333,16.5,16,0,850.781318
+overload,2,kd-900,Kd 900,0,1127,0.55,0,0,0,0,28.030018
+overload,2,kd-3600,Kd 3600,0,1128,0.5,0,0,0,0,32.852368
+overload,2,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1149,0.15,0.166667,0,0,0,581.732727
+overload,3,current,current (120 / 1h / 1800),0,1077,0.25,0,0,0,0,0
+overload,3,kp-80,Kp 80,0.247494,1096,0,6,3.5,1.833333,0.333333,570.806958
+overload,3,kp-160,Kp 160,0,1068,0.6,0,0,0,0,535.815794
+overload,3,ti-2h,Ti 2h,0,1103,0.05,10.5,1.166667,0,0,654.970238
+overload,3,ti-half-hour,Ti 0.5h,0,1055,0.75,0,0,0,0,1461.069036
+overload,3,kd-900,Kd 900,0,1078,0.2,0,0,0,0,45.075223
+overload,3,kd-3600,Kd 3600,0,1077,0.25,0,0,0,0,0.483611
+overload,3,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1103,0.05,10.5,1.166667,0,0,655.1918
+overload,4,current,current (120 / 1h / 1800),0.665666,1167,0,0,0,0,0,0
+overload,4,kp-80,Kp 80,1.15,1179,0,2.666667,0.5,0,0,602.132857
+overload,4,kp-160,Kp 160,0,1161,0.15,15.5,14.5,0,0,574.452232
+overload,4,ti-2h,Ti 2h,0,1184,0.1,15.166667,0,0,0,665.779697
+overload,4,ti-half-hour,Ti 0.5h,0,1150,0.25,15.666667,15.166667,14.666667,0,1467.831399
+overload,4,kd-900,Kd 900,0.665639,1167,0,0,0,0,0,1.4285
+overload,4,kd-3600,Kd 3600,1.016667,1167,0,0,0,0,0,94.100571
+overload,4,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1185,0.05,15.333333,0,0,0,698.468923
+overload,5,current,current (120 / 1h / 1800),0,1101,0.45,0,0,0,0,0
+overload,5,kp-80,Kp 80,0,1122,0,3.5,1.666667,0,0,580.060454
+overload,5,kp-160,Kp 160,0,1090,0.9,15,0,0,0,367.451325
+overload,5,ti-2h,Ti 2h,0,1121,0.3,12.166667,0,0,0,540.177197
+overload,5,ti-half-hour,Ti 0.5h,0,1079,1.05,15.666667,0,0,0,1110.675497
+overload,5,kd-900,Kd 900,0,1102,0.45,0,0,0,0,66.183544
+overload,5,kd-3600,Kd 3600,0,1102,0.45,0,0,0,0,53.823817
+overload,5,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1123,0.25,12.166667,0,0,0,536.533717
+overload,6,current,current (120 / 1h / 1800),0,1095,0.8,0,0,0,0,0
+overload,6,kp-80,Kp 80,0,1119,0.1,7.333333,3,0.833333,0,601.25775
+overload,6,kp-160,Kp 160,0,1090,1.15,17.666667,0,0,0,593.394136
+overload,6,ti-2h,Ti 2h,0,1125,0.25,13.833333,0,0,0,576.725659
+overload,6,ti-half-hour,Ti 0.5h,0,1079,1.8,19.5,19.166667,0,0,1685.487554
+overload,6,kd-900,Kd 900,0,1095,0.8,0,0,0,0,85.814645
+overload,6,kd-3600,Kd 3600,0,1096,0.75,0,0,0,0,23.98098
+overload,6,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1123,0.3,13.833333,0,0,0,576.938614
+overload,7,current,current (120 / 1h / 1800),0,1168,0.25,0,0,0,0,0
+overload,7,kp-80,Kp 80,0.555963,1185,0,4,2.5,1,0,611.927274
+overload,7,kp-160,Kp 160,0,1152,0.75,15.5,0,0,0,545.246725
+overload,7,ti-2h,Ti 2h,0,1190,0,3.166667,0,0,0,689.973687
+overload,7,ti-half-hour,Ti 0.5h,0,1135,1.2,16,0,0,0,1007.475649
+overload,7,kd-900,Kd 900,0,1168,0.25,0,0,0,0,0.306092
+overload,7,kd-3600,Kd 3600,0,1167,0.25,0,0,0,0,27.043462
+overload,7,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1190,0,3.166667,0,0,0,690.163286
+burst-recovery,0,current,current (120 / 1h / 1800),0,1496,6.9,11.666667,11.333333,10.833333,10.333333,0
+burst-recovery,0,kp-80,Kp 80,0,1496,6.9,16.166667,15.666667,15.166667,14.5,1172.556237
+burst-recovery,0,kp-160,Kp 160,0,1496,6.9,8.833333,8.333333,8,7.5,961.840774
+burst-recovery,0,ti-2h,Ti 2h,0,1496,6.9,15.5,14.666667,13.833333,13,972.539809
+burst-recovery,0,ti-half-hour,Ti 0.5h,0,1496,6.9,7.5,7.166667,6.833333,6.5,1350.137163
+burst-recovery,0,kd-900,Kd 900,0,1496,6.9,11.666667,11.333333,10.833333,10.333333,14.170266
+burst-recovery,0,kd-3600,Kd 3600,0,1496,6.9,11.666667,11.333333,10.833333,10.333333,30.933057
+burst-recovery,0,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1496,6.9,15.166667,14.333333,13.5,12.666667,1003.262079
+burst-recovery,1,current,current (120 / 1h / 1800),0,1562,5.8,7.166667,6.5,6,5.333333,0
+burst-recovery,1,kp-80,Kp 80,0,1562,5.8,12,11.5,10.833333,10.166667,1088.312283
+burst-recovery,1,kp-160,Kp 160,0,1562,5.8,4.666667,4.166667,3.666667,3.166667,670.270016
+burst-recovery,1,ti-2h,Ti 2h,0,1562,5.8,11.333333,10.333333,9.333333,8.5,875.436154
+burst-recovery,1,ti-half-hour,Ti 0.5h,0,1562,5.8,3.666667,3.333333,3,2.666667,1423.013769
+burst-recovery,1,kd-900,Kd 900,0,1562,5.8,7.166667,6.5,6,5.333333,22.519004
+burst-recovery,1,kd-3600,Kd 3600,0,1562,5.8,7.166667,6.5,6,5.333333,23.630031
+burst-recovery,1,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1562,5.8,11.333333,10.333333,9.333333,8.5,875.685117
+burst-recovery,2,current,current (120 / 1h / 1800),0,1562,4.55,8.166667,7.666667,7,6.5,0
+burst-recovery,2,kp-80,Kp 80,0,1562,4.55,12.5,11.833333,11.166667,10.5,975.312064
+burst-recovery,2,kp-160,Kp 160,0,1562,4.55,5.833333,5.5,5,4.5,610.106228
+burst-recovery,2,ti-2h,Ti 2h,0,1562,4.55,12.666667,11.833333,10.833333,9.833333,818.681477
+burst-recovery,2,ti-half-hour,Ti 0.5h,0,1562,4.55,3.833333,3.5,3,2.666667,1135.728231
+burst-recovery,2,kd-900,Kd 900,0,1562,4.55,8.166667,7.666667,7,6.5,22.121413
+burst-recovery,2,kd-3600,Kd 3600,0,1562,4.55,8.166667,7.666667,7,6.5,16.856588
+burst-recovery,2,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1562,4.55,12.666667,11.833333,10.833333,9.833333,818.889423
+burst-recovery,3,current,current (120 / 1h / 1800),0,1461,8.1,16,15.666667,15.333333,15,0
+burst-recovery,3,kp-80,Kp 80,0,1461,8.1,18.833333,18.333333,17.833333,17.333333,1028.529236
+burst-recovery,3,kp-160,Kp 160,0,1461,8.1,13.166667,13,12.666667,12.333333,1249.971061
+burst-recovery,3,ti-2h,Ti 2h,0,1461,8.1,17,16.333333,15.666667,15,1848.315427
+burst-recovery,3,ti-half-hour,Ti 0.5h,0,1461,8.1,13.666667,13.5,13.333333,13.166667,2668.869974
+burst-recovery,3,kd-900,Kd 900,0,1461,8.1,16,15.666667,15.333333,15,22.517106
+burst-recovery,3,kd-3600,Kd 3600,0,1461,8.1,16,15.666667,15.333333,15,20.827998
+burst-recovery,3,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1461,8.1,17,16.333333,15.666667,15,1848.467727
+burst-recovery,4,current,current (120 / 1h / 1800),0,1489,7.55,10.833333,10.5,10.166667,9.666667,0
+burst-recovery,4,kp-80,Kp 80,0,1489,7.55,14.5,14,13.5,13,1037.319874
+burst-recovery,4,kp-160,Kp 160,0,1489,7.55,8.666667,8.333333,8,7.666667,834.660813
+burst-recovery,4,ti-2h,Ti 2h,0,1489,7.55,12.5,11.666667,10.833333,10,1504.36601
+burst-recovery,4,ti-half-hour,Ti 0.5h,0,1489,7.55,9.166667,9,8.833333,8.5,2516.024511
+burst-recovery,4,kd-900,Kd 900,0,1489,7.55,10.833333,10.5,10.166667,9.666667,12.904067
+burst-recovery,4,kd-3600,Kd 3600,0,1489,7.55,10.833333,10.5,10.166667,9.666667,2.513073
+burst-recovery,4,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1489,7.55,12.5,11.666667,10.833333,10,1504.56972
+burst-recovery,5,current,current (120 / 1h / 1800),0,1476,7.8,13.833333,13.5,13,12.666667,0
+burst-recovery,5,kp-80,Kp 80,0,1476,7.8,18,17.666667,17.166667,16.666667,1305.224543
+burst-recovery,5,kp-160,Kp 160,0,1476,7.8,11.833333,11.5,11.166667,11,803.438063
+burst-recovery,5,ti-2h,Ti 2h,0,1476,7.8,16.5,15.666667,15,14.333333,1302.312989
+burst-recovery,5,ti-half-hour,Ti 0.5h,0,1476,7.8,11,10.833333,10.5,10.333333,1997.9341
+burst-recovery,5,kd-900,Kd 900,0,1476,7.8,13.833333,13.5,13,12.666667,13.450439
+burst-recovery,5,kd-3600,Kd 3600,0,1476,7.8,13.833333,13.5,13,12.666667,2.642508
+burst-recovery,5,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1476,7.8,16.5,15.666667,15,14.333333,1302.525537
+burst-recovery,6,current,current (120 / 1h / 1800),0,1528,5.9,15.833333,15.5,15.166667,14.833333,0
+burst-recovery,6,kp-80,Kp 80,0,1528,5.9,19,18.5,18,17.666667,1032.504849
+burst-recovery,6,kp-160,Kp 160,0,1528,5.9,13.666667,13.333333,13.166667,12.833333,1009.631852
+burst-recovery,6,ti-2h,Ti 2h,0,1528,5.9,16.666667,16,15.333333,14.666667,1912.275062
+burst-recovery,6,ti-half-hour,Ti 0.5h,0,1528,5.9,14.333333,14.166667,14,13.833333,3106.003474
+burst-recovery,6,kd-900,Kd 900,0,1528,5.9,15.833333,15.5,15.166667,14.833333,16.669377
+burst-recovery,6,kd-3600,Kd 3600,0,1528,5.9,15.666667,15.333333,15,14.666667,123.825785
+burst-recovery,6,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1528,5.9,16.666667,16,15.333333,14.666667,1912.466312
+burst-recovery,7,current,current (120 / 1h / 1800),0,1485,9.9,9.666667,9.333333,8.833333,8.333333,0
+burst-recovery,7,kp-80,Kp 80,0,1485,9.9,13.666667,13.166667,12.5,12,1028.659348
+burst-recovery,7,kp-160,Kp 160,0,1485,9.9,7.5,7.166667,6.833333,6.5,749.227192
+burst-recovery,7,ti-2h,Ti 2h,0,1485,9.9,11.166667,10.166667,9.333333,8.333333,1342.035091
+burst-recovery,7,ti-half-hour,Ti 0.5h,0,1485,9.9,8,7.833333,7.5,7.333333,2308.242674
+burst-recovery,7,kd-900,Kd 900,0,1485,9.9,9.666667,9.333333,8.833333,8.333333,15.002203
+burst-recovery,7,kd-3600,Kd 3600,0,1485,9.9,9.666667,9.333333,8.833333,8.333333,11.962518
+burst-recovery,7,weaker-i-stronger-d,Ti 2h + Kd 3600,0,1485,9.9,11.166667,10.166667,9.333333,8.333333,1342.267991
+responsive-heavy,0,current,current (120 / 1h / 1800),0,455,2.95,19.166667,18.166667,17.166667,16.166667,0
+responsive-heavy,0,kp-80,Kp 80,5.216667,531,0,113.833333,25.833333,24,22.333333,3270.126735
+responsive-heavy,0,kp-160,Kp 160,0,440,3.25,17.666667,16.666667,0,0,1361.190184
+responsive-heavy,0,ti-2h,Ti 2h,2.216667,535,0,40.5,36.833333,24.5,21.666667,3046.397645
+responsive-heavy,0,ti-half-hour,Ti 0.5h,0,460,1.6,2.833333,1.166667,0.333333,0,3060.970658
+responsive-heavy,0,kd-900,Kd 900,0,455,2.95,19.166667,18.166667,17.166667,16.166667,0.245183
+responsive-heavy,0,kd-3600,Kd 3600,0,455,2.95,19.166667,18.166667,17.166667,16.166667,0.490365
+responsive-heavy,0,weaker-i-stronger-d,Ti 2h + Kd 3600,2.216667,535,0,40.5,36.833333,24.5,21.666667,3041.796777
+responsive-heavy,1,current,current (120 / 1h / 1800),0,426,0.15,25,23.833333,22.833333,22,0
+responsive-heavy,1,kp-80,Kp 80,3.497853,442,0,44.333333,43.166667,42.166667,41,1313.158001
+responsive-heavy,1,kp-160,Kp 160,0,404,0.95,20.666667,20,19.5,18.833333,4082.585871
+responsive-heavy,1,ti-2h,Ti 2h,0,432,0.6,47.333333,44.833333,43.333333,42,1556.913273
+responsive-heavy,1,ti-half-hour,Ti 0.5h,4.766667,421,0,19.333333,19,18.5,18,8414.849383
+responsive-heavy,1,kd-900,Kd 900,0,426,0.15,25,23.833333,22.833333,22,0.249814
+responsive-heavy,1,kd-3600,Kd 3600,0,425,0.15,25,23.833333,22.833333,22,64.733041
+responsive-heavy,1,weaker-i-stronger-d,Ti 2h + Kd 3600,0,432,0.6,47.333333,44.833333,43.333333,42,1557.049607
+responsive-heavy,2,current,current (120 / 1h / 1800),0,467,0.35,18,17,0,0,0
+responsive-heavy,2,kp-80,Kp 80,0,467,0.9,23.166667,21.833333,20.5,19.5,2968.429386
+responsive-heavy,2,kp-160,Kp 160,0.983333,470,0,16.833333,0,0,0,3106.118606
+responsive-heavy,2,ti-2h,Ti 2h,0,470,0.75,132.5,23,21.166667,0,2953.890748
+responsive-heavy,2,ti-half-hour,Ti 0.5h,0,463,0.1,0,0,0,0,4614.791416
+responsive-heavy,2,kd-900,Kd 900,0,467,0.35,18,17,0,0,1.370297
+responsive-heavy,2,kd-3600,Kd 3600,0,467,0.35,18,17,0,0,0.897128
+responsive-heavy,2,weaker-i-stronger-d,Ti 2h + Kd 3600,0,470,0.75,132.5,23,21.166667,0,2954.032254
+responsive-heavy,3,current,current (120 / 1h / 1800),0.554732,411,0,18.166667,17.333333,16.5,15.666667,0
+responsive-heavy,3,kp-80,Kp 80,6.416667,420,0,45.666667,24,22.166667,20.833333,2726.003
+responsive-heavy,3,kp-160,Kp 160,6.283333,398,0,15.666667,14.833333,14.166667,13.5,2114.01434
+responsive-heavy,3,ti-2h,Ti 2h,5.216667,427,0,132.833333,42.833333,21.333333,19.666667,2743.50682
+responsive-heavy,3,ti-half-hour,Ti 0.5h,6.833333,388,0,15.5,15,14.666667,14.166667,6037.642899
+responsive-heavy,3,kd-900,Kd 900,0.554641,411,0,18.166667,17.333333,16.5,15.666667,0.352118
+responsive-heavy,3,kd-3600,Kd 3600,0.554913,411,0,18.166667,17.333333,16.5,15.666667,1.285228
+responsive-heavy,3,weaker-i-stronger-d,Ti 2h + Kd 3600,5.216667,427,0,132.833333,42.833333,21.333333,19.666667,2743.632045
+responsive-heavy,4,current,current (120 / 1h / 1800),0,473,1,42.833333,42.166667,41.5,40.833333,0
+responsive-heavy,4,kp-80,Kp 80,4.533333,503,0,55.666667,52.166667,50.333333,49,2134.104428
+responsive-heavy,4,kp-160,Kp 160,0,457,1.3,38.833333,37.833333,37,35.833333,907.548148
+responsive-heavy,4,ti-2h,Ti 2h,1.033333,507,0,62.166667,60.666667,59.166667,57.666667,2129.425152
+responsive-heavy,4,ti-half-hour,Ti 0.5h,0,453,1,40,27.5,26.333333,25.5,2314.102284
+responsive-heavy,4,kd-900,Kd 900,0,473,1,42.833333,42.166667,41.5,40.833333,1.506627
+responsive-heavy,4,kd-3600,Kd 3600,0,473,1,42.833333,42.166667,41.5,40.833333,0.689195
+responsive-heavy,4,weaker-i-stronger-d,Ti 2h + Kd 3600,0.683333,507,0,62.166667,60.666667,59.166667,57.666667,2130.35586
+responsive-heavy,5,current,current (120 / 1h / 1800),0,534,0.35,18,0.833333,0,0,0
+responsive-heavy,5,kp-80,Kp 80,3.366667,557,0,23,21.166667,19.666667,18.333333,2406.651196
+responsive-heavy,5,kp-160,Kp 160,2.566491,539,0,0,0,0,0,2638.191919
+responsive-heavy,5,ti-2h,Ti 2h,0.788597,561,0,117.5,46.666667,20.166667,0,2540.292521
+responsive-heavy,5,ti-half-hour,Ti 0.5h,0,481,2.55,0,0,0,0,3873.491969
+responsive-heavy,5,kd-900,Kd 900,0,534,0.35,18,0.833333,0,0,1.443214
+responsive-heavy,5,kd-3600,Kd 3600,0,534,0.35,18,0.833333,0,0,1.555633
+responsive-heavy,5,weaker-i-stronger-d,Ti 2h + Kd 3600,0.789119,561,0,117.666667,46.666667,20.166667,0,2540.377941
+responsive-heavy,6,current,current (120 / 1h / 1800),7.233333,453,0,38.5,37.5,36.333333,35.333333,0
+responsive-heavy,6,kp-80,Kp 80,5.883333,467,0,45,44.166667,43.5,42.666667,2391.450624
+responsive-heavy,6,kp-160,Kp 160,7.166667,445,0,30.333333,26.333333,25,24.333333,1384.096562
+responsive-heavy,6,ti-2h,Ti 2h,5.566667,473,0,45.166667,43.833333,42.833333,41.833333,3043.92762
+responsive-heavy,6,ti-half-hour,Ti 0.5h,6.766667,437,0,26.166667,25.666667,25.166667,24.666667,3830.487441
+responsive-heavy,6,kd-900,Kd 900,7.233333,453,0,38.5,37.5,36.333333,35.333333,20.575606
+responsive-heavy,6,kd-3600,Kd 3600,7.233333,453,0,38.5,37.5,36.333333,35.333333,9.809711
+responsive-heavy,6,weaker-i-stronger-d,Ti 2h + Kd 3600,5.733333,470,0,45.166667,43.833333,42.833333,41.833333,3019.801144
+responsive-heavy,7,current,current (120 / 1h / 1800),0,462,0.55,18.833333,17.833333,16.666667,0,0
+responsive-heavy,7,kp-80,Kp 80,6.283333,478,0,25.333333,22.833333,21.5,20.5,2450.8524
+responsive-heavy,7,kp-160,Kp 160,0,444,0.95,17,16,0.666667,0,1166.808649
+responsive-heavy,7,ti-2h,Ti 2h,5.65,483,0,44.5,41.333333,21.833333,0,2334.087806
+responsive-heavy,7,ti-half-hour,Ti 0.5h,0,444,0.95,16,15.166667,1,0,3829.213043
+responsive-heavy,7,kd-900,Kd 900,0,462,0.55,18.833333,17.833333,16.666667,0,0.28259
+responsive-heavy,7,kd-3600,Kd 3600,0,464,0.5,18.833333,17.666667,16.666667,0,121.274628
+responsive-heavy,7,weaker-i-stronger-d,Ti 2h + Kd 3600,5.566667,486,0,44.5,41.333333,21.833333,0,2326.388105

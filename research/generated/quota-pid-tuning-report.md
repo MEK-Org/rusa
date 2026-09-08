@@ -47,6 +47,5 @@ The evidence is sufficient to rule out treating stronger derivative alone as a r
 
 ## Artifacts
 
-- [traces CSV](quota-pid-tuning-traces.csv) contains every plotted row and labels its source.
 - [metrics CSV](quota-pid-tuning-summary.csv) contains the table inputs.
 - [SVG chart](quota-pid-tuning-charts.svg) is a dependency-free rendering of the six scenarios.

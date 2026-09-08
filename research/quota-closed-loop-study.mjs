@@ -33,6 +33,18 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const GENERATED = join(HERE, "generated");
 
 const IDEAL_SPACING_SECONDS = WINDOW_SECONDS / BUDGET_RUNS_PER_WEEK;
+const RECOVERY_MULTIPLIERS = [1, 1.5, 2, 2.5];
+
+function recoveryField(multiplier) {
+  if (multiplier === 1) return "recovery_to_ideal_hours";
+  return `recovery_to_${String(multiplier).replace(".", "_")}x_ideal_hours`;
+}
+
+function recoveryHours(samples, multiplier) {
+  const afterBurst = samples.filter((row) => row.seconds >= 36 * 3_600);
+  const relaxed = afterBurst.find((row) => row.interval <= multiplier * IDEAL_SPACING_SECONDS);
+  return relaxed ? (relaxed.seconds - 36 * 3_600) / 3_600 : null;
+}
 
 // Each scenario fixes its own seed, so every candidate meets identical demand.
 const SCENARIOS = [
@@ -132,10 +144,6 @@ function metricRow(scenario, candidate, result, referenceSamples) {
   const absError = week.map((row) => Math.abs(row.error));
   const waitsHours = result.externalWaits.map((value) => value / 3_600);
   const cappedSamples = samples.filter((row) => row.uncappedInterval > MAX_INTERVAL_SECONDS);
-  // Recovery lag: after the burst ends, how long until pacing is back to a
-  // level that no longer materially delays work?
-  const afterBurst = samples.filter((row) => row.seconds >= 36 * 3_600);
-  const relaxed = afterBurst.find((row) => row.interval <= 2 * IDEAL_SPACING_SECONDS);
   return {
     scenario: scenario.id,
     candidate: candidate.id,
@@ -166,7 +174,12 @@ function metricRow(scenario, candidate, result, referenceSamples) {
     max_derivative_term_seconds: Math.max(
       ...samples.map((row) => Math.abs(candidate.kd * row.derivative))
     ),
-    recovery_to_2x_ideal_hours: relaxed ? (relaxed.seconds - 36 * 3_600) / 3_600 : null,
+    ...Object.fromEntries(
+      RECOVERY_MULTIPLIERS.map((multiplier) => [
+        recoveryField(multiplier),
+        recoveryHours(samples, multiplier),
+      ])
+    ),
   };
 }
 
@@ -191,6 +204,13 @@ function runStudy() {
     metrics,
     robustnessRows,
     robustnessRows2: robustnessSummary(robustnessRows),
+    thresholdRows: RECOVERY_MULTIPLIERS.flatMap((multiplier) =>
+      robustnessSummary(robustnessRows, multiplier).map((row) => ({
+        threshold_x_ideal: multiplier,
+        ...row,
+      }))
+    ),
+    plantSensitivityRows: plantSensitivity(),
   };
 }
 
@@ -211,8 +231,6 @@ function robustness() {
       for (const candidate of CANDIDATES) {
         const result =
           candidate.id === BASELINE.id ? reference : simulate({ ...seeded, arrivals }, candidate);
-        const afterBurst = result.samples.filter((row) => row.seconds >= 36 * 3_600);
-        const relaxed = afterBurst.find((row) => row.interval <= 2 * IDEAL_SPACING_SECONDS);
         rows.push({
           scenario: scenario.id,
           seed_offset: offset,
@@ -221,7 +239,12 @@ function robustness() {
           exhausted_hours: result.exhaustedHours,
           external_completed: result.externalCompleted,
           quota_left_week_end_pct: result.quotaAtWeekEndPct,
-          recovery_to_2x_ideal_hours: relaxed ? (relaxed.seconds - 36 * 3_600) / 3_600 : null,
+          ...Object.fromEntries(
+            RECOVERY_MULTIPLIERS.map((multiplier) => [
+              recoveryField(multiplier),
+              recoveryHours(result.samples, multiplier),
+            ])
+          ),
           max_interval_delta_vs_current_seconds: Math.max(
             ...result.samples.map((row, index) =>
               Math.abs(row.interval - (reference.samples[index]?.interval ?? row.interval))
@@ -234,23 +257,18 @@ function robustness() {
   return rows;
 }
 
-function robustnessSummary(rows) {
+function robustnessSummary(rows, multiplier = 2) {
+  const field = recoveryField(multiplier);
   return CANDIDATES.map((candidate) => {
     const mine = rows.filter((row) => row.candidate === candidate.id);
     const burst = mine.filter((row) => row.scenario === "burst-recovery");
-    const recoveries = burst
-      .map((row) => row.recovery_to_2x_ideal_hours)
-      .filter((value) => value != null);
+    const recoveries = burst.map((row) => row[field]).filter((value) => value != null);
     const baselineBurst = rows.filter(
       (row) => row.candidate === BASELINE.id && row.scenario === "burst-recovery"
     );
     const faster = burst.filter((row, index) => {
-      const reference = baselineBurst[index]?.recovery_to_2x_ideal_hours;
-      return (
-        row.recovery_to_2x_ideal_hours != null &&
-        reference != null &&
-        row.recovery_to_2x_ideal_hours < reference
-      );
+      const reference = baselineBurst[index]?.[field];
+      return row[field] != null && reference != null && row[field] < reference;
     }).length;
     return {
       candidate: candidate.id,
@@ -272,30 +290,49 @@ function robustnessSummary(rows) {
   });
 }
 
-function traceRows({ scenarios, results }) {
+const PLANT_SENSITIVITIES = [
+  { id: "30s-1-slot", runDurationSeconds: 30, maxConcurrentRuns: 1 },
+  { id: "30s-4-slot", runDurationSeconds: 30, maxConcurrentRuns: 4 },
+  { id: "240s-1-slot", runDurationSeconds: 240, maxConcurrentRuns: 1 },
+  { id: "240s-4-slot", runDurationSeconds: 240, maxConcurrentRuns: 4 },
+  { id: "600s-1-slot", runDurationSeconds: 600, maxConcurrentRuns: 1 },
+  { id: "600s-4-slot", runDurationSeconds: 600, maxConcurrentRuns: 4 },
+];
+
+/**
+ * Completion charging is an explicit v1 assumption, not a claim about when a
+ * provider reports usage. Varying duration and concurrency together bounds the
+ * phase delay that this assumption introduces without fabricating telemetry.
+ */
+function plantSensitivity() {
+  const scenarioDefinition = SCENARIOS.find((item) => item.id === "burst-recovery");
+  const scenario = { ...scenarioDefinition, arrivals: generateArrivals(scenarioDefinition) };
   const rows = [];
-  for (const scenario of scenarios) {
+  for (const plant of PLANT_SENSITIVITIES) {
+    const reference = simulate(scenario, BASELINE, plant);
     for (const candidate of CANDIDATES) {
-      for (const row of results.get(`${scenario.id}/${candidate.id}`).samples) {
-        rows.push({
-          scenario: scenario.id,
-          source: "closed-loop-simulation",
-          candidate: candidate.id,
-          time_hours: row.hours,
-          quota_left_pct: row.quotaPct,
-          time_remaining_pct: row.timeRemainingPct,
-          error: row.error,
-          applied_interval_seconds: row.interval,
-          commanded_interval_seconds: row.uncappedInterval,
-          integral: row.integral,
-          derivative: row.derivative,
-          external_backlog: row.backlog,
-          running: row.running,
-          external_completed: row.externalCompleted,
-          responsive_completed: row.responsiveCompleted,
-          exhausted: row.exhausted,
-        });
-      }
+      const result =
+        candidate.id === BASELINE.id ? reference : simulate(scenario, candidate, plant);
+      rows.push({
+        plant: plant.id,
+        run_duration_seconds: plant.runDurationSeconds,
+        max_concurrent_runs: plant.maxConcurrentRuns,
+        candidate: candidate.id,
+        label: candidate.label,
+        recovery_to_ideal_hours: recoveryHours(result.samples, 1),
+        recovery_to_1_5x_ideal_hours: recoveryHours(result.samples, 1.5),
+        recovery_to_2x_ideal_hours: recoveryHours(result.samples, 2),
+        recovery_to_2_5x_ideal_hours: recoveryHours(result.samples, 2.5),
+        exhausted_hours: result.exhaustedHours,
+        max_derivative_term_seconds: Math.max(
+          ...result.samples.map((row) => Math.abs(candidate.kd * row.derivative))
+        ),
+        max_interval_delta_vs_current_seconds: Math.max(
+          ...result.samples.map((row, index) =>
+            Math.abs(row.interval - (reference.samples[index]?.interval ?? row.interval))
+          )
+        ),
+      });
     }
   }
   return rows;
@@ -669,7 +706,7 @@ function fixed(value, digits = 1) {
   return value == null ? "not reached" : Number(value).toFixed(digits);
 }
 
-function report({ scenarios, metrics, robustnessRows2 }) {
+function report({ scenarios, metrics, robustnessRows2, thresholdRows, plantSensitivityRows }) {
   const baselineRows = scenarios
     .map((scenario) => {
       const row = metrics.find(
@@ -715,6 +752,28 @@ function report({ scenarios, metrics, robustnessRows2 }) {
       row.exhausting_runs > baselineRobust.exhausting_runs
   );
   const proposalRobust = robustBy("weaker-i-stronger-d");
+  const thresholdCandidates = [BASELINE.id, "ti-half-hour", "kp-160", "ti-2h"];
+  const thresholdTable = RECOVERY_MULTIPLIERS.map((multiplier) => {
+    const rows = thresholdRows.filter((row) => row.threshold_x_ideal === multiplier);
+    const find = (candidate) => rows.find((row) => row.candidate === candidate);
+    return `| ${multiplier}× | ${thresholdCandidates
+      .map((candidate) => {
+        const row = find(candidate);
+        return `${fixed(row?.recovery_mean_hours)} h (${row?.seeds_faster_than_current ?? 0}/8 faster)`;
+      })
+      .join(" | ")} |`;
+  }).join("\n");
+  const sensitivityTable = PLANT_SENSITIVITIES.map((plant) => {
+    const rows = plantSensitivityRows.filter((row) => row.plant === plant.id);
+    const find = (candidate) => rows.find((row) => row.candidate === candidate);
+    const current = find(BASELINE.id);
+    const weakerIntegral = find("ti-2h");
+    const strongerDerivative = find("kd-3600");
+    return `| ${plant.runDurationSeconds} s | ${plant.maxConcurrentRuns} | ${fixed(current?.recovery_to_2x_ideal_hours)} | ${fixed(weakerIntegral?.recovery_to_2x_ideal_hours)} | ${fixed(strongerDerivative?.recovery_to_2x_ideal_hours)} | ${fixed(strongerDerivative?.max_derivative_term_seconds, 2)} | ${fixed(strongerDerivative?.max_interval_delta_vs_current_seconds, 0)} |`;
+  }).join("\n");
+  const maxSensitivityDerivative = Math.max(
+    ...plantSensitivityRows.map((row) => row.max_derivative_term_seconds)
+  );
   // The faster candidates buy recovery with a higher peak command; measure how
   // much, and whether that actually reached external work as queueing delay.
   const peakCommandRise = (id) => {
@@ -749,7 +808,7 @@ function report({ scenarios, metrics, robustnessRows2 }) {
     `## Plant model (v1)\n\n` +
     `- **Quota window:** weekly, ${WINDOW_SECONDS.toLocaleString()} s, simulated for ${(HORIZON_SECONDS / 86_400).toFixed(0)} days so the rollover, refill, and post-reset behaviour all occur inside the loop.\n` +
     `- **Quota cost:** a fixed ${QUOTA_COST_PER_RUN_POINTS.toFixed(3)} points per completed run, which is the v1 simplification requested for this iteration. The weekly budget is therefore ${BUDGET_RUNS_PER_WEEK.toLocaleString()} runs and perfectly even pacing is ${IDEAL_SPACING_SECONDS.toFixed(0)} s between starts.\n` +
-    `- **Runs:** ${RUN_DURATION_SECONDS} s each, at most ${MAX_CONCURRENT_RUNS} concurrent. Quota is charged at completion.\n` +
+    `- **Runs:** ${RUN_DURATION_SECONDS} s each, at most ${MAX_CONCURRENT_RUNS} concurrent. Quota is charged as a lump sum at completion.\n` +
     `- **Arrivals:** deterministic thinned-Poisson draws split into responsive and external work, shaped by a daytime activity profile (a raised half-sine across a 14-hour working day over a 0.15 night floor).\n` +
     `- **Applied throttling:** a faithful copy of \`ProviderPacer\`'s start-to-start gate. External runs wait for the commanded interval; responsive runs bypass the wait but still charge the interval clock, so responsive load displaces external work instead of adding to it. Raising the interval re-bases the pending wait on the last actual start, exactly as \`setInterval\` does.\n` +
     `- **Exhaustion:** at zero quota the controller update is skipped and the pacer is deferred to the reset instant, matching the production early return and \`deferUntil\`.\n` +
@@ -758,9 +817,13 @@ function report({ scenarios, metrics, robustnessRows2 }) {
     `| scenario | exhausted (h) | quota left at week end (%) | external done | responsive done | external wait p95 (h) | mean wait (s) |\n` +
     `| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n${baselineRows}\n\n` +
     `## Burst then quiet — the #291 recovery question\n\n` +
-    `Recovery is measured as the time from the end of the 36-hour burst until the applied wait returns to twice the ideal ${IDEAL_SPACING_SECONDS.toFixed(0)} s spacing.\n\n` +
+    `The primary recovery measure is time from the end of the 36-hour burst until the applied wait is at or below twice the ideal ${IDEAL_SPACING_SECONDS.toFixed(0)} s spacing. Twice ideal was chosen as a legible “no longer materially delayed” threshold for this v1 comparison; it is not a production SLO or a stability proof. The same seed sweep also reports 1×, 1.5×, and 2.5× thresholds below.\n\n` +
     `| candidate | recovery (h) | exhausted (h) | external done | external wait p95 (h) | mean abs error (pts) |\n` +
     `| --- | ---: | ---: | ---: | ---: | ---: |\n${burst}\n\n` +
+    `### Recovery-threshold sensitivity (8 burst-demand seeds)\n\n` +
+    `Each cell is mean recovery hours; the parenthesis is seeds faster than current. The rankings used for the bounded recommendation are visible rather than inferred from the 2× cutoff alone.\n\n` +
+    `| threshold | current | Ti 0.5h | Kp 160 | Ti 2h |\n` +
+    `| --- | ---: | ---: | ---: | ---: |\n${thresholdTable}\n\n` +
     `## Sustained overload — the safety side of the same choice\n\n` +
     `| candidate | exhausted (h) | quota left at week end (%) | external done | max wait (s) | mean abs error (pts) |\n` +
     `| --- | ---: | ---: | ---: | ---: | ---: |\n${overload}\n\n` +
@@ -771,10 +834,16 @@ function report({ scenarios, metrics, robustnessRows2 }) {
     `- **The combined proposal inherits that.** \`${proposal.label}\` recovered in ${fixed(proposalRobust.recovery_mean_hours)} h on average against the current controller's ${fixed(baselineRobust.recovery_mean_hours)} h, was slower on ${proposalRobust.seeds - proposalRobust.seeds_faster_than_current} of ${proposalRobust.seeds} seeds, and the stronger derivative did not offset it.\n` +
     `${fasterEverySeed.length > 0 ? `- **What did improve recovery was moving the opposite way.** ${fasterEverySeed.map((row) => `\`${row.label}\` recovered faster than current on all ${row.seeds} seeds (${fixed(row.recovery_mean_hours)} h mean vs ${fixed(baselineRobust.recovery_mean_hours)} h) and exhausted quota in ${describeExhaustion(row)}`).join("; ")}. Both buy that recovery with a higher peak command \u2014 up to ${fixed(fasterPeakRise, 0)} s above the current weights at a scenario peak. On these runs that extra pacing did not turn into much extra queueing (external p95 wait moved by at most ${fixed(fasterWaitRise, 2)} h), because the backlog is already dominated by demand exceeding what the budget can serve.\n` : ""}` +
     `\n${anyExhaustion.length} of ${metrics.length} candidate-scenario pairs reached zero quota on the headline seed. Exhaustion appears only in the responsive-dominated and sustained-overload scenarios, which is where the controller has the least authority: responsive work bypasses pacing entirely, so the only lever left is squeezing external work that is already queued.\n\n` +
+    `## Completion-lag and capacity sensitivity\n\n` +
+    `None of the v1 plant constants are observed production telemetry: the 2,000-run budget, 240 s completion lag, four-slot capacity, daytime curve, and arrival mixes are explicit calibration assumptions selected to make the loop exercise pacing without pinning it at the cap. In particular, this model does **not** claim to know whether a provider's observed quota falls continuously, at completion, or only at polling time. It charges at completion because the requested v1 scope was fixed quota per completed run.\n\n` +
+    `To bound the resulting phase-delay assumption, the same burst demand is re-run for 30/240/600 s completion lags and one/four concurrent slots. The table keeps the 2× threshold only for compactness; the CSV includes all four thresholds and every candidate.\n\n` +
+    `| completion lag | slots | current recovery (h) | Ti 2h recovery (h) | Kd 3600 recovery (h) | Kd 3600 max D term (s) | Kd 3600 max Δ from current (s) |\n` +
+    `| ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n${sensitivityTable}\n\n` +
+    `Across those deliberately wide completion/capacity variants, the largest derivative contribution is ${fixed(maxSensitivityDerivative, 2)} s, so the derivative finding survives this sensitivity. The weaker-integral result deliberately does **not** claim that robustness: the 240 s / one-slot row reverses its recovery relation, while the 600 s / one-slot plant is already below every recovery cutoff at the end of the burst. This is evidence that capacity and completion timing must be calibrated before treating any integral ranking as durable.\n\n` +
     `## Assumptions and limits\n\n` +
     `This is v1 and is deliberately coarse. It should not be used to pick production weights on its own.\n\n` +
     `- Every run costs the same quota. Real runs vary by model, context length, and tool use, and that variance is exactly what determines the tail behaviour near exhaustion.\n` +
-    `- Run duration is fixed and failures, retries, and cancellations are not modelled.\n` +
+    `- The headline uses a fixed completion delay; the sensitivity table varies delay and capacity, but failures, retries, cancellations, and non-completion quota accounting are not modelled.\n` +
     `- Demand is resampled across ${ROBUSTNESS_SEEDS} seeds, but the *shape* — the arrival rates, the responsive/external split, the daytime curve — is a plausible guess rather than a measurement. Resampling shows an ordering is not a seed artifact; it cannot show the shape is right. Absolute run counts carry no operational meaning; only the comparison between candidates on identical demand does.\n` +
     `- Responsive work is assumed to be admitted unconditionally. Real responsive load has its own upstream limits.\n` +
     `- One provider, one bucket, one weekly window. Multi-bucket interaction and the five-hour window are out of scope.\n` +
@@ -782,13 +851,14 @@ function report({ scenarios, metrics, robustnessRows2 }) {
     `## Recommendation\n\n` +
     `Still no production retune from this evidence alone, and this study is not a mandate to change weights. What it does support is a narrowing:\n\n` +
     `1. **The stronger-derivative direction is not worth pursuing further in this form.** The derivative contribution is too small at the production observation cadence to move the command, so raising \`Kd\` changes nothing measurable. Making it matter would mean observing far more often, which is a different change with its own cost.\n` +
-    `2. **The weaker-integral direction should not be adopted on recovery grounds.** In closed loop it recovered more slowly than the current weights, not faster, and it exhausted the budget in a scenario where the current weights did not.\n` +
+    `2. **The weaker-integral direction is not supported on recovery grounds by the baseline plant and seed sweep.** It recovered more slowly than the current weights there, not faster, and it exhausted the budget in a scenario where the current weights did not. The completion/capacity sensitivity also means that this is a bounded finding, not a durable ranking.\n` +
     `3. **If faster recovery is the goal, the candidates that achieved it moved the opposite way** — a shorter integral time or a stronger proportional term, each faster than the current weights on every seed tested. That is a live hypothesis worth a v2, not a recommendation: both hold external work at a higher peak wait to do it, and both were measured against an uncalibrated demand model.\n\n` +
     `Before any of this becomes a weight change it needs an operator target in operational units — acceptable exhausted hours per week, acceptable p95 delay for external work, and whether responsive work should keep bypassing pacing under load — plus a per-run quota cost and arrival rates calibrated against real telemetry. That calibration is the natural v2.\n\n` +
     `## Artifacts\n\n` +
-    `- [closed-loop traces CSV](quota-closed-loop-traces.csv) — every simulated observation for every candidate and scenario.\n` +
     `- [closed-loop metrics CSV](quota-closed-loop-summary.csv) — the table inputs above.\n` +
     `- [seed robustness CSV](quota-closed-loop-robustness.csv) — every scenario re-run across ${ROBUSTNESS_SEEDS} demand seeds.\n` +
+    `- [threshold sensitivity CSV](quota-closed-loop-thresholds.csv) — all recovery cutoffs over the seed sweep.\n` +
+    `- [plant sensitivity CSV](quota-closed-loop-plant-sensitivity.csv) — completion-lag/capacity variants over the burst demand.\n` +
     `- [current-controller charts](quota-closed-loop-baseline-charts.svg) — quota, commanded vs applied wait, and backlog per scenario.\n` +
     `- [candidate charts](quota-closed-loop-candidate-charts.svg) — one parameter axis per row on the burst scenario.\n` +
     `- [tradeoff charts](quota-closed-loop-tradeoffs.svg) — safety and throughput per candidate and scenario.\n`
@@ -841,9 +911,10 @@ function buildArtifacts() {
   const study = runStudy();
   validateStudy(study);
   return new Map([
-    [join(GENERATED, "quota-closed-loop-traces.csv"), csv(traceRows(study))],
     [join(GENERATED, "quota-closed-loop-summary.csv"), csv(study.metrics)],
     [join(GENERATED, "quota-closed-loop-robustness.csv"), csv(study.robustnessRows)],
+    [join(GENERATED, "quota-closed-loop-thresholds.csv"), csv(study.thresholdRows)],
+    [join(GENERATED, "quota-closed-loop-plant-sensitivity.csv"), csv(study.plantSensitivityRows)],
     [join(GENERATED, "quota-closed-loop-baseline-charts.svg"), baselineCharts(study)],
     [join(GENERATED, "quota-closed-loop-candidate-charts.svg"), candidateCharts(study)],
     [join(GENERATED, "quota-closed-loop-tradeoffs.svg"), tradeoffCharts(study)],

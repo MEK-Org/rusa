@@ -92,7 +92,11 @@ export function generateArrivals({ seed, externalRunsPerWeek, responsiveRunsPerW
  * a responsive run skips the interval wait but still charges the start-to-start
  * clock, so responsive load displaces external work rather than adding to it.
  */
-export function simulate(scenario, candidate) {
+export function simulate(scenario, candidate, plant = {}) {
+  // These overrides exist only for the deterministic sensitivity study. The
+  // baseline simulation continues to use the v1 values exported above.
+  const runDurationSeconds = plant.runDurationSeconds ?? RUN_DURATION_SECONDS;
+  const maxConcurrentRuns = plant.maxConcurrentRuns ?? MAX_CONCURRENT_RUNS;
   const arrivals = scenario.arrivals;
   let arrivalIndex = 0;
   let now = 0;
@@ -120,7 +124,7 @@ export function simulate(scenario, candidate) {
   const startRun = (request, responsive) => {
     lastStartedAt = now;
     nextAvailableAt = now + controller.interval;
-    running.push({ completesAt: now + RUN_DURATION_SECONDS, responsive });
+    running.push({ completesAt: now + runDurationSeconds, responsive });
     running.sort((a, b) => a.completesAt - b.completesAt);
     if (!responsive) externalWaits.push(now - request.at);
   };
@@ -143,12 +147,12 @@ export function simulate(scenario, candidate) {
         progressed = true;
       }
       // A responsive run bypasses the interval wait but not concurrency.
-      if (responsiveQueue.length > 0 && running.length < MAX_CONCURRENT_RUNS && !exhausted()) {
+      if (responsiveQueue.length > 0 && running.length < maxConcurrentRuns && !exhausted()) {
         startRun(responsiveQueue.shift(), true);
         progressed = true;
       } else if (
         externalQueue.length > 0 &&
-        running.length < MAX_CONCURRENT_RUNS &&
+        running.length < maxConcurrentRuns &&
         !exhausted() &&
         now >= nextAvailableAt
       ) {
@@ -206,7 +210,7 @@ export function simulate(scenario, candidate) {
     const candidates = [nextObservationAt, resetAt, HORIZON_SECONDS];
     if (arrivalIndex < arrivals.length) candidates.push(arrivals[arrivalIndex].at);
     if (running.length > 0) candidates.push(running[0].completesAt);
-    if (externalQueue.length > 0 && running.length < MAX_CONCURRENT_RUNS && !exhausted()) {
+    if (externalQueue.length > 0 && running.length < maxConcurrentRuns && !exhausted()) {
       candidates.push(Math.max(now, nextAvailableAt));
     }
     const next = Math.min(...candidates.filter((value) => value > now));

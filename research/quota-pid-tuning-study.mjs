@@ -234,31 +234,6 @@ function metricRow(candidate, history, recovery, overspend, reversal, refill, no
   };
 }
 
-function traceRows(scenarios) {
-  const rows = [];
-  for (const [scenario, candidateMap] of Object.entries(scenarios)) {
-    for (const candidate of CANDIDATES) {
-      for (const row of candidateMap.get(candidate.id)) {
-        rows.push({
-          scenario,
-          source: row.source,
-          candidate: candidate.id,
-          time_hours: row.hours,
-          error: row.error,
-          interval_seconds: row.interval,
-          integral: row.integral,
-          derivative: row.derivative,
-          integral_step_seconds: row.integralDtSeconds,
-          cycle_changed: row.cycleChanged,
-          observed_interval_seconds: row.observed?.interval ?? "",
-          observed_integral: row.observed?.integral ?? "",
-        });
-      }
-    }
-  }
-  return rows;
-}
-
 function svgLine(rows, box, color) {
   if (rows.length === 0) return "";
   const maxHours = Math.max(1, rows.at(-1).hours);
@@ -373,7 +348,6 @@ function report(metrics) {
     `Do **not** select new production PID weights from these probes. The historical trace validates only the current controller; the other scenarios deliberately hold errors fixed and cannot model the traffic/quota feedback that determines exhaustion. In particular, a weaker integral with a raw persisted integral would create an immediate protection reduction, which this contribution-matched study intentionally excludes.\n\n` +
     `The evidence is sufficient to rule out treating stronger derivative alone as a recovery fix and to show the explicit pacing/recovery tradeoff of the other candidates, but not to authorize a tuning change. Retain current weights, cap, conditional integration, and reset behavior until an operator supplies closed-loop safety targets (minimum sustained-overspend pacing, recovery target, and allowed noise/jitter) plus representative traces.\n\n` +
     `## Artifacts\n\n` +
-    `- [traces CSV](quota-pid-tuning-traces.csv) contains every plotted row and labels its source.\n` +
     `- [metrics CSV](quota-pid-tuning-summary.csv) contains the table inputs.\n` +
     `- [SVG chart](quota-pid-tuning-charts.svg) is a dependency-free rendering of the six scenarios.\n`
   );
@@ -439,7 +413,6 @@ function buildStudy() {
   }
   validateStudy(scenarios, metrics);
   return new Map([
-    [join(GENERATED, "quota-pid-tuning-traces.csv"), csv(traceRows(scenarios))],
     [join(GENERATED, "quota-pid-tuning-summary.csv"), csv(metrics)],
     [join(GENERATED, "quota-pid-tuning-charts.svg"), charts(scenarios)],
     [join(GENERATED, "quota-pid-tuning-report.md"), report(metrics)],
