@@ -552,7 +552,12 @@ class FakeApi extends DashboardApi {
     );
     return ObligationDetailSnapshot(
       obligation: ob,
-      parent: ob.parentId == null ? null : makeObligation(ob.parentId!),
+      parent: ob.parentId == null
+          ? null
+          : obligationsResult.firstWhere(
+              (o) => o.id == ob.parentId!,
+              orElse: () => makeObligation(ob.parentId!),
+            ),
       children: obligationsResult.where((o) => o.parentId == id).toList(),
       blockingChildren: obligationsResult
           .where(
