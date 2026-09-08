@@ -869,6 +869,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     {
       tokenFile: wakeTokenPath(mcHome),
       portFile: wakePortPath(mcHome),
+      instanceId: mcHome,
     }
   );
   const wakeToken = ensureWakeToken(mcHome);

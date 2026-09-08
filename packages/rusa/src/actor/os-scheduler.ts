@@ -1,3 +1,4 @@
+import { resolveHome } from "../config/secrets.js";
 import type { AtIo } from "./at-queue.js";
 import { assertCronExprCanFire } from "./cron-expression.js";
 import type { CrontabMutator } from "./crontab.js";
@@ -19,14 +20,21 @@ export interface ActorWakeScheduler {
   list(): Promise<WakeEntry[]>;
 }
 
+/** One parsed obligation activation entry from the OS scheduler. */
+export interface ObligationActivationRecord {
+  id: string;
+  instanceId?: string;
+}
+
 /** The obligation-facing slice of the host scheduler. */
 export interface ObligationActivationScheduler {
+  readonly instanceId?: string;
   scheduleObligationActivation(
     id: string,
     time: { kind: "cron"; cronExpr: string } | { kind: "at"; date: Date }
   ): void;
   cancelObligationActivation(id: string): void;
-  listObligationActivations(): string[];
+  listObligationActivations(): ObligationActivationRecord[];
 }
 
 /** A complete one-shot message persisted inside its versioned `at` job. */
@@ -61,6 +69,7 @@ export interface OsSchedulerOptions {
   portFile: string;
   host?: string;
   curlPath?: string;
+  instanceId?: string;
 }
 
 export interface WakeEntry {
@@ -164,11 +173,19 @@ function decodeScheduledMessage(script: string): ScheduledMessage {
 }
 
 export class DefaultOsScheduler implements OsScheduler {
+  readonly instanceId: string;
+
   constructor(
     private readonly mutator: CrontabMutator,
     private readonly atIo: AtIo,
     private readonly opts: OsSchedulerOptions
-  ) {}
+  ) {
+    const rawInstanceId = opts.instanceId?.trim();
+    this.instanceId = rawInstanceId && rawInstanceId.length > 0 ? rawInstanceId : resolveHome();
+    if (this.instanceId.includes("\n") || this.instanceId.includes("\r")) {
+      throw new Error(`instanceId must not contain newlines: ${this.instanceId}`);
+    }
+  }
 
   /** Build the complete cron line for an actor wake. */
   buildWakeJobLine(
@@ -362,11 +379,11 @@ export class DefaultOsScheduler implements OsScheduler {
     for (const id of ids) this.atIo.remove(id);
   }
 
-  /** The tag/end-tag pair bounding one obligation's managed cron block, exactly. */
+  /** The tag/end-tag pair bounding one obligation's managed cron block, scoped to this instance. */
   private activationTags(id: string): { tag: string; endTag: string } {
     return {
-      tag: `# mc-obligation-activation:${id}`,
-      endTag: `# mc-obligation-activation-end:${id}`,
+      tag: `# mc-obligation-activation:${this.instanceId}:${id}`,
+      endTag: `# mc-obligation-activation-end:${this.instanceId}:${id}`,
     };
   }
 
@@ -428,18 +445,46 @@ export class DefaultOsScheduler implements OsScheduler {
     this.removeAtIds(this.staleAtIds(tag));
   }
 
-  listObligationActivations(): string[] {
-    const ids = new Set<string>();
+  listObligationActivations(): ObligationActivationRecord[] {
+    const entries = new Map<string, ObligationActivationRecord>();
+    const parseTag = (tagContent: string): ObligationActivationRecord | null => {
+      const trimmed = tagContent.trim();
+      if (!trimmed) return null;
+      const lastColon = trimmed.lastIndexOf(":");
+      if (lastColon === -1) {
+        return { id: trimmed };
+      }
+      const instanceId = trimmed.slice(0, lastColon).trim();
+      const id = trimmed.slice(lastColon + 1).trim();
+      if (!id) return null;
+      if (!instanceId) return { id };
+      return { instanceId, id };
+    };
+
     const current = this.mutator.read();
     for (const line of current.split("\n")) {
       const m = line.match(/^# mc-obligation-activation:(.+)$/);
-      if (m) ids.add(m[1].trim());
+      if (m) {
+        const record = parseTag(m[1]);
+        if (record) {
+          const key = `${record.instanceId ?? ""}:${record.id}`;
+          entries.set(key, record);
+        }
+      }
     }
     for (const job of this.atIo.list()) {
-      const m = job.script.match(/# mc-obligation-activation:(.+)/);
-      if (m) ids.add(m[1].trim());
+      for (const line of job.script.split("\n")) {
+        const m = line.match(/^# mc-obligation-activation:(.+)$/);
+        if (m) {
+          const record = parseTag(m[1]);
+          if (record) {
+            const key = `${record.instanceId ?? ""}:${record.id}`;
+            entries.set(key, record);
+          }
+        }
+      }
     }
-    return Array.from(ids);
+    return Array.from(entries.values());
   }
 
   scheduleMessageDelivery(message: ScheduledMessage): void {

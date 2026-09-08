@@ -1,6 +1,12 @@
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js";
+import type { AtIo } from "../../actor/at-queue.js";
+import { type CrontabIo, CrontabMutator } from "../../actor/crontab.js";
+import {
+  DefaultOsScheduler,
+  type ObligationActivationRecord,
+  type ObligationActivationScheduler,
+} from "../../actor/os-scheduler.js";
 import type { Obligation } from "../../obligations/obligation.js";
 import { asGitHubIssue } from "../../references/reference.js";
 import { obligations } from "../migrations/0016_obligations.js";
@@ -17,6 +23,7 @@ import { ObligationRepository } from "./obligation-repository.js";
 class FakeObligationScheduler implements ObligationActivationScheduler {
   activations = new Map<string, { kind: "cron"; cronExpr: string } | { kind: "at"; date: Date }>();
   cancelled: string[] = [];
+  readonly instanceId = "test-instance";
   scheduleObligationActivation(
     id: string,
     time: { kind: "cron"; cronExpr: string } | { kind: "at"; date: Date }
@@ -27,8 +34,11 @@ class FakeObligationScheduler implements ObligationActivationScheduler {
     this.cancelled.push(id);
     this.activations.delete(id);
   }
-  listObligationActivations(): string[] {
-    return Array.from(this.activations.keys());
+  listObligationActivations(): ObligationActivationRecord[] {
+    return Array.from(this.activations.keys()).map((id) => ({
+      id,
+      instanceId: this.instanceId,
+    }));
   }
 }
 
@@ -2261,6 +2271,22 @@ describe("ObligationRepository", () => {
         expect(scheduler.activations.has("ghost-id")).toBe(false);
       });
 
+      it("does not cancel an orphaned OS activation belonging to a foreign instance", () => {
+        // Scheduler reports an orphaned entry belonging to another instance
+        scheduler.listObligationActivations = () => [
+          { id: "foreign-id", instanceId: "other-instance" },
+        ];
+        repository.reconcileScheduledObligations();
+        expect(scheduler.cancelled).not.toContain("foreign-id");
+      });
+
+      it("does not cancel a legacy unscoped OS activation without an instance component", () => {
+        // Scheduler reports a legacy unscoped entry
+        scheduler.listObligationActivations = () => [{ id: "legacy-id", instanceId: undefined }];
+        repository.reconcileScheduledObligations();
+        expect(scheduler.cancelled).not.toContain("legacy-id");
+      });
+
       it("keeps reconciling other rows when one row's OS scheduler call fails (e.g. `at` confirmed unavailable)", () => {
         repository.create({ title: "iv", id: "rec-2", ownerId: "actor-a", intent: "recur" });
         repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
@@ -2886,5 +2912,295 @@ describe("ObligationRepository", () => {
       repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
       expect(() => repository.removePrerequisite("dependent", "prereq")).not.toThrow();
     });
+  });
+});
+
+describe("multi-instance crontab reconciliation (#304)", () => {
+  const setupDb = (): Database.Database => {
+    const d = new Database(":memory:");
+    d.pragma("foreign_keys = ON");
+    obligations.up(d);
+    obligationPriority.up(d);
+    obligationTimestamps.up(d);
+    obligationTerminalNote.up(d);
+    obligationTitle.up(d);
+    obligationArtifacts.up(d);
+    recurringObligations.up(d);
+    obligationDependencies.up(d);
+    return d;
+  };
+
+  const createFixture = () => {
+    const prodDb = setupDb();
+    const stagingDb = setupDb();
+    const now = Date.now();
+    const nowFn = () => now;
+
+    let sharedCrontab = "";
+    const sharedCrontabIo: CrontabIo = {
+      read: () => sharedCrontab,
+      write: (data: string) => {
+        sharedCrontab = data;
+      },
+    };
+
+    const sharedAtJobs: { id: string; script: string; date: Date }[] = [];
+    let nextAtId = 1;
+    const makeAtIo = (): AtIo => ({
+      schedule: vi.fn((script: string, date: Date) => {
+        const id = String(nextAtId++);
+        sharedAtJobs.push({ id, script, date });
+        return id;
+      }),
+      list: vi.fn(() => [...sharedAtJobs]),
+      remove: vi.fn((id: string) => {
+        const idx = sharedAtJobs.findIndex((j) => j.id === id);
+        if (idx !== -1) sharedAtJobs.splice(idx, 1);
+      }),
+    });
+
+    const prodScheduler = new DefaultOsScheduler(new CrontabMutator(sharedCrontabIo), makeAtIo(), {
+      tokenFile: "/prod/token",
+      portFile: "/prod/port",
+      instanceId: "/srv/rusa-prod",
+    });
+
+    const stagingScheduler = new DefaultOsScheduler(
+      new CrontabMutator(sharedCrontabIo),
+      makeAtIo(),
+      {
+        tokenFile: "/staging/token",
+        portFile: "/staging/port",
+        instanceId: "/srv/rusa-staging",
+      }
+    );
+
+    const prodRepo = new ObligationRepository(prodDb, () => true, nowFn);
+    prodRepo.setOsScheduler(prodScheduler);
+
+    const stagingRepo = new ObligationRepository(stagingDb, () => true, nowFn);
+    stagingRepo.setOsScheduler(stagingScheduler);
+
+    // Baseline unmanaged / foreign contents:
+    const userLine1 = "0 1 * * * /usr/local/bin/daily-backup\n";
+    const userLine2 = "*/10 * * * * /usr/local/bin/metrics-collector\n";
+    const wakeLine =
+      "# mc-wake:system-monitor\n0 2 * * * curl -fsS http://127.0.0.1:8000/wake -d actorId=system-monitor -d reason=hourly\n";
+    const legacyBlock =
+      "# mc-obligation-activation:legacy-ob-1\n" +
+      "CRON_TZ=UTC\n" +
+      "30 3 * * * curl -fsS http://127.0.0.1:9000/wake-obligation -d 'id=legacy-ob-1'\n" +
+      'CRON_TZ=""\n' +
+      "# mc-obligation-activation-end:legacy-ob-1\n";
+
+    // Seed crontab with baseline
+    sharedCrontab = userLine1 + wakeLine + legacyBlock + userLine2;
+
+    // Seed shared at with a legacy at job
+    sharedAtJobs.push({
+      id: "legacy-at-1",
+      script: "# mc-obligation-activation:legacy-ob-at\ncurl wake\n",
+      date: new Date(now + 100000),
+    });
+
+    // Create obligations in prod DB:
+    prodRepo.create({
+      title: "Prod Active",
+      id: "prod-active",
+      ownerId: "actor-a",
+      intent: "prod",
+    });
+    prodRepo.setRecurrence("prod-active", { policy: "cron", cronExpr: "45 8 * * *" });
+
+    prodRepo.create({
+      title: "Prod Stale",
+      id: "prod-stale",
+      ownerId: "actor-a",
+      intent: "prod-stale",
+    });
+    prodRepo.setRecurrence("prod-stale", { policy: "cron", cronExpr: "0 5 * * *" });
+
+    // Create obligations in staging DB:
+    stagingRepo.create({
+      title: "Staging Active",
+      id: "staging-active",
+      ownerId: "actor-a",
+      intent: "staging",
+    });
+    stagingRepo.setRecurrence("staging-active", { policy: "cron", cronExpr: "0 12 * * *" });
+
+    stagingRepo.create({
+      title: "Staging Stale",
+      id: "staging-stale",
+      ownerId: "actor-a",
+      intent: "staging-stale",
+    });
+    stagingRepo.setRecurrence("staging-stale", { policy: "cron", cronExpr: "0 18 * * *" });
+
+    // Mark stale obligations in DBs:
+    prodRepo.setTerminalStatus("prod-stale", "cancelled");
+    stagingRepo.setTerminalStatus("staging-stale", "cancelled");
+
+    // Re-arm stale blocks in the shared crontab to simulate an existing un-swept state before boot:
+    prodScheduler.scheduleObligationActivation("prod-stale", {
+      kind: "cron",
+      cronExpr: "0 5 * * *",
+    });
+    stagingScheduler.scheduleObligationActivation("staging-stale", {
+      kind: "cron",
+      cronExpr: "0 18 * * *",
+    });
+
+    // Add stale at-jobs
+    sharedAtJobs.push({
+      id: "prod-at-stale",
+      script: "# mc-obligation-activation:/srv/rusa-prod:prod-at-stale\ncurl wake\n",
+      date: new Date(now + 200000),
+    });
+    sharedAtJobs.push({
+      id: "staging-at-stale",
+      script: "# mc-obligation-activation:/srv/rusa-staging:staging-at-stale\ncurl wake\n",
+      date: new Date(now + 300000),
+    });
+
+    const prodActiveBlock =
+      "# mc-obligation-activation:/srv/rusa-prod:prod-active\n" +
+      "CRON_TZ=UTC\n" +
+      '45 8 * * * /usr/bin/curl -fsS -H "Authorization: Bearer $(cat /prod/token)" "http://127.0.0.1:$(cat /prod/port)/wake-obligation" -d \'id=prod-active\'\n' +
+      'CRON_TZ=""\n' +
+      "# mc-obligation-activation-end:/srv/rusa-prod:prod-active";
+
+    const stagingActiveBlock =
+      "# mc-obligation-activation:/srv/rusa-staging:staging-active\n" +
+      "CRON_TZ=UTC\n" +
+      '0 12 * * * /usr/bin/curl -fsS -H "Authorization: Bearer $(cat /staging/token)" "http://127.0.0.1:$(cat /staging/port)/wake-obligation" -d \'id=staging-active\'\n' +
+      'CRON_TZ=""\n' +
+      "# mc-obligation-activation-end:/srv/rusa-staging:staging-active";
+
+    const prodStaleTag = "# mc-obligation-activation:/srv/rusa-prod:prod-stale";
+    const stagingStaleTag = "# mc-obligation-activation:/srv/rusa-staging:staging-stale";
+
+    return {
+      prodRepo,
+      stagingRepo,
+      prodDb,
+      stagingDb,
+      userLine1,
+      userLine2,
+      wakeLine,
+      legacyBlock,
+      prodActiveBlock,
+      stagingActiveBlock,
+      prodStaleTag,
+      stagingStaleTag,
+      getCrontab: () => sharedCrontab,
+      getAtJobs: () => [...sharedAtJobs],
+    };
+  };
+
+  it("exercises reconcile order 1: prod reconciles first, then staging reconciles", () => {
+    const f = createFixture();
+
+    // Verify initial state has everything
+    expect(f.getCrontab()).toContain(f.prodActiveBlock);
+    expect(f.getCrontab()).toContain(f.stagingActiveBlock);
+    expect(f.getCrontab()).toContain(f.prodStaleTag);
+    expect(f.getCrontab()).toContain(f.stagingStaleTag);
+    expect(f.getCrontab()).toContain(f.legacyBlock);
+    expect(f.getCrontab()).toContain(f.wakeLine);
+    expect(f.getCrontab()).toContain(f.userLine1);
+    expect(f.getCrontab()).toContain(f.userLine2);
+
+    // Step 1: Prod reconciles
+    f.prodRepo.reconcileScheduledObligations();
+
+    // Prod removes its own stale block
+    expect(f.getCrontab()).not.toContain(f.prodStaleTag);
+    // Prod's own active block is still intact
+    expect(f.getCrontab()).toContain(f.prodActiveBlock);
+
+    // Staging's active AND stale blocks are BYTE-FOR-BYTE IDENTICAL
+    expect(f.getCrontab()).toContain(f.stagingActiveBlock);
+    expect(f.getCrontab()).toContain(f.stagingStaleTag);
+
+    // Legacy block, wake lines, and user lines are BYTE-FOR-BYTE IDENTICAL
+    expect(f.getCrontab()).toContain(f.legacyBlock);
+    expect(f.getCrontab()).toContain(f.wakeLine);
+    expect(f.getCrontab()).toContain(f.userLine1);
+    expect(f.getCrontab()).toContain(f.userLine2);
+
+    // Check at jobs
+    expect(f.getAtJobs().some((j) => j.id === "prod-at-stale")).toBe(false);
+    expect(f.getAtJobs().some((j) => j.id === "staging-at-stale")).toBe(true);
+    expect(f.getAtJobs().some((j) => j.id === "legacy-at-1")).toBe(true);
+
+    // Step 2: Staging reconciles
+    f.stagingRepo.reconcileScheduledObligations();
+
+    // Staging removes its own stale block
+    expect(f.getCrontab()).not.toContain(f.stagingStaleTag);
+    // Staging's own active block is still intact
+    expect(f.getCrontab()).toContain(f.stagingActiveBlock);
+
+    // Prod's active block remains BYTE-FOR-BYTE IDENTICAL
+    expect(f.getCrontab()).toContain(f.prodActiveBlock);
+
+    // Legacy block, wake lines, and user lines are BYTE-FOR-BYTE IDENTICAL
+    expect(f.getCrontab()).toContain(f.legacyBlock);
+    expect(f.getCrontab()).toContain(f.wakeLine);
+    expect(f.getCrontab()).toContain(f.userLine1);
+    expect(f.getCrontab()).toContain(f.userLine2);
+
+    // Staging at job removed, legacy at job intact
+    expect(f.getAtJobs().some((j) => j.id === "staging-at-stale")).toBe(false);
+    expect(f.getAtJobs().some((j) => j.id === "legacy-at-1")).toBe(true);
+  });
+
+  it("exercises reconcile order 2: staging reconciles first, then prod reconciles", () => {
+    const f = createFixture();
+
+    // Step 1: Staging reconciles first
+    f.stagingRepo.reconcileScheduledObligations();
+
+    // Staging removes its own stale block
+    expect(f.getCrontab()).not.toContain(f.stagingStaleTag);
+    // Staging's own active block is still intact
+    expect(f.getCrontab()).toContain(f.stagingActiveBlock);
+
+    // Prod's active AND stale blocks are BYTE-FOR-BYTE IDENTICAL
+    expect(f.getCrontab()).toContain(f.prodActiveBlock);
+    expect(f.getCrontab()).toContain(f.prodStaleTag);
+
+    // Legacy block, wake lines, and user lines are BYTE-FOR-BYTE IDENTICAL
+    expect(f.getCrontab()).toContain(f.legacyBlock);
+    expect(f.getCrontab()).toContain(f.wakeLine);
+    expect(f.getCrontab()).toContain(f.userLine1);
+    expect(f.getCrontab()).toContain(f.userLine2);
+
+    // Staging at job removed, prod stale and legacy at jobs intact
+    expect(f.getAtJobs().some((j) => j.id === "staging-at-stale")).toBe(false);
+    expect(f.getAtJobs().some((j) => j.id === "prod-at-stale")).toBe(true);
+    expect(f.getAtJobs().some((j) => j.id === "legacy-at-1")).toBe(true);
+
+    // Step 2: Prod reconciles second
+    f.prodRepo.reconcileScheduledObligations();
+
+    // Prod removes its own stale block
+    expect(f.getCrontab()).not.toContain(f.prodStaleTag);
+    // Prod's active block is intact
+    expect(f.getCrontab()).toContain(f.prodActiveBlock);
+
+    // Staging's active block remains BYTE-FOR-BYTE IDENTICAL
+    expect(f.getCrontab()).toContain(f.stagingActiveBlock);
+
+    // Legacy block, wake lines, and user lines are BYTE-FOR-BYTE IDENTICAL
+    expect(f.getCrontab()).toContain(f.legacyBlock);
+    expect(f.getCrontab()).toContain(f.wakeLine);
+    expect(f.getCrontab()).toContain(f.userLine1);
+    expect(f.getCrontab()).toContain(f.userLine2);
+
+    // Prod at job removed, legacy at job intact
+    expect(f.getAtJobs().some((j) => j.id === "prod-at-stale")).toBe(false);
+    expect(f.getAtJobs().some((j) => j.id === "legacy-at-1")).toBe(true);
   });
 });
