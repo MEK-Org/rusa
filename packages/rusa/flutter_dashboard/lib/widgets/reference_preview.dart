@@ -14,6 +14,7 @@ class ReferencePreview extends StatefulWidget {
     this.attachedBy,
     this.lookupActorHandle,
     this.openLink = openInNewTab,
+    this.action,
   });
 
   final ReferenceDto reference;
@@ -30,6 +31,9 @@ class ReferencePreview extends StatefulWidget {
   /// Opens a reference's url. Injectable so tests can assert exactly what
   /// gets opened without touching a real browser/platform channel.
   final void Function(String url) openLink;
+
+  /// Optional action widget rendered at the trailing edge of the header row.
+  final Widget? action;
 
   @override
   State<ReferencePreview> createState() => _ReferencePreviewState();
@@ -158,6 +162,10 @@ class _ReferencePreviewState extends State<ReferencePreview> {
                     fontSize: 10.5,
                   ),
                 ),
+              ],
+              if (widget.action != null) ...[
+                const SizedBox(width: 8),
+                widget.action!,
               ],
             ],
           ),

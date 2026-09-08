@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../actor_display.dart';
+import '../link_opener.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -13,10 +14,19 @@ import 'obligation_dialogs.dart';
 import 'reference_preview.dart';
 
 class WorkTab extends StatefulWidget {
-  const WorkTab({super.key, required this.store, required this.onSelectView});
+  const WorkTab({
+    super.key,
+    required this.store,
+    required this.onSelectView,
+    this.openLink = openInNewTab,
+  });
 
   final DashboardStore store;
   final ValueChanged<DashboardView> onSelectView;
+
+  /// Opens an external link. Injectable so tests can assert exactly what
+  /// gets opened without touching a real browser.
+  final void Function(String url) openLink;
 
   @override
   State<WorkTab> createState() => _WorkTabState();
@@ -207,6 +217,7 @@ class _WorkTabState extends State<WorkTab> {
                       store: widget.store,
                       onSelectView: widget.onSelectView,
                       onMutated: _loadRoots,
+                      openLink: widget.openLink,
                     ),
                   ),
                 ],
@@ -227,6 +238,7 @@ class _WorkTabState extends State<WorkTab> {
                         store: widget.store,
                         onSelectView: widget.onSelectView,
                         onMutated: _loadRoots,
+                        openLink: widget.openLink,
                       )
                     : const Center(
                         child: Text(
@@ -463,12 +475,14 @@ class _DetailView extends StatefulWidget {
     required this.store,
     required this.onSelectView,
     this.onMutated,
+    this.openLink = openInNewTab,
   });
 
   final String obligationId;
   final DashboardStore store;
   final ValueChanged<DashboardView> onSelectView;
   final VoidCallback? onMutated;
+  final void Function(String url) openLink;
 
   @override
   State<_DetailView> createState() => _DetailViewState();
@@ -486,6 +500,7 @@ class _DetailViewState extends State<_DetailView> {
   DashboardStore get store => widget.store;
   ValueChanged<DashboardView> get onSelectView => widget.onSelectView;
   VoidCallback? get onMutated => widget.onMutated;
+  void Function(String url) get openLink => widget.openLink;
 
   @override
   void initState() {
@@ -606,6 +621,7 @@ class _DetailViewState extends State<_DetailView> {
                   label: artifact.label,
                   attachedBy: artifact.attachedBy,
                   lookupActorHandle: (id) => store.actor(id)?.handle,
+                  openLink: openLink,
                 ),
               const SizedBox(height: 16),
             ],
@@ -619,7 +635,7 @@ class _DetailViewState extends State<_DetailView> {
             // appears once a ref exists gives no way to add the first one.
             const SizedBox(height: 24),
             _SectionHeader('EXTERNAL LINK'),
-            _externalRefPanel(context, o),
+            _externalRefPanel(context, data),
             const SizedBox(height: 24),
             if (o.isScheduled) ...[
               _SectionHeader('SCHEDULE'),
@@ -927,7 +943,11 @@ class _DetailViewState extends State<_DetailView> {
     );
   }
 
-  Widget _externalRefPanel(BuildContext context, ObligationDto o) {
+  Widget _externalRefPanel(
+    BuildContext context,
+    ObligationDetailSnapshot data,
+  ) {
+    final o = data.obligation;
     final ref = o.externalRef?.trim() ?? '';
     final edit = o.isTerminal
         ? null
@@ -972,30 +992,18 @@ class _DetailViewState extends State<_DetailView> {
         ),
       );
     }
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: MeshColors.bgSecondary,
-        border: Border.all(color: MeshColors.border),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Row(
-        children: [
-          const Icon(Icons.link, color: MeshColors.accent, size: 20),
-          const SizedBox(width: 12),
-          Expanded(
-            child: SelectableText(
-              ref,
-              style: const TextStyle(
-                color: MeshColors.accent,
-                fontFamily: kMonoFontFamily,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-          ),
-          ?edit,
-        ],
-      ),
+    final reference = data.externalReference ??
+        ReferenceDto(
+          ref: ref,
+          scheme: ref.split(':').first,
+          title: ref,
+          unavailable: 'Not resolvable yet.',
+        );
+    return ReferencePreview(
+      reference: reference,
+      action: edit,
+      lookupActorHandle: (id) => store.actor(id)?.handle,
+      openLink: openLink,
     );
   }
 

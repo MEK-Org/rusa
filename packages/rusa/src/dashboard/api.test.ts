@@ -2166,6 +2166,85 @@ describe("handleMeshApiRequest", () => {
         expect(failure?.reference?.unavailable).toBe("could not load context");
       });
 
+      it("returns obligation with externalReference resolved and isolates cache faults", async () => {
+        obligations.create({
+          title: "with-ext-ref",
+          id: "with-ext-ref",
+          ownerId: "actor-1",
+          externalRef: "github:MEK-Org/rusa/issues/345",
+        });
+        obligations.create({
+          title: "with-ext-ref-fault",
+          id: "with-ext-ref-fault",
+          ownerId: "actor-1",
+          externalRef: "github:MEK-Org/rusa/issues/999",
+        });
+        obligations.create({
+          title: "without-ext-ref",
+          id: "without-ext-ref",
+          ownerId: "actor-1",
+        });
+
+        const depsWithCache = {
+          ...deps,
+          referenceCache: {
+            get: async (ref: string) => {
+              if (ref.includes("issues/345")) {
+                return {
+                  ref,
+                  scheme: "github",
+                  title: "Issue 345 Title",
+                  body: "Issue 345 description",
+                  cacheState: "fresh",
+                  entity: {
+                    type: "github_issue",
+                    title: "Issue 345 Title",
+                    description: "Issue 345 description",
+                  },
+                  url: "https://github.com/MEK-Org/rusa/issues/345",
+                  unavailable: null,
+                };
+              }
+              throw new Error("cache fault on issue 999");
+            },
+          } as unknown as ReferenceCacheService,
+        };
+
+        const resSuccess = await call(depsWithCache, "GET", "/api/mesh/obligations/with-ext-ref");
+        expect(resSuccess.res.statusCode).toBe(200);
+        const dataSuccess = JSON.parse(resSuccess.res.body);
+        expect(dataSuccess.externalReference).toEqual({
+          ref: "github:MEK-Org/rusa/issues/345",
+          scheme: "github",
+          title: "Issue 345 Title",
+          body: "Issue 345 description",
+          cacheState: "fresh",
+          entity: {
+            type: "github_issue",
+            title: "Issue 345 Title",
+            description: "Issue 345 description",
+          },
+          url: "https://github.com/MEK-Org/rusa/issues/345",
+          unavailable: null,
+        });
+
+        const resFault = await call(
+          depsWithCache,
+          "GET",
+          "/api/mesh/obligations/with-ext-ref-fault"
+        );
+        expect(resFault.res.statusCode).toBe(200);
+        const dataFault = JSON.parse(resFault.res.body);
+        expect(dataFault.externalReference?.cacheState).toBe("unavailable");
+        expect(dataFault.externalReference?.unavailable).toBe("could not load context");
+        expect(dataFault.externalReference?.url).toBe("https://github.com/MEK-Org/rusa/issues/999");
+
+        const resNone = await call(depsWithCache, "GET", "/api/mesh/obligations/without-ext-ref");
+        expect(resNone.res.statusCode).toBe(200);
+        const dataNone = JSON.parse(resNone.res.body);
+        expect(dataNone.externalReference).toBeNull();
+      });
+
       it("returns obligation with a PR comment and a PR review embedded, not just a plain issue", async () => {
         obligations.create({
           title: "with-comment-and-review",
