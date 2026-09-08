@@ -558,11 +558,13 @@ function candidateCharts({ scenarios, results }) {
         onTop: set.onTop,
         points: seriesFor(set.samples, box, maxY, key),
       }));
+    panels.push(`<text x="24" y="${top - 38}" class="rowlabel">${facet.label}</text>`);
+    if (worstDeparture < 0.05 * peakWait) {
+      panels.push(
+        `<text x="${24 + facet.label.length * 6.6 + 14}" y="${top - 38}" class="note">every candidate here stays within ${Math.round(worstDeparture)} s of current (${((worstDeparture / peakWait) * 100).toFixed(1)}% of the ${Math.round(peakWait).toLocaleString()} s peak) \u2014 the lines coincide</text>`
+      );
+    }
     panels.push(
-      `<text x="24" y="${top - 38}" class="rowlabel">${facet.label}</text>`,
-      worstDeparture < 0.05 * peakWait
-        ? `<text x="${24 + facet.label.length * 6.6 + 14}" y="${top - 38}" class="note">every candidate here stays within ${Math.round(worstDeparture)} s of current (${((worstDeparture / peakWait) * 100).toFixed(1)}% of the ${Math.round(peakWait).toLocaleString()} s peak) \u2014 the lines coincide</text>`
-        : "",
       linePanel({
         title: "Quota remaining",
         subtitle: "percent of the weekly budget",
@@ -600,7 +602,7 @@ function candidateCharts({ scenarios, results }) {
       "One parameter axis per row, each against identical seeded demand. The near-black line is the current controller in",
     subtitle2:
       "every panel; coloured lines are counterfactual weights. Panel axes are scaled per row, so compare within a panel.",
-    body: panels.join("\n  "),
+    body: panels.filter(Boolean).join("\n  "),
     footer:
       "Demand runs at 4x budget for 36 hours and then collapses to 0.4x \u2014 the #291 recovery-lag complaint expressed as closed-loop demand rather than as a fixed error sequence.",
   });
