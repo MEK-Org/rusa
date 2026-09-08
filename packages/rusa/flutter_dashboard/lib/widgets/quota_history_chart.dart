@@ -117,8 +117,7 @@ class QuotaHistoryChart extends StatelessWidget {
         _ChartSection(
           title: 'Throttle Period',
           subtitle:
-              'How long the mesh waits between runs. The scale is logarithmic, '
-              'so each labelled gridline is ten times the one below it.',
+              'How long the mesh waits between runs. The scale is logarithmic.',
           semanticsLabel:
               'Throttle period over the prior 3 days. '
               'Logarithmic vertical scale in seconds.'

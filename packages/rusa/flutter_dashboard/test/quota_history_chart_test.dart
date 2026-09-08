@@ -135,6 +135,18 @@ void main() {
     expect(find.text('Quota Headroom'), findsOneWidget);
     expect(find.text('Throttle Period'), findsOneWidget);
     expect(
+      find.text(
+        'How long the mesh waits between runs. The scale is logarithmic.',
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining(
+        'each labelled gridline is ten times the one below it',
+      ),
+      findsNothing,
+    );
+    expect(
       find.text('Pace-Controller Error — Delta from Target %'),
       findsNothing,
     );
