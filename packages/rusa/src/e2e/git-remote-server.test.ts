@@ -1,11 +1,13 @@
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildActorBwrapArgs } from "../providers/sandbox.js";
 import { type E2EGitRemoteServer, startE2EGitRemoteServer } from "./git-remote-server.js";
+import { LocalTracker } from "./local-tracker.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -63,7 +65,7 @@ describe("startE2EGitRemoteServer", () => {
     rmSync(remoteRoot, { recursive: true, force: true });
   });
 
-  it("serves clone + push over loopback HTTP, and the pushed ref is visible directly in the bare repo afterward", async () => {
+  it("serves clone + push over loopback HTTP, and LocalTracker observes the pushed branch afterward", async () => {
     server = await startE2EGitRemoteServer({ repoDir: remoteDir, port: 0 });
     const remote = server;
     expect(remote.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/repo\.git$/);
@@ -94,6 +96,21 @@ describe("startE2EGitRemoteServer", () => {
         encoding: "utf8",
       }).trim();
       expect(revParse).toMatch(/^[0-9a-f]{40}$/);
+
+      const tracker = new LocalTracker({
+        repo: "rusa-e2e/scratch",
+        baseUrl: "http://localhost:8084",
+        botAccount: "rusa-e2e-bot",
+        remotePath: remoteDir,
+      });
+      tracker.upsertPrByHead({
+        headRef: "feature",
+        title: "HTTP push",
+        body: "",
+        base: "main",
+        author: "rusa-e2e-bot",
+      });
+      expect(tracker.getPrDiff(1)).toContain("+hello");
     } finally {
       rmSync(clonePath, { recursive: true, force: true });
     }
@@ -104,10 +121,29 @@ describe("startE2EGitRemoteServer", () => {
     expect(new URL(server.url).hostname).toBe("127.0.0.1");
   });
 
-  it("returns 404 for any path outside the served repo, even with GIT_HTTP_EXPORT_ALL set", async () => {
+  it("returns 404 for a route outside the served repo, even with GIT_HTTP_EXPORT_ALL set", async () => {
     server = await startE2EGitRemoteServer({ repoDir: remoteDir, port: 0 });
-    const res = await fetch(`http://127.0.0.1:${server.port}/../../etc/passwd/info/refs`);
+    const res = await fetch(`http://127.0.0.1:${server.port}/another-repo.git/info/refs`);
     expect(res.status).toBe(404);
+  });
+
+  it("rejects a chunked POST instead of buffering an unbounded request body", async () => {
+    server = await startE2EGitRemoteServer({ repoDir: remoteDir, port: 0 });
+    const response = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+      const req = request(`${server?.url}/git-receive-pack`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-git-receive-pack-request",
+          "transfer-encoding": "chunked",
+        },
+      });
+      req.once("response", resolve);
+      req.once("error", reject);
+      req.write("body without a content length");
+      req.end();
+    });
+    response.resume();
+    expect(response.statusCode).toBe(411);
   });
 
   it("close() fully releases the port so a fresh server can rebind to it", async () => {
@@ -115,6 +151,28 @@ describe("startE2EGitRemoteServer", () => {
     const { port } = server;
     await server.close();
     server = undefined;
+
+    server = await startE2EGitRemoteServer({ repoDir: remoteDir, port });
+    expect(server.port).toBe(port);
+  });
+
+  it("closes an in-flight receive-pack request so teardown can rebind the port", async () => {
+    server = await startE2EGitRemoteServer({ repoDir: remoteDir, port: 0 });
+    const { port } = server;
+    const client = request(`${server.url}/git-receive-pack`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-git-receive-pack-request",
+        "content-length": "1024",
+      },
+    });
+    client.on("error", () => {});
+    client.write("incomplete request");
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+    await server.close();
+    server = undefined;
+    client.destroy();
 
     server = await startE2EGitRemoteServer({ repoDir: remoteDir, port });
     expect(server.port).toBe(port);
