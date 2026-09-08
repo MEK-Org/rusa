@@ -1477,6 +1477,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const calendarClients = new GoogleCalendarClientProvider(config.chat?.gchatConfigDir);
   const driveClients = new GoogleDriveClient(config.chat?.gchatConfigDir);
   const commitmentPolarityEvaluator = createCommitmentPolarityEvaluator(config.geminiApiKey);
+  // The one live attribution source: populated only for an actual provider
+  // attempt (including fallbacks), and cleared by every terminal run hook.
   const activeRunSelections = new Map<string, RawProviderModelConfig>();
   const grantableServers = buildGrantableServers({
     // The nightly-report producer  writes the run-journal / rendered reports /
@@ -1545,7 +1547,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }),
     chatClient: chatClient ?? undefined,
     onChatWrite: (actorId) => mesh.markUnkillable(actorId),
-    actorHandleForId: (id) => (id === rootId ? rootHandle : generateHandle(id)),
     getRunSelectionForActor: (id) => activeRunSelections.get(id),
     // Confines chat-write attachment filePaths to the grantee's workdir — same
     // mapping the pnpm-install and root wiring use for actor roots.
@@ -1955,7 +1956,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
       try {
         const isFenced = () => mesh.isYielded(id);
-        let activeRunSelection: RawProviderModelConfig | undefined;
         // A per-actor agent-execution endpoint, with this actor's identity baked in.
         const meshUrl = mcpHttp.addServer(id, () =>
           createAgentExecMcpServer(mesh, id, rootId, undefined, {
@@ -2021,7 +2021,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             },
             onWrite: () => webhookSilenceDetector?.recordOutboundWrite(),
             instanceId: rootHandle,
-            getRunSelection: () => activeRunSelection,
+            getRunSelection: () => activeRunSelections.get(id),
             isFenced,
             // Mechanically hand the created issue/PR's exact event source to its
             // creator : follow-up events route here, not the repo/org
@@ -2215,8 +2215,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           onRuntimeStateChanged: ctx.onRuntimeStateChanged,
           onRunStart: (responsive, injectRecord, selected) => {
             lastSelected = selected;
-            activeRunSelection = selected;
-            activeRunSelections.set(id, selected);
             // The run actually launched: the queued reservation this
             // describes no longer exists to cancel or report on.
             mesh.clearSelection(id);
@@ -2245,12 +2243,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             });
           },
           onProviderAttempt: (attempt) => {
-            activeRunSelection = {
+            activeRunSelections.set(id, {
               provider: attempt.providerName,
               model: attempt.model,
               effort: attempt.effort,
-            };
-            activeRunSelections.set(id, activeRunSelection);
+            });
           },
           onFirstChunk: () =>
             mesh.recordEvent({
@@ -2265,10 +2262,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             });
           },
           onRunAbandoned: ({ reason, started }) => {
-            if (started) {
-              activeRunSelection = undefined;
-              activeRunSelections.delete(id);
-            }
+            activeRunSelections.delete(id);
             if (started) abandonActorRun(id, reason);
             runLogger(id).warn("run_abandoned", { reason, started });
             mesh.recordEvent({
@@ -2279,7 +2273,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             });
           },
           onRunEnd: async (result) => {
-            activeRunSelection = undefined;
             activeRunSelections.delete(id);
             const runId = completeActorRun(id, result);
             logRunEnd(runLogger(id, runId), result);
@@ -2548,14 +2541,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       instanceId: rootHandle,
     })
   );
-  let rootRunSelection: RawProviderModelConfig | undefined;
   const rootTrackerUrl = mcpHttp.addServer(`${rootId}:${TRACKER_MCP_NAME}`, () =>
     createTrackerMcpServer(rootId, issueClient, {
       gitBridge: config.gitBridge ? { port: gitBridgePort } : undefined,
       onWrite: () => webhookSilenceDetector?.recordOutboundWrite(),
       instanceId: rootHandle,
       actorHandle: rootHandle,
-      getRunSelection: () => rootRunSelection,
+      getRunSelection: () => activeRunSelections.get(rootId),
       // Uniform rule : the root gets mechanical subscriptions for what
       // it creates too, and can delegate them onward.
       onResourceCreated: (resource) => {
@@ -2585,7 +2577,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           createChatWriteMcpServer(rootId, cc, {
             allowedSpaces,
             actorHandle: rootHandle,
-            getRunSelection: () => rootRunSelection,
+            getRunSelection: () => activeRunSelections.get(rootId),
             onWrite: (actorId) => {
               mesh.markUnkillable(actorId);
             },
@@ -2820,8 +2812,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
       onRunStart: (responsive, injectRecord, selected) => {
         rootLastSelected = selected;
-        rootRunSelection = selected;
-        activeRunSelections.set(rootId, selected);
         // The run actually launched: the queued reservation this describes
         // no longer exists to cancel or report on.
         mesh.clearSelection(rootId);
@@ -2850,12 +2840,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         });
       },
       onProviderAttempt: (attempt) => {
-        rootRunSelection = {
+        activeRunSelections.set(rootId, {
           provider: attempt.providerName,
           model: attempt.model,
           effort: attempt.effort,
-        };
-        activeRunSelections.set(rootId, rootRunSelection);
+        });
       },
       onFirstChunk: () =>
         mesh.recordEvent({
@@ -2870,10 +2859,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         });
       },
       onRunAbandoned: ({ reason, started }) => {
-        if (started) {
-          rootRunSelection = undefined;
-          activeRunSelections.delete(rootId);
-        }
+        activeRunSelections.delete(rootId);
         if (started) abandonActorRun(rootId, reason);
         runLogger(rootId).warn("run_abandoned", { reason, started });
         mesh.recordEvent({
@@ -2884,7 +2870,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         });
       },
       onRunEnd: async (result) => {
-        rootRunSelection = undefined;
         activeRunSelections.delete(rootId);
         mesh.finishInboxRun(rootId);
         const runId = completeActorRun(rootId, result);

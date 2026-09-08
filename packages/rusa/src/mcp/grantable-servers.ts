@@ -62,10 +62,8 @@ export interface GrantableServerDeps {
   onCalendarWrite?: (actorId: string, observation: CalendarWriteObservation) => void;
   chatClient?: ChatClient;
   onChatWrite?: (actorId: string) => void;
-  /** Authoritative display handle for each actor. */
-  actorHandleForId?: (actorId: string) => string;
   /** Provider selection currently executing for each actor. */
-  getRunSelectionForActor?: (actorId: string) => RawProviderModelConfig | undefined;
+  getRunSelectionForActor: (actorId: string) => RawProviderModelConfig | undefined;
   /** Workdir for a grantee actor; confines chat-write attachment `filePath`s. */
   actorRootFor?: (actorId: string) => string;
   driveClients: DriveClient;
@@ -173,10 +171,7 @@ export function buildGrantableServers(
       const workDir = deps.actorRootFor?.(selfId);
       return createChatWriteMcpServer(selfId, deps.chatClient, {
         allowedSpaces,
-        ...(deps.actorHandleForId ? { actorHandle: deps.actorHandleForId(selfId) } : {}),
-        ...(deps.getRunSelectionForActor
-          ? { getRunSelection: () => deps.getRunSelectionForActor?.(selfId) }
-          : {}),
+        getRunSelection: () => deps.getRunSelectionForActor(selfId),
         onWrite: deps.onChatWrite,
         isFenced: options?.isFenced,
         ...(workDir ? { workDir } : {}),

@@ -280,7 +280,7 @@ describe("chat MCP server", () => {
     expect(fake.sent).toEqual([
       {
         spaceName: "spaces/A",
-        text: "hi\n\n*actor-handle (test-model, high)*",
+        text: "hi\n\n_actor-handle (test-model, high)_",
         threadName: undefined,
       },
     ]);
@@ -304,7 +304,7 @@ describe("chat MCP server", () => {
     expect(fake.sent).toEqual([
       {
         spaceName: "spaces/A",
-        text: "hi\n\n*actor-handle (test-model, high)*",
+        text: "hi\n\n_actor-handle (test-model, high)_",
         threadName: "spaces/A/threads/T",
       },
     ]);
@@ -320,7 +320,7 @@ describe("chat MCP server", () => {
         getRunSelection: () => ({ provider: "test", model: "test-model", effort: "high" }),
       })
     );
-    const signedText = "hi\n\n*actor-handle (test-model, high)*";
+    const signedText = "hi\n\n_actor-handle (test-model, high)_";
     const res = (await client.callTool({
       name: "send_message",
       arguments: { spaceName: "spaces/A", text: signedText },
@@ -330,7 +330,7 @@ describe("chat MCP server", () => {
     expect(fake.sent[0]?.text).toBe(signedText);
   });
 
-  it("uploads an attachment and sends a message referencing it", async () => {
+  it("uploads an attachment and sends a signed attachment-only message", async () => {
     const fake = new FakeChatClient();
     const client = await connect(
       createChatWriteMcpServer("test", fake, {
@@ -357,14 +357,14 @@ describe("chat MCP server", () => {
       name: "send_message",
       arguments: {
         spaceName: "spaces/A",
-        text: "here is the file",
+        text: "",
         attachments: [{ attachmentDataRef: uploadData.attachmentDataRef }],
       },
     })) as CallToolResult;
     expect(sendRes.isError).toBeFalsy();
     expect(fake.sent[0]).toEqual({
       spaceName: "spaces/A",
-      text: "here is the file\n\n*actor-handle*",
+      text: "_actor-handle_",
       attachments: [{ attachmentDataRef: uploadData.attachmentDataRef }],
       threadName: undefined,
     });
@@ -434,7 +434,7 @@ describe("chat MCP server", () => {
     })) as CallToolResult;
     expect(sendRes.isError).toBeFalsy();
     expect(fake.sent.length).toBe(1);
-    expect(fake.sent[0]?.text).toBe("inline base64 upload\n\n*test*");
+    expect(fake.sent[0]?.text).toBe("inline base64 upload\n\n_test_");
     expect(fake.sent[0]?.attachments?.length).toBe(1);
     expect(fake.uploadedAttachments.length).toBe(1);
     expect(fake.uploadedAttachments[0]?.filename).toBe("inline-doc.txt");
@@ -592,7 +592,7 @@ describe("chat MCP server", () => {
 
       expect(sendRes.isError).toBeFalsy();
       expect(fake.sent.length).toBe(1);
-      expect(fake.sent[0]?.text).toBe("here is an image from disk\n\n*test*");
+      expect(fake.sent[0]?.text).toBe("here is an image from disk\n\n_test_");
       expect(fake.sent[0]?.attachments?.length).toBe(1);
       expect(fake.uploadedAttachments.length).toBe(1);
       expect(fake.uploadedAttachments[0]?.filename).toBe("image.png");

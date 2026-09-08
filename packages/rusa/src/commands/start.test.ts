@@ -10,6 +10,8 @@ import {
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
@@ -17,6 +19,7 @@ import { Actor, type RunAbandon } from "../actor/actor.js";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import { InMemoryEventSourceOwnerStore } from "../actor/event-subscriptions.js";
 import { HaltSwitch } from "../actor/halt-switch.js";
+import { generateHandle } from "../actor/handle-generator.js";
 import { abandonedRunHadStarted } from "../actor/mesh-events.js";
 import { GeminiPortableContextCompactor } from "../actor/portable-context-compactor.js";
 import { FakeChatClient, FakeChatSource } from "../chat/fake.js";
@@ -4443,5 +4446,99 @@ describe("runStart webhook event routing (Phase 4)", () => {
     const afterRevokeSpecs = actor.opts.mcpServers.filter((s) => s.name === "chat-read");
     expect(afterRevokeSpecs).toHaveLength(1);
     expect(afterRevokeSpecs[0].url).toBe(initialChatReadUrl);
+  });
+
+  it("wires the current provider attempt into root and granted-worker Chat signatures", async () => {
+    const chatClient = new FakeChatClient();
+    writeFileSync(
+      join(homeDir, "config.yaml"),
+      toYaml({
+        github: { account: "mock-bot" },
+        providers: { antigravity: { cliCommand: "agy" } },
+        rootActor: { provider: "antigravity", effort: "high" },
+        chat: {
+          projectId: "test",
+          subscription: "test",
+          pubsubKeyPath: "/dev/null",
+          gchat: "all",
+        },
+        geminiApiKey: "fake-gemini-key",
+      }),
+      "utf8"
+    );
+
+    let mesh: ActorMesh | undefined;
+    let root: Actor | undefined;
+    await new Promise<void>((resolve) => {
+      runStart({
+        e2e: {
+          chatClient,
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            root = handles.root as Actor;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh || !root) throw new Error("mesh or root not ready");
+
+    type ChatActorOptions = {
+      mcpServers: Array<{ name: string; url: string }>;
+      onProviderAttempt?: (attempt: {
+        providerName: string;
+        model?: string;
+        effort?: string;
+      }) => void;
+    };
+    const callChat = async (url: string, text: string) => {
+      const client = new Client({ name: "test", version: "0.0.0" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+      try {
+        return await client.callTool({
+          name: "send_message",
+          arguments: { spaceName: "spaces/A", text },
+        });
+      } finally {
+        await client.close();
+      }
+    };
+
+    const rootOptions = (root as unknown as { opts: ChatActorOptions }).opts;
+    rootOptions.onProviderAttempt?.({
+      providerName: "antigravity",
+      model: "Gemini 3.7 Flash",
+      effort: "high",
+    });
+    const rootChatUrl = rootOptions.mcpServers.find((server) => server.name === "chat-write")?.url;
+    if (!rootChatUrl) throw new Error("root chat-write server missing");
+    expect((await callChat(rootChatUrl, "from root")).isError).toBeFalsy();
+    expect(chatClient.sent[0]?.text).toBe(
+      `from root\n\n_${generateHandle("root")} (Gemini 3.7 Flash, high)_`
+    );
+
+    const workerId = mesh.spawn({
+      charter: "chat writer",
+      parentId: "root",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash (High)" },
+    });
+    mesh.grantCapability(workerId, "chat-write:spaces/A", "root");
+    const worker = mesh.get(workerId);
+    if (!worker) throw new Error("worker not ready");
+    const workerOptions = (worker as unknown as { opts: ChatActorOptions }).opts;
+    workerOptions.onProviderAttempt?.({
+      providerName: "antigravity",
+      model: "Gemini 3.7 Pro",
+      effort: "low",
+    });
+    const workerChatUrl = workerOptions.mcpServers.find(
+      (server) => server.name === "chat-write"
+    )?.url;
+    if (!workerChatUrl) throw new Error("worker chat-write server missing");
+    expect((await callChat(workerChatUrl, "from worker")).isError).toBeFalsy();
+    expect(chatClient.sent[1]?.text).toBe(
+      `from worker\n\n_${generateHandle(workerId)} (Gemini 3.7 Pro, low)_`
+    );
   });
 });

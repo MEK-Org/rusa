@@ -12,7 +12,7 @@ import {
   MESSAGE_ATTACHMENT_NAME_RE,
 } from "../chat/types.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
-import { appendVisibleActorSignature, formatVisibleActorSignature } from "./actor-signature.js";
+import { formatVisibleActorSignature } from "./actor-signature.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 
@@ -278,6 +278,13 @@ export interface ChatWriteMcpOptions {
   workDir?: string;
 }
 
+/** Add the terminal Chat footer unless the caller already supplied this exact one. */
+function appendVisibleActorSignature(body: string, signature: string): string {
+  const escapedSignature = signature.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const trailingSignature = new RegExp(`(?:^|\\r?\\n)${escapedSignature}[\\t ]*(?:\\r?\\n)?$`);
+  return trailingSignature.test(body) ? body : body ? `${body}\n\n${signature}` : signature;
+}
+
 function isContained(parent: string, child: string): boolean {
   const rel = relative(parent, child);
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
@@ -330,7 +337,7 @@ export function createChatWriteMcpServer(
   const signedText = (text: string) =>
     appendVisibleActorSignature(
       text,
-      formatVisibleActorSignature(actorHandle, options.getRunSelection?.())
+      formatVisibleActorSignature(actorHandle, options.getRunSelection?.(), "google-chat")
     );
   const workDir = options.workDir ?? process.cwd();
 

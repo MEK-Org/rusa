@@ -508,7 +508,7 @@ describe("McpHttpServer", () => {
     })) as CallToolResult;
     expect(res.isError).toBeFalsy();
     expect(chat.sent).toEqual([
-      { spaceName: "spaces/A", text: "hi over http\n\n*test*", threadName: undefined },
+      { spaceName: "spaces/A", text: "hi over http\n\n_test_", threadName: undefined },
     ]);
     expect(JSON.parse(textOf(res)).name).toContain("spaces/A/messages/");
     await client.close();
