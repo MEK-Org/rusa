@@ -459,20 +459,24 @@ describe("ProviderPacer", () => {
 
       const a = laneFor("a");
       const b = laneFor("b");
-      const selections: string[] = [];
+      const selections: Array<{ candidate: string; responsive: boolean }> = [];
       const handle = submitPoolGate(async (config: string) => config, [a, b], {
         enqueueNormal: (fn) => mesh.enqueue(fn),
-        onSelected: (sel) => selections.push(sel.candidate),
+        onSelected: (sel) =>
+          selections.push({ candidate: sel.candidate, responsive: sel.responsive }),
       });
-      expect(selections).toEqual(["a"]);
+      expect(selections).toEqual([{ candidate: "a", responsive: false }]);
 
       handle.promote();
       await vi.advanceTimersByTimeAsync(0);
       expect(mesh.inFlight).toBe(1); // promoted out of the mesh queue, not started as a duplicate
       release();
       await expect(handle.result).resolves.toBe("a");
-      // No reselection needed: "a" was already the earliest healthy candidate.
-      expect(selections).toEqual(["a"]);
+      // No lane reselection is needed, but telemetry reflects the promotion.
+      expect(selections).toEqual([
+        { candidate: "a", responsive: false },
+        { candidate: "a", responsive: true },
+      ]);
     });
 
     it("promote() keeps the same next-available lane as normal admission, with exactly one invocation", async () => {
@@ -487,7 +491,7 @@ describe("ProviderPacer", () => {
       a.pacer.deferUntil(Date.now() + 20_000);
 
       const started: string[] = [];
-      const selections: string[] = [];
+      const selections: Array<{ candidate: string; responsive: boolean }> = [];
       const handle = submitPoolGate(
         async (config: string) => {
           started.push(config);
@@ -496,15 +500,19 @@ describe("ProviderPacer", () => {
         [a, b],
         {
           enqueueNormal: (fn) => mesh.enqueue(fn),
-          onSelected: (sel) => selections.push(sel.candidate),
+          onSelected: (sel) =>
+            selections.push({ candidate: sel.candidate, responsive: sel.responsive }),
         }
       );
-      expect(selections).toEqual(["b"]);
+      expect(selections).toEqual([{ candidate: "b", responsive: false }]);
 
       // Responsive input arrives while queued on "b": it bypasses pacing and
       // mesh concurrency, but preserves normal admission's selection of "b".
       handle.promote();
-      expect(selections).toEqual(["b"]);
+      expect(selections).toEqual([
+        { candidate: "b", responsive: false },
+        { candidate: "b", responsive: true },
+      ]);
 
       await vi.advanceTimersByTimeAsync(0);
       release();

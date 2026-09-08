@@ -510,7 +510,7 @@ export interface ActorMeshOptions {
       enqueueNormal: <R>(run: () => Promise<R>) => RunStartHandle<R>;
       /**
        * Report the reserved candidate — at initial reservation and again on
-       * any later reselection (e.g. a responsive promote) — so the mesh can
+       * a later reselection or in-place responsive promotion — so the mesh can
        * track it for HALT safety and selection telemetry. A `providerGate`
        * implementation that never calls this leaves the mesh without a
        * recorded selection, which falls back to whole-pool HALT checks.

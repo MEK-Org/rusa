@@ -406,6 +406,7 @@ describe("Actor", () => {
     });
     let promotions = 0;
     const priorities: boolean[] = [];
+    const startPriorities: boolean[] = [];
     const gate: NonNullable<ActorOptions["gate"]> = <T>(
       fn: (selected: RawProviderModelConfig) => Promise<T>,
       candidates: readonly RawProviderModelConfig[],
@@ -433,6 +434,7 @@ describe("Actor", () => {
     actor = makeActor(
       {
         gate,
+        onRunStart: (responsive) => startPriorities.push(responsive),
       },
       provider
     );
@@ -446,6 +448,7 @@ describe("Actor", () => {
 
     expect(promotions).toBe(1);
     expect(priorities).toEqual([false]);
+    expect(startPriorities).toEqual([true]);
     expect(provider.calls).toHaveLength(1);
   });
 

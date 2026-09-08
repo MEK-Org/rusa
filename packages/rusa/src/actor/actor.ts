@@ -725,7 +725,7 @@ export class Actor {
   /** The genuine-execution body of a run (everything after the beforeRun gate). */
   private async executeTurn(nudge: RunNudge): Promise<void> {
     const isCorrectiveRun = nudge.mode === "yield-elicitation";
-    const responsive = isResponsiveNudge(nudge);
+    let responsive = isResponsiveNudge(nudge);
     const sessionId = this.opts.loadSessionId();
     // The provider treats the actor's cwd as its private directory and shadows
     // everything beside it (see buildActorBwrapArgs). This object is just the
@@ -889,10 +889,27 @@ export class Actor {
         // losing the run.
         for (;;) {
           const gated = this.opts.gate(invoke, this.opts.modelConfig, responsive);
-          const start: RunStartHandle<RunResult> =
+          const gatedStart: RunStartHandle<RunResult> =
             gated instanceof Promise
               ? { result: gated, started: false, promote: () => {}, cancel: () => false }
               : gated;
+          // A responsive nudge can arrive after ordinary admission has reserved
+          // a lane but before it invokes the provider. Keep run-start telemetry
+          // aligned with that promoted priority while delegating the actual
+          // queue bypass to the gate's existing handle.
+          const start: RunStartHandle<RunResult> = {
+            result: gatedStart.result,
+            get started() {
+              return gatedStart.started;
+            },
+            promote: () => {
+              if (!gatedStart.started) responsive = true;
+              gatedStart.promote();
+            },
+            cancel: gatedStart.cancel
+              ? () => gatedStart.cancel?.call(gatedStart) ?? false
+              : undefined,
+          };
           this.pendingStart = start;
           try {
             result = await start.result;

@@ -319,7 +319,7 @@ export interface PoolLaneCandidate<C> {
 }
 
 /** The provider-wide weekly reading used only to break an immediate-lane tie. */
-export interface WeeklyQuotaObservation {
+interface WeeklyQuotaObservation {
   /** Percentage of the weekly quota still available, from 0 through 100. */
   percentLeft: number;
   /** When this reading was scraped, as an ISO-8601 instant. */
@@ -407,10 +407,9 @@ export interface SubmitPoolGateOptions<C>
   /** Excludes a declared candidate from selection (e.g. an emergency-halted provider). */
   isHalted?: (config: C) => boolean;
   /**
-   * Fires synchronously every time a candidate is reserved — the initial
-   * reservation and any later `promote()`-driven reselection — so callers can
-   * track which declared tuple a queued run actually holds, for cancellation
-   * and telemetry.
+   * Fires synchronously when the queued selection is first reserved, reselected,
+   * or promoted in place, so callers can track its declared tuple and current
+   * priority for cancellation and telemetry.
    */
   onSelected?: (selection: PoolGateSelection<C>) => void;
   /** Same contract as {@link ProviderPacerSubmitOptions.revalidateProvider}, scoped to the currently reserved candidate. */
@@ -461,6 +460,20 @@ export function submitPoolGate<C, T>(
     return alive.length > 0 ? alive : candidates;
   };
 
+  const reportSelection = (
+    candidate: PoolLaneCandidate<C>,
+    responsive: boolean,
+    eligibleAt: number
+  ): void => {
+    opts.onSelected?.({
+      candidate: candidate.config,
+      lane: candidate.lane,
+      declaredIndex: candidates.indexOf(candidate),
+      eligibleAt,
+      responsive,
+    });
+  };
+
   const reserve = (candidate: PoolLaneCandidate<C>, responsive: boolean): void => {
     generation++;
     const myGeneration = generation;
@@ -488,13 +501,7 @@ export function submitPoolGate<C, T>(
         rejectResult(error);
       }
     );
-    opts.onSelected?.({
-      candidate: candidate.config,
-      lane: candidate.lane,
-      declaredIndex: candidates.indexOf(candidate),
-      eligibleAt,
-      responsive,
-    });
+    reportSelection(candidate, responsive, eligibleAt);
   };
 
   const responsive = opts.responsive === true;
@@ -510,6 +517,10 @@ export function submitPoolGate<C, T>(
       if (settled || inner?.started) return;
       const target = selectPoolLane(healthy(), now()) ?? candidates[0];
       if (currentCandidate === target) {
+        // The reservation stays put, but its queued priority has changed.
+        // Publish that transition so dashboard/HALT state cannot report a
+        // normal request after it has bypassed the queues.
+        reportSelection(target, true, now());
         inner?.promote();
         return;
       }
