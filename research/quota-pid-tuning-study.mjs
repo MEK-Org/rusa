@@ -13,46 +13,22 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  advance,
+  BASE_KI,
+  BASELINE,
+  CANDIDATES,
+  COLORS,
+  csv,
+  INTEGRAL_MAX_STEP_SECONDS,
+  MAX_INTERVAL_SECONDS,
+  matchedState,
+  parameters,
+  percentile,
+} from "./lib/controller.mjs";
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const GENERATED = join(HERE, "generated");
-
-const MAX_INTERVAL_SECONDS = 36_000;
-const INTEGRAL_MAX_STEP_SECONDS = 300;
-const DERIVATIVE_TAU_SECONDS = 1_800;
-const ACTUATOR_SMOOTHING = 0.25;
-const MAX_SLEW_SECONDS = 900;
-
-const BASELINE = {
-  id: "current",
-  label: "current (120 / 1h / 1800)",
-  kp: 120,
-  ti: 3_600,
-  kd: 1_800,
-};
-
-// One-axis perturbations make the attribution legible; the final row is the
-// stronger-derivative / weaker-integral combination raised for comparison.
-const CANDIDATES = [
-  BASELINE,
-  { id: "kp-80", label: "Kp 80", kp: 80, ti: 3_600, kd: 1_800 },
-  { id: "kp-160", label: "Kp 160", kp: 160, ti: 3_600, kd: 1_800 },
-  { id: "ti-2h", label: "Ti 2h", kp: 120, ti: 7_200, kd: 1_800 },
-  { id: "ti-half-hour", label: "Ti 0.5h", kp: 120, ti: 1_800, kd: 1_800 },
-  { id: "kd-900", label: "Kd 900", kp: 120, ti: 3_600, kd: 900 },
-  { id: "kd-3600", label: "Kd 3600", kp: 120, ti: 3_600, kd: 3_600 },
-  { id: "weaker-i-stronger-d", label: "Ti 2h + Kd 3600", kp: 120, ti: 7_200, kd: 3_600 },
-];
-
-const COLORS = [
-  "#111827",
-  "#2563eb",
-  "#dc2626",
-  "#7c3aed",
-  "#d97706",
-  "#0891b2",
-  "#16a34a",
-  "#be185d",
-];
 
 // time, error, stored integral, observed interval. The first row is a seed;
 // the remaining 54 rows are the sanitized processed observations published in
@@ -115,58 +91,9 @@ const TRACE = [
   ["12:10:13", -3.865, 1044723.1, 34461],
 ];
 
-function parameters(candidate) {
-  return { ...candidate, ki: candidate.kp / candidate.ti };
-}
-
-const BASE_KI = parameters(BASELINE).ki;
-
 function secondsSinceMidnight(time) {
   const [hour, minute, second] = time.split(":").map(Number);
   return hour * 3_600 + minute * 60 + second;
-}
-
-/** Exact fixed-weight update from shared-store.ts, parameterized only for study. */
-function advance(previous, input, candidate) {
-  const { kp, ki, kd } = parameters(candidate);
-  const dtSeconds = Math.max(0, input.dtSeconds);
-  const cycleChanged = input.cycleChanged ?? false;
-  const derivativeAlpha = dtSeconds > 0 ? dtSeconds / (DERIVATIVE_TAU_SECONDS + dtSeconds) : 1;
-  const previousDerivative = cycleChanged ? 0 : previous.derivative;
-  const rawDerivative =
-    !cycleChanged && dtSeconds > 0 ? (input.error - previous.error) / dtSeconds : 0;
-  const derivative = previousDerivative + derivativeAlpha * (rawDerivative - previousDerivative);
-  const integralDtSeconds = cycleChanged ? 0 : Math.min(dtSeconds, INTEGRAL_MAX_STEP_SECONDS);
-  const previousIntegral = cycleChanged ? 0 : previous.integral;
-  const candidateIntegral = previousIntegral + input.error * integralDtSeconds;
-  const rawWithoutIntegral = kp * input.error + kd * derivative;
-  const rawInterval = (integral) => rawWithoutIntegral + ki * integral;
-  const candidateRaw = rawInterval(candidateIntegral);
-  let integral = candidateIntegral;
-  if (input.error > 0 && candidateRaw > MAX_INTERVAL_SECONDS) {
-    const upperBound = (MAX_INTERVAL_SECONDS - rawWithoutIntegral) / ki;
-    integral = Math.min(candidateIntegral, Math.max(previousIntegral, upperBound));
-  } else if (input.error < 0 && candidateRaw < 0) {
-    const lowerBound = -rawWithoutIntegral / ki;
-    integral = Math.max(candidateIntegral, Math.min(previousIntegral, lowerBound));
-  }
-  const target = Math.max(0, rawInterval(integral));
-  const smoothed = previous.interval + ACTUATOR_SMOOTHING * (target - previous.interval);
-  const uncappedInterval = Math.max(
-    0,
-    Math.min(
-      previous.interval + MAX_SLEW_SECONDS,
-      Math.max(previous.interval - MAX_SLEW_SECONDS, smoothed)
-    )
-  );
-  return {
-    error: input.error,
-    derivative,
-    integral,
-    interval: Math.min(MAX_INTERVAL_SECONDS, uncappedInterval),
-    integralDtSeconds,
-    cycleChanged,
-  };
 }
 
 function run(inputs, candidate, initial) {
@@ -183,12 +110,6 @@ function run(inputs, candidate, initial) {
       observed: input.observed ?? null,
     };
   });
-}
-
-function matchedState(state, candidate) {
-  // Preserve Ki*I at the first counterfactual row. Otherwise changing Kp or Ti
-  // silently changes the active command merely by reinterpreting stored state.
-  return { ...state, integral: state.integral * (BASE_KI / parameters(candidate).ki) };
 }
 
 function historicalInputs() {
@@ -283,12 +204,6 @@ function firstHourAtOrAbove(rows, limit) {
   return row ? row.hours : null;
 }
 
-function percentile(values, p) {
-  if (values.length === 0) return 0;
-  const ordered = [...values].sort((a, b) => a - b);
-  return ordered[Math.min(ordered.length - 1, Math.floor((ordered.length - 1) * p))];
-}
-
 function metricRow(candidate, history, recovery, overspend, reversal, refill, noisy) {
   const baselineDeltas = history.map((row) => ({
     integral: Math.abs(row.integral - row.observed.integral),
@@ -318,20 +233,6 @@ function metricRow(candidate, history, recovery, overspend, reversal, refill, no
     noisy_max_step_seconds: Math.max(...noiseSteps),
     noisy_max_integral_step_seconds: Math.max(...noisy.map((row) => row.integralDtSeconds)),
   };
-}
-
-function csvEscape(value) {
-  const text = String(value ?? "");
-  return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
-}
-
-function csv(rows) {
-  const headers = Object.keys(rows[0]);
-  return `${headers.join(",")}\n${rows.map((row) => headers.map((header) => csvEscape(round(row[header]))).join(",")).join("\n")}\n`;
-}
-
-function round(value) {
-  return typeof value === "number" ? Number(value.toFixed(6)) : value;
 }
 
 function traceRows(scenarios) {
