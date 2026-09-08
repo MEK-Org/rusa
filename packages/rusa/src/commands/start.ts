@@ -1268,6 +1268,21 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     }
     return pacer;
   };
+  // Admission only reads the canonical provider-wide weekly observation that
+  // already feeds quota pacing. No quota probe is initiated on a run path;
+  // absent or stale evidence is deliberately left for submitPoolGate's
+  // declared-order fallback.
+  const weeklyQuotaFor = (providerName: string) => {
+    const bucket = sharedQuotaStore
+      ?.getProviderThrottle(providerName)
+      ?.buckets.find((candidate) => candidate.key === `${providerName}:weekly`);
+    if (!bucket?.resetAtIso) return undefined;
+    return {
+      percentLeft: bucket.percentLeft,
+      observedAt: bucket.observedAt,
+      resetAtIso: bucket.resetAtIso,
+    };
+  };
   const quotaThrottleStatuses = new Map<QuotaThrottleProvider, QuotaThrottleStatus>();
   const recordQuotaThrottleTick = (
     providerName: QuotaThrottleProvider,
@@ -1764,17 +1779,18 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     grantableCapabilities: new Set([...grantableServers.keys(), ...PARENT_GRANTABLE_CAPABILITIES]),
     maxConcurrent: config.mesh?.maxConcurrent,
     providerGate: (fn, candidates, request) => {
-      const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
-        config: c,
-        lane: providerThrottleKey(c.provider, config),
-        pacer: pacerFor(providerThrottleKey(c.provider, config)),
-      }));
-      // submitPoolGate owns both selection rules: normal requests quote every
-      // healthy lane and reserve the earliest (declaration order breaking
-      // ties); responsive requests bypass pacing and take the first healthy
-      // declared candidate, and its own `promote()` re-runs that same
-      // first-healthy-declared selection rather than merely promoting
-      // whichever lane was first reserved.
+      const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => {
+        const lane = providerThrottleKey(c.provider, config);
+        return {
+          config: c,
+          lane,
+          pacer: pacerFor(lane),
+          weeklyQuota: weeklyQuotaFor(lane),
+        };
+      });
+      // submitPoolGate owns selection for both priorities: normal work quotes
+      // healthy lanes and responsive work makes that same selection, then
+      // bypasses provider and mesh pacing after its lane is reserved.
       return submitPoolGate((selected) => fn(selected), lanes, {
         responsive: request.responsive,
         threadId: request.threadId,
