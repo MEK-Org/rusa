@@ -1,29 +1,32 @@
-// Deterministic closed-loop plant model for the #291 controller study (v1).
+// Deterministic closed-loop plant model for the #291 controller study.
 //
 // The point of this model is the feedback path that fixed-input probes cannot
 // have: the controller's own output sets run spacing, run spacing sets quota
 // burn, and quota burn sets the error the controller sees next. Nothing here
 // runs in production and nothing here reads production data.
 //
-// Plant elements, per the v1 scope:
-//   * model runs with a fixed duration and a fixed quota cost each;
+// Plant elements and evidence accounting:
+//   * model runs with modeled execution duration and normalized quota cost,
+//     plus variable-cost and completion-lag sensitivity;
 //   * run arrivals split into responsive and external work;
 //   * daytime activity shaping the arrival rate;
 //   * applied throttling through a faithful copy of ProviderPacer's
-//     start-to-start gate, including responsive bypass;
-//   * a weekly quota window with rollover, refill, and exhaustion.
+//     start-to-start gate, staging pipeline, and ConcurrencyLimiter interaction;
+//   * weekly quota window with rollover, refill, and exhaustion;
+//   * a modeled 300 s observation cadence matching the production slot width
+//     (SLOT_MS); actual polling timing is not public telemetry.
 
 import { advance, makeRandom, REFILL_EPSILON_POINTS } from "./controller.mjs";
 
 export const WINDOW_SECONDS = 7 * 24 * 60 * 60;
 export const HORIZON_SECONDS = 8 * 24 * 60 * 60;
-export const OBSERVATION_PERIOD_SECONDS = 600;
+export const OBSERVATION_PERIOD_SECONDS = 300;
 
 /**
- * v1 uses one fixed quota cost per completed run, so the weekly budget is a
- * run count. 2,000 runs per week is the calibration point; it makes the
- * perfectly paced spacing 302 s, which sits well inside the 36,000 s cap and
- * keeps the actuator in its informative range rather than pinned at a bound.
+ * This normalized baseline uses fixed quota cost per completed run, so the
+ * weekly budget is a run count. 2,000 runs per week makes perfectly paced
+ * spacing 302 s, keeping the modeled actuator away from its bounds. It is not
+ * an observation of provider quota cost or throughput.
  */
 export const BUDGET_RUNS_PER_WEEK = 2_000;
 export const QUOTA_COST_PER_RUN_POINTS = 100 / BUDGET_RUNS_PER_WEEK;
@@ -82,6 +85,17 @@ export function generateArrivals({ seed, externalRunsPerWeek, responsiveRunsPerW
     for (let index = 0; index < external; index++) arrivals.push({ at: t, responsive: false });
     for (let index = 0; index < responsive; index++) arrivals.push({ at: t, responsive: true });
   }
+  // Cost is an exogenous property of a generated request, never a consequence
+  // of its start order. Full groups preserve the exact unit mean; a short final
+  // group stays at 1× so the entire prepared scenario has the same total cost
+  // as the fixed-cost case.
+  for (let index = 0; index < arrivals.length; index += 3) {
+    const groupLength = Math.min(3, arrivals.length - index);
+    const multipliers = groupLength === 3 ? [1.8, 0.6, 0.6] : Array(groupLength).fill(1);
+    for (let offset = 0; offset < groupLength; offset++) {
+      arrivals[index + offset].costMultiplier = multipliers[offset];
+    }
+  }
   return arrivals;
 }
 
@@ -94,10 +108,12 @@ export function generateArrivals({ seed, externalRunsPerWeek, responsiveRunsPerW
  * delay the next external start without occupying a normal-concurrency slot.
  */
 export function simulate(scenario, candidate, plant = {}) {
-  // These overrides exist only for the deterministic sensitivity study. The
-  // baseline simulation continues to use the v1 values exported above.
+  // These overrides exist for the deterministic sensitivity study. The
+  // baseline simulation continues to use the calibrated values exported above.
   const runDurationSeconds = plant.runDurationSeconds ?? RUN_DURATION_SECONDS;
   const maxConcurrentRuns = plant.maxConcurrentRuns ?? MAX_CONCURRENT_RUNS;
+  const observationPeriodSeconds = plant.observationPeriodSeconds ?? OBSERVATION_PERIOD_SECONDS;
+  const variableCost = plant.variableCost ?? false;
   const arrivals = scenario.arrivals;
   let arrivalIndex = 0;
   let now = 0;
@@ -105,7 +121,7 @@ export function simulate(scenario, candidate, plant = {}) {
   let resetAt = WINDOW_SECONDS;
   let nextAvailableAt = 0;
   let lastStartedAt = null;
-  let nextObservationAt = OBSERVATION_PERIOD_SECONDS;
+  let nextObservationAt = observationPeriodSeconds;
   let controller = { error: 0, derivative: 0, integral: 0, interval: 0, uncappedInterval: 0 };
   let previousObservation = null;
   let exhaustedSeconds = 0;
@@ -114,6 +130,7 @@ export function simulate(scenario, candidate, plant = {}) {
 
   const running = [];
   const externalQueue = [];
+  let staged = null;
   const responsiveQueue = [];
   const samples = [];
   const externalWaits = [];
@@ -126,7 +143,12 @@ export function simulate(scenario, candidate, plant = {}) {
   const startRun = (request, responsive) => {
     lastStartedAt = now;
     nextAvailableAt = now + controller.interval;
-    running.push({ completesAt: now + runDurationSeconds, responsive });
+    // Each generated request carries its deterministic, mean-preserving cost
+    // multiplier, so every candidate sees an identical exogenous cost trace.
+    const cost = variableCost
+      ? QUOTA_COST_PER_RUN_POINTS * (request.costMultiplier ?? 1)
+      : QUOTA_COST_PER_RUN_POINTS;
+    running.push({ completesAt: now + runDurationSeconds, responsive, cost });
     running.sort((a, b) => a.completesAt - b.completesAt);
     if (!responsive) externalWaits.push(now - request.at);
   };
@@ -143,24 +165,33 @@ export function simulate(scenario, candidate, plant = {}) {
       }
       while (running.length > 0 && running[0].completesAt <= now) {
         const finished = running.shift();
-        quotaPct = Math.max(0, quotaPct - QUOTA_COST_PER_RUN_POINTS);
+        quotaPct = Math.max(0, quotaPct - (finished.cost ?? QUOTA_COST_PER_RUN_POINTS));
         if (finished.responsive) responsiveCompleted++;
         else externalCompleted++;
         progressed = true;
       }
-      // ProviderPacer starts responsive work directly. It can consume quota
-      // and charge the next normal start, but it never consumes normal mesh
-      // concurrency that would otherwise block an external request.
+      // ProviderPacer starts responsive work directly. It bypasses normal
+      // pacing and normal concurrency, but re-bases lastStartedAt and nextAvailableAt.
       if (responsiveQueue.length > 0 && !exhausted()) {
         startRun(responsiveQueue.shift(), true);
         progressed = true;
-      } else if (
-        externalQueue.length > 0 &&
-        externalRunning() < maxConcurrentRuns &&
-        !exhausted() &&
-        now >= nextAvailableAt
-      ) {
-        startRun(externalQueue.shift(), false);
+      }
+      // ProviderPacer stages external head request once pacing interval elapses
+      if (staged === null && externalQueue.length > 0 && now >= nextAvailableAt && !exhausted()) {
+        staged = externalQueue.shift();
+        progressed = true;
+      }
+      // ConcurrencyLimiter admits staged external request when concurrency slot opens
+      if (staged !== null && externalRunning() < maxConcurrentRuns && !exhausted()) {
+        // Selection-time revalidation (matches provider-pacer.ts line 262)
+        if (now < nextAvailableAt) {
+          externalQueue.unshift(staged);
+          staged = null;
+        } else {
+          const request = staged;
+          staged = null;
+          startRun(request, false);
+        }
         progressed = true;
       }
     }
@@ -199,13 +230,13 @@ export function simulate(scenario, candidate, plant = {}) {
         uncappedInterval: controller.uncappedInterval,
         integral: controller.integral,
         derivative: controller.derivative,
-        backlog: externalQueue.length,
+        backlog: externalQueue.length + (staged !== null ? 1 : 0),
         running: running.length,
         externalCompleted,
         responsiveCompleted,
         exhausted: exhausted(),
       });
-      nextObservationAt += OBSERVATION_PERIOD_SECONDS;
+      nextObservationAt += observationPeriodSeconds;
     }
 
     if (quotaAtWeekEnd === null && now >= WINDOW_SECONDS) quotaAtWeekEnd = quotaPct;
@@ -214,7 +245,7 @@ export function simulate(scenario, candidate, plant = {}) {
     const candidates = [nextObservationAt, resetAt, HORIZON_SECONDS];
     if (arrivalIndex < arrivals.length) candidates.push(arrivals[arrivalIndex].at);
     if (running.length > 0) candidates.push(running[0].completesAt);
-    if (externalQueue.length > 0 && externalRunning() < maxConcurrentRuns && !exhausted()) {
+    if (staged === null && externalQueue.length > 0 && !exhausted()) {
       candidates.push(Math.max(now, nextAvailableAt));
     }
     const next = Math.min(...candidates.filter((value) => value > now));
@@ -244,6 +275,6 @@ export function simulate(scenario, candidate, plant = {}) {
     exhaustedHours: exhaustedSeconds / 3_600,
     firstExhaustionHour: firstExhaustionAt === null ? null : firstExhaustionAt / 3_600,
     quotaAtWeekEndPct: quotaAtWeekEnd ?? quotaPct,
-    finalBacklog: externalQueue.length,
+    finalBacklog: externalQueue.length + (staged !== null ? 1 : 0),
   };
 }

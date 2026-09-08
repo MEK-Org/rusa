@@ -57,35 +57,33 @@ The historical fixture is the 55-observation sanitized trace from [#291 comment 
 - `quota-closed-loop-summary.csv` — per-candidate, per-scenario metrics.
 - `quota-closed-loop-robustness.csv` — every scenario re-run across 8 demand seeds.
 - `quota-closed-loop-thresholds.csv` — recovery rankings at 1×, 1.5×, 2×, and 2.5× ideal spacing.
-- `quota-closed-loop-plant-sensitivity.csv` — burst-demand variants over 30/240/600-second completion lags and one/four concurrent slots.
+- `quota-closed-loop-plant-sensitivity.csv` — burst-demand variants over 30/240/600-second completion lags, concurrency capacity, observation cadence, and cost variance.
 - `quota-closed-loop-baseline-charts.svg` — the current controller's quota, commanded vs applied wait, and backlog per scenario.
 - `quota-closed-loop-candidate-charts.svg` — one parameter axis per row on the burst scenario.
 - `quota-closed-loop-tradeoffs.svg` — safety and throughput per candidate and scenario.
-- `quota-closed-loop-report.md` — method, findings, assumptions, limits, and recommendation.
+- `quota-closed-loop-report.md` — method, evidence accounting, findings, assumptions, limits, and recommendation.
 
-### What the closed-loop model does and does not model
+### High-fidelity simulator calibration and evidence accounting
 
-The v1 plant models run arrivals split into responsive and external work, a
-daytime activity curve, admission through the pacing interval, a fixed quota cost
-per completed run, and the resulting quota observations fed back into the
-controller. Throttling is applied the way `ProviderPacer` applies it: responsive
-runs bypass the normal pace and concurrency queues but still charge the interval
-clock, and a changed interval re-bases the pending wait on the last actual start.
+The closed-loop simulation audits eight modeler-selected coverage categories. Public
+#291 establishes the evidence-first, analysis-only boundary; it does not enumerate
+this list.
 
-Demand is generated from a seeded arrival process before the controller runs, so
-every candidate faces byte-identical demand; only the controller's response to it
-differs. The robustness sweep repeats each scenario across 8 seeds, which shows
-whether an ordering survives resampled demand — it cannot show that the demand
-*shape* is right, because that shape is a plausible guess and not a measurement.
+1. **Applied throttling (Source-backed mechanism):** One `ProviderPacer` lane stages one external request behind the interval clock, then waits for `ConcurrencyLimiter` selection. The staged request remains in that queue until selection-time revalidation; interval lengthening rebases pending pacing on `lastStartedAt`.
+2. **Observation cadence (Source-backed slot width; modeled timing):** The baseline uses the store's 300 s `SLOT_MS` width. Exact 300 s simulation steps avoid the earlier 600 s model's `QUOTA_INTEGRAL_MAX_STEP_SECONDS = 300` integration clipping; live jitter and skipped slots are uncalibrated.
+3. **Execution duration and concurrency (Modeled duration; source-backed default capacity):** 240 s is a modeled duration baseline. Four concurrent normal slots match the mesh configuration default; 30/240/600 s and 1/4 slots are sensitivity cases.
+4. **Quota reset behavior (Source-backed mechanism):** The model mirrors `shared-store.ts` cycle rollover at 7 days, 100% refill, integral/derivative zeroing, and post-reset slew/smoothing.
+5. **Responsive and external demand (Source-backed gating; modeled split):** Responsive runs bypass pacing and mesh concurrency while updating the interval clock. Demand split is an explicit assumption.
+6. **Quota usage (Modeled normalization + sensitivity):** Fixed 0.050 points per run and the derived 2,000-run weekly budget are normalized model inputs, not observed usage. The deterministic 1.8×/0.6×/0.6× sensitivity is attached to generated arrivals so every candidate receives the same exogenous cost trace; it is not a real token-cost distribution.
+7. **Model-run arrivals (Uncalibrated assumption):** Deterministic thinned-Poisson draws (no public arrival telemetry).
+8. **Daytime activity (Uncalibrated assumption):** Raised half-sine across a 14-hour day over a 0.15 night floor (synthetic profile).
 
 The scripts intentionally do not check in sample-by-sample CSV dumps. The compact
 summary tables, report, and charts are sufficient to inspect the reported
 metrics, while the deterministic scripts remain the reproducible recipe for every
-plotted sample. This avoids carrying roughly 60,000 raw rows into each research
-revision.
+plotted sample.
 
-Per-run quota cost, run duration, arrival rates, and the responsive/external split
-are uncalibrated. Absolute run counts and hours therefore carry no operational
-meaning; only comparisons between candidates on identical demand do. Failures,
-retries, cancellations, multi-bucket interaction, and the five-hour window are out
-of scope for v1. The report states the full list of assumptions and limits.
+Absolute run counts and hours carry no operational meaning; only comparisons
+between candidates on identical demand and arrival-attached cost do. Failures,
+retries, cancellations, multi-provider/multi-bucket interaction, and the
+five-hour window remain out of scope.
