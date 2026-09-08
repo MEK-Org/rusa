@@ -1,11 +1,37 @@
 import { copyFile, mkdir, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import Database from "better-sqlite3";
-import {
-  getObservationProjection,
-  OBSERVATION_COLUMNS,
-  SharedQuotaStore,
-} from "../dist/quota/shared-store.js";
+import { SharedQuotaStore } from "../dist/quota/shared-store.js";
+
+const OBSERVATION_COLUMNS = [
+  "provider",
+  "kind",
+  "observed_slot",
+  "label",
+  "observed_at",
+  "percent_left",
+  "reset_at_iso",
+  "window_ms",
+  "processed",
+  "controller_error",
+  "controller_derivative",
+  "controller_integral",
+  "uncapped_interval_seconds",
+  "interval_seconds",
+  "commanded_interval_seconds",
+  "commanded_uncapped_interval_seconds",
+  "recovery_credit_seconds",
+];
+
+function getObservationProjection(db) {
+  const existing = new Set(
+    db
+      .prepare("PRAGMA table_info(quota_observations)")
+      .all()
+      .map((c) => c.name)
+  );
+  return OBSERVATION_COLUMNS.map((col) => (existing.has(col) ? col : `NULL AS ${col}`)).join(", ");
+}
 
 function usage() {
   return [
@@ -227,14 +253,32 @@ function validateReplay(metadata, since) {
   }
 }
 
-function applyReplay(databasePath, since, snapshot, rebuilt) {
-  // Ensure the target database is widened before inserting rebuilt observations
-  const store = new SharedQuotaStore(databasePath);
-  store.close();
+function ensureReplayColumns(db) {
+  const columns = new Set(
+    db
+      .prepare("PRAGMA table_info(quota_observations)")
+      .all()
+      .map((c) => c.name)
+  );
+  if (!columns.has("controller_integral")) {
+    db.exec("ALTER TABLE quota_observations ADD COLUMN controller_integral REAL");
+  }
+  if (!columns.has("commanded_interval_seconds")) {
+    db.exec("ALTER TABLE quota_observations ADD COLUMN commanded_interval_seconds REAL");
+  }
+  if (!columns.has("commanded_uncapped_interval_seconds")) {
+    db.exec("ALTER TABLE quota_observations ADD COLUMN commanded_uncapped_interval_seconds REAL");
+  }
+  if (!columns.has("recovery_credit_seconds")) {
+    db.exec("ALTER TABLE quota_observations ADD COLUMN recovery_credit_seconds REAL");
+  }
+}
 
+function applyReplay(databasePath, since, snapshot, rebuilt) {
   const db = new Database(databasePath, { fileMustExist: true });
   db.pragma("busy_timeout = 30000");
   try {
+    ensureReplayColumns(db);
     const insert = db.prepare(
       `INSERT INTO quota_observations (${OBSERVATION_COLUMNS.join(", ")})
        VALUES (${OBSERVATION_COLUMNS.map(() => "?").join(", ")})`

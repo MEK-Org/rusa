@@ -71,39 +71,6 @@ export const QUOTA_RECOVERY_MAX_ELAPSED_SECONDS = 3600;
  */
 export const QUOTA_REFILL_EPSILON_POINTS = 2;
 
-export const OBSERVATION_COLUMNS = [
-  "provider",
-  "kind",
-  "observed_slot",
-  "label",
-  "observed_at",
-  "percent_left",
-  "reset_at_iso",
-  "window_ms",
-  "processed",
-  "controller_error",
-  "controller_derivative",
-  "controller_integral",
-  "uncapped_interval_seconds",
-  "interval_seconds",
-  "commanded_interval_seconds",
-  "commanded_uncapped_interval_seconds",
-  "recovery_credit_seconds",
-] as const;
-
-/**
- * Returns a SQL SELECT column projection for `quota_observations` that dynamically falls back
- * to `NULL AS <col>` for columns that have not yet been added to a pre-upgrade database schema.
- */
-export function getObservationProjection(db: Database.Database): string {
-  const existing = new Set(
-    (db.prepare("PRAGMA table_info(quota_observations)").all() as Array<{ name: string }>).map(
-      (c) => c.name
-    )
-  );
-  return OBSERVATION_COLUMNS.map((col) => (existing.has(col) ? col : `NULL AS ${col}`)).join(", ");
-}
-
 export function resolveQuotaDatabasePath(configuredPath: string, rusaHome: string): string {
   const expanded =
     configuredPath === "~" || configuredPath.startsWith("~/")
@@ -207,7 +174,21 @@ interface ReasonedObservation {
   controllerIntegral: number | null;
   observedAt: string;
   percentLeft: number;
-  windowMs?: number;
+}
+
+interface PriorReasonedObservation {
+  intervalSeconds: number;
+  uncappedIntervalSeconds: number;
+  commandedIntervalSeconds: number | null;
+  commandedUncappedIntervalSeconds: number | null;
+  recoveryCreditSeconds: number | null;
+  controllerError: number;
+  controllerDerivative: number;
+  controllerIntegral: number | null;
+  observedAt: string;
+  resetAtIso: string | null;
+  percentLeft: number;
+  windowMs: number | null;
 }
 
 interface StoredScrapeRow {
@@ -509,7 +490,7 @@ export class SharedQuotaStore {
         observation.provider,
         observation.kind,
         priorObservationsForGate
-      ) as ReasonedObservation[];
+      ) as PriorReasonedObservation[];
     const previous = previousRows[0];
     const timeRemainingPct = Math.min(
       100,
@@ -637,8 +618,10 @@ export class SharedQuotaStore {
       const previousCredit = cycleChanged ? 0 : (previous?.recoveryCreditSeconds ?? 0);
       const creditDtSeconds = Math.min(dtSeconds, QUOTA_RECOVERY_MAX_ELAPSED_SECONDS);
       const alpha = 1 - 2 ** (-creditDtSeconds / QUOTA_RECOVERY_HALF_LIFE_SECONDS);
-      credit =
-        previousCredit + alpha * (QUOTA_KI_SECONDS_PER_POINT_SECOND * integral - previousCredit);
+      credit = Math.max(
+        0,
+        previousCredit + alpha * (QUOTA_KI_SECONDS_PER_POINT_SECOND * integral - previousCredit)
+      );
 
       const target = Math.max(0, uncappedCandidate - credit);
       const previousCommanded =
@@ -786,7 +769,8 @@ export class SharedQuotaStore {
       intervalSeconds: governingInterval,
       uncappedIntervalSeconds: governingUncapped,
       governingBucketKey: governing ? `${provider}:${governing.kind}` : null,
-      capped: governing !== undefined && governingUncapped > governingInterval,
+      capped:
+        governing !== undefined && governing.uncappedIntervalSeconds > governing.intervalSeconds,
       expired: exhaustedUntil !== null,
       exhaustedUntil,
       updatedAt,

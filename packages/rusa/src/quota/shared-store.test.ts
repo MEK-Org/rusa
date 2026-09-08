@@ -7,7 +7,6 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ProviderQuotaSnapshot, QuotaWindowKind } from "../mcp/quota-mcp.js";
 import {
-  getObservationProjection,
   QUOTA_ACTUATOR_SMOOTHING,
   QUOTA_DERIVATIVE_TAU_SECONDS,
   QUOTA_INTEGRAL_MAX_STEP_SECONDS,
@@ -1122,6 +1121,108 @@ describe("SharedQuotaStore PID recovery output credit overlay", () => {
     }
   });
 
+  it("smoothly converges commanded interval to zero floor under extended negative-error run past the end of the trace", () => {
+    const root = mkdtempSync(join(tmpdir(), "rusa-recovery-asymptote-"));
+    roots.push(root);
+    const store = new SharedQuotaStore(join(root, "shared.db"));
+    const maxIntervalSeconds = 36_000;
+    store.configureController({ maxIntervalSeconds });
+
+    const baseDate = "2026-09-07";
+    const reset = "2026-09-14T00:00:00.000Z";
+    const windowMs = 7 * 24 * 60 * 60 * 1000;
+
+    try {
+      // Seed row 0
+      const seedTime = `${baseDate}T${TRACE[0][0]}.000Z`;
+      const seedMs = Date.parse(seedTime);
+      const seedTimePct = ((Date.parse(reset) - seedMs) / windowMs) * 100;
+      const seedError = TRACE[0][1];
+      const seedPercentLeft = seedTimePct - seedError;
+      const seedIntegral = TRACE[0][2];
+      const seedInterval = TRACE[0][3];
+      const seedSlot = Math.floor(seedMs / (5 * 60 * 1000));
+
+      store.db
+        .prepare(
+          `INSERT INTO quota_observations
+            (provider, kind, observed_slot, label, observed_at, percent_left, reset_at_iso, window_ms,
+             processed, controller_error, controller_derivative, controller_integral,
+             uncapped_interval_seconds, interval_seconds,
+             commanded_interval_seconds, commanded_uncapped_interval_seconds, recovery_credit_seconds)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, NULL, NULL, NULL)`
+        )
+        .run(
+          "kimi",
+          "weekly",
+          seedSlot,
+          "weekly limit",
+          seedTime,
+          seedPercentLeft,
+          reset,
+          windowMs,
+          seedError,
+          -0.0002,
+          seedIntegral,
+          seedInterval,
+          seedInterval
+        );
+
+      // Record subsequent 54 observations to reach end of trace
+      for (let index = 1; index < TRACE.length; index += 1) {
+        const [time, error] = TRACE[index];
+        const observedAt = `${baseDate}T${time}.000Z`;
+        const observedMs = Date.parse(observedAt);
+        const timePct = ((Date.parse(reset) - observedMs) / windowMs) * 100;
+        const percentLeft = timePct - error;
+        recordObservation(store, "kimi", observedAt, percentLeft, reset, "weekly");
+      }
+
+      // At end of trace (row 54), commandedInterval is ~4,105s
+      const endTraceRow = reasonedRows(store, "kimi")[54];
+      expect(endTraceRow.commandedInterval).toBeCloseTo(4105.1, 0);
+
+      // Continue negative error run past the end of the trace (60 more 5-minute steps = 5 hours with error = -3.865)
+      let currentMs = Date.parse(`${baseDate}T${TRACE.at(-1)?.[0]}.000Z`);
+      for (let step = 1; step <= 60; step += 1) {
+        currentMs += 300_000;
+        const stepTime = new Date(currentMs).toISOString();
+        const stepTimePct = ((Date.parse(reset) - currentMs) / windowMs) * 100;
+        const percentLeft = stepTimePct - -3.865;
+        recordObservation(store, "kimi", stepTime, percentLeft, reset, "weekly");
+      }
+
+      const extendedRows = reasonedRows(store, "kimi");
+      expect(extendedRows).toHaveLength(115);
+
+      // Commanded interval walks down smoothly and reaches <= 1 second (asymptote to zero floor)
+      const zeroRow = extendedRows.at(-1) as ReasonedRow;
+      expect(zeroRow.commandedInterval).toBeLessThanOrEqual(1);
+      expect(zeroRow.credit).toBeGreaterThan(32_000);
+      // Protective shadow interval remains conservative
+      expect(zeroRow.interval).toBeGreaterThan(30_000);
+
+      // Provider throttle reflects <= 1s commanded interval while capped reflects protective state
+      const throttle = store.getProviderThrottle("kimi");
+      expect(throttle?.intervalSeconds).toBeLessThanOrEqual(1);
+      expect(throttle?.capped).toBe(false);
+
+      // On first non-negative reversal (+10 error), protective shadow interval is immediately restored
+      currentMs += 300_000;
+      const reversalTime = new Date(currentMs).toISOString();
+      const reversalTimePct = ((Date.parse(reset) - currentMs) / windowMs) * 100;
+      recordObservation(store, "kimi", reversalTime, reversalTimePct - 10, reset, "weekly");
+
+      const reversalRow = reasonedRows(store, "kimi").at(-1) as ReasonedRow;
+      expect(reversalRow.credit).toBeNull();
+      expect(reversalRow.commandedInterval).toBeNull();
+      expect(reversalRow.interval).toBeGreaterThan(30_000);
+      expect(store.getProviderThrottle("kimi")?.intervalSeconds).toBe(reversalRow.interval);
+    } finally {
+      store.close();
+    }
+  });
+
   it("applies no behavior difference outside recovery and enforces the deliberate cap", () => {
     const root = mkdtempSync(join(tmpdir(), "rusa-recovery-outside-"));
     roots.push(root);
@@ -1684,14 +1785,27 @@ describe("SharedQuotaStore PID recovery output credit overlay", () => {
     ).run();
     db.close();
 
-    // Query pre-upgrade database using dynamic observation projection helper
+    // Query pre-upgrade database using dynamic projection
     const dbRead = new Database(dbPath, { readonly: true });
     try {
-      const projection = getObservationProjection(dbRead);
-      expect(projection).toContain("NULL AS commanded_interval_seconds");
-      expect(projection).toContain("NULL AS commanded_uncapped_interval_seconds");
-      expect(projection).toContain("NULL AS recovery_credit_seconds");
-      expect(projection).toContain("interval_seconds");
+      const existingCols = new Set(
+        (
+          dbRead.prepare("PRAGMA table_info(quota_observations)").all() as Array<{ name: string }>
+        ).map((c) => c.name)
+      );
+      expect(existingCols.has("commanded_interval_seconds")).toBe(false);
+      expect(existingCols.has("commanded_uncapped_interval_seconds")).toBe(false);
+      expect(existingCols.has("recovery_credit_seconds")).toBe(false);
+
+      const projection = [
+        "interval_seconds",
+        existingCols.has("commanded_interval_seconds")
+          ? "commanded_interval_seconds"
+          : "NULL AS commanded_interval_seconds",
+        existingCols.has("recovery_credit_seconds")
+          ? "recovery_credit_seconds"
+          : "NULL AS recovery_credit_seconds",
+      ].join(", ");
 
       const observations = dbRead
         .prepare(
@@ -1719,12 +1833,20 @@ describe("SharedQuotaStore PID recovery output credit overlay", () => {
     try {
       const dbWidened = new Database(dbPath, { readonly: true });
       try {
-        const widenedProjection = getObservationProjection(dbWidened);
-        expect(widenedProjection).not.toContain("NULL AS commanded_interval_seconds");
-        expect(widenedProjection).not.toContain("NULL AS recovery_credit_seconds");
+        const widenedCols = new Set(
+          (
+            dbWidened.prepare("PRAGMA table_info(quota_observations)").all() as Array<{
+              name: string;
+            }>
+          ).map((c) => c.name)
+        );
+        expect(widenedCols.has("commanded_interval_seconds")).toBe(true);
+        expect(widenedCols.has("commanded_uncapped_interval_seconds")).toBe(true);
+        expect(widenedCols.has("recovery_credit_seconds")).toBe(true);
+
         const widenedObs = dbWidened
           .prepare(
-            `SELECT ${widenedProjection}
+            `SELECT interval_seconds, commanded_interval_seconds, recovery_credit_seconds
              FROM quota_observations
              WHERE provider = 'codex' AND observed_at >= ?
              ORDER BY observed_at ASC, rowid ASC`
