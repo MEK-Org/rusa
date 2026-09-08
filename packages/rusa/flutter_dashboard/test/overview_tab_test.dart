@@ -526,12 +526,16 @@ void main() {
 
         await tester.binding.setSurfaceSize(const Size(390, 844));
         addTearDown(() => tester.binding.setSurfaceSize(null));
-        await tester.pumpWidget(_app(store));
+        DashboardView? navigatedView;
+        await tester.pumpWidget(
+          _app(store, onSelectView: (v) => navigatedView = v),
+        );
         await tester.pump();
         await tester.pump();
 
         expect(find.text('running-handle'), findsOneWidget);
         expect(find.text('Running actor title'), findsOneWidget);
+        expect(find.text('charter running'), findsNothing);
         expect(find.text('queued-handle'), findsOneWidget);
         expect(find.text('Queued actor title'), findsOneWidget);
         expect(find.text('Initial running focus'), findsOneWidget);
@@ -539,6 +543,11 @@ void main() {
         expect(find.text('No current focus'), findsOneWidget);
         expect(find.byType(ActorAvatarWithStatus), findsNWidgets(3));
         expect(tester.takeException(), isNull);
+
+        await tester.tap(find.text('running-handle'));
+        await tester.pump();
+        expect(store.primary.value, 'running');
+        expect(navigatedView, DashboardView.actors);
 
         final updatedRunning = makeObligation(
           'updated-running-focus',

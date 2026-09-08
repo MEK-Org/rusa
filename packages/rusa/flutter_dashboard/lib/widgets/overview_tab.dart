@@ -689,7 +689,6 @@ class _OverviewTabState extends State<OverviewTab> {
                           _buildActorContextCard(
                             t,
                             width: itemWidth,
-                            showCharter: true,
                           ),
                       ],
                     );
@@ -776,7 +775,6 @@ class _OverviewTabState extends State<OverviewTab> {
     ActorViewState actor, {
     double? width,
     String? queueDetail,
-    bool showCharter = false,
   }) {
     final selectedObligation = actor.selectedObligation;
     return Container(
@@ -794,102 +792,85 @@ class _OverviewTabState extends State<OverviewTab> {
             borderRadius: BorderRadius.circular(6),
             child: Padding(
               padding: const EdgeInsets.all(12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  LayoutBuilder(
-                    builder: (context, constraints) {
-                      final identity = Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisSize: MainAxisSize.min,
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final identity = Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          actor.handle,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: kMonoStyle.copyWith(
+                            color: MeshColors.textPrimary,
+                            fontWeight: FontWeight.w700,
+                            fontSize: 13,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          actor.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: MeshColors.textSecondary,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                  final avatar = ActorAvatarWithStatus(
+                    id: actor.id,
+                    state: actor.dotState,
+                    size: 40,
+                    retired: actor.isRetired,
+                    store: widget.store,
+                  );
+                  final details = queueDetail == null
+                      ? null
+                      : Text(
+                          queueDetail,
+                          textAlign: TextAlign.right,
+                          style: kMonoStyle.copyWith(
+                            color: MeshColors.textSecondary,
+                            fontSize: 11,
+                          ),
+                        );
+                  if (constraints.maxWidth < 430 && details != null) {
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
                           children: [
-                            Text(
-                              actor.handle,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: kMonoStyle.copyWith(
-                                color: MeshColors.textPrimary,
-                                fontWeight: FontWeight.w700,
-                                fontSize: 13,
-                              ),
-                            ),
-                            const SizedBox(height: 2),
-                            Text(
-                              actor.title,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                color: MeshColors.textSecondary,
-                                fontSize: 12,
-                              ),
-                            ),
+                            avatar,
+                            const SizedBox(width: 10),
+                            identity,
                           ],
                         ),
-                      );
-                      final avatar = ActorAvatarWithStatus(
-                        id: actor.id,
-                        state: actor.dotState,
-                        size: 40,
-                        retired: actor.isRetired,
-                        store: widget.store,
-                      );
-                      final details = queueDetail == null
-                          ? null
-                          : Text(
-                              queueDetail,
-                              textAlign: TextAlign.right,
-                              style: kMonoStyle.copyWith(
-                                color: MeshColors.textSecondary,
-                                fontSize: 11,
-                              ),
-                            );
-                      if (constraints.maxWidth < 430 && details != null) {
-                        return Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                avatar,
-                                const SizedBox(width: 10),
-                                identity,
-                              ],
-                            ),
-                            const SizedBox(height: 8),
-                            Align(
-                              alignment: Alignment.centerRight,
-                              child: details,
-                            ),
-                          ],
-                        );
-                      }
-                      return Row(
-                        crossAxisAlignment: CrossAxisAlignment.center,
-                        children: [
-                          avatar,
-                          const SizedBox(width: 10),
-                          identity,
-                          if (details != null) ...[
-                            const SizedBox(width: 12),
-                            Flexible(child: details),
-                          ],
-                        ],
-                      );
-                    },
-                  ),
-                  if (showCharter && actor.charterPreview.isNotEmpty) ...[
-                    const SizedBox(height: 8),
-                    Text(
-                      actor.charterPreview,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: MeshColors.textSecondary,
-                        fontSize: 12,
-                      ),
-                    ),
-                  ],
-                ],
+                        const SizedBox(height: 8),
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: details,
+                        ),
+                      ],
+                    );
+                  }
+                  return Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      avatar,
+                      const SizedBox(width: 10),
+                      identity,
+                      if (details != null) ...[
+                        const SizedBox(width: 12),
+                        Flexible(child: details),
+                      ],
+                    ],
+                  );
+                },
               ),
             ),
           ),
