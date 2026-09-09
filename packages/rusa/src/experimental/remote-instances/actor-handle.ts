@@ -309,6 +309,19 @@ export class ActorHandle implements MeshActor {
               });
               break;
             case "admit": {
+              // A remote actor's provider gate lives here, not inside the
+              // follower. Recheck host authority immediately before reserving
+              // capacity so ordinary work queued before voice opens cannot
+              // cross the boundary after it changes.
+              if (
+                !(await (ctx.admitRun?.({
+                  responsive: request.responsive,
+                  mode: request.mode,
+                }) ?? true))
+              ) {
+                this.send({ type: "reply", requestId, value: { deferred: true } });
+                break;
+              }
               let release!: () => void;
               const finished = new Promise<void>((resolve) => {
                 release = resolve;

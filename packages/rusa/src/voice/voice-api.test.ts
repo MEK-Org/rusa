@@ -14,7 +14,7 @@ import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import type { SpeechClient } from "./gemini-speech.js";
 import { handleVoiceApiRequest, type VoiceApiDeps } from "./voice-api.js";
-import { VOICE_MEMO_PREFIX, VoiceService } from "./voice-service.js";
+import { VOICE_MEMO_PREFIX, VOICE_SESSION_LEASE_MS, VoiceService } from "./voice-service.js";
 import { attachVoiceOutbound } from "./wiring.js";
 
 const UUID_A = "aaaaaaaa-0000-4000-8000-000000000001";
@@ -366,8 +366,15 @@ describe("handleVoiceApiRequest", () => {
       const first = call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-1`);
       expect(service.hasSession("walkie-1", UUID_A)).toBe(true);
 
+      // A healthy EventSource holds authority beyond the reconnect allowance.
+      now += VOICE_SESSION_LEASE_MS * 2;
+      service.expireSessions();
+      expect(service.hasSession("walkie-1", UUID_A)).toBe(true);
+
       // An EventSource error/reconnect does not release background work.
       first.res.req.emit("close");
+      now += VOICE_SESSION_LEASE_MS - 1;
+      service.expireSessions();
       expect(service.hasSession("walkie-1", UUID_A)).toBe(true);
       call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-1`);
       expect(service.hasSession("walkie-1", UUID_A)).toBe(true);

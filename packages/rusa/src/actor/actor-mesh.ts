@@ -433,6 +433,8 @@ export interface ActorFactoryContext {
   ) => RunStartHandle<T>;
   /** Lease check run before each wake; returns false (and retires) when exhausted. */
   beforeRun: (context: { mode: ActorRunMode }) => boolean;
+  /** Final admission after provider pacing selects a run, before it launches. */
+  admitRun?: (context: { responsive: boolean; mode: ActorRunMode }) => boolean;
   /** General lifecycle hook after the pre-run gate and before scheduler admission. */
   onQueued: (context: { responsive: boolean; mode: ActorRunMode }) => void;
   /** Post-run accounting (token usage) + completion-review hook. */
@@ -446,6 +448,8 @@ export interface ActorFactoryContext {
    * run has actually started; `onRunEnd` is the clearing point for that case.
    */
   onQueuedRunCancelled?: () => void;
+  /** Closes mesh run-scoped state when a queued opportunity never starts. */
+  onRunAbandoned?: () => void;
 }
 
 export type ActorFactory = (ctx: ActorFactoryContext) => MeshActor;
@@ -1276,6 +1280,17 @@ export class ActorMesh {
     // run's own dispatch (see the `onRunStart` wiring), so this call is then a
     // no-op — {@link applyPendingModel} tolerates being called from both.
     this.applyPendingModel(actorId);
+  }
+
+  /**
+   * Close the run-scoped inbox state for an opportunity that never launched.
+   * Unlike {@link finishInboxRun}, this must not consume a staged model change:
+   * the next real dispatch still owns that transition.
+   */
+  abandonInboxRun(actorId: string): void {
+    actorId = this.resolveThreadId(actorId);
+    this.selectedInboxEntryIds.delete(actorId);
+    this.flushRunHeadAttention(actorId);
   }
 
   /**
@@ -3768,6 +3783,8 @@ export class ActorMesh {
         }
         return this.inboxStore.countUnhandled(record.id) > 0;
       },
+      admitRun: ({ responsive, mode }) =>
+        responsive || mode !== "ordinary" || !this.isVoiceSessionActive(record.id),
       onQueued: (context) => {
         this.actorQueued(record.id, context);
       },
@@ -3780,6 +3797,10 @@ export class ActorMesh {
       },
       onRuntimeStateChanged: (state) => this.actorRuntimeStateChanged(record.id, state),
       onQueuedRunCancelled: () => this.clearSelection(record.id),
+      onRunAbandoned: () => {
+        this.abandonInboxRun(record.id);
+        this.clearSelection(record.id);
+      },
     };
   }
 

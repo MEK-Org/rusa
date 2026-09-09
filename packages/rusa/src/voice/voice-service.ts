@@ -44,10 +44,16 @@ export const VOICE_MEMO_PREFIX = "🎙️ [voice memo — reply for the ear]: ";
 export const VOICE_PRESENCE_GRACE_MS = 2 * 60 * 1000;
 
 /**
- * A dropped EventSource is allowed a short window to reconnect without
- * releasing the actor's walkie authority. This is deliberately separate from
- * {@link VOICE_PRESENCE_GRACE_MS}: presence protects TTS delivery, while this
- * lease controls whether ordinary inbox work may run.
+ * A dropped EventSource is allowed a short window to reconnect without releasing
+ * the actor's walkie authority. #186 specifies a short reconnect lease, but its
+ * approved product record does not select a duration or contain reconnect
+ * measurements. Thirty seconds is therefore an explicitly provisional default,
+ * not a claim about browser or mobile recovery behavior. Keep it injectable so
+ * tests and a later evidence-backed policy can choose the budget directly.
+ *
+ * This deliberately does not reuse {@link VOICE_PRESENCE_GRACE_MS}: that
+ * two-minute grace protects TTS delivery. Immediate expiry would defeat the
+ * accepted reconnect lease; an unbounded lease would hold ordinary work forever.
  */
 export const VOICE_SESSION_LEASE_MS = 30 * 1000;
 
@@ -142,8 +148,11 @@ export interface VoiceServiceOptions {
 
 interface VoiceSession {
   actorId: string;
-  expiresAt: number;
-  timer: ReturnType<typeof setTimeout>;
+  /** Number of open SSE connections carrying this stable session id. */
+  connections: number;
+  /** Null while a stream remains open; otherwise the reconnect deadline. */
+  expiresAt: number | null;
+  timer: ReturnType<typeof setTimeout> | null;
 }
 
 export class VoiceService {
@@ -170,7 +179,7 @@ export class VoiceService {
   private readonly lastSeen = new Map<string, number>();
   /** Explicit dashboard-owned session authority, keyed by stable session UUID. */
   private readonly sessions = new Map<string, VoiceSession>();
-  private readonly sessionEndedListeners = new Set<(actorId: string) => void>();
+  private readonly onSessionEnded?: (actorId: string) => void;
   /** Insertion-ordered announcement ring, oldest first, bounded. */
   private readonly announcements: VoiceAnnouncement[] = [];
 
@@ -188,23 +197,36 @@ export class VoiceService {
     if (!Number.isFinite(this.sessionLeaseMs) || this.sessionLeaseMs <= 0) {
       throw new Error("sessionLeaseMs must be a positive finite number");
     }
-    if (options.onSessionEnded) this.sessionEndedListeners.add(options.onSessionEnded);
+    this.onSessionEnded = options.onSessionEnded;
   }
 
   // ── Explicit leased walkie sessions ────────────────────────────────────
 
-  /** Subscribe to one-shot session-end notifications (for held-work release). */
-  onSessionEnded(listener: (actorId: string) => void): () => void {
-    this.sessionEndedListeners.add(listener);
-    return () => this.sessionEndedListeners.delete(listener);
-  }
-
   /**
-   * Create or renew a dashboard's stable session UUID. A UUID is permanently
-   * bound to its first actor for this process lifetime; a different actor is a
-   * protocol error rather than an implicit transfer (transfers are slice B).
+   * Attach one voice SSE connection to a dashboard's stable session UUID. A UUID
+   * is permanently bound to its first actor for this process lifetime; a
+   * different actor is a protocol error rather than an implicit transfer
+   * (transfers are slice B). Any live connection holds authority indefinitely.
    */
   openSession(sessionId: string, actorId: string): void {
+    const existing = this.validateSession(sessionId, actorId);
+    if (existing) {
+      if (existing.timer) clearTimeout(existing.timer);
+      existing.timer = null;
+      existing.expiresAt = null;
+      existing.connections++;
+      return;
+    }
+    this.sessions.set(sessionId, {
+      actorId,
+      connections: 1,
+      expiresAt: null,
+      timer: null,
+    });
+  }
+
+  /** Validate a pending stream without granting authority until it is attached. */
+  validateSession(sessionId: string, actorId: string): VoiceSession | undefined {
     if (!sessionId.trim()) throw new Error("sessionId is required");
     if (!actorId.trim()) throw new Error("actorId is required");
     this.expireSessions();
@@ -212,18 +234,23 @@ export class VoiceService {
     if (existing && existing.actorId !== actorId) {
       throw new Error("sessionId is already bound to a different actor");
     }
-    if (existing) {
-      clearTimeout(existing.timer);
-      existing.expiresAt = this.now() + this.sessionLeaseMs;
-      existing.timer = this.scheduleSessionExpiry(sessionId, existing.expiresAt);
-      return;
-    }
+    return existing;
+  }
+
+  /**
+   * Detach one SSE connection. Only the final drop starts the reconnect timer;
+   * another open stream retains authority without a deadline.
+   */
+  disconnectSession(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.connections === 0) return false;
+    session.connections--;
+    if (session.connections > 0) return true;
+
     const expiresAt = this.now() + this.sessionLeaseMs;
-    this.sessions.set(sessionId, {
-      actorId,
-      expiresAt,
-      timer: this.scheduleSessionExpiry(sessionId, expiresAt),
-    });
+    session.expiresAt = expiresAt;
+    session.timer = this.scheduleSessionExpiry(sessionId, expiresAt);
+    return true;
   }
 
   /** Explicit mode exit. Returns false when it was already absent (idempotent). */
@@ -231,11 +258,13 @@ export class VoiceService {
     return this.endSession(sessionId);
   }
 
-  /** True while at least one unexpired explicit session belongs to this actor. */
+  /** True while an explicit session belongs to this actor and is live or unexpired. */
   hasActiveSession(actorId: string): boolean {
     const now = this.now();
     for (const session of this.sessions.values()) {
-      if (session.actorId === actorId && session.expiresAt > now) return true;
+      if (session.actorId === actorId && (session.expiresAt === null || session.expiresAt > now)) {
+        return true;
+      }
     }
     return false;
   }
@@ -244,14 +273,16 @@ export class VoiceService {
   expireSessions(): void {
     const now = this.now();
     for (const [sessionId, session] of this.sessions) {
-      if (session.expiresAt <= now) this.endSession(sessionId);
+      if (session.expiresAt !== null && session.expiresAt <= now) this.endSession(sessionId);
     }
   }
 
   /** Whether this stable UUID currently authorizes voice memos for its actor. */
   hasSession(sessionId: string, actorId: string): boolean {
     const session = this.sessions.get(sessionId);
-    return session?.actorId === actorId && session.expiresAt > this.now();
+    return (
+      session?.actorId === actorId && (session.expiresAt === null || session.expiresAt > this.now())
+    );
   }
 
   private scheduleSessionExpiry(
@@ -274,9 +305,9 @@ export class VoiceService {
   private endSession(sessionId: string): boolean {
     const session = this.sessions.get(sessionId);
     if (!session) return false;
-    clearTimeout(session.timer);
+    if (session.timer) clearTimeout(session.timer);
     this.sessions.delete(sessionId);
-    for (const listener of this.sessionEndedListeners) listener(session.actorId);
+    this.onSessionEnded?.(session.actorId);
     return true;
   }
 

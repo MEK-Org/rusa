@@ -32,6 +32,8 @@ describe("remote actor run accounting", () => {
   let handle: ActorHandle;
   let failures: Error[];
   let accountingErrors: string[];
+  let admits: Array<{ responsive: boolean; mode: string }>;
+  let gateCalls: number;
 
   const openRuns = () =>
     db
@@ -63,6 +65,8 @@ describe("remote actor run accounting", () => {
     runs = new ActorRunRepository(db);
     failures = [];
     accountingErrors = [];
+    admits = [];
+    gateCalls = 0;
     const accounting = createRunAccounting(() => runs);
     remote = new RemoteInstance("test-follower", process.platform, process.pid);
 
@@ -73,6 +77,14 @@ describe("remote actor run accounting", () => {
       onRunEnd: (result: RunResult) => accounting.complete(ACTOR_ID, result),
       onRuntimeStateChanged: () => {},
       onQueued: () => {},
+      admitRun: (context: { responsive: boolean; mode: string }) => {
+        admits.push(context);
+        return false;
+      },
+      gate: () => {
+        gateCalls++;
+        throw new Error("a refused remote admission must not reserve a lane");
+      },
     } as unknown as ActorFactoryContext;
 
     const actorOptions = {
@@ -121,6 +133,28 @@ describe("remote actor run accounting", () => {
     expect(failures).toHaveLength(1);
     expect(allRuns()).toEqual([]);
     expect(accountingErrors).toEqual([]);
+  });
+
+  it("defers ordinary work at remote final admission without reserving a lane", async () => {
+    followerSends({
+      type: "request",
+      requestId: 9,
+      request: {
+        op: "admit",
+        candidates: [{ provider: "codex", model: "gpt-5.5" }],
+        responsive: false,
+        mode: "ordinary",
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(admits).toEqual([{ responsive: false, mode: "ordinary" }]);
+    expect(gateCalls).toBe(0);
+    expect(remote.commands).toContainEqual({
+      actorId: ACTOR_ID,
+      message: { type: "reply", requestId: 9, value: { deferred: true } },
+    });
   });
 
   it("records nothing when the follower drops while the actor is idle", async () => {

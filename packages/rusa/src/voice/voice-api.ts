@@ -183,8 +183,8 @@ export function handleVoiceApiRequest(
   }
 
   // GET /api/mesh/voice/stream?actors=a&sessionId=UUID — the `voice` SSE
-  // channel. The explicit UUID owns deferral authority; a close is only a
-  // transient transport drop and retains its short reconnect lease.
+  // channel. The explicit UUID owns deferral authority. A close is only a
+  // transient transport drop: the last connection starts its reconnect lease.
   if (req.method === "GET" && pathname === STREAM_ROUTE) {
     const actors = parseActors(url);
     if (actors.size === 0) {
@@ -198,17 +198,24 @@ export function handleVoiceApiRequest(
         return true;
       }
       try {
-        service.openSession(sessionId, [...actors][0]);
+        service.validateSession(sessionId, [...actors][0]);
       } catch (err) {
         sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
         return true;
       }
     }
     service.presenceConnect(actors);
-    const attached = deps.sseHub.addVoiceConnection(res, actors, () =>
-      service.presenceDisconnect(actors)
-    );
-    if (!attached) service.presenceDisconnect(actors);
+    const attached = deps.sseHub.addVoiceConnection(res, actors, () => {
+      service.presenceDisconnect(actors);
+      if (sessionId) service.disconnectSession(sessionId);
+    });
+    if (!attached) {
+      service.presenceDisconnect(actors);
+      return true;
+    }
+    // Grant authority only after the stream has actually attached; a rejected
+    // connection must not create a reconnect lease on its own.
+    if (sessionId) service.openSession(sessionId, [...actors][0]);
     return true;
   }
 

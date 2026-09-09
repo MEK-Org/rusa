@@ -272,8 +272,10 @@ function setup(
         },
         gate: ctx.gate,
         beforeRun: ctx.beforeRun,
+        admitRun: ctx.admitRun,
         onQueued: ctx.onQueued,
         onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+        onRunAbandoned: ctx.onRunAbandoned,
         // Mirrors the production onRunStart wiring in start.ts (#199): apply a
         // pending model/provider/effort tuple before this run's own dispatch,
         // the same way start.ts calls `mesh.applyPendingModel` there.
@@ -304,8 +306,11 @@ function setup(
     saveSessionId: (id) => registry.patch(rootId, { sessionId: id }),
     buildPrompt: () => ({ prompt: "Work from your inbox." }),
     onQueued: (context) => mesh.actorQueued(rootId, context),
+    admitRun: ({ responsive, mode }) =>
+      responsive || mode !== "ordinary" || !(opts.isVoiceSessionActive?.(rootId) ?? false),
     onRunStart: () => mesh.applyPendingModel(rootId),
     onRunEnd: () => mesh.finishInboxRun(rootId),
+    onRunAbandoned: () => mesh.abandonInboxRun(rootId),
     onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
     debounceMs: DEBOUNCE,
   });
@@ -1520,6 +1525,52 @@ describe("ActorMesh", () => {
     expect(
       inboxStore.entries.filter((entry) => entry.actorId === worker && !entry.handledAt)
     ).toHaveLength(3);
+  });
+
+  it("defers a normal run queued before voice authority opens at final admission", async () => {
+    const inboxStore = createMemoryInboxStore();
+    let voiceActive = false;
+    let launch!: () => void;
+    const { mesh, fake, tick } = setup({
+      inboxStore,
+      isVoiceSessionActive: () => voiceActive,
+      providerGate: (fn, candidates) => {
+        let started = false;
+        let resolve!: (value: unknown) => void;
+        let reject!: (reason?: unknown) => void;
+        const result = new Promise<unknown>((res, rej) => {
+          resolve = res;
+          reject = rej;
+        });
+        launch = () => {
+          started = true;
+          void fn(candidates[0] ?? { provider: "fake" }).then(resolve, reject);
+        };
+        return {
+          result: result as Promise<never>,
+          get started() {
+            return started;
+          },
+          promote: launch,
+          cancel: () => false,
+        };
+      },
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    mesh.sendMessage(worker, "ordinary work", "root");
+    await tick();
+    expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+
+    // The ordinary opportunity passed its earlier preflight but has not yet
+    // started. Opening walkie authority here must block its provider launch.
+    voiceActive = true;
+    launch();
+    await tick();
+
+    expect(fake(worker).calls).toHaveLength(0);
+    expect(inboxStore.entries.find((entry) => entry.actorId === worker)?.handledAt).toBeNull();
+    expect(mesh.activeRunState(worker)).toBeNull();
   });
 
   it("preempts an active run for durable responsive inbox work and runs the replacement", async () => {

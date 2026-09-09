@@ -2207,6 +2207,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           // the exhaustion-classified onRun failure notice below).
           gate: ctx.gate,
           beforeRun: ctx.beforeRun,
+          admitRun: ctx.admitRun,
           onQueuedRunCancelled: ctx.onQueuedRunCancelled,
           // Compatibility only: Actor enforces one corrective yield prompt
           // regardless of this legacy cap value.
@@ -2283,6 +2284,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             });
           },
           onRunAbandoned: ({ reason, started }) => {
+            ctx.onRunAbandoned?.();
             activeRunSelections.delete(id);
             if (started) abandonActorRun(id, reason);
             runLogger(id).warn("run_abandoned", { reason, started });
@@ -2802,6 +2804,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         }
         return inboxStore.countUnhandled(rootId) > 0;
       },
+      admitRun: ({ responsive, mode }): boolean =>
+        responsive || mode !== "ordinary" || !(voiceService?.hasActiveSession(rootId) ?? false),
       gate: (fn, candidates, responsive) => mesh.gateRun(fn, candidates, responsive, rootId),
       onQueuedRunCancelled: () => mesh.clearSelection(rootId),
       onContinue: (n) =>
@@ -2876,6 +2880,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         });
       },
       onRunAbandoned: ({ reason, started }) => {
+        mesh.abandonInboxRun(rootId);
         activeRunSelections.delete(rootId);
         if (started) abandonActorRun(rootId, reason);
         runLogger(rootId).warn("run_abandoned", { reason, started });

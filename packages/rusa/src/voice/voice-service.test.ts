@@ -26,13 +26,23 @@ function fakeSpeech(overrides: Partial<SpeechClient> = {}): SpeechClient {
   };
 }
 
-function makeService(opts: { now?: () => number; speech?: SpeechClient; max?: number } = {}) {
+function makeService(
+  opts: {
+    now?: () => number;
+    speech?: SpeechClient;
+    max?: number;
+    sessionLeaseMs?: number;
+    onSessionEnded?: (actorId: string) => void;
+  } = {}
+) {
   const home = mkdtempSync(join(tmpdir(), "voice-service-"));
   const service = new VoiceService({
     home,
     speech: opts.speech ?? fakeSpeech(),
     now: opts.now,
     maxAnnouncements: opts.max,
+    sessionLeaseMs: opts.sessionLeaseMs,
+    onSessionEnded: opts.onSessionEnded,
     encode: async (pcm, _rate, basePath) => {
       const path = `${basePath}.mp3`;
       await writeFile(path, pcm);
@@ -96,31 +106,53 @@ describe("VoiceService presence & grace", () => {
 });
 
 describe("VoiceService leased sessions", () => {
-  it("keeps an explicit session through an SSE drop, renews on reconnect, and ends only once", () => {
+  it("holds authority while connections remain and expires only after the final drop", () => {
     let now = 1_000_000;
     const ended: string[] = [];
-    const { service } = makeService({ now: () => now });
+    const leaseMs = 30_000;
+    const { service } = makeService({
+      now: () => now,
+      sessionLeaseMs: leaseMs,
+      onSessionEnded: (actorId) => ended.push(actorId),
+    });
     const sessions = service as unknown as {
       openSession(sessionId: string, actorId: string): void;
+      disconnectSession(sessionId: string): boolean;
       closeSession(sessionId: string): boolean;
       hasActiveSession(actorId: string): boolean;
       expireSessions(): void;
-      onSessionEnded: (listener: (actorId: string) => void) => void;
     };
 
-    sessions.onSessionEnded((actorId) => ended.push(actorId));
     sessions.openSession("session-a", ACTOR);
     expect(sessions.hasActiveSession(ACTOR)).toBe(true);
 
-    // Closing an SSE connection is not an explicit mode exit.
-    now += 20_000;
-    sessions.openSession("session-a", ACTOR);
+    // One open stream holds authority beyond the reconnect allowance.
+    now += leaseMs * 2;
+    sessions.expireSessions();
     expect(sessions.hasActiveSession(ACTOR)).toBe(true);
 
-    expect(sessions.closeSession("session-a")).toBe(true);
-    expect(sessions.closeSession("session-a")).toBe(false);
+    // A second connection and one drop still leave the first holding authority.
+    sessions.openSession("session-a", ACTOR);
+    expect(sessions.disconnectSession("session-a")).toBe(true);
+    now += leaseMs * 2;
+    sessions.expireSessions();
+    expect(sessions.hasActiveSession(ACTOR)).toBe(true);
+
+    // Only the final drop starts the reconnect expiry.
+    expect(sessions.disconnectSession("session-a")).toBe(true);
+    now += leaseMs - 1;
+    sessions.expireSessions();
+    expect(sessions.hasActiveSession(ACTOR)).toBe(true);
+    now += 1;
+    sessions.expireSessions();
     expect(sessions.hasActiveSession(ACTOR)).toBe(false);
     expect(ended).toEqual([ACTOR]);
+
+    // Explicit disable remains idempotent for a newly opened session.
+    sessions.openSession("session-a", ACTOR);
+    expect(sessions.closeSession("session-a")).toBe(true);
+    expect(sessions.closeSession("session-a")).toBe(false);
+    expect(ended).toEqual([ACTOR, ACTOR]);
   });
 });
 
