@@ -1034,13 +1034,19 @@ export function createAgentExecMcpServer(
       {
         title: "List event source ownership and subscriptions (root-only)",
         description:
-          "List every event source owner (active claims and released tombstones) and every direct subscriber — the audit/inspection view. Exposes effective routing authority where live obligation claims take precedence over stored subscriptions. If a canonical source is specified, returns its effective route projection. Root-only.",
+          "List every event source owner (active claims and released tombstones) and every direct subscriber — the audit/inspection view. If a canonical source is specified, reconciles and returns its effective route projection (where live obligation claims take precedence over stored subscriptions). Root-only.",
         inputSchema: eventResourceInputSchema,
       },
       async (args) => {
         const denied = assertRoot();
         if (denied) return denied;
         try {
+          // All row classes in one response, under the tool's existing name.
+          // They answer one operator question ("who is getting this source's
+          // events, and why") and splitting them across separate tools would make
+          // the ownership half read as the whole answer. When a canonical source
+          // is queried, effectiveRoute reconciles live obligation claims against
+          // stored subscriptions under that same unified inspection lens.
           const owners = mesh.listSubscriptions();
           const subscribers = mesh.listEventSourceSubscriptions();
 
@@ -1061,22 +1067,12 @@ export function createAgentExecMcpServer(
               owners,
               subscribers,
               effectiveRoute,
-              effective_route: effectiveRoute,
-              effective: effectiveRoute,
             });
           }
-
-          const activeResources = [
-            ...new Set(owners.filter((o) => !o.unsubscribedAt).map((o) => o.resource)),
-          ];
-          const effectiveRoutes = activeResources.map((res) => mesh.resolveEffectiveRoute(res));
 
           return toolOk({
             owners,
             subscribers,
-            effectiveRoutes,
-            effective_routes: effectiveRoutes,
-            effective: effectiveRoutes,
           });
         } catch (err) {
           return toolError(err);

@@ -7548,6 +7548,37 @@ describe("ActorMesh", () => {
         /caller is not the current effective owner/
       );
     });
+
+    it("reports uncovered effective route when stored subscription owner is dead (#369)", () => {
+      const issueRef = "github:synthetic-org/synthetic-repo/issues/104";
+      const env = setup();
+      const worker = env.mesh.spawn({ charter: "worker", parentId: "root" });
+      env.mesh.subscribeEventSource(issueRef, worker, "root");
+
+      // Before worker dies, worker is the effective owner
+      const activeRoute = env.mesh.resolveEffectiveRoute(issueRef);
+      expect(activeRoute.governingSource).toBe("subscription");
+      expect(activeRoute.principal).toBe(worker);
+      expect(activeRoute.isLive).toBe(true);
+
+      // Worker is retired/dead and no longer in live set
+      (env.mesh as unknown as { live: Set<string> }).live.delete(worker);
+
+      const deadRoute = env.mesh.resolveEffectiveRoute(issueRef);
+      // Route is uncovered because subscriber is dead and has no live ancestor owner
+      expect(deadRoute.governingSource).toBeNull();
+      expect(deadRoute.principal).toBeNull();
+      expect(deadRoute.resourceLevel).toBeNull();
+      expect(deadRoute.isLive).toBe(false);
+
+      // Reconciles delegation refusal: neither worker nor root can delegate
+      expect(() => env.mesh.delegateEventSource(issueRef, "root", worker)).toThrow(
+        /caller is not the current effective owner/
+      );
+      expect(() => env.mesh.delegateEventSource(issueRef, worker, "root")).toThrow(
+        /caller is not the current effective owner/
+      );
+    });
   });
 
   describe("retirement preflight is fail-closed on undisposed work (#191)", () => {

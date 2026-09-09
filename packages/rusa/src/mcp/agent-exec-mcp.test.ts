@@ -1706,31 +1706,16 @@ describe("agent-execution MCP server", () => {
         isLive: true,
       });
 
-      // Broad audit without arguments also includes effectiveRoutes
-      const broadAudit = dataOf(
+      // Audit without arguments returns raw stored owners and subscribers without targeted effectiveRoute
+      const baseAudit = dataOf(
         (await rootClient.callTool({
           name: "list_subscriptions",
           arguments: {},
         })) as CallToolResult
-      ) as {
-        effectiveRoutes: Array<{
-          resource: string;
-          governingSource: string;
-          principal: string;
-          isLive: boolean;
-        }>;
-      };
-
-      expect(broadAudit.effectiveRoutes).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            resource: ISSUE,
-            governingSource: "obligation",
-            principal: "t1",
-            isLive: true,
-          }),
-        ])
-      );
+      ) as Record<string, unknown>;
+      expect(baseAudit.owners).toBeDefined();
+      expect(baseAudit.subscribers).toBeDefined();
+      expect(baseAudit.effectiveRoute).toBeUndefined();
 
       // When the obligation becomes terminal, diagnostic falls back to stored subscription
       liveObligations[ISSUE] = null;
@@ -1767,6 +1752,17 @@ describe("agent-execution MCP server", () => {
         },
       })) as CallToolResult;
       expect(succeedDelegation.isError).toBeFalsy();
+    });
+
+    it("rejects partially specified resource arguments instead of silent fallback (#369)", async () => {
+      const { mesh } = setup();
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const result = (await rootClient.callTool({
+        name: "list_subscriptions",
+        arguments: { kind: "github_issue", repo: "synthetic-org/synthetic-repo" },
+      })) as CallToolResult;
+      expect(result.isError).toBe(true);
+      expect(String(dataOf(result))).toContain("number is required for github_issue inspection");
     });
 
     it("preserves direct subscriptions as delivery-only in diagnostic output (#369)", async () => {
