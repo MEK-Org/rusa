@@ -910,10 +910,10 @@ One error envelope: `{ "error": { "code": "...", "message": "...", "retryable": 
 | Code | Meaning | Client action |
 | --- | --- | --- |
 | `not_ready` | Service is up but cold — no observation for this provider yet | Keep the last applied interval, or `maxIntervalSeconds` if there has never been one (§5.7 rule 0); retry next tick |
-| `provider_unknown` | Provider not configured on this service | Refuse; this is a configuration error, not a runtime one |
+| `provider_unknown` | Provider argument is blank or not configured on this service | Refuse; this is a configuration error, not a runtime one |
 
-**Two codes, and revision 8 deleted three.** Each deletion is a claim that the
-code could not fire, so each is worth its sentence:
+**Two application-state codes, and revision 8 deleted three.** Each deletion is
+a claim that the code could not fire, so each is worth its sentence:
 
 - **`protocol_mismatch` is not a server error at all.** With no handshake taking
   a client version (§5.2), the server has nothing to compare and cannot raise it.
@@ -945,6 +945,14 @@ snapshot rather than an error (`quota-mcp.ts:910`). `GET /v1/quota` keeps that
 behaviour exactly — the snapshot shape can say "unsupported", so it does. `GET
 /v1/throttle` cannot: there is no throttle shape meaning "this provider is not
 mine", so it is the one path that answers with the code.
+
+An unrouted URL is a typed, versioned HTTP `404`, not a provider-state error:
+its error carries a message and `retryable: false`, but deliberately no
+application-state code. A path mismatch is neither a cold service nor an unknown
+provider, and borrowing either code would give a client the wrong prescribed
+action. HTTP status is sufficient for this transport failure; adding an honestly
+named code remains a future protocol-minor decision if a client ever needs to
+branch on it.
 
 Every v1 call is safe to retry, trivially, because every v1 call is a `GET` and
 nothing on the wire mutates. This is the entire idempotency section — under

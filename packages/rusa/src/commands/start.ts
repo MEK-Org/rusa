@@ -204,6 +204,8 @@ import {
   normalizeFallbackModel,
   providerCapabilityName,
   providerThrottleKey,
+  QUOTA_THROTTLE_PROVIDERS,
+  type QuotaThrottleProvider,
   resolveProvider,
   resolveRootProvider,
 } from "../providers/registry.js";
@@ -274,9 +276,6 @@ const NEVER_DELIVERED_EVENT_TYPES = new Set(["check_run/created", "check_run/com
 // that boots, runs, then dies every ~minute, which the fast window never trips.
 const FLAP_WINDOW_MS = 60 * 60 * 1000;
 const FLAP_THRESHOLD = 5;
-
-const QUOTA_THROTTLE_PROVIDERS = ["claude", "codex", "agy", "kimi"] as const;
-type QuotaThrottleProvider = (typeof QUOTA_THROTTLE_PROVIDERS)[number];
 
 /** Fire-and-forget v1 receipts: seen_at is durable, reaction delivery is not retried. */
 export function reactToQueuedInboxEntries(

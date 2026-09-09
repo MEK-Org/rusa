@@ -316,6 +316,32 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       }
     }
     validateQuotaThrottle(quota.throttle);
+    if (quota.coordinator !== undefined) {
+      if (
+        typeof quota.coordinator !== "object" ||
+        quota.coordinator === null ||
+        Array.isArray(quota.coordinator)
+      ) {
+        throw new Error("config.yaml: quota.coordinator must be a mapping when set");
+      }
+      const allowedCoordinatorKeys = new Set(["socketPath", "databasePath"]);
+      for (const k of Object.keys(quota.coordinator)) {
+        if (!allowedCoordinatorKeys.has(k)) {
+          throw new Error(`config.yaml: unknown key quota.coordinator.${k}`);
+        }
+      }
+      for (const key of ["socketPath", "databasePath"] as const) {
+        const value = quota.coordinator[key];
+        if (value !== undefined) {
+          if (typeof value !== "string" || !value.trim()) {
+            throw new Error(
+              `config.yaml: quota.coordinator.${key} must be a non-empty string when set`
+            );
+          }
+          quota.coordinator[key] = value.trim();
+        }
+      }
+    }
     if (quota.throttle?.enabled === true && !quota.databasePath) {
       throw new Error(
         "config.yaml: quota.databasePath is required when quota.throttle.enabled is true"

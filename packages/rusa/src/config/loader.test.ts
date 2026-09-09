@@ -3,6 +3,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
+import { providerThrottleKey } from "../providers/registry.js";
 import { loadConfig } from "./loader.js";
 import { DEFAULT_DEPLOY_BRANCH } from "./types.js";
 
@@ -729,6 +730,17 @@ describe("loadConfig quota throttle", () => {
 });
 
 describe("loadConfig shared quota store", () => {
+  it("normalizes configured provider throttle keys before alias resolution", () => {
+    const config = loadConfig(
+      writeConfig({
+        providers: { antigravity: { cliCommand: " Antigravity " } },
+        rootActor: { provider: "antigravity", model: "gemini-3.7-flash" },
+      })
+    );
+
+    expect(providerThrottleKey("antigravity", config)).toBe("agy");
+  });
+
   it("accepts and trims a shared database path", () => {
     const config = loadConfig(writeConfig({ quota: { databasePath: "  /srv/rusa/quota.db  " } }));
     expect(config.quota).toEqual({ databasePath: "/srv/rusa/quota.db" });
@@ -744,6 +756,49 @@ describe("loadConfig shared quota store", () => {
     expect(() =>
       loadConfig(writeConfig({ quota: { databasePath: "/srv/rusa/quota.db", poolId: "shared" } }))
     ).toThrow(/quota.poolId has been removed/);
+  });
+
+  it("accepts and trims quota.coordinator configuration", () => {
+    const config = loadConfig(
+      writeConfig({
+        quota: {
+          coordinator: {
+            socketPath: "  /run/rusa/coord.sock  ",
+            databasePath: "  /srv/rusa/quota-coordinator.db  ",
+          },
+        },
+      })
+    );
+    expect(config.quota?.coordinator).toEqual({
+      socketPath: "/run/rusa/coord.sock",
+      databasePath: "/srv/rusa/quota-coordinator.db",
+    });
+  });
+
+  it("rejects invalid quota.coordinator types", () => {
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          quota: {
+            coordinator: "not-a-mapping" as unknown as Record<string, unknown>,
+          },
+        })
+      )
+    ).toThrow(/quota.coordinator must be a mapping/);
+    expect(() =>
+      loadConfig(writeConfig({ quota: { coordinator: { socketPath: "   " } } }))
+    ).toThrow(/quota.coordinator.socketPath must be a non-empty string/);
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          quota: {
+            coordinator: {
+              socketpath: "/run/rusa/coord.sock",
+            } as unknown as { socketPath: string },
+          },
+        })
+      )
+    ).toThrow(/unknown key quota.coordinator.socketpath/);
   });
 });
 
