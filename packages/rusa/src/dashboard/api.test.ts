@@ -15,13 +15,16 @@ import { runMigrations } from "../db/migrations/runner.js";
 import { InboxRepository } from "../db/repositories/inbox-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
-import { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import {
+  MAX_OBLIGATION_PAGE_LIMIT,
+  ObligationRepository,
+} from "../db/repositories/obligation-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { createLogger } from "../observability/logger.js";
 import { assertConcreteModelConfig } from "../providers/model-config.js";
 import type { ReferenceCacheService } from "../references/cache-service.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
-import { type DashboardDataDeps, handleMeshApiRequest } from "./api.js";
+import { type DashboardDataDeps, handleMeshApiRequest, MAX_LIMIT } from "./api.js";
 import { MeshEventEmitter } from "./mesh-event-emitter.js";
 import { SseHub } from "./sse.js";
 
@@ -235,6 +238,11 @@ describe("handleMeshApiRequest", () => {
         },
       },
     ]);
+  });
+
+  it("derives MAX_LIMIT directly from authoritative MAX_OBLIGATION_PAGE_LIMIT", () => {
+    expect(MAX_LIMIT).toBe(MAX_OBLIGATION_PAGE_LIMIT);
+    expect(MAX_OBLIGATION_PAGE_LIMIT).toBe(100);
   });
 
   it("POST /api/mesh/actors forwards a portable context selection ", async () => {
@@ -1989,9 +1997,26 @@ describe("handleMeshApiRequest", () => {
         const { res } = await call(noObligationsDeps, "GET", "/api/mesh/obligations");
         expect(res.statusCode).toBe(503);
       });
+
+      it("clamps limit > 100 to the repository cap without throwing", async () => {
+        obligations.create({ title: "root-1", id: "root-1", ownerId: "actor-1" });
+        const { res } = await call(deps, "GET", "/api/mesh/obligations?limit=150");
+        expect(res.statusCode).toBe(200);
+        const data = JSON.parse(res.body);
+        expect(data.obligations).toHaveLength(1);
+        expect(data.total).toBe(1);
+      });
     });
 
     describe("GET /api/mesh/obligations/forest", () => {
+      it("clamps limit > 100 to the repository cap without throwing", async () => {
+        obligations.create({ title: "root-1", id: "root-1", ownerId: "actor-1" });
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/forest?limit=150");
+        expect(res.statusCode).toBe(200);
+        const data = JSON.parse(res.body);
+        expect(data.trees).toHaveLength(1);
+        expect(data.total).toBe(1);
+      });
       it("returns one root page's trees, in root-page order, without a request per root", async () => {
         obligations.create({ title: "root-1", id: "root-1", ownerId: "actor-1" });
         obligations.create({
@@ -2350,6 +2375,12 @@ describe("handleMeshApiRequest", () => {
         expect(page2Data.completions).toHaveLength(1);
         expect(page2Data.completions[0].note).toBe("cycle one");
         expect(page2Data.completionsHasMore).toBe(false);
+      });
+
+      it("clamps limit > 100 to the repository cap without throwing", async () => {
+        obligations.create({ title: "root-task", id: "root-task", ownerId: "actor-1" });
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/root-task?limit=150");
+        expect(res.statusCode).toBe(200);
       });
     });
 

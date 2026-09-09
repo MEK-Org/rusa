@@ -7,7 +7,11 @@ import {
   type ObligationActivationRecord,
   type ObligationActivationScheduler,
 } from "../../actor/os-scheduler.js";
-import { OBLIGATION_CHECKPOINT_MAX, type Obligation } from "../../obligations/obligation.js";
+import {
+  OBLIGATION_CHECKPOINT_MAX,
+  type Obligation,
+  ObligationValidationError,
+} from "../../obligations/obligation.js";
 import { asGitHubIssue } from "../../references/reference.js";
 import { obligations } from "../migrations/0016_obligations.js";
 import { obligationPriority } from "../migrations/0017_obligation_priority.js";
@@ -18,7 +22,7 @@ import { obligationArtifacts } from "../migrations/0028_obligation_artifacts.js"
 import { recurringObligations } from "../migrations/0035_recurring_obligations.js";
 import { obligationDependencies } from "../migrations/0037_obligation_dependencies.js";
 import { obligationCheckpoint } from "../migrations/0043_obligation_checkpoint.js";
-import { ObligationRepository } from "./obligation-repository.js";
+import { MAX_OBLIGATION_PAGE_LIMIT, ObligationRepository } from "./obligation-repository.js";
 
 /** Records every scheduler call instead of touching the OS, for assertions. */
 class FakeObligationScheduler implements ObligationActivationScheduler {
@@ -1703,6 +1707,22 @@ describe("ObligationRepository", () => {
       expect(page2.obligations).toHaveLength(1);
       expect(page2.total).toBe(2);
       expect(page2.hasMore).toBe(false);
+    });
+
+    it("validates page limit against MAX_OBLIGATION_PAGE_LIMIT", () => {
+      expect(() => repository.listPage({ limit: MAX_OBLIGATION_PAGE_LIMIT + 1 })).toThrow(
+        ObligationValidationError
+      );
+      expect(() => repository.listPage({ limit: MAX_OBLIGATION_PAGE_LIMIT + 1 })).toThrow(
+        `obligation page limit must be an integer from 1 to ${MAX_OBLIGATION_PAGE_LIMIT}`
+      );
+
+      expect(() => repository.listPage({ limit: 0 })).toThrow(ObligationValidationError);
+      expect(() => repository.listPage({ limit: -1 })).toThrow(ObligationValidationError);
+      expect(() => repository.listPage({ limit: 1.5 })).toThrow(ObligationValidationError);
+
+      const page = repository.listPage({ limit: MAX_OBLIGATION_PAGE_LIMIT });
+      expect(page.obligations).toBeDefined();
     });
   });
 

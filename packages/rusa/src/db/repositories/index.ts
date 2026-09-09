@@ -115,7 +115,10 @@ export type {
   CreateObligationInput,
   ListOwnedObligationsOptions,
 } from "./obligation-repository.js";
-export { ObligationRepository } from "./obligation-repository.js";
+export {
+  MAX_OBLIGATION_PAGE_LIMIT,
+  ObligationRepository,
+} from "./obligation-repository.js";
 export { QuotaScrapeRepository } from "./quota-scrape-repository.js";
 export type { RawInput } from "./raw-input-repository.js";
 export { RawInputRepository } from "./raw-input-repository.js";

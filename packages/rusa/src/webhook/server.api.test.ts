@@ -10,6 +10,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 import { describe, expect, it, vi } from "vitest";
+import type { DashboardDataDeps } from "../dashboard/api.js";
+import { type Logger, nullLogger } from "../observability/logger.js";
 import { writeBuildSentinel } from "../update/build-sentinel.js";
 import {
   createDashboardRequestHandler,
@@ -43,15 +45,19 @@ class MockServerResponse extends EventEmitter {
   statusCode = 200;
   headers: Record<string, string> = {};
   body = "";
+  headersSent = false;
+  writableEnded = false;
 
   writeHead(statusCode: number, headers?: Record<string, string>): this {
     this.statusCode = statusCode;
     this.headers = headers ?? {};
+    this.headersSent = true;
     return this;
   }
 
   end(body?: string): this {
     if (body) this.body += body;
+    this.writableEnded = true;
     this.emit("finish");
     return this;
   }
@@ -291,5 +297,141 @@ describe("exported deployedSha resolution", () => {
     } finally {
       rmSync(join(__dirname, ".build-ok"), { force: true });
     }
+  });
+});
+
+describe("dashboard request fault boundary", () => {
+  it("catches unhandled exceptions in request handling, logs at error level, and answers 500", async () => {
+    const errorLogs: Array<{ event: string; data?: Record<string, unknown> }> = [];
+    const testLogger: Logger = {
+      ...nullLogger,
+      error: (event: string, data?: Record<string, unknown>) => {
+        errorLogs.push({ event, data });
+      },
+      child: () => testLogger,
+    };
+
+    const throwingDeps = {
+      obligations: {
+        listPage: () => {
+          throw new Error("simulated unhandled handler failure");
+        },
+      },
+    } as unknown as DashboardDataDeps;
+
+    const handler = createDashboardRequestHandler(
+      {
+        port: 8791,
+        logger: testLogger,
+      },
+      throwingDeps
+    );
+
+    const req = new MockIncomingMessage({ method: "GET", url: "/api/mesh/obligations" });
+    const res = new MockServerResponse();
+    const done = once(res, "finish");
+
+    await expect(
+      handler(req as unknown as IncomingMessage, res as unknown as ServerResponse)
+    ).resolves.not.toThrow();
+    req.emit("end");
+    await done;
+
+    expect(res.statusCode).toBe(500);
+    expect(res.body).toBe("Internal error");
+    expect(errorLogs).toHaveLength(1);
+    expect(errorLogs[0].event).toBe("dashboard_request_failed");
+    expect(errorLogs[0].data?.method).toBe("GET");
+    expect(errorLogs[0].data?.path).toBe("/api/mesh/obligations");
+    expect(errorLogs[0].data?.err).toBeInstanceOf(Error);
+  });
+
+  it("safely handles exceptions when response headers were already sent", async () => {
+    const errorLogs: Array<{ event: string; data?: Record<string, unknown> }> = [];
+    const testLogger: Logger = {
+      ...nullLogger,
+      error: (event: string, data?: Record<string, unknown>) => {
+        errorLogs.push({ event, data });
+      },
+      child: () => testLogger,
+    };
+
+    let responseRef: MockServerResponse | null = null;
+    const throwingAfterHeadersDeps = {
+      obligations: {
+        listPage: () => {
+          responseRef?.writeHead(200, { "Content-Type": "application/json" });
+          throw new Error("failure after headers sent");
+        },
+      },
+    } as unknown as DashboardDataDeps;
+
+    const handler = createDashboardRequestHandler(
+      {
+        port: 8792,
+        logger: testLogger,
+      },
+      throwingAfterHeadersDeps
+    );
+
+    const req = new MockIncomingMessage({ method: "GET", url: "/api/mesh/obligations" });
+    const res = new MockServerResponse();
+    responseRef = res;
+    const done = once(res, "finish");
+
+    await expect(
+      handler(req as unknown as IncomingMessage, res as unknown as ServerResponse)
+    ).resolves.not.toThrow();
+    req.emit("end");
+    await done;
+
+    // Headers were already sent with 200, so writeHead(500) must not be called
+    expect(res.statusCode).toBe(200);
+    expect(res.writableEnded).toBe(true);
+    expect(errorLogs).toHaveLength(1);
+    expect(errorLogs[0].event).toBe("dashboard_request_failed");
+    expect(errorLogs[0].data?.err).toBeInstanceOf(Error);
+  });
+
+  it("keeps the service running for subsequent requests after a crash is contained", async () => {
+    let fail = true;
+    const recoveringDeps = {
+      obligations: {
+        listPage: () => {
+          if (fail) {
+            throw new Error("transient crash");
+          }
+          return { obligations: [], total: 0, hasMore: false };
+        },
+      },
+    } as unknown as DashboardDataDeps;
+
+    const handler = createDashboardRequestHandler(
+      {
+        port: 8793,
+      },
+      recoveringDeps
+    );
+
+    // First request fails and is caught
+    const req1 = new MockIncomingMessage({ method: "GET", url: "/api/mesh/obligations" });
+    const res1 = new MockServerResponse();
+    const done1 = once(res1, "finish");
+    await handler(req1 as unknown as IncomingMessage, res1 as unknown as ServerResponse);
+    req1.emit("end");
+    await done1;
+    expect(res1.statusCode).toBe(500);
+    expect(res1.body).toBe("Internal error");
+
+    // Second request succeeds
+    fail = false;
+    const req2 = new MockIncomingMessage({ method: "GET", url: "/api/mesh/obligations" });
+    const res2 = new MockServerResponse();
+    const done2 = once(res2, "finish");
+    await handler(req2 as unknown as IncomingMessage, res2 as unknown as ServerResponse);
+    req2.emit("end");
+    await done2;
+    expect(res2.statusCode).toBe(200);
+    expect(JSON.parse(res2.body)).toEqual({ obligations: [], total: 0, hasMore: false });
   });
 });

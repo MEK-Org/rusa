@@ -16,7 +16,10 @@ import {
 } from "../avatar/avatars.js";
 import type { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import type { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
-import type { ObligationRepository } from "../db/repositories/obligation-repository.js";
+import {
+  MAX_OBLIGATION_PAGE_LIMIT,
+  type ObligationRepository,
+} from "../db/repositories/obligation-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { Obligation, ObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
@@ -150,8 +153,12 @@ function parseAvatarId(raw: string): string | null {
   return id;
 }
 
-/** Upper bounds so a crafted query can't ask for an unbounded scan/result. */
-const MAX_LIMIT = 200;
+/**
+ * Upper bounds so a crafted query can't ask for an unbounded scan/result.
+ * The query limit is bounded by the authoritative obligation repository cap
+ * so dashboard limit clamping and repository validation cannot drift.
+ */
+export const MAX_LIMIT = MAX_OBLIGATION_PAGE_LIMIT;
 const MAX_ACTORS = 200;
 const DEFAULT_LIMIT = 50;
 /** Cap on a manually-uploaded avatar's decoded byte size (5 MB). */
