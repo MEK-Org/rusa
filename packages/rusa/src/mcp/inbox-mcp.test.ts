@@ -171,6 +171,62 @@ describe("inbox MCP server", () => {
     expect(ownEntry?.hint).toBeUndefined();
   });
 
+  it("holds normal work during a leased voice session while leaving voice responsive", async () => {
+    let voiceActive = false;
+    let selected: string[] = [];
+    store.append([
+      {
+        id: "voice",
+        actorId: "actor-a",
+        source: "mesh:human:operator",
+        payload: { type: "human.voice", priority: "responsive", fromId: "human:operator" },
+      },
+    ]);
+    const client = await connect(
+      createInboxMcpServer(store, "actor-a", {
+        select: (ids) => {
+          selected = ids;
+          return ids.map((id) => {
+            const entry = store.read("actor-a", id);
+            if (!entry) throw new Error("missing test entry");
+            return entry;
+          });
+        },
+        selected: () => selected,
+        isVoiceSessionActive: () => voiceActive,
+      })
+    );
+
+    // Selection cannot be carried over the authority boundary into an ordinary
+    // mark-handled call.
+    await client.callTool({ name: "select", arguments: { entry_ids: ["own"] } });
+    voiceActive = true;
+
+    const listed = (await client.callTool({ name: "list", arguments: {} })) as CallToolResult;
+    expect(
+      (dataOf(listed) as { entries: Array<{ id: string }> }).entries.map((entry) => entry.id)
+    ).toEqual(["voice"]);
+
+    const selectedNormal = (await client.callTool({
+      name: "select",
+      arguments: { entry_ids: ["own"] },
+    })) as CallToolResult;
+    expect(selectedNormal.isError).toBe(true);
+
+    const markedNormal = (await client.callTool({
+      name: "mark_handled",
+      arguments: { entry_ids: ["own"], note: "should remain held" },
+    })) as CallToolResult;
+    expect(markedNormal.isError).toBe(true);
+    expect(store.read("actor-a", "own")?.handledAt).toBeNull();
+
+    const selectedVoice = (await client.callTool({
+      name: "select",
+      arguments: { entry_ids: ["voice"] },
+    })) as CallToolResult;
+    expect(selectedVoice.isError).not.toBe(true);
+  });
+
   it("passes an explicit obligation to the run scope and returns resolved focus", async () => {
     let selectedObligation: string | undefined;
     const client = await connect(

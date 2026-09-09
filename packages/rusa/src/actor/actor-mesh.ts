@@ -670,6 +670,8 @@ export interface ActorMeshOptions {
   obligations?: MeshObligationPort;
   /** Durable actor inbox used for singleton wake recovery. Optional for isolated tests. */
   inboxStore?: InboxStore;
+  /** Host-owned leased walkie authority; absent preserves existing dispatch semantics. */
+  isVoiceSessionActive?: (actorId: string) => boolean;
   /** General lifecycle hook matching onYield. */
   onQueued?: (actorId: string, context: { responsive: boolean; mode: ActorRunMode }) => void;
   /** Best-effort receipts for entries first accepted into an execution opportunity. */
@@ -758,6 +760,7 @@ export class ActorMesh {
   private readonly configuredEventSources: readonly EventResource[] | undefined;
   private readonly obligations?: MeshObligationPort;
   private readonly inboxStore?: InboxStore;
+  private readonly isVoiceSessionActive: (actorId: string) => boolean;
   private readonly onQueued?: ActorMeshOptions["onQueued"];
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
   private readonly grantable: ReadonlySet<string>;
@@ -817,6 +820,7 @@ export class ActorMesh {
     this.configuredEventSources = opts.configuredEventSources;
     this.obligations = opts.obligations;
     this.inboxStore = opts.inboxStore;
+    this.isVoiceSessionActive = opts.isVoiceSessionActive ?? (() => false);
     this.onQueued = opts.onQueued;
     this.onInboxEntriesSeen = opts.onInboxEntriesSeen;
     this.grantable = opts.grantableCapabilities ?? new Set();
@@ -1160,6 +1164,13 @@ export class ActorMesh {
       this.log(`inbox_changed for ${actorId} not nudged — no live actor`);
       return false;
     }
+    if (!isResponsiveNudge(nudge) && this.isVoiceSessionActive(actorId)) {
+      // The entry is already durable. It must wait for the session-end nudge,
+      // rather than adding an ordinary execution opportunity behind the voice
+      // conversation. Responsive work still preempts exactly as before.
+      this.log(`inbox_changed for ${actorId} held — active voice session`);
+      return true;
+    }
     if (isResponsiveNudge(nudge)) {
       const preemption = target.preemptForResponsive();
       if (preemption.preempted) {
@@ -1233,6 +1244,9 @@ export class ActorMesh {
       const entry = inboxStore.read(actorId, id);
       if (!entry) throw new Error(`Inbox entry not found: ${id}`);
       if (entry.handledAt) throw new Error(`Inbox entry already handled: ${id}`);
+      if (this.isVoiceSessionActive(actorId) && entry.payload.priority !== "responsive") {
+        throw new Error("ordinary inbox work is held while a voice session is active");
+      }
       return entry;
     });
     beforeCommit?.(entries);
@@ -1436,6 +1450,25 @@ export class ActorMesh {
     if (this.inboxStore && this.inboxStore.countUnhandled(actorId) > 0) {
       this.notifyInboxChanged(actorId);
     }
+  }
+
+  /**
+   * Called once by the leased voice registry on explicit end or lease expiry.
+   * The durable inbox remains the source of truth; this is only the one
+   * ordinary nudge that lets held background work resume.
+   */
+  notifyVoiceSessionEnded(actorId: string): boolean {
+    actorId = this.resolveThreadId(actorId);
+    if (!this.inboxStore) return false;
+    let cursor: string | undefined;
+    do {
+      const page = this.inboxStore.list(actorId, { status: "unhandled", limit: 100, cursor });
+      if (page.entries.some((entry) => entry.payload.priority !== "responsive")) {
+        return this.notifyInboxChanged(actorId);
+      }
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    return false;
   }
 
   /**

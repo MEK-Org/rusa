@@ -237,6 +237,7 @@ import { readBuildSentinel } from "../update/build-sentinel.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
 import { BuildRunner, GitRunner } from "../update/runner.js";
+import type { VoiceService } from "../voice/voice-service.js";
 import { createVoiceService } from "../voice/wiring.js";
 import {
   directiveBodyForWebhookPayload,
@@ -1700,6 +1701,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     ? instanceWorkerFactory(config, followerHub, { logger: log })
     : undefined;
   const createWorkerActor = opts?.e2e?.createWorkerActor ?? followerWorkerFactory;
+  // The mesh is built before the configured voice client. The closure keeps
+  // authority host-owned while letting the later service attach its registry.
+  let voiceService: VoiceService | null = null;
 
   // ── Actor mesh: the root plus any worker threads it spawns ──
   const mesh: ActorMesh = new ActorMesh({
@@ -1776,6 +1780,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           })),
     },
     inboxStore,
+    isVoiceSessionActive: (actorId) => voiceService?.hasActiveSession(actorId) ?? false,
     onInboxEntriesSeen: (_actorId, entries) =>
       reactToQueuedInboxEntries(issueClient, entries, console.warn, chatClient ?? undefined),
     // Grantable = every registered MCP-server capability PLUS the secret
@@ -2003,6 +2008,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             selected: () => mesh.selectedInboxEntries(id),
             onHandled: () => mesh.inboxHandled(id),
             isFenced,
+            isVoiceSessionActive: () => voiceService?.hasActiveSession(id) ?? false,
           })
         );
         const obligationsUrl = mcpHttp.addServer(`${id}:${OBLIGATIONS_MCP_NAME}`, () =>
@@ -2531,6 +2537,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       },
       selected: () => mesh.selectedInboxEntries(rootId),
       onHandled: () => mesh.inboxHandled(rootId),
+      isVoiceSessionActive: () => voiceService?.hasActiveSession(rootId) ?? false,
     })
   );
   const rootMeshChatUrl = mcpHttp.addServer(`${rootId}:${MESH_CHAT_MCP_NAME}`, () =>
@@ -3209,8 +3216,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // and TTS are host-side Gemini calls — the key never reaches workers). When
   // absent the voice routes 503 with a clear error and nothing else changes.
   const geminiApiKey = config.geminiApiKey?.trim();
-  const voiceService = geminiApiKey
-    ? createVoiceService({ home: mcHome, apiKey: geminiApiKey, voice: config.voice })
+  voiceService = geminiApiKey
+    ? createVoiceService({
+        home: mcHome,
+        apiKey: geminiApiKey,
+        voice: config.voice,
+        onSessionEnded: (actorId) => mesh.notifyVoiceSessionEnded(actorId),
+      })
     : null;
   const dashboardServer = shouldBindDashboardServer({
     e2eMode,

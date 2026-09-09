@@ -265,6 +265,7 @@ describe("handleVoiceApiRequest", () => {
   describe("POST /api/mesh/actors/:id/voice-memo", () => {
     it("stores audio, transcribes, and delivers the marked transcript", async () => {
       const audio = Buffer.from("webm-bytes");
+      call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=sess-9`);
       const { res } = call(deps, "POST", `/api/mesh/actors/${UUID_A}/voice-memo?sessionId=sess-9`, {
         body: audio,
         contentType: "audio/webm",
@@ -359,6 +360,25 @@ describe("handleVoiceApiRequest", () => {
     it("400s without an actors filter", () => {
       const { res } = call(deps, "GET", "/api/mesh/voice/stream");
       expect(res.statusCode).toBe(400);
+    });
+
+    it("keeps an explicit session through an SSE drop and ends it only on disable", async () => {
+      const first = call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-1`);
+      expect(service.hasSession("walkie-1", UUID_A)).toBe(true);
+
+      // An EventSource error/reconnect does not release background work.
+      first.res.req.emit("close");
+      expect(service.hasSession("walkie-1", UUID_A)).toBe(true);
+      call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-1`);
+      expect(service.hasSession("walkie-1", UUID_A)).toBe(true);
+
+      const { res } = call(deps, "POST", "/api/mesh/voice/session/disable", {
+        body: JSON.stringify({ sessionId: "walkie-1" }),
+        contentType: "application/json",
+      });
+      await settled(res);
+      expect(res.statusCode).toBe(200);
+      expect(service.hasActiveSession(UUID_A)).toBe(false);
     });
 
     it("a connected subscription is presence; replies stream as voice frames", async () => {

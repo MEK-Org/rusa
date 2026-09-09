@@ -38,6 +38,7 @@ const BACKLOG_ROUTE = /^\/api\/mesh\/actors\/([^/]+)\/voice\/backlog$/;
 const AUDIO_ROUTE = /^\/api\/mesh\/voice\/audio\/([^/]+)$/;
 const STREAM_ROUTE = "/api/mesh/voice/stream";
 const ACK_ROUTE = "/api/mesh/voice/ack";
+const SESSION_DISABLE_ROUTE = "/api/mesh/voice/session/disable";
 
 /** Cap inbound memo audio well above any realistic tap-to-talk clip. */
 const MAX_MEMO_BYTES = 25 * 1024 * 1024;
@@ -82,6 +83,7 @@ function isVoicePath(pathname: string): boolean {
   return (
     pathname === STREAM_ROUTE ||
     pathname === ACK_ROUTE ||
+    pathname === SESSION_DISABLE_ROUTE ||
     AUDIO_ROUTE.test(pathname) ||
     MEMO_ROUTE.test(pathname) ||
     BACKLOG_ROUTE.test(pathname)
@@ -139,7 +141,16 @@ export function handleVoiceApiRequest(
       sendJson(res, 500, { error: "ActorMesh instance not bound to deps" });
       return true;
     }
-    const sessionId = url.searchParams.get("sessionId") ?? randomUUID();
+    const suppliedSessionId = url.searchParams.get("sessionId");
+    // Older clients did not carry a stable id. Keep their memo delivery
+    // semantics, but never let that implicit one-off id become leased session
+    // authority. Current dashboard clients establish their supplied id on SSE
+    // and every memo must match that actor binding.
+    if (suppliedSessionId && !service.hasSession(suppliedSessionId, actorId)) {
+      sendJson(res, 409, { error: "voice session is not active for this actor" });
+      return true;
+    }
+    const sessionId = suppliedSessionId ?? randomUUID();
 
     void (async () => {
       const audio = await readRawBody(req, MAX_MEMO_BYTES);
@@ -171,20 +182,57 @@ export function handleVoiceApiRequest(
     return true;
   }
 
-  // GET /api/mesh/voice/stream?actors=a,b — the `voice` SSE channel. A
-  // connected subscription IS the walkie-mode presence signal for its actors;
-  // teardown starts the reply-TTS grace window.
+  // GET /api/mesh/voice/stream?actors=a&sessionId=UUID — the `voice` SSE
+  // channel. The explicit UUID owns deferral authority; a close is only a
+  // transient transport drop and retains its short reconnect lease.
   if (req.method === "GET" && pathname === STREAM_ROUTE) {
     const actors = parseActors(url);
     if (actors.size === 0) {
       sendJson(res, 400, { error: "actors query param is required (comma-separated actor ids)" });
       return true;
     }
+    const sessionId = url.searchParams.get("sessionId");
+    if (sessionId) {
+      if (actors.size !== 1) {
+        sendJson(res, 400, { error: "a leased voice session requires exactly one actor" });
+        return true;
+      }
+      try {
+        service.openSession(sessionId, [...actors][0]);
+      } catch (err) {
+        sendJson(res, 409, { error: err instanceof Error ? err.message : String(err) });
+        return true;
+      }
+    }
     service.presenceConnect(actors);
     const attached = deps.sseHub.addVoiceConnection(res, actors, () =>
       service.presenceDisconnect(actors)
     );
     if (!attached) service.presenceDisconnect(actors);
+    return true;
+  }
+
+  // Explicit mode exit is distinct from a socket close: it ends the lease
+  // immediately and lets held ordinary inbox work receive one normal nudge.
+  if (req.method === "POST" && pathname === SESSION_DISABLE_ROUTE) {
+    void (async () => {
+      const body = (await readRawBody(req, 64 * 1024)).toString("utf-8");
+      let sessionId: unknown;
+      try {
+        sessionId = (JSON.parse(body) as { sessionId?: unknown }).sessionId;
+      } catch {
+        sendJson(res, 400, { error: "Invalid JSON body" });
+        return;
+      }
+      if (typeof sessionId !== "string" || !sessionId.trim()) {
+        sendJson(res, 400, { error: "Missing sessionId" });
+        return;
+      }
+      service.closeSession(sessionId);
+      sendJson(res, 200, { ok: true });
+    })().catch((err) => {
+      sendJson(res, 500, { error: String(err) });
+    });
     return true;
   }
 

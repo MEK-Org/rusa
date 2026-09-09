@@ -333,6 +333,23 @@ class DashboardApi {
     }
   }
 
+  /// `POST /api/mesh/voice/session/disable` — explicitly end the leased
+  /// walkie session. Socket close alone intentionally leaves a reconnect lease.
+  Future<void> disableVoiceSession(String sessionId) async {
+    final uri = _u('/api/mesh/voice/session/disable');
+    final res = await _client.post(
+      uri,
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({'sessionId': sessionId}),
+    );
+    if (res.statusCode != 200) {
+      throw DashboardApiException(uri, res.statusCode, res.body);
+    }
+  }
+
   // ── Obligations read routes ──
 
   Future<ObligationPage> fetchObligations({

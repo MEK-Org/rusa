@@ -43,6 +43,14 @@ export const VOICE_MEMO_PREFIX = "🎙️ [voice memo — reply for the ear]: ";
  */
 export const VOICE_PRESENCE_GRACE_MS = 2 * 60 * 1000;
 
+/**
+ * A dropped EventSource is allowed a short window to reconnect without
+ * releasing the actor's walkie authority. This is deliberately separate from
+ * {@link VOICE_PRESENCE_GRACE_MS}: presence protects TTS delivery, while this
+ * lease controls whether ordinary inbox work may run.
+ */
+export const VOICE_SESSION_LEASE_MS = 30 * 1000;
+
 /** Ring bound on the in-memory announcement registry. */
 export const MAX_ANNOUNCEMENTS = 50;
 
@@ -126,6 +134,16 @@ export interface VoiceServiceOptions {
   ) => Promise<StreamingEncodedAudio>;
   maxAnnouncements?: number;
   presenceGraceMs?: number;
+  /** Reconnect allowance for an explicit walkie session. */
+  sessionLeaseMs?: number;
+  /** Called once when an explicit session ends or expires. */
+  onSessionEnded?: (actorId: string) => void;
+}
+
+interface VoiceSession {
+  actorId: string;
+  expiresAt: number;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 export class VoiceService {
@@ -144,11 +162,15 @@ export class VoiceService {
   ) => Promise<StreamingEncodedAudio>;
   private readonly maxAnnouncements: number;
   private readonly presenceGraceMs: number;
+  private readonly sessionLeaseMs: number;
 
   /** Live `voice` SSE subscription count per actor. */
   private readonly liveSubscriptions = new Map<string, number>();
   /** Epoch ms of the last disconnect per actor (starts the grace window). */
   private readonly lastSeen = new Map<string, number>();
+  /** Explicit dashboard-owned session authority, keyed by stable session UUID. */
+  private readonly sessions = new Map<string, VoiceSession>();
+  private readonly sessionEndedListeners = new Set<(actorId: string) => void>();
   /** Insertion-ordered announcement ring, oldest first, bounded. */
   private readonly announcements: VoiceAnnouncement[] = [];
 
@@ -162,6 +184,100 @@ export class VoiceService {
       ((pcmStream, rate, basePath) => encodePcmStream(pcmStream, rate, basePath));
     this.maxAnnouncements = options.maxAnnouncements ?? MAX_ANNOUNCEMENTS;
     this.presenceGraceMs = options.presenceGraceMs ?? VOICE_PRESENCE_GRACE_MS;
+    this.sessionLeaseMs = options.sessionLeaseMs ?? VOICE_SESSION_LEASE_MS;
+    if (!Number.isFinite(this.sessionLeaseMs) || this.sessionLeaseMs <= 0) {
+      throw new Error("sessionLeaseMs must be a positive finite number");
+    }
+    if (options.onSessionEnded) this.sessionEndedListeners.add(options.onSessionEnded);
+  }
+
+  // ── Explicit leased walkie sessions ────────────────────────────────────
+
+  /** Subscribe to one-shot session-end notifications (for held-work release). */
+  onSessionEnded(listener: (actorId: string) => void): () => void {
+    this.sessionEndedListeners.add(listener);
+    return () => this.sessionEndedListeners.delete(listener);
+  }
+
+  /**
+   * Create or renew a dashboard's stable session UUID. A UUID is permanently
+   * bound to its first actor for this process lifetime; a different actor is a
+   * protocol error rather than an implicit transfer (transfers are slice B).
+   */
+  openSession(sessionId: string, actorId: string): void {
+    if (!sessionId.trim()) throw new Error("sessionId is required");
+    if (!actorId.trim()) throw new Error("actorId is required");
+    this.expireSessions();
+    const existing = this.sessions.get(sessionId);
+    if (existing && existing.actorId !== actorId) {
+      throw new Error("sessionId is already bound to a different actor");
+    }
+    if (existing) {
+      clearTimeout(existing.timer);
+      existing.expiresAt = this.now() + this.sessionLeaseMs;
+      existing.timer = this.scheduleSessionExpiry(sessionId, existing.expiresAt);
+      return;
+    }
+    const expiresAt = this.now() + this.sessionLeaseMs;
+    this.sessions.set(sessionId, {
+      actorId,
+      expiresAt,
+      timer: this.scheduleSessionExpiry(sessionId, expiresAt),
+    });
+  }
+
+  /** Explicit mode exit. Returns false when it was already absent (idempotent). */
+  closeSession(sessionId: string): boolean {
+    return this.endSession(sessionId);
+  }
+
+  /** True while at least one unexpired explicit session belongs to this actor. */
+  hasActiveSession(actorId: string): boolean {
+    const now = this.now();
+    for (const session of this.sessions.values()) {
+      if (session.actorId === actorId && session.expiresAt > now) return true;
+    }
+    return false;
+  }
+
+  /** Testable expiry sweep; production timers invoke this at each lease boundary. */
+  expireSessions(): void {
+    const now = this.now();
+    for (const [sessionId, session] of this.sessions) {
+      if (session.expiresAt <= now) this.endSession(sessionId);
+    }
+  }
+
+  /** Whether this stable UUID currently authorizes voice memos for its actor. */
+  hasSession(sessionId: string, actorId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    return session?.actorId === actorId && session.expiresAt > this.now();
+  }
+
+  private scheduleSessionExpiry(
+    sessionId: string,
+    expiresAt: number
+  ): ReturnType<typeof setTimeout> {
+    const timer = setTimeout(
+      () => {
+        const session = this.sessions.get(sessionId);
+        if (!session) return;
+        if (session.expiresAt !== expiresAt) return;
+        this.expireSessions();
+      },
+      Math.max(0, expiresAt - this.now())
+    );
+    timer.unref?.();
+    return timer;
+  }
+
+  private endSession(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    clearTimeout(session.timer);
+    this.sessions.delete(sessionId);
+    for (const listener of this.sessionEndedListeners) listener(session.actorId);
+    return true;
   }
 
   // ── Presence ────────────────────────────────────────────────────────────

@@ -170,6 +170,7 @@ function setup(
     onYield?: (actorId: string, ctx: { notifyingParent: boolean }) => string | null | undefined;
     recordRunYield?: ActorMeshOptions["recordRunYield"];
     inboxStore?: InboxStore;
+    isVoiceSessionActive?: ActorMeshOptions["isVoiceSessionActive"];
     onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
     grantableCapabilities?: ReadonlySet<string>;
     validateSpawn?: ActorMeshOptions["validateSpawn"];
@@ -208,6 +209,7 @@ function setup(
     events: opts.events,
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
     inboxStore: opts.inboxStore ?? createMemoryInboxStore(),
+    isVoiceSessionActive: opts.isVoiceSessionActive,
     obligations: opts.obligations,
     configuredEventSources: opts.configuredEventSources,
     scheduledMessages,
@@ -1467,6 +1469,57 @@ describe("ActorMesh", () => {
       }),
     ]);
     expect(fake("root").calls).toHaveLength(1);
+  });
+
+  it("durably holds normal GitHub and cron work for a voice session, then releases it once", async () => {
+    const inboxStore = createMemoryInboxStore();
+    let voiceActive = true;
+    const { mesh, fake, tick } = setup({
+      inboxStore,
+      isVoiceSessionActive: () => voiceActive,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    const [github] = inboxStore.append([
+      {
+        actorId: worker,
+        source: "github:example/repo",
+        payload: { type: "github.issue" },
+      },
+    ]);
+    mesh.notifyInboxChanged(worker);
+    mesh.deliverWake(worker, "cron maintenance");
+    await tick();
+
+    expect(github?.handledAt).toBeNull();
+    expect(
+      inboxStore.entries.filter((entry) => entry.actorId === worker && !entry.handledAt)
+    ).toHaveLength(2);
+    expect(fake(worker).calls).toHaveLength(0);
+    expect(() => mesh.selectInboxEntries(worker, [github?.id ?? "missing"])).toThrow(
+      "ordinary inbox work is held"
+    );
+
+    // A voice memo remains responsive even though normal work is held.
+    expect(
+      mesh.sendHumanMessage(worker, "🎙️ [voice memo — reply for the ear]: status?", "voice-a")
+    ).toEqual({
+      delivered: true,
+    });
+    await tick();
+    expect(fake(worker).calls).toHaveLength(1);
+
+    voiceActive = false;
+    expect(mesh.notifyVoiceSessionEnded(worker)).toBe(true);
+    await tick();
+    const callsAfterRelease = fake(worker).calls.length;
+    expect(callsAfterRelease).toBeGreaterThan(1);
+
+    // The registry calls this method once per ended session; a new session end
+    // is not inferred from the remaining durable work.
+    expect(
+      inboxStore.entries.filter((entry) => entry.actorId === worker && !entry.handledAt)
+    ).toHaveLength(3);
   });
 
   it("preempts an active run for durable responsive inbox work and runs the replacement", async () => {

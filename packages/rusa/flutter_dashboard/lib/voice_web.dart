@@ -234,9 +234,9 @@ class WebScreenWakeLock implements ScreenWakeLock {
   }
 }
 
-/// Browser EventSource on `/api/mesh/voice/stream`. The open connection is the
-/// walkie presence signal, so this object lives exactly as long as the mode is
-/// ON (the controller creates one per mode entry and disposes it on exit).
+/// Browser EventSource on `/api/mesh/voice/stream`. Its stable session UUID is
+/// the walkie authority, so this object lives exactly as long as the mode is ON
+/// (the controller creates one per mode entry and disposes it on exit).
 /// EventSource auto-reconnects on blips; `open`/`error` events surface as
 /// [VoiceStreamStatus] so the controller can re-fetch the backlog after a gap.
 class WebVoiceStream implements VoiceStreamSource {
@@ -250,10 +250,13 @@ class WebVoiceStream implements VoiceStreamSource {
   Stream<VoiceStreamStatus> get status => _status.stream;
 
   @override
-  void connect(List<String> actors) {
+  void connect(List<String> actors, String sessionId) {
     _es?.close();
     final qs = Uri.encodeQueryComponent(actors.join(','));
-    final es = web.EventSource('/api/mesh/voice/stream?actors=$qs');
+    final session = Uri.encodeQueryComponent(sessionId);
+    final es = web.EventSource(
+      '/api/mesh/voice/stream?actors=$qs&sessionId=$session',
+    );
     es.addEventListener(
       'voice',
       (web.Event e) {

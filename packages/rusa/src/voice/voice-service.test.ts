@@ -95,6 +95,35 @@ describe("VoiceService presence & grace", () => {
   });
 });
 
+describe("VoiceService leased sessions", () => {
+  it("keeps an explicit session through an SSE drop, renews on reconnect, and ends only once", () => {
+    let now = 1_000_000;
+    const ended: string[] = [];
+    const { service } = makeService({ now: () => now });
+    const sessions = service as unknown as {
+      openSession(sessionId: string, actorId: string): void;
+      closeSession(sessionId: string): boolean;
+      hasActiveSession(actorId: string): boolean;
+      expireSessions(): void;
+      onSessionEnded: (listener: (actorId: string) => void) => void;
+    };
+
+    sessions.onSessionEnded((actorId) => ended.push(actorId));
+    sessions.openSession("session-a", ACTOR);
+    expect(sessions.hasActiveSession(ACTOR)).toBe(true);
+
+    // Closing an SSE connection is not an explicit mode exit.
+    now += 20_000;
+    sessions.openSession("session-a", ACTOR);
+    expect(sessions.hasActiveSession(ACTOR)).toBe(true);
+
+    expect(sessions.closeSession("session-a")).toBe(true);
+    expect(sessions.closeSession("session-a")).toBe(false);
+    expect(sessions.hasActiveSession(ACTOR)).toBe(false);
+    expect(ended).toEqual([ACTOR]);
+  });
+});
+
 describe("VoiceService outbound reply TTS", () => {
   it("renders, stores, and registers a reply to human:operator from a present actor", async () => {
     const { service, home } = makeService();
