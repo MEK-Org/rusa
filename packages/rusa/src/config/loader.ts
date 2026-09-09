@@ -324,6 +324,12 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       ) {
         throw new Error("config.yaml: quota.coordinator must be a mapping when set");
       }
+      const allowedCoordinatorKeys = new Set(["socketPath", "databasePath"]);
+      for (const k of Object.keys(quota.coordinator)) {
+        if (!allowedCoordinatorKeys.has(k)) {
+          throw new Error(`config.yaml: unknown key quota.coordinator.${k}`);
+        }
+      }
       for (const key of ["socketPath", "databasePath"] as const) {
         const value = quota.coordinator[key];
         if (value !== undefined) {

@@ -70,36 +70,3 @@ export function widenToWal(db: Database.Database, budgetMs: number = BUSY_TIMEOU
     db.pragma(`busy_timeout = ${priorBusyTimeoutMs}`);
   }
 }
-
-export const QUOTA_SCHEMA_VERSION = 1;
-
-export class SchemaVersionRefusalError extends Error {
-  constructor(
-    readonly currentVersion: number,
-    readonly maxSupportedVersion: number
-  ) {
-    super(
-      `Database user_version ${currentVersion} is newer than supported schema version ${maxSupportedVersion}`
-    );
-    this.name = "SchemaVersionRefusalError";
-  }
-}
-
-/**
- * Enforce the schema guard from §5.2 and §7 of the quota coordinator design.
- * Refuses to open a database whose PRAGMA user_version is newer than supported.
- */
-export function assertQuotaSchemaVersion(
-  db: Database.Database,
-  maxSupportedVersion: number = QUOTA_SCHEMA_VERSION
-): number {
-  const current = db.pragma("user_version", { simple: true }) as number;
-  if (typeof current === "number" && current > maxSupportedVersion) {
-    throw new SchemaVersionRefusalError(current, maxSupportedVersion);
-  }
-  if (current === 0) {
-    db.pragma(`user_version = ${maxSupportedVersion}`);
-    return maxSupportedVersion;
-  }
-  return current;
-}

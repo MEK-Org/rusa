@@ -65,6 +65,9 @@ export function providerThrottleKey(providerName: string, config: RusaConfig): s
   return key === "antigravity" ? "agy" : key;
 }
 
+export const QUOTA_THROTTLE_PROVIDERS = ["claude", "codex", "agy", "kimi"] as const;
+export type QuotaThrottleProvider = (typeof QUOTA_THROTTLE_PROVIDERS)[number];
+
 /**
  * Resolve the provider the root actor runs on. Config-driven and intentionally
  * independent of the DB enabled-models / persona quota routing — the root model

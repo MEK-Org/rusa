@@ -776,6 +776,17 @@ describe("loadConfig shared quota store", () => {
     expect(() =>
       loadConfig(writeConfig({ quota: { coordinator: { socketPath: "   " } } }))
     ).toThrow(/quota.coordinator.socketPath must be a non-empty string/);
+    expect(() =>
+      loadConfig(
+        writeConfig({
+          quota: {
+            coordinator: {
+              socketpath: "/run/rusa/coord.sock",
+            } as unknown as { socketPath: string },
+          },
+        })
+      )
+    ).toThrow(/unknown key quota.coordinator.socketpath/);
   });
 });
 

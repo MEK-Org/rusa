@@ -1,6 +1,8 @@
 import http from "node:http";
 import {
   COORDINATOR_PROTOCOL_MAJOR,
+  DEFAULT_HARD_STALE_AFTER_MS,
+  DEFAULT_MAX_INTERVAL_SECONDS,
   type PublishedThrottleCollectionResponse,
   type PublishedThrottleResponse,
   validateProtocolMajor,
@@ -9,16 +11,40 @@ import {
 export interface QuotaCoordinatorClientOptions {
   socketPath: string;
   defaultIntervalSeconds?: number;
+  maxIntervalSeconds?: number;
+  hardStaleAfterMs?: number;
+  now?: () => number;
   logger?: { warn: (...args: unknown[]) => void; error: (...args: unknown[]) => void };
 }
 
 export class QuotaCoordinatorClient {
   private lastAppliedIntervals: Map<string, number> = new Map();
+  private lastSuccessfulReadMs: Map<string, number> = new Map();
 
   constructor(readonly options: QuotaCoordinatorClientOptions) {}
 
   getLastAppliedInterval(provider: string): number {
-    return this.lastAppliedIntervals.get(provider) ?? this.options.defaultIntervalSeconds ?? 3600;
+    const maxInterval =
+      this.options.maxIntervalSeconds ??
+      this.options.defaultIntervalSeconds ??
+      DEFAULT_MAX_INTERVAL_SECONDS;
+
+    const lastApplied = this.lastAppliedIntervals.get(provider);
+    const lastRead = this.lastSuccessfulReadMs.get(provider);
+
+    // §5.7 Rule 0: A client that has never had a successful read starts at maxIntervalSeconds
+    if (lastApplied === undefined || lastRead === undefined) {
+      return maxInterval;
+    }
+
+    // §5.7 Rule 2: Past hardStaleAfterMs since its last successful read, the client widens to maxIntervalSeconds on its own
+    const nowMs = this.options.now ? this.options.now() : Date.now();
+    const hardStaleAfterMs = this.options.hardStaleAfterMs ?? DEFAULT_HARD_STALE_AFTER_MS;
+    if (nowMs - lastRead > hardStaleAfterMs) {
+      return Math.max(lastApplied, maxInterval);
+    }
+
+    return lastApplied;
   }
 
   /**
@@ -43,14 +69,14 @@ export class QuotaCoordinatorClient {
       "intervalSeconds" in body &&
       typeof (body as { intervalSeconds: unknown }).intervalSeconds === "number"
     ) {
-      this.lastAppliedIntervals.set(
-        provider,
-        (body as { intervalSeconds: number }).intervalSeconds
-      );
+      const interval = (body as { intervalSeconds: number }).intervalSeconds;
+      const nowMs = this.options.now ? this.options.now() : Date.now();
+      this.lastAppliedIntervals.set(provider, interval);
+      this.lastSuccessfulReadMs.set(provider, nowMs);
       return true;
     }
 
-    return true;
+    return false;
   }
 
   async getThrottle(
@@ -76,6 +102,31 @@ export class QuotaCoordinatorClient {
             if (res.statusCode === 200) {
               try {
                 const parsed = JSON.parse(data);
+                try {
+                  validateProtocolMajor(parsed, COORDINATOR_PROTOCOL_MAJOR);
+                } catch (err) {
+                  this.options.logger?.warn(
+                    `[quota-client] Discarding response due to protocol mismatch: ${
+                      err instanceof Error ? err.message : String(err)
+                    }`
+                  );
+                  resolve(null);
+                  return;
+                }
+
+                if (provider) {
+                  this.applyResponse(provider, parsed);
+                } else if (
+                  parsed &&
+                  typeof parsed === "object" &&
+                  "providers" in parsed &&
+                  parsed.providers &&
+                  typeof parsed.providers === "object"
+                ) {
+                  for (const [p, pStatus] of Object.entries(parsed.providers)) {
+                    this.applyResponse(p, pStatus);
+                  }
+                }
                 resolve(parsed);
               } catch (err) {
                 reject(err);

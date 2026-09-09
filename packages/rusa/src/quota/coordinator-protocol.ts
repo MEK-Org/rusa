@@ -14,7 +14,7 @@ export interface QuotaCoordinatorServiceInfo {
 }
 
 export interface QuotaFreshness {
-  ageMs: number;
+  ageMs: number | null;
   buckets: Record<string, number>;
   stale: boolean;
   hardStale: boolean;
@@ -42,8 +42,14 @@ export interface PublishedThrottleCollectionResponse {
   providers: Record<string, PublishedThrottleProviderStatus>;
 }
 
+export type QuotaCoordinatorErrorCode =
+  | "not_ready"
+  | "provider_unknown"
+  | "method_not_allowed"
+  | "internal_error";
+
 export interface QuotaCoordinatorError {
-  code: "not_ready" | "provider_unknown" | "method_not_allowed" | "not_found" | "internal_error";
+  code: QuotaCoordinatorErrorCode;
   message: string;
   retryable: boolean;
 }
@@ -99,17 +105,19 @@ export function calculateFreshness(
   if (stored.buckets && stored.buckets.length > 0) {
     for (const b of stored.buckets) {
       const observedMs = Date.parse(b.observedAt);
-      buckets[b.key] = Number.isFinite(observedMs) ? Math.max(0, nowMs - observedMs) : 0;
+      buckets[b.key] = Number.isFinite(observedMs)
+        ? Math.max(0, nowMs - observedMs)
+        : Number.POSITIVE_INFINITY;
     }
   }
 
   const bucketAges = Object.values(buckets);
-  const ageMs =
-    bucketAges.length > 0
-      ? Math.max(...bucketAges)
-      : Number.isFinite(Date.parse(stored.updatedAt))
-        ? Math.max(0, nowMs - Date.parse(stored.updatedAt))
-        : 0;
+  const updatedParsed = Date.parse(stored.updatedAt);
+  const updatedAge = Number.isFinite(updatedParsed)
+    ? Math.max(0, nowMs - updatedParsed)
+    : Number.POSITIVE_INFINITY;
+
+  const ageMs = bucketAges.length > 0 ? Math.max(...bucketAges) : updatedAge;
 
   const stale = ageMs > staleAfterMs;
   const hardStale = ageMs > hardStaleAfterMs;

@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { assertQuotaSchemaVersion, QUOTA_SCHEMA_VERSION } from "../db/wal.js";
 import { QuotaCoordinatorClient } from "./coordinator-client.js";
 import {
   COORDINATOR_PROTOCOL_MAJOR,
@@ -14,6 +13,7 @@ import {
   validateProtocolMajor,
 } from "./coordinator-protocol.js";
 import { QuotaCoordinatorService, SERVED_ROUTES } from "./coordinator-service.js";
+import { QUOTA_SCHEMA_VERSION, SchemaVersionRefusalError } from "./schema-guard.js";
 import { type PersistedQuotaProviderStatus, SharedQuotaStore } from "./shared-store.js";
 
 interface TestResponse {
@@ -100,12 +100,27 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(SERVED_ROUTES.length).toBeGreaterThan(0);
     const nonGetMethods = ["POST", "PUT", "PATCH", "DELETE"];
 
-    for (const route of SERVED_ROUTES) {
+    for (const baseRoute of SERVED_ROUTES) {
       for (const method of nonGetMethods) {
-        const res = await makeRequest(socketPath, route, method, JSON.stringify({ mutate: true }));
-        expect(res.status, `Expected 405 for ${method} on ${route}`).toBe(405);
+        const res = await makeRequest(
+          socketPath,
+          baseRoute,
+          method,
+          JSON.stringify({ mutate: true })
+        );
+        expect(res.status, `Expected 405 for ${method} on ${baseRoute}`).toBe(405);
         expect(res.headers.allow).toContain("GET");
       }
+
+      // Assert GET with a body does not fail or mutate — body is ignored
+      const route = baseRoute === "/v1/history" ? "/v1/history?provider=claude" : baseRoute;
+      const getWithBody = await makeRequest(
+        socketPath,
+        route,
+        "GET",
+        JSON.stringify({ mutate: true })
+      );
+      expect([200, 503].includes(getWithBody.status)).toBe(true);
     }
   });
 
@@ -117,6 +132,9 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
       defaultIntervalSeconds: 600,
       logger,
     });
+
+    // Rule 0: client with no successful read starts at default/maxIntervalSeconds
+    expect(client.getLastAppliedInterval("claude")).toBe(600);
 
     // Initial valid application
     const validBody = {
@@ -161,6 +179,34 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
 
     // Direct protocol check also throws ProtocolMismatchError
     expect(() => validateProtocolMajor(mismatchedBody)).toThrow(ProtocolMismatchError);
+
+    // Rule 2: past hardStaleAfterMs, client widens to maxIntervalSeconds
+    let now = Date.now();
+    const staleClient = new QuotaCoordinatorClient({
+      socketPath: "/dummy/sock",
+      maxIntervalSeconds: 3600,
+      hardStaleAfterMs: 1000,
+      now: () => now,
+    });
+    staleClient.applyResponse("claude", validBody);
+    expect(staleClient.getLastAppliedInterval("claude")).toBe(300);
+    now += 2000; // advance past hardStaleAfterMs
+    expect(staleClient.getLastAppliedInterval("claude")).toBe(3600);
+  });
+
+  it("criterion 9: client getThrottle performs protocol validation on live responses", async () => {
+    service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude"],
+      version: "0.1.0",
+    });
+    await service.start();
+
+    const client = new QuotaCoordinatorClient({ socketPath });
+    const throttle = await client.getThrottle();
+    expect(throttle).not.toBeNull();
+    expect(throttle?.service.protocolMajor).toBe(COORDINATOR_PROTOCOL_MAJOR);
   });
 
   // Criterion 2: publishedThrottle equality and boundary pin.
@@ -259,12 +305,16 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     );
     store.configureController({ maxIntervalSeconds: 3600 });
 
-    service = new QuotaCoordinatorService({
+    const serviceOpts = {
       socketPath,
       store,
       configuredProviders: ["claude"],
       now: () => nowMs,
-    });
+      maxIntervalSeconds: 3600,
+      staleAfterMs: 900000,
+      hardStaleAfterMs: 3600000,
+    };
+    service = new QuotaCoordinatorService(serviceOpts);
     await service.start();
 
     const res = await makeRequest(socketPath, "/v1/throttle?provider=claude");
@@ -274,7 +324,12 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     const storedStatus = store.getProviderThrottle("claude");
     expect(storedStatus).not.toBeNull();
     if (!storedStatus) throw new Error("Expected storedStatus for claude");
-    const expected = publishedThrottle(storedStatus, { nowMs });
+    const expected = publishedThrottle(storedStatus, {
+      nowMs,
+      maxIntervalSeconds: serviceOpts.maxIntervalSeconds,
+      staleAfterMs: serviceOpts.staleAfterMs,
+      hardStaleAfterMs: serviceOpts.hardStaleAfterMs,
+    });
 
     expect(res.json.provider).toBe(expected.provider);
     expect(res.json.intervalSeconds).toBe(expected.intervalSeconds);
@@ -283,6 +338,8 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(res.json.capped).toBe(expected.capped);
     expect(res.json.expired).toBe(expected.expired);
     expect(res.json.exhaustedUntil).toBe(expected.exhaustedUntil);
+    expect(res.json.updatedAt).toBe(expected.updatedAt);
+    expect(res.json.buckets).toEqual(expected.buckets);
     expect(res.json.freshness).toEqual(expected.freshness);
   });
 
@@ -357,7 +414,31 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
   });
 
   // Criterion 9: no databasePath anywhere on the wire.
-  it("criterion 9: no v1 response carries databasePath anywhere", async () => {
+  it("criterion 9: no v1 response carries databasePath anywhere across populated responses", async () => {
+    // Seed database with observations so responses are populated
+    const nowMs = Date.now();
+    const id = store.recordRaw({
+      provider: "claude",
+      scrapedAt: new Date(nowMs - 5000).toISOString(),
+      rawOutput: "sample-raw-data",
+    });
+    store.recordParsed(
+      id,
+      {
+        provider: "claude",
+        status: "available",
+        scrapedAt: new Date(nowMs - 5000).toISOString(),
+        limits: [{ kind: "session", label: "Session", percentLeft: 80 }],
+      },
+      {
+        provider: "claude",
+        status: "available",
+        scrapedAt: new Date(nowMs - 5000).toISOString(),
+        limits: [{ kind: "session", label: "Session", percentLeft: 80 }],
+      }
+    );
+    store.configureController({ maxIntervalSeconds: 3600 });
+
     service = new QuotaCoordinatorService({
       socketPath,
       store,
@@ -365,25 +446,46 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     });
     await service.start();
 
-    for (const route of SERVED_ROUTES) {
+    const populatedEndpoints = [
+      "/v1/throttle?provider=claude",
+      "/v1/throttle",
+      "/v1/quota?provider=claude",
+      "/v1/history?provider=claude",
+      "/v1/healthz",
+      "/v1/readyz",
+    ];
+
+    for (const route of populatedEndpoints) {
       const res = await makeRequest(socketPath, route);
+      expect(res.status).toBe(200);
       expect(res.body).not.toContain("databasePath");
+      expect(res.body).not.toContain(dbPath);
     }
   });
 
-  // Criterion 9 & §7: Schema version refusal.
-  it("criterion 9 & §7: service refuses to open database with PRAGMA user_version newer than supported", () => {
+  // Criterion 9 & §7: Schema version refusal without mutating.
+  it("criterion 9 & §7: service refuses to open database with PRAGMA user_version newer than supported without mutating", () => {
     // Create DB with user_version = 2
     const futureDbPath = join(tmpDir, "future.db");
     const db = new Database(futureDbPath);
     db.pragma("user_version = 2");
     db.close();
 
-    const futureStore = new SharedQuotaStore(futureDbPath);
+    // SharedQuotaStore constructor must throw SchemaVersionRefusalError before ensureSchema/widenToWal
     expect(() => {
-      assertQuotaSchemaVersion(futureStore.db, QUOTA_SCHEMA_VERSION);
-    }).toThrow(/newer than supported/);
-    futureStore.close();
+      new SharedQuotaStore(futureDbPath);
+    }).toThrow(SchemaVersionRefusalError);
+
+    // Verify the database was left untouched
+    const checkDb = new Database(futureDbPath, { readonly: true });
+    const version = checkDb.pragma("user_version", { simple: true });
+    expect(version).toBe(2);
+    const tables = checkDb
+      .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+      .all() as Array<{ name: string }>;
+    expect(tables.map((t) => t.name)).not.toContain("quota_scrapes");
+    expect(tables.map((t) => t.name)).not.toContain("quota_observations");
+    checkDb.close();
   });
 
   // §5.6: Two-code error envelope: provider_unknown and not_ready
@@ -504,6 +606,8 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(Array.isArray(res.json.records)).toBe(true);
     expect(res.json.records.length).toBeGreaterThan(0);
     expect(res.json.records[0].percentLeft).toBe(85);
+    // records is emitted once, not duplicated under history
+    expect(res.json.history).toBeUndefined();
   });
 
   // §5.5: GET /v1/healthz and GET /v1/readyz
@@ -556,5 +660,54 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(warmReadyRes.json.ready).toBe(true);
     expect(warmReadyRes.json.cold).toBe(false);
     expect(warmReadyRes.json.scrapes.claude.status).toBe("ok");
+  });
+
+  // §5.1: Socket collision refusal
+  it("§5.1: refuses to start if another coordinator is already listening on socketPath", async () => {
+    service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude"],
+    });
+    await service.start();
+
+    const competingService = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude"],
+    });
+
+    await expect(competingService.start()).rejects.toThrow(/already listening/);
+  });
+
+  // §5.7: Degradation on unparseable timestamp
+  it("§5.7: unparseable timestamp degrades toward slower (infinite age / hard-stale)", () => {
+    const corruptStatus: PersistedQuotaProviderStatus = {
+      provider: "claude",
+      intervalSeconds: 300,
+      uncappedIntervalSeconds: 300,
+      governingBucketKey: "claude:session",
+      capped: false,
+      expired: false,
+      exhaustedUntil: null,
+      updatedAt: "invalid-timestamp",
+      buckets: [
+        {
+          key: "claude:session",
+          percentLeft: 50,
+          timeRemainingPct: 50,
+          error: 0,
+          derivative: 0,
+          requiredIntervalSeconds: 300,
+          resetAtIso: null,
+          observedAt: "not-a-date",
+        },
+      ],
+    };
+
+    const published = publishedThrottle(corruptStatus, { maxIntervalSeconds: 3600 });
+    expect(published.freshness.stale).toBe(true);
+    expect(published.freshness.hardStale).toBe(true);
+    expect(published.intervalSeconds).toBe(3600);
   });
 });

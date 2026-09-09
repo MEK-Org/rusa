@@ -1,7 +1,8 @@
 import { chmodSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import { dirname } from "node:path";
-import { assertQuotaSchemaVersion, QUOTA_SCHEMA_VERSION } from "../db/wal.js";
+import { QUOTA_THROTTLE_PROVIDERS } from "../providers/registry.js";
 import {
   COORDINATOR_PROTOCOL_MAJOR,
   COORDINATOR_PROTOCOL_MINOR,
@@ -10,8 +11,11 @@ import {
   DEFAULT_STALE_AFTER_MS,
   type PublishedThrottleProviderStatus,
   publishedThrottle,
+  type QuotaCoordinatorError,
+  type QuotaCoordinatorErrorResponse,
   type QuotaCoordinatorServiceInfo,
 } from "./coordinator-protocol.js";
+import { assertQuotaSchemaVersion, QUOTA_SCHEMA_VERSION } from "./schema-guard.js";
 import type { SharedQuotaStore } from "./shared-store.js";
 
 export const SERVED_ROUTES = [
@@ -22,7 +26,7 @@ export const SERVED_ROUTES = [
   "/v1/readyz",
 ] as const;
 
-export const DEFAULT_COORDINATOR_PROVIDERS = ["claude", "codex", "agy", "kimi"] as const;
+export const DEFAULT_COORDINATOR_PROVIDERS = QUOTA_THROTTLE_PROVIDERS;
 
 export interface QuotaCoordinatorServiceOptions {
   socketPath: string;
@@ -37,6 +41,7 @@ export interface QuotaCoordinatorServiceOptions {
 
 export class QuotaCoordinatorService {
   private server: http.Server | null = null;
+  private boundSocketPath: string | null = null;
   private readonly configuredProviders: readonly string[];
   private readonly maxIntervalSeconds: number;
   private readonly staleAfterMs: number;
@@ -63,8 +68,30 @@ export class QuotaCoordinatorService {
     // Enforce schema guard before opening/serving per §5.2, §7, and Criterion 9
     assertQuotaSchemaVersion(this.options.store.db, QUOTA_SCHEMA_VERSION);
 
-    mkdirSync(dirname(this.options.socketPath), { recursive: true, mode: 0o700 });
+    const socketDir = dirname(this.options.socketPath);
+    mkdirSync(socketDir, { recursive: true, mode: 0o700 });
+    try {
+      chmodSync(socketDir, 0o700);
+    } catch {}
+
     if (existsSync(this.options.socketPath)) {
+      // Check if an active coordinator is already listening to prevent silent socket hijacking
+      const isAlive = await new Promise<boolean>((resolve) => {
+        const client = net.connect(this.options.socketPath);
+        client.on("connect", () => {
+          client.destroy();
+          resolve(true);
+        });
+        client.on("error", () => {
+          client.destroy();
+          resolve(false);
+        });
+      });
+
+      if (isAlive) {
+        throw new Error(`A quota coordinator is already listening at ${this.options.socketPath}`);
+      }
+
       try {
         unlinkSync(this.options.socketPath);
       } catch {}
@@ -78,8 +105,11 @@ export class QuotaCoordinatorService {
       this.server?.listen(this.options.socketPath, () => {
         try {
           chmodSync(this.options.socketPath, 0o600);
-        } catch {}
-        resolve();
+          this.boundSocketPath = this.options.socketPath;
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
       });
       this.server?.on("error", reject);
     });
@@ -92,17 +122,18 @@ export class QuotaCoordinatorService {
       });
       this.server = null;
     }
-    if (existsSync(this.options.socketPath)) {
+    if (this.boundSocketPath && existsSync(this.boundSocketPath)) {
       try {
-        unlinkSync(this.options.socketPath);
+        unlinkSync(this.boundSocketPath);
       } catch {}
+      this.boundSocketPath = null;
     }
   }
 
-  private sendJson(
+  private sendJson<T = unknown>(
     res: http.ServerResponse,
     status: number,
-    body: unknown,
+    body: T,
     extraHeaders?: Record<string, string>
   ): void {
     const json = JSON.stringify(body);
@@ -114,7 +145,36 @@ export class QuotaCoordinatorService {
     res.end(json);
   }
 
+  private sendError(
+    res: http.ServerResponse,
+    status: number,
+    error: QuotaCoordinatorError,
+    extraHeaders?: Record<string, string>
+  ): void {
+    this.sendJson<QuotaCoordinatorErrorResponse>(
+      res,
+      status,
+      {
+        service: this.getServiceInfo(),
+        error,
+      },
+      extraHeaders
+    );
+  }
+
   private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+    try {
+      this.dispatchRequest(req, res);
+    } catch (err) {
+      this.sendError(res, 500, {
+        code: "internal_error",
+        message: err instanceof Error ? err.message : String(err),
+        retryable: true,
+      });
+    }
+  }
+
+  private dispatchRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
     const serviceInfo = this.getServiceInfo();
     const url = new URL(req.url ?? "/", "http://localhost");
     const pathname = url.pathname;
@@ -123,16 +183,13 @@ export class QuotaCoordinatorService {
     // Any other method on any v1 path returns 405 unconditionally, and no v1 path accepts a body.
     if (pathname.startsWith("/v1/")) {
       if (req.method !== "GET") {
-        this.sendJson(
+        this.sendError(
           res,
           405,
           {
-            service: serviceInfo,
-            error: {
-              code: "method_not_allowed",
-              message: `Method ${req.method} not allowed on v1 endpoints; only GET is permitted`,
-              retryable: false,
-            },
+            code: "method_not_allowed",
+            message: `Method ${req.method} not allowed on v1 endpoints; only GET is permitted`,
+            retryable: false,
           },
           { Allow: "GET" }
         );
@@ -141,32 +198,35 @@ export class QuotaCoordinatorService {
     }
 
     if (pathname === "/v1/throttle") {
-      const providerParam = url.searchParams.get("provider");
       const nowMs = this.options.now ? this.options.now() : Date.now();
 
-      if (providerParam !== null && providerParam.trim().length > 0) {
-        const provider = providerParam.trim().toLocaleLowerCase("en-US");
+      if (url.searchParams.has("provider")) {
+        const rawParam = url.searchParams.get("provider")?.trim() ?? "";
+        if (!rawParam) {
+          this.sendError(res, 404, {
+            code: "provider_unknown",
+            message: "Query parameter ?provider= was provided but was empty",
+            retryable: false,
+          });
+          return;
+        }
+
+        const provider = rawParam === "antigravity" ? "agy" : rawParam.toLocaleLowerCase("en-US");
         if (!this.configuredProviders.includes(provider)) {
-          this.sendJson(res, 404, {
-            service: serviceInfo,
-            error: {
-              code: "provider_unknown",
-              message: `Provider "${provider}" is not configured on this coordinator`,
-              retryable: false,
-            },
+          this.sendError(res, 404, {
+            code: "provider_unknown",
+            message: `Provider "${rawParam}" is not configured on this coordinator`,
+            retryable: false,
           });
           return;
         }
 
         const stored = this.options.store.getProviderThrottle(provider);
         if (!stored) {
-          this.sendJson(res, 503, {
-            service: serviceInfo,
-            error: {
-              code: "not_ready",
-              message: `Coordinator is cold: no observations recorded for provider "${provider}" yet`,
-              retryable: true,
-            },
+          this.sendError(res, 503, {
+            code: "not_ready",
+            message: `Coordinator is cold: no observations recorded for provider "${provider}" yet`,
+            retryable: true,
           });
           return;
         }
@@ -207,24 +267,13 @@ export class QuotaCoordinatorService {
     }
 
     if (pathname === "/v1/quota") {
-      const providerParam = url.searchParams.get("provider");
-      if (!providerParam) {
-        this.sendJson(res, 400, {
-          service: serviceInfo,
-          error: {
-            code: "invalid_request",
-            message: "Missing required ?provider= query parameter",
-            retryable: false,
-          },
-        });
-        return;
-      }
+      const rawParam = url.searchParams.get("provider")?.trim() ?? "";
+      const provider = rawParam === "antigravity" ? "agy" : rawParam.toLocaleLowerCase("en-US");
 
-      const provider = providerParam.trim().toLocaleLowerCase("en-US");
-      if (!this.configuredProviders.includes(provider)) {
+      if (!provider || !this.configuredProviders.includes(provider)) {
         this.sendJson(res, 200, {
           service: serviceInfo,
-          provider,
+          provider: provider || "unknown",
           status: "unsupported",
           limits: [],
         });
@@ -240,6 +289,7 @@ export class QuotaCoordinatorService {
           limits: [],
           freshness: {
             ageMs: null,
+            buckets: {},
             stale: true,
             hardStale: true,
           },
@@ -255,20 +305,20 @@ export class QuotaCoordinatorService {
     }
 
     if (pathname === "/v1/history") {
-      const providerParam = url.searchParams.get("provider");
-      if (!providerParam) {
-        this.sendJson(res, 400, {
-          service: serviceInfo,
-          error: {
-            code: "invalid_request",
-            message: "Missing required ?provider= query parameter",
-            retryable: false,
-          },
+      const rawParam = url.searchParams.get("provider")?.trim() ?? "";
+      const provider = rawParam === "antigravity" ? "agy" : rawParam.toLocaleLowerCase("en-US");
+
+      if (!provider || !this.configuredProviders.includes(provider)) {
+        this.sendError(res, 404, {
+          code: "provider_unknown",
+          message: provider
+            ? `Provider "${provider}" is not configured on this coordinator`
+            : "Missing required ?provider= query parameter",
+          retryable: false,
         });
         return;
       }
 
-      const provider = providerParam.trim().toLocaleLowerCase("en-US");
       const since = url.searchParams.get("since") ?? new Date(0).toISOString();
       const records = this.options.store.listHistorySince(provider, since);
 
@@ -277,15 +327,17 @@ export class QuotaCoordinatorService {
         provider,
         since,
         records,
-        history: records,
       });
       return;
     }
 
     if (pathname === "/v1/healthz") {
       try {
-        // Confirm SQLite database is open and writable
-        this.options.store.db.pragma("quick_check(1)");
+        if (this.options.store.db.readonly) {
+          throw new Error("Database connection is read-only");
+        }
+        // Constant-time handle and schema liveness check (O(1))
+        this.options.store.db.pragma("user_version", { simple: true });
         this.sendJson(res, 200, {
           service: serviceInfo,
           ok: true,
@@ -302,10 +354,11 @@ export class QuotaCoordinatorService {
 
     if (pathname === "/v1/readyz") {
       try {
-        const userVersion = this.options.store.db.pragma("user_version", {
+        const rawVersion = this.options.store.db.pragma("user_version", {
           simple: true,
-        }) as number;
-        if (typeof userVersion === "number" && userVersion > QUOTA_SCHEMA_VERSION) {
+        });
+        const userVersion = typeof rawVersion === "number" ? rawVersion : Number(rawVersion ?? 0);
+        if (userVersion > QUOTA_SCHEMA_VERSION) {
           this.sendJson(res, 503, {
             service: serviceInfo,
             ready: false,
@@ -370,13 +423,16 @@ export class QuotaCoordinatorService {
       return;
     }
 
-    this.sendJson(res, 404, {
-      service: serviceInfo,
-      error: {
-        code: "not_found",
-        message: `Path ${pathname} not found`,
-        retryable: false,
-      },
-    });
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        service: serviceInfo,
+        error: {
+          code: "provider_unknown",
+          message: `Path ${pathname} not found`,
+          retryable: false,
+        },
+      })
+    );
   }
 }
