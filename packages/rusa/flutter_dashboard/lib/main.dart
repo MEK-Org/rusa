@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_web_plugins/url_strategy.dart';
 import 'package:web/web.dart' as web;
 
 import 'api.dart';
@@ -18,6 +19,7 @@ import 'widgets/dashboard_body.dart';
 /// SSE stream and renders the locked V1.4.0 design: an alive-actor tree on the
 /// left and the selected actor's Events / Live Output on the right.
 void main() {
+  usePathUrlStrategy();
   // Read the served shell's title before the first frame — see
   // `dashboard_title.dart` for why MaterialApp would otherwise overwrite it.
   runApp(RusaDashboardApp(title: resolveDashboardTitle(web.document.title)));
@@ -36,6 +38,12 @@ class RusaDashboardApp extends StatelessWidget {
       title: title,
       debugShowCheckedModeBanner: false,
       theme: buildMeshTheme(),
+      // Keep one DashboardPage for every initial path. With path URL strategy,
+      // Navigator's default initial-route expansion asks for each path prefix;
+      // an onGenerateRoute that built DashboardPage for them would leave
+      // duplicate stores and SSE connections mounted. The home fallback is
+      // intentional, including its debug-only initial-route diagnostic; direct
+      // deep links still select their view in DashboardBody.
       home: const DashboardPage(),
     );
   }
