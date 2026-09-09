@@ -30,6 +30,7 @@ import { resolveReferenceSync } from "../references/resolve.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import { DEFAULT_VOICE_NAME } from "../voice/gemini-speech.js";
 import { canonicalSupportedVoiceName, SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
+import type { MeshEventEmitter } from "./mesh-event-emitter.js";
 import type { SseHub } from "./sse.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
@@ -47,6 +48,8 @@ export interface DashboardDataDeps {
    */
   inbox?: InboxStore;
   sseHub: SseHub;
+  /** Live cache-invalidation emitter for settings changed through dashboard routes. */
+  emitter?: MeshEventEmitter;
   /** The live ActorMesh instance. */
   mesh?: ActorMesh;
   /** Root-authorized commands exposed to trusted dashboard operators. */
@@ -1281,6 +1284,11 @@ export async function handleMeshApiRequest(
           actors.patch(actorId, {
             voiceConfig: voiceName === undefined ? undefined : { schemaVersion: 1, voiceName },
           });
+          // Other open dashboards hold a thread snapshot too. Broadcast the
+          // lightweight invalidation after the durable update so they re-fetch
+          // the value that is now authoritative; this intentionally is not a
+          // mesh-event timeline record.
+          deps.emitter?.emitActorConfigUpdated({ actorId, voiceName: voiceName ?? null });
           sendJson(res, 200, voiceConfigPayload(actors.get(actorId) as ActorRecord));
         })
         .catch((err) => sendJson(res, 500, { error: String(err) }));

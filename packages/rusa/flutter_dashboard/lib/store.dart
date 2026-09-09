@@ -396,6 +396,7 @@ class DashboardStore {
   /// and de-duped), then load the thread list.
   Future<void> init() async {
     _subs.add(_stream.meshEvents.listen(_onMeshEvent));
+    _subs.add(_stream.actorConfigUpdates.listen(_onActorConfigUpdate));
     _subs.add(_stream.liveOutput.listen(_onLiveOutput));
     _subs.add(_stream.elided.listen((_) => _onElided()));
     _subs.add(_stream.runtimeHello.listen(_onRuntimeHello));
@@ -1202,6 +1203,12 @@ class DashboardStore {
         }
       }
     }
+  }
+
+  /// Another dashboard changed a persisted actor setting. The snapshot owns
+  /// the complete shape, so this signal only schedules its normal refresh.
+  void _onActorConfigUpdate(ActorConfigUpdate update) {
+    _scheduleTopologyRefresh();
   }
 
   /// Bounds a newest-first [items] list to its newest [cap] entries, evicting

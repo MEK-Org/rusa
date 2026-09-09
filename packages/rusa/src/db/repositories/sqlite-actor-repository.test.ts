@@ -672,11 +672,11 @@ describe("SqliteActorRepository", () => {
     }
   });
 
-  it("rejects an unsupported voice name when the document is consumed", () => {
+  it("falls back to the instance voice when a well-formed document names a retired voice", () => {
     repository.upsert(root);
     db.prepare("UPDATE actors SET voice_config = ? WHERE id = 'root'").run(
       JSON.stringify({ schemaVersion: 1, voiceName: "NotAVoice" })
     );
-    expect(() => repository.get("root")).toThrow(/invalid voice_config for actor 'root'/);
+    expect(repository.get("root")?.voiceConfig).toBeUndefined();
   });
 });

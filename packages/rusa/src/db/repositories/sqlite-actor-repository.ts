@@ -140,10 +140,7 @@ const voiceConfigSchema = z
     schemaVersion: z.literal(1),
     voiceName: z.string().min(1),
   })
-  .strict()
-  .refine((config) => canonicalSupportedVoiceName(config.voiceName) !== undefined, {
-    message: "voiceName must name a supported Google TTS voice",
-  });
+  .strict();
 
 type VoiceConfigDocument = z.infer<typeof voiceConfigSchema>;
 
@@ -321,18 +318,20 @@ function buildVoiceConfig(record: ActorRecord): string | null {
  * strictly; a malformed document throws fail-closed, matching the other
  * versioned columns.
  *
- * Voice names are also consumer-validated against the shared supported
- * catalog. SQLite stays deliberately unconstrained: a direct database edit
- * remains readable only when it is a document this build can actually render.
+ * Voice names are consumer-validated against the shared supported catalog.
+ * A well-formed V1 document naming a retired vendor voice degrades to the
+ * instance default instead of making its actor unreadable; malformed or unknown
+ * document versions still fail closed. SQLite stays deliberately unconstrained.
  */
 function parseVoiceConfig(actorId: string, json: string | null): Pick<ActorRecord, "voiceConfig"> {
   if (!json) return {};
   const parsed = parseDocument(actorId, "voice_config", json, voiceConfigSchema);
-  // The schema's refinement above proves this exists; canonicalizing also
-  // repairs case-only hand edits so the dropdown always receives one of its
-  // exact option values.
+  // Canonicalizing repairs case-only hand edits so the dropdown always receives
+  // one of its exact option values. A vendor-retired name is not a malformed
+  // document: leave the stored row intact but return no override, which uses
+  // the instance-wide fallback until an operator selects a current voice.
   const voiceName = canonicalSupportedVoiceName(parsed.voiceName);
-  if (!voiceName) throw new Error(`invalid voice_config for actor '${actorId}'`);
+  if (!voiceName) return {};
   return { voiceConfig: { schemaVersion: 1, voiceName } };
 }
 

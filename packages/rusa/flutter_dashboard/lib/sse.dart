@@ -17,6 +17,7 @@ import 'models.dart';
 /// browser automatically.
 class WebEventSourceStream implements MeshStreamSource {
   final _mesh = StreamController<MeshEvent>.broadcast();
+  final _actorConfig = StreamController<ActorConfigUpdate>.broadcast();
   final _live = StreamController<LiveOutputChunk>.broadcast();
   final _elided = StreamController<void>.broadcast();
   final _runtimeHello = StreamController<RuntimeHello>.broadcast();
@@ -25,6 +26,8 @@ class WebEventSourceStream implements MeshStreamSource {
 
   @override
   Stream<MeshEvent> get meshEvents => _mesh.stream;
+  @override
+  Stream<ActorConfigUpdate> get actorConfigUpdates => _actorConfig.stream;
   @override
   Stream<LiveOutputChunk> get liveOutput => _live.stream;
   @override
@@ -45,6 +48,14 @@ class WebEventSourceStream implements MeshStreamSource {
       'mesh_event',
       _listener((data) {
         _mesh.add(MeshEvent.fromJson(jsonDecode(data) as Map<String, dynamic>));
+      }),
+    );
+    es.addEventListener(
+      'actor_config_updated',
+      _listener((data) {
+        _actorConfig.add(
+          ActorConfigUpdate.fromJson(jsonDecode(data) as Map<String, dynamic>),
+        );
       }),
     );
     es.addEventListener(
@@ -96,6 +107,7 @@ class WebEventSourceStream implements MeshStreamSource {
     _es?.close();
     _es = null;
     _mesh.close();
+    _actorConfig.close();
     _live.close();
     _elided.close();
     _runtimeHello.close();

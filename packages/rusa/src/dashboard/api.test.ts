@@ -145,6 +145,7 @@ describe("handleMeshApiRequest", () => {
   let inbox: InboxRepository;
   let obligations: ObligationRepository;
   let actors: InMemoryActorRepository;
+  let emitter: MeshEventEmitter;
   let deps: DashboardDataDeps;
   let rootSpawns: Array<{ request: unknown; principal: string }>;
 
@@ -156,6 +157,7 @@ describe("handleMeshApiRequest", () => {
     inbox = new InboxRepository(db);
     obligations = new ObligationRepository(db);
     actors = new InMemoryActorRepository();
+    emitter = new MeshEventEmitter();
     rootSpawns = [];
     const mockMesh = {
       sendHumanMessage: (toId: string, body: string, sessionId: string) => {
@@ -176,7 +178,8 @@ describe("handleMeshApiRequest", () => {
       meshChat,
       inbox,
       obligations,
-      sseHub: new SseHub(new MeshEventEmitter()),
+      sseHub: new SseHub(emitter),
+      emitter,
       mesh: mockMesh as unknown as ActorMesh,
       rootControl: {
         providers: ["agy", "codex"],
@@ -242,6 +245,25 @@ describe("handleMeshApiRequest", () => {
 
       const got = await call(deps, "GET", `/api/mesh/actors/${UUID_A}/voice`);
       expect(JSON.parse(got.res.body).voiceConfig).toEqual({ schemaVersion: 1, voiceName: "Puck" });
+    });
+
+    it("PATCH invalidates every connected dashboard snapshot over SSE", async () => {
+      actors.upsert(rec(UUID_A, null, "active"));
+      const subscriber = new MockRes();
+      deps.sseHub.addConnection(subscriber as unknown as ServerResponse, null);
+
+      const { res } = await call(
+        deps,
+        "PATCH",
+        `/api/mesh/actors/${UUID_A}/voice`,
+        JSON.stringify({ voiceName: "Puck" })
+      );
+      await settled(res);
+
+      expect(res.statusCode).toBe(200);
+      expect(subscriber.writes).toContain(
+        `event: actor_config_updated\ndata: {"actorId":"${UUID_A}","voiceName":"Puck"}\n\n`
+      );
     });
 
     it("PATCH canonicalizes a supported wire spelling for the dropdown", async () => {

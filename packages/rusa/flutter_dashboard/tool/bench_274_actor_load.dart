@@ -32,6 +32,9 @@ class _BenchStream implements MeshStreamSource {
   Stream<MeshEvent> get meshEvents => const Stream.empty();
 
   @override
+  Stream<ActorConfigUpdate> get actorConfigUpdates => const Stream.empty();
+
+  @override
   Stream<LiveOutputChunk> get liveOutput => const Stream.empty();
 
   @override

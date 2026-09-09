@@ -766,6 +766,36 @@ void main() {
     },
   );
 
+  test('actor config update refreshes a second dashboard snapshot', () {
+    fakeAsync((async) {
+      final stream = FakeStream();
+      final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
+        ..threadsResult = [
+          makeThread('a', voiceName: 'Kore', runState: RunState.idle),
+        ];
+      final store = DashboardStore(api: api, stream: stream);
+      unawaited(store.init());
+      async.flushMicrotasks();
+
+      expect(store.actor('a')?.thread.voiceName, 'Kore');
+      api.threadsResult = [
+        makeThread('a', voiceName: 'Puck', runState: RunState.idle),
+      ];
+      stream.actorConfigCtrl.add(
+        const ActorConfigUpdate(actorId: 'a', voiceName: 'Puck'),
+      );
+      async.flushMicrotasks();
+      async.elapse(const Duration(milliseconds: 400));
+      async.flushMicrotasks();
+
+      expect(store.actor('a')?.thread.voiceName, 'Puck');
+
+      unawaited(store.dispose());
+      async.flushMicrotasks();
+    });
+  });
+
   test(
     'interruptActor waits for authoritative runtime state instead of writing optimistically',
     () async {

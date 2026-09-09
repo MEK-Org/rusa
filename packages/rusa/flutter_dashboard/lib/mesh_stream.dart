@@ -10,6 +10,7 @@ import 'models.dart';
 /// [connect]. `elided` signals a dropped-output gap (the named `elided` frame).
 abstract interface class MeshStreamSource {
   Stream<MeshEvent> get meshEvents;
+  Stream<ActorConfigUpdate> get actorConfigUpdates;
   Stream<LiveOutputChunk> get liveOutput;
   Stream<void> get elided;
   Stream<RuntimeHello> get runtimeHello;

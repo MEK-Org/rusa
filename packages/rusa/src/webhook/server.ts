@@ -496,6 +496,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
           obligations: options.mesh.obligations,
           inbox: options.mesh.inbox,
           sseHub,
+          emitter: options.mesh.emitter,
           mesh: options.mesh.mesh,
           rootControl: options.mesh.rootControl,
           isHalted: options.mesh.isHalted,
