@@ -7467,6 +7467,118 @@ describe("ActorMesh", () => {
 
       expect(woken).toEqual([steward]);
     });
+
+    it("reports the obligation owner when an exact obligation outranks an exact stored subscription (#369)", () => {
+      const issueRef = "github:synthetic-org/synthetic-repo/issues/101";
+      const obligationsByRef: Record<string, string | null> = {};
+      const env = setup({
+        obligations: {
+          findLiveByExternalRef: (ref) => {
+            const ownerId = obligationsByRef[ref];
+            return ownerId ? { ownerId } : null;
+          },
+        },
+      });
+      const worker = env.mesh.spawn({ charter: "worker", parentId: "root" });
+      obligationsByRef[issueRef] = worker;
+      env.mesh.subscribeEventSource(issueRef, "root", "root");
+
+      const route = env.mesh.resolveEffectiveRoute(issueRef);
+      expect(route.governingSource).toBe("obligation");
+      expect(route.principal).toBe(worker);
+      expect(route.resourceLevel).toBe(issueRef);
+      expect(route.isLive).toBe(true);
+
+      // Root delegation guard fails because root is superseded by the live obligation
+      expect(() => env.mesh.delegateEventSource(issueRef, worker, "root")).toThrow(
+        /caller is not the current effective owner/
+      );
+    });
+
+    it("falls back to stored subscription when obligation becomes terminal (#369)", () => {
+      const issueRef = "github:synthetic-org/synthetic-repo/issues/102";
+      let liveObligationOwner: string | null = null;
+      const env = setup({
+        obligations: {
+          findLiveByExternalRef: (ref) =>
+            ref === issueRef && liveObligationOwner ? { ownerId: liveObligationOwner } : null,
+        },
+      });
+      const worker = env.mesh.spawn({ charter: "worker", parentId: "root" });
+      liveObligationOwner = worker;
+      env.mesh.subscribeEventSource(issueRef, "root", "root");
+
+      // While live, obligation governs
+      const liveRoute = env.mesh.resolveEffectiveRoute(issueRef);
+      expect(liveRoute.governingSource).toBe("obligation");
+      expect(liveRoute.principal).toBe(worker);
+      expect(liveRoute.isLive).toBe(true);
+
+      // Obligation resolves/terminates (findLiveByExternalRef returns null)
+      liveObligationOwner = null;
+
+      // Effective route falls back to root's stored subscription
+      const terminalRoute = env.mesh.resolveEffectiveRoute(issueRef);
+      expect(terminalRoute.governingSource).toBe("subscription");
+      expect(terminalRoute.principal).toBe("root");
+      expect(terminalRoute.resourceLevel).toBe(issueRef);
+      expect(terminalRoute.isLive).toBe(true);
+
+      // Root can now delegate because root is the effective owner
+      expect(() => env.mesh.delegateEventSource(issueRef, worker, "root")).not.toThrow();
+    });
+
+    it("treats direct subscriptions as delivery-only without conferring ownership (#369)", () => {
+      const issueRef = "github:synthetic-org/synthetic-repo/issues/103";
+      const env = setup();
+      const subscriber = env.mesh.spawn({ charter: "watcher", parentId: "root" });
+      const target = env.mesh.spawn({ charter: "target", parentId: "root" });
+      env.mesh.subscribeEventSource(issueRef, "root", "root");
+      env.mesh.addEventSourceSubscriber(issueRef, subscriber, subscriber);
+
+      // Diagnostic reports root (stored subscription owner), not the direct subscriber
+      const route = env.mesh.resolveEffectiveRoute(issueRef);
+      expect(route.governingSource).toBe("subscription");
+      expect(route.principal).toBe("root");
+      expect(route.resourceLevel).toBe(issueRef);
+      expect(route.isLive).toBe(true);
+
+      // Direct subscriber cannot delegate the resource
+      expect(() => env.mesh.delegateEventSource(issueRef, target, subscriber)).toThrow(
+        /caller is not the current effective owner/
+      );
+    });
+
+    it("reports uncovered effective route when stored subscription owner is dead (#369)", () => {
+      const issueRef = "github:synthetic-org/synthetic-repo/issues/104";
+      const env = setup();
+      const worker = env.mesh.spawn({ charter: "worker", parentId: "root" });
+      env.mesh.subscribeEventSource(issueRef, worker, "root");
+
+      // Before worker dies, worker is the effective owner
+      const activeRoute = env.mesh.resolveEffectiveRoute(issueRef);
+      expect(activeRoute.governingSource).toBe("subscription");
+      expect(activeRoute.principal).toBe(worker);
+      expect(activeRoute.isLive).toBe(true);
+
+      // Worker is retired/dead and no longer in live set
+      (env.mesh as unknown as { live: Set<string> }).live.delete(worker);
+
+      const deadRoute = env.mesh.resolveEffectiveRoute(issueRef);
+      // Route is uncovered because subscriber is dead and has no live ancestor owner
+      expect(deadRoute.governingSource).toBeNull();
+      expect(deadRoute.principal).toBeNull();
+      expect(deadRoute.resourceLevel).toBeNull();
+      expect(deadRoute.isLive).toBe(false);
+
+      // Reconciles delegation refusal: neither worker nor root can delegate
+      expect(() => env.mesh.delegateEventSource(issueRef, "root", worker)).toThrow(
+        /caller is not the current effective owner/
+      );
+      expect(() => env.mesh.delegateEventSource(issueRef, worker, "root")).toThrow(
+        /caller is not the current effective owner/
+      );
+    });
   });
 
   describe("retirement preflight is fail-closed on undisposed work (#191)", () => {

@@ -608,7 +608,7 @@ export function createAgentExecMcpServer(
     {
       title: "Delegate event source to an actor",
       description:
-        "Delegate an event source you currently own to any actor you hold a handle to. Ownership is resolved by most-specific-live-subscriber-wins with parent bubbling.",
+        "Delegate an event source you currently own to any actor you hold a handle to. Effective ownership is resolved with live obligation claims taking precedence over stored subscriptions, which fall back to most-specific-live-subscriber-wins with parent bubbling.",
       inputSchema: {
         child_thread_id: z.string().describe("The actor thread id to receive events."),
         ...eventResourceInputSchema,
@@ -633,7 +633,7 @@ export function createAgentExecMcpServer(
     {
       title: "Reclaim delegated event source",
       description:
-        "Reclaim an exact delegated event source back to yourself when you would be its effective owner after that exact delegation is removed.",
+        "Reclaim an exact delegated event source back to yourself when you would be its effective owner after that exact delegation is removed. Live obligation claims take precedence over stored subscriptions.",
       inputSchema: eventResourceInputSchema,
     },
     async ({ source, kind, org, repo, number, ref, space }) => {
@@ -1034,20 +1034,45 @@ export function createAgentExecMcpServer(
       {
         title: "List event source ownership and subscriptions (root-only)",
         description:
-          "List every event source owner (active claims and released tombstones) and every direct subscriber — the audit/inspection view. Root-only.",
-        inputSchema: {},
+          "List every event source owner (active claims and released tombstones) and every direct subscriber — the audit/inspection view. If a canonical source is specified, reconciles and returns its effective route projection (where live obligation claims take precedence over stored subscriptions). Root-only.",
+        inputSchema: eventResourceInputSchema,
       },
-      async () => {
+      async (args) => {
         const denied = assertRoot();
         if (denied) return denied;
         try {
-          // Both row classes in one response, under the tool's existing name.
+          // All row classes in one response, under the tool's existing name.
           // They answer one operator question ("who is getting this source's
-          // events, and why") and splitting them across two tools would make
-          // the ownership half read as the whole answer.
+          // events, and why") and splitting them across separate tools would make
+          // the ownership half read as the whole answer. When a canonical source
+          // is queried, effectiveRoute reconciles live obligation claims against
+          // stored subscriptions under that same unified inspection lens.
+          const owners = mesh.listSubscriptions();
+          const subscribers = mesh.listEventSourceSubscriptions();
+
+          const hasResource = Boolean(
+            args?.source ||
+              args?.kind ||
+              args?.org ||
+              args?.repo ||
+              args?.number !== undefined ||
+              args?.ref ||
+              args?.space
+          );
+
+          if (hasResource) {
+            const resource = parseEventResource(args, "inspection");
+            const effectiveRoute = mesh.resolveEffectiveRoute(resource);
+            return toolOk({
+              owners,
+              subscribers,
+              effectiveRoute,
+            });
+          }
+
           return toolOk({
-            owners: mesh.listSubscriptions(),
-            subscribers: mesh.listEventSourceSubscriptions(),
+            owners,
+            subscribers,
           });
         } catch (err) {
           return toolError(err);

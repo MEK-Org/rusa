@@ -52,8 +52,8 @@ export const SCHEDULER_SENDER_ID = "scheduler";
 
 /** Map only the issue-shaped event resources obligations may govern. */
 function eventResourceObligationKey(resource: EventResource): string | undefined {
-  const key = resourceKey(resource);
   try {
+    const key = resourceKey(resource);
     return asGitHubIssue(parseReference(key)) ? key : undefined;
   } catch {
     // An invalid resource cannot name an obligation. Preserve subscription routing.
@@ -218,6 +218,45 @@ export interface MessageRetirementBlocker {
 export interface RetirementBlockers {
   obligations: ObligationRetirementBlocker[];
   messages: MessageRetirementBlocker[];
+}
+
+/**
+ * Effective event routing authority diagnostic (#369).
+ * Distinguishes the governing source, principal, resource level, and liveness for a canonical resource.
+ */
+export interface EffectiveRouteDiagnostic {
+  /**
+   * The canonical resource queried, normalized to canonical scheme and
+   * path syntax (resolving legacy prefixes or alternate representations).
+   */
+  resource: EventResource;
+  /**
+   * Governing authority kind:
+   * - 'obligation': claimed by a live obligation in the hierarchy (takes precedence over subscriptions).
+   * - 'subscription': governed by an active live subscription in the hierarchy.
+   * - null: uncovered by any live obligation or live subscription.
+   */
+  governingSource: "obligation" | "subscription" | null;
+  /**
+   * The principal (actor id or entity id) holding effective authority,
+   * or null if uncovered. For subscriptions, the system invariant enforces
+   * at most one active subscriber per resource level.
+   */
+  principal: string | null;
+  /**
+   * The canonical resource level where the governing claim was found
+   * (exact resource or ancestor level), or null if uncovered.
+   */
+  resourceLevel: EventResource | null;
+  /**
+   * Whether the governing principal is currently a live, runnable actor.
+   * - On 'subscription' routes, this is always true because stored subscriptions only
+   *   confer effective authority when the subscriber is live (dead subscribers yield to live ancestors or uncovered).
+   * - On 'obligation' routes, this surfaces when a live obligation is held by a non-runnable
+   *   principal (e.g. human:operator or an absent actor), which claims authority but cannot receive delivery.
+   * - On uncovered routes, this is always false.
+   */
+  isLive: boolean;
 }
 
 /**
@@ -1730,7 +1769,16 @@ export class ActorMesh {
    * a subscriber appearing in its result would let anyone who subscribed to a
    * source delegate or reclaim it.
    */
-  private resolveLiveOwnerDestinations(
+  /**
+   * Resolve effective event routing decision and diagnostic for an event resource (#369).
+   * Single-sources the hierarchy traversal, obligation precedence, exact-resource ignoring,
+   * liveness check, and parent bubbling across delivery, delegation guards, and audit inspection.
+   *
+   * Note: Bubbling policy is enforced only when `opts.enforceBubblingPolicy` is true (for event
+   * delivery in {@link deliverEvent}); delegation guards and audit inspection walk ancestors
+   * unconditionally to determine governing authority.
+   */
+  private resolveRoutingDecision(
     resource: EventResource,
     opts: {
       ignoreExactResource?: EventResource;
@@ -1739,8 +1787,7 @@ export class ActorMesh {
       /** A precomputed exact-resource lookup; `null` means it found no claim. */
       exactObligationOwner?: string | null;
     } = {}
-  ): string[] {
-    const destinations: string[] = [];
+  ): { diagnostic: EffectiveRouteDiagnostic; destinations: string[] } {
     let current: EventResource | undefined = resource;
     let exact = true;
 
@@ -1767,13 +1814,21 @@ export class ActorMesh {
         // human/system owner, or a temporarily absent actor, produces no
         // destination; falling through would hand their work to whichever actor
         // happened to be subscribed earlier.
-        if (this.live.has(governing) && !destinations.includes(governing)) {
-          destinations.push(governing);
-        }
-        return destinations;
+        const isLive = this.live.has(governing);
+        return {
+          diagnostic: {
+            resource: resourceKey(resource),
+            governingSource: "obligation",
+            principal: governing,
+            resourceLevel: resourceKey(current),
+            isLive,
+          },
+          destinations: isLive ? [governing] : [],
+        };
       }
 
       const activeSubs = this.eventSourceOwners.activeForResource(current);
+      const liveSubs: string[] = [];
       for (const sub of activeSubs) {
         if (
           opts.ignoreExactResource &&
@@ -1782,12 +1837,21 @@ export class ActorMesh {
         ) {
           continue;
         }
-        if (this.live.has(sub.actorId) && !destinations.includes(sub.actorId)) {
-          destinations.push(sub.actorId);
+        if (this.live.has(sub.actorId) && !liveSubs.includes(sub.actorId)) {
+          liveSubs.push(sub.actorId);
         }
       }
-      if (destinations.length > 0) {
-        break;
+      if (liveSubs.length > 0) {
+        return {
+          diagnostic: {
+            resource: resourceKey(resource),
+            governingSource: "subscription",
+            principal: liveSubs[0],
+            resourceLevel: resourceKey(current),
+            isLive: true,
+          },
+          destinations: liveSubs,
+        };
       }
       // Event-class policy gates only the first parent climb. Once an
       // allowlisted event may bubble, the existing walk may continue past dead
@@ -1804,7 +1868,41 @@ export class ActorMesh {
       current = parentOf(current);
     }
 
-    return destinations;
+    return {
+      diagnostic: {
+        resource: resourceKey(resource),
+        governingSource: null,
+        principal: null,
+        resourceLevel: null,
+        isLive: false,
+      },
+      destinations: [],
+    };
+  }
+
+  /**
+   * The live **owner** destinations for an event, walking the ownership ladder:
+   * a live obligation claiming the source, then an explicit ownership row, then
+   * (for bubble-eligible event classes) the same two questions of the parent
+   * resource.
+   *
+   * Ownership only. Direct subscribers are resolved by
+   * {@link liveDirectSubscribers} and merged by {@link deliverEvent}, never
+   * here — this function is also what {@link effectiveOwnerOf} answers with, so
+   * a subscriber appearing in its result would let anyone who subscribed to a
+   * source delegate or reclaim it.
+   */
+  private resolveLiveOwnerDestinations(
+    resource: EventResource,
+    opts: {
+      ignoreExactResource?: EventResource;
+      eventPayload?: InboxPayload;
+      enforceBubblingPolicy?: boolean;
+      /** A precomputed exact-resource lookup; `null` means it found no claim. */
+      exactObligationOwner?: string | null;
+    } = {}
+  ): string[] {
+    return this.resolveRoutingDecision(resource, opts).destinations;
   }
 
   /**
@@ -1960,6 +2058,28 @@ export class ActorMesh {
   }
 
   /**
+   * Resolve effective event routing authority for a canonical resource (#369).
+   *
+   * Answers ownership and delegation authority via an unconditional ancestor walk,
+   * reconciling the precedence rule used by delegation guards (e.g. {@link delegateEventSource}):
+   * a live obligation claim at any rung of the resource hierarchy outranks
+   * stored subscriptions at that rung or higher rungs. Stored subscriptions
+   * fall back to most-specific-live-subscriber-wins with parent bubbling.
+   *
+   * Note: This walk is unconditional for authority inspection. A reported
+   * ancestor-level route is only deliverable by {@link deliverEvent} for
+   * bubble-eligible event classes; non-bubbling event classes are exact-only.
+   * Direct subscriptions are delivery-only and never confer ownership.
+   */
+  resolveEffectiveRoute(
+    resource: EventResource,
+    opts: { ignoreExactResource?: EventResource } = {}
+  ): EffectiveRouteDiagnostic {
+    const canonical = resourceKey(resource);
+    return this.resolveRoutingDecision(canonical, opts).diagnostic;
+  }
+
+  /**
    * Add a direct subscriber to an event source. Records an audit event.
    *
    * Unlike {@link subscribeEventSource} this takes no ownership and refuses
@@ -2017,7 +2137,8 @@ export class ActorMesh {
 
   /**
    * Resolve the active subscriber for a hierarchy-aware EventResource, checking liveness,
-   * and delivering to the most-specific live subscriber. An allowlisted event may bubble
+   * and delivering to the governing live owner (live obligation claims taking precedence over
+   * stored subscriptions, with fallback to most-specific live subscriber). An allowlisted event may bubble
    * up the ancestor chain past dead/absent exact subscribers; every other class is exact-only.
    * An event no subscription covers is DROPPED (journal-visible):
    * sources are config-declared , so an uncovered event is out-of-scope for this
