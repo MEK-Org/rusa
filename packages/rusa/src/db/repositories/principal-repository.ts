@@ -9,7 +9,6 @@ import type {
 type PrincipalRow = {
   id: string;
   kind: string;
-  actor_id: string | null;
   created_at: string;
 };
 
@@ -21,7 +20,6 @@ type UserRow = {
   root_actor_id: string | null;
   disabled_at: string | null;
   last_authenticated_at: string | null;
-  created_at: string;
 };
 
 export interface CreateUserInput {
@@ -83,10 +81,10 @@ export class PrincipalRepository {
   ensureActorPrincipal(actorId: string, createdAt: string): void {
     const result = this.db
       .prepare(
-        `INSERT INTO principals (id, kind, actor_id, created_at) VALUES (?, 'actor', ?, ?)
+        `INSERT INTO principals (id, kind, created_at) VALUES (?, 'actor', ?)
          ON CONFLICT(id) DO NOTHING`
       )
-      .run(actorId, actorId, createdAt);
+      .run(actorId, createdAt);
     if (result.changes === 0) this.assertKind(actorId, "actor");
   }
 
@@ -94,7 +92,7 @@ export class PrincipalRepository {
   ensureSystemPrincipal(id: string, createdAt: string): void {
     const result = this.db
       .prepare(
-        `INSERT INTO principals (id, kind, actor_id, created_at) VALUES (?, 'system', NULL, ?)
+        `INSERT INTO principals (id, kind, created_at) VALUES (?, 'system', ?)
          ON CONFLICT(id) DO NOTHING`
       )
       .run(id, createdAt);
@@ -106,10 +104,7 @@ export class PrincipalRepository {
     const row = this.principalRow(id);
     if (!row) return undefined;
     if (row.kind === "actor") {
-      // The CHECK constraints make this unreachable for an actor row; narrowing
-      // rather than asserting keeps the null out of the returned type.
-      if (row.actor_id === null) return undefined;
-      return { kind: "actor", id: row.id, actorId: row.actor_id, createdAt: row.created_at };
+      return { kind: "actor", id: row.id, actorId: row.id, createdAt: row.created_at };
     }
     if (row.kind === "system") {
       return { kind: "system", id: row.id, createdAt: row.created_at };
@@ -150,23 +145,20 @@ export class PrincipalRepository {
     const created = this.db.transaction(() => {
       if (input.identity) this.assertIdentityAvailable(input.identity);
       this.db
-        .prepare(
-          `INSERT INTO principals (id, kind, actor_id, created_at) VALUES (?, 'user', NULL, ?)`
-        )
+        .prepare(`INSERT INTO principals (id, kind, created_at) VALUES (?, 'user', ?)`)
         .run(id, input.createdAt);
       this.db
         .prepare(
           `INSERT INTO users (
-             principal_id, email, firebase_issuer, firebase_subject, root_actor_id, created_at
-           ) VALUES (?, ?, ?, ?, ?, ?)`
+             principal_id, email, firebase_issuer, firebase_subject, root_actor_id
+           ) VALUES (?, ?, ?, ?, ?)`
         )
         .run(
           id,
           email,
           input.identity?.issuer ?? null,
           input.identity?.subject ?? null,
-          input.rootActorId ?? null,
-          input.createdAt
+          input.rootActorId ?? null
         );
       return this.requireUser(id);
     })();

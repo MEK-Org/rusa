@@ -14,15 +14,11 @@ import type { Migration } from "./types.js";
  * that a lookup instead — and is why an actor's principal id *is* its actor id:
  * the ids already written into those columns must keep resolving unchanged.
  *
- * **`principals.actor_id` duplicates `id` for actor principals on purpose.**
- * The invariant worth holding is "an actor-kind principal names a real actor
- * row"; SQLite has no conditional foreign key, so the only way to express it is
- * a nullable column that carries the reference, pinned to the primary key by
- * CHECK. `ON DELETE RESTRICT` matches `capability_grants.actor_id`: nothing
- * deletes actors today (retirement is a `retired_at` timestamp), so this fixes
- * the answer before something starts asking — an actor's identity may not
- * vanish out from under the rows attributed to it. Its index exists for that
- * foreign key's child-side lookup, not to add uniqueness the CHECK already has.
+ * **Actors and principals are synchronized in application transactions.**
+ * An actor's principal id is its actor id. Because actor retirement is tracked via
+ * `retired_at` timestamp mutation rather than hard row deletion, and actor creation
+ * runs transactionally with principal creation in `SqliteActorRepository`, the
+ * schema avoids an artificial nullable `actor_id` foreign key column on `principals`.
  *
  * **Users are keyed by verified issuer + subject, never by email.** Email is
  * admission metadata that a provider can legitimately change; the durable key
@@ -47,12 +43,8 @@ export const principals: Migration = {
       CREATE TABLE principals (
         id         TEXT PRIMARY KEY CHECK (length(trim(id)) > 0),
         kind       TEXT NOT NULL CHECK (kind IN ('actor', 'user', 'system')),
-        actor_id   TEXT REFERENCES actors(id) ON DELETE RESTRICT,
-        created_at TEXT NOT NULL,
-        CHECK ((kind = 'actor') = (actor_id IS NOT NULL)),
-        CHECK (actor_id IS NULL OR actor_id = id)
+        created_at TEXT NOT NULL
       );
-      CREATE INDEX principals_actor_id_idx ON principals (actor_id);
 
       CREATE TABLE users (
         principal_id          TEXT PRIMARY KEY REFERENCES principals(id) ON DELETE RESTRICT,
@@ -65,7 +57,6 @@ export const principals: Migration = {
         root_actor_id         TEXT REFERENCES actors(id) ON DELETE RESTRICT,
         disabled_at           TEXT,
         last_authenticated_at TEXT,
-        created_at            TEXT NOT NULL,
         CHECK ((firebase_issuer IS NULL) = (firebase_subject IS NULL))
       );
       CREATE UNIQUE INDEX users_external_identity_idx
@@ -77,15 +68,15 @@ export const principals: Migration = {
       -- creation time. An instance upgrading with a populated actors table and a
       -- fresh instance creating the same actors through the repository therefore
       -- reach byte-identical principal rows.
-      INSERT OR IGNORE INTO principals (id, kind, actor_id, created_at)
-        SELECT id, 'actor', id, created_at FROM actors;
+      INSERT OR IGNORE INTO principals (id, kind, created_at)
+        SELECT id, 'actor', created_at FROM actors;
 
       -- The mesh's own writes (dropped-delivery notices and the like) are
       -- attributed to this identity today. The literal is inlined rather than
       -- imported so a later rename of the constant cannot retroactively change
       -- what this migration did, following 0025's handling of the same problem.
-      INSERT OR IGNORE INTO principals (id, kind, actor_id, created_at)
-        VALUES ('system:mesh', 'system', NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+      INSERT OR IGNORE INTO principals (id, kind, created_at)
+        VALUES ('system:mesh', 'system', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
     `);
   },
 };

@@ -24,9 +24,9 @@ Lifecycle, against the actor lifecycle as it actually is:
 
 - **Retirement** is a `retired_at` timestamp on `actors`. The principal is
   untouched: a retired actor's attributed history stays attributable.
-- **Deletion** of an actor is refused (`ON DELETE RESTRICT`) while a principal
-  names it, and while any user holds it as their root. Nothing deletes actors
-  today; this fixes the answer before something starts asking.
+- **Deletion** of an actor is refused (`ON DELETE RESTRICT`) while any user
+  holds it as their root. Nothing deletes actors today; actor lifecycles treat
+  retirement as a `retired_at` timestamp mutation.
 - **Disabling a user** is a `disabled_at` timestamp. The root actor, the bound
   identity and all history are preserved.
 

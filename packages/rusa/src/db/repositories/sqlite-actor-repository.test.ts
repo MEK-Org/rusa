@@ -529,11 +529,10 @@ describe("SqliteActorRepository", () => {
     repository.upsert(root);
 
     expect(
-      db.prepare("SELECT id, kind, actor_id, created_at FROM principals WHERE id = 'root'").get()
+      db.prepare("SELECT id, kind, created_at FROM principals WHERE id = 'root'").get()
     ).toEqual({
       id: "root",
       kind: "actor",
-      actor_id: "root",
       created_at: root.createdAt,
     });
   });
@@ -564,7 +563,7 @@ describe("SqliteActorRepository", () => {
     ]);
   });
 
-  it("keeps a retired actor's identity, and refuses to delete the actor under it", () => {
+  it("keeps a retired actor's identity", () => {
     repository.upsert(root);
     const worker: ActorRecord = {
       id: "worker",
@@ -584,6 +583,5 @@ describe("SqliteActorRepository", () => {
       actorId: "worker",
       createdAt: worker.createdAt,
     });
-    expect(() => db.prepare("DELETE FROM actors WHERE id = 'worker'").run()).toThrow();
   });
 });

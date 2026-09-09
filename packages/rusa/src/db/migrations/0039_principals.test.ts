@@ -8,7 +8,7 @@ import { runMigrations } from "./runner.js";
 const ROOT_CREATED_AT = "2026-09-03T13:00:00.000Z";
 const WORKER_CREATED_AT = "2026-09-03T13:01:00.000Z";
 
-type PrincipalRow = { id: string; kind: string; actor_id: string | null; created_at: string };
+type PrincipalRow = { id: string; kind: string; created_at: string };
 
 /**
  * A database migrated to the head *before* this migration, so the backfill can
@@ -57,13 +57,13 @@ function insertUser(
   }> = {}
 ): void {
   db.prepare(
-    `INSERT INTO principals (id, kind, actor_id, created_at)
-     VALUES (?, 'user', NULL, '2026-09-05T00:00:00.000Z')`
+    `INSERT INTO principals (id, kind, created_at)
+     VALUES (?, 'user', '2026-09-05T00:00:00.000Z')`
   ).run(principalId);
   db.prepare(
     `INSERT INTO users (
-       principal_id, email, firebase_issuer, firebase_subject, root_actor_id, created_at
-     ) VALUES (?, ?, ?, ?, ?, '2026-09-05T00:00:00.000Z')`
+       principal_id, email, firebase_issuer, firebase_subject, root_actor_id
+     ) VALUES (?, ?, ?, ?, ?)`
   ).run(
     principalId,
     overrides.email ?? `${principalId}@example.com`,
@@ -88,8 +88,12 @@ describe("0039_principals (schema, application bypassed)", () => {
       "root_actor_id",
       "disabled_at",
       "last_authenticated_at",
-      "created_at",
     ]);
+
+    const principalColumns = (
+      db.prepare("PRAGMA table_info(principals)").all() as Array<{ name: string; type: string }>
+    ).map((column) => column.name);
+    expect(principalColumns).toEqual(["id", "kind", "created_at"]);
 
     const sql = (
       db.prepare("SELECT sql FROM sqlite_master WHERE name = 'principals'").get() as { sql: string }
@@ -104,9 +108,9 @@ describe("0039_principals (schema, application bypassed)", () => {
     const db = migratedWithActors();
 
     expect(principalRows(db)).toEqual([
-      { id: "root", kind: "actor", actor_id: "root", created_at: ROOT_CREATED_AT },
-      { id: "system:mesh", kind: "system", actor_id: null, created_at: expect.any(String) },
-      { id: "worker", kind: "actor", actor_id: "worker", created_at: WORKER_CREATED_AT },
+      { id: "root", kind: "actor", created_at: ROOT_CREATED_AT },
+      { id: "system:mesh", kind: "system", created_at: expect.any(String) },
+      { id: "worker", kind: "actor", created_at: WORKER_CREATED_AT },
     ]);
 
     db.close();
@@ -150,26 +154,21 @@ describe("0039_principals (schema, application bypassed)", () => {
     upgraded.close();
   });
 
-  it("refuses an actor principal that names no actor, or that renames one", () => {
+  it("refuses a principal with invalid kind or blank id", () => {
     const db = migratedWithActors();
     const insert = db.prepare(
-      "INSERT INTO principals (id, kind, actor_id, created_at) VALUES (?, ?, ?, '2026-09-05T00:00:00.000Z')"
+      "INSERT INTO principals (id, kind, created_at) VALUES (?, ?, '2026-09-05T00:00:00.000Z')"
     );
 
-    expect(() => insert.run("ghost", "actor", "ghost")).toThrow();
-    expect(() => insert.run("worker-alias", "actor", "worker")).toThrow();
-    expect(() => insert.run("worker", "actor", null)).toThrow();
-    expect(() => insert.run("impostor", "user", "worker")).toThrow();
-    expect(() => insert.run("nonsense", "robot", null)).toThrow();
+    expect(() => insert.run("nonsense", "robot")).toThrow();
+    expect(() => insert.run("", "actor")).toThrow();
+    expect(() => insert.run("   ", "user")).toThrow();
 
     db.close();
   });
 
-  it("restricts deleting an actor that carries an identity or holds a user's root", () => {
+  it("restricts deleting an actor that holds a user's root", () => {
     const db = migratedWithActors();
-    expect(() => db.prepare("DELETE FROM actors WHERE id = ?").run("worker")).toThrow();
-
-    db.prepare("DELETE FROM principals WHERE id = ?").run("worker");
     insertUser(db, "owner", { rootActorId: "worker" });
     expect(() => db.prepare("DELETE FROM actors WHERE id = ?").run("worker")).toThrow();
 
@@ -210,8 +209,8 @@ describe("0039_principals (schema, application bypassed)", () => {
     expect(() =>
       db
         .prepare(
-          `INSERT INTO users (principal_id, email, created_at)
-           VALUES ('unknown', 'nobody@example.com', '2026-09-05T00:00:00.000Z')`
+          `INSERT INTO users (principal_id, email)
+           VALUES ('unknown', 'nobody@example.com')`
         )
         .run()
     ).toThrow();
