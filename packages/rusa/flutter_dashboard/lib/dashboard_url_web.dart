@@ -1,4 +1,6 @@
-import 'package:web/web.dart' as web;
+import 'dart:async';
+
+import 'package:flutter/services.dart';
 
 import 'widgets/header.dart';
 
@@ -44,8 +46,10 @@ void writeDashboardViewToUrl(
     port: base.hasPort ? base.port : null,
     path: newPath,
     queryParameters: queryParams.isEmpty ? null : queryParams,
-  ).toString();
-  web.window.history.replaceState(null, '', url);
+  );
+  // Let Flutter update its own browser-history entry. Calling the DOM History
+  // API directly replaces the engine's serialized state and breaks teardown.
+  unawaited(SystemNavigator.routeInformationUpdated(uri: url, replace: true));
 }
 
 DashboardView _parse(String path) {
