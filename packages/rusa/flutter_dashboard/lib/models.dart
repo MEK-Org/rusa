@@ -1210,6 +1210,9 @@ class ObligationDto {
     this.recurrenceCron,
     this.recurrenceIntervalSeconds,
     this.nextReadyAt,
+    this.checkpoint,
+    this.checkpointAt,
+    this.checkpointBy,
     this.hasCompletionHistory = false,
   });
 
@@ -1264,6 +1267,17 @@ class ObligationDto {
   /// `scheduled`.
   final String? nextReadyAt;
 
+  /// Where this obligation's work stands right now, in its owner's words.
+  /// Rewritten in place, so this is the current standing and never a history
+  /// to replay. Null means no standing has been recorded — which is also what
+  /// a cleared checkpoint means.
+  final String? checkpoint;
+
+  /// When [checkpoint] was written, and by which entity. Non-null exactly when
+  /// [checkpoint] is: a stamp without a standing would date an absence.
+  final String? checkpointAt;
+  final String? checkpointBy;
+
   /// Whether the durable completion ledger contains at least one row, even if
   /// recurrence was later disabled. Exact counts live on the detail snapshot's
   /// completion-page metadata rather than every obligation projection.
@@ -1297,6 +1311,11 @@ class ObligationDto {
   bool get isTerminal => status == 'done' || status == 'cancelled';
   bool get isRecurring => recurrencePolicy != null;
 
+  /// The database coherence constraint makes a checkpoint and its stamp appear
+  /// together, and rejects blank checkpoints. The client can trust that API
+  /// invariant rather than inventing a partial-record fallback.
+  bool get hasCheckpoint => checkpoint != null;
+
   factory ObligationDto.fromJson(Map<String, dynamic> j) {
     // The server sends a parsed reference object; older rows and some fixtures
     // send the bare canonical string. Both reduce to the same `key`.
@@ -1325,6 +1344,9 @@ class ObligationDto {
       recurrenceCron: j['recurrenceCron'] as String?,
       recurrenceIntervalSeconds: j['recurrenceIntervalSeconds'] as int?,
       nextReadyAt: j['nextReadyAt'] as String?,
+      checkpoint: j['checkpoint'] as String?,
+      checkpointAt: j['checkpointAt'] as String?,
+      checkpointBy: j['checkpointBy'] as String?,
       hasCompletionHistory: j['hasCompletionHistory'] as bool? ?? false,
     );
   }

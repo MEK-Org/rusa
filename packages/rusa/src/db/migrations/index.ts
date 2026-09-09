@@ -37,6 +37,7 @@ import { eventSources } from "./0038_event_sources.js";
 import { hostJobs } from "./0040_host_jobs.js";
 import { modelClasses } from "./0041_model_classes.js";
 import { actorRunLaunchConfig } from "./0042_actor_run_launch_config.js";
+import { obligationCheckpoint } from "./0043_obligation_checkpoint.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -86,4 +87,5 @@ export const migrations: Migration[] = [
   hostJobs,
   modelClasses,
   actorRunLaunchConfig,
+  obligationCheckpoint,
 ];

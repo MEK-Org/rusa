@@ -244,6 +244,7 @@ class DashboardStore {
   final _avatarEpoch = BehaviorSubject<int>.seeded(0);
   final _focusedObligationId = BehaviorSubject<String?>.seeded(null);
   final _detailPanelIndex = BehaviorSubject<int>.seeded(0);
+  final _obligationRefreshes = PublishSubject<String?>();
 
   /// Anchor for shift-range selection (set by plain/ctrl clicks).
   String? _anchor;
@@ -292,6 +293,12 @@ class DashboardStore {
   ValueStream<int> get avatarEpoch => _avatarEpoch.stream;
   ValueStream<String?> get focusedObligationId => _focusedObligationId.stream;
   ValueStream<int> get detailPanelIndex => _detailPanelIndex.stream;
+
+  /// Fires after a committed checkpoint rewrite arrives over the mesh stream.
+  /// WorkTab owns the forest snapshot, so it consumes this narrow invalidation
+  /// signal and reloads the visible tree instead of keeping stale standing,
+  /// while mounted detail views filter on their specific obligation ID.
+  Stream<String?> get obligationRefreshes => _obligationRefreshes.stream;
 
   // ── Normalized actor selectors ──
   ActorViewState? actor(String id) => _actorStates.value.actor(id);
@@ -1032,6 +1039,11 @@ class DashboardStore {
       }
     }
 
+    if (e.kind == 'obligation_checkpoint_set' &&
+        !_obligationRefreshes.isClosed) {
+      _obligationRefreshes.add(e.detail);
+    }
+
     // Prepend to the Events list only if it matches the *current* view filter.
     final actorId = e.actorId;
     if (actorId == null) return;
@@ -1412,6 +1424,7 @@ class DashboardStore {
       _error.close(),
       _collapsed.close(),
       _walkieActive.close(),
+      _obligationRefreshes.close(),
     ]);
   }
 }

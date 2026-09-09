@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../actor_display.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -193,6 +194,14 @@ class ObligationRow extends StatelessWidget {
                 actionButtons,
               ],
             ),
+            if (obligation.hasCheckpoint) ...[
+              const SizedBox(height: 10),
+              ObligationCheckpointPanel(
+                obligation: obligation,
+                lookupHandle: (id) => store.actor(id)?.handle,
+                maxLines: 4,
+              ),
+            ],
             if (obligation.externalRef != null && obligation.externalRef!.trim().isNotEmpty) ...[
               const SizedBox(height: 8),
               Row(
@@ -305,6 +314,100 @@ class ObligationRow extends StatelessWidget {
             ],
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// Who last said where this obligation stands, and when — `handle · timestamp`.
+///
+/// Both halves are present whenever a checkpoint is present: the database
+/// coherence constraint and single write statement make a partial stamp
+/// unrepresentable on this API.
+String checkpointStampLabel(
+  ObligationDto obligation,
+  String? Function(String id) lookupHandle,
+) {
+  final author = actorDisplayLabel(obligation.checkpointBy!, lookupHandle);
+  final when = formatTs(obligation.checkpointAt!);
+  return '$author · $when';
+}
+
+/// The owner's account of where this obligation's work stands.
+///
+/// Rendered directly under the heading, and above the evidence, because it is
+/// the thing a reader wants first: what is true *now*. It is deliberately
+/// styled apart from [ObligationDto.body] — intent says why the work exists and
+/// does not change; a checkpoint is rewritten at every milestone, so reading
+/// one as the other would mislead in both directions.
+class ObligationCheckpointPanel extends StatelessWidget {
+  const ObligationCheckpointPanel({
+    super.key,
+    required this.obligation,
+    required this.lookupHandle,
+    this.maxLines,
+    this.selectable = false,
+  });
+
+  final ObligationDto obligation;
+  final String? Function(String id) lookupHandle;
+
+  /// Cap the standing's height where the surrounding surface is a summary. Null
+  /// shows it whole, which is what a detail view owes a reader.
+  final int? maxLines;
+  final bool selectable;
+
+  @override
+  Widget build(BuildContext context) {
+    const bodyStyle = TextStyle(
+      color: MeshColors.textPrimary,
+      fontSize: 11.5,
+      height: 1.4,
+    );
+    final text = obligation.checkpoint!.trim();
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: MeshColors.bgTertiary,
+        border: const Border(
+          left: BorderSide(color: MeshColors.accent, width: 3),
+        ),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.flag_outlined, size: 13, color: MeshColors.accent),
+              const SizedBox(width: 4),
+              const Text(
+                'Standing',
+                style: TextStyle(
+                  color: MeshColors.textSecondary,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  checkpointStampLabel(obligation, lookupHandle),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: MeshColors.textMuted, fontSize: 11),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          if (selectable)
+            SelectableText(text, style: bodyStyle)
+          else
+            Text(text, maxLines: maxLines, overflow: TextOverflow.ellipsis, style: bodyStyle),
+        ],
       ),
     );
   }

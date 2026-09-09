@@ -7,6 +7,7 @@ import { ObligationRepository } from "../db/repositories/obligation-repository.j
 import type { IssueClient } from "../gitops/issue-client.js";
 import { MESH_SYSTEM, resolveStampedAuthor } from "../mcp/stamp.js";
 import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
+import { canManageObligation } from "../obligations/owner.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import {
   assertConcreteModelConfig,
@@ -374,6 +375,20 @@ const payload = (type: string, merged?: boolean): InboxPayload =>
 describe("ActorMesh", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
+
+  it("applies checkpoint authority to the real owner/ancestor topology", () => {
+    const { mesh } = setup();
+    const owner = mesh.spawn({ charter: "owner", parentId: "root" });
+    const descendant = mesh.spawn({ charter: "descendant", parentId: owner });
+    const sibling = mesh.spawn({ charter: "sibling", parentId: "root" });
+    const canWrite = (actorId: string) =>
+      canManageObligation(actorId, { ownerId: owner }, mesh.isAncestorOf.bind(mesh));
+
+    expect(canWrite(owner)).toBe(true);
+    expect(canWrite("root")).toBe(true);
+    expect(canWrite(sibling)).toBe(false);
+    expect(canWrite(descendant)).toBe(false);
+  });
 
   it("sequences real actor and external-root transitions on one contiguous revision", async () => {
     const { mesh, root, tick } = setup();

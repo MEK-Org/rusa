@@ -7,7 +7,7 @@ import {
   type ObligationActivationRecord,
   type ObligationActivationScheduler,
 } from "../../actor/os-scheduler.js";
-import type { Obligation } from "../../obligations/obligation.js";
+import { OBLIGATION_CHECKPOINT_MAX, type Obligation } from "../../obligations/obligation.js";
 import { asGitHubIssue } from "../../references/reference.js";
 import { obligations } from "../migrations/0016_obligations.js";
 import { obligationPriority } from "../migrations/0017_obligation_priority.js";
@@ -17,6 +17,7 @@ import { obligationTitle } from "../migrations/0027_obligation_title.js";
 import { obligationArtifacts } from "../migrations/0028_obligation_artifacts.js";
 import { recurringObligations } from "../migrations/0035_recurring_obligations.js";
 import { obligationDependencies } from "../migrations/0037_obligation_dependencies.js";
+import { obligationCheckpoint } from "../migrations/0043_obligation_checkpoint.js";
 import { ObligationRepository } from "./obligation-repository.js";
 
 /** Records every scheduler call instead of touching the OS, for assertions. */
@@ -58,6 +59,7 @@ describe("ObligationRepository", () => {
     obligationArtifacts.up(db);
     recurringObligations.up(db);
     obligationDependencies.up(db);
+    obligationCheckpoint.up(db);
     now = 1_000;
     repository = new ObligationRepository(
       db,
@@ -2913,6 +2915,152 @@ describe("ObligationRepository", () => {
       expect(() => repository.removePrerequisite("dependent", "prereq")).not.toThrow();
     });
   });
+
+  describe("checkpoint", () => {
+    const HEAD_STANDING =
+      "head 8bdc01d; migration 0043 in flight; CI green; next: operator schema approval";
+
+    it("records the standing with who wrote it and when", () => {
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+
+      const updated = repository.setCheckpoint("arc", HEAD_STANDING, "actor-a");
+
+      expect(updated.checkpoint).toBe(HEAD_STANDING);
+      expect(updated.checkpointBy).toBe("actor-a");
+      expect(updated.checkpointAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+      expect(repository.require("arc").checkpoint).toBe(HEAD_STANDING);
+    });
+
+    it("replaces rather than accumulating, and restamps the write", () => {
+      // The whole point of the field: reading it is reading the current
+      // standing, never a sequence to replay.
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+      const first = repository.setCheckpoint("arc", HEAD_STANDING, "actor-a");
+
+      const second = repository.setCheckpoint(
+        "arc",
+        "head c5b256a; PR open; next: review",
+        "actor-b"
+      );
+
+      expect(second.checkpoint).toBe("head c5b256a; PR open; next: review");
+      expect(second.checkpoint).not.toContain("8bdc01d");
+      expect(second.checkpointBy).toBe("actor-b");
+      expect(second.checkpointAt).not.toBe(first.checkpointAt);
+    });
+
+    it("clears the standing and its stamp together", () => {
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+      repository.setCheckpoint("arc", HEAD_STANDING, "actor-a");
+
+      const cleared = repository.setCheckpoint("arc", null, "actor-b");
+
+      // A cleared checkpoint is "no standing recorded", so a stamp left behind
+      // would date an absence.
+      expect(cleared.checkpoint).toBeNull();
+      expect(cleared.checkpointAt).toBeNull();
+      expect(cleared.checkpointBy).toBeNull();
+    });
+
+    it("treats a blank write as a clear rather than a stored blank", () => {
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+      repository.setCheckpoint("arc", HEAD_STANDING, "actor-a");
+
+      expect(repository.setCheckpoint("arc", "  \n\t ", "actor-a").checkpoint).toBeNull();
+    });
+
+    it("trims the stored standing", () => {
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+
+      expect(repository.setCheckpoint("arc", `  ${HEAD_STANDING}\n`, "actor-a").checkpoint).toBe(
+        HEAD_STANDING
+      );
+    });
+
+    it("advances updatedAt on both a write and a clear", async () => {
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+      const created = repository.require("arc");
+
+      const written = repository.setCheckpoint("arc", HEAD_STANDING, "actor-a");
+      expect(written.updatedAt).not.toBe(created.updatedAt);
+
+      const cleared = repository.setCheckpoint("arc", null, "actor-a");
+      expect(cleared.updatedAt).not.toBe(written.updatedAt);
+    });
+
+    it("refuses a checkpoint longer than the cap", () => {
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+
+      expect(() =>
+        repository.setCheckpoint("arc", "x".repeat(OBLIGATION_CHECKPOINT_MAX + 1), "actor-a")
+      ).toThrow(new RegExp(`cannot exceed ${OBLIGATION_CHECKPOINT_MAX} characters`));
+      expect(repository.require("arc").checkpoint).toBeNull();
+      expect(() =>
+        repository.setCheckpoint("arc", "x".repeat(OBLIGATION_CHECKPOINT_MAX), "actor-a")
+      ).not.toThrow();
+    });
+
+    it("clears the standing on a terminal transition, then freezes the terminal row", () => {
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+      repository.setCheckpoint("arc", HEAD_STANDING, "actor-a");
+      repository.setTerminalStatus("arc", "done", "shipped");
+
+      expect(() => repository.setCheckpoint("arc", "reopened", "actor-a")).toThrow(
+        /terminal obligations cannot change their checkpoint/
+      );
+      expect(() => repository.setCheckpoint("arc", null, "actor-a")).toThrow();
+      expect(repository.require("arc")).toMatchObject({
+        checkpoint: null,
+        checkpointAt: null,
+        checkpointBy: null,
+      });
+    });
+
+    it("clears the finished cycle's standing when recurrence moves it to scheduled", () => {
+      repository.create({ title: "recurring arc", id: "recurring", ownerId: "actor-a" });
+      repository.setRecurrence("recurring", { policy: "cron", cronExpr: "0 * * * *" });
+      repository.setCheckpoint("recurring", HEAD_STANDING, "actor-a");
+
+      const scheduled = repository.setTerminalStatus("recurring", "done", "cycle complete");
+
+      expect(scheduled).toMatchObject({
+        status: "scheduled",
+        checkpoint: null,
+        checkpointAt: null,
+        checkpointBy: null,
+      });
+    });
+
+    it("clears a scheduled checkpoint when disabling recurrence finalizes the obligation", () => {
+      repository.create({ title: "recurring arc", id: "recurring", ownerId: "actor-a" });
+      repository.setRecurrence("recurring", { policy: "cron", cronExpr: "0 * * * *" });
+      repository.setTerminalStatus("recurring", "done", "cycle complete");
+      repository.setCheckpoint("recurring", "next run waits on the cron wake", "actor-a");
+
+      const finalized = repository.setRecurrence("recurring", null);
+
+      expect(finalized).toMatchObject({
+        status: "done",
+        checkpoint: null,
+        checkpointAt: null,
+        checkpointBy: null,
+      });
+    });
+
+    it("refuses to write against an obligation that does not exist", () => {
+      expect(() => repository.setCheckpoint("missing", HEAD_STANDING, "actor-a")).toThrow();
+    });
+
+    it("carries the standing into the read paths a wake actually uses", () => {
+      repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
+      repository.setCheckpoint("arc", HEAD_STANDING, "actor-a");
+
+      const owned = repository.listOwnedPage("actor-a", { limit: 10, offset: 0 });
+      expect(owned.obligations.find((o) => o.id === "arc")?.checkpoint).toBe(HEAD_STANDING);
+      expect(repository.get("arc")?.checkpoint).toBe(HEAD_STANDING);
+      expect(repository.getTree("arc").obligation.checkpoint).toBe(HEAD_STANDING);
+    });
+  });
 });
 
 describe("multi-instance crontab reconciliation (#304)", () => {
@@ -2927,6 +3075,7 @@ describe("multi-instance crontab reconciliation (#304)", () => {
     obligationArtifacts.up(d);
     recurringObligations.up(d);
     obligationDependencies.up(d);
+    obligationCheckpoint.up(d);
     return d;
   };
 
