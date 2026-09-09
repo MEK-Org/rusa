@@ -221,6 +221,40 @@ export interface RetirementBlockers {
 }
 
 /**
+ * Effective event routing authority diagnostic (#369).
+ * Distinguishes the governing source, principal, resource level, and liveness for a canonical resource.
+ */
+export interface EffectiveRouteDiagnostic {
+  /** The canonical resource queried. */
+  resource: EventResource;
+  /**
+   * Governing authority kind: 'obligation' if claimed by a live obligation,
+   * 'subscription' if governed by a stored subscription, or null if uncovered.
+   */
+  governingSource: "obligation" | "subscription" | null;
+  governing_source?: "obligation" | "subscription" | null;
+  /**
+   * The principal (actor id or entity id) holding effective authority,
+   * or null if uncovered.
+   */
+  principal: string | null;
+  /**
+   * The canonical resource level where the governing claim was found
+   * (exact resource or ancestor level), or null if uncovered.
+   */
+  resourceLevel: EventResource | null;
+  resource_level?: EventResource | null;
+  /**
+   * Whether the governing claim was matched at the exact resource or bubbled from an ancestor.
+   */
+  level?: "exact" | "ancestor" | null;
+  /** Whether the principal is currently a live, runnable actor. */
+  isLive: boolean;
+  is_live?: boolean;
+  live?: boolean;
+}
+
+/**
  * Retirement refused because the subtree still holds work someone has to decide
  * about. Carries the blockers structurally as well as in the message, so a
  * caller that wants to act on them doesn't have to parse prose back out.
@@ -1960,6 +1994,111 @@ export class ActorMesh {
   }
 
   /**
+   * Resolve effective event routing authority for a canonical resource (#369).
+   *
+   * Reconciles the precedence rule used by {@link resolveLiveOwnerDestinations}:
+   * a live obligation claim at any rung of the resource hierarchy outranks
+   * stored subscriptions at that rung or higher rungs. Stored subscriptions
+   * fall back to most-specific-live-subscriber-wins with parent bubbling.
+   * Direct subscriptions are delivery-only and never confer ownership.
+   */
+  resolveEffectiveRoute(
+    resource: EventResource,
+    opts: { ignoreExactResource?: EventResource } = {}
+  ): EffectiveRouteDiagnostic {
+    const canonical = resourceKey(resource);
+    let current: EventResource | undefined = canonical;
+    let fallbackSubscription: { principal: string; resourceLevel: EventResource } | undefined;
+
+    while (current) {
+      const obligationOwner = this.obligationOwnerFor(current);
+      if (obligationOwner) {
+        const isLive = this.live.has(obligationOwner);
+        return {
+          resource: canonical,
+          governingSource: "obligation",
+          governing_source: "obligation",
+          principal: obligationOwner,
+          resourceLevel: resourceKey(current),
+          resource_level: resourceKey(current),
+          level: sameResource(current, canonical) ? "exact" : "ancestor",
+          isLive,
+          is_live: isLive,
+          live: isLive,
+        };
+      }
+
+      const activeSubs = this.eventSourceOwners.activeForResource(current);
+      for (const sub of activeSubs) {
+        if (
+          opts.ignoreExactResource &&
+          sameResource(sub.resource, opts.ignoreExactResource) &&
+          sameResource(current, opts.ignoreExactResource)
+        ) {
+          continue;
+        }
+        if (this.live.has(sub.actorId)) {
+          return {
+            resource: canonical,
+            governingSource: "subscription",
+            governing_source: "subscription",
+            principal: sub.actorId,
+            resourceLevel: resourceKey(current),
+            resource_level: resourceKey(current),
+            level: sameResource(current, canonical) ? "exact" : "ancestor",
+            isLive: true,
+            is_live: true,
+            live: true,
+          };
+        } else if (!fallbackSubscription) {
+          fallbackSubscription = {
+            principal: sub.actorId,
+            resourceLevel: resourceKey(current),
+          };
+        }
+      }
+
+      current = parentOf(current);
+    }
+
+    if (fallbackSubscription) {
+      return {
+        resource: canonical,
+        governingSource: "subscription",
+        governing_source: "subscription",
+        principal: fallbackSubscription.principal,
+        resourceLevel: fallbackSubscription.resourceLevel,
+        resource_level: fallbackSubscription.resourceLevel,
+        level: sameResource(fallbackSubscription.resourceLevel, canonical) ? "exact" : "ancestor",
+        isLive: false,
+        is_live: false,
+        live: false,
+      };
+    }
+
+    return {
+      resource: canonical,
+      governingSource: null,
+      governing_source: null,
+      principal: null,
+      resourceLevel: null,
+      resource_level: null,
+      level: null,
+      isLive: false,
+      is_live: false,
+      live: false,
+    };
+  }
+
+  /** Alias for {@link resolveEffectiveRoute}. */
+  effectiveRouteOf(
+    resource: EventResource,
+    opts: { ignoreExactResource?: EventResource } = {}
+  ): EffectiveRouteDiagnostic {
+    return this.resolveEffectiveRoute(resource, opts);
+  }
+
+  /**
    * Add a direct subscriber to an event source. Records an audit event.
    *
    * Unlike {@link subscribeEventSource} this takes no ownership and refuses
@@ -2017,7 +2156,8 @@ export class ActorMesh {
 
   /**
    * Resolve the active subscriber for a hierarchy-aware EventResource, checking liveness,
-   * and delivering to the most-specific live subscriber. An allowlisted event may bubble
+   * and delivering to the governing live owner (live obligation claims taking precedence over
+   * stored subscriptions, with fallback to most-specific live subscriber). An allowlisted event may bubble
    * up the ancestor chain past dead/absent exact subscribers; every other class is exact-only.
    * An event no subscription covers is DROPPED (journal-visible):
    * sources are config-declared , so an uncovered event is out-of-scope for this
