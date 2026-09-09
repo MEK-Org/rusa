@@ -54,6 +54,19 @@ function getEffectiveProviderConfig(
 }
 
 /**
+ * The one home for throttle-lane aliases. `antigravity`'s binary is `agy`, so
+ * every spelling of the provider name must canonicalize onto the `agy` lane —
+ * adding a future alias means adding one row here, nowhere else.
+ */
+const THROTTLE_LANE_ALIASES: Record<string, string> = {
+  antigravity: "agy",
+};
+
+function resolveThrottleLaneAlias(key: string): string {
+  return THROTTLE_LANE_ALIASES[key] ?? key;
+}
+
+/**
  * The canonical provider-pacing lane key for a configured provider name — the
  * shared identity used to fan multiple config keys aliasing the same CLI (or
  * modelConfig pool entries) onto one pacer/quota lane. Antigravity's binary is
@@ -62,7 +75,17 @@ function getEffectiveProviderConfig(
 export function providerThrottleKey(providerName: string, config: RusaConfig): string {
   const cliCommand = config.providers[providerName]?.cliCommand;
   const key = cliCommand ?? providerName;
-  return key === "antigravity" ? "agy" : key;
+  return resolveThrottleLaneAlias(key);
+}
+
+/**
+ * Normalize an inbound provider query parameter (e.g. `?provider=`) to the
+ * canonical throttle lane key: trim and case-fold, then apply the alias table.
+ * Config-free counterpart of {@link providerThrottleKey} so the alias table
+ * lives in exactly one place.
+ */
+export function normalizeProviderThrottleKey(raw: string): string {
+  return resolveThrottleLaneAlias(raw.trim().toLocaleLowerCase("en-US"));
 }
 
 export const QUOTA_THROTTLE_PROVIDERS = ["claude", "codex", "agy", "kimi"] as const;

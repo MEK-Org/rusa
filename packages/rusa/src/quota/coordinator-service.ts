@@ -2,7 +2,7 @@ import { chmodSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { dirname } from "node:path";
-import { QUOTA_THROTTLE_PROVIDERS } from "../providers/registry.js";
+import { normalizeProviderThrottleKey, QUOTA_THROTTLE_PROVIDERS } from "../providers/registry.js";
 import {
   COORDINATOR_PROTOCOL_MAJOR,
   COORDINATOR_PROTOCOL_MINOR,
@@ -13,6 +13,7 @@ import {
   publishedThrottle,
   type QuotaCoordinatorError,
   type QuotaCoordinatorErrorResponse,
+  type QuotaCoordinatorPathMismatchError,
   type QuotaCoordinatorServiceInfo,
 } from "./coordinator-protocol.js";
 import { assertQuotaSchemaVersion, QUOTA_SCHEMA_VERSION } from "./schema-guard.js";
@@ -108,6 +109,14 @@ export class QuotaCoordinatorService {
           this.boundSocketPath = this.options.socketPath;
           resolve();
         } catch (err) {
+          // A failed chmod must not leave a live socket with umask-default
+          // permissions behind — §5.3 makes the file mode the entire v1 auth
+          // story. Refuse cleanly: close the server and remove the socket.
+          this.server?.close();
+          this.server = null;
+          try {
+            unlinkSync(this.options.socketPath);
+          } catch {}
           reject(err);
         }
       });
@@ -148,7 +157,7 @@ export class QuotaCoordinatorService {
   private sendError(
     res: http.ServerResponse,
     status: number,
-    error: QuotaCoordinatorError,
+    error: QuotaCoordinatorError | QuotaCoordinatorPathMismatchError,
     extraHeaders?: Record<string, string>
   ): void {
     this.sendJson<QuotaCoordinatorErrorResponse>(
@@ -211,7 +220,7 @@ export class QuotaCoordinatorService {
           return;
         }
 
-        const provider = rawParam === "antigravity" ? "agy" : rawParam.toLocaleLowerCase("en-US");
+        const provider = normalizeProviderThrottleKey(rawParam);
         if (!this.configuredProviders.includes(provider)) {
           this.sendError(res, 404, {
             code: "provider_unknown",
@@ -268,7 +277,7 @@ export class QuotaCoordinatorService {
 
     if (pathname === "/v1/quota") {
       const rawParam = url.searchParams.get("provider")?.trim() ?? "";
-      const provider = rawParam === "antigravity" ? "agy" : rawParam.toLocaleLowerCase("en-US");
+      const provider = normalizeProviderThrottleKey(rawParam);
 
       if (!provider || !this.configuredProviders.includes(provider)) {
         this.sendJson(res, 200, {
@@ -306,7 +315,7 @@ export class QuotaCoordinatorService {
 
     if (pathname === "/v1/history") {
       const rawParam = url.searchParams.get("provider")?.trim() ?? "";
-      const provider = rawParam === "antigravity" ? "agy" : rawParam.toLocaleLowerCase("en-US");
+      const provider = normalizeProviderThrottleKey(rawParam);
 
       if (!provider || !this.configuredProviders.includes(provider)) {
         this.sendError(res, 404, {
@@ -423,16 +432,14 @@ export class QuotaCoordinatorService {
       return;
     }
 
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        service: serviceInfo,
-        error: {
-          code: "provider_unknown",
-          message: `Path ${pathname} not found`,
-          retryable: false,
-        },
-      })
-    );
+    // Unrouted path: a typed, versioned 404. It is a routing typo rather than
+    // a provider configuration error, so it intentionally has no semantic
+    // endpoint error code. HTTP 404 is the complete path-mismatch signal;
+    // `provider_unknown` would misdirect a client into treating it as a
+    // permanent configuration failure.
+    this.sendError(res, 404, {
+      message: `Path ${pathname} not found`,
+      retryable: false,
+    });
   }
 }

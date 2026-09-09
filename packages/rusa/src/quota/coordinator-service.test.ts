@@ -8,6 +8,7 @@ import { QuotaCoordinatorClient } from "./coordinator-client.js";
 import {
   COORDINATOR_PROTOCOL_MAJOR,
   COORDINATOR_PROTOCOL_MINOR,
+  DEFAULT_MAX_INTERVAL_SECONDS,
   ProtocolMismatchError,
   publishedThrottle,
   validateProtocolMajor,
@@ -129,12 +130,17 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     const logger = { warn: vi.fn(), error: vi.fn() };
     const client = new QuotaCoordinatorClient({
       socketPath: "/dummy/sock",
-      defaultIntervalSeconds: 600,
+      maxIntervalSeconds: 600,
       logger,
     });
 
-    // Rule 0: client with no successful read starts at default/maxIntervalSeconds
+    // Rule 0: client with no successful read starts at maxIntervalSeconds
     expect(client.getLastAppliedInterval("claude")).toBe(600);
+
+    // Rule 0 with no configured ceiling falls back to DEFAULT_MAX_INTERVAL_SECONDS,
+    // never to a "normal interval" default — degradation starts at the slow end.
+    const bareClient = new QuotaCoordinatorClient({ socketPath: "/dummy/sock" });
+    expect(bareClient.getLastAppliedInterval("claude")).toBe(DEFAULT_MAX_INTERVAL_SECONDS);
 
     // Initial valid application
     const validBody = {
@@ -388,7 +394,9 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     service = new QuotaCoordinatorService({
       socketPath,
       store,
-      configuredProviders: ["claude", "codex"],
+      // Kimi is configured but cold. The collection must not invent a status
+      // for it, while its individual request remains a retryable not_ready.
+      configuredProviders: ["claude", "codex", "kimi"],
       now: () => nowMs,
     });
     await service.start();
@@ -397,6 +405,11 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     const collRes = await makeRequest(socketPath, "/v1/throttle");
     expect(collRes.status).toBe(200);
     expect(collRes.json.providers).toBeDefined();
+    expect(Object.keys(collRes.json.providers)).toEqual(["claude", "codex"]);
+
+    const coldSingleRes = await makeRequest(socketPath, "/v1/throttle?provider=kimi");
+    expect(coldSingleRes.status).toBe(503);
+    expect(coldSingleRes.json.error.code).toBe("not_ready");
 
     for (const p of ["claude", "codex"]) {
       const singleRes = await makeRequest(socketPath, `/v1/throttle?provider=${p}`);
@@ -488,7 +501,7 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     checkDb.close();
   });
 
-  // §5.6: Two-code error envelope: provider_unknown and not_ready
+  // §5.6: The two semantic endpoint codes are provider_unknown and not_ready.
   it("§5.6: returns provider_unknown (404) for unconfigured provider and not_ready (503) when cold", async () => {
     service = new QuotaCoordinatorService({
       socketPath,
@@ -510,6 +523,71 @@ describe("QuotaCoordinatorService contract tests (#353)", () => {
     expect(coldRes.json.error.code).toBe("not_ready");
     expect(coldRes.json.error.retryable).toBe(true);
     expect(coldRes.json.service.protocolMajor).toBe(COORDINATOR_PROTOCOL_MAJOR);
+  });
+
+  // §5.6: An unrouted path is a routing typo, not a provider misconfiguration —
+  // it must never wear provider_unknown's "refuse as configuration error" code.
+  // The typed response keeps its service block, but HTTP 404 is the complete
+  // path-mismatch signal; v1 does not add a third semantic endpoint code.
+  it("§5.6: unknown paths return a typed 404 without provider_unknown or a new endpoint error code", async () => {
+    service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude"],
+    });
+    await service.start();
+
+    for (const badPath of ["/v1/nope", "/v1/throttle/extra", "/nope"]) {
+      const res = await makeRequest(socketPath, badPath);
+      expect(res.status, `Expected 404 for ${badPath}`).toBe(404);
+      expect(res.json.error.code).toBeUndefined();
+      expect(res.json.error.message).toBe(`Path ${badPath} not found`);
+      expect(res.json.error.retryable).toBe(false);
+      expect(res.json.service.protocolMajor).toBe(COORDINATOR_PROTOCOL_MAJOR);
+      expect(res.body).not.toContain("provider_unknown");
+    }
+  });
+
+  // Provider normalization: case-insensitive matching, antigravity -> agy alias,
+  // single alias table shared with providerThrottleKey (providers/registry.ts).
+  it("provider input normalization: mixed case and antigravity alias resolve on every provider endpoint", async () => {
+    service = new QuotaCoordinatorService({
+      socketPath,
+      store,
+      configuredProviders: ["claude", "agy"],
+    });
+    await service.start();
+
+    // Mixed-case alias on throttle: normalizes to the agy lane, which is
+    // configured but cold -> not_ready (503). A miss would be provider_unknown (404).
+    for (const spelling of ["Antigravity", "ANTIGRAVITY", "antigravity"]) {
+      const res = await makeRequest(socketPath, `/v1/throttle?provider=${spelling}`);
+      expect(res.status, `Expected 503 not_ready for ${spelling}`).toBe(503);
+      expect(res.json.error.code).toBe("not_ready");
+    }
+
+    // Mixed-case plain provider also matches case-insensitively
+    const claudeRes = await makeRequest(socketPath, "/v1/throttle?provider=CLAUDE");
+    expect(claudeRes.status).toBe(503);
+    expect(claudeRes.json.error.code).toBe("not_ready");
+
+    // quota: normalized alias resolves to the configured agy lane ("unknown",
+    // not "unsupported"), and the canonical lane name is echoed back
+    const quotaRes = await makeRequest(socketPath, "/v1/quota?provider=Antigravity");
+    expect(quotaRes.status).toBe(200);
+    expect(quotaRes.json.provider).toBe("agy");
+    expect(quotaRes.json.status).toBe("unknown");
+
+    // history: normalized alias is accepted (200), not provider_unknown (404)
+    const historyRes = await makeRequest(socketPath, "/v1/history?provider=ANTIGRAVITY");
+    expect(historyRes.status).toBe(200);
+    expect(historyRes.json.provider).toBe("agy");
+
+    // Present-but-empty ?provider= remains a client bug: 404 provider_unknown,
+    // distinct from the absent-param collection form.
+    const emptyRes = await makeRequest(socketPath, "/v1/throttle?provider=");
+    expect(emptyRes.status).toBe(404);
+    expect(emptyRes.json.error.code).toBe("provider_unknown");
   });
 
   // §5.5: GET /v1/quota

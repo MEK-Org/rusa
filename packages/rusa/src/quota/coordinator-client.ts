@@ -10,7 +10,6 @@ import {
 
 export interface QuotaCoordinatorClientOptions {
   socketPath: string;
-  defaultIntervalSeconds?: number;
   maxIntervalSeconds?: number;
   hardStaleAfterMs?: number;
   now?: () => number;
@@ -24,10 +23,11 @@ export class QuotaCoordinatorClient {
   constructor(readonly options: QuotaCoordinatorClientOptions) {}
 
   getLastAppliedInterval(provider: string): number {
-    const maxInterval =
-      this.options.maxIntervalSeconds ??
-      this.options.defaultIntervalSeconds ??
-      DEFAULT_MAX_INTERVAL_SECONDS;
+    // §5.7 Rule 0/Rule 2 read only the ceiling: a client that has never had a
+    // successful read starts at maxIntervalSeconds, and the hard-stale widening
+    // target is the same value. Degradation is always toward slower, never
+    // faster — a "normal interval" default must not substitute for the ceiling.
+    const maxInterval = this.options.maxIntervalSeconds ?? DEFAULT_MAX_INTERVAL_SECONDS;
 
     const lastApplied = this.lastAppliedIntervals.get(provider);
     const lastRead = this.lastSuccessfulReadMs.get(provider);

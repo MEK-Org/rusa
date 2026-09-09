@@ -54,9 +54,19 @@ export interface QuotaCoordinatorError {
   retryable: boolean;
 }
 
+/**
+ * A request that does not select a v1 endpoint has an HTTP routing failure,
+ * not a quota-service state. Keep its response typed and versioned without
+ * inventing a third semantic error code in the v1 endpoint contract.
+ */
+export interface QuotaCoordinatorPathMismatchError {
+  message: string;
+  retryable: boolean;
+}
+
 export interface QuotaCoordinatorErrorResponse {
   service: QuotaCoordinatorServiceInfo;
-  error: QuotaCoordinatorError;
+  error: QuotaCoordinatorError | QuotaCoordinatorPathMismatchError;
 }
 
 export interface QuotaCoordinatorHealthResponse {
