@@ -11,6 +11,7 @@ import 'sse.dart';
 import 'store.dart';
 import 'theme.dart';
 import 'voice_web.dart';
+import 'web_actor_hierarchy_cache.dart';
 import 'web_quota_cache.dart';
 import 'web_tree_preferences_cache.dart';
 import 'widgets/dashboard_body.dart';
@@ -69,6 +70,7 @@ class _DashboardPageState extends State<DashboardPage> {
       stream: WebEventSourceStream(),
       quotaCache: WebQuotaCache(),
       treePreferencesCache: WebTreePreferencesCache(),
+      actorHierarchyCache: WebActorHierarchyCache(),
       walkie: webWalkieDeps(_api),
       avatarFilePicker: WebAvatarFilePicker(),
     );

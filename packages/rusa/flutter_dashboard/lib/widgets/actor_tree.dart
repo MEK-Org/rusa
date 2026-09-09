@@ -106,16 +106,25 @@ class ActorTree extends StatelessWidget {
     child: Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
-        const Flexible(
-          child: Text(
-            'Active Hierarchy',
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              color: MeshColors.textSecondary,
-              fontSize: 12,
-              fontWeight: FontWeight.w600,
-              letterSpacing: 0.8,
+        Flexible(
+          // While the tree is painted from the persisted cache the heading says
+          // so, so a restored hierarchy is never mistaken for confirmed server
+          // truth (#273). The suffix disappears on the first successful sync.
+          child: StreamBuilder<bool>(
+            stream: store.actorsStale,
+            initialData: store.actorsStale.valueOrNull ?? false,
+            builder: (_, snap) => Text(
+              snap.data == true
+                  ? 'Active Hierarchy · cached'
+                  : 'Active Hierarchy',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: MeshColors.textSecondary,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 0.8,
+              ),
             ),
           ),
         ),

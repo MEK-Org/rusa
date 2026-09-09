@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:rusa_dashboard/actor_hierarchy_cache.dart';
 import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/avatar_platform.dart';
 import 'package:rusa_dashboard/mesh_stream.dart';
@@ -28,6 +29,7 @@ ThreadDto makeThread(
   String? modelClass,
   List<ProviderModelConfig>? desiredModelConfig,
   String? desiredModelClass,
+  String? commitmentKind,
   String? charterPreview,
   int? queuePosition,
   String? estimatedStartAt,
@@ -48,6 +50,7 @@ ThreadDto makeThread(
   modelClass: modelClass,
   desiredModelConfig: desiredModelConfig,
   desiredModelClass: desiredModelClass,
+  commitmentKind: commitmentKind,
   charterPreview: charterPreview ?? 'charter $id',
   title: title ?? 'charter $id',
   createdAt: created,
@@ -879,6 +882,37 @@ class FakeQuotaCache implements QuotaCache {
   @override
   void save(QuotaSnapshotDto snapshot) {
     stored = snapshot;
+    saveCount++;
+  }
+
+  @override
+  void clear() {
+    stored = null;
+    clearCount++;
+  }
+}
+
+/// In-memory [ActorHierarchyCache] for headless store tests — stands in for
+/// the browser localStorage-backed `WebActorHierarchyCache`. Seed [stored] to
+/// simulate a prior session's persisted hierarchy; `saveCount`/`clearCount`
+/// record write-backs and invalidations.
+class FakeActorHierarchyCache implements ActorHierarchyCache {
+  FakeActorHierarchyCache([this.stored]);
+
+  PersistedActorHierarchy? stored;
+  int saveCount = 0;
+  int clearCount = 0;
+  int loadCount = 0;
+
+  @override
+  PersistedActorHierarchy? load() {
+    loadCount++;
+    return stored;
+  }
+
+  @override
+  void save(PersistedActorHierarchy hierarchy) {
+    stored = hierarchy;
     saveCount++;
   }
 
