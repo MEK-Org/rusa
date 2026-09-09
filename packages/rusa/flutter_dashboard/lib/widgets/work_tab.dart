@@ -39,7 +39,7 @@ class _WorkTabState extends State<WorkTab> {
   late final Set<String> _expandedIds = widget.store.workExpanded;
   String? _selectedObligationId;
   StreamSubscription<String?>? _focusSub;
-  StreamSubscription<void>? _checkpointSub;
+  StreamSubscription<String?>? _checkpointSub;
   bool _showDone = false;
   bool _fetchedTerminalRoots = false;
 
@@ -521,6 +521,8 @@ class _DetailViewState extends State<_DetailView> {
   int _completionsTotal = 0;
   bool _completionsHasMore = false;
   late Future<ObligationDetailSnapshot> _future;
+  StreamSubscription<String?>? _checkpointSub;
+  int _fetchGeneration = 0;
 
   DashboardStore get store => widget.store;
   ValueChanged<DashboardView> get onSelectView => widget.onSelectView;
@@ -531,11 +533,24 @@ class _DetailViewState extends State<_DetailView> {
   void initState() {
     super.initState();
     _fetch();
+    _checkpointSub = widget.store.obligationRefreshes.listen((obligationId) {
+      if (obligationId == null || obligationId == widget.obligationId) {
+        _refresh();
+      }
+    });
   }
 
   @override
   void didUpdateWidget(covariant _DetailView oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.store != widget.store) {
+      _checkpointSub?.cancel();
+      _checkpointSub = widget.store.obligationRefreshes.listen((obligationId) {
+        if (obligationId == null || obligationId == widget.obligationId) {
+          _refresh();
+        }
+      });
+    }
     if (oldWidget.obligationId != widget.obligationId) {
       _completions = const [];
       _completionsTotal = 0;
@@ -544,27 +559,67 @@ class _DetailViewState extends State<_DetailView> {
     }
   }
 
+  @override
+  void dispose() {
+    _checkpointSub?.cancel();
+    super.dispose();
+  }
+
   void _fetch() {
+    final gen = ++_fetchGeneration;
+    final future = store.api.fetchObligationDetail(widget.obligationId);
+    _future = future;
+    future.then((data) {
+      if (!mounted || gen != _fetchGeneration) return;
+      setState(() {
+        _completions = data.completions;
+        _completionsTotal = data.completionsTotal;
+        _completionsHasMore = data.completionsHasMore;
+      });
+    }).catchError((_) {});
+  }
+
+  void _loadMoreCompletions() {
+    final gen = ++_fetchGeneration;
     final offset = _completions.length;
     final future = store.api.fetchObligationDetail(
       widget.obligationId,
       completionsOffset: offset,
     );
-    _future = future;
-    future.then((data) {
-      if (!mounted) return;
-      setState(() {
-        _completions = offset == 0
-            ? data.completions
-            : [..._completions, ...data.completions];
-        _completionsTotal = data.completionsTotal;
-        _completionsHasMore = data.completionsHasMore;
-      });
+    setState(() {
+      _future = future;
     });
+    future.then((data) {
+      if (!mounted || gen != _fetchGeneration) return;
+      setState(() {
+        _completions = mergeCompletions(data.completions, _completions);
+        _completionsTotal = data.completionsTotal;
+        _completionsHasMore = _completions.length < data.completionsTotal;
+      });
+    }).catchError((_) {});
   }
 
-  void _loadMoreCompletions() {
-    setState(_fetch);
+  void _refresh() {
+    final gen = ++_fetchGeneration;
+    final future = store.api.fetchObligationDetail(widget.obligationId);
+    setState(() {
+      _future = future;
+    });
+    future.then((data) {
+      if (!mounted || gen != _fetchGeneration) return;
+      setState(() {
+        if (!data.completionsHasMore ||
+            _completions.length <= data.completions.length) {
+          _completions = data.completions;
+          _completionsTotal = data.completionsTotal;
+          _completionsHasMore = data.completionsHasMore;
+        } else {
+          _completions = mergeCompletions(data.completions, _completions);
+          _completionsTotal = data.completionsTotal;
+          _completionsHasMore = _completions.length < data.completionsTotal;
+        }
+      });
+    }).catchError((_) {});
   }
 
   @override
@@ -1395,4 +1450,29 @@ class _Chip extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Merges incoming completions with existing loaded completions by stable
+/// completion ID and sorts them descending by sequence (newest first).
+///
+/// Preserves paged historical cycles across refreshes without assuming
+/// positional alignment or dropping seam rows when new completions land.
+List<ObligationCompletionDto> mergeCompletions(
+  List<ObligationCompletionDto> incoming,
+  List<ObligationCompletionDto> existing,
+) {
+  if (existing.isEmpty) return incoming;
+  if (incoming.isEmpty) return existing;
+  final byId = <String, ObligationCompletionDto>{};
+  for (final c in incoming) {
+    byId[c.id] = c;
+  }
+  for (final c in existing) {
+    byId.putIfAbsent(c.id, () => c);
+  }
+  final merged = byId.values.toList();
+  // Stable order: descending by completion sequence (newest first),
+  // matching the database contract (ORDER BY sequence DESC).
+  merged.sort((a, b) => b.sequence.compareTo(a.sequence));
+  return merged;
 }
