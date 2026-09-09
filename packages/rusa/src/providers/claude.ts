@@ -11,6 +11,7 @@ import {
   SANDBOX_MCP_CONFIG_PATH,
   teardownFlutterOverlay,
 } from "./sandbox.js";
+import { sanitizeArgvText } from "./spawn-arguments.js";
 import { runSubprocess } from "./subprocess-execution.js";
 import {
   attributedTokenUsage,
@@ -38,7 +39,8 @@ export interface ClaudeArgsOptions {
 export function buildClaudeArgs(o: ClaudeArgsOptions): string[] {
   const args = [
     "-p",
-    o.prompt,
+    // Assembled text, made spawnable before it enters argv (#206).
+    sanitizeArgvText(o.prompt),
     "--dangerously-skip-permissions",
     "--output-format",
     "stream-json",
