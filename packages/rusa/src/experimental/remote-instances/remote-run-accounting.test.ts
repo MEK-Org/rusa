@@ -7,6 +7,7 @@ import { createRunAccounting } from "../../actor/run-accounting.js";
 import { runMigrations } from "../../db/migrations/runner.js";
 import { createActorRunModelConfig } from "../../db/repositories/actor-run-model-config.js";
 import { ActorRunRepository } from "../../db/repositories/actor-run-repository.js";
+import type { RawProviderModelConfig } from "../../providers/model-config.js";
 import type { RunResult } from "../../providers/types.js";
 import { ActorHandle } from "./actor-handle.js";
 import type { LeaderCommand } from "./protocol.js";
@@ -34,6 +35,8 @@ describe("remote actor run accounting", () => {
   let accountingErrors: string[];
   let admits: Array<{ responsive: boolean; mode: string }>;
   let gateCalls: number;
+  let snapshotCalls: number;
+  let context: ActorFactoryContext;
 
   const openRuns = () =>
     db
@@ -67,10 +70,11 @@ describe("remote actor run accounting", () => {
     accountingErrors = [];
     admits = [];
     gateCalls = 0;
+    snapshotCalls = 0;
     const accounting = createRunAccounting(() => runs);
     remote = new RemoteInstance("test-follower", process.platform, process.pid);
 
-    const context = {
+    context = {
       executionTarget: "test-follower",
       record: { id: ACTOR_ID },
       getRecord: () => ({ id: ACTOR_ID }),
@@ -114,6 +118,7 @@ describe("remote actor run accounting", () => {
       context,
       actorOptions,
       snapshot: () => {
+        snapshotCalls++;
         throw new Error("not admitted in this test");
       },
       saveSession: () => {},
@@ -154,6 +159,75 @@ describe("remote actor run accounting", () => {
     expect(remote.commands).toContainEqual({
       actorId: ACTOR_ID,
       message: { type: "reply", requestId: 9, value: { deferred: true } },
+    });
+  });
+
+  it("defers ordinary work when voice opens while remote provider pacing waits", async () => {
+    let voiceActive = false;
+    let launch!: () => void;
+    let remoteGateCalls = 0;
+    context.admitRun = ({ responsive, mode }) => {
+      admits.push({ responsive, mode });
+      return !voiceActive;
+    };
+    context.gate = ((
+      fn: (selected: RawProviderModelConfig) => Promise<void>,
+      candidates: readonly RawProviderModelConfig[]
+    ) => {
+      remoteGateCalls++;
+      let started = false;
+      let resolve!: () => void;
+      let reject!: (error: unknown) => void;
+      const result = new Promise<void>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      launch = () => {
+        started = true;
+        void fn(candidates[0] ?? { provider: "codex", model: "gpt-5.5" }).then(resolve, reject);
+      };
+      return {
+        result,
+        get started() {
+          return started;
+        },
+        promote: launch,
+        cancel: () => false,
+      };
+    }) as ActorFactoryContext["gate"];
+
+    followerSends({
+      type: "request",
+      requestId: 10,
+      request: {
+        op: "admit",
+        candidates: [{ provider: "codex", model: "gpt-5.5" }],
+        responsive: false,
+        mode: "ordinary",
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(admits).toEqual([{ responsive: false, mode: "ordinary" }]);
+    expect(remoteGateCalls).toBe(1);
+    expect(snapshotCalls).toBe(0);
+
+    // The normal request passed preflight and is queued behind remote provider
+    // pacing. Voice authority opens before the selected callback can admit it.
+    voiceActive = true;
+    launch();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(admits).toEqual([
+      { responsive: false, mode: "ordinary" },
+      { responsive: false, mode: "ordinary" },
+    ]);
+    expect(snapshotCalls).toBe(0);
+    expect(remote.commands).toContainEqual({
+      actorId: ACTOR_ID,
+      message: { type: "reply", requestId: 10, value: { deferred: true } },
     });
   });
 

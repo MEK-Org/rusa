@@ -328,6 +328,20 @@ export class ActorHandle implements MeshActor {
               });
               const handle = ctx.gate(
                 async (selected) => {
+                  // Provider pacing can delay this callback after the first
+                  // preflight above. Recheck the live host authority at the
+                  // actual admission boundary before exposing a snapshot to
+                  // the follower, so no ordinary provider launch can cross a
+                  // newly opened voice session.
+                  if (
+                    !(await (ctx.admitRun?.({
+                      responsive: request.responsive,
+                      mode: request.mode,
+                    }) ?? true))
+                  ) {
+                    this.send({ type: "reply", requestId, value: { deferred: true } });
+                    return;
+                  }
                   if (this.closed) throw new Error("Actor closed before admission");
                   // Selection is decided here and carried to the follower, so the
                   // remote run uses the candidate the leader actually reserved.
