@@ -553,13 +553,13 @@ describe("SqliteActorRepository", () => {
     expect(db.prepare("SELECT id FROM principals WHERE id = 'worker'").get()).toBeUndefined();
   });
 
-  it("seeds an actor principal exactly once no matter how often the actor is written", () => {
+  it("keeps the actor principal timestamp aligned when an actor is re-upserted", () => {
     repository.upsert(root);
-    repository.upsert({ ...root, title: "Renamed" });
+    repository.upsert({ ...root, title: "Renamed", createdAt: "2026-09-04T13:00:00.000Z" });
     repository.patch("root", { charter: "Own the mesh, still" });
 
     expect(db.prepare("SELECT created_at FROM principals WHERE id = 'root'").all()).toEqual([
-      { created_at: root.createdAt },
+      { created_at: "2026-09-04T13:00:00.000Z" },
     ]);
   });
 

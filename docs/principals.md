@@ -47,8 +47,10 @@ authenticates. Specifically:
   an attribution column cannot become a user.
 - **The single-root invariant stands.** `actors_single_root_idx` still permits
   one parentless actor, so at most one user can hold a root until the multi-root
-  runtime slice lifts it. `users.root_actor_id` is nullable for that reason,
-  among others.
+  runtime slice lifts it. `PrincipalRepository` accepts only a parentless actor
+  for `root_actor_id` and refuses to silently repoint an already-rooted user;
+  the future cutover owns any deliberate reassignment. The column is nullable
+  for explicit pre-binding provisioning.
 - **No Firebase, session, network or route authorization code lands here.**
   `last_authenticated_at` has a storage-level writer and no caller yet.
 
@@ -57,7 +59,7 @@ authenticates. Specifically:
 Each of these decides identity today by reading a string, and each has to move
 onto `PrincipalRef`. This is the reason the storage exists. The list was derived
 by grepping for `HUMAN_OPERATOR`, `MESH_SYSTEM`, `isHumanOperator`,
-`isSystemActor` and the bare `human:operator` literal across `packages/rusa/src`
+`isSystemActor`, and the bare `human:operator` and `system:` literals across `packages/rusa/src`
 and dropping the hits that are prose — a prompt string, JSDoc, and comments in
 `worker-prompt.ts`, `providers/types.ts`, `voice/wiring.ts` and
 `webhook/server.ts`. Re-run that grep before trusting it; it is accurate as of
@@ -116,6 +118,18 @@ this branch, not permanently.
 `obligations.owner_id` and `obligations.creator_id`; `mesh_chat.sender_id` and
 `recipient_id`; `mesh_events.actor_id`; `actor_inbox_entries.actor_id`;
 `capability_grants.granted_by`.
+
+**`system:` resource strings that are not principals**
+
+`system:events` is a canonical event-source resource, not an actor or a mesh
+writer identity: `actor/event-subscriptions.ts` normalizes it,
+`commands/start.ts` delivers disk alerts to it, and `mcp/agent-exec-mcp.ts`
+constructs it for system subscriptions. It is persisted as an event-source or
+inbox `source`, never in an attribution column, so it deliberately has no
+`principals` row and `PrincipalRepository.get("system:events")` returns nothing.
+The actual infrastructure attribution identity is `MESH_SYSTEM` (`system:mesh`),
+which the migration seeds. A future source must not become a principal merely
+because its resource key shares the `system:` prefix.
 
 Completing this list is what completes the identity half of authenticated
 multi-user mode. Finishing the storage does not finish it.

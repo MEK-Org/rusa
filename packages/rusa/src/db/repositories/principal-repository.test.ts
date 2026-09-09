@@ -17,6 +17,9 @@ function makeDb(): Database.Database {
   db.prepare(
     "INSERT INTO actors (id, charter, parent_id, created_at) VALUES ('root', 'Own the mesh', NULL, ?)"
   ).run(CREATED_AT);
+  db.prepare(
+    "INSERT INTO actors (id, charter, parent_id, created_at) VALUES ('worker', 'Do work', 'root', ?)"
+  ).run(CREATED_AT);
   return db;
 }
 
@@ -29,7 +32,7 @@ describe("PrincipalRepository", () => {
     principals = new PrincipalRepository(db);
   });
 
-  it("records an actor principal once and keeps its first creation time", () => {
+  it("keeps an actor principal creation time synchronized with its actor row", () => {
     principals.ensureActorPrincipal("root", CREATED_AT);
     principals.ensureActorPrincipal("root", "2026-10-01T00:00:00.000Z");
 
@@ -37,7 +40,7 @@ describe("PrincipalRepository", () => {
       kind: "actor",
       id: "root",
       actorId: "root",
-      createdAt: CREATED_AT,
+      createdAt: "2026-10-01T00:00:00.000Z",
     });
     expect(db.prepare("SELECT COUNT(*) AS n FROM principals").get()).toEqual({ n: 2 });
   });
@@ -47,6 +50,7 @@ describe("PrincipalRepository", () => {
     const user = principals.createUser({ email: "owner@example.com", createdAt: CREATED_AT });
 
     expect(principals.get("no-such-id")).toBeUndefined();
+    expect(principals.get("system:events")).toBeUndefined();
     expect(principals.getUser("no-such-id")).toBeUndefined();
     expect(principals.getUser("root")).toBeUndefined();
     expect(principals.get("system:mesh")).toEqual({
@@ -61,9 +65,9 @@ describe("PrincipalRepository", () => {
     expect(() => principals.ensureActorPrincipal("system:mesh", CREATED_AT)).toThrow(
       /already exists as kind 'system'/
     );
-    principals.ensureActorPrincipal("root", CREATED_AT);
-    expect(() => principals.ensureSystemPrincipal("root", CREATED_AT)).toThrow(
-      /already exists as kind 'actor'/
+    const user = principals.createUser({ email: "owner@example.com", createdAt: CREATED_AT });
+    expect(() => principals.ensureActorPrincipal(user.id, CREATED_AT)).toThrow(
+      /already exists as kind 'user'/
     );
   });
 
@@ -166,11 +170,21 @@ describe("PrincipalRepository", () => {
     expect(principals.setRootActor(owner.id, "root").rootActorId).toBe("root");
     expect(() => principals.setRootActor(colleague.id, "root")).toThrow();
     expect(principals.getUser(colleague.id)?.rootActorId).toBeUndefined();
+    expect(() => principals.setRootActor(owner.id, "worker")).toThrow(/already has root 'root'/);
+    expect(principals.getUser(owner.id)?.rootActorId).toBe("root");
   });
 
-  it("refuses a root actor that does not exist", () => {
+  it("refuses a missing or non-root actor for a root association", () => {
     const owner = principals.createUser({ email: "owner@example.com", createdAt: CREATED_AT });
-    expect(() => principals.setRootActor(owner.id, "no-such-actor")).toThrow();
+    expect(() => principals.setRootActor(owner.id, "no-such-actor")).toThrow(/does not exist/);
+    expect(() => principals.setRootActor(owner.id, "worker")).toThrow(/not a root actor/);
+    expect(() =>
+      principals.createUser({
+        email: "worker-owner@example.com",
+        rootActorId: "worker",
+        createdAt: CREATED_AT,
+      })
+    ).toThrow(/not a root actor/);
   });
 
   it("names the missing principal when a mutation targets one that is not a user", () => {

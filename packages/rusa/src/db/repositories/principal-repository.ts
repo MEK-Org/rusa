@@ -71,9 +71,12 @@ export class PrincipalRepository {
 
   /**
    * Record the principal for an actor. Idempotent by primary key, so the actor
-   * repository can call it on every upsert and a re-run of an import writes
-   * nothing new. Refuses if the id is already held by a principal of another
-   * kind, rather than leaving an actor attributed to a foreign identity.
+   * repository can call it on every upsert and a re-run of an import writes no
+   * extra row. Its timestamp follows the actor row: actor upsert deliberately
+   * accepts the supplied `createdAt` on conflict, and fresh and upgraded paths
+   * must therefore converge on the same value. Refuses if the id is already
+   * held by a principal of another kind, rather than leaving an actor attributed
+   * to a foreign identity.
    *
    * Caller must be inside the same transaction as the `actors` write — see
    * `SqliteActorRepository.upsert`, which is the only production caller.
@@ -82,21 +85,11 @@ export class PrincipalRepository {
     const result = this.db
       .prepare(
         `INSERT INTO principals (id, kind, created_at) VALUES (?, 'actor', ?)
-         ON CONFLICT(id) DO NOTHING`
+         ON CONFLICT(id) DO UPDATE SET created_at = excluded.created_at
+         WHERE principals.kind = 'actor'`
       )
       .run(actorId, createdAt);
     if (result.changes === 0) this.assertKind(actorId, "actor");
-  }
-
-  /** Record a `system:*` infrastructure identity. Idempotent, as above. */
-  ensureSystemPrincipal(id: string, createdAt: string): void {
-    const result = this.db
-      .prepare(
-        `INSERT INTO principals (id, kind, created_at) VALUES (?, 'system', ?)
-         ON CONFLICT(id) DO NOTHING`
-      )
-      .run(id, createdAt);
-    if (result.changes === 0) this.assertKind(id, "system");
   }
 
   /** The principal for `id`, or undefined when no row holds it. */
@@ -144,6 +137,7 @@ export class PrincipalRepository {
     const id = randomUUID();
     const created = this.db.transaction(() => {
       if (input.identity) this.assertIdentityAvailable(input.identity);
+      if (input.rootActorId) this.assertRootActor(input.rootActorId);
       this.db
         .prepare(`INSERT INTO principals (id, kind, created_at) VALUES (?, 'user', ?)`)
         .run(id, input.createdAt);
@@ -207,10 +201,20 @@ export class PrincipalRepository {
     })();
   }
 
-  /** Associate a user with its root actor. One root belongs to one user. */
+  /**
+   * Associate a previously unrooted user with a parentless actor. A root is
+   * chosen once: changing it would silently redirect the identity and its
+   * history, so a later reassignment needs an explicit cutover operation.
+   */
   setRootActor(principalId: string, rootActorId: string): UserPrincipal {
     return this.db.transaction(() => {
-      this.requireUser(principalId);
+      const user = this.requireUser(principalId);
+      if (user.rootActorId && user.rootActorId !== rootActorId) {
+        throw new Error(
+          `PrincipalRepository: user '${principalId}' already has root '${user.rootActorId}'`
+        );
+      }
+      this.assertRootActor(rootActorId);
       this.db
         .prepare("UPDATE users SET root_actor_id = ? WHERE principal_id = ?")
         .run(rootActorId, principalId);
@@ -270,6 +274,17 @@ export class PrincipalRepository {
       throw new Error(
         `PrincipalRepository: external identity is already bound to user '${holder.id}'`
       );
+    }
+  }
+
+  /** The relational FK proves existence; the repository also proves rootness. */
+  private assertRootActor(actorId: string): void {
+    const actor = this.db.prepare("SELECT parent_id FROM actors WHERE id = ?").get(actorId) as
+      | { parent_id: string | null }
+      | undefined;
+    if (!actor) throw new Error(`PrincipalRepository: root actor '${actorId}' does not exist`);
+    if (actor.parent_id !== null) {
+      throw new Error(`PrincipalRepository: actor '${actorId}' is not a root actor`);
     }
   }
 
