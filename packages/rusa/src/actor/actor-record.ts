@@ -15,6 +15,18 @@ export interface PortableContextConfig {
 
 export type ContextConfig = NativeContextConfig | PortableContextConfig;
 
+/**
+ * Durable per-actor walkie-talkie voice setting (the `voice_config` column,
+ * a versioned JSON document). V1 carries only the prebuilt Gemini TTS voice
+ * name; the version must identify the exact strict document shape. Absent
+ * means the actor follows the instance-wide voice default — the behavior
+ * every pre-migration actor keeps.
+ */
+export interface VoiceConfigDocument {
+  schemaVersion: 1;
+  voiceName: string;
+}
+
 /** A capability to message another actor. The unguessable id is the capability. */
 export interface ActorHandle {
   id: string;
@@ -54,4 +66,6 @@ export interface ActorRecord {
   createdAt: string;
   /** Registered follower ID where this actor is placed remotely; unset for leader-local execution. */
   executionTarget?: string;
+  /** Per-actor walkie-talkie voice; absent follows the instance-wide default. */
+  voiceConfig?: VoiceConfigDocument;
 }

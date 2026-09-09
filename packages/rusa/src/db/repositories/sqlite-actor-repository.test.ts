@@ -584,4 +584,99 @@ describe("SqliteActorRepository", () => {
       createdAt: worker.createdAt,
     });
   });
+
+  it("round-trips the voice_config document and omits the column when unset", () => {
+    repository.upsert(root);
+    const spoken: ActorRecord = {
+      id: "worker-voice",
+      charter: "Speak",
+      parentId: "root",
+      status: "active",
+      voiceConfig: { schemaVersion: 1, voiceName: "Puck" },
+      createdAt: "2026-09-09T12:00:00.000Z",
+    };
+    repository.upsert(spoken);
+    const quiet: ActorRecord = {
+      id: "worker-quiet",
+      charter: "Fallback",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-09-09T12:01:00.000Z",
+    };
+    repository.upsert(quiet);
+
+    expect(repository.get("worker-voice")).toEqual(spoken);
+    expect(repository.get("worker-quiet")).toEqual(quiet);
+    const rows = db
+      .prepare(
+        "SELECT id, voice_config FROM actors WHERE id IN ('worker-voice','worker-quiet') ORDER BY id"
+      )
+      .all() as Array<{ id: string; voice_config: string | null }>;
+    expect(rows).toEqual([
+      { id: "worker-quiet", voice_config: null },
+      { id: "worker-voice", voice_config: JSON.stringify({ schemaVersion: 1, voiceName: "Puck" }) },
+    ]);
+
+    // Clearing the setting (the PATCH route's null path) drops the document.
+    repository.patch("worker-voice", { voiceConfig: undefined });
+    expect(repository.get("worker-voice")?.voiceConfig).toBeUndefined();
+    const cleared = db
+      .prepare("SELECT voice_config FROM actors WHERE id = 'worker-voice'")
+      .get() as { voice_config: string | null };
+    expect(cleared.voice_config).toBeNull();
+  });
+
+  it("persists voice_config across a file-backed database reopen", () => {
+    const directory = mkdtempSync(join(tmpdir(), "rusa-actor-voice-"));
+    const file = join(directory, "mesh.db");
+    try {
+      const first = new Database(file);
+      runMigrations(first);
+      first.pragma("foreign_keys = ON");
+      const firstRepository = new SqliteActorRepository(first);
+      firstRepository.upsert(root);
+      firstRepository.upsert({
+        id: "worker",
+        charter: "Persist",
+        parentId: "root",
+        status: "active",
+        voiceConfig: { schemaVersion: 1, voiceName: "Kore" },
+        createdAt: "2026-09-09T12:00:00.000Z",
+      });
+      first.close();
+
+      const reopened = new Database(file);
+      expect(new SqliteActorRepository(reopened).get("worker")?.voiceConfig).toEqual({
+        schemaVersion: 1,
+        voiceName: "Kore",
+      });
+      reopened.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("validates voice_config version and shape when records are consumed", () => {
+    repository.upsert(root);
+
+    for (const invalid of [
+      "not-json",
+      '{"voiceName":"Puck"}',
+      '{"schemaVersion":2,"voiceName":"Puck"}',
+      '{"schemaVersion":1}',
+      '{"schemaVersion":1,"voiceName":""}',
+      '{"schemaVersion":1,"voiceName":"Puck","unknown":true}',
+    ]) {
+      db.prepare("UPDATE actors SET voice_config = ? WHERE id = 'root'").run(invalid);
+      expect(() => repository.get("root")).toThrow(/invalid voice_config for actor 'root'/);
+    }
+  });
+
+  it("rejects an unsupported voice name when the document is consumed", () => {
+    repository.upsert(root);
+    db.prepare("UPDATE actors SET voice_config = ? WHERE id = 'root'").run(
+      JSON.stringify({ schemaVersion: 1, voiceName: "NotAVoice" })
+    );
+    expect(() => repository.get("root")).toThrow(/invalid voice_config for actor 'root'/);
+  });
 });

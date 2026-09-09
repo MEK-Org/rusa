@@ -268,6 +268,7 @@ class DashboardStore {
   );
   final _halted = BehaviorSubject<bool>.seeded(false);
   final _schedulerWarning = BehaviorSubject<List<String>?>.seeded(null);
+  final _supportedVoices = BehaviorSubject<List<String>>.seeded(const []);
   final _showRetired = BehaviorSubject<bool>.seeded(false);
   final _selection = BehaviorSubject<Set<String>>.seeded(const {});
   final _collapsed = BehaviorSubject<Set<String>>.seeded(const {});
@@ -335,6 +336,7 @@ class DashboardStore {
   ValueStream<ActorStateSnapshot> get actorStates => _actorStates.stream;
   ValueStream<bool> get halted => _halted.stream;
   ValueStream<List<String>?> get schedulerWarning => _schedulerWarning.stream;
+  ValueStream<List<String>> get supportedVoices => _supportedVoices.stream;
   ValueStream<bool> get showRetired => _showRetired.stream;
   ValueStream<Set<String>> get selection => _selection.stream;
   ValueStream<Set<String>> get collapsed => _collapsed.stream;
@@ -1084,6 +1086,19 @@ class DashboardStore {
     }
   }
 
+  /// Set (or, with null, clear) the actor's persisted walkie-talkie voice.
+  /// The next threads refresh reflects the change; synthesis picks it up on
+  /// the actor's next spoken reply.
+  Future<void> updateActorVoice(String actorId, String? voiceName) async {
+    try {
+      await _api.updateActorVoice(actorId, voiceName);
+      _error.add(null);
+      await refreshThreads();
+    } catch (e) {
+      _error.add('$e');
+    }
+  }
+
   // ── Live SSE handlers ──
 
   void _onMeshEvent(MeshEvent e) {
@@ -1326,6 +1341,7 @@ class DashboardStore {
       _runtimeRetryDelay = _kRuntimeRetryInitial;
       _halted.add(snap.halted);
       _schedulerWarning.add(snap.schedulerWarning);
+      _supportedVoices.add(snap.supportedVoices);
       _updateActorStatesFromThreads(snap.threads);
       // Server truth has landed: the snapshot above REPLACED the seeded rows
       // wholesale, so an actor the server no longer lists is gone from the tree
@@ -1509,6 +1525,7 @@ class DashboardStore {
       _actorStates.close(),
       _halted.close(),
       _schedulerWarning.close(),
+      _supportedVoices.close(),
       _showRetired.close(),
       _selection.close(),
       _primary.close(),

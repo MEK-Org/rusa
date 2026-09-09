@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { brotliCompress, gzip, constants as zlibConstants } from "node:zlib";
 import type { ActorMesh } from "../actor/actor-mesh.js";
+import type { ActorRecord } from "../actor/actor-record.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import type { InboxPage, InboxPayload, InboxStore } from "../actor/inbox-store.js";
@@ -27,6 +28,8 @@ import { type Logger, nullLogger } from "../observability/logger.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
 import { resolveReferenceSync } from "../references/resolve.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
+import { DEFAULT_VOICE_NAME } from "../voice/gemini-speech.js";
+import { canonicalSupportedVoiceName, SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import type { SseHub } from "./sse.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
@@ -221,6 +224,11 @@ interface ThreadDto {
   /** The active run's selected inbox-focus obligation, when one exists. */
   selectedObligation?: Obligation;
   /**
+   * The actor's persisted walkie-talkie voice, or null when it follows the
+   * instance-wide default (every actor without a stored `voice_config`).
+   */
+  voiceName: string | null;
+  /**
    * The leading `CHARTER_PREVIEW_CHARS` characters of the charter, ellipsised
    * when clipped. The full text is detail data: `GET
    * /api/mesh/threads/charter?id=<threadId>`.
@@ -273,6 +281,24 @@ function operatorHandledNote(reason: string): string {
   return reason
     ? `Cleared from the dashboard by the operator: ${reason}`
     : "Cleared from the dashboard by the operator; no reason given.";
+}
+
+/**
+ * The per-actor voice payload shared by `GET` and `PATCH`
+ * `/api/mesh/actors/<id>/voice`: the persisted document (null = instance
+ * default), the supported catalog for the UI dropdown, and that instance
+ * default so the UI can label the fallback honestly.
+ */
+function voiceConfigPayload(record: ActorRecord): {
+  voiceConfig: ActorRecord["voiceConfig"] | null;
+  supportedVoices: readonly string[];
+  defaultVoiceName: string;
+} {
+  return {
+    voiceConfig: record.voiceConfig ?? null,
+    supportedVoices: SUPPORTED_TTS_VOICES,
+    defaultVoiceName: DEFAULT_VOICE_NAME,
+  };
 }
 
 /**
@@ -1197,6 +1223,71 @@ export async function handleMeshApiRequest(
     }
   }
 
+  if (req.method === "PATCH") {
+    // PATCH /api/mesh/actors/<id>/voice — set or clear the actor's persisted
+    // walkie-talkie voice. `{ "voiceName": "Puck" }` stores a supported voice;
+    // `{ "voiceName": null }` clears it back to the instance-wide default.
+    // The voice is presentation config, not run state: editing a retired
+    // actor is allowed and takes effect on that actor's next spoken reply.
+    const voicePatchMatch = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/voice$/);
+    if (voicePatchMatch) {
+      if (!deps?.actors) {
+        sendJson(res, 503, { error: "mesh data API unavailable (no live mesh bound)" });
+        return true;
+      }
+      const actors = deps.actors;
+      const actorId = decodeURIComponent(voicePatchMatch[1]);
+      if (!actors.get(actorId)) {
+        sendJson(res, 404, { error: "actor not found" });
+        return true;
+      }
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            sendJson(res, 400, { error: "Missing or invalid body" });
+            return;
+          }
+          const body = parsed as Record<string, unknown>;
+          if (!("voiceName" in body)) {
+            sendJson(res, 400, {
+              error: "voiceName is required (null restores the instance default)",
+            });
+            return;
+          }
+          const requestedVoiceName = body.voiceName;
+          if (requestedVoiceName !== null && typeof requestedVoiceName !== "string") {
+            sendJson(res, 400, {
+              error: "voiceName must be a supported Google TTS voice, or null for the default",
+            });
+            return;
+          }
+          const voiceName =
+            requestedVoiceName === null
+              ? undefined
+              : canonicalSupportedVoiceName(requestedVoiceName);
+          if (requestedVoiceName !== null && !voiceName) {
+            sendJson(res, 400, {
+              error: "voiceName must be a supported Google TTS voice, or null for the default",
+            });
+            return;
+          }
+          actors.patch(actorId, {
+            voiceConfig: voiceName === undefined ? undefined : { schemaVersion: 1, voiceName },
+          });
+          sendJson(res, 200, voiceConfigPayload(actors.get(actorId) as ActorRecord));
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+  }
+
   if (req.method !== "GET") {
     sendJson(res, 405, { error: "method not allowed" });
     return true;
@@ -1258,6 +1349,21 @@ export async function handleMeshApiRequest(
       return true;
     }
     sendJson(res, 200, { id: thread.id, charter: thread.charter });
+    return true;
+  }
+
+  // GET /api/mesh/actors/<id>/voice — the actor's persisted walkie-talkie
+  // voice plus the supported catalog and instance default. The voice routes
+  // are declared in the dashboard API (not the voice API) because editing the
+  // setting must work even on an instance without a configured geminiApiKey.
+  const voiceGetMatch = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/voice$/);
+  if (voiceGetMatch) {
+    const rec = actors.get(decodeURIComponent(voiceGetMatch[1]));
+    if (!rec) {
+      sendJson(res, 404, { error: "actor not found" });
+      return true;
+    }
+    sendJson(res, 200, voiceConfigPayload(rec));
     return true;
   }
 
@@ -1335,6 +1441,7 @@ export async function handleMeshApiRequest(
         selectedEffort: selection?.effort ?? null,
         eligibleAt: selection?.eligibleAt ?? null,
         ...(selectedObligation ? { selectedObligation } : {}),
+        voiceName: r.voiceConfig?.voiceName ?? null,
       };
     });
     const schedulerHealth = deps.schedulerHealth?.();
@@ -1343,6 +1450,7 @@ export async function handleMeshApiRequest(
       schedulerWarning: schedulerHealth && !schedulerHealth.ok ? schedulerHealth.issues : null,
       runtimeCursor: runtime ? { streamId: runtime.streamId, revision: runtime.revision } : null,
       threads,
+      supportedVoices: SUPPORTED_TTS_VOICES,
     });
     return true;
   }

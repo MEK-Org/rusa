@@ -115,6 +115,7 @@ class ThreadDto {
     this.estimatedStartAt,
     this.ownerExpectsRetirement,
     this.selectedObligation,
+    this.voiceName,
   });
 
   final String id;
@@ -194,6 +195,11 @@ class ThreadDto {
   /// This is absent rather than a stale previous-run value once that run ends.
   final ObligationDto? selectedObligation;
 
+  /// The actor's persisted walkie-talkie voice, or null when it follows the
+  /// instance-wide default. Absent (null) is the state of every actor without
+  /// a stored voice setting, including all actors on an older server.
+  final String? voiceName;
+
   bool get isRetired => status == 'retired';
 
   ThreadDto copyWith({
@@ -224,6 +230,7 @@ class ThreadDto {
     String? estimatedStartAt,
     bool? ownerExpectsRetirement,
     Object? selectedObligation = _keepThreadField,
+    Object? voiceName = _keepThreadField,
   }) => ThreadDto(
     id: id ?? this.id,
     handle: handle ?? this.handle,
@@ -269,6 +276,9 @@ class ThreadDto {
     selectedObligation: identical(selectedObligation, _keepThreadField)
         ? this.selectedObligation
         : selectedObligation as ObligationDto?,
+    voiceName: identical(voiceName, _keepThreadField)
+        ? this.voiceName
+        : voiceName as String?,
   );
 
   factory ThreadDto.fromJson(Map<String, dynamic> j) => ThreadDto(
@@ -314,6 +324,7 @@ class ThreadDto {
             (j['selectedObligation'] as Map).cast<String, dynamic>(),
           )
         : null,
+    voiceName: j['voiceName'] as String?,
   );
 }
 
@@ -326,11 +337,17 @@ class ThreadsSnapshot {
     required this.threads,
     this.runtimeCursor,
     this.schedulerWarning,
+    this.supportedVoices = const [],
   });
 
   final bool halted;
   final List<ThreadDto> threads;
   final RuntimeCursor? runtimeCursor;
+
+  /// The supported prebuilt Google TTS voices, as reported by the server — the
+  /// source for every voice picker in the UI. Empty against an older server
+  /// that predates the per-actor voice setting.
+  final List<String> supportedVoices;
 
   /// Boot-time `at`/`atrm`/`atd`/`atq` preflight issues, when that facility is
   /// unavailable — null when it's fine or the server doesn't report it. A
@@ -349,6 +366,10 @@ class ThreadsSnapshot {
     schedulerWarning: (j['schedulerWarning'] as List<dynamic>?)
         ?.map((e) => e as String)
         .toList(),
+    supportedVoices: (j['supportedVoices'] as List<dynamic>?)
+            ?.map((e) => e as String)
+            .toList() ??
+        const [],
   );
 }
 

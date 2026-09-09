@@ -242,6 +242,25 @@ class DashboardApi {
     }
   }
 
+  /// `PATCH /api/mesh/actors/:actorId/voice` — set the actor's persisted
+  /// walkie-talkie voice, or pass null to restore the instance-wide default.
+  /// The server rejects any voice outside the supported Google TTS catalog
+  /// with a 400.
+  Future<void> updateActorVoice(String actorId, String? voiceName) async {
+    final uri = _u('/api/mesh/actors/$actorId/voice');
+    final res = await _client.patch(
+      uri,
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({'voiceName': voiceName}),
+    );
+    if (res.statusCode != 200) {
+      throw DashboardApiException(uri, res.statusCode, res.body);
+    }
+  }
+
   /// `POST /api/mesh/avatar/<id>` — manual avatar upload . `imageBase64`
   /// must already be base64-encoded (the caller reads the picked file's raw
   /// bytes and encodes client-side); `contentType` must be `image/png` — the

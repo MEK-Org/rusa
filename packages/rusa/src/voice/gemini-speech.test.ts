@@ -141,5 +141,61 @@ describe("createGeminiSpeechClient", () => {
         "Gemini TTS stream ended with no audio"
       );
     });
+
+    it("sends the per-call voiceName override and falls back to the configured default", async () => {
+      const requests: Array<Record<string, unknown>> = [];
+      const mockFetch = async (_url: string, init?: RequestInit) => {
+        requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        const stream = new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder();
+            const part = JSON.stringify({
+              candidates: [
+                {
+                  content: {
+                    parts: [
+                      {
+                        inlineData: {
+                          mimeType: "audio/L16;codec=pcm;rate=24000",
+                          data: Buffer.from("test1").toString("base64"),
+                        },
+                      },
+                    ],
+                  },
+                },
+              ],
+            });
+            controller.enqueue(encoder.encode(`data: ${part}\r\n\r\n`));
+            controller.enqueue(encoder.encode(`data: [DONE]\r\n\r\n`));
+            controller.close();
+          },
+        });
+        return { ok: true, body: stream };
+      };
+
+      const client = createGeminiSpeechClient({
+        apiKey: "fake-key",
+        voiceName: "Laomedeia",
+        fetchImpl: mockFetch as unknown as typeof fetch,
+      });
+
+      await drain(await client.streamSynthesize("hello", "Charon"));
+      await drain(await client.streamSynthesize("hello"));
+
+      const voiceOf = (body: Record<string, unknown>) => {
+        const config = body.generationConfig as {
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: string } } };
+        };
+        return config.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName;
+      };
+      expect(voiceOf(requests[0])).toBe("Charon");
+      expect(voiceOf(requests[1])).toBe("Laomedeia");
+    });
   });
 });
+
+async function drain(result: { pcmStream: AsyncIterable<Buffer> }): Promise<void> {
+  for await (const _chunk of result.pcmStream) {
+    // discard
+  }
+}

@@ -100,6 +100,7 @@ describe("Database Migration System", () => {
       "0041_model_classes",
       "0042_actor_run_launch_config",
       "0043_obligation_checkpoint",
+      "0044_actor_voice_config",
     ]);
 
     const meshEventsColumns = (
@@ -113,6 +114,11 @@ describe("Database Migration System", () => {
     ).map((c) => c.name);
     expect(modelScrapesColumns).not.toContain("created_at");
     expect(modelScrapesColumns).toContain("scraped_at");
+
+    const actorColumns = (
+      db.prepare("PRAGMA table_info(actors)").all() as Array<{ name: string }>
+    ).map((c) => c.name);
+    expect(actorColumns).toContain("voice_config");
 
     const renameEpoch = db
       .prepare("SELECT applied_at FROM _migrations WHERE id = '0008_run_lifecycle_taxonomy'")

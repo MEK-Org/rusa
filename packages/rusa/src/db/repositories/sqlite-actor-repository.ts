@@ -4,6 +4,7 @@ import type { ActorRecord } from "../../actor/actor-record.js";
 import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
 import type { ProviderModelConfig } from "../../providers/model-config.js";
 import type { ActorRepository } from "../../repositories/actor-repository.js";
+import { canonicalSupportedVoiceName } from "../../voice/tts-voices.js";
 import { PrincipalRepository } from "./principal-repository.js";
 
 type ActorRow = {
@@ -12,6 +13,7 @@ type ActorRow = {
   parent_id: string | null;
   model_config: string | null;
   context_config: string | null;
+  voice_config: string | null;
   title: string | null;
   retired_at: string | null;
   created_at: string;
@@ -132,9 +134,22 @@ const contextConfigSchema = z.union([legacyContextConfigSchema, currentContextCo
 type LegacyContextConfigDocument = z.infer<typeof legacyContextConfigSchema>;
 type CurrentContextConfigDocument = z.infer<typeof currentContextConfigSchema>;
 
+/** `voice_config` shape emitted by this build: V1 names a prebuilt Gemini TTS voice. */
+const voiceConfigSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    voiceName: z.string().min(1),
+  })
+  .strict()
+  .refine((config) => canonicalSupportedVoiceName(config.voiceName) !== undefined, {
+    message: "voiceName must name a supported Google TTS voice",
+  });
+
+type VoiceConfigDocument = z.infer<typeof voiceConfigSchema>;
+
 function parseDocument<T>(
   actorId: string,
-  column: "model_config" | "context_config",
+  column: "model_config" | "context_config" | "voice_config",
   json: string,
   schema: z.ZodType<T>
 ): T {
@@ -285,6 +300,42 @@ function parseContextConfig(
   };
 }
 
+/** Builds the versioned voice-config document, or null when the actor follows the instance default. */
+function buildVoiceConfig(record: ActorRecord): string | null {
+  if (!record.voiceConfig) return null;
+  const voiceName = canonicalSupportedVoiceName(record.voiceConfig.voiceName);
+  if (!voiceName) {
+    throw new Error(
+      `invalid voice_config for actor '${record.id}': voiceName must name a supported Google TTS voice`
+    );
+  }
+  const config: VoiceConfigDocument = {
+    schemaVersion: 1,
+    voiceName,
+  };
+  return JSON.stringify(config);
+}
+
+/**
+ * Parses the `voice_config` document. Version and shape are validated
+ * strictly; a malformed document throws fail-closed, matching the other
+ * versioned columns.
+ *
+ * Voice names are also consumer-validated against the shared supported
+ * catalog. SQLite stays deliberately unconstrained: a direct database edit
+ * remains readable only when it is a document this build can actually render.
+ */
+function parseVoiceConfig(actorId: string, json: string | null): Pick<ActorRecord, "voiceConfig"> {
+  if (!json) return {};
+  const parsed = parseDocument(actorId, "voice_config", json, voiceConfigSchema);
+  // The schema's refinement above proves this exists; canonicalizing also
+  // repairs case-only hand edits so the dropdown always receives one of its
+  // exact option values.
+  const voiceName = canonicalSupportedVoiceName(parsed.voiceName);
+  if (!voiceName) throw new Error(`invalid voice_config for actor '${actorId}'`);
+  return { voiceConfig: { schemaVersion: 1, voiceName } };
+}
+
 /** A staged, not-yet-applied replacement for the actor's declared modelConfig pool. */
 type DesiredOverlayEntry = {
   desiredModelConfig?: ProviderModelConfig[];
@@ -343,10 +394,11 @@ export class SqliteActorRepository implements ActorRepository {
 
       this.db
         .prepare(`INSERT INTO actors (
-        id, charter, parent_id, model_config, context_config, title, retired_at, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        id, charter, parent_id, model_config, context_config, voice_config, title, retired_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET charter=excluded.charter, parent_id=excluded.parent_id,
         model_config=excluded.model_config, context_config=excluded.context_config,
+        voice_config=excluded.voice_config,
         title=excluded.title, retired_at=excluded.retired_at, created_at=excluded.created_at`)
         .run(
           record.id,
@@ -354,6 +406,7 @@ export class SqliteActorRepository implements ActorRepository {
           record.parentId,
           buildModelConfig(record),
           buildContextConfig(record),
+          buildVoiceConfig(record),
           record.title ?? null,
           retiredAt,
           record.createdAt
@@ -449,6 +502,7 @@ export class SqliteActorRepository implements ActorRepository {
       createdAt: row.created_at,
       ...parseModelConfig(row.id, row.model_config),
       ...parseContextConfig(row.id, row.context_config),
+      ...parseVoiceConfig(row.id, row.voice_config),
       ...(row.title === null ? {} : { title: row.title }),
       ...(row.parent_id === null ? { isRoot: true } : {}),
       ...(handles.length

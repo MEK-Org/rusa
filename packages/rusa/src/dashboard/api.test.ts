@@ -21,6 +21,7 @@ import { createLogger } from "../observability/logger.js";
 import { assertConcreteModelConfig } from "../providers/model-config.js";
 import type { ReferenceCacheService } from "../references/cache-service.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import { DEFAULT_VOICE_NAME } from "../voice/gemini-speech.js";
 import { type DashboardDataDeps, handleMeshApiRequest } from "./api.js";
 import { MeshEventEmitter } from "./mesh-event-emitter.js";
 import { SseHub } from "./sse.js";
@@ -99,6 +100,13 @@ async function call(
 
   await p;
   return { handled, res, req };
+}
+
+/** Wait until a mocked response has fully ended (async route handlers finish off `call`'s await). */
+async function settled(res: MockRes): Promise<void> {
+  while (!res.ended) {
+    await new Promise((resolve) => process.nextTick(resolve));
+  }
 }
 
 function rec(id: string, parentId: string | null, status: "active" | "retired"): ActorRecord {
@@ -205,6 +213,122 @@ describe("handleMeshApiRequest", () => {
     const { res } = await call(deps, "GET", "/api/mesh/control/options");
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ providers: ["agy", "codex"] });
+  });
+
+  describe("per-actor voice routes", () => {
+    it("GET reports no voice, the supported catalog, and the instance default", async () => {
+      actors.upsert(rec(UUID_A, null, "active"));
+      const { res } = await call(deps, "GET", `/api/mesh/actors/${UUID_A}/voice`);
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.voiceConfig).toBeNull();
+      expect(body.supportedVoices).toContain("Puck");
+      expect(body.supportedVoices).toContain(DEFAULT_VOICE_NAME);
+      expect(body.defaultVoiceName).toBe(DEFAULT_VOICE_NAME);
+    });
+
+    it("PATCH stores a supported voice and GET reflects it", async () => {
+      actors.upsert(rec(UUID_A, null, "active"));
+      const { res } = await call(
+        deps,
+        "PATCH",
+        `/api/mesh/actors/${UUID_A}/voice`,
+        JSON.stringify({ voiceName: "Puck" })
+      );
+      await settled(res);
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).voiceConfig).toEqual({ schemaVersion: 1, voiceName: "Puck" });
+      expect(actors.get(UUID_A)?.voiceConfig).toEqual({ schemaVersion: 1, voiceName: "Puck" });
+
+      const got = await call(deps, "GET", `/api/mesh/actors/${UUID_A}/voice`);
+      expect(JSON.parse(got.res.body).voiceConfig).toEqual({ schemaVersion: 1, voiceName: "Puck" });
+    });
+
+    it("PATCH canonicalizes a supported wire spelling for the dropdown", async () => {
+      actors.upsert(rec(UUID_A, null, "active"));
+      const { res } = await call(
+        deps,
+        "PATCH",
+        `/api/mesh/actors/${UUID_A}/voice`,
+        JSON.stringify({ voiceName: " puck " })
+      );
+      await settled(res);
+      expect(JSON.parse(res.body).voiceConfig).toEqual({ schemaVersion: 1, voiceName: "Puck" });
+      expect(actors.get(UUID_A)?.voiceConfig).toEqual({ schemaVersion: 1, voiceName: "Puck" });
+    });
+
+    it("PATCH rejects an unsupported voice with 400 and leaves the record untouched", async () => {
+      actors.upsert({
+        ...rec(UUID_A, null, "active"),
+        voiceConfig: { schemaVersion: 1, voiceName: "Kore" },
+      });
+      const { res } = await call(
+        deps,
+        "PATCH",
+        `/api/mesh/actors/${UUID_A}/voice`,
+        JSON.stringify({ voiceName: "GLaDOS" })
+      );
+      await settled(res);
+      expect(res.statusCode).toBe(400);
+      expect(actors.get(UUID_A)?.voiceConfig).toEqual({ schemaVersion: 1, voiceName: "Kore" });
+    });
+
+    it("PATCH with null clears the voice back to the instance default", async () => {
+      actors.upsert({
+        ...rec(UUID_A, null, "active"),
+        voiceConfig: { schemaVersion: 1, voiceName: "Kore" },
+      });
+      const { res } = await call(
+        deps,
+        "PATCH",
+        `/api/mesh/actors/${UUID_A}/voice`,
+        JSON.stringify({ voiceName: null })
+      );
+      await settled(res);
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).voiceConfig).toBeNull();
+      expect(actors.get(UUID_A)?.voiceConfig).toBeUndefined();
+    });
+
+    it("GET and PATCH 404 for an unknown actor", async () => {
+      const got = await call(deps, "GET", `/api/mesh/actors/${UUID_B}/voice`);
+      expect(got.res.statusCode).toBe(404);
+      const patched = await call(
+        deps,
+        "PATCH",
+        `/api/mesh/actors/${UUID_B}/voice`,
+        JSON.stringify({ voiceName: "Puck" })
+      );
+      await settled(patched.res);
+      expect(patched.res.statusCode).toBe(404);
+    });
+
+    it("PATCH 400s a missing or malformed voiceName", async () => {
+      actors.upsert(rec(UUID_A, null, "active"));
+      for (const body of ["{}", JSON.stringify({ voiceName: 42 }), "not-json"]) {
+        const { res } = await call(deps, "PATCH", `/api/mesh/actors/${UUID_A}/voice`, body);
+        await settled(res);
+        expect(res.statusCode).toBe(400);
+      }
+      expect(actors.get(UUID_A)?.voiceConfig).toBeUndefined();
+    });
+
+    it("threads list reports each actor's voiceName and the catalog top-level", async () => {
+      actors.upsert(rec(UUID_A, null, "active"));
+      actors.upsert({
+        ...rec(UUID_B, UUID_A, "active"),
+        voiceConfig: { schemaVersion: 1, voiceName: "Zephyr" },
+      });
+      const { res } = await call(deps, "GET", "/api/mesh/threads");
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.supportedVoices).toContain("Puck");
+      const byId = new Map<string, { voiceName: string | null }>(
+        body.threads.map((t: { id: string; voiceName: string | null }) => [t.id, t])
+      );
+      expect(byId.get(UUID_A)?.voiceName).toBeNull();
+      expect(byId.get(UUID_B)?.voiceName).toBe("Zephyr");
+    });
   });
 
   it("POST /api/mesh/actors delegates a root child spawn to the human principal", async () => {
