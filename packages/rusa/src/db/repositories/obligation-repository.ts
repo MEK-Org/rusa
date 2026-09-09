@@ -127,6 +127,9 @@ export interface ObligationPageOptions {
   offset?: number;
 }
 
+/** Authoritative maximum page limit accepted by obligation pagination queries. */
+export const MAX_OBLIGATION_PAGE_LIMIT = 100;
+
 export interface ListObligationsPageOptions extends ObligationPageOptions, ListObligationsOptions {}
 
 export interface ChildObligationPageOptions extends ObligationPageOptions {
@@ -239,8 +242,14 @@ function strictMidpoint(low: number, high: number): number | null {
 
 function validatePage(options: ObligationPageOptions): { limit: number; offset: number } {
   const offset = options.offset ?? 0;
-  if (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 100) {
-    throw new ObligationValidationError("obligation page limit must be an integer from 1 to 100");
+  if (
+    !Number.isInteger(options.limit) ||
+    options.limit < 1 ||
+    options.limit > MAX_OBLIGATION_PAGE_LIMIT
+  ) {
+    throw new ObligationValidationError(
+      `obligation page limit must be an integer from 1 to ${MAX_OBLIGATION_PAGE_LIMIT}`
+    );
   }
   if (!Number.isSafeInteger(offset) || offset < 0) {
     throw new ObligationValidationError(
