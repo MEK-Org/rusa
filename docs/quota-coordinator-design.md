@@ -782,9 +782,9 @@ while `governingBucketKey` still names the weekly one — which is why both the
 key and the per-bucket map are on the wire and no separate governing-age field
 is.
 
-**Omitting `provider` returns the published statuses from configured providers**,
-and that is the call a client's tick actually makes, so the collection form is
-part of the contract rather than a convenience:
+**Omitting `provider` returns every configured provider**, and that is the call a
+client's tick actually makes, so the collection form is part of the contract
+rather than a convenience:
 
 ```jsonc
 {
@@ -801,20 +801,6 @@ A map keyed by provider, not an array: `freshness`, `governingBucketKey` and
 per-provider object byte-identical to the single-provider response minus its
 `service` block. Criterion 16 pins that identity, because otherwise the shape
 every client uses would be the one shape no criterion covers.
-
-**Omitting means the `provider` key is absent.** `GET /v1/throttle` selects this
-collection form; a present-but-empty `GET /v1/throttle?provider=` is not the
-same request and returns `provider_unknown`. Provider input is trimmed,
-case-folded, and resolved to its canonical throttle lane before that lookup, so
-the documented aliases select the same published lane in either form.
-
-**The collection includes only configured lanes with a published throttle.** A
-configured lane that is cold is absent rather than represented by an invented
-throttle object, preserving the byte-identity rule above. A client already knows
-its configured lanes: for an absent configured lane it has no successful read
-and therefore applies §5.7 rule 0; an individual lookup distinguishes
-`not_ready` from an unconfigured provider's `provider_unknown` response. An
-unconfigured lane is never a collection key.
 
 Notes on the shape, because the shape is the point:
 

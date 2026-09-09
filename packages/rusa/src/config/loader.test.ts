@@ -3,6 +3,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
+import { providerThrottleKey } from "../providers/registry.js";
 import { loadConfig } from "./loader.js";
 import { DEFAULT_DEPLOY_BRANCH } from "./types.js";
 
@@ -729,6 +730,17 @@ describe("loadConfig quota throttle", () => {
 });
 
 describe("loadConfig shared quota store", () => {
+  it("normalizes configured provider throttle keys before alias resolution", () => {
+    const config = loadConfig(
+      writeConfig({
+        providers: { antigravity: { cliCommand: " Antigravity " } },
+        rootActor: { provider: "antigravity", model: "gemini-3.7-flash" },
+      })
+    );
+
+    expect(providerThrottleKey("antigravity", config)).toBe("agy");
+  });
+
   it("accepts and trims a shared database path", () => {
     const config = loadConfig(writeConfig({ quota: { databasePath: "  /srv/rusa/quota.db  " } }));
     expect(config.quota).toEqual({ databasePath: "/srv/rusa/quota.db" });

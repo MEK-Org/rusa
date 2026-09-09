@@ -62,7 +62,8 @@ const THROTTLE_LANE_ALIASES: Record<string, string> = {
   antigravity: "agy",
 };
 
-function resolveThrottleLaneAlias(key: string): string {
+function resolveThrottleLaneAlias(raw: string): string {
+  const key = raw.trim().toLocaleLowerCase("en-US");
   return THROTTLE_LANE_ALIASES[key] ?? key;
 }
 
@@ -85,7 +86,7 @@ export function providerThrottleKey(providerName: string, config: RusaConfig): s
  * lives in exactly one place.
  */
 export function normalizeProviderThrottleKey(raw: string): string {
-  return resolveThrottleLaneAlias(raw.trim().toLocaleLowerCase("en-US"));
+  return resolveThrottleLaneAlias(raw);
 }
 
 export const QUOTA_THROTTLE_PROVIDERS = ["claude", "codex", "agy", "kimi"] as const;
