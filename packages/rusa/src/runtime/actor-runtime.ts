@@ -16,7 +16,7 @@ export interface ActorRuntimeDriver<TActor> {
 export interface ActorRuntimeProfile<TActor> {
   actor: {
     id: string;
-    parentId: string | null;
+    parentId?: string | null;
   };
   /** Effective capabilities selected by composition; policy remains above this seam. */
   capabilities: ReadonlySet<string>;
@@ -26,7 +26,12 @@ export interface ActorRuntimeProfile<TActor> {
   };
   driver: ActorRuntimeDriver<TActor>;
   options: Omit<ActorOptions, "id" | "cwd" | "sandbox" | "onRunEnd">;
-  terminal: ActorTerminalLifecycle;
+  /**
+   * Direct construction sites may bind the current terminal pipeline here.
+   * RunManager deliberately omits it and owns terminal cleanup around the
+   * invocation instead.
+   */
+  terminal?: ActorTerminalLifecycle;
 }
 
 /**
@@ -58,11 +63,19 @@ export interface ActorTerminalLifecycle {
 export function composeActorRuntime<TActor>(profile: ActorRuntimeProfile<TActor>): ActorOptions {
   const { actor, workspace, options, terminal } = profile;
 
-  return {
+  const actorOptions: ActorOptions = {
     ...options,
     id: actor.id,
     cwd: workspace.path,
     sandbox: workspace.sandboxed,
+  };
+
+  if (!terminal) {
+    return actorOptions;
+  }
+
+  return {
+    ...actorOptions,
     onRunEnd: async (result) => {
       terminal.finishInboxRun?.();
       const runId = terminal.completeRun(result);
