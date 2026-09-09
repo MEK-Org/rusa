@@ -102,8 +102,13 @@ function createMemoryInboxStore(): InboxStore & { entries: InboxEntry[] } {
     },
     read: (actorId: string, entryId: string) =>
       entries.find((entry) => entry.actorId === actorId && entry.id === entryId) ?? null,
-    countUnhandled: (actorId: string) =>
-      entries.filter((entry) => entry.actorId === actorId && entry.handledAt === null).length,
+    countUnhandled: (actorId: string, options = {}) =>
+      entries.filter(
+        (entry) =>
+          entry.actorId === actorId &&
+          entry.handledAt === null &&
+          (!options.responsiveOnly || entry.payload.priority === "responsive")
+      ).length,
     actorsWithUnhandled: () => pendingActors((entry) => entry.handledAt === null),
     actorsWithUnseen: () =>
       pendingActors((entry) => entry.handledAt === null && entry.seenAt === null),
@@ -170,6 +175,7 @@ function setup(
     onYield?: (actorId: string, ctx: { notifyingParent: boolean }) => string | null | undefined;
     recordRunYield?: ActorMeshOptions["recordRunYield"];
     inboxStore?: InboxStore;
+    isVoiceSessionActive?: ActorMeshOptions["isVoiceSessionActive"];
     onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
     grantableCapabilities?: ReadonlySet<string>;
     validateSpawn?: ActorMeshOptions["validateSpawn"];
@@ -208,6 +214,7 @@ function setup(
     events: opts.events,
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
     inboxStore: opts.inboxStore ?? createMemoryInboxStore(),
+    isVoiceSessionActive: opts.isVoiceSessionActive,
     obligations: opts.obligations,
     configuredEventSources: opts.configuredEventSources,
     scheduledMessages,
@@ -270,8 +277,10 @@ function setup(
         },
         gate: ctx.gate,
         beforeRun: ctx.beforeRun,
+        admitRun: ctx.admitRun,
         onQueued: ctx.onQueued,
         onQueuedRunCancelled: ctx.onQueuedRunCancelled,
+        onRunAbandoned: ctx.onRunAbandoned,
         // Mirrors the production onRunStart wiring in start.ts (#199): apply a
         // pending model/provider/effort tuple before this run's own dispatch,
         // the same way start.ts calls `mesh.applyPendingModel` there.
@@ -302,8 +311,11 @@ function setup(
     saveSessionId: (id) => registry.patch(rootId, { sessionId: id }),
     buildPrompt: () => ({ prompt: "Work from your inbox." }),
     onQueued: (context) => mesh.actorQueued(rootId, context),
+    admitRun: ({ responsive, mode }) =>
+      responsive || mode !== "ordinary" || !(opts.isVoiceSessionActive?.(rootId) ?? false),
     onRunStart: () => mesh.applyPendingModel(rootId),
     onRunEnd: () => mesh.finishInboxRun(rootId),
+    onRunAbandoned: () => mesh.abandonInboxRun(rootId),
     onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
     debounceMs: DEBOUNCE,
   });
@@ -1467,6 +1479,103 @@ describe("ActorMesh", () => {
       }),
     ]);
     expect(fake("root").calls).toHaveLength(1);
+  });
+
+  it("durably holds normal GitHub and cron work for a voice session, then releases it once", async () => {
+    const inboxStore = createMemoryInboxStore();
+    let voiceActive = true;
+    const { mesh, fake, tick } = setup({
+      inboxStore,
+      isVoiceSessionActive: () => voiceActive,
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    const [github] = inboxStore.append([
+      {
+        actorId: worker,
+        source: "github:example/repo",
+        payload: { type: "github.issue" },
+      },
+    ]);
+    expect(mesh.notifyInboxChanged(worker)).toBe(false);
+    mesh.deliverWake(worker, "cron maintenance");
+    await tick();
+
+    expect(github?.handledAt).toBeNull();
+    expect(
+      inboxStore.entries.filter((entry) => entry.actorId === worker && !entry.handledAt)
+    ).toHaveLength(2);
+    expect(fake(worker).calls).toHaveLength(0);
+    expect(() => mesh.selectInboxEntries(worker, [github?.id ?? "missing"])).toThrow(
+      "ordinary inbox work is held"
+    );
+
+    // A voice memo remains responsive even though normal work is held.
+    expect(
+      mesh.sendHumanMessage(worker, "🎙️ [voice memo — reply for the ear]: status?", "voice-a")
+    ).toEqual({
+      delivered: true,
+    });
+    await tick();
+    expect(fake(worker).calls).toHaveLength(1);
+
+    voiceActive = false;
+    expect(mesh.notifyVoiceSessionEnded(worker)).toBe(true);
+    await tick();
+    const callsAfterRelease = fake(worker).calls.length;
+    expect(callsAfterRelease).toBeGreaterThan(1);
+
+    // The registry calls this method once per ended session; a new session end
+    // is not inferred from the remaining durable work.
+    expect(
+      inboxStore.entries.filter((entry) => entry.actorId === worker && !entry.handledAt)
+    ).toHaveLength(3);
+  });
+
+  it("defers a normal run queued before voice authority opens at final admission", async () => {
+    const inboxStore = createMemoryInboxStore();
+    let voiceActive = false;
+    let launch!: () => void;
+    const { mesh, fake, tick } = setup({
+      inboxStore,
+      isVoiceSessionActive: () => voiceActive,
+      providerGate: (fn, candidates) => {
+        let started = false;
+        let resolve!: (value: unknown) => void;
+        let reject!: (reason?: unknown) => void;
+        const result = new Promise<unknown>((res, rej) => {
+          resolve = res;
+          reject = rej;
+        });
+        launch = () => {
+          started = true;
+          void fn(candidates[0] ?? { provider: "fake" }).then(resolve, reject);
+        };
+        return {
+          result: result as Promise<never>,
+          get started() {
+            return started;
+          },
+          promote: launch,
+          cancel: () => false,
+        };
+      },
+    });
+    const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+
+    mesh.sendMessage(worker, "ordinary work", "root");
+    await tick();
+    expect(mesh.activeRunState(worker)?.phase).toBe("queued");
+
+    // The ordinary opportunity passed its earlier preflight but has not yet
+    // started. Opening walkie authority here must block its provider launch.
+    voiceActive = true;
+    launch();
+    await tick();
+
+    expect(fake(worker).calls).toHaveLength(0);
+    expect(inboxStore.entries.find((entry) => entry.actorId === worker)?.handledAt).toBeNull();
+    expect(mesh.activeRunState(worker)).toBeNull();
   });
 
   it("preempts an active run for durable responsive inbox work and runs the replacement", async () => {

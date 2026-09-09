@@ -344,7 +344,11 @@ class FakeApi extends DashboardApi {
     delivered: true,
   );
   DashboardApiException? memoError;
-  final memoSends = <({String actorId, int byteLength, String mimeType})>[];
+  final memoSends =
+      <
+        ({String actorId, int byteLength, String mimeType, String? sessionId})
+      >[];
+  final disabledVoiceSessions = <String>[];
 
   @override
   Future<List<VoiceAnnouncement>> fetchVoiceBacklog(String actorId) async {
@@ -374,10 +378,16 @@ class FakeApi extends DashboardApi {
       actorId: actorId,
       byteLength: audio.length,
       mimeType: mimeType,
+      sessionId: sessionId,
     ));
     final err = memoError;
     if (err != null) throw err;
     return memoResult;
+  }
+
+  @override
+  Future<void> disableVoiceSession(String sessionId) async {
+    disabledVoiceSessions.add(sessionId);
   }
 
   final chatSends = <Map<String, String>>[];
@@ -1057,7 +1067,7 @@ class FakeWakeLock implements ScreenWakeLock {
 class FakeVoiceStream implements VoiceStreamSource {
   final framesCtrl = StreamController<VoiceAnnouncement>.broadcast();
   final statusCtrl = StreamController<VoiceStreamStatus>.broadcast();
-  final connectCalls = <List<String>>[];
+  final connectCalls = <({List<String> actors, String sessionId})>[];
   bool disposed = false;
 
   @override
@@ -1066,7 +1076,8 @@ class FakeVoiceStream implements VoiceStreamSource {
   Stream<VoiceStreamStatus> get status => statusCtrl.stream;
 
   @override
-  void connect(List<String> actors) => connectCalls.add(actors);
+  void connect(List<String> actors, String sessionId) =>
+      connectCalls.add((actors: actors, sessionId: sessionId));
 
   @override
   void dispose() {

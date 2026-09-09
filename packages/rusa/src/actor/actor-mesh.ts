@@ -433,6 +433,8 @@ export interface ActorFactoryContext {
   ) => RunStartHandle<T>;
   /** Lease check run before each wake; returns false (and retires) when exhausted. */
   beforeRun: (context: { mode: ActorRunMode }) => boolean;
+  /** Final admission after provider pacing selects a run, before it launches. */
+  admitRun?: (context: { responsive: boolean; mode: ActorRunMode }) => boolean;
   /** General lifecycle hook after the pre-run gate and before scheduler admission. */
   onQueued: (context: { responsive: boolean; mode: ActorRunMode }) => void;
   /** Post-run accounting (token usage) + completion-review hook. */
@@ -446,6 +448,8 @@ export interface ActorFactoryContext {
    * run has actually started; `onRunEnd` is the clearing point for that case.
    */
   onQueuedRunCancelled?: () => void;
+  /** Closes mesh run-scoped state when a queued opportunity never starts. */
+  onRunAbandoned?: () => void;
 }
 
 export type ActorFactory = (ctx: ActorFactoryContext) => MeshActor;
@@ -670,6 +674,8 @@ export interface ActorMeshOptions {
   obligations?: MeshObligationPort;
   /** Durable actor inbox used for singleton wake recovery. Optional for isolated tests. */
   inboxStore?: InboxStore;
+  /** Host-owned leased walkie authority; absent preserves existing dispatch semantics. */
+  isVoiceSessionActive?: (actorId: string) => boolean;
   /** General lifecycle hook matching onYield. */
   onQueued?: (actorId: string, context: { responsive: boolean; mode: ActorRunMode }) => void;
   /** Best-effort receipts for entries first accepted into an execution opportunity. */
@@ -758,6 +764,7 @@ export class ActorMesh {
   private readonly configuredEventSources: readonly EventResource[] | undefined;
   private readonly obligations?: MeshObligationPort;
   private readonly inboxStore?: InboxStore;
+  private readonly isVoiceSessionActive: (actorId: string) => boolean;
   private readonly onQueued?: ActorMeshOptions["onQueued"];
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
   private readonly grantable: ReadonlySet<string>;
@@ -817,6 +824,7 @@ export class ActorMesh {
     this.configuredEventSources = opts.configuredEventSources;
     this.obligations = opts.obligations;
     this.inboxStore = opts.inboxStore;
+    this.isVoiceSessionActive = opts.isVoiceSessionActive ?? (() => false);
     this.onQueued = opts.onQueued;
     this.onInboxEntriesSeen = opts.onInboxEntriesSeen;
     this.grantable = opts.grantableCapabilities ?? new Set();
@@ -1144,9 +1152,11 @@ export class ActorMesh {
   }
 
   /**
-   * Notify an actor that its durable worklist changed. If an execution
-   * opportunity is already queued, the new entry joins it and becomes seen
-   * immediately; only deliveries during an active run set the dirty follow-up.
+   * Notify an actor that its durable worklist changed, returning whether this
+   * call requested an execution opportunity. If one is already queued, the new
+   * entry joins it and becomes seen immediately; only deliveries during an
+   * active run set the dirty follow-up. A held normal entry remains durable but
+   * returns false because the session-end release, not this call, will nudge it.
    */
   notifyInboxChanged(actorId: string, nudge: RunNudge = {}): boolean {
     actorId = this.resolveThreadId(actorId);
@@ -1158,6 +1168,13 @@ export class ActorMesh {
     const target = this.live.get(actorId);
     if (!target) {
       this.log(`inbox_changed for ${actorId} not nudged — no live actor`);
+      return false;
+    }
+    if (!isResponsiveNudge(nudge) && this.isVoiceSessionActive(actorId)) {
+      // The entry is already durable. It must wait for the session-end nudge,
+      // rather than adding an ordinary execution opportunity behind the voice
+      // conversation. Responsive work still preempts exactly as before.
+      this.log(`inbox_changed for ${actorId} held — active voice session`);
       return false;
     }
     if (isResponsiveNudge(nudge)) {
@@ -1233,6 +1250,9 @@ export class ActorMesh {
       const entry = inboxStore.read(actorId, id);
       if (!entry) throw new Error(`Inbox entry not found: ${id}`);
       if (entry.handledAt) throw new Error(`Inbox entry already handled: ${id}`);
+      if (this.isVoiceSessionActive(actorId) && entry.payload.priority !== "responsive") {
+        throw new Error("ordinary inbox work is held while a voice session is active");
+      }
       return entry;
     });
     beforeCommit?.(entries);
@@ -1262,6 +1282,17 @@ export class ActorMesh {
     // run's own dispatch (see the `onRunStart` wiring), so this call is then a
     // no-op — {@link applyPendingModel} tolerates being called from both.
     this.applyPendingModel(actorId);
+  }
+
+  /**
+   * Close the run-scoped inbox state for an opportunity that never launched.
+   * Unlike {@link finishInboxRun}, this must not consume a staged model change:
+   * the next real dispatch still owns that transition.
+   */
+  abandonInboxRun(actorId: string): void {
+    actorId = this.resolveThreadId(actorId);
+    this.selectedInboxEntryIds.delete(actorId);
+    this.flushRunHeadAttention(actorId);
   }
 
   /**
@@ -1436,6 +1467,20 @@ export class ActorMesh {
     if (this.inboxStore && this.inboxStore.countUnhandled(actorId) > 0) {
       this.notifyInboxChanged(actorId);
     }
+  }
+
+  /**
+   * Called once by the leased voice registry on explicit end or lease expiry.
+   * The durable inbox remains the source of truth; this is only the one
+   * ordinary nudge that lets held background work resume.
+   */
+  notifyVoiceSessionEnded(actorId: string): boolean {
+    actorId = this.resolveThreadId(actorId);
+    if (!this.inboxStore) return false;
+    const total = this.inboxStore.countUnhandled(actorId);
+    const responsive = this.inboxStore.countUnhandled(actorId, { responsiveOnly: true });
+    if (total > responsive) return this.notifyInboxChanged(actorId);
+    return false;
   }
 
   /**
@@ -3735,6 +3780,8 @@ export class ActorMesh {
         }
         return this.inboxStore.countUnhandled(record.id) > 0;
       },
+      admitRun: ({ responsive, mode }) =>
+        responsive || mode !== "ordinary" || !this.isVoiceSessionActive(record.id),
       onQueued: (context) => {
         this.actorQueued(record.id, context);
       },
@@ -3747,6 +3794,10 @@ export class ActorMesh {
       },
       onRuntimeStateChanged: (state) => this.actorRuntimeStateChanged(record.id, state),
       onQueuedRunCancelled: () => this.clearSelection(record.id),
+      onRunAbandoned: () => {
+        this.abandonInboxRun(record.id);
+        this.clearSelection(record.id);
+      },
     };
   }
 

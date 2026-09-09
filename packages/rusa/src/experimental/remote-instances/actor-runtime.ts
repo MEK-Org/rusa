@@ -1,4 +1,6 @@
 import { Actor } from "../../actor/actor.js";
+import { RunStartCancelledError } from "../../actor/concurrency-limiter.js";
+import type { ActorRunMode } from "../../actor/trigger-runner.js";
 import type { McpServerSpec } from "../../providers/types.js";
 import type {
   ActorEvent,
@@ -21,6 +23,9 @@ export function createActorRuntime(
   let activeGates = 0;
   let closed = false;
   let sessionId: string | undefined;
+  // `beforeRun` belongs to the same serialized Actor opportunity as its later
+  // provider gate. Carry its mode to the leader's final admission boundary.
+  let pendingRunMode: ActorRunMode = "ordinary";
   let lastRuntimeState: "queued" | "running" | "winding_down" | "idle" = "idle";
   const mcpServers: McpServerSpec[] = [];
   function finishClose(): void {
@@ -94,6 +99,7 @@ export function createActorRuntime(
       buildPrompt: () => snapshot.promptBuild ?? { prompt: snapshot.prompt },
       prepareUnderstandingMount: () => request<string | undefined>({ op: "prepareMount" }).result,
       beforeRun: async ({ mode }) => {
+        pendingRunMode = mode;
         const reply = await request<{ allowed: boolean; sessionId?: string }>({
           op: "beforeRun",
           mode,
@@ -103,13 +109,16 @@ export function createActorRuntime(
       },
       gate: async (fn, candidates, responsive) => {
         activeGates++;
-        const admission = request<RunSnapshot>({
+        const admission = request<RunSnapshot | { deferred: true }>({
           op: "admit",
           candidates: [...candidates],
           responsive,
+          mode: pendingRunMode,
         });
         try {
-          snapshot = await admission.result;
+          const admitted = await admission.result;
+          if ("deferred" in admitted) throw new RunStartCancelledError();
+          snapshot = admitted;
           if (stopping) throw new Error("Actor stopped before admission");
           sessionId = snapshot.record.sessionId;
           if (snapshot.mcpServers) {

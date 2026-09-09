@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:rxdart/rxdart.dart';
 
@@ -83,6 +84,18 @@ class _QueueItem {
 /// via the normal mesh_event SSE push, so nothing is lost).
 const Duration kDeliveredResetDelay = Duration(seconds: 4);
 
+/// Mint a V4 UUID in the browser app rather than deriving identity from an SSE
+/// socket. The same value is sent on the stream and every memo until mode exit.
+String newWalkieSessionId() {
+  final bytes = List<int>.generate(16, (_) => Random.secure().nextInt(256));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  final hex = bytes
+      .map((byte) => byte.toRadixString(16).padLeft(2, '0'))
+      .join();
+  return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
+}
+
 /// Per-actor walkie-talkie brain : owns the mode toggle lifecycle
 /// (presence SSE + wake lock + autoplay priming), the tap-toggle record state
 /// machine, and the ordered auto-advancing playback queue with ack-after-play
@@ -118,6 +131,7 @@ class WalkieController {
   final _seenIds = <String>{};
 
   VoiceStreamSource? _stream;
+  String? _sessionId;
   final _streamSubs = <StreamSubscription<dynamic>>[];
   bool _draining = false;
   bool _droppedSinceConnect = false;
@@ -183,10 +197,12 @@ class WalkieController {
     unawaited(_deps.wakeLock.acquire());
 
     final stream = _deps.createStream();
+    final sessionId = newWalkieSessionId();
+    _sessionId = sessionId;
     _stream = stream;
     _streamSubs.add(stream.frames.listen(_onFrame));
     _streamSubs.add(stream.status.listen(_onStreamStatus));
-    stream.connect([actorId]);
+    stream.connect([actorId], sessionId);
 
     await _fetchBacklog();
   }
@@ -197,6 +213,8 @@ class WalkieController {
   /// NOT acked — they come back via the backlog on the next mode entry.
   Future<void> disable() async {
     if (!_enabled.value) return;
+    final sessionId = _sessionId;
+    _sessionId = null;
     _enabled.add(false);
     _connection.add(WalkieConnection.off);
     _teardownStream();
@@ -218,6 +236,13 @@ class WalkieController {
     }
     _record.add(const RecordStatus());
     await _deps.wakeLock.release();
+    if (sessionId != null) {
+      try {
+        await _deps.api.disableVoiceSession(sessionId);
+      } catch (e) {
+        if (!_disposed) _lastError.add('Voice session exit failed: $e');
+      }
+    }
   }
 
   void _teardownStream() {
@@ -406,6 +431,7 @@ class WalkieController {
         actorId,
         clip.bytes,
         mimeType: clip.mimeType,
+        sessionId: _sessionId,
       );
       if (_disposed) return;
       // Append the user's transcribed memo to the session transcript .

@@ -31,9 +31,15 @@ void main() {
 
       expect(controller.enabled.value, isTrue);
       expect(walkie.streams, hasLength(1));
-      expect(walkie.stream.connectCalls, [
-        ['a'],
-      ]);
+      expect(walkie.stream.connectCalls.single.actors, ['a']);
+      expect(
+        walkie.stream.connectCalls.single.sessionId,
+        matches(
+          RegExp(
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+          ),
+        ),
+      );
       expect(walkie.player.primeCalls, 1);
       expect(walkie.wakeLock.acquireCalls, 1);
       expect(api.backlogCalls, 1);
@@ -54,6 +60,9 @@ void main() {
       expect(controller.connection.value, WalkieConnection.off);
       expect(walkie.stream.disposed, isTrue);
       expect(walkie.wakeLock.releaseCalls, 1);
+      expect(api.disabledVoiceSessions, [
+        walkie.stream.connectCalls.single.sessionId,
+      ]);
     });
 
     test('dispose (leaving the screen) tears the mode down', () async {
@@ -273,6 +282,10 @@ void main() {
         expect(api.memoSends.single.actorId, 'a');
         expect(api.memoSends.single.byteLength, 3);
         expect(api.memoSends.single.mimeType, 'audio/webm;codecs=opus');
+        expect(
+          api.memoSends.single.sessionId,
+          walkie.stream.connectCalls.single.sessionId,
+        );
         expect(controller.record.value.phase, RecordPhase.delivered);
         expect(controller.record.value.transcript, 'hello');
         expect(controller.record.value.delivered, isTrue);

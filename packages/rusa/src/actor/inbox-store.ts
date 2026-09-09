@@ -28,6 +28,8 @@ export type InboxStatus = "unhandled" | "handled" | "all";
 export interface InboxListOptions {
   status?: InboxStatus;
   source?: string;
+  /** Return only responsive entries while an explicit voice session is active. */
+  responsiveOnly?: boolean;
   limit?: number;
   cursor?: string;
 }
@@ -63,7 +65,7 @@ export interface InboxStore {
   append(entries: InboxAppendInput[]): InboxEntry[];
   list(actorId: string, options?: InboxListOptions): InboxPage;
   read(actorId: string, entryId: string): InboxEntry | null;
-  countUnhandled(actorId: string): number;
+  countUnhandled(actorId: string, options?: { responsiveOnly?: boolean }): number;
   /** Each actor with pending work, promoted when any pending entry is responsive. */
   actorsWithUnhandled(): InboxActorWork[];
   /** Each actor with unseen work, promoted when any unseen entry is responsive. */

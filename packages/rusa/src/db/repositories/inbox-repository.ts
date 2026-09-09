@@ -119,6 +119,9 @@ export class InboxRepository implements InboxStore {
       where.push("source = ?");
       params.push(options.source);
     }
+    if (options.responsiveOnly) {
+      where.push("json_extract(payload_json, '$.priority') = 'responsive'");
+    }
     if (options.cursor) {
       const cursor = decodeCursor(options.cursor);
       where.push("(delivered_at < ? OR (delivered_at = ? AND id < ?))");
@@ -136,7 +139,7 @@ export class InboxRepository implements InboxStore {
     const last = pageRows.at(-1);
     return {
       entries: pageRows.map(toEntry),
-      unhandledCount: this.countUnhandled(actorId),
+      unhandledCount: this.countUnhandled(actorId, { responsiveOnly: options.responsiveOnly }),
       nextCursor:
         hasMore && last ? encodeCursor({ deliveredAt: last.delivered_at, id: last.id }) : null,
     };
@@ -149,10 +152,14 @@ export class InboxRepository implements InboxStore {
     return row ? toEntry(row) : null;
   }
 
-  countUnhandled(actorId: string): number {
+  countUnhandled(actorId: string, options: { responsiveOnly?: boolean } = {}): number {
+    const responsiveWhere = options.responsiveOnly
+      ? " AND json_extract(payload_json, '$.priority') = 'responsive'"
+      : "";
     const row = this.db
       .prepare(
-        "SELECT COUNT(*) AS count FROM actor_inbox_entries WHERE actor_id = ? AND handled_at IS NULL"
+        `SELECT COUNT(*) AS count FROM actor_inbox_entries
+         WHERE actor_id = ? AND handled_at IS NULL${responsiveWhere}`
       )
       .get(actorId) as { count: number };
     return row.count;
