@@ -15,16 +15,13 @@ import { runMigrations } from "../db/migrations/runner.js";
 import { InboxRepository } from "../db/repositories/inbox-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { MeshEventRepository } from "../db/repositories/mesh-event-repository.js";
-import {
-  MAX_OBLIGATION_PAGE_LIMIT,
-  ObligationRepository,
-} from "../db/repositories/obligation-repository.js";
+import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { createLogger } from "../observability/logger.js";
 import { assertConcreteModelConfig } from "../providers/model-config.js";
 import type { ReferenceCacheService } from "../references/cache-service.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
-import { type DashboardDataDeps, handleMeshApiRequest, MAX_LIMIT } from "./api.js";
+import { type DashboardDataDeps, handleMeshApiRequest } from "./api.js";
 import { MeshEventEmitter } from "./mesh-event-emitter.js";
 import { SseHub } from "./sse.js";
 
@@ -238,11 +235,6 @@ describe("handleMeshApiRequest", () => {
         },
       },
     ]);
-  });
-
-  it("derives MAX_LIMIT directly from authoritative MAX_OBLIGATION_PAGE_LIMIT", () => {
-    expect(MAX_LIMIT).toBe(MAX_OBLIGATION_PAGE_LIMIT);
-    expect(MAX_OBLIGATION_PAGE_LIMIT).toBe(100);
   });
 
   it("POST /api/mesh/actors forwards a portable context selection ", async () => {
@@ -1104,6 +1096,17 @@ describe("handleMeshApiRequest", () => {
     expect(JSON.parse(second.res.body).events.map((e: { detail: string }) => e.detail)).toEqual([
       "1",
     ]);
+  });
+
+  it("GET /api/mesh/events preserves its 200-item route limit", async () => {
+    for (let i = 0; i < 150; i += 1) {
+      meshEvents.record({ kind: "run_start", actorId: UUID_A, detail: String(i) });
+    }
+
+    const { res } = await call(deps, "GET", `/api/mesh/events?actors=${UUID_A}&limit=150`);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).events).toHaveLength(150);
   });
 
   it("GET /api/mesh/events?since= returns ALL actors, oldest-first, forward (distiller read)", async () => {
@@ -2005,6 +2008,14 @@ describe("handleMeshApiRequest", () => {
         const data = JSON.parse(res.body);
         expect(data.obligations).toHaveLength(1);
         expect(data.total).toBe(1);
+      });
+
+      it("treats an unsafe offset as invalid before repository pagination", async () => {
+        obligations.create({ title: "root-1", id: "root-1", ownerId: "actor-1" });
+        const { res } = await call(deps, "GET", "/api/mesh/obligations?offset=10000000000000000");
+
+        expect(res.statusCode).toBe(200);
+        expect(JSON.parse(res.body).obligations).toHaveLength(1);
       });
     });
 

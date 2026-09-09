@@ -153,12 +153,8 @@ function parseAvatarId(raw: string): string | null {
   return id;
 }
 
-/**
- * Upper bounds so a crafted query can't ask for an unbounded scan/result.
- * The query limit is bounded by the authoritative obligation repository cap
- * so dashboard limit clamping and repository validation cannot drift.
- */
-export const MAX_LIMIT = MAX_OBLIGATION_PAGE_LIMIT;
+/** Upper bound for dashboard routes whose backing store has no smaller cap. */
+const MAX_LIMIT = 200;
 const MAX_ACTORS = 200;
 const DEFAULT_LIMIT = 50;
 /** Cap on a manually-uploaded avatar's decoded byte size (5 MB). */
@@ -431,12 +427,12 @@ function parsePositiveInt(url: URL, name: string): number | undefined {
   const raw = url.searchParams.get(name);
   if (raw == null) return undefined;
   const n = Number(raw);
-  return Number.isInteger(n) && n > 0 ? n : undefined;
+  return Number.isSafeInteger(n) && n > 0 ? n : undefined;
 }
 
-function clampLimit(url: URL): number {
+function clampLimit(url: URL, maxLimit = MAX_LIMIT): number {
   const requested = parsePositiveInt(url, "limit") ?? DEFAULT_LIMIT;
-  return Math.min(requested, MAX_LIMIT);
+  return Math.min(requested, maxLimit);
 }
 
 /**
@@ -1429,7 +1425,7 @@ export async function handleMeshApiRequest(
     const status = url.searchParams.get("status") ?? undefined;
     const rawRootsOnly = url.searchParams.get("rootsOnly") ?? url.searchParams.get("roots_only");
     const rootsOnly = rawRootsOnly === "true" || rawRootsOnly === "1";
-    const limit = clampLimit(url);
+    const limit = clampLimit(url, MAX_OBLIGATION_PAGE_LIMIT);
     const offset = parsePositiveInt(url, "offset") ?? 0;
 
     if (status && !["ready", "waiting", "done", "cancelled", "scheduled"].includes(status)) {
@@ -1468,7 +1464,7 @@ export async function handleMeshApiRequest(
       sendJson(res, 503, { error: "obligations data unavailable" });
       return true;
     }
-    const limit = clampLimit(url);
+    const limit = clampLimit(url, MAX_OBLIGATION_PAGE_LIMIT);
     const offset = parsePositiveInt(url, "offset") ?? 0;
     const rawIncludeTerminalRoots =
       url.searchParams.get("includeTerminalRoots") ??
@@ -1521,7 +1517,7 @@ export async function handleMeshApiRequest(
       sendJson(res, 404, { error: "obligation not found" });
       return true;
     }
-    const limit = clampLimit(url);
+    const limit = clampLimit(url, MAX_OBLIGATION_PAGE_LIMIT);
     const offset = parsePositiveInt(url, "offset") ?? 0;
     const completionsOffset = parsePositiveInt(url, "completions_offset") ?? 0;
     const children = deps.obligations.listChildrenPage(id, { limit, offset });
