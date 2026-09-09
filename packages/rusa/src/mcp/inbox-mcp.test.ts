@@ -185,6 +185,12 @@ describe("inbox MCP server", () => {
     const client = await connect(
       createInboxMcpServer(store, "actor-a", {
         select: (ids) => {
+          if (
+            voiceActive &&
+            ids.some((id) => store.read("actor-a", id)?.payload.priority !== "responsive")
+          ) {
+            throw new Error("ordinary inbox work is held while a voice session is active");
+          }
           selected = ids;
           return ids.map((id) => {
             const entry = store.read("actor-a", id);
@@ -197,8 +203,8 @@ describe("inbox MCP server", () => {
       })
     );
 
-    // Selection cannot be carried over the authority boundary into an ordinary
-    // mark-handled call.
+    // Authority blocks starting ordinary work, but cannot make already-complete
+    // work appear unfinished when it crosses the boundary.
     await client.callTool({ name: "select", arguments: { entry_ids: ["own"] } });
     voiceActive = true;
 
@@ -215,10 +221,10 @@ describe("inbox MCP server", () => {
 
     const markedNormal = (await client.callTool({
       name: "mark_handled",
-      arguments: { entry_ids: ["own"], note: "should remain held" },
+      arguments: { entry_ids: ["own"], note: "completed before voice session" },
     })) as CallToolResult;
-    expect(markedNormal.isError).toBe(true);
-    expect(store.read("actor-a", "own")?.handledAt).toBeNull();
+    expect(markedNormal.isError).not.toBe(true);
+    expect(store.read("actor-a", "own")?.handledAt).not.toBeNull();
 
     const selectedVoice = (await client.callTool({
       name: "select",

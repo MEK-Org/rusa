@@ -48,9 +48,6 @@ export function createInboxMcpServer(
       },
       selected: () => localSelection,
     } satisfies InboxMcpRunScope);
-  const isHeld = (entry: InboxEntry): boolean =>
-    scope.isVoiceSessionActive?.() === true && entry.payload.priority !== "responsive";
-
   server.registerTool(
     "list",
     {
@@ -102,12 +99,6 @@ export function createInboxMcpServer(
       try {
         if (new Set(entry_ids).size !== entry_ids.length) {
           throw new Error("entry_ids must be unique");
-        }
-        for (const id of entry_ids) {
-          const entry = store.read(actorId, id);
-          if (entry && isHeld(entry)) {
-            throw new Error("ordinary inbox work is held while a voice session is active");
-          }
         }
         const selected = scope.select(entry_ids, obligation_id);
         if (Array.isArray(selected)) {
@@ -178,12 +169,6 @@ export function createInboxMcpServer(
         const unselected = ids.filter((id) => !selected.has(id));
         if (unselected.length > 0) {
           throw new Error(`entries must be selected in this run: ${unselected.join(", ")}`);
-        }
-        for (const id of ids) {
-          const entry = store.read(actorId, id);
-          if (entry && isHeld(entry)) {
-            throw new Error("ordinary inbox work is held while a voice session is active");
-          }
         }
         const entries = store.markHandled(actorId, ids, undefined, note);
         scope.onHandled?.();

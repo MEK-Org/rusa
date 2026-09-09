@@ -102,8 +102,13 @@ function createMemoryInboxStore(): InboxStore & { entries: InboxEntry[] } {
     },
     read: (actorId: string, entryId: string) =>
       entries.find((entry) => entry.actorId === actorId && entry.id === entryId) ?? null,
-    countUnhandled: (actorId: string) =>
-      entries.filter((entry) => entry.actorId === actorId && entry.handledAt === null).length,
+    countUnhandled: (actorId: string, options = {}) =>
+      entries.filter(
+        (entry) =>
+          entry.actorId === actorId &&
+          entry.handledAt === null &&
+          (!options.responsiveOnly || entry.payload.priority === "responsive")
+      ).length,
     actorsWithUnhandled: () => pendingActors((entry) => entry.handledAt === null),
     actorsWithUnseen: () =>
       pendingActors((entry) => entry.handledAt === null && entry.seenAt === null),
@@ -1492,7 +1497,7 @@ describe("ActorMesh", () => {
         payload: { type: "github.issue" },
       },
     ]);
-    mesh.notifyInboxChanged(worker);
+    expect(mesh.notifyInboxChanged(worker)).toBe(false);
     mesh.deliverWake(worker, "cron maintenance");
     await tick();
 

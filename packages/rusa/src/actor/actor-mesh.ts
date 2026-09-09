@@ -1152,9 +1152,11 @@ export class ActorMesh {
   }
 
   /**
-   * Notify an actor that its durable worklist changed. If an execution
-   * opportunity is already queued, the new entry joins it and becomes seen
-   * immediately; only deliveries during an active run set the dirty follow-up.
+   * Notify an actor that its durable worklist changed, returning whether this
+   * call requested an execution opportunity. If one is already queued, the new
+   * entry joins it and becomes seen immediately; only deliveries during an
+   * active run set the dirty follow-up. A held normal entry remains durable but
+   * returns false because the session-end release, not this call, will nudge it.
    */
   notifyInboxChanged(actorId: string, nudge: RunNudge = {}): boolean {
     actorId = this.resolveThreadId(actorId);
@@ -1173,7 +1175,7 @@ export class ActorMesh {
       // rather than adding an ordinary execution opportunity behind the voice
       // conversation. Responsive work still preempts exactly as before.
       this.log(`inbox_changed for ${actorId} held — active voice session`);
-      return true;
+      return false;
     }
     if (isResponsiveNudge(nudge)) {
       const preemption = target.preemptForResponsive();
@@ -1475,14 +1477,9 @@ export class ActorMesh {
   notifyVoiceSessionEnded(actorId: string): boolean {
     actorId = this.resolveThreadId(actorId);
     if (!this.inboxStore) return false;
-    let cursor: string | undefined;
-    do {
-      const page = this.inboxStore.list(actorId, { status: "unhandled", limit: 100, cursor });
-      if (page.entries.some((entry) => entry.payload.priority !== "responsive")) {
-        return this.notifyInboxChanged(actorId);
-      }
-      cursor = page.nextCursor ?? undefined;
-    } while (cursor);
+    const total = this.inboxStore.countUnhandled(actorId);
+    const responsive = this.inboxStore.countUnhandled(actorId, { responsiveOnly: true });
+    if (total > responsive) return this.notifyInboxChanged(actorId);
     return false;
   }
 

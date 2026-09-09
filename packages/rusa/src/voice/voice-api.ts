@@ -142,15 +142,13 @@ export function handleVoiceApiRequest(
       return true;
     }
     const suppliedSessionId = url.searchParams.get("sessionId");
-    // Older clients did not carry a stable id. Keep their memo delivery
-    // semantics, but never let that implicit one-off id become leased session
-    // authority. Current dashboard clients establish their supplied id on SSE
-    // and every memo must match that actor binding.
-    if (suppliedSessionId && !service.hasSession(suppliedSessionId, actorId)) {
-      sendJson(res, 409, { error: "voice session is not active for this actor" });
-      return true;
-    }
-    const sessionId = suppliedSessionId ?? randomUUID();
+    // The stream route alone grants session authority. Keep the pre-session
+    // delivery behavior for a stale/unknown supplied id (including a restart
+    // race): rekey this one memo, deliver it, and do not create a lease.
+    const sessionId =
+      suppliedSessionId && service.hasSession(suppliedSessionId, actorId)
+        ? suppliedSessionId
+        : randomUUID();
 
     void (async () => {
       const audio = await readRawBody(req, MAX_MEMO_BYTES);

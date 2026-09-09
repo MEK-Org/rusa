@@ -300,6 +300,39 @@ describe("handleVoiceApiRequest", () => {
       expect(sessionId).toMatch(/^[0-9a-f-]{36}$/);
     });
 
+    it("delivers an unknown session id during a restart race without granting it authority", async () => {
+      const sessionId = "reconnect-after-restart";
+      const first = call(
+        deps,
+        "POST",
+        `/api/mesh/actors/${UUID_A}/voice-memo?sessionId=${sessionId}`,
+        { body: Buffer.from("x"), contentType: "audio/webm" }
+      );
+      await settled(first.res);
+
+      expect(first.res.statusCode).toBe(200);
+      expect(sendHumanMessage.mock.calls[0]?.[2]).toMatch(/^[0-9a-f-]{36}$/);
+      expect(sendHumanMessage.mock.calls[0]?.[2]).not.toBe(sessionId);
+      expect(service.hasActiveSession(UUID_A)).toBe(false);
+
+      call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=${sessionId}`);
+      expect(service.hasSession(sessionId, UUID_A)).toBe(true);
+
+      const second = call(
+        deps,
+        "POST",
+        `/api/mesh/actors/${UUID_A}/voice-memo?sessionId=${sessionId}`,
+        { body: Buffer.from("y"), contentType: "audio/webm" }
+      );
+      await settled(second.res);
+      expect(second.res.statusCode).toBe(200);
+      expect(sendHumanMessage.mock.calls[1]).toEqual([
+        UUID_A,
+        `${VOICE_MEMO_PREFIX}pick up milk on the way home`,
+        sessionId,
+      ]);
+    });
+
     it("reports delivered: false for a non-live actor (memo still transcribed)", async () => {
       sendHumanMessage.mockReturnValue({ delivered: false, status: "active" });
       const { res } = call(deps, "POST", `/api/mesh/actors/${UUID_A}/voice-memo`, {

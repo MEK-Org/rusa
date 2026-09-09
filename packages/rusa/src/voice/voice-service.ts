@@ -140,7 +140,7 @@ export interface VoiceServiceOptions {
   ) => Promise<StreamingEncodedAudio>;
   maxAnnouncements?: number;
   presenceGraceMs?: number;
-  /** Reconnect allowance for an explicit walkie session. */
+  /** Test seam for the explicit walkie reconnect allowance. */
   sessionLeaseMs?: number;
   /** Called once when an explicit session ends or expires. */
   onSessionEnded?: (actorId: string) => void;
@@ -204,9 +204,9 @@ export class VoiceService {
 
   /**
    * Attach one voice SSE connection to a dashboard's stable session UUID. A UUID
-   * is permanently bound to its first actor for this process lifetime; a
-   * different actor is a protocol error rather than an implicit transfer
-   * (transfers are slice B). Any live connection holds authority indefinitely.
+   * remains bound to its first actor for this session's lifetime; a different
+   * actor is a protocol error rather than an implicit transfer (transfers are
+   * slice B). Any live connection holds authority indefinitely.
    */
   openSession(sessionId: string, actorId: string): void {
     const existing = this.validateSession(sessionId, actorId);

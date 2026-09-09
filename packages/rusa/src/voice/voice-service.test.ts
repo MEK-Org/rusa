@@ -147,6 +147,8 @@ describe("VoiceService leased sessions", () => {
     sessions.expireSessions();
     expect(sessions.hasActiveSession(ACTOR)).toBe(false);
     expect(ended).toEqual([ACTOR]);
+    expect(sessions.closeSession("session-a")).toBe(false);
+    expect(ended).toEqual([ACTOR]);
 
     // Explicit disable remains idempotent for a newly opened session.
     sessions.openSession("session-a", ACTOR);
