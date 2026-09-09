@@ -28,8 +28,7 @@ void writeDashboardViewToUrl(
   String? focusedObligationId,
   String? focusedActorId,
 }) {
-  final base = Uri.base;
-  var queryParams = Map<String, String>.from(base.queryParameters);
+  var queryParams = Map<String, String>.from(Uri.base.queryParameters);
   queryParams.remove('obligation');
 
   var newPath = '/${view.name}';
@@ -40,15 +39,13 @@ void writeDashboardViewToUrl(
   }
 
   final url = Uri(
-    scheme: base.scheme,
-    userInfo: base.userInfo,
-    host: base.host,
-    port: base.hasPort ? base.port : null,
     path: newPath,
     queryParameters: queryParams.isEmpty ? null : queryParams,
   );
   // Let Flutter update its own browser-history entry. Calling the DOM History
   // API directly replaces the engine's serialized state and breaks teardown.
+  // This is deliberately fire-and-forget: a view selection must not wait for
+  // best-effort address-bar synchronization.
   unawaited(SystemNavigator.routeInformationUpdated(uri: url, replace: true));
 }
 
