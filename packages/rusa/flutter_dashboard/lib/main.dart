@@ -38,15 +38,13 @@ class RusaDashboardApp extends StatelessWidget {
       title: title,
       debugShowCheckedModeBanner: false,
       theme: buildMeshTheme(),
+      // Keep one DashboardPage for every initial path. With path URL strategy,
+      // Navigator's default initial-route expansion asks for each path prefix;
+      // an onGenerateRoute that built DashboardPage for them would leave
+      // duplicate stores and SSE connections mounted. The home fallback is
+      // intentional, including its debug-only initial-route diagnostic; direct
+      // deep links still select their view in DashboardBody.
       home: const DashboardPage(),
-      // With path URL strategy, Flutter treats a direct dashboard URL as its
-      // initial route. Every path still hosts the one dashboard page; this
-      // route keeps the framework and address bar aligned without debug-only
-      // "Could not navigate to initial route" fallback noise.
-      onGenerateRoute: (settings) => MaterialPageRoute<void>(
-        settings: settings,
-        builder: (_) => const DashboardPage(),
-      ),
     );
   }
 }
