@@ -377,8 +377,15 @@ export function createDashboardRequestHandler(
         err,
       });
       if (!res.headersSent) {
-        res.writeHead(500, { "Content-Type": "text/plain" });
-        res.end("Internal error");
+        // Mesh API consumers use JSON error objects; keep that contract even
+        // when the failure occurred outside an individual route handler.
+        if ((req.url ?? "/").startsWith("/api/")) {
+          res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ error: "Internal error" }));
+        } else {
+          res.writeHead(500, { "Content-Type": "text/plain" });
+          res.end("Internal error");
+        }
       } else if (!res.writableEnded) {
         res.end();
       }

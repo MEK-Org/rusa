@@ -338,7 +338,8 @@ describe("dashboard request fault boundary", () => {
     await done;
 
     expect(res.statusCode).toBe(500);
-    expect(res.body).toBe("Internal error");
+    expect(res.headers["Content-Type"]).toBe("application/json; charset=utf-8");
+    expect(JSON.parse(res.body)).toEqual({ error: "Internal error" });
     expect(errorLogs).toHaveLength(1);
     expect(errorLogs[0].event).toBe("dashboard_request_failed");
     expect(errorLogs[0].data?.method).toBe("GET");
@@ -421,7 +422,8 @@ describe("dashboard request fault boundary", () => {
     req1.emit("end");
     await done1;
     expect(res1.statusCode).toBe(500);
-    expect(res1.body).toBe("Internal error");
+    expect(res1.headers["Content-Type"]).toBe("application/json; charset=utf-8");
+    expect(JSON.parse(res1.body)).toEqual({ error: "Internal error" });
 
     // Second request succeeds
     fail = false;
