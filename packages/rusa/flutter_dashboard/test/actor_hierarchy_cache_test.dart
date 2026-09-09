@@ -34,6 +34,7 @@ void main() {
         model: 'claude-opus-5',
         effort: 'high',
         desiredModel: 'claude-sonnet-5',
+        desiredEffort: 'medium',
         desiredProvider: 'claude',
         modelConfig: const [
           ProviderModelConfig(
@@ -42,9 +43,12 @@ void main() {
             effort: 'high',
           ),
         ],
+        modelClass: 'fast',
         desiredModelConfig: const [
           ProviderModelConfig(provider: 'claude', model: 'claude-sonnet-5'),
         ],
+        desiredModelClass: 'careful',
+        commitmentKind: 'REVIEW',
         charterPreview: 'a charter preview…',
         lastActiveAt: '2026-02-28T00:00:00Z',
       ),
@@ -67,8 +71,13 @@ void main() {
     expect(child.model, 'claude-opus-5');
     expect(child.effort, 'high');
     expect(child.desiredModel, 'claude-sonnet-5');
+    expect(child.desiredEffort, 'medium');
+    expect(child.effortChangePending, isTrue);
     expect(child.modelConfig, threads[1].modelConfig);
+    expect(child.modelClass, 'fast');
     expect(child.desiredModelConfig, threads[1].desiredModelConfig);
+    expect(child.desiredModelClass, 'careful');
+    expect(child.commitmentKind, 'REVIEW');
     expect(child.createdAt, '2026-01-02T00:00:00Z');
     expect(child.lastActiveAt, '2026-02-28T00:00:00Z');
   });

@@ -54,8 +54,9 @@ class PersistedActorHierarchy {
   /// would misread. A payload carrying any other version is dropped rather
   /// than migrated — the cost of a single cold load is lower than the cost of
   /// a migration path nobody exercises. v2 narrowed the record from a whole
-  /// `ThreadDto` to the row fields below.
-  static const int schemaVersion = 2;
+  /// `ThreadDto` to the row fields below; v3 adds the row's configured and
+  /// staged model-class labels.
+  static const int schemaVersion = 3;
 
   /// Budget for the serialized capture. Browsers give an origin roughly 5 MiB
   /// of `localStorage`, shared across every key this dashboard writes (the
@@ -186,7 +187,7 @@ class PersistedActorHierarchy {
   }
 
   /// One actor, as the tree row draws it: identity and place in the tree, the
-  /// label and its timestamps, and the model/effort/pool/commitment chips
+  /// label and its timestamps, and the model/effort/class/pool/commitment chips
   /// (`widgets/actor_tree.dart` reads exactly these). Optional fields are
   /// emitted only when set, which keeps a plain row near 310 bytes.
   ///
@@ -208,12 +209,14 @@ class PersistedActorHierarchy {
     if (t.effortChangePending) 'desiredEffort': t.desiredEffort,
     if (t.modelConfig.isNotEmpty)
       'modelConfig': t.modelConfig.map((c) => c.toJson()).toList(),
+    if (t.modelClass != null) 'modelClass': t.modelClass,
     // A staged pool is never empty (the server rejects one), so a null must
     // stay absent rather than come back as `[]` and draw "staged (0)".
     if (t.desiredModelConfig != null)
       'desiredModelConfig': t.desiredModelConfig!
           .map((c) => c.toJson())
           .toList(),
+    if (t.desiredModelClass != null) 'desiredModelClass': t.desiredModelClass,
     if (t.commitmentKind != null) 'commitmentKind': t.commitmentKind,
   };
 
@@ -232,7 +235,9 @@ class PersistedActorHierarchy {
     desiredEffort: j['desiredEffort'] as String?,
     effortChangePending: j.containsKey('desiredEffort'),
     modelConfig: _configs(j['modelConfig']) ?? const [],
+    modelClass: j['modelClass'] as String?,
     desiredModelConfig: _configs(j['desiredModelConfig']),
+    desiredModelClass: j['desiredModelClass'] as String?,
     charterPreview: '',
     title: j['title'] as String? ?? '',
     createdAt: j['createdAt'] as String? ?? '',
