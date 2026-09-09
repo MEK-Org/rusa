@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RusaConfig } from "../config/types.js";
-import { DEFAULT_ROOT_PROVIDER, resolveProvider, resolveRootProvider } from "./registry.js";
+import { resolveProvider, resolveRootProvider } from "./registry.js";
 
 // resolveRootProvider reads only providers / root / geminiApiKey and never the
 // DB, so a partial config is sufficient.
@@ -17,12 +17,8 @@ function configWith(rootActor?: RusaConfig["rootActor"]): RusaConfig {
 }
 
 describe("resolveRootProvider", () => {
-  it("defaults to agy (antigravity) with explicit effort when rootActor is unset", () => {
-    const provider = resolveRootProvider(configWith());
-    expect(provider.providerName).toBe(DEFAULT_ROOT_PROVIDER);
-    expect(provider.providerName).toBe("antigravity");
-    expect(provider.model).toBeUndefined();
-    expect(provider.effort).toBe("high");
+  it("requires an explicit root provider and model", () => {
+    expect(() => resolveRootProvider(configWith())).toThrow(/rootActor/i);
   });
 
   it("honors an explicit provider and model", () => {
@@ -43,16 +39,16 @@ describe("resolveRootProvider", () => {
     expect(provider.name).toBe("claude-opus-4-8 @ max (claude)");
   });
 
-  it("uses the provider's default model when only a provider is given", () => {
-    const provider = resolveRootProvider(configWith({ provider: "claude" }));
-    expect(provider.providerName).toBe("claude");
-    expect(provider.model).toBeUndefined();
-    expect(provider.effort).toBeUndefined();
-    expect(provider.name).toBe("claude");
+  it("rejects a root provider without an explicit model", () => {
+    expect(() => resolveRootProvider(configWith({ provider: "claude" } as never))).toThrow(
+      /model/i
+    );
   });
 
   it("throws when root.provider is not declared under providers", () => {
-    expect(() => resolveRootProvider(configWith({ provider: "bogus" }))).toThrow(/not configured/);
+    expect(() =>
+      resolveRootProvider(configWith({ provider: "bogus", model: "bogus-model" }))
+    ).toThrow(/not configured/);
   });
 });
 

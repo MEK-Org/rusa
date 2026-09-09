@@ -107,7 +107,11 @@ export interface DashboardDataDeps {
   referenceCache?: import("../references/cache-service.js").ReferenceCacheService;
   chatClient?: import("../chat/types.js").ChatClient;
   issueClient?: import("../references/resolve.js").ReferenceResolverDeps["issueClient"];
+  getFollowers?: () => FollowerInfo[];
 }
+
+import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
+export type { FollowerInfo };
 
 /** Route prefix for the per-actor avatar endpoint . */
 const AVATAR_PREFIX = "/api/mesh/avatar/";
@@ -178,6 +182,7 @@ interface ThreadDto {
   handle: string;
   parentId: string | null;
   status: string;
+  executionTarget?: string | null;
   /** The declared candidate pool's first (or only) entry — compat view of {@link modelConfig}. */
   provider: string | null;
   /** The single authoritative model for this actor, as configured in the registry. */
@@ -192,8 +197,12 @@ interface ThreadDto {
   desiredProvider?: string | null;
   /** The declared candidate pool, in earliest-available order. */
   modelConfig: ProviderModelConfig[];
+  /** Named class that produced the declared snapshot, if it was class-configured. */
+  modelClass?: string;
   /** Pending full-pool replacement staged for the next run boundary, if any. */
   desiredModelConfig?: ProviderModelConfig[];
+  /** Named class that produced the pending snapshot, if it was class-configured. */
+  desiredModelClass?: string;
   /**
    * The reserved candidate for a genuinely queued run, or null when idle/running
    * or nothing has been reserved yet. `selectedProvider` is the declared alias;
@@ -523,8 +532,10 @@ export async function handleMeshApiRequest(
               compactionModel:
                 typeof body.compactionModel === "string" ? body.compactionModel : undefined,
             });
+            const target = typeof body.target === "string" ? body.target : undefined;
             const id = deps.rootControl?.spawnChild(
               {
+                ...(target !== undefined ? { executionTarget: target } : {}),
                 charter: typeof body.charter === "string" ? body.charter : "",
                 modelConfig: {
                   provider: typeof body.provider === "string" ? body.provider : "",
@@ -1247,6 +1258,13 @@ export async function handleMeshApiRequest(
     return true;
   }
 
+  // GET /api/mesh/followers — list connected followers
+  if (pathname === "/api/mesh/followers") {
+    const followers = deps?.getFollowers ? deps.getFollowers() : [];
+    sendJson(res, 200, { followers });
+    return true;
+  }
+
   // GET /api/mesh/threads — every thread (active + retired), handle up front.
   if (pathname === "/api/mesh/threads") {
     const runtime =
@@ -1287,6 +1305,7 @@ export async function handleMeshApiRequest(
         handle: r.isRoot === true ? rootHandle : generateHandle(r.id),
         parentId: r.parentId,
         status: r.status,
+        executionTarget: r.executionTarget ?? null,
         provider: r.modelConfig?.[0]?.provider ?? null,
         model: r.modelConfig?.[0]?.model ?? null,
         effort: r.modelConfig?.[0]?.effort ?? null,
@@ -1296,7 +1315,9 @@ export async function handleMeshApiRequest(
           : {}),
         desiredProvider: r.desiredModelConfig?.[0]?.provider ?? null,
         modelConfig: r.modelConfig ?? [],
+        ...(r.modelClass !== undefined ? { modelClass: r.modelClass } : {}),
         ...(r.desiredModelConfig !== undefined ? { desiredModelConfig: r.desiredModelConfig } : {}),
+        ...(r.desiredModelClass !== undefined ? { desiredModelClass: r.desiredModelClass } : {}),
         charterPreview: charterPreview(r.charter),
         title: r.title ?? summarizeCharter(r.charter),
         createdAt: r.createdAt,
@@ -1519,6 +1540,16 @@ export async function handleMeshApiRequest(
           : resolveReferenceSync(artifact.ref, { meshChat: deps.meshChat }),
       }))
     );
+    const externalRefKey = obligation.externalRef?.key;
+    const externalReference = externalRefKey
+      ? deps.referenceCache
+        ? await deps.referenceCache.get(externalRefKey, deps).catch(() => ({
+            ...resolveReferenceSync(externalRefKey, { meshChat: deps.meshChat }),
+            unavailable: "could not load context",
+            cacheState: "unavailable",
+          }))
+        : resolveReferenceSync(externalRefKey, { meshChat: deps.meshChat })
+      : null;
     sendJson(res, 200, {
       obligation,
       parent,
@@ -1528,6 +1559,7 @@ export async function handleMeshApiRequest(
       completionsTotal: completions.total,
       completionsHasMore: completions.hasMore,
       artifacts,
+      externalReference,
     });
     return true;
   }

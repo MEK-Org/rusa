@@ -117,6 +117,7 @@ class EventsTab extends StatelessWidget {
     final detail = row.isCoalesced
         ? (row.yielded!.body ?? e.detail)
         : (isMessage ? (e.body ?? e.detail) : e.detail);
+    final resolvedRunModel = e.resolvedRunModel;
 
     Widget? peerLabel;
     String? directionPeer;
@@ -211,6 +212,16 @@ class EventsTab extends StatelessWidget {
                     ?peerLabel,
                   ],
                 ),
+                if (resolvedRunModel != null) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    'resolved model: $resolvedRunModel',
+                    style: kMonoStyle.copyWith(
+                      color: MeshColors.textSecondary,
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
                 if ((detail ?? '').isNotEmpty) ...[
                   const SizedBox(height: 4),
                   Text(

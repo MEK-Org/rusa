@@ -48,10 +48,9 @@ export type MeshEventKind =
   // content-free so observability does not become a second worklist.
   | "run_queued"
   // A queued run reserved a declared candidate from its modelConfig pool —
-  // the earliest-eligible canonical provider lane for a normal run, or the
-  // first healthy declared candidate for a responsive one. Fires once at
-  // initial reservation and again on any later reselection (e.g. a
-  // responsive promote reselecting an earlier-declared lane). `actorId` =
+  // the earliest-eligible canonical provider lane for either priority. Fires
+  // once at initial reservation and again on any later reselection (e.g. a
+  // responsive promote after availability changes). `actorId` =
   // the queued actor, `payload` = {@link RunSelectedPayload}. Distinct from
   // `run_start`: this records what the run RESERVED, before it necessarily
   // starts (it may still be cancelled by a HALT while queued); `run_start`

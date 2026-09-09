@@ -259,6 +259,85 @@ describe("handleMeshApiRequest", () => {
     });
   });
 
+  it("POST /api/mesh/actors forwards target to root control", async () => {
+    const { res } = await call(
+      deps,
+      "POST",
+      "/api/mesh/actors",
+      JSON.stringify({
+        charter: "Remote task",
+        provider: "agy",
+        model: "gemini-3.5-flash-medium",
+        target: "mac-mini",
+      })
+    );
+    await new Promise((resolve) => process.nextTick(resolve));
+    await new Promise((resolve) => process.nextTick(resolve));
+
+    expect(res.statusCode).toBe(201);
+    expect(rootSpawns[0]?.request).toMatchObject({
+      executionTarget: "mac-mini",
+    });
+  });
+
+  it("POST /api/mesh/actors 400s when target is refused by placement check", async () => {
+    const failingDeps: DashboardDataDeps = {
+      ...deps,
+      rootControl: {
+        providers: ["agy", "codex"],
+        spawnChild: () => {
+          throw new Error(
+            'executionTarget "unknown" is not available: this runtime has no remote placement support'
+          );
+        },
+      } as unknown as RootControlService,
+    };
+    const { res } = await call(
+      failingDeps,
+      "POST",
+      "/api/mesh/actors",
+      JSON.stringify({
+        charter: "Remote task",
+        provider: "agy",
+        model: "gemini-3.5-flash-medium",
+        target: "unknown",
+      })
+    );
+    await new Promise((resolve) => process.nextTick(resolve));
+    await new Promise((resolve) => process.nextTick(resolve));
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain('executionTarget "unknown" is not available');
+  });
+
+  it("GET /api/mesh/followers lists connected followers", async () => {
+    const followerDeps: DashboardDataDeps = {
+      ...deps,
+      getFollowers: () => [
+        {
+          id: "mac-mini",
+          platform: "darwin",
+          pid: 12345,
+          actors: ["thread-1"],
+          lastSeen: "2026-09-07T00:00:00.000Z",
+        },
+      ],
+    };
+    const { res } = await call(followerDeps, "GET", "/api/mesh/followers");
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({
+      followers: [
+        {
+          id: "mac-mini",
+          platform: "darwin",
+          pid: 12345,
+          actors: ["thread-1"],
+          lastSeen: "2026-09-07T00:00:00.000Z",
+        },
+      ],
+    });
+  });
+
   it("POST /api/mesh/actors 400s an unknown context selection instead of spawning native", async () => {
     // Silently falling back to native is the failure mode that matters here: the
     // operator would get an ordinary actor and believe it was portable.
@@ -541,6 +620,25 @@ describe("handleMeshApiRequest", () => {
     expect(actor.model).toBe("gpt-5-codex");
     expect(actor.requestedModel).toBeUndefined();
     expect(actor.boundModel).toBeUndefined();
+  });
+
+  it("GET /api/mesh/threads exposes class provenance only when the actor has it", async () => {
+    actors.upsert({
+      ...rec(UUID_A, "root", "active"),
+      modelConfig: [{ provider: "codex", model: "gpt-5-codex" }],
+      modelClass: "fast",
+    });
+    actors.upsert({
+      ...rec(UUID_B, "root", "active"),
+      modelConfig: [{ provider: "codex", model: "gpt-5-codex" }],
+    });
+
+    const { res } = await call(deps, "GET", "/api/mesh/threads");
+    const { threads } = JSON.parse(res.body);
+    const classConfigured = threads.find((t: { id: string }) => t.id === UUID_A);
+    const explicit = threads.find((t: { id: string }) => t.id === UUID_B);
+    expect(classConfigured.modelClass).toBe("fast");
+    expect(Object.hasOwn(explicit, "modelClass")).toBe(false);
   });
 
   it("GET /api/mesh/threads surfaces pending desiredModel and desiredProvider when staged", async () => {
@@ -2066,6 +2164,85 @@ describe("handleMeshApiRequest", () => {
         // Since cacheService threw, Promise.all would reject in api.ts if we don't catch it!
         expect(failure?.reference?.cacheState).toBe("unavailable");
         expect(failure?.reference?.unavailable).toBe("could not load context");
+      });
+
+      it("returns obligation with externalReference resolved and isolates cache faults", async () => {
+        obligations.create({
+          title: "with-ext-ref",
+          id: "with-ext-ref",
+          ownerId: "actor-1",
+          externalRef: "github:MEK-Org/rusa/issues/345",
+        });
+        obligations.create({
+          title: "with-ext-ref-fault",
+          id: "with-ext-ref-fault",
+          ownerId: "actor-1",
+          externalRef: "github:MEK-Org/rusa/issues/999",
+        });
+        obligations.create({
+          title: "without-ext-ref",
+          id: "without-ext-ref",
+          ownerId: "actor-1",
+        });
+
+        const depsWithCache = {
+          ...deps,
+          referenceCache: {
+            get: async (ref: string) => {
+              if (ref.includes("issues/345")) {
+                return {
+                  ref,
+                  scheme: "github",
+                  title: "Issue 345 Title",
+                  body: "Issue 345 description",
+                  cacheState: "fresh",
+                  entity: {
+                    type: "github_issue",
+                    title: "Issue 345 Title",
+                    description: "Issue 345 description",
+                  },
+                  url: "https://github.com/MEK-Org/rusa/issues/345",
+                  unavailable: null,
+                };
+              }
+              throw new Error("cache fault on issue 999");
+            },
+          } as unknown as ReferenceCacheService,
+        };
+
+        const resSuccess = await call(depsWithCache, "GET", "/api/mesh/obligations/with-ext-ref");
+        expect(resSuccess.res.statusCode).toBe(200);
+        const dataSuccess = JSON.parse(resSuccess.res.body);
+        expect(dataSuccess.externalReference).toEqual({
+          ref: "github:MEK-Org/rusa/issues/345",
+          scheme: "github",
+          title: "Issue 345 Title",
+          body: "Issue 345 description",
+          cacheState: "fresh",
+          entity: {
+            type: "github_issue",
+            title: "Issue 345 Title",
+            description: "Issue 345 description",
+          },
+          url: "https://github.com/MEK-Org/rusa/issues/345",
+          unavailable: null,
+        });
+
+        const resFault = await call(
+          depsWithCache,
+          "GET",
+          "/api/mesh/obligations/with-ext-ref-fault"
+        );
+        expect(resFault.res.statusCode).toBe(200);
+        const dataFault = JSON.parse(resFault.res.body);
+        expect(dataFault.externalReference?.cacheState).toBe("unavailable");
+        expect(dataFault.externalReference?.unavailable).toBe("could not load context");
+        expect(dataFault.externalReference?.url).toBe("https://github.com/MEK-Org/rusa/issues/999");
+
+        const resNone = await call(depsWithCache, "GET", "/api/mesh/obligations/without-ext-ref");
+        expect(resNone.res.statusCode).toBe(200);
+        const dataNone = JSON.parse(resNone.res.body);
+        expect(dataNone.externalReference).toBeNull();
       });
 
       it("returns obligation with a PR comment and a PR review embedded, not just a plain issue", async () => {

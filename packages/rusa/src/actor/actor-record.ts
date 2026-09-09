@@ -29,8 +29,18 @@ export interface ActorRecord {
   handles?: ActorHandle[];
   /** Bounded, non-empty, validated pool of provider/model/effort candidates. */
   modelConfig?: ProviderModelConfig[];
+  /**
+   * Named runtime model class that produced [modelConfig]'s resolved snapshot.
+   * Omitted for an explicitly declared tuple or pool, including records written
+   * before class provenance was retained. The original class cannot be
+   * truthfully recovered from a historical resolved pool, so those records
+   * remain on the explicit-pool dashboard fallback until reconfigured.
+   */
+  modelClass?: string;
   /** Process-local staged full-pool replacement; deliberately not durable. */
   desiredModelConfig?: ProviderModelConfig[];
+  /** Process-local provenance for [desiredModelConfig], cleared with that staged pool. */
+  desiredModelClass?: string;
   sessionId?: string;
   context?: ContextConfig;
   title?: string;
@@ -42,4 +52,6 @@ export interface ActorRecord {
   /** Derived from the latest durable operator chat, never stored on the actor row. */
   lastChatSessionId?: string;
   createdAt: string;
+  /** Registered follower ID where this actor is placed remotely; unset for leader-local execution. */
+  executionTarget?: string;
 }

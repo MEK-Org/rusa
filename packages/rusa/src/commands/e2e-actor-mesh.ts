@@ -16,6 +16,7 @@ import type { ChatMessage } from "../chat/types.js";
 import type { QuotaApiDeps } from "../dashboard/quota-api.js";
 import { getRepositories } from "../db/index.js";
 import { FakeIssueClient } from "../e2e/fake-issue-client.js";
+import { type E2EGitRemoteServer, startE2EGitRemoteServer } from "../e2e/git-remote-server.js";
 import { LocalTracker } from "../e2e/local-tracker.js";
 import {
   E2E_RUNS_DIR_NAME,
@@ -39,6 +40,12 @@ const TRACKER_PORT = 8084;
 const CHAT_CONTROL_PORT = 8085;
 /** Trusted control surface used when the root is driven outside the instance. */
 const ROOT_CONTROL_PORT = 8086;
+/**
+ * Loopback smart-HTTP endpoint for the instance's disposable bare remote.
+ * Fixed (not ephemeral) so a `--resume` reopens the same URL an earlier
+ * `am-up` already baked into the instance's `insteadOf` gitconfig.
+ */
+const GIT_REMOTE_PORT = 8087;
 
 /** Deterministic edge values for exercising both full and exhausted quota rings. */
 export function createDashboardE2EQuotaApi(now = Date.now()): QuotaApiDeps {
@@ -127,12 +134,13 @@ export async function runActorMeshE2EUp(opts: {
   resume?: boolean;
 }): Promise<void> {
   const offset = opts.portOffset ?? 0;
-  if (!Number.isInteger(offset) || offset < 0 || ROOT_CONTROL_PORT + offset > 65535) {
+  if (!Number.isInteger(offset) || offset < 0 || GIT_REMOTE_PORT + offset > 65535) {
     throw new Error("--port-offset must be an integer between 0 and 57449");
   }
   const trackerPort = TRACKER_PORT + offset;
   const chatPort = CHAT_CONTROL_PORT + offset;
   const controlPort = opts.rootControlPort ?? ROOT_CONTROL_PORT + offset;
+  const gitRemotePort = GIT_REMOTE_PORT + offset;
   try {
     assertBwrapAvailable();
   } catch (err) {
@@ -142,8 +150,10 @@ export async function runActorMeshE2EUp(opts: {
 
   // Provision OUTSIDE /tmp. Sandboxed workers run under bwrap with `--tmpfs /tmp`,
   // which replaces /tmp with a fresh empty mount — so anything the instance puts
-  // under /tmp (the bare remote, the gitconfig with the clone `insteadOf`) is
-  // invisible to a worker. Rooting under $HOME keeps it ro-bound and visible, so
+  // under /tmp (the bare remote backing the loopback endpoint, the gitconfig with
+  // the clone `insteadOf`) would be invisible to a worker's own process, and the
+  // instance's own git-http-backend child processes need the bare remote to keep
+  // existing across the run. Rooting under $HOME keeps it ro-bound and visible, so
   // a worker can clone the synthetic repo via the rewritten URL.
   const runsDir = join(homedir(), E2E_RUNS_DIR_NAME);
   mkdirSync(runsDir, { recursive: true });
@@ -163,7 +173,10 @@ export async function runActorMeshE2EUp(opts: {
         baseConfigHome: opts.baseConfigHome,
         // External control does not invoke a root provider, but children still
         // use the real provider catalog and credentials seeded below.
-        rootActor: { provider: opts.rootDriver === "external" ? "fake" : "claude" },
+        rootActor: {
+          provider: opts.rootDriver === "external" ? "fake" : "claude",
+          model: opts.rootDriver === "external" ? "fake-model" : "claude-sonnet-5",
+        },
         chat: {
           projectId: "e2e",
           subscription: "e2e",
@@ -175,28 +188,62 @@ export async function runActorMeshE2EUp(opts: {
   const { root: rootDir, home, config, repo } = instance;
   const bot = config.github.account ?? "quickstart-user";
 
-  // Resolve clones of the synthetic repo to the local bare remote, so a worker
-  // that `git clone`s the GitHub URL transparently hits our throwaway origin.
-  if (!opts.resume) {
-    appendFileSync(
-      join(rootDir, "gitconfig"),
-      [
-        `[url "${instance.remotePath}"]`,
-        `\tinsteadOf = https://github.com/${repo}`,
-        `\tinsteadOf = https://github.com/${repo}.git`,
-        `\tinsteadOf = git@github.com:${repo}.git`,
-        "",
-      ].join("\n"),
-      "utf8"
+  // Serve the disposable bare remote over loopback smart HTTP (receive-pack
+  // enabled) so a sandboxed actor's ordinary `git clone`/`git push` reaches it
+  // over the network, the same shape as talking to GitHub — no bubblewrap
+  // bind needs to expose the host filesystem to make the remote writable.
+  let gitRemoteServer: E2EGitRemoteServer;
+  try {
+    gitRemoteServer = await startE2EGitRemoteServer({
+      repoDir: instance.remotePath,
+      port: gitRemotePort,
+    });
+  } catch (err) {
+    console.error(
+      `❌ failed to start the e2e git remote endpoint: ${err instanceof Error ? err.message : String(err)}`
     );
+    process.exit(1);
   }
 
-  writeFileSync(join(rootDir, PID_FILE), String(process.pid), "utf8");
+  let gitRemoteClosePromise: Promise<void> | undefined;
+  const closeGitRemote = () => {
+    if (!gitRemoteClosePromise) gitRemoteClosePromise = gitRemoteServer.close();
+    return gitRemoteClosePromise;
+  };
+  const closeGitOnExit = () => {
+    void closeGitRemote();
+  };
+  // Install ownership immediately: synchronous setup below can still fail
+  // before runStart takes over the process lifecycle.
+  process.once("exit", closeGitOnExit);
+
+  try {
+    // Resolve clones of the synthetic repo to the loopback endpoint, so a worker
+    // that `git clone`s the GitHub URL transparently hits our throwaway origin.
+    if (!opts.resume) {
+      appendFileSync(
+        join(rootDir, "gitconfig"),
+        [
+          `[url "${gitRemoteServer.url}"]`,
+          `\tinsteadOf = https://github.com/${repo}`,
+          `\tinsteadOf = https://github.com/${repo}.git`,
+          `\tinsteadOf = git@github.com:${repo}.git`,
+          "",
+        ].join("\n"),
+        "utf8"
+      );
+    }
+    writeFileSync(join(rootDir, PID_FILE), String(process.pid), "utf8");
+  } catch (err) {
+    process.removeListener("exit", closeGitOnExit);
+    await closeGitRemote();
+    throw err;
+  }
 
   console.log(`\n🧪 Rusa e2e — actor mesh\n${"━".repeat(30)}\n`);
   console.log(`E2E_ROOT=${rootDir}`);
   console.log(`E2E_HOME=${home}`);
-  console.log(`E2E_REMOTE=${instance.remotePath}`);
+  console.log(`E2E_REMOTE=${gitRemoteServer.url} (${instance.remotePath})`);
   console.log(`E2E_SCRATCH=${instance.scratchPath}`);
 
   // Fakes for the two human-facing edges.
@@ -221,14 +268,34 @@ export async function runActorMeshE2EUp(opts: {
   let trackerServer: { close: () => Promise<void> } | null = null;
   let chatServer: Server | null = null;
   let rootControlServer: Server | null = null;
-  const followerHub = opts.followerGateway
-    ? new FollowerHub(readFileSync(opts.followerGateway.tokenFile, "utf8").trim())
-    : undefined;
-  if (followerHub && opts.followerGateway) {
-    console.log(
-      `FOLLOWER_URL=${await followerHub.listen(opts.followerGateway.host, opts.followerGateway.port)}`
-    );
+  let followerHub: FollowerHub | undefined;
+  try {
+    followerHub = opts.followerGateway
+      ? new FollowerHub(readFileSync(opts.followerGateway.tokenFile, "utf8").trim())
+      : undefined;
+    if (followerHub && opts.followerGateway) {
+      console.log(
+        `FOLLOWER_URL=${await followerHub.listen(opts.followerGateway.host, opts.followerGateway.port)}`
+      );
+    }
+  } catch (err) {
+    process.removeListener("exit", closeGitOnExit);
+    await followerHub?.close();
+    await closeGitRemote();
+    throw err;
   }
+
+  // Belt-and-suspenders: close our extra servers on shutdown (runStart's own
+  // SIGTERM handler exits the process, which also frees them).
+  const closeExtra = () => {
+    void followerHub?.close();
+    void trackerServer?.close();
+    chatServer?.close();
+    rootControlServer?.close();
+    void closeGitRemote();
+  };
+  process.removeListener("exit", closeGitOnExit);
+  process.once("exit", closeExtra);
 
   // Fire-and-forget: runStart keeps the process alive (its mcp/control servers
   // are active handles). onReady fires once every edge is wired.
@@ -240,12 +307,18 @@ export async function runActorMeshE2EUp(opts: {
       createWorkerActor: followerHub ? instanceWorkerFactory(config, followerHub) : undefined,
       dashboard: true,
       quotaApi: createDashboardE2EQuotaApi(),
-      remoteGitDir: instance.remotePath,
       onReady: (handles) => {
         emitGitHubEvent = handles.emitGitHubEvent;
-        void startTrackerServer({ port: trackerPort, tracker }).then((s) => {
-          trackerServer = s;
-        });
+        void startTrackerServer({ port: trackerPort, tracker })
+          .then((s) => {
+            trackerServer = s;
+          })
+          .catch((err) => {
+            console.error(
+              `❌ failed to start the e2e tracker endpoint: ${err instanceof Error ? err.message : String(err)}`
+            );
+            void closeExtra();
+          });
         chatServer = startChatControlServer({ port: chatPort, chatSource, chatClient });
         if (handles.externalRoot) {
           rootControlServer = startRootControlServer({
@@ -265,17 +338,12 @@ export async function runActorMeshE2EUp(opts: {
         });
       },
     },
+  }).catch((err) => {
+    console.error(
+      `❌ failed to start the e2e actor mesh: ${err instanceof Error ? err.message : String(err)}`
+    );
+    void closeExtra();
   });
-
-  // Belt-and-suspenders: close our extra servers on shutdown (runStart's own
-  // SIGTERM handler exits the process, which also frees them).
-  const closeExtra = () => {
-    void followerHub?.close();
-    void trackerServer?.close();
-    chatServer?.close();
-    rootControlServer?.close();
-  };
-  process.on("exit", closeExtra);
 }
 
 /** HTTP controller for an externally driven root. Every mutation uses RootControlService. */

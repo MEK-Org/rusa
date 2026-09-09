@@ -85,6 +85,7 @@ void main() {
           {'provider': 'kimi', 'model': 'kimi-for-coding'},
           {'provider': 'codex', 'model': 'gpt-5.6-sol', 'effort': 'high'},
         ],
+        'modelClass': 'fast',
         'charterPreview': 'c',
         'createdAt': 't0',
       });
@@ -97,6 +98,7 @@ void main() {
       ]);
       expect(t.modelConfig[2].effort, 'high');
       expect(t.modelConfig[0].effort, isNull);
+      expect(t.modelClass, 'fast');
       // Nothing staged is distinct from a staged empty pool.
       expect(t.desiredModelConfig, isNull);
     });
@@ -189,6 +191,131 @@ void main() {
       );
     });
   });
+
+  testWidgets(
+    'the hierarchy names configured classes and keeps explicit-pool fallback',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [
+            makeThread('root', created: 't0'),
+            makeThread(
+              'class-worker',
+              parent: 'root',
+              created: 't1',
+              model: 'claude-opus-5',
+              modelConfig: _pool,
+              modelClass: 'fast',
+            ),
+            makeThread(
+              'explicit-worker',
+              parent: 'root',
+              created: 't2',
+              model: 'claude-opus-5',
+              modelConfig: _pool,
+            ),
+          ];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await tester.pumpWidget(_harness(store));
+        await tester.pump(const Duration(milliseconds: 50));
+
+        expect(find.text('class fast'), findsOneWidget);
+        expect(find.text('claude-opus-5 +2'), findsOneWidget);
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'the hierarchy shows class provenance transitions even when pools are equal',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [
+            makeThread('root', created: 't0'),
+            makeThread(
+              'class-to-class',
+              parent: 'root',
+              created: 't1',
+              model: 'claude-opus-5',
+              desiredModel: 'claude-opus-5',
+              modelConfig: _pool,
+              desiredModelConfig: _pool,
+              modelClass: 'fast',
+              desiredModelClass: 'careful',
+            ),
+            makeThread(
+              'class-to-explicit',
+              parent: 'root',
+              created: 't2',
+              model: 'claude-opus-5',
+              desiredModel: 'claude-opus-5',
+              modelConfig: _pool,
+              desiredModelConfig: _pool,
+              modelClass: 'fast',
+            ),
+          ];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await tester.pumpWidget(_harness(store));
+        await tester.pump(const Duration(milliseconds: 50));
+
+        expect(find.text('class fast → class careful'), findsOneWidget);
+        expect(find.text('class fast → claude-opus-5 +2'), findsOneWidget);
+        expect(
+          tester
+              .widget<Tooltip>(
+                find.ancestor(
+                  of: find.text('class fast → class careful'),
+                  matching: find.byType(Tooltip),
+                ),
+              )
+              .message,
+          contains('Staged for next run:'),
+        );
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'the hierarchy shows default -> desiredModel for an actor with null current model and staged replacement',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [
+            makeThread('root', created: 't0'),
+            makeThread(
+              'null-current-staged',
+              parent: 'root',
+              created: 't1',
+              model: null,
+              desiredModel: 'gpt-5.6-sol',
+              modelConfig: const [],
+              desiredModelConfig: const [
+                ProviderModelConfig(provider: 'codex', model: 'gpt-5.6-sol'),
+              ],
+            ),
+            makeThread(
+              'null-current-unstaged',
+              parent: 'root',
+              created: 't2',
+              model: null,
+              desiredModel: null,
+              modelConfig: const [],
+            ),
+          ];
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        await tester.pumpWidget(_harness(store));
+        await tester.pump(const Duration(milliseconds: 50));
+
+        expect(find.text('default → gpt-5.6-sol'), findsOneWidget);
+        await store.dispose();
+      });
+    },
+  );
 
   testWidgets('detail panel lists every configured candidate in order', (
     tester,

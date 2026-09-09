@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { compactPortableContext } from "../commands/start.js";
 import * as dbIdx from "../db/index.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import { createActorRunModelConfig } from "../db/repositories/actor-run-model-config.js";
 import {
   ActorRunRepository,
   type PortableLedgerSource,
@@ -1511,7 +1512,11 @@ describe("compactPortableContext integration (spec 6b)", () => {
     });
   const recordYield = (body: string, status: "complete" | "blocked"): string => {
     const ts = nextTimestamp();
-    const id = actorRuns.start({ actorId: "actor-a", startedAt: ts });
+    const id = actorRuns.start({
+      actorId: "actor-a",
+      startedAt: ts,
+      modelConfig: createActorRunModelConfig({ provider: "fake", model: "test-model" }),
+    });
     actorRuns.recordYield(id, status, body, ts);
     actorRuns.complete(id, { endedAt: ts, success: true, exitCode: 0, output: body });
     return id;

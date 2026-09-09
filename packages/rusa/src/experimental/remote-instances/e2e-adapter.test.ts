@@ -20,7 +20,7 @@ function configWith(providers: RusaConfig["providers"]): RusaConfig {
     github: { account: "test-bot" },
     webhook: { port: 0, secret: "test-secret" },
     providers,
-    rootActor: { provider: "codex" },
+    rootActor: { provider: "codex", model: "gpt-5.6-sol" },
   };
 }
 

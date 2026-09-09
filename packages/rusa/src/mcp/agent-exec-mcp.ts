@@ -11,6 +11,7 @@ import type { ActorWakeScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
 import type { ModelClassRepository } from "../db/repositories/model-class-repository.js";
+import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
 import type { ConcreteModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
 import { githubBranchReference } from "../references/reference.js";
 import { toolError, toolOk } from "./result.js";
@@ -76,6 +77,8 @@ const concreteModelConfigSchema = z.union([
   z.array(providerModelConfigSchema).min(1),
 ]);
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * The agent-execution MCP server — the actor mesh's primitive (design B.4)
  * exposed as tools: spawn children, message any thread you hold a handle to,
@@ -100,6 +103,8 @@ export function createAgentExecMcpServer(
     modelClasses?: Pick<ModelClassRepository, "list" | "upsert" | "delete">;
     /** Config-aware concrete tuple validation at the management boundary. */
     validateModelClass?: (input: ConcreteModelConfigInput) => ProviderModelConfig[];
+    /** List of connected followers available for remote placement. */
+    getFollowers?: () => FollowerInfo[];
   }
 ): McpServer {
   const server = createMcpServer(
@@ -266,15 +271,22 @@ export function createAgentExecMcpServer(
           .describe(
             "Who owns the child's memory between runs. Omit (or 'native') for the default: the provider keeps the session and resumes it. 'ledger' and 'tail' hand ownership to the mesh — the child is called FRESH every run with its own recent history injected into the prompt, so it survives provider quota exhaustion and can be re-mounted on a different harness. 'ledger' keeps a rolling compacted digest plus recent messages and is the one to reach for; 'tail' is a raw window that never compacts. Incompatible with conversation_id."
           ),
+        target: z
+          .string()
+          .optional()
+          .describe(
+            "Execution follower/instance to run this actor on (e.g. 'mac-mini'). Omit to execute locally on this machine."
+          ),
       },
     },
-    async ({ charter, model_config, conversation_id, title, context_mode }) => {
+    async ({ charter, model_config, conversation_id, title, context_mode, target }) => {
       try {
         const context = resolveContextSelection(context_mode);
         const id =
           selfId === rootId && options?.rootControl
             ? options.rootControl.spawnChild(
                 {
+                  executionTarget: target,
                   charter,
                   modelConfig: model_config,
                   conversationId: conversation_id,
@@ -284,6 +296,7 @@ export function createAgentExecMcpServer(
                 "root-llm"
               )
             : mesh.spawn({
+                executionTarget: target,
                 charter,
                 parentId: selfId,
                 modelConfig: model_config,
@@ -295,6 +308,26 @@ export function createAgentExecMcpServer(
       } catch (err) {
         return toolError(err);
       }
+    }
+  );
+
+  server.registerTool(
+    "list_followers",
+    {
+      title: "List connected followers",
+      description:
+        "List all connected follower instances available for remote actor placement via spawn_thread target.",
+      inputSchema: {},
+    },
+    async () => {
+      const followers = (options?.getFollowers?.() ?? []).map((f) => ({
+        id: f.id,
+        platform: f.platform,
+        pid: f.pid,
+        actors: [...f.actors],
+        lastSeen: f.lastSeen,
+      }));
+      return toolOk({ followers });
     }
   );
 
@@ -474,42 +507,52 @@ export function createAgentExecMcpServer(
     {
       title: "List your direct reports",
       description:
-        "List the child threads you've spawned, with their charter summary, status, and " +
+        "List the child threads you've spawned, with their charter summary, status, handle, declared model pool, context portability, and " +
         "whether each one has a run in flight right now — your org chart for deciding what " +
-        "to follow up on or retire. A child whose run_state is 'running', 'winding_down', or 'queued' is " +
+        "to follow up on, inspect, or retire. Supply `handle` to resolve a specific direct child. A child whose run_state is 'running', 'winding_down', or 'queued' is " +
         "mid-work: retiring it would abandon that run, and the attempt will be refused.",
-      inputSchema: {},
+      inputSchema: {
+        handle: z
+          .string()
+          .optional()
+          .describe(
+            "Optional direct-child handle to resolve. When provided, returns only the matching direct report, or fails if the handle is unknown or ambiguous."
+          ),
+      },
     },
-    async () => {
+    async ({ handle }) => {
       try {
-        // `run_state` is here because its absence is half of what caused ISSUE_NUM: a parent
-        // deciding which of two look-alike children to retire could see their charters
-        // and their status, but nothing that distinguished a thread mid-build from an
-        // idle one. The retire refusal is the guard; this is the information that stops
-        // the parent forming the intent in the first place.
+        let childRecords = mesh.list().filter((r) => r.parentId === selfId);
+        if (handle !== undefined) {
+          childRecords = [mesh.resolveDirectChildHandle(selfId, handle)];
+        }
+
         const runStates = mesh.listChildRunStates(selfId);
-        const children = mesh
-          .list()
-          .filter((r) => r.parentId === selfId)
-          .map((r) => {
-            const runState = runStates.get(r.id) ?? "idle";
-            const selection = runState === "queued" ? mesh.getSelection(r.id) : undefined;
-            return {
-              thread_id: r.id,
-              charter: summarizeCharter(r.charter),
-              status: r.status,
-              run_state: runState,
-              ...(selection
-                ? {
-                    selected_provider: selection.provider,
-                    selected_lane: selection.lane,
-                    selected_model: selection.model,
-                    selected_effort: selection.effort,
-                    eligible_at: selection.eligibleAt,
-                  }
-                : {}),
-            };
-          });
+        const children = childRecords.map((r) => {
+          const runState = runStates.get(r.id) ?? "idle";
+          const selection = runState === "queued" ? mesh.getSelection(r.id) : undefined;
+          return {
+            thread_id: r.id,
+            handle: mesh.getActorHandle(r.id),
+            charter: summarizeCharter(r.charter),
+            status: r.status,
+            run_state: runState,
+            model_config: r.modelConfig ?? [],
+            ...(r.desiredModelConfig !== undefined
+              ? { desired_model_config: r.desiredModelConfig }
+              : {}),
+            context: r.context ?? { type: "native" },
+            ...(selection
+              ? {
+                  selected_provider: selection.provider,
+                  selected_lane: selection.lane,
+                  selected_model: selection.model,
+                  selected_effort: selection.effort,
+                  eligible_at: selection.eligibleAt,
+                }
+              : {}),
+          };
+        });
         return toolOk(children);
       } catch (err) {
         return toolError(err);
@@ -725,7 +768,7 @@ export function createAgentExecMcpServer(
         "A pool of more than one entry, or a change of provider, is only permitted for portable (ledger/tail) actors. " +
         "Preserves the actor's accumulated context and session history.",
       inputSchema: {
-        actor_id: z.string().describe("The actor's id to update."),
+        actor_id: z.string().describe("The actor's thread id (or direct child handle) to update."),
         model_config: modelConfigSchema.describe(
           'The full replacement provider/model/effort choice(s), in earliest-available order — replaces the entire current pool. `{"class": "<name>"}` names a runtime-managed model class and expands to its currently committed pool. A class reference always replaces the whole pool, so it cannot be used for an effort-only or model-only partial update.'
         ),
@@ -733,8 +776,26 @@ export function createAgentExecMcpServer(
     },
     async ({ actor_id, model_config }) => {
       try {
-        mesh.setActorModel(actor_id, model_config, selfId);
-        return toolOk(`staged modelConfig update for ${actor_id}`);
+        let targetId = actor_id;
+        try {
+          mesh.setActorModel(targetId, model_config, selfId);
+        } catch (err) {
+          if (
+            err instanceof Error &&
+            err.message.startsWith("Cannot set model on unknown thread")
+          ) {
+            if (!UUID_REGEX.test(actor_id)) {
+              const child = mesh.resolveDirectChildHandle(selfId, actor_id);
+              targetId = child.id;
+              mesh.setActorModel(targetId, model_config, selfId);
+            } else {
+              throw err;
+            }
+          } else {
+            throw err;
+          }
+        }
+        return toolOk(`staged modelConfig update for ${targetId}`);
       } catch (err) {
         return toolError(err);
       }

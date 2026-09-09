@@ -1,6 +1,12 @@
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js";
+import type { AtIo } from "../../actor/at-queue.js";
+import { type CrontabIo, CrontabMutator } from "../../actor/crontab.js";
+import {
+  DefaultOsScheduler,
+  type ObligationActivationRecord,
+  type ObligationActivationScheduler,
+} from "../../actor/os-scheduler.js";
 import type { Obligation } from "../../obligations/obligation.js";
 import { asGitHubIssue } from "../../references/reference.js";
 import { obligations } from "../migrations/0016_obligations.js";
@@ -17,6 +23,7 @@ import { ObligationRepository } from "./obligation-repository.js";
 class FakeObligationScheduler implements ObligationActivationScheduler {
   activations = new Map<string, { kind: "cron"; cronExpr: string } | { kind: "at"; date: Date }>();
   cancelled: string[] = [];
+  readonly instanceId = "test-instance";
   scheduleObligationActivation(
     id: string,
     time: { kind: "cron"; cronExpr: string } | { kind: "at"; date: Date }
@@ -27,8 +34,11 @@ class FakeObligationScheduler implements ObligationActivationScheduler {
     this.cancelled.push(id);
     this.activations.delete(id);
   }
-  listObligationActivations(): string[] {
-    return Array.from(this.activations.keys());
+  listObligationActivations(): ObligationActivationRecord[] {
+    return Array.from(this.activations.keys()).map((id) => ({
+      id,
+      instanceId: this.instanceId,
+    }));
   }
 }
 
@@ -2261,6 +2271,22 @@ describe("ObligationRepository", () => {
         expect(scheduler.activations.has("ghost-id")).toBe(false);
       });
 
+      it("does not cancel an orphaned OS activation belonging to a foreign instance", () => {
+        // Scheduler reports an orphaned entry belonging to another instance
+        scheduler.listObligationActivations = () => [
+          { id: "foreign-id", instanceId: "other-instance" },
+        ];
+        repository.reconcileScheduledObligations();
+        expect(scheduler.cancelled).not.toContain("foreign-id");
+      });
+
+      it("does not cancel a legacy unscoped OS activation without an instance component", () => {
+        // Scheduler reports a legacy unscoped entry
+        scheduler.listObligationActivations = () => [{ id: "legacy-id", instanceId: undefined }];
+        repository.reconcileScheduledObligations();
+        expect(scheduler.cancelled).not.toContain("legacy-id");
+      });
+
       it("keeps reconciling other rows when one row's OS scheduler call fails (e.g. `at` confirmed unavailable)", () => {
         repository.create({ title: "iv", id: "rec-2", ownerId: "actor-a", intent: "recur" });
         repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
@@ -2886,5 +2912,253 @@ describe("ObligationRepository", () => {
       repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
       expect(() => repository.removePrerequisite("dependent", "prereq")).not.toThrow();
     });
+  });
+});
+
+describe("multi-instance crontab reconciliation (#304)", () => {
+  const setupDb = (): Database.Database => {
+    const d = new Database(":memory:");
+    d.pragma("foreign_keys = ON");
+    obligations.up(d);
+    obligationPriority.up(d);
+    obligationTimestamps.up(d);
+    obligationTerminalNote.up(d);
+    obligationTitle.up(d);
+    obligationArtifacts.up(d);
+    recurringObligations.up(d);
+    obligationDependencies.up(d);
+    return d;
+  };
+
+  const createFixture = () => {
+    const prodDb = setupDb();
+    const stagingDb = setupDb();
+    const now = Date.now();
+    const nowFn = () => now;
+
+    let sharedCrontab = "";
+    const sharedCrontabIo: CrontabIo = {
+      read: () => sharedCrontab,
+      write: (data: string) => {
+        sharedCrontab = data;
+      },
+    };
+
+    const sharedAtJobs: { id: string; script: string; date: Date }[] = [];
+    let nextAtId = 1;
+    const makeAtIo = (): AtIo => ({
+      schedule: vi.fn((script: string, date: Date) => {
+        const id = String(nextAtId++);
+        sharedAtJobs.push({ id, script, date });
+        return id;
+      }),
+      list: vi.fn(() => [...sharedAtJobs]),
+      remove: vi.fn((id: string) => {
+        const idx = sharedAtJobs.findIndex((j) => j.id === id);
+        if (idx !== -1) sharedAtJobs.splice(idx, 1);
+      }),
+    });
+
+    const prodScheduler = new DefaultOsScheduler(new CrontabMutator(sharedCrontabIo), makeAtIo(), {
+      tokenFile: "/prod/token",
+      portFile: "/prod/port",
+      instanceId: "/srv/rusa-prod",
+    });
+
+    const stagingScheduler = new DefaultOsScheduler(
+      new CrontabMutator(sharedCrontabIo),
+      makeAtIo(),
+      {
+        tokenFile: "/staging/token",
+        portFile: "/staging/port",
+        instanceId: "/srv/rusa-staging",
+      }
+    );
+
+    const prodRepo = new ObligationRepository(prodDb, () => true, nowFn);
+    prodRepo.setOsScheduler(prodScheduler);
+
+    const stagingRepo = new ObligationRepository(stagingDb, () => true, nowFn);
+    stagingRepo.setOsScheduler(stagingScheduler);
+
+    // Baseline unmanaged / foreign contents:
+    const userLine1 = "0 1 * * * /usr/local/bin/daily-backup\n";
+    const userLine2 = "*/10 * * * * /usr/local/bin/metrics-collector\n";
+    const wakeLine =
+      "# mc-wake:system-monitor\n0 2 * * * curl -fsS http://127.0.0.1:8000/wake -d actorId=system-monitor -d reason=hourly\n";
+    const legacyBlock =
+      "# mc-obligation-activation:legacy-ob-1\n" +
+      "CRON_TZ=UTC\n" +
+      "30 3 * * * curl -fsS http://127.0.0.1:9000/wake-obligation -d 'id=legacy-ob-1'\n" +
+      'CRON_TZ=""\n' +
+      "# mc-obligation-activation-end:legacy-ob-1\n";
+
+    // Seed crontab with baseline
+    sharedCrontab = userLine1 + wakeLine + legacyBlock + userLine2;
+
+    // Seed shared at with a legacy at job
+    sharedAtJobs.push({
+      id: "legacy-at-1",
+      script: "# mc-obligation-activation:legacy-ob-at\ncurl wake\n",
+      date: new Date(now + 100000),
+    });
+
+    // Create obligations in prod DB:
+    prodRepo.create({
+      title: "Prod Active",
+      id: "prod-active",
+      ownerId: "actor-a",
+      intent: "prod",
+    });
+    prodRepo.setRecurrence("prod-active", { policy: "cron", cronExpr: "45 8 * * *" });
+
+    prodRepo.create({
+      title: "Prod Stale",
+      id: "prod-stale",
+      ownerId: "actor-a",
+      intent: "prod-stale",
+    });
+    prodRepo.setRecurrence("prod-stale", { policy: "cron", cronExpr: "0 5 * * *" });
+
+    // Create obligations in staging DB:
+    stagingRepo.create({
+      title: "Staging Active",
+      id: "staging-active",
+      ownerId: "actor-a",
+      intent: "staging",
+    });
+    stagingRepo.setRecurrence("staging-active", { policy: "cron", cronExpr: "0 12 * * *" });
+
+    stagingRepo.create({
+      title: "Staging Stale",
+      id: "staging-stale",
+      ownerId: "actor-a",
+      intent: "staging-stale",
+    });
+    stagingRepo.setRecurrence("staging-stale", { policy: "cron", cronExpr: "0 18 * * *" });
+
+    // Mark stale obligations in DBs:
+    prodRepo.setTerminalStatus("prod-stale", "cancelled");
+    stagingRepo.setTerminalStatus("staging-stale", "cancelled");
+
+    // Re-arm stale blocks in the shared crontab to simulate an existing un-swept state before boot:
+    prodScheduler.scheduleObligationActivation("prod-stale", {
+      kind: "cron",
+      cronExpr: "0 5 * * *",
+    });
+    stagingScheduler.scheduleObligationActivation("staging-stale", {
+      kind: "cron",
+      cronExpr: "0 18 * * *",
+    });
+
+    // Add stale at-jobs
+    sharedAtJobs.push({
+      id: "prod-at-stale",
+      script:
+        "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhLXByb2Q:cHJvZC1hdC1zdGFsZQ\ncurl wake\n",
+      date: new Date(now + 200000),
+    });
+    sharedAtJobs.push({
+      id: "staging-at-stale",
+      script:
+        "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhLXN0YWdpbmc:c3RhZ2luZy1hdC1zdGFsZQ\ncurl wake\n",
+      date: new Date(now + 300000),
+    });
+
+    const prodActiveBlock =
+      "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhLXByb2Q:cHJvZC1hY3RpdmU\n" +
+      "CRON_TZ=UTC\n" +
+      '45 8 * * * /usr/bin/curl -fsS -H "Authorization: Bearer $(cat /prod/token)" "http://127.0.0.1:$(cat /prod/port)/wake-obligation" -d \'id=prod-active\'\n' +
+      'CRON_TZ=""\n' +
+      "# mc-obligation-activation-instance-end:v1:L3Nydi9ydXNhLXByb2Q:cHJvZC1hY3RpdmU";
+
+    const stagingActiveBlock =
+      "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhLXN0YWdpbmc:c3RhZ2luZy1hY3RpdmU\n" +
+      "CRON_TZ=UTC\n" +
+      '0 12 * * * /usr/bin/curl -fsS -H "Authorization: Bearer $(cat /staging/token)" "http://127.0.0.1:$(cat /staging/port)/wake-obligation" -d \'id=staging-active\'\n' +
+      'CRON_TZ=""\n' +
+      "# mc-obligation-activation-instance-end:v1:L3Nydi9ydXNhLXN0YWdpbmc:c3RhZ2luZy1hY3RpdmU";
+
+    const prodStaleTag =
+      "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhLXByb2Q:cHJvZC1zdGFsZQ";
+    const stagingStaleTag =
+      "# mc-obligation-activation-instance:v1:L3Nydi9ydXNhLXN0YWdpbmc:c3RhZ2luZy1zdGFsZQ";
+
+    return {
+      prodRepo,
+      stagingRepo,
+      prodDb,
+      stagingDb,
+      userLine1,
+      userLine2,
+      wakeLine,
+      legacyBlock,
+      prodActiveBlock,
+      stagingActiveBlock,
+      prodStaleTag,
+      stagingStaleTag,
+      getCrontab: () => sharedCrontab,
+      getAtJobs: () => [...sharedAtJobs],
+    };
+  };
+
+  const cronBlock = (crontab: string, tag: string): string => {
+    const endTag = tag.replace(
+      "# mc-obligation-activation-instance:",
+      "# mc-obligation-activation-instance-end:"
+    );
+    const start = crontab.indexOf(tag);
+    const end = crontab.indexOf(endTag, start);
+    if (start === -1 || end === -1) throw new Error(`missing test cron block ${tag}`);
+    return crontab.slice(start, end + endTag.length);
+  };
+
+  it.each([
+    ["prod then staging", "prod", "staging"],
+    ["staging then prod", "staging", "prod"],
+  ] as const)("preserves foreign blocks and removes own stale work: %s", (_order, firstName, secondName) => {
+    const f = createFixture();
+    const instance = (name: "prod" | "staging") =>
+      name === "prod"
+        ? {
+            repo: f.prodRepo,
+            activeBlock: f.prodActiveBlock,
+            staleTag: f.prodStaleTag,
+            staleAtId: "prod-at-stale",
+          }
+        : {
+            repo: f.stagingRepo,
+            activeBlock: f.stagingActiveBlock,
+            staleTag: f.stagingStaleTag,
+            staleAtId: "staging-at-stale",
+          };
+    const first = instance(firstName);
+    const second = instance(secondName);
+    const initialAtScripts = new Map(f.getAtJobs().map((job) => [job.id, job.script]));
+    const commonForeignBlocks = [f.userLine1, f.wakeLine, f.legacyBlock, f.userLine2];
+    const foreignStaleBlock = cronBlock(f.getCrontab(), second.staleTag);
+    const assertBlocksUnchanged = (blocks: string[]) => {
+      for (const block of blocks) expect(f.getCrontab()).toContain(block);
+    };
+    const assertAtUnchanged = (id: string) => {
+      expect(f.getAtJobs().find((job) => job.id === id)?.script).toBe(initialAtScripts.get(id));
+    };
+
+    first.repo.reconcileScheduledObligations();
+
+    expect(f.getCrontab()).not.toContain(first.staleTag);
+    expect(f.getCrontab()).toContain(first.activeBlock);
+    assertBlocksUnchanged([...commonForeignBlocks, second.activeBlock, foreignStaleBlock]);
+    expect(f.getAtJobs().some((job) => job.id === first.staleAtId)).toBe(false);
+    assertAtUnchanged(second.staleAtId);
+    assertAtUnchanged("legacy-at-1");
+
+    second.repo.reconcileScheduledObligations();
+
+    expect(f.getCrontab()).not.toContain(second.staleTag);
+    expect(f.getCrontab()).toContain(second.activeBlock);
+    assertBlocksUnchanged([...commonForeignBlocks, first.activeBlock]);
+    expect(f.getAtJobs().some((job) => job.id === second.staleAtId)).toBe(false);
+    assertAtUnchanged("legacy-at-1");
   });
 });

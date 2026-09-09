@@ -64,7 +64,7 @@ export function buildE2EConfig(opts: {
 }): RusaConfig {
   const base = opts.baseConfig ?? null;
   return {
-    ...(opts.rootActor ? { rootActor: opts.rootActor } : {}),
+    rootActor: opts.rootActor ?? base?.rootActor ?? { provider: "fake", model: "fake-model" },
     ...(opts.chat ? { chat: opts.chat } : {}),
     github: {
       account: E2E_BOT,

@@ -290,16 +290,15 @@ export interface LoggingConfig {
 export interface RootActorConfig {
   /**
    * Which configured provider the root actor runs on — a key in `providers`
-   * (e.g. "antigravity", "claude"). Defaults to "antigravity" (the `agy` CLI).
-   * The root model is config-driven and intentionally independent of the
-   * persona/quota model routing.
+   * (e.g. "antigravity", "claude"). The root model is config-driven and
+   * intentionally independent of persona/quota model routing.
    */
   provider: string;
   /**
-   * Optional model id for the root provider (passed to the CLI's --model).
-   * Omit to use the provider's own default model.
+   * Exact model id for the root provider, passed to the CLI. Root launches are
+   * always pinned so their durable launch record is auditable.
    */
-  model?: string;
+  model: string;
   /**
    * Optional provider-native reasoning level, independent of `model`.
    * Omit to preserve the provider/model default.
@@ -375,7 +374,7 @@ export interface RusaConfig {
   /** Mistral API key. Optional; grantable to sandboxed actors as MISTRAL_API_KEY. */
   mistralApiKey?: string;
   webhook: WebhookConfig;
-  /** Which provider/model the root actor runs on (optional; defaults to agy). */
+  /** Explicit provider/model selection for the root actor. */
   rootActor?: RootActorConfig;
   /** Google Chat inbound/outbound integration (optional; disabled if absent). */
   chat?: ChatConfig;
@@ -405,6 +404,18 @@ export interface RusaConfig {
   gitBridgePort?: number;
   /** Host/interface the local Git HTTP server binds to (default: 127.0.0.1). */
   gitBridgeBindHost?: string;
+  /** Follower gateway configuration for remote worker placement. Off by default. */
+  followers?: FollowerGatewayConfig;
+}
+
+/** Configuration for hosting remote followers on a persistent leader instance. */
+export interface FollowerGatewayConfig {
+  /** Tailscale IPv4 address or loopback to bind the follower gateway to. Never public/0.0.0.0. */
+  bind: string;
+  /** TCP port for the follower gateway HTTP server (e.g. 8190). */
+  port: number;
+  /** Path to the enrollment token secret file. */
+  tokenFile: string;
 }
 
 /** Tunables for the actor mesh's safety governors; all fields optional. */

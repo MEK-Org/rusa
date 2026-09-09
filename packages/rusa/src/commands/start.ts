@@ -3,6 +3,8 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -86,7 +88,7 @@ import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-thro
 import { resolveRootActorId } from "../actor/root-actor-id.js";
 import { RootControlService } from "../actor/root-control.js";
 import { buildRootPrompt } from "../actor/root-prompt.js";
-import { createRunAccounting } from "../actor/run-accounting.js";
+import { createRunAccounting, projectActorRunLaunchConfig } from "../actor/run-accounting.js";
 import {
   ensureWakeToken,
   wakePortPath,
@@ -126,6 +128,8 @@ import type {
 } from "../db/repositories/obligation-repository.js";
 import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
+import { instanceWorkerFactory } from "../experimental/remote-instances/e2e-adapter.js";
+import { FollowerHub } from "../experimental/remote-instances/follower-hub.js";
 import {
   checkSuiteWakesAnyone,
   deriveGitHubInboxNotification,
@@ -197,7 +201,6 @@ import {
 } from "../providers/model-config.js";
 import { refreshConfiguredProviderModelCatalogs } from "../providers/model-scrape.js";
 import {
-  DEFAULT_ROOT_PROVIDER,
   normalizeFallbackModel,
   providerCapabilityName,
   providerThrottleKey,
@@ -515,14 +518,6 @@ export interface RunStartE2EHooks {
   dashboard?: boolean;
   /** Optional deterministic quota source for dashboard scenarios; production never sets this. */
   quotaApi?: QuotaApiDeps;
-  /**
-   * The e2e harness's disposable bare-remote git dir (or its narrowly scoped
-   * shared git directory). When set, every sandboxed actor spawned in this
-   * instance — root and workers alike — gets it as an explicit writable bind,
-   * so a sandboxed actor's `git push` to the local scratch remote succeeds.
-   * Production never sets this.
-   */
-  remoteGitDir?: string;
   onReady?: (handles: RunStartE2EHandles) => void;
 }
 
@@ -796,6 +791,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     process.exit(1);
     return;
   }
+  const rootActor = config.rootActor;
+  if (!rootActor) {
+    throw new Error("config loader returned no rootActor after validating root configuration");
+  }
   // Config is parsed: its credentials join the scrub set (which `bootLog` shares
   // through the same closure) and its configured level takes effect.
   const configSecretEntries = collectConfigSecretEntries(config);
@@ -871,6 +870,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     {
       tokenFile: wakeTokenPath(mcHome),
       portFile: wakePortPath(mcHome),
+      // Database initialization above creates the home when needed; resolving
+      // it here makes relative spellings and symlink aliases one owner.
+      instanceId: realpathSync(mcHome),
     }
   );
   const wakeToken = ensureWakeToken(mcHome);
@@ -1216,7 +1218,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // Emergency brake: the single source of truth is the sentinel file. Halt by
   // hand (`touch ~/.rusa/HALT`), by chat (`/halt`), or pull the plug.
   const haltSwitch = new HaltSwitch(join(mcHome, "HALT"));
-  const rootProviderName = config.rootActor?.provider?.trim() || DEFAULT_ROOT_PROVIDER;
+  const rootProviderName = rootActor.provider;
   const isProviderHalted = (providerName?: string) =>
     haltSwitch.isHalted(providerName ?? rootProviderName);
   let haltExpiryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1272,6 +1274,21 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       providerPacers.set(providerName, pacer);
     }
     return pacer;
+  };
+  // Admission only reads the canonical provider-wide weekly observation that
+  // already feeds quota pacing. No quota probe is initiated on a run path;
+  // absent or stale evidence is deliberately left for submitPoolGate's
+  // declared-order fallback.
+  const weeklyQuotaFor = (providerName: string) => {
+    const bucket = sharedQuotaStore
+      ?.getProviderThrottle(providerName)
+      ?.buckets.find((candidate) => candidate.key === `${providerName}:weekly`);
+    if (!bucket?.resetAtIso) return undefined;
+    return {
+      percentLeft: bucket.percentLeft,
+      observedAt: bucket.observedAt,
+      resetAtIso: bucket.resetAtIso,
+    };
   };
   const quotaThrottleStatuses = new Map<QuotaThrottleProvider, QuotaThrottleStatus>();
   const recordQuotaThrottleTick = (
@@ -1474,6 +1491,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const calendarClients = new GoogleCalendarClientProvider(config.chat?.gchatConfigDir);
   const driveClients = new GoogleDriveClient(config.chat?.gchatConfigDir);
   const commitmentPolarityEvaluator = createCommitmentPolarityEvaluator(config.geminiApiKey);
+  // The one live attribution source: populated only for an actual provider
+  // attempt (including fallbacks), and cleared by every terminal run hook.
+  const activeRunSelections = new Map<string, RawProviderModelConfig>();
   const grantableServers = buildGrantableServers({
     // The nightly-report producer  writes the run-journal / rendered reports /
     // index.json instance-side under <mcHome>/iu-distiller/reports/ — colocated with the
@@ -1541,6 +1561,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }),
     chatClient: chatClient ?? undefined,
     onChatWrite: (actorId) => mesh.markUnkillable(actorId),
+    getRunSelectionForActor: (id) => activeRunSelections.get(id),
     // Confines chat-write attachment filePaths to the grantee's workdir — same
     // mapping the pnpm-install and root wiring use for actor roots.
     actorRootFor: (actorId) =>
@@ -1646,14 +1667,52 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     }
   };
 
+  // ── Follower gateway: persistent remote execution nodes ──
+  let followerHub: FollowerHub | undefined;
+  if (config.followers) {
+    const tokenFile = config.followers.tokenFile;
+    let token: string;
+    try {
+      if (process.platform !== "win32") {
+        const stats = statSync(tokenFile);
+        if ((stats.mode & 0o077) !== 0) {
+          log.warn("follower_token_file_insecure_permissions", {
+            tokenFile,
+            mode: (stats.mode & 0o777).toString(8),
+            hint: "tokenFile should be readable only by its owner (e.g. chmod 0600)",
+          });
+        }
+      }
+      token = readFileSync(tokenFile, "utf8").trim();
+    } catch (err) {
+      throw new Error(
+        `Failed to read follower tokenFile '${tokenFile}': ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    followerHub = new FollowerHub(token, { logger: log });
+    await followerHub.listen(config.followers.bind, config.followers.port);
+    log.info("follower_gateway_started", {
+      bind: config.followers.bind,
+      port: config.followers.port,
+    });
+  }
+
+  const followerWorkerFactory = followerHub
+    ? instanceWorkerFactory(config, followerHub, { logger: log })
+    : undefined;
+  const createWorkerActor = opts?.e2e?.createWorkerActor ?? followerWorkerFactory;
+
   // ── Actor mesh: the root plus any worker threads it spawns ──
   const mesh: ActorMesh = new ActorMesh({
     actors,
     rootId,
-    // Placement exists only while the experimental remote-instance seam is
-    // wired (the E2E rig supplies it). Production leaves it unset, so an
-    // `executionTarget` is rejected at the spawn choke point.
-    supportsExecutionTarget: opts?.e2e?.createWorkerActor ? () => true : undefined,
+    // Placement exists when an experimental remote-instance seam or follower gateway
+    // is wired. Unknown or disconnected targets fail closed.
+    supportsExecutionTarget: opts?.e2e?.createWorkerActor
+      ? () => true
+      : followerHub
+        ? (target: string) => followerHub.list().some((f) => f.id === target)
+        : undefined,
     validateSpawn: (req) => {
       // Portable-context refusals  live here, at the mesh's single spawn
       // choke point, so the MCP tool, root control, the dashboard and the A/B rig
@@ -1662,9 +1721,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         ledgerCompactionAvailable: portableContextApiKey !== null,
       });
       // Named model classes resolve from the current committed database row
-      // here, before validation: spawns arriving via root control are already
-      // resolved, so this call is identity for them and expansion for every
-      // other spawn path.
+      // here, before validation. Spawns arriving via root control retain their
+      // original declaration so the mesh can derive class provenance directly,
+      // and this call expands that declaration alongside every other spawn path.
       return validateModelConfigPool(config, resolveModelClasses(modelClasses, req.modelConfig), {
         portable: req.context?.type === "portable",
       });
@@ -1727,17 +1786,18 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     grantableCapabilities: new Set([...grantableServers.keys(), ...PARENT_GRANTABLE_CAPABILITIES]),
     maxConcurrent: config.mesh?.maxConcurrent,
     providerGate: (fn, candidates, request) => {
-      const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => ({
-        config: c,
-        lane: providerThrottleKey(c.provider, config),
-        pacer: pacerFor(providerThrottleKey(c.provider, config)),
-      }));
-      // submitPoolGate owns both selection rules: normal requests quote every
-      // healthy lane and reserve the earliest (declaration order breaking
-      // ties); responsive requests bypass pacing and take the first healthy
-      // declared candidate, and its own `promote()` re-runs that same
-      // first-healthy-declared selection rather than merely promoting
-      // whichever lane was first reserved.
+      const lanes: PoolLaneCandidate<RawProviderModelConfig>[] = candidates.map((c) => {
+        const lane = providerThrottleKey(c.provider, config);
+        return {
+          config: c,
+          lane,
+          pacer: pacerFor(lane),
+          weeklyQuota: weeklyQuotaFor(lane),
+        };
+      });
+      // submitPoolGate owns selection for both priorities: normal work quotes
+      // healthy lanes and responsive work makes that same selection, then
+      // bypasses provider and mesh pacing after its lane is reserved.
       return submitPoolGate((selected) => fn(selected), lanes, {
         responsive: request.responsive,
         threadId: request.threadId,
@@ -1871,9 +1931,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       // to the root provider.
       const modelConfigPool: readonly RawProviderModelConfig[] = rec.modelConfig ?? [
         {
-          provider: config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER,
-          model: config.rootActor?.model,
-          effort: config.rootActor?.effort,
+          provider: rootActor.provider,
+          model: rootActor.model,
+          effort: rootActor.effort,
         },
       ];
       try {
@@ -1911,7 +1971,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
 
       try {
         const isFenced = () => mesh.isYielded(id);
-        let activeRunSelection: RawProviderModelConfig | undefined;
         // A per-actor agent-execution endpoint, with this actor's identity baked in.
         const meshUrl = mcpHttp.addServer(id, () =>
           createAgentExecMcpServer(mesh, id, rootId, undefined, {
@@ -1919,6 +1978,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
               mesh.markUnkillable(id);
             },
             isFenced,
+            getFollowers: () => (followerHub ? followerHub.list() : []),
           })
         );
         const inboxUrl = mcpHttp.addServer(`${id}:${INBOX_MCP_NAME}`, () =>
@@ -1976,7 +2036,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             },
             onWrite: () => webhookSilenceDetector?.recordOutboundWrite(),
             instanceId: rootHandle,
-            getRunSelection: () => activeRunSelection,
+            getRunSelection: () => activeRunSelections.get(id),
             isFenced,
             // Mechanically hand the created issue/PR's exact event source to its
             // creator : follow-up events route here, not the repo/org
@@ -2080,7 +2140,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           mcpServers: workerMcp,
           addDirs: [],
           sandbox,
-          e2eWritableRemoteDir: opts?.e2e?.remoteGitDir,
           prepareUnderstandingMount: understandingMountEnabled
             ? async () => {
                 const client = await localWriteDeps.getClient();
@@ -2170,16 +2229,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           onRuntimeStateChanged: ctx.onRuntimeStateChanged,
           onRunStart: (responsive, injectRecord, selected) => {
             lastSelected = selected;
-            activeRunSelection = selected;
             // The run actually launched: the queued reservation this
             // describes no longer exists to cancel or report on.
             mesh.clearSelection(id);
-            const providerName = providerThrottleKey(selected.provider, config);
-            const runId = beginActorRun(id, providerName);
+            const launchConfig = projectActorRunLaunchConfig(selected);
+            const runId = beginActorRun(id, launchConfig);
             runLogger(id, runId).info("run_start", {
-              provider: providerName,
-              model: selected.model,
-              effort: selected.effort,
+              provider: launchConfig.provider,
+              model: launchConfig.model,
+              effort: launchConfig.effort,
               responsive,
             });
             mesh.recordEvent({
@@ -2190,20 +2248,20 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                 : undefined,
               body: injectRecord ? JSON.stringify(injectRecord) : undefined,
               payload: JSON.stringify({
-                provider: providerName,
-                model: selected.model,
-                effort: selected.effort,
+                provider: launchConfig.provider,
+                model: launchConfig.model,
+                effort: launchConfig.effort,
                 responsive,
                 runId,
               }),
             });
           },
           onProviderAttempt: (attempt) => {
-            activeRunSelection = {
+            activeRunSelections.set(id, {
               provider: attempt.providerName,
               model: attempt.model,
               effort: attempt.effort,
-            };
+            });
           },
           onFirstChunk: () =>
             mesh.recordEvent({
@@ -2218,7 +2276,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             });
           },
           onRunAbandoned: ({ reason, started }) => {
-            if (started) activeRunSelection = undefined;
+            activeRunSelections.delete(id);
             if (started) abandonActorRun(id, reason);
             runLogger(id).warn("run_abandoned", { reason, started });
             mesh.recordEvent({
@@ -2229,7 +2287,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             });
           },
           onRunEnd: async (result) => {
-            activeRunSelection = undefined;
+            activeRunSelections.delete(id);
             const runId = completeActorRun(id, result);
             logRunEnd(runLogger(id, runId), result);
             mesh.recordEvent({
@@ -2271,7 +2329,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // Second fail-closed gate, covering rehydrate/adopt as well as spawn: a
         // placement request only ever reaches a remote runtime, never a local
         // Actor standing in silently for the instance that was asked for.
-        const createWorkerActor = opts?.e2e?.createWorkerActor;
         if (ctx.executionTarget !== undefined && !createWorkerActor) {
           throw new Error(
             `actor ${id} requests executionTarget ${JSON.stringify(ctx.executionTarget)} but this runtime has no remote placement support`
@@ -2288,6 +2345,38 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       }
     },
   });
+
+  if (followerHub) {
+    followerHub.onRegister((follower) => {
+      for (const record of actors.list()) {
+        if (record.executionTarget !== follower.id) continue;
+        if (record.status !== "active") {
+          followerHub.stopActor(follower.id, record.id);
+          continue;
+        }
+        const existing = mesh.get(record.id);
+        if (!existing) {
+          mesh.rehydrate(record);
+          mesh.notifyInboxChanged(record.id);
+        } else if (
+          "attachHost" in existing &&
+          typeof (existing as { attachHost?: (host: unknown) => void }).attachHost === "function"
+        ) {
+          try {
+            const newHost = followerHub.createHost(follower.id, record.id);
+            (existing as { attachHost: (host: unknown) => void }).attachHost(newHost);
+            mesh.notifyInboxChanged(record.id);
+          } catch (err) {
+            log.warn("follower_reconnect_attach_failed", {
+              actorId: record.id,
+              followerId: follower.id,
+              err,
+            });
+          }
+        }
+      }
+    });
+  }
   // Route head changes as soon as the mesh exists — ahead of rehydration, which
   // is what registers the per-actor obligations MCP servers, and well ahead of
   // the dashboard binding its port. A head change cannot commit into a sink
@@ -2416,6 +2505,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       onWrite: () => {
         mesh.markUnkillable(rootId);
       },
+      getFollowers: () => (followerHub ? followerHub.list() : []),
     })
   );
   const rootInboxUrl = mcpHttp.addServer(`${rootId}:${INBOX_MCP_NAME}`, () =>
@@ -2465,14 +2555,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       instanceId: rootHandle,
     })
   );
-  let rootRunSelection: RawProviderModelConfig | undefined;
   const rootTrackerUrl = mcpHttp.addServer(`${rootId}:${TRACKER_MCP_NAME}`, () =>
     createTrackerMcpServer(rootId, issueClient, {
       gitBridge: config.gitBridge ? { port: gitBridgePort } : undefined,
       onWrite: () => webhookSilenceDetector?.recordOutboundWrite(),
       instanceId: rootHandle,
       actorHandle: rootHandle,
-      getRunSelection: () => rootRunSelection,
+      getRunSelection: () => activeRunSelections.get(rootId),
       // Uniform rule : the root gets mechanical subscriptions for what
       // it creates too, and can delegate them onward.
       onResourceCreated: (resource) => {
@@ -2501,6 +2590,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       ? mcpHttp.addServer(`${rootId}:${CHAT_WRITE_MCP_NAME}`, () =>
           createChatWriteMcpServer(rootId, cc, {
             allowedSpaces,
+            actorHandle: rootHandle,
+            getRunSelection: () => activeRunSelections.get(rootId),
             onWrite: (actorId) => {
               mesh.markUnkillable(actorId);
             },
@@ -2648,7 +2739,6 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       addDirs,
       sandbox: Boolean(opts?.e2e),
       isE2eRoot: Boolean(opts?.e2e),
-      e2eWritableRemoteDir: opts?.e2e?.remoteGitDir,
       loadSessionId: () =>
         actors.get(rootId)?.context?.type === "portable"
           ? undefined
@@ -2666,7 +2756,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           portableContextStore
         );
         return {
-          prompt: buildRootPrompt(config.rootActor?.charter, injection?.priorContext, rootHandle),
+          prompt: buildRootPrompt(rootActor.charter, injection?.priorContext, rootHandle),
           injectRecord: injection?.injectRecord,
         };
       },
@@ -2677,12 +2767,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             // reads the provider instance this resolves, so it cannot relabel a
             // fallback with the primary request.
             resolveProvider: (model) =>
-              resolveProvider(
-                config,
-                config.rootActor?.provider ?? DEFAULT_ROOT_PROVIDER,
-                model,
-                config.rootActor?.effort
-              ),
+              resolveProvider(config, rootActor.provider, model, rootActor.effort),
             classify: classifyExhaustion,
           }
         : undefined,
@@ -2735,16 +2820,15 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       onRuntimeStateChanged: (state) => mesh.actorRuntimeStateChanged(rootId, state),
       onRunStart: (responsive, injectRecord, selected) => {
         rootLastSelected = selected;
-        rootRunSelection = selected;
         // The run actually launched: the queued reservation this describes
         // no longer exists to cancel or report on.
         mesh.clearSelection(rootId);
-        const providerName = providerThrottleKey(selected.provider, config);
-        const runId = beginActorRun(rootId, providerName);
+        const launchConfig = projectActorRunLaunchConfig(selected);
+        const runId = beginActorRun(rootId, launchConfig);
         runLogger(rootId, runId).info("run_start", {
-          provider: providerName,
-          model: selected.model,
-          effort: selected.effort,
+          provider: launchConfig.provider,
+          model: launchConfig.model,
+          effort: launchConfig.effort,
           responsive,
         });
         mesh.recordEvent({
@@ -2755,20 +2839,20 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             : undefined,
           body: injectRecord ? JSON.stringify(injectRecord) : undefined,
           payload: JSON.stringify({
-            provider: providerName,
-            model: selected.model,
-            effort: selected.effort,
+            provider: launchConfig.provider,
+            model: launchConfig.model,
+            effort: launchConfig.effort,
             responsive,
             runId,
           }),
         });
       },
       onProviderAttempt: (attempt) => {
-        rootRunSelection = {
+        activeRunSelections.set(rootId, {
           provider: attempt.providerName,
           model: attempt.model,
           effort: attempt.effort,
-        };
+        });
       },
       onFirstChunk: () =>
         mesh.recordEvent({
@@ -2783,7 +2867,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         });
       },
       onRunAbandoned: ({ reason, started }) => {
-        if (started) rootRunSelection = undefined;
+        activeRunSelections.delete(rootId);
         if (started) abandonActorRun(rootId, reason);
         runLogger(rootId).warn("run_abandoned", { reason, started });
         mesh.recordEvent({
@@ -2794,7 +2878,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         });
       },
       onRunEnd: async (result) => {
-        rootRunSelection = undefined;
+        activeRunSelections.delete(rootId);
         mesh.finishInboxRun(rootId);
         const runId = completeActorRun(rootId, result);
         logRunEnd(runLogger(rootId, runId), result);
@@ -2835,25 +2919,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     });
   const rootRecord: ActorRecord = {
     id: rootId,
-    charter: config.rootActor?.charter ?? DEFAULT_ROOT_CHARTER,
+    charter: rootActor.charter ?? DEFAULT_ROOT_CHARTER,
     parentId: null,
     isRoot: true,
-    // Only recorded when a concrete model is actually declared — root's own
-    // scalar config may omit `model` to mean "the provider CLI's own
-    // default", which the durable modelConfig pool contract (#169) can't
-    // represent (it requires a concrete model on every entry). Omitting the
-    // field here leaves `launchProviderName`'s fallback (below) as the
-    // provider-only source of truth for a CLI-default root.
-    ...(provider.model
-      ? {
-          modelConfig: [
-            { provider: provider.providerName, model: provider.model, effort: provider.effort },
-          ],
-        }
-      : {}),
-    context: config.rootActor?.context,
+    modelConfig: [
+      {
+        provider: rootActor.provider,
+        model: rootActor.model,
+        ...(rootActor.effort === undefined ? {} : { effort: rootActor.effort }),
+      },
+    ],
+    context: rootActor.context,
     sessionId:
-      config.rootActor?.context?.type === "portable"
+      rootActor.context?.type === "portable"
         ? undefined
         : (actors.get(rootId)?.sessionId ?? legacyActorImport.deferredRootSessionId),
     status: "active",
@@ -2894,7 +2972,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     rootControl.recordDriverAttached("e2e-controller");
     console.log(`[root] driver=external tools=${rootMcp.map((u) => u.name).join(",")}`);
   } else {
-    const rootContext = config.rootActor?.context;
+    const rootContext = rootActor.context;
     const sessionDescription =
       rootContext?.type === "portable"
         ? `portable/${rootContext.mode} (stateless)`
@@ -2928,6 +3006,19 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   const restored = actors.list().filter((r) => r.status === "active" && r.id !== rootId);
   if (restored.length > 0) {
     console.log(`[mesh] rehydrated ${restored.length} active actor(s) from the repository`);
+  }
+
+  if (followerHub) {
+    const pendingReconnect = actors
+      .list()
+      .filter((r) => r.status === "active" && r.executionTarget !== undefined && !mesh.get(r.id));
+    for (const record of pendingReconnect) {
+      log.warn("follower_actor_pending_reconnect", {
+        actorId: record.id,
+        target: record.executionTarget,
+        hint: `Follower '${record.executionTarget}' is not connected; actor will rehydrate when the follower enrolls`,
+      });
+    }
   }
 
   // One-time avatar backfill : generate a cached avatar for every currently
@@ -3182,10 +3273,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           // The configured root identity  — display handle + avatar
           // override — so the dashboard shows this instance's own identity
           // instead of the default root-actor.
-          rootIdentity: { id: rootId, handle: rootHandle, avatarPath: config.rootActor?.avatar },
+          rootIdentity: { id: rootId, handle: rootHandle, avatarPath: rootActor.avatar },
           // On-demand avatar generation  reuses the same key the
           // walkie-talkie transcription/TTS calls above already gate on.
           geminiApiKey,
+          getFollowers: () => (followerHub ? followerHub.list() : []),
         },
         // The IU calibration view's server half (ISSUE_NUM 2b): a read-only paginated
         // op-getter over the distiller's LOCAL would-be-graph files (baseline + ops-log),
@@ -3462,6 +3554,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       await mcpHttp.close();
     } catch {
       /* already closed */
+    }
+    if (followerHub) {
+      try {
+        await followerHub.close();
+      } catch {
+        /* already closed */
+      }
     }
     if (gitBridgeServer) {
       try {

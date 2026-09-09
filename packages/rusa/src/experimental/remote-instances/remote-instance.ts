@@ -3,7 +3,57 @@ import { EventEmitter } from "node:events";
 import type { ServerResponse } from "node:http";
 import type { ActorChannel } from "./actor-channel.js";
 import type { FollowerCommand, FollowerEvent } from "./follower-hub.js";
-import type { LeaderCommand } from "./protocol.js";
+import type { ActorEvent, LeaderCommand } from "./protocol.js";
+
+/** In-memory deduplication tracker preserving at-most-once delivery across follower reconnects. */
+export class FollowerDedupeTracker {
+  private readonly processedBatches = new Set<string>();
+  private readonly processedEvents = new Set<string>();
+  private readonly batchOrder: string[] = [];
+  private readonly eventOrder: string[] = [];
+  private static readonly MAX_TRACKED_BATCHES = 1000;
+  private static readonly MAX_TRACKED_EVENTS = 10_000;
+  lastSeen = Date.now();
+
+  touch(): void {
+    this.lastSeen = Date.now();
+  }
+
+  hasBatch(batchId: string): boolean {
+    return this.processedBatches.has(batchId);
+  }
+
+  recordBatch(batchId: string): void {
+    // The tracker must survive a follower generation replacement after a
+    // response-lost retry. Recording the just-accepted batch is meaningful
+    // activity even when the instance has been connected for a long time.
+    this.touch();
+    if (this.processedBatches.has(batchId)) return;
+    this.processedBatches.add(batchId);
+    this.batchOrder.push(batchId);
+    if (this.batchOrder.length > FollowerDedupeTracker.MAX_TRACKED_BATCHES) {
+      const oldest = this.batchOrder.shift();
+      if (oldest) this.processedBatches.delete(oldest);
+    }
+  }
+
+  hasEvent(eventId: string): boolean {
+    return this.processedEvents.has(eventId);
+  }
+
+  recordEvent(eventId: string): void {
+    // Keep the follower's replay fence fresh for individual event processing
+    // too, in case a batch is interrupted before it reaches recordBatch().
+    this.touch();
+    if (this.processedEvents.has(eventId)) return;
+    this.processedEvents.add(eventId);
+    this.eventOrder.push(eventId);
+    if (this.eventOrder.length > FollowerDedupeTracker.MAX_TRACKED_EVENTS) {
+      const oldest = this.eventOrder.shift();
+      if (oldest) this.processedEvents.delete(oldest);
+    }
+  }
+}
 
 /** Leader-side representation of one registered follower generation. */
 export class RemoteInstance {
@@ -17,8 +67,25 @@ export class RemoteInstance {
   constructor(
     readonly id: string,
     readonly platform: string,
-    readonly pid: number
+    readonly pid: number,
+    private readonly dedupeTracker: FollowerDedupeTracker = new FollowerDedupeTracker()
   ) {}
+
+  hasBatch(batchId: string): boolean {
+    return this.dedupeTracker.hasBatch(batchId);
+  }
+
+  recordBatch(batchId: string): void {
+    this.dedupeTracker.recordBatch(batchId);
+  }
+
+  hasEvent(eventId: string): boolean {
+    return this.dedupeTracker.hasEvent(eventId);
+  }
+
+  recordEvent(eventId: string): void {
+    this.dedupeTracker.recordEvent(eventId);
+  }
 
   createHost(actorId: string): ActorChannel {
     if (this.hosts.has(actorId)) throw new Error("Actor already assigned");
@@ -31,8 +98,22 @@ export class RemoteInstance {
     return host;
   }
 
-  receive(event: FollowerEvent): void {
+  receive(event: {
+    actorId: string;
+    message: ActorEvent | { type: "exit"; code: number | null; signal: NodeJS.Signals | null };
+    eventId?: string;
+  }): void {
     this.hosts.get(event.actorId)?.receive(event.message);
+  }
+
+  stopActor(actorId: string): void {
+    const host = this.hosts.get(actorId);
+    if (host) {
+      host.receive({ type: "exit", code: 0, signal: null });
+      this.hosts.delete(actorId);
+    }
+    this.commands.push({ actorId, message: { type: "stop" } });
+    this.flush();
   }
 
   flush(): void {

@@ -18,15 +18,36 @@ Leader Node process                       Follower Node process
 ```
 
 The earlier local-process demo, per-actor Node entrypoint, and `--worker-runtime`
-mode have been removed. Protocol version 2 requires rebuilding both ends;
+mode have been removed. Protocol version 3 requires rebuilding both ends;
 old followers are rejected at enrollment. Existing running instances are not
 automatically upgraded or restarted.
 
-The leader runs a disposable E2E instance with its own directory, ports and
-database. Its GitHub/chat endpoints are fakes. Never stop another mesh's E2E
-instance to run this experiment. `--port-offset 200` uses ports 8283–8286,
-and the follower gateway uses 8290. The gateway binds only to a specified
-Tailscale address (or loopback for testing), not the public interface.
+The follower gateway can be hosted either persistently in `rusa start` (for staging
+and production) via `config.yaml`, or in a disposable E2E instance via `rusa am-up`.
+The gateway binds only to a specified Tailscale IPv4 address (`100.64.0.0/10`) or
+loopback (`127.0.0.1` for local testing); public interfaces and wildcard `0.0.0.0`
+are strictly refused.
+
+## Persistent leader configuration (`rusa start`)
+
+In `config.yaml`, configure the `followers:` block:
+
+```yaml
+followers:
+  bind: 100.x.y.z        # Tailscale IPv4 (100.64.0.0/10) or 127.0.0.1. Refuses 0.0.0.0.
+  port: 8290
+  tokenFile: /absolute/private/path/enrollment-token
+```
+
+Generate the enrollment token if needed:
+```sh
+node scripts/follower-token.mjs /absolute/private/path/enrollment-token
+```
+
+When `rusa start` runs with this configuration, it starts `FollowerHub`, binds to
+the configured address and port, and enables remote placement for `POST /api/mesh/actors`
+and `spawn_thread`.
+
 
 ## Mac setup
 
@@ -108,6 +129,10 @@ directory. Stop only that test unit; do not stop another mesh's instance.
 The leader's control API remains loopback-only. On the leader:
 
 ```sh
+# Staging/production dashboard API (port 8080 by default):
+curl -fsS http://127.0.0.1:8080/api/mesh/followers
+
+# Or E2E harness (port offset 200 -> port 8286):
 curl -fsS http://127.0.0.1:8286/followers
 node scripts/follower-smoke.mjs --target '<follower-name>' --port 8286
 ```
@@ -119,28 +144,42 @@ actor leaves the follower and its sibling alive. It retires its test actors.
 It also checks that both actors execute in the registered follower's single PID.
 Follower workspaces are retained for inspection.
 
-Automated instance tests (including a separately launched follower process):
+Automated instance and restart tests:
 
 ```sh
 pnpm exec vitest run src/experimental/remote-instances
 ```
 
-The fixture provider is test-only. Tests cover instance registration/versioning,
-shared PID, actor-local sessions, fresh admission-time prompts, active retirement,
-initialization failure, disconnect, and MCP capability routing/revocation —
+Tests cover instance registration/versioning, safe bind enforcement (refusing 0.0.0.0
+and public IPs), shared PID, actor-local sessions, fresh admission-time prompts,
+active retirement, initialization failure, disconnect, automatic reconnect with backoff,
+actor re-attachment by ID across synthetic leader restart, and MCP capability routing/revocation —
 both mid-life, when a grant leaves the snapshot, and at actor exit.
 
-For real work, use the existing control API and add `target`:
+### Placement API and model-facing tools
+
+Remote placement is fully model-facing and API-accessible:
+
+1. **Model-facing MCP tools**:
+   - `list_followers`: Returns the list of currently connected follower nodes and their platform/actor details.
+   - `spawn_thread`: Accepts an optional `target: "<follower-name>"` parameter.
+2. **Dashboard REST API**:
+   - `GET /api/mesh/followers`: Returns `{ followers: [...] }`.
+   - `POST /api/mesh/actors`: Accepts optional `target: "<follower-name>"`.
+   - `GET /api/mesh/threads`: Thread DTO includes `executionTarget: "<follower-name>" | null`.
+3. **Fail-closed placement**:
+   - If `target` specifies an unknown or disconnected follower, the request immediately fails with a 400 error (or tool error).
+   - Remote placement never silently falls back to local execution.
+
+Example spawn via control API:
 
 ```sh
-curl -fsS http://127.0.0.1:8286/actors -H 'content-type: application/json' \
-  -d '{"target":"<follower-name>","provider":"claude","model":"claude-sonnet-5","charter":"Perform the bounded task sent in your inbox, report to your parent, and yield."}'
+curl -fsS http://127.0.0.1:8080/api/mesh/actors -H 'content-type: application/json' \
+  -d '{"target":"<follower-name>","provider":"codex","model":"gpt-5.6-sol","charter":"Perform the bounded task sent in your inbox, report to your parent, and yield."}'
 ```
 
-Send work to the returned ID with `POST /actors/<id>/messages`. Spawning alone
-does not start a run. Omitting `target` keeps execution on the leader. This
-prototype exposes placement through the E2E controller; the model-facing
-`spawn_thread` tool does not yet offer the target field.
+Send work to the returned ID with `POST /api/mesh/actors/<id>/chat` or mesh `send_message`. Spawning alone
+does not start a run. Omitting `target` keeps execution on the leader.
 
 ## What crosses the connection
 
@@ -168,29 +207,39 @@ the follower from ever holding the control secret — a compromised follower
 process can reach only the MCP endpoints currently assigned to its own actors —
 at the cost of putting a bearer capability in a URL, where request logs, proxies
 and process listings can capture it. The gateway therefore never logs request
-paths, and the routing table is in memory only, so a leader restart invalidates
-every outstanding capability. Adding a second
-per-actor credential is deferred: it would need its own distribution and
-rotation path on the follower, which is federation work rather than
-connectivity work.
+paths, and the routing table is in memory only.
+
+## Reconnect and durability across leader restarts
+
+1. **Durable placement**: `executionTarget` is persisted on the `ActorRecord` in `mesh.db`'s
+   application-owned `context_config` JSON document. The reader accepts the previous strict
+   v1 document and this build writes strict v2 documents; this is not a SQL migration and does
+   not add a database JSON validator.
+2. **Client-side backoff reconnect**: If the leader restarts or transient network interruptions occur, the follower does not exit; it initiates an exponential backoff reconnect loop calling `/register`.
+3. **Re-attachment and capability re-issuance**: When the leader restarts and the follower re-enrolls, the leader re-attaches placed actors by ID and re-issues fresh bearer capability URLs. Unhandled inbox items trigger recovery wakes.
+
+Before enabling placement, take the normal `mesh.db` backup for the deploy. Once a v2 document
+has been written, do not roll the database back to a pre-v2 binary: that binary strictly rejects
+the newer document. Roll forward with a fix, or restore the pre-rollout database snapshot as a
+coordinated service rollback. There is no SQL migration to reverse.
+
+## Provider and computer-use support
+
+- **Codex computer use**: Downstream of the 2026-09-06 live follower validation test on macOS against an E2E leader, where Codex's native computer-use MCP (screen/accessibility state, mouse, keyboard) drove Notes.app end-to-end without macOS permission prompts. Rusa does not provide a custom desktop automation harness or macOS sandboxing; execution relies on the provider's native host capabilities.
+- **Claude computer use**: Strictly excluded and out of scope for #301 per the 2026-09-06 operator scope ruling. Headless Claude Code sessions lack a computer-use tool in this environment; no PTY harness or desktop automation tooling is provided or attempted.
 
 ## Limits
 
-This is a connectivity/lifecycle prototype, not durable federation. Placement
-and follower sessions are in memory. Start a fresh leader rather than resuming
-these instances. A connection failure stops the follower generation; automatic
-reconnect, command replay and actor migration are deferred. Leader run
-accounting is exactly-once for admitted runs: a dropped connection fails
+Leader run accounting is exactly-once for admitted runs: a dropped connection fails
 exactly one durable run when it interrupts a run the leader had admitted, and
 books nothing when the follower was idle or never finished starting. The work
 that run was performing is not resumed or replayed, so effects the provider
 already committed are not exactly-once.
+
 The leader expires unresponsive followers after 45 seconds. Provider process-tree
 cleanup after an abrupt crash still needs validation beyond this experiment.
 There is deliberately no per-actor Node crash isolation, matching the leader.
 Retirement interrupts/closes only that Actor; instance shutdown closes all actors.
-The unsandboxed Codex adapter does not yet capture/resume sessions; scripted
-session-continuity tests do not establish real Codex session continuity on macOS.
 
 Local files stay on the follower. Media/file transfer, leader-local repository
 URL rewrites, host-job tools, Understanding mounts, provider/model changes and

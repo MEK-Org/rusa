@@ -53,11 +53,9 @@ export interface ActorOptions {
   cwd: string;
   /**
    * The declared candidate pool this actor runs on (design MEK-Org/rusa#169).
-   * A single fixed-model actor still declares a one-element pool. `model` is
-   * optional here (unlike the validated {@link ProviderModelConfig} pool
-   * contract) solely for root's own scalar config, which may omit a model to
-   * mean "the provider CLI's own default" — a worker's pool always carries
-   * concrete models, enforced upstream by `validateModelConfigPool`.
+   * A single fixed-model actor still declares a one-element pool. In-process
+   * actors receive validated entries; the raw shape remains at this transport
+   * boundary so a remote actor can report a malformed selection as a run fault.
    */
   modelConfig: RawProviderModelConfig[];
   /** Resolve one declared candidate into the coding provider that will run it. */
@@ -76,13 +74,6 @@ export interface ActorOptions {
    * the directory basename.
    */
   isE2eRoot?: boolean;
-  /**
-   * E2E-only: the actor-mesh harness's disposable bare-remote git dir, passed
-   * through to the sandbox layer as a writable bind. Undefined in production
-   * — only the e2e actor-mesh runner sets this, for both the root actor and
-   * every sandboxed worker it spawns.
-   */
-  e2eWritableRemoteDir?: string;
   /**
    * Optional factory to prepare and return a host directory containing the
    * Integrated Understanding snapshot to mount into the sandbox at /tmp/understanding.
@@ -732,7 +723,7 @@ export class Actor {
   /** The genuine-execution body of a run (everything after the beforeRun gate). */
   private async executeTurn(nudge: RunNudge): Promise<void> {
     const isCorrectiveRun = nudge.mode === "yield-elicitation";
-    const responsive = isResponsiveNudge(nudge);
+    let responsive = isResponsiveNudge(nudge);
     const sessionId = this.opts.loadSessionId();
     // The provider treats the actor's cwd as its private directory and shadows
     // everything beside it (see buildActorBwrapArgs). This object is just the
@@ -746,7 +737,6 @@ export class Actor {
           worktreePath: this.opts.cwd,
           isE2eRoot: this.opts.isE2eRoot,
           understandingMount,
-          e2eWritableRemoteDir: this.opts.e2eWritableRemoteDir,
         }
       : undefined;
 
@@ -897,10 +887,27 @@ export class Actor {
         // losing the run.
         for (;;) {
           const gated = this.opts.gate(invoke, this.opts.modelConfig, responsive);
-          const start: RunStartHandle<RunResult> =
+          const gatedStart: RunStartHandle<RunResult> =
             gated instanceof Promise
               ? { result: gated, started: false, promote: () => {}, cancel: () => false }
               : gated;
+          // A responsive nudge can arrive after ordinary admission has reserved
+          // a lane but before it invokes the provider. Keep run-start telemetry
+          // aligned with that promoted priority while delegating the actual
+          // queue bypass to the gate's existing handle.
+          const start: RunStartHandle<RunResult> = {
+            result: gatedStart.result,
+            get started() {
+              return gatedStart.started;
+            },
+            promote: () => {
+              if (!gatedStart.started) responsive = true;
+              gatedStart.promote();
+            },
+            cancel: gatedStart.cancel
+              ? () => gatedStart.cancel?.call(gatedStart) ?? false
+              : undefined,
+          };
           this.pendingStart = start;
           try {
             result = await start.result;

@@ -2,6 +2,32 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 
 void main() {
+  group('MeshEvent.resolvedRunModel', () {
+    test('uses launch metadata and leaves historical run_start rows blank', () {
+      final launched = MeshEvent.fromJson({
+        'id': 'launch',
+        'kind': 'run_start',
+        'actorId': 'a',
+        'detail': null,
+        'body': null,
+        'payload': '{"provider":"codex","model":"gpt-5.6-sol"}',
+        'success': null,
+      });
+      final historical = MeshEvent.fromJson({
+        'id': 'historical',
+        'kind': 'run_start',
+        'actorId': 'a',
+        'detail': null,
+        'body': null,
+        'payload': '{"provider":"codex"}',
+        'success': null,
+      });
+
+      expect(launched.resolvedRunModel, 'gpt-5.6-sol');
+      expect(historical.resolvedRunModel, isNull);
+    });
+  });
+
   group('ObligationDto.fromJson', () {
     test(
       'deserializes externalRef when it is a nested map (server format)',
@@ -186,6 +212,40 @@ void main() {
       expect(snapshot.completions, isEmpty);
       expect(snapshot.completionsTotal, 0);
       expect(snapshot.completionsHasMore, false);
+      expect(snapshot.externalReference, isNull);
+    });
+
+    test('deserializes externalReference when present', () {
+      final json = {
+        'obligation': {
+          'id': 'ob-with-ext',
+          'ownerId': 'test-actor',
+          'status': 'ready',
+          'effectivePriority': 50.0,
+          'externalRef': 'github:MEK-Org/rusa/issues/345',
+        },
+        'parent': null,
+        'children': [],
+        'blockingChildren': [],
+        'artifacts': [],
+        'externalReference': {
+          'ref': 'github:MEK-Org/rusa/issues/345',
+          'scheme': 'github',
+          'title': 'Issue 345 Title',
+          'body': 'Issue 345 description',
+          'url': 'https://github.com/MEK-Org/rusa/issues/345',
+          'author': 'AlabasterAxe',
+        },
+      };
+
+      final snapshot = ObligationDetailSnapshot.fromJson(json);
+      expect(snapshot.externalReference, isNotNull);
+      expect(snapshot.externalReference!.ref, 'github:MEK-Org/rusa/issues/345');
+      expect(snapshot.externalReference!.scheme, 'github');
+      expect(snapshot.externalReference!.title, 'Issue 345 Title');
+      expect(snapshot.externalReference!.body, 'Issue 345 description');
+      expect(snapshot.externalReference!.url, 'https://github.com/MEK-Org/rusa/issues/345');
+      expect(snapshot.externalReference!.author, 'AlabasterAxe');
     });
   });
 

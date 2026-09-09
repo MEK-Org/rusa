@@ -3,6 +3,7 @@ import { basename, isAbsolute, relative, resolve } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import mime from "mime";
 import { z } from "zod";
+import { generateHandle } from "../actor/handle-generator.js";
 import {
   type ChatClient,
   type ChatSpace,
@@ -10,6 +11,8 @@ import {
   MEDIA_TOKEN_RE,
   MESSAGE_ATTACHMENT_NAME_RE,
 } from "../chat/types.js";
+import type { RawProviderModelConfig } from "../providers/model-config.js";
+import { formatVisibleActorSignature } from "./actor-signature.js";
 import { toolError, toolOk } from "./result.js";
 import { createMcpServer } from "./strict-server.js";
 
@@ -264,11 +267,22 @@ export function createChatReadMcpServer(
 
 export interface ChatWriteMcpOptions {
   allowedSpaces: string[];
+  /** Display name for this actor's visible Chat footer. */
+  actorHandle?: string;
+  /** The exact normalized selection for the provider attempt currently writing. */
+  getRunSelection?: () => RawProviderModelConfig | undefined;
   onWrite?: (actorId: string) => void;
   isFenced?: () => boolean;
   maxAttachmentBytes?: number;
   /** Directory attachment `filePath`s are confined to; defaults to `process.cwd()`. */
   workDir?: string;
+}
+
+/** Add the terminal Chat footer unless the caller already supplied this exact one. */
+function appendVisibleActorSignature(body: string, signature: string): string {
+  const escapedSignature = signature.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const trailingSignature = new RegExp(`(?:^|\\r?\\n)${escapedSignature}[\\t ]*(?:\\r?\\n)?$`);
+  return trailingSignature.test(body) ? body : body ? `${body}\n\n${signature}` : signature;
 }
 
 function isContained(parent: string, child: string): boolean {
@@ -319,6 +333,12 @@ export function createChatWriteMcpServer(
     return options.allowedSpaces.includes(spaceName);
   };
 
+  const actorHandle = options.actorHandle ?? generateHandle(actorId);
+  const signedText = (text: string) =>
+    appendVisibleActorSignature(
+      text,
+      formatVisibleActorSignature(actorHandle, options.getRunSelection?.(), "google-chat")
+    );
   const workDir = options.workDir ?? process.cwd();
 
   server.registerTool(
@@ -439,7 +459,7 @@ export function createChatWriteMcpServer(
             }
           }
         }
-        const res = await chatClient.send(spaceName, text, {
+        const res = await chatClient.send(spaceName, signedText(text), {
           ...(threadName ? { threadName } : {}),
           ...(normalizedAttachments.length > 0 ? { attachments: normalizedAttachments } : {}),
         });

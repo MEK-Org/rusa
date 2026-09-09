@@ -404,6 +404,8 @@ class _ActorRowState extends State<_ActorRow> {
     String text, {
     List<ProviderModelConfig>? pool,
     List<ProviderModelConfig>? staged,
+    String? modelClass,
+    String? desiredModelClass,
   }) {
     final label = Text(
       text,
@@ -414,13 +416,20 @@ class _ActorRowState extends State<_ActorRow> {
         color: MeshColors.textSecondary,
       ),
     );
-    if (pool == null) return label;
+    if (pool == null && modelClass == null && desiredModelClass == null) {
+      return label;
+    }
     final lines = [
-      if (pool.isNotEmpty) ...[
-        'Configured candidates, in order:',
-        ...pool.map((e) => '• ${e.label}'),
+      if (modelClass != null) 'Configured model class: $modelClass',
+      if (pool?.isNotEmpty ?? false) ...[
+        modelClass == null
+            ? 'Configured candidates, in order:'
+            : 'Resolved candidates, in order:',
+        ...pool!.map((e) => '• ${e.label}'),
       ],
-      if (staged != null && !listEquals(staged, pool)) ...[
+      if (desiredModelClass != null) 'Staged model class: $desiredModelClass',
+      if (staged != null &&
+          (!listEquals(staged, pool) || desiredModelClass != modelClass)) ...[
         'Staged for next run:',
         ...staged.map((e) => '• ${e.label}'),
       ],
@@ -444,6 +453,8 @@ class _ActorRowState extends State<_ActorRow> {
     // list is in the Info panel, which is the readable surface on a phone.
     final pool = thread.modelConfig;
     final staged = thread.desiredModelConfig;
+    final modelClass = thread.modelClass;
+    final desiredModelClass = thread.desiredModelClass;
     // Both predicates read whole pools rather than the server's first-entry
     // compatibility fields, which describe a pool replacement only by
     // accident: `[a, b] → [a, c, d]` leaves `desiredModel` identical to
@@ -453,20 +464,31 @@ class _ActorRowState extends State<_ActorRow> {
     // fallback for a payload predating the full field.
     final isPool = pool.length > 1 || (staged?.length ?? 0) > 1;
     final staging = staged != null
-        ? !listEquals(staged, pool)
-        : thread.desiredModel != null && thread.desiredModel != thread.model;
-    final showModel = thread.model != null || thread.desiredModel != null;
+        ? !listEquals(staged, pool) || desiredModelClass != modelClass
+        : desiredModelClass != null ||
+              (thread.desiredModel != null && thread.desiredModel != thread.model);
+    final showModel =
+        thread.model != null ||
+        thread.desiredModel != null ||
+        modelClass != null ||
+        desiredModelClass != null;
     final showEffort =
         !isPool && (thread.effort != null || thread.effortChangePending);
-    final current = thread.model ?? 'default';
-    final desired = thread.desiredModel ?? 'default';
-    final singleText = staging ? '$current → $desired' : (thread.model ?? '');
-    // Both sides carry their own count, so a staged pool replacement never
-    // reads as one model becoming one other model.
-    final poolText = staging
-        ? '$current${_poolSuffix(pool.length)}'
-              ' → $desired${_poolSuffix(staged?.length ?? 0)}'
-        : '$current${_poolSuffix(pool.length)}';
+    final currentModel = thread.model ?? (staging ? 'default' : '');
+    final currentText = modelClass != null
+        ? 'class $modelClass'
+        : (isPool
+              ? '$currentModel${_poolSuffix(pool.length)}'
+              : currentModel);
+    final desiredModel = thread.desiredModel ?? 'default';
+    final desiredText = desiredModelClass != null
+        ? 'class $desiredModelClass'
+        : (isPool
+              ? '$desiredModel${_poolSuffix(staged?.length ?? 0)}'
+              : desiredModel);
+    final displayedModel = staging ? '$currentText → $desiredText' : currentText;
+    final tooltipPool =
+        modelClass != null || desiredModelClass != null || isPool ? pool : null;
 
     return Container(
       decoration: BoxDecoration(
@@ -539,9 +561,11 @@ class _ActorRowState extends State<_ActorRow> {
                       if (showModel)
                         Flexible(
                           child: _modelLabel(
-                            isPool ? poolText : singleText,
-                            pool: isPool ? pool : null,
+                            displayedModel,
+                            pool: tooltipPool,
                             staged: staged,
+                            modelClass: modelClass,
+                            desiredModelClass: desiredModelClass,
                           ),
                         ),
                       if (showEffort) ...[

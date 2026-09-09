@@ -2,7 +2,9 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
+import 'package:rusa_dashboard/widgets/reference_preview.dart';
 import 'package:rusa_dashboard/widgets/work_tab.dart';
 
 import 'fakes.dart';
@@ -581,6 +583,218 @@ void main() {
         await tester.pump();
 
         expect(find.text('WORK QUEUE'), findsOneWidget);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'renders external reference card when obligation has externalRef',
+    (tester) async {
+      await tester.runAsync(() async {
+        final ob = makeObligation(
+          'ob-with-ref',
+          ownerId: 'root',
+          intent: 'Task with external link',
+          externalRef: 'github:MEK-Org/rusa#345',
+        );
+        const refDto = ReferenceDto(
+          ref: 'github:MEK-Org/rusa#345',
+          scheme: 'github',
+          title: 'Make external link a reference card',
+          author: 'root',
+          body: 'Reference card in obligation view preview snippet',
+          url: 'https://github.com/MEK-Org/rusa/issues/345',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [ob]
+          ..obExternalReferences['ob-with-ref'] = refDto;
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        final openedLinks = <String>[];
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(
+                store: store,
+                onSelectView: (_) {},
+                openLink: openedLinks.add,
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.tap(find.text('Task with external link'));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('EXTERNAL LINK'), findsOneWidget);
+        expect(find.byType(ReferencePreview), findsOneWidget);
+        expect(find.text('GITHUB'), findsOneWidget);
+        expect(find.text('Make external link a reference card'), findsOneWidget);
+        expect(find.text('root-handle'), findsOneWidget);
+        expect(
+          find.text('Reference card in obligation view preview snippet'),
+          findsOneWidget,
+        );
+
+        // Tap open link icon button
+        expect(find.byTooltip('Open in new tab'), findsOneWidget);
+        await tester.tap(find.byTooltip('Open in new tab'));
+        expect(openedLinks, ['https://github.com/MEK-Org/rusa/issues/345']);
+
+        // Tap edit button to open edit dialog
+        expect(find.byTooltip('Change or unlink'), findsOneWidget);
+        await tester.tap(find.byTooltip('Change or unlink'));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('External Reference'), findsOneWidget);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'hides change/unlink edit button on external reference card when obligation is terminal',
+    (tester) async {
+      await tester.runAsync(() async {
+        final ob = makeObligation(
+          'ob-terminal-with-ref',
+          ownerId: 'root',
+          intent: 'Terminal task with external link',
+          externalRef: 'github:MEK-Org/rusa#345',
+          status: 'done',
+        );
+        const refDto = ReferenceDto(
+          ref: 'github:MEK-Org/rusa#345',
+          scheme: 'github',
+          title: 'Done obligation with reference card',
+          url: 'https://github.com/MEK-Org/rusa/issues/345',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [ob]
+          ..obExternalReferences['ob-terminal-with-ref'] = refDto;
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        store.setFocusedObligationId('ob-terminal-with-ref');
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        // Let widening / initial loads complete
+        for (int i = 0; i < 5; i++) {
+          await tester.pump();
+        }
+
+        expect(find.text('EXTERNAL LINK'), findsOneWidget);
+        expect(find.byType(ReferencePreview), findsOneWidget);
+        expect(find.text('Done obligation with reference card'), findsOneWidget);
+        expect(find.byTooltip('Open in new tab'), findsOneWidget);
+        expect(find.byTooltip('Change or unlink'), findsNothing);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'renders fallback reference card when externalReference is not yet resolved',
+    (tester) async {
+      await tester.runAsync(() async {
+        final ob = makeObligation(
+          'ob-unresolved-ref',
+          ownerId: 'root',
+          intent: 'Unresolved external reference task',
+          externalRef: 'github:MEK-Org/rusa#999',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [ob];
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.tap(find.text('Unresolved external reference task'));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('EXTERNAL LINK'), findsOneWidget);
+        expect(find.byType(ReferencePreview), findsOneWidget);
+        expect(find.text('GITHUB'), findsOneWidget);
+        expect(find.text('GitHub reference'), findsOneWidget);
+        expect(find.text('Not resolvable yet.'), findsOneWidget);
+        expect(find.byTooltip('Change or unlink'), findsOneWidget);
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'renders unlinked placeholder and edit button when obligation has no externalRef',
+    (tester) async {
+      await tester.runAsync(() async {
+        final ob = makeObligation(
+          'ob-no-ref',
+          ownerId: 'root',
+          intent: 'Task without external link',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [ob];
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.tap(find.text('Task without external link'));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('EXTERNAL LINK'), findsOneWidget);
+        expect(find.byType(ReferencePreview), findsNothing);
+        expect(
+          find.text('Not linked to an issue, PR or repository.'),
+          findsOneWidget,
+        );
+        expect(find.byTooltip('Link an issue, PR or repo'), findsOneWidget);
+
+        // Tap link button to open edit dialog
+        await tester.tap(find.byTooltip('Link an issue, PR or repo'));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('External Reference'), findsOneWidget);
 
         await store.dispose();
       });

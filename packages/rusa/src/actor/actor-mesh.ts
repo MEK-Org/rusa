@@ -4,6 +4,7 @@ import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../
 import { prerequisiteEdgeKey } from "../obligations/obligation.js";
 import {
   assertConcreteModelConfig,
+  isModelClassReference,
   type ModelConfigInput,
   type ProviderModelConfig,
   type RawProviderModelConfig,
@@ -494,10 +495,10 @@ export interface ActorMeshOptions {
   /**
    * Provider pacing composed with the mesh's normal-run concurrency queue.
    * Given the actor's declared candidate pool, atomically selects (quotes and
-   * reserves) the earliest-eligible canonical provider lane — declaration
-   * order breaks ties — and invokes `fn` with the winning tuple. A responsive
-   * run bypasses pacing/concurrency and picks the first healthy declared
-   * candidate instead.
+   * reserves) the earliest-eligible canonical provider lane — with
+   * declaration order breaking unresolvable ties — and invokes `fn` with the
+   * winning tuple. A responsive run uses that same selection, then bypasses
+   * pacing/concurrency after its candidate is reserved.
    */
   providerGate?: <T>(
     fn: (selected: RawProviderModelConfig) => Promise<T>,
@@ -509,7 +510,7 @@ export interface ActorMeshOptions {
       enqueueNormal: <R>(run: () => Promise<R>) => RunStartHandle<R>;
       /**
        * Report the reserved candidate — at initial reservation and again on
-       * any later reselection (e.g. a responsive promote) — so the mesh can
+       * a later reselection or in-place responsive promotion — so the mesh can
        * track it for HALT safety and selection telemetry. A `providerGate`
        * implementation that never calls this leaves the mesh without a
        * recorded selection, which falls back to whole-pool HALT checks.
@@ -1434,17 +1435,23 @@ export class ActorMesh {
     }
     const id = this.idgen();
     const parentId = this.resolveThreadId(req.parentId);
+    // Store provenance only when the caller declared a class in modelConfig.
+    // The validation gate resolves that reference to this concrete snapshot;
+    // an explicit tuple/pool cannot attach an arbitrary class label.
+    const modelClass = isModelClassReference(req.modelConfig) ? req.modelConfig.class : undefined;
     const record: ActorRecord = {
       id,
       charter,
       parentId,
       modelConfig,
+      ...(modelClass !== undefined ? { modelClass } : {}),
       context: req.context,
       handles: req.handles ? [...req.handles] : undefined,
       // Seed the session so the actor's first run resumes this conversation
       // instead of creating a fresh one (loadSessionId reads record.sessionId).
       sessionId: req.conversationId,
       title: req.title,
+      executionTarget: req.executionTarget,
       status: "active",
       createdAt: this.now(),
     };
@@ -2933,6 +2940,39 @@ export class ActorMesh {
     return states;
   }
 
+  /** Return the display handle for an actor thread id. */
+  getActorHandle(actorId: string): string {
+    return this.handleForId(this.resolveThreadId(actorId));
+  }
+
+  /**
+   * Resolve a direct child actor record by display handle for a given requester.
+   * Performs trim and case-insensitive matching against direct reports.
+   * Throws if handle is blank, unknown, or ambiguous.
+   */
+  resolveDirectChildHandle(requesterId: string, handle: string): ActorRecord {
+    requesterId = this.resolveThreadId(requesterId);
+    const normalized = handle.trim().toLowerCase();
+    if (!normalized) {
+      throw new Error("child handle must not be blank");
+    }
+    const directChildren = this.list().filter(
+      (r) => r.parentId === requesterId && r.status === "active"
+    );
+    const matches = directChildren.filter(
+      (r) => this.handleForId(r.id).toLowerCase() === normalized
+    );
+    if (matches.length === 0) {
+      throw new Error(`unknown child handle: "${handle}"`);
+    }
+    if (matches.length > 1) {
+      throw new Error(
+        `ambiguous child handle "${handle}": matches multiple child threads (${matches.map((m) => m.id).join(", ")})`
+      );
+    }
+    return matches[0];
+  }
+
   private retireInner(id: string): void {
     for (const child of this.actors.children(id)) {
       if (child.status === "active") this.retireUnchecked(child.id);
@@ -3163,6 +3203,9 @@ export class ActorMesh {
     if (!record) {
       throw new Error(`Cannot set model on unknown thread: ${id}`);
     }
+    if (record.status === "retired") {
+      throw new Error(`Cannot set model on retired thread: ${id}`);
+    }
     const isRoot = this.isRootActor(requestedBy);
     if (!isRoot) {
       if (requestedBy === id) {
@@ -3201,7 +3244,12 @@ export class ActorMesh {
     // An idle or queued actor has no launched run yet, so the staged pool
     // applies atomically at its next dispatch, before run_start is recorded
     // and before launch (see {@link applyPendingModel}).
-    this.actors.patch(id, { desiredModelConfig: validated });
+    this.actors.patch(id, {
+      desiredModelConfig: validated,
+      // An explicit replacement deliberately clears any prior class label;
+      // equality with a class's current entries is not provenance.
+      desiredModelClass: isModelClassReference(modelConfig) ? modelConfig.class : undefined,
+    });
 
     // A queued reservation has already quoted one of the old pool's lanes.
     // Replacing that pool must release the old quote now and pass the same
@@ -3248,7 +3296,12 @@ export class ActorMesh {
     const oldModelConfig = record.modelConfig;
     const newModelConfig = record.desiredModelConfig;
 
-    this.actors.patch(id, { modelConfig: newModelConfig, desiredModelConfig: undefined });
+    this.actors.patch(id, {
+      modelConfig: newModelConfig,
+      modelClass: record.desiredModelClass,
+      desiredModelConfig: undefined,
+      desiredModelClass: undefined,
+    });
 
     const verified = this.actors.get(id);
     if (!verified) throw new Error(`Failed to reload thread after model update: ${id}`);
@@ -3531,6 +3584,7 @@ export class ActorMesh {
     return {
       record,
       getRecord: () => this.actors.get(record.id),
+      executionTarget: record.executionTarget,
       mesh: this,
       gate: (fn, candidates, responsive) => this.gateRun(fn, candidates, responsive, record.id),
       beforeRun: ({ mode }) => {

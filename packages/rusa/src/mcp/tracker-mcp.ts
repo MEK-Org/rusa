@@ -8,6 +8,7 @@ import {
 } from "../gitops/git-bridge-deliverable.js";
 import type { IssueClient } from "../gitops/issue-client.js";
 import type { RawProviderModelConfig } from "../providers/model-config.js";
+import { formatVisibleActorSignature } from "./actor-signature.js";
 import { toolError, toolOk } from "./result.js";
 import { stampAuthor, stripAuthorStamps } from "./stamp.js";
 import { createMcpServer } from "./strict-server.js";
@@ -50,15 +51,8 @@ export function createTrackerMcpServer(
   );
 
   const actorHandle = options.actorHandle ?? generateHandle(selfId);
-  const formatSignature = () => {
-    const selection = options.getRunSelection?.();
-    const signature = selection?.model
-      ? selection.effort
-        ? `${actorHandle} (${selection.model}, ${selection.effort})`
-        : `${actorHandle} (${selection.model})`
-      : actorHandle;
-    return `*${signature}*`;
-  };
+  const formatSignature = () =>
+    formatVisibleActorSignature(actorHandle, options.getRunSelection?.());
   const appendSignature = (body: string) =>
     body ? `${body}\n\n${formatSignature()}` : formatSignature();
   // A footer is removable only as a pair with the tracker author stamp it

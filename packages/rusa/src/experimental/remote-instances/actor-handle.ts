@@ -2,6 +2,7 @@ import type { ActorOptions } from "../../actor/actor.js";
 import type { ActorFactoryContext, ActorRuntimeState, MeshActor } from "../../actor/actor-mesh.js";
 import type { RunStartHandle } from "../../actor/concurrency-limiter.js";
 import type { RunNudge } from "../../actor/trigger-runner.js";
+import { type Logger, nullLogger } from "../../observability/logger.js";
 import type { RunResult } from "../../providers/types.js";
 import type { ActorChannel } from "./actor-channel.js";
 import type { ActorEvent, Bootstrap, LeaderCommand, RunSnapshot } from "./protocol.js";
@@ -21,25 +22,39 @@ export interface ActorHandleOptions {
    */
   onFailure: (error: Error) => void;
   actorOptions?: ActorOptions;
+  target?: string;
+  logger?: Logger;
 }
 
 /** MeshActor compatibility handle; connection/lifetime belongs to RemoteInstance. */
 export class ActorHandle implements MeshActor {
   readonly id: string;
-  readonly channel: ActorChannel;
-  readonly ready: Promise<number>;
-  readonly exited: Promise<void>;
+  channel: ActorChannel;
+  ready!: Promise<number>;
+  exited!: Promise<void>;
+  private readonly log: Logger;
+  private runStartTime?: number;
   private state: ActorRuntimeState = "idle";
   private yielded = false;
   private closed = false;
   private gates = new Map<number, { handle: RunStartHandle<void>; release: () => void }>();
-  private startupTimer: ReturnType<typeof setTimeout>;
+  private startupTimer?: ReturnType<typeof setTimeout>;
   /** True between the leader admitting a run and that same run's terminal accounting. */
   private runOpen = false;
 
   constructor(private readonly opts: ActorHandleOptions) {
     this.id = opts.bootstrap.id;
     this.channel = opts.host;
+    this.log = (opts.logger ?? nullLogger).child({
+      component: "remote-instance",
+      actorId: this.id,
+      target: opts.target ?? opts.host.nodeId,
+    });
+    this.bindChannel(opts.host);
+    this.send({ type: "init", bootstrap: opts.bootstrap });
+  }
+
+  private bindChannel(channel: ActorChannel): void {
     let resolveReady!: (pid: number) => void;
     let rejectReady!: (error: Error) => void;
     this.ready = new Promise((resolve, reject) => {
@@ -48,11 +63,12 @@ export class ActorHandle implements MeshActor {
     });
     // Factories are synchronous; boot failure can arrive before the caller awaits ready.
     void this.ready.catch(() => {});
+    clearTimeout(this.startupTimer);
     this.startupTimer = setTimeout(
       () => this.fail(new Error("Remote actor startup timed out")),
       10_000
     );
-    this.channel.on("message", (raw) => {
+    channel.on("message", (raw) => {
       const message = raw as ActorEvent;
       if (message.type === "ready") {
         clearTimeout(this.startupTimer);
@@ -60,23 +76,41 @@ export class ActorHandle implements MeshActor {
       }
       void this.receive(message).catch((error) => this.fail(error));
     });
-    this.channel.on("error", (error) => {
+    channel.on("error", (error) => {
       rejectReady(error);
       this.fail(error);
     });
     this.exited = new Promise((resolve) =>
-      this.channel.once("exit", (code, signal) => {
+      channel.once("exit", (code, signal) => {
         clearTimeout(this.startupTimer);
         const error = new Error(`Remote actor exited (${signal ?? code})`);
         rejectReady(error);
         if (!this.closed) this.fail(error);
         this.releaseGates();
         this.state = "idle";
-        opts.context.onRuntimeStateChanged("idle");
+        this.opts.context.onRuntimeStateChanged("idle");
         resolve();
       })
     );
-    this.send({ type: "init", bootstrap: opts.bootstrap });
+  }
+
+  attachHost(newChannel: ActorChannel): void {
+    this.channel.removeAllListeners();
+    this.channel = newChannel;
+    this.closed = false;
+    this.bindChannel(newChannel);
+    const freshSnapshot = this.opts.snapshot();
+    const sessionId = freshSnapshot.record.sessionId ?? this.opts.bootstrap.sessionId;
+    this.send({
+      type: "init",
+      bootstrap: {
+        ...this.opts.bootstrap,
+        ...(sessionId ? { sessionId } : {}),
+        modelConfig: freshSnapshot.record.modelConfig ?? this.opts.bootstrap.modelConfig,
+        mcpServers: freshSnapshot.mcpServers,
+        reconnect: true,
+      },
+    });
   }
 
   get isRunning(): boolean {
@@ -151,6 +185,18 @@ export class ActorHandle implements MeshActor {
   private async endRun(result: RunResult): Promise<void> {
     if (!this.runOpen) return;
     this.runOpen = false;
+    const elapsedMs =
+      this.runStartTime !== undefined
+        ? Math.round(performance.now() - this.runStartTime)
+        : undefined;
+    this.runStartTime = undefined;
+    this.log.info("remote_run_end", {
+      actorId: this.id,
+      target: this.opts.target ?? this.channel.nodeId,
+      success: result.success,
+      exitCode: result.exitCode,
+      elapsedMs,
+    });
     try {
       await this.opts.context.onRunEnd(result);
     } catch (error) {
@@ -192,8 +238,15 @@ export class ActorHandle implements MeshActor {
       case "runStart":
         // Mark open only once the leader's own run-start accounting has taken:
         // a throw here leaves no run to close.
+        this.runStartTime = performance.now();
         hooks?.onRunStart?.(message.responsive, message.injectRecord, message.selected);
         this.runOpen = true;
+        this.log.info("remote_run_start", {
+          actorId: this.id,
+          target: this.opts.target ?? this.channel.nodeId,
+          responsive: message.responsive,
+          selected: message.selected,
+        });
         break;
       case "firstChunk":
         hooks?.onFirstChunk?.();

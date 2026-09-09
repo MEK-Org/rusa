@@ -10,6 +10,8 @@ import { createTrackerMcpServer } from "../mcp/tracker-mcp.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import {
   assertConcreteModelConfig,
+  isModelClassReference,
+  type ProviderModelConfig,
   type RawProviderModelConfig,
 } from "../providers/model-config.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
@@ -181,6 +183,7 @@ function setup(
     scheduledMessages?: FakeScheduledMessageScheduler;
     actors?: InMemoryActorRepository;
     withTransaction?: ActorMeshOptions["withTransaction"];
+    handleForId?: (id: string) => string;
   } = {}
 ) {
   const registry = opts.actors ?? new InMemoryActorRepository();
@@ -193,6 +196,7 @@ function setup(
   const mesh = new ActorMesh({
     actors: registry,
     rootId: opts.rootId ?? "root",
+    handleForId: opts.handleForId,
     validateSpawn: opts.validateSpawn,
     validateModel: opts.validateModel,
     onModelSet: opts.onModelSet,
@@ -820,6 +824,89 @@ describe("ActorMesh", () => {
     expect(() => mesh.setActorModel(child, { class: "fast" }, parent)).toThrow(
       /model class reference/
     );
+  });
+
+  it("derives named-class provenance from the declaration across equal-pool transitions", async () => {
+    const resolve = (input: SpawnRequest["modelConfig"]): ProviderModelConfig[] => {
+      if (isModelClassReference(input)) {
+        return [{ provider: "claude", model: "shared-model" }];
+      }
+      const concrete = assertConcreteModelConfig(input);
+      const entries = Array.isArray(concrete) ? concrete : [concrete];
+      return entries.map((entry) => {
+        if (!entry.model) throw new Error("test model is required");
+        return { provider: entry.provider, model: entry.model, effort: entry.effort };
+      });
+    };
+    const { mesh, registry, tick } = setup({
+      validateSpawn: (request) => resolve(request.modelConfig),
+      validateModel: (_record, input) => resolve(input),
+    });
+
+    const classConfigured = mesh.spawn({
+      charter: "class-configured worker",
+      parentId: "root",
+      modelConfig: { class: "fast" },
+    });
+    const explicit = mesh.spawn({
+      charter: "explicit worker",
+      parentId: "root",
+      modelConfig: { provider: "claude", model: "fast-model" },
+    });
+
+    expect(registry.get(classConfigured)).toMatchObject({
+      modelConfig: [{ provider: "claude", model: "shared-model" }],
+      modelClass: "fast",
+    });
+    expect(registry.get(explicit)?.modelClass).toBeUndefined();
+
+    // Equal pools do not make equivalent provenance: switching named classes
+    // must remain staged and visible even though their current snapshots match.
+    mesh.setActorModel(classConfigured, { class: "careful" }, "root");
+    expect(registry.get(classConfigured)).toMatchObject({
+      modelClass: "fast",
+      desiredModelConfig: [{ provider: "claude", model: "shared-model" }],
+      desiredModelClass: "careful",
+    });
+    mesh.sendMessage(classConfigured, "apply class", "root");
+    await tick();
+    expect(registry.get(classConfigured)).toMatchObject({
+      modelConfig: [{ provider: "claude", model: "shared-model" }],
+      modelClass: "careful",
+    });
+    expect(registry.get(classConfigured)?.desiredModelClass).toBeUndefined();
+
+    // An identical explicit pin clears class provenance; pool equality is not
+    // used as evidence that the class declaration still applies.
+    mesh.setActorModel(classConfigured, { provider: "claude", model: "shared-model" }, "root");
+    expect(registry.get(classConfigured)?.desiredModelClass).toBeUndefined();
+    mesh.sendMessage(classConfigured, "apply explicit pin", "root");
+    await tick();
+    expect(registry.get(classConfigured)?.modelClass).toBeUndefined();
+  });
+
+  it("ignores an untyped modelClass sidecar on an explicit spawn request", () => {
+    const { mesh, registry } = setup({
+      validateSpawn: (request) => {
+        const concrete = assertConcreteModelConfig(request.modelConfig);
+        const entries = Array.isArray(concrete) ? concrete : [concrete];
+        return entries.map((entry) => ({
+          provider: entry.provider,
+          model: entry.model ?? "required-model",
+          effort: entry.effort,
+        }));
+      },
+    });
+    const id = mesh.spawn({
+      charter: "explicit worker",
+      parentId: "root",
+      modelConfig: { provider: "claude", model: "shared-model" },
+      // JavaScript callers can still append unknown properties. ActorMesh must
+      // ignore this one instead of persisting false class provenance.
+      modelClass: "invented",
+    } as SpawnRequest & { modelClass: string });
+
+    expect(registry.get(id)?.modelClass).toBeUndefined();
   });
 
   it("revokes parent handle and marks record retired when createActor throws on spawn", () => {
@@ -4580,34 +4667,28 @@ describe("ActorMesh", () => {
     });
   });
 
-  // #169 responsive promotion reselects: a normal request that queued behind
-  // mesh capacity on a later-declared lane (because the earlier-declared one
-  // quoted later) must, on a responsive delivery, reselect onto the first
-  // healthy *declared* candidate — not merely bypass pacing on the lane it
-  // happened to already be queued on.
-  describe("responsive promotion reselects onto the earliest healthy declared lane (#169)", () => {
-    it("promotes a queued run from a later-declared lane onto an earlier-declared one, with exactly one immediate run", async () => {
+  // #347 responsive promotion retains the normal admission choice. A queued
+  // normal run selected on a later-declared lane because it quoted sooner must
+  // use that same lane when promoted; responsive priority only bypasses queues.
+  describe("responsive promotion retains normal pool selection (#347)", () => {
+    it("promotes a queued run on its next-available lane, with exactly one immediate run", async () => {
       const poolARuns: string[] = [];
       const poolBRuns: string[] = [];
       const liveActors = new Map<string, Actor>();
       const blockerDeferred = deferredProvider();
-      // pool-a's run blocks until released, so the reselected-but-not-yet-
+      // pool-b's run blocks until released, so the promoted-but-not-yet-
       // finished state can be inspected before the run completes.
-      const poolAGates: Array<() => void> = [];
+      const poolBGates: Array<() => void> = [];
       const providerByName = new Map<string, CodingProvider>([
         [
           "pool-a",
           {
             name: "pool-a",
             providerName: "pool-a",
-            run: (runOpts) => {
+            run: async (runOpts) => {
               poolARuns.push(runOpts.cwd);
-              return new Promise((resolve) => {
-                poolAGates.push(() => {
-                  liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
-                  resolve({ success: true, exitCode: 0, output: "a" });
-                });
-              });
+              liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
+              return { success: true, exitCode: 0, output: "a" };
             },
           },
         ],
@@ -4616,10 +4697,14 @@ describe("ActorMesh", () => {
           {
             name: "pool-b",
             providerName: "pool-b",
-            run: async (runOpts) => {
+            run: (runOpts) => {
               poolBRuns.push(runOpts.cwd);
-              liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
-              return { success: true, exitCode: 0, output: "b" };
+              return new Promise((resolve) => {
+                poolBGates.push(() => {
+                  liveActors.get(runOpts.cwd.replace("/tmp/", ""))?.declareYield();
+                  resolve({ success: true, exitCode: 0, output: "b" });
+                });
+              });
             },
           },
         ],
@@ -4634,8 +4719,8 @@ describe("ActorMesh", () => {
         return pacer;
       };
       // pool-a is declared first but quotes later than pool-b, so the initial
-      // normal selection reserves pool-b — the exact setup a responsive
-      // promotion must correct.
+      // normal selection reserves pool-b — the selection responsive promotion
+      // must preserve.
       pacerFor("pool-a").deferUntil(Date.now() + 20_000);
 
       const { mesh, registry, tick } = setup({
@@ -4731,27 +4816,25 @@ describe("ActorMesh", () => {
       expect(mesh.activeRunState(worker)?.phase).toBe("queued");
       expect(mesh.getSelection(worker)?.provider).toBe("pool-b");
 
-      // A responsive delivery must reselect onto pool-a — the first healthy
-      // declared candidate — cancelling the stale pool-b reservation, and
-      // bypass pacing/concurrency entirely (blocker still holds the mesh's
-      // only slot).
+      // A responsive delivery preserves pool-b, while bypassing
+      // pacing/concurrency entirely (blocker still holds the mesh's only slot).
       mesh.sendHumanMessage(worker, "urgent", "human-session");
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(poolARuns).toEqual([`/tmp/${worker}`]);
-      expect(poolBRuns).toEqual([]);
-      expect(mesh.getSelection(worker)?.provider).toBe("pool-a");
+      expect(poolARuns).toEqual([]);
+      expect(poolBRuns).toEqual([`/tmp/${worker}`]);
+      expect(mesh.getSelection(worker)?.provider).toBe("pool-b");
       expect(mesh.getSelection(worker)?.responsive).toBe(true);
       expect(mesh.runningThreadIds()).toEqual(new Set([blocker, worker]));
 
-      poolAGates.splice(0).forEach((release) => {
+      poolBGates.splice(0).forEach((release) => {
         release();
       });
       blockerDeferred.releaseAll();
       await tick();
 
-      expect(poolARuns).toEqual([`/tmp/${worker}`]);
-      expect(poolBRuns).toEqual([]);
+      expect(poolARuns).toEqual([]);
+      expect(poolBRuns).toEqual([`/tmp/${worker}`]);
       expect(mesh.runningThreadIds()).toEqual(new Set());
       expect(mesh.queuedThreadIds()).toEqual(new Set());
     });
@@ -7597,4 +7680,117 @@ describe("ActorMesh", () => {
   // and persistence of a canonicalized modelConfig across a restart is
   // covered in actor-mesh-restart-persistence.test.ts. Removed rather than
   // rewritten.
+
+  describe("resolveDirectChildHandle and getActorHandle (#323)", () => {
+    it("resolves a direct child by handle case-insensitively and with trimming", () => {
+      const { mesh } = setup();
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child = mesh.spawn({ charter: "child", parentId: parent });
+      const handle = mesh.getActorHandle(child);
+
+      const resolved = mesh.resolveDirectChildHandle(parent, `  ${handle.toUpperCase()}  `);
+      expect(resolved.id).toBe(child);
+      expect(resolved.parentId).toBe(parent);
+    });
+
+    it("fails when resolving with a blank or whitespace-only handle", () => {
+      const { mesh } = setup();
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      mesh.spawn({ charter: "child", parentId: parent });
+
+      expect(() => mesh.resolveDirectChildHandle(parent, "   ")).toThrow(
+        /child handle must not be blank/
+      );
+    });
+
+    it("fails when resolving an unknown child handle", () => {
+      const { mesh } = setup();
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      mesh.spawn({ charter: "child", parentId: parent });
+
+      expect(() => mesh.resolveDirectChildHandle(parent, "non-existent-handle")).toThrow(
+        /unknown child handle: "non-existent-handle"/
+      );
+    });
+
+    it("refuses to resolve children belonging to a different parent", () => {
+      const { mesh } = setup();
+      const parentA = mesh.spawn({ charter: "parent A", parentId: "root" });
+      const childA = mesh.spawn({ charter: "child A", parentId: parentA });
+      const handleA = mesh.getActorHandle(childA);
+
+      const parentB = mesh.spawn({ charter: "parent B", parentId: "root" });
+
+      expect(() => mesh.resolveDirectChildHandle(parentB, handleA)).toThrow(
+        new RegExp(`unknown child handle: "${handleA}"`)
+      );
+    });
+
+    it("fails when direct children have ambiguous duplicate handles", () => {
+      const { mesh } = setup({
+        handleForId: (id) => {
+          if (id === "t2" || id === "t3") return "twin-badger";
+          return id;
+        },
+      });
+
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child1 = mesh.spawn({ charter: "child 1", parentId: parent });
+      const child2 = mesh.spawn({ charter: "child 2", parentId: parent });
+      expect(mesh.getActorHandle(child1)).toBe("twin-badger");
+      expect(mesh.getActorHandle(child2)).toBe("twin-badger");
+
+      expect(() => mesh.resolveDirectChildHandle(parent, "twin-badger")).toThrow(
+        /ambiguous child handle "twin-badger": matches multiple child threads/
+      );
+    });
+
+    it("ignores retired children so handle collisions with retired siblings do not cause ambiguity", () => {
+      const { mesh, registry } = setup({
+        handleForId: (id) => {
+          if (id === "t2" || id === "t3") return "twin-badger";
+          return id;
+        },
+      });
+
+      const parent = mesh.spawn({ charter: "parent", parentId: "root" });
+      const child1 = mesh.spawn({ charter: "child 1", parentId: parent });
+      const child2 = mesh.spawn({ charter: "child 2", parentId: parent });
+      expect(mesh.getActorHandle(child1)).toBe("twin-badger");
+      expect(mesh.getActorHandle(child2)).toBe("twin-badger");
+
+      // When child1 is retired, resolving "twin-badger" resolves cleanly to active child2
+      mesh.retire(child1);
+      expect(registry.get(child1)?.status).toBe("retired");
+      expect(registry.get(child2)?.status).toBe("active");
+
+      const resolved = mesh.resolveDirectChildHandle(parent, "twin-badger");
+      expect(resolved.id).toBe(child2);
+
+      // When child2 is also retired, resolving "twin-badger" throws unknown child handle
+      mesh.retire(child2);
+      expect(() => mesh.resolveDirectChildHandle(parent, "twin-badger")).toThrow(
+        /unknown child handle: "twin-badger"/
+      );
+    });
+
+    it("refuses setActorModel on retired threads", () => {
+      const { mesh } = setup();
+      const parent = mesh.spawn({
+        charter: "parent",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const child = mesh.spawn({
+        charter: "child",
+        parentId: parent,
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+
+      mesh.retire(child);
+      expect(() =>
+        mesh.setActorModel(child, { provider: "claude", model: "claude-opus-4-8" }, parent)
+      ).toThrow(new RegExp(`Cannot set model on retired thread: ${child}`));
+    });
+  });
 });

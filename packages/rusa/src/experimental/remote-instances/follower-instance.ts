@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { createActorRuntime } from "./actor-runtime.js";
@@ -28,18 +29,28 @@ export class FollowerInstance {
       this.actors.get(actorId)?.dispatch(message);
       return;
     }
-    if (this.actors.has(actorId)) throw new Error("Actor already exists on follower");
     const cwd = join(this.home, "workers", actorId);
     mkdirSync(cwd, { recursive: true });
-    const actor = createActorRuntime(
-      this.providerFactory,
-      (event) => this.emit({ actorId, message: event }),
-      () => {
-        this.actors.delete(actorId);
-        this.emit({ actorId, message: { type: "exit", code: 0, signal: null } });
+    let actor = this.actors.get(actorId);
+    if (actor) {
+      if (!message.bootstrap.reconnect) {
+        throw new Error("Actor already exists on follower");
       }
-    );
-    this.actors.set(actorId, actor);
+    } else {
+      actor = createActorRuntime(
+        this.providerFactory,
+        (event) => this.emit({ eventId: randomUUID(), actorId, message: event }),
+        () => {
+          this.actors.delete(actorId);
+          this.emit({
+            eventId: randomUUID(),
+            actorId,
+            message: { type: "exit", code: 0, signal: null },
+          });
+        }
+      );
+      this.actors.set(actorId, actor);
+    }
     actor.dispatch({
       type: "init",
       bootstrap: {

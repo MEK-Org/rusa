@@ -1,12 +1,14 @@
 import { Actor } from "../../actor/actor.js";
 import type { RunStartE2EHooks } from "../../commands/start.js";
 import type { RusaConfig } from "../../config/types.js";
+import type { Logger } from "../../observability/logger.js";
 import { ActorHandle } from "./actor-handle.js";
 import type { FollowerHub } from "./follower-hub.js";
 
 export function instanceWorkerFactory(
   config: RusaConfig,
-  hub: FollowerHub
+  hub: FollowerHub,
+  opts?: { logger?: Logger }
 ): NonNullable<RunStartE2EHooks["createWorkerActor"]> {
   return (context, options) => {
     const record = context.record;
@@ -47,6 +49,7 @@ export function instanceWorkerFactory(
           yieldGraceMs: options.yieldGraceMs,
           debounceMs: options.debounceMs,
         },
+        reconnect: Boolean(options.loadSessionId() || record.sessionId),
       },
       context: {
         ...context,
@@ -78,6 +81,8 @@ export function instanceWorkerFactory(
       onFailure: (error) => {
         options.log?.(`[remote-instance] ${error.message}\n`);
       },
+      logger: opts?.logger,
+      target,
     });
     return runtime;
   };

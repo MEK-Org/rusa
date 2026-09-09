@@ -1,5 +1,22 @@
+import {
+  type ActorRunModelConfig,
+  createActorRunModelConfig,
+} from "../db/repositories/actor-run-model-config.js";
 import type { ActorRunRepository } from "../db/repositories/actor-run-repository.js";
+import type { RawProviderModelConfig } from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
+
+/**
+ * Project the exact validated tuple selected for a launch into the durable run
+ * document. Production and the provider-matrix test share this boundary.
+ */
+export function projectActorRunLaunchConfig(selected: RawProviderModelConfig): ActorRunModelConfig {
+  return createActorRunModelConfig({
+    provider: selected.provider,
+    model: selected.model ?? "",
+    ...(selected.effort === undefined ? {} : { effort: selected.effort }),
+  });
+}
 
 /**
  * The leader's durable run ledger, addressed by actor.
@@ -13,7 +30,7 @@ import type { RunResult } from "../providers/types.js";
  */
 export interface RunAccounting {
   /** Open this actor's durable run. Throws if one is already open. */
-  begin(actorId: string, provider: string): string;
+  begin(actorId: string, modelConfig: ActorRunModelConfig): string;
   /** Close this actor's open run. Throws if the actor has none. */
   complete(actorId: string, result: RunResult): string;
   /** Close this actor's open run as abandoned, or report there was none. */
@@ -38,17 +55,16 @@ export function createRunAccounting(runs: () => ActorRunRepository): RunAccounti
       output: result.output,
       yieldStatus: result.yieldStatus,
       yieldNote: result.yieldNote,
-      model: result.model,
     });
     activeRunIds.delete(actorId);
     return runId;
   };
   return {
-    begin: (actorId, provider) => {
+    begin: (actorId, modelConfig) => {
       if (activeRunIds.has(actorId)) {
         throw new Error(`actor already has an active durable run: ${actorId}`);
       }
-      const runId = runs().start({ actorId, provider });
+      const runId = runs().start({ actorId, modelConfig });
       activeRunIds.set(actorId, runId);
       return runId;
     },

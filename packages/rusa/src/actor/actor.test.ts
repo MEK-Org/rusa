@@ -206,22 +206,6 @@ describe("Actor", () => {
     });
   });
 
-  it("passes e2eWritableRemoteDir through to sandbox options when the actor opts set it (e2e-only propagation)", async () => {
-    const provider = new FakeProvider();
-    const actor = makeActor(
-      { sandbox: true, e2eWritableRemoteDir: "/home/e2e-operator/.rusa-e2e/run-1/remote/repo.git" },
-      provider
-    );
-
-    actor.requestRun();
-    await vi.advanceTimersByTimeAsync(10);
-
-    expect(provider.calls[0]?.sandbox).toEqual({
-      worktreePath: "/tmp/a1",
-      e2eWritableRemoteDir: "/home/e2e-operator/.rusa-e2e/run-1/remote/repo.git",
-    });
-  });
-
   it("skips provider sandbox options when disabled", async () => {
     const provider = new FakeProvider();
     const actor = makeActor({ sandbox: false }, provider);
@@ -422,6 +406,7 @@ describe("Actor", () => {
     });
     let promotions = 0;
     const priorities: boolean[] = [];
+    const startPriorities: boolean[] = [];
     const gate: NonNullable<ActorOptions["gate"]> = <T>(
       fn: (selected: RawProviderModelConfig) => Promise<T>,
       candidates: readonly RawProviderModelConfig[],
@@ -449,6 +434,7 @@ describe("Actor", () => {
     actor = makeActor(
       {
         gate,
+        onRunStart: (responsive) => startPriorities.push(responsive),
       },
       provider
     );
@@ -462,6 +448,7 @@ describe("Actor", () => {
 
     expect(promotions).toBe(1);
     expect(priorities).toEqual([false]);
+    expect(startPriorities).toEqual([true]);
     expect(provider.calls).toHaveLength(1);
   });
 
@@ -1600,6 +1587,34 @@ describe("Actor", () => {
 
       expect(started).toBe(0);
       expect(provider.calls).toHaveLength(0);
+    });
+
+    it("turns an onRunStart failure into a failed result without invoking the provider", async () => {
+      const results: RunResult[] = [];
+      const provider = new FakeProvider();
+      const actor = makeActor(
+        {
+          onRunStart: () => {
+            throw new Error("launch configuration rejected");
+          },
+          onRunEnd: (result) => {
+            results.push(result);
+          },
+        },
+        provider
+      );
+
+      actor.requestRun();
+      await vi.advanceTimersByTimeAsync(10);
+      await flush();
+
+      expect(provider.calls).toHaveLength(0);
+      expect(results).toHaveLength(1);
+      expect(results[0]).toMatchObject({
+        success: false,
+        exitCode: 1,
+        output: expect.stringContaining("launch configuration rejected"),
+      });
     });
 
     // The third timestamp : start says the provider was invoked, the

@@ -262,24 +262,81 @@ describe("chat MCP server", () => {
     expect(tools.map((t) => t.name).sort()).toEqual(["react", "send_message", "upload_attachment"]);
   });
 
-  it("routes send_message to the backend and returns the created name", async () => {
+  it("signs unsigned top-level messages at the Chat write boundary", async () => {
     const fake = new FakeChatClient();
-    const client = await connect(createChatWriteMcpServer("test", fake, { allowedSpaces: ["*"] }));
+    const client = await connect(
+      createChatWriteMcpServer("test", fake, {
+        allowedSpaces: ["*"],
+        actorHandle: "actor-handle",
+        getRunSelection: () => ({ provider: "test", model: "test-model", effort: "high" }),
+      })
+    );
+    const res = (await client.callTool({
+      name: "send_message",
+      arguments: { spaceName: "spaces/A", text: "hi" },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    expect(fake.sent).toEqual([
+      {
+        spaceName: "spaces/A",
+        text: "hi\n\n_actor-handle (test-model, high)_",
+        threadName: undefined,
+      },
+    ]);
+    expect(fake.sent[0]?.text).not.toContain("mesh:author");
+  });
+
+  it("signs threaded messages without changing their thread target", async () => {
+    const fake = new FakeChatClient();
+    const client = await connect(
+      createChatWriteMcpServer("test", fake, {
+        allowedSpaces: ["*"],
+        actorHandle: "actor-handle",
+        getRunSelection: () => ({ provider: "test", model: "test-model", effort: "high" }),
+      })
+    );
     const res = (await client.callTool({
       name: "send_message",
       arguments: { spaceName: "spaces/A", text: "hi", threadName: "spaces/A/threads/T" },
     })) as CallToolResult;
     expect(res.isError).toBeFalsy();
     expect(fake.sent).toEqual([
-      { spaceName: "spaces/A", text: "hi", threadName: "spaces/A/threads/T" },
+      {
+        spaceName: "spaces/A",
+        text: "hi\n\n_actor-handle (test-model, high)_",
+        threadName: "spaces/A/threads/T",
+      },
     ]);
     expect(JSON.parse(textOf(res)).name).toContain("spaces/A/messages/");
   });
 
-  it("uploads an attachment and sends a message referencing it", async () => {
+  it("does not duplicate a caller-supplied matching signature", async () => {
     const fake = new FakeChatClient();
     const client = await connect(
-      createChatWriteMcpServer("test", fake, { allowedSpaces: ["spaces/A"] })
+      createChatWriteMcpServer("test", fake, {
+        allowedSpaces: ["*"],
+        actorHandle: "actor-handle",
+        getRunSelection: () => ({ provider: "test", model: "test-model", effort: "high" }),
+      })
+    );
+    const signedText = "hi\n\n_actor-handle (test-model, high)_";
+    const res = (await client.callTool({
+      name: "send_message",
+      arguments: { spaceName: "spaces/A", text: signedText },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    expect(fake.sent[0]?.text).toBe(signedText);
+  });
+
+  it("uploads an attachment and sends a signed attachment-only message", async () => {
+    const fake = new FakeChatClient();
+    const client = await connect(
+      createChatWriteMcpServer("test", fake, {
+        allowedSpaces: ["spaces/A"],
+        actorHandle: "actor-handle",
+      })
     );
     const uploadRes = (await client.callTool({
       name: "upload_attachment",
@@ -300,14 +357,17 @@ describe("chat MCP server", () => {
       name: "send_message",
       arguments: {
         spaceName: "spaces/A",
-        text: "here is the file",
+        text: "",
         attachments: [{ attachmentDataRef: uploadData.attachmentDataRef }],
       },
     })) as CallToolResult;
     expect(sendRes.isError).toBeFalsy();
-    expect(fake.sent[0]?.attachments).toEqual([
-      { attachmentDataRef: uploadData.attachmentDataRef },
-    ]);
+    expect(fake.sent[0]).toEqual({
+      spaceName: "spaces/A",
+      text: "_actor-handle_",
+      attachments: [{ attachmentDataRef: uploadData.attachmentDataRef }],
+      threadName: undefined,
+    });
   });
 
   it("rejects malformed or loose attachment resource names on download_attachment", async () => {
@@ -374,7 +434,7 @@ describe("chat MCP server", () => {
     })) as CallToolResult;
     expect(sendRes.isError).toBeFalsy();
     expect(fake.sent.length).toBe(1);
-    expect(fake.sent[0]?.text).toBe("inline base64 upload");
+    expect(fake.sent[0]?.text).toBe("inline base64 upload\n\n_test_");
     expect(fake.sent[0]?.attachments?.length).toBe(1);
     expect(fake.uploadedAttachments.length).toBe(1);
     expect(fake.uploadedAttachments[0]?.filename).toBe("inline-doc.txt");
@@ -532,7 +592,7 @@ describe("chat MCP server", () => {
 
       expect(sendRes.isError).toBeFalsy();
       expect(fake.sent.length).toBe(1);
-      expect(fake.sent[0]?.text).toBe("here is an image from disk");
+      expect(fake.sent[0]?.text).toBe("here is an image from disk\n\n_test_");
       expect(fake.sent[0]?.attachments?.length).toBe(1);
       expect(fake.uploadedAttachments.length).toBe(1);
       expect(fake.uploadedAttachments[0]?.filename).toBe("image.png");

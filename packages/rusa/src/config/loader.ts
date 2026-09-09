@@ -1,12 +1,12 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { assertSpawnContextSupported, resolveContextConfig } from "../actor/context-selection.js";
-import {
-  providerCapabilityName,
-  validateProviderSelection,
-} from "../providers/provider-selection.js";
+import { isSafeFollowerBind } from "../experimental/remote-instances/safe-bind.js";
+import { validateModelConfigPool } from "../providers/model-config.js";
+import { providerCapabilityName } from "../providers/provider-selection.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import {
   GEMINI_API_KEY_SECRET_FILENAME,
@@ -229,7 +229,10 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
   if (!parsed.providers || Object.keys(parsed.providers).length === 0) {
     throw new Error("config.yaml: at least one provider is required");
   }
-  if (parsed.rootActor?.context !== undefined) {
+  if (!parsed.rootActor) {
+    throw new Error("config.yaml: rootActor must specify an explicit provider and model");
+  }
+  if (parsed.rootActor.context !== undefined) {
     try {
       parsed.rootActor.context = resolveContextConfig(parsed.rootActor.context);
     } catch (err) {
@@ -238,33 +241,32 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
       );
     }
   }
-  if (parsed.rootActor) {
-    const provider = parsed.rootActor.provider?.trim();
-    if (!provider) throw new Error("config.yaml: rootActor.provider must be a non-empty string");
-    const capabilityName = providerCapabilityName(provider, parsed);
-    if (capabilityName === "agy" && parsed.rootActor.effort === undefined) {
-      const { effort: parsedEffort } = normalizeModelEffortSelection(
-        capabilityName,
-        parsed.rootActor.model,
-        undefined
-      );
-      if (parsedEffort === undefined) {
-        console.warn(
-          `[migration] defaulting omitted config rootActor effort to "high" for antigravity model "${parsed.rootActor.model || "default"}"`
-        );
-        parsed.rootActor.effort = "high";
-      }
-    }
-    const selection = validateProviderSelection(
-      parsed,
-      provider,
-      parsed.rootActor.model,
-      parsed.rootActor.effort
+  const rootActor = parsed.rootActor;
+  const provider = rootActor.provider?.trim();
+  if (!provider) throw new Error("config.yaml: rootActor.provider must be a non-empty string");
+  const capabilityName = providerCapabilityName(provider, parsed);
+  if (capabilityName === "agy" && rootActor.effort === undefined) {
+    const { effort: parsedEffort } = normalizeModelEffortSelection(
+      capabilityName,
+      rootActor.model,
+      undefined
     );
-    parsed.rootActor.provider = provider;
-    parsed.rootActor.model = selection.model;
-    parsed.rootActor.effort = selection.effort;
+    if (parsedEffort === undefined) {
+      console.warn(
+        `[migration] defaulting omitted config rootActor effort to "high" for antigravity model "${rootActor.model || ""}"`
+      );
+      rootActor.effort = "high";
+    }
   }
+  const [selection] = validateModelConfigPool(
+    parsed,
+    { provider, model: rootActor.model, effort: rootActor.effort },
+    { portable: rootActor.context?.type === "portable" }
+  );
+  if (!selection) throw new Error("config.yaml: rootActor requires one provider/model entry");
+  rootActor.provider = selection.provider;
+  rootActor.model = selection.model;
+  rootActor.effort = selection.effort;
   if (parsed.understanding?.rootNodeId !== undefined) {
     if (
       typeof parsed.understanding.rootNodeId !== "string" ||
@@ -581,6 +583,38 @@ export function loadConfig(home?: string, options?: LoadConfigOptions): RusaConf
     parsed.gitBridgeBindHost = parsed.gitBridgeBindHost.trim();
   } else {
     parsed.gitBridgeBindHost = "127.0.0.1";
+  }
+
+  const followers = parsed.followers;
+  if (followers !== undefined) {
+    if (typeof followers !== "object" || followers === null || Array.isArray(followers)) {
+      throw new Error("config.yaml: followers must be a mapping when set");
+    }
+    if (typeof followers.bind !== "string" || !followers.bind.trim()) {
+      throw new Error("config.yaml: followers.bind must be a non-empty string when set");
+    }
+    followers.bind = followers.bind.trim();
+    if (!isSafeFollowerBind(followers.bind)) {
+      throw new Error(
+        `config.yaml: followers.bind must be an explicit loopback (127.0.0.1) or Tailscale IPv4 address (100.64.0.0/10), got ${JSON.stringify(followers.bind)}`
+      );
+    }
+    if (
+      typeof followers.port !== "number" ||
+      !Number.isInteger(followers.port) ||
+      followers.port <= 0 ||
+      followers.port > 65535
+    ) {
+      throw new Error("config.yaml: followers.port must be a valid port integer (1-65535)");
+    }
+    if (typeof followers.tokenFile !== "string" || !followers.tokenFile.trim()) {
+      throw new Error("config.yaml: followers.tokenFile must be a non-empty string when set");
+    }
+    const rawTokenFile = followers.tokenFile.trim();
+    followers.tokenFile =
+      rawTokenFile === "~" || rawTokenFile.startsWith("~/")
+        ? join(homedir(), rawTokenFile.slice(2))
+        : rawTokenFile;
   }
 
   applySecretFiles(parsed, mcHome);

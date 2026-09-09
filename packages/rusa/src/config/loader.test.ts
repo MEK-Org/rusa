@@ -1,5 +1,5 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { stringify as toYaml } from "yaml";
@@ -13,6 +13,7 @@ function writeConfig(overrides: Record<string, unknown> = {}): string {
     toYaml({
       github: { account: "CodeChopsBot", pollIntervalSeconds: 300 },
       providers: { codex: { cliCommand: "codex" } },
+      rootActor: { provider: "codex", model: "gpt-5.6-sol" },
       geminiApiKey: "test-key",
       webhook: { port: 9742, secret: "secret" },
       ...overrides,
@@ -23,6 +24,20 @@ function writeConfig(overrides: Record<string, unknown> = {}): string {
 }
 
 describe("loadConfig deployBranch", () => {
+  it("requires an explicit root provider and model", () => {
+    const home = mkdtempSync(join(tmpdir(), "rusa-config-"));
+    writeFileSync(
+      join(home, "config.yaml"),
+      toYaml({
+        github: { account: "CodeChopsBot", pollIntervalSeconds: 300 },
+        providers: { codex: { cliCommand: "codex" } },
+        webhook: { port: 9742, secret: "secret" },
+      }),
+      "utf8"
+    );
+    expect(() => loadConfig(home)).toThrow(/rootActor must specify an explicit provider and model/);
+  });
+
   it("defaults deployBranch to master when omitted", () => {
     const config = loadConfig(writeConfig());
     expect(config.deployBranch).toBe(DEFAULT_DEPLOY_BRANCH);
@@ -49,6 +64,7 @@ describe("loadConfig geminiApiKey (optional)", () => {
       toYaml({
         github: { account: "CodeChopsBot", pollIntervalSeconds: 300 },
         providers: { codex: { cliCommand: "codex" } },
+        rootActor: { provider: "codex", model: "gpt-5.6-sol" },
         webhook: { port: 9742, secret: "secret" },
       }),
       "utf8"
@@ -68,6 +84,7 @@ describe("loadConfig rootActor.context", () => {
       writeConfig({
         rootActor: {
           provider: "codex",
+          model: "gpt-5.6-sol",
           context: {
             type: "portable",
             mode: "ledger",
@@ -93,9 +110,9 @@ describe("loadConfig rootActor.context", () => {
     ],
     [{ type: "native", mode: "tail" }, /mode is meaningless for native context/],
   ])("rejects malformed or meaningless context %#", (context, message) => {
-    expect(() => loadConfig(writeConfig({ rootActor: { provider: "codex", context } }))).toThrow(
-      message
-    );
+    expect(() =>
+      loadConfig(writeConfig({ rootActor: { provider: "codex", model: "gpt-5.6-sol", context } }))
+    ).toThrow(message);
   });
 
   it("rejects ledger mode when no Gemini key is available", () => {
@@ -105,6 +122,7 @@ describe("loadConfig rootActor.context", () => {
           geminiApiKey: undefined,
           rootActor: {
             provider: "codex",
+            model: "gpt-5.6-sol",
             context: { type: "portable", mode: "ledger" },
           },
         })
@@ -223,6 +241,7 @@ describe("loadConfig secrets files ($RUSA_HOME/secrets, ISSUE_NUM)", () => {
       toYaml({
         github: { account: "CodeChopsBot", pollIntervalSeconds: 300 },
         providers: { codex: { cliCommand: "codex" } },
+        rootActor: { provider: "codex", model: "gpt-5.6-sol" },
         webhook: { port: 9742, secret: "" },
       }),
       "utf8"
@@ -256,6 +275,7 @@ describe("loadConfig secrets files ($RUSA_HOME/secrets, ISSUE_NUM)", () => {
       toYaml({
         github: { account: "CodeChopsBot", pollIntervalSeconds: 300 },
         providers: { codex: { cliCommand: "codex" } },
+        rootActor: { provider: "codex", model: "gpt-5.6-sol" },
         webhook: { port: 9742, secret: "secret" },
       }),
       "utf8"
@@ -758,7 +778,7 @@ describe("loadConfig providers.<name>.fallbackModel is rejected ", () => {
   it("still accepts rootActor.fallbackModel (root-only, unaffected)", () => {
     const config = loadConfig(
       writeConfig({
-        rootActor: { provider: "codex", fallbackModel: "codex-fallback" },
+        rootActor: { provider: "codex", model: "gpt-5.6-sol", fallbackModel: "codex-fallback" },
       })
     );
     expect(config.rootActor?.fallbackModel).toBe("codex-fallback");
@@ -1193,5 +1213,80 @@ describe("loadConfig observability.logging", () => {
     expect(() => loadConfig(writeConfig({ observability: { logging: { format: 1 } } }))).toThrow(
       /observability.logging.format must be one of/
     );
+  });
+
+  describe("followers gateway config", () => {
+    it("loads valid followers config with loopback bind", () => {
+      const config = loadConfig(
+        writeConfig({
+          followers: {
+            bind: "127.0.0.1",
+            port: 8190,
+            tokenFile: "/path/to/token",
+          },
+        })
+      );
+      expect(config.followers).toEqual({
+        bind: "127.0.0.1",
+        port: 8190,
+        tokenFile: "/path/to/token",
+      });
+    });
+
+    it("loads valid followers config with tailscale bind", () => {
+      const config = loadConfig(
+        writeConfig({
+          followers: {
+            bind: "100.100.50.25",
+            port: 8190,
+            tokenFile: "/path/to/token",
+          },
+        })
+      );
+      expect(config.followers?.bind).toBe("100.100.50.25");
+    });
+
+    it("expands ~ in tokenFile path", () => {
+      const config = loadConfig(
+        writeConfig({
+          followers: {
+            bind: "127.0.0.1",
+            port: 8190,
+            tokenFile: "~/.config/rusa/token",
+          },
+        })
+      );
+      expect(config.followers?.tokenFile).toBe(join(homedir(), ".config/rusa/token"));
+    });
+
+    it("rejects public or wildcard bind address (0.0.0.0)", () => {
+      expect(() =>
+        loadConfig(
+          writeConfig({
+            followers: {
+              bind: "0.0.0.0",
+              port: 8190,
+              tokenFile: "/path/to/token",
+            },
+          })
+        )
+      ).toThrow(
+        /followers\.bind must be an explicit loopback \(127\.0\.0\.1\) or Tailscale IPv4 address/
+      );
+    });
+
+    it("rejects invalid port", () => {
+      expect(() =>
+        loadConfig(
+          writeConfig({
+            followers: {
+              bind: "127.0.0.1",
+              port: 70000,
+              tokenFile: "/path/to/token",
+            },
+          })
+        )
+      ).toThrow(/followers\.port must be a valid port integer/);
+    });
   });
 });

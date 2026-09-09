@@ -20,12 +20,21 @@ type LastHumanMessage = {
   session_id: string | null;
 };
 
-export const ACTOR_CONFIG_SCHEMA_VERSION = 1 as const;
+/**
+ * `context_config` version emitted by this build. Version 2 adds the durable
+ * execution-placement field; the version must identify the exact strict
+ * document shape rather than merely its broad category.
+ */
+export const ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION = 2 as const;
+/** `context_config` shape emitted before durable remote placement (#301). */
+const LEGACY_ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION = 1 as const;
 
 /** schemaVersion for a `model_config` document written before #169's pool contract. */
 const LEGACY_MODEL_CONFIG_SCHEMA_VERSION = 1 as const;
 /** schemaVersion for a `model_config` document holding a `ProviderModelConfig[]` pool. */
 const MODEL_CONFIG_POOL_SCHEMA_VERSION = 2 as const;
+/** schemaVersion for a pool with declared model-class provenance. */
+const MODEL_CONFIG_CLASS_SCHEMA_VERSION = 3 as const;
 
 const legacyModelConfigSchema = z
   .object({
@@ -56,26 +65,71 @@ const modelConfigPoolSchema = z
   })
   .strict();
 
-const modelConfigDocumentSchema = z.union([modelConfigPoolSchema, legacyModelConfigSchema]);
+const modelConfigClassSchema = z
+  .object({
+    schemaVersion: z.literal(MODEL_CONFIG_CLASS_SCHEMA_VERSION),
+    entries: z.array(modelConfigEntrySchema).min(1),
+    // A class resolves to this concrete snapshot at ingress. Retaining its
+    // name lets the dashboard distinguish that intentional class selection
+    // from an explicit pool without making the runtime re-resolve it later.
+    modelClass: z.string().min(1),
+  })
+  .strict();
 
-const contextConfigSchema = z.discriminatedUnion("type", [
+// v1 and v2 remain readable so existing records stay valid. New class-bearing
+// documents are v3; a v2 parser therefore never mistakes them for malformed
+// v2 records with an unrecognized member.
+const modelConfigDocumentSchema = z.union([
+  modelConfigClassSchema,
+  modelConfigPoolSchema,
+  legacyModelConfigSchema,
+]);
+
+const legacyContextConfigSchema = z.discriminatedUnion("type", [
   z
     .object({
-      schemaVersion: z.literal(ACTOR_CONFIG_SCHEMA_VERSION),
+      schemaVersion: z.literal(LEGACY_ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
       type: z.literal("native"),
       sessionId: z.string().optional(),
     })
     .strict(),
   z
     .object({
-      schemaVersion: z.literal(ACTOR_CONFIG_SCHEMA_VERSION),
+      schemaVersion: z.literal(LEGACY_ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
       type: z.literal("portable"),
       mode: z.enum(["tail", "ledger"]),
       compactionModel: z.string().optional(),
     })
     .strict(),
 ]);
-type ContextConfigDocument = z.infer<typeof contextConfigSchema>;
+
+const currentContextConfigSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      schemaVersion: z.literal(ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
+      type: z.literal("native"),
+      sessionId: z.string().optional(),
+      executionTarget: z.string().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      schemaVersion: z.literal(ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION),
+      type: z.literal("portable"),
+      mode: z.enum(["tail", "ledger"]),
+      compactionModel: z.string().optional(),
+      executionTarget: z.string().optional(),
+    })
+    .strict(),
+]);
+/**
+ * Read both strict shapes. We write v2 only when executionTarget is set,
+ * keeping unplaced actors on v1 so rollback blast radius is strictly bounded
+ * to remotely-placed actors.
+ */
+const contextConfigSchema = z.union([legacyContextConfigSchema, currentContextConfigSchema]);
+type LegacyContextConfigDocument = z.infer<typeof legacyContextConfigSchema>;
+type CurrentContextConfigDocument = z.infer<typeof currentContextConfigSchema>;
 
 function parseDocument<T>(
   actorId: string,
@@ -98,23 +152,40 @@ function buildModelConfig(record: ActorRecord): string | null {
     model: entry.model,
     ...(entry.effort !== undefined ? { effort: entry.effort } : {}),
   }));
-  return JSON.stringify({ schemaVersion: MODEL_CONFIG_POOL_SCHEMA_VERSION, entries });
+  return JSON.stringify(
+    record.modelClass === undefined
+      ? { schemaVersion: MODEL_CONFIG_POOL_SCHEMA_VERSION, entries }
+      : {
+          schemaVersion: MODEL_CONFIG_CLASS_SCHEMA_VERSION,
+          entries,
+          modelClass: record.modelClass,
+        }
+  );
 }
 
 /**
- * Parses the `model_config` document. A document written before #169's pool
- * contract (`schemaVersion: 1`, a single optional provider/model/effort) is
- * migrated on read into a one-entry pool. A legacy document missing either
- * `provider` or `model` predates the required-model contract and can't form a
- * valid entry — `modelConfig` is left unset so callers fall back the same way
- * they do for an actor with no configuration at all, rather than failing to
- * load the row.
+ * Parses the `model_config` document. Versioned documents (v2 explicit pools,
+ * v3 class-bearing records) are validated strictly; an invalid versioned
+ * payload throws fail-closed so corrupted configuration is never silently
+ * executed.
+ *
+ * For unversioned legacy documents predating #169: a single optional
+ * provider/model/effort is migrated on read into a one-entry pool. A legacy
+ * document missing either `provider` or `model` predates the required-model
+ * contract and leaves `modelConfig` unset so callers fall back the same way
+ * they do for an unconfigured actor, rather than failing to load the row.
  */
-function parseModelConfig(actorId: string, json: string | null): Pick<ActorRecord, "modelConfig"> {
+function parseModelConfig(
+  actorId: string,
+  json: string | null
+): Pick<ActorRecord, "modelConfig" | "modelClass"> {
   if (!json) return {};
   const parsed = parseDocument(actorId, "model_config", json, modelConfigDocumentSchema);
   if ("entries" in parsed) {
-    return { modelConfig: parsed.entries };
+    return {
+      modelConfig: parsed.entries,
+      ...("modelClass" in parsed ? { modelClass: parsed.modelClass } : {}),
+    };
   }
   if (parsed.provider !== undefined && parsed.model !== undefined) {
     return {
@@ -138,8 +209,20 @@ function parseModelConfig(actorId: string, json: string | null): Pick<ActorRecor
  */
 function buildContextConfig(record: ActorRecord): string | null {
   if (record.context?.type === "portable") {
-    const config: ContextConfigDocument = {
-      schemaVersion: ACTOR_CONFIG_SCHEMA_VERSION,
+    if (record.executionTarget !== undefined) {
+      const config: CurrentContextConfigDocument = {
+        schemaVersion: ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
+        type: "portable",
+        mode: record.context.mode,
+        ...(record.context.compactionModel !== undefined
+          ? { compactionModel: record.context.compactionModel }
+          : {}),
+        executionTarget: record.executionTarget,
+      };
+      return JSON.stringify(config);
+    }
+    const config: LegacyContextConfigDocument = {
+      schemaVersion: LEGACY_ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
       type: "portable",
       mode: record.context.mode,
       ...(record.context.compactionModel !== undefined
@@ -148,9 +231,22 @@ function buildContextConfig(record: ActorRecord): string | null {
     };
     return JSON.stringify(config);
   }
-  if (record.context?.type === "native" || record.sessionId !== undefined) {
-    const config: ContextConfigDocument = {
-      schemaVersion: ACTOR_CONFIG_SCHEMA_VERSION,
+  if (
+    record.context?.type === "native" ||
+    record.sessionId !== undefined ||
+    record.executionTarget !== undefined
+  ) {
+    if (record.executionTarget !== undefined) {
+      const config: CurrentContextConfigDocument = {
+        schemaVersion: ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
+        type: "native",
+        ...(record.sessionId !== undefined ? { sessionId: record.sessionId } : {}),
+        executionTarget: record.executionTarget,
+      };
+      return JSON.stringify(config);
+    }
+    const config: LegacyContextConfigDocument = {
+      schemaVersion: LEGACY_ACTOR_CONTEXT_CONFIG_SCHEMA_VERSION,
       type: "native",
       ...(record.sessionId !== undefined ? { sessionId: record.sessionId } : {}),
     };
@@ -162,9 +258,13 @@ function buildContextConfig(record: ActorRecord): string | null {
 function parseContextConfig(
   actorId: string,
   json: string | null
-): Pick<ActorRecord, "context" | "sessionId"> {
+): Pick<ActorRecord, "context" | "sessionId" | "executionTarget"> {
   if (!json) return {};
   const parsed = parseDocument(actorId, "context_config", json, contextConfigSchema);
+  const executionTarget =
+    "executionTarget" in parsed && parsed.executionTarget !== undefined
+      ? { executionTarget: parsed.executionTarget }
+      : {};
   if (parsed.type === "portable") {
     return {
       context: {
@@ -174,17 +274,20 @@ function parseContextConfig(
           ? { compactionModel: parsed.compactionModel }
           : {}),
       },
+      ...executionTarget,
     };
   }
   return {
     context: { type: "native" },
     ...(parsed.sessionId !== undefined ? { sessionId: parsed.sessionId } : {}),
+    ...executionTarget,
   };
 }
 
 /** A staged, not-yet-applied replacement for the actor's declared modelConfig pool. */
 type DesiredOverlayEntry = {
   desiredModelConfig?: ProviderModelConfig[];
+  desiredModelClass?: string;
 };
 
 /**
@@ -305,7 +408,10 @@ export class SqliteActorRepository implements ActorRepository {
 
   private storeDesiredOverlay(record: ActorRecord): void {
     if ("desiredModelConfig" in record) {
-      this.desiredOverlay.set(record.id, { desiredModelConfig: record.desiredModelConfig });
+      this.desiredOverlay.set(record.id, {
+        desiredModelConfig: record.desiredModelConfig,
+        ...("desiredModelClass" in record ? { desiredModelClass: record.desiredModelClass } : {}),
+      });
     } else {
       this.desiredOverlay.delete(record.id);
     }

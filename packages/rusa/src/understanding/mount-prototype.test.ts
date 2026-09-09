@@ -82,7 +82,8 @@ function fake(goals: Goal[] = []): { sync: SyncClient; fakeSync: FakeSync } {
 function writeConfig(dir: string, data: Record<string, unknown>): string {
   const full = {
     github: { account: "test-bot" },
-    providers: { antigravity: {} },
+    providers: { codex: { cliCommand: "codex" } },
+    rootActor: { provider: "codex", model: "gpt-5.6-sol" },
     ...data,
   };
   writeFileSync(join(dir, "config.yaml"), stringify(full), "utf-8");

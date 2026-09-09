@@ -131,7 +131,7 @@ describe("quickstart command", () => {
   });
 
   it("writes quickstart config without the removed targets field", async () => {
-    promptMocks.state.inputs = ["codex", "/work/example-repo", "my-root-entity"];
+    promptMocks.state.inputs = ["codex", "/work/example-repo", "my-root-entity", "gpt-5.6-sol"];
     promptMocks.state.passwords = ["test-gemini-key"];
     await runQuickstartConfigure({
       home,
@@ -149,13 +149,19 @@ describe("quickstart command", () => {
     });
     expect(config).not.toHaveProperty("targets");
     expect(config.rootActor?.provider).toBe("codex");
+    expect(config.rootActor?.model).toBe("gpt-5.6-sol");
     expect(config.rootActor?.handle).toBe("my-root-entity");
     expect(config.dashboard?.port).toBe(8080);
     expect(config.providers).toEqual({ codex: { cliCommand: "codex" } });
   });
 
   it("generates a valid config for antigravity that loadConfig accepts", async () => {
-    promptMocks.state.inputs = ["antigravity", "/work/example-repo", "my-root-entity"];
+    promptMocks.state.inputs = [
+      "antigravity",
+      "/work/example-repo",
+      "my-root-entity",
+      "Gemini 3.7 Flash",
+    ];
     promptMocks.state.passwords = ["test-gemini-key"];
     await runQuickstartConfigure({
       home,
@@ -168,7 +174,7 @@ describe("quickstart command", () => {
   });
 
   it("keeps the generated root handle when the handle prompt is blank", async () => {
-    promptMocks.state.inputs = ["codex", "", ""];
+    promptMocks.state.inputs = ["codex", "", "", "gpt-5.6-sol"];
     promptMocks.state.passwords = ["test-gemini-key"];
 
     await runQuickstartConfigure({ home, executeProviderCommand: () => 0 });

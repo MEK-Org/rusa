@@ -25,7 +25,9 @@ ThreadDto makeThread(
   bool? effortChangePending,
   String? desiredProvider,
   List<ProviderModelConfig> modelConfig = const [],
+  String? modelClass,
   List<ProviderModelConfig>? desiredModelConfig,
+  String? desiredModelClass,
   String? charterPreview,
   int? queuePosition,
   String? estimatedStartAt,
@@ -43,7 +45,9 @@ ThreadDto makeThread(
   effortChangePending: effortChangePending ?? desiredEffort != null,
   desiredProvider: desiredProvider,
   modelConfig: modelConfig,
+  modelClass: modelClass,
   desiredModelConfig: desiredModelConfig,
+  desiredModelClass: desiredModelClass,
   charterPreview: charterPreview ?? 'charter $id',
   title: title ?? 'charter $id',
   createdAt: created,
@@ -474,6 +478,7 @@ class FakeApi extends DashboardApi {
   // ── Obligations routes ──
   List<ObligationDto> obligationsResult = [];
   Map<String, ObligationDetailSnapshot> obligationDetails = {};
+  Map<String, ReferenceDto?> obExternalReferences = {};
 
   /// When set, computes the detail snapshot per call instead of the static
   /// [obligationDetails] map — needed to fake a paginated completions field
@@ -567,6 +572,7 @@ class FakeApi extends DashboardApi {
                 o.status != 'cancelled',
           )
           .toList(),
+      externalReference: obExternalReferences[id],
     );
   }
 

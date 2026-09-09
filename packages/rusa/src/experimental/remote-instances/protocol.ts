@@ -6,7 +6,7 @@ import type { RawProviderModelConfig } from "../../providers/model-config.js";
 import type { CodingProvider, McpServerSpec, RunResult } from "../../providers/types.js";
 
 // Commands/events multiplexed by actor ID over the authenticated instance connection.
-export const INSTANCE_PROTOCOL_VERSION = 2;
+export const INSTANCE_PROTOCOL_VERSION = 3;
 export interface Bootstrap {
   id: string;
   cwd: string;
@@ -23,6 +23,8 @@ export interface Bootstrap {
     ActorOptions,
     "sandbox" | "addDirs" | "timeoutMs" | "yieldGraceMs" | "debounceMs"
   >;
+  /** True when reconnecting to an existing actor runtime (avoids duplicate host error). */
+  reconnect?: boolean;
 }
 
 export interface RunSnapshot {
