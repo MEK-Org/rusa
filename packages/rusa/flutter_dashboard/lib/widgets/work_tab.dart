@@ -32,16 +32,6 @@ class WorkTab extends StatefulWidget {
   State<WorkTab> createState() => _WorkTabState();
 }
 
-/// Whether [o] stays listed while done obligations are hidden.
-///
-/// A terminal obligation still shows if it retains completion history — the
-/// same "recurring, or ledger rows survived recurrence being turned off" test
-/// the detail view uses to decide whether to render the COMPLETION HISTORY
-/// section at all. The work-queue tree and the detail view's CHILDREN section
-/// share this so a "Show Done" toggle means the same thing in both places.
-bool _showsWhenDoneHidden(ObligationDto o) =>
-    !o.isTerminal || o.isRecurring || o.hasCompletionHistory;
-
 class _WorkTabState extends State<WorkTab> {
   bool _loading = true;
   String? _error;
@@ -153,12 +143,25 @@ class _WorkTabState extends State<WorkTab> {
   List<_FlatNode> _flattenTree(List<ObligationTreeDto> nodes, int depth) {
     final result = <_FlatNode>[];
     for (final node in nodes) {
-      final visible = _showDone || _showsWhenDoneHidden(node.obligation);
+      // A terminal obligation still shows if it retains completion history —
+      // the same "recurring, or ledger rows survived recurrence being turned
+      // off" test the detail panel uses to decide whether to render the
+      // COMPLETION HISTORY section at all.
+      final visible =
+          _showDone ||
+          !node.obligation.isTerminal ||
+          node.obligation.isRecurring ||
+          node.obligation.hasCompletionHistory;
       if (!visible) continue;
       final id = node.obligation.id;
       final hasVisibleChildren = _showDone
           ? node.children.isNotEmpty
-          : node.children.any((c) => _showsWhenDoneHidden(c.obligation));
+          : node.children.any(
+              (c) =>
+                  !c.obligation.isTerminal ||
+                  c.obligation.isRecurring ||
+                  c.obligation.hasCompletionHistory,
+            );
       final isCollapsed = !_expandedIds.contains(id);
       result.add(
         _FlatNode(node.obligation, depth, hasVisibleChildren, isCollapsed),
@@ -1122,13 +1125,13 @@ class _DetailViewState extends State<_DetailView> {
 
   Widget _childrenPanel(BuildContext context, ObligationDetailSnapshot data) {
     final all = data.children;
-    final hiddenCount = all.where((c) => !_showsWhenDoneHidden(c)).length;
+    // Only `done` is hidden: that is what #396 asks for, and a cancelled child
+    // is not "completed" — it stays listed so the reader sees it was dropped.
+    final hiddenCount = all.where((c) => c.isDone).length;
     // Filtering keeps the server's order for whatever remains, so the visible
     // rows (and the reorder neighbours computed from them) are the same
-    // siblings in the same sequence, minus the ones that are finished.
-    final list = _showDoneChildren
-        ? all
-        : all.where(_showsWhenDoneHidden).toList();
+    // siblings in the same sequence, minus the ones that are done.
+    final list = _showDoneChildren ? all : all.where((c) => !c.isDone).toList();
 
     if (all.isEmpty) {
       return Container(

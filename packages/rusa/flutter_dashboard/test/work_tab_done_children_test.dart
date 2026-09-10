@@ -5,9 +5,9 @@ import 'package:rusa_dashboard/widgets/work_tab.dart';
 
 import 'fakes.dart';
 
-/// The detail view's CHILDREN section hides finished children by default so
-/// the outstanding ones stay prominent (#396), with an explicit control to
-/// reveal them.
+/// The detail view's CHILDREN section hides done children by default so the
+/// outstanding ones stay prominent (#396), with an explicit control to reveal
+/// them. Only `done` counts as completed: a cancelled child stays listed.
 void main() {
   Future<DashboardStore> pumpWorkTab(
     WidgetTester tester,
@@ -36,7 +36,7 @@ void main() {
   }
 
   testWidgets(
-    'hides done and cancelled children by default, keeping the rest in order',
+    'hides only done children by default, keeping the rest in order',
     (tester) async {
       await tester.runAsync(() async {
         final api = FakeApi()
@@ -60,6 +60,15 @@ void main() {
               intent: 'Abandoned approach',
               status: 'cancelled',
             ),
+            // Done with ledger rows is still done: the detail view does not
+            // carry the work-queue tree's completion-history exception.
+            makeObligation(
+              'c-ledger',
+              parentId: 'parent',
+              intent: 'Nightly backup',
+              status: 'done',
+              hasCompletionHistory: true,
+            ),
             makeObligation(
               'c-second',
               parentId: 'parent',
@@ -70,14 +79,16 @@ void main() {
         final store = await pumpWorkTab(tester, api, open: 'Ship the feature');
 
         expect(find.text('Build the thing'), findsOneWidget);
+        expect(find.text('Abandoned approach'), findsOneWidget);
         expect(find.text('Review the thing'), findsOneWidget);
         expect(find.text('Write the spec'), findsNothing);
-        expect(find.text('Abandoned approach'), findsNothing);
-        // Outstanding children keep the server's relative order.
-        expect(
-          tester.getTopLeft(find.text('Build the thing')).dy,
-          lessThan(tester.getTopLeft(find.text('Review the thing')).dy),
-        );
+        expect(find.text('Nightly backup'), findsNothing);
+        // Remaining children keep the server's relative order.
+        final build = tester.getTopLeft(find.text('Build the thing')).dy;
+        final dropped = tester.getTopLeft(find.text('Abandoned approach')).dy;
+        final review = tester.getTopLeft(find.text('Review the thing')).dy;
+        expect(build, lessThan(dropped));
+        expect(dropped, lessThan(review));
         expect(find.text('Show 2 done children'), findsOneWidget);
         expect(find.text('Hide done children'), findsNothing);
 
@@ -189,39 +200,30 @@ void main() {
     });
   });
 
-  testWidgets(
-    'keeps a done child that retains completion history visible, as the tree '
-    'does',
-    (tester) async {
-      await tester.runAsync(() async {
-        final api = FakeApi()
-          ..threadsResult = [makeThread('root')]
-          ..obligationsResult = [
-            makeObligation('parent', intent: 'Ship the feature'),
-            makeObligation(
-              'c-ledger',
-              parentId: 'parent',
-              intent: 'Nightly backup',
-              status: 'done',
-              hasCompletionHistory: true,
-            ),
-            makeObligation(
-              'c-done',
-              parentId: 'parent',
-              intent: 'Write the spec',
-              status: 'done',
-            ),
-          ];
-        final store = await pumpWorkTab(tester, api, open: 'Ship the feature');
+  testWidgets('a lone cancelled child is listed, not reported as done', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final api = FakeApi()
+        ..threadsResult = [makeThread('root')]
+        ..obligationsResult = [
+          makeObligation('parent', intent: 'Ship the feature'),
+          makeObligation(
+            'c-cancelled',
+            parentId: 'parent',
+            intent: 'Abandoned approach',
+            status: 'cancelled',
+          ),
+        ];
+      final store = await pumpWorkTab(tester, api, open: 'Ship the feature');
 
-        expect(find.text('Nightly backup'), findsOneWidget);
-        expect(find.text('Write the spec'), findsNothing);
-        expect(find.text('Show 1 done child'), findsOneWidget);
+      expect(find.text('Abandoned approach'), findsOneWidget);
+      expect(find.textContaining('is done'), findsNothing);
+      expect(find.textContaining('done child'), findsNothing);
 
-        await store.dispose();
-      });
-    },
-  );
+      await store.dispose();
+    });
+  });
 
   testWidgets('revealing done children is per obligation, not sticky', (
     tester,
