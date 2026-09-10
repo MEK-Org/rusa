@@ -2029,9 +2029,12 @@ export class ActorMesh {
    * instance back into an org-wide firehose . A covering org source is considered only
    * for the event classes explicitly allowed by {@link mayBubbleToParent} .
    * Follows the CRITICAL invariant of checking liveness and delivering synchronously.
-   * Production ingress enters {@link deliverExternalEvent}; this legacy public
-   * contract remains for embedders and characterization coverage until a
-   * separately scoped follow-up can collapse it.
+   * TRANSITIONAL: production ingress enters {@link deliverExternalEvent}. Since
+   * the GitHub, Chat, and timer callers moved there, this payload-bearing path
+   * has no in-repo caller outside tests; it remains only as the published
+   * embedder contract and as characterization coverage. #393 tracks collapsing
+   * it into the EventManager path so the most-tested entry point is again the
+   * production one.
    */
   async deliverEvent(
     resource: EventResource,
