@@ -19,6 +19,8 @@ import {
   type EventSourceOwnershipDiagnostic,
   type RawIntegrationEvent,
 } from "../runtime/event-manager.js";
+import { randomSupportedVoiceName } from "../voice/tts-voices.js";
+import { googleVoiceConfig } from "../voice/voice-config.js";
 import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./actor-record.js";
 import {
   type CapabilityGrantStore,
@@ -1487,6 +1489,10 @@ export class ActorMesh {
       sessionId: req.conversationId,
       title: req.title,
       executionTarget: req.executionTarget,
+      // Every actor gets its own walkie-talkie voice at birth so a transfer or
+      // multi-actor chat is audible as different speakers; the operator can
+      // re-pick it from the actor info panel at any time.
+      voiceConfig: googleVoiceConfig(randomSupportedVoiceName()),
       status: "active",
       createdAt: this.now(),
     };

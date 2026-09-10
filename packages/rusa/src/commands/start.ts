@@ -235,6 +235,7 @@ import { readBuildSentinel } from "../update/build-sentinel.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
 import { BuildRunner, GitRunner } from "../update/runner.js";
+import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
 import type { VoiceService } from "../voice/voice-service.js";
 import { createVoiceService } from "../voice/wiring.js";
 import {
@@ -3241,6 +3242,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         home: mcHome,
         apiKey: geminiApiKey,
         voice: config.voice,
+        // Per-actor voice for reply TTS: the actor's persisted voice_config,
+        // validated against the supported catalog, else the instance-wide
+        // default. Resolved fresh per reply so a dashboard edit takes effect
+        // on the actor's very next spoken reply.
+        voiceNameFor: (actorId) => {
+          const voiceConfig = actors.get(actorId)?.voiceConfig;
+          const voiceName =
+            voiceConfig?.provider === "google" ? voiceConfig.config.voiceName : undefined;
+          return voiceName === undefined ? undefined : canonicalSupportedVoiceName(voiceName);
+        },
         onSessionEnded: (actorId) => mesh.notifyVoiceSessionEnded(actorId),
       })
     : null;

@@ -39,6 +39,7 @@ import { hostJobs } from "./0040_host_jobs.js";
 import { modelClasses } from "./0041_model_classes.js";
 import { actorRunLaunchConfig } from "./0042_actor_run_launch_config.js";
 import { obligationCheckpoint } from "./0043_obligation_checkpoint.js";
+import { actorVoiceConfig } from "./0044_actor_voice_config.js";
 import type { Migration } from "./types.js";
 
 /**
@@ -90,4 +91,5 @@ export const migrations: Migration[] = [
   modelClasses,
   actorRunLaunchConfig,
   obligationCheckpoint,
+  actorVoiceConfig,
 ];

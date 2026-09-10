@@ -126,6 +126,14 @@ export interface VoiceServiceOptions {
   /** `$RUSA_HOME`; audio lands under `<home>/voice/{inbox,outbox}`. */
   home: string;
   speech: SpeechClient;
+  /**
+   * Resolve the voice to synthesize this actor's replies with — the per-actor
+   * voice selection, looked up fresh before every render. Return undefined to
+   * use the speech client's instance-wide default (actors with no persisted
+   * voice setting, and every pre-migration actor). Transcription never consults
+   * this: it stays instance-wide.
+   */
+  voiceNameFor?: (actorId: string) => string | undefined;
   /** Injectable clock for presence/grace tests. */
   now?: () => number;
   /**
@@ -172,6 +180,7 @@ export class VoiceService {
   private readonly maxAnnouncements: number;
   private readonly presenceGraceMs: number;
   private readonly sessionLeaseMs: number;
+  private readonly voiceNameFor: ((actorId: string) => string | undefined) | undefined;
 
   /** Live `voice` SSE subscription count per actor. */
   private readonly liveSubscriptions = new Map<string, number>();
@@ -197,6 +206,7 @@ export class VoiceService {
     if (!Number.isFinite(this.sessionLeaseMs) || this.sessionLeaseMs <= 0) {
       throw new Error("sessionLeaseMs must be a positive finite number");
     }
+    this.voiceNameFor = options.voiceNameFor;
     this.onSessionEnded = options.onSessionEnded;
   }
 
@@ -389,8 +399,14 @@ export class VoiceService {
     const text = speakableText(event.body);
     if (!text) return null;
 
+    // Per-actor voice selection happens here, once per reply, before synthesis
+    // — an actor whose voice the operator just changed speaks with the new one
+    // on the very next reply. No persisted setting → undefined → the speech
+    // client's instance-wide default, which is the pre-existing behavior.
+    const voiceName = this.voiceNameFor?.(senderId);
+
     const streamRequestedAt = this.now();
-    const streamInfo = await this.speech.streamSynthesize(text);
+    const streamInfo = await this.speech.streamSynthesize(text, voiceName);
     const dir = join(this.home, "voice", "outbox");
     await mkdir(dir, { recursive: true });
     const id = randomUUID();

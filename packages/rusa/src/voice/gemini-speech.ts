@@ -27,15 +27,21 @@ export interface SynthesizedPcm {
 
 /**
  * The speech surface `VoiceService` depends on. Production uses the Gemini
- * client below; tests inject fakes.
+ * client below; tests inject fakes. TTS calls take an optional per-call
+ * `voiceName`: when present it overrides the client's instance-wide default
+ * for that one render (the per-actor voice setting), and when absent the
+ * instance default applies. Transcription stays instance-wide.
  */
 export interface SpeechClient {
   /** Transcribe an audio blob (any `audio/*` mime) to plain text. */
   transcribe(audio: Buffer, mimeType: string): Promise<string>;
   /** Render text to raw PCM via the TTS model. */
-  synthesize(text: string): Promise<SynthesizedPcm>;
+  synthesize(text: string, voiceName?: string): Promise<SynthesizedPcm>;
   /** Render text to raw PCM stream via the TTS model. */
-  streamSynthesize(text: string): Promise<{ sampleRate: number; pcmStream: AsyncIterable<Buffer> }>;
+  streamSynthesize(
+    text: string,
+    voiceName?: string
+  ): Promise<{ sampleRate: number; pcmStream: AsyncIterable<Buffer> }>;
 }
 
 export interface GeminiSpeechOptions {
@@ -92,7 +98,7 @@ export function createGeminiSpeechClient(options: GeminiSpeechOptions): SpeechCl
   const fetchImpl = options.fetchImpl ?? fetch;
   const transcriptionModel = options.transcriptionModel ?? DEFAULT_TRANSCRIPTION_MODEL;
   const ttsModel = options.ttsModel ?? DEFAULT_TTS_MODEL;
-  const voiceName = options.voiceName ?? DEFAULT_VOICE_NAME;
+  const defaultVoiceName = options.voiceName ?? DEFAULT_VOICE_NAME;
 
   return {
     async transcribe(audio: Buffer, mimeType: string): Promise<string> {
@@ -119,12 +125,14 @@ export function createGeminiSpeechClient(options: GeminiSpeechOptions): SpeechCl
       return transcript;
     },
 
-    async synthesize(text: string): Promise<SynthesizedPcm> {
+    async synthesize(text: string, voiceName?: string): Promise<SynthesizedPcm> {
       const result = await generateContent(fetchImpl, ttsModel, options.apiKey, {
         contents: [{ parts: [{ text }] }],
         generationConfig: {
           responseModalities: ["AUDIO"],
-          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName } } },
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName ?? defaultVoiceName } },
+          },
         },
       });
       const parts = result.candidates?.[0]?.content?.parts ?? [];
@@ -139,7 +147,8 @@ export function createGeminiSpeechClient(options: GeminiSpeechOptions): SpeechCl
     },
 
     async streamSynthesize(
-      text: string
+      text: string,
+      voiceName?: string
     ): Promise<{ sampleRate: number; pcmStream: AsyncIterable<Buffer> }> {
       const response = await fetchImpl(
         `${GEMINI_BASE}/${ttsModel}:streamGenerateContent?alt=sse&key=${encodeURIComponent(options.apiKey)}`,
@@ -150,7 +159,9 @@ export function createGeminiSpeechClient(options: GeminiSpeechOptions): SpeechCl
             contents: [{ parts: [{ text }] }],
             generationConfig: {
               responseModalities: ["AUDIO"],
-              speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName } } },
+              speechConfig: {
+                voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName ?? defaultVoiceName } },
+              },
             },
           }),
         }

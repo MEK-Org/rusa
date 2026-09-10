@@ -33,6 +33,7 @@ function makeService(
     max?: number;
     sessionLeaseMs?: number;
     onSessionEnded?: (actorId: string) => void;
+    voiceNameFor?: (actorId: string) => string | undefined;
   } = {}
 ) {
   const home = mkdtempSync(join(tmpdir(), "voice-service-"));
@@ -43,6 +44,7 @@ function makeService(
     maxAnnouncements: opts.max,
     sessionLeaseMs: opts.sessionLeaseMs,
     onSessionEnded: opts.onSessionEnded,
+    voiceNameFor: opts.voiceNameFor,
     encode: async (pcm, _rate, basePath) => {
       const path = `${basePath}.mp3`;
       await writeFile(path, pcm);
@@ -221,6 +223,68 @@ describe("VoiceService outbound reply TTS", () => {
     }
     const backlog = service.backlog(ACTOR);
     expect(backlog.map((a) => a.text)).toEqual(["reply 2", "reply 3", "reply 4"]);
+  });
+});
+
+describe("VoiceService per-actor voice selection", () => {
+  it("passes the actor's resolved voice to synthesis, looked up per reply", async () => {
+    const streamSynthesize = vi.fn(async () => ({
+      sampleRate: 24_000,
+      pcmStream: (async function* () {})(),
+    }));
+    const voiceNameFor = vi.fn((actorId: string): string | undefined =>
+      actorId === ACTOR ? "Charon" : undefined
+    );
+    const { service } = makeService({
+      speech: fakeSpeech({ streamSynthesize }),
+      voiceNameFor,
+    });
+    service.presenceConnect([ACTOR]);
+
+    await service.handleMeshEvent(replyEvent());
+    expect(streamSynthesize).toHaveBeenCalledWith("On it — ETA five minutes.", "Charon");
+    expect(voiceNameFor).toHaveBeenCalledWith(ACTOR);
+
+    // Resolved again for the next reply, so a mid-conversation voice change
+    // takes effect immediately.
+    voiceNameFor.mockReturnValue("Kore");
+    await service.handleMeshEvent(replyEvent({ body: "Second reply." }));
+    expect(streamSynthesize).toHaveBeenLastCalledWith("Second reply.", "Kore");
+  });
+
+  it("passes undefined for an actor with no voice setting — the instance default", async () => {
+    const streamSynthesize = vi.fn(async () => ({
+      sampleRate: 24_000,
+      pcmStream: (async function* () {})(),
+    }));
+    const { service } = makeService({
+      speech: fakeSpeech({ streamSynthesize }),
+      voiceNameFor: () => undefined,
+    });
+    service.presenceConnect([ACTOR]);
+
+    await service.handleMeshEvent(replyEvent());
+    expect(streamSynthesize).toHaveBeenCalledWith("On it — ETA five minutes.", undefined);
+  });
+
+  it("uses the instance default when no voice resolver is installed", async () => {
+    const streamSynthesize = vi.fn(async () => ({
+      sampleRate: 24_000,
+      pcmStream: (async function* () {})(),
+    }));
+    const { service } = makeService({ speech: fakeSpeech({ streamSynthesize }) });
+    service.presenceConnect([ACTOR]);
+
+    await service.handleMeshEvent(replyEvent());
+    expect(streamSynthesize).toHaveBeenCalledWith("On it — ETA five minutes.", undefined);
+  });
+
+  it("never consults the voice resolver for a non-reply event", async () => {
+    const voiceNameFor = vi.fn(() => "Charon");
+    const { service } = makeService({ voiceNameFor });
+    service.presenceConnect([ACTOR]);
+    expect(await service.handleMeshEvent(replyEvent({ kind: "run_start" }))).toBeNull();
+    expect(voiceNameFor).not.toHaveBeenCalled();
   });
 });
 

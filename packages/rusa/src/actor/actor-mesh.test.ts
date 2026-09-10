@@ -19,6 +19,7 @@ import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js"
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
+import { isSupportedVoiceName } from "../voice/tts-voices.js";
 import { Actor } from "./actor.js";
 import type {
   ActorFactoryContext,
@@ -429,6 +430,23 @@ describe("ActorMesh", () => {
     expect(canWrite("root")).toBe(true);
     expect(canWrite(sibling)).toBe(false);
     expect(canWrite(descendant)).toBe(false);
+  });
+
+  it("randomizes a supported voice for every newly spawned actor", () => {
+    const { mesh, registry } = setup();
+    const voices = new Set<string>();
+    for (let i = 0; i < 25; i++) {
+      const id = mesh.spawn({ charter: `worker ${i}`, parentId: "root" });
+      const voiceConfig = registry.get(id)?.voiceConfig;
+      expect(voiceConfig?.schemaVersion).toBe(1);
+      expect(voiceConfig?.provider).toBe("google");
+      expect(voiceConfig?.config.voiceName).toBeDefined();
+      expect(isSupportedVoiceName(voiceConfig?.config.voiceName ?? "")).toBe(true);
+      voices.add(voiceConfig?.config.voiceName ?? "");
+    }
+    // 25 spawns over a 30-voice catalog must not collapse to one voice; the
+    // probability of a false failure is astronomically small.
+    expect(voices.size).toBeGreaterThan(1);
   });
 
   it("sequences real actor and external-root transitions on one contiguous revision", async () => {
