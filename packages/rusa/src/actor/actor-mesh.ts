@@ -1491,7 +1491,11 @@ export class ActorMesh {
       // Every actor gets its own walkie-talkie voice at birth so a transfer or
       // multi-actor chat is audible as different speakers; the operator can
       // re-pick it from the actor info panel at any time.
-      voiceConfig: { schemaVersion: 1, voiceName: randomSupportedVoiceName() },
+      voiceConfig: {
+        schemaVersion: 1,
+        provider: "google",
+        config: { voiceName: randomSupportedVoiceName() },
+      },
       status: "active",
       createdAt: this.now(),
     };

@@ -113,6 +113,12 @@ function rec(id: string, parentId: string | null, status: "active" | "retired"):
   return { id, charter: `charter ${id}`, parentId, status, createdAt: "2026-06-21T00:00:00.000Z" };
 }
 
+const googleVoiceConfig = (voiceName: string) => ({
+  schemaVersion: 1 as const,
+  provider: "google" as const,
+  config: { voiceName },
+});
+
 const UUID_A = "aaaaaaaa-0000-4000-8000-000000000001";
 const UUID_B = "bbbbbbbb-0000-4000-8000-000000000002";
 const UUID_C = "cccccccc-0000-4000-8000-000000000004";
@@ -230,21 +236,21 @@ describe("handleMeshApiRequest", () => {
       expect(body.defaultVoiceName).toBe(DEFAULT_VOICE_NAME);
     });
 
-    it("PATCH stores a supported voice and GET reflects it", async () => {
+    it("PATCH stores a supported Google provider document and GET reflects it", async () => {
       actors.upsert(rec(UUID_A, null, "active"));
       const { res } = await call(
         deps,
         "PATCH",
         `/api/mesh/actors/${UUID_A}/voice`,
-        JSON.stringify({ voiceName: "Puck" })
+        JSON.stringify({ voiceConfig: googleVoiceConfig("Puck") })
       );
       await settled(res);
       expect(res.statusCode).toBe(200);
-      expect(JSON.parse(res.body).voiceConfig).toEqual({ schemaVersion: 1, voiceName: "Puck" });
-      expect(actors.get(UUID_A)?.voiceConfig).toEqual({ schemaVersion: 1, voiceName: "Puck" });
+      expect(JSON.parse(res.body).voiceConfig).toEqual(googleVoiceConfig("Puck"));
+      expect(actors.get(UUID_A)?.voiceConfig).toEqual(googleVoiceConfig("Puck"));
 
       const got = await call(deps, "GET", `/api/mesh/actors/${UUID_A}/voice`);
-      expect(JSON.parse(got.res.body).voiceConfig).toEqual({ schemaVersion: 1, voiceName: "Puck" });
+      expect(JSON.parse(got.res.body).voiceConfig).toEqual(googleVoiceConfig("Puck"));
     });
 
     it("PATCH invalidates every connected dashboard snapshot over SSE", async () => {
@@ -256,7 +262,7 @@ describe("handleMeshApiRequest", () => {
         deps,
         "PATCH",
         `/api/mesh/actors/${UUID_A}/voice`,
-        JSON.stringify({ voiceName: "Puck" })
+        JSON.stringify({ voiceConfig: googleVoiceConfig("Puck") })
       );
       await settled(res);
 
@@ -272,39 +278,39 @@ describe("handleMeshApiRequest", () => {
         deps,
         "PATCH",
         `/api/mesh/actors/${UUID_A}/voice`,
-        JSON.stringify({ voiceName: " puck " })
+        JSON.stringify({ voiceConfig: googleVoiceConfig(" puck ") })
       );
       await settled(res);
-      expect(JSON.parse(res.body).voiceConfig).toEqual({ schemaVersion: 1, voiceName: "Puck" });
-      expect(actors.get(UUID_A)?.voiceConfig).toEqual({ schemaVersion: 1, voiceName: "Puck" });
+      expect(JSON.parse(res.body).voiceConfig).toEqual(googleVoiceConfig("Puck"));
+      expect(actors.get(UUID_A)?.voiceConfig).toEqual(googleVoiceConfig("Puck"));
     });
 
     it("PATCH rejects an unsupported voice with 400 and leaves the record untouched", async () => {
       actors.upsert({
         ...rec(UUID_A, null, "active"),
-        voiceConfig: { schemaVersion: 1, voiceName: "Kore" },
+        voiceConfig: googleVoiceConfig("Kore"),
       });
       const { res } = await call(
         deps,
         "PATCH",
         `/api/mesh/actors/${UUID_A}/voice`,
-        JSON.stringify({ voiceName: "GLaDOS" })
+        JSON.stringify({ voiceConfig: googleVoiceConfig("GLaDOS") })
       );
       await settled(res);
       expect(res.statusCode).toBe(400);
-      expect(actors.get(UUID_A)?.voiceConfig).toEqual({ schemaVersion: 1, voiceName: "Kore" });
+      expect(actors.get(UUID_A)?.voiceConfig).toEqual(googleVoiceConfig("Kore"));
     });
 
     it("PATCH with null clears the voice back to the instance default", async () => {
       actors.upsert({
         ...rec(UUID_A, null, "active"),
-        voiceConfig: { schemaVersion: 1, voiceName: "Kore" },
+        voiceConfig: googleVoiceConfig("Kore"),
       });
       const { res } = await call(
         deps,
         "PATCH",
         `/api/mesh/actors/${UUID_A}/voice`,
-        JSON.stringify({ voiceName: null })
+        JSON.stringify({ voiceConfig: null })
       );
       await settled(res);
       expect(res.statusCode).toBe(200);
@@ -319,15 +325,31 @@ describe("handleMeshApiRequest", () => {
         deps,
         "PATCH",
         `/api/mesh/actors/${UUID_B}/voice`,
-        JSON.stringify({ voiceName: "Puck" })
+        JSON.stringify({ voiceConfig: googleVoiceConfig("Puck") })
       );
       await settled(patched.res);
       expect(patched.res.statusCode).toBe(404);
     });
 
-    it("PATCH 400s a missing or malformed voiceName", async () => {
+    it("PATCH 400s a missing, malformed, or unsupported provider document", async () => {
       actors.upsert(rec(UUID_A, null, "active"));
-      for (const body of ["{}", JSON.stringify({ voiceName: 42 }), "not-json"]) {
+      for (const body of [
+        "{}",
+        JSON.stringify({
+          voiceConfig: { schemaVersion: 1, provider: "google", config: { voiceName: 42 } },
+        }),
+        JSON.stringify({
+          voiceConfig: { schemaVersion: 1, provider: "elevenlabs", config: { voiceId: "abc" } },
+        }),
+        JSON.stringify({
+          voiceConfig: {
+            schemaVersion: 1,
+            provider: "google",
+            config: { voiceName: "Puck", extra: true },
+          },
+        }),
+        "not-json",
+      ]) {
         const { res } = await call(deps, "PATCH", `/api/mesh/actors/${UUID_A}/voice`, body);
         await settled(res);
         expect(res.statusCode).toBe(400);
@@ -339,7 +361,7 @@ describe("handleMeshApiRequest", () => {
       actors.upsert(rec(UUID_A, null, "active"));
       actors.upsert({
         ...rec(UUID_B, UUID_A, "active"),
-        voiceConfig: { schemaVersion: 1, voiceName: "Zephyr" },
+        voiceConfig: googleVoiceConfig("Zephyr"),
       });
       const { res } = await call(deps, "GET", "/api/mesh/threads");
       expect(res.statusCode).toBe(200);

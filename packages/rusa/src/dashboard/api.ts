@@ -1228,8 +1228,10 @@ export async function handleMeshApiRequest(
 
   if (req.method === "PATCH") {
     // PATCH /api/mesh/actors/<id>/voice — set or clear the actor's persisted
-    // walkie-talkie voice. `{ "voiceName": "Puck" }` stores a supported voice;
-    // `{ "voiceName": null }` clears it back to the instance-wide default.
+    // walkie-talkie voice. `{ "voiceConfig": { schemaVersion: 1,
+    // provider: "google", config: { voiceName: "Puck" } } }` stores the
+    // current provider branch; `{ "voiceConfig": null }` clears it back to
+    // the instance-wide default.
     // The voice is presentation config, not run state: editing a retired
     // actor is allowed and takes effect on that actor's next spoken reply.
     const voicePatchMatch = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/voice$/);
@@ -1258,31 +1260,62 @@ export async function handleMeshApiRequest(
             return;
           }
           const body = parsed as Record<string, unknown>;
-          if (!("voiceName" in body)) {
+          if (!("voiceConfig" in body)) {
             sendJson(res, 400, {
-              error: "voiceName is required (null restores the instance default)",
+              error: "voiceConfig is required (null restores the instance default)",
             });
             return;
           }
-          const requestedVoiceName = body.voiceName;
-          if (requestedVoiceName !== null && typeof requestedVoiceName !== "string") {
+          const requestedVoiceConfig = body.voiceConfig;
+          if (
+            requestedVoiceConfig !== null &&
+            (typeof requestedVoiceConfig !== "object" || Array.isArray(requestedVoiceConfig))
+          ) {
             sendJson(res, 400, {
-              error: "voiceName must be a supported Google TTS voice, or null for the default",
+              error: "voiceConfig must be a supported provider document, or null for the default",
+            });
+            return;
+          }
+          const config = requestedVoiceConfig as Record<string, unknown> | null;
+          const providerConfig = config?.config as Record<string, unknown> | undefined;
+          if (
+            config !== null &&
+            (config.schemaVersion !== 1 ||
+              config.provider !== "google" ||
+              providerConfig === undefined ||
+              Object.keys(config).length !== 3 ||
+              !Object.keys(config).every((key) =>
+                ["schemaVersion", "provider", "config"].includes(key)
+              ) ||
+              Object.keys(providerConfig).length !== 1 ||
+              !Object.hasOwn(providerConfig, "voiceName") ||
+              typeof providerConfig.voiceName !== "string")
+          ) {
+            sendJson(res, 400, {
+              error:
+                "voiceConfig must be { schemaVersion: 1, provider: 'google', config: { voiceName } }, or null for the default",
             });
             return;
           }
           const voiceName =
-            requestedVoiceName === null
+            config === null
               ? undefined
-              : canonicalSupportedVoiceName(requestedVoiceName);
-          if (requestedVoiceName !== null && !voiceName) {
+              : canonicalSupportedVoiceName(providerConfig?.voiceName as string);
+          if (config !== null && !voiceName) {
             sendJson(res, 400, {
-              error: "voiceName must be a supported Google TTS voice, or null for the default",
+              error: "voiceConfig.config.voiceName must name a supported Google TTS voice",
             });
             return;
           }
           actors.patch(actorId, {
-            voiceConfig: voiceName === undefined ? undefined : { schemaVersion: 1, voiceName },
+            voiceConfig:
+              voiceName === undefined
+                ? undefined
+                : {
+                    schemaVersion: 1,
+                    provider: "google",
+                    config: { voiceName },
+                  },
           });
           // Other open dashboards hold a thread snapshot too. Broadcast the
           // lightweight invalidation after the durable update so they re-fetch
@@ -1449,7 +1482,7 @@ export async function handleMeshApiRequest(
         selectedEffort: selection?.effort ?? null,
         eligibleAt: selection?.eligibleAt ?? null,
         ...(selectedObligation ? { selectedObligation } : {}),
-        voiceName: r.voiceConfig?.voiceName ?? null,
+        voiceName: r.voiceConfig?.provider === "google" ? r.voiceConfig.config.voiceName : null,
       };
     });
     const schedulerHealth = deps.schedulerHealth?.();

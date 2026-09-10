@@ -1,5 +1,10 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:rusa_dashboard/api.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/widgets/actor_tree.dart';
 import 'package:rusa_dashboard/widgets/detail_panel.dart';
@@ -28,6 +33,36 @@ Future<void> _openInfo(WidgetTester tester, String handle) async {
 }
 
 void main() {
+  test(
+    'voice editor sends the V1 Google provider document and clears with null',
+    () async {
+      final bodies = <Object?>[];
+      final api = DashboardApi(
+        base: Uri.parse('http://localhost:3000'),
+        client: MockClient((request) async {
+          expect(request.method, 'PATCH');
+          expect(request.url.path, '/api/mesh/actors/worker/voice');
+          bodies.add(jsonDecode(request.body));
+          return http.Response('{}', 200);
+        }),
+      );
+
+      await api.updateActorVoice('worker', 'Puck');
+      await api.updateActorVoice('worker', null);
+
+      expect(bodies, [
+        {
+          'voiceConfig': {
+            'schemaVersion': 1,
+            'provider': 'google',
+            'config': {'voiceName': 'Puck'},
+          },
+        },
+        {'voiceConfig': null},
+      ]);
+    },
+  );
+
   testWidgets(
     'Info tab edits an actor voice from the server-supported picker',
     (tester) async {

@@ -3247,7 +3247,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // default. Resolved fresh per reply so a dashboard edit takes effect
         // on the actor's very next spoken reply.
         voiceNameFor: (actorId) => {
-          const voiceName = actors.get(actorId)?.voiceConfig?.voiceName;
+          const voiceConfig = actors.get(actorId)?.voiceConfig;
+          const voiceName =
+            voiceConfig?.provider === "google" ? voiceConfig.config.voiceName : undefined;
           return voiceName === undefined ? undefined : canonicalSupportedVoiceName(voiceName);
         },
         onSessionEnded: (actorId) => mesh.notifyVoiceSessionEnded(actorId),

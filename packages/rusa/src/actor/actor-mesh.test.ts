@@ -439,9 +439,10 @@ describe("ActorMesh", () => {
       const id = mesh.spawn({ charter: `worker ${i}`, parentId: "root" });
       const voiceConfig = registry.get(id)?.voiceConfig;
       expect(voiceConfig?.schemaVersion).toBe(1);
-      expect(voiceConfig?.voiceName).toBeDefined();
-      expect(isSupportedVoiceName(voiceConfig?.voiceName ?? "")).toBe(true);
-      voices.add(voiceConfig?.voiceName ?? "");
+      expect(voiceConfig?.provider).toBe("google");
+      expect(voiceConfig?.config.voiceName).toBeDefined();
+      expect(isSupportedVoiceName(voiceConfig?.config.voiceName ?? "")).toBe(true);
+      voices.add(voiceConfig?.config.voiceName ?? "");
     }
     // 25 spawns over a 30-voice catalog must not collapse to one voice; the
     // probability of a false failure is astronomically small.

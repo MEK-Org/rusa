@@ -243,9 +243,9 @@ class DashboardApi {
   }
 
   /// `PATCH /api/mesh/actors/:actorId/voice` — set the actor's persisted
-  /// walkie-talkie voice, or pass null to restore the instance-wide default.
-  /// The server rejects any voice outside the supported Google TTS catalog
-  /// with a 400.
+  /// Google-provider voice document, or pass null to restore the instance-wide
+  /// default. The server rejects shapes and voices outside that provider's
+  /// supported catalog with a 400.
   Future<void> updateActorVoice(String actorId, String? voiceName) async {
     final uri = _u('/api/mesh/actors/$actorId/voice');
     final res = await _client.patch(
@@ -254,7 +254,15 @@ class DashboardApi {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
       },
-      body: jsonEncode({'voiceName': voiceName}),
+      body: jsonEncode({
+        'voiceConfig': voiceName == null
+            ? null
+            : {
+                'schemaVersion': 1,
+                'provider': 'google',
+                'config': {'voiceName': voiceName},
+              },
+      }),
     );
     if (res.statusCode != 200) {
       throw DashboardApiException(uri, res.statusCode, res.body);

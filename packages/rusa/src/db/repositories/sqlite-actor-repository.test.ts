@@ -592,7 +592,11 @@ describe("SqliteActorRepository", () => {
       charter: "Speak",
       parentId: "root",
       status: "active",
-      voiceConfig: { schemaVersion: 1, voiceName: "Puck" },
+      voiceConfig: {
+        schemaVersion: 1,
+        provider: "google",
+        config: { voiceName: "Puck" },
+      },
       createdAt: "2026-09-09T12:00:00.000Z",
     };
     repository.upsert(spoken);
@@ -614,7 +618,14 @@ describe("SqliteActorRepository", () => {
       .all() as Array<{ id: string; voice_config: string | null }>;
     expect(rows).toEqual([
       { id: "worker-quiet", voice_config: null },
-      { id: "worker-voice", voice_config: JSON.stringify({ schemaVersion: 1, voiceName: "Puck" }) },
+      {
+        id: "worker-voice",
+        voice_config: JSON.stringify({
+          schemaVersion: 1,
+          provider: "google",
+          config: { voiceName: "Puck" },
+        }),
+      },
     ]);
 
     // Clearing the setting (the PATCH route's null path) drops the document.
@@ -640,7 +651,11 @@ describe("SqliteActorRepository", () => {
         charter: "Persist",
         parentId: "root",
         status: "active",
-        voiceConfig: { schemaVersion: 1, voiceName: "Kore" },
+        voiceConfig: {
+          schemaVersion: 1,
+          provider: "google",
+          config: { voiceName: "Kore" },
+        },
         createdAt: "2026-09-09T12:00:00.000Z",
       });
       first.close();
@@ -648,7 +663,8 @@ describe("SqliteActorRepository", () => {
       const reopened = new Database(file);
       expect(new SqliteActorRepository(reopened).get("worker")?.voiceConfig).toEqual({
         schemaVersion: 1,
-        voiceName: "Kore",
+        provider: "google",
+        config: { voiceName: "Kore" },
       });
       reopened.close();
     } finally {
@@ -661,11 +677,12 @@ describe("SqliteActorRepository", () => {
 
     for (const invalid of [
       "not-json",
-      '{"voiceName":"Puck"}',
-      '{"schemaVersion":2,"voiceName":"Puck"}',
-      '{"schemaVersion":1}',
-      '{"schemaVersion":1,"voiceName":""}',
-      '{"schemaVersion":1,"voiceName":"Puck","unknown":true}',
+      '{"provider":"google","config":{"voiceName":"Puck"}}',
+      '{"schemaVersion":2,"provider":"google","config":{"voiceName":"Puck"}}',
+      '{"schemaVersion":1,"provider":"elevenlabs","config":{"voiceId":"abc"}}',
+      '{"schemaVersion":1,"provider":"google"}',
+      '{"schemaVersion":1,"provider":"google","config":{"voiceName":""}}',
+      '{"schemaVersion":1,"provider":"google","config":{"voiceName":"Puck","unknown":true}}',
     ]) {
       db.prepare("UPDATE actors SET voice_config = ? WHERE id = 'root'").run(invalid);
       expect(() => repository.get("root")).toThrow(/invalid voice_config for actor 'root'/);
@@ -675,7 +692,11 @@ describe("SqliteActorRepository", () => {
   it("falls back to the instance voice when a well-formed document names a retired voice", () => {
     repository.upsert(root);
     db.prepare("UPDATE actors SET voice_config = ? WHERE id = 'root'").run(
-      JSON.stringify({ schemaVersion: 1, voiceName: "NotAVoice" })
+      JSON.stringify({
+        schemaVersion: 1,
+        provider: "google",
+        config: { voiceName: "NotAVoice" },
+      })
     );
     expect(repository.get("root")?.voiceConfig).toBeUndefined();
   });

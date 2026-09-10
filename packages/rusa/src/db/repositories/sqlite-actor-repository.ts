@@ -134,13 +134,25 @@ const contextConfigSchema = z.union([legacyContextConfigSchema, currentContextCo
 type LegacyContextConfigDocument = z.infer<typeof legacyContextConfigSchema>;
 type CurrentContextConfigDocument = z.infer<typeof currentContextConfigSchema>;
 
-/** `voice_config` shape emitted by this build: V1 names a prebuilt Gemini TTS voice. */
-const voiceConfigSchema = z
+/** The current V1 branch of the provider-discriminated `voice_config` union. */
+const googleVoiceConfigSchema = z
   .object({
     schemaVersion: z.literal(1),
-    voiceName: z.string().min(1),
+    provider: z.literal("google"),
+    config: z
+      .object({
+        voiceName: z.string().min(1),
+      })
+      .strict(),
   })
   .strict();
+
+/**
+ * `voice_config` is deliberately a strict provider-discriminated union. A
+ * future provider gets a new branch with its own nested config shape; SQLite
+ * remains an unconstrained TEXT column and this consumer is the validator.
+ */
+const voiceConfigSchema = z.discriminatedUnion("provider", [googleVoiceConfigSchema]);
 
 type VoiceConfigDocument = z.infer<typeof voiceConfigSchema>;
 
@@ -300,15 +312,16 @@ function parseContextConfig(
 /** Builds the versioned voice-config document, or null when the actor follows the instance default. */
 function buildVoiceConfig(record: ActorRecord): string | null {
   if (!record.voiceConfig) return null;
-  const voiceName = canonicalSupportedVoiceName(record.voiceConfig.voiceName);
+  const voiceName = canonicalSupportedVoiceName(record.voiceConfig.config.voiceName);
   if (!voiceName) {
     throw new Error(
-      `invalid voice_config for actor '${record.id}': voiceName must name a supported Google TTS voice`
+      `invalid voice_config for actor '${record.id}': Google voiceName must name a supported TTS voice`
     );
   }
   const config: VoiceConfigDocument = {
     schemaVersion: 1,
-    voiceName,
+    provider: "google",
+    config: { voiceName },
   };
   return JSON.stringify(config);
 }
@@ -330,9 +343,15 @@ function parseVoiceConfig(actorId: string, json: string | null): Pick<ActorRecor
   // one of its exact option values. A vendor-retired name is not a malformed
   // document: leave the stored row intact but return no override, which uses
   // the instance-wide fallback until an operator selects a current voice.
-  const voiceName = canonicalSupportedVoiceName(parsed.voiceName);
+  const voiceName = canonicalSupportedVoiceName(parsed.config.voiceName);
   if (!voiceName) return {};
-  return { voiceConfig: { schemaVersion: 1, voiceName } };
+  return {
+    voiceConfig: {
+      schemaVersion: 1,
+      provider: "google",
+      config: { voiceName },
+    },
+  };
 }
 
 /** A staged, not-yet-applied replacement for the actor's declared modelConfig pool. */

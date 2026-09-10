@@ -17,15 +17,26 @@ export type ContextConfig = NativeContextConfig | PortableContextConfig;
 
 /**
  * Durable per-actor walkie-talkie voice setting (the `voice_config` column,
- * a versioned JSON document). V1 carries only the prebuilt Gemini TTS voice
- * name; the version must identify the exact strict document shape. Absent
- * means the actor follows the instance-wide voice default — the behavior
- * every pre-migration actor keeps.
+ * a versioned JSON document). V1 is a provider-discriminated union: each
+ * provider owns the strict shape of its `config` object. The currently wired
+ * Google branch carries its prebuilt Gemini TTS voice name. Absent means the
+ * actor follows the instance-wide voice default — the behavior every
+ * pre-migration actor keeps.
  */
-export interface VoiceConfigDocument {
+export interface GoogleVoiceConfigDocument {
   schemaVersion: 1;
-  voiceName: string;
+  provider: "google";
+  config: {
+    voiceName: string;
+  };
 }
+
+/**
+ * Add a provider-specific branch here when its synthesizer is wired. Keeping
+ * the discriminant beside its nested config means persisted provider settings
+ * never compete for unscoped top-level fields.
+ */
+export type VoiceConfigDocument = GoogleVoiceConfigDocument;
 
 /** A capability to message another actor. The unguessable id is the capability. */
 export interface ActorHandle {

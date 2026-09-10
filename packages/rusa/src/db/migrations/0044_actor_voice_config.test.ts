@@ -52,11 +52,19 @@ describe("0044_actor_voice_config", () => {
     actorVoiceConfig.up(db);
 
     db.prepare("UPDATE actors SET voice_config = ? WHERE id = 'actor-a'").run(
-      JSON.stringify({ schemaVersion: 1, voiceName: "Puck" })
+      JSON.stringify({
+        schemaVersion: 1,
+        provider: "google",
+        config: { voiceName: "Puck" },
+      })
     );
     const row = db.prepare("SELECT voice_config FROM actors WHERE id = 'actor-a'").get() as {
       voice_config: string;
     };
-    expect(JSON.parse(row.voice_config)).toEqual({ schemaVersion: 1, voiceName: "Puck" });
+    expect(JSON.parse(row.voice_config)).toEqual({
+      schemaVersion: 1,
+      provider: "google",
+      config: { voiceName: "Puck" },
+    });
   });
 });
