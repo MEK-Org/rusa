@@ -13,6 +13,7 @@ import type { RunResult } from "../providers/types.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import {
   applyAuthorSuppression,
+  type DurableEventDelivery,
   deduplicatedInboxEntryId,
   type EventManager,
   type EventRoutingKernel,
@@ -1110,8 +1111,18 @@ export class ActorMesh {
    * entry joins it and becomes seen immediately; only deliveries during an
    * active run set the dirty follow-up. A held normal entry remains durable but
    * returns false because the session-end release, not this call, will nudge it.
+   *
+   * Responsive work replaces an in-flight run by default — operator control,
+   * human messages, and `runNow` all mean "now". Event fan-out passes
+   * `preempt: false` for a recipient that is not the event's effective owner:
+   * that copy keeps responsive scheduling and admission but joins the run as
+   * a follow-up instead of aborting work the event does not belong to.
    */
-  notifyInboxChanged(actorId: string, nudge: RunNudge = {}): boolean {
+  notifyInboxChanged(
+    actorId: string,
+    nudge: RunNudge = {},
+    opts: { preempt?: boolean } = {}
+  ): boolean {
     actorId = this.resolveThreadId(actorId);
     const rec = this.actors.get(actorId);
     if (rec && rec.status !== "active") {
@@ -1130,7 +1141,7 @@ export class ActorMesh {
       this.log(`inbox_changed for ${actorId} held — active voice session`);
       return false;
     }
-    if (isResponsiveNudge(nudge)) {
+    if (isResponsiveNudge(nudge) && opts.preempt !== false) {
       const preemption = target.preemptForResponsive();
       if (preemption.preempted) {
         this.recordEvent({
@@ -2058,7 +2069,7 @@ export class ActorMesh {
         throw new Error("Inbox delivery requires a host-assembled EventManager");
       }
       const rawResource = typeof resource === "string" ? resource : resourceKey(resource);
-      const entries = this.eventManager.handleNormalizedEvent({
+      const delivery = this.eventManager.handleNormalizedEvent({
         resource: rawResource,
         payload: {
           ...opts.inboxPayload,
@@ -2071,7 +2082,7 @@ export class ActorMesh {
         instanceId: opts.instanceId,
         eventSummary,
       });
-      this.notifyPersistedInboxEntries(entries, opts.inboxPriority);
+      this.notifyPersistedInboxEntries(delivery, opts.inboxPriority);
       return;
     }
 
@@ -2112,7 +2123,8 @@ export class ActorMesh {
     if (deliverable.length === 0) return;
 
     for (const dest of deliverable) {
-      if (!this.notifyInboxChanged(dest, { priority: opts.inboxPriority })) {
+      const preempt = recipients.ownerIds.includes(dest);
+      if (!this.notifyInboxChanged(dest, { priority: opts.inboxPriority }, { preempt })) {
         this.log(`Delivery target ${dest} is not live; cannot deliver event`);
       }
     }
@@ -2131,17 +2143,23 @@ export class ActorMesh {
     if (!this.eventManager) {
       throw new Error("External event delivery requires a host-assembled EventManager");
     }
-    const entries = this.eventManager.handleExternalEvent(raw);
-    this.notifyPersistedInboxEntries(entries, raw.priority);
+    this.notifyPersistedInboxEntries(this.eventManager.handleExternalEvent(raw), raw.priority);
   }
 
+  /**
+   * Only the event's effective owner may have its active run replaced. Every
+   * other recipient's copy is just as durable and just as responsive for
+   * scheduling, but a subscriber's run is not aborted by an event it merely
+   * observes; a subscriber-only route therefore preempts nobody.
+   */
   private notifyPersistedInboxEntries(
-    entries: readonly InboxEntry[],
+    delivery: DurableEventDelivery,
     priority: "responsive" | "normal" | undefined
   ): void {
-    for (const entry of entries) {
+    for (const entry of delivery.entries) {
       const dest = entry.actorId;
-      if (!this.notifyInboxChanged(dest, { priority })) {
+      const preempt = delivery.ownerIds.includes(dest);
+      if (!this.notifyInboxChanged(dest, { priority }, { preempt })) {
         throw new Error(`Delivery target ${dest} is not live after inbox persistence`);
       }
     }
