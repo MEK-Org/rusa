@@ -133,6 +133,11 @@ export interface ActorOptions {
    */
   beforeRun?: (context: { mode: ActorRunMode }) => boolean | Promise<boolean>;
   /**
+   * Final scheduler-admission check, after a gate selects this run but before
+   * the provider starts. Returning false defers the content-free opportunity.
+   */
+  admitRun?: (context: { responsive: boolean; mode: ActorRunMode }) => boolean | Promise<boolean>;
+  /**
    * General lifecycle notification after {@link beforeRun} passes and before the
    * provider/concurrency scheduler. No work content or prompt state crosses it.
    */
@@ -824,13 +829,26 @@ export class Actor {
         },
       });
     };
-    const invoke = (selected: RawProviderModelConfig): Promise<RunResult> => {
+    const invoke = async (selected: RawProviderModelConfig): Promise<RunResult> => {
       // Both queues have selected this run. From this point a later responsive
       // wake obeys per-actor serialization; v1 never cancels a live provider.
       this.pendingStart = undefined;
       this.queued = false;
       if (this.closed || this.preemptedQueuedRun) {
         this.preemptedQueuedRun = false;
+        throw new RunStartCancelledError();
+      }
+      if (
+        this.opts.admitRun &&
+        !(await this.opts.admitRun({
+          responsive,
+          mode: nudge.mode ?? "ordinary",
+        }))
+      ) {
+        // A normal run can wait in provider pacing after its initial preflight.
+        // Do not let that stale opportunity cross a newer host-owned authority
+        // boundary; the authority release supplies its own durable-work nudge.
+        this.lastRunSkipped = true;
         throw new RunStartCancelledError();
       }
       this.executing = true;

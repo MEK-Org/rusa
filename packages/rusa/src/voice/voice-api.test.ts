@@ -14,7 +14,7 @@ import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import type { SpeechClient } from "./gemini-speech.js";
 import { handleVoiceApiRequest, type VoiceApiDeps } from "./voice-api.js";
-import { VOICE_MEMO_PREFIX, VoiceService } from "./voice-service.js";
+import { VOICE_MEMO_PREFIX, VOICE_SESSION_LEASE_MS, VoiceService } from "./voice-service.js";
 import { attachVoiceOutbound } from "./wiring.js";
 
 const UUID_A = "aaaaaaaa-0000-4000-8000-000000000001";
@@ -265,6 +265,7 @@ describe("handleVoiceApiRequest", () => {
   describe("POST /api/mesh/actors/:id/voice-memo", () => {
     it("stores audio, transcribes, and delivers the marked transcript", async () => {
       const audio = Buffer.from("webm-bytes");
+      call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=sess-9`);
       const { res } = call(deps, "POST", `/api/mesh/actors/${UUID_A}/voice-memo?sessionId=sess-9`, {
         body: audio,
         contentType: "audio/webm",
@@ -297,6 +298,39 @@ describe("handleVoiceApiRequest", () => {
       expect(res.statusCode).toBe(200);
       const sessionId = sendHumanMessage.mock.calls[0][2];
       expect(sessionId).toMatch(/^[0-9a-f-]{36}$/);
+    });
+
+    it("delivers an unknown session id during a restart race without granting it authority", async () => {
+      const sessionId = "reconnect-after-restart";
+      const first = call(
+        deps,
+        "POST",
+        `/api/mesh/actors/${UUID_A}/voice-memo?sessionId=${sessionId}`,
+        { body: Buffer.from("x"), contentType: "audio/webm" }
+      );
+      await settled(first.res);
+
+      expect(first.res.statusCode).toBe(200);
+      expect(sendHumanMessage.mock.calls[0]?.[2]).toMatch(/^[0-9a-f-]{36}$/);
+      expect(sendHumanMessage.mock.calls[0]?.[2]).not.toBe(sessionId);
+      expect(service.hasActiveSession(UUID_A)).toBe(false);
+
+      call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=${sessionId}`);
+      expect(service.hasSession(sessionId, UUID_A)).toBe(true);
+
+      const second = call(
+        deps,
+        "POST",
+        `/api/mesh/actors/${UUID_A}/voice-memo?sessionId=${sessionId}`,
+        { body: Buffer.from("y"), contentType: "audio/webm" }
+      );
+      await settled(second.res);
+      expect(second.res.statusCode).toBe(200);
+      expect(sendHumanMessage.mock.calls[1]).toEqual([
+        UUID_A,
+        `${VOICE_MEMO_PREFIX}pick up milk on the way home`,
+        sessionId,
+      ]);
     });
 
     it("reports delivered: false for a non-live actor (memo still transcribed)", async () => {
@@ -359,6 +393,32 @@ describe("handleVoiceApiRequest", () => {
     it("400s without an actors filter", () => {
       const { res } = call(deps, "GET", "/api/mesh/voice/stream");
       expect(res.statusCode).toBe(400);
+    });
+
+    it("keeps an explicit session through an SSE drop and ends it only on disable", async () => {
+      const first = call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-1`);
+      expect(service.hasSession("walkie-1", UUID_A)).toBe(true);
+
+      // A healthy EventSource holds authority beyond the reconnect allowance.
+      now += VOICE_SESSION_LEASE_MS * 2;
+      service.expireSessions();
+      expect(service.hasSession("walkie-1", UUID_A)).toBe(true);
+
+      // An EventSource error/reconnect does not release background work.
+      first.res.req.emit("close");
+      now += VOICE_SESSION_LEASE_MS - 1;
+      service.expireSessions();
+      expect(service.hasSession("walkie-1", UUID_A)).toBe(true);
+      call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-1`);
+      expect(service.hasSession("walkie-1", UUID_A)).toBe(true);
+
+      const { res } = call(deps, "POST", "/api/mesh/voice/session/disable", {
+        body: JSON.stringify({ sessionId: "walkie-1" }),
+        contentType: "application/json",
+      });
+      await settled(res);
+      expect(res.statusCode).toBe(200);
+      expect(service.hasActiveSession(UUID_A)).toBe(false);
     });
 
     it("a connected subscription is presence; replies stream as voice frames", async () => {

@@ -43,10 +43,15 @@ export function resolveInboxHint(entry: InboxEntry): string | undefined {
   const { source, payload } = entry;
   const fromId = typeof payload.fromId === "string" ? payload.fromId : undefined;
 
+  // Voice needs its own contract before the general human-message branch:
+  // speech is lossy and silence reads as a dropped conversation.
+  if (payload.type === "human.voice") {
+    return "This is a live voice memo from the human operator. You must acknowledge immediately with a short, ear-first reply; keep progress updates short, assume speech is lossy, and reconfirm understanding more often than in text. Reply directly to the human operator using your reply tool or mesh chat.";
+  }
+
   // an issue: Human operator message cue
   if (
     payload.type === "human.message" ||
-    payload.type === "human.voice" ||
     (fromId !== undefined && isHumanOperator(fromId)) ||
     source === "mesh:human" ||
     source.startsWith("mesh:human:")

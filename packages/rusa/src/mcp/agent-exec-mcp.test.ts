@@ -1640,6 +1640,183 @@ describe("agent-execution MCP server", () => {
         expect.objectContaining({ resource: ISSUE, actorId: "t1" }),
       ]);
     });
+
+    it("exposes obligation-governed effective ownership ahead of stored subscriptions and reconciles delegation failure (#369)", async () => {
+      const liveObligations: Record<string, string | null> = {};
+      const { mesh } = setup({
+        obligations: {
+          findLiveByExternalRef: (ref) => {
+            const ownerId = liveObligations[ref];
+            return ownerId ? { ownerId } : null;
+          },
+        },
+      });
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+
+      // Spawn investigator/worker actor
+      await rootClient.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "investigator",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      });
+      // Root holds exact stored subscription
+      mesh.subscribeEventSource(ISSUE, "root", "root");
+
+      // Live obligation claims the exact issue and is owned by investigator (t1)
+      liveObligations[ISSUE] = "t1";
+
+      // Attempting to delegate fails because caller is not effective owner
+      const failedDelegation = (await rootClient.callTool({
+        name: "delegate_event_source",
+        arguments: {
+          child_thread_id: "t1",
+          source: ISSUE,
+        },
+      })) as CallToolResult;
+      expect(failedDelegation.isError).toBe(true);
+      expect(String(dataOf(failedDelegation))).toContain(
+        "caller is not the current effective owner"
+      );
+
+      // Root routing audit reconciles effective ownership for the canonical source
+      const audited = dataOf(
+        (await rootClient.callTool({
+          name: "list_subscriptions",
+          arguments: { source: ISSUE },
+        })) as CallToolResult
+      ) as {
+        owners: unknown[];
+        subscribers: unknown[];
+        effectiveRoute: {
+          resource: string;
+          governingSource: string;
+          principal: string;
+          resourceLevel: string;
+          isLive: boolean;
+        };
+      };
+
+      expect(audited.effectiveRoute).toMatchObject({
+        resource: ISSUE,
+        governingSource: "obligation",
+        principal: "t1",
+        resourceLevel: ISSUE,
+        isLive: true,
+      });
+
+      // Audit without arguments returns raw stored owners and subscribers without targeted effectiveRoute
+      const baseAudit = dataOf(
+        (await rootClient.callTool({
+          name: "list_subscriptions",
+          arguments: {},
+        })) as CallToolResult
+      ) as Record<string, unknown>;
+      expect(baseAudit.owners).toBeDefined();
+      expect(baseAudit.subscribers).toBeDefined();
+      expect(baseAudit.effectiveRoute).toBeUndefined();
+
+      // When the obligation becomes terminal, diagnostic falls back to stored subscription
+      liveObligations[ISSUE] = null;
+
+      const fallbackAudit = dataOf(
+        (await rootClient.callTool({
+          name: "list_subscriptions",
+          arguments: { source: ISSUE },
+        })) as CallToolResult
+      ) as {
+        effectiveRoute: {
+          resource: string;
+          governingSource: string;
+          principal: string;
+          resourceLevel: string;
+          isLive: boolean;
+        };
+      };
+
+      expect(fallbackAudit.effectiveRoute).toMatchObject({
+        resource: ISSUE,
+        governingSource: "subscription",
+        principal: "root",
+        resourceLevel: ISSUE,
+        isLive: true,
+      });
+
+      // Root delegation now succeeds
+      const succeedDelegation = (await rootClient.callTool({
+        name: "delegate_event_source",
+        arguments: {
+          child_thread_id: "t1",
+          source: ISSUE,
+        },
+      })) as CallToolResult;
+      expect(succeedDelegation.isError).toBeFalsy();
+    });
+
+    it("rejects partially specified resource arguments instead of silent fallback (#369)", async () => {
+      const { mesh } = setup();
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const result = (await rootClient.callTool({
+        name: "list_subscriptions",
+        arguments: { kind: "github_issue", repo: "synthetic-org/synthetic-repo" },
+      })) as CallToolResult;
+      expect(result.isError).toBe(true);
+      expect(String(dataOf(result))).toContain("number is required for github_issue inspection");
+    });
+
+    it("preserves direct subscriptions as delivery-only in diagnostic output (#369)", async () => {
+      const { mesh } = setup();
+      const rootClient = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      await rootClient.callTool({
+        name: "spawn_thread",
+        arguments: {
+          charter: "watcher",
+          model_config: { provider: "claude", model: "claude-sonnet-4-6" },
+        },
+      });
+      mesh.subscribeEventSource(ISSUE, "root", "root");
+
+      const watcherClient = await connect(createAgentExecMcpServer(mesh, "t1", "root"));
+      await watcherClient.callTool({
+        name: "subscribe_event_source",
+        arguments: { source: ISSUE },
+      });
+
+      const audit = dataOf(
+        (await rootClient.callTool({
+          name: "list_subscriptions",
+          arguments: { source: ISSUE },
+        })) as CallToolResult
+      ) as {
+        owners: unknown[];
+        subscribers: Array<{ resource: string; actorId: string }>;
+        effectiveRoute: {
+          governingSource: string;
+          principal: string;
+        };
+      };
+
+      // Watcher is present in direct subscribers, but effectiveRoute principal remains root
+      expect(audit.subscribers).toEqual([
+        expect.objectContaining({ resource: ISSUE, actorId: "t1" }),
+      ]);
+      expect(audit.effectiveRoute.governingSource).toBe("subscription");
+      expect(audit.effectiveRoute.principal).toBe("root");
+
+      // Watcher cannot delegate
+      const watcherDelegate = (await watcherClient.callTool({
+        name: "delegate_event_source",
+        arguments: {
+          child_thread_id: "root",
+          source: ISSUE,
+        },
+      })) as CallToolResult;
+      expect(watcherDelegate.isError).toBe(true);
+      expect(String(dataOf(watcherDelegate))).toContain(
+        "caller is not the current effective owner"
+      );
+    });
   });
 });
 

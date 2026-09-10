@@ -103,9 +103,7 @@ void main() {
     expect(find.byKey(const ValueKey('walkie-panel')), findsOneWidget);
     expect(find.byType(TextField), findsNothing);
     expect(walkie.streams, hasLength(1));
-    expect(walkie.stream.connectCalls, [
-      ['a'],
-    ]);
+    expect(walkie.stream.connectCalls.single.actors, ['a']);
     expect(walkie.wakeLock.acquireCalls, 1);
     expect(walkie.player.primeCalls, 1);
 

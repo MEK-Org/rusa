@@ -15,6 +15,7 @@ export function createVoiceService(options: {
   home: string;
   apiKey: string;
   voice?: VoiceConfig;
+  onSessionEnded?: (actorId: string) => void;
 }): VoiceService {
   return new VoiceService({
     home: options.home,
@@ -24,6 +25,7 @@ export function createVoiceService(options: {
       ttsModel: options.voice?.ttsModel,
       voiceName: options.voice?.voiceName,
     }),
+    onSessionEnded: options.onSessionEnded,
   });
 }
 

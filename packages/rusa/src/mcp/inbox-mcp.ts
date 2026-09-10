@@ -18,6 +18,8 @@ export interface InboxMcpRunScope {
   selected: () => readonly string[];
   onHandled?: () => void;
   isFenced?: () => boolean;
+  /** Explicit walkie authority hides and fences ordinary work for this actor. */
+  isVoiceSessionActive?: () => boolean;
 }
 
 /** Actor-bound durable notification tools. The model never supplies actor_id. */
@@ -46,7 +48,6 @@ export function createInboxMcpServer(
       },
       selected: () => localSelection,
     } satisfies InboxMcpRunScope);
-
   server.registerTool(
     "list",
     {
@@ -62,7 +63,15 @@ export function createInboxMcpServer(
     },
     async ({ status, source, limit, cursor }) => {
       try {
-        return toolOk(store.list(actorId, { status, source, limit, cursor }));
+        return toolOk(
+          store.list(actorId, {
+            status,
+            source,
+            limit,
+            cursor,
+            responsiveOnly: scope.isVoiceSessionActive?.() === true,
+          })
+        );
       } catch (err) {
         return toolError(err);
       }

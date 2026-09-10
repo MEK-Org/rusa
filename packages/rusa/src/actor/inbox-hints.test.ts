@@ -45,6 +45,9 @@ describe("inbox hints", () => {
         },
       });
       const hint = resolveInboxHint(entry);
+      expect(hint).toContain("acknowledge immediately");
+      expect(hint).toContain("lossy");
+      expect(hint).toContain("reconfirm");
       expect(hint).toContain(
         "Reply directly to the human operator using your reply tool or mesh chat"
       );

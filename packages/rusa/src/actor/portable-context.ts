@@ -321,10 +321,16 @@ const OBLIGATIONS_HEADING =
 
 function renderObligation(obligation: Obligation): string {
   const ref = obligation.externalRef ? ` (${obligation.externalRef.key})` : "";
-  return `- [READY] ${obligation.id}${ref}: ${obligation.intent ?? "(no intent recorded)"}`;
+  const checkpoint = obligation.checkpoint?.trim();
+  const standing = checkpoint ? `\n  Current standing: ${checkpoint}` : "";
+  return `- [READY] ${obligation.id}${ref}: ${obligation.intent ?? "(no intent recorded)"}${standing}`;
 }
 
-/** Waiting obligations appear as a bare reference — enough to recognise, not to act on. */
+/**
+ * Waiting obligations remain bare references: the ratified projection reserves
+ * its detail budget for ready work. Their standing is still available through
+ * the obligation read tools when a wake needs to inspect a gate.
+ */
 function renderWaitingRef(obligation: Obligation): string {
   const ref = obligation.externalRef ? ` (${obligation.externalRef.key})` : "";
   return `- [WAITING] ${obligation.id}${ref}`;

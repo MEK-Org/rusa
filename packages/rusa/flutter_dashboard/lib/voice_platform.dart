@@ -58,17 +58,15 @@ abstract interface class ScreenWakeLock {
 /// Connection-level signal from the `voice` SSE stream.
 enum VoiceStreamStatus { connected, reconnecting }
 
-/// The `voice` SSE channel (`GET /api/mesh/voice/stream?actors=…`). The open
-/// connection IS the walkie presence signal, so implementations must only hold
-/// it open between [connect] and [dispose]. Browser EventSource auto-reconnects
-/// on blips; [status] surfaces those transitions so the controller can re-fetch
-/// the backlog after a gap.
+/// The `voice` SSE channel (`GET /api/mesh/voice/stream?actors=…&sessionId=…`).
+/// The stable UUID is the explicit walkie authority; implementations must carry
+/// the same id through EventSource reconnects until [dispose].
 abstract interface class VoiceStreamSource {
   Stream<VoiceAnnouncement> get frames;
   Stream<VoiceStreamStatus> get status;
 
   /// Open the stream for [actors] (≥1 required by the server).
-  void connect(List<String> actors);
+  void connect(List<String> actors, String sessionId);
 
   /// Close the connection (drops walkie presence) and the streams.
   void dispose();

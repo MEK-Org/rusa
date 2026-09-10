@@ -252,123 +252,144 @@ export function createDashboardRequestHandler(
   const { serveUi = true } = options;
   const log = (options.logger ?? nullLogger).child({ component: "dashboard" });
   return async (req: IncomingMessage, res: ServerResponse) => {
-    const requestUrl = new URL(req.url || "/", "http://localhost");
-    const { pathname } = requestUrl;
+    try {
+      const requestUrl = new URL(req.url || "/", "http://localhost");
+      const { pathname } = requestUrl;
 
-    // Minimal liveness endpoint — always available, even without a live mesh.
-    if (req.method === "GET" && pathname === "/api/health") {
-      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(
-        JSON.stringify({
-          status: "ok",
-          deployedSha,
-          startedAt,
-          version: packageVersion,
-        })
-      );
-      return;
-    }
-
-    if (req.method === "GET" && pathname === "/api/dashboard/config") {
-      res.writeHead(200, {
-        "Content-Type": "application/json; charset=utf-8",
-        "Cache-Control": "no-store",
-      });
-      res.end(JSON.stringify({ quotaProviders: options.dashboardConfig?.quotaProviders ?? {} }));
-      return;
-    }
-
-    // IU calibration op-getter (ISSUE_NUM 2b). Owns `/api/understanding/ops` when wired
-    // (paginated local would-be-graph ops); returns false otherwise.
-    if (
-      options.understandingOps &&
-      (await handleUnderstandingOpsRequest(req, res, requestUrl, options.understandingOps))
-    )
-      return;
-
-    // IU node-body strings . Owns `/api/understanding/strings` when wired — resolves
-    // externalized log-entry text by id so node bodies render; returns false otherwise.
-    if (
-      options.understandingOps &&
-      (await handleUnderstandingStringsRequest(req, res, requestUrl, options.understandingOps))
-    )
-      return;
-
-    // IU reports API
-    if (
-      options.iuReportsApi &&
-      (await handleIuReportsApiRequest(req, res, requestUrl, options.iuReportsApi))
-    )
-      return;
-
-    // Cached per-provider quota snapshot . Owns `GET /api/quota` (503s if no
-    // QuotaService is bound); returns false otherwise.
-    if (await handleQuotaApiRequest(req, res, requestUrl, options.quotaApi ?? null)) return;
-
-    // Walkie-talkie voice routes . Must run BEFORE the general mesh
-    // handler, which owns every other `/api/mesh/*` path. 503s when voice is
-    // unconfigured (no geminiApiKey) or no mesh is bound.
-    if (handleVoiceApiRequest(req, res, requestUrl, voiceDeps)) return;
-
-    // Live mesh Data API + SSE. Owns every `/api/mesh/*` path (503s if no mesh
-    // is bound); returns false otherwise so we fall through to static serving.
-    if (await handleMeshApiRequest(req, res, requestUrl, dataDeps)) return;
-
-    if (serveUi && req.method === "GET" && !pathname.startsWith("/api/")) {
-      // This instance's own name and face (#48), from the configured root
-      // actor. Resolved per request, not once at startup, because an operator can
-      // upload a new root image from the dashboard while the server runs.
-      const branding = resolveDashboardBranding(options.mesh?.rootIdentity);
-
-      // The manifest carries the installed PWA's name and icon, so it is rewritten
-      // rather than served verbatim.
-      if (pathname === "/manifest.json") {
-        const manifest = getDashboardAsset(pathname);
-        if (manifest) {
-          const body = applyBrandingToManifest(manifest.body.toString("utf8"), branding);
-          res.writeHead(200, {
-            "Content-Type": manifest.contentType,
-            // Tracks live config and the uploaded root image, so it must not be
-            // held past the change that produced it.
-            "Cache-Control": "no-store",
-          });
-          res.end(body);
-          return;
-        }
-      }
-
-      // Serve a built static asset if one matches the path. `index.html` is
-      // excluded so an explicit request for it gets the same branded shell as `/`.
-      const staticAsset = pathname === "/index.html" ? null : getDashboardAsset(pathname);
-      if (staticAsset) {
-        res.writeHead(200, { "Content-Type": staticAsset.contentType });
-        res.end(staticAsset.body);
+      // Minimal liveness endpoint — always available, even without a live mesh.
+      if (req.method === "GET" && pathname === "/api/health") {
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(
+          JSON.stringify({
+            status: "ok",
+            deployedSha,
+            startedAt,
+            version: packageVersion,
+          })
+        );
         return;
       }
-      // Otherwise serve the SPA shell for `/`, `/dashboard`, and deep links, so a
-      // refresh keeps working — when the Flutter assets have been built.
-      if (hasDashboardAsset("index.html")) {
-        try {
-          const html = applyBrandingToHtml(getDashboardHtml(), branding);
-          res.writeHead(200, {
-            "Content-Type": "text/html; charset=utf-8",
-            // The title and icon links are branded per request; see above.
-            "Cache-Control": "no-store",
-          });
-          res.end(html);
-          return;
-        } catch (err) {
-          log.error("dashboard_shell_render_failed", { path: pathname, err });
-          res.writeHead(500, { "Content-Type": "text/plain" });
-          res.end("Dashboard unavailable — assets may not be built yet.");
+
+      if (req.method === "GET" && pathname === "/api/dashboard/config") {
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store",
+        });
+        res.end(JSON.stringify({ quotaProviders: options.dashboardConfig?.quotaProviders ?? {} }));
+        return;
+      }
+
+      // IU calibration op-getter (ISSUE_NUM 2b). Owns `/api/understanding/ops` when wired
+      // (paginated local would-be-graph ops); returns false otherwise.
+      if (
+        options.understandingOps &&
+        (await handleUnderstandingOpsRequest(req, res, requestUrl, options.understandingOps))
+      )
+        return;
+
+      // IU node-body strings . Owns `/api/understanding/strings` when wired — resolves
+      // externalized log-entry text by id so node bodies render; returns false otherwise.
+      if (
+        options.understandingOps &&
+        (await handleUnderstandingStringsRequest(req, res, requestUrl, options.understandingOps))
+      )
+        return;
+
+      // IU reports API
+      if (
+        options.iuReportsApi &&
+        (await handleIuReportsApiRequest(req, res, requestUrl, options.iuReportsApi))
+      )
+        return;
+
+      // Cached per-provider quota snapshot . Owns `GET /api/quota` (503s if no
+      // QuotaService is bound); returns false otherwise.
+      if (await handleQuotaApiRequest(req, res, requestUrl, options.quotaApi ?? null)) return;
+
+      // Walkie-talkie voice routes . Must run BEFORE the general mesh
+      // handler, which owns every other `/api/mesh/*` path. 503s when voice is
+      // unconfigured (no geminiApiKey) or no mesh is bound.
+      if (handleVoiceApiRequest(req, res, requestUrl, voiceDeps)) return;
+
+      // Live mesh Data API + SSE. Owns every `/api/mesh/*` path (503s if no mesh
+      // is bound); returns false otherwise so we fall through to static serving.
+      if (await handleMeshApiRequest(req, res, requestUrl, dataDeps)) return;
+
+      if (serveUi && req.method === "GET" && !pathname.startsWith("/api/")) {
+        // This instance's own name and face (#48), from the configured root
+        // actor. Resolved per request, not once at startup, because an operator can
+        // upload a new root image from the dashboard while the server runs.
+        const branding = resolveDashboardBranding(options.mesh?.rootIdentity);
+
+        // The manifest carries the installed PWA's name and icon, so it is rewritten
+        // rather than served verbatim.
+        if (pathname === "/manifest.json") {
+          const manifest = getDashboardAsset(pathname);
+          if (manifest) {
+            const body = applyBrandingToManifest(manifest.body.toString("utf8"), branding);
+            res.writeHead(200, {
+              "Content-Type": manifest.contentType,
+              // Tracks live config and the uploaded root image, so it must not be
+              // held past the change that produced it.
+              "Cache-Control": "no-store",
+            });
+            res.end(body);
+            return;
+          }
+        }
+
+        // Serve a built static asset if one matches the path. `index.html` is
+        // excluded so an explicit request for it gets the same branded shell as `/`.
+        const staticAsset = pathname === "/index.html" ? null : getDashboardAsset(pathname);
+        if (staticAsset) {
+          res.writeHead(200, { "Content-Type": staticAsset.contentType });
+          res.end(staticAsset.body);
           return;
         }
+        // Otherwise serve the SPA shell for `/`, `/dashboard`, and deep links, so a
+        // refresh keeps working — when the Flutter assets have been built.
+        if (hasDashboardAsset("index.html")) {
+          try {
+            const html = applyBrandingToHtml(getDashboardHtml(), branding);
+            res.writeHead(200, {
+              "Content-Type": "text/html; charset=utf-8",
+              // The title and icon links are branded per request; see above.
+              "Cache-Control": "no-store",
+            });
+            res.end(html);
+            return;
+          } catch (err) {
+            log.error("dashboard_shell_render_failed", { path: pathname, err });
+            res.writeHead(500, { "Content-Type": "text/plain" });
+            res.end("Dashboard unavailable — assets may not be built yet.");
+            return;
+          }
+        }
+      }
+
+      log.debug("dashboard_route_not_found", { method: req.method, path: pathname });
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("Dashboard UI not found or invalid API route");
+    } catch (err) {
+      log.error("dashboard_request_failed", {
+        method: req.method,
+        path: req.url ?? "/",
+        err,
+      });
+      if (!res.headersSent) {
+        // Mesh API consumers use JSON error objects; keep that contract even
+        // when the failure occurred outside an individual route handler.
+        if ((req.url ?? "/").startsWith("/api/")) {
+          res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ error: "Internal error" }));
+        } else {
+          res.writeHead(500, { "Content-Type": "text/plain" });
+          res.end("Internal error");
+        }
+      } else if (!res.writableEnded) {
+        res.end();
       }
     }
-
-    log.debug("dashboard_route_not_found", { method: req.method, path: pathname });
-    res.writeHead(404, { "Content-Type": "text/plain" });
-    res.end("Dashboard UI not found or invalid API route");
   };
 }
 

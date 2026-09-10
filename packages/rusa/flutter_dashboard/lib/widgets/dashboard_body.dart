@@ -65,12 +65,8 @@ class _DashboardBodyState extends State<DashboardBody> {
     if (initialActor != null) {
       widget.store.clickActor(initialActor);
     }
-    writeDashboardViewToUrl(
-      _view,
-      focusedObligationId: widget.store.focusedObligationId.valueOrNull,
-      focusedActorId: widget.store.primary.valueOrNull,
-    );
-    
+    // Both seeded BehaviorSubjects replay after subscription, supplying the
+    // initial URL write as well as later focus and actor updates.
     _focusSub = widget.store.focusedObligationId.listen((id) {
       if (mounted) {
         writeDashboardViewToUrl(

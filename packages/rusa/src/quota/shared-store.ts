@@ -6,7 +6,14 @@ import Database from "better-sqlite3";
 import type { QuotaScrape } from "../db/repositories/quota-scrape-repository.js";
 import { BUSY_TIMEOUT_MS, widenToWal } from "../db/wal.js";
 import type { ProviderQuotaSnapshot, QuotaWindowKind } from "../mcp/quota-mcp.js";
+import {
+  assertQuotaSchemaVersion,
+  QUOTA_SCHEMA_VERSION,
+  SchemaVersionRefusalError,
+} from "./schema-guard.js";
 import { isProviderScopedWindow } from "./window-scope.js";
+
+export { assertQuotaSchemaVersion, QUOTA_SCHEMA_VERSION, SchemaVersionRefusalError };
 
 const SLOT_MS = 5 * 60 * 1000;
 export const QUOTA_RAW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -182,12 +189,18 @@ export class SharedQuotaStore {
   constructor(readonly databasePath: string) {
     mkdirSync(dirname(databasePath), { recursive: true });
     this.db = new Database(databasePath);
-    // The conversion runs its own budget, then hands the connection the
-    // ordinary one it keeps for the rest of its life.
-    widenToWal(this.db);
-    this.db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
-    this.db.pragma("foreign_keys = ON");
-    this.ensureSchema();
+    try {
+      assertQuotaSchemaVersion(this.db, QUOTA_SCHEMA_VERSION);
+      // The conversion runs its own budget, then hands the connection the
+      // ordinary one it keeps for the rest of its life.
+      widenToWal(this.db);
+      this.db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
+      this.db.pragma("foreign_keys = ON");
+      this.ensureSchema();
+    } catch (err) {
+      this.db.close();
+      throw err;
+    }
   }
 
   close(): void {
@@ -204,6 +217,12 @@ export class SharedQuotaStore {
   }
 
   private ensureSchema(): void {
+    const rawVersion = this.db.pragma("user_version", { simple: true });
+    const currentVersion = typeof rawVersion === "number" ? rawVersion : Number(rawVersion ?? 0);
+    if (currentVersion === 0) {
+      this.db.pragma(`user_version = ${QUOTA_SCHEMA_VERSION}`);
+    }
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS quota_scrapes (
         id TEXT PRIMARY KEY,
@@ -388,6 +407,20 @@ export class SharedQuotaStore {
          ORDER BY observed_at ASC, rowid ASC`
       )
       .all(provider, sinceIso) as QuotaHistoryRecord[];
+  }
+
+  getLatestSnapshot(provider: string): ProviderQuotaSnapshot | null {
+    const row = this.db
+      .prepare(
+        `SELECT parsed_state
+         FROM quota_scrapes
+         WHERE provider = ? AND parsed_state IS NOT NULL
+         ORDER BY scraped_at DESC, rowid DESC
+         LIMIT 1`
+      )
+      .get(provider) as { parsed_state: string } | undefined;
+    if (!row) return null;
+    return parsedSnapshot(row.parsed_state);
   }
 
   /** Advance every unprocessed observation exactly once across all connections. */

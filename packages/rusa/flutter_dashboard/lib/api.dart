@@ -15,6 +15,10 @@ class DashboardApi {
   final http.Client _client;
   final Uri _base;
 
+  /// The origin every request is resolved against. Exposed so the store can
+  /// scope persisted state to the server it actually came from.
+  Uri get base => _base;
+
   Uri _u(String path, [Map<String, String>? query]) => _base
       .resolve(path)
       .replace(queryParameters: query?.isEmpty ?? true ? null : query);
@@ -327,6 +331,23 @@ class DashboardApi {
         'Content-Type': 'application/json',
       },
       body: jsonEncode({'id': id}),
+    );
+    if (res.statusCode != 200) {
+      throw DashboardApiException(uri, res.statusCode, res.body);
+    }
+  }
+
+  /// `POST /api/mesh/voice/session/disable` — explicitly end the leased
+  /// walkie session. Socket close alone intentionally leaves a reconnect lease.
+  Future<void> disableVoiceSession(String sessionId) async {
+    final uri = _u('/api/mesh/voice/session/disable');
+    final res = await _client.post(
+      uri,
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({'sessionId': sessionId}),
     );
     if (res.statusCode != 200) {
       throw DashboardApiException(uri, res.statusCode, res.body);

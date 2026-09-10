@@ -39,7 +39,10 @@ never something to narrate past or assume succeeded. Prefer a typed tool over ra
 shell when one covers the job — read issues, PRs, and comments through your
 tracker tools rather than shelling \`gh\`. When you're unsure what actually
 happened, re-check with a tool or say so — never fill the gap with a plausible
-guess.`;
+guess. Claims about provenance, history, or motivation — why work exists, what
+prior incident or decision drove it, or where it originated — must cite a
+verifiable artifact (issue, PR, commit, or specific human request) or explicitly
+say the origin is unknown. Never synthesize a plausible-sounding origin.`;
 
 /** Tell actors their handle without asking them to add a visible byline. */
 export function trackerWritingGuidance(handle: string): string {

@@ -161,6 +161,20 @@ export type MeshEventKind =
   | "host_job_submitted"
   | "host_job_stopped"
   | "host_job_exited"
+  // An obligation's owner (or an ancestor owner) rewrote its checkpoint — the
+  // owner-maintained record of where that work stands (#302). `actorId` = the
+  // AUTHOR, not the obligation's owner, because the event records a judgment
+  // about standing rather than something that happened to the obligation;
+  // `detail` = the obligation id, so the (kind, detail) index answers "when did
+  // this arc's standing last change?"; `payload` = { cleared }. The id is not
+  // repeated in payload because it is already detail.
+  //
+  // Carries no `body` and no checkpoint text, on purpose. The checkpoint is
+  // replace-only, and an event log that quoted each value would be the very
+  // append-only history the field exists to stop anyone replaying. The current
+  // standing is read from the obligation; this says only that it moved, by
+  // whom, and whether the current-standing field was cleared.
+  | "obligation_checkpoint_set"
   // A granted email-send tool successfully sent via Gmail. `actorId` is the
   // sender; `detail` is the To recipient; payload contains To and Cc only.
   | "email_sent"

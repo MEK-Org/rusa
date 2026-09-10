@@ -50,7 +50,13 @@ export type Request =
   | { op: "beforeRun"; mode: ActorRunMode }
   | { op: "prepareMount" }
   | { op: "complete"; result: RunResult }
-  | { op: "admit"; candidates: RawProviderModelConfig[]; responsive: boolean }
+  | {
+      op: "admit";
+      candidates: RawProviderModelConfig[];
+      responsive: boolean;
+      /** The final admission check must distinguish ordinary work from session work. */
+      mode: ActorRunMode;
+    }
   | { op: "sendMessage"; to: string; body: string };
 
 export type LeaderCommand =

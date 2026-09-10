@@ -1098,6 +1098,17 @@ describe("handleMeshApiRequest", () => {
     ]);
   });
 
+  it("GET /api/mesh/events preserves its 200-item route limit", async () => {
+    for (let i = 0; i < 150; i += 1) {
+      meshEvents.record({ kind: "run_start", actorId: UUID_A, detail: String(i) });
+    }
+
+    const { res } = await call(deps, "GET", `/api/mesh/events?actors=${UUID_A}&limit=150`);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).events).toHaveLength(150);
+  });
+
   it("GET /api/mesh/events?since= returns ALL actors, oldest-first, forward (distiller read)", async () => {
     meshEvents.record({
       kind: "run_start",
@@ -1989,9 +2000,34 @@ describe("handleMeshApiRequest", () => {
         const { res } = await call(noObligationsDeps, "GET", "/api/mesh/obligations");
         expect(res.statusCode).toBe(503);
       });
+
+      it("clamps limit > 100 to the repository cap without throwing", async () => {
+        obligations.create({ title: "root-1", id: "root-1", ownerId: "actor-1" });
+        const { res } = await call(deps, "GET", "/api/mesh/obligations?limit=150");
+        expect(res.statusCode).toBe(200);
+        const data = JSON.parse(res.body);
+        expect(data.obligations).toHaveLength(1);
+        expect(data.total).toBe(1);
+      });
+
+      it("treats an unsafe offset as invalid before repository pagination", async () => {
+        obligations.create({ title: "root-1", id: "root-1", ownerId: "actor-1" });
+        const { res } = await call(deps, "GET", "/api/mesh/obligations?offset=10000000000000000");
+
+        expect(res.statusCode).toBe(200);
+        expect(JSON.parse(res.body).obligations).toHaveLength(1);
+      });
     });
 
     describe("GET /api/mesh/obligations/forest", () => {
+      it("clamps limit > 100 to the repository cap without throwing", async () => {
+        obligations.create({ title: "root-1", id: "root-1", ownerId: "actor-1" });
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/forest?limit=150");
+        expect(res.statusCode).toBe(200);
+        const data = JSON.parse(res.body);
+        expect(data.trees).toHaveLength(1);
+        expect(data.total).toBe(1);
+      });
       it("returns one root page's trees, in root-page order, without a request per root", async () => {
         obligations.create({ title: "root-1", id: "root-1", ownerId: "actor-1" });
         obligations.create({
@@ -2350,6 +2386,12 @@ describe("handleMeshApiRequest", () => {
         expect(page2Data.completions).toHaveLength(1);
         expect(page2Data.completions[0].note).toBe("cycle one");
         expect(page2Data.completionsHasMore).toBe(false);
+      });
+
+      it("clamps limit > 100 to the repository cap without throwing", async () => {
+        obligations.create({ title: "root-task", id: "root-task", ownerId: "actor-1" });
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/root-task?limit=150");
+        expect(res.statusCode).toBe(200);
       });
     });
 

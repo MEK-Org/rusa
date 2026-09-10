@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
 import { runMigrations } from "../migrations/runner.js";
+import { PrincipalRepository } from "./principal-repository.js";
 import { SqliteActorRepository } from "./sqlite-actor-repository.js";
 
 const root: ActorRecord = {
@@ -446,7 +447,6 @@ describe("SqliteActorRepository", () => {
 
     expect(repository.get("worker")?.modelConfig).toEqual(portableWorker.modelConfig);
   });
-
   it("persists executionTarget across repository reopen", () => {
     const remoteWorker: ActorRecord = {
       id: "worker-remote",
@@ -522,6 +522,66 @@ describe("SqliteActorRepository", () => {
       schemaVersion: 1,
       type: "native",
       sessionId: "local-session-123",
+    });
+  });
+
+  it("writes each actor's principal in the same transaction as its row", () => {
+    repository.upsert(root);
+
+    expect(
+      db.prepare("SELECT id, kind, created_at FROM principals WHERE id = 'root'").get()
+    ).toEqual({
+      id: "root",
+      kind: "actor",
+      created_at: root.createdAt,
+    });
+  });
+
+  it("rolls the principal back with the actor row when the write fails", () => {
+    repository.upsert(root);
+    expect(() =>
+      repository.upsert({
+        id: "worker",
+        charter: "Implement a slice",
+        parentId: "missing",
+        status: "active",
+        createdAt: "2026-09-03T13:01:00.000Z",
+      })
+    ).toThrow();
+
+    expect(repository.get("worker")).toBeUndefined();
+    expect(db.prepare("SELECT id FROM principals WHERE id = 'worker'").get()).toBeUndefined();
+  });
+
+  it("keeps the actor principal timestamp aligned when an actor is re-upserted", () => {
+    repository.upsert(root);
+    repository.upsert({ ...root, title: "Renamed", createdAt: "2026-09-04T13:00:00.000Z" });
+    repository.patch("root", { charter: "Own the mesh, still" });
+
+    expect(db.prepare("SELECT created_at FROM principals WHERE id = 'root'").all()).toEqual([
+      { created_at: "2026-09-04T13:00:00.000Z" },
+    ]);
+  });
+
+  it("keeps a retired actor's identity", () => {
+    repository.upsert(root);
+    const worker: ActorRecord = {
+      id: "worker",
+      charter: "Implement a slice",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-09-03T13:01:00.000Z",
+    };
+    repository.upsert(worker);
+
+    repository.patch("worker", { status: "retired" });
+
+    expect(repository.get("worker")?.status).toBe("retired");
+    expect(new PrincipalRepository(db).get("worker")).toEqual({
+      kind: "actor",
+      id: "worker",
+      actorId: "worker",
+      createdAt: worker.createdAt,
     });
   });
 });

@@ -429,7 +429,8 @@ describe("obligation projection (ISSUE_NUM, ratified in ISSUE_NUM comment 536984
     intent: string,
     priority = 1,
     externalRef: Obligation["externalRef"] = null,
-    nextReadyAt: string | null = null
+    nextReadyAt: string | null = null,
+    checkpoint: string | null = null
   ): Obligation => ({
     id,
     parentId: null,
@@ -450,6 +451,9 @@ describe("obligation projection (ISSUE_NUM, ratified in ISSUE_NUM comment 536984
     recurrenceCron: status === "scheduled" ? "0 * * * *" : null,
     recurrenceIntervalSeconds: null,
     nextReadyAt: status === "scheduled" ? (nextReadyAt ?? "2026-08-02T00:00:00.000Z") : null,
+    checkpoint,
+    checkpointAt: checkpoint == null ? null : "2026-09-07T12:00:00.000Z",
+    checkpointBy: checkpoint == null ? null : "actor-a",
     hasCompletionHistory: false,
   });
 
@@ -484,6 +488,25 @@ describe("obligation projection (ISSUE_NUM, ratified in ISSUE_NUM comment 536984
     expect(section).toContain("[WAITING] ob-waiting");
     expect(section).not.toContain("Blocked work");
     expect(section).toContain("[READY] ob-first");
+  });
+
+  it("puts a ready obligation's current standing into its automatic wake context", () => {
+    const section = project([
+      obligation(
+        "ob-checkpoint",
+        "ready",
+        "Finish the checkpoint implementation",
+        1,
+        null,
+        null,
+        "head 0f8372e; skeptic review in flight; next: answer inline questions"
+      ),
+    ]);
+
+    expect(section).toContain("[READY] ob-checkpoint");
+    expect(section).toContain(
+      "Current standing: head 0f8372e; skeptic review in flight; next: answer inline questions"
+    );
   });
 
   it("cuts ready obligations by priority and never skips ahead to a smaller one", () => {
