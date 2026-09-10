@@ -1,5 +1,5 @@
-import type { InboxPayload } from "../actor/inbox-store.js";
-import type { InboxItem, InboxItemRepository, NewInboxItem } from "./inbox-item-repository.js";
+import type { InboxAppendInput, InboxEntry, InboxPayload } from "../actor/inbox-store.js";
+import type { InboxRepository } from "../repositories/inbox-repository.js";
 
 export interface RawIntegrationEvent {
   sourceType: "github" | "chat" | "timer" | "custom";
@@ -31,7 +31,7 @@ export interface EventSourceResolver {
  * 1. Normalize external events from integrations into rusa-shaped events.
  * 2. Apply event source ownership and subscription rules to determine which
  *    actor(s) should receive an inbox item.
- * 3. Append deduplicated inbox items into the authoritative InboxItemRepository.
+ * 3. Append deduplicated inbox items into the authoritative InboxRepository.
  *
  * Strict invariant:
  * EventManager NEVER directly invokes actors or schedules runs. It ends its
@@ -39,7 +39,7 @@ export interface EventSourceResolver {
  */
 export class EventManager {
   constructor(
-    private readonly inboxRepository: InboxItemRepository,
+    private readonly inboxRepository: InboxRepository,
     private readonly resolver: EventSourceResolver,
     private readonly normalizer?: (event: RawIntegrationEvent) => NormalizedIntegrationEvent
   ) {}
@@ -74,7 +74,7 @@ export class EventManager {
    * inbox rows. Actors are not invoked here; the downstream mesh and run manager
    * respond to durable changes.
    */
-  async handleExternalEvent(raw: RawIntegrationEvent): Promise<readonly InboxItem[]> {
+  async handleExternalEvent(raw: RawIntegrationEvent): Promise<readonly InboxEntry[]> {
     const normalized = this.normalizeEvent(raw);
     const { ownerId, subscriberIds } = await this.resolver.resolveRecipients(normalized.resource);
 
@@ -88,7 +88,7 @@ export class EventManager {
       return [];
     }
 
-    const newItems: NewInboxItem[] = [];
+    const newItems: InboxAppendInput[] = [];
     for (const actorId of targetActorIds) {
       const id = normalized.dedupeKey ? `dedupe:${normalized.dedupeKey}:${actorId}` : undefined;
       newItems.push({
@@ -100,6 +100,6 @@ export class EventManager {
       });
     }
 
-    return await this.inboxRepository.append(newItems);
+    return this.inboxRepository.append(newItems);
   }
 }

@@ -1,21 +1,10 @@
+import { randomUUID } from "node:crypto";
 import type { ActorOptions } from "../actor/actor.js";
 import type { RunResult } from "../providers/types.js";
-import type { InboxItemRepository } from "./inbox-item-repository.js";
+import type { InboxRepository } from "../repositories/inbox-repository.js";
+import { type ActorLifecycleListener, emitLifecycle } from "./actor-lifecycle.js";
 
 export type ActorExecutionState = "idle" | "queued" | "running" | "winding_down";
-
-/**
- * Terminal-stage lifecycle callbacks kept at the composition boundary.
- */
-export interface ActorTerminalLifecycle {
-  finishInboxRun?: () => void;
-  completeRun: (result: RunResult) => string;
-  logRunEnd: (runId: string, result: RunResult) => void;
-  recordRunEnd: (runId: string, result: RunResult) => void;
-  afterTerminal?: (result: RunResult) => void;
-  compact?: () => Promise<void>;
-  routeFailure?: (result: RunResult) => Promise<void>;
-}
 
 /** The driver instantiation target supplied by command composition. */
 export interface ActorRuntimeDriver<TActor = unknown> {
@@ -29,6 +18,10 @@ export interface ActorRuntimeDriver<TActor = unknown> {
  * Notice: This contains NO actor hierarchy (no parentId, no child records,
  * no subtree authority, and no isRoot / role). RunManager cares only about
  * execution inputs. This strictly preserves duck rootness.
+ *
+ * It also carries no terminal-stage callbacks: what happens around a run is
+ * expressed as lifecycle events (see `actor-lifecycle.ts`), so this contract
+ * stays about how to build and run the actor and nothing else.
  */
 export interface ActorInvocationInputs<TActor = unknown> {
   actorId: string;
@@ -39,7 +32,6 @@ export interface ActorInvocationInputs<TActor = unknown> {
   };
   driver: ActorRuntimeDriver<TActor>;
   options: Omit<ActorOptions, "id" | "cwd" | "sandbox" | "onRunEnd">;
-  terminal: ActorTerminalLifecycle;
   runActor: (actor: TActor, signal?: AbortSignal) => Promise<RunResult>;
 }
 
@@ -57,8 +49,14 @@ export function createActorFromInputs<TActor>(inputs: ActorInvocationInputs<TAct
 }
 
 export interface RunManagerOptions<TActor = unknown> {
-  inboxRepository: InboxItemRepository;
+  inboxRepository: InboxRepository;
   resolveInvocationInputs: (actorId: string) => Promise<ActorInvocationInputs<TActor>>;
+  /**
+   * Lifecycle observers, notified in registration order. Logging, run
+   * accounting, mesh event recording, compaction, and failure routing all
+   * enter here rather than as named hooks on the invocation contract.
+   */
+  lifecycle?: readonly ActorLifecycleListener[];
   /** Maximum concurrent runs allowed (parallelism admission). */
   maxParallelism?: number;
   /**
@@ -66,6 +64,8 @@ export interface RunManagerOptions<TActor = unknown> {
    * Return false if provider quota is exhausted or throttled.
    */
   checkQuota?: (actorId: string) => boolean | Promise<boolean>;
+  /** Mints the run id carried on onStart/onEnd/onError. */
+  newRunId?: () => string;
   log?: (message: string) => void;
 }
 
@@ -85,14 +85,14 @@ interface PerActorState {
  * - quota and parallelism admission (v1 internal implementation)
  * - actor construction from explicit invocation inputs (no actor hierarchy)
  * - interruption of active runs
- * - terminal lifecycle execution and follow-up dispatch
+ * - run lifecycle emission and follow-up dispatch
  *
  * NOTE on future fine-grained dispatch flags:
- * Matt sketched possible future fine-grained dispatch flags on inbox items,
- * such as `{ interrupt: boolean; skipQueue: boolean; skipWake: boolean }` (e.g. for FYI-tier items).
- * In this POC, current dispatch semantics are preserved exactly: priority is
- * derived directly from the durable inbox item payload (`payload.priority === "responsive"` vs normal).
- * Fine-grained flags are explicitly deferred future possibilities, not POC behavior or schema.
+ * Per-item dispatch flags such as `{ interrupt, skipQueue, skipWake }` (e.g. for
+ * FYI-tier items) have been floated as a future direction. This POC deliberately
+ * preserves current dispatch semantics exactly: priority is derived from the
+ * durable inbox row (`payload.priority === "responsive"` vs normal). Those flags
+ * are a deferred possibility, not POC behavior and not POC schema.
  *
  * NOTE on future composable admission policy:
  * In this v1 implementation, parallelism limiting and quota throttling are
@@ -101,12 +101,14 @@ interface PerActorState {
  * deliberately introduces no policy interface.
  */
 export class RunManager<TActor = unknown> {
-  private readonly inboxRepository: InboxItemRepository;
+  private readonly inboxRepository: InboxRepository;
   private readonly resolveInvocationInputs: (
     actorId: string
   ) => Promise<ActorInvocationInputs<TActor>>;
+  private readonly lifecycle: readonly ActorLifecycleListener[];
   private readonly maxParallelism: number;
   private readonly checkQuota?: (actorId: string) => boolean | Promise<boolean>;
+  private readonly newRunId: () => string;
   private readonly log: (message: string) => void;
 
   private readonly actorStates = new Map<string, PerActorState>();
@@ -116,8 +118,10 @@ export class RunManager<TActor = unknown> {
   constructor(options: RunManagerOptions<TActor>) {
     this.inboxRepository = options.inboxRepository;
     this.resolveInvocationInputs = options.resolveInvocationInputs;
+    this.lifecycle = options.lifecycle ?? [];
     this.maxParallelism = options.maxParallelism ?? 10;
     this.checkQuota = options.checkQuota;
+    this.newRunId = options.newRunId ?? (() => randomUUID());
     this.log = options.log ?? (() => {});
   }
 
@@ -129,19 +133,23 @@ export class RunManager<TActor = unknown> {
    * The single dispatch entry point: a content-free poke.
    *
    * The caller specifies only which actor was nudged. RunManager inspects
-   * the durable inbox item repository to determine whether work exists and what
+   * the durable inbox repository to determine whether work exists and what
    * its priority is (responsive vs normal).
    */
-  async dispatchRun(actorId: string): Promise<void> {
+  async dispatch(actorId: string): Promise<void> {
     if (this.isShutdown) return;
 
-    // 1. Inspect durable inbox to derive priority
-    const unhandled = await this.inboxRepository.getUnhandledItems(actorId);
-    if (unhandled.length === 0) {
+    // 1. Inspect durable inbox to derive priority. `actorsWithUnhandled()`
+    //    already promotes an actor whose pending work includes a responsive
+    //    entry, so the existing store answers both questions in one read.
+    const pending = this.inboxRepository
+      .actorsWithUnhandled()
+      .find((work) => work.actorId === actorId);
+    if (!pending) {
       return;
     }
 
-    const isResponsive = unhandled.some((item) => item.payload?.priority === "responsive");
+    const isResponsive = pending.priority === "responsive";
 
     let actorState = this.actorStates.get(actorId);
     if (!actorState) {
@@ -178,6 +186,7 @@ export class RunManager<TActor = unknown> {
     // Transition to queued
     actorState.state = "queued";
     actorState.responsiveQueued = isResponsive;
+    await this.emit("onQueued", { actorId });
 
     // Attempt admission and execution. Callers may await this in focused
     // tests; process-local inbox notifications intentionally discard it.
@@ -226,6 +235,7 @@ export class RunManager<TActor = unknown> {
     actorState.admissionPending = true;
     this.activeRunsCount++;
     let started = false;
+    const runId = this.newRunId();
 
     try {
       // v1 admission: retain the existing quota check inside RunManager.
@@ -247,7 +257,7 @@ export class RunManager<TActor = unknown> {
       actorState.abortController = abortController;
 
       // Mark unhandled items seen
-      await this.inboxRepository.markSeen(actorId);
+      this.inboxRepository.markSeen(actorId);
 
       // Consumes ONLY invocation inputs — NOT actor hierarchy!
       const inputs = await this.resolveInvocationInputs(actorId);
@@ -255,16 +265,21 @@ export class RunManager<TActor = unknown> {
       // Construct actor through shared profile (duck rootness: no role/isRoot)
       const actor = createActorFromInputs(inputs);
 
+      await this.emit("onStart", { actorId, runId });
+
       // Execute run
       const result = await inputs.runActor(actor, abortController.signal);
 
-      // Terminal cleanup stays with the run state machine, rather than the
-      // actor hierarchy or the external EventManager.
-      await this.finishTerminal(inputs.terminal, result);
-    } catch (err) {
+      // The end of a run is one event with many listeners, rather than a fixed
+      // sequence of named terminal hooks.
+      await this.emit("onEnd", { actorId, runId, result });
+    } catch (error) {
       this.log(
-        `[RunManager] Run failed for ${actorId}: ${err instanceof Error ? err.message : String(err)}`
+        `[RunManager] Run failed for ${actorId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
       );
+      if (started) await this.emit("onError", { actorId, runId, error });
     } finally {
       this.activeRunsCount--;
       actorState.admissionPending = false;
@@ -282,7 +297,7 @@ export class RunManager<TActor = unknown> {
         const shouldFollowUp = actorState.dirty;
         actorState.dirty = false;
         if (shouldFollowUp) {
-          void this.dispatchRun(actorId);
+          void this.dispatch(actorId);
         }
 
         // Check any other queued actors for parallelism admission.
@@ -295,16 +310,16 @@ export class RunManager<TActor = unknown> {
     }
   }
 
-  /** Preserve the current terminal-stage order while making its owner explicit. */
-  private async finishTerminal(terminal: ActorTerminalLifecycle, result: RunResult): Promise<void> {
-    terminal.finishInboxRun?.();
-    const runId = terminal.completeRun(result);
-    terminal.logRunEnd(runId, result);
-    terminal.recordRunEnd(runId, result);
-    terminal.afterTerminal?.(result);
-    await terminal.compact?.();
-    if (!result.success && !result.capped) {
-      await terminal.routeFailure?.(result);
-    }
+  private async emit<K extends keyof ActorLifecycleListener>(
+    event: K,
+    payload: Parameters<NonNullable<ActorLifecycleListener[K]>>[0]
+  ): Promise<void> {
+    await emitLifecycle(this.lifecycle, event, payload, (error) => {
+      this.log(
+        `[RunManager] ${String(event)} listener failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    });
   }
 }
