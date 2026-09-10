@@ -58,12 +58,20 @@ abstract interface class ScreenWakeLock {
 /// Connection-level signal from the `voice` SSE stream.
 enum VoiceStreamStatus { connected, reconnecting }
 
+/// A server-directed handoff on an already-active leased voice session.
+class VoiceSessionControl {
+  const VoiceSessionControl({required this.targetActorId});
+
+  final String targetActorId;
+}
+
 /// The `voice` SSE channel (`GET /api/mesh/voice/stream?actors=…&sessionId=…`).
 /// The stable UUID is the explicit walkie authority; implementations must carry
 /// the same id through EventSource reconnects until [dispose].
 abstract interface class VoiceStreamSource {
   Stream<VoiceAnnouncement> get frames;
   Stream<VoiceStreamStatus> get status;
+  Stream<VoiceSessionControl> get controls;
 
   /// Open the stream for [actors] (≥1 required by the server).
   void connect(List<String> actors, String sessionId);

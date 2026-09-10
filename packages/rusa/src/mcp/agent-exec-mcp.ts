@@ -380,6 +380,39 @@ export function createAgentExecMcpServer(
   );
 
   server.registerTool(
+    "transfer_voice_session",
+    {
+      title: "Transfer the active voice session",
+      description:
+        "Transfer the caller's active leased voice session to an active actor whose handle the caller holds. The same session stays active; the recipient receives responsive handoff context and the dashboard reconnects to it.",
+      inputSchema: {
+        target: z
+          .string()
+          .min(1)
+          .describe("Held actor thread id or display handle for the receiving actor."),
+        handoff_note: z
+          .string()
+          .trim()
+          .min(1)
+          .max(2_000)
+          .optional()
+          .describe(
+            "Optional bounded note for the receiving actor, alongside durable session context."
+          ),
+      },
+    },
+    async ({ target, handoff_note }) => {
+      try {
+        const result = mesh.transferVoiceSession(selfId, target, handoff_note);
+        options?.onWrite?.();
+        return toolOk({ target_thread_id: result.targetActorId });
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
     "list_pending_messages",
     {
       title: "List pending scheduled messages",

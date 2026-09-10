@@ -1119,6 +1119,7 @@ class FakeWakeLock implements ScreenWakeLock {
 class FakeVoiceStream implements VoiceStreamSource {
   final framesCtrl = StreamController<VoiceAnnouncement>.broadcast();
   final statusCtrl = StreamController<VoiceStreamStatus>.broadcast();
+  final controlsCtrl = StreamController<VoiceSessionControl>.broadcast();
   final connectCalls = <({List<String> actors, String sessionId})>[];
   bool disposed = false;
 
@@ -1126,6 +1127,8 @@ class FakeVoiceStream implements VoiceStreamSource {
   Stream<VoiceAnnouncement> get frames => framesCtrl.stream;
   @override
   Stream<VoiceStreamStatus> get status => statusCtrl.stream;
+  @override
+  Stream<VoiceSessionControl> get controls => controlsCtrl.stream;
 
   @override
   void connect(List<String> actors, String sessionId) =>
@@ -1136,6 +1139,7 @@ class FakeVoiceStream implements VoiceStreamSource {
     disposed = true;
     framesCtrl.close();
     statusCtrl.close();
+    controlsCtrl.close();
   }
 }
 

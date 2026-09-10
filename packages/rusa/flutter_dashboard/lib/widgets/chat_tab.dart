@@ -53,7 +53,11 @@ class _ChatTabState extends State<ChatTab> {
               Set<String>,
               ActorStateSnapshot,
               (Set<String>, ActorStateSnapshot)
-            >(widget.store.selection, widget.store.actorStates, (s, t) => (s, t))
+            >(
+              widget.store.selection,
+              widget.store.actorStates,
+              (s, t) => (s, t),
+            )
             .listen((data) {
               final selection = data.$1;
               final actorStates = data.$2;
@@ -72,6 +76,15 @@ class _ChatTabState extends State<ChatTab> {
   void _updateController(String? newActorId, bool chatDisabled) {
     if (_actorId == newActorId) return;
 
+    // A server-driven walkie handoff updates the controller's actor before it
+    // asks the store to select that actor. Keep the controller/session alive on
+    // that matching selection rather than treating it like a manual chat switch
+    // (which would disable and close the transferred session).
+    if (newActorId != null && _controller?.actorId == newActorId) {
+      _actorId = newActorId;
+      return;
+    }
+
     _cleanupController();
 
     _actorId = newActorId;
@@ -79,7 +92,11 @@ class _ChatTabState extends State<ChatTab> {
 
     final deps = widget.store.walkie;
     if (deps != null && !chatDisabled) {
-      final controller = WalkieController(actorId: newActorId, deps: deps);
+      final controller = WalkieController(
+        actorId: newActorId,
+        deps: deps,
+        onTransfer: widget.store.clickActor,
+      );
       _controller = controller;
       _enabledSub = controller.enabled.listen((val) {
         widget.store.setWalkieActive(val);
@@ -139,7 +156,9 @@ class _ChatTabState extends State<ChatTab> {
           );
         }
 
-        final handles = {for (final a in actorStates) a.thread.id: a.thread.handle};
+        final handles = {
+          for (final a in actorStates) a.thread.id: a.thread.handle,
+        };
 
         final height = MediaQuery.of(context).size.height;
         final walkieActive = widget.store.walkieActive.valueOrNull ?? false;

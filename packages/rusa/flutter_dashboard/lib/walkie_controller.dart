@@ -33,10 +33,7 @@ final class UserMemoEntry extends WalkieEntry {
 
 /// One actor reply that has finished playing.
 final class ActorReplyEntry extends WalkieEntry {
-  const ActorReplyEntry({
-    required super.timestamp,
-    required this.announcement,
-  });
+  const ActorReplyEntry({required super.timestamp, required this.announcement});
 
   final VoiceAnnouncement announcement;
 }
@@ -102,12 +99,22 @@ String newWalkieSessionId() {
 /// and dedupe-by-announcement-id. Pure Dart — every browser API sits behind the
 /// `voice_platform.dart` seams, so this is fully testable headless.
 class WalkieController {
-  WalkieController({required this.actorId, required WalkieDeps deps})
-    : _deps = deps,
-      _available = BehaviorSubject<bool?>.seeded(deps.voiceAvailable);
+  WalkieController({
+    required String actorId,
+    required WalkieDeps deps,
+    this.onTransfer,
+  }) : _actorId = actorId,
+       _deps = deps,
+       _available = BehaviorSubject<bool?>.seeded(deps.voiceAvailable);
 
-  final String actorId;
+  String _actorId;
+
+  /// Current session holder; changes only through a server-issued handoff control.
+  String get actorId => _actorId;
   final WalkieDeps _deps;
+
+  /// Lets the containing dashboard select the recipient without closing this controller.
+  final void Function(String targetActorId)? onTransfer;
 
   final _enabled = BehaviorSubject<bool>.seeded(false);
   final _connection = BehaviorSubject<WalkieConnection>.seeded(
@@ -202,6 +209,7 @@ class WalkieController {
     _stream = stream;
     _streamSubs.add(stream.frames.listen(_onFrame));
     _streamSubs.add(stream.status.listen(_onStreamStatus));
+    _streamSubs.add(stream.controls.listen(_onControl));
     stream.connect([actorId], sessionId);
 
     await _fetchBacklog();
@@ -295,6 +303,31 @@ class WalkieController {
     _enqueue(frame);
   }
 
+  /// Keep the same UUID and local walkie state while moving its SSE filter to
+  /// the receiving actor selected by the server-side transfer primitive.
+  void _onControl(VoiceSessionControl control) {
+    if (!_enabled.value || _disposed) return;
+    final targetActorId = control.targetActorId.trim();
+    final sessionId = _sessionId;
+    if (targetActorId.isEmpty ||
+        targetActorId == actorId ||
+        sessionId == null) {
+      return;
+    }
+
+    _actorId = targetActorId;
+    _connection.add(WalkieConnection.connecting);
+    _teardownStream();
+    final stream = _deps.createStream();
+    _stream = stream;
+    _streamSubs.add(stream.frames.listen(_onFrame));
+    _streamSubs.add(stream.status.listen(_onStreamStatus));
+    _streamSubs.add(stream.controls.listen(_onControl));
+    stream.connect([targetActorId], sessionId);
+    onTransfer?.call(targetActorId);
+    unawaited(_fetchBacklog());
+  }
+
   // ── Playback queue ──
 
   void _enqueue(VoiceAnnouncement frame) {
@@ -325,10 +358,7 @@ class WalkieController {
         _lastPlayed.add(item.frame);
         // Record the played reply in the session transcript .
         _appendTranscript(
-          ActorReplyEntry(
-            timestamp: DateTime.now(),
-            announcement: item.frame,
-          ),
+          ActorReplyEntry(timestamp: DateTime.now(), announcement: item.frame),
         );
         // Turned off mid-play: leave it unacked so it replays next mode entry.
         if (!_enabled.value) break;

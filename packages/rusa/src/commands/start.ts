@@ -237,6 +237,7 @@ import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
 import { BuildRunner, GitRunner } from "../update/runner.js";
 import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
 import type { VoiceService } from "../voice/voice-service.js";
+import { MAX_VOICE_TRANSFER_CONTEXT_MESSAGES } from "../voice/voice-transfer-context.js";
 import { createVoiceService } from "../voice/wiring.js";
 import {
   directiveBodyForWebhookPayload,
@@ -1806,6 +1807,27 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     },
     inboxStore,
     isVoiceSessionActive: (actorId) => voiceService?.hasActiveSession(actorId) ?? false,
+    // The registry is constructed later with the configured Gemini client, so
+    // this host-owned port closes over it. ActorMesh keeps authorization and
+    // durable handoff delivery; VoiceService keeps the one live-session map.
+    voiceSessionTransfer: {
+      activeSessionIdFor: (actorId) => {
+        if (!voiceService)
+          throw new Error("voice session transfer is unavailable on this instance");
+        return voiceService.activeSessionIdFor(actorId);
+      },
+      transferActiveSession: (fromActorId, targetActorId) => {
+        if (!voiceService)
+          throw new Error("voice session transfer is unavailable on this instance");
+        return voiceService.transferActiveSession(fromActorId, targetActorId);
+      },
+      notifySessionTransferred: (sessionId, targetActorId) =>
+        voiceService?.notifySessionTransferred(sessionId, targetActorId),
+    },
+    listVoiceSessionChat: (sessionId) =>
+      getRepositories().meshChat.listForSession(sessionId, {
+        limit: MAX_VOICE_TRANSFER_CONTEXT_MESSAGES,
+      }),
     onInboxEntriesSeen: (_actorId, entries) =>
       reactToQueuedInboxEntries(issueClient, entries, console.warn, chatClient ?? undefined),
     // Grantable = every registered MCP-server capability PLUS the secret

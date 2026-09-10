@@ -183,6 +183,8 @@ function setup(
     recordRunYield?: ActorMeshOptions["recordRunYield"];
     inboxStore?: InboxStore;
     isVoiceSessionActive?: ActorMeshOptions["isVoiceSessionActive"];
+    voiceSessionTransfer?: ActorMeshOptions["voiceSessionTransfer"];
+    listVoiceSessionChat?: ActorMeshOptions["listVoiceSessionChat"];
     onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
     grantableCapabilities?: ReadonlySet<string>;
     validateSpawn?: ActorMeshOptions["validateSpawn"];
@@ -245,6 +247,8 @@ function setup(
     eventSourceSubscriptions,
     eventManager,
     isVoiceSessionActive: opts.isVoiceSessionActive,
+    voiceSessionTransfer: opts.voiceSessionTransfer,
+    listVoiceSessionChat: opts.listVoiceSessionChat,
     obligations: opts.obligations,
     configuredEventSources: opts.configuredEventSources,
     scheduledMessages,
@@ -1577,6 +1581,115 @@ describe("ActorMesh", () => {
     expect(
       inboxStore.entries.filter((entry) => entry.actorId === worker && !entry.handledAt)
     ).toHaveLength(3);
+  });
+
+  it("transfers the same voice session to a held active actor with bounded context", async () => {
+    const inboxStore = createMemoryInboxStore();
+    let holder = "";
+    let releaseSource: (() => void) | undefined;
+    const controls: Array<[string, string]> = [];
+    const context = [
+      {
+        id: "one",
+        ts: "2026-01-01T00:00:01.000Z",
+        senderId: "human:operator",
+        recipientId: "source",
+        body: "first durable memo",
+        sessionId: "walkie-session",
+      },
+      {
+        id: "two",
+        ts: "2026-01-01T00:00:02.000Z",
+        senderId: "source",
+        recipientId: "human:operator",
+        body: "second durable reply",
+        sessionId: "walkie-session",
+      },
+    ];
+    const { mesh, fake, tick, registry } = setup({
+      inboxStore,
+      isVoiceSessionActive: (actorId) => actorId === holder,
+      voiceSessionTransfer: {
+        activeSessionIdFor: (actorId) => {
+          if (actorId !== holder) throw new Error("caller does not hold an active voice session");
+          return "walkie-session";
+        },
+        transferActiveSession: (fromActorId, targetActorId) => {
+          if (fromActorId !== holder)
+            throw new Error("caller does not hold an active voice session");
+          holder = targetActorId;
+          releaseSource?.();
+          return "walkie-session";
+        },
+        notifySessionTransferred: (sessionId, targetActorId) =>
+          controls.push([sessionId, targetActorId]),
+      },
+      listVoiceSessionChat: (sessionId) => (sessionId === "walkie-session" ? context : []),
+    });
+    const source = mesh.spawn({ charter: "source", parentId: "root" });
+    const target = mesh.spawn({ charter: "target", parentId: source });
+    holder = source;
+    releaseSource = () => mesh.notifyVoiceSessionEnded(source);
+
+    const [sourceNormal] = inboxStore.append([
+      { actorId: source, source: "github:MEK-Org/rusa", payload: { type: "github.issue" } },
+    ]);
+    expect(mesh.notifyInboxChanged(source)).toBe(false);
+
+    const result = mesh.transferVoiceSession(source, target, "take over the review");
+    expect(result).toEqual({ sessionId: "walkie-session", targetActorId: target });
+    expect(controls).toEqual([["walkie-session", target]]);
+    expect(registry.get(target)?.lastChatSessionId).toBe("walkie-session");
+    expect(registry.get(target)?.humanUnlocked).toBe(true);
+
+    const handoff = inboxStore.entries.find(
+      (entry) => entry.actorId === target && entry.payload.type === "voice.transfer"
+    );
+    expect(handoff?.payload.priority).toBe("responsive");
+    expect(String(handoff?.payload.context)).toContain("first durable memo");
+    expect(String(handoff?.payload.context).indexOf("first durable memo")).toBeLessThan(
+      String(handoff?.payload.context).indexOf("second durable reply")
+    );
+    expect(String(handoff?.payload.context)).toContain("take over the review");
+    expect(sourceNormal?.handledAt).toBeNull();
+
+    // Rebinding releases the source's held ordinary work exactly through the
+    // existing session-end path, while the recipient's normal work stays held.
+    await tick();
+    expect(fake(source).calls.length).toBeGreaterThan(0);
+    const targetCallsBeforeRelease = fake(target).calls.length;
+    inboxStore.append([
+      { actorId: target, source: "github:MEK-Org/rusa", payload: { type: "github.issue" } },
+    ]);
+    expect(mesh.notifyInboxChanged(target)).toBe(false);
+    holder = "";
+    expect(mesh.notifyVoiceSessionEnded(target)).toBe(true);
+    await tick();
+    expect(fake(target).calls.length).toBeGreaterThan(targetCallsBeforeRelease);
+  });
+
+  it("refuses voice transfer to self, a retired target, or an unheld actor", () => {
+    let holder = "";
+    const { mesh } = setup({
+      isVoiceSessionActive: (actorId) => actorId === holder,
+      voiceSessionTransfer: {
+        activeSessionIdFor: () => "walkie-session",
+        transferActiveSession: (_fromActorId, targetActorId) => {
+          holder = targetActorId;
+          return "walkie-session";
+        },
+        notifySessionTransferred: () => {},
+      },
+    });
+    const source = mesh.spawn({ charter: "source", parentId: "root" });
+    const heldTarget = mesh.spawn({ charter: "target", parentId: source });
+    const unheld = mesh.spawn({ charter: "unheld", parentId: "root" });
+    holder = source;
+
+    expect(() => mesh.transferVoiceSession(source, source)).toThrow("itself");
+    expect(() => mesh.transferVoiceSession(source, unheld)).toThrow("not a handle held");
+    mesh.retire(heldTarget);
+    expect(() => mesh.transferVoiceSession(source, heldTarget)).toThrow("retired");
   });
 
   it("defers a normal run queued before voice authority opens at final admission", async () => {

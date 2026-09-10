@@ -96,6 +96,10 @@ function setup(
     validateModel?: ActorMeshOptions["validateModel"];
     configuredEventSources?: readonly string[];
     handleForId?: (id: string) => string;
+    isVoiceSessionActive?: ActorMeshOptions["isVoiceSessionActive"];
+    voiceSessionTransfer?: ActorMeshOptions["voiceSessionTransfer"];
+    listVoiceSessionChat?: ActorMeshOptions["listVoiceSessionChat"];
+    useInboxStore?: boolean;
   } = {}
 ) {
   const registry = new InMemoryActorRepository();
@@ -125,8 +129,9 @@ function setup(
   // manager so this harness cannot drift from production append semantics.
   const eventDb = new Database(":memory:");
   runMigrations(eventDb);
+  const inboxStore = new InboxRepository(eventDb);
   const eventManager = new EventManager({
-    inboxStore: new InboxRepository(eventDb),
+    inboxStore,
     resolver: eventSourceResolver,
   });
   mesh = new ActorMesh({
@@ -139,6 +144,10 @@ function setup(
     eventSourceOwners,
     eventSourceSubscriptions,
     eventManager,
+    inboxStore: opts.useInboxStore ? inboxStore : undefined,
+    isVoiceSessionActive: opts.isVoiceSessionActive,
+    voiceSessionTransfer: opts.voiceSessionTransfer,
+    listVoiceSessionChat: opts.listVoiceSessionChat,
     events: (e) => events.push(e),
     grantableCapabilities: new Set([
       "understanding-write",
@@ -188,7 +197,7 @@ function setup(
     },
     root
   );
-  return { registry, mesh, events };
+  return { registry, mesh, events, inboxStore };
 }
 
 describe("agent-execution MCP server", () => {
@@ -218,6 +227,7 @@ describe("agent-execution MCP server", () => {
         "set_thread_title",
         "spawn_thread",
         "subscribe_event_source",
+        "transfer_voice_session",
         "unsubscribe_event_source",
         "yield_run",
       ].sort()
@@ -231,6 +241,57 @@ describe("agent-execution MCP server", () => {
     const yieldTool = tools.find((t) => t.name === "yield_run");
     expect(yieldTool?.description).toMatch(/finish work your parent asked you to do/i);
     expect(yieldTool?.description).toMatch(/automatic parent notification won't fire/i);
+  });
+
+  it("transfers only the caller's active voice session through a held target", async () => {
+    let holder = "";
+    const controls: Array<[string, string]> = [];
+    const { inboxStore, mesh } = setup({
+      useInboxStore: true,
+      isVoiceSessionActive: (actorId) => actorId === holder,
+      voiceSessionTransfer: {
+        activeSessionIdFor: (actorId) => {
+          if (actorId !== holder) throw new Error("caller does not hold an active voice session");
+          return "session-a";
+        },
+        transferActiveSession: (fromActorId, targetActorId) => {
+          if (fromActorId !== holder)
+            throw new Error("caller does not hold an active voice session");
+          holder = targetActorId;
+          return "session-a";
+        },
+        notifySessionTransferred: (sessionId, targetActorId) =>
+          controls.push([sessionId, targetActorId]),
+      },
+      listVoiceSessionChat: () => [],
+    });
+    const source = mesh.spawn({
+      charter: "source",
+      parentId: "root",
+      modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+    });
+    const target = mesh.spawn({
+      charter: "target",
+      parentId: source,
+      modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+    });
+    holder = source;
+    const client = await connect(createAgentExecMcpServer(mesh, source, "root"));
+
+    const result = (await client.callTool({
+      name: "transfer_voice_session",
+      arguments: { target, handoff_note: "continue the incident response" },
+    })) as CallToolResult;
+
+    expect(result.isError).not.toBe(true);
+    expect(dataOf(result)).toEqual({ target_thread_id: target });
+    expect(holder).toBe(target);
+    expect(controls).toEqual([["session-a", target]]);
+    expect(inboxStore.list(target).entries[0]?.payload).toMatchObject({
+      type: "voice.transfer",
+      priority: "responsive",
+      sessionId: "session-a",
+    });
   });
 
   it("describes live capability grants as effective on the next run", async () => {
@@ -271,6 +332,7 @@ describe("agent-execution MCP server", () => {
         "set_actor_model",
         "spawn_thread",
         "subscribe_event_source",
+        "transfer_voice_session",
         "unsubscribe_event_source",
         "yield_run",
       ].sort()

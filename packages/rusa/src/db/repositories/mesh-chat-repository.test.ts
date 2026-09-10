@@ -73,6 +73,60 @@ describe("MeshChatRepository.listChatByActors", () => {
   });
 });
 
+describe("MeshChatRepository.listForSession", () => {
+  it("takes the newest session rows and returns them in chronological order", () => {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE mesh_chat (
+        id TEXT PRIMARY KEY,
+        ts TEXT NOT NULL,
+        sender_id TEXT NOT NULL,
+        recipient_id TEXT NOT NULL,
+        body TEXT NOT NULL,
+        session_id TEXT
+      )
+    `);
+    const repo = new MeshChatRepository(db);
+    repo.record({
+      id: "a",
+      ts: "2026-01-01T00:00:00Z",
+      senderId: "human:operator",
+      recipientId: "one",
+      body: "first",
+      sessionId: "walkie",
+    });
+    repo.record({
+      id: "other",
+      ts: "2026-01-01T00:00:01Z",
+      senderId: "human:operator",
+      recipientId: "other",
+      body: "other",
+      sessionId: "other",
+    });
+    repo.record({
+      id: "b",
+      ts: "2026-01-01T00:00:02Z",
+      senderId: "one",
+      recipientId: "human:operator",
+      body: "second",
+      sessionId: "walkie",
+    });
+    repo.record({
+      id: "c",
+      ts: "2026-01-01T00:00:03Z",
+      senderId: "human:operator",
+      recipientId: "one",
+      body: "third",
+      sessionId: "walkie",
+    });
+
+    expect(repo.listForSession("walkie", { limit: 2 }).map((message) => message.id)).toEqual([
+      "b",
+      "c",
+    ]);
+  });
+});
+
 describe("MeshChatRepository.record idempotency", () => {
   it("ignores a second record() call with a previously-used id instead of duplicating the row", () => {
     const db = new Database(":memory:");

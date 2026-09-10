@@ -53,6 +53,22 @@ describe("inbox hints", () => {
       );
     });
 
+    it("carries the mechanically rendered bounded context for voice.transfer", () => {
+      const hint = resolveInboxHint(
+        makeEntry({
+          source: "voice:transfer:worker-a",
+          payload: {
+            type: "voice.transfer",
+            priority: "responsive",
+            context: "Bounded durable session context (oldest to newest):\nworker-a: status",
+          },
+        })
+      );
+      expect(hint).toContain("transferred to you");
+      expect(hint).toContain("not a model summary");
+      expect(hint).toContain("worker-a: status");
+    });
+
     it("provides a reminder when source is mesh:human", () => {
       const entry = makeEntry({
         source: "mesh:human",

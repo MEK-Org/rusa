@@ -421,6 +421,20 @@ describe("handleVoiceApiRequest", () => {
       expect(service.hasActiveSession(UUID_A)).toBe(false);
     });
 
+    it("delivers a handoff control only to the browser holding that session", () => {
+      const held = call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-1`);
+      const other = call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}&sessionId=walkie-2`);
+
+      hub.pushVoiceControl("walkie-1", UUID_B);
+
+      expect(held.res.frames()).toHaveLength(1);
+      expect(held.res.frames()[0]).toContain("event: voice_control");
+      expect(JSON.parse(held.res.frames()[0].split("\ndata: ")[1])).toEqual({
+        targetActorId: UUID_B,
+      });
+      expect(other.res.frames()).toEqual([]);
+    });
+
     it("a connected subscription is presence; replies stream as voice frames", async () => {
       const detach = attachVoiceOutbound(emitter, service, hub);
       const { res } = call(deps, "GET", `/api/mesh/voice/stream?actors=${UUID_A}`);

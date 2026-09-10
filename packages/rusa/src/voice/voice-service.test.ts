@@ -11,6 +11,7 @@ import { VOICE_PRESENCE_GRACE_MS, VoiceService } from "./voice-service.js";
 import { attachVoiceOutbound } from "./wiring.js";
 
 const ACTOR = "aaaaaaaa-0000-4000-8000-000000000001";
+const TARGET = "bbbbbbbb-0000-4000-8000-000000000002";
 
 function fakeSpeech(overrides: Partial<SpeechClient> = {}): SpeechClient {
   return {
@@ -157,6 +158,28 @@ describe("VoiceService leased sessions", () => {
     expect(sessions.closeSession("session-a")).toBe(true);
     expect(sessions.closeSession("session-a")).toBe(false);
     expect(ended).toEqual([ACTOR, ACTOR]);
+  });
+
+  it("atomically rebinds the same active session and releases only the source", () => {
+    const ended: string[] = [];
+    const controls: Array<[string, string]> = [];
+    const { service } = makeService({ onSessionEnded: (actorId) => ended.push(actorId) });
+    service.setSessionTransferNotifier((sessionId, targetActorId) =>
+      controls.push([sessionId, targetActorId])
+    );
+    service.openSession("session-a", ACTOR);
+
+    expect(service.activeSessionIdFor(ACTOR)).toBe("session-a");
+    expect(service.transferActiveSession(ACTOR, TARGET)).toBe("session-a");
+    expect(service.hasSession("session-a", ACTOR)).toBe(false);
+    expect(service.hasSession("session-a", TARGET)).toBe(true);
+    expect(service.hasActiveSession(ACTOR)).toBe(false);
+    expect(service.hasActiveSession(TARGET)).toBe(true);
+    expect(ended).toEqual([ACTOR]);
+
+    service.notifySessionTransferred("session-a", TARGET);
+    expect(controls).toEqual([["session-a", TARGET]]);
+    expect(() => service.transferActiveSession(ACTOR, TARGET)).toThrow("does not hold");
   });
 });
 
