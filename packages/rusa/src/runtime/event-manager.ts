@@ -1,21 +1,16 @@
 import { createHash } from "node:crypto";
-import {
-  type EventResource,
-  type EventSourceOwnerStore,
-  type EventSourceSubscriptionStore,
-  parentOf,
-  resourceKey,
-  sameResource,
-} from "../actor/event-subscriptions.js";
+import { type EventResource, resourceKey } from "../actor/event-subscriptions.js";
 import type {
   InboxAppendInput,
   InboxEntry,
   InboxPayload,
   InboxStore,
 } from "../actor/inbox-store.js";
-import { deriveGitHubInboxNotification } from "../github/inbox-notification.js";
+import {
+  checkSuiteWakesAnyone,
+  deriveGitHubInboxNotification,
+} from "../github/inbox-notification.js";
 import { isSystemActor } from "../mcp/stamp.js";
-import { asGitHubIssue, parseReference } from "../references/reference.js";
 
 /**
  * Normalizes a resource to canonical reference form when valid, otherwise
@@ -67,27 +62,15 @@ export function mayBubbleToParent(
   }
 }
 
-/** Map only the issue-shaped event resources obligations may govern. */
-function eventResourceObligationKey(resource: EventResource): string | undefined {
-  try {
-    const key = resourceKey(resource);
-    return asGitHubIssue(parseReference(key)) ? key : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-export type IntegrationSourceType = "github" | "chat" | "timer" | "custom";
+export type IntegrationSourceType = "github" | "chat" | "timer";
 
 export interface StampedAuthorInfo {
   actorId: string;
   instanceId: string;
 }
 
-export interface RawIntegrationEvent {
-  sourceType: IntegrationSourceType;
+interface RawEventMetadata {
   rawResource?: EventResource | string;
-  rawPayload: unknown;
   receivedAt?: Date;
   idempotencyKey?: string;
   priority?: "responsive" | "normal";
@@ -96,6 +79,35 @@ export interface RawIntegrationEvent {
   instanceId?: string;
   eventSummary?: string;
 }
+
+/** The webhook server carries GitHub's event name separately from its body. */
+export interface RawGitHubIntegrationEvent extends RawEventMetadata {
+  sourceType: "github";
+  rawPayload: { event: string; payload: Record<string, unknown> };
+}
+
+/** The Chat source exposes this source-backed message pointer after trigger filtering. */
+export interface RawChatIntegrationEvent extends RawEventMetadata {
+  sourceType: "chat";
+  rawPayload: {
+    name: string;
+    spaceName: string;
+    threadName?: string;
+    senderName?: string;
+    createTime?: string;
+  };
+}
+
+/** Timer ingress already owns a canonical payload; EventManager adds routing and durability. */
+export interface RawTimerIntegrationEvent extends RawEventMetadata {
+  sourceType: "timer";
+  rawPayload: InboxPayload;
+}
+
+export type RawIntegrationEvent =
+  | RawGitHubIntegrationEvent
+  | RawChatIntegrationEvent
+  | RawTimerIntegrationEvent;
 
 export interface NormalizedIntegrationEvent {
   resource: string;
@@ -201,17 +213,48 @@ export interface EventSourceResolver {
   ): Promise<EventSourceRecipients> | EventSourceRecipients;
 }
 
-export interface ObligationLookup {
-  findLiveByExternalRef(ref: string): { ownerId: string } | null | undefined;
+/** Narrow read-only ports owned by the runtime assembly. */
+export interface EventRoutingReadPorts {
+  parentOf: (resource: EventResource) => EventResource | undefined;
+  isLive: (actorId: string) => boolean;
+  activeDelegationsFor: (resource: EventResource) => readonly { actorId: string }[];
+  directSubscribersFor: (resource: EventResource) => readonly { actorId: string }[];
+  governingObligationOwnerFor: (resource: EventResource) => string | undefined;
+  resolveActor?: (handleOrId: string) => { id: string } | undefined;
 }
 
 export interface HierarchicalEventSourceResolverOptions {
-  eventSourceOwners: EventSourceOwnerStore;
-  eventSourceSubscriptions: EventSourceSubscriptionStore;
-  obligations?: ObligationLookup;
-  isLive: (actorId: string) => boolean;
-  resolveActor?: (handleOrId: string) => { id: string } | undefined;
+  ports: EventRoutingReadPorts;
   log?: (message: string) => void;
+}
+
+export interface ResolveOwnerOptions {
+  ignoreExactResource?: EventResource;
+  eventPayload?: InboxPayload;
+  enforceBubblingPolicy?: boolean;
+  /** A precomputed exact-resource lookup; `null` means it found no claim. */
+  exactObligationOwner?: string | null;
+}
+
+export interface EventSourceOwnershipDiagnostic {
+  resource: EventResource;
+  governingSource: "obligation" | "subscription" | null;
+  principal: string | null;
+  resourceLevel: EventResource | null;
+  isLive: boolean;
+}
+
+export interface EventSourceOwnerResolution {
+  diagnostic: EventSourceOwnershipDiagnostic;
+  ownerIds: string[];
+}
+
+/** One ownership ladder shared by delivery and ActorMesh authority checks. */
+export interface EventRoutingKernel extends EventSourceResolver {
+  resolveOwner(
+    resource: EventResource | string,
+    options?: ResolveOwnerOptions
+  ): EventSourceOwnerResolution;
 }
 
 /**
@@ -220,7 +263,7 @@ export interface HierarchicalEventSourceResolverOptions {
  * govern, allowlisted events bubble up ancestor resources, direct subscribers
  * receive exact-resource events, and directives target specific live actors.
  */
-export class HierarchicalEventSourceResolver implements EventSourceResolver {
+export class HierarchicalEventSourceResolver implements EventRoutingKernel {
   constructor(private readonly options: HierarchicalEventSourceResolverOptions) {}
 
   resolveRecipients(
@@ -233,12 +276,12 @@ export class HierarchicalEventSourceResolver implements EventSourceResolver {
     let ownerIds: string[] = [];
 
     if (opts.directedTarget) {
-      const governing = this.obligationOwnerFor(key);
+      const governing = this.options.ports.governingObligationOwnerFor(key);
       if (governing) {
-        ownerIds = this.options.isLive(governing) ? [governing] : [];
+        ownerIds = this.options.ports.isLive(governing) ? [governing] : [];
       } else {
-        const target = this.options.resolveActor?.(opts.directedTarget);
-        if (target && this.options.isLive(target.id)) {
+        const target = this.options.ports.resolveActor?.(opts.directedTarget);
+        if (target && this.options.ports.isLive(target.id)) {
           this.options.log?.(
             `mesh:deliver directed-delivered to ${opts.directedTarget} (${summary})`
           );
@@ -248,16 +291,18 @@ export class HierarchicalEventSourceResolver implements EventSourceResolver {
           this.options.log?.(
             `mesh:deliver target not live: ${opts.directedTarget} — directive ignored`
           );
-          ownerIds = this.resolveLiveOwnerHierarchically(key, {
+          ownerIds = this.resolveOwner(key, {
             eventPayload: opts.eventPayload,
+            enforceBubblingPolicy: true,
             exactObligationOwner: null,
-          });
+          }).ownerIds;
         }
       }
     } else {
-      ownerIds = this.resolveLiveOwnerHierarchically(key, {
+      ownerIds = this.resolveOwner(key, {
         eventPayload: opts.eventPayload,
-      });
+        enforceBubblingPolicy: true,
+      }).ownerIds;
     }
 
     // Direct subscribers are added to whatever ownership resolved to — the two
@@ -281,9 +326,9 @@ export class HierarchicalEventSourceResolver implements EventSourceResolver {
     // a landed directive earns.
     const subscriberIds: string[] = [];
     if (!directed) {
-      const subs = this.options.eventSourceSubscriptions.subscribersOf(key);
+      const subs = this.options.ports.directSubscribersFor(key);
       for (const sub of subs) {
-        if (this.options.isLive(sub.actorId) && !subscriberIds.includes(sub.actorId)) {
+        if (this.options.ports.isLive(sub.actorId) && !subscriberIds.includes(sub.actorId)) {
           subscriberIds.push(sub.actorId);
         }
       }
@@ -292,46 +337,60 @@ export class HierarchicalEventSourceResolver implements EventSourceResolver {
     return { directed, ownerIds, subscriberIds };
   }
 
-  private obligationOwnerFor(resource: string): string | undefined {
-    if (!this.options.obligations) return undefined;
-    const refKey = eventResourceObligationKey(resource);
-    if (!refKey) return undefined;
-    return this.options.obligations.findLiveByExternalRef(refKey)?.ownerId;
-  }
-
-  private resolveLiveOwnerHierarchically(
-    resource: string,
-    opts: {
-      eventPayload?: InboxPayload;
-      exactObligationOwner?: string | null;
-    }
-  ): string[] {
-    let current: string | undefined = resource;
+  resolveOwner(
+    resource: EventResource | string,
+    opts: ResolveOwnerOptions = {}
+  ): EventSourceOwnerResolution {
+    const key = safeResourceKey(resource);
+    const ignoredExactResource = opts.ignoreExactResource
+      ? safeResourceKey(opts.ignoreExactResource)
+      : undefined;
+    let current: EventResource | undefined = key;
     let exact = true;
 
     while (current) {
       const governing =
         exact && opts.exactObligationOwner !== undefined
           ? (opts.exactObligationOwner ?? undefined)
-          : this.obligationOwnerFor(current);
+          : this.options.ports.governingObligationOwnerFor(current);
       exact = false;
 
       if (governing) {
-        return this.options.isLive(governing) ? [governing] : [];
+        const isLive = this.options.ports.isLive(governing);
+        return {
+          diagnostic: {
+            resource: key,
+            governingSource: "obligation",
+            principal: governing,
+            resourceLevel: current,
+            isLive,
+          },
+          ownerIds: isLive ? [governing] : [],
+        };
       }
 
-      const activeSubs = this.options.eventSourceOwners.activeForResource(current);
+      const activeSubs = this.options.ports.activeDelegationsFor(current);
       const liveSubs: string[] = [];
       for (const sub of activeSubs) {
-        if (this.options.isLive(sub.actorId) && !liveSubs.includes(sub.actorId)) {
+        if (current === ignoredExactResource) continue;
+        if (this.options.ports.isLive(sub.actorId) && !liveSubs.includes(sub.actorId)) {
           liveSubs.push(sub.actorId);
         }
       }
       if (liveSubs.length > 0) {
-        return liveSubs;
+        return {
+          diagnostic: {
+            resource: key,
+            governingSource: "subscription",
+            principal: liveSubs[0] ?? null,
+            resourceLevel: current,
+            isLive: true,
+          },
+          ownerIds: liveSubs,
+        };
       }
 
-      if (sameResource(current, resource)) {
+      if (current === key && opts.enforceBubblingPolicy) {
         const allowParent = mayBubbleToParent(
           opts.eventPayload?.type,
           opts.eventPayload?.merged === true
@@ -341,10 +400,19 @@ export class HierarchicalEventSourceResolver implements EventSourceResolver {
         }
       }
 
-      current = parentOf(current);
+      current = this.options.ports.parentOf(current);
     }
 
-    return [];
+    return {
+      diagnostic: {
+        resource: key,
+        governingSource: null,
+        principal: null,
+        resourceLevel: null,
+        isLive: false,
+      },
+      ownerIds: [],
+    };
   }
 }
 
@@ -358,7 +426,7 @@ export interface EventManagerOptions {
  * EventManager is a sibling process component to ActorMesh.
  *
  * Responsibilities:
- * 1. Normalize external events from integrations (GitHub, Chat, timer, custom)
+ * 1. Normalize external events from the live GitHub, Chat, and timer ingress
  *    into canonical inbox payload shapes while preserving public payloads.
  * 2. Apply event-source ownership and subscription rules to determine which
  *    actor(s) should receive an inbox item.
@@ -383,7 +451,7 @@ export class EventManager {
    * Normalizes an incoming integration event into the canonical payload shape
    * while preserving public payload contracts for existing consumers.
    */
-  normalizeEvent(raw: RawIntegrationEvent): NormalizedIntegrationEvent {
+  normalizeEvent(raw: RawIntegrationEvent): NormalizedIntegrationEvent | null {
     switch (raw.sourceType) {
       case "github":
         return this.normalizeGitHubEvent(raw);
@@ -391,75 +459,36 @@ export class EventManager {
         return this.normalizeChatEvent(raw);
       case "timer":
         return this.normalizeTimerEvent(raw);
-      default:
-        return this.normalizeCustomEvent(raw);
     }
   }
 
-  private normalizeGitHubEvent(raw: RawIntegrationEvent): NormalizedIntegrationEvent {
-    const deliveredAt = raw.receivedAt;
-    const p = raw.rawPayload;
-    if (p != null && typeof p === "object") {
-      const rec = p as Record<string, unknown>;
-
-      // 1. Explicit { event: string, payload: Record<string, unknown> } envelope.
-      //
-      // The event name is carried, never guessed. Inferring it from which keys
-      // a payload happens to have cannot distinguish GitHub's own overlapping
-      // shapes — `pull_request_review` and `pull_request_review_comment` both
-      // carry `pull_request`, and would both be mislabelled `pull_request` —
-      // so an ingress that knows its event name states it here.
-      if (typeof rec.event === "string" && rec.payload != null && typeof rec.payload === "object") {
-        const ghEvent = rec.event;
-        const ghPayload = rec.payload as Record<string, unknown>;
-        const notif = deriveGitHubInboxNotification(ghEvent, ghPayload);
-        if (notif) {
-          const payload: InboxPayload = { ...notif.payload };
-          if (raw.priority === "responsive") payload.priority = "responsive";
-          return {
-            resource: raw.rawResource ? safeResourceKey(raw.rawResource) : notif.resource,
-            payload,
-            dedupeKey: raw.idempotencyKey,
-            deliveredAt,
-            directedTarget: raw.directedTarget,
-            stampedAuthor: raw.stampedAuthor,
-            instanceId: raw.instanceId,
-            eventSummary: raw.eventSummary,
-          };
-        }
-      }
-
-      // 2. Pre-derived or explicit InboxPayload with string type
-      if (typeof rec.type === "string") {
-        const payload: InboxPayload = { ...rec, type: rec.type };
-        if (raw.priority === "responsive") payload.priority = "responsive";
-        return {
-          resource: safeResourceKey(raw.rawResource ?? "github"),
-          payload,
-          dedupeKey: raw.idempotencyKey,
-          deliveredAt,
-          directedTarget: raw.directedTarget,
-          stampedAuthor: raw.stampedAuthor,
-          instanceId: raw.instanceId,
-          eventSummary: raw.eventSummary,
-        };
-      }
+  private normalizeGitHubEvent(raw: RawGitHubIntegrationEvent): NormalizedIntegrationEvent | null {
+    const { event, payload: githubPayload } = raw.rawPayload;
+    // GitHub's event name is an ingress fact, never inferred from overlapping
+    // payload keys. `pull_request_review` and `pull_request_review_comment`,
+    // for example, both carry `pull_request`.
+    if (
+      event === "check_suite" &&
+      githubPayload.action === "completed" &&
+      !checkSuiteWakesAnyone(githubPayload)
+    ) {
+      this.log?.(`non-actionable check suite dropped (${raw.eventSummary ?? event})`);
+      return null;
     }
-
-    // 3. Default integration envelope for generic payloads
-    const resource = safeResourceKey(raw.rawResource ?? "github");
-    const payload: InboxPayload = {
-      type: "github.event",
-      sourceType: "github",
-      rawResource: resource,
-      rawPayload: raw.rawPayload,
-      ...(raw.priority === "responsive" ? { priority: "responsive" } : {}),
-    };
+    const notification = deriveGitHubInboxNotification(event, githubPayload);
+    if (!notification) {
+      // This is the same error the former start.ts ingress raised after it had
+      // accepted a repository-backed webhook but could not derive its durable
+      // source pointer.
+      throw new Error("GitHub event repository could not be resolved");
+    }
+    const payload: InboxPayload = { ...notification.payload };
+    if (raw.priority === "responsive") payload.priority = "responsive";
     return {
-      resource,
+      resource: raw.rawResource ? safeResourceKey(raw.rawResource) : notification.resource,
       payload,
       dedupeKey: raw.idempotencyKey,
-      deliveredAt,
+      deliveredAt: raw.receivedAt,
       directedTarget: raw.directedTarget,
       stampedAuthor: raw.stampedAuthor,
       instanceId: raw.instanceId,
@@ -467,79 +496,26 @@ export class EventManager {
     };
   }
 
-  private normalizeChatEvent(raw: RawIntegrationEvent): NormalizedIntegrationEvent {
-    const p = raw.rawPayload;
-    if (p != null && typeof p === "object") {
-      const rec = p as Record<string, unknown>;
-      const spaceName = typeof rec.spaceName === "string" ? rec.spaceName : undefined;
-      const messageName =
-        typeof rec.name === "string"
-          ? rec.name
-          : typeof rec.messageName === "string"
-            ? rec.messageName
-            : undefined;
-
-      if (spaceName || messageName) {
-        const cleanSpace = spaceName
-          ? spaceName.startsWith("spaces/")
-            ? spaceName
-            : `spaces/${spaceName}`
-          : "";
-        const resource = raw.rawResource
-          ? safeResourceKey(raw.rawResource)
-          : cleanSpace
-            ? `gchat:${cleanSpace}`
-            : "gchat:spaces";
-        const payload: InboxPayload = {
-          type: typeof rec.type === "string" ? rec.type : "gchat.message",
-          messageName: messageName ?? "",
-          spaceName: spaceName ?? "",
-          threadName: typeof rec.threadName === "string" ? rec.threadName : undefined,
-          senderName: typeof rec.senderName === "string" ? rec.senderName : undefined,
-          priority: "responsive",
-        };
-        const createTime =
-          typeof rec.createTime === "string" ? new Date(rec.createTime) : undefined;
-        return {
-          resource,
-          payload,
-          dedupeKey: raw.idempotencyKey ?? messageName,
-          deliveredAt: raw.receivedAt ?? createTime,
-          directedTarget: raw.directedTarget,
-          stampedAuthor: raw.stampedAuthor,
-          instanceId: raw.instanceId,
-          eventSummary: raw.eventSummary,
-        };
-      }
-
-      if (typeof rec.type === "string") {
-        const payload: InboxPayload = { ...rec, type: rec.type, priority: "responsive" };
-        return {
-          resource: safeResourceKey(raw.rawResource ?? "gchat:spaces"),
-          payload,
-          dedupeKey: raw.idempotencyKey,
-          deliveredAt: raw.receivedAt,
-          directedTarget: raw.directedTarget,
-          stampedAuthor: raw.stampedAuthor,
-          instanceId: raw.instanceId,
-          eventSummary: raw.eventSummary,
-        };
-      }
-    }
-
-    const resource = safeResourceKey(raw.rawResource ?? "gchat:spaces");
+  private normalizeChatEvent(raw: RawChatIntegrationEvent): NormalizedIntegrationEvent {
+    const message = raw.rawPayload;
+    const spaceName = message.spaceName.startsWith("spaces/")
+      ? message.spaceName
+      : `spaces/${message.spaceName}`;
+    const resource = raw.rawResource ? safeResourceKey(raw.rawResource) : `gchat:${spaceName}`;
     const payload: InboxPayload = {
-      type: "chat.event",
-      sourceType: "chat",
-      rawResource: resource,
-      rawPayload: raw.rawPayload,
+      type: "gchat.message",
+      messageName: message.name,
+      spaceName: message.spaceName,
+      threadName: message.threadName,
+      senderName: message.senderName,
       priority: "responsive",
     };
     return {
       resource,
       payload,
-      dedupeKey: raw.idempotencyKey,
-      deliveredAt: raw.receivedAt,
+      dedupeKey: raw.idempotencyKey ?? message.name,
+      deliveredAt:
+        raw.receivedAt ?? (message.createTime ? new Date(message.createTime) : undefined),
       directedTarget: raw.directedTarget,
       stampedAuthor: raw.stampedAuthor,
       instanceId: raw.instanceId,
@@ -547,78 +523,13 @@ export class EventManager {
     };
   }
 
-  private normalizeTimerEvent(raw: RawIntegrationEvent): NormalizedIntegrationEvent {
+  private normalizeTimerEvent(raw: RawTimerIntegrationEvent): NormalizedIntegrationEvent {
     const resource = safeResourceKey(raw.rawResource ?? "system:events");
     const priority = raw.priority ?? "responsive";
-    const payloadPriority = priority === "responsive" ? "responsive" : undefined;
-    let payload: InboxPayload;
-
-    if (raw.rawPayload != null && typeof raw.rawPayload === "object") {
-      const rec = raw.rawPayload as Record<string, unknown>;
-      if (typeof rec.type === "string") {
-        payload = {
-          ...rec,
-          type: rec.type,
-          ...(payloadPriority ? { priority: payloadPriority } : {}),
-        };
-      } else {
-        payload = {
-          type: "timer.event",
-          sourceType: "timer",
-          rawResource: resource,
-          rawPayload: raw.rawPayload,
-          ...(payloadPriority ? { priority: payloadPriority } : {}),
-        };
-      }
-    } else {
-      payload = {
-        type: "timer.event",
-        sourceType: "timer",
-        rawResource: resource,
-        rawPayload: raw.rawPayload,
-        ...(payloadPriority ? { priority: payloadPriority } : {}),
-      };
-    }
-
-    return {
-      resource,
-      payload,
-      dedupeKey: raw.idempotencyKey,
-      deliveredAt: raw.receivedAt,
-      directedTarget: raw.directedTarget,
-      stampedAuthor: raw.stampedAuthor,
-      instanceId: raw.instanceId,
-      eventSummary: raw.eventSummary,
+    const payload: InboxPayload = {
+      ...raw.rawPayload,
+      ...(priority === "responsive" ? { priority: "responsive" } : {}),
     };
-  }
-
-  private normalizeCustomEvent(raw: RawIntegrationEvent): NormalizedIntegrationEvent {
-    const resource = safeResourceKey(raw.rawResource ?? "system:events");
-    let payload: InboxPayload;
-
-    if (raw.rawPayload != null && typeof raw.rawPayload === "object") {
-      const rec = raw.rawPayload as Record<string, unknown>;
-      if (typeof rec.type === "string") {
-        payload = { ...rec, type: rec.type };
-        if (raw.priority === "responsive") payload.priority = "responsive";
-      } else {
-        payload = {
-          type: "custom.event",
-          sourceType: "custom",
-          rawResource: resource,
-          rawPayload: raw.rawPayload,
-          ...(raw.priority === "responsive" ? { priority: "responsive" } : {}),
-        };
-      }
-    } else {
-      payload = {
-        type: "custom.event",
-        sourceType: "custom",
-        rawResource: resource,
-        rawPayload: raw.rawPayload,
-        ...(raw.priority === "responsive" ? { priority: "responsive" } : {}),
-      };
-    }
 
     return {
       resource,
@@ -639,6 +550,18 @@ export class EventManager {
    */
   async handleExternalEvent(raw: RawIntegrationEvent): Promise<readonly InboxEntry[]> {
     const normalized = this.normalizeEvent(raw);
+    if (!normalized) return [];
+    return this.handleNormalizedEvent(normalized);
+  }
+
+  /**
+   * Routes and durably appends an already-canonical payload. This preserves the
+   * legacy ActorMesh delivery contract without inventing a fourth ingress
+   * normalizer branch.
+   */
+  async handleNormalizedEvent(
+    normalized: NormalizedIntegrationEvent
+  ): Promise<readonly InboxEntry[]> {
     const summary = normalized.eventSummary ?? normalized.resource;
     const recipients = await this.resolver.resolveRecipients(normalized.resource, {
       eventPayload: normalized.payload,

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   InMemoryEventSourceOwnerStore,
   InMemoryEventSourceSubscriptionStore,
+  parentOf,
 } from "../actor/event-subscriptions.js";
 import type {
   InboxActorWork,
@@ -83,6 +84,26 @@ class FakeInboxStore implements InboxStore {
   }
 }
 
+function createRoutingKernel(opts: {
+  owners: InMemoryEventSourceOwnerStore;
+  subscriptions: InMemoryEventSourceSubscriptionStore;
+  obligations?: { findLiveByExternalRef(ref: string): { ownerId: string } | null | undefined };
+  isLive?: (actorId: string) => boolean;
+  resolveActor?: (handleOrId: string) => { id: string } | undefined;
+}) {
+  return new HierarchicalEventSourceResolver({
+    ports: {
+      parentOf,
+      isLive: opts.isLive ?? (() => true),
+      activeDelegationsFor: (resource) => opts.owners.activeForResource(resource),
+      directSubscribersFor: (resource) => opts.subscriptions.subscribersOf(resource),
+      governingObligationOwnerFor: (resource) =>
+        opts.obligations?.findLiveByExternalRef(resource)?.ownerId,
+      resolveActor: opts.resolveActor,
+    },
+  });
+}
+
 describe("EventManager", () => {
   describe("Normalization without changing public payloads", () => {
     it("normalizes GitHub webhook payloads preserving exact issue/comment payload contracts", async () => {
@@ -109,6 +130,8 @@ describe("EventManager", () => {
       };
 
       const normalized = em.normalizeEvent(rawWebhook);
+      expect(normalized).not.toBeNull();
+      if (!normalized) throw new Error("GitHub webhook was unexpectedly dropped");
       expect(normalized.resource).toBe("github:MEK-Org/rusa/issues/383");
       expect(normalized.payload).toEqual({
         type: "issue_comment.created",
@@ -147,6 +170,36 @@ describe("EventManager", () => {
       expect(entries[0].source).toBe("github:MEK-Org/rusa/pulls/380");
       expect(entries[0].payload.type).toBe("pull_request.closed");
       expect(entries[0].payload.merged).toBe(true);
+    });
+
+    it("drops a green GitHub check suite inside the normalizer before routing", async () => {
+      const inbox = new FakeInboxStore();
+      let resolved = false;
+      const em = new EventManager({
+        inboxStore: inbox,
+        resolver: {
+          resolveRecipients: () => {
+            resolved = true;
+            return { directed: false, ownerIds: ["actor-ci"], subscriberIds: [] };
+          },
+        },
+      });
+
+      const entries = await em.handleExternalEvent({
+        sourceType: "github",
+        rawPayload: {
+          event: "check_suite",
+          payload: {
+            action: "completed",
+            repository: { full_name: "MEK-Org/rusa" },
+            check_suite: { id: 1, conclusion: "success" },
+          },
+        },
+      });
+
+      expect(entries).toEqual([]);
+      expect(resolved).toBe(false);
+      expect(inbox.entries).toEqual([]);
     });
 
     it("normalizes Chat events into canonical gchat.message with responsive priority", async () => {
@@ -207,7 +260,7 @@ describe("EventManager", () => {
       expect(entries[0].payload.reminder).toBe("check build");
     });
 
-    it("normalizes custom ingress shapes preserving payload contents", async () => {
+    it("normalizes timer ingress shapes preserving payload contents", async () => {
       const inbox = new FakeInboxStore();
       const resolver: EventSourceResolver = {
         resolveRecipients: () => ({
@@ -218,13 +271,13 @@ describe("EventManager", () => {
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
 
-      const rawCustom: RawIntegrationEvent = {
-        sourceType: "custom",
+      const rawTimer: RawIntegrationEvent = {
+        sourceType: "timer",
         rawResource: "system:events/deploys/b-999",
         rawPayload: { type: "service.deploy", buildId: "b-999" },
       };
 
-      const entries = await em.handleExternalEvent(rawCustom);
+      const entries = await em.handleExternalEvent(rawTimer);
       expect(entries.length).toBe(1);
       expect(entries[0].source).toBe("system:events/deploys/b-999");
       expect(entries[0].payload.type).toBe("service.deploy");
@@ -265,6 +318,10 @@ describe("EventManager", () => {
         },
       });
 
+      expect(review).not.toBeNull();
+      expect(reviewComment).not.toBeNull();
+      if (!review || !reviewComment)
+        throw new Error("GitHub review event was unexpectedly dropped");
       expect(review.payload.type).toBe("pull_request_review.submitted");
       expect(reviewComment.payload.type).toBe("pull_request_review_comment.created");
     });
@@ -283,7 +340,7 @@ describe("EventManager", () => {
       const em = new EventManager({ inboxStore: inbox, resolver });
 
       const entries = await em.handleExternalEvent({
-        sourceType: "custom",
+        sourceType: "timer",
         rawResource: "system:events",
         rawPayload: { type: "test.event" },
       });
@@ -305,7 +362,7 @@ describe("EventManager", () => {
       const em = new EventManager({ inboxStore: inbox, resolver });
 
       const entries = await em.handleExternalEvent({
-        sourceType: "custom",
+        sourceType: "timer",
         rawResource: "system:events",
         rawPayload: { type: "test.event" },
       });
@@ -324,7 +381,7 @@ describe("EventManager", () => {
       const em = new EventManager({ inboxStore: inbox, resolver });
 
       const entries = await em.handleExternalEvent({
-        sourceType: "custom",
+        sourceType: "timer",
         rawResource: "system:events/uncovered/1",
         rawPayload: { type: "test.event" },
       });
@@ -357,7 +414,7 @@ describe("EventManager", () => {
       const em = new EventManager({ inboxStore: inbox, resolver });
 
       const event: RawIntegrationEvent = {
-        sourceType: "github",
+        sourceType: "timer",
         rawResource: "github:org/repo/issues/100",
         rawPayload: { type: "issues.opened" },
         idempotencyKey: "unique-guid-456",
@@ -387,7 +444,7 @@ describe("EventManager", () => {
 
       // Verify no runtime, runner, or execution dispatcher is invoked
       const entries = await em.handleExternalEvent({
-        sourceType: "custom",
+        sourceType: "timer",
         rawResource: "system:events/jobs/1",
         rawPayload: { type: "job.created" },
       });
@@ -419,10 +476,9 @@ describe("EventManager", () => {
         subscribedAt: "2026-09-10T12:00:00Z",
       });
 
-      const resolver = new HierarchicalEventSourceResolver({
-        eventSourceOwners: ownerStore,
-        eventSourceSubscriptions: subStore,
-        isLive: () => true,
+      const resolver = createRoutingKernel({
+        owners: ownerStore,
+        subscriptions: subStore,
       });
 
       const { directed, ownerIds, subscriberIds } = resolver.resolveRecipients(
@@ -445,10 +501,9 @@ describe("EventManager", () => {
         subscribedAt: "2026-09-10T12:00:00Z",
       });
 
-      const resolver = new HierarchicalEventSourceResolver({
-        eventSourceOwners: ownerStore,
-        eventSourceSubscriptions: subStore,
-        isLive: () => true,
+      const resolver = createRoutingKernel({
+        owners: ownerStore,
+        subscriptions: subStore,
       });
 
       // issues.opened is allowlisted for bubbling
@@ -484,11 +539,10 @@ describe("EventManager", () => {
         },
       };
 
-      const resolver = new HierarchicalEventSourceResolver({
-        eventSourceOwners: ownerStore,
-        eventSourceSubscriptions: subStore,
+      const resolver = createRoutingKernel({
+        owners: ownerStore,
+        subscriptions: subStore,
         obligations: mockObligations,
-        isLive: () => true,
       });
 
       const { ownerIds } = resolver.resolveRecipients("github:MEK-Org/rusa/issues/383");
@@ -510,9 +564,9 @@ describe("EventManager", () => {
         findLiveByExternalRef: () => ({ ownerId: "human:operator" }),
       };
 
-      const resolver = new HierarchicalEventSourceResolver({
-        eventSourceOwners: ownerStore,
-        eventSourceSubscriptions: subStore,
+      const resolver = createRoutingKernel({
+        owners: ownerStore,
+        subscriptions: subStore,
         obligations: mockObligations,
         isLive: (id) => id !== "human:operator",
       });
@@ -536,7 +590,7 @@ describe("EventManager", () => {
       const em = new EventManager({ inboxStore: inbox, resolver });
 
       const entries = await em.handleExternalEvent({
-        sourceType: "github",
+        sourceType: "timer",
         rawResource: "github:org/repo/issues/1",
         rawPayload: { type: "issue_comment.created" },
         stampedAuthor: { actorId: "actor-self", instanceId: "inst-1" },
@@ -560,7 +614,7 @@ describe("EventManager", () => {
       const em = new EventManager({ inboxStore: inbox, resolver });
 
       const entries = await em.handleExternalEvent({
-        sourceType: "custom",
+        sourceType: "timer",
         rawResource: "system:events",
         rawPayload: { type: "system.event" },
         stampedAuthor: { actorId: "system:mesh", instanceId: "inst-1" },
@@ -577,13 +631,12 @@ describe("EventManager", () => {
       handle?: string;
       handleId?: string;
     }) =>
-      new HierarchicalEventSourceResolver({
-        eventSourceOwners: new InMemoryEventSourceOwnerStore(),
-        eventSourceSubscriptions: new InMemoryEventSourceSubscriptionStore(),
+      createRoutingKernel({
+        owners: new InMemoryEventSourceOwnerStore(),
+        subscriptions: new InMemoryEventSourceSubscriptionStore(),
         obligations: opts.obligationOwner
           ? { findLiveByExternalRef: () => ({ ownerId: opts.obligationOwner as string }) }
           : undefined,
-        isLive: () => true,
         resolveActor: (handleOrId) =>
           handleOrId === opts.handle ? { id: opts.handleId as string } : undefined,
       });
@@ -600,7 +653,7 @@ describe("EventManager", () => {
       });
 
       const entries = await em.handleExternalEvent({
-        sourceType: "custom",
+        sourceType: "timer",
         rawResource: "github:MEK-Org/rusa/issues/383",
         rawPayload: { type: "issue_comment.created" },
         directedTarget: "cloudy-porpoise",
@@ -619,7 +672,7 @@ describe("EventManager", () => {
       });
 
       const entries = await em.handleExternalEvent({
-        sourceType: "custom",
+        sourceType: "timer",
         rawResource: "github:MEK-Org/rusa/issues/383",
         rawPayload: { type: "issue_comment.created" },
         directedTarget: "cloudy-porpoise",
@@ -641,7 +694,7 @@ describe("EventManager", () => {
       });
 
       const entries = await em.handleExternalEvent({
-        sourceType: "custom",
+        sourceType: "timer",
         rawResource: "github:MEK-Org/rusa/issues/383",
         rawPayload: { type: "issue_comment.created" },
         directedTarget: "actor-governing",
@@ -678,10 +731,9 @@ describe("EventManager", () => {
         subscribedBy: "root",
         subscribedAt: "2026-09-10T12:00:00Z",
       });
-      const resolver = new HierarchicalEventSourceResolver({
-        eventSourceOwners: new InMemoryEventSourceOwnerStore(),
-        eventSourceSubscriptions: subs,
-        isLive: () => true,
+      const resolver = createRoutingKernel({
+        owners: new InMemoryEventSourceOwnerStore(),
+        subscriptions: subs,
         resolveActor: (h) => (h === "cloudy-porpoise" ? { id: "uuid-cloudy" } : undefined),
       });
 
@@ -715,7 +767,7 @@ describe("EventManager", () => {
       const em = new EventManager({ inboxStore: inbox, resolver });
 
       const entries = await em.handleExternalEvent({
-        sourceType: "custom",
+        sourceType: "timer",
         rawResource: "system:events",
         rawPayload: { type: "test.event" },
       });
@@ -747,7 +799,7 @@ describe("EventManager", () => {
       const em = new EventManager({ inboxStore: inbox, resolver });
 
       const entries = await em.handleExternalEvent({
-        sourceType: "custom",
+        sourceType: "timer",
         rawResource: "system:events",
         rawPayload: { type: "test.event" },
         stampedAuthor: { actorId: "actor-self", instanceId: "inst-1" },
@@ -775,7 +827,7 @@ describe("EventManager", () => {
 
       await expect(
         em.handleExternalEvent({
-          sourceType: "custom",
+          sourceType: "timer",
           rawResource: "system:events",
           rawPayload: { type: "test.event" },
         })

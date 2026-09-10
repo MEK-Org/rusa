@@ -12,6 +12,11 @@ import {
   type SpawnRequest,
 } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
+import {
+  InMemoryEventSourceOwnerStore,
+  InMemoryEventSourceSubscriptionStore,
+  parentOf,
+} from "../actor/event-subscriptions.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import type { RusaConfig } from "../config/types.js";
@@ -26,6 +31,7 @@ import {
 } from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import { HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
 import { createAgentExecMcpServer } from "./agent-exec-mcp.js";
 
 async function connect(server: McpServer): Promise<Client> {
@@ -100,13 +106,30 @@ function setup(
     payload?: string;
   }[] = [];
   let seq = 0;
-  const mesh = new ActorMesh({
+  const eventSourceOwners = new InMemoryEventSourceOwnerStore();
+  const eventSourceSubscriptions = new InMemoryEventSourceSubscriptionStore();
+  let mesh!: ActorMesh;
+  const eventSourceResolver = new HierarchicalEventSourceResolver({
+    ports: {
+      parentOf,
+      isLive: (actorId) => mesh.isLiveActor(actorId),
+      activeDelegationsFor: (resource) => eventSourceOwners.activeForResource(resource),
+      directSubscribersFor: (resource) => eventSourceSubscriptions.subscribersOf(resource),
+      governingObligationOwnerFor: (resource) =>
+        opts.obligations?.findLiveByExternalRef(resource)?.ownerId,
+      resolveActor: (handleOrId) => mesh.resolveLiveActorId(handleOrId),
+    },
+  });
+  mesh = new ActorMesh({
     actors: registry,
     validateSpawn: opts.validateSpawn,
     validateModel: opts.validateModel,
     maxConcurrent: opts.maxConcurrent,
     scheduledMessages: opts.scheduledMessages,
     obligations: opts.obligations,
+    eventSourceOwners,
+    eventSourceSubscriptions,
+    eventSourceResolver,
     events: (e) => events.push(e),
     grantableCapabilities: new Set([
       "understanding-write",

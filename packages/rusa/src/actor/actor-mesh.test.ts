@@ -17,7 +17,9 @@ import {
 } from "../providers/model-config.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
+import { asGitHubIssue, parseReference } from "../references/reference.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
 import { Actor } from "./actor.js";
 import type {
   ActorFactoryContext,
@@ -30,7 +32,12 @@ import type {
 import { ActorMesh, RetirementBlockedError } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
 import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
-import type { EventResource } from "./event-subscriptions.js";
+import {
+  type EventResource,
+  InMemoryEventSourceOwnerStore,
+  InMemoryEventSourceSubscriptionStore,
+  parentOf,
+} from "./event-subscriptions.js";
 import { ExternalRootDriver } from "./external-root-driver.js";
 import { routeRunFailure } from "./failure-sink.js";
 import type {
@@ -199,8 +206,36 @@ function setup(
   let seq = 0;
   let chatSeq = 0;
   const scheduledMessages = opts.scheduledMessages ?? new FakeScheduledMessageScheduler();
+  const inboxStore = opts.inboxStore ?? createMemoryInboxStore();
+  const eventSourceOwners = new InMemoryEventSourceOwnerStore();
+  const eventSourceSubscriptions = new InMemoryEventSourceSubscriptionStore();
 
-  const mesh = new ActorMesh({
+  let mesh!: ActorMesh;
+  const eventSourceResolver = new HierarchicalEventSourceResolver({
+    ports: {
+      parentOf,
+      isLive: (actorId) => mesh.isLiveActor(actorId),
+      activeDelegationsFor: (resource) => eventSourceOwners.activeForResource(resource),
+      directSubscribersFor: (resource) => eventSourceSubscriptions.subscribersOf(resource),
+      governingObligationOwnerFor: (resource) => {
+        try {
+          return asGitHubIssue(parseReference(resource))
+            ? opts.obligations?.findLiveByExternalRef(resource)?.ownerId
+            : undefined;
+        } catch {
+          return undefined;
+        }
+      },
+      resolveActor: (handleOrId) => mesh.resolveLiveActorId(handleOrId),
+    },
+    log: (m) => logs.push(m),
+  });
+  const eventManager = new EventManager({
+    inboxStore,
+    resolver: eventSourceResolver,
+    log: (m) => logs.push(m),
+  });
+  mesh = new ActorMesh({
     actors: registry,
     rootId: opts.rootId ?? "root",
     handleForId: opts.handleForId,
@@ -213,7 +248,11 @@ function setup(
     isShuttingDown: opts.isShuttingDown,
     events: opts.events,
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
-    inboxStore: opts.inboxStore ?? createMemoryInboxStore(),
+    inboxStore,
+    eventSourceOwners,
+    eventSourceSubscriptions,
+    eventSourceResolver,
+    eventManager,
     isVoiceSessionActive: opts.isVoiceSessionActive,
     obligations: opts.obligations,
     configuredEventSources: opts.configuredEventSources,

@@ -10,15 +10,14 @@ import {
   type RawProviderModelConfig,
 } from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
-import { asGitHubIssue, parseReference } from "../references/reference.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import {
   applyAuthorSuppression,
   deduplicatedInboxEntryId,
-  EventManager,
-  type EventSourceResolver,
-  HierarchicalEventSourceResolver,
-  mayBubbleToParent,
+  type EventManager,
+  type EventRoutingKernel,
+  type EventSourceOwnershipDiagnostic,
+  type RawIntegrationEvent,
 } from "../runtime/event-manager.js";
 import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./actor-record.js";
 import {
@@ -40,9 +39,7 @@ import {
   InMemoryEventSourceOwnerStore,
   InMemoryEventSourceSubscriptionStore,
   isSubResourceOf,
-  parentOf,
   resourceKey,
-  sameResource,
 } from "./event-subscriptions.js";
 import { generateHandle } from "./handle-generator.js";
 import type { InboxEntry, InboxPayload, InboxStore } from "./inbox-store.js";
@@ -57,17 +54,6 @@ import { type ActorRunMode, isResponsiveNudge, type RunNudge } from "./trigger-r
 
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
 export const SCHEDULER_SENDER_ID = "scheduler";
-
-/** Map only the issue-shaped event resources obligations may govern. */
-function eventResourceObligationKey(resource: EventResource): string | undefined {
-  try {
-    const key = resourceKey(resource);
-    return asGitHubIssue(parseReference(key)) ? key : undefined;
-  } catch {
-    // An invalid resource cannot name an obligation. Preserve subscription routing.
-    return undefined;
-  }
-}
 
 /** Runtime contract the mesh needs for routing; provider-backed Actor is one implementation. */
 export interface MeshActor {
@@ -232,40 +218,8 @@ export interface RetirementBlockers {
  * Effective event routing authority diagnostic (#369).
  * Distinguishes the governing source, principal, resource level, and liveness for a canonical resource.
  */
-export interface EffectiveRouteDiagnostic {
-  /**
-   * The canonical resource queried, normalized to canonical scheme and
-   * path syntax (resolving legacy prefixes or alternate representations).
-   */
-  resource: EventResource;
-  /**
-   * Governing authority kind:
-   * - 'obligation': claimed by a live obligation in the hierarchy (takes precedence over subscriptions).
-   * - 'subscription': governed by an active live subscription in the hierarchy.
-   * - null: uncovered by any live obligation or live subscription.
-   */
-  governingSource: "obligation" | "subscription" | null;
-  /**
-   * The principal (actor id or entity id) holding effective authority,
-   * or null if uncovered. For subscriptions, the system invariant enforces
-   * at most one active subscriber per resource level.
-   */
-  principal: string | null;
-  /**
-   * The canonical resource level where the governing claim was found
-   * (exact resource or ancestor level), or null if uncovered.
-   */
-  resourceLevel: EventResource | null;
-  /**
-   * Whether the governing principal is currently a live, runnable actor.
-   * - On 'subscription' routes, this is always true because stored subscriptions only
-   *   confer effective authority when the subscriber is live (dead subscribers yield to live ancestors or uncovered).
-   * - On 'obligation' routes, this surfaces when a live obligation is held by a non-runnable
-   *   principal (e.g. human:operator or an absent actor), which claims authority but cannot receive delivery.
-   * - On uncovered routes, this is always false.
-   */
-  isLive: boolean;
-}
+/** Public diagnostic from the shared routing kernel (#369). */
+export type EffectiveRouteDiagnostic = EventSourceOwnershipDiagnostic;
 
 /**
  * Retirement refused because the subtree still holds work someone has to decide
@@ -639,7 +593,12 @@ export interface ActorMeshOptions {
   capabilityGrants?: CapabilityGrantStore;
   eventSourceOwners?: EventSourceOwnerStore;
   eventSourceSubscriptions?: EventSourceSubscriptionStore;
-  eventSourceResolver?: EventSourceResolver;
+  /** The one routing kernel assembled by the host and shared with EventManager. */
+  eventSourceResolver?: EventRoutingKernel;
+  /**
+   * Transitionally retained only to append through EventManager before
+   * notifyInboxChanged; #384 will move after-commit notification out of Mesh.
+   */
   eventManager?: EventManager;
   /**
    * The event sources this instance is configured for. Direct subscriptions are
@@ -740,7 +699,7 @@ export class ActorMesh {
     body: string;
     sessionId?: string;
   }) => string;
-  readonly eventSourceResolver: EventSourceResolver;
+  readonly eventSourceResolver?: EventRoutingKernel;
   readonly eventManager?: EventManager;
   private readonly grants: CapabilityGrantStore;
   private readonly eventSourceOwners: EventSourceOwnerStore;
@@ -851,25 +810,8 @@ export class ActorMesh {
     this.log = opts.log ?? (() => {});
     this.scheduledMessages = opts.scheduledMessages;
     this.withTransaction = opts.withTransaction ?? ((fn) => fn());
-    this.eventSourceResolver =
-      opts.eventSourceResolver ??
-      new HierarchicalEventSourceResolver({
-        eventSourceOwners: this.eventSourceOwners,
-        eventSourceSubscriptions: this.eventSourceSubscriptions,
-        obligations: this.obligations,
-        isLive: (actorId) => this.live.has(actorId),
-        resolveActor: (handleOrId) => this.resolveLiveActor(handleOrId),
-        log: this.log,
-      });
-    this.eventManager =
-      opts.eventManager ??
-      (this.inboxStore
-        ? new EventManager({
-            inboxStore: this.inboxStore,
-            resolver: this.eventSourceResolver,
-            log: this.log,
-          })
-        : undefined);
+    this.eventSourceResolver = opts.eventSourceResolver;
+    this.eventManager = opts.eventManager;
   }
 
   /**
@@ -1836,96 +1778,11 @@ export class ActorMesh {
       exactObligationOwner?: string | null;
     } = {}
   ): { diagnostic: EffectiveRouteDiagnostic; destinations: string[] } {
-    let current: EventResource | undefined = resource;
-    let exact = true;
-
-    // Atomicity Invariant: The check `this.live.has(sub.actorId)` and the delivery
-    // via `requestRun` happen in the same synchronous section with no await.
-    while (current) {
-      // The obligation store is the ownership authority for linked issue/PR
-      // work. Consulted before the subscription store at every rung of
-      // the climb, so a live obligation supersedes any manual delegation on the
-      // same source — and so a comment event resolves to the obligation on its
-      // issue one level up, which the path grammar makes free.
-      //
-      // Derived, never written: nothing here deactivates a subscription. The
-      // prior subscriber is superseded rather than destroyed, which keeps the
-      // audit history intact and makes replay and restart reconstruct the same
-      // answer with no chance of reviving a stale owner.
-      const governing =
-        exact && opts.exactObligationOwner !== undefined
-          ? (opts.exactObligationOwner ?? undefined)
-          : this.obligationOwnerFor(current);
-      exact = false;
-      if (governing) {
-        // The claim is authoritative even when its owner is not runnable. A
-        // human/system owner, or a temporarily absent actor, produces no
-        // destination; falling through would hand their work to whichever actor
-        // happened to be subscribed earlier.
-        const isLive = this.live.has(governing);
-        return {
-          diagnostic: {
-            resource: resourceKey(resource),
-            governingSource: "obligation",
-            principal: governing,
-            resourceLevel: resourceKey(current),
-            isLive,
-          },
-          destinations: isLive ? [governing] : [],
-        };
-      }
-
-      const activeSubs = this.eventSourceOwners.activeForResource(current);
-      const liveSubs: string[] = [];
-      for (const sub of activeSubs) {
-        if (
-          opts.ignoreExactResource &&
-          sameResource(sub.resource, opts.ignoreExactResource) &&
-          sameResource(current, opts.ignoreExactResource)
-        ) {
-          continue;
-        }
-        if (this.live.has(sub.actorId) && !liveSubs.includes(sub.actorId)) {
-          liveSubs.push(sub.actorId);
-        }
-      }
-      if (liveSubs.length > 0) {
-        return {
-          diagnostic: {
-            resource: resourceKey(resource),
-            governingSource: "subscription",
-            principal: liveSubs[0],
-            resourceLevel: resourceKey(current),
-            isLive: true,
-          },
-          destinations: liveSubs,
-        };
-      }
-      // Event-class policy gates only the first parent climb. Once an
-      // allowlisted event may bubble, the existing walk may continue past dead
-      // intermediate subscribers to the first live ancestor owner.
-      if (sameResource(current, resource) && opts.enforceBubblingPolicy) {
-        const allowParent = mayBubbleToParent(
-          opts.eventPayload?.type,
-          opts.eventPayload?.merged === true
-        );
-        if (!allowParent) {
-          break;
-        }
-      }
-      current = parentOf(current);
+    if (!this.eventSourceResolver) {
+      throw new Error("Event routing requires a host-assembled routing kernel");
     }
-
-    return {
-      diagnostic: {
-        resource: resourceKey(resource),
-        governingSource: null,
-        principal: null,
-        resourceLevel: null,
-        isLive: false,
-      },
-      destinations: [],
-    };
+    const decision = this.eventSourceResolver.resolveOwner(resource, opts);
+    return { diagnostic: decision.diagnostic, destinations: decision.ownerIds };
   }
 
   /**
@@ -1951,20 +1808,6 @@ export class ActorMesh {
     } = {}
   ): string[] {
     return this.resolveRoutingDecision(resource, opts).destinations;
-  }
-
-  /**
-   * The owner of the live obligation claiming this event source, if any.
-   *
-   * Returns an entity id, which may be a human — the caller decides what that
-   * means for routing. Absent an obligation repository (a mesh built without
-   * one, as in many tests) this is always undefined and routing is unchanged.
-   */
-  private obligationOwnerFor(resource: EventResource): string | undefined {
-    if (!this.obligations) return undefined;
-    const referenceKey = eventResourceObligationKey(resource);
-    if (!referenceKey) return undefined;
-    return this.obligations.findLiveByExternalRef(referenceKey)?.ownerId;
   }
 
   private effectiveOwnerOf(
@@ -2177,32 +2020,31 @@ export class ActorMesh {
     opts: EventDeliveryOptions = {}
   ): Promise<void> {
     if (opts.inboxPayload) {
-      if (!this.inboxStore || !this.eventManager) {
-        throw new Error("GitHub inbox delivery requires an inbox store");
+      if (!this.eventManager) {
+        throw new Error("Inbox delivery requires a host-assembled EventManager");
       }
       const rawResource = typeof resource === "string" ? resource : resourceKey(resource);
-      const entries = await this.eventManager.handleExternalEvent({
-        sourceType: "custom",
-        rawResource,
-        rawPayload: opts.inboxPayload,
-        receivedAt: opts.inboxDeliveredAt,
-        idempotencyKey: opts.inboxDedupeKey,
-        priority: opts.inboxPriority,
+      const entries = await this.eventManager.handleNormalizedEvent({
+        resource: rawResource,
+        payload: {
+          ...opts.inboxPayload,
+          ...(opts.inboxPriority === "responsive" ? { priority: "responsive" } : {}),
+        },
+        deliveredAt: opts.inboxDeliveredAt,
+        dedupeKey: opts.inboxDedupeKey,
         directedTarget: opts.directedTarget,
         stampedAuthor: opts.stampedAuthor,
         instanceId: opts.instanceId,
         eventSummary,
       });
-      for (const entry of entries) {
-        const dest = entry.actorId;
-        if (!this.notifyInboxChanged(dest, { priority: opts.inboxPriority })) {
-          throw new Error(`Delivery target ${dest} is not live after inbox persistence`);
-        }
-      }
+      this.notifyPersistedInboxEntries(entries, opts.inboxPriority);
       return;
     }
 
     const rawResource = typeof resource === "string" ? resource : resourceKey(resource);
+    if (!this.eventSourceResolver) {
+      throw new Error("Event routing requires a host-assembled routing kernel");
+    }
     const recipients = await this.eventSourceResolver.resolveRecipients(rawResource, {
       directedTarget: opts.directedTarget,
       eventPayload: opts.inboxPayload,
@@ -2239,6 +2081,41 @@ export class ActorMesh {
         this.log(`Delivery target ${dest} is not live; cannot deliver event`);
       }
     }
+  }
+
+  /**
+   * The host's three external ingress paths enter here with an explicit raw
+   * source shape. EventManager owns normalize → route → append; Mesh owns the
+   * after-commit wake until #384 extracts that notification seam.
+   */
+  async deliverExternalEvent(raw: RawIntegrationEvent): Promise<void> {
+    if (!this.eventManager) {
+      throw new Error("External event delivery requires a host-assembled EventManager");
+    }
+    const entries = await this.eventManager.handleExternalEvent(raw);
+    this.notifyPersistedInboxEntries(entries, raw.priority);
+  }
+
+  private notifyPersistedInboxEntries(
+    entries: readonly InboxEntry[],
+    priority: "responsive" | "normal" | undefined
+  ): void {
+    for (const entry of entries) {
+      const dest = entry.actorId;
+      if (!this.notifyInboxChanged(dest, { priority })) {
+        throw new Error(`Delivery target ${dest} is not live after inbox persistence`);
+      }
+    }
+  }
+
+  /** A narrow live-actor read port for the host-assembled routing kernel. */
+  isLiveActor(actorId: string): boolean {
+    return this.live.has(actorId);
+  }
+
+  /** A narrow handle/id resolution port for directed delivery. */
+  resolveLiveActorId(handleOrId: string): { id: string } | undefined {
+    return this.resolveLiveActor(handleOrId);
   }
 
   private resolveLiveActor(handleOrId: string): MeshActor | undefined {
