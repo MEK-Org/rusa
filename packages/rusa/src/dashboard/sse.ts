@@ -252,19 +252,6 @@ export class SseHub {
         }
       })
     );
-    this.unsubscribers.push(
-      this.emitter.onActorConfigUpdated((update) => {
-        const text = frame("actor_config_updated", update);
-        for (const client of this.clients) {
-          if (client.channel !== "mesh") continue;
-          try {
-            client.send(text);
-          } catch {
-            this.remove(client);
-          }
-        }
-      })
-    );
     if (opts.runtimeState) {
       this.unsubscribers.push(
         opts.runtimeState.onRuntimeStateDelta((delta) => {

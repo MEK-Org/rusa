@@ -3,7 +3,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ActorMesh, type MeshActor } from "../../actor/actor-mesh.js";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
 import { runMigrations } from "../migrations/runner.js";
@@ -22,18 +21,6 @@ const root: ActorRecord = {
   status: "active",
   createdAt: "2026-09-03T13:00:00.000Z",
 };
-
-function adoptedActor(id: string): MeshActor {
-  return {
-    id,
-    requestRun: () => {},
-    declareYield: () => {},
-    markUnkillable: () => {},
-    close: () => {},
-    isRunning: false,
-    preemptForResponsive: () => ({ preempted: false as const }),
-  };
-}
 
 describe("SqliteActorRepository", () => {
   let db: Database.Database;
@@ -685,6 +672,39 @@ describe("SqliteActorRepository", () => {
     }
   });
 
+  it("rejects complete invalid voice documents at upsert and patch boundaries", () => {
+    repository.upsert(root);
+    const worker: ActorRecord = {
+      id: "worker",
+      charter: "Speak",
+      parentId: "root",
+      status: "active",
+      voiceConfig: { schemaVersion: 1, provider: "google", config: { voiceName: "Puck" } },
+      createdAt: "2026-09-09T12:00:00.000Z",
+    };
+    repository.upsert(worker);
+    const invalidDocuments = [
+      { schemaVersion: 2, provider: "google", config: { voiceName: "Puck" } },
+      { schemaVersion: 1, provider: "elevenlabs", config: { voiceName: "Puck" } },
+      {
+        schemaVersion: 1,
+        provider: "google",
+        config: { voiceName: "Puck" },
+        extra: true,
+      },
+    ];
+
+    for (const invalid of invalidDocuments) {
+      expect(() =>
+        repository.upsert({ ...worker, voiceConfig: invalid as ActorRecord["voiceConfig"] })
+      ).toThrow(/invalid voice_config for actor 'worker'/);
+      expect(() =>
+        repository.patch("worker", { voiceConfig: invalid as ActorRecord["voiceConfig"] })
+      ).toThrow(/invalid voice_config for actor 'worker'/);
+      expect(repository.get("worker")?.voiceConfig).toEqual(worker.voiceConfig);
+    }
+  });
+
   it("validates voice_config version and shape when records are consumed", () => {
     repository.upsert(root);
 
@@ -695,7 +715,7 @@ describe("SqliteActorRepository", () => {
       '{"schemaVersion":1,"provider":"google"}',
       '{"schemaVersion":1,"provider":"google","config":{"voiceName":""}}',
       '{"schemaVersion":1,"provider":"google","config":{"voiceName":"Puck","unknown":true}}',
-      '{"schemaVersion":1,"provider":"elevenlabs","config":{"voiceId":"abc"},"unknown":true}',
+      '{"schemaVersion":1,"provider":"elevenlabs","config":{"voiceId":"abc"}}',
     ]) {
       db.prepare("UPDATE actors SET voice_config = ? WHERE id = 'root'").run(invalid);
       expect(() => repository.get("root")).toThrow(/invalid voice_config for actor 'root'/);
@@ -711,80 +731,5 @@ describe("SqliteActorRepository", () => {
     });
     db.prepare("UPDATE actors SET voice_config = ? WHERE id = 'root'").run(stored);
     expect(repository.get("root")?.voiceConfig).toBeUndefined();
-    repository.patch("root", { title: "Unrelated update" });
-    expect(
-      (
-        db.prepare("SELECT voice_config FROM actors WHERE id = 'root'").get() as {
-          voice_config: string | null;
-        }
-      ).voice_config
-    ).toBe(stored);
-  });
-
-  it("falls back across an unknown-provider rollback and retains its document on unrelated patches", () => {
-    repository.upsert(root);
-    const stored = JSON.stringify({
-      schemaVersion: 1,
-      provider: "elevenlabs",
-      config: { voiceId: "future-voice" },
-    });
-    db.prepare("UPDATE actors SET voice_config = ? WHERE id = 'root'").run(stored);
-
-    expect(repository.get("root")?.voiceConfig).toBeUndefined();
-    repository.patch("root", { title: "Still loads on rollback" });
-    expect(repository.get("root")?.title).toBe("Still loads on rollback");
-    expect(
-      (
-        db.prepare("SELECT voice_config FROM actors WHERE id = 'root'").get() as {
-          voice_config: string | null;
-        }
-      ).voice_config
-    ).toBe(stored);
-  });
-
-  it("preserves fallback-only raw voice_config when start adopts the existing root", () => {
-    const documents = [
-      JSON.stringify({
-        schemaVersion: 1,
-        provider: "google",
-        config: { voiceName: "RetiredGoogleVoice" },
-      }),
-      JSON.stringify({
-        schemaVersion: 1,
-        provider: "elevenlabs",
-        config: { voiceId: "future-voice" },
-      }),
-    ];
-
-    for (const stored of documents) {
-      repository.upsert(root);
-      db.prepare("UPDATE actors SET voice_config = ? WHERE id = 'root'").run(stored);
-
-      // commands/start.ts rebuilds this root record without a voiceConfig key
-      // on every boot, then registers it through ActorMesh.adopt().
-      const mesh = new ActorMesh({
-        actors: repository,
-        createActor: () => adoptedActor("unused"),
-      });
-      mesh.adopt({ ...root, title: "Reconfigured at boot" }, adoptedActor("root"));
-
-      expect(
-        (
-          db.prepare("SELECT voice_config FROM actors WHERE id = 'root'").get() as {
-            voice_config: string | null;
-          }
-        ).voice_config
-      ).toBe(stored);
-    }
-
-    // Explicit ownership of the setting remains the only clear path.
-    repository.patch("root", { voiceConfig: undefined });
-    expect(
-      (
-        db.prepare("SELECT voice_config FROM actors WHERE id = 'root'").get() as {
-          voice_config: string | null;
-        }
-      ).voice_config
-    ).toBeNull();
   });
 });

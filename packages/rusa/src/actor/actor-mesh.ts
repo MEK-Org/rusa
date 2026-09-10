@@ -20,6 +20,7 @@ import {
   type RawIntegrationEvent,
 } from "../runtime/event-manager.js";
 import { randomSupportedVoiceName } from "../voice/tts-voices.js";
+import { googleVoiceConfig } from "../voice/voice-config.js";
 import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./actor-record.js";
 import {
   type CapabilityGrantStore,
@@ -952,16 +953,8 @@ export class ActorMesh {
    * changing stable creation metadata.
    */
   adopt(record: ActorRecord, actor: MeshActor): void {
-    // Boot re-registers an existing root with current runtime configuration.
-    // Route that merge through the repository so an unreadable-to-this-build
-    // (but well-formed) voice document is retained unless adoption explicitly
-    // owns `voiceConfig`; start's root record deliberately does not.
-    if (this.actors.get(record.id)) {
-      const { id, ...changes } = record;
-      this.actors.patch(id, changes);
-    } else {
-      this.actors.upsert(record);
-    }
+    const existing = this.actors.get(record.id);
+    this.actors.upsert(existing ? { ...existing, ...record } : record);
     this.live.set(record.id, actor);
     this.actorRuntimeStateChanged(record.id, this.runtimeStateOf(actor));
   }
@@ -1499,11 +1492,7 @@ export class ActorMesh {
       // Every actor gets its own walkie-talkie voice at birth so a transfer or
       // multi-actor chat is audible as different speakers; the operator can
       // re-pick it from the actor info panel at any time.
-      voiceConfig: {
-        schemaVersion: 1,
-        provider: "google",
-        config: { voiceName: randomSupportedVoiceName() },
-      },
+      voiceConfig: googleVoiceConfig(randomSupportedVoiceName()),
       status: "active",
       createdAt: this.now(),
     };

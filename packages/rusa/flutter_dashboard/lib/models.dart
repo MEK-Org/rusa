@@ -678,21 +678,6 @@ class MeshEvent {
   }
 }
 
-/// Ephemeral SSE cache invalidation for a changed persisted actor setting.
-/// The next thread snapshot remains the authoritative value.
-class ActorConfigUpdate {
-  const ActorConfigUpdate({required this.actorId, required this.voiceName});
-
-  final String actorId;
-  final String? voiceName;
-
-  factory ActorConfigUpdate.fromJson(Map<String, dynamic> j) =>
-      ActorConfigUpdate(
-        actorId: j['actorId'] as String,
-        voiceName: j['voiceName'] as String?,
-      );
-}
-
 /// A page from `GET /api/mesh/events` (newest-first; `nextCursor` is an opaque
 /// rowid to pass back as `before`, or null when exhausted).
 class EventPage {

@@ -11,24 +11,12 @@ export interface LiveOutputChunk {
   text: string;
 }
 
-/**
- * Ephemeral dashboard cache invalidation for a persisted actor setting. Unlike
- * a mesh event this is not a timeline entry: reconnecting clients get the
- * current value from the thread snapshot.
- */
-export interface ActorConfigUpdate {
-  actorId: string;
-  voiceName: string | null;
-}
-
 /** The channels the dashboard SSE stream multiplexes. */
 export interface MeshEventEmitterEvents {
   /** A freshly-recorded mesh event (topology, messages, run lifecycle). */
   mesh_event: [MeshEvent];
   /** A live model-output chunk from a running actor. */
   live_output: [LiveOutputChunk];
-  /** A persisted actor setting changed and dashboard snapshots should refresh. */
-  actor_config_updated: [ActorConfigUpdate];
 }
 
 /**
@@ -60,10 +48,6 @@ export class MeshEventEmitter {
     this.emitter.emit("live_output", chunk);
   }
 
-  emitActorConfigUpdated(update: ActorConfigUpdate): void {
-    this.emitter.emit("actor_config_updated", update);
-  }
-
   onMeshEvent(listener: (event: MeshEvent) => void): () => void {
     this.emitter.on("mesh_event", listener);
     return () => this.emitter.off("mesh_event", listener);
@@ -72,11 +56,6 @@ export class MeshEventEmitter {
   onLiveOutput(listener: (chunk: LiveOutputChunk) => void): () => void {
     this.emitter.on("live_output", listener);
     return () => this.emitter.off("live_output", listener);
-  }
-
-  onActorConfigUpdated(listener: (update: ActorConfigUpdate) => void): () => void {
-    this.emitter.on("actor_config_updated", listener);
-    return () => this.emitter.off("actor_config_updated", listener);
   }
 
   /** Current number of SSE subscribers (max across the two channels). */

@@ -21,7 +21,6 @@ import { createLogger } from "../observability/logger.js";
 import { assertConcreteModelConfig } from "../providers/model-config.js";
 import type { ReferenceCacheService } from "../references/cache-service.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
-import { DEFAULT_VOICE_NAME } from "../voice/gemini-speech.js";
 import { type DashboardDataDeps, handleMeshApiRequest } from "./api.js";
 import { MeshEventEmitter } from "./mesh-event-emitter.js";
 import { SseHub } from "./sse.js";
@@ -151,7 +150,6 @@ describe("handleMeshApiRequest", () => {
   let inbox: InboxRepository;
   let obligations: ObligationRepository;
   let actors: InMemoryActorRepository;
-  let emitter: MeshEventEmitter;
   let deps: DashboardDataDeps;
   let rootSpawns: Array<{ request: unknown; principal: string }>;
 
@@ -163,7 +161,6 @@ describe("handleMeshApiRequest", () => {
     inbox = new InboxRepository(db);
     obligations = new ObligationRepository(db);
     actors = new InMemoryActorRepository();
-    emitter = new MeshEventEmitter();
     rootSpawns = [];
     const mockMesh = {
       sendHumanMessage: (toId: string, body: string, sessionId: string) => {
@@ -184,8 +181,7 @@ describe("handleMeshApiRequest", () => {
       meshChat,
       inbox,
       obligations,
-      sseHub: new SseHub(emitter),
-      emitter,
+      sseHub: new SseHub(new MeshEventEmitter()),
       mesh: mockMesh as unknown as ActorMesh,
       rootControl: {
         providers: ["agy", "codex"],
@@ -225,18 +221,7 @@ describe("handleMeshApiRequest", () => {
   });
 
   describe("per-actor voice routes", () => {
-    it("GET reports no voice, the supported catalog, and the instance default", async () => {
-      actors.upsert(rec(UUID_A, null, "active"));
-      const { res } = await call(deps, "GET", `/api/mesh/actors/${UUID_A}/voice`);
-      expect(res.statusCode).toBe(200);
-      const body = JSON.parse(res.body);
-      expect(body.voiceConfig).toBeNull();
-      expect(body.supportedVoices).toContain("Puck");
-      expect(body.supportedVoices).toContain(DEFAULT_VOICE_NAME);
-      expect(body.defaultVoiceName).toBe(DEFAULT_VOICE_NAME);
-    });
-
-    it("PATCH stores a supported Google provider document and GET reflects it", async () => {
+    it("PATCH stores a supported Google provider document and acknowledges its voice", async () => {
       actors.upsert(rec(UUID_A, null, "active"));
       const { res } = await call(
         deps,
@@ -246,30 +231,8 @@ describe("handleMeshApiRequest", () => {
       );
       await settled(res);
       expect(res.statusCode).toBe(200);
-      expect(JSON.parse(res.body).voiceConfig).toEqual(googleVoiceConfig("Puck"));
+      expect(JSON.parse(res.body)).toEqual({ voiceName: "Puck" });
       expect(actors.get(UUID_A)?.voiceConfig).toEqual(googleVoiceConfig("Puck"));
-
-      const got = await call(deps, "GET", `/api/mesh/actors/${UUID_A}/voice`);
-      expect(JSON.parse(got.res.body).voiceConfig).toEqual(googleVoiceConfig("Puck"));
-    });
-
-    it("PATCH invalidates every connected dashboard snapshot over SSE", async () => {
-      actors.upsert(rec(UUID_A, null, "active"));
-      const subscriber = new MockRes();
-      deps.sseHub.addConnection(subscriber as unknown as ServerResponse, null);
-
-      const { res } = await call(
-        deps,
-        "PATCH",
-        `/api/mesh/actors/${UUID_A}/voice`,
-        JSON.stringify({ voiceConfig: googleVoiceConfig("Puck") })
-      );
-      await settled(res);
-
-      expect(res.statusCode).toBe(200);
-      expect(subscriber.writes).toContain(
-        `event: actor_config_updated\ndata: {"actorId":"${UUID_A}","voiceName":"Puck"}\n\n`
-      );
     });
 
     it("PATCH canonicalizes a supported wire spelling for the dropdown", async () => {
@@ -281,7 +244,7 @@ describe("handleMeshApiRequest", () => {
         JSON.stringify({ voiceConfig: googleVoiceConfig(" puck ") })
       );
       await settled(res);
-      expect(JSON.parse(res.body).voiceConfig).toEqual(googleVoiceConfig("Puck"));
+      expect(JSON.parse(res.body)).toEqual({ voiceName: "Puck" });
       expect(actors.get(UUID_A)?.voiceConfig).toEqual(googleVoiceConfig("Puck"));
     });
 
@@ -314,13 +277,11 @@ describe("handleMeshApiRequest", () => {
       );
       await settled(res);
       expect(res.statusCode).toBe(200);
-      expect(JSON.parse(res.body).voiceConfig).toBeNull();
+      expect(JSON.parse(res.body)).toEqual({ voiceName: null });
       expect(actors.get(UUID_A)?.voiceConfig).toBeUndefined();
     });
 
-    it("GET and PATCH 404 for an unknown actor", async () => {
-      const got = await call(deps, "GET", `/api/mesh/actors/${UUID_B}/voice`);
-      expect(got.res.statusCode).toBe(404);
+    it("PATCH 404s for an unknown actor", async () => {
       const patched = await call(
         deps,
         "PATCH",

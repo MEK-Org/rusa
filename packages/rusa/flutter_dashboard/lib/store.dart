@@ -396,7 +396,6 @@ class DashboardStore {
   /// and de-duped), then load the thread list.
   Future<void> init() async {
     _subs.add(_stream.meshEvents.listen(_onMeshEvent));
-    _subs.add(_stream.actorConfigUpdates.listen(_onActorConfigUpdate));
     _subs.add(_stream.liveOutput.listen(_onLiveOutput));
     _subs.add(_stream.elided.listen((_) => _onElided()));
     _subs.add(_stream.runtimeHello.listen(_onRuntimeHello));
@@ -1092,9 +1091,19 @@ class DashboardStore {
   /// the actor's next spoken reply.
   Future<void> updateActorVoice(String actorId, String? voiceName) async {
     try {
-      await _api.updateActorVoice(actorId, voiceName);
+      final updatedVoiceName = await _api.updateActorVoice(actorId, voiceName);
+      final current = _actorStates.value;
+      final existing = current.actors[actorId];
+      if (existing != null) {
+        final updatedActors = Map<String, ActorViewState>.of(current.actors);
+        updatedActors[actorId] = existing.copyWith(
+          thread: existing.thread.copyWith(voiceName: updatedVoiceName),
+        );
+        _actorStates.add(
+          current.copyWith(revision: current.revision + 1, actors: updatedActors),
+        );
+      }
       _error.add(null);
-      await refreshThreads();
     } catch (e) {
       _error.add('$e');
     }
@@ -1203,12 +1212,6 @@ class DashboardStore {
         }
       }
     }
-  }
-
-  /// Another dashboard changed a persisted actor setting. The snapshot owns
-  /// the complete shape, so this signal only schedules its normal refresh.
-  void _onActorConfigUpdate(ActorConfigUpdate update) {
-    _scheduleTopologyRefresh();
   }
 
   /// Bounds a newest-first [items] list to its newest [cap] entries, evicting

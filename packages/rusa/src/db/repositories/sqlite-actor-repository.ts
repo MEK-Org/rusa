@@ -5,6 +5,7 @@ import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
 import type { ProviderModelConfig } from "../../providers/model-config.js";
 import type { ActorRepository } from "../../repositories/actor-repository.js";
 import { canonicalSupportedVoiceName } from "../../voice/tts-voices.js";
+import { googleVoiceConfig, voiceConfigSchema } from "../../voice/voice-config.js";
 import { PrincipalRepository } from "./principal-repository.js";
 
 type ActorRow = {
@@ -133,46 +134,6 @@ const currentContextConfigSchema = z.discriminatedUnion("type", [
 const contextConfigSchema = z.union([legacyContextConfigSchema, currentContextConfigSchema]);
 type LegacyContextConfigDocument = z.infer<typeof legacyContextConfigSchema>;
 type CurrentContextConfigDocument = z.infer<typeof currentContextConfigSchema>;
-
-/** The current V1 branch of the provider-discriminated `voice_config` union. */
-const googleVoiceConfigSchema = z
-  .object({
-    schemaVersion: z.literal(1),
-    provider: z.literal("google"),
-    config: z
-      .object({
-        voiceName: z.string().min(1),
-      })
-      .strict(),
-  })
-  .strict();
-
-/**
- * Current strict voice-config contract, shared by storage writers and
- * dashboard ingress. Adding a supported provider is one new union branch, so
- * the API and repository cannot disagree about the document it accepts.
- */
-export const voiceConfigSchema = z.discriminatedUnion("provider", [googleVoiceConfigSchema]);
-
-type VoiceConfigDocument = z.infer<typeof voiceConfigSchema>;
-
-/**
- * A V1 document written by a newer provider branch that this build cannot
- * synthesize yet. Its outer envelope remains strict, while its provider-owned
- * `config` is intentionally opaque until the matching branch is installed.
- * This lets a rollback load the actor and use the instance voice without
- * mistaking a newer provider setting for database corruption.
- */
-const unknownVoiceProviderConfigSchema = z
-  .object({
-    schemaVersion: z.literal(1),
-    provider: z.string().min(1),
-    config: z.record(z.string(), z.unknown()),
-  })
-  .strict()
-  .refine((config) => config.provider !== "google");
-
-const readableVoiceConfigSchema = z.union([voiceConfigSchema, unknownVoiceProviderConfigSchema]);
 
 function parseDocument<T>(
   actorId: string,
@@ -330,18 +291,17 @@ function parseContextConfig(
 /** Builds the versioned voice-config document, or null when the actor follows the instance default. */
 function buildVoiceConfig(record: ActorRecord): string | null {
   if (!record.voiceConfig) return null;
-  const voiceName = canonicalSupportedVoiceName(record.voiceConfig.config.voiceName);
+  const parsed = voiceConfigSchema.safeParse(record.voiceConfig);
+  if (!parsed.success) {
+    throw new Error(`invalid voice_config for actor '${record.id}'`);
+  }
+  const voiceName = canonicalSupportedVoiceName(parsed.data.config.voiceName);
   if (!voiceName) {
     throw new Error(
       `invalid voice_config for actor '${record.id}': Google voiceName must name a supported TTS voice`
     );
   }
-  const config: VoiceConfigDocument = {
-    schemaVersion: 1,
-    provider: "google",
-    config: { voiceName },
-  };
-  return JSON.stringify(config);
+  return JSON.stringify(googleVoiceConfig(voiceName));
 }
 
 /**
@@ -349,32 +309,20 @@ function buildVoiceConfig(record: ActorRecord): string | null {
  * strictly; a malformed document throws fail-closed, matching the other
  * versioned columns.
  *
- * Voice names are consumer-validated against the shared supported catalog.
- * A well-formed V1 document naming a retired vendor voice degrades to the
- * instance default instead of making its actor unreadable; malformed or unknown
- * document versions still fail closed. SQLite stays deliberately unconstrained.
+ * Voice names are consumer-validated against the shared supported catalog. A
+ * retired Google voice uses the instance fallback until an operator chooses a
+ * supported one; every version, provider, and shape mismatch fails closed.
+ * SQLite stays deliberately unconstrained.
  */
 function parseVoiceConfig(actorId: string, json: string | null): Pick<ActorRecord, "voiceConfig"> {
   if (!json) return {};
-  const parsed = parseDocument(actorId, "voice_config", json, readableVoiceConfigSchema);
-  // A newer provider's valid V1 envelope remains durable but cannot be used by
-  // this build. Treat it like an unavailable vendor voice: load the actor and
-  // use the instance fallback until a build that knows the provider is active.
-  const supported = voiceConfigSchema.safeParse(parsed);
-  if (!supported.success) return {};
+  const parsed = parseDocument(actorId, "voice_config", json, voiceConfigSchema);
   // Canonicalizing repairs case-only hand edits so the dropdown always receives
-  // one of its exact option values. A vendor-retired name is not a malformed
-  // document: leave the stored row intact but return no override, which uses
-  // the instance-wide fallback until an operator selects a current voice.
-  const voiceName = canonicalSupportedVoiceName(supported.data.config.voiceName);
+  // one of its exact option values. A retired vendor voice uses the instance
+  // fallback without treating its otherwise valid document as malformed.
+  const voiceName = canonicalSupportedVoiceName(parsed.config.voiceName);
   if (!voiceName) return {};
-  return {
-    voiceConfig: {
-      schemaVersion: 1,
-      provider: "google",
-      config: { voiceName },
-    },
-  };
+  return { voiceConfig: googleVoiceConfig(voiceName) };
 }
 
 /** A staged, not-yet-applied replacement for the actor's declared modelConfig pool. */
@@ -413,7 +361,7 @@ export class SqliteActorRepository implements ActorRepository {
     this.write(record);
   }
 
-  private write(record: ActorRecord, preservedVoiceConfig?: string | null): void {
+  private write(record: ActorRecord): void {
     const isRoot = record.isRoot === true;
     if (record.parentId === null && !isRoot) {
       throw new Error(
@@ -451,7 +399,7 @@ export class SqliteActorRepository implements ActorRepository {
           record.parentId,
           buildModelConfig(record),
           buildContextConfig(record),
-          preservedVoiceConfig ?? buildVoiceConfig(record),
+          buildVoiceConfig(record),
           record.title ?? null,
           retiredAt,
           record.createdAt
@@ -512,25 +460,8 @@ export class SqliteActorRepository implements ActorRepository {
   }
 
   patch(id: string, changes: Partial<Omit<ActorRecord, "id">>): void {
-    const row = this.db.prepare("SELECT * FROM actors WHERE id = ?").get(id) as
-      | ActorRow
-      | undefined;
-    if (!row) return;
-    const record = this.fromRow(row);
-    // A fallback-only read may represent a well-formed voice document from a
-    // retired vendor voice or newer provider. An unrelated patch must not turn
-    // that unreadable-to-this-build choice into NULL; only an explicit
-    // `voiceConfig` patch may replace or clear it.
-    const preserveVoiceConfig =
-      row.voice_config !== null &&
-      record.voiceConfig === undefined &&
-      !Object.hasOwn(changes, "voiceConfig");
-    if (!preserveVoiceConfig) {
-      this.upsert({ ...record, ...changes, id });
-      return;
-    }
-
-    this.write({ ...record, ...changes, id }, row.voice_config);
+    const record = this.get(id);
+    if (record) this.upsert({ ...record, ...changes, id });
   }
 
   private storeDesiredOverlay(record: ActorRecord): void {

@@ -213,12 +213,13 @@ class FakeApi extends DashboardApi {
   final actorVoiceUpdates = <({String actorId, String? voiceName})>[];
 
   @override
-  Future<void> updateActorVoice(String actorId, String? voiceName) async {
+  Future<String?> updateActorVoice(String actorId, String? voiceName) async {
     actorVoiceUpdates.add((actorId: actorId, voiceName: voiceName));
     threadsResult = [
       for (final thread in threadsResult)
         thread.id == actorId ? thread.copyWith(voiceName: voiceName) : thread,
     ];
+    return voiceName;
   }
 
   @override
@@ -1170,7 +1171,6 @@ class FakeWalkie {
 /// Fake SSE source driven by exposed controllers.
 class FakeStream implements MeshStreamSource {
   final meshCtrl = StreamController<MeshEvent>.broadcast();
-  final actorConfigCtrl = StreamController<ActorConfigUpdate>.broadcast();
   final liveCtrl = StreamController<LiveOutputChunk>.broadcast();
   final elidedCtrl = StreamController<void>.broadcast();
   final runtimeHelloCtrl = StreamController<RuntimeHello>.broadcast();
@@ -1180,9 +1180,6 @@ class FakeStream implements MeshStreamSource {
 
   @override
   Stream<MeshEvent> get meshEvents => meshCtrl.stream;
-
-  @override
-  Stream<ActorConfigUpdate> get actorConfigUpdates => actorConfigCtrl.stream;
   @override
   Stream<LiveOutputChunk> get liveOutput => liveCtrl.stream;
   @override

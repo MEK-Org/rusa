@@ -42,8 +42,13 @@ void main() {
         client: MockClient((request) async {
           expect(request.method, 'PATCH');
           expect(request.url.path, '/api/mesh/actors/worker/voice');
-          bodies.add(jsonDecode(request.body));
-          return http.Response('{}', 200);
+          final body = jsonDecode(request.body) as Map<String, dynamic>;
+          bodies.add(body);
+          final config = body['voiceConfig'] as Map<String, dynamic>?;
+          return http.Response(
+            jsonEncode({'voiceName': config?['config']?['voiceName']}),
+            200,
+          );
         }),
       );
 

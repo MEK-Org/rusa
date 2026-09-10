@@ -246,7 +246,7 @@ class DashboardApi {
   /// Google-provider voice document, or pass null to restore the instance-wide
   /// default. The server rejects shapes and voices outside that provider's
   /// supported catalog with a 400.
-  Future<void> updateActorVoice(String actorId, String? voiceName) async {
+  Future<String?> updateActorVoice(String actorId, String? voiceName) async {
     final uri = _u('/api/mesh/actors/$actorId/voice');
     final res = await _client.patch(
       uri,
@@ -267,6 +267,15 @@ class DashboardApi {
     if (res.statusCode != 200) {
       throw DashboardApiException(uri, res.statusCode, res.body);
     }
+    final body = jsonDecode(res.body);
+    if (body is! Map<String, dynamic> || !body.containsKey('voiceName')) {
+      throw const FormatException('invalid actor voice update response');
+    }
+    final updatedVoiceName = body['voiceName'];
+    if (updatedVoiceName != null && updatedVoiceName is! String) {
+      throw const FormatException('invalid actor voice update response');
+    }
+    return updatedVoiceName as String?;
   }
 
   /// `POST /api/mesh/avatar/<id>` — manual avatar upload . `imageBase64`

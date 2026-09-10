@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { brotliCompress, gzip, constants as zlibConstants } from "node:zlib";
 import type { ActorMesh } from "../actor/actor-mesh.js";
-import type { ActorRecord } from "../actor/actor-record.js";
 import { resolveContextSelection } from "../actor/context-selection.js";
 import { generateHandle } from "../actor/handle-generator.js";
 import type { InboxPage, InboxPayload, InboxStore } from "../actor/inbox-store.js";
@@ -21,7 +20,6 @@ import {
   MAX_OBLIGATION_PAGE_LIMIT,
   type ObligationRepository,
 } from "../db/repositories/obligation-repository.js";
-import { voiceConfigSchema } from "../db/repositories/sqlite-actor-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { Obligation, ObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
@@ -29,9 +27,8 @@ import { type Logger, nullLogger } from "../observability/logger.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
 import { resolveReferenceSync } from "../references/resolve.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
-import { DEFAULT_VOICE_NAME } from "../voice/gemini-speech.js";
 import { canonicalSupportedVoiceName, SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
-import type { MeshEventEmitter } from "./mesh-event-emitter.js";
+import { googleVoiceConfig, voiceConfigSchema } from "../voice/voice-config.js";
 import type { SseHub } from "./sse.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
@@ -49,8 +46,6 @@ export interface DashboardDataDeps {
    */
   inbox?: InboxStore;
   sseHub: SseHub;
-  /** Live cache-invalidation emitter for settings changed through dashboard routes. */
-  emitter?: MeshEventEmitter;
   /** The live ActorMesh instance. */
   mesh?: ActorMesh;
   /** Root-authorized commands exposed to trusted dashboard operators. */
@@ -285,24 +280,6 @@ function operatorHandledNote(reason: string): string {
   return reason
     ? `Cleared from the dashboard by the operator: ${reason}`
     : "Cleared from the dashboard by the operator; no reason given.";
-}
-
-/**
- * The per-actor voice payload shared by `GET` and `PATCH`
- * `/api/mesh/actors/<id>/voice`: the persisted document (null = instance
- * default), the supported catalog for the UI dropdown, and that instance
- * default so the UI can label the fallback honestly.
- */
-function voiceConfigPayload(record: ActorRecord): {
-  voiceConfig: ActorRecord["voiceConfig"] | null;
-  supportedVoices: readonly string[];
-  defaultVoiceName: string;
-} {
-  return {
-    voiceConfig: record.voiceConfig ?? null,
-    supportedVoices: SUPPORTED_TTS_VOICES,
-    defaultVoiceName: DEFAULT_VOICE_NAME,
-  };
 }
 
 /**
@@ -1287,21 +1264,12 @@ export async function handleMeshApiRequest(
             return;
           }
           actors.patch(actorId, {
-            voiceConfig:
-              voiceName === undefined
-                ? undefined
-                : {
-                    schemaVersion: 1,
-                    provider: "google",
-                    config: { voiceName },
-                  },
+            voiceConfig: voiceName === undefined ? undefined : googleVoiceConfig(voiceName),
           });
-          // Other open dashboards hold a thread snapshot too. Broadcast the
-          // lightweight invalidation after the durable update so they re-fetch
-          // the value that is now authoritative; this intentionally is not a
-          // mesh-event timeline record.
-          deps.emitter?.emitActorConfigUpdated({ actorId, voiceName: voiceName ?? null });
-          sendJson(res, 200, voiceConfigPayload(actors.get(actorId) as ActorRecord));
+          // The initiating dashboard applies this acknowledgement directly.
+          // Other tabs follow their normal refresh lifecycle; one setting does
+          // not warrant a dedicated SSE event and cache path.
+          sendJson(res, 200, { voiceName: voiceName ?? null });
         })
         .catch((err) => sendJson(res, 500, { error: String(err) }));
       return true;
@@ -1369,21 +1337,6 @@ export async function handleMeshApiRequest(
       return true;
     }
     sendJson(res, 200, { id: thread.id, charter: thread.charter });
-    return true;
-  }
-
-  // GET /api/mesh/actors/<id>/voice — the actor's persisted walkie-talkie
-  // voice plus the supported catalog and instance default. The voice routes
-  // are declared in the dashboard API (not the voice API) because editing the
-  // setting must work even on an instance without a configured geminiApiKey.
-  const voiceGetMatch = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/voice$/);
-  if (voiceGetMatch) {
-    const rec = actors.get(decodeURIComponent(voiceGetMatch[1]));
-    if (!rec) {
-      sendJson(res, 404, { error: "actor not found" });
-      return true;
-    }
-    sendJson(res, 200, voiceConfigPayload(rec));
     return true;
   }
 
