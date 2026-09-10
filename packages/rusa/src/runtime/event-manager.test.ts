@@ -88,17 +88,22 @@ describe("EventManager", () => {
     it("normalizes GitHub webhook payloads preserving exact issue/comment payload contracts", async () => {
       const inbox = new FakeInboxStore();
       const resolver: EventSourceResolver = {
-        resolveRecipients: () => ({ ownerId: "actor-gh", subscriberIds: [] }),
+        resolveRecipients: () => ({ directed: false, ownerIds: ["actor-gh"], subscriberIds: [] }),
       };
-      const em = new EventManager(inbox, resolver);
+      const em = new EventManager({ inboxStore: inbox, resolver });
 
+      // The ingress states its event name; the manager never guesses it from
+      // which keys a payload happens to carry.
       const rawWebhook: RawIntegrationEvent = {
         sourceType: "github",
         rawPayload: {
-          repository: { full_name: "MEK-Org/rusa" },
-          action: "created",
-          issue: { number: 383 },
-          comment: { id: 987654 },
+          event: "issue_comment",
+          payload: {
+            repository: { full_name: "MEK-Org/rusa" },
+            action: "created",
+            issue: { number: 383 },
+            comment: { id: 987654 },
+          },
         },
         idempotencyKey: "webhook-deliv-1",
       };
@@ -121,16 +126,19 @@ describe("EventManager", () => {
     it("normalizes GitHub PR events including merged flag for pull_request.closed", async () => {
       const inbox = new FakeInboxStore();
       const resolver: EventSourceResolver = {
-        resolveRecipients: () => ({ ownerId: "actor-pr", subscriberIds: [] }),
+        resolveRecipients: () => ({ directed: false, ownerIds: ["actor-pr"], subscriberIds: [] }),
       };
-      const em = new EventManager(inbox, resolver);
+      const em = new EventManager({ inboxStore: inbox, resolver });
 
       const rawPrClosed: RawIntegrationEvent = {
         sourceType: "github",
         rawPayload: {
-          repository: { full_name: "MEK-Org/rusa" },
-          action: "closed",
-          pull_request: { number: 380, merged: true },
+          event: "pull_request",
+          payload: {
+            repository: { full_name: "MEK-Org/rusa" },
+            action: "closed",
+            pull_request: { number: 380, merged: true },
+          },
         },
       };
 
@@ -144,9 +152,9 @@ describe("EventManager", () => {
     it("normalizes Chat events into canonical gchat.message with responsive priority", async () => {
       const inbox = new FakeInboxStore();
       const resolver: EventSourceResolver = {
-        resolveRecipients: () => ({ ownerId: "actor-chat", subscriberIds: [] }),
+        resolveRecipients: () => ({ directed: false, ownerIds: ["actor-chat"], subscriberIds: [] }),
       };
-      const em = new EventManager(inbox, resolver);
+      const em = new EventManager({ inboxStore: inbox, resolver });
 
       const rawChat: RawIntegrationEvent = {
         sourceType: "chat",
@@ -176,9 +184,13 @@ describe("EventManager", () => {
     it("normalizes timer events with responsive priority by default", async () => {
       const inbox = new FakeInboxStore();
       const resolver: EventSourceResolver = {
-        resolveRecipients: () => ({ ownerId: "actor-timer", subscriberIds: [] }),
+        resolveRecipients: () => ({
+          directed: false,
+          ownerIds: ["actor-timer"],
+          subscriberIds: [],
+        }),
       };
-      const em = new EventManager(inbox, resolver);
+      const em = new EventManager({ inboxStore: inbox, resolver });
 
       const rawTimer: RawIntegrationEvent = {
         sourceType: "timer",
@@ -198,42 +210,63 @@ describe("EventManager", () => {
     it("normalizes custom ingress shapes preserving payload contents", async () => {
       const inbox = new FakeInboxStore();
       const resolver: EventSourceResolver = {
-        resolveRecipients: () => ({ ownerId: "actor-custom", subscriberIds: [] }),
+        resolveRecipients: () => ({
+          directed: false,
+          ownerIds: ["actor-custom"],
+          subscriberIds: [],
+        }),
       };
-      const em = new EventManager(inbox, resolver);
+      const em = new EventManager({ inboxStore: inbox, resolver });
 
       const rawCustom: RawIntegrationEvent = {
         sourceType: "custom",
-        rawResource: "custom:service/events",
+        rawResource: "system:events/deploys/b-999",
         rawPayload: { type: "service.deploy", buildId: "b-999" },
       };
 
       const entries = await em.handleExternalEvent(rawCustom);
       expect(entries.length).toBe(1);
-      expect(entries[0].source).toBe("custom:service/events");
+      expect(entries[0].source).toBe("system:events/deploys/b-999");
       expect(entries[0].payload.type).toBe("service.deploy");
       expect(entries[0].payload.buildId).toBe("b-999");
     });
 
-    it("drops non-actionable check_suite events", async () => {
+    it("distinguishes PR review events that share a pull_request key", async () => {
       const inbox = new FakeInboxStore();
       const resolver: EventSourceResolver = {
-        resolveRecipients: () => ({ ownerId: "actor-ci", subscriberIds: [] }),
+        resolveRecipients: () => ({ directed: false, ownerIds: ["actor-ci"], subscriberIds: [] }),
       };
-      const em = new EventManager(inbox, resolver);
+      const em = new EventManager({ inboxStore: inbox, resolver });
 
-      const rawGreenCheckSuite: RawIntegrationEvent = {
+      // `pull_request_review` and `pull_request_review_comment` both carry a
+      // `pull_request`; only the carried event name tells them apart.
+      const review = em.normalizeEvent({
         sourceType: "github",
         rawPayload: {
-          repository: { full_name: "MEK-Org/rusa" },
-          action: "completed",
-          check_suite: { conclusion: "success" },
+          event: "pull_request_review",
+          payload: {
+            repository: { full_name: "MEK-Org/rusa" },
+            action: "submitted",
+            pull_request: { number: 392 },
+            review: { id: 1 },
+          },
         },
-      };
+      });
+      const reviewComment = em.normalizeEvent({
+        sourceType: "github",
+        rawPayload: {
+          event: "pull_request_review_comment",
+          payload: {
+            repository: { full_name: "MEK-Org/rusa" },
+            action: "created",
+            pull_request: { number: 392 },
+            comment: { id: 2 },
+          },
+        },
+      });
 
-      const entries = await em.handleExternalEvent(rawGreenCheckSuite);
-      expect(entries).toEqual([]);
-      expect(inbox.entries.length).toBe(0);
+      expect(review.payload.type).toBe("pull_request_review.submitted");
+      expect(reviewComment.payload.type).toBe("pull_request_review_comment.created");
     });
   });
 
@@ -242,15 +275,16 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventSourceResolver = {
         resolveRecipients: () => ({
-          ownerId: "owner-actor",
+          directed: false,
+          ownerIds: ["owner-actor"],
           subscriberIds: ["sub-1", "sub-2"],
         }),
       };
-      const em = new EventManager(inbox, resolver);
+      const em = new EventManager({ inboxStore: inbox, resolver });
 
       const entries = await em.handleExternalEvent({
         sourceType: "custom",
-        rawResource: "test:topic",
+        rawResource: "system:events",
         rawPayload: { type: "test.event" },
       });
 
@@ -263,15 +297,16 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventSourceResolver = {
         resolveRecipients: () => ({
-          ownerId: "actor-both",
+          directed: false,
+          ownerIds: ["actor-both"],
           subscriberIds: ["actor-both", "other-sub"],
         }),
       };
-      const em = new EventManager(inbox, resolver);
+      const em = new EventManager({ inboxStore: inbox, resolver });
 
       const entries = await em.handleExternalEvent({
         sourceType: "custom",
-        rawResource: "test:topic",
+        rawResource: "system:events",
         rawPayload: { type: "test.event" },
       });
 
@@ -284,13 +319,13 @@ describe("EventManager", () => {
     it("returns empty array and writes nothing when no recipients exist", async () => {
       const inbox = new FakeInboxStore();
       const resolver: EventSourceResolver = {
-        resolveRecipients: () => ({ ownerId: null, subscriberIds: [] }),
+        resolveRecipients: () => ({ directed: false, ownerIds: [], subscriberIds: [] }),
       };
-      const em = new EventManager(inbox, resolver);
+      const em = new EventManager({ inboxStore: inbox, resolver });
 
       const entries = await em.handleExternalEvent({
         sourceType: "custom",
-        rawResource: "uncovered:resource",
+        rawResource: "system:events/uncovered/1",
         rawPayload: { type: "test.event" },
       });
 
@@ -313,9 +348,13 @@ describe("EventManager", () => {
     it("prevents duplicate inbox entries on repeated deliveries with same idempotency key", async () => {
       const inbox = new FakeInboxStore();
       const resolver: EventSourceResolver = {
-        resolveRecipients: () => ({ ownerId: "actor-idemp", subscriberIds: [] }),
+        resolveRecipients: () => ({
+          directed: false,
+          ownerIds: ["actor-idemp"],
+          subscriberIds: [],
+        }),
       };
-      const em = new EventManager(inbox, resolver);
+      const em = new EventManager({ inboxStore: inbox, resolver });
 
       const event: RawIntegrationEvent = {
         sourceType: "github",
@@ -338,14 +377,18 @@ describe("EventManager", () => {
     it("only performs durable inbox append and never triggers execution", async () => {
       const inbox = new FakeInboxStore();
       const resolver: EventSourceResolver = {
-        resolveRecipients: () => ({ ownerId: "actor-quiet", subscriberIds: [] }),
+        resolveRecipients: () => ({
+          directed: false,
+          ownerIds: ["actor-quiet"],
+          subscriberIds: [],
+        }),
       };
-      const em = new EventManager(inbox, resolver);
+      const em = new EventManager({ inboxStore: inbox, resolver });
 
       // Verify no runtime, runner, or execution dispatcher is invoked
       const entries = await em.handleExternalEvent({
         sourceType: "custom",
-        rawResource: "custom:event",
+        rawResource: "system:events/jobs/1",
         rawPayload: { type: "job.created" },
       });
 
@@ -382,10 +425,11 @@ describe("EventManager", () => {
         isLive: () => true,
       });
 
-      const { ownerId, subscriberIds } = resolver.resolveRecipients(
+      const { directed, ownerIds, subscriberIds } = resolver.resolveRecipients(
         "github:MEK-Org/rusa/issues/383"
       );
-      expect(ownerId).toBe("actor-issue-owner");
+      expect(directed).toBe(false);
+      expect(ownerIds).toEqual(["actor-issue-owner"]);
       expect(subscriberIds).toEqual(["actor-issue-sub"]);
     });
 
@@ -411,13 +455,13 @@ describe("EventManager", () => {
       const bubbleResult = resolver.resolveRecipients("github:MEK-Org/rusa/issues/500", {
         eventPayload: { type: "issues.opened" },
       });
-      expect(bubbleResult.ownerId).toBe("repo-owner");
+      expect(bubbleResult.ownerIds).toEqual(["repo-owner"]);
 
       // pull_request.closed without merged is NOT allowlisted
       const noBubbleResult = resolver.resolveRecipients("github:MEK-Org/rusa/pulls/500", {
         eventPayload: { type: "pull_request.closed", merged: false },
       });
-      expect(noBubbleResult.ownerId).toBeNull();
+      expect(noBubbleResult.ownerIds).toEqual([]);
     });
 
     it("gives live obligation claims precedence over explicit subscriptions", () => {
@@ -447,8 +491,8 @@ describe("EventManager", () => {
         isLive: () => true,
       });
 
-      const { ownerId } = resolver.resolveRecipients("github:MEK-Org/rusa/issues/383");
-      expect(ownerId).toBe("obligation-actor");
+      const { ownerIds } = resolver.resolveRecipients("github:MEK-Org/rusa/issues/383");
+      expect(ownerIds).toEqual(["obligation-actor"]);
     });
 
     it("terminates bubbling climb when obligation is held by dead or human owner", () => {
@@ -473,22 +517,23 @@ describe("EventManager", () => {
         isLive: (id) => id !== "human:operator",
       });
 
-      const { ownerId } = resolver.resolveRecipients("github:MEK-Org/rusa/issues/383", {
+      const { ownerIds } = resolver.resolveRecipients("github:MEK-Org/rusa/issues/383", {
         eventPayload: { type: "issues.opened" },
       });
       // Obligation terminates the climb; does not fall back to repo-owner
-      expect(ownerId).toBeNull();
+      expect(ownerIds).toEqual([]);
     });
 
     it("suppresses delivery to author matching stampedAuthor", async () => {
       const inbox = new FakeInboxStore();
       const resolver: EventSourceResolver = {
         resolveRecipients: () => ({
-          ownerId: "actor-self",
+          directed: false,
+          ownerIds: ["actor-self"],
           subscriberIds: ["actor-other"],
         }),
       };
-      const em = new EventManager(inbox, resolver);
+      const em = new EventManager({ inboxStore: inbox, resolver });
 
       const entries = await em.handleExternalEvent({
         sourceType: "github",
@@ -507,11 +552,12 @@ describe("EventManager", () => {
       const inbox = new FakeInboxStore();
       const resolver: EventSourceResolver = {
         resolveRecipients: () => ({
-          ownerId: "actor-1",
+          directed: false,
+          ownerIds: ["actor-1"],
           subscriberIds: ["actor-2"],
         }),
       };
-      const em = new EventManager(inbox, resolver);
+      const em = new EventManager({ inboxStore: inbox, resolver });
 
       const entries = await em.handleExternalEvent({
         sourceType: "custom",
@@ -523,6 +569,217 @@ describe("EventManager", () => {
 
       expect(entries).toEqual([]);
       expect(inbox.entries.length).toBe(0);
+    });
+  });
+  describe("Directed delivery is the resolver's answer, not a re-derivation", () => {
+    const directedResolver = (opts: {
+      obligationOwner?: string;
+      handle?: string;
+      handleId?: string;
+    }) =>
+      new HierarchicalEventSourceResolver({
+        eventSourceOwners: new InMemoryEventSourceOwnerStore(),
+        eventSourceSubscriptions: new InMemoryEventSourceSubscriptionStore(),
+        obligations: opts.obligationOwner
+          ? { findLiveByExternalRef: () => ({ ownerId: opts.obligationOwner as string }) }
+          : undefined,
+        isLive: () => true,
+        resolveActor: (handleOrId) =>
+          handleOrId === opts.handle ? { id: opts.handleId as string } : undefined,
+      });
+
+    it("delivers a handle-form directive carrying a same-instance system stamp", async () => {
+      // `parseDirectedDeliveryDirective` yields a *handle*; the resolver maps it
+      // to an actor id. Reconstructing `directed` from `ownerIds.includes(target)`
+      // misses this — the landed directive loses its suppression exemption and
+      // the system-stamped event is dropped outright.
+      const inbox = new FakeInboxStore();
+      const em = new EventManager({
+        inboxStore: inbox,
+        resolver: directedResolver({ handle: "cloudy-porpoise", handleId: "uuid-cloudy" }),
+      });
+
+      const entries = await em.handleExternalEvent({
+        sourceType: "custom",
+        rawResource: "github:MEK-Org/rusa/issues/383",
+        rawPayload: { type: "issue_comment.created" },
+        directedTarget: "cloudy-porpoise",
+        stampedAuthor: { actorId: "system:mesh", instanceId: "inst-1" },
+        instanceId: "inst-1",
+      });
+
+      expect(entries.map((entry) => entry.actorId)).toEqual(["uuid-cloudy"]);
+    });
+
+    it("delivers a handle-form directive carrying a same-instance self stamp", async () => {
+      const inbox = new FakeInboxStore();
+      const em = new EventManager({
+        inboxStore: inbox,
+        resolver: directedResolver({ handle: "cloudy-porpoise", handleId: "uuid-cloudy" }),
+      });
+
+      const entries = await em.handleExternalEvent({
+        sourceType: "custom",
+        rawResource: "github:MEK-Org/rusa/issues/383",
+        rawPayload: { type: "issue_comment.created" },
+        directedTarget: "cloudy-porpoise",
+        stampedAuthor: { actorId: "uuid-cloudy", instanceId: "inst-1" },
+        instanceId: "inst-1",
+      });
+
+      expect(entries.map((entry) => entry.actorId)).toEqual(["uuid-cloudy"]);
+    });
+
+    it("does not exempt an obligation owner that merely equals an id-form target", async () => {
+      // The inverse error: a live obligation overrides the directive, so the
+      // resolver deliberately leaves `directed` false. String equality against
+      // `ownerIds` would call this directed and skip suppression staging applies.
+      const inbox = new FakeInboxStore();
+      const em = new EventManager({
+        inboxStore: inbox,
+        resolver: directedResolver({ obligationOwner: "actor-governing" }),
+      });
+
+      const entries = await em.handleExternalEvent({
+        sourceType: "custom",
+        rawResource: "github:MEK-Org/rusa/issues/383",
+        rawPayload: { type: "issue_comment.created" },
+        directedTarget: "actor-governing",
+        stampedAuthor: { actorId: "actor-governing", instanceId: "inst-1" },
+        instanceId: "inst-1",
+      });
+
+      expect(entries).toEqual([]);
+      expect(inbox.entries.length).toBe(0);
+    });
+
+    it("reports directed on the resolver result for a landed directive only", () => {
+      expect(
+        directedResolver({ handle: "cloudy-porpoise", handleId: "uuid-cloudy" }).resolveRecipients(
+          "github:MEK-Org/rusa/issues/383",
+          { directedTarget: "cloudy-porpoise" }
+        )
+      ).toEqual({ directed: true, ownerIds: ["uuid-cloudy"], subscriberIds: [] });
+
+      // Overridden by a live obligation: ownership resolves normally instead.
+      expect(
+        directedResolver({ obligationOwner: "actor-governing" }).resolveRecipients(
+          "github:MEK-Org/rusa/issues/383",
+          { directedTarget: "actor-governing" }
+        )
+      ).toEqual({ directed: false, ownerIds: ["actor-governing"], subscriberIds: [] });
+    });
+
+    it("does not fan a landed directive out to subscribers", () => {
+      const subs = new InMemoryEventSourceSubscriptionStore();
+      subs.subscribe({
+        resource: "github:MEK-Org/rusa/issues/383",
+        actorId: "actor-watcher",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-10T12:00:00Z",
+      });
+      const resolver = new HierarchicalEventSourceResolver({
+        eventSourceOwners: new InMemoryEventSourceOwnerStore(),
+        eventSourceSubscriptions: subs,
+        isLive: () => true,
+        resolveActor: (h) => (h === "cloudy-porpoise" ? { id: "uuid-cloudy" } : undefined),
+      });
+
+      const landed = resolver.resolveRecipients("github:MEK-Org/rusa/issues/383", {
+        directedTarget: "cloudy-porpoise",
+      });
+      expect(landed).toEqual({ directed: true, ownerIds: ["uuid-cloudy"], subscriberIds: [] });
+
+      // A directive that failed to land does not defeat a standing interest.
+      const missed = resolver.resolveRecipients("github:MEK-Org/rusa/issues/383", {
+        directedTarget: "nobody-here",
+      });
+      expect(missed).toEqual({
+        directed: false,
+        ownerIds: [],
+        subscriberIds: ["actor-watcher"],
+      });
+    });
+  });
+
+  describe("Delivery order and append-result agreement", () => {
+    it("appends owners before subscribers in resolver order", async () => {
+      const inbox = new FakeInboxStore();
+      const resolver: EventSourceResolver = {
+        resolveRecipients: () => ({
+          directed: false,
+          ownerIds: ["owner-1", "owner-2"],
+          subscriberIds: ["sub-1", "sub-2"],
+        }),
+      };
+      const em = new EventManager({ inboxStore: inbox, resolver });
+
+      const entries = await em.handleExternalEvent({
+        sourceType: "custom",
+        rawResource: "system:events",
+        rawPayload: { type: "test.event" },
+      });
+
+      // Order is asserted rather than inferred: owners first, then subscribers.
+      expect(entries.map((entry) => entry.actorId)).toEqual([
+        "owner-1",
+        "owner-2",
+        "sub-1",
+        "sub-2",
+      ]);
+      expect(inbox.appendCalls[0].map((input) => input.actorId)).toEqual([
+        "owner-1",
+        "owner-2",
+        "sub-1",
+        "sub-2",
+      ]);
+    });
+
+    it("keeps a suppressed author out of the append and preserves the rest in order", async () => {
+      const inbox = new FakeInboxStore();
+      const resolver: EventSourceResolver = {
+        resolveRecipients: () => ({
+          directed: false,
+          ownerIds: ["owner-1"],
+          subscriberIds: ["actor-self", "sub-2"],
+        }),
+      };
+      const em = new EventManager({ inboxStore: inbox, resolver });
+
+      const entries = await em.handleExternalEvent({
+        sourceType: "custom",
+        rawResource: "system:events",
+        rawPayload: { type: "test.event" },
+        stampedAuthor: { actorId: "actor-self", instanceId: "inst-1" },
+        instanceId: "inst-1",
+      });
+
+      expect(entries.map((entry) => entry.actorId)).toEqual(["owner-1", "sub-2"]);
+    });
+
+    it("throws when the store returns an actor the manager did not compute", async () => {
+      class StrayingInboxStore extends FakeInboxStore {
+        override append(inputs: InboxAppendInput[]): InboxEntry[] {
+          return super.append([...inputs, { ...inputs[0], id: undefined, actorId: "intruder" }]);
+        }
+      }
+      const inbox = new StrayingInboxStore();
+      const resolver: EventSourceResolver = {
+        resolveRecipients: () => ({
+          directed: false,
+          ownerIds: ["owner-1"],
+          subscriberIds: [],
+        }),
+      };
+      const em = new EventManager({ inboxStore: inbox, resolver });
+
+      await expect(
+        em.handleExternalEvent({
+          sourceType: "custom",
+          rawResource: "system:events",
+          rawPayload: { type: "test.event" },
+        })
+      ).rejects.toThrow("Inbox append returned an unexpected actor: intruder");
     });
   });
 });

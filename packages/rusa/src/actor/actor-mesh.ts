@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
-import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../mcp/stamp.js";
+import { HUMAN_OPERATOR, isHumanOperator, MESH_SYSTEM } from "../mcp/stamp.js";
 import { prerequisiteEdgeKey } from "../obligations/obligation.js";
 import {
   assertConcreteModelConfig,
@@ -13,6 +13,7 @@ import type { RunResult } from "../providers/types.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import {
+  applyAuthorSuppression,
   deduplicatedInboxEntryId,
   EventManager,
   type EventSourceResolver,
@@ -1810,10 +1811,10 @@ export class ActorMesh {
    * (for bubble-eligible event classes) the same two questions of the parent
    * resource.
    *
-   * Ownership only. Direct subscribers are resolved by
-   * {@link liveDirectSubscribers} and merged by {@link deliverEvent}, never
-   * here — this function is also what {@link effectiveOwnerOf} answers with, so
-   * a subscriber appearing in its result would let anyone who subscribed to a
+   * Ownership only. Direct subscribers are resolved and merged by
+   * {@link HierarchicalEventSourceResolver.resolveRecipients}, never here —
+   * this function is also what {@link effectiveOwnerOf} answers with, so a
+   * subscriber appearing in its result would let anyone who subscribed to a
    * source delegate or reclaim it.
    */
   /**
@@ -1933,10 +1934,10 @@ export class ActorMesh {
    * (for bubble-eligible event classes) the same two questions of the parent
    * resource.
    *
-   * Ownership only. Direct subscribers are resolved by
-   * {@link liveDirectSubscribers} and merged by {@link deliverEvent}, never
-   * here — this function is also what {@link effectiveOwnerOf} answers with, so
-   * a subscriber appearing in its result would let anyone who subscribed to a
+   * Ownership only. Direct subscribers are resolved and merged by
+   * {@link HierarchicalEventSourceResolver.resolveRecipients}, never here —
+   * this function is also what {@link effectiveOwnerOf} answers with, so a
+   * subscriber appearing in its result would let anyone who subscribed to a
    * source delegate or reclaim it.
    */
   private resolveLiveOwnerDestinations(
@@ -2208,8 +2209,7 @@ export class ActorMesh {
       eventSummary,
     });
     const destinations: string[] = [];
-    const ownerIds = recipients.ownerIds ?? (recipients.ownerId ? [recipients.ownerId] : []);
-    for (const id of ownerIds) {
+    for (const id of recipients.ownerIds) {
       if (!destinations.includes(id)) destinations.push(id);
     }
     for (const sub of recipients.subscriberIds) {
@@ -2217,46 +2217,21 @@ export class ActorMesh {
     }
 
     if (destinations.length === 0) {
+      // See the drop rationale in EventManager.handleExternalEvent: an
+      // uncovered event is out-of-scope for this instance by definition,
+      // because root retains a covering source for anything it delegates from.
       this.log(`event not covered by any subscription — dropped (${eventSummary})`);
       return;
     }
 
-    const directed = Boolean(opts.directedTarget && ownerIds.includes(opts.directedTarget));
-    const systemSuppressed =
-      !directed &&
-      opts.stampedAuthor != null &&
-      opts.instanceId !== undefined &&
-      isSystemActor(opts.stampedAuthor.actorId) &&
-      opts.stampedAuthor.instanceId === opts.instanceId;
-    if (systemSuppressed && opts.stampedAuthor) {
-      this.log(
-        `system-event suppressed by author stamp: actor=${opts.stampedAuthor.actorId} instance=${opts.stampedAuthor.instanceId} (${eventSummary})`
-      );
-    }
-
-    const deliverable: string[] = [];
-    for (const dest of destinations) {
-      let suppressed = false;
-      if (directed) {
-        // A valid bot-authored mesh:deliver directive intentionally targets the
-        // actor even though the underlying bot event would otherwise self-suppress.
-      } else if (systemSuppressed) {
-        suppressed = true;
-      } else if (
-        opts.stampedAuthor != null &&
-        opts.instanceId !== undefined &&
-        opts.stampedAuthor.actorId === dest &&
-        opts.stampedAuthor.instanceId === opts.instanceId
-      ) {
-        this.log(
-          `self-event suppressed by author stamp: actor=${opts.stampedAuthor.actorId} instance=${opts.stampedAuthor.instanceId} (${eventSummary})`
-        );
-        suppressed = true;
-      }
-
-      if (!suppressed) deliverable.push(dest);
-    }
-
+    const deliverable = applyAuthorSuppression({
+      directed: recipients.directed,
+      destinations,
+      stampedAuthor: opts.stampedAuthor,
+      instanceId: opts.instanceId,
+      eventSummary,
+      log: this.log,
+    });
     if (deliverable.length === 0) return;
 
     for (const dest of deliverable) {

@@ -13,10 +13,7 @@ import type {
   InboxPayload,
   InboxStore,
 } from "../actor/inbox-store.js";
-import {
-  checkSuiteWakesAnyone,
-  deriveGitHubInboxNotification,
-} from "../github/inbox-notification.js";
+import { deriveGitHubInboxNotification } from "../github/inbox-notification.js";
 import { isSystemActor } from "../mcp/stamp.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
 
@@ -105,7 +102,6 @@ export interface NormalizedIntegrationEvent {
   payload: InboxPayload;
   dedupeKey?: string;
   deliveredAt?: Date;
-  priority?: "responsive" | "normal";
   directedTarget?: string | null;
   stampedAuthor?: StampedAuthorInfo | null;
   instanceId?: string;
@@ -113,9 +109,83 @@ export interface NormalizedIntegrationEvent {
 }
 
 export interface EventSourceRecipients {
-  ownerId: string | null;
-  ownerIds?: readonly string[];
+  /**
+   * True only when a directive named a live actor and that actor became the
+   * sole owner — the resolver's own answer, never re-derived by a consumer.
+   *
+   * A consumer cannot reconstruct this from {@link ownerIds}: a directive names
+   * a *handle*, while `ownerIds` carries resolved actor *ids*, so string
+   * equality against the raw target misses every landed handle directive and
+   * falsely matches a governing obligation whose owner happens to equal an
+   * id-form target. Two rules read this flag — subscribers do not compose with
+   * a landed directive, and only a landed directive earns the author
+   * suppression exemption — so a wrong answer changes delivery both ways.
+   */
+  directed: boolean;
+  /**
+   * Live owners in ladder order, empty when ownership resolved to nobody.
+   * Subscribers compose on top of this rather than displacing it.
+   */
+  ownerIds: readonly string[];
   subscriberIds: readonly string[];
+}
+
+export interface AuthorSuppressionInput {
+  /** The resolver's own answer, not a re-derivation. See {@link EventSourceRecipients.directed}. */
+  directed: boolean;
+  /** Candidate destinations in delivery order. */
+  destinations: readonly string[];
+  stampedAuthor?: StampedAuthorInfo | null;
+  instanceId?: string;
+  eventSummary: string;
+  log?: (message: string) => void;
+}
+
+/**
+ * Filters destinations an author stamp says should not be woken, preserving
+ * input order.
+ *
+ * A verified `system:*` stamp marks a persistence-only write performed by mesh
+ * infrastructure rather than a peer actor — it withholds delivery to EVERY
+ * destination, not just an author-match. Only a verified stamp may trigger
+ * this (`stampedAuthor` only exists when `resolveStampedAuthor`'s HMAC +
+ * freshness checks passed in `start.ts`); an unverified or stale
+ * system-looking stamp resolves to null upstream and falls through to the
+ * ordinary per-destination checks, so it still fails open and delivers.
+ *
+ * A landed directive is exempt from both arms: a valid bot-authored
+ * `mesh:deliver` directive intentionally targets the actor even though the
+ * underlying bot event would otherwise self-suppress.
+ *
+ * Single-sourced deliberately — the durable path in
+ * {@link EventManager.handleExternalEvent} and the payload-less path in
+ * `ActorMesh.deliverEvent` are the same rule, and a second copy is how the
+ * two silently drift into disagreeing about who gets woken.
+ */
+export function applyAuthorSuppression(input: AuthorSuppressionInput): string[] {
+  const { directed, destinations, stampedAuthor, instanceId, eventSummary, log } = input;
+  if (directed || stampedAuthor == null || instanceId === undefined) {
+    return [...destinations];
+  }
+
+  if (isSystemActor(stampedAuthor.actorId) && stampedAuthor.instanceId === instanceId) {
+    log?.(
+      `system-event suppressed by author stamp: actor=${stampedAuthor.actorId} instance=${stampedAuthor.instanceId} (${eventSummary})`
+    );
+    return [];
+  }
+
+  const deliverable: string[] = [];
+  for (const dest of destinations) {
+    if (stampedAuthor.actorId === dest && stampedAuthor.instanceId === instanceId) {
+      log?.(
+        `self-event suppressed by author stamp: actor=${stampedAuthor.actorId} instance=${stampedAuthor.instanceId} (${eventSummary})`
+      );
+      continue;
+    }
+    deliverable.push(dest);
+  }
+  return deliverable;
 }
 
 export interface ResolveRecipientsOptions {
@@ -190,6 +260,25 @@ export class HierarchicalEventSourceResolver implements EventSourceResolver {
       });
     }
 
+    // Direct subscribers are added to whatever ownership resolved to — the two
+    // relationships compose rather than compete. A subscriber is added even when
+    // ownership resolved to nobody (an obligation held by a human, an absent
+    // owner, a source no live actor owns), and never displaces the owner when it
+    // did. The exact resource only: a subscription does not bubble.
+    //
+    // A *successfully targeted* delivery is the one case where this does not
+    // apply. A verified bot directive names the single actor an event is for;
+    // fanning it out to subscribers would make `mesh:deliver` mean something
+    // other than what it says.
+    //
+    // Read `directed` precisely: it is set only on that happy path. A directive
+    // overridden by a live obligation, or one naming a target that is no longer
+    // live, resolves ownership normally and still reaches subscribers. That is
+    // deliberate rather than incidental — a standing interest in a source's
+    // direct events is not defeated by a directive aimed at someone else, or by
+    // one that failed to land. Those paths also leave `directed` false for the
+    // author-suppression exemption in {@link applyAuthorSuppression}, which only
+    // a landed directive earns.
     const subscriberIds: string[] = [];
     if (!directed) {
       const subs = this.options.eventSourceSubscriptions.subscribersOf(key);
@@ -200,11 +289,7 @@ export class HierarchicalEventSourceResolver implements EventSourceResolver {
       }
     }
 
-    return {
-      ownerId: ownerIds[0] ?? null,
-      ownerIds,
-      subscriberIds,
-    };
+    return { directed, ownerIds, subscriberIds };
   }
 
   private obligationOwnerFor(resource: string): string | undefined {
@@ -266,11 +351,6 @@ export class HierarchicalEventSourceResolver implements EventSourceResolver {
 export interface EventManagerOptions {
   inboxStore: InboxStore;
   resolver: EventSourceResolver;
-  normalizer?: (event: RawIntegrationEvent) => NormalizedIntegrationEvent;
-  onDelivered?: (
-    entries: readonly InboxEntry[],
-    event: NormalizedIntegrationEvent
-  ) => void | Promise<void>;
   log?: (message: string) => void;
 }
 
@@ -291,37 +371,12 @@ export interface EventManagerOptions {
 export class EventManager {
   private readonly inboxStore: InboxStore;
   private readonly resolver: EventSourceResolver;
-  private readonly normalizer?: (event: RawIntegrationEvent) => NormalizedIntegrationEvent;
-  private readonly onDelivered?: (
-    entries: readonly InboxEntry[],
-    event: NormalizedIntegrationEvent
-  ) => void | Promise<void>;
   private readonly log?: (message: string) => void;
 
-  constructor(
-    inboxStoreOrOptions: InboxStore | EventManagerOptions,
-    resolver?: EventSourceResolver,
-    normalizer?: (event: RawIntegrationEvent) => NormalizedIntegrationEvent
-  ) {
-    if (
-      inboxStoreOrOptions &&
-      "append" in inboxStoreOrOptions &&
-      typeof inboxStoreOrOptions.append === "function"
-    ) {
-      this.inboxStore = inboxStoreOrOptions as InboxStore;
-      if (!resolver) {
-        throw new Error("EventSourceResolver is required when passing InboxStore directly");
-      }
-      this.resolver = resolver;
-      this.normalizer = normalizer;
-    } else {
-      const opts = inboxStoreOrOptions as EventManagerOptions;
-      this.inboxStore = opts.inboxStore;
-      this.resolver = opts.resolver;
-      this.normalizer = opts.normalizer;
-      this.onDelivered = opts.onDelivered;
-      this.log = opts.log;
-    }
+  constructor(options: EventManagerOptions) {
+    this.inboxStore = options.inboxStore;
+    this.resolver = options.resolver;
+    this.log = options.log;
   }
 
   /**
@@ -329,10 +384,6 @@ export class EventManager {
    * while preserving public payload contracts for existing consumers.
    */
   normalizeEvent(raw: RawIntegrationEvent): NormalizedIntegrationEvent {
-    if (this.normalizer) {
-      return this.normalizer(raw);
-    }
-
     switch (raw.sourceType) {
       case "github":
         return this.normalizeGitHubEvent(raw);
@@ -351,7 +402,13 @@ export class EventManager {
     if (p != null && typeof p === "object") {
       const rec = p as Record<string, unknown>;
 
-      // 1. Nested { event: string, payload: Record<string, unknown> } shape
+      // 1. Explicit { event: string, payload: Record<string, unknown> } envelope.
+      //
+      // The event name is carried, never guessed. Inferring it from which keys
+      // a payload happens to have cannot distinguish GitHub's own overlapping
+      // shapes — `pull_request_review` and `pull_request_review_comment` both
+      // carry `pull_request`, and would both be mislabelled `pull_request` —
+      // so an ingress that knows its event name states it here.
       if (typeof rec.event === "string" && rec.payload != null && typeof rec.payload === "object") {
         const ghEvent = rec.event;
         const ghPayload = rec.payload as Record<string, unknown>;
@@ -364,7 +421,6 @@ export class EventManager {
             payload,
             dedupeKey: raw.idempotencyKey,
             deliveredAt,
-            priority: raw.priority,
             directedTarget: raw.directedTarget,
             stampedAuthor: raw.stampedAuthor,
             instanceId: raw.instanceId,
@@ -373,37 +429,7 @@ export class EventManager {
         }
       }
 
-      // 2. Direct webhook payload containing repository object
-      if (rec.repository != null && typeof rec.repository === "object") {
-        let ghEvent = "unknown";
-        if (rec.issue != null && rec.comment != null) ghEvent = "issue_comment";
-        else if (rec.issue != null) ghEvent = "issues";
-        else if (rec.pull_request != null) ghEvent = "pull_request";
-        else if (rec.check_suite != null) ghEvent = "check_suite";
-        else if (rec.check_run != null) ghEvent = "check_run";
-        else if (rec.commits != null || rec.head_commit != null) ghEvent = "push";
-
-        if (ghEvent !== "unknown") {
-          const notif = deriveGitHubInboxNotification(ghEvent, rec);
-          if (notif) {
-            const payload: InboxPayload = { ...notif.payload };
-            if (raw.priority === "responsive") payload.priority = "responsive";
-            return {
-              resource: raw.rawResource ? safeResourceKey(raw.rawResource) : notif.resource,
-              payload,
-              dedupeKey: raw.idempotencyKey,
-              deliveredAt,
-              priority: raw.priority,
-              directedTarget: raw.directedTarget,
-              stampedAuthor: raw.stampedAuthor,
-              instanceId: raw.instanceId,
-              eventSummary: raw.eventSummary,
-            };
-          }
-        }
-      }
-
-      // 3. Pre-derived or explicit InboxPayload with string type
+      // 2. Pre-derived or explicit InboxPayload with string type
       if (typeof rec.type === "string") {
         const payload: InboxPayload = { ...rec, type: rec.type };
         if (raw.priority === "responsive") payload.priority = "responsive";
@@ -412,7 +438,6 @@ export class EventManager {
           payload,
           dedupeKey: raw.idempotencyKey,
           deliveredAt,
-          priority: raw.priority ?? (payload.priority === "responsive" ? "responsive" : undefined),
           directedTarget: raw.directedTarget,
           stampedAuthor: raw.stampedAuthor,
           instanceId: raw.instanceId,
@@ -421,7 +446,7 @@ export class EventManager {
       }
     }
 
-    // 4. Default integration envelope for generic payloads
+    // 3. Default integration envelope for generic payloads
     const resource = safeResourceKey(raw.rawResource ?? "github");
     const payload: InboxPayload = {
       type: "github.event",
@@ -435,7 +460,6 @@ export class EventManager {
       payload,
       dedupeKey: raw.idempotencyKey,
       deliveredAt,
-      priority: raw.priority,
       directedTarget: raw.directedTarget,
       stampedAuthor: raw.stampedAuthor,
       instanceId: raw.instanceId,
@@ -481,7 +505,6 @@ export class EventManager {
           payload,
           dedupeKey: raw.idempotencyKey ?? messageName,
           deliveredAt: raw.receivedAt ?? createTime,
-          priority: "responsive",
           directedTarget: raw.directedTarget,
           stampedAuthor: raw.stampedAuthor,
           instanceId: raw.instanceId,
@@ -496,7 +519,6 @@ export class EventManager {
           payload,
           dedupeKey: raw.idempotencyKey,
           deliveredAt: raw.receivedAt,
-          priority: "responsive",
           directedTarget: raw.directedTarget,
           stampedAuthor: raw.stampedAuthor,
           instanceId: raw.instanceId,
@@ -518,7 +540,6 @@ export class EventManager {
       payload,
       dedupeKey: raw.idempotencyKey,
       deliveredAt: raw.receivedAt,
-      priority: "responsive",
       directedTarget: raw.directedTarget,
       stampedAuthor: raw.stampedAuthor,
       instanceId: raw.instanceId,
@@ -564,7 +585,6 @@ export class EventManager {
       payload,
       dedupeKey: raw.idempotencyKey,
       deliveredAt: raw.receivedAt,
-      priority,
       directedTarget: raw.directedTarget,
       stampedAuthor: raw.stampedAuthor,
       instanceId: raw.instanceId,
@@ -605,7 +625,6 @@ export class EventManager {
       payload,
       dedupeKey: raw.idempotencyKey,
       deliveredAt: raw.receivedAt,
-      priority: raw.priority ?? (payload.priority === "responsive" ? "responsive" : undefined),
       directedTarget: raw.directedTarget,
       stampedAuthor: raw.stampedAuthor,
       instanceId: raw.instanceId,
@@ -619,24 +638,6 @@ export class EventManager {
    * durable changes.
    */
   async handleExternalEvent(raw: RawIntegrationEvent): Promise<readonly InboxEntry[]> {
-    // Drop non-actionable check_suite before delivery
-    if (
-      raw.sourceType === "github" &&
-      raw.rawPayload != null &&
-      typeof raw.rawPayload === "object"
-    ) {
-      const p = raw.rawPayload as Record<string, unknown>;
-      const innerPayload =
-        p.payload != null && typeof p.payload === "object"
-          ? (p.payload as Record<string, unknown>)
-          : p;
-      const isCheckSuite = innerPayload.check_suite != null;
-      const action = innerPayload.action;
-      if (isCheckSuite && action === "completed" && !checkSuiteWakesAnyone(innerPayload)) {
-        return [];
-      }
-    }
-
     const normalized = this.normalizeEvent(raw);
     const summary = normalized.eventSummary ?? normalized.resource;
     const recipients = await this.resolver.resolveRecipients(normalized.resource, {
@@ -645,65 +646,61 @@ export class EventManager {
       eventSummary: normalized.eventSummary,
     });
 
-    const ownerIds = recipients.ownerIds ?? (recipients.ownerId ? [recipients.ownerId] : []);
-    const targetActorIds = new Set<string>();
-    for (const id of ownerIds) {
-      targetActorIds.add(id);
+    // Owners first, then subscribers — an explicit ordered array rather than a
+    // Set, so delivery order is a property of this code instead of an unwritten
+    // dependency on Set iteration semantics.
+    const destinations: string[] = [];
+    for (const id of recipients.ownerIds) {
+      if (!destinations.includes(id)) destinations.push(id);
     }
     for (const sub of recipients.subscriberIds) {
-      targetActorIds.add(sub);
+      if (!destinations.includes(sub)) destinations.push(sub);
     }
 
-    if (targetActorIds.size === 0) {
+    if (destinations.length === 0) {
+      // Invariant this drop relies on (#369 review): root retains a covering
+      // source for anything it delegates from (config-declared sources persist;
+      // delegation only adds child sub-slices). So a live event that's in-scope
+      // always matches an ancestor source before reaching here — an uncovered
+      // event is genuinely out-of-scope for this instance, and dropping it
+      // (journal-visible) is correct rather than a silent loss. If a future
+      // change ever lets root delegate away its only covering source for a
+      // slice, events under it would hit this drop when the delegate dies —
+      // still visible here, but the invariant is what keeps that from happening.
       this.log?.(`event not covered by any subscription — dropped (${summary})`);
       return [];
     }
 
-    // Author suppression: system events suppressed for all destinations; self events suppressed for author
-    const directed = Boolean(
-      normalized.directedTarget && ownerIds.includes(normalized.directedTarget)
-    );
-    if (!directed && normalized.stampedAuthor != null && normalized.instanceId !== undefined) {
-      if (
-        isSystemActor(normalized.stampedAuthor.actorId) &&
-        normalized.stampedAuthor.instanceId === normalized.instanceId
-      ) {
-        this.log?.(
-          `system-event suppressed by author stamp: actor=${normalized.stampedAuthor.actorId} instance=${normalized.instanceId} (${summary})`
-        );
-        return [];
-      }
-      if (
-        targetActorIds.has(normalized.stampedAuthor.actorId) &&
-        normalized.stampedAuthor.instanceId === normalized.instanceId
-      ) {
-        this.log?.(
-          `self-event suppressed by author stamp: actor=${normalized.stampedAuthor.actorId} instance=${normalized.instanceId} (${summary})`
-        );
-        targetActorIds.delete(normalized.stampedAuthor.actorId);
-      }
-      if (targetActorIds.size === 0) {
-        return [];
-      }
-    }
+    const deliverable = applyAuthorSuppression({
+      directed: recipients.directed,
+      destinations,
+      stampedAuthor: normalized.stampedAuthor,
+      instanceId: normalized.instanceId,
+      eventSummary: summary,
+      log: this.log,
+    });
+    if (deliverable.length === 0) return [];
 
-    const newItems: InboxAppendInput[] = [];
-    for (const actorId of targetActorIds) {
-      const id = normalized.dedupeKey
+    const newItems: InboxAppendInput[] = deliverable.map((actorId) => ({
+      id: normalized.dedupeKey
         ? deduplicatedInboxEntryId(normalized.dedupeKey, actorId)
-        : undefined;
-      newItems.push({
-        id,
-        actorId,
-        source: normalized.resource,
-        deliveredAt: normalized.deliveredAt,
-        payload: normalized.payload,
-      });
-    }
+        : undefined,
+      actorId,
+      source: normalized.resource,
+      deliveredAt: normalized.deliveredAt,
+      payload: normalized.payload,
+    }));
 
     const entries = this.inboxStore.append(newItems);
-    if (this.onDelivered) {
-      await this.onDelivered(entries, normalized);
+    // The append result is what wakes actors downstream, so it is checked
+    // against the recipients this component actually computed. Routing now
+    // happens behind a component boundary; without this, a suppression or
+    // resolution bug here would silently wake whoever the store returned
+    // instead of failing loudly at the seam that produced the mistake.
+    for (const entry of entries) {
+      if (!deliverable.includes(entry.actorId)) {
+        throw new Error(`Inbox append returned an unexpected actor: ${entry.actorId}`);
+      }
     }
     return entries;
   }
