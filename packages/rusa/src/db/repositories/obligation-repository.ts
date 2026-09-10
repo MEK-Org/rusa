@@ -72,7 +72,7 @@ export interface CreateObligationInput {
   title: string;
   intent?: string | null;
   externalRef?: string | null;
-  /** Explicit finite priority. Children inherit when omitted/null; roots default to the clock. */
+  /** Explicit finite priority. Defaults to creation time when omitted/null. */
   priority?: number | null;
   /**
    * The entity raising this obligation, bound by the calling server — never
@@ -849,9 +849,7 @@ export class ObligationRepository {
 
       const priority =
         input.priority == null
-          ? parentId === null
-            ? validatePriority(this.now())
-            : null
+          ? validatePriority(Date.parse(stampedAt))
           : validatePriority(input.priority);
 
       // Resolve and validate every declared prerequisite before writing

@@ -989,6 +989,11 @@ describe("ObligationRepository", () => {
       ownerId: "actor-a",
     });
 
+    // Produce nullable descendants through supported subtree priority clears:
+    // clearing root clears descendant overrides, and reprioritizing override clears leaf.
+    repository.setPriorityInternal("root", 10);
+    repository.setPriorityInternal("override", 20);
+
     expect(repository.require("child")).toMatchObject({
       priority: null,
       effectivePriority: 10,
@@ -999,6 +1004,47 @@ describe("ObligationRepository", () => {
       effectivePriority: 20,
       prioritySourceId: "override",
     });
+  });
+
+  it("defaults omitted and null priority to each obligation's persisted creation timestamp (#212)", () => {
+    repository.create({
+      title: "root",
+      id: "root-p",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "child1",
+      id: "child-1",
+      parentId: "root-p",
+      ownerId: "actor-a",
+      priority: null,
+    });
+    repository.create({
+      title: "child2",
+      id: "child-2",
+      parentId: "root-p",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "grandchild",
+      id: "grandchild-1",
+      parentId: "child-1",
+      ownerId: "actor-a",
+      priority: null,
+    });
+
+    const root = repository.require("root-p");
+    const child1 = repository.require("child-1");
+    const child2 = repository.require("child-2");
+    const grandchild = repository.require("grandchild-1");
+
+    for (const obligation of [root, child1, child2, grandchild]) {
+      expect(obligation.priority).toBe(Date.parse(obligation.createdAt as string));
+      expect(obligation.effectivePriority).toBe(obligation.priority);
+      expect(obligation.prioritySourceId).toBe(obligation.id);
+    }
+
+    // Equal-millisecond timestamps retain the established stable-ID queue tie-break.
   });
 
   it("moves a subtree by clearing every descendant override", () => {
@@ -1060,6 +1106,8 @@ describe("ObligationRepository", () => {
       ownerId: "actor-b",
       priority: 20,
     });
+
+    db.prepare("UPDATE obligations SET priority = NULL WHERE id IN ('inheriting', 'leaf')").run();
 
     repository.setPriorityInternal("root", 5, "self");
     expect(repository.require("root").effectivePriority).toBe(5);
@@ -1815,13 +1863,14 @@ describe("ObligationRepository", () => {
         id: "parent-1",
         ownerId: "actor-a",
       });
-      const child = repository.create({
+      repository.create({
         title: "child-1",
         id: "child-1",
         parentId: "parent-1",
         ownerId: "actor-a",
       });
-      expect(child.priority).toBeNull();
+      repository.setPriorityInternal("parent-1", 10);
+      expect(repository.require("child-1").priority).toBeNull();
 
       const reparented = repository.reparent("child-1", null);
       expect(reparented.parentId).toBeNull();
