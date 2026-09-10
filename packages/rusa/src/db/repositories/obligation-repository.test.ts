@@ -962,7 +962,7 @@ describe("ObligationRepository", () => {
     );
   });
 
-  it("resolves persisted legacy nullable priority through the nearest explicit ancestor", () => {
+  it("resolves nullable child priority through the nearest explicit ancestor", () => {
     repository.create({
       title: "root",
       id: "root",
@@ -989,10 +989,10 @@ describe("ObligationRepository", () => {
       ownerId: "actor-a",
     });
 
-    // Fixture persisted before #212: creation now always stamps a priority.
-    // The adjacent subtree-priority test covers the supported mutation that
-    // clears descendant priorities after this change.
-    db.prepare("UPDATE obligations SET priority = NULL WHERE id IN ('child', 'leaf')").run();
+    // Produce nullable descendants through supported subtree priority clears:
+    // clearing root clears descendant overrides, and reprioritizing override clears leaf.
+    repository.setPriorityInternal("root", 10);
+    repository.setPriorityInternal("override", 20);
 
     expect(repository.require("child")).toMatchObject({
       priority: null,
