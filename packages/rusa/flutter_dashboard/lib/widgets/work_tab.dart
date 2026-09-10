@@ -11,6 +11,7 @@ import 'avatar.dart';
 import 'header.dart';
 import 'obligation_card.dart';
 import 'obligation_dialogs.dart';
+import 'obligation_status.dart';
 import 'reference_preview.dart';
 
 class WorkTab extends StatefulWidget {
@@ -405,7 +406,10 @@ class _WorkTabState extends State<WorkTab> {
                                   : null,
                             ),
                             const SizedBox(width: 4),
-                            _statusDot(node.obligation.status),
+                            ObligationStatusDot(
+                              obligation: node.obligation,
+                              store: widget.store,
+                            ),
                             const SizedBox(width: 8),
                             Expanded(
                               child: Column(
@@ -458,32 +462,6 @@ class _WorkTabState extends State<WorkTab> {
       ],
     ),
   );
-
-  Widget _statusDot(String status) {
-    Color color = MeshColors.statusIdle;
-    switch (status.toLowerCase()) {
-      case 'ready':
-        color = MeshColors.statusActive;
-        break;
-      case 'waiting':
-        color = MeshColors.statusIdle;
-        break;
-      case 'done':
-        color = MeshColors.statusRetired;
-        break;
-      case 'cancelled':
-        color = MeshColors.statusHalted;
-        break;
-      case 'scheduled':
-        color = MeshColors.accent;
-        break;
-    }
-    return Container(
-      width: 8,
-      height: 8,
-      decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-    );
-  }
 }
 
 class _FlatNode {
@@ -647,7 +625,11 @@ class _DetailViewState extends State<_DetailView> {
           children: [
             Row(
               children: [
-                _Chip(o.status),
+                ObligationStatusChip(
+                  obligation: o,
+                  store: store,
+                  bordered: true,
+                ),
                 const SizedBox(width: 10),
                 Expanded(
                   child: SelectableText(
@@ -1263,8 +1245,8 @@ class _DetailViewState extends State<_DetailView> {
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
               decoration: BoxDecoration(
                 color: o.isDone
-                    ? const Color(0xFF064E3B)
-                    : const Color(0xFF450A0A),
+                    ? ObligationStatusColors.done.chipBackground
+                    : ObligationStatusColors.cancelled.chipBackground,
                 borderRadius: BorderRadius.circular(6),
               ),
               child: Row(
@@ -1274,16 +1256,16 @@ class _DetailViewState extends State<_DetailView> {
                     o.isDone ? Icons.check_circle : Icons.cancel,
                     size: 16,
                     color: o.isDone
-                        ? const Color(0xFF34D399)
-                        : const Color(0xFFF87171),
+                        ? ObligationStatusColors.done.chipForeground
+                        : ObligationStatusColors.cancelled.chipForeground,
                   ),
                   const SizedBox(width: 8),
                   Text(
                     'This obligation is in terminal status (${o.status.toUpperCase()}).',
                     style: TextStyle(
                       color: o.isDone
-                          ? const Color(0xFF34D399)
-                          : const Color(0xFFF87171),
+                          ? ObligationStatusColors.done.chipForeground
+                          : ObligationStatusColors.cancelled.chipForeground,
                       fontSize: 12,
                       fontWeight: FontWeight.w600,
                     ),
@@ -1306,9 +1288,11 @@ class _DetailViewState extends State<_DetailView> {
                   ),
                   icon: const Icon(Icons.check_circle_outline, size: 16),
                   label: const Text('Mark Done'),
+                  // Blue, not green: green now means an actor is working the
+                  // obligation, so the button that ends it must not wear it.
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF064E3B),
-                    foregroundColor: const Color(0xFF34D399),
+                    backgroundColor: ObligationStatusColors.done.chipBackground,
+                    foregroundColor: ObligationStatusColors.done.chipForeground,
                   ),
                 ),
                 ElevatedButton.icon(
@@ -1393,59 +1377,6 @@ class _SectionHeader extends StatelessWidget {
           fontSize: 11,
           fontWeight: FontWeight.bold,
           letterSpacing: 0.8,
-        ),
-      ),
-    );
-  }
-}
-
-class _Chip extends StatelessWidget {
-  const _Chip(this.label);
-  final String label;
-
-  @override
-  Widget build(BuildContext context) {
-    Color bg = const Color(0xFF1E293B);
-    Color fg = const Color(0xFF94A3B8);
-    Color border = const Color(0xFF334155);
-
-    switch (label.toLowerCase()) {
-      case 'ready':
-        bg = const Color(0xFF064E3B);
-        fg = const Color(0xFF34D399);
-        border = const Color(0xFF047857);
-        break;
-      case 'waiting':
-        bg = const Color(0xFF78350F);
-        fg = const Color(0xFFFBBF24);
-        border = const Color(0xFFB45309);
-        break;
-      case 'done':
-        bg = const Color(0xFF14532D);
-        fg = const Color(0xFF4ADE80);
-        border = const Color(0xFF15803D);
-        break;
-      case 'cancelled':
-        bg = const Color(0xFF450A0A);
-        fg = const Color(0xFFF87171);
-        border = const Color(0xFFB91C1C);
-        break;
-    }
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-      decoration: BoxDecoration(
-        color: bg,
-        border: Border.all(color: border),
-        borderRadius: BorderRadius.circular(4),
-      ),
-      child: Text(
-        label.toUpperCase(),
-        style: TextStyle(
-          fontSize: 10,
-          color: fg,
-          fontFamily: kMonoFontFamily,
-          fontWeight: FontWeight.w600,
         ),
       ),
     );

@@ -9,6 +9,7 @@ import '../util.dart';
 import 'avatar.dart';
 import 'header.dart';
 import 'obligation_card.dart';
+import 'obligation_status.dart';
 import 'obligation_dialogs.dart';
 import 'quota_history_chart.dart';
 
@@ -440,13 +441,17 @@ class _OverviewTabState extends State<OverviewTab> {
                               vertical: 1,
                             ),
                             decoration: BoxDecoration(
-                              color: const Color(0xFF064E3B),
+                              color: ObligationStatusColors
+                                  .ready
+                                  .chipBackground,
                               borderRadius: BorderRadius.circular(4),
                             ),
                             child: Text(
                               '${ready.length} ready',
                               style: kMonoStyle.copyWith(
-                                color: const Color(0xFF34D399),
+                                color: ObligationStatusColors
+                                    .ready
+                                    .chipForeground,
                                 fontSize: 11,
                                 fontWeight: FontWeight.w600,
                               ),
@@ -476,13 +481,17 @@ class _OverviewTabState extends State<OverviewTab> {
                               vertical: 1,
                             ),
                             decoration: BoxDecoration(
-                              color: const Color(0xFF78350F),
+                              color: ObligationStatusColors
+                                  .waiting
+                                  .chipBackground,
                               borderRadius: BorderRadius.circular(4),
                             ),
                             child: Text(
                               '${waiting.length} waiting',
                               style: kMonoStyle.copyWith(
-                                color: const Color(0xFFFBBF24),
+                                color: ObligationStatusColors
+                                    .waiting
+                                    .chipForeground,
                                 fontSize: 11,
                                 fontWeight: FontWeight.w600,
                               ),
@@ -512,13 +521,17 @@ class _OverviewTabState extends State<OverviewTab> {
                               vertical: 1,
                             ),
                             decoration: BoxDecoration(
-                              color: const Color(0xFF1E3A8A),
+                              color: ObligationStatusColors
+                                  .scheduled
+                                  .chipBackground,
                               borderRadius: BorderRadius.circular(4),
                             ),
                             child: Text(
                               '${scheduled.length} scheduled',
                               style: kMonoStyle.copyWith(
-                                color: const Color(0xFF93C5FD),
+                                color: ObligationStatusColors
+                                    .scheduled
+                                    .chipForeground,
                                 fontSize: 11,
                                 fontWeight: FontWeight.w600,
                               ),
