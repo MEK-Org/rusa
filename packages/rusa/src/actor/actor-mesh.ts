@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
 import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../mcp/stamp.js";
 import { prerequisiteEdgeKey } from "../obligations/obligation.js";
@@ -12,6 +12,13 @@ import {
 import type { RunResult } from "../providers/types.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
+import {
+  deduplicatedInboxEntryId,
+  EventManager,
+  type EventSourceResolver,
+  HierarchicalEventSourceResolver,
+  mayBubbleToParent,
+} from "../runtime/event-manager.js";
 import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./actor-record.js";
 import {
   type CapabilityGrantStore,
@@ -466,34 +473,6 @@ export interface EventDeliveryOptions {
   inboxPriority?: "responsive" | "normal";
 }
 
-/**
- * Whether an event is important enough to climb from its exact resource to a
- * broader subscriber when no live exact subscriber exists .
- *
- * Exact subscriptions do not consult this policy. Keep the list closed: an
- * unknown event remains deliverable to an exact subscriber but is not allowed
- * to wake a repo/org (or chat-root) owner as a fallback.
- */
-function mayBubbleToParent(
-  eventType: string | undefined,
-  eventMerged: boolean | undefined
-): boolean {
-  switch (eventType) {
-    case "issues.opened":
-    case "issue_comment.created":
-    case "pull_request.opened":
-    case "pull_request_review.submitted":
-    case "pull_request_review_comment.created":
-    case "check_suite.completed":
-    case "gchat.message":
-      return true;
-    case "pull_request.closed":
-      return eventMerged === true;
-    default:
-      return false;
-  }
-}
-
 export interface RetireCleanup {
   name: string;
   /**
@@ -659,6 +638,8 @@ export interface ActorMeshOptions {
   capabilityGrants?: CapabilityGrantStore;
   eventSourceOwners?: EventSourceOwnerStore;
   eventSourceSubscriptions?: EventSourceSubscriptionStore;
+  eventSourceResolver?: EventSourceResolver;
+  eventManager?: EventManager;
   /**
    * The event sources this instance is configured for. Direct subscriptions are
    * refused outside them, which is what keeps a subscription from reopening the
@@ -758,6 +739,8 @@ export class ActorMesh {
     body: string;
     sessionId?: string;
   }) => string;
+  readonly eventSourceResolver: EventSourceResolver;
+  readonly eventManager?: EventManager;
   private readonly grants: CapabilityGrantStore;
   private readonly eventSourceOwners: EventSourceOwnerStore;
   private readonly eventSourceSubscriptions: EventSourceSubscriptionStore;
@@ -867,6 +850,25 @@ export class ActorMesh {
     this.log = opts.log ?? (() => {});
     this.scheduledMessages = opts.scheduledMessages;
     this.withTransaction = opts.withTransaction ?? ((fn) => fn());
+    this.eventSourceResolver =
+      opts.eventSourceResolver ??
+      new HierarchicalEventSourceResolver({
+        eventSourceOwners: this.eventSourceOwners,
+        eventSourceSubscriptions: this.eventSourceSubscriptions,
+        obligations: this.obligations,
+        isLive: (actorId) => this.live.has(actorId),
+        resolveActor: (handleOrId) => this.resolveLiveActor(handleOrId),
+        log: this.log,
+      });
+    this.eventManager =
+      opts.eventManager ??
+      (this.inboxStore
+        ? new EventManager({
+            inboxStore: this.inboxStore,
+            resolver: this.eventSourceResolver,
+            log: this.log,
+          })
+        : undefined);
   }
 
   /**
@@ -1951,30 +1953,6 @@ export class ActorMesh {
   }
 
   /**
-   * The live actors directly subscribed to this **exact** resource.
-   *
-   * Deliberately not part of the ownership walk. Subscribers never receive
-   * bubbled events — bubbling exists so an important event is not missed by
-   * whoever is responsible for it, and a subscriber is interested rather than
-   * responsible — so there is no ancestor loop here and no event-class gate to
-   * apply.
-   *
-   * Computing this outside {@link resolveLiveOwnerDestinations} is what makes
-   * it reliable rather than a convenience. That walk returns from inside its
-   * obligation rung: a live obligation owned by a human, or by an actor that is
-   * not currently live, terminates the climb with an empty destination list.
-   * Adding subscribers as another push inside the loop would mean a subscriber
-   * silently received nothing on exactly the sources busy enough to carry an
-   * obligation.
-   */
-  private liveDirectSubscribers(resource: EventResource): string[] {
-    return this.eventSourceSubscriptions
-      .subscribersOf(resource)
-      .map((subscription) => subscription.actorId)
-      .filter((actorId) => this.live.has(actorId));
-  }
-
-  /**
    * The owner of the live obligation claiming this event source, if any.
    *
    * Returns an entity id, which may be a human — the caller decides what that
@@ -2197,83 +2175,53 @@ export class ActorMesh {
     eventSummary: string,
     opts: EventDeliveryOptions = {}
   ): Promise<void> {
-    let destinations: string[];
-    let directed = false;
-    // A live obligation is the ownership authority even when the event carries
-    // a bot-authored directed target. Directives remain useful for unclaimed
-    // work, but cannot route claimed work around its current owner.
-    if (opts.directedTarget) {
-      const governing = this.obligationOwnerFor(resource);
-      if (governing) {
-        destinations = this.live.has(governing) ? [governing] : [];
-      } else {
-        const directedTarget = this.resolveLiveActor(opts.directedTarget);
-        if (directedTarget) {
-          this.log(`mesh:deliver directed-delivered to ${opts.directedTarget} (${eventSummary})`);
-          destinations = [directedTarget.id];
-          directed = true;
-        } else {
-          this.log(`mesh:deliver target not live: ${opts.directedTarget} — directive ignored`);
-          destinations = this.resolveLiveOwnerDestinations(resource, {
-            enforceBubblingPolicy: true,
-            eventPayload: opts.inboxPayload,
-            exactObligationOwner: null,
-          });
+    if (opts.inboxPayload) {
+      if (!this.inboxStore || !this.eventManager) {
+        throw new Error("GitHub inbox delivery requires an inbox store");
+      }
+      const rawResource = typeof resource === "string" ? resource : resourceKey(resource);
+      const entries = await this.eventManager.handleExternalEvent({
+        sourceType: "custom",
+        rawResource,
+        rawPayload: opts.inboxPayload,
+        receivedAt: opts.inboxDeliveredAt,
+        idempotencyKey: opts.inboxDedupeKey,
+        priority: opts.inboxPriority,
+        directedTarget: opts.directedTarget,
+        stampedAuthor: opts.stampedAuthor,
+        instanceId: opts.instanceId,
+        eventSummary,
+      });
+      for (const entry of entries) {
+        const dest = entry.actorId;
+        if (!this.notifyInboxChanged(dest, { priority: opts.inboxPriority })) {
+          throw new Error(`Delivery target ${dest} is not live after inbox persistence`);
         }
       }
-    } else {
-      destinations = this.resolveLiveOwnerDestinations(resource, {
-        enforceBubblingPolicy: true,
-        eventPayload: opts.inboxPayload,
-      });
+      return;
     }
 
-    // Direct subscribers are added to whatever ownership resolved to — the two
-    // relationships compose rather than compete. A subscriber is added even when
-    // ownership resolved to nobody (an obligation held by a human, an absent
-    // owner, a source no live actor owns), and never displaces the owner when it
-    // did. The exact resource only: a subscription does not bubble.
-    //
-    // A *successfully targeted* delivery is the one case where this does not
-    // apply. A verified bot directive names the single actor an event is for;
-    // fanning it out to subscribers would make `mesh:deliver` mean something
-    // other than what it says.
-    //
-    // Read `directed` precisely: it is set only on that happy path. A directive
-    // overridden by a live obligation, or one naming a target that is no longer
-    // live, resolves ownership normally and still reaches subscribers. That is
-    // deliberate rather than incidental — a standing interest in a source's
-    // direct events is not defeated by a directive aimed at someone else, or by
-    // one that failed to land. Those paths also leave `directed` false for the
-    // author-suppression exemption below, which only a landed directive earns.
-    if (!directed) {
-      for (const subscriber of this.liveDirectSubscribers(resource)) {
-        if (!destinations.includes(subscriber)) destinations.push(subscriber);
-      }
+    const rawResource = typeof resource === "string" ? resource : resourceKey(resource);
+    const recipients = await this.eventSourceResolver.resolveRecipients(rawResource, {
+      directedTarget: opts.directedTarget,
+      eventPayload: opts.inboxPayload,
+      eventSummary,
+    });
+    const destinations: string[] = [];
+    const ownerIds = recipients.ownerIds ?? (recipients.ownerId ? [recipients.ownerId] : []);
+    for (const id of ownerIds) {
+      if (!destinations.includes(id)) destinations.push(id);
+    }
+    for (const sub of recipients.subscriberIds) {
+      if (!destinations.includes(sub)) destinations.push(sub);
     }
 
     if (destinations.length === 0) {
-      // Invariant this drop relies on (ISSUE_NUM review): root retains a covering
-      // source for anything it delegates from (config-declared sources persist;
-      // delegation only adds child sub-slices). So a live event that's in-scope
-      // always matches an ancestor source before reaching here — an uncovered
-      // event is genuinely out-of-scope for this instance, and dropping it
-      // (journal-visible) is correct rather than a silent loss. If a future
-      // change ever lets root delegate away its only covering source for a
-      // slice, events under it would hit this drop when the delegate dies —
-      // still visible here, but the invariant is what keeps that from happening.
       this.log(`event not covered by any subscription — dropped (${eventSummary})`);
       return;
     }
 
-    // A verified `system:*` stamp marks a persistence-only write performed by
-    // mesh infrastructure rather than a peer actor — it
-    // withholds delivery to EVERY destination, not just an author-match. Only a
-    // verified stamp may trigger this (opts.stampedAuthor only exists when
-    // resolveStampedAuthor's HMAC + freshness checks passed in start.ts); an
-    // unverified or stale system-looking stamp resolves to null upstream and
-    // falls through to the ordinary per-destination checks below, so it still
-    // fails open and delivers .
+    const directed = Boolean(opts.directedTarget && ownerIds.includes(opts.directedTarget));
     const systemSuppressed =
       !directed &&
       opts.stampedAuthor != null &&
@@ -2310,33 +2258,6 @@ export class ActorMesh {
     }
 
     if (deliverable.length === 0) return;
-
-    if (opts.inboxPayload) {
-      if (!this.inboxStore) throw new Error("GitHub inbox delivery requires an inbox store");
-      const source = resourceKey(resource);
-      const inboxPayload = opts.inboxPayload;
-      const entries = this.inboxStore.append(
-        deliverable.map((actorId) => ({
-          id: opts.inboxDedupeKey
-            ? deduplicatedInboxEntryId(opts.inboxDedupeKey, actorId)
-            : undefined,
-          actorId,
-          source,
-          deliveredAt: opts.inboxDeliveredAt,
-          payload: inboxPayload,
-        }))
-      );
-      for (const entry of entries) {
-        const dest = entry.actorId;
-        if (!deliverable.includes(dest)) {
-          throw new Error(`Inbox append returned an unexpected actor: ${dest}`);
-        }
-        if (!this.notifyInboxChanged(dest, { priority: opts.inboxPriority })) {
-          throw new Error(`Delivery target ${dest} is not live after inbox persistence`);
-        }
-      }
-      return;
-    }
 
     for (const dest of deliverable) {
       if (!this.notifyInboxChanged(dest, { priority: opts.inboxPriority })) {
@@ -3969,14 +3890,4 @@ function immediateStart<T>(fn: () => Promise<T>): RunStartHandle<T> {
       return true;
     },
   };
-}
-
-function deduplicatedInboxEntryId(dedupeKey: string, actorId: string): string {
-  const digest = createHash("sha256")
-    .update(dedupeKey)
-    .update("\0")
-    .update(actorId)
-    .digest("hex")
-    .slice(0, 32);
-  return `dedupe:${digest}`;
 }
