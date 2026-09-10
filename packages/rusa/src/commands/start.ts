@@ -1714,16 +1714,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       isLive: (actorId) => mesh.isLiveActor(actorId),
       activeDelegationsFor: (resource) => eventSourceOwners.activeForResource(resource),
       directSubscribersFor: (resource) => eventSourceSubscriptions.subscribersOf(resource),
-      governingObligationOwnerFor: (resource) => {
-        try {
-          const reference = parseReference(resourceKey(resource));
-          return asGitHubIssue(reference)
-            ? getRepositories().obligations.findLiveByExternalRef(resourceKey(resource))?.ownerId
-            : undefined;
-        } catch {
-          return undefined;
-        }
-      },
+      findLiveObligationByExternalRef: (ref) =>
+        getRepositories().obligations.findLiveByExternalRef(ref),
       resolveActor: (handleOrId) => mesh.resolveLiveActorId(handleOrId),
     },
     log: emitMeshRoutingLog,

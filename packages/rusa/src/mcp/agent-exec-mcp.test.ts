@@ -116,8 +116,7 @@ function setup(
       isLive: (actorId) => mesh.isLiveActor(actorId),
       activeDelegationsFor: (resource) => eventSourceOwners.activeForResource(resource),
       directSubscribersFor: (resource) => eventSourceSubscriptions.subscribersOf(resource),
-      governingObligationOwnerFor: (resource) =>
-        opts.obligations?.findLiveByExternalRef(resource)?.ownerId,
+      findLiveObligationByExternalRef: (ref) => opts.obligations?.findLiveByExternalRef(ref),
       resolveActor: (handleOrId) => mesh.resolveLiveActorId(handleOrId),
     },
   });

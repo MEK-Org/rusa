@@ -17,7 +17,6 @@ import {
 } from "../providers/model-config.js";
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
-import { asGitHubIssue, parseReference } from "../references/reference.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
 import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
 import { Actor } from "./actor.js";
@@ -217,15 +216,7 @@ function setup(
       isLive: (actorId) => mesh.isLiveActor(actorId),
       activeDelegationsFor: (resource) => eventSourceOwners.activeForResource(resource),
       directSubscribersFor: (resource) => eventSourceSubscriptions.subscribersOf(resource),
-      governingObligationOwnerFor: (resource) => {
-        try {
-          return asGitHubIssue(parseReference(resource))
-            ? opts.obligations?.findLiveByExternalRef(resource)?.ownerId
-            : undefined;
-        } catch {
-          return undefined;
-        }
-      },
+      findLiveObligationByExternalRef: (ref) => opts.obligations?.findLiveByExternalRef(ref),
       resolveActor: (handleOrId) => mesh.resolveLiveActorId(handleOrId),
     },
     log: (m) => logs.push(m),
@@ -5267,6 +5258,24 @@ describe("ActorMesh", () => {
       await retirement;
 
       expect(inboxStore.entries.filter((entry) => entry.actorId === worker)).toHaveLength(1);
+    });
+
+    it("canonicalizes a legacy resource once for both routing and durable inbox source", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh } = setup({ inboxStore });
+      const worker = mesh.spawn({ charter: "issue worker", parentId: "root" });
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo/issues/456", worker, "root");
+
+      await mesh.deliverEvent("github_issue:dummy-org/dummy-repo#456", "legacy issue event", {
+        inboxPayload: payload("issues.opened"),
+      });
+
+      expect(inboxStore.entries).toEqual([
+        expect.objectContaining({
+          actorId: worker,
+          source: "github:dummy-org/dummy-repo/issues/456",
+        }),
+      ]);
     });
 
     it("subscribes and unsubscribes event sources and records audit events", () => {

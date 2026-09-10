@@ -33,6 +33,7 @@ import { stampAuthor } from "../mcp/stamp.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
+import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
 
 const worktreeMock = vi.hoisted(() => ({
@@ -1516,6 +1517,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(inbox.entries).toHaveLength(1);
     expect(inbox.entries[0]).toMatchObject({
       actorId: workerId,
+      id: deduplicatedInboxEntryId("github:delivery-903", workerId),
       source: "github:dummy-org/dummy-repo/issues/456",
       seenAt: null,
       handledAt: null,

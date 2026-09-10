@@ -218,7 +218,11 @@ export interface RetirementBlockers {
  * Effective event routing authority diagnostic (#369).
  * Distinguishes the governing source, principal, resource level, and liveness for a canonical resource.
  */
-/** Public diagnostic from the shared routing kernel (#369). */
+/**
+ * Public diagnostic from the shared routing kernel (#369). Its field-level
+ * #369 semantics live with {@link EventSourceOwnershipDiagnostic}, where the
+ * ladder constructs the value.
+ */
 export type EffectiveRouteDiagnostic = EventSourceOwnershipDiagnostic;
 
 /**
@@ -2025,6 +2029,9 @@ export class ActorMesh {
    * instance back into an org-wide firehose . A covering org source is considered only
    * for the event classes explicitly allowed by {@link mayBubbleToParent} .
    * Follows the CRITICAL invariant of checking liveness and delivering synchronously.
+   * Production ingress enters {@link deliverExternalEvent}; this legacy public
+   * contract remains for embedders and characterization coverage until a
+   * separately scoped follow-up can collapse it.
    */
   async deliverEvent(
     resource: EventResource,

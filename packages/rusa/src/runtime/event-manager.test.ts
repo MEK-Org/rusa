@@ -97,8 +97,7 @@ function createRoutingKernel(opts: {
       isLive: opts.isLive ?? (() => true),
       activeDelegationsFor: (resource) => opts.owners.activeForResource(resource),
       directSubscribersFor: (resource) => opts.subscriptions.subscribersOf(resource),
-      governingObligationOwnerFor: (resource) =>
-        opts.obligations?.findLiveByExternalRef(resource)?.ownerId,
+      findLiveObligationByExternalRef: (ref) => opts.obligations?.findLiveByExternalRef(ref),
       resolveActor: opts.resolveActor,
     },
   });
@@ -481,6 +480,36 @@ describe("EventManager", () => {
   });
 
   describe("HierarchicalEventSourceResolver", () => {
+    it("keeps issue-only obligation governance inside the shared kernel", () => {
+      const owners = new InMemoryEventSourceOwnerStore();
+      const subscriptions = new InMemoryEventSourceSubscriptionStore();
+      const lookups: string[] = [];
+      const resolver = createRoutingKernel({
+        owners,
+        subscriptions,
+        obligations: {
+          findLiveByExternalRef(ref) {
+            lookups.push(ref);
+            return ref === "github:MEK-Org/rusa/issues/383" ? { ownerId: "issue-owner" } : null;
+          },
+        },
+      });
+
+      expect(resolver.resolveRecipients("system:events")).toEqual({
+        directed: false,
+        ownerIds: [],
+        subscriberIds: [],
+      });
+      expect(lookups).toEqual([]);
+
+      expect(resolver.resolveRecipients("github_issue:MEK-Org/rusa#383")).toEqual({
+        directed: false,
+        ownerIds: ["issue-owner"],
+        subscriberIds: [],
+      });
+      expect(lookups).toEqual(["github:MEK-Org/rusa/issues/383"]);
+    });
+
     it("resolves exact owner and direct subscribers", () => {
       const ownerStore = new InMemoryEventSourceOwnerStore();
       const subStore = new InMemoryEventSourceSubscriptionStore();

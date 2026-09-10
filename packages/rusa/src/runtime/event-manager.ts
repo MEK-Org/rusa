@@ -11,6 +11,7 @@ import {
   deriveGitHubInboxNotification,
 } from "../github/inbox-notification.js";
 import { isSystemActor } from "../mcp/stamp.js";
+import { asGitHubIssue, parseReference } from "../references/reference.js";
 
 /**
  * Normalizes a resource to canonical reference form when valid, otherwise
@@ -229,7 +230,12 @@ export interface EventRoutingReadPorts {
   isLive: (actorId: string) => boolean;
   activeDelegationsFor: (resource: EventResource) => readonly { actorId: string }[];
   directSubscribersFor: (resource: EventResource) => readonly { actorId: string }[];
-  governingObligationOwnerFor: (resource: EventResource) => string | undefined;
+  /**
+   * Looks up a live obligation by its already-canonical external reference.
+   * The resolver, rather than each host, decides which resource kinds an
+   * obligation may govern.
+   */
+  findLiveObligationByExternalRef?: (ref: string) => { ownerId: string } | null | undefined;
   resolveActor?: (handleOrId: string) => { id: string } | undefined;
 }
 
@@ -247,10 +253,33 @@ export interface ResolveOwnerOptions {
 }
 
 export interface EventSourceOwnershipDiagnostic {
+  /**
+   * The canonical resource queried, normalized to canonical scheme and path
+   * syntax (including legacy prefixes or alternate representations).
+   */
   resource: EventResource;
+  /**
+   * Governing authority kind: a live obligation takes precedence over a live
+   * subscription; null means no live claim covered the resource.
+   */
   governingSource: "obligation" | "subscription" | null;
+  /**
+   * The actor or entity holding effective authority, or null if uncovered.
+   * Subscriptions may return several live owners for delivery order; this is
+   * the first governing principal for the audit-facing diagnostic.
+   */
   principal: string | null;
+  /** The exact canonical resource or ancestor level that supplied the claim. */
   resourceLevel: EventResource | null;
+  /**
+   * Whether the governing principal is currently runnable.
+   *
+   * Subscription routes are always live because dead subscriptions yield to
+   * live ancestors or uncovered. Obligation routes intentionally expose a
+   * human or absent owner as non-live: its claim remains authoritative and
+   * must not fall through to a manual subscription. Uncovered routes are
+   * always false.
+   */
   isLive: boolean;
 }
 
@@ -286,7 +315,7 @@ export class HierarchicalEventSourceResolver implements EventRoutingKernel {
     let ownerIds: string[] = [];
 
     if (opts.directedTarget) {
-      const governing = this.options.ports.governingObligationOwnerFor(key);
+      const governing = this.obligationOwnerFor(key);
       if (governing) {
         ownerIds = this.options.ports.isLive(governing) ? [governing] : [];
       } else {
@@ -359,14 +388,27 @@ export class HierarchicalEventSourceResolver implements EventRoutingKernel {
     let exact = true;
 
     while (current) {
+      // The obligation store is the ownership authority for linked issue/PR
+      // work. Consult it before the delegation store at every rung: a live
+      // obligation supersedes manual delegation on the same source, and a
+      // comment naturally reaches its issue's governing obligation one level
+      // up through the shared path grammar.
+      //
+      // This answer is derived, never written. Resolving an obligation does
+      // not deactivate the superseded delegation, preserving audit history and
+      // making replay/restart reconstruct the same authority without reviving
+      // a stale owner.
       const governing =
         exact && opts.exactObligationOwner !== undefined
           ? (opts.exactObligationOwner ?? undefined)
-          : this.options.ports.governingObligationOwnerFor(current);
+          : this.obligationOwnerFor(current);
       exact = false;
 
       if (governing) {
         const isLive = this.options.ports.isLive(governing);
+        // A claim remains authoritative even when its holder is not runnable.
+        // A human/system owner or an absent actor yields no destination; falling
+        // through would hand that work to an unrelated manual delegation.
         return {
           diagnostic: {
             resource: key,
@@ -423,6 +465,23 @@ export class HierarchicalEventSourceResolver implements EventRoutingKernel {
       },
       ownerIds: [],
     };
+  }
+
+  /**
+   * Obligations govern issue-shaped GitHub resources only. Keeping the
+   * reference-kind guard beside the hierarchy walk makes every host — start,
+   * the mesh harnesses, and the MCP harness — apply exactly the same
+   * governance boundary rather than reproducing it in their assembly code.
+   */
+  private obligationOwnerFor(resource: EventResource): string | undefined {
+    const findLive = this.options.ports.findLiveObligationByExternalRef;
+    if (!findLive) return undefined;
+    try {
+      const canonical = resourceKey(resource);
+      return asGitHubIssue(parseReference(canonical)) ? findLive(canonical)?.ownerId : undefined;
+    } catch {
+      return undefined;
+    }
   }
 }
 
@@ -506,7 +565,7 @@ export class EventManager {
     const payload: InboxPayload = { ...notification.payload };
     if (raw.priority === "responsive") payload.priority = "responsive";
     return {
-      resource: raw.rawResource ? safeResourceKey(raw.rawResource) : notification.resource,
+      resource: raw.rawResource ?? notification.resource,
       payload,
       dedupeKey: raw.idempotencyKey,
       deliveredAt: raw.receivedAt,
@@ -522,7 +581,7 @@ export class EventManager {
     const spaceName = message.spaceName.startsWith("spaces/")
       ? message.spaceName
       : `spaces/${message.spaceName}`;
-    const resource = raw.rawResource ? safeResourceKey(raw.rawResource) : `gchat:${spaceName}`;
+    const resource = raw.rawResource ?? `gchat:${spaceName}`;
     const payload: InboxPayload = {
       type: "gchat.message",
       messageName: message.name,
@@ -545,7 +604,7 @@ export class EventManager {
   }
 
   private normalizeTimerEvent(raw: RawTimerIntegrationEvent): NormalizedIntegrationEvent {
-    const resource = safeResourceKey(raw.rawResource ?? "system:events");
+    const resource = raw.rawResource ?? "system:events";
     const priority = raw.priority ?? "responsive";
     const payload: InboxPayload = {
       ...raw.rawPayload,
@@ -581,8 +640,13 @@ export class EventManager {
    * normalizer branch.
    */
   handleNormalizedEvent(normalized: NormalizedIntegrationEvent): readonly InboxEntry[] {
-    const summary = normalized.eventSummary ?? normalized.resource;
-    const recipients = this.routing.resolveRecipients(normalized.resource, {
+    // Normalize once at the durable boundary, before either side effect. The
+    // resolver and InboxStore must observe the same canonical key: otherwise a
+    // legacy-form ActorMesh delivery routes correctly but writes an inbox row
+    // `inbox.list({ source })` cannot find under its canonical source.
+    const resource = safeResourceKey(normalized.resource);
+    const summary = normalized.eventSummary ?? resource;
+    const recipients = this.routing.resolveRecipients(resource, {
       eventPayload: normalized.payload,
       directedTarget: normalized.directedTarget,
       eventSummary: normalized.eventSummary,
@@ -628,7 +692,7 @@ export class EventManager {
         ? deduplicatedInboxEntryId(normalized.dedupeKey, actorId)
         : undefined,
       actorId,
-      source: normalized.resource,
+      source: resource,
       deliveredAt: normalized.deliveredAt,
       payload: normalized.payload,
     }));
