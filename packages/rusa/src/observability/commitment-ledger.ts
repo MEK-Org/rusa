@@ -212,6 +212,12 @@ const LEDGER_READS: Readonly<Record<MeshEventKind, LedgerRead>> = {
   // closing: the obligation tree already holds that standing, and the run that
   // wrote it is bracketed by events this projection does read.
   obligation_checkpoint_set: "ignored",
+  // Root moving an actor into or out of a rollout is administration of the
+  // mesh's own experiment state, not the actor opening or closing a commitment
+  // to anybody. The run that enrolls somebody is bracketed by events this
+  // projection already reads.
+  experiment_enrolled: "ignored",
+  experiment_unenrolled: "ignored",
   host_job_submitted: "ignored",
   host_job_stopped: "ignored",
   host_job_exited: "ignored",

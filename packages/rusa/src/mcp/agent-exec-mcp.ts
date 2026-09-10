@@ -7,6 +7,7 @@ import {
   normalizeEventResource,
   resourceKey,
 } from "../actor/event-subscriptions.js";
+import { EXPERIMENT_NAMES, EXPERIMENTS } from "../actor/experiments.js";
 import type { ActorWakeScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import { summarizeCharter } from "../actor/worker-prompt.js";
@@ -954,6 +955,95 @@ export function createAgentExecMcpServer(
         }
       );
     }
+
+    // ── Experiment enrollment (#394) ── Rollout state, not actor configuration:
+    // an actor is enrolled in a hard-coded experiment or it is not. Registered
+    // ONLY on root's endpoint, each handler re-asserts root, and the mesh
+    // enforces root-only authority again — the boundary is deliberately
+    // ungrantable, so there is no capability that ever mounts these elsewhere.
+    server.registerTool(
+      "enroll_actor_experiment",
+      {
+        title: "Enroll an actor in an experiment (root-only)",
+        description:
+          "Enroll an existing actor in one of the hard-coded experiments (see list_actor_experiments for the registry). Root-only and ungrantable. Enrollment is always post-spawn and applies to the named actor alone; an unknown experiment name is rejected rather than stored. Idempotent — re-enrolling an already-enrolled actor reports changed: false and leaves the original enrollment in force. Refused for a retired thread.",
+        inputSchema: {
+          actor_id: z.string().describe("The thread id of the actor to enroll."),
+          experiment: z
+            .string()
+            .describe("A registered experiment name, e.g. 'head_obligation_closure'."),
+        },
+      },
+      async ({ actor_id, experiment }) => {
+        const denied = assertRoot();
+        if (denied) return denied;
+        try {
+          const changed = mesh.enrollActorInExperiment(actor_id, experiment, selfId);
+          return toolOk({ actor_id, experiment, enrolled: true, changed });
+        } catch (err) {
+          return toolError(err);
+        }
+      }
+    );
+
+    server.registerTool(
+      "unenroll_actor_experiment",
+      {
+        title: "Remove an actor's experiment enrollment (root-only)",
+        description:
+          "Remove an actor's enrollment in a hard-coded experiment. Root-only and ungrantable. Idempotent — unenrolling an actor that is not enrolled reports changed: false. Permitted for a retired thread, so a rollout can be withdrawn without reviving it; an enrollment otherwise survives retirement and applies again if the thread is revived.",
+        inputSchema: {
+          actor_id: z.string().describe("The thread id of the actor to unenroll."),
+          experiment: z.string().describe("A registered experiment name."),
+        },
+      },
+      async ({ actor_id, experiment }) => {
+        const denied = assertRoot();
+        if (denied) return denied;
+        try {
+          const changed = mesh.unenrollActorFromExperiment(actor_id, experiment, selfId);
+          return toolOk({ actor_id, experiment, enrolled: false, changed });
+        } catch (err) {
+          return toolError(err);
+        }
+      }
+    );
+
+    server.registerTool(
+      "list_actor_experiments",
+      {
+        title: "List experiments and current enrollments (root-only)",
+        description:
+          "List the hard-coded experiment registry and the enrollments currently in force. Root-only. Pass actor_id to scope the enrollments to one actor; omit it for every enrollment in the mesh. This is the deterministic readback for enroll_actor_experiment and unenroll_actor_experiment.",
+        inputSchema: {
+          actor_id: z
+            .string()
+            .optional()
+            .describe("Scope the enrollments to this thread id. Omit for all actors."),
+        },
+      },
+      async ({ actor_id }) => {
+        const denied = assertRoot();
+        if (denied) return denied;
+        try {
+          const enrollments = mesh.listExperimentEnrollments(actor_id).map((enrollment) => ({
+            actor_id: enrollment.actorId,
+            experiment: enrollment.experiment,
+            enrolled_by: enrollment.enrolledBy,
+            enrolled_at: enrollment.enrolledAt,
+          }));
+          return toolOk({
+            experiments: EXPERIMENT_NAMES.map((name) => ({
+              name,
+              intent: EXPERIMENTS[name].intent,
+            })),
+            enrollments,
+          });
+        } catch (err) {
+          return toolError(err);
+        }
+      }
+    );
 
     server.registerTool(
       "revive_thread",

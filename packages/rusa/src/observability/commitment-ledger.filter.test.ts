@@ -59,6 +59,8 @@ const ALL_MESH_EVENT_KINDS = Object.keys({
   continuation_capped: 0,
   capability_granted: 0,
   capability_revoked: 0,
+  experiment_enrolled: 0,
+  experiment_unenrolled: 0,
   scheduled_wake: 0,
   event_source_subscribed: 0,
   event_source_unsubscribed: 0,
