@@ -17,7 +17,7 @@ import { validateInboxPayload } from "../actor/inbox-store.js";
 import {
   deduplicatedInboxEntryId,
   EventManager,
-  type EventSourceResolver,
+  type EventRoutingKernel,
   HierarchicalEventSourceResolver,
   type RawIntegrationEvent,
 } from "./event-manager.js";
@@ -104,11 +104,22 @@ function createRoutingKernel(opts: {
   });
 }
 
+/**
+ * EventManager routes through the host's one ladder and never asks it for
+ * ownership itself — ActorMesh does, off {@link EventManager.routing}. These
+ * tests therefore stub recipients and leave the ownership arm loud rather than
+ * silently answering a question this component does not ask.
+ */
+function unusedLadder(): never {
+  throw new Error("EventManager routing must not call resolveOwner");
+}
+
 describe("EventManager", () => {
   describe("Normalization without changing public payloads", () => {
     it("normalizes GitHub webhook payloads preserving exact issue/comment payload contracts", async () => {
       const inbox = new FakeInboxStore();
-      const resolver: EventSourceResolver = {
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
         resolveRecipients: () => ({ directed: false, ownerIds: ["actor-gh"], subscriberIds: [] }),
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
@@ -148,7 +159,8 @@ describe("EventManager", () => {
 
     it("normalizes GitHub PR events including merged flag for pull_request.closed", async () => {
       const inbox = new FakeInboxStore();
-      const resolver: EventSourceResolver = {
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
         resolveRecipients: () => ({ directed: false, ownerIds: ["actor-pr"], subscriberIds: [] }),
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
@@ -178,6 +190,7 @@ describe("EventManager", () => {
       const em = new EventManager({
         inboxStore: inbox,
         resolver: {
+          resolveOwner: unusedLadder,
           resolveRecipients: () => {
             resolved = true;
             return { directed: false, ownerIds: ["actor-ci"], subscriberIds: [] };
@@ -204,7 +217,8 @@ describe("EventManager", () => {
 
     it("normalizes Chat events into canonical gchat.message with responsive priority", async () => {
       const inbox = new FakeInboxStore();
-      const resolver: EventSourceResolver = {
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
         resolveRecipients: () => ({ directed: false, ownerIds: ["actor-chat"], subscriberIds: [] }),
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
@@ -236,7 +250,8 @@ describe("EventManager", () => {
 
     it("normalizes timer events with responsive priority by default", async () => {
       const inbox = new FakeInboxStore();
-      const resolver: EventSourceResolver = {
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["actor-timer"],
@@ -262,7 +277,8 @@ describe("EventManager", () => {
 
     it("normalizes timer ingress shapes preserving payload contents", async () => {
       const inbox = new FakeInboxStore();
-      const resolver: EventSourceResolver = {
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["actor-custom"],
@@ -286,7 +302,8 @@ describe("EventManager", () => {
 
     it("distinguishes PR review events that share a pull_request key", async () => {
       const inbox = new FakeInboxStore();
-      const resolver: EventSourceResolver = {
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
         resolveRecipients: () => ({ directed: false, ownerIds: ["actor-ci"], subscriberIds: [] }),
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
@@ -330,7 +347,8 @@ describe("EventManager", () => {
   describe("Owner-plus-subscriber routing and deduplication", () => {
     it("delivers to both owner and direct subscribers", async () => {
       const inbox = new FakeInboxStore();
-      const resolver: EventSourceResolver = {
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["owner-actor"],
@@ -352,7 +370,8 @@ describe("EventManager", () => {
 
     it("deduplicates recipients when an actor is both owner and subscriber", async () => {
       const inbox = new FakeInboxStore();
-      const resolver: EventSourceResolver = {
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["actor-both"],
@@ -375,7 +394,8 @@ describe("EventManager", () => {
 
     it("returns empty array and writes nothing when no recipients exist", async () => {
       const inbox = new FakeInboxStore();
-      const resolver: EventSourceResolver = {
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
         resolveRecipients: () => ({ directed: false, ownerIds: [], subscriberIds: [] }),
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
@@ -404,7 +424,8 @@ describe("EventManager", () => {
 
     it("prevents duplicate inbox entries on repeated deliveries with same idempotency key", async () => {
       const inbox = new FakeInboxStore();
-      const resolver: EventSourceResolver = {
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["actor-idemp"],
@@ -433,7 +454,8 @@ describe("EventManager", () => {
   describe("Strict invariant: EventManager never invokes actors", () => {
     it("only performs durable inbox append and never triggers execution", async () => {
       const inbox = new FakeInboxStore();
-      const resolver: EventSourceResolver = {
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["actor-quiet"],
@@ -580,7 +602,8 @@ describe("EventManager", () => {
 
     it("suppresses delivery to author matching stampedAuthor", async () => {
       const inbox = new FakeInboxStore();
-      const resolver: EventSourceResolver = {
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["actor-self"],
@@ -604,7 +627,8 @@ describe("EventManager", () => {
 
     it("suppresses all destinations when stampedAuthor is a system actor on the same instance", async () => {
       const inbox = new FakeInboxStore();
-      const resolver: EventSourceResolver = {
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["actor-1"],
@@ -757,7 +781,8 @@ describe("EventManager", () => {
   describe("Delivery order and append-result agreement", () => {
     it("appends owners before subscribers in resolver order", async () => {
       const inbox = new FakeInboxStore();
-      const resolver: EventSourceResolver = {
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["owner-1", "owner-2"],
@@ -789,7 +814,8 @@ describe("EventManager", () => {
 
     it("keeps a suppressed author out of the append and preserves the rest in order", async () => {
       const inbox = new FakeInboxStore();
-      const resolver: EventSourceResolver = {
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["owner-1"],
@@ -809,14 +835,15 @@ describe("EventManager", () => {
       expect(entries.map((entry) => entry.actorId)).toEqual(["owner-1", "sub-2"]);
     });
 
-    it("throws when the store returns an actor the manager did not compute", async () => {
+    it("throws when the store returns an actor the manager did not compute", () => {
       class StrayingInboxStore extends FakeInboxStore {
         override append(inputs: InboxAppendInput[]): InboxEntry[] {
           return super.append([...inputs, { ...inputs[0], id: undefined, actorId: "intruder" }]);
         }
       }
       const inbox = new StrayingInboxStore();
-      const resolver: EventSourceResolver = {
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
         resolveRecipients: () => ({
           directed: false,
           ownerIds: ["owner-1"],
@@ -825,13 +852,13 @@ describe("EventManager", () => {
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
 
-      await expect(
+      expect(() =>
         em.handleExternalEvent({
           sourceType: "timer",
           rawResource: "system:events",
           rawPayload: { type: "test.event" },
         })
-      ).rejects.toThrow("Inbox append returned an unexpected actor: intruder");
+      ).toThrow("Inbox append returned an unexpected actor: intruder");
     });
   });
 });

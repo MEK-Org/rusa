@@ -206,11 +206,21 @@ export interface ResolveRecipientsOptions {
   eventSummary?: string;
 }
 
+/**
+ * Recipient resolution is deliberately synchronous. Delivery depends on a
+ * same-turn invariant: recipient liveness, durable append, and the caller's
+ * wake must not be separated by an await, or an actor can retire after being
+ * selected as live and leave a durable unhandled row nobody is alive to take
+ * (`InboxRepository.append` validates only non-empty ids, and the inbox table
+ * has no actor foreign key). Every read port behind this is a synchronous
+ * in-memory or better-sqlite3 read, so a promise here would buy nothing and
+ * cost the invariant.
+ */
 export interface EventSourceResolver {
   resolveRecipients(
     resource: EventResource | string,
     options?: ResolveRecipientsOptions
-  ): Promise<EventSourceRecipients> | EventSourceRecipients;
+  ): EventSourceRecipients;
 }
 
 /** Narrow read-only ports owned by the runtime assembly. */
@@ -418,7 +428,12 @@ export class HierarchicalEventSourceResolver implements EventRoutingKernel {
 
 export interface EventManagerOptions {
   inboxStore: InboxStore;
-  resolver: EventSourceResolver;
+  /**
+   * The one routing kernel assembled by the host. EventManager re-exposes it as
+   * {@link EventManager.routing} so a mesh cannot be handed a second, competing
+   * ladder alongside this one.
+   */
+  resolver: EventRoutingKernel;
   log?: (message: string) => void;
 }
 
@@ -438,12 +453,18 @@ export interface EventManagerOptions {
  */
 export class EventManager {
   private readonly inboxStore: InboxStore;
-  private readonly resolver: EventSourceResolver;
+  /**
+   * The host-assembled ownership ladder, readable by collaborators that need
+   * routing authority (ActorMesh's delegation guards and audit inspection).
+   * Exposing the manager's own kernel is what makes "two authoritative
+   * policies in one process" unrepresentable rather than merely unconventional.
+   */
+  readonly routing: EventRoutingKernel;
   private readonly log?: (message: string) => void;
 
   constructor(options: EventManagerOptions) {
     this.inboxStore = options.inboxStore;
-    this.resolver = options.resolver;
+    this.routing = options.resolver;
     this.log = options.log;
   }
 
@@ -548,7 +569,7 @@ export class EventManager {
    * inbox rows. Actors are not invoked here; downstream components respond to
    * durable changes.
    */
-  async handleExternalEvent(raw: RawIntegrationEvent): Promise<readonly InboxEntry[]> {
+  handleExternalEvent(raw: RawIntegrationEvent): readonly InboxEntry[] {
     const normalized = this.normalizeEvent(raw);
     if (!normalized) return [];
     return this.handleNormalizedEvent(normalized);
@@ -559,11 +580,9 @@ export class EventManager {
    * legacy ActorMesh delivery contract without inventing a fourth ingress
    * normalizer branch.
    */
-  async handleNormalizedEvent(
-    normalized: NormalizedIntegrationEvent
-  ): Promise<readonly InboxEntry[]> {
+  handleNormalizedEvent(normalized: NormalizedIntegrationEvent): readonly InboxEntry[] {
     const summary = normalized.eventSummary ?? normalized.resource;
-    const recipients = await this.resolver.resolveRecipients(normalized.resource, {
+    const recipients = this.routing.resolveRecipients(normalized.resource, {
       eventPayload: normalized.payload,
       directedTarget: normalized.directedTarget,
       eventSummary: normalized.eventSummary,

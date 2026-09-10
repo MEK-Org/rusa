@@ -3,11 +3,9 @@ import { ActorMesh } from "../../actor/actor-mesh.js";
 import {
   InMemoryEventSourceOwnerStore,
   InMemoryEventSourceSubscriptionStore,
-  parentOf,
 } from "../../actor/event-subscriptions.js";
 import { ExternalRootDriver } from "../../actor/external-root-driver.js";
 import { InMemoryActorRepository } from "../../repositories/in-memory-actor-repository.js";
-import { HierarchicalEventSourceResolver } from "../../runtime/event-manager.js";
 import { ActorHandle } from "./actor-handle.js";
 import { createProvider } from "./fixture-provider.js";
 import { FollowerInstance } from "./follower-instance.js";
@@ -48,23 +46,13 @@ export function createHarness(options: {
   let sequence = 0;
   const eventSourceOwners = new InMemoryEventSourceOwnerStore();
   const eventSourceSubscriptions = new InMemoryEventSourceSubscriptionStore();
-  let mesh!: ActorMesh;
-  const eventSourceResolver = new HierarchicalEventSourceResolver({
-    ports: {
-      parentOf,
-      isLive: (actorId) => mesh.isLiveActor(actorId),
-      activeDelegationsFor: (resource) => eventSourceOwners.activeForResource(resource),
-      directSubscribersFor: (resource) => eventSourceSubscriptions.subscribersOf(resource),
-      governingObligationOwnerFor: () => undefined,
-      resolveActor: (handleOrId) => mesh.resolveLiveActorId(handleOrId),
-    },
-  });
-  mesh = new ActorMesh({
+  // No event seam: these follower tests never route or deliver events, and a
+  // mesh without one simply refuses those paths rather than inventing a ladder.
+  const mesh = new ActorMesh({
     actors,
     rootId: "root",
     eventSourceOwners,
     eventSourceSubscriptions,
-    eventSourceResolver,
     maxConcurrent: 1,
     idgen: () => `instance-worker-${++sequence}`,
     recordChat: (message) => {

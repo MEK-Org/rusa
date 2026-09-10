@@ -1782,7 +1782,8 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     capabilityGrants,
     eventSourceOwners,
     eventSourceSubscriptions,
-    eventSourceResolver,
+    // One seam: the manager carries the kernel built above, so mesh authority
+    // and event delivery cannot diverge.
     eventManager,
     // The configured scope the mesh refuses new subscriptions outside of, so a
     // `subscribe_event_source` call cannot reopen what the config closed.

@@ -593,10 +593,14 @@ export interface ActorMeshOptions {
   capabilityGrants?: CapabilityGrantStore;
   eventSourceOwners?: EventSourceOwnerStore;
   eventSourceSubscriptions?: EventSourceSubscriptionStore;
-  /** The one routing kernel assembled by the host and shared with EventManager. */
-  eventSourceResolver?: EventRoutingKernel;
   /**
-   * Transitionally retained only to append through EventManager before
+   * The single external-event seam: the host-assembled EventManager, which
+   * carries the one routing kernel as {@link EventManager.routing}. Mesh reads
+   * its authority ladder from that manager rather than accepting a resolver
+   * beside it, so a mesh with two competing routing policies cannot be
+   * constructed at all.
+   *
+   * Mesh retains the manager only to append through it before
    * notifyInboxChanged; #384 will move after-commit notification out of Mesh.
    */
   eventManager?: EventManager;
@@ -699,7 +703,6 @@ export class ActorMesh {
     body: string;
     sessionId?: string;
   }) => string;
-  readonly eventSourceResolver?: EventRoutingKernel;
   readonly eventManager?: EventManager;
   private readonly grants: CapabilityGrantStore;
   private readonly eventSourceOwners: EventSourceOwnerStore;
@@ -810,7 +813,6 @@ export class ActorMesh {
     this.log = opts.log ?? (() => {});
     this.scheduledMessages = opts.scheduledMessages;
     this.withTransaction = opts.withTransaction ?? ((fn) => fn());
-    this.eventSourceResolver = opts.eventSourceResolver;
     this.eventManager = opts.eventManager;
   }
 
@@ -1748,6 +1750,15 @@ export class ActorMesh {
   }
 
   /**
+   * The one routing kernel, read off the single event seam. There is no setter
+   * and no fallback construction: if the host assembled a manager, its ladder
+   * is the mesh's ladder by identity.
+   */
+  private get routing(): EventRoutingKernel | undefined {
+    return this.eventManager?.routing;
+  }
+
+  /**
    * The live **owner** destinations for an event, walking the ownership ladder:
    * a live obligation claiming the source, then an explicit ownership row, then
    * (for bubble-eligible event classes) the same two questions of the parent
@@ -1778,10 +1789,11 @@ export class ActorMesh {
       exactObligationOwner?: string | null;
     } = {}
   ): { diagnostic: EffectiveRouteDiagnostic; destinations: string[] } {
-    if (!this.eventSourceResolver) {
-      throw new Error("Event routing requires a host-assembled routing kernel");
+    const routing = this.routing;
+    if (!routing) {
+      throw new Error("Event routing requires a host-assembled EventManager");
     }
-    const decision = this.eventSourceResolver.resolveOwner(resource, opts);
+    const decision = routing.resolveOwner(resource, opts);
     return { diagnostic: decision.diagnostic, destinations: decision.ownerIds };
   }
 
@@ -2019,12 +2031,18 @@ export class ActorMesh {
     eventSummary: string,
     opts: EventDeliveryOptions = {}
   ): Promise<void> {
+    // CRITICAL: no `await` may appear between recipient resolution and the
+    // notification below. EventManager's routing and append are synchronous for
+    // exactly this reason, and this method stays async only to preserve its
+    // public contract — as it did before the extraction. Yield anywhere in
+    // here and an actor can retire after being resolved as live, leaving a
+    // durable unhandled row with nobody alive to take it.
     if (opts.inboxPayload) {
       if (!this.eventManager) {
         throw new Error("Inbox delivery requires a host-assembled EventManager");
       }
       const rawResource = typeof resource === "string" ? resource : resourceKey(resource);
-      const entries = await this.eventManager.handleNormalizedEvent({
+      const entries = this.eventManager.handleNormalizedEvent({
         resource: rawResource,
         payload: {
           ...opts.inboxPayload,
@@ -2042,10 +2060,11 @@ export class ActorMesh {
     }
 
     const rawResource = typeof resource === "string" ? resource : resourceKey(resource);
-    if (!this.eventSourceResolver) {
-      throw new Error("Event routing requires a host-assembled routing kernel");
+    const routing = this.routing;
+    if (!routing) {
+      throw new Error("Event routing requires a host-assembled EventManager");
     }
-    const recipients = await this.eventSourceResolver.resolveRecipients(rawResource, {
+    const recipients = routing.resolveRecipients(rawResource, {
       directedTarget: opts.directedTarget,
       eventPayload: opts.inboxPayload,
       eventSummary,
@@ -2087,12 +2106,16 @@ export class ActorMesh {
    * The host's three external ingress paths enter here with an explicit raw
    * source shape. EventManager owns normalize → route → append; Mesh owns the
    * after-commit wake until #384 extracts that notification seam.
+   *
+   * Like {@link deliverEvent}, the body runs to completion in one turn: the
+   * manager's normalize/route/append is synchronous, so nothing can retire
+   * between resolution, persistence, and the wake.
    */
   async deliverExternalEvent(raw: RawIntegrationEvent): Promise<void> {
     if (!this.eventManager) {
       throw new Error("External event delivery requires a host-assembled EventManager");
     }
-    const entries = await this.eventManager.handleExternalEvent(raw);
+    const entries = this.eventManager.handleExternalEvent(raw);
     this.notifyPersistedInboxEntries(entries, raw.priority);
   }
 

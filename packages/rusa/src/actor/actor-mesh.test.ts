@@ -251,7 +251,6 @@ function setup(
     inboxStore,
     eventSourceOwners,
     eventSourceSubscriptions,
-    eventSourceResolver,
     eventManager,
     isVoiceSessionActive: opts.isVoiceSessionActive,
     obligations: opts.obligations,
@@ -5230,6 +5229,46 @@ describe("ActorMesh", () => {
   });
 
   describe("Event Subscriptions (Phase 2)", () => {
+    it("offers no second routing seam to construct a mesh with", () => {
+      const { mesh } = setup();
+      // Authority and delivery are the same object by construction: the mesh
+      // reads its ladder off the manager it was given. A resolver passed
+      // beside that manager is what let an embedder hold two disagreeing
+      // policies, so the option no longer exists to pass.
+      const options: ActorMeshOptions = {
+        actors: new InMemoryActorRepository(),
+        // @ts-expect-error - there is one event seam: the EventManager itself.
+        eventSourceResolver: {},
+      };
+      expect(options).toBeDefined();
+      expect(mesh).toBeDefined();
+    });
+
+    it("delivers in one turn, so a queued retirement cannot orphan a durable entry", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh } = setup({ inboxStore });
+      const worker = mesh.spawn({ charter: "repo worker", parentId: "root" });
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", worker, "root");
+
+      // Recipient liveness, the durable append, and the wake are one turn.
+      // Suspend anywhere between them and a retirement lands after a recipient
+      // was resolved as live: the row is still written (InboxRepository.append
+      // validates only non-empty actor ids, and the inbox table has no actor
+      // foreign key), leaving durable unhandled work nobody alive can take,
+      // and the wake then fails. A microtask queued before the call is the
+      // tightest interleaving available — it runs at the first suspension
+      // point inside deliverEvent, if the code has one at all.
+      const retirement = Promise.resolve().then(() => mesh.retire(worker));
+      const delivery = mesh.deliverEvent("github:dummy-org/dummy-repo", "repo event", {
+        inboxPayload: payload("push"),
+      });
+
+      await expect(delivery).resolves.toBeUndefined();
+      await retirement;
+
+      expect(inboxStore.entries.filter((entry) => entry.actorId === worker)).toHaveLength(1);
+    });
+
     it("subscribes and unsubscribes event sources and records audit events", () => {
       const events: MeshEventInput[] = [];
       const { mesh } = setup({ events: (e: MeshEventInput) => events.push(e) });
