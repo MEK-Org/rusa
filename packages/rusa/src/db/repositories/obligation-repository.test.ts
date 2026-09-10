@@ -989,6 +989,8 @@ describe("ObligationRepository", () => {
       ownerId: "actor-a",
     });
 
+    db.prepare("UPDATE obligations SET priority = NULL WHERE id IN ('child', 'leaf')").run();
+
     expect(repository.require("child")).toMatchObject({
       priority: null,
       effectivePriority: 10,
@@ -999,6 +1001,59 @@ describe("ObligationRepository", () => {
       effectivePriority: 20,
       prioritySourceId: "override",
     });
+  });
+
+  it("defaults new child and descendant obligations without explicit priority to their own creation timestamps (#212)", () => {
+    repository.create({
+      title: "root",
+      id: "root-p",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "child1",
+      id: "child-1",
+      parentId: "root-p",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "child2",
+      id: "child-2",
+      parentId: "root-p",
+      ownerId: "actor-a",
+    });
+    repository.create({
+      title: "grandchild",
+      id: "grandchild-1",
+      parentId: "child-1",
+      ownerId: "actor-a",
+    });
+
+    const root = repository.require("root-p");
+    const child1 = repository.require("child-1");
+    const child2 = repository.require("child-2");
+    const grandchild = repository.require("grandchild-1");
+
+    expect(root.priority).toBeTypeOf("number");
+    expect(child1.priority).toBeTypeOf("number");
+    expect(child2.priority).toBeTypeOf("number");
+    expect(grandchild.priority).toBeTypeOf("number");
+
+    // Sibling/descendant obligations do not inherit root's priority; they have their own creation-time priority
+    expect(child1.priority).toBeGreaterThan(root.priority ?? 0);
+    expect(child2.priority).toBeGreaterThan(child1.priority ?? 0);
+    expect(grandchild.priority).toBeGreaterThan(child2.priority ?? 0);
+
+    expect(child1.effectivePriority).toBe(child1.priority);
+    expect(child1.prioritySourceId).toBe("child-1");
+    expect(child2.effectivePriority).toBe(child2.priority);
+    expect(child2.prioritySourceId).toBe("child-2");
+    expect(grandchild.effectivePriority).toBe(grandchild.priority);
+    expect(grandchild.prioritySourceId).toBe("grandchild-1");
+
+    // Queue ordering among ready siblings without explicit priority reflects creation timestamps
+    const ready = repository.listOwned("actor-a", { status: "ready" });
+    const readyIds = ready.map((o) => o.id);
+    expect(readyIds.indexOf("child-2")).toBeLessThan(readyIds.indexOf("grandchild-1"));
   });
 
   it("moves a subtree by clearing every descendant override", () => {
@@ -1060,6 +1115,8 @@ describe("ObligationRepository", () => {
       ownerId: "actor-b",
       priority: 20,
     });
+
+    db.prepare("UPDATE obligations SET priority = NULL WHERE id IN ('inheriting', 'leaf')").run();
 
     repository.setPriorityInternal("root", 5, "self");
     expect(repository.require("root").effectivePriority).toBe(5);
@@ -1815,13 +1872,14 @@ describe("ObligationRepository", () => {
         id: "parent-1",
         ownerId: "actor-a",
       });
-      const child = repository.create({
+      repository.create({
         title: "child-1",
         id: "child-1",
         parentId: "parent-1",
         ownerId: "actor-a",
       });
-      expect(child.priority).toBeNull();
+      db.prepare("UPDATE obligations SET priority = NULL WHERE id = 'child-1'").run();
+      expect(repository.require("child-1").priority).toBeNull();
 
       const reparented = repository.reparent("child-1", null);
       expect(reparented.parentId).toBeNull();
