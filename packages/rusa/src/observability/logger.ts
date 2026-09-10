@@ -357,11 +357,18 @@ export function redactValue(
   }
 }
 
-/** Normalize one call's fields into the object handed to Pino. */
+/**
+ * Pino writes these record keys itself. Application context and call fields
+ * bearing one are ignored, so they cannot collide with Pino's generated value.
+ */
+const PINO_OWNED_RECORD_KEYS = ["level", "time", "msg"] as const;
+
+/** Normalize one record's application fields into the object handed to Pino. */
 function normalizeFields(fields: LogFields | undefined, secrets: readonly string[]): LogFields {
   if (!fields) return {};
   const { err, ...rest } = fields;
   const normalized = redactValue(rest, secrets) as LogFields;
+  for (const key of PINO_OWNED_RECORD_KEYS) delete normalized[key];
   if (err !== undefined) normalized.err = serializeError(err, secrets);
   return normalized;
 }
@@ -378,9 +385,10 @@ function normalizeFields(fields: LogFields | undefined, secrets: readonly string
  *
  * Merging into one object first makes the outcome a single key with explicit
  * precedence — innermost layer wins, and a per-call field beats every bound
- * layer — which is also the precedence a reader would guess. The cost is
- * re-serializing a small context per record instead of once per child; context
- * is a handful of identifiers, and a record nobody can parse costs more.
+ * layer. Pino exclusively owns `level`, `time`, and `msg`, so user-supplied
+ * values for those names are removed before Pino writes its own. The final
+ * merged record is normalized at write time, which keeps a secret registered
+ * after a logger or child was created out of every context value too.
  */
 function wrap(
   target: PinoLogger,
@@ -391,7 +399,7 @@ function wrap(
     (level: LogLevel) =>
     (event: string, fields?: LogFields): void => {
       const secrets = readSecrets();
-      target[level]({ ...context, ...normalizeFields(fields, secrets) }, scrubText(event, secrets));
+      target[level](normalizeFields({ ...context, ...fields }, secrets), scrubText(event, secrets));
     };
   return {
     debug: emit("debug"),
@@ -401,7 +409,7 @@ function wrap(
     child: (layer) =>
       wrap(target, readSecrets, {
         ...context,
-        ...(redactValue(layer, readSecrets()) as LogContext),
+        ...layer,
       }),
   };
 }
@@ -439,7 +447,7 @@ export function createLogger(options: CreateLoggerOptions = {}): Logger {
     // `pretty` reformats that same stream in place; it does not tee it.
     sink
   );
-  return wrap(root, readSecrets, options.context ?? { component: "rusa" });
+  return wrap(root, readSecrets, { ...(options.context ?? { component: "rusa" }) });
 }
 
 /** A logger that discards everything, for callers with nothing to log to. */

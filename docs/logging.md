@@ -97,9 +97,14 @@ A key bound twice appears in the record once, and the closer binding wins:
 a call's own field beats every bound layer, an inner child beats an outer one,
 and a child beats the root. So the `actor-run` child of a logger rooted at
 `component: start` writes `"component":"actor-run"` and nothing else — the
-record has no repeated key for a strict reader to reject, and no ambiguity for
-a lenient one to resolve by accident. Everything the closer layer did not name
-is inherited unchanged.
+record has no repeated key. That lets strict readers accept it and leaves no
+ambiguity for lenient ones to resolve by accident. Everything the closer layer
+did not name is inherited unchanged.
+
+`level`, `time`, and `msg` belong to Pino: the logger generates the first two,
+and the event argument supplies `msg`. If application context or a call field
+uses one of those names, it is dropped rather than colliding with Pino's record
+key. Use a distinct application field instead.
 
 Rebinding is for narrowing the unit of work, not for renaming a field. If two
 layers mean different things, give them different names (`component` and

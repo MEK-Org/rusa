@@ -98,15 +98,10 @@ function topLevelKeys(line: string): string[] {
   return keys;
 }
 
-/** The keys `topLevelKeys` saw more than once. Empty is the only good answer. */
-function duplicateKeys(line: string): string[] {
-  const seen = new Set<string>();
-  const repeated = new Set<string>();
-  for (const key of topLevelKeys(line)) {
-    if (seen.has(key)) repeated.add(key);
-    seen.add(key);
-  }
-  return [...repeated];
+/** Assert raw top-level keys are unique without letting JSON.parse conceal a duplicate. */
+function expectUniqueTopLevelKeys(line: string): void {
+  const keys = topLevelKeys(line);
+  expect(new Set(keys)).toHaveLength(keys.length);
 }
 
 const originalLevelEnv = process.env[LOG_LEVEL_ENV_VAR];
@@ -230,6 +225,15 @@ describe("child context", () => {
 });
 
 describe("context key uniqueness", () => {
+  it("scans escaped keys while ignoring nested and string-embedded lookalikes", () => {
+    const line =
+      '{"level":"info","escaped\\"key":1,"nested":{"escaped\\"key":2},"array":[{"time":"nested"}],"text":"{\\"time\\":\\"string\\"}","escaped\\u0022key":3}';
+
+    const keys = topLevelKeys(line);
+    expect(keys).toEqual(["level", 'escaped"key', "nested", "array", "text", 'escaped"key']);
+    expect(new Set(keys)).toHaveLength(keys.length - 1);
+  });
+
   /**
    * The shape `rusa start` actually builds: a root bound to `component: start`
    * whose `actor-run` child rebinds the same key. Before the merge, Pino
@@ -241,7 +245,7 @@ describe("context key uniqueness", () => {
     logger.child({ component: "actor-run" }).info("run_start", { provider: "claude" });
 
     const line = lines.join("").trim();
-    expect(duplicateKeys(line)).toEqual([]);
+    expectUniqueTopLevelKeys(line);
     expect(line).toContain('"component":"actor-run"');
     expect(line).not.toContain('"component":"start"');
   });
@@ -251,7 +255,7 @@ describe("context key uniqueness", () => {
 
     logger.child({ component: "actor-run" }).child({ component: "provider" }).info("call_started");
 
-    expect(duplicateKeys(lines.join("").trim())).toEqual([]);
+    expectUniqueTopLevelKeys(lines.join("").trim());
     expect(records()[0].component).toBe("provider");
   });
 
@@ -262,7 +266,7 @@ describe("context key uniqueness", () => {
       component: "sub-step",
     });
 
-    expect(duplicateKeys(lines.join("").trim())).toEqual([]);
+    expectUniqueTopLevelKeys(lines.join("").trim());
     expect(records()[0]).toMatchObject({ component: "sub-step", actorId: "worker-7" });
   });
 
@@ -276,7 +280,7 @@ describe("context key uniqueness", () => {
       .child({ actorId: "worker-7", runId: "run-42" })
       .info("run_start");
 
-    expect(duplicateKeys(lines.join("").trim())).toEqual([]);
+    expectUniqueTopLevelKeys(lines.join("").trim());
     expect(records()[0]).toMatchObject({
       component: "actor-run",
       service: "rusa",
@@ -297,7 +301,7 @@ describe("context key uniqueness", () => {
     logger.info("service_stopped");
 
     for (const line of lines.join("").split("\n").filter(Boolean)) {
-      expect(duplicateKeys(line)).toEqual([]);
+      expectUniqueTopLevelKeys(line);
     }
     expect(records().map((record) => record.component)).toEqual([
       "provider",
@@ -319,7 +323,7 @@ describe("context key uniqueness", () => {
       .error("run_end", { success: false, err: failure });
 
     const line = lines.join("").trim();
-    expect(duplicateKeys(line)).toEqual([]);
+    expectUniqueTopLevelKeys(line);
     expect(records()[0]).toMatchObject({ component: "actor-run", actorId: "worker-7" });
     const err = records()[0].err as SerializedError;
     expect(err.message).toBe("run failed");
@@ -339,7 +343,7 @@ describe("context key uniqueness", () => {
       .info("call_started");
 
     const line = lines.join("").trim();
-    expect(duplicateKeys(line)).toEqual([]);
+    expectUniqueTopLevelKeys(line);
     expect(line).not.toContain(token);
     expect(records()[0]).toMatchObject({
       component: "provider",
@@ -360,6 +364,52 @@ describe("context key uniqueness", () => {
     expect(tokens[2]).toBe("actor-run");
     expect(tokens).not.toContain("start");
     expect(lines()[0]).not.toContain("component=");
+  });
+
+  it("reserves Pino-owned keys across root, child and call context", () => {
+    const ignored = ["root", "child", "call"];
+    const { logger, lines, records } = recordingLogger({
+      context: { component: "start", level: ignored[0], time: ignored[0], msg: ignored[0] },
+    });
+
+    logger
+      .child({ component: "actor-run", level: ignored[1], time: ignored[1], msg: ignored[1] })
+      .info("run_start", { level: ignored[2], time: ignored[2], msg: ignored[2] });
+
+    const line = lines.join("").trim();
+    expectUniqueTopLevelKeys(line);
+    expect(records()[0]).toMatchObject({
+      level: "info",
+      time: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+      component: "actor-run",
+      msg: "run_start",
+    });
+    for (const value of ignored) expect(line).not.toContain(`"${value}"`);
+  });
+
+  it("redacts a secret registered after root and child context were bound", () => {
+    // Synthetic value only; it is registered only after both contexts exist.
+    const token = "fixture-late-token-9999";
+    let secrets: readonly string[] = [];
+    const { logger, lines, records } = recordingLogger({
+      context: { component: "start", rootEndpoint: `https://example.test/${token}` },
+      secrets: () => secrets,
+    });
+    const child = logger.child({
+      component: "provider",
+      childEndpoint: `https://example.test/${token}`,
+    });
+
+    secrets = [token];
+    child.info("call_started");
+
+    const line = lines.join("").trim();
+    expectUniqueTopLevelKeys(line);
+    expect(line).not.toContain(token);
+    expect(records()[0]).toMatchObject({
+      rootEndpoint: `https://example.test/${REDACTED}`,
+      childEndpoint: `https://example.test/${REDACTED}`,
+    });
   });
 });
 
