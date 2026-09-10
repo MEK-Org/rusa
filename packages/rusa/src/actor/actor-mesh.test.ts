@@ -18,6 +18,7 @@ import {
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
 import { Actor } from "./actor.js";
 import type {
   ActorFactoryContext,
@@ -30,7 +31,12 @@ import type {
 import { ActorMesh, RetirementBlockedError } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
 import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
-import type { EventResource } from "./event-subscriptions.js";
+import {
+  type EventResource,
+  InMemoryEventSourceOwnerStore,
+  InMemoryEventSourceSubscriptionStore,
+  parentOf,
+} from "./event-subscriptions.js";
 import { ExternalRootDriver } from "./external-root-driver.js";
 import { routeRunFailure } from "./failure-sink.js";
 import type {
@@ -199,8 +205,28 @@ function setup(
   let seq = 0;
   let chatSeq = 0;
   const scheduledMessages = opts.scheduledMessages ?? new FakeScheduledMessageScheduler();
+  const inboxStore = opts.inboxStore ?? createMemoryInboxStore();
+  const eventSourceOwners = new InMemoryEventSourceOwnerStore();
+  const eventSourceSubscriptions = new InMemoryEventSourceSubscriptionStore();
 
-  const mesh = new ActorMesh({
+  let mesh!: ActorMesh;
+  const eventSourceResolver = new HierarchicalEventSourceResolver({
+    ports: {
+      parentOf,
+      isLive: (actorId) => mesh.isLiveActor(actorId),
+      activeDelegationsFor: (resource) => eventSourceOwners.activeForResource(resource),
+      directSubscribersFor: (resource) => eventSourceSubscriptions.subscribersOf(resource),
+      findLiveObligationByExternalRef: (ref) => opts.obligations?.findLiveByExternalRef(ref),
+      resolveActor: (handleOrId) => mesh.resolveLiveActorId(handleOrId),
+    },
+    log: (m) => logs.push(m),
+  });
+  const eventManager = new EventManager({
+    inboxStore,
+    resolver: eventSourceResolver,
+    log: (m) => logs.push(m),
+  });
+  mesh = new ActorMesh({
     actors: registry,
     rootId: opts.rootId ?? "root",
     handleForId: opts.handleForId,
@@ -213,7 +239,10 @@ function setup(
     isShuttingDown: opts.isShuttingDown,
     events: opts.events,
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
-    inboxStore: opts.inboxStore ?? createMemoryInboxStore(),
+    inboxStore,
+    eventSourceOwners,
+    eventSourceSubscriptions,
+    eventManager,
     isVoiceSessionActive: opts.isVoiceSessionActive,
     obligations: opts.obligations,
     configuredEventSources: opts.configuredEventSources,
@@ -5191,6 +5220,64 @@ describe("ActorMesh", () => {
   });
 
   describe("Event Subscriptions (Phase 2)", () => {
+    it("offers no second routing seam to construct a mesh with", () => {
+      const { mesh } = setup();
+      // Authority and delivery are the same object by construction: the mesh
+      // reads its ladder off the manager it was given. A resolver passed
+      // beside that manager is what let an embedder hold two disagreeing
+      // policies, so the option no longer exists to pass.
+      const options: ActorMeshOptions = {
+        actors: new InMemoryActorRepository(),
+        // @ts-expect-error - there is one event seam: the EventManager itself.
+        eventSourceResolver: {},
+      };
+      expect(options).toBeDefined();
+      expect(mesh).toBeDefined();
+    });
+
+    it("delivers in one turn, so a queued retirement cannot orphan a durable entry", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh } = setup({ inboxStore });
+      const worker = mesh.spawn({ charter: "repo worker", parentId: "root" });
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", worker, "root");
+
+      // Recipient liveness, the durable append, and the wake are one turn.
+      // Suspend anywhere between them and a retirement lands after a recipient
+      // was resolved as live: the row is still written (InboxRepository.append
+      // validates only non-empty actor ids, and the inbox table has no actor
+      // foreign key), leaving durable unhandled work nobody alive can take,
+      // and the wake then fails. A microtask queued before the call is the
+      // tightest interleaving available — it runs at the first suspension
+      // point inside deliverEvent, if the code has one at all.
+      const retirement = Promise.resolve().then(() => mesh.retire(worker));
+      const delivery = mesh.deliverEvent("github:dummy-org/dummy-repo", "repo event", {
+        inboxPayload: payload("push"),
+      });
+
+      await expect(delivery).resolves.toBeUndefined();
+      await retirement;
+
+      expect(inboxStore.entries.filter((entry) => entry.actorId === worker)).toHaveLength(1);
+    });
+
+    it("canonicalizes a legacy resource once for both routing and durable inbox source", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh } = setup({ inboxStore });
+      const worker = mesh.spawn({ charter: "issue worker", parentId: "root" });
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo/issues/456", worker, "root");
+
+      await mesh.deliverEvent("github_issue:dummy-org/dummy-repo#456", "legacy issue event", {
+        inboxPayload: payload("issues.opened"),
+      });
+
+      expect(inboxStore.entries).toEqual([
+        expect.objectContaining({
+          actorId: worker,
+          source: "github:dummy-org/dummy-repo/issues/456",
+        }),
+      ]);
+    });
+
     it("subscribes and unsubscribes event sources and records audit events", () => {
       const events: MeshEventInput[] = [];
       const { mesh } = setup({ events: (e: MeshEventInput) => events.push(e) });

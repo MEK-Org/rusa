@@ -12,10 +12,16 @@ import {
   type SpawnRequest,
 } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
+import {
+  InMemoryEventSourceOwnerStore,
+  InMemoryEventSourceSubscriptionStore,
+  parentOf,
+} from "../actor/event-subscriptions.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import type { RusaConfig } from "../config/types.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import { InboxRepository } from "../db/repositories/inbox-repository.js";
 import { ModelClassRepository } from "../db/repositories/model-class-repository.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import {
@@ -26,6 +32,7 @@ import {
 } from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
 import { createAgentExecMcpServer } from "./agent-exec-mcp.js";
 
 async function connect(server: McpServer): Promise<Client> {
@@ -100,13 +107,38 @@ function setup(
     payload?: string;
   }[] = [];
   let seq = 0;
-  const mesh = new ActorMesh({
+  const eventSourceOwners = new InMemoryEventSourceOwnerStore();
+  const eventSourceSubscriptions = new InMemoryEventSourceSubscriptionStore();
+  let mesh!: ActorMesh;
+  const eventSourceResolver = new HierarchicalEventSourceResolver({
+    ports: {
+      parentOf,
+      isLive: (actorId) => mesh.isLiveActor(actorId),
+      activeDelegationsFor: (resource) => eventSourceOwners.activeForResource(resource),
+      directSubscribersFor: (resource) => eventSourceSubscriptions.subscribersOf(resource),
+      findLiveObligationByExternalRef: (ref) => opts.obligations?.findLiveByExternalRef(ref),
+      resolveActor: (handleOrId) => mesh.resolveLiveActorId(handleOrId),
+    },
+  });
+  // The delegation tools read the ownership ladder, and a mesh reaches that
+  // ladder only through its one event seam. A real InboxRepository backs the
+  // manager so this harness cannot drift from production append semantics.
+  const eventDb = new Database(":memory:");
+  runMigrations(eventDb);
+  const eventManager = new EventManager({
+    inboxStore: new InboxRepository(eventDb),
+    resolver: eventSourceResolver,
+  });
+  mesh = new ActorMesh({
     actors: registry,
     validateSpawn: opts.validateSpawn,
     validateModel: opts.validateModel,
     maxConcurrent: opts.maxConcurrent,
     scheduledMessages: opts.scheduledMessages,
     obligations: opts.obligations,
+    eventSourceOwners,
+    eventSourceSubscriptions,
+    eventManager,
     events: (e) => events.push(e),
     grantableCapabilities: new Set([
       "understanding-write",
