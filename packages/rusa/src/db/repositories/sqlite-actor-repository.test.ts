@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { ActorMesh, type MeshActor } from "../../actor/actor-mesh.js";
 import type { ActorRecord } from "../../actor/actor-record.js";
 import { HUMAN_OPERATOR } from "../../mcp/stamp.js";
 import { runMigrations } from "../migrations/runner.js";
@@ -21,6 +22,18 @@ const root: ActorRecord = {
   status: "active",
   createdAt: "2026-09-03T13:00:00.000Z",
 };
+
+function adoptedActor(id: string): MeshActor {
+  return {
+    id,
+    requestRun: () => {},
+    declareYield: () => {},
+    markUnkillable: () => {},
+    close: () => {},
+    isRunning: false,
+    preemptForResponsive: () => ({ preempted: false as const }),
+  };
+}
 
 describe("SqliteActorRepository", () => {
   let db: Database.Database;
@@ -727,5 +740,51 @@ describe("SqliteActorRepository", () => {
         }
       ).voice_config
     ).toBe(stored);
+  });
+
+  it("preserves fallback-only raw voice_config when start adopts the existing root", () => {
+    const documents = [
+      JSON.stringify({
+        schemaVersion: 1,
+        provider: "google",
+        config: { voiceName: "RetiredGoogleVoice" },
+      }),
+      JSON.stringify({
+        schemaVersion: 1,
+        provider: "elevenlabs",
+        config: { voiceId: "future-voice" },
+      }),
+    ];
+
+    for (const stored of documents) {
+      repository.upsert(root);
+      db.prepare("UPDATE actors SET voice_config = ? WHERE id = 'root'").run(stored);
+
+      // commands/start.ts rebuilds this root record without a voiceConfig key
+      // on every boot, then registers it through ActorMesh.adopt().
+      const mesh = new ActorMesh({
+        actors: repository,
+        createActor: () => adoptedActor("unused"),
+      });
+      mesh.adopt({ ...root, title: "Reconfigured at boot" }, adoptedActor("root"));
+
+      expect(
+        (
+          db.prepare("SELECT voice_config FROM actors WHERE id = 'root'").get() as {
+            voice_config: string | null;
+          }
+        ).voice_config
+      ).toBe(stored);
+    }
+
+    // Explicit ownership of the setting remains the only clear path.
+    repository.patch("root", { voiceConfig: undefined });
+    expect(
+      (
+        db.prepare("SELECT voice_config FROM actors WHERE id = 'root'").get() as {
+          voice_config: string | null;
+        }
+      ).voice_config
+    ).toBeNull();
   });
 });
