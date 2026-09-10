@@ -1869,7 +1869,7 @@ describe("ObligationRepository", () => {
         parentId: "parent-1",
         ownerId: "actor-a",
       });
-      db.prepare("UPDATE obligations SET priority = NULL WHERE id = 'child-1'").run();
+      repository.setPriorityInternal("parent-1", 10);
       expect(repository.require("child-1").priority).toBeNull();
 
       const reparented = repository.reparent("child-1", null);
