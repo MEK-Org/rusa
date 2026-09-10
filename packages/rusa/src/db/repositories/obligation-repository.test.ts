@@ -962,7 +962,7 @@ describe("ObligationRepository", () => {
     );
   });
 
-  it("resolves nullable child priority through the nearest explicit ancestor", () => {
+  it("resolves persisted legacy nullable priority through the nearest explicit ancestor", () => {
     repository.create({
       title: "root",
       id: "root",
@@ -989,6 +989,9 @@ describe("ObligationRepository", () => {
       ownerId: "actor-a",
     });
 
+    // Fixture persisted before #212: creation now always stamps a priority.
+    // The adjacent subtree-priority test covers the supported mutation that
+    // clears descendant priorities after this change.
     db.prepare("UPDATE obligations SET priority = NULL WHERE id IN ('child', 'leaf')").run();
 
     expect(repository.require("child")).toMatchObject({
@@ -1003,7 +1006,7 @@ describe("ObligationRepository", () => {
     });
   });
 
-  it("defaults new child and descendant obligations without explicit priority to their own creation timestamps (#212)", () => {
+  it("defaults omitted and null priority to each obligation's persisted creation timestamp (#212)", () => {
     repository.create({
       title: "root",
       id: "root-p",
@@ -1014,6 +1017,7 @@ describe("ObligationRepository", () => {
       id: "child-1",
       parentId: "root-p",
       ownerId: "actor-a",
+      priority: null,
     });
     repository.create({
       title: "child2",
@@ -1026,6 +1030,7 @@ describe("ObligationRepository", () => {
       id: "grandchild-1",
       parentId: "child-1",
       ownerId: "actor-a",
+      priority: null,
     });
 
     const root = repository.require("root-p");
@@ -1033,27 +1038,13 @@ describe("ObligationRepository", () => {
     const child2 = repository.require("child-2");
     const grandchild = repository.require("grandchild-1");
 
-    expect(root.priority).toBeTypeOf("number");
-    expect(child1.priority).toBeTypeOf("number");
-    expect(child2.priority).toBeTypeOf("number");
-    expect(grandchild.priority).toBeTypeOf("number");
+    for (const obligation of [root, child1, child2, grandchild]) {
+      expect(obligation.priority).toBe(Date.parse(obligation.createdAt as string));
+      expect(obligation.effectivePriority).toBe(obligation.priority);
+      expect(obligation.prioritySourceId).toBe(obligation.id);
+    }
 
-    // Sibling/descendant obligations do not inherit root's priority; they have their own creation-time priority
-    expect(child1.priority).toBeGreaterThan(root.priority ?? 0);
-    expect(child2.priority).toBeGreaterThan(child1.priority ?? 0);
-    expect(grandchild.priority).toBeGreaterThan(child2.priority ?? 0);
-
-    expect(child1.effectivePriority).toBe(child1.priority);
-    expect(child1.prioritySourceId).toBe("child-1");
-    expect(child2.effectivePriority).toBe(child2.priority);
-    expect(child2.prioritySourceId).toBe("child-2");
-    expect(grandchild.effectivePriority).toBe(grandchild.priority);
-    expect(grandchild.prioritySourceId).toBe("grandchild-1");
-
-    // Queue ordering among ready siblings without explicit priority reflects creation timestamps
-    const ready = repository.listOwned("actor-a", { status: "ready" });
-    const readyIds = ready.map((o) => o.id);
-    expect(readyIds.indexOf("child-2")).toBeLessThan(readyIds.indexOf("grandchild-1"));
+    // Equal-millisecond timestamps retain the established stable-ID queue tie-break.
   });
 
   it("moves a subtree by clearing every descendant override", () => {

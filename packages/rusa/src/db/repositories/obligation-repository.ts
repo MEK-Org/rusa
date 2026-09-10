@@ -848,7 +848,9 @@ export class ObligationRepository {
       }
 
       const priority =
-        input.priority == null ? validatePriority(this.now()) : validatePriority(input.priority);
+        input.priority == null
+          ? validatePriority(Date.parse(stampedAt))
+          : validatePriority(input.priority);
 
       // Resolve and validate every declared prerequisite before writing
       // anything (#212): a blocked obligation must be inserted `waiting`
