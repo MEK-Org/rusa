@@ -21,6 +21,7 @@ import {
   MAX_OBLIGATION_PAGE_LIMIT,
   type ObligationRepository,
 } from "../db/repositories/obligation-repository.js";
+import { voiceConfigSchema } from "../db/repositories/sqlite-actor-repository.js";
 import { HUMAN_OPERATOR } from "../mcp/stamp.js";
 import type { Obligation, ObligationStatus } from "../obligations/obligation.js";
 import { resolveObligationOwner } from "../obligations/owner.js";
@@ -1266,31 +1267,9 @@ export async function handleMeshApiRequest(
             });
             return;
           }
-          const requestedVoiceConfig = body.voiceConfig;
-          if (
-            requestedVoiceConfig !== null &&
-            (typeof requestedVoiceConfig !== "object" || Array.isArray(requestedVoiceConfig))
-          ) {
-            sendJson(res, 400, {
-              error: "voiceConfig must be a supported provider document, or null for the default",
-            });
-            return;
-          }
-          const config = requestedVoiceConfig as Record<string, unknown> | null;
-          const providerConfig = config?.config as Record<string, unknown> | undefined;
-          if (
-            config !== null &&
-            (config.schemaVersion !== 1 ||
-              config.provider !== "google" ||
-              providerConfig === undefined ||
-              Object.keys(config).length !== 3 ||
-              !Object.keys(config).every((key) =>
-                ["schemaVersion", "provider", "config"].includes(key)
-              ) ||
-              Object.keys(providerConfig).length !== 1 ||
-              !Object.hasOwn(providerConfig, "voiceName") ||
-              typeof providerConfig.voiceName !== "string")
-          ) {
+          const voiceConfigResult =
+            body.voiceConfig === null ? null : voiceConfigSchema.safeParse(body.voiceConfig);
+          if (voiceConfigResult !== null && !voiceConfigResult.success) {
             sendJson(res, 400, {
               error:
                 "voiceConfig must be { schemaVersion: 1, provider: 'google', config: { voiceName } }, or null for the default",
@@ -1298,10 +1277,10 @@ export async function handleMeshApiRequest(
             return;
           }
           const voiceName =
-            config === null
+            voiceConfigResult === null
               ? undefined
-              : canonicalSupportedVoiceName(providerConfig?.voiceName as string);
-          if (config !== null && !voiceName) {
+              : canonicalSupportedVoiceName(voiceConfigResult.data.config.voiceName);
+          if (voiceConfigResult !== null && !voiceName) {
             sendJson(res, 400, {
               error: "voiceConfig.config.voiceName must name a supported Google TTS voice",
             });

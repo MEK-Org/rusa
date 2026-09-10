@@ -345,6 +345,17 @@ describe("handleMeshApiRequest", () => {
           voiceConfig: {
             schemaVersion: 1,
             provider: "google",
+            config: { voiceName: "Puck" },
+            extra: true,
+          },
+        }),
+        JSON.stringify({
+          voiceConfig: { schemaVersion: 2, provider: "google", config: { voiceName: "Puck" } },
+        }),
+        JSON.stringify({
+          voiceConfig: {
+            schemaVersion: 1,
+            provider: "google",
             config: { voiceName: "Puck", extra: true },
           },
         }),

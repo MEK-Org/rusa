@@ -679,10 +679,10 @@ describe("SqliteActorRepository", () => {
       "not-json",
       '{"provider":"google","config":{"voiceName":"Puck"}}',
       '{"schemaVersion":2,"provider":"google","config":{"voiceName":"Puck"}}',
-      '{"schemaVersion":1,"provider":"elevenlabs","config":{"voiceId":"abc"}}',
       '{"schemaVersion":1,"provider":"google"}',
       '{"schemaVersion":1,"provider":"google","config":{"voiceName":""}}',
       '{"schemaVersion":1,"provider":"google","config":{"voiceName":"Puck","unknown":true}}',
+      '{"schemaVersion":1,"provider":"elevenlabs","config":{"voiceId":"abc"},"unknown":true}',
     ]) {
       db.prepare("UPDATE actors SET voice_config = ? WHERE id = 'root'").run(invalid);
       expect(() => repository.get("root")).toThrow(/invalid voice_config for actor 'root'/);
@@ -691,13 +691,41 @@ describe("SqliteActorRepository", () => {
 
   it("falls back to the instance voice when a well-formed document names a retired voice", () => {
     repository.upsert(root);
-    db.prepare("UPDATE actors SET voice_config = ? WHERE id = 'root'").run(
-      JSON.stringify({
-        schemaVersion: 1,
-        provider: "google",
-        config: { voiceName: "NotAVoice" },
-      })
-    );
+    const stored = JSON.stringify({
+      schemaVersion: 1,
+      provider: "google",
+      config: { voiceName: "NotAVoice" },
+    });
+    db.prepare("UPDATE actors SET voice_config = ? WHERE id = 'root'").run(stored);
     expect(repository.get("root")?.voiceConfig).toBeUndefined();
+    repository.patch("root", { title: "Unrelated update" });
+    expect(
+      (
+        db.prepare("SELECT voice_config FROM actors WHERE id = 'root'").get() as {
+          voice_config: string | null;
+        }
+      ).voice_config
+    ).toBe(stored);
+  });
+
+  it("falls back across an unknown-provider rollback and retains its document on unrelated patches", () => {
+    repository.upsert(root);
+    const stored = JSON.stringify({
+      schemaVersion: 1,
+      provider: "elevenlabs",
+      config: { voiceId: "future-voice" },
+    });
+    db.prepare("UPDATE actors SET voice_config = ? WHERE id = 'root'").run(stored);
+
+    expect(repository.get("root")?.voiceConfig).toBeUndefined();
+    repository.patch("root", { title: "Still loads on rollback" });
+    expect(repository.get("root")?.title).toBe("Still loads on rollback");
+    expect(
+      (
+        db.prepare("SELECT voice_config FROM actors WHERE id = 'root'").get() as {
+          voice_config: string | null;
+        }
+      ).voice_config
+    ).toBe(stored);
   });
 });
