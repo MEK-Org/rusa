@@ -1189,6 +1189,7 @@ describe("GitHubIssueClient", () => {
           body: null,
           html_url: "https://github.com/test-org/test-repo/pull/5",
           head: { ref: "mc/issue-3", sha: "details-head-sha" },
+          base: { ref: "staging" },
           state: "open",
         },
       },
@@ -1201,6 +1202,7 @@ describe("GitHubIssueClient", () => {
       body: "",
       htmlUrl: "https://github.com/test-org/test-repo/pull/5",
       headRef: "mc/issue-3",
+      baseRef: "staging",
       headSha: "details-head-sha",
       state: "open",
     });

@@ -89,6 +89,7 @@ function recordingIssueClient(): { client: IssueClient; calls: Call[] } {
         body: "b",
         htmlUrl: "u",
         headRef: "h",
+        baseRef: "staging",
         headSha: "head-sha",
         state: "open",
       };
