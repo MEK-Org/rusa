@@ -185,6 +185,8 @@ class FakeApi extends DashboardApi {
   final rootSpawnCalls =
       <({String charter, String? title, String? provider, String? model})>[];
   String spawnedRootChildId = 'spawned-child';
+  final actorReparentCalls = <({String id, String parentId})>[];
+  Object? actorReparentError;
 
   /// When set, the NEXT fetchQuota awaits this instead of returning
   /// [quotaResult] immediately — lets a test observe the SWR "refreshing"
@@ -276,6 +278,17 @@ class FakeApi extends DashboardApi {
       makeThread(spawnedRootChildId, parent: 'root', title: title),
     ];
     return spawnedRootChildId;
+  }
+
+  @override
+  Future<void> reparentActor(String id, {required String parentId}) async {
+    actorReparentCalls.add((id: id, parentId: parentId));
+    final error = actorReparentError;
+    if (error != null) throw error;
+    threadsResult = [
+      for (final thread in threadsResult)
+        thread.id == id ? thread.copyWith(parentId: parentId) : thread,
+    ];
   }
 
   @override

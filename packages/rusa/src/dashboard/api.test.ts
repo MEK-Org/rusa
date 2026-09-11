@@ -152,6 +152,7 @@ describe("handleMeshApiRequest", () => {
   let actors: InMemoryActorRepository;
   let deps: DashboardDataDeps;
   let rootSpawns: Array<{ request: unknown; principal: string }>;
+  let rootReparents: Array<{ id: string; parentId: string; principal: string }>;
 
   beforeEach(() => {
     db = new Database(":memory:");
@@ -162,6 +163,7 @@ describe("handleMeshApiRequest", () => {
     obligations = new ObligationRepository(db);
     actors = new InMemoryActorRepository();
     rootSpawns = [];
+    rootReparents = [];
     const mockMesh = {
       sendHumanMessage: (toId: string, body: string, sessionId: string) => {
         meshEvents.record({
@@ -188,6 +190,9 @@ describe("handleMeshApiRequest", () => {
         spawnChild: (request: unknown, principal: string) => {
           rootSpawns.push({ request, principal });
           return UUID_A;
+        },
+        reparentChild: (id: string, parentId: string, principal: string) => {
+          rootReparents.push({ id, parentId, principal });
         },
       } as unknown as RootControlService,
     };
@@ -375,6 +380,29 @@ describe("handleMeshApiRequest", () => {
         },
       },
     ]);
+  });
+
+  it("POST /api/mesh/actors/:id/reparent delegates an operator-root move", async () => {
+    const { res } = await call(
+      deps,
+      "POST",
+      `/api/mesh/actors/${UUID_B}/reparent`,
+      JSON.stringify({ parentId: UUID_A })
+    );
+    await settled(res);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ok: true });
+    expect(rootReparents).toEqual([{ id: UUID_B, parentId: UUID_A, principal: "human:operator" }]);
+  });
+
+  it("POST /api/mesh/actors/:id/reparent rejects a missing parent before root control", async () => {
+    const { res } = await call(deps, "POST", `/api/mesh/actors/${UUID_B}/reparent`, "{}");
+    await settled(res);
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("parentId is required");
+    expect(rootReparents).toEqual([]);
   });
 
   it("POST /api/mesh/actors forwards a portable context selection ", async () => {

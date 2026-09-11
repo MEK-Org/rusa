@@ -82,6 +82,23 @@ class DashboardApi {
     return (jsonDecode(res.body) as Map<String, dynamic>)['id'] as String;
   }
 
+  /// `POST /api/mesh/actors/:id/reparent` — root-authorized actor hierarchy
+  /// change. The server keeps the authoritative cycle and liveness guards.
+  Future<void> reparentActor(String id, {required String parentId}) async {
+    final uri = _u('/api/mesh/actors/$id/reparent');
+    final res = await _client.post(
+      uri,
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({'parentId': parentId}),
+    );
+    if (res.statusCode != 200) {
+      throw DashboardApiException(uri, res.statusCode, res.body);
+    }
+  }
+
   /// `GET /api/quota` → cached per-provider provider quota snapshot.
   Future<QuotaSnapshotDto> fetchQuota() async {
     return QuotaSnapshotDto.fromJson(await _getJson(_u('/api/quota')));
@@ -126,12 +143,12 @@ class DashboardApi {
     }
     final q = <String, String>{
       if (actors != null && actors.isNotEmpty) 'actors': actors.join(','),
-      'since':? since,
+      'since': ?since,
       'limit': '$limit',
       if (kinds != null && kinds.isNotEmpty) 'kinds': kinds.join(','),
       if (before != null) 'before': '$before',
       if (conversation) 'conversation': 'true',
-      'order':? order,
+      'order': ?order,
     };
     return EventPage.fromJson(await _getJson(_u('/api/mesh/events', q)));
   }
@@ -156,12 +173,13 @@ class DashboardApi {
     String actorId, {
     String status = 'all',
     int limit = 20,
-  }) =>
-      _getJson(_u('/api/mesh/inbox', {
-        'actor': actorId,
-        'status': status,
-        'limit': '$limit',
-      }));
+  }) => _getJson(
+    _u('/api/mesh/inbox', {
+      'actor': actorId,
+      'status': status,
+      'limit': '$limit',
+    }),
+  );
 
   /// `POST /api/mesh/actors/:actorId/inbox/handled` — clear one inbox entry
   /// the actor should not have to answer. `reason` is the operator's own
@@ -295,7 +313,10 @@ class DashboardApi {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
       },
-      body: jsonEncode({'imageBase64': imageBase64, 'contentType': contentType}),
+      body: jsonEncode({
+        'imageBase64': imageBase64,
+        'contentType': contentType,
+      }),
     );
     if (res.statusCode != 200) {
       throw DashboardApiException(uri, res.statusCode, res.body);
@@ -400,8 +421,8 @@ class DashboardApi {
     int? offset,
   }) async {
     final q = <String, String>{
-      'ownerId':? ownerId,
-      'status':? status,
+      'ownerId': ?ownerId,
+      'status': ?status,
       if (rootsOnly != null) 'rootsOnly': '$rootsOnly',
       if (limit != null) 'limit': '$limit',
       if (offset != null) 'offset': '$offset',
@@ -532,7 +553,9 @@ class DashboardApi {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
       },
-      body: jsonEncode({'externalRef': (trimmed == null || trimmed.isEmpty) ? null : trimmed}),
+      body: jsonEncode({
+        'externalRef': (trimmed == null || trimmed.isEmpty) ? null : trimmed,
+      }),
     );
     if (res.statusCode != 200) {
       throw DashboardApiException(uri, res.statusCode, res.body);
@@ -568,11 +591,12 @@ class DashboardApi {
     return ObligationDto.fromJson(json['obligation'] as Map<String, dynamic>);
   }
 
-  Future<ObligationDto> reparentObligation(String id, {String? parentId}) async {
+  Future<ObligationDto> reparentObligation(
+    String id, {
+    String? parentId,
+  }) async {
     final uri = _u('/api/mesh/obligations/$id/reparent');
-    final payload = {
-      'parentId': ?parentId,
-    };
+    final payload = {'parentId': ?parentId};
     final res = await _client.post(
       uri,
       headers: {

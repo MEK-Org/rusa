@@ -12,6 +12,7 @@ import 'header.dart';
 import 'obligation_card.dart';
 import 'obligation_dialogs.dart';
 import 'obligation_status.dart';
+import 'hierarchy_drag_drop.dart';
 import 'reference_preview.dart';
 
 class WorkTab extends StatefulWidget {
@@ -118,6 +119,114 @@ class _WorkTabState extends State<WorkTab> {
       }
     }
     return null;
+  }
+
+  ObligationTreeDto? _findTree(String id, [List<ObligationTreeDto>? nodes]) {
+    for (final node in nodes ?? _rootTrees) {
+      if (node.obligation.id == id) return node;
+      final found = _findTree(id, node.children);
+      if (found != null) return found;
+    }
+    return null;
+  }
+
+  List<ObligationDto>? _siblingsFor(
+    String id, [
+    List<ObligationTreeDto>? nodes,
+  ]) {
+    final current = nodes ?? _rootTrees;
+    if (current.any((node) => node.obligation.id == id)) {
+      return current.map((node) => node.obligation).toList();
+    }
+    for (final node in current) {
+      final found = _siblingsFor(id, node.children);
+      if (found != null) return found;
+    }
+    return null;
+  }
+
+  bool _isObligationDescendant(String candidateId, String ancestorId) {
+    final candidate = _findTree(candidateId);
+    if (candidate == null) return false;
+    bool visit(ObligationTreeDto node) {
+      if (node.obligation.id == ancestorId) return true;
+      return node.children.any(visit);
+    }
+
+    return candidate.children.any(visit);
+  }
+
+  bool _canAcceptObligationDrop(
+    ObligationDto dragged,
+    ObligationDto target,
+    HierarchyDropZone zone,
+  ) {
+    if (dragged.id == target.id ||
+        dragged.isTerminal ||
+        target.isTerminal ||
+        _isObligationDescendant(target.id, dragged.id)) {
+      return false;
+    }
+    if (zone == HierarchyDropZone.on) return true;
+    return dragged.status == 'ready' &&
+        target.status == 'ready' &&
+        dragged.parentId == target.parentId &&
+        dragged.ownerId == target.ownerId;
+  }
+
+  Future<void> _dropObligation(
+    BuildContext context,
+    ObligationDto dragged,
+    ObligationDto target,
+    HierarchyDropZone zone,
+  ) async {
+    try {
+      if (zone == HierarchyDropZone.on) {
+        await widget.store.api.reparentObligation(
+          dragged.id,
+          parentId: target.id,
+        );
+        _expandedIds.add(target.id);
+        widget.store.saveWorkExpanded(_expandedIds);
+      } else {
+        final siblings = _siblingsFor(target.id)
+            ?.where(
+              (o) =>
+                  o.status == 'ready' &&
+                  o.ownerId == dragged.ownerId &&
+                  !o.isTerminal,
+            )
+            .toList();
+        if (siblings == null) return;
+        siblings.removeWhere((o) => o.id == dragged.id);
+        final targetIndex = siblings.indexWhere((o) => o.id == target.id);
+        if (targetIndex < 0) return;
+        final insertIndex = zone == HierarchyDropZone.before
+            ? targetIndex
+            : targetIndex + 1;
+        final previousId = insertIndex == 0
+            ? null
+            : siblings[insertIndex - 1].id;
+        final nextId = insertIndex == siblings.length
+            ? null
+            : siblings[insertIndex].id;
+        await widget.store.api.reorderObligation(
+          dragged.id,
+          previousId: previousId,
+          nextId: nextId,
+        );
+      }
+      await _loadRoots();
+    } catch (err) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to move obligation: $err'),
+            backgroundColor: MeshColors.statusHalted,
+          ),
+        );
+      }
+    }
   }
 
   @override
@@ -359,7 +468,7 @@ class _WorkTabState extends State<WorkTab> {
                     final isSelected =
                         node.obligation.id == _selectedObligationId;
 
-                    return InkWell(
+                    final content = InkWell(
                       onTap: () => widget.store.setFocusedObligationId(
                         node.obligation.id,
                       ),
@@ -455,6 +564,44 @@ class _WorkTabState extends State<WorkTab> {
                           ],
                         ),
                       ),
+                    );
+                    return HierarchyDropTarget<ObligationDto>(
+                      canAccept: (dragged, zone) => _canAcceptObligationDrop(
+                        dragged,
+                        node.obligation,
+                        zone,
+                      ),
+                      onDrop: (dragged, zone) => _dropObligation(
+                        context,
+                        dragged,
+                        node.obligation,
+                        zone,
+                      ),
+                      builder: (context, activeDropZone) {
+                        final highlighted = HierarchyDropHighlight(
+                          zone: activeDropZone,
+                          child: content,
+                        );
+                        if (node.obligation.isTerminal) return highlighted;
+                        return Draggable<ObligationDto>(
+                          data: node.obligation,
+                          dragAnchorStrategy: pointerDragAnchorStrategy,
+                          hitTestBehavior: HitTestBehavior.opaque,
+                          feedback: HierarchyDragFeedback(
+                            leading: Icon(
+                              Icons.account_tree_outlined,
+                              size: 16,
+                              color: MeshColors.accent,
+                            ),
+                            label: node.obligation.heading,
+                          ),
+                          childWhenDragging: Opacity(
+                            opacity: .35,
+                            child: highlighted,
+                          ),
+                          child: highlighted,
+                        );
+                      },
                     );
                   },
                 ),
@@ -554,14 +701,16 @@ class _DetailViewState extends State<_DetailView> {
     final gen = ++_fetchGeneration;
     final future = store.api.fetchObligationDetail(widget.obligationId);
     _future = future;
-    future.then((data) {
-      if (!mounted || gen != _fetchGeneration) return;
-      setState(() {
-        _completions = data.completions;
-        _completionsTotal = data.completionsTotal;
-        _completionsHasMore = data.completionsHasMore;
-      });
-    }).catchError((_) {});
+    future
+        .then((data) {
+          if (!mounted || gen != _fetchGeneration) return;
+          setState(() {
+            _completions = data.completions;
+            _completionsTotal = data.completionsTotal;
+            _completionsHasMore = data.completionsHasMore;
+          });
+        })
+        .catchError((_) {});
   }
 
   void _loadMoreCompletions() {
@@ -574,14 +723,16 @@ class _DetailViewState extends State<_DetailView> {
     setState(() {
       _future = future;
     });
-    future.then((data) {
-      if (!mounted || gen != _fetchGeneration) return;
-      setState(() {
-        _completions = mergeCompletions(data.completions, _completions);
-        _completionsTotal = data.completionsTotal;
-        _completionsHasMore = _completions.length < data.completionsTotal;
-      });
-    }).catchError((_) {});
+    future
+        .then((data) {
+          if (!mounted || gen != _fetchGeneration) return;
+          setState(() {
+            _completions = mergeCompletions(data.completions, _completions);
+            _completionsTotal = data.completionsTotal;
+            _completionsHasMore = _completions.length < data.completionsTotal;
+          });
+        })
+        .catchError((_) {});
   }
 
   void _refresh() {
@@ -590,21 +741,23 @@ class _DetailViewState extends State<_DetailView> {
     setState(() {
       _future = future;
     });
-    future.then((data) {
-      if (!mounted || gen != _fetchGeneration) return;
-      setState(() {
-        if (!data.completionsHasMore ||
-            _completions.length <= data.completions.length) {
-          _completions = data.completions;
-          _completionsTotal = data.completionsTotal;
-          _completionsHasMore = data.completionsHasMore;
-        } else {
-          _completions = mergeCompletions(data.completions, _completions);
-          _completionsTotal = data.completionsTotal;
-          _completionsHasMore = _completions.length < data.completionsTotal;
-        }
-      });
-    }).catchError((_) {});
+    future
+        .then((data) {
+          if (!mounted || gen != _fetchGeneration) return;
+          setState(() {
+            if (!data.completionsHasMore ||
+                _completions.length <= data.completions.length) {
+              _completions = data.completions;
+              _completionsTotal = data.completionsTotal;
+              _completionsHasMore = data.completionsHasMore;
+            } else {
+              _completions = mergeCompletions(data.completions, _completions);
+              _completionsTotal = data.completionsTotal;
+              _completionsHasMore = _completions.length < data.completionsTotal;
+            }
+          });
+        })
+        .catchError((_) {});
   }
 
   @override
@@ -630,35 +783,7 @@ class _DetailViewState extends State<_DetailView> {
         return ListView(
           padding: const EdgeInsets.all(24),
           children: [
-            Row(
-              children: [
-                ObligationStatusChip(
-                  obligation: o,
-                  store: store,
-                  bordered: true,
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: SelectableText(
-                    o.id,
-                    style: const TextStyle(
-                      color: MeshColors.textMuted,
-                      fontSize: 12,
-                      fontFamily: kMonoFontFamily,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            SelectableText(
-              o.heading,
-              style: const TextStyle(
-                color: MeshColors.textPrimary,
-                fontSize: 22,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
+            _detailHeader(context, data),
             if (o.body != null) ...[
               const SizedBox(height: 10),
               SelectableText(
@@ -734,9 +859,6 @@ class _DetailViewState extends State<_DetailView> {
             ],
             _SectionHeader('CHILDREN'),
             _childrenPanel(context, data),
-            const SizedBox(height: 28),
-            _SectionHeader('OBLIGATION ACTIONS'),
-            _actionsPanel(context, data),
           ],
         );
       },
@@ -1069,7 +1191,8 @@ class _DetailViewState extends State<_DetailView> {
         ),
       );
     }
-    final reference = data.externalReference ??
+    final reference =
+        data.externalReference ??
         ReferenceDto(
           ref: ref,
           scheme: ref.split(':').first,
@@ -1267,138 +1390,98 @@ class _DetailViewState extends State<_DetailView> {
     );
   }
 
-  Widget _actionsPanel(BuildContext context, ObligationDetailSnapshot data) {
+  Widget _detailHeader(BuildContext context, ObligationDetailSnapshot data) {
     final o = data.obligation;
-    final isTerminal = o.isTerminal;
+    final actions = <Widget>[
+      IconButton(
+        tooltip: 'Mark Done',
+        icon: const Icon(Icons.check_circle_outline),
+        color: ObligationStatusColors.done.chipForeground,
+        onPressed: () => confirmAndSetObligationStatus(
+          context,
+          store,
+          o,
+          'done',
+          onUpdated: onMutated,
+        ),
+      ),
+      IconButton(
+        tooltip: 'Cancel Obligation',
+        icon: const Icon(Icons.cancel_outlined),
+        color: ObligationStatusColors.cancelled.chipForeground,
+        onPressed: () => confirmAndSetObligationStatus(
+          context,
+          store,
+          o,
+          'cancelled',
+          onUpdated: onMutated,
+        ),
+      ),
+      IconButton(
+        tooltip: 'Reassign obligation',
+        icon: const Icon(Icons.person_outline),
+        onPressed: () => showReassignObligationDialog(
+          context,
+          store,
+          o,
+          onReassigned: onMutated,
+        ),
+      ),
+      IconButton(
+        tooltip: 'Add child obligation',
+        icon: const Icon(Icons.add_task),
+        onPressed: () => showCreateObligationDialog(
+          context,
+          store,
+          defaultParentId: o.id,
+          defaultOwnerId: o.ownerId,
+          onCreated: onMutated,
+        ),
+      ),
+    ];
+    final titleAndStatus = Row(
+      children: [
+        Expanded(
+          child: SelectableText(
+            o.heading,
+            maxLines: 2,
+            style: const TextStyle(
+              color: MeshColors.textPrimary,
+              fontSize: 22,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+        const SizedBox(width: 10),
+        ObligationStatusChip(obligation: o, store: store, bordered: true),
+      ],
+    );
 
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: MeshColors.bgSecondary,
-        border: Border.all(color: MeshColors.border),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (isTerminal) ...[
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-              decoration: BoxDecoration(
-                color: o.isDone
-                    ? ObligationStatusColors.done.chipBackground
-                    : ObligationStatusColors.cancelled.chipBackground,
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    o.isDone ? Icons.check_circle : Icons.cancel,
-                    size: 16,
-                    color: o.isDone
-                        ? ObligationStatusColors.done.chipForeground
-                        : ObligationStatusColors.cancelled.chipForeground,
-                  ),
-                  const SizedBox(width: 8),
-                  Text(
-                    'This obligation is in terminal status (${o.status.toUpperCase()}).',
-                    style: TextStyle(
-                      color: o.isDone
-                          ? ObligationStatusColors.done.chipForeground
-                          : ObligationStatusColors.cancelled.chipForeground,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ] else ...[
-            Wrap(
-              spacing: 12,
-              runSpacing: 12,
-              children: [
-                ElevatedButton.icon(
-                  onPressed: () => confirmAndSetObligationStatus(
-                    context,
-                    store,
-                    o,
-                    'done',
-                    onUpdated: onMutated,
-                  ),
-                  icon: const Icon(Icons.check_circle_outline, size: 16),
-                  label: const Text('Mark Done'),
-                  // Blue, not green: green now means an actor is working the
-                  // obligation, so the button that ends it must not wear it.
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: ObligationStatusColors.done.chipBackground,
-                    foregroundColor: ObligationStatusColors.done.chipForeground,
-                  ),
-                ),
-                ElevatedButton.icon(
-                  onPressed: () => confirmAndSetObligationStatus(
-                    context,
-                    store,
-                    o,
-                    'cancelled',
-                    onUpdated: onMutated,
-                  ),
-                  icon: const Icon(Icons.cancel_outlined, size: 16),
-                  label: const Text('Cancel Obligation'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF450A0A),
-                    foregroundColor: const Color(0xFFF87171),
-                  ),
-                ),
-                OutlinedButton.icon(
-                  onPressed: () => showReassignObligationDialog(
-                    context,
-                    store,
-                    o,
-                    onReassigned: onMutated,
-                  ),
-                  icon: const Icon(Icons.person_outline, size: 16),
-                  label: const Text('Reassign...'),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: MeshColors.accent,
-                    side: const BorderSide(color: MeshColors.border),
-                  ),
-                ),
-                OutlinedButton.icon(
-                  onPressed: () => showReparentObligationDialog(
-                    context,
-                    store,
-                    o,
-                    onReparented: onMutated,
-                  ),
-                  icon: const Icon(Icons.drive_file_move_outlined, size: 16),
-                  label: const Text('Reparent...'),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: MeshColors.accent,
-                    side: const BorderSide(color: MeshColors.border),
-                  ),
-                ),
-                OutlinedButton.icon(
-                  onPressed: () => showCreateObligationDialog(
-                    context,
-                    store,
-                    defaultParentId: o.id,
-                    defaultOwnerId: o.ownerId,
-                    onCreated: onMutated,
-                  ),
-                  icon: const Icon(Icons.add_task, size: 16),
-                  label: const Text('Add Child...'),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: MeshColors.accent,
-                    side: const BorderSide(color: MeshColors.border),
-                  ),
-                ),
-              ],
-            ),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (o.isTerminal) return titleAndStatus;
+        final actionRow = Row(
+          mainAxisSize: MainAxisSize.min,
+          children: actions,
+        );
+        if (constraints.maxWidth < 560) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              titleAndStatus,
+              const SizedBox(height: 4),
+              Align(alignment: Alignment.centerRight, child: actionRow),
+            ],
+          );
+        }
+        return Row(
+          children: [
+            Expanded(child: titleAndStatus),
+            const SizedBox(width: 8),
+            actionRow,
           ],
-        ],
-      ),
+        );
+      },
     );
   }
 }

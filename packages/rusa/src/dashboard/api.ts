@@ -574,6 +574,44 @@ export async function handleMeshApiRequest(
       return true;
     }
 
+    // POST /api/mesh/actors/:id/reparent — operator-root reorganization.
+    const reparentActorMatch = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/reparent$/);
+    if (reparentActorMatch) {
+      const rootControl = deps?.rootControl;
+      if (!rootControl) {
+        sendJson(res, 503, { error: "root control unavailable" });
+        return true;
+      }
+      const actorId = decodeURIComponent(reparentActorMatch[1]);
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            sendJson(res, 400, { error: "Missing or invalid parentId" });
+            return;
+          }
+          const parentId = (parsed as Record<string, unknown>).parentId;
+          if (typeof parentId !== "string" || !parentId.trim()) {
+            sendJson(res, 400, { error: "parentId is required" });
+            return;
+          }
+          try {
+            rootControl.reparentChild(actorId, parentId.trim(), "human:operator");
+            sendJson(res, 200, { ok: true });
+          } catch (err) {
+            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
     const match = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/chat$/);
     if (match) {
       if (!deps) {

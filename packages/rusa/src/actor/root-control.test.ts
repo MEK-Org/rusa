@@ -19,6 +19,7 @@ function setup(extra: Partial<RootControlOptions> = {}) {
     retire: vi.fn(),
     interrupt: vi.fn(() => ({ interrupted: true })),
     runNow: vi.fn(() => ({ queued: true })),
+    reparentThread: vi.fn(),
     recordEvent: (event) => events.push(event),
     list: vi.fn(() => []),
   };
@@ -331,5 +332,36 @@ describe("RootControlService", () => {
       action: "run_now_child",
       targetId: "child-1",
     });
+  });
+
+  it("reparents a root descendant and audits the new parent", () => {
+    const { mesh, events, service } = setup();
+
+    service.reparentChild("worker-1", "steward-2", "human:operator");
+
+    expect(mesh.reparentThread).toHaveBeenCalledWith("worker-1", "steward-2");
+    expect(JSON.parse(events[0]?.payload ?? "{}")).toMatchObject({
+      action: "reparent_child",
+      targetId: "worker-1",
+      newParentId: "steward-2",
+      principal: "human:operator",
+    });
+  });
+
+  it("refuses a root or foreign actor before asking the mesh to reparent it", () => {
+    const { mesh, service } = setup({
+      mesh: {
+        ...setup().mesh,
+        isAncestorOf: vi.fn((_, id) => id !== "foreign"),
+      },
+    });
+
+    expect(() => service.reparentChild("root", "worker-2", "human:operator")).toThrow(
+      /root descendants/
+    );
+    expect(() => service.reparentChild("foreign", "worker-2", "human:operator")).toThrow(
+      /root descendants/
+    );
+    expect(mesh.reparentThread).not.toHaveBeenCalled();
   });
 });

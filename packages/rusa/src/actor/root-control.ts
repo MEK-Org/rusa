@@ -42,6 +42,7 @@ export interface RootControlMesh {
   retire(id: string, opts?: { force?: boolean; forceQueued?: boolean }): void;
   interrupt(id: string, by?: string): { interrupted: boolean; status?: string };
   runNow(id: string, source?: string): { queued: boolean };
+  reparentThread(id: string, newParentId: string): void;
   recordEvent(event: {
     kind: "root_control_action";
     actorId: string;
@@ -197,6 +198,24 @@ export class RootControlService {
     const result = this.options.mesh.runNow(id, principal);
     this.record(principal, "run_now_child", id);
     return result;
+  }
+
+  /**
+   * Reorganize one live branch with the root's authority. The mesh remains the
+   * validation authority for root/self/cycle and active-parent guards; root
+   * control narrows the transport to its own hierarchy and records the human
+   * principal exactly like its other dashboard actions.
+   */
+  reparentChild(id: string, newParentId: string, principal: RootControlPrincipal): void {
+    if (
+      id === this.rootId ||
+      !this.options.mesh.isAncestorOf(this.rootId, id) ||
+      (newParentId !== this.rootId && !this.options.mesh.isAncestorOf(this.rootId, newParentId))
+    ) {
+      throw new Error("root control may only reparent root descendants");
+    }
+    this.options.mesh.reparentThread(id, newParentId);
+    this.record(principal, "reparent_child", id, { newParentId });
   }
 
   listChildren(): ActorRecord[] {
