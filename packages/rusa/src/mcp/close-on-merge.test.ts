@@ -110,6 +110,28 @@ describe("parseCloseOnMergeDirective", () => {
     ).toEqual({ kind: "close", issueNumbers: [9] });
   });
 
+  it("ignores literal directive examples in four-space-indented Markdown code", () => {
+    for (const body of [
+      "Documentation:\n\n    <!-- mesh:close-on-merge #114 -->",
+      "Documentation:\n\n\t<!-- mesh:close-on-merge #114 -->",
+      "Example:\n\n    step one\n    <!-- mesh:close-on-merge #114 -->\n    step three",
+    ]) {
+      expect(parseCloseOnMergeDirective(body), body).toEqual({ kind: "absent" });
+    }
+
+    expect(
+      parseCloseOnMergeDirective(
+        "    <!-- mesh:close-on-merge #114 -->\n\n<!-- mesh:close-on-merge #9 -->"
+      )
+    ).toEqual({ kind: "close", issueNumbers: [9] });
+  });
+
+  it("treats an indented directive after a paragraph line as live HTML, not code", () => {
+    expect(
+      parseCloseOnMergeDirective("See the note\n    <!-- mesh:close-on-merge #114 -->")
+    ).toEqual({ kind: "close", issueNumbers: [114] });
+  });
+
   it("rejects the whole body when a valid directive sits beside a malformed one", () => {
     const parsed = parseCloseOnMergeDirective(
       "<!-- mesh:close-on-merge #114 -->\n<!-- mesh:close-on-merge nope -->"
