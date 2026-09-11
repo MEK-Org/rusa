@@ -8604,10 +8604,10 @@ describe("strict obligation handling experiment (#382)", () => {
       repo.create({ id, title: id, ownerId: subject });
       selectHead(mesh, subject, id);
       if (terminal === "scheduled") {
-        repo.setRecurrence(id, { policy: "cron", cronExpr: "0 0 * * *" });
-        repo.setTerminalStatus(id, "done");
+        repo.setRecurrence(id, { policy: "cron", cronExpr: "0 0 * * *" }, "system:mesh");
+        repo.setTerminalStatus(id, "done", null, null, "system:mesh");
       } else {
-        repo.setTerminalStatus(id, terminal);
+        repo.setTerminalStatus(id, terminal, null, null, "system:mesh");
       }
       expect(() => mesh.declareYield(subject, "complete")).not.toThrow();
     }
@@ -8649,7 +8649,7 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(() => mesh.declareYield(subject, "complete")).toThrow(/pre-existing work/);
 
     repo.create({ id: "review", title: "Review", ownerId: "human:reviewer" });
-    repo.addPrerequisite("parent", "review");
+    repo.addPrerequisite("parent", "review", "system:mesh");
     expect(() => mesh.declareYield(subject, "blocked")).not.toThrow();
   });
 
@@ -8660,8 +8660,8 @@ describe("strict obligation handling experiment (#382)", () => {
     repo.create({ id: "first", title: "First", ownerId: subject });
     selectHead(mesh, subject, "first");
     repo.create({ id: "cancelled-gate", title: "Cancelled gate", ownerId: subject });
-    repo.setTerminalStatus("cancelled-gate", "cancelled");
-    repo.addPrerequisite("first", "cancelled-gate");
+    repo.setTerminalStatus("cancelled-gate", "cancelled", null, null, "system:mesh");
+    repo.addPrerequisite("first", "cancelled-gate", "system:mesh");
     expect(() => mesh.declareYield(subject, "blocked")).toThrow(/pre-existing work/);
 
     mesh.abandonInboxRun(subject);
@@ -8703,7 +8703,7 @@ describe("strict obligation handling experiment (#382)", () => {
       creatorId: subject,
     });
 
-    repo.setTerminalStatus("initial-child", "done");
+    repo.setTerminalStatus("initial-child", "done", null, null, "system:mesh");
     expect(repo.get("standing-effort")?.status).toBe("ready");
 
     selectHead(mesh, subject, "standing-effort");
@@ -8763,19 +8763,19 @@ describe("strict obligation handling experiment (#382)", () => {
 
     repo.create({ id: "blocker", title: "Blocker", ownerId: subject, priority: 50 });
     repo.create({ id: "head-2", title: "Head 2", ownerId: subject, priority: 100 });
-    repo.addPrerequisite("head-2", "blocker");
+    repo.addPrerequisite("head-2", "blocker", "system:mesh");
     expect(repo.get("head-2")?.status).toBe("waiting");
     const beforeUnblock = headEntries().length;
 
     // head-2 goes waiting -> ready behind head-1, which stays the head: the
     // owner's head never changes, so no attention is emitted early.
-    repo.setTerminalStatus("blocker", "done");
+    repo.setTerminalStatus("blocker", "done", null, null, "system:mesh");
     expect(repo.get("head-2")?.status).toBe("ready");
     expect(headEntries().length).toBe(beforeUnblock);
 
     // Ordinary later delivery: head-1 finishing makes head-2 the head, and the
     // same production listener path appends it with no manual injection.
-    repo.setTerminalStatus("head-1", "done");
+    repo.setTerminalStatus("head-1", "done", null, null, "system:mesh");
     expect(headEntries().map((entry) => entry.payload.obligationId)).toEqual(["head-1", "head-2"]);
   });
 
@@ -8835,11 +8835,11 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(notice).not.toMatch(/experiment/i);
 
     // Finishing one head is not enough: enforcement still names the other.
-    repo.setTerminalStatus("first-head", "done");
+    repo.setTerminalStatus("first-head", "done", null, null, "system:mesh");
     expect(() => mesh.declareYield(subject, "complete")).toThrow(
       /selected head obligation second-head \("Second head"\) was not finished or decomposed/
     );
-    repo.setTerminalStatus("second-head", "done");
+    repo.setTerminalStatus("second-head", "done", null, null, "system:mesh");
     expect(() => mesh.declareYield(subject, "complete")).not.toThrow();
   });
 

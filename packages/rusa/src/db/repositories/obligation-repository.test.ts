@@ -3141,8 +3141,8 @@ describe("ObligationRepository", () => {
         });
       }
       repository.create({ title: "prerequisite", id: "prereq-edge", ownerId: "actor-a" });
-      repository.addPrerequisite("parent-edge", "prereq-edge");
-      repository.setTerminalStatus("prereq-edge", "done");
+      repository.addPrerequisite("parent-edge", "prereq-edge", "system:mesh");
+      repository.setTerminalStatus("prereq-edge", "done", null, null, "system:mesh");
 
       expect(repository.listDirectChildEdges("parent-edge")).toContainEqual({
         id: "child-edge-100",
