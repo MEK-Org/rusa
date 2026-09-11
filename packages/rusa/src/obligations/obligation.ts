@@ -314,7 +314,7 @@ export function parseExternalRef(value: string): ObligationExternalRef {
  * Mutation kinds that categorize what operation altered an obligation's tracked state (#185).
  *
  * This serves as a coarse label for the primary operation or intent that caused
- * the mutation (e.g. "reassign", "reparent", "reorder", "priority", "status", "external_ref"),
+ * the mutation (e.g. "reassign", "reparent", "priority", "status", "external_ref"),
  * not an index into which specific fields changed. When a single operation alters
  * multiple tracked fields simultaneously (e.g., reparenting that also shifts priority
  * or triggers a readiness demotion), `mutationKind` identifies the triggering operation.
@@ -323,7 +323,6 @@ export function parseExternalRef(value: string): ObligationExternalRef {
 export const OBLIGATION_MUTATION_KINDS = [
   "reassign",
   "reparent",
-  "reorder",
   "priority",
   "status",
   "external_ref",

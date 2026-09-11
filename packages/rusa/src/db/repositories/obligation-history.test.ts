@@ -125,6 +125,26 @@ describe("Obligation mutation history", () => {
         after: { ownerId: "actor-b" },
       });
     });
+
+    it("fails closed against re-entrant mutate calls to protect capture seam", () => {
+      const ob = repository.create({
+        title: "Test Obligation",
+        ownerId: "actor-a",
+      });
+
+      expect(() => {
+        (repository as unknown as { mutate: (principal: string, work: () => void) => void }).mutate(
+          "system:mesh",
+          () => {
+            repository.reassign(ob.id, "actor-b", "system:mesh");
+          }
+        );
+      }).toThrow("ObligationRepository.mutate cannot be called re-entrantly");
+
+      const history = repository.listHistory(ob.id);
+      expect(history).toHaveLength(0);
+      expect(repository.get(ob.id)?.ownerId).toBe("actor-a");
+    });
   });
 
   describe("no-ops record no history", () => {

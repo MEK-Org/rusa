@@ -619,6 +619,9 @@ export class ObligationRepository {
    */
   private pendingCancellationAttention: PrerequisiteAttention[] = [];
 
+  /** Guard against re-entrant calls to {@link mutate}. */
+  private isMutating = false;
+
   /**
    * `(dependentId, prerequisiteId)` keys whose cancellation-attention delivery
    * threw on a previous {@link mutate} call (#212) — e.g. a transient inbox
@@ -747,6 +750,9 @@ export class ObligationRepository {
    * guarantee durability across restarts and process downtime.
    */
   private mutate<T>(principal: EntityId, work: () => T): T {
+    if (this.isMutating) {
+      throw new Error("ObligationRepository.mutate cannot be called re-entrantly");
+    }
     const changes: ReadyHeadChange[] = [];
     this.dirtyScheduleIds.clear();
     this.pendingCancellationAttention = [];
@@ -761,7 +767,13 @@ export class ObligationRepository {
       // the deltas and the history rows with it: a failed call records nothing.
       this.db.prepare("DELETE FROM obligation_history_delta").run();
 
-      const res = work();
+      this.isMutating = true;
+      let res: T;
+      try {
+        res = work();
+      } finally {
+        this.isMutating = false;
+      }
 
       this.recordMutationHistory(actingPrincipal);
 
