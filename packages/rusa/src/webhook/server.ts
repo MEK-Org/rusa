@@ -400,73 +400,87 @@ export function createWebhookRequestHandler(options: WebhookServerOptions) {
   const { secret, onEvent, onNonWebhookRequest } = options;
   const log = (options.logger ?? nullLogger).child({ component: "webhook" });
   return async (req: IncomingMessage, res: ServerResponse) => {
-    // Only accept POST to /webhook
-    if (req.method !== "POST" || req.url !== "/webhook") {
-      if (onNonWebhookRequest) {
-        await onNonWebhookRequest(req, res);
+    try {
+      // Only accept POST to /webhook
+      if (req.method !== "POST" || req.url !== "/webhook") {
+        if (onNonWebhookRequest) {
+          await onNonWebhookRequest(req, res);
+          return;
+        }
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("Not found");
         return;
       }
-      res.writeHead(404, { "Content-Type": "text/plain" });
-      res.end("Not found");
-      return;
-    }
 
-    const body = await readBody(req);
+      const body = await readBody(req);
 
-    // Validate signature
-    const signature = req.headers["x-hub-signature-256"] as string | undefined;
-    if (!validateSignature(secret, body, signature)) {
-      log.warn("webhook_signature_rejected", { signaturePresent: signature !== undefined });
-      res.writeHead(401, { "Content-Type": "text/plain" });
-      res.end("Invalid signature");
-      return;
-    }
+      // Validate signature
+      const signature = req.headers["x-hub-signature-256"] as string | undefined;
+      if (!validateSignature(secret, body, signature)) {
+        log.warn("webhook_signature_rejected", { signaturePresent: signature !== undefined });
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("Invalid signature");
+        return;
+      }
 
-    // Parse event
-    const eventType = req.headers["x-github-event"] as string | undefined;
-    if (!eventType) {
-      res.writeHead(400, { "Content-Type": "text/plain" });
-      res.end("Missing X-GitHub-Event header");
-      return;
-    }
+      // Parse event
+      const eventType = req.headers["x-github-event"] as string | undefined;
+      if (!eventType) {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("Missing X-GitHub-Event header");
+        return;
+      }
 
-    // Handle ping (sent when webhook is first registered)
-    if (eventType === "ping") {
-      log.info("webhook_ping_received");
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end("pong");
-      return;
-    }
+      // Handle ping (sent when webhook is first registered)
+      if (eventType === "ping") {
+        log.info("webhook_ping_received");
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("pong");
+        return;
+      }
 
-    const deliveryId = req.headers["x-github-delivery"] as string | undefined;
-    if (!deliveryId) {
-      res.writeHead(400, { "Content-Type": "text/plain" });
-      res.end("Missing X-GitHub-Delivery header");
-      return;
-    }
+      const deliveryId = req.headers["x-github-delivery"] as string | undefined;
+      if (!deliveryId) {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("Missing X-GitHub-Delivery header");
+        return;
+      }
 
-    // Parse payload
-    let payload: Record<string, unknown>;
-    try {
-      payload = JSON.parse(body);
-    } catch {
-      res.writeHead(400, { "Content-Type": "text/plain" });
-      res.end("Invalid JSON");
-      return;
-    }
+      // Parse payload
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(body);
+      } catch {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("Invalid JSON");
+        return;
+      }
 
-    // Dispatch event. The delivery id is GitHub's request id: binding it to a
-    // child logger ties every record from this delivery back to the request.
-    const deliveryLog = log.child({ deliveryId });
-    deliveryLog.debug("webhook_event_received", { event: eventType });
-    try {
-      await onEvent(eventType, payload, deliveryId);
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end("ok");
+      // Dispatch event. The delivery id is GitHub's request id: binding it to a
+      // child logger ties every record from this delivery back to the request.
+      const deliveryLog = log.child({ deliveryId });
+      deliveryLog.debug("webhook_event_received", { event: eventType });
+      try {
+        await onEvent(eventType, payload, deliveryId);
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("ok");
+      } catch (err) {
+        deliveryLog.error("webhook_event_failed", { event: eventType, err });
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end("Internal error");
+      }
     } catch (err) {
-      deliveryLog.error("webhook_event_failed", { event: eventType, err });
-      res.writeHead(500, { "Content-Type": "text/plain" });
-      res.end("Internal error");
+      log.error("webhook_request_failed", {
+        method: req.method,
+        path: req.url ?? "/",
+        err,
+      });
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end("Internal error");
+      } else if (!res.writableEnded) {
+        res.end();
+      }
     }
   };
 }

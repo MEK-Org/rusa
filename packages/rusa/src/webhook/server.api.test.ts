@@ -1,7 +1,13 @@
 import { createHmac } from "node:crypto";
 import { EventEmitter, once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
-import type { IncomingMessage, ServerResponse } from "node:http";
+import {
+  createServer,
+  request as httpRequest,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -169,6 +175,131 @@ describe("GitHub webhook request handler", () => {
     expect(result.statusCode).toBe(400);
     expect(result.body).toBe("Missing X-GitHub-Delivery header");
     expect(result.onEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe("webhook request fault boundary", () => {
+  function recordingLogger() {
+    const errors: Array<{ event: string; data?: Record<string, unknown> }> = [];
+    const logger: Logger = {
+      ...nullLogger,
+      error: (event: string, data?: Record<string, unknown>) => {
+        errors.push({ event, data });
+      },
+      child: () => logger,
+    };
+    return { logger, errors };
+  }
+
+  it("contains a rejected body read, logs request context, and answers 500", async () => {
+    const { logger, errors } = recordingLogger();
+    const handler = createWebhookRequestHandler({
+      port: 0,
+      secret: "test-secret",
+      logger,
+      onEvent: vi.fn(),
+    });
+    const req = new MockIncomingMessage({ method: "POST", url: "/webhook" });
+    const res = new MockServerResponse();
+    const done = once(res, "finish");
+    const result = handler(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+
+    const failure = new Error("request stream failed");
+    req.emit("error", failure);
+    await result;
+    await done;
+
+    expect(res.statusCode).toBe(500);
+    expect(res.headers["Content-Type"]).toBe("text/plain");
+    expect(res.body).toBe("Internal error");
+    expect(errors).toEqual([
+      {
+        event: "webhook_request_failed",
+        data: expect.objectContaining({ method: "POST", path: "/webhook", err: failure }),
+      },
+    ]);
+  });
+
+  it("contains a rejected non-webhook handler without taking down the reused HTTP server", async () => {
+    const { logger, errors } = recordingLogger();
+    let rejectFirstRequest = true;
+    const server = createServer(
+      createWebhookRequestHandler({
+        port: 0,
+        secret: "test-secret",
+        logger,
+        onEvent: vi.fn(),
+        onNonWebhookRequest: (_req, res) => {
+          if (rejectFirstRequest) {
+            rejectFirstRequest = false;
+            return Promise.reject(new Error("delegated handler failed"));
+          }
+          res.writeHead(204);
+          res.end();
+        },
+      })
+    );
+    const requestStatus = (port: number) =>
+      new Promise<number>((resolve, reject) => {
+        const req = httpRequest(
+          { host: "127.0.0.1", method: "GET", path: "/dashboard", port },
+          (res) => {
+            res.resume();
+            res.once("end", () => resolve(res.statusCode ?? 0));
+          }
+        );
+        req.once("error", reject);
+        req.end();
+      });
+
+    try {
+      server.listen(0, "127.0.0.1");
+      await once(server, "listening");
+      const port = (server.address() as AddressInfo).port;
+
+      expect(await requestStatus(port)).toBe(500);
+      expect(await requestStatus(port)).toBe(204);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((err) => (err ? reject(err) : resolve()))
+      );
+    }
+
+    expect(errors).toEqual([
+      {
+        event: "webhook_request_failed",
+        data: expect.objectContaining({
+          method: "GET",
+          path: "/dashboard",
+          err: expect.any(Error),
+        }),
+      },
+    ]);
+  });
+
+  it("ends an unfinished response without replacing headers that were already sent", async () => {
+    const { logger, errors } = recordingLogger();
+    const handler = createWebhookRequestHandler({
+      port: 0,
+      secret: "test-secret",
+      logger,
+      onEvent: vi.fn(),
+      onNonWebhookRequest: (_req, res) => {
+        res.writeHead(202, { "Content-Type": "text/plain" });
+        throw new Error("delegated handler failed after headers");
+      },
+    });
+    const req = new MockIncomingMessage({ method: "GET", url: "/dashboard" });
+    const res = new MockServerResponse();
+    const done = once(res, "finish");
+
+    await handler(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+    await done;
+
+    expect(res.statusCode).toBe(202);
+    expect(res.writableEnded).toBe(true);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ event: "webhook_request_failed" });
   });
 });
 
