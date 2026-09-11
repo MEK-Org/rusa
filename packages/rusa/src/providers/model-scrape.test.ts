@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -712,6 +712,32 @@ done
     }
   });
 
+  it("records tmux startup after its short-lived pane self-reaps", async () => {
+    const actorDir = mkdtempSync(join(tmpdir(), "codex-test-actor-startup-"));
+    const mockBin = join(actorDir, "mock-codex-exits.sh");
+    const startupMarkerPath = join(actorDir, "tmux-started");
+    writeFileSync(
+      mockBin,
+      `#!/bin/bash
+touch "${startupMarkerPath}" || { echo "Failed to touch startup marker" >&2; exit 2; }
+exit 0
+`,
+      { mode: 0o755 }
+    );
+
+    try {
+      const options = {
+        actorDir,
+        cliCommand: mockBin,
+        timeoutMs: 3_000,
+      };
+      await expect(scrapeCodexModelScreen(options)).rejects.toThrow("composer never became ready");
+      expect(existsSync(startupMarkerPath)).toBe(true);
+    } finally {
+      rmSync(actorDir, { recursive: true, force: true });
+    }
+  });
+
   it("leaves no tmux server behind when its socket is destroyed before teardown ", async () => {
     // The production leak shape. The tmux server the probe starts lives in its
     // own session, so killing the wrapper's process group cannot reach it, and
@@ -721,9 +747,15 @@ done
     // instance. Destroying the socket mid-probe reproduces that deterministically.
     const actorDir = mkdtempSync(join(tmpdir(), "codex-test-actor-orphan-"));
     const mockBin = join(actorDir, "mock-codex-hang.sh");
+    // The mock binary itself writes this marker as its very first action. Because
+    // the mock only runs when tmux new-session succeeded and launched the pane,
+    // the marker durably proves tmux started even under scheduling starvation
+    // where the server and pane self-reaped before a live ps snapshot could be taken.
+    const startupMarkerPath = join(actorDir, "tmux-started");
     writeFileSync(
       mockBin,
       `#!/bin/bash
+touch "${startupMarkerPath}" || { echo "Failed to touch startup marker" >&2; exit 2; }
 echo "OpenAI Codex"
 echo "Ask Codex to do anything"
 while true; do
@@ -766,79 +798,127 @@ done
       return row.pgid;
     };
     const paneGroupSize = (pgid: number) => processTable().filter((r) => r.pgid === pgid).length;
+    const probeProcessCount = () => processTable().filter((r) => r.args.includes(mockBin)).length;
 
-    const before = probeDirs();
-    // The probe creates its temp dir synchronously, so it is observable as soon
-    // as the call returns a promise.
-    const pending = scrapeCodexModelScreen({
-      actorDir,
-      cliCommand: mockBin,
-      timeoutMs: 4_000,
-    });
-    // Keep an early assertion failure from surfacing as an unhandled rejection:
-    // the probe is still in flight and will reject once its deadline lands.
-    pending.catch(() => {});
-    const created = [...probeDirs()].filter((n) => !before.has(n));
-    expect(created).toHaveLength(1);
-    const tempHome = join(tmpdir(), created[0]);
-    const sock = join(tempHome, "model-tmux.sock");
+    const maxAttempts = 2;
+    let leakShapeExercised = false;
 
-    let paneGroup: number | undefined;
     try {
-      for (let i = 0; i < 100 && serversFor(sock).length === 0; i++) {
-        await new Promise((r) => setTimeout(r, 100));
-      }
-      expect(serversFor(sock).length).toBeGreaterThan(0);
-      // Take the descendants' group while they are alive; once they exit there
-      // is nothing left to derive it from.
-      paneGroup = paneGroupOf(mockBin);
-      expect(paneGroup).toBeDefined();
-      // Establishing the separate group is the probe's job; proving it is this
-      // test's, because everything below signals that group by its negative id.
-      expect(unsafeGroupReason(paneGroup as number)).toBeUndefined();
-      expect(paneGroupSize(paneGroup as number)).toBeGreaterThan(0);
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        rmSync(startupMarkerPath, { force: true });
+        const timeoutMs = attempt === 1 ? 5_000 : 8_000;
 
-      // Slam the door: the socket is gone, so no kill-server can ever land.
-      rmSync(tempHome, { recursive: true, force: true });
-      await expect(pending).rejects.toThrow();
+        const before = probeDirs();
+        // The probe creates its temp dir synchronously, so it is observable as soon
+        // as the call returns a promise.
+        const pending = scrapeCodexModelScreen({
+          actorDir,
+          cliCommand: mockBin,
+          timeoutMs,
+        });
+        // Keep an early assertion failure from surfacing as an unhandled rejection:
+        // the probe is still in flight and will reject once its deadline lands.
+        pending.catch(() => {});
+        const created = [...probeDirs()].filter((n) => !before.has(n));
+        expect(created).toHaveLength(1);
+        const tempHome = join(tmpdir(), created[0]);
+        const sock = join(tempHome, "model-tmux.sock");
 
-      for (
-        let i = 0;
-        i < 150 && (serversFor(sock).length > 0 || paneGroupSize(paneGroup as number) > 0);
-        i++
-      ) {
-        await new Promise((r) => setTimeout(r, 100));
+        let paneGroup: number | undefined;
+        try {
+          for (let i = 0; i < 100 && !existsSync(startupMarkerPath); i++) {
+            await new Promise((r) => setTimeout(r, 100));
+          }
+          if (!existsSync(startupMarkerPath)) {
+            throw new Error(
+              "tmux never started or mock failed to execute: startup marker was not written"
+            );
+          }
+
+          for (
+            let i = 0;
+            i < 50 && (serversFor(sock).length === 0 || paneGroupOf(mockBin) === undefined);
+            i++
+          ) {
+            await new Promise((r) => setTimeout(r, 100));
+          }
+
+          if (serversFor(sock).length === 0 || paneGroupOf(mockBin) === undefined) {
+            // tmux started (proven by startupMarkerPath), but under CI scheduling
+            // pressure the probe self-reaped before socket destruction could be executed.
+            // Never silently return: wait for this probe to finish, clean up, and retry
+            // with a widened deadline or fail loudly.
+            await expect(pending).rejects.toThrow();
+            for (let i = 0; i < 150 && probeProcessCount() > 0; i++) {
+              await new Promise((r) => setTimeout(r, 100));
+            }
+            if (attempt < maxAttempts) {
+              console.warn(
+                `[attempt ${attempt}/${maxAttempts}] tmux started but self-reaped before socket destruction; retrying with widened window`
+              );
+              continue;
+            }
+            throw new Error(
+              "tmux started but self-reaped before the test could destroy its socket; leak shape not exercised this run across all bounded attempts"
+            );
+          }
+
+          // Take the descendants' group while they are alive; once they exit there
+          // is nothing left to derive it from.
+          paneGroup = paneGroupOf(mockBin);
+          expect(paneGroup).toBeDefined();
+          // Establishing the separate group is the probe's job; proving it is this
+          // test's, because everything below signals that group by its negative id.
+          expect(unsafeGroupReason(paneGroup as number)).toBeUndefined();
+          expect(paneGroupSize(paneGroup as number)).toBeGreaterThan(0);
+
+          // Slam the door: the socket is gone, so no kill-server can ever land.
+          rmSync(tempHome, { recursive: true, force: true });
+          await expect(pending).rejects.toThrow();
+
+          for (
+            let i = 0;
+            i < 150 && (serversFor(sock).length > 0 || paneGroupSize(paneGroup as number) > 0);
+            i++
+          ) {
+            await new Promise((r) => setTimeout(r, 100));
+          }
+          expect(serversFor(sock)).toEqual([]);
+          // The point of the fix: the tree the probe spawned is gone too, not just
+          // the daemon that supervised it.
+          expect(paneGroupSize(paneGroup as number)).toBe(0);
+          leakShapeExercised = true;
+          break;
+        } finally {
+          // A failing run deliberately creates an unreapable server; never let one
+          // escape onto the shared box - and reap the descendant group too, since
+          // that is the residue #84 was actually about.
+          // Both paths go through the guarded helpers: inside a sandbox whose init
+          // is PID 1, a misread group id is not a stray signal, it is this run.
+          for (const line of serversFor(sock)) {
+            reapProcess(Number(line.trim().split(/\s+/)[0]));
+          }
+          // Group ids are recycled, and this one was read tens of seconds ago, so
+          // only signal it while it still holds something this probe started. That
+          // shrinks the window to the gap between the check and the signal rather
+          // than closing it - `ps` is a snapshot, not a lock.
+          // `mockBin` is this run's own mkdtemp path, which is the uniqueness
+          // `groupStillHosts` asks its callers for: as a substring of argv it can
+          // name only processes this test started. It is matched here without the
+          // new-session exclusion paneGroupOf needs, and that asymmetry is
+          // deliberate rather than an oversight to tidy up. tmux setsids the pane
+          // leader, so the server never shares the pane group and the filter would
+          // exclude nothing; and a member of this group that did carry the
+          // server's argv would be probe residue to drain, not to spare. Adding
+          // the exclusion here could only shrink what cleanup reaps.
+          if (paneGroup !== undefined && groupStillHosts(paneGroup, mockBin)) {
+            reapProcessGroup(paneGroup);
+          }
+          rmSync(tempHome, { recursive: true, force: true });
+        }
       }
-      expect(serversFor(sock)).toEqual([]);
-      // The point of the fix: the tree the probe spawned is gone too, not just
-      // the daemon that supervised it.
-      expect(paneGroupSize(paneGroup as number)).toBe(0);
+      expect(leakShapeExercised).toBe(true);
     } finally {
-      // A failing run deliberately creates an unreapable server; never let one
-      // escape onto the shared box - and reap the descendant group too, since
-      // that is the residue #84 was actually about.
-      // Both paths go through the guarded helpers: inside a sandbox whose init
-      // is PID 1, a misread group id is not a stray signal, it is this run.
-      for (const line of serversFor(sock)) {
-        reapProcess(Number(line.trim().split(/\s+/)[0]));
-      }
-      // Group ids are recycled, and this one was read tens of seconds ago, so
-      // only signal it while it still holds something this probe started. That
-      // shrinks the window to the gap between the check and the signal rather
-      // than closing it - `ps` is a snapshot, not a lock.
-      // `mockBin` is this run's own mkdtemp path, which is the uniqueness
-      // `groupStillHosts` asks its callers for: as a substring of argv it can
-      // name only processes this test started. It is matched here without the
-      // new-session exclusion paneGroupOf needs, and that asymmetry is
-      // deliberate rather than an oversight to tidy up. tmux setsids the pane
-      // leader, so the server never shares the pane group and the filter would
-      // exclude nothing; and a member of this group that did carry the
-      // server's argv would be probe residue to drain, not to spare. Adding
-      // the exclusion here could only shrink what cleanup reaps.
-      if (paneGroup !== undefined && groupStillHosts(paneGroup, mockBin)) {
-        reapProcessGroup(paneGroup);
-      }
-      rmSync(tempHome, { recursive: true, force: true });
       rmSync(actorDir, { recursive: true, force: true });
     }
   }, 45_000);
