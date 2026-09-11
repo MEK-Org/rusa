@@ -1,3 +1,4 @@
+import { z } from "zod";
 import {
   asGitHubTarget,
   GITHUB_OWNER_MAX,
@@ -6,7 +7,9 @@ import {
   type Reference,
 } from "../references/reference.js";
 
-export type ObligationStatus = "ready" | "waiting" | "done" | "cancelled" | "scheduled";
+export const OBLIGATION_STATUSES = ["ready", "waiting", "done", "cancelled", "scheduled"] as const;
+
+export type ObligationStatus = (typeof OBLIGATION_STATUSES)[number];
 
 /**
  * One entity in the mesh's single id space: an actor UUID, `root`, `human:*`,
@@ -159,7 +162,7 @@ export class ObligationValidationError extends Error {
   }
 }
 
-const STATUSES = new Set<ObligationStatus>(["ready", "waiting", "done", "cancelled", "scheduled"]);
+const STATUSES = new Set<ObligationStatus>(OBLIGATION_STATUSES);
 
 export function isBlockingObligationStatus(status: ObligationStatus): boolean {
   return status === "ready" || status === "waiting";
@@ -305,4 +308,158 @@ export function parseExternalRef(value: string): ObligationExternalRef {
     );
   }
   return reference;
+}
+
+/**
+ * Mutation kinds corresponding to the five tracked lifecycle fields (#185).
+ *
+ * Maps directly to whichever tracked field changed on this obligation row
+ * ("reassign" for ownerId, "reparent" for parentId, "priority" for priority,
+ * "status" for status, "external_ref" for externalRef).
+ *
+ * If a single mutation touches multiple tracked fields on the same row (such as
+ * reparenting to root without explicit priority, which clears parentId and sets
+ * priority), the mutation kind reflects the highest-precedence changed field
+ * (`owner > parent > priority > status > external_ref`).
+ *
+ * Collateral updates to distinct rows (such as parent readiness status demotions
+ * or promotions) record the exact field modified on that row ("status").
+ * Consuming code inspecting exact field transitions should inspect the keys of
+ * `before` and `after` in the versioned payload.
+ */
+export const OBLIGATION_MUTATION_KINDS = [
+  "reassign",
+  "reparent",
+  "priority",
+  "status",
+  "external_ref",
+] as const;
+
+export type ObligationMutationKind = (typeof OBLIGATION_MUTATION_KINDS)[number];
+
+/**
+ * Tracked fields on an obligation row whose changes are recorded in history.
+ *
+ * These represent sparse deltas: only fields that changed in this mutation
+ * are present in `before` and `after`. Absent fields were unchanged, not unset.
+ */
+export interface ObligationHistoryState {
+  ownerId?: string;
+  parentId?: string | null;
+  priority?: number | null;
+  status?: ObligationStatus;
+  externalRef?: string | null;
+}
+
+/**
+ * One immutable, attributable mutation history record (#185).
+ */
+export interface ObligationHistoryEntry {
+  id: number;
+  obligationId: string;
+  mutationKind: ObligationMutationKind;
+  actingPrincipal: EntityId;
+  timestamp: string;
+  before: ObligationHistoryState;
+  after: ObligationHistoryState;
+}
+
+/**
+ * Version of the versioned JSON payload in `obligation_history.payload`.
+ * The schema carries no SQLite json_* validator; consuming code validates
+ * and owns schema evolution at this boundary.
+ */
+export const OBLIGATION_HISTORY_SCHEMA_VERSION = 1;
+
+export const obligationHistoryStateSchema = z
+  .object({
+    ownerId: z.string().optional(),
+    parentId: z.string().nullable().optional(),
+    priority: z.number().nullable().optional(),
+    status: z.enum(OBLIGATION_STATUSES).optional(),
+    externalRef: z.string().nullable().optional(),
+  })
+  .strict();
+
+export const obligationHistoryPayloadSchema = z
+  .object({
+    schemaVersion: z.literal(OBLIGATION_HISTORY_SCHEMA_VERSION),
+    before: obligationHistoryStateSchema,
+    after: obligationHistoryStateSchema,
+  })
+  .strict();
+
+export interface ObligationHistoryPayload {
+  schemaVersion: typeof OBLIGATION_HISTORY_SCHEMA_VERSION;
+  before: ObligationHistoryState;
+  after: ObligationHistoryState;
+}
+
+export function buildHistoryPayload(
+  before: ObligationHistoryState,
+  after: ObligationHistoryState
+): string {
+  return JSON.stringify({
+    schemaVersion: OBLIGATION_HISTORY_SCHEMA_VERSION,
+    before,
+    after,
+  });
+}
+
+export function parseHistoryPayload(json: string): ObligationHistoryPayload {
+  try {
+    const raw = JSON.parse(json);
+    return obligationHistoryPayloadSchema.parse(raw);
+  } catch (cause) {
+    throw new ObligationValidationError(
+      `invalid obligation history payload: ${cause instanceof Error ? cause.message : String(cause)}`
+    );
+  }
+}
+
+/**
+ * The stored shape of one history row, validated whole at the read boundary.
+ *
+ * The table constrains its scalars only to "non-empty", because a CHECK is a
+ * migration to change and the set of mutation kinds is expected to grow. That
+ * makes the row's TypeScript type a claim the database does not enforce, so each
+ * field's typed claim is validated here instead — the same place and for the same
+ * reason the JSON half is checked. `acting_principal` is validated into `EntityId`
+ * via `validateEntityId` (matching `toObligation` for `owner_id`), `timestamp` is
+ * strictly parsed as ISO-8601 UTC, and `mutation_kind` is validated against the
+ * closed set of enum kinds. Validating one half and casting the other would let a
+ * hand-edited or future-version row arrive at a caller typed as something it is
+ * not.
+ */
+const obligationHistoryRowSchema = z
+  .object({
+    id: z.number().int().positive(),
+    obligation_id: z.string().trim().min(1),
+    mutation_kind: z.enum(OBLIGATION_MUTATION_KINDS),
+    acting_principal: z.string().trim().min(1),
+    timestamp: z.iso.datetime(),
+    payload: z.string(),
+  })
+  .strict();
+
+/** Validate one stored history row, scalars and payload alike, into its entry. */
+export function parseHistoryRow(row: unknown): ObligationHistoryEntry {
+  let parsed: z.infer<typeof obligationHistoryRowSchema>;
+  try {
+    parsed = obligationHistoryRowSchema.parse(row);
+  } catch (cause) {
+    throw new ObligationValidationError(
+      `invalid obligation history row: ${cause instanceof Error ? cause.message : String(cause)}`
+    );
+  }
+  const payload = parseHistoryPayload(parsed.payload);
+  return {
+    id: parsed.id,
+    obligationId: parsed.obligation_id,
+    mutationKind: parsed.mutation_kind,
+    actingPrincipal: validateEntityId(parsed.acting_principal),
+    timestamp: parsed.timestamp,
+    before: payload.before,
+    after: payload.after,
+  };
 }

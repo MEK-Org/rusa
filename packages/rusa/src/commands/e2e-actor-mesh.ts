@@ -569,7 +569,8 @@ export function startRootControlServer(opts: {
             decodeURIComponent(statusMatch[1]),
             body.status === "cancelled" ? "cancelled" : "done",
             typeof body.note === "string" ? body.note : null,
-            typeof body.resolutionRef === "string" ? body.resolutionRef : null
+            typeof body.resolutionRef === "string" ? body.resolutionRef : null,
+            HUMAN_OPERATOR
           );
           send(res, 200, { obligation });
           return;
@@ -578,7 +579,8 @@ export function startRootControlServer(opts: {
         if (reassignMatch) {
           const obligation = getRepositories().obligations.reassign(
             decodeURIComponent(reassignMatch[1]),
-            String(body.ownerId ?? "")
+            String(body.ownerId ?? ""),
+            HUMAN_OPERATOR
           );
           send(res, 200, { obligation });
           return;
@@ -587,7 +589,8 @@ export function startRootControlServer(opts: {
         if (reparentMatch) {
           const obligation = getRepositories().obligations.reparent(
             decodeURIComponent(reparentMatch[1]),
-            body.parentId == null ? null : String(body.parentId)
+            body.parentId == null ? null : String(body.parentId),
+            HUMAN_OPERATOR
           );
           send(res, 200, { obligation });
           return;

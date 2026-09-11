@@ -2540,7 +2540,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   mcpHttp.setWakeObligationHandler({
     token: wakeToken,
     deliver: (id: string) => {
-      getRepositories().obligations.activateScheduled(id);
+      getRepositories().obligations.activateScheduled(id, "system:mesh");
     },
   });
 

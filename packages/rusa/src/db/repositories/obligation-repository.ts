@@ -9,16 +9,21 @@ import {
 import type { ObligationActivationScheduler } from "../../actor/os-scheduler.js";
 import {
   assertObligationStatus,
+  buildHistoryPayload,
   type EntityId,
   isBlockingObligationStatus,
   isTerminalObligationStatus,
   normalizeCheckpoint,
   type Obligation,
   type ObligationArtifact,
+  type ObligationHistoryEntry,
+  type ObligationHistoryState,
+  type ObligationMutationKind,
   type ObligationStatus,
   type ObligationTree,
   ObligationValidationError,
   parseExternalRef,
+  parseHistoryRow,
   parseObligationReference,
   prerequisiteEdgeKey,
   validateEntityId,
@@ -62,6 +67,31 @@ interface ObligationArtifactRow {
   label: string | null;
   attached_by: string | null;
   attached_at: string;
+}
+
+/** The five lifecycle columns carried in an obligation-history sparse delta. */
+interface TrackedObligationRow {
+  id: string;
+  owner_id: string;
+  parent_id: string | null;
+  priority: number | null;
+  status: ObligationStatus;
+  external_ref: string | null;
+}
+
+/** One captured UPDATE, as the TEMP history-capture trigger records it. */
+interface ObligationDeltaRow {
+  obligation_id: string;
+  before_owner_id: string;
+  before_parent_id: string | null;
+  before_priority: number | null;
+  before_status: ObligationStatus;
+  before_external_ref: string | null;
+  after_owner_id: string;
+  after_parent_id: string | null;
+  after_priority: number | null;
+  after_status: ObligationStatus;
+  after_external_ref: string | null;
 }
 
 export interface CreateObligationInput {
@@ -321,6 +351,70 @@ export class ObligationRepository {
 
   private scheduler?: ObligationActivationScheduler;
 
+  /** Set once the connection carries the TEMP capture table and trigger. */
+  private historyCaptureInstalled = false;
+
+  /**
+   * Install the per-connection capture seam that `mutate()` reads history from.
+   *
+   * A history entry has to cover every obligation row a call actually changed —
+   * the named target, a parent demoted into `waiting`, a suffix bumped by a
+   * collision repair, a terminal descendant whose stored priority a subtree move
+   * clears. Deriving that in JS means asking the database which rows *might*
+   * have changed, and the only honest answer to that is "any of them", which is
+   * why the first cut snapshotted the whole active set twice per write and still
+   * needed mutators to hand-register the terminal rows it excluded.
+   *
+   * An `AFTER UPDATE` trigger is told precisely which rows changed, by the one
+   * component that knows. Cost becomes proportional to rows written rather than
+   * rows held, a checkpoint or artifact write captures nothing at all, and no
+   * mutator can add a tracked-column write that escapes the audit stream by
+   * forgetting to announce itself. The `WHEN` clause uses `IS NOT` so a NULL
+   * priority compares as a value rather than dropping the row.
+   *
+   * TEMP, so the capture table is per-connection scratch that cannot outlive the
+   * process or collide between them, and so it needs no migration of its own.
+   */
+  private installHistoryCapture(): void {
+    if (this.historyCaptureInstalled) return;
+    this.db.exec(`
+      CREATE TEMP TABLE IF NOT EXISTS obligation_history_delta (
+        seq                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        obligation_id       TEXT NOT NULL,
+        before_owner_id     TEXT NOT NULL,
+        before_parent_id    TEXT,
+        before_priority     REAL,
+        before_status       TEXT NOT NULL,
+        before_external_ref TEXT,
+        after_owner_id      TEXT NOT NULL,
+        after_parent_id     TEXT,
+        after_priority      REAL,
+        after_status        TEXT NOT NULL,
+        after_external_ref  TEXT
+      );
+
+      CREATE TEMP TRIGGER IF NOT EXISTS obligation_history_capture
+      AFTER UPDATE ON obligations
+      WHEN old.owner_id IS NOT new.owner_id
+        OR old.parent_id IS NOT new.parent_id
+        OR old.priority IS NOT new.priority
+        OR old.status IS NOT new.status
+        OR old.external_ref IS NOT new.external_ref
+      BEGIN
+        INSERT INTO obligation_history_delta (
+          obligation_id,
+          before_owner_id, before_parent_id, before_priority, before_status, before_external_ref,
+          after_owner_id, after_parent_id, after_priority, after_status, after_external_ref
+        ) VALUES (
+          new.id,
+          old.owner_id, old.parent_id, old.priority, old.status, old.external_ref,
+          new.owner_id, new.parent_id, new.priority, new.status, new.external_ref
+        );
+      END;
+    `);
+    this.historyCaptureInstalled = true;
+  }
+
   /**
    * Obligation ids whose OS scheduler job needs re-deriving once the current
    * `mutate()` transaction commits. `spawnSync`-backed cron/`at` writes are
@@ -436,7 +530,8 @@ export class ObligationRepository {
         } else if (row.status === "scheduled" && row.next_ready_at) {
           const nextDate = new Date(row.next_ready_at);
           if (nextDate.getTime() <= this.now()) {
-            this.activateScheduled(row.id);
+            // Background scheduler activation is an automated system process; bind "system:mesh"
+            this.activateScheduled(row.id, "system:mesh");
           } else {
             validIds.add(row.id);
             this.scheduler.scheduleObligationActivation(row.id, {
@@ -523,6 +618,9 @@ export class ObligationRepository {
    * durable state instead of racing it.
    */
   private pendingCancellationAttention: PrerequisiteAttention[] = [];
+
+  /** Guard against re-entrant calls to {@link mutate}. */
+  private isMutating = false;
 
   /**
    * `(dependentId, prerequisiteId)` keys whose cancellation-attention delivery
@@ -651,13 +749,40 @@ export class ObligationRepository {
    * Ready-head transitions are written transactionally inside SQLite to
    * guarantee durability across restarts and process downtime.
    */
-  private mutate<T>(work: () => T): T {
+  private mutate<T>(principal: EntityId, work: () => T): T {
+    if (this.isMutating) {
+      throw new Error("ObligationRepository.mutate cannot be called re-entrantly");
+    }
     const changes: ReadyHeadChange[] = [];
     this.dirtyScheduleIds.clear();
     this.pendingCancellationAttention = [];
+    const actingPrincipal = validateEntityId(principal);
+    this.installHistoryCapture();
     const result = this.db.transaction(() => {
       const before = this.readyHeads();
-      const res = work();
+
+      // A tracked-column write outside mutate() is an audited-seam violation.
+      // Assert the delta table is empty rather than silently discarding leftover
+      // writes, so uncommitted or stray tracked updates fail loudly.
+      const strayDelta = this.db
+        .prepare("SELECT COUNT(*) AS count FROM obligation_history_delta")
+        .get() as { count: number };
+      if (strayDelta.count > 0) {
+        throw new Error(
+          `ObligationRepository.mutate detected ${strayDelta.count} uncommitted obligation_history_delta rows outside mutate()`
+        );
+      }
+
+      this.isMutating = true;
+      let res: T;
+      try {
+        res = work();
+      } finally {
+        this.isMutating = false;
+      }
+
+      this.recordMutationHistory(actingPrincipal);
+
       const after = this.readyHeads();
 
       for (const ownerId of before.keys()) {
@@ -667,11 +792,11 @@ export class ObligationRepository {
           this.db
             .prepare(
               `UPDATE obligation_ready_heads
-               SET head_id = NULL,
-                   previous_head_id = ?,
-                   sequence = sequence + 1,
-                   updated_at = ?
-               WHERE owner_id = ?`
+             SET head_id = NULL,
+                 previous_head_id = ?,
+                 sequence = sequence + 1,
+                 updated_at = ?
+             WHERE owner_id = ?`
             )
             .run(previousHeadId, now, ownerId);
 
@@ -695,12 +820,12 @@ export class ObligationRepository {
         this.db
           .prepare(
             `INSERT INTO obligation_ready_heads (owner_id, head_id, previous_head_id, sequence, updated_at)
-             VALUES (?, ?, ?, 1, ?)
-             ON CONFLICT(owner_id) DO UPDATE SET
-               previous_head_id = excluded.previous_head_id,
-               head_id = excluded.head_id,
-               sequence = sequence + 1,
-               updated_at = excluded.updated_at`
+           VALUES (?, ?, ?, 1, ?)
+           ON CONFLICT(owner_id) DO UPDATE SET
+             previous_head_id = excluded.previous_head_id,
+             head_id = excluded.head_id,
+             sequence = sequence + 1,
+             updated_at = excluded.updated_at`
           )
           .run(ownerId, headId, previousHeadId, now);
 
@@ -795,6 +920,124 @@ export class ObligationRepository {
   }
 
   /**
+   * Write the history rows for the tracked-column changes this transaction made.
+   *
+   * The capture table holds one row per UPDATE statement, so a call that touches
+   * the same obligation twice appears twice; those are coalesced into the net
+   * before/after for the call, which is what an audit reader wants and what
+   * makes a change-and-change-back land as the no-op it is. Iteration follows
+   * capture order, so the stream reflects the order the mutation actually wrote
+   * rows in.
+   */
+  private recordMutationHistory(actingPrincipal: EntityId): void {
+    const deltas = this.db
+      .prepare(
+        `SELECT obligation_id,
+                before_owner_id, before_parent_id, before_priority, before_status, before_external_ref,
+                after_owner_id, after_parent_id, after_priority, after_status, after_external_ref
+         FROM obligation_history_delta
+         ORDER BY seq`
+      )
+      .all() as ObligationDeltaRow[];
+    if (deltas.length === 0) return;
+    this.db.prepare("DELETE FROM obligation_history_delta").run();
+
+    const net = new Map<string, { before: TrackedObligationRow; after: TrackedObligationRow }>();
+    for (const delta of deltas) {
+      const after: TrackedObligationRow = {
+        id: delta.obligation_id,
+        owner_id: delta.after_owner_id,
+        parent_id: delta.after_parent_id,
+        priority: delta.after_priority,
+        status: delta.after_status,
+        external_ref: delta.after_external_ref,
+      };
+      const existing = net.get(delta.obligation_id);
+      if (existing) {
+        existing.after = after;
+        continue;
+      }
+      net.set(delta.obligation_id, {
+        before: {
+          id: delta.obligation_id,
+          owner_id: delta.before_owner_id,
+          parent_id: delta.before_parent_id,
+          priority: delta.before_priority,
+          status: delta.before_status,
+          external_ref: delta.before_external_ref,
+        },
+        after,
+      });
+    }
+
+    const insert = this.db.prepare(
+      `INSERT INTO obligation_history (obligation_id, mutation_kind, acting_principal, timestamp, payload)
+       VALUES (?, ?, ?, ?, ?)`
+    );
+
+    for (const [id, { before: b, after: a }] of net) {
+      const ownerChanged = b.owner_id !== a.owner_id;
+      const parentChanged = b.parent_id !== a.parent_id;
+      const priorityChanged = b.priority !== a.priority;
+      const statusChanged = b.status !== a.status;
+      const externalRefChanged = b.external_ref !== a.external_ref;
+
+      if (
+        !ownerChanged &&
+        !parentChanged &&
+        !priorityChanged &&
+        !statusChanged &&
+        !externalRefChanged
+      ) {
+        continue;
+      }
+
+      const beforeState: ObligationHistoryState = {};
+      const afterState: ObligationHistoryState = {};
+
+      if (ownerChanged) {
+        beforeState.ownerId = b.owner_id;
+        afterState.ownerId = a.owner_id;
+      }
+      if (parentChanged) {
+        beforeState.parentId = b.parent_id;
+        afterState.parentId = a.parent_id;
+      }
+      if (priorityChanged) {
+        beforeState.priority = b.priority;
+        afterState.priority = a.priority;
+      }
+      if (statusChanged) {
+        beforeState.status = b.status;
+        afterState.status = a.status;
+      }
+      if (externalRefChanged) {
+        beforeState.externalRef = b.external_ref;
+        afterState.externalRef = a.external_ref;
+      }
+
+      // Map the primary modified field to its semantic mutation kind.
+      const kind: ObligationMutationKind = ownerChanged
+        ? "reassign"
+        : parentChanged
+          ? "reparent"
+          : priorityChanged
+            ? "priority"
+            : statusChanged
+              ? "status"
+              : "external_ref";
+
+      insert.run(
+        id,
+        kind,
+        actingPrincipal,
+        this.stamp(),
+        buildHistoryPayload(beforeState, afterState)
+      );
+    }
+  }
+
+  /**
    * The wall-clock stamp for a write, in the ISO-8601 shape `mesh_events` uses.
    *
    * Derived from the injected clock so tests can pin it, and read once per
@@ -812,7 +1055,16 @@ export class ObligationRepository {
   }
 
   create(input: CreateObligationInput): Obligation {
-    return this.mutate(() => {
+    // Boundary attribution: a create can change an existing row — most often
+    // demoting the new child's parent out of `ready` — and that change belongs to
+    // whoever raised the obligation, not to the mesh. `creatorId` is already the
+    // server-bound identity of that entity, minted by the calling surface and
+    // never read from model-supplied payload, so it is the right principal for
+    // the collateral write. A surface with no identity to bind records the
+    // honest `system:mesh` rather than inferring one from `owner`.
+    const actingPrincipal: EntityId =
+      input.creatorId == null ? "system:mesh" : validateEntityId(input.creatorId);
+    return this.mutate(actingPrincipal, () => {
       const stampedAt = this.stamp();
       const creatorId = input.creatorId == null ? null : validateEntityId(input.creatorId);
       const id = input.id ?? randomUUID();
@@ -1080,8 +1332,8 @@ export class ObligationRepository {
    * Demotes an already-`ready` dependent back to `waiting` when the named
    * prerequisite is not yet done — the mirror image of {@link tryRelease}.
    */
-  addPrerequisite(dependentId: string, prerequisiteId: string): Obligation {
-    return this.mutate(() => {
+  addPrerequisite(dependentId: string, prerequisiteId: string, principal: EntityId): Obligation {
+    return this.mutate(principal, () => {
       if (dependentId === prerequisiteId) {
         throw new ObligationValidationError("obligation cannot be blocked by itself");
       }
@@ -1138,8 +1390,8 @@ export class ObligationRepository {
    * that does not exist is a no-op. Releases the dependent immediately if
    * this was its last unmet prerequisite and it has no live children.
    */
-  removePrerequisite(dependentId: string, prerequisiteId: string): Obligation {
-    return this.mutate(() => {
+  removePrerequisite(dependentId: string, prerequisiteId: string, principal: EntityId): Obligation {
+    return this.mutate(principal, () => {
       const dependent = this.require(dependentId);
       const result = this.db
         .prepare(
@@ -1493,8 +1745,13 @@ export class ObligationRepository {
   }
 
   /** Apply an explicit priority using the v1 subtree/self inheritance contract. */
-  setPriorityInternal(id: string, priority: number, scope: PriorityScope = "subtree"): Obligation {
-    return this.mutate(() => {
+  setPriorityInternal(
+    id: string,
+    priority: number,
+    principal: EntityId,
+    scope: PriorityScope = "subtree"
+  ): Obligation {
+    return this.mutate(principal, () => {
       this.applyPriority(id, validatePriority(priority), scope);
       return this.require(id);
     });
@@ -1509,9 +1766,10 @@ export class ObligationRepository {
     id: string,
     previousId: string | null,
     nextId: string | null,
+    principal: EntityId,
     scope: PriorityScope = "subtree"
   ): Obligation {
-    return this.mutate(() => {
+    return this.mutate(principal, () => {
       const target = this.require(id);
       if (target.status !== "ready") {
         throw new ObligationValidationError("only ready obligations can be reordered");
@@ -1590,9 +1848,10 @@ export class ObligationRepository {
    */
   inheritRetiringActorObligationsInternal(
     retiringActorId: string,
-    parentActorId: string | null
+    parentActorId: string | null,
+    principal: EntityId
   ): RetirementInheritanceResult {
-    return this.mutate(() => {
+    return this.mutate(principal, () => {
       const retiringOwner = validateEntityId(retiringActorId);
       if (parentActorId === null) {
         throw new ObligationValidationError(
@@ -1619,8 +1878,8 @@ export class ObligationRepository {
    * Change the owner of one live obligation without changing its identity,
    * position, ancestry, or state. Authorization belongs to the calling surface.
    */
-  reassign(id: string, newOwnerId: EntityId): Obligation {
-    return this.mutate(() => {
+  reassign(id: string, newOwnerId: EntityId, principal: EntityId): Obligation {
+    return this.mutate(principal, () => {
       const obligation = this.require(id);
       if (isTerminalObligationStatus(obligation.status)) {
         throw new ObligationValidationError("terminal obligations cannot be reassigned");
@@ -1666,8 +1925,8 @@ export class ObligationRepository {
    * Terminal obligations are frozen, consistent with {@link reassign} and
    * `reparent`: a closed obligation's identity is part of the record.
    */
-  setExternalRef(id: string, ref: string | null): Obligation {
-    return this.mutate(() => {
+  setExternalRef(id: string, ref: string | null, principal: EntityId): Obligation {
+    return this.mutate(principal, () => {
       const obligation = this.require(id);
       if (isTerminalObligationStatus(obligation.status)) {
         throw new ObligationValidationError(
@@ -1721,13 +1980,13 @@ export class ObligationRepository {
    * this boundary records who wrote, and the MCP seam decides who may.
    */
   setCheckpoint(id: string, checkpoint: string | null, by: EntityId): Obligation {
-    return this.mutate(() => {
+    const checkpointBy = validateEntityId(by);
+    return this.mutate(checkpointBy, () => {
       const obligation = this.require(id);
       if (isTerminalObligationStatus(obligation.status)) {
         throw new ObligationValidationError("terminal obligations cannot change their checkpoint");
       }
       const next = normalizeCheckpoint(checkpoint);
-      const checkpointBy = validateEntityId(by);
       const now = this.stamp();
 
       this.db
@@ -1757,7 +2016,7 @@ export class ObligationRepository {
     ref: string,
     options?: { label?: string | null; attachedBy?: EntityId | null }
   ): ObligationArtifact {
-    return this.mutate(() => {
+    return this.db.transaction(() => {
       this.require(obligationId);
       const key = parseObligationReference(ref).key;
       const label = options?.label == null ? null : options.label.trim() || null;
@@ -1773,7 +2032,7 @@ export class ObligationRepository {
         .prepare("SELECT * FROM obligation_artifacts WHERE obligation_id = ? AND ref = ?")
         .get(obligationId, key) as ObligationArtifactRow;
       return toArtifact(row);
-    });
+    })();
   }
 
   /**
@@ -1862,6 +2121,26 @@ export class ObligationRepository {
     };
   }
 
+  /**
+   * Append-only attributable mutation history stream for an obligation (#185).
+   * Returned in deterministic newest-first order (`ORDER BY id DESC`), guaranteed
+   * strictly chronological by the monotonic integer primary key.
+   */
+  listHistory(id: string): ObligationHistoryEntry[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, obligation_id, mutation_kind, acting_principal, timestamp, payload
+         FROM obligation_history
+         WHERE obligation_id = ?
+         ORDER BY id DESC`
+      )
+      .all(id);
+
+    // Validated, not cast: the table constrains its scalars only to non-empty,
+    // so this is where a row proves it is the entry the caller is typed to get.
+    return rows.map(parseHistoryRow);
+  }
+
   listArtifacts(obligationId: string): ObligationArtifact[] {
     const rows = this.db
       .prepare(
@@ -1877,15 +2156,16 @@ export class ObligationRepository {
     id: string,
     status: "done" | "cancelled",
     /** Why, in the terminating principal's words. Omitted means no reason given. */
-    note?: string | null,
+    note: string | null | undefined,
     /**
      * The artifact that settled this — the message that answered the question,
      * the PR that delivered the work. Attached to the obligation if it is not
      * already, so citing evidence never needs two calls.
      */
-    resolutionRef?: string | null
+    resolutionRef: string | null | undefined,
+    principal: EntityId
   ): Obligation {
-    return this.mutate(() => {
+    return this.mutate(principal, () => {
       const obligation = this.require(id);
       if (isTerminalObligationStatus(obligation.status)) {
         throw new ObligationValidationError("terminal obligations cannot be reopened or changed");
@@ -1912,8 +2192,8 @@ export class ObligationRepository {
         this.db
           .prepare(
             `INSERT INTO obligation_artifacts (id, obligation_id, ref, label, attached_by, attached_at)
-             VALUES (?, ?, ?, NULL, NULL, ?)
-             ON CONFLICT(obligation_id, ref) DO NOTHING`
+           VALUES (?, ?, ?, NULL, NULL, ?)
+           ON CONFLICT(obligation_id, ref) DO NOTHING`
           )
           .run(randomUUID(), id, resolution, completedAt);
       }
@@ -1945,7 +2225,7 @@ export class ObligationRepository {
         this.db
           .prepare(
             `INSERT INTO obligation_completions (id, obligation_id, sequence, completed_at, note, resolution_ref, next_ready_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
           )
           .run(
             completionId,
@@ -1960,9 +2240,9 @@ export class ObligationRepository {
         this.db
           .prepare(
             `UPDATE obligations
-           SET status = 'scheduled', next_ready_at = ?, updated_at = ?,
-               checkpoint = NULL, checkpoint_at = NULL, checkpoint_by = NULL
-           WHERE id = ?`
+         SET status = 'scheduled', next_ready_at = ?, updated_at = ?,
+             checkpoint = NULL, checkpoint_at = NULL, checkpoint_by = NULL
+         WHERE id = ?`
           )
           .run(nextReadyAt, completedAt, id);
 
@@ -1977,11 +2257,11 @@ export class ObligationRepository {
         this.db
           .prepare(
             `UPDATE obligations
-             SET status = ?, terminal_note = ?, resolution_ref = ?, updated_at = ?,
-                 next_ready_at = NULL, recurrence_policy = NULL, recurrence_cron = NULL,
-                 recurrence_interval_seconds = NULL,
-                 checkpoint = NULL, checkpoint_at = NULL, checkpoint_by = NULL
-             WHERE id = ?`
+           SET status = ?, terminal_note = ?, resolution_ref = ?, updated_at = ?,
+               next_ready_at = NULL, recurrence_policy = NULL, recurrence_cron = NULL,
+               recurrence_interval_seconds = NULL,
+               checkpoint = NULL, checkpoint_at = NULL, checkpoint_by = NULL
+           WHERE id = ?`
           )
           .run(status, normalizeTerminalNote(note), resolution, completedAt, id);
 
@@ -2007,10 +2287,10 @@ export class ObligationRepository {
           const dependents = this.db
             .prepare(
               `SELECT op.dependent_id AS dependent_id, dependent.owner_id AS dependent_owner_id
-               FROM obligation_prerequisites op
-               JOIN obligations dependent ON dependent.id = op.dependent_id
-               WHERE op.prerequisite_id = ?
-                 AND dependent.status IN ('ready', 'waiting', 'scheduled')`
+             FROM obligation_prerequisites op
+             JOIN obligations dependent ON dependent.id = op.dependent_id
+             WHERE op.prerequisite_id = ?
+               AND dependent.status IN ('ready', 'waiting', 'scheduled')`
             )
             .all(id) as Array<{ dependent_id: string; dependent_owner_id: string }>;
           for (const dependent of dependents) {
@@ -2039,7 +2319,8 @@ export class ObligationRepository {
     recurrence:
       | { policy: "cron"; cronExpr: string }
       | { policy: "completion_interval"; intervalSeconds: number }
-      | null
+      | null,
+    principal: EntityId
   ): Obligation {
     if (recurrence?.policy === "cron") this.assertFiringCronExpr(recurrence.cronExpr);
     if (
@@ -2048,7 +2329,7 @@ export class ObligationRepository {
     ) {
       throw new ObligationValidationError("recurrence interval must be a positive integer");
     }
-    return this.mutate(() => {
+    return this.mutate(principal, () => {
       const obligation = this.require(id);
       if (isTerminalObligationStatus(obligation.status)) {
         throw new ObligationValidationError("terminal obligations cannot be recurring");
@@ -2072,11 +2353,11 @@ export class ObligationRepository {
           this.db
             .prepare(
               `UPDATE obligations
-               SET status = 'done', recurrence_policy = NULL, recurrence_cron = NULL,
-                   recurrence_interval_seconds = NULL, next_ready_at = NULL,
-                   checkpoint = NULL, checkpoint_at = NULL, checkpoint_by = NULL,
-                   updated_at = ?
-               WHERE id = ?`
+             SET status = 'done', recurrence_policy = NULL, recurrence_cron = NULL,
+                 recurrence_interval_seconds = NULL, next_ready_at = NULL,
+                 checkpoint = NULL, checkpoint_at = NULL, checkpoint_by = NULL,
+                 updated_at = ?
+             WHERE id = ?`
             )
             .run(this.stamp(), id);
           if (obligation.parentId !== null) this.tryRelease(obligation.parentId);
@@ -2084,9 +2365,9 @@ export class ObligationRepository {
           this.db
             .prepare(
               `UPDATE obligations
-               SET recurrence_policy = NULL, recurrence_cron = NULL,
-                   recurrence_interval_seconds = NULL, next_ready_at = NULL, updated_at = ?
-               WHERE id = ?`
+             SET recurrence_policy = NULL, recurrence_cron = NULL,
+                 recurrence_interval_seconds = NULL, next_ready_at = NULL, updated_at = ?
+             WHERE id = ?`
             )
             .run(this.stamp(), id);
         }
@@ -2146,8 +2427,8 @@ export class ObligationRepository {
     });
   }
 
-  activateScheduled(id: string): Obligation | null {
-    return this.mutate(() => {
+  activateScheduled(id: string, principal: EntityId): Obligation | null {
+    return this.mutate(principal, () => {
       const obligation = this.get(id);
       if (!obligation) return null;
       if (obligation.status !== "scheduled") return obligation;
@@ -2164,8 +2445,8 @@ export class ObligationRepository {
     });
   }
 
-  reparent(id: string, newParentId: string | null): Obligation {
-    return this.mutate(() => {
+  reparent(id: string, newParentId: string | null, principal: EntityId): Obligation {
+    return this.mutate(principal, () => {
       const obligation = this.require(id);
       if (isTerminalObligationStatus(obligation.status)) {
         throw new ObligationValidationError("terminal obligations cannot be reparented");
@@ -2187,13 +2468,13 @@ export class ObligationRepository {
         const isDescendant = this.db
           .prepare(
             `WITH RECURSIVE ancestors(id, parent_id) AS (
-               SELECT id, parent_id FROM obligations WHERE id = ?
-               UNION ALL
-               SELECT o.id, o.parent_id
-               FROM obligations o
-               JOIN ancestors a ON o.id = a.parent_id
-             )
-             SELECT COUNT(*) AS count FROM ancestors WHERE id = ?`
+             SELECT id, parent_id FROM obligations WHERE id = ?
+             UNION ALL
+             SELECT o.id, o.parent_id
+             FROM obligations o
+             JOIN ancestors a ON o.id = a.parent_id
+           )
+           SELECT COUNT(*) AS count FROM ancestors WHERE id = ?`
           )
           .get(newParentId, id) as { count: number };
         if (isDescendant.count > 0) {
@@ -2246,9 +2527,10 @@ export class ObligationRepository {
     id: string,
     previousId: string | null,
     nextId: string | null,
+    principal: EntityId,
     scope: PriorityScope = "subtree"
   ): Obligation {
-    return this.movePriorityInternal(id, previousId, nextId, scope);
+    return this.movePriorityInternal(id, previousId, nextId, principal, scope);
   }
 
   private applyPriority(id: string, priority: number, scope: PriorityScope): void {

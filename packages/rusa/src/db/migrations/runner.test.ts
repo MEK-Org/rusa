@@ -101,6 +101,7 @@ describe("Database Migration System", () => {
       "0042_actor_run_launch_config",
       "0043_obligation_checkpoint",
       "0044_actor_voice_config",
+      "0045_obligation_history",
       "0047_actor_experiments",
     ]);
 

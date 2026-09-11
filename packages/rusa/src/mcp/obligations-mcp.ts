@@ -413,7 +413,7 @@ export function createObligationsMcpServer(
       try {
         const existing = repository.require(id);
         if (!canManage(existing)) throw new Error("not authorized to manage this obligation");
-        const obligation = repository.setRecurrence(id, recurrence);
+        const obligation = repository.setRecurrence(id, recurrence, actorId);
         return toolOk({ obligation });
       } catch (error) {
         return toolError(error);
@@ -440,7 +440,8 @@ export function createObligationsMcpServer(
           id,
           status,
           note ?? null,
-          resolution_ref ?? null
+          resolution_ref ?? null,
+          actorId
         );
         return toolOk({ obligation });
       } catch (err) {
@@ -465,7 +466,7 @@ export function createObligationsMcpServer(
         const current = repository.get(id);
         if (!current) throw new Error("obligation not found");
         if (!canManage(current)) throw new Error("not authorized to change this obligation's ref");
-        return toolOk({ obligation: repository.setExternalRef(id, external_ref ?? null) });
+        return toolOk({ obligation: repository.setExternalRef(id, external_ref ?? null, actorId) });
       } catch (err) {
         return toolError(err);
       }
@@ -564,6 +565,7 @@ export function createObligationsMcpServer(
           id,
           previous_id ?? null,
           next_id ?? null,
+          actorId,
           scope
         );
         return toolOk({ obligation });
@@ -591,7 +593,7 @@ export function createObligationsMcpServer(
         if (!canManage(current)) throw new Error("not authorized to reassign this obligation");
         const owner = options?.resolveOwner?.(owner_id) ?? { ok: true as const, ownerId: owner_id };
         if (!owner.ok) throw new Error(owner.error);
-        const obligation = repository.reassign(id, owner.ownerId);
+        const obligation = repository.reassign(id, owner.ownerId, actorId);
         return toolOk({ obligation, previousOwnerId: current.ownerId });
       } catch (err) {
         return toolError(err);
@@ -612,7 +614,7 @@ export function createObligationsMcpServer(
     },
     async ({ id, parent_id }) => {
       try {
-        const obligation = repository.reparent(id, parent_id ?? null);
+        const obligation = repository.reparent(id, parent_id ?? null, actorId);
         return toolOk({ obligation });
       } catch (err) {
         return toolError(err);
@@ -637,7 +639,7 @@ export function createObligationsMcpServer(
         if (!canManage(dependent)) {
           throw new Error("not authorized to manage this obligation's prerequisites");
         }
-        const obligation = repository.addPrerequisite(id, prerequisite_id);
+        const obligation = repository.addPrerequisite(id, prerequisite_id, actorId);
         return toolOk({ obligation });
       } catch (err) {
         return toolError(err);
@@ -662,7 +664,7 @@ export function createObligationsMcpServer(
         if (!canManage(dependent)) {
           throw new Error("not authorized to manage this obligation's prerequisites");
         }
-        const obligation = repository.removePrerequisite(id, prerequisite_id);
+        const obligation = repository.removePrerequisite(id, prerequisite_id, actorId);
         return toolOk({ obligation });
       } catch (err) {
         return toolError(err);

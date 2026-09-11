@@ -2260,7 +2260,7 @@ describe("handleMeshApiRequest", () => {
       it("excludes quiet terminal roots by default, includes them with includeTerminalRoots=true (#241)", async () => {
         obligations.create({ title: "live-root", id: "live-root", ownerId: "actor-1" });
         obligations.create({ title: "quiet-done", id: "quiet-done", ownerId: "actor-1" });
-        obligations.setTerminalStatus("quiet-done", "done");
+        obligations.setTerminalStatus("quiet-done", "done", null, null, "system:mesh");
 
         const { res: defaultRes } = await call(deps, "GET", "/api/mesh/obligations/forest");
         const defaultData = JSON.parse(defaultRes.body);
@@ -2301,7 +2301,7 @@ describe("handleMeshApiRequest", () => {
           parentId: "root-task",
           ownerId: "actor-2",
         });
-        obligations.setTerminalStatus("sub-1", "done");
+        obligations.setTerminalStatus("sub-1", "done", null, null, "system:mesh");
 
         const { res } = await call(deps, "GET", "/api/mesh/obligations/root-task");
         expect(res.statusCode).toBe(200);
@@ -2527,10 +2527,14 @@ describe("handleMeshApiRequest", () => {
           id: "recurring-task",
           ownerId: "actor-1",
         });
-        obligations.setRecurrence("recurring-task", { policy: "cron", cronExpr: "0 * * * *" });
-        obligations.setTerminalStatus("recurring-task", "done", "cycle one");
-        obligations.activateScheduled("recurring-task");
-        obligations.setTerminalStatus("recurring-task", "done", "cycle two");
+        obligations.setRecurrence(
+          "recurring-task",
+          { policy: "cron", cronExpr: "0 * * * *" },
+          "system:mesh"
+        );
+        obligations.setTerminalStatus("recurring-task", "done", "cycle one", null, "system:mesh");
+        obligations.activateScheduled("recurring-task", "system:mesh");
+        obligations.setTerminalStatus("recurring-task", "done", "cycle two", null, "system:mesh");
 
         const { res } = await call(deps, "GET", "/api/mesh/obligations/recurring-task?limit=1");
         expect(res.statusCode).toBe(200);
