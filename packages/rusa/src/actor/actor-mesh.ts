@@ -230,6 +230,25 @@ export interface MeshObligationPort {
   ): Array<{ prerequisiteId: string; status: ObligationStatus }>;
 }
 
+/**
+ * The narrower contract strict obligation handling (#382) actually requires.
+ *
+ * These reads stay optional on {@link MeshObligationPort} so an embedder built
+ * before #382 keeps working, but they are not optional for an *enrolled* actor:
+ * enrollment without this contract is a misconfiguration, not a soft mode.
+ * {@link ActorMesh.selectInboxEntries} refuses head attention in that state
+ * rather than letting an enrolled run yield cleanly on an untouched head.
+ */
+export type MeshObligationClosurePort = MeshObligationPort &
+  Required<Pick<MeshObligationPort, "get" | "listDirectChildEdges" | "listPrerequisiteEdges">>;
+
+/** Whether a wired port can answer every read strict closure needs. */
+export function supportsObligationClosureReads(
+  port: MeshObligationPort | undefined
+): port is MeshObligationClosurePort {
+  return Boolean(port?.get && port.listDirectChildEdges && port.listPrerequisiteEdges);
+}
+
 /** One live obligation owned inside a retiring subtree (#191). */
 export interface ObligationRetirementBlocker {
   obligationId: string;
@@ -1309,50 +1328,56 @@ export class ActorMesh {
       }
       return entry;
     });
-    beforeCommit?.(entries);
-    this.selectedInboxEntryIds.set(actorId, unique);
     // Capture experiment membership now. Root can revise enrollment later, but
     // that governs a future selection rather than retroactively releasing or
     // constraining this already-running actor.
-    if (this.isEnrolledInExperiment(actorId, STRICT_OBLIGATION_HANDLING_EXPERIMENT)) {
-      for (const entry of entries) {
-        if (
+    const headObligationIds = this.isEnrolledInExperiment(
+      actorId,
+      STRICT_OBLIGATION_HANDLING_EXPERIMENT
+    )
+      ? entries.flatMap((entry) =>
           entry.payload.type === "obligation.ready_head" &&
           typeof entry.payload.obligationId === "string"
-        ) {
-          const obligationId = entry.payload.obligationId;
-          let run = this.headClosureRuns.get(actorId);
-          if (!run) {
-            run = {
-              headObligationIds: new Set<string>(),
-              preExistingChildIds: new Map<string, Set<string>>(),
-              preExistingPrerequisiteIds: new Map<string, Set<string>>(),
-            };
-            this.headClosureRuns.set(actorId, run);
-          }
-          run.headObligationIds.add(obligationId);
-          if (
-            !run.preExistingChildIds.has(obligationId) &&
-            this.obligations?.listDirectChildEdges
-          ) {
-            run.preExistingChildIds.set(
-              obligationId,
-              new Set(this.obligations.listDirectChildEdges(obligationId).map((child) => child.id))
-            );
-          }
-          if (
-            !run.preExistingPrerequisiteIds.has(obligationId) &&
-            this.obligations?.listPrerequisiteEdges
-          ) {
-            run.preExistingPrerequisiteIds.set(
-              obligationId,
-              new Set(
-                this.obligations
-                  .listPrerequisiteEdges(obligationId)
-                  .map((prerequisite) => prerequisite.prerequisiteId)
-              )
-            );
-          }
+            ? [entry.payload.obligationId]
+            : []
+        )
+      : [];
+    // Fail closed, and fail here — before the selection commits, so nothing has
+    // run yet and no clean yield can slip past unenforced. An enrolled actor in
+    // a mesh without closure reads is a misconfiguration the root must fix by
+    // wiring the port or unenrolling, not a run that silently opts out.
+    const closure = this.obligations;
+    if (headObligationIds.length > 0 && !supportsObligationClosureReads(closure)) {
+      throw new Error(
+        `Cannot select head attention: ${actorId} is enrolled in ${STRICT_OBLIGATION_HANDLING_EXPERIMENT}, but this mesh has no obligation closure reads (get, listDirectChildEdges, listPrerequisiteEdges) wired. Wire the closure port or unenroll the actor.`
+      );
+    }
+    beforeCommit?.(entries);
+    this.selectedInboxEntryIds.set(actorId, unique);
+    if (headObligationIds.length > 0 && supportsObligationClosureReads(closure)) {
+      const run: HeadClosureRunState = this.headClosureRuns.get(actorId) ?? {
+        headObligationIds: new Set<string>(),
+        preExistingChildIds: new Map<string, Set<string>>(),
+        preExistingPrerequisiteIds: new Map<string, Set<string>>(),
+      };
+      this.headClosureRuns.set(actorId, run);
+      for (const obligationId of headObligationIds) {
+        run.headObligationIds.add(obligationId);
+        if (!run.preExistingChildIds.has(obligationId)) {
+          run.preExistingChildIds.set(
+            obligationId,
+            new Set(closure.listDirectChildEdges(obligationId).map((child) => child.id))
+          );
+        }
+        if (!run.preExistingPrerequisiteIds.has(obligationId)) {
+          run.preExistingPrerequisiteIds.set(
+            obligationId,
+            new Set(
+              closure
+                .listPrerequisiteEdges(obligationId)
+                .map((prerequisite) => prerequisite.prerequisiteId)
+            )
+          );
         }
       }
     }
@@ -2935,19 +2960,22 @@ export class ActorMesh {
   private assertCleanYieldAllowed(actorId: string): void {
     const runState = this.headClosureRuns.get(actorId);
     if (!runState || runState.headObligationIds.size === 0) return;
-    if (
-      !this.obligations?.get ||
-      !this.obligations.listDirectChildEdges ||
-      !this.obligations.listPrerequisiteEdges
-    ) {
-      this.log(
-        `[warning] strict obligation handling skipped for ${actorId}: obligations port is missing required methods`
+    const closure = this.obligations;
+    // Selection already refused to arm a run without these reads, so this is
+    // the second half of the same fail-closed rule rather than a soft skip: an
+    // enforced run never yields cleanly on evidence the mesh cannot read.
+    if (!supportsObligationClosureReads(closure)) {
+      const [obligationId] = runState.headObligationIds;
+      this.rejectCleanYield(
+        actorId,
+        obligationId ?? "unknown",
+        null,
+        "the mesh obligation closure port is unavailable, so closure cannot be verified"
       );
-      return;
     }
 
     for (const obligationId of runState.headObligationIds) {
-      const obligation = this.obligations.get(obligationId);
+      const obligation = closure.get(obligationId);
       if (!obligation || !isBlockingObligationStatus(obligation.status)) continue;
 
       if (obligation.status === "ready") {
@@ -2956,7 +2984,7 @@ export class ActorMesh {
 
       const preExistingChildren =
         runState.preExistingChildIds.get(obligationId) ?? new Set<string>();
-      const hasNewlyCreatedLiveChild = this.obligations
+      const hasNewlyCreatedLiveChild = closure
         .listDirectChildEdges(obligationId)
         .some(
           (child) =>
@@ -2966,7 +2994,7 @@ export class ActorMesh {
         );
       const preExistingPrerequisites =
         runState.preExistingPrerequisiteIds.get(obligationId) ?? new Set<string>();
-      const hasNewlyAddedUnmetPrerequisite = this.obligations
+      const hasNewlyAddedUnmetPrerequisite = closure
         .listPrerequisiteEdges(obligationId)
         .some(
           (prerequisite) =>

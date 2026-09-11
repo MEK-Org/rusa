@@ -17,6 +17,7 @@ import {
   type ActorFactoryContext,
   ActorMesh,
   type MeshActor,
+  type MeshObligationClosurePort,
   type RetireCleanup,
 } from "../actor/actor-mesh.js";
 import type { ActorRecord, PortableContextConfig } from "../actor/actor-record.js";
@@ -1816,7 +1817,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             status: obligation.status,
             title: obligation.title,
           })),
-    },
+      // The production mesh always satisfies the strict-closure contract: this
+      // assertion is what makes "the closure reads are wired here" a compile
+      // error to break rather than a runtime warning to miss.
+    } satisfies MeshObligationClosurePort,
     inboxStore,
     isVoiceSessionActive: (actorId) => voiceService?.hasActiveSession(actorId) ?? false,
     // The registry is constructed later with the configured Gemini client, so

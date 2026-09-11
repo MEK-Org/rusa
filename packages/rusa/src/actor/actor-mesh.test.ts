@@ -8737,31 +8737,71 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(repo.get("ob-crashed")?.status).toBe("ready");
   });
 
-  it("preserves head-only notification ordering: non-head waiting->ready emits no early attention item", () => {
+  it("preserves head-only notification ordering through the production ready-head listener", () => {
     const { mesh } = strictMesh();
     const subject = worker(mesh);
+    // Exactly what runStart wires: repository head transitions route into the
+    // mesh's attention delivery. Without this, no repository mutation could
+    // ever append an entry and the "no early notification" assertion below
+    // would hold even if head routing were broken.
+    repo.setReadyHeadListener(({ ownerId, head, previousHeadId, sequence }) =>
+      mesh.deliverReadyHeadAttention(
+        ownerId,
+        head === null ? null : { id: head.id, intent: head.intent },
+        previousHeadId,
+        sequence
+      )
+    );
+    const headEntries = () =>
+      inboxStore.entries.filter(
+        (entry) => entry.actorId === subject && entry.payload.type === "obligation.ready_head"
+      );
 
     repo.create({ id: "head-1", title: "Head 1", ownerId: subject, priority: 10 });
+    // The listener — not a manual call — delivered the first head.
+    expect(headEntries().map((entry) => entry.payload.obligationId)).toEqual(["head-1"]);
+
     repo.create({ id: "blocker", title: "Blocker", ownerId: subject, priority: 50 });
     repo.create({ id: "head-2", title: "Head 2", ownerId: subject, priority: 100 });
     repo.addPrerequisite("head-2", "blocker");
     expect(repo.get("head-2")?.status).toBe("waiting");
+    const beforeUnblock = headEntries().length;
 
-    mesh.deliverReadyHeadAttention(subject, { id: "head-1", intent: "head 1" }, null);
-    const initialCount = inboxStore.entries.filter((e) => e.actorId === subject).length;
-
+    // head-2 goes waiting -> ready behind head-1, which stays the head: the
+    // owner's head never changes, so no attention is emitted early.
     repo.setTerminalStatus("blocker", "done");
     expect(repo.get("head-2")?.status).toBe("ready");
+    expect(headEntries().length).toBe(beforeUnblock);
 
-    const afterCount = inboxStore.entries.filter((e) => e.actorId === subject).length;
-    expect(afterCount).toBe(initialCount);
-
+    // Ordinary later delivery: head-1 finishing makes head-2 the head, and the
+    // same production listener path appends it with no manual injection.
     repo.setTerminalStatus("head-1", "done");
-    mesh.deliverReadyHeadAttention(subject, { id: "head-2", intent: "head 2" }, "head-1");
-    const finalEntries = inboxStore.entries.filter((e) => e.actorId === subject);
-    expect(finalEntries[finalEntries.length - 1].payload).toMatchObject({
-      type: "obligation.ready_head",
-      obligationId: "head-2",
+    expect(headEntries().map((entry) => entry.payload.obligationId)).toEqual(["head-1", "head-2"]);
+  });
+
+  it("refuses head selection for an enrolled actor when the mesh has no closure reads", () => {
+    // A partial port — every embedder built before #382 has one — must not
+    // quietly turn enrollment into a no-op.
+    const { mesh } = setup({
+      inboxStore,
+      experimentEnrollments: enrollments,
+      obligations: { findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref) },
     });
+    const enrolled = worker(mesh, "enrolled");
+    const unenrolled = worker(mesh, "unenrolled");
+    mesh.enrollActorInExperiment(enrolled, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "partial-head", title: "Partial head", ownerId: enrolled });
+    repo.create({ id: "partial-control-head", title: "Control head", ownerId: unenrolled });
+
+    expect(() => selectHead(mesh, enrolled, "partial-head")).toThrow(
+      /enrolled in strict_obligation_handling, but this mesh has no obligation closure reads/
+    );
+    // Nothing was armed and nothing was committed, so no clean yield can pass
+    // unenforced on a stale selection either.
+    expect(mesh.selectedInboxEntries(enrolled)).toEqual([]);
+
+    // An unenrolled actor on the same partial port is untouched.
+    expect(() => selectHead(mesh, unenrolled, "partial-control-head")).not.toThrow();
+    expect(() => mesh.declareYield(unenrolled, "complete")).not.toThrow();
   });
 });
