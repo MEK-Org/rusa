@@ -1644,7 +1644,7 @@ export async function handleMeshApiRequest(
     return true;
   }
 
-  // GET /api/mesh/obligations/:id — single obligation with parent + children + blockingChildren
+  // GET /api/mesh/obligations/:id — single obligation with parent + children + blockingChildren + dependencies
   const obligationMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)$/);
   if (obligationMatch) {
     if (!deps.obligations) {
@@ -1658,8 +1658,11 @@ export async function handleMeshApiRequest(
       return true;
     }
     const limit = clampLimit(url, MAX_OBLIGATION_PAGE_LIMIT);
-    const offset = parsePositiveInt(url, "offset") ?? 0;
+    const offset = parsePositiveInt(url, "offset") ?? parsePositiveInt(url, "children_offset") ?? 0;
     const completionsOffset = parsePositiveInt(url, "completions_offset") ?? 0;
+    const blockedByOffset = parsePositiveInt(url, "blocked_by_offset") ?? 0;
+    const blocksOffset =
+      parsePositiveInt(url, "blocks_offset") ?? parsePositiveInt(url, "unblocks_offset") ?? 0;
     const children = deps.obligations.listChildrenPage(id, { limit, offset });
     const blockingChildren = deps.obligations.listChildrenPage(id, {
       limit,
@@ -1669,6 +1672,14 @@ export async function handleMeshApiRequest(
     const completions = deps.obligations.listCompletionsPage(id, {
       limit,
       offset: completionsOffset,
+    });
+    const blockedBy = deps.obligations.listBlockedByPage(id, {
+      limit,
+      offset: blockedByOffset,
+    });
+    const blocks = deps.obligations.listUnblocksPage(id, {
+      limit,
+      offset: blocksOffset,
     });
     const parent = obligation.parentId ? deps.obligations.get(obligation.parentId) : null;
     const artifacts = await Promise.all(
@@ -1701,6 +1712,12 @@ export async function handleMeshApiRequest(
       completions: completions.completions,
       completionsTotal: completions.total,
       completionsHasMore: completions.hasMore,
+      blockedBy: blockedBy.obligations,
+      blockedByTotal: blockedBy.total,
+      blockedByHasMore: blockedBy.hasMore,
+      blocks: blocks.obligations,
+      blocksTotal: blocks.total,
+      blocksHasMore: blocks.hasMore,
       artifacts,
       externalReference,
     });

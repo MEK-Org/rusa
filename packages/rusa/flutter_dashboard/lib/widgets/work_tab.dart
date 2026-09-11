@@ -643,6 +643,14 @@ class _DetailViewState extends State<_DetailView> {
   int _completionsTotal = 0;
   bool _completionsHasMore = false;
 
+  List<ObligationDto> _blockedBy = const [];
+  int _blockedByTotal = 0;
+  bool _blockedByHasMore = false;
+
+  List<ObligationDto> _blocks = const [];
+  int _blocksTotal = 0;
+  bool _blocksHasMore = false;
+
   /// Done children are hidden by default so the CHILDREN section reads as the
   /// outstanding work under this obligation (#396). Per obligation, like the
   /// completion history above: revealing them here says nothing about the
@@ -683,6 +691,12 @@ class _DetailViewState extends State<_DetailView> {
       _completions = const [];
       _completionsTotal = 0;
       _completionsHasMore = false;
+      _blockedBy = const [];
+      _blockedByTotal = 0;
+      _blockedByHasMore = false;
+      _blocks = const [];
+      _blocksTotal = 0;
+      _blocksHasMore = false;
       _showDoneChildren = false;
       _fetch();
     }
@@ -705,6 +719,12 @@ class _DetailViewState extends State<_DetailView> {
             _completions = data.completions;
             _completionsTotal = data.completionsTotal;
             _completionsHasMore = data.completionsHasMore;
+            _blockedBy = data.blockedBy;
+            _blockedByTotal = data.blockedByTotal;
+            _blockedByHasMore = data.blockedByHasMore;
+            _blocks = data.blocks;
+            _blocksTotal = data.blocksTotal;
+            _blocksHasMore = data.blocksHasMore;
           });
         })
         .catchError((_) {});
@@ -732,6 +752,50 @@ class _DetailViewState extends State<_DetailView> {
         .catchError((_) {});
   }
 
+  void _loadMoreBlockedBy() {
+    final gen = ++_fetchGeneration;
+    final offset = _blockedBy.length;
+    final future = store.api.fetchObligationDetail(
+      widget.obligationId,
+      blockedByOffset: offset,
+    );
+    setState(() {
+      _future = future;
+    });
+    future
+        .then((data) {
+          if (!mounted || gen != _fetchGeneration) return;
+          setState(() {
+            _blockedBy = mergeObligations(data.blockedBy, _blockedBy);
+            _blockedByTotal = data.blockedByTotal;
+            _blockedByHasMore = _blockedBy.length < data.blockedByTotal;
+          });
+        })
+        .catchError((_) {});
+  }
+
+  void _loadMoreBlocks() {
+    final gen = ++_fetchGeneration;
+    final offset = _blocks.length;
+    final future = store.api.fetchObligationDetail(
+      widget.obligationId,
+      blocksOffset: offset,
+    );
+    setState(() {
+      _future = future;
+    });
+    future
+        .then((data) {
+          if (!mounted || gen != _fetchGeneration) return;
+          setState(() {
+            _blocks = mergeObligations(data.blocks, _blocks);
+            _blocksTotal = data.blocksTotal;
+            _blocksHasMore = _blocks.length < data.blocksTotal;
+          });
+        })
+        .catchError((_) {});
+  }
+
   void _refresh() {
     final gen = ++_fetchGeneration;
     final future = store.api.fetchObligationDetail(widget.obligationId);
@@ -751,6 +815,25 @@ class _DetailViewState extends State<_DetailView> {
               _completions = mergeCompletions(data.completions, _completions);
               _completionsTotal = data.completionsTotal;
               _completionsHasMore = _completions.length < data.completionsTotal;
+            }
+            if (!data.blockedByHasMore ||
+                _blockedBy.length <= data.blockedBy.length) {
+              _blockedBy = data.blockedBy;
+              _blockedByTotal = data.blockedByTotal;
+              _blockedByHasMore = data.blockedByHasMore;
+            } else {
+              _blockedBy = mergeObligations(data.blockedBy, _blockedBy);
+              _blockedByTotal = data.blockedByTotal;
+              _blockedByHasMore = _blockedBy.length < data.blockedByTotal;
+            }
+            if (!data.blocksHasMore || _blocks.length <= data.blocks.length) {
+              _blocks = data.blocks;
+              _blocksTotal = data.blocksTotal;
+              _blocksHasMore = data.blocksHasMore;
+            } else {
+              _blocks = mergeObligations(data.blocks, _blocks);
+              _blocksTotal = data.blocksTotal;
+              _blocksHasMore = _blocks.length < data.blocksTotal;
             }
           });
         })
@@ -856,6 +939,12 @@ class _DetailViewState extends State<_DetailView> {
             ],
             _SectionHeader('CHILDREN'),
             _childrenPanel(context, data),
+            const SizedBox(height: 24),
+            _SectionHeader('BLOCKED BY'),
+            _blockedByPanel(context),
+            const SizedBox(height: 24),
+            _SectionHeader('BLOCKS'),
+            _blocksPanel(context),
           ],
         );
       },
@@ -1217,6 +1306,7 @@ class _DetailViewState extends State<_DetailView> {
         showOwner: true,
         showActions: false,
         onSelectView: onSelectView,
+        openLink: openLink,
         contentPadding: const EdgeInsets.symmetric(
           horizontal: 16,
           vertical: 12,
@@ -1295,6 +1385,7 @@ class _DetailViewState extends State<_DetailView> {
                   obligation: c,
                   store: store,
                   showOwner: true,
+                  openLink: openLink,
                   showActions:
                       false, // In the original, the work_tab children row didn't have actions menu.
                   contentPadding: const EdgeInsets.symmetric(
@@ -1380,6 +1471,118 @@ class _DetailViewState extends State<_DetailView> {
                       : 'Show $hiddenCount done '
                             '${hiddenCount == 1 ? 'child' : 'children'}',
                 ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _blockedByPanel(BuildContext context) {
+    final list = _blockedBy;
+    if (list.isEmpty) {
+      return Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: MeshColors.bgSecondary,
+          border: Border.all(color: MeshColors.border),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: const Text(
+          'Not blocked by any obligations or issues.',
+          style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
+        ),
+      );
+    }
+
+    final remaining = _blockedByTotal - list.length;
+    return Container(
+      decoration: BoxDecoration(
+        color: MeshColors.bgSecondary,
+        border: Border.all(color: MeshColors.border),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          for (var i = 0; i < list.length; i++) ...[
+            ObligationRow(
+              obligation: list[i],
+              store: store,
+              showOwner: true,
+              showActions: false,
+              onSelectView: onSelectView,
+              openLink: openLink,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 16,
+                vertical: 12,
+              ),
+            ),
+            if (i < list.length - 1 || _blockedByHasMore)
+              const Divider(height: 1, color: MeshColors.border),
+          ],
+          if (_blockedByHasMore)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              child: TextButton(
+                onPressed: _loadMoreBlockedBy,
+                child: Text('Load more ($remaining remaining)'),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _blocksPanel(BuildContext context) {
+    final list = _blocks;
+    if (list.isEmpty) {
+      return Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: MeshColors.bgSecondary,
+          border: Border.all(color: MeshColors.border),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: const Text(
+          'Does not block any obligations or issues.',
+          style: TextStyle(color: MeshColors.textMuted, fontSize: 13),
+        ),
+      );
+    }
+
+    final remaining = _blocksTotal - list.length;
+    return Container(
+      decoration: BoxDecoration(
+        color: MeshColors.bgSecondary,
+        border: Border.all(color: MeshColors.border),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          for (var i = 0; i < list.length; i++) ...[
+            ObligationRow(
+              obligation: list[i],
+              store: store,
+              showOwner: true,
+              showActions: false,
+              onSelectView: onSelectView,
+              openLink: openLink,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 16,
+                vertical: 12,
+              ),
+            ),
+            if (i < list.length - 1 || _blocksHasMore)
+              const Divider(height: 1, color: MeshColors.border),
+          ],
+          if (_blocksHasMore)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              child: TextButton(
+                onPressed: _loadMoreBlocks,
+                child: Text('Load more ($remaining remaining)'),
               ),
             ),
         ],
@@ -1527,4 +1730,33 @@ List<ObligationCompletionDto> mergeCompletions(
   // matching the database contract (ORDER BY sequence DESC).
   merged.sort((a, b) => b.sequence.compareTo(a.sequence));
   return merged;
+}
+
+/// Merges incoming obligations with existing loaded obligations preserving stable ID ordering.
+List<ObligationDto> mergeObligations(
+  List<ObligationDto> incoming,
+  List<ObligationDto> existing,
+) {
+  if (existing.isEmpty) return incoming;
+  if (incoming.isEmpty) return existing;
+  final byId = <String, ObligationDto>{};
+  for (final o in existing) {
+    byId[o.id] = o;
+  }
+  for (final o in incoming) {
+    byId[o.id] = o;
+  }
+  final result = <ObligationDto>[];
+  final seen = <String>{};
+  for (final o in existing) {
+    result.add(byId[o.id]!);
+    seen.add(o.id);
+  }
+  for (final o in incoming) {
+    if (!seen.contains(o.id)) {
+      result.add(o);
+      seen.add(o.id);
+    }
+  }
+  return result;
 }

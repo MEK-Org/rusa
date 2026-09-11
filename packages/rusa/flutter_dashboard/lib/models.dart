@@ -1597,6 +1597,12 @@ class ObligationDetailSnapshot {
     this.parent,
     required this.children,
     required this.blockingChildren,
+    this.blockedBy = const [],
+    this.blockedByTotal = 0,
+    this.blockedByHasMore = false,
+    this.blocks = const [],
+    this.blocksTotal = 0,
+    this.blocksHasMore = false,
     this.artifacts = const [],
     this.completions = const [],
     this.completionsTotal = 0,
@@ -1608,6 +1614,12 @@ class ObligationDetailSnapshot {
   final ObligationDto? parent;
   final List<ObligationDto> children;
   final List<ObligationDto> blockingChildren;
+  final List<ObligationDto> blockedBy;
+  final int blockedByTotal;
+  final bool blockedByHasMore;
+  final List<ObligationDto> blocks;
+  final int blocksTotal;
+  final bool blocksHasMore;
   final List<ObligationArtifactDto> artifacts;
   final List<ObligationCompletionDto> completions;
   final int completionsTotal;
@@ -1616,46 +1628,85 @@ class ObligationDetailSnapshot {
 
   factory ObligationDetailSnapshot.fromJson(
     Map<String, dynamic> j,
-  ) => ObligationDetailSnapshot(
-    obligation: ObligationDto.fromJson(j['obligation'] as Map<String, dynamic>),
-    parent: j['parent'] == null
-        ? null
-        : ObligationDto.fromJson(j['parent'] as Map<String, dynamic>),
-    children: (j['children'] is List)
-        ? (j['children'] as List<dynamic>)
+  ) {
+    final blockedByRaw = j['blockedBy'];
+    final blockedByList = (blockedByRaw is List)
+        ? (blockedByRaw as List<dynamic>)
               .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
               .toList()
-        : (j['children'] is Map<String, dynamic> &&
-              j['children']['items'] is List)
-        ? (j['children']['items'] as List<dynamic>)
+        : (blockedByRaw is Map<String, dynamic> &&
+              blockedByRaw['items'] is List)
+        ? (blockedByRaw['items'] as List<dynamic>)
               .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
               .toList()
-        : const <ObligationDto>[],
-    blockingChildren: (j['blockingChildren'] is List)
-        ? (j['blockingChildren'] as List<dynamic>)
+        : const <ObligationDto>[];
+    final blockedByTotal = j['blockedByTotal'] as int? ??
+        (blockedByRaw is Map ? blockedByRaw['total'] as int? ?? 0 : blockedByList.length);
+    final blockedByHasMore = j['blockedByHasMore'] as bool? ??
+        (blockedByRaw is Map ? (blockedByRaw['truncated'] as bool? ?? false) : false);
+
+    final blocksRaw = j['blocks'] ?? j['unblocks'];
+    final blocksList = (blocksRaw is List)
+        ? (blocksRaw as List<dynamic>)
               .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
               .toList()
-        : (j['blockingChildren'] is Map<String, dynamic> &&
-              j['blockingChildren']['items'] is List)
-        ? (j['blockingChildren']['items'] as List<dynamic>)
+        : (blocksRaw is Map<String, dynamic> && blocksRaw['items'] is List)
+        ? (blocksRaw['items'] as List<dynamic>)
               .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
               .toList()
-        : const <ObligationDto>[],
-    artifacts: (j['artifacts'] is List)
-        ? (j['artifacts'] as List<dynamic>)
-              .map(
-                (e) =>
-                    ObligationArtifactDto.fromJson(e as Map<String, dynamic>),
-              )
-              .toList()
-        : const <ObligationArtifactDto>[],
-    completions: (j['completions'] as List<dynamic>? ?? const [])
-        .map((e) => ObligationCompletionDto.fromJson(e as Map<String, dynamic>))
-        .toList(),
-    completionsTotal: j['completionsTotal'] as int? ?? 0,
-    completionsHasMore: j['completionsHasMore'] as bool? ?? false,
-    externalReference: j['externalReference'] is Map<String, dynamic>
-        ? ReferenceDto.fromJson(j['externalReference'] as Map<String, dynamic>)
-        : null,
-  );
+        : const <ObligationDto>[];
+    final blocksTotal = j['blocksTotal'] as int? ??
+        (blocksRaw is Map ? blocksRaw['total'] as int? ?? 0 : blocksList.length);
+    final blocksHasMore = j['blocksHasMore'] as bool? ??
+        (blocksRaw is Map ? (blocksRaw['truncated'] as bool? ?? false) : false);
+
+    return ObligationDetailSnapshot(
+      obligation: ObligationDto.fromJson(j['obligation'] as Map<String, dynamic>),
+      parent: j['parent'] == null
+          ? null
+          : ObligationDto.fromJson(j['parent'] as Map<String, dynamic>),
+      children: (j['children'] is List)
+          ? (j['children'] as List<dynamic>)
+                .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
+                .toList()
+          : (j['children'] is Map<String, dynamic> &&
+                j['children']['items'] is List)
+          ? (j['children']['items'] as List<dynamic>)
+                .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
+                .toList()
+          : const <ObligationDto>[],
+      blockingChildren: (j['blockingChildren'] is List)
+          ? (j['blockingChildren'] as List<dynamic>)
+                .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
+                .toList()
+          : (j['blockingChildren'] is Map<String, dynamic> &&
+                j['blockingChildren']['items'] is List)
+          ? (j['blockingChildren']['items'] as List<dynamic>)
+                .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
+                .toList()
+          : const <ObligationDto>[],
+      blockedBy: blockedByList,
+      blockedByTotal: blockedByTotal,
+      blockedByHasMore: blockedByHasMore,
+      blocks: blocksList,
+      blocksTotal: blocksTotal,
+      blocksHasMore: blocksHasMore,
+      artifacts: (j['artifacts'] is List)
+          ? (j['artifacts'] as List<dynamic>)
+                .map(
+                  (e) =>
+                      ObligationArtifactDto.fromJson(e as Map<String, dynamic>),
+                )
+                .toList()
+          : const <ObligationArtifactDto>[],
+      completions: (j['completions'] as List<dynamic>? ?? const [])
+          .map((e) => ObligationCompletionDto.fromJson(e as Map<String, dynamic>))
+          .toList(),
+      completionsTotal: j['completionsTotal'] as int? ?? 0,
+      completionsHasMore: j['completionsHasMore'] as bool? ?? false,
+      externalReference: j['externalReference'] is Map<String, dynamic>
+          ? ReferenceDto.fromJson(j['externalReference'] as Map<String, dynamic>)
+          : null,
+    );
+  }
 }

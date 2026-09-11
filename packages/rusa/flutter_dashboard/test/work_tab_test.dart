@@ -800,4 +800,215 @@ void main() {
       });
     },
   );
+
+  testWidgets(
+    'renders empty state for BLOCKED BY and BLOCKS when no dependencies exist',
+    (tester) async {
+      await tester.runAsync(() async {
+        await tester.binding.setSurfaceSize(const Size(1200, 1600));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final ob = makeObligation(
+          'ob-no-deps',
+          ownerId: 'root',
+          intent: 'Standalone task',
+        );
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [ob];
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.tap(find.text('Standalone task'));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('BLOCKED BY'), findsOneWidget);
+        expect(
+          find.text('Not blocked by any obligations or issues.'),
+          findsOneWidget,
+        );
+        expect(find.text('BLOCKS'), findsOneWidget);
+        expect(
+          find.text('Does not block any obligations or issues.'),
+          findsOneWidget,
+        );
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'renders both dependency directions (BLOCKED BY and BLOCKS) with human-readable titles and navigable links',
+    (tester) async {
+      await tester.runAsync(() async {
+        await tester.binding.setSurfaceSize(const Size(1200, 1600));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final targetOb = makeObligation(
+          'ob-target',
+          ownerId: 'root',
+          intent: 'Main target obligation',
+        );
+        final prereqNonGh = makeObligation(
+          'prereq-non-gh',
+          ownerId: 'root',
+          title: 'Prerequisite Non-GitHub Title',
+        );
+        final prereqGh = makeObligation(
+          'prereq-gh',
+          ownerId: 'root',
+          title: 'Prerequisite with GitHub Issue',
+          externalRef: 'github:MEK-Org/rusa/issues/101',
+        );
+        final depGh = makeObligation(
+          'dep-gh',
+          ownerId: 'root',
+          title: 'Dependent with GitHub PR',
+          externalRef: 'github:MEK-Org/rusa/pulls/202',
+        );
+        final depNonGh = makeObligation(
+          'dep-non-gh',
+          ownerId: 'root',
+          title: 'Dependent Non-GitHub Title',
+        );
+
+        final openedLinks = <String>[];
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [
+            targetOb,
+            prereqNonGh,
+            prereqGh,
+            depGh,
+            depNonGh,
+          ]
+          ..obBlockedBy = {
+            'ob-target': [prereqNonGh, prereqGh],
+          }
+          ..obBlocks = {
+            'ob-target': [depGh, depNonGh],
+          };
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(
+                store: store,
+                onSelectView: (_) {},
+                openLink: openedLinks.add,
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.tap(find.text('Main target obligation'));
+        await tester.pump();
+        await tester.pump();
+
+        // Check BLOCKED BY section
+        expect(find.text('BLOCKED BY'), findsOneWidget);
+        expect(find.text('Prerequisite Non-GitHub Title'), findsWidgets);
+        expect(find.text('Prerequisite with GitHub Issue'), findsWidgets);
+        expect(find.text('github:MEK-Org/rusa/issues/101'), findsOneWidget);
+
+        // Check BLOCKS section
+        expect(find.text('BLOCKS'), findsOneWidget);
+        expect(find.text('Dependent with GitHub PR'), findsWidgets);
+        expect(find.text('github:MEK-Org/rusa/pulls/202'), findsOneWidget);
+        expect(find.text('Dependent Non-GitHub Title'), findsWidgets);
+
+        // Tapping the external reference link opens the derived GitHub URL
+        await tester.tap(find.text('github:MEK-Org/rusa/issues/101'));
+        expect(openedLinks, ['https://github.com/MEK-Org/rusa/issues/101']);
+
+        await tester.tap(find.text('github:MEK-Org/rusa/pulls/202'));
+        expect(openedLinks, [
+          'https://github.com/MEK-Org/rusa/issues/101',
+          'https://github.com/MEK-Org/rusa/pull/202',
+        ]);
+
+        // Tapping an obligation row focuses it
+        await tester.tap(find.text('Prerequisite Non-GitHub Title').last);
+        for (int i = 0; i < 5; i++) {
+          await tester.pump(const Duration(milliseconds: 10));
+        }
+        expect(store.focusedObligationId.value, 'prereq-non-gh');
+
+        await store.dispose();
+      });
+    },
+  );
+
+  testWidgets(
+    'supports pagination load more buttons for BLOCKED BY and BLOCKS',
+    (tester) async {
+      await tester.runAsync(() async {
+        await tester.binding.setSurfaceSize(const Size(1200, 1600));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final targetOb = makeObligation(
+          'ob-target',
+          ownerId: 'root',
+          intent: 'Paged obligation',
+        );
+        final item1 = makeObligation('item-1', ownerId: 'root', title: 'Item 1');
+        final item2 = makeObligation('item-2', ownerId: 'root', title: 'Item 2');
+
+        final api = FakeApi()
+          ..threadsResult = [makeThread('root')]
+          ..obligationsResult = [targetOb, item1, item2]
+          ..obligationDetails = {
+            'ob-target': ObligationDetailSnapshot(
+              obligation: targetOb,
+              parent: null,
+              children: [],
+              blockingChildren: [],
+              blockedBy: [item1],
+              blockedByTotal: 3,
+              blockedByHasMore: true,
+              blocks: [item2],
+              blocksTotal: 5,
+              blocksHasMore: true,
+            ),
+          };
+
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+        await tester.tap(find.text('Paged obligation'));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.text('Load more (2 remaining)'), findsOneWidget);
+        expect(find.text('Load more (4 remaining)'), findsOneWidget);
+
+        await store.dispose();
+      });
+    },
+  );
 }

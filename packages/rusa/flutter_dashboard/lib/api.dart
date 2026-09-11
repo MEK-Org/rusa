@@ -437,12 +437,16 @@ class DashboardApi {
     int? childrenOffset,
     int? blockingOffset,
     int? completionsOffset,
+    int? blockedByOffset,
+    int? blocksOffset,
     int? limit,
   }) async {
     final q = <String, String>{
       if (childrenOffset != null) 'children_offset': '$childrenOffset',
       if (blockingOffset != null) 'blocking_offset': '$blockingOffset',
       if (completionsOffset != null) 'completions_offset': '$completionsOffset',
+      if (blockedByOffset != null) 'blocked_by_offset': '$blockedByOffset',
+      if (blocksOffset != null) 'blocks_offset': '$blocksOffset',
       if (limit != null) 'limit': '$limit',
     };
     return ObligationDetailSnapshot.fromJson(

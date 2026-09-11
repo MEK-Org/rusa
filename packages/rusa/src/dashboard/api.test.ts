@@ -2340,6 +2340,96 @@ describe("handleMeshApiRequest", () => {
           ["sub-1", "sub-2"].sort()
         );
         expect(data.blockingChildren.map((c: { id: string }) => c.id)).toEqual(["sub-2"]);
+        expect(data.blockedBy).toEqual([]);
+        expect(data.blockedByTotal).toBe(0);
+        expect(data.blockedByHasMore).toBe(false);
+        expect(data.blocks).toEqual([]);
+        expect(data.blocksTotal).toBe(0);
+        expect(data.blocksHasMore).toBe(false);
+      });
+
+      it("returns both blockedBy and blocks dependency directions with titles and externalRefs", async () => {
+        obligations.create({
+          title: "Prerequisite Non-GitHub",
+          id: "prereq-non-gh",
+          ownerId: "actor-1",
+        });
+        obligations.create({
+          title: "Prerequisite GitHub",
+          id: "prereq-gh",
+          ownerId: "actor-1",
+          externalRef: "github:MEK-Org/rusa/issues/101",
+        });
+        obligations.create({
+          title: "Target Obligation",
+          id: "target-ob",
+          ownerId: "actor-2",
+          blockedBy: ["prereq-non-gh", "prereq-gh"],
+        });
+        obligations.create({
+          title: "Dependent GitHub",
+          id: "dep-gh",
+          ownerId: "actor-3",
+          externalRef: "github:MEK-Org/rusa/issues/102",
+          blockedBy: ["target-ob"],
+        });
+        obligations.create({
+          title: "Dependent Non-GitHub",
+          id: "dep-non-gh",
+          ownerId: "actor-3",
+          blockedBy: ["target-ob"],
+        });
+
+        // Test target-ob: blocked by prereq-non-gh and prereq-gh; blocks dep-gh and dep-non-gh
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/target-ob");
+        expect(res.statusCode).toBe(200);
+        const data = JSON.parse(res.body);
+
+        expect(data.blockedByTotal).toBe(2);
+        expect(data.blockedByHasMore).toBe(false);
+        expect(data.blockedBy).toHaveLength(2);
+        const nonGhPrereq = data.blockedBy.find((b: { id: string }) => b.id === "prereq-non-gh");
+        expect(nonGhPrereq.title).toBe("Prerequisite Non-GitHub");
+        expect(nonGhPrereq.externalRef).toBeNull();
+        const ghPrereq = data.blockedBy.find((b: { id: string }) => b.id === "prereq-gh");
+        expect(ghPrereq.title).toBe("Prerequisite GitHub");
+        expect(ghPrereq.externalRef.key).toBe("github:MEK-Org/rusa/issues/101");
+
+        expect(data.blocksTotal).toBe(2);
+        expect(data.blocksHasMore).toBe(false);
+        expect(data.blocks).toHaveLength(2);
+        const ghDep = data.blocks.find((b: { id: string }) => b.id === "dep-gh");
+        expect(ghDep.title).toBe("Dependent GitHub");
+        expect(ghDep.externalRef.key).toBe("github:MEK-Org/rusa/issues/102");
+        const nonGhDep = data.blocks.find((b: { id: string }) => b.id === "dep-non-gh");
+        expect(nonGhDep.title).toBe("Dependent Non-GitHub");
+        expect(nonGhDep.externalRef).toBeNull();
+
+        // Test pagination on blockedBy and blocks
+        const { res: pagedRes } = await call(
+          deps,
+          "GET",
+          "/api/mesh/obligations/target-ob?limit=1&blocked_by_offset=1&blocks_offset=1"
+        );
+        expect(pagedRes.statusCode).toBe(200);
+        const pagedData = JSON.parse(pagedRes.body);
+        expect(pagedData.blockedByTotal).toBe(2);
+        expect(pagedData.blockedBy).toHaveLength(1);
+        expect(pagedData.blockedByHasMore).toBe(false);
+        expect(pagedData.blocksTotal).toBe(2);
+        expect(pagedData.blocks).toHaveLength(1);
+        expect(pagedData.blocksHasMore).toBe(false);
+
+        // Test offset 0 hasMore
+        const { res: limitRes } = await call(
+          deps,
+          "GET",
+          "/api/mesh/obligations/target-ob?limit=1&blocked_by_offset=0&unblocks_offset=0"
+        );
+        expect(limitRes.statusCode).toBe(200);
+        const limitData = JSON.parse(limitRes.body);
+        expect(limitData.blockedByHasMore).toBe(true);
+        expect(limitData.blocksHasMore).toBe(true);
       });
 
       it("returns obligation with referenceCache embeddings and isolates faults", async () => {
