@@ -20,6 +20,12 @@ export interface ModelProbeOptions {
   signal?: AbortSignal;
   cliCommand?: string;
   configDir?: string;
+  /**
+   * Test-only path written after tmux has accepted `new-session`. Kept outside
+   * the probe's socket directory so a lifecycle test can distinguish a tmux
+   * startup that later self-reaped from one that never started at all.
+   */
+  startupMarkerPath?: string;
 }
 
 /** tmux orchestration: launch codex, send /model, capture the rendered menu panel . */
@@ -27,7 +33,8 @@ export function buildCodexModelTmuxScript(
   cliCommand: string,
   sockPath: string,
   trustArg: string,
-  deadlineSeconds: number
+  deadlineSeconds: number,
+  startupMarkerPath?: string
 ): string {
   // The waits are derived from the caller's deadline rather than from a fixed
   // iteration count. Fixed counts gave the composer ~20s and the panel ~20s no
@@ -49,6 +56,7 @@ export function buildCodexModelTmuxScript(
   return [
     "set -u",
     `SOCK=${q(sockPath)}`,
+    `STARTUP_MARKER=${q(startupMarkerPath ?? "")}`,
     "S=probe",
     // Both deadlines are measured against SECONDS (seconds since this shell
     // started), so the readiness wait and the render wait draw on one shared
@@ -69,7 +77,9 @@ export function buildCodexModelTmuxScript(
     // system tmux.conf would otherwise disable, stranding an empty server for
     // good. It also keeps someone's status bar or key bindings out of the pane
     // text this probe greps.
-    `tmux -f /dev/null -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 timeout --kill-after=5 ${deadlineS} ${q(cliCommand)}${trustArg ? ` ${trustArg}` : ""}`,
+    `if tmux -f /dev/null -S "$SOCK" new-session -d -s "$S" -x 120 -y 50 timeout --kill-after=5 ${deadlineS} ${q(cliCommand)}${trustArg ? ` ${trustArg}` : ""}; then`,
+    '  if [ -n "$STARTUP_MARKER" ]; then touch "$STARTUP_MARKER"; fi',
+    "fi",
     // Wait for the composer prompt to become ready (not just the banner).
     "ready=0",
     'while [ "$SECONDS" -lt "$READY_S" ]; do',
@@ -320,7 +330,8 @@ export async function scrapeCodexModelScreen(opts: ModelProbeOptions): Promise<s
     cliCommand,
     sock,
     trustArg,
-    Math.ceil(timeoutMs / 1000) + 1
+    Math.ceil(timeoutMs / 1000) + 1,
+    opts.startupMarkerPath
   );
 
   const killTmux = () => {

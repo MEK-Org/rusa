@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -712,6 +712,26 @@ done
     }
   });
 
+  it("records tmux startup after its short-lived pane self-reaps", async () => {
+    const actorDir = mkdtempSync(join(tmpdir(), "codex-test-actor-startup-"));
+    const mockBin = join(actorDir, "mock-codex-exits.sh");
+    const startupMarkerPath = join(actorDir, "tmux-started");
+    writeFileSync(mockBin, "#!/bin/bash\nexit 0\n", { mode: 0o755 });
+
+    try {
+      const options = {
+        actorDir,
+        cliCommand: mockBin,
+        timeoutMs: 3_000,
+        startupMarkerPath,
+      };
+      await expect(scrapeCodexModelScreen(options)).rejects.toThrow("composer never became ready");
+      expect(existsSync(startupMarkerPath)).toBe(true);
+    } finally {
+      rmSync(actorDir, { recursive: true, force: true });
+    }
+  });
+
   it("leaves no tmux server behind when its socket is destroyed before teardown ", async () => {
     // The production leak shape. The tmux server the probe starts lives in its
     // own session, so killing the wrapper's process group cannot reach it, and
@@ -721,6 +741,11 @@ done
     // instance. Destroying the socket mid-probe reproduces that deterministically.
     const actorDir = mkdtempSync(join(tmpdir(), "codex-test-actor-orphan-"));
     const mockBin = join(actorDir, "mock-codex-hang.sh");
+    // This marker lives in actorDir, not under the probe's tempHome: tempHome
+    // is deliberately deleted below, and the probe may self-reap before this
+    // test gets a CPU slice. Its presence means tmux accepted new-session even
+    // if a later `ps` snapshot cannot see the server any more.
+    const startupMarkerPath = join(actorDir, "tmux-started");
     writeFileSync(
       mockBin,
       `#!/bin/bash
@@ -766,6 +791,7 @@ done
       return row.pgid;
     };
     const paneGroupSize = (pgid: number) => processTable().filter((r) => r.pgid === pgid).length;
+    const probeProcessCount = () => processTable().filter((r) => r.args.includes(mockBin)).length;
 
     const before = probeDirs();
     // The probe creates its temp dir synchronously, so it is observable as soon
@@ -774,6 +800,7 @@ done
       actorDir,
       cliCommand: mockBin,
       timeoutMs: 4_000,
+      startupMarkerPath,
     });
     // Keep an early assertion failure from surfacing as an unhandled rejection:
     // the probe is still in flight and will reject once its deadline lands.
@@ -785,10 +812,27 @@ done
 
     let paneGroup: number | undefined;
     try {
-      for (let i = 0; i < 100 && serversFor(sock).length === 0; i++) {
+      for (let i = 0; i < 100 && !existsSync(startupMarkerPath); i++) {
         await new Promise((r) => setTimeout(r, 100));
       }
-      expect(serversFor(sock).length).toBeGreaterThan(0);
+      if (!existsSync(startupMarkerPath)) {
+        throw new Error("tmux never started: startup marker was not written");
+      }
+      if (serversFor(sock).length === 0) {
+        // The startup marker distinguishes this from a failed launch: tmux did
+        // start, then its bounded pane and empty server self-reaped before this
+        // test observed them. That path has no socket left to destroy and no
+        // server to orphan, so verify the expected rejection and residue-free
+        // state rather than treating a truthful later process snapshot as a
+        // failed startup.
+        await expect(pending).rejects.toThrow();
+        for (let i = 0; i < 150 && probeProcessCount() > 0; i++) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        expect(serversFor(sock)).toEqual([]);
+        expect(probeProcessCount()).toBe(0);
+        return;
+      }
       // Take the descendants' group while they are alive; once they exit there
       // is nothing left to derive it from.
       paneGroup = paneGroupOf(mockBin);
