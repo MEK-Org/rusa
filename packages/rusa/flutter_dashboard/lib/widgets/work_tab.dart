@@ -498,6 +498,12 @@ class _DetailViewState extends State<_DetailView> {
   List<ObligationCompletionDto> _completions = const [];
   int _completionsTotal = 0;
   bool _completionsHasMore = false;
+
+  /// Done children are hidden by default so the CHILDREN section reads as the
+  /// outstanding work under this obligation (#396). Per obligation, like the
+  /// completion history above: revealing them here says nothing about the
+  /// next obligation the reader opens.
+  bool _showDoneChildren = false;
   late Future<ObligationDetailSnapshot> _future;
   StreamSubscription<String?>? _checkpointSub;
   int _fetchGeneration = 0;
@@ -533,6 +539,7 @@ class _DetailViewState extends State<_DetailView> {
       _completions = const [];
       _completionsTotal = 0;
       _completionsHasMore = false;
+      _showDoneChildren = false;
       _fetch();
     }
   }
@@ -1099,9 +1106,16 @@ class _DetailViewState extends State<_DetailView> {
   }
 
   Widget _childrenPanel(BuildContext context, ObligationDetailSnapshot data) {
-    final list = data.children;
+    final all = data.children;
+    // Only `done` is hidden: that is what #396 asks for, and a cancelled child
+    // is not "completed" — it stays listed so the reader sees it was dropped.
+    final hiddenCount = all.where((c) => c.isDone).length;
+    // Filtering keeps the server's order for whatever remains, so the visible
+    // rows (and the reorder neighbours computed from them) are the same
+    // siblings in the same sequence, minus the ones that are done.
+    final list = _showDoneChildren ? all : all.where((c) => !c.isDone).toList();
 
-    if (list.isEmpty) {
+    if (all.isEmpty) {
       return Container(
         padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
@@ -1221,6 +1235,33 @@ class _DetailViewState extends State<_DetailView> {
             ),
             const Divider(height: 1, color: MeshColors.border),
           ],
+          if (list.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(
+                hiddenCount == 1
+                    ? 'The only child is done.'
+                    : 'All $hiddenCount children are done.',
+                style: const TextStyle(
+                  color: MeshColors.textMuted,
+                  fontSize: 13,
+                ),
+              ),
+            ),
+          if (hiddenCount > 0)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              child: TextButton(
+                onPressed: () =>
+                    setState(() => _showDoneChildren = !_showDoneChildren),
+                child: Text(
+                  _showDoneChildren
+                      ? 'Hide done children'
+                      : 'Show $hiddenCount done '
+                            '${hiddenCount == 1 ? 'child' : 'children'}',
+                ),
+              ),
+            ),
         ],
       ),
     );
