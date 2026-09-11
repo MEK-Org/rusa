@@ -311,14 +311,21 @@ export function parseExternalRef(value: string): ObligationExternalRef {
 }
 
 /**
- * Mutation kinds that categorize what operation altered an obligation's tracked state (#185).
+ * Mutation kinds corresponding to the five tracked lifecycle fields (#185).
  *
- * This serves as a coarse label for the primary operation or intent that caused
- * the mutation (e.g. "reassign", "reparent", "priority", "status", "external_ref"),
- * not an index into which specific fields changed. When a single operation alters
- * multiple tracked fields simultaneously (e.g., reparenting that also shifts priority
- * or triggers a readiness demotion), `mutationKind` identifies the triggering operation.
- * Consuming code inspecting exact field deltas should inspect the keys of `before` and `after`.
+ * Maps directly to whichever tracked field changed on this obligation row
+ * ("reassign" for ownerId, "reparent" for parentId, "priority" for priority,
+ * "status" for status, "external_ref" for externalRef).
+ *
+ * If a single mutation touches multiple tracked fields on the same row (such as
+ * reparenting to root without explicit priority, which clears parentId and sets
+ * priority), the mutation kind reflects the highest-precedence changed field
+ * (`owner > parent > priority > status > external_ref`).
+ *
+ * Collateral updates to distinct rows (such as parent readiness status demotions
+ * or promotions) record the exact field modified on that row ("status").
+ * Consuming code inspecting exact field transitions should inspect the keys of
+ * `before` and `after` in the versioned payload.
  */
 export const OBLIGATION_MUTATION_KINDS = [
   "reassign",
@@ -415,9 +422,12 @@ export function parseHistoryPayload(json: string): ObligationHistoryPayload {
  *
  * The table constrains its scalars only to "non-empty", because a CHECK is a
  * migration to change and the set of mutation kinds is expected to grow. That
- * makes the row's TypeScript type a claim the database does not enforce, so the
- * claim is checked here instead — the same place and for the same reason the
- * JSON half is checked. Validating one half and casting the other would let a
+ * makes the row's TypeScript type a claim the database does not enforce, so each
+ * field's typed claim is validated here instead — the same place and for the same
+ * reason the JSON half is checked. `acting_principal` is validated into `EntityId`
+ * via `validateEntityId` (matching `toObligation` for `owner_id`), `timestamp` is
+ * strictly parsed as ISO-8601 UTC, and `mutation_kind` is validated against the
+ * closed set of enum kinds. Validating one half and casting the other would let a
  * hand-edited or future-version row arrive at a caller typed as something it is
  * not.
  */
@@ -447,7 +457,7 @@ export function parseHistoryRow(row: unknown): ObligationHistoryEntry {
     id: parsed.id,
     obligationId: parsed.obligation_id,
     mutationKind: parsed.mutation_kind,
-    actingPrincipal: parsed.acting_principal,
+    actingPrincipal: validateEntityId(parsed.acting_principal),
     timestamp: parsed.timestamp,
     before: payload.before,
     after: payload.after,

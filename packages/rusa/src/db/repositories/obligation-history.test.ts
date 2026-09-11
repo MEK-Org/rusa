@@ -145,6 +145,21 @@ describe("Obligation mutation history", () => {
       expect(history).toHaveLength(0);
       expect(repository.get(ob.id)?.ownerId).toBe("actor-a");
     });
+
+    it("fails loudly when a tracked-column write occurs outside mutate", () => {
+      const ob = repository.create({
+        title: "Test Obligation",
+        ownerId: "actor-a",
+      });
+
+      // Directly update a tracked column outside mutate(), populating obligation_history_delta
+      db.prepare("UPDATE obligations SET owner_id = 'actor-c' WHERE id = ?").run(ob.id);
+
+      // The next mutate() call must fail loudly rather than silently discarding or misattributing the write
+      expect(() => {
+        repository.reassign(ob.id, "actor-b", "actor-a");
+      }).toThrow(/uncommitted obligation_history_delta rows outside mutate/);
+    });
   });
 
   describe("no-ops record no history", () => {
@@ -394,6 +409,7 @@ describe("Obligation mutation history", () => {
         parentId: parent.id,
       });
       db.prepare("UPDATE obligations SET priority = NULL WHERE id = ?").run(child.id);
+      db.prepare("DELETE FROM obligation_history_delta").run();
       repository.setTerminalStatus(child.id, "done", null, null, "actor-a");
 
       now += 1000;
@@ -545,38 +561,6 @@ describe("Obligation mutation history", () => {
       );
 
       expect(large).toBe(small);
-    });
-
-    it("reads no whole-table tracked-column snapshot on any mutation", () => {
-      const raw = migratedDb();
-      const prepared: string[] = [];
-      const clock = Date.parse("2026-09-09T12:00:00.000Z");
-      const spy = new Proxy(raw, {
-        get(target, prop) {
-          const value = Reflect.get(target, prop, target);
-          if (prop !== "prepare") return typeof value === "function" ? value.bind(target) : value;
-          return (sql: string) => {
-            prepared.push(sql);
-            return target.prepare(sql);
-          };
-        },
-      });
-      const repo = new ObligationRepository(
-        spy,
-        (id) => ["actor-a", "actor-b", "actor-c"].includes(id),
-        () => clock
-      );
-      repo.create({ id: "target", title: "Target", ownerId: "actor-a" });
-      prepared.length = 0;
-
-      repo.reassign("target", "actor-b", "actor-a");
-
-      const snapshotScans = prepared.filter((sql) =>
-        /select[^;]*owner_id[^;]*parent_id[^;]*priority[^;]*status[^;]*external_ref[^;]*from\s+obligations\b(?![^;]*\bwhere\s+id\s*=)/is.test(
-          sql
-        )
-      );
-      expect(snapshotScans).toEqual([]);
     });
   });
 

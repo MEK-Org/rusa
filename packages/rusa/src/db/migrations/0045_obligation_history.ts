@@ -57,6 +57,12 @@ import type { Migration } from "./types.js";
  * integer key guarantees deterministic chronological insertion ordering even
  * for multiple mutations occurring within the same millisecond timestamp,
  * eliminating wall-clock timestamp ties and non-chronological random-UUID ordering.
+ *
+ * In SQLite, secondary indexes on rowid tables automatically append the rowid (`id`).
+ * An index on `(obligation_id)` therefore stores `(obligation_id, id)` B-tree keys,
+ * allowing queries filtered by `obligation_id` and ordered by `id DESC` to scan the
+ * index backwards with zero temporary B-trees or sorting overhead. The index narrows
+ * and orders the search; non-indexed columns are retrieved via rowid lookup.
  */
 export const obligationHistory: Migration = {
   id: "0045_obligation_history",
@@ -72,7 +78,7 @@ export const obligationHistory: Migration = {
       );
 
       CREATE INDEX IF NOT EXISTS idx_obligation_history_obligation
-        ON obligation_history(obligation_id, id DESC);
+        ON obligation_history(obligation_id);
     `);
   },
 };

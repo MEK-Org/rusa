@@ -761,11 +761,17 @@ export class ObligationRepository {
     const result = this.db.transaction(() => {
       const before = this.readyHeads();
 
-      // Discard anything a write outside this seam may have left behind, so a
-      // stray row can never be attributed to this call's principal. The capture
-      // table lives in the connection's transaction, so a rollback takes both
-      // the deltas and the history rows with it: a failed call records nothing.
-      this.db.prepare("DELETE FROM obligation_history_delta").run();
+      // A tracked-column write outside mutate() is an audited-seam violation.
+      // Assert the delta table is empty rather than silently discarding leftover
+      // writes, so uncommitted or stray tracked updates fail loudly.
+      const strayDelta = this.db
+        .prepare("SELECT COUNT(*) AS count FROM obligation_history_delta")
+        .get() as { count: number };
+      if (strayDelta.count > 0) {
+        throw new Error(
+          `ObligationRepository.mutate detected ${strayDelta.count} uncommitted obligation_history_delta rows outside mutate()`
+        );
+      }
 
       this.isMutating = true;
       let res: T;
@@ -2010,11 +2016,11 @@ export class ObligationRepository {
     ref: string,
     options?: { label?: string | null; attachedBy?: EntityId | null }
   ): ObligationArtifact {
-    const attachedBy = options?.attachedBy == null ? null : validateEntityId(options.attachedBy);
-    return this.mutate(attachedBy ?? "system:mesh", () => {
+    return this.db.transaction(() => {
       this.require(obligationId);
       const key = parseObligationReference(ref).key;
       const label = options?.label == null ? null : options.label.trim() || null;
+      const attachedBy = options?.attachedBy == null ? null : validateEntityId(options.attachedBy);
       this.db
         .prepare(
           `INSERT INTO obligation_artifacts (id, obligation_id, ref, label, attached_by, attached_at)
@@ -2026,7 +2032,7 @@ export class ObligationRepository {
         .prepare("SELECT * FROM obligation_artifacts WHERE obligation_id = ? AND ref = ?")
         .get(obligationId, key) as ObligationArtifactRow;
       return toArtifact(row);
-    });
+    })();
   }
 
   /**

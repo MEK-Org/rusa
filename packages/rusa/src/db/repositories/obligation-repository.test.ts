@@ -1139,6 +1139,7 @@ describe("ObligationRepository", () => {
     });
 
     db.prepare("UPDATE obligations SET priority = NULL WHERE id IN ('inheriting', 'leaf')").run();
+    db.prepare("DELETE FROM obligation_history_delta").run();
 
     repository.setPriorityInternal("root", 5, "system:mesh", "self");
     expect(repository.require("root").effectivePriority).toBe(5);
@@ -1332,6 +1333,7 @@ describe("ObligationRepository", () => {
     db.prepare(
       "UPDATE obligations SET status = 'scheduled', recurrence_policy = 'cron', recurrence_cron = '* * * * *', next_ready_at = '2026-08-01T00:00:00.000Z' WHERE id = ?"
     ).run(child.id);
+    db.prepare("DELETE FROM obligation_history_delta").run();
 
     // parent should not be blocked from completion
     const completed = repository.setTerminalStatus(parent.id, "done", null, null, "system:mesh");

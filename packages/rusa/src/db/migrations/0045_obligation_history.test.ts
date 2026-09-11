@@ -145,4 +145,18 @@ describe("0045_obligation_history", () => {
     const r2 = insert.run();
     expect(r2.lastInsertRowid).toBeGreaterThan(r1.lastInsertRowid);
   });
+
+  it("satisfies newest-first queries via index without temporary B-tree", () => {
+    const db = seedDb();
+    obligationHistory.up(db);
+    const plan = db
+      .prepare(
+        "EXPLAIN QUERY PLAN SELECT id, obligation_id, mutation_kind, acting_principal, timestamp, payload FROM obligation_history WHERE obligation_id = ? ORDER BY id DESC"
+      )
+      .all("test") as Array<{ detail: string }>;
+    expect(
+      plan.some((p) => p.detail.includes("USING INDEX idx_obligation_history_obligation"))
+    ).toBe(true);
+    expect(plan.some((p) => p.detail.toLowerCase().includes("temp b-tree"))).toBe(false);
+  });
 });
