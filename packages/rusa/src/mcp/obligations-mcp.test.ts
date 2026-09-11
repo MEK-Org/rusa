@@ -14,6 +14,7 @@ import { obligationArtifacts } from "../db/migrations/0028_obligation_artifacts.
 import { recurringObligations } from "../db/migrations/0035_recurring_obligations.js";
 import { obligationDependencies } from "../db/migrations/0037_obligation_dependencies.js";
 import { obligationCheckpoint } from "../db/migrations/0043_obligation_checkpoint.js";
+import { obligationHistory } from "../db/migrations/0045_obligation_history.js";
 import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { OBLIGATION_CHECKPOINT_MAX } from "../obligations/obligation.js";
 import { canManageObligation, resolveObligationOwner } from "../obligations/owner.js";
@@ -48,6 +49,7 @@ describe("obligations MCP", () => {
     recurringObligations.up(db);
     obligationDependencies.up(db);
     obligationCheckpoint.up(db);
+    obligationHistory.up(db);
     repository = new ObligationRepository(db);
   });
 
@@ -96,7 +98,7 @@ describe("obligations MCP", () => {
     expect(obligation.creatorId).toBe("actor-a");
 
     // And it survives the reassignment that destroys owner attribution.
-    repository.reassign(obligation.id, "human:operator");
+    repository.reassign(obligation.id, "human:operator", "system:mesh");
     expect(repository.require(obligation.id).creatorId).toBe("actor-a");
   });
 
@@ -477,7 +479,7 @@ describe("obligations MCP", () => {
       id: "foreign",
       ownerId: "actor-b",
     });
-    repository.movePriorityInternal("second", null, "first");
+    repository.movePriorityInternal("second", null, "first", "actor-a", "subtree");
 
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
     const result = (await client.callTool({
@@ -598,7 +600,7 @@ describe("obligations MCP", () => {
       parentId: "parent",
       ownerId: "actor-b",
     });
-    repository.setTerminalStatus("a-terminal", "done");
+    repository.setTerminalStatus("a-terminal", "done", null, null, "actor-b");
     repository.create({
       title: "z-live",
       id: "z-live",
@@ -648,13 +650,17 @@ describe("obligations MCP", () => {
       id: "recurring",
       ownerId: "actor-a",
     });
-    repository.setRecurrence("recurring", {
-      policy: "completion_interval",
-      intervalSeconds: 999_999_999,
-    });
+    repository.setRecurrence(
+      "recurring",
+      {
+        policy: "completion_interval",
+        intervalSeconds: 999_999_999,
+      },
+      "actor-a"
+    );
     for (let i = 0; i < 2; i++) {
-      repository.setTerminalStatus("recurring", "done", `cycle ${i}`);
-      repository.activateScheduled("recurring");
+      repository.setTerminalStatus("recurring", "done", `cycle ${i}`, null, "actor-a");
+      repository.activateScheduled("recurring", "system:mesh");
     }
 
     const client = await connect(createObligationsMcpServer(repository, "actor-a"));
@@ -1105,6 +1111,64 @@ describe("obligations MCP", () => {
         arguments: { id: "nope", checkpoint: STANDING },
       })) as CallToolResult;
       expect(res.isError).toBe(true);
+    });
+  });
+
+  describe("obligation mutation history and server-bound attribution", () => {
+    it("binds acting principal to actorId and never accepts it from client payload", async () => {
+      repository.create({ title: "Task", id: "task-1", ownerId: "bound-actor-xyz" });
+      const client = await connect(createObligationsMcpServer(repository, "bound-actor-xyz"));
+
+      const { tools } = await client.listTools();
+      for (const tool of tools) {
+        const schema = tool.inputSchema as { properties?: Record<string, unknown> };
+        expect(schema.properties?.acting_principal).toBeUndefined();
+        expect(schema.properties?.actingPrincipal).toBeUndefined();
+      }
+
+      const res = (await client.callTool({
+        name: "reassign_obligation",
+        arguments: { id: "task-1", owner_id: "actor-b" },
+      })) as CallToolResult;
+      expect(res.isError).toBeFalsy();
+
+      const entries = repository.listHistory("task-1");
+      expect(entries.length).toBe(1);
+      expect(entries[0].actingPrincipal).toBe("bound-actor-xyz");
+      expect(entries[0].mutationKind).toBe("reassign");
+    });
+
+    it("does not expose history projection on get_obligation, preserving analytical repository access", async () => {
+      repository.create({ title: "Parent", id: "p1", ownerId: "actor-a" });
+      for (let i = 0; i < 5; i++) {
+        repository.create({ title: `Child ${i}`, ownerId: "actor-a", parentId: "p1" });
+      }
+
+      // Collateral status transition (ready -> waiting) + 2 direct mutations = 3 history entries
+      repository.reassign("p1", "actor-b", "actor-a");
+      repository.setExternalRef("p1", "github:MEK-Org/rusa/issues/185", "actor-b");
+
+      const client = await connect(createObligationsMcpServer(repository, "actor-a"));
+
+      // Schema check: get_obligation does not expose history_cursor parameter
+      const { tools } = await client.listTools();
+      const getObligationTool = tools.find((t) => t.name === "get_obligation");
+      const schema = getObligationTool?.inputSchema as { properties?: Record<string, unknown> };
+      expect(schema?.properties?.history_cursor).toBeUndefined();
+
+      // Payload check: get_obligation does not return history field
+      const res = (await client.callTool({
+        name: "get_obligation",
+        arguments: { id: "p1", limit: 2 },
+      })) as CallToolResult;
+      const data = dataOf(res) as Record<string, unknown>;
+      expect(data.history).toBeUndefined();
+      expect(data.children).toBeDefined();
+
+      // Repository analytical history read path remains fully functional
+      const historyEntries = repository.listHistory("p1");
+      expect(historyEntries.length).toBe(3);
+      expect(historyEntries[0].actingPrincipal).toBe("actor-b");
     });
   });
 });

@@ -40,6 +40,7 @@ import { modelClasses } from "./0041_model_classes.js";
 import { actorRunLaunchConfig } from "./0042_actor_run_launch_config.js";
 import { obligationCheckpoint } from "./0043_obligation_checkpoint.js";
 import { actorVoiceConfig } from "./0044_actor_voice_config.js";
+import { obligationHistory } from "./0045_obligation_history.js";
 import { actorExperiments } from "./0047_actor_experiments.js";
 import type { Migration } from "./types.js";
 
@@ -93,9 +94,6 @@ export const migrations: Migration[] = [
   actorRunLaunchConfig,
   obligationCheckpoint,
   actorVoiceConfig,
-  // 0045 and 0046 are claimed by migrations in flight on other branches
-  // (#371 and held #391 respectively; 0044 #377 has now landed on staging),
-  // so this one takes the next free number rather than colliding with a
-  // number already presented for review.
+  obligationHistory,
   actorExperiments,
 ];

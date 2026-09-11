@@ -22,6 +22,7 @@ import { obligationArtifacts } from "../migrations/0028_obligation_artifacts.js"
 import { recurringObligations } from "../migrations/0035_recurring_obligations.js";
 import { obligationDependencies } from "../migrations/0037_obligation_dependencies.js";
 import { obligationCheckpoint } from "../migrations/0043_obligation_checkpoint.js";
+import { obligationHistory } from "../migrations/0045_obligation_history.js";
 import { MAX_OBLIGATION_PAGE_LIMIT, ObligationRepository } from "./obligation-repository.js";
 
 /** Records every scheduler call instead of touching the OS, for assertions. */
@@ -64,6 +65,7 @@ describe("ObligationRepository", () => {
     recurringObligations.up(db);
     obligationDependencies.up(db);
     obligationCheckpoint.up(db);
+    obligationHistory.up(db);
     now = 1_000;
     repository = new ObligationRepository(
       db,
@@ -84,7 +86,7 @@ describe("ObligationRepository", () => {
     expect(created.updatedAt).toBe(created.createdAt);
 
     await new Promise((resolve) => setTimeout(resolve, 5));
-    repository.setTerminalStatus("stamped", "done");
+    repository.setTerminalStatus("stamped", "done", null, null, "system:mesh");
 
     const after = repository.require("stamped");
     expect(after.createdAt).toBe(created.createdAt);
@@ -141,7 +143,7 @@ describe("ObligationRepository", () => {
         ownerId: "actor-a",
         priority: 1,
       });
-      repository.setTerminalStatus("urgent", "done");
+      repository.setTerminalStatus("urgent", "done", null, null, "system:mesh");
 
       // "first" is the head twice, and only `previousHeadId` separates the two.
       // Without it a consumer deduplicating on head identity cannot tell the
@@ -208,7 +210,7 @@ describe("ObligationRepository", () => {
       ]);
 
       // 2. Complete terminal status on "ob-1" -> queue is empty!
-      repository.setTerminalStatus("ob-1", "done");
+      repository.setTerminalStatus("ob-1", "done", null, null, "system:mesh");
       transitions = repository.readyHeadTransitions();
       expect(transitions).toEqual([]);
 
@@ -260,7 +262,7 @@ describe("ObligationRepository", () => {
       });
       heads = [];
 
-      repository.reassign("work", "actor-b");
+      repository.reassign("work", "actor-b", "system:mesh");
 
       // Both sides are reported: actor-a's head vanished, actor-b gained one.
       // Losing a head is still not attention-worthy — the mesh delivers nothing
@@ -287,7 +289,7 @@ describe("ObligationRepository", () => {
       });
       heads = [];
 
-      repository.setTerminalStatus("child", "done");
+      repository.setTerminalStatus("child", "done", null, null, "system:mesh");
 
       // The parent's owner was never named by the caller; the head diff finds it.
       // actor-b's head went terminal, so they are reported as having none.
@@ -306,7 +308,7 @@ describe("ObligationRepository", () => {
       });
       heads = [];
 
-      repository.inheritRetiringActorObligationsInternal("actor-b", "actor-a");
+      repository.inheritRetiringActorObligationsInternal("actor-b", "actor-a", "system:mesh");
 
       expect(heads).toEqual([
         { ownerId: "actor-b", headId: null },
@@ -367,7 +369,9 @@ describe("ObligationRepository", () => {
       heads = [];
 
       // A parent with a live child cannot go terminal; the transaction throws.
-      expect(() => repository.setTerminalStatus("parent", "done")).toThrow();
+      expect(() =>
+        repository.setTerminalStatus("parent", "done", null, null, "system:mesh")
+      ).toThrow();
 
       expect(heads).toEqual([]);
     });
@@ -414,14 +418,18 @@ describe("ObligationRepository", () => {
     const done = repository.setTerminalStatus(
       "answered",
       "done",
-      "Flutter — tooling is already wired."
+      "Flutter — tooling is already wired.",
+      null,
+      "system:mesh"
     );
     expect(done.terminalNote).toBe("Flutter — tooling is already wired.");
 
     const cancelled = repository.setTerminalStatus(
       "dropped",
       "cancelled",
-      "Stack decided elsewhere."
+      "Stack decided elsewhere.",
+      null,
+      "system:mesh"
     );
     expect(cancelled.terminalNote).toBe("Stack decided elsewhere.");
   });
@@ -440,7 +448,9 @@ describe("ObligationRepository", () => {
         id,
         ownerId: "actor-a",
       });
-      expect(repository.setTerminalStatus(id, "done", note).terminalNote).toBeNull();
+      expect(
+        repository.setTerminalStatus(id, "done", note, null, "system:mesh").terminalNote
+      ).toBeNull();
     }
   });
 
@@ -451,7 +461,13 @@ describe("ObligationRepository", () => {
       ownerId: "actor-a",
     });
     expect(
-      repository.setTerminalStatus("padded", "cancelled", "  superseded by #61\n").terminalNote
+      repository.setTerminalStatus(
+        "padded",
+        "cancelled",
+        "  superseded by #61\n",
+        null,
+        "system:mesh"
+      ).terminalNote
     ).toBe("superseded by #61");
   });
 
@@ -462,7 +478,7 @@ describe("ObligationRepository", () => {
       ownerId: "actor-a",
     });
     expect(live.terminalNote).toBeNull();
-    expect(repository.reassign("live", "actor-b").terminalNote).toBeNull();
+    expect(repository.reassign("live", "actor-b", "system:mesh").terminalNote).toBeNull();
   });
 
   it("requires a heading, and keeps it to one short line", () => {
@@ -540,7 +556,8 @@ describe("ObligationRepository", () => {
         "q",
         "done",
         "A monster-catching JRPG in a cave.",
-        "mesh:messages/msg-7"
+        "mesh:messages/msg-7",
+        "system:mesh"
       );
 
       expect(resolved.resolutionRef).toBe("mesh:messages/msg-7");
@@ -552,10 +569,14 @@ describe("ObligationRepository", () => {
 
     it("leaves resolutionRef null when nothing is cited, and rejects a bad ref", () => {
       repository.create({ title: "Quiet", id: "quiet", ownerId: "actor-a" });
-      expect(repository.setTerminalStatus("quiet", "done").resolutionRef).toBeNull();
+      expect(
+        repository.setTerminalStatus("quiet", "done", null, null, "system:mesh").resolutionRef
+      ).toBeNull();
 
       repository.create({ title: "Bad", id: "bad", ownerId: "actor-a" });
-      expect(() => repository.setTerminalStatus("bad", "done", null, "nope:x")).toThrow();
+      expect(() =>
+        repository.setTerminalStatus("bad", "done", null, "nope:x", "system:mesh")
+      ).toThrow();
       // The transition is rolled back with it — a rejected citation must not
       // leave the obligation terminal with no record of why.
       expect(repository.require("bad").status).toBe("ready");
@@ -568,64 +589,68 @@ describe("ObligationRepository", () => {
       expect(created.externalRef).toBeNull();
 
       expect(
-        repository.setExternalRef("work", "github:MEK-Org/rusa/issues/33").externalRef?.key
+        repository.setExternalRef("work", "github:MEK-Org/rusa/issues/33", "system:mesh")
+          .externalRef?.key
       ).toBe("github:MEK-Org/rusa/issues/33");
       // Relinking a mistyped number, and unlinking entirely, are both ordinary.
       expect(
-        repository.setExternalRef("work", "github:MEK-Org/rusa/issues/34").externalRef?.key
+        repository.setExternalRef("work", "github:MEK-Org/rusa/issues/34", "system:mesh")
+          .externalRef?.key
       ).toBe("github:MEK-Org/rusa/issues/34");
-      expect(repository.setExternalRef("work", null).externalRef).toBeNull();
+      expect(repository.setExternalRef("work", null, "system:mesh").externalRef).toBeNull();
     });
 
     it("frees the ref for its rightful claimant when unlinked", () => {
       repository.create({ title: "Wrong", id: "wrong", ownerId: "actor-a" });
       repository.create({ title: "Right", id: "right", ownerId: "actor-b" });
-      repository.setExternalRef("wrong", "github:MEK-Org/rusa/issues/33");
+      repository.setExternalRef("wrong", "github:MEK-Org/rusa/issues/33", "system:mesh");
 
       // Live uniqueness holds while the mislink stands...
-      expect(() => repository.setExternalRef("right", "github:MEK-Org/rusa/issues/33")).toThrow(
-        "already uses external ref"
-      );
+      expect(() =>
+        repository.setExternalRef("right", "github:MEK-Org/rusa/issues/33", "system:mesh")
+      ).toThrow("already uses external ref");
       // ...and unlinking is what releases it. Without this the claim would be
       // stuck on the wrong obligation for as long as that obligation lives.
-      repository.setExternalRef("wrong", null);
+      repository.setExternalRef("wrong", null, "system:mesh");
       expect(
-        repository.setExternalRef("right", "github:MEK-Org/rusa/issues/33").externalRef?.key
+        repository.setExternalRef("right", "github:MEK-Org/rusa/issues/33", "system:mesh")
+          .externalRef?.key
       ).toBe("github:MEK-Org/rusa/issues/33");
     });
 
     it("treats case variants as one live identity claim", () => {
       repository.create({ title: "First", id: "first-claim", ownerId: "actor-a" });
       repository.create({ title: "Second", id: "second-claim", ownerId: "actor-b" });
-      repository.setExternalRef("first-claim", "github:MEK-Org/rusa");
+      repository.setExternalRef("first-claim", "github:MEK-Org/rusa", "system:mesh");
 
-      expect(() => repository.setExternalRef("second-claim", "github:mek-org/RUSA")).toThrow(
-        "already uses external ref"
-      );
+      expect(() =>
+        repository.setExternalRef("second-claim", "github:mek-org/RUSA", "system:mesh")
+      ).toThrow("already uses external ref");
     });
 
     it("accepts a repository or an owner as the identity", () => {
       repository.create({ title: "Keep rusa releasable", id: "repo-level", ownerId: "actor-a" });
-      expect(repository.setExternalRef("repo-level", "github:MEK-Org/rusa").externalRef?.key).toBe(
-        "github:MEK-Org/rusa"
-      );
+      expect(
+        repository.setExternalRef("repo-level", "github:MEK-Org/rusa", "system:mesh").externalRef
+          ?.key
+      ).toBe("github:MEK-Org/rusa");
       repository.create({ title: "Org health", id: "org-level", ownerId: "actor-a" });
-      expect(repository.setExternalRef("org-level", "github:MEK-Org").externalRef?.key).toBe(
-        "github:MEK-Org"
-      );
+      expect(
+        repository.setExternalRef("org-level", "github:MEK-Org", "system:mesh").externalRef?.key
+      ).toBe("github:MEK-Org");
     });
 
     it("rejects a sub-resource and freezes a terminal obligation's identity", () => {
       repository.create({ title: "Work", id: "sub", ownerId: "actor-a" });
       expect(() =>
-        repository.setExternalRef("sub", "github:MEK-Org/rusa/issues/33/comments/9")
+        repository.setExternalRef("sub", "github:MEK-Org/rusa/issues/33/comments/9", "system:mesh")
       ).toThrow("external ref must name");
 
       repository.create({ title: "Done", id: "closed", ownerId: "actor-a" });
-      repository.setTerminalStatus("closed", "done");
-      expect(() => repository.setExternalRef("closed", "github:MEK-Org/rusa")).toThrow(
-        "terminal obligations cannot change their external ref"
-      );
+      repository.setTerminalStatus("closed", "done", null, null, "system:mesh");
+      expect(() =>
+        repository.setExternalRef("closed", "github:MEK-Org/rusa", "system:mesh")
+      ).toThrow("terminal obligations cannot change their external ref");
     });
   });
 
@@ -647,10 +672,16 @@ describe("ObligationRepository", () => {
 
   it("stamps every public mutation, not just the ones with a bespoke test", async () => {
     const mutate: Array<[string, (name: string) => void]> = [
-      ["setTerminalStatus", (n) => repository.setTerminalStatus(`subject-${n}`, "done")],
-      ["reassign", (n) => repository.reassign(`subject-${n}`, "actor-c")],
-      ["reparent", (n) => repository.reparent(`subject-${n}`, null)],
-      ["setPriorityInternal", (n) => repository.setPriorityInternal(`subject-${n}`, 77)],
+      [
+        "setTerminalStatus",
+        (n) => repository.setTerminalStatus(`subject-${n}`, "done", null, null, "system:mesh"),
+      ],
+      ["reassign", (n) => repository.reassign(`subject-${n}`, "actor-c", "system:mesh")],
+      ["reparent", (n) => repository.reparent(`subject-${n}`, null, "system:mesh")],
+      [
+        "setPriorityInternal",
+        (n) => repository.setPriorityInternal(`subject-${n}`, 77, "system:mesh"),
+      ],
     ];
     for (const [name, apply] of mutate) {
       // Fresh ids per case rather than deleting: obligations reference their
@@ -690,7 +721,7 @@ describe("ObligationRepository", () => {
     expect(created.creatorId).toBe("human:operator");
     expect(created.ownerId).toEqual("actor-b");
 
-    repository.reassign("owned-elsewhere", "actor-c");
+    repository.reassign("owned-elsewhere", "actor-c", "system:mesh");
     const moved = repository.require("owned-elsewhere");
     expect(moved.ownerId).toEqual("actor-c");
     expect(moved.creatorId).toBe("human:operator");
@@ -742,7 +773,7 @@ describe("ObligationRepository", () => {
     });
 
     await new Promise((resolve) => setTimeout(resolve, 5));
-    repository.reassign("child", "actor-c");
+    repository.reassign("child", "actor-c", "system:mesh");
 
     expect(Date.parse(repository.require("child").updatedAt as string)).toBeGreaterThan(
       Date.parse(child.updatedAt as string)
@@ -852,8 +883,8 @@ describe("ObligationRepository", () => {
       repo: "b".repeat(100),
     });
 
-    repository.setTerminalStatus("original", "done");
-    repository.setTerminalStatus("max-bounds", "done");
+    repository.setTerminalStatus("original", "done", null, null, "system:mesh");
+    repository.setTerminalStatus("max-bounds", "done", null, null, "system:mesh");
     expect(
       repository.create({
         title: "successor",
@@ -876,7 +907,7 @@ describe("ObligationRepository", () => {
       ownerId: "actor-b",
     });
 
-    repository.setTerminalStatus("claimed", "done");
+    repository.setTerminalStatus("claimed", "done", null, null, "system:mesh");
     expect(repository.findLiveByExternalRef("github:dummy-org/dummy-repo/issues/7")).toBeNull();
   });
 
@@ -896,9 +927,9 @@ describe("ObligationRepository", () => {
       id: "third",
       ownerId: "actor-a",
     });
-    repository.setPriorityInternal("third", 100);
-    repository.setPriorityInternal("parent", 200);
-    repository.setPriorityInternal("first", 300);
+    repository.setPriorityInternal("third", 100, "system:mesh");
+    repository.setPriorityInternal("parent", 200, "system:mesh");
+    repository.setPriorityInternal("first", 300, "system:mesh");
     repository.create({
       title: "child",
       id: "child",
@@ -914,7 +945,7 @@ describe("ObligationRepository", () => {
     ]);
     expect(repository.getTree("parent").blockingChildren.map((o) => o.id)).toEqual(["child"]);
 
-    repository.setTerminalStatus("child", "done");
+    repository.setTerminalStatus("child", "done", null, null, "system:mesh");
 
     expect(repository.require("parent").status).toBe("ready");
     expect(repository.listOwned("actor-a", { status: "ready" }).map((o) => o.id)).toEqual([
@@ -942,22 +973,22 @@ describe("ObligationRepository", () => {
       ownerId: "actor-b",
     });
 
-    expect(() => repository.movePriorityInternal("second", "foreign", null)).toThrow(
+    expect(() => repository.movePriorityInternal("second", "foreign", null, "system:mesh")).toThrow(
       "neighbors must be adjacent ready obligations owned by the target owner"
     );
-    expect(() => repository.movePriorityInternal("second", "first", "first")).toThrow(
-      "neighbors must be adjacent"
-    );
+    expect(() =>
+      repository.movePriorityInternal("second", "first", "first", "system:mesh")
+    ).toThrow("neighbors must be adjacent");
     repository.create({
       title: "child",
       id: "child",
       parentId: "first",
       ownerId: "actor-b",
     });
-    expect(() => repository.movePriorityInternal("first", null, "second")).toThrow(
+    expect(() => repository.movePriorityInternal("first", null, "second", "system:mesh")).toThrow(
       "only ready obligations can be reordered"
     );
-    expect(() => repository.setPriorityInternal("second", Number.NaN)).toThrow(
+    expect(() => repository.setPriorityInternal("second", Number.NaN, "system:mesh")).toThrow(
       "priority must be finite"
     );
   });
@@ -991,8 +1022,8 @@ describe("ObligationRepository", () => {
 
     // Produce nullable descendants through supported subtree priority clears:
     // clearing root clears descendant overrides, and reprioritizing override clears leaf.
-    repository.setPriorityInternal("root", 10);
-    repository.setPriorityInternal("override", 20);
+    repository.setPriorityInternal("root", 10, "system:mesh");
+    repository.setPriorityInternal("override", 20, "system:mesh");
 
     expect(repository.require("child")).toMatchObject({
       priority: null,
@@ -1069,7 +1100,7 @@ describe("ObligationRepository", () => {
       priority: 30,
     });
 
-    repository.setPriorityInternal("root", 5);
+    repository.setPriorityInternal("root", 5, "system:mesh");
 
     for (const id of ["child", "leaf"]) {
       expect(repository.require(id)).toMatchObject({
@@ -1109,13 +1140,13 @@ describe("ObligationRepository", () => {
 
     db.prepare("UPDATE obligations SET priority = NULL WHERE id IN ('inheriting', 'leaf')").run();
 
-    repository.setPriorityInternal("root", 5, "self");
+    repository.setPriorityInternal("root", 5, "system:mesh", "self");
     expect(repository.require("root").effectivePriority).toBe(5);
     expect(repository.require("inheriting")).toMatchObject({ priority: 10, effectivePriority: 10 });
     expect(repository.require("leaf")).toMatchObject({ priority: null, effectivePriority: 10 });
     expect(repository.require("explicit")).toMatchObject({ priority: 20, effectivePriority: 20 });
 
-    repository.setPriorityInternal("root", 1);
+    repository.setPriorityInternal("root", 1, "system:mesh");
     for (const id of ["inheriting", "leaf", "explicit"]) {
       expect(repository.require(id)).toMatchObject({ priority: null, effectivePriority: 1 });
     }
@@ -1147,7 +1178,9 @@ describe("ObligationRepository", () => {
       priority: 40,
     });
 
-    expect(repository.movePriorityInternal("moved", "a", "b").effectivePriority).toBe(15);
+    expect(
+      repository.movePriorityInternal("moved", "a", "b", "system:mesh").effectivePriority
+    ).toBe(15);
     expect(repository.listOwned("actor-a", { status: "ready" }).map((o) => o.id)).toEqual([
       "a",
       "moved",
@@ -1155,11 +1188,11 @@ describe("ObligationRepository", () => {
       "c",
     ]);
 
-    repository.setPriorityInternal("a", 10);
-    repository.setPriorityInternal("b", 10);
-    repository.setPriorityInternal("c", 10);
-    repository.setPriorityInternal("moved", 50);
-    repository.movePriorityInternal("moved", "a", "b");
+    repository.setPriorityInternal("a", 10, "system:mesh");
+    repository.setPriorityInternal("b", 10, "system:mesh");
+    repository.setPriorityInternal("c", 10, "system:mesh");
+    repository.setPriorityInternal("moved", 50, "system:mesh");
+    repository.movePriorityInternal("moved", "a", "b", "system:mesh");
     expect(repository.require("moved").effectivePriority).toBe(11);
     expect(repository.require("b").effectivePriority).toBe(12);
     expect(repository.require("c").effectivePriority).toBe(13);
@@ -1185,13 +1218,15 @@ describe("ObligationRepository", () => {
       priority: 0,
     });
 
-    expect(repository.movePriorityInternal("moved", "low", "high").effectivePriority).toBe(0);
-    expect(repository.movePriorityInternal("moved", null, "low").effectivePriority).toSatisfy(
-      (priority: number) => Number.isFinite(priority) && priority < -1e308
-    );
-    expect(repository.movePriorityInternal("moved", "high", null).effectivePriority).toSatisfy(
-      (priority: number) => Number.isFinite(priority) && priority > 1e308
-    );
+    expect(
+      repository.movePriorityInternal("moved", "low", "high", "system:mesh").effectivePriority
+    ).toBe(0);
+    expect(
+      repository.movePriorityInternal("moved", null, "low", "system:mesh").effectivePriority
+    ).toSatisfy((priority: number) => Number.isFinite(priority) && priority < -1e308);
+    expect(
+      repository.movePriorityInternal("moved", "high", null, "system:mesh").effectivePriority
+    ).toSatisfy((priority: number) => Number.isFinite(priority) && priority > 1e308);
   });
 
   it("repairs large equal-priority bands using the next representable values", () => {
@@ -1220,7 +1255,7 @@ describe("ObligationRepository", () => {
       priority: 1.5e308,
     });
 
-    repository.movePriorityInternal("moved", "a", "b");
+    repository.movePriorityInternal("moved", "a", "b", "system:mesh");
     const moved = repository.require("moved").effectivePriority;
     const b = repository.require("b").effectivePriority;
     const c = repository.require("c").effectivePriority;
@@ -1249,9 +1284,9 @@ describe("ObligationRepository", () => {
       ownerId: "human:operator",
     });
 
-    repository.setTerminalStatus("child-a", "done");
+    repository.setTerminalStatus("child-a", "done", null, null, "system:mesh");
     expect(repository.require("parent").status).toBe("waiting");
-    repository.setTerminalStatus("child-b", "cancelled");
+    repository.setTerminalStatus("child-b", "cancelled", null, null, "system:mesh");
     expect(repository.require("parent").status).toBe("ready");
   });
 
@@ -1268,15 +1303,15 @@ describe("ObligationRepository", () => {
       ownerId: "actor-b",
     });
 
-    expect(() => repository.setTerminalStatus("parent", "cancelled")).toThrow(
-      "cannot cancel obligation with live children"
-    );
-    expect(() => repository.setTerminalStatus("parent", "done")).toThrow(
+    expect(() =>
+      repository.setTerminalStatus("parent", "cancelled", null, null, "system:mesh")
+    ).toThrow("cannot cancel obligation with live children");
+    expect(() => repository.setTerminalStatus("parent", "done", null, null, "system:mesh")).toThrow(
       "cannot complete obligation with live children"
     );
-    repository.setTerminalStatus("child", "done");
-    repository.setTerminalStatus("parent", "cancelled");
-    expect(() => repository.setTerminalStatus("parent", "done")).toThrow(
+    repository.setTerminalStatus("child", "done", null, null, "system:mesh");
+    repository.setTerminalStatus("parent", "cancelled", null, null, "system:mesh");
+    expect(() => repository.setTerminalStatus("parent", "done", null, null, "system:mesh")).toThrow(
       "terminal obligations cannot be reopened or changed"
     );
     expect(() =>
@@ -1299,12 +1334,12 @@ describe("ObligationRepository", () => {
     ).run(child.id);
 
     // parent should not be blocked from completion
-    const completed = repository.setTerminalStatus(parent.id, "done");
+    const completed = repository.setTerminalStatus(parent.id, "done", null, null, "system:mesh");
     expect(completed.status).toBe("done");
 
     // test reparenting a scheduled child
     const newParent = repository.create({ ownerId: "actor-a", title: "new parent" });
-    repository.reparent(child.id, newParent.id);
+    repository.reparent(child.id, newParent.id, "system:mesh");
 
     // new parent should not be blocked
     const newParentAfter = repository.get(newParent.id);
@@ -1391,7 +1426,7 @@ describe("ObligationRepository", () => {
     it("builds multiple root trees from one bulk read, in the order requested, with terminal children retained but non-blocking", () => {
       buildForest("root-x", "actor-a", 1, 2); // root-x, root-x-0, root-x-1
       buildForest("root-y", "actor-b", 1, 2);
-      repository.setTerminalStatus("root-x-0", "done");
+      repository.setTerminalStatus("root-x-0", "done", null, null, "system:mesh");
 
       const prepareSpy = vi.spyOn(db, "prepare");
       const [treeY, treeX] = repository.getForest(["root-y", "root-x"]);
@@ -1474,20 +1509,28 @@ describe("ObligationRepository", () => {
     it("listPage excludeQuietTerminalRoots drops done/cancelled roots with no recurrence or completion history, keeps everything else", () => {
       repository.create({ id: "live-root", title: "live-root", ownerId: "actor-a" });
       repository.create({ id: "quiet-done", title: "quiet-done", ownerId: "actor-a" });
-      repository.setTerminalStatus("quiet-done", "done");
+      repository.setTerminalStatus("quiet-done", "done", null, null, "system:mesh");
       repository.create({ id: "quiet-cancelled", title: "quiet-cancelled", ownerId: "actor-a" });
-      repository.setTerminalStatus("quiet-cancelled", "cancelled");
+      repository.setTerminalStatus("quiet-cancelled", "cancelled", null, null, "system:mesh");
 
       repository.create({ id: "recurring-done", title: "recurring-done", ownerId: "actor-a" });
-      repository.setRecurrence("recurring-done", { policy: "cron", cronExpr: "0 * * * *" });
-      repository.setTerminalStatus("recurring-done", "done");
+      repository.setRecurrence(
+        "recurring-done",
+        { policy: "cron", cronExpr: "0 * * * *" },
+        "system:mesh"
+      );
+      repository.setTerminalStatus("recurring-done", "done", null, null, "system:mesh");
 
       repository.create({ id: "historied-done", title: "historied-done", ownerId: "actor-a" });
-      repository.setRecurrence("historied-done", { policy: "cron", cronExpr: "0 * * * *" });
-      repository.setTerminalStatus("historied-done", "done");
-      repository.activateScheduled("historied-done");
-      repository.setRecurrence("historied-done", null);
-      repository.setTerminalStatus("historied-done", "done");
+      repository.setRecurrence(
+        "historied-done",
+        { policy: "cron", cronExpr: "0 * * * *" },
+        "system:mesh"
+      );
+      repository.setTerminalStatus("historied-done", "done", null, null, "system:mesh");
+      repository.activateScheduled("historied-done", "system:mesh");
+      repository.setRecurrence("historied-done", null, "system:mesh");
+      repository.setTerminalStatus("historied-done", "done", null, null, "system:mesh");
 
       const filtered = repository.listPage({
         rootsOnly: true,
@@ -1570,7 +1613,7 @@ describe("ObligationRepository", () => {
       id: "retiring-terminal",
       ownerId: "actor-a",
     });
-    repository.setTerminalStatus("retiring-terminal", "done");
+    repository.setTerminalStatus("retiring-terminal", "done", null, null, "system:mesh");
     repository.create({
       title: "waiting-parent",
       id: "waiting-parent",
@@ -1589,7 +1632,9 @@ describe("ObligationRepository", () => {
       ])
     );
 
-    expect(repository.inheritRetiringActorObligationsInternal("actor-a", "actor-b")).toEqual({
+    expect(
+      repository.inheritRetiringActorObligationsInternal("actor-a", "actor-b", "system:mesh")
+    ).toEqual({
       ready: 2,
       waiting: 1,
       scheduled: 0,
@@ -1614,11 +1659,23 @@ describe("ObligationRepository", () => {
       id: "retiring-recurring",
       ownerId: "actor-a",
     });
-    repository.setRecurrence("retiring-recurring", { policy: "cron", cronExpr: "0 * * * *" });
-    const scheduled = repository.setTerminalStatus("retiring-recurring", "done", "cycle one");
+    repository.setRecurrence(
+      "retiring-recurring",
+      { policy: "cron", cronExpr: "0 * * * *" },
+      "system:mesh"
+    );
+    const scheduled = repository.setTerminalStatus(
+      "retiring-recurring",
+      "done",
+      "cycle one",
+      null,
+      "system:mesh"
+    );
     expect(scheduled.status).toBe("scheduled");
 
-    expect(repository.inheritRetiringActorObligationsInternal("actor-a", "actor-b")).toEqual({
+    expect(
+      repository.inheritRetiringActorObligationsInternal("actor-a", "actor-b", "system:mesh")
+    ).toEqual({
       ready: 0,
       waiting: 0,
       scheduled: 1,
@@ -1644,12 +1701,16 @@ describe("ObligationRepository", () => {
       ownerId: "actor-a",
     });
 
-    expect(repository.inheritRetiringActorObligationsInternal("actor-a", "actor-b")).toEqual({
+    expect(
+      repository.inheritRetiringActorObligationsInternal("actor-a", "actor-b", "system:mesh")
+    ).toEqual({
       ready: 1,
       waiting: 0,
       scheduled: 0,
     });
-    expect(repository.inheritRetiringActorObligationsInternal("actor-b", "actor-c")).toEqual({
+    expect(
+      repository.inheritRetiringActorObligationsInternal("actor-b", "actor-c", "system:mesh")
+    ).toEqual({
       ready: 1,
       waiting: 0,
       scheduled: 0,
@@ -1669,12 +1730,12 @@ describe("ObligationRepository", () => {
       ownerId: "actor-a",
     });
 
-    expect(() => repository.inheritRetiringActorObligationsInternal("actor-a", null)).toThrow(
-      "root/no-parent behavior is unresolved (ISSUE_NUM Q69)"
-    );
-    expect(() => repository.inheritRetiringActorObligationsInternal("actor-a", "unknown")).toThrow(
-      "actor owner does not exist: unknown"
-    );
+    expect(() =>
+      repository.inheritRetiringActorObligationsInternal("actor-a", null, "system:mesh")
+    ).toThrow("root/no-parent behavior is unresolved (ISSUE_NUM Q69)");
+    expect(() =>
+      repository.inheritRetiringActorObligationsInternal("actor-a", "unknown", "system:mesh")
+    ).toThrow("actor owner does not exist: unknown");
     expect(repository.require("root-work").ownerId).toEqual("actor-a");
   });
 
@@ -1732,7 +1793,7 @@ describe("ObligationRepository", () => {
         parentId: "root-1",
         ownerId: "actor-a",
       });
-      repository.setTerminalStatus("root-2", "done");
+      repository.setTerminalStatus("root-2", "done", null, null, "system:mesh");
 
       const all = repository.list();
       expect(all.map((o) => o.id).sort()).toEqual(["child-1", "root-1", "root-2"].sort());
@@ -1796,13 +1857,13 @@ describe("ObligationRepository", () => {
       // timestamp tests. Comparing the rest pins that nothing ELSE moved.
       const identity = ({ ownerId: _ownerId, updatedAt: _updatedAt, ...rest }: Obligation) => rest;
 
-      const humanOwned = repository.reassign("parent", "human:operator");
+      const humanOwned = repository.reassign("parent", "human:operator", "system:mesh");
       expect(identity(humanOwned)).toEqual(identity(before));
       expect(humanOwned.ownerId).toEqual("human:operator");
       expect(repository.listOwned("actor-a")).toEqual([]);
       expect(repository.listOwned("human:operator").map((o) => o.id)).toEqual(["parent"]);
 
-      const actorOwned = repository.reassign("parent", "actor-c");
+      const actorOwned = repository.reassign("parent", "actor-c", "system:mesh");
       expect(identity(actorOwned)).toEqual(identity(before));
       expect(actorOwned.ownerId).toEqual("actor-c");
       expect(repository.getTree("parent").children[0].obligation.id).toBe("child");
@@ -1814,10 +1875,12 @@ describe("ObligationRepository", () => {
         id: "task",
         ownerId: "actor-a",
       });
-      expect(repository.reassign("task", task.ownerId)).toEqual(task);
-      expect(() => repository.reassign("task", "missing")).toThrow("actor owner does not exist");
-      repository.setTerminalStatus("task", "done");
-      expect(() => repository.reassign("task", "human:operator")).toThrow(
+      expect(repository.reassign("task", task.ownerId, "system:mesh")).toEqual(task);
+      expect(() => repository.reassign("task", "missing", "system:mesh")).toThrow(
+        "actor owner does not exist"
+      );
+      repository.setTerminalStatus("task", "done", null, null, "system:mesh");
+      expect(() => repository.reassign("task", "human:operator", "system:mesh")).toThrow(
         "terminal obligations cannot be reassigned"
       );
     });
@@ -1845,7 +1908,7 @@ describe("ObligationRepository", () => {
       expect(repository.require("parent-1").status).toBe("waiting");
       expect(repository.require("parent-2").status).toBe("ready");
 
-      const reparented = repository.reparent("child-1", "parent-2");
+      const reparented = repository.reparent("child-1", "parent-2", "system:mesh");
       expect(reparented.parentId).toBe("parent-2");
 
       // Old parent (parent-1) has no live children left -> re-readies at retained priority
@@ -1869,10 +1932,10 @@ describe("ObligationRepository", () => {
         parentId: "parent-1",
         ownerId: "actor-a",
       });
-      repository.setPriorityInternal("parent-1", 10);
+      repository.setPriorityInternal("parent-1", 10, "system:mesh");
       expect(repository.require("child-1").priority).toBeNull();
 
-      const reparented = repository.reparent("child-1", null);
+      const reparented = repository.reparent("child-1", null, "system:mesh");
       expect(reparented.parentId).toBeNull();
       expect(reparented.priority).toBeTypeOf("number");
       expect(Number.isFinite(reparented.priority)).toBe(true);
@@ -1898,7 +1961,7 @@ describe("ObligationRepository", () => {
         priority: 42.5,
       });
 
-      const reparented = repository.reparent("c1", "p2");
+      const reparented = repository.reparent("c1", "p2", "system:mesh");
       expect(reparented.priority).toBe(42.5);
       expect(reparented.parentId).toBe("p2");
     });
@@ -1926,35 +1989,35 @@ describe("ObligationRepository", () => {
         id: "terminal-root",
         ownerId: "actor-a",
       });
-      repository.setTerminalStatus("terminal-root", "done");
+      repository.setTerminalStatus("terminal-root", "done", null, null, "system:mesh");
 
       // Self-parenting
-      expect(() => repository.reparent("root-a", "root-a")).toThrow(
+      expect(() => repository.reparent("root-a", "root-a", "system:mesh")).toThrow(
         "obligation cannot parent itself"
       );
 
       // Cycle (reparent root-a to its own grandchild)
-      expect(() => repository.reparent("root-a", "grandchild-a")).toThrow(
+      expect(() => repository.reparent("root-a", "grandchild-a", "system:mesh")).toThrow(
         "cannot reparent obligation to its own descendant"
       );
 
       // Reparent to terminal parent
-      expect(() => repository.reparent("child-a", "terminal-root")).toThrow(
+      expect(() => repository.reparent("child-a", "terminal-root", "system:mesh")).toThrow(
         "cannot add a child to a terminal obligation"
       );
 
       // Reparent terminal target
-      expect(() => repository.reparent("terminal-root", "root-a")).toThrow(
+      expect(() => repository.reparent("terminal-root", "root-a", "system:mesh")).toThrow(
         "terminal obligations cannot be reparented"
       );
 
       // Reparent to non-existent parent
-      expect(() => repository.reparent("child-a", "non-existent")).toThrow(
+      expect(() => repository.reparent("child-a", "non-existent", "system:mesh")).toThrow(
         "parent obligation not found: non-existent"
       );
 
       // Reparent to same parent (no-op)
-      const same = repository.reparent("child-a", "root-a");
+      const same = repository.reparent("child-a", "root-a", "system:mesh");
       expect(same.parentId).toBe("root-a");
     });
   });
@@ -1971,7 +2034,7 @@ describe("ObligationRepository", () => {
     it("completing a never-recurring ready obligation makes no scheduler call (#227)", () => {
       const scheduleSpy = vi.spyOn(scheduler, "scheduleObligationActivation");
       const cancelSpy = vi.spyOn(scheduler, "cancelObligationActivation");
-      repository.setTerminalStatus("rec-1", "done");
+      repository.setTerminalStatus("rec-1", "done", null, null, "system:mesh");
       expect(scheduleSpy).not.toHaveBeenCalled();
       expect(cancelSpy).not.toHaveBeenCalled();
     });
@@ -1979,23 +2042,31 @@ describe("ObligationRepository", () => {
     it("cancelling a never-recurring waiting obligation makes no scheduler call (#227)", () => {
       const scheduleSpy = vi.spyOn(scheduler, "scheduleObligationActivation");
       const cancelSpy = vi.spyOn(scheduler, "cancelObligationActivation");
-      repository.setTerminalStatus("rec-1", "cancelled");
+      repository.setTerminalStatus("rec-1", "cancelled", null, null, "system:mesh");
       expect(scheduleSpy).not.toHaveBeenCalled();
       expect(cancelSpy).not.toHaveBeenCalled();
     });
 
     it("rejects an invalid cron expression or non-positive interval without mutating", () => {
-      expect(() => repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "bad" })).toThrow(
-        "invalid cron expression"
-      );
       expect(() =>
-        repository.setRecurrence("rec-1", { policy: "completion_interval", intervalSeconds: 0 })
+        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "bad" }, "system:mesh")
+      ).toThrow("invalid cron expression");
+      expect(() =>
+        repository.setRecurrence(
+          "rec-1",
+          { policy: "completion_interval", intervalSeconds: 0 },
+          "system:mesh"
+        )
       ).toThrow("recurrence interval must be a positive integer");
       expect(() =>
-        repository.setRecurrence("rec-1", {
-          policy: "completion_interval",
-          intervalSeconds: 1.5,
-        })
+        repository.setRecurrence(
+          "rec-1",
+          {
+            policy: "completion_interval",
+            intervalSeconds: 1.5,
+          },
+          "system:mesh"
+        )
       ).toThrow("recurrence interval must be a positive integer");
       expect(repository.require("rec-1").recurrencePolicy).toBeNull();
       expect(scheduler.activations.size).toBe(0);
@@ -2003,18 +2074,18 @@ describe("ObligationRepository", () => {
 
     it("rejects a calendar-impossible cron expression before persisting recurrence", () => {
       expect(() =>
-        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 0 31 2 *" })
+        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 0 31 2 *" }, "system:mesh")
       ).toThrow("cron expression can never fire");
       expect(repository.require("rec-1").recurrencePolicy).toBeNull();
       expect(scheduler.activations.size).toBe(0);
     });
 
     it("rejects setting or disabling recurrence on a terminal obligation", () => {
-      repository.setTerminalStatus("rec-1", "done");
+      repository.setTerminalStatus("rec-1", "done", null, null, "system:mesh");
       expect(() =>
-        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" })
+        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" }, "system:mesh")
       ).toThrow("terminal obligations cannot be recurring");
-      expect(() => repository.setRecurrence("rec-1", null)).toThrow(
+      expect(() => repository.setRecurrence("rec-1", null, "system:mesh")).toThrow(
         "terminal obligations cannot be recurring"
       );
     });
@@ -2028,18 +2099,26 @@ describe("ObligationRepository", () => {
       });
 
       expect(() =>
-        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" })
+        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" }, "system:mesh")
       ).toThrow(/recurring or scheduled/);
       expect(() =>
-        repository.setRecurrence("rec-1", { policy: "completion_interval", intervalSeconds: 60 })
+        repository.setRecurrence(
+          "rec-1",
+          { policy: "completion_interval", intervalSeconds: 60 },
+          "system:mesh"
+        )
       ).toThrow(/recurring or scheduled/);
       expect(repository.require("rec-1").recurrencePolicy).toBeNull();
       // Disabling recurrence is not naming it as one, so it stays unaffected by the guard.
-      expect(() => repository.setRecurrence("rec-1", null)).not.toThrow();
+      expect(() => repository.setRecurrence("rec-1", null, "system:mesh")).not.toThrow();
     });
 
     it("sets a cron policy on a ready obligation without touching next_ready_at, and arms the OS entry", () => {
-      const updated = repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
+      const updated = repository.setRecurrence(
+        "rec-1",
+        { policy: "cron", cronExpr: "0 * * * *" },
+        "system:mesh"
+      );
       expect(updated.status).toBe("ready");
       expect(updated.recurrencePolicy).toBe("cron");
       expect(updated.recurrenceCron).toBe("0 * * * *");
@@ -2048,8 +2127,8 @@ describe("ObligationRepository", () => {
     });
 
     it("completing a cron-recurring obligation moves it to scheduled, ledgers the completion, and leaves the cron entry armed", () => {
-      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "30 4 * * *" });
-      const done = repository.setTerminalStatus("rec-1", "done", "cycle one");
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "30 4 * * *" }, "system:mesh");
+      const done = repository.setTerminalStatus("rec-1", "done", "cycle one", null, "system:mesh");
       expect(done.status).toBe("scheduled");
       expect(done.recurrencePolicy).toBe("cron");
       expect(done.nextReadyAt).not.toBeNull();
@@ -2070,17 +2149,23 @@ describe("ObligationRepository", () => {
     });
 
     it("rejects completing a scheduled obligation as done until it returns to ready", () => {
-      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "30 4 * * *" });
-      repository.setTerminalStatus("rec-1", "done");
-      expect(() => repository.setTerminalStatus("rec-1", "done")).toThrow(
-        "scheduled obligations cannot be completed until they are ready"
-      );
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "30 4 * * *" }, "system:mesh");
+      repository.setTerminalStatus("rec-1", "done", null, null, "system:mesh");
+      expect(() =>
+        repository.setTerminalStatus("rec-1", "done", null, null, "system:mesh")
+      ).toThrow("scheduled obligations cannot be completed until they are ready");
     });
 
     it("cancelling a scheduled recurring obligation clears recurrence columns and cancels the OS entry", () => {
-      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "30 4 * * *" });
-      repository.setTerminalStatus("rec-1", "done");
-      const cancelled = repository.setTerminalStatus("rec-1", "cancelled");
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "30 4 * * *" }, "system:mesh");
+      repository.setTerminalStatus("rec-1", "done", null, null, "system:mesh");
+      const cancelled = repository.setTerminalStatus(
+        "rec-1",
+        "cancelled",
+        null,
+        null,
+        "system:mesh"
+      );
       expect(cancelled.status).toBe("cancelled");
       expect(cancelled.recurrencePolicy).toBeNull();
       expect(cancelled.recurrenceCron).toBeNull();
@@ -2090,8 +2175,12 @@ describe("ObligationRepository", () => {
     });
 
     it("completing a completion_interval obligation schedules a one-off `at` activation at completedAt + interval", () => {
-      repository.setRecurrence("rec-1", { policy: "completion_interval", intervalSeconds: 60 });
-      const done = repository.setTerminalStatus("rec-1", "done");
+      repository.setRecurrence(
+        "rec-1",
+        { policy: "completion_interval", intervalSeconds: 60 },
+        "system:mesh"
+      );
+      const done = repository.setTerminalStatus("rec-1", "done", null, null, "system:mesh");
       expect(done.status).toBe("scheduled");
       expect(done.nextReadyAt).toBe(
         new Date(Date.parse(done.updatedAt as string) + 60_000).toISOString()
@@ -2102,17 +2191,17 @@ describe("ObligationRepository", () => {
     });
 
     it("disabling recurrence on a non-scheduled obligation clears columns without changing status", () => {
-      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
-      const updated = repository.setRecurrence("rec-1", null);
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" }, "system:mesh");
+      const updated = repository.setRecurrence("rec-1", null, "system:mesh");
       expect(updated.status).toBe("ready");
       expect(updated.recurrencePolicy).toBeNull();
       expect(scheduler.cancelled).toContain("rec-1");
     });
 
     it("disabling recurrence on a scheduled obligation forfeits the pending cycle and finalizes as done", () => {
-      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
-      repository.setTerminalStatus("rec-1", "done");
-      const disabled = repository.setRecurrence("rec-1", null);
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" }, "system:mesh");
+      repository.setTerminalStatus("rec-1", "done", null, null, "system:mesh");
+      const disabled = repository.setRecurrence("rec-1", null, "system:mesh");
       expect(disabled.status).toBe("done");
       expect(disabled.recurrencePolicy).toBeNull();
       expect(disabled.nextReadyAt).toBeNull();
@@ -2122,13 +2211,21 @@ describe("ObligationRepository", () => {
     });
 
     it("switching a scheduled obligation's policy to cron computes a fresh next_ready_at in the same statement", () => {
-      repository.setRecurrence("rec-1", { policy: "completion_interval", intervalSeconds: 60 });
-      repository.setTerminalStatus("rec-1", "done");
+      repository.setRecurrence(
+        "rec-1",
+        { policy: "completion_interval", intervalSeconds: 60 },
+        "system:mesh"
+      );
+      repository.setTerminalStatus("rec-1", "done", null, null, "system:mesh");
       expect(repository.require("rec-1").status).toBe("scheduled");
 
       // The CHECK constraint requires a non-null next_ready_at throughout —
       // this must not throw a SQLITE_CONSTRAINT error.
-      const switched = repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
+      const switched = repository.setRecurrence(
+        "rec-1",
+        { policy: "cron", cronExpr: "0 * * * *" },
+        "system:mesh"
+      );
       expect(switched.status).toBe("scheduled");
       expect(switched.recurrencePolicy).toBe("cron");
       expect(switched.nextReadyAt).not.toBeNull();
@@ -2136,8 +2233,8 @@ describe("ObligationRepository", () => {
     });
 
     it("switching a scheduled obligation to completion_interval with an overdue interval returns it to ready immediately", () => {
-      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
-      repository.setTerminalStatus("rec-1", "done");
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" }, "system:mesh");
+      repository.setTerminalStatus("rec-1", "done", null, null, "system:mesh");
       // Back-date the completion so any positive interval is already overdue,
       // independent of the fixture clock's own small increasing values.
       db.prepare(`UPDATE obligation_completions SET completed_at = ? WHERE obligation_id = ?`).run(
@@ -2145,10 +2242,14 @@ describe("ObligationRepository", () => {
         "rec-1"
       );
 
-      const switched = repository.setRecurrence("rec-1", {
-        policy: "completion_interval",
-        intervalSeconds: 1,
-      });
+      const switched = repository.setRecurrence(
+        "rec-1",
+        {
+          policy: "completion_interval",
+          intervalSeconds: 1,
+        },
+        "system:mesh"
+      );
       expect(switched.status).toBe("ready");
       expect(switched.nextReadyAt).toBeNull();
       expect(switched.recurrencePolicy).toBe("completion_interval");
@@ -2157,27 +2258,31 @@ describe("ObligationRepository", () => {
 
     it("rejects naming a prerequisite for a dependent that is currently scheduled", () => {
       repository.create({ title: "blocker", id: "blocker-1", ownerId: "actor-a", intent: "block" });
-      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
-      repository.setTerminalStatus("rec-1", "done");
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" }, "system:mesh");
+      repository.setTerminalStatus("rec-1", "done", null, null, "system:mesh");
       expect(repository.require("rec-1").status).toBe("scheduled");
 
       // A scheduled row re-arms on its own cycle independent of any wait-for
       // graph (#212) — it cannot pick up a prerequisite while armed, whether
       // via addPrerequisite or by re-enabling recurrence with one already
       // named, since neither direction of that edge is ever allowed to exist.
-      expect(() => repository.addPrerequisite("rec-1", "blocker-1")).toThrow(
+      expect(() => repository.addPrerequisite("rec-1", "blocker-1", "system:mesh")).toThrow(
         /recurring or scheduled/
       );
     });
 
     it("switching a scheduled obligation to completion_interval with a future interval stays scheduled and re-arms an `at` job", () => {
-      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
-      repository.setTerminalStatus("rec-1", "done");
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" }, "system:mesh");
+      repository.setTerminalStatus("rec-1", "done", null, null, "system:mesh");
 
-      const switched = repository.setRecurrence("rec-1", {
-        policy: "completion_interval",
-        intervalSeconds: 999_999_999,
-      });
+      const switched = repository.setRecurrence(
+        "rec-1",
+        {
+          policy: "completion_interval",
+          intervalSeconds: 999_999_999,
+        },
+        "system:mesh"
+      );
       expect(switched.status).toBe("scheduled");
       expect(switched.nextReadyAt).not.toBeNull();
       const armed = scheduler.activations.get("rec-1");
@@ -2186,10 +2291,14 @@ describe("ObligationRepository", () => {
     });
 
     it("switching recurrence policy while not scheduled has no lastCompletion to react to, and is a plain column update", () => {
-      const updated = repository.setRecurrence("rec-1", {
-        policy: "completion_interval",
-        intervalSeconds: 30,
-      });
+      const updated = repository.setRecurrence(
+        "rec-1",
+        {
+          policy: "completion_interval",
+          intervalSeconds: 30,
+        },
+        "system:mesh"
+      );
       expect(updated.status).toBe("ready");
       expect(updated.recurrenceIntervalSeconds).toBe(30);
       expect(updated.nextReadyAt).toBeNull();
@@ -2197,29 +2306,33 @@ describe("ObligationRepository", () => {
     });
 
     it("activateScheduled returns a scheduled obligation to ready and clears next_ready_at", () => {
-      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
-      repository.setTerminalStatus("rec-1", "done");
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" }, "system:mesh");
+      repository.setTerminalStatus("rec-1", "done", null, null, "system:mesh");
       expect(repository.require("rec-1").status).toBe("scheduled");
 
-      const activated = repository.activateScheduled("rec-1");
+      const activated = repository.activateScheduled("rec-1", "system:mesh");
       expect(activated?.status).toBe("ready");
       expect(activated?.nextReadyAt).toBeNull();
     });
 
     it("activateScheduled is a no-op for a non-scheduled obligation and null for a missing one", () => {
-      const unchanged = repository.activateScheduled("rec-1");
+      const unchanged = repository.activateScheduled("rec-1", "system:mesh");
       expect(unchanged?.status).toBe("ready");
-      expect(repository.activateScheduled("does-not-exist")).toBeNull();
+      expect(repository.activateScheduled("does-not-exist", "system:mesh")).toBeNull();
     });
 
     it("paginates the completion ledger newest-sequence-first with hasMore/total", () => {
-      repository.setRecurrence("rec-1", {
-        policy: "completion_interval",
-        intervalSeconds: 999_999_999,
-      });
+      repository.setRecurrence(
+        "rec-1",
+        {
+          policy: "completion_interval",
+          intervalSeconds: 999_999_999,
+        },
+        "system:mesh"
+      );
       for (let i = 0; i < 3; i++) {
-        repository.setTerminalStatus("rec-1", "done", `cycle ${i}`);
-        repository.activateScheduled("rec-1");
+        repository.setTerminalStatus("rec-1", "done", `cycle ${i}`, null, "system:mesh");
+        repository.activateScheduled("rec-1", "system:mesh");
       }
 
       const page1 = repository.listCompletionsPage("rec-1", { limit: 2, offset: 0 });
@@ -2241,7 +2354,7 @@ describe("ObligationRepository", () => {
       };
 
       expect(() =>
-        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" })
+        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" }, "system:mesh")
       ).not.toThrow();
       expect(attempts).toBe(1);
       vi.runAllTimers();
@@ -2264,7 +2377,7 @@ describe("ObligationRepository", () => {
         throw new Error("persistent crontab failure");
       };
 
-      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
+      repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" }, "system:mesh");
       vi.runAllTimers();
       // One committed mutation plus the two explicitly bounded retries.
       expect(attempts).toBe(3);
@@ -2284,11 +2397,19 @@ describe("ObligationRepository", () => {
         originalSchedule(id, time);
       };
 
-      repository.setRecurrence("rec-1", { policy: "completion_interval", intervalSeconds: 60 });
-      repository.setTerminalStatus("rec-1", "done");
+      repository.setRecurrence(
+        "rec-1",
+        { policy: "completion_interval", intervalSeconds: 60 },
+        "system:mesh"
+      );
+      repository.setTerminalStatus("rec-1", "done", null, null, "system:mesh");
       scheduleCalls.length = 0;
 
-      const switched = repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
+      const switched = repository.setRecurrence(
+        "rec-1",
+        { policy: "cron", cronExpr: "0 * * * *" },
+        "system:mesh"
+      );
       expect(switched.recurrencePolicy).toBe("cron");
       // Exactly one reconciliation call for the id, derived from the row the
       // transaction actually committed — not a remove-then-install pair that
@@ -2298,15 +2419,19 @@ describe("ObligationRepository", () => {
 
     describe("reconcileScheduledObligations (boot reconciliation)", () => {
       it("re-arms a cron entry regardless of the obligation's current status", () => {
-        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
+        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" }, "system:mesh");
         scheduler.activations.clear(); // simulate a restart: nothing armed yet
         repository.reconcileScheduledObligations();
         expect(scheduler.activations.get("rec-1")).toEqual({ kind: "cron", cronExpr: "0 * * * *" });
       });
 
       it("activates an overdue scheduled obligation immediately instead of arming a past OS job", () => {
-        repository.setRecurrence("rec-1", { policy: "completion_interval", intervalSeconds: 1 });
-        repository.setTerminalStatus("rec-1", "done");
+        repository.setRecurrence(
+          "rec-1",
+          { policy: "completion_interval", intervalSeconds: 1 },
+          "system:mesh"
+        );
+        repository.setTerminalStatus("rec-1", "done", null, null, "system:mesh");
         db.prepare(`UPDATE obligations SET next_ready_at = ? WHERE id = ?`).run(
           "1960-01-01T00:00:00.000Z",
           "rec-1"
@@ -2319,8 +2444,12 @@ describe("ObligationRepository", () => {
       });
 
       it("arms a future `at` job for a scheduled obligation that has not yet come due", () => {
-        repository.setRecurrence("rec-1", { policy: "completion_interval", intervalSeconds: 1 });
-        repository.setTerminalStatus("rec-1", "done");
+        repository.setRecurrence(
+          "rec-1",
+          { policy: "completion_interval", intervalSeconds: 1 },
+          "system:mesh"
+        );
+        repository.setTerminalStatus("rec-1", "done", null, null, "system:mesh");
         db.prepare(`UPDATE obligations SET next_ready_at = ? WHERE id = ?`).run(
           "2999-01-01T00:00:00.000Z",
           "rec-1"
@@ -2360,9 +2489,13 @@ describe("ObligationRepository", () => {
 
       it("keeps reconciling other rows when one row's OS scheduler call fails (e.g. `at` confirmed unavailable)", () => {
         repository.create({ title: "iv", id: "rec-2", ownerId: "actor-a", intent: "recur" });
-        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" });
-        repository.setRecurrence("rec-2", { policy: "completion_interval", intervalSeconds: 1 });
-        repository.setTerminalStatus("rec-2", "done");
+        repository.setRecurrence("rec-1", { policy: "cron", cronExpr: "0 * * * *" }, "system:mesh");
+        repository.setRecurrence(
+          "rec-2",
+          { policy: "completion_interval", intervalSeconds: 1 },
+          "system:mesh"
+        );
+        repository.setTerminalStatus("rec-2", "done", null, null, "system:mesh");
         db.prepare(`UPDATE obligations SET next_ready_at = ? WHERE id = ?`).run(
           "2999-01-01T00:00:00.000Z",
           "rec-2"
@@ -2385,7 +2518,7 @@ describe("ObligationRepository", () => {
       it("is a no-op when no OS scheduler is attached", () => {
         const bare = new ObligationRepository(
           db,
-          (id) => ["actor-a"].includes(id),
+          (id: string) => ["actor-a"].includes(id),
           () => now++
         );
         expect(() => bare.reconcileScheduledObligations()).not.toThrow();
@@ -2416,7 +2549,7 @@ describe("ObligationRepository", () => {
 
     it("creates ready outright when every named prerequisite is already done", () => {
       repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
-      repository.setTerminalStatus("prereq", "done");
+      repository.setTerminalStatus("prereq", "done", null, null, "system:mesh");
 
       const dependent = repository.create({
         title: "dependent",
@@ -2444,7 +2577,7 @@ describe("ObligationRepository", () => {
       expect(repository.require("dep-1").status).toBe("waiting");
       expect(repository.require("dep-2").status).toBe("waiting");
 
-      repository.setTerminalStatus("prereq", "done");
+      repository.setTerminalStatus("prereq", "done", null, null, "system:mesh");
 
       expect(repository.require("dep-1").status).toBe("ready");
       expect(repository.require("dep-2").status).toBe("ready");
@@ -2460,10 +2593,10 @@ describe("ObligationRepository", () => {
         blockedBy: ["p1", "p2"],
       });
 
-      repository.setTerminalStatus("p1", "done");
+      repository.setTerminalStatus("p1", "done", null, null, "system:mesh");
       expect(repository.require("dependent").status).toBe("waiting");
 
-      repository.setTerminalStatus("p2", "done");
+      repository.setTerminalStatus("p2", "done", null, null, "system:mesh");
       expect(repository.require("dependent").status).toBe("ready");
     });
 
@@ -2476,7 +2609,7 @@ describe("ObligationRepository", () => {
         blockedBy: ["prereq"],
       });
 
-      repository.setTerminalStatus("prereq", "cancelled");
+      repository.setTerminalStatus("prereq", "cancelled", null, null, "system:mesh");
 
       expect(repository.require("dependent").status).toBe("waiting");
       expect(
@@ -2502,7 +2635,7 @@ describe("ObligationRepository", () => {
         blockedBy: ["prereq"],
       });
 
-      repository.setTerminalStatus("prereq", "cancelled");
+      repository.setTerminalStatus("prereq", "cancelled", null, null, "system:mesh");
 
       expect(delivered).toEqual(
         expect.arrayContaining([
@@ -2541,7 +2674,7 @@ describe("ObligationRepository", () => {
         delivered.push(attention);
       });
 
-      repository.setTerminalStatus("prereq", "cancelled");
+      repository.setTerminalStatus("prereq", "cancelled", null, null, "system:mesh");
       expect(delivered).toEqual([]);
 
       repository.create({ title: "unrelated", id: "unrelated", ownerId: "actor-a" });
@@ -2578,8 +2711,8 @@ describe("ObligationRepository", () => {
         delivered.push(attention);
       });
 
-      repository.setTerminalStatus("gate", "cancelled");
-      repository.setTerminalStatus("1 gate", "cancelled");
+      repository.setTerminalStatus("gate", "cancelled", null, null, "system:mesh");
+      repository.setTerminalStatus("1 gate", "cancelled", null, null, "system:mesh");
       expect(delivered).toEqual([]);
 
       shouldThrow = false;
@@ -2597,7 +2730,7 @@ describe("ObligationRepository", () => {
 
     it("queues cancellation attention immediately when the prerequisite is already cancelled at edge-creation time", () => {
       repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
-      repository.setTerminalStatus("prereq", "cancelled");
+      repository.setTerminalStatus("prereq", "cancelled", null, null, "system:mesh");
 
       const delivered: Array<{ dependentId: string; prerequisiteId: string }> = [];
       repository.setCancellationAttentionListener((attention) => delivered.push(attention));
@@ -2616,7 +2749,7 @@ describe("ObligationRepository", () => {
 
     it("demotes an already-ready dependent to waiting when addPrerequisite names an already-cancelled prerequisite", () => {
       repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
-      repository.setTerminalStatus("prereq", "cancelled");
+      repository.setTerminalStatus("prereq", "cancelled", null, null, "system:mesh");
       const dependent = repository.create({
         title: "dependent",
         id: "dependent",
@@ -2631,7 +2764,7 @@ describe("ObligationRepository", () => {
       }> = [];
       repository.setCancellationAttentionListener((attention) => delivered.push(attention));
 
-      repository.addPrerequisite("dependent", "prereq");
+      repository.addPrerequisite("dependent", "prereq", "system:mesh");
 
       expect(repository.require("dependent").status).toBe("waiting");
       expect(delivered).toEqual([
@@ -2647,9 +2780,9 @@ describe("ObligationRepository", () => {
         ownerId: "actor-a",
         blockedBy: ["prereq"],
       });
-      repository.setTerminalStatus("prereq", "cancelled");
+      repository.setTerminalStatus("prereq", "cancelled", null, null, "system:mesh");
 
-      repository.removePrerequisite("dependent", "prereq");
+      repository.removePrerequisite("dependent", "prereq", "system:mesh");
 
       expect(repository.require("dependent").status).toBe("ready");
       expect(repository.listPrerequisiteCancellationAttention()).toEqual([]);
@@ -2674,7 +2807,7 @@ describe("ObligationRepository", () => {
       ).toThrow(/recurring or scheduled/);
 
       repository.create({ title: "dependent", id: "dependent", ownerId: "actor-a" });
-      expect(() => repository.addPrerequisite("dependent", "recurring")).toThrow(
+      expect(() => repository.addPrerequisite("dependent", "recurring", "system:mesh")).toThrow(
         /recurring or scheduled/
       );
     });
@@ -2698,7 +2831,7 @@ describe("ObligationRepository", () => {
         })
       ).toThrow(/recurring or scheduled/);
 
-      expect(() => repository.addPrerequisite("recurring", "prereq")).toThrow(
+      expect(() => repository.addPrerequisite("recurring", "prereq", "system:mesh")).toThrow(
         /recurring or scheduled/
       );
     });
@@ -2713,7 +2846,11 @@ describe("ObligationRepository", () => {
       });
 
       expect(() =>
-        repository.setRecurrence("dependent", { policy: "cron", cronExpr: "0 * * * *" })
+        repository.setRecurrence(
+          "dependent",
+          { policy: "cron", cronExpr: "0 * * * *" },
+          "system:mesh"
+        )
       ).toThrow(/recurring or scheduled/);
       expect(repository.require("dependent").recurrencePolicy).toBeNull();
     });
@@ -2724,14 +2861,16 @@ describe("ObligationRepository", () => {
       ).toThrow(/blocked by itself/);
 
       repository.create({ title: "a", id: "a", ownerId: "actor-a" });
-      expect(() => repository.addPrerequisite("a", "a")).toThrow(/blocked by itself/);
+      expect(() => repository.addPrerequisite("a", "a", "system:mesh")).toThrow(
+        /blocked by itself/
+      );
     });
 
     it("rejects a direct two-node cycle via addPrerequisite", () => {
       repository.create({ title: "a", id: "a", ownerId: "actor-a" });
       repository.create({ title: "b", id: "b", ownerId: "actor-a" });
-      repository.addPrerequisite("a", "b");
-      expect(() => repository.addPrerequisite("b", "a")).toThrow(/cycle/);
+      repository.addPrerequisite("a", "b", "system:mesh");
+      expect(() => repository.addPrerequisite("b", "a", "system:mesh")).toThrow(/cycle/);
     });
 
     it("rejects creating a child that names its own new parent as a prerequisite", () => {
@@ -2758,7 +2897,7 @@ describe("ObligationRepository", () => {
       repository.create({ title: "p", id: "p", ownerId: "actor-a" });
       repository.create({ title: "c", id: "c", ownerId: "actor-a", parentId: "p" });
 
-      expect(() => repository.addPrerequisite("c", "p")).toThrow(/cycle/);
+      expect(() => repository.addPrerequisite("c", "p", "system:mesh")).toThrow(/cycle/);
     });
 
     it("rejects creating a child whose declared prerequisite already transitively waits for the new parent", () => {
@@ -2792,7 +2931,9 @@ describe("ObligationRepository", () => {
       // gate-waits-for-dependent (hierarchy) on top of the existing edge, and
       // dependent has no path back to gate yet — so make gate the one being
       // moved under dependent instead, which does create the cycle.
-      expect(() => repository.reparent("gate", "dependent")).toThrow(/already waits for/);
+      expect(() => repository.reparent("gate", "dependent", "system:mesh")).toThrow(
+        /already waits for/
+      );
     });
 
     it("preserves prerequisite edges across reassignment", () => {
@@ -2804,7 +2945,7 @@ describe("ObligationRepository", () => {
         blockedBy: ["prereq"],
       });
 
-      repository.reassign("dependent", "actor-b");
+      repository.reassign("dependent", "actor-b", "system:mesh");
 
       expect(repository.require("dependent").ownerId).toBe("actor-b");
       expect(
@@ -2812,7 +2953,7 @@ describe("ObligationRepository", () => {
           .listBlockedByPage("dependent", { limit: 10, offset: 0 })
           .obligations.map((o) => o.id)
       ).toEqual(["prereq"]);
-      repository.setTerminalStatus("prereq", "done");
+      repository.setTerminalStatus("prereq", "done", null, null, "system:mesh");
       expect(repository.require("dependent").status).toBe("ready");
     });
 
@@ -2824,7 +2965,7 @@ describe("ObligationRepository", () => {
         ownerId: "actor-a",
         blockedBy: ["prereq"],
       });
-      repository.setTerminalStatus("prereq", "cancelled");
+      repository.setTerminalStatus("prereq", "cancelled", null, null, "system:mesh");
 
       const delivered: Array<{
         dependentId: string;
@@ -2833,7 +2974,7 @@ describe("ObligationRepository", () => {
       }> = [];
       repository.setCancellationAttentionListener((attention) => delivered.push(attention));
 
-      repository.reassign("dependent", "actor-b");
+      repository.reassign("dependent", "actor-b", "system:mesh");
 
       expect(delivered).toEqual([
         { dependentId: "dependent", dependentOwnerId: "actor-b", prerequisiteId: "prereq" },
@@ -2848,7 +2989,7 @@ describe("ObligationRepository", () => {
         ownerId: "actor-b",
         blockedBy: ["prereq"],
       });
-      repository.setTerminalStatus("prereq", "cancelled");
+      repository.setTerminalStatus("prereq", "cancelled", null, null, "system:mesh");
 
       const delivered: Array<{
         dependentId: string;
@@ -2857,7 +2998,7 @@ describe("ObligationRepository", () => {
       }> = [];
       repository.setCancellationAttentionListener((attention) => delivered.push(attention));
 
-      repository.inheritRetiringActorObligationsInternal("actor-b", "actor-a");
+      repository.inheritRetiringActorObligationsInternal("actor-b", "actor-a", "system:mesh");
 
       expect(delivered).toEqual([
         { dependentId: "dependent", dependentOwnerId: "actor-a", prerequisiteId: "prereq" },
@@ -2873,7 +3014,7 @@ describe("ObligationRepository", () => {
         ownerId: "actor-a",
         blockedBy: ["prereq"],
       });
-      repository.setTerminalStatus("dependent", "cancelled");
+      repository.setTerminalStatus("dependent", "cancelled", null, null, "system:mesh");
 
       const delivered: Array<{
         dependentId: string;
@@ -2882,7 +3023,7 @@ describe("ObligationRepository", () => {
       }> = [];
       repository.setCancellationAttentionListener((attention) => delivered.push(attention));
 
-      repository.setTerminalStatus("prereq", "cancelled");
+      repository.setTerminalStatus("prereq", "cancelled", null, null, "system:mesh");
 
       expect(delivered).toEqual([]);
       expect(repository.listPrerequisiteCancellationAttention()).toEqual([]);
@@ -2900,7 +3041,7 @@ describe("ObligationRepository", () => {
       // Simulate a fresh process attaching to the same database.
       const reloaded = new ObligationRepository(
         db,
-        (id) => ["actor-a", "actor-b", "actor-c"].includes(id),
+        (id: string) => ["actor-a", "actor-b", "actor-c"].includes(id),
         () => now++
       );
 
@@ -2911,7 +3052,7 @@ describe("ObligationRepository", () => {
           .obligations.map((o) => o.id)
       ).toEqual(["prereq"]);
 
-      reloaded.setTerminalStatus("prereq", "done");
+      reloaded.setTerminalStatus("prereq", "done", null, null, "system:mesh");
       expect(reloaded.require("dependent").status).toBe("ready");
     });
 
@@ -2927,7 +3068,7 @@ describe("ObligationRepository", () => {
       db.exec("VACUUM");
 
       expect(repository.require("dependent").status).toBe("waiting");
-      repository.setTerminalStatus("prereq", "done");
+      repository.setTerminalStatus("prereq", "done", null, null, "system:mesh");
       expect(repository.require("dependent").status).toBe("ready");
     });
 
@@ -2961,18 +3102,18 @@ describe("ObligationRepository", () => {
       repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
       expect(repository.require("dependent").status).toBe("ready");
 
-      repository.addPrerequisite("dependent", "prereq");
+      repository.addPrerequisite("dependent", "prereq", "system:mesh");
       expect(repository.require("dependent").status).toBe("waiting");
 
-      repository.setTerminalStatus("prereq", "done");
+      repository.setTerminalStatus("prereq", "done", null, null, "system:mesh");
       expect(repository.require("dependent").status).toBe("ready");
     });
 
     it("adding the same prerequisite edge twice is a no-op", () => {
       repository.create({ title: "dependent", id: "dependent", ownerId: "actor-a" });
       repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
-      repository.addPrerequisite("dependent", "prereq");
-      expect(() => repository.addPrerequisite("dependent", "prereq")).not.toThrow();
+      repository.addPrerequisite("dependent", "prereq", "system:mesh");
+      expect(() => repository.addPrerequisite("dependent", "prereq", "system:mesh")).not.toThrow();
       expect(
         repository.listBlockedByPage("dependent", { limit: 10, offset: 0 }).obligations
       ).toHaveLength(1);
@@ -2981,7 +3122,9 @@ describe("ObligationRepository", () => {
     it("removing a nonexistent edge is a no-op", () => {
       repository.create({ title: "dependent", id: "dependent", ownerId: "actor-a" });
       repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
-      expect(() => repository.removePrerequisite("dependent", "prereq")).not.toThrow();
+      expect(() =>
+        repository.removePrerequisite("dependent", "prereq", "system:mesh")
+      ).not.toThrow();
     });
 
     it("reads unbounded lightweight child and prerequisite edges for lifecycle checks", () => {
@@ -3098,7 +3241,7 @@ describe("ObligationRepository", () => {
     it("clears the standing on a terminal transition, then freezes the terminal row", () => {
       repository.create({ title: "persistence arc", id: "arc", ownerId: "actor-a" });
       repository.setCheckpoint("arc", HEAD_STANDING, "actor-a");
-      repository.setTerminalStatus("arc", "done", "shipped");
+      repository.setTerminalStatus("arc", "done", "shipped", null, "system:mesh");
 
       expect(() => repository.setCheckpoint("arc", "reopened", "actor-a")).toThrow(
         /terminal obligations cannot change their checkpoint/
@@ -3113,10 +3256,20 @@ describe("ObligationRepository", () => {
 
     it("clears the finished cycle's standing when recurrence moves it to scheduled", () => {
       repository.create({ title: "recurring arc", id: "recurring", ownerId: "actor-a" });
-      repository.setRecurrence("recurring", { policy: "cron", cronExpr: "0 * * * *" });
+      repository.setRecurrence(
+        "recurring",
+        { policy: "cron", cronExpr: "0 * * * *" },
+        "system:mesh"
+      );
       repository.setCheckpoint("recurring", HEAD_STANDING, "actor-a");
 
-      const scheduled = repository.setTerminalStatus("recurring", "done", "cycle complete");
+      const scheduled = repository.setTerminalStatus(
+        "recurring",
+        "done",
+        "cycle complete",
+        null,
+        "system:mesh"
+      );
 
       expect(scheduled).toMatchObject({
         status: "scheduled",
@@ -3128,11 +3281,15 @@ describe("ObligationRepository", () => {
 
     it("clears a scheduled checkpoint when disabling recurrence finalizes the obligation", () => {
       repository.create({ title: "recurring arc", id: "recurring", ownerId: "actor-a" });
-      repository.setRecurrence("recurring", { policy: "cron", cronExpr: "0 * * * *" });
-      repository.setTerminalStatus("recurring", "done", "cycle complete");
+      repository.setRecurrence(
+        "recurring",
+        { policy: "cron", cronExpr: "0 * * * *" },
+        "system:mesh"
+      );
+      repository.setTerminalStatus("recurring", "done", "cycle complete", null, "system:mesh");
       repository.setCheckpoint("recurring", "next run waits on the cron wake", "actor-a");
 
-      const finalized = repository.setRecurrence("recurring", null);
+      const finalized = repository.setRecurrence("recurring", null, "system:mesh");
 
       expect(finalized).toMatchObject({
         status: "done",
@@ -3171,6 +3328,7 @@ describe("multi-instance crontab reconciliation (#304)", () => {
     recurringObligations.up(d);
     obligationDependencies.up(d);
     obligationCheckpoint.up(d);
+    obligationHistory.up(d);
     return d;
   };
 
@@ -3254,7 +3412,11 @@ describe("multi-instance crontab reconciliation (#304)", () => {
       ownerId: "actor-a",
       intent: "prod",
     });
-    prodRepo.setRecurrence("prod-active", { policy: "cron", cronExpr: "45 8 * * *" });
+    prodRepo.setRecurrence(
+      "prod-active",
+      { policy: "cron", cronExpr: "45 8 * * *" },
+      "system:mesh"
+    );
 
     prodRepo.create({
       title: "Prod Stale",
@@ -3262,7 +3424,7 @@ describe("multi-instance crontab reconciliation (#304)", () => {
       ownerId: "actor-a",
       intent: "prod-stale",
     });
-    prodRepo.setRecurrence("prod-stale", { policy: "cron", cronExpr: "0 5 * * *" });
+    prodRepo.setRecurrence("prod-stale", { policy: "cron", cronExpr: "0 5 * * *" }, "system:mesh");
 
     // Create obligations in staging DB:
     stagingRepo.create({
@@ -3271,7 +3433,11 @@ describe("multi-instance crontab reconciliation (#304)", () => {
       ownerId: "actor-a",
       intent: "staging",
     });
-    stagingRepo.setRecurrence("staging-active", { policy: "cron", cronExpr: "0 12 * * *" });
+    stagingRepo.setRecurrence(
+      "staging-active",
+      { policy: "cron", cronExpr: "0 12 * * *" },
+      "system:mesh"
+    );
 
     stagingRepo.create({
       title: "Staging Stale",
@@ -3279,11 +3445,15 @@ describe("multi-instance crontab reconciliation (#304)", () => {
       ownerId: "actor-a",
       intent: "staging-stale",
     });
-    stagingRepo.setRecurrence("staging-stale", { policy: "cron", cronExpr: "0 18 * * *" });
+    stagingRepo.setRecurrence(
+      "staging-stale",
+      { policy: "cron", cronExpr: "0 18 * * *" },
+      "system:mesh"
+    );
 
     // Mark stale obligations in DBs:
-    prodRepo.setTerminalStatus("prod-stale", "cancelled");
-    stagingRepo.setTerminalStatus("staging-stale", "cancelled");
+    prodRepo.setTerminalStatus("prod-stale", "cancelled", null, null, "system:mesh");
+    stagingRepo.setTerminalStatus("staging-stale", "cancelled", null, null, "system:mesh");
 
     // Re-arm stale blocks in the shared crontab to simulate an existing un-swept state before boot:
     prodScheduler.scheduleObligationActivation("prod-stale", {

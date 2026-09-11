@@ -7960,7 +7960,7 @@ describe("ActorMesh", () => {
           },
           issue,
           (mesh) => {
-            repository.reassign("linked-work", secondOwner);
+            repository.reassign("linked-work", secondOwner, "system:mesh");
             mesh.deliverEvent(issue, "event", { inboxPayload: payload("issues.edited") });
           }
         );

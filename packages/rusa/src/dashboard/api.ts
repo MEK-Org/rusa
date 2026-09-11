@@ -1012,7 +1012,13 @@ export async function handleMeshApiRequest(
             return;
           }
           try {
-            const obligation = obligations.setTerminalStatus(id, status, note, resolutionRef);
+            const obligation = obligations.setTerminalStatus(
+              id,
+              status,
+              note,
+              resolutionRef,
+              HUMAN_OPERATOR
+            );
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1065,7 +1071,7 @@ export async function handleMeshApiRequest(
           try {
             sendJson(res, 200, {
               ok: true,
-              obligation: obligations.setExternalRef(id, externalRef),
+              obligation: obligations.setExternalRef(id, externalRef, HUMAN_OPERATOR),
             });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1111,7 +1117,13 @@ export async function handleMeshApiRequest(
             return;
           }
           try {
-            const obligation = obligations.movePriorityInternal(id, previousId, nextId, scope);
+            const obligation = obligations.movePriorityInternal(
+              id,
+              previousId,
+              nextId,
+              HUMAN_OPERATOR,
+              scope
+            );
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1153,7 +1165,7 @@ export async function handleMeshApiRequest(
             return;
           }
           try {
-            const obligation = obligations.reparent(id, parentId);
+            const obligation = obligations.reparent(id, parentId, HUMAN_OPERATOR);
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1201,7 +1213,7 @@ export async function handleMeshApiRequest(
             return;
           }
           try {
-            const obligation = obligations.reassign(id, owner.ownerId);
+            const obligation = obligations.reassign(id, owner.ownerId, HUMAN_OPERATOR);
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
