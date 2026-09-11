@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
+import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
 import { HUMAN_OPERATOR, isHumanOperator, MESH_SYSTEM } from "../mcp/stamp.js";
 import { prerequisiteEdgeKey } from "../obligations/obligation.js";
 import {
@@ -22,6 +23,10 @@ import {
 } from "../runtime/event-manager.js";
 import { randomSupportedVoiceName } from "../voice/tts-voices.js";
 import { googleVoiceConfig } from "../voice/voice-config.js";
+import {
+  MAX_VOICE_TRANSFER_NOTE_CHARS,
+  renderVoiceTransferContext,
+} from "../voice/voice-transfer-context.js";
 import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./actor-record.js";
 import {
   type CapabilityGrantStore,
@@ -169,6 +174,18 @@ export interface RetireOptions {
    * but still refuse if any thread in the subtree is actively running.
    */
   forceQueued?: boolean;
+}
+
+/** Host-owned live-session operations used by the actor transfer primitive. */
+export interface VoiceSessionTransferPort {
+  /** Read the caller's unambiguous active session before any authority moves. */
+  activeSessionIdFor(actorId: string): string;
+  /** Atomically rebind the caller's active session and return its same UUID. */
+  transferActiveSession(fromActorId: string, targetActorId: string): string;
+  /** Restore a just-rebound session before its durable handoff was accepted. */
+  revertActiveSessionTransfer(sessionId: string, fromActorId: string, targetActorId: string): void;
+  /** Tell the dashboard browser that owns this session to reconnect to target. */
+  notifySessionTransferred(sessionId: string, targetActorId: string): void;
 }
 
 /** One live obligation, in the detail a retirement refusal needs to name it. */
@@ -628,6 +645,14 @@ export interface ActorMeshOptions {
   inboxStore?: InboxStore;
   /** Host-owned leased walkie authority; absent preserves existing dispatch semantics. */
   isVoiceSessionActive?: (actorId: string) => boolean;
+  /**
+   * Host-owned in-memory session registry. The mesh owns target authorization,
+   * inbox delivery, and the durable handoff projection; this port owns only the
+   * atomic live-session rebind and dashboard transport notification.
+   */
+  voiceSessionTransfer?: VoiceSessionTransferPort;
+  /** Read existing durable rows for the session; never creates a transcript store. */
+  listVoiceSessionChat?: (sessionId: string) => MeshChat[];
   /** General lifecycle hook matching onYield. */
   onQueued?: (actorId: string, context: { responsive: boolean; mode: ActorRunMode }) => void;
   /** Best-effort receipts for entries first accepted into an execution opportunity. */
@@ -718,6 +743,8 @@ export class ActorMesh {
   private readonly obligations?: MeshObligationPort;
   private readonly inboxStore?: InboxStore;
   private readonly isVoiceSessionActive: (actorId: string) => boolean;
+  private readonly voiceSessionTransfer?: VoiceSessionTransferPort;
+  private readonly listVoiceSessionChat?: (sessionId: string) => MeshChat[];
   private readonly onQueued?: ActorMeshOptions["onQueued"];
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
   private readonly grantable: ReadonlySet<string>;
@@ -778,6 +805,8 @@ export class ActorMesh {
     this.obligations = opts.obligations;
     this.inboxStore = opts.inboxStore;
     this.isVoiceSessionActive = opts.isVoiceSessionActive ?? (() => false);
+    this.voiceSessionTransfer = opts.voiceSessionTransfer;
+    this.listVoiceSessionChat = opts.listVoiceSessionChat;
     this.onQueued = opts.onQueued;
     this.onInboxEntriesSeen = opts.onInboxEntriesSeen;
     this.grantable = opts.grantableCapabilities ?? new Set();
@@ -1464,6 +1493,144 @@ export class ActorMesh {
     const responsive = this.inboxStore.countUnhandled(actorId, { responsiveOnly: true });
     if (total > responsive) return this.notifyInboxChanged(actorId);
     return false;
+  }
+
+  /**
+   * Transfer the caller's one active leased voice session to a target the
+   * caller already holds as a messaging capability. The session remains
+   * process-local; the receiving actor gets a responsive, durable inbox entry
+   * whose context is mechanically rendered from existing `mesh_chat` rows.
+   */
+  transferVoiceSession(
+    fromActorId: string,
+    targetHandleOrId: string,
+    handoffNote?: string
+  ): { sessionId: string; targetActorId: string } {
+    fromActorId = this.resolveThreadId(fromActorId);
+    const source = this.actors.get(fromActorId);
+    if (!source || source.status !== "active" || !this.live.has(fromActorId)) {
+      throw new Error("source actor is not active");
+    }
+    const target = this.resolveHeldActiveActor(fromActorId, targetHandleOrId);
+    if (target.id === fromActorId) throw new Error("cannot transfer a voice session to itself");
+    const transfer = this.voiceSessionTransfer;
+    if (!transfer) throw new Error("voice session transfer is unavailable on this instance");
+    const inboxStore = this.inboxStore;
+    if (!inboxStore) throw new Error("voice session transfer requires a durable inbox");
+    if (handoffNote !== undefined && handoffNote.trim().length > MAX_VOICE_TRANSFER_NOTE_CHARS) {
+      throw new Error(`handoff note must be at most ${MAX_VOICE_TRANSFER_NOTE_CHARS} characters`);
+    }
+
+    // Read and render before rebinding. If the durable context projection is
+    // unavailable, no live authority moves and the caller can retry safely.
+    const sessionId = transfer.activeSessionIdFor(fromActorId);
+    const context = renderVoiceTransferContext(
+      this.listVoiceSessionChat?.(sessionId) ?? [],
+      handoffNote
+    );
+    transfer.transferActiveSession(fromActorId, target.id);
+    let inserted: InboxEntry[];
+    try {
+      inserted = inboxStore.append([
+        {
+          actorId: target.id,
+          source: `voice:transfer:${fromActorId}`,
+          payload: {
+            type: "voice.transfer",
+            priority: "responsive",
+            fromId: fromActorId,
+            sessionId,
+            context,
+          },
+        },
+      ]);
+      if (inserted.length !== 1) {
+        throw new Error("voice session transfer handoff was not durably inserted");
+      }
+    } catch (error) {
+      // Authority moves only after durable context has been rendered, and it
+      // moves back if the durable handoff cannot be written. The source is not
+      // released until after this point, so a failed write leaves its ordinary
+      // work held exactly as it was before the request.
+      try {
+        transfer.revertActiveSessionTransfer(sessionId, fromActorId, target.id);
+      } catch (rollbackError) {
+        this.log(
+          `voice session transfer rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`
+        );
+      }
+      throw error;
+    }
+    // The responsive row is now durable; releasing the source through the
+    // existing session-end path preserves normal-work deferral semantics.
+    this.notifyVoiceSessionEnded(fromActorId);
+    if (inserted.length > 0) {
+      try {
+        this.notifyInboxChanged(target.id, { priority: "responsive" });
+      } catch (error) {
+        this.log(
+          `voice transfer recipient nudge failed after durable handoff: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+    // The control is intentionally last: the recipient has durable work before
+    // the browser changes selection/reconnects to it.
+    try {
+      transfer.notifySessionTransferred(sessionId, target.id);
+    } catch (error) {
+      this.log(
+        `voice transfer dashboard control failed after durable handoff: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    return { sessionId, targetActorId: target.id };
+  }
+
+  /**
+   * The currently leased voice session for an actor, if this host has one.
+   * This is intentionally lease-scoped rather than an actor-row capability:
+   * a recipient of a transfer may reply during the live handoff without
+   * permanently gaining direct-human authority.
+   */
+  activeVoiceSessionIdFor(actorId: string): string | undefined {
+    const transfer = this.voiceSessionTransfer;
+    if (!transfer) return undefined;
+    try {
+      return transfer.activeSessionIdFor(this.resolveThreadId(actorId));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Resolve an active live actor from the caller's own handle set. */
+  private resolveHeldActiveActor(requesterId: string, targetHandleOrId: string): ActorRecord {
+    const requested = targetHandleOrId.trim();
+    if (!requested) throw new Error("target actor must not be blank");
+    const requester = this.actors.get(requesterId);
+    if (!requester) throw new Error("source actor not found");
+
+    const normalized = requested.toLowerCase();
+    if (requested === requesterId || this.handleForId(requesterId).toLowerCase() === normalized) {
+      throw new Error("cannot transfer a voice session to itself");
+    }
+    const held = requester.handles ?? [];
+    const matches = held
+      .map((handle) => this.actors.get(handle.id))
+      .filter((record): record is ActorRecord =>
+        Boolean(
+          record &&
+            (record.id === requested || this.handleForId(record.id).toLowerCase() === normalized)
+        )
+      );
+    if (matches.length === 0) {
+      throw new Error("target actor is not a handle held by the caller");
+    }
+    if (matches.length > 1) {
+      throw new Error(`target actor handle is ambiguous: ${requested}`);
+    }
+    const target = matches[0];
+    if (target.status === "retired") throw new Error("target actor is retired");
+    if (!this.live.has(target.id)) throw new Error("target actor is not live");
+    return target;
   }
 
   /**

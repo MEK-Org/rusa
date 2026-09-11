@@ -203,10 +203,15 @@ export function handleVoiceApiRequest(
       }
     }
     service.presenceConnect(actors);
-    const attached = deps.sseHub.addVoiceConnection(res, actors, () => {
-      service.presenceDisconnect(actors);
-      if (sessionId) service.disconnectSession(sessionId);
-    });
+    const attached = deps.sseHub.addVoiceConnection(
+      res,
+      actors,
+      () => {
+        service.presenceDisconnect(actors);
+        if (sessionId) service.disconnectSession(sessionId);
+      },
+      sessionId ?? undefined
+    );
     if (!attached) {
       service.presenceDisconnect(actors);
       return true;

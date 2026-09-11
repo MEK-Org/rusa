@@ -242,12 +242,16 @@ class WebScreenWakeLock implements ScreenWakeLock {
 class WebVoiceStream implements VoiceStreamSource {
   final _frames = StreamController<VoiceAnnouncement>.broadcast();
   final _status = StreamController<VoiceStreamStatus>.broadcast();
+  final _controls = StreamController<VoiceSessionControl>.broadcast();
   web.EventSource? _es;
 
   @override
   Stream<VoiceAnnouncement> get frames => _frames.stream;
   @override
   Stream<VoiceStreamStatus> get status => _status.stream;
+
+  @override
+  Stream<VoiceSessionControl> get controls => _controls.stream;
 
   @override
   void connect(List<String> actors, String sessionId) {
@@ -274,6 +278,25 @@ class WebVoiceStream implements VoiceStreamSource {
       }.toJS,
     );
     es.addEventListener(
+      'voice_control',
+      (web.Event e) {
+        final data = (e as web.MessageEvent).data;
+        if (data == null) return;
+        try {
+          final json = jsonDecode((data as JSString).toDart);
+          if (json is Map<String, dynamic> && json['targetActorId'] is String) {
+            _controls.add(
+              VoiceSessionControl(
+                targetActorId: json['targetActorId'] as String,
+              ),
+            );
+          }
+        } catch (_) {
+          // A malformed control must not disrupt an active walkie session.
+        }
+      }.toJS,
+    );
+    es.addEventListener(
       'open',
       (web.Event _) {
         _status.add(VoiceStreamStatus.connected);
@@ -294,5 +317,6 @@ class WebVoiceStream implements VoiceStreamSource {
     _es = null;
     _frames.close();
     _status.close();
+    _controls.close();
   }
 }

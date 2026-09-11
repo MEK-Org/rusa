@@ -189,6 +189,7 @@ export class VoiceService {
   /** Explicit dashboard-owned session authority, keyed by stable session UUID. */
   private readonly sessions = new Map<string, VoiceSession>();
   private readonly onSessionEnded?: (actorId: string) => void;
+  private onSessionTransferred?: (sessionId: string, targetActorId: string) => void;
   /** Insertion-ordered announcement ring, oldest first, bounded. */
   private readonly announcements: VoiceAnnouncement[] = [];
 
@@ -293,6 +294,66 @@ export class VoiceService {
     return (
       session?.actorId === actorId && (session.expiresAt === null || session.expiresAt > this.now())
     );
+  }
+
+  /** The caller's sole active session UUID, or an error when transfer is ambiguous. */
+  activeSessionIdFor(actorId: string): string {
+    this.expireSessions();
+    const active = [...this.sessions.entries()].filter(
+      ([, session]) =>
+        session.actorId === actorId &&
+        (session.expiresAt === null || session.expiresAt > this.now())
+    );
+    if (active.length === 0) throw new Error("caller does not hold an active voice session");
+    if (active.length > 1) {
+      throw new Error("caller holds multiple active voice sessions; transfer is ambiguous");
+    }
+    return active[0][0];
+  }
+
+  /**
+   * Rebind this actor's one active leased session to a different active actor.
+   * The session UUID, open connection count, and reconnect lease remain intact;
+   * only its authority changes. The mesh releases the old holder only after it
+   * has durably accepted the recipient's handoff, allowing a failed write to
+   * be rolled back without prematurely admitting ordinary source work.
+   */
+  transferActiveSession(fromActorId: string, targetActorId: string): string {
+    if (!fromActorId.trim()) throw new Error("source actor id is required");
+    if (!targetActorId.trim()) throw new Error("target actor id is required");
+    if (fromActorId === targetActorId) throw new Error("cannot transfer a voice session to itself");
+    this.expireSessions();
+
+    const sessionId = this.activeSessionIdFor(fromActorId);
+    if (this.hasActiveSession(targetActorId)) {
+      throw new Error("target actor already holds an active voice session");
+    }
+
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error("active voice session disappeared before transfer");
+    session.actorId = targetActorId;
+    return sessionId;
+  }
+
+  /** Undo a rebind that could not be paired with a durable mesh handoff. */
+  revertActiveSessionTransfer(sessionId: string, fromActorId: string, targetActorId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.actorId !== targetActorId) {
+      throw new Error("voice session cannot be restored after transfer");
+    }
+    session.actorId = fromActorId;
+  }
+
+  /** Deliver a post-rebind dashboard control frame when a voice UI is bound. */
+  notifySessionTransferred(sessionId: string, targetActorId: string): void {
+    this.onSessionTransferred?.(sessionId, targetActorId);
+  }
+
+  /** Wire or clear the live dashboard notifier after its SSE hub is constructed. */
+  setSessionTransferNotifier(
+    notifier: ((sessionId: string, targetActorId: string) => void) | undefined
+  ): void {
+    this.onSessionTransferred = notifier;
   }
 
   private scheduleSessionExpiry(

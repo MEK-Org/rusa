@@ -111,7 +111,9 @@ class SseClient {
     private readonly maxQueue = DEFAULT_MAX_QUEUE,
     /** Invoked exactly once when this client closes, so the hub can unregister
      * it deterministically even on the write-throw path (no req close event). */
-    private readonly onClose?: () => void
+    private readonly onClose?: () => void,
+    /** Stable leased-session id for targeted voice handoff controls. */
+    readonly voiceSessionId?: string
   ) {}
 
   wantsLiveOutput(actorId: string): boolean {
@@ -290,8 +292,13 @@ export class SseHub {
    * those actors; `onClose` fires exactly once on teardown so the caller can
    * start the presence grace window.
    */
-  addVoiceConnection(res: ServerResponse, actors: Set<string>, onClose?: () => void): boolean {
-    return this.attach(res, actors, "voice", onClose);
+  addVoiceConnection(
+    res: ServerResponse,
+    actors: Set<string>,
+    onClose?: () => void,
+    sessionId?: string
+  ): boolean {
+    return this.attach(res, actors, "voice", onClose, sessionId);
   }
 
   /** Push a reply-TTS announcement to every voice client watching its actor. */
@@ -308,11 +315,29 @@ export class SseHub {
     }
   }
 
+  /**
+   * Ask only the browser(s) attached to one leased session to switch its
+   * selected walkie actor. This is a control frame, not a voice announcement:
+   * it preserves the session UUID and lets the client reconnect its SSE filter.
+   */
+  pushVoiceControl(sessionId: string, targetActorId: string): void {
+    const text = frame("voice_control", { targetActorId });
+    for (const client of this.clients) {
+      if (client.channel !== "voice" || client.voiceSessionId !== sessionId) continue;
+      try {
+        client.send(text);
+      } catch {
+        this.remove(client);
+      }
+    }
+  }
+
   private attach(
     res: ServerResponse,
     actors: Set<string> | null,
     channel: "mesh" | "voice",
-    onClose?: () => void
+    onClose?: () => void,
+    voiceSessionId?: string
   ): boolean {
     if (this.clients.size >= this.maxClients) {
       res.writeHead(503, { "Content-Type": "text/plain; charset=utf-8" });
@@ -333,10 +358,17 @@ export class SseHub {
     // The onClose callback makes unregistration deterministic even on the
     // write-throw path (where no req close/error event fires). `remove` is
     // idempotent, so the req handlers below remain a correct fallback.
-    const client: SseClient = new SseClient(res, actors, channel, this.maxQueuePerClient, () => {
-      this.remove(client);
-      onClose?.();
-    });
+    const client: SseClient = new SseClient(
+      res,
+      actors,
+      channel,
+      this.maxQueuePerClient,
+      () => {
+        this.remove(client);
+        onClose?.();
+      },
+      voiceSessionId
+    );
     if (channel === "mesh" && this.runtimeState) {
       client.send(frame("hello", { streamId: this.runtimeState.runtimeStateSnapshot().streamId }));
     }
