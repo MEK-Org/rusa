@@ -3252,4 +3252,17 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
     })) as CallToolResult;
     expect(reEnroll.isError).toBe(true);
   });
+
+  it("describes the unregistered stale-row cleanup path in unenroll_actor_experiment tool schema", async () => {
+    const { mesh } = setup();
+    const root = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+    const { tools } = await root.listTools();
+    const tool = tools.find((t) => t.name === "unenroll_actor_experiment");
+    expect(tool?.description).toMatch(/unregistered/i);
+    expect(tool?.description).toMatch(/clean\s*up/i);
+    const experimentProp = (
+      tool?.inputSchema as { properties?: Record<string, { description?: string }> }
+    )?.properties?.experiment;
+    expect(experimentProp?.description).toMatch(/unregistered/i);
+  });
 });

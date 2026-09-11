@@ -993,10 +993,14 @@ export function createAgentExecMcpServer(
       {
         title: "Remove an actor's experiment enrollment (root-only)",
         description:
-          "Remove an actor's enrollment in a hard-coded experiment. Root-only and ungrantable. Idempotent — unenrolling an actor that is not enrolled reports changed: false. Permitted for a retired thread, so a rollout can be withdrawn without reviving it; an enrollment otherwise survives retirement and applies again if the thread is revived.",
+          "Remove an actor's enrollment in an experiment. Root-only and ungrantable. Idempotent — unenrolling an actor that is not enrolled reports changed: false. Also accepts unregistered experiment names to clean up stale rows after an experiment is retired from the registry. Permitted for a retired thread, so a rollout can be withdrawn without reviving it; an enrollment otherwise survives retirement and applies again if the thread is revived.",
         inputSchema: {
           actor_id: z.string().describe("The thread id of the actor to unenroll."),
-          experiment: z.string().describe("A registered experiment name."),
+          experiment: z
+            .string()
+            .describe(
+              "The experiment name to remove. Accepts registered names or unregistered names from retired experiments awaiting cleanup."
+            ),
         },
       },
       async ({ actor_id, experiment }) => {

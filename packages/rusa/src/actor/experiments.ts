@@ -12,8 +12,11 @@
  *
  * Three properties are the whole design:
  *
- * - **The registry is code.** {@link EXPERIMENTS} is the complete list; nothing
- *   at any layer may persist a name that is not in it. That is what keeps the
+ * - **The registry is code.** {@link EXPERIMENTS} is the complete list. New
+ *   enrollments must be registered, and unregistered names are behaviorally
+ *   inactive (`isEnrolledInExperiment` evaluates to false). Stale rows may
+ *   temporarily exist in the store after an experiment is removed from the
+ *   registry until root explicitly unenrolls them for cleanup. That keeps the
  *   store from silently becoming a bag of arbitrary strings whose meaning lives
  *   only in whoever typed them.
  * - **Presence is the state.** A row means enrolled; no row means not enrolled.
@@ -88,7 +91,7 @@ export function assertKnownExperiment(name: string): ExperimentName {
 export interface ExperimentEnrollment {
   /** The enrolled actor's id (its stable thread id). */
   actorId: string;
-  /** The registered experiment name. */
+  /** The experiment name: registered when enrolled, or a formerly registered name in a stale row awaiting cleanup. */
   experiment: string;
   /** Who enrolled it — the root, in v1. */
   enrolledBy: string;
