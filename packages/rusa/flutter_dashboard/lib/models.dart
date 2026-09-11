@@ -1631,7 +1631,7 @@ class ObligationDetailSnapshot {
   ) {
     final blockedByRaw = j['blockedBy'];
     final blockedByList = (blockedByRaw is List)
-        ? (blockedByRaw as List<dynamic>)
+        ? blockedByRaw
               .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
               .toList()
         : (blockedByRaw is Map<String, dynamic> &&
@@ -1647,7 +1647,7 @@ class ObligationDetailSnapshot {
 
     final blocksRaw = j['blocks'] ?? j['unblocks'];
     final blocksList = (blocksRaw is List)
-        ? (blocksRaw as List<dynamic>)
+        ? blocksRaw
               .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
               .toList()
         : (blocksRaw is Map<String, dynamic> && blocksRaw['items'] is List)
