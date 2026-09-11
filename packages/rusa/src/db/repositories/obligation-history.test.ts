@@ -643,5 +643,38 @@ describe("Obligation mutation history", () => {
 
       expect(() => repository.listHistory(ob.id)).toThrow(ObligationValidationError);
     });
+
+    it("throws on malformed ownerId in history payload when reading history", () => {
+      const ob = repository.create({ title: "Task", ownerId: "actor-a" });
+
+      db.prepare(
+        `INSERT INTO obligation_history (obligation_id, mutation_kind, acting_principal, timestamp, payload)
+         VALUES (?, 'reassign', 'actor-a', '2026-09-09T12:00:00.000Z', '{"schemaVersion":1,"before":{},"after":{"ownerId":"   "}}')`
+      ).run(ob.id);
+
+      expect(() => repository.listHistory(ob.id)).toThrow(ObligationValidationError);
+    });
+
+    it("throws on malformed parentId in history payload when reading history", () => {
+      const ob = repository.create({ title: "Task", ownerId: "actor-a" });
+
+      db.prepare(
+        `INSERT INTO obligation_history (obligation_id, mutation_kind, acting_principal, timestamp, payload)
+         VALUES (?, 'reparent', 'actor-a', '2026-09-09T12:00:00.000Z', '{"schemaVersion":1,"before":{},"after":{"parentId":""}}')`
+      ).run(ob.id);
+
+      expect(() => repository.listHistory(ob.id)).toThrow(ObligationValidationError);
+    });
+
+    it("throws on malformed externalRef in history payload when reading history", () => {
+      const ob = repository.create({ title: "Task", ownerId: "actor-a" });
+
+      db.prepare(
+        `INSERT INTO obligation_history (obligation_id, mutation_kind, acting_principal, timestamp, payload)
+         VALUES (?, 'external_ref', 'actor-a', '2026-09-09T12:00:00.000Z', '{"schemaVersion":1,"before":{},"after":{"externalRef":"not-a-ref"}}')`
+      ).run(ob.id);
+
+      expect(() => repository.listHistory(ob.id)).toThrow(ObligationValidationError);
+    });
   });
 });

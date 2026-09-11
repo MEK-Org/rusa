@@ -371,13 +371,35 @@ export interface ObligationHistoryEntry {
  */
 export const OBLIGATION_HISTORY_SCHEMA_VERSION = 1;
 
+const historyEntityIdSchema = z.string().superRefine((val, ctx) => {
+  try {
+    validateEntityId(val);
+  } catch (err) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+const historyExternalRefSchema = z.string().superRefine((val, ctx) => {
+  try {
+    parseExternalRef(val);
+  } catch (err) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
 export const obligationHistoryStateSchema = z
   .object({
-    ownerId: z.string().optional(),
-    parentId: z.string().nullable().optional(),
+    ownerId: historyEntityIdSchema.optional(),
+    parentId: historyEntityIdSchema.nullable().optional(),
     priority: z.number().nullable().optional(),
     status: z.enum(OBLIGATION_STATUSES).optional(),
-    externalRef: z.string().nullable().optional(),
+    externalRef: historyExternalRefSchema.nullable().optional(),
   })
   .strict();
 
