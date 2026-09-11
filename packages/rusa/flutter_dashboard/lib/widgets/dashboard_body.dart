@@ -54,14 +54,22 @@ class _DashboardBodyState extends State<DashboardBody> {
   StreamSubscription<String?>? _actorSub;
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
 
+  /// The view the address named when this body was mounted, read exactly once:
+  /// the first [writeDashboardViewToUrl] (the seeded streams replay one as soon
+  /// as they are subscribed) puts a view in the address, so re-reading it later
+  /// would no longer tell us whether the *load* was addressed.
+  DashboardView? _urlNamedView;
+
   /// Whether the landing view has been settled against the viewport, which
-  /// takes a [MediaQuery] and so can only happen once dependencies are in.
+  /// takes the body's own layout constraints and so can only happen once it is
+  /// being laid out.
   bool _landingViewResolved = false;
 
   @override
   void initState() {
     super.initState();
-    _view = dashboardViewFromUrl() ?? DashboardView.overview;
+    _urlNamedView = dashboardViewFromUrl();
+    _view = _urlNamedView ?? DashboardView.overview;
     final initialObligation = focusedObligationIdFromUrl();
     if (initialObligation != null) {
       widget.store.setFocusedObligationId(initialObligation);
@@ -93,19 +101,18 @@ class _DashboardBodyState extends State<DashboardBody> {
     });
   }
 
-  /// Settles where an unaddressed load lands, once the body knows how much room
-  /// it has. On a truly short viewport — the geometry the walkie-talkie takes
-  /// over full screen — the overview's stacked cards have nowhere to go, so the
-  /// actor hierarchy is the useful landing. A URL that names a view still wins;
-  /// this only picks the default, and only for the first layout, so a later
-  /// rotation never yanks you off the view you are reading.
+  /// Settles where the load lands, once the body knows how much room it has.
+  /// Taken only for the first bounded layout, so a later rotation never yanks
+  /// you off the view you are reading. Assigns [_view] directly rather than
+  /// through `setState`: this runs during layout, and every read of `_view` in
+  /// this same pass happens below it.
   void _resolveLandingView(BoxConstraints constraints) {
     if (_landingViewResolved || !constraints.hasBoundedHeight) return;
     _landingViewResolved = true;
-    if (dashboardViewFromUrl() == null &&
-        constraints.maxHeight < kShortViewportHeight) {
-      _view = DashboardView.actors;
-    }
+    _view = landingViewFor(
+      urlNamedView: _urlNamedView,
+      height: constraints.maxHeight,
+    );
   }
 
   @override
@@ -201,6 +208,25 @@ class _DashboardBodyState extends State<DashboardBody> {
       ),
     );
   }
+}
+
+/// Where a load lands: the view the address named, if it named one, and
+/// otherwise the default that suits [height]. On a truly short viewport — the
+/// geometry the walkie-talkie takes over full screen — the overview's stacked
+/// cards have nowhere to go, so the actor hierarchy is the useful landing.
+///
+/// Short means short at any width: the header already collapses its walkie row
+/// on the same [kShortViewportHeight] threshold regardless of width, and a wide
+/// 450px-tall window has no more room for stacked overview cards than a
+/// landscape phone does.
+DashboardView landingViewFor({
+  required DashboardView? urlNamedView,
+  required double height,
+}) {
+  if (urlNamedView != null) return urlNamedView;
+  return height < kShortViewportHeight
+      ? DashboardView.actors
+      : DashboardView.overview;
 }
 
 Map<String, QuotaProviderConfig> _quotaProviders(DashboardConfigDto? config) {

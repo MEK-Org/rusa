@@ -9,6 +9,68 @@ import '../theme.dart';
 /// The top-level dashboard views the header nav switches between.
 enum DashboardView { overview, actors, understanding, reports, work }
 
+/// One top-level destination the navigation offers. The desktop header renders
+/// these inline and the phone drawer renders them as rows, from this one list —
+/// a fifth destination, or a change to what `IU` covers, lands in both places
+/// at once.
+class DashboardDestination {
+  const DashboardDestination({
+    required this.label,
+    required this.view,
+    required this.icon,
+    this.alsoActiveFor = const [],
+  });
+
+  final String label;
+  final DashboardView view;
+
+  /// Shown by the drawer, which has room for one; the inline header nav is
+  /// labels only.
+  final IconData icon;
+
+  /// Extra views this one destination also represents (ISSUE_NUM: `IU` covers both
+  /// the node and the report sub-view). Selecting any of them keeps it lit, and
+  /// tapping it while already there is a no-op rather than a jump back to
+  /// [view] — otherwise a tap on the lit `IU` button would silently throw away
+  /// the sub-view the user is reading.
+  final List<DashboardView> alsoActiveFor;
+
+  bool isActive(DashboardView selected) =>
+      view == selected || alsoActiveFor.contains(selected);
+
+  /// What a tap should select: the view itself, or — when already here — the
+  /// sub-view you are on, left alone.
+  DashboardView targetFrom(DashboardView selected) =>
+      isActive(selected) ? selected : view;
+}
+
+const List<DashboardDestination> kDashboardDestinations = [
+  DashboardDestination(
+    label: 'Overview',
+    view: DashboardView.overview,
+    icon: Icons.dashboard_outlined,
+  ),
+  DashboardDestination(
+    label: 'Actors',
+    view: DashboardView.actors,
+    icon: Icons.account_tree_outlined,
+  ),
+  DashboardDestination(
+    label: 'Work',
+    view: DashboardView.work,
+    icon: Icons.checklist_outlined,
+  ),
+  // ISSUE_NUM: ONE top-level IU destination. The node/report choice lives inside
+  // the IU route (`_IuBody` in dashboard_body.dart), so it stays active for
+  // either sub-view.
+  DashboardDestination(
+    label: 'IU',
+    view: DashboardView.understanding,
+    icon: Icons.insights_outlined,
+    alsoActiveFor: [DashboardView.reports],
+  ),
+];
+
 /// Per-provider quota UI config. Each provider owns the windows that drive its
 /// header rings: `primaryWindow` (weekly, outer ring) and `sessionWindow`
 /// (the short-rolling window — session/5h — inner ring), concentric with it.
@@ -174,44 +236,14 @@ class MeshHeader extends StatelessWidget {
                                     child: Row(
                                       children: [
                                         SizedBox(width: compact ? 8 : 16),
-                                        _NavItem(
-                                          label: 'Overview',
-                                          view: DashboardView.overview,
-                                          selected: selected,
-                                          onSelect: onSelect!,
-                                          compact: compact,
-                                        ),
-                                        _NavItem(
-                                          label: 'Actors',
-                                          view: DashboardView.actors,
-                                          selected: selected,
-                                          onSelect: onSelect!,
-                                          compact: compact,
-                                        ),
-                                        _NavItem(
-                                          label: 'Work',
-                                          view: DashboardView.work,
-                                          selected: selected,
-                                          onSelect: onSelect!,
-                                          compact: compact,
-                                        ),
-                                        // ISSUE_NUM: ONE top-level IU button. The
-                                        // node/report choice now lives inside
-                                        // the IU route (`_IuBody` in
-                                        // dashboard_body.dart), so this item
-                                        // stays active for either sub-view and
-                                        // a tap while already in IU keeps the
-                                        // sub-view you were on.
-                                        _NavItem(
-                                          label: 'IU',
-                                          view: DashboardView.understanding,
-                                          alsoActiveFor: const [
-                                            DashboardView.reports,
-                                          ],
-                                          selected: selected,
-                                          onSelect: onSelect!,
-                                          compact: compact,
-                                        ),
+                                        for (final destination
+                                            in kDashboardDestinations)
+                                          _NavItem(
+                                            destination: destination,
+                                            selected: selected,
+                                            onSelect: onSelect!,
+                                            compact: compact,
+                                          ),
                                       ],
                                     ),
                                   ),
@@ -282,8 +314,14 @@ class _LeadingAction extends StatelessWidget {
       ),
       tooltip: back != null ? 'Back' : 'Navigation',
       padding: EdgeInsets.zero,
-      visualDensity: VisualDensity.compact,
-      constraints: const BoxConstraints.tightFor(width: 40, height: 40),
+      // The Material minimum touch target, which the 56px header row has room
+      // for — the same standard the phone actor list asks for with
+      // `touchTargets: true`. Left at the default (standard) visual density,
+      // since `VisualDensity.compact` would shave these constraints back to 40.
+      constraints: const BoxConstraints.tightFor(
+        width: kMinInteractiveDimension,
+        height: kMinInteractiveDimension,
+      ),
     );
   }
 }
@@ -356,6 +394,7 @@ class _QuotaHeaderStrip extends StatelessWidget {
     final rings = [
       for (final entry in providers)
         _ProviderQuotaRing(
+          axis: axis,
           provider: entry.provider!,
           weeklyWindow: _findWindow(entry.provider, entry.config.primaryWindow),
           sessionWindow: entry.config.sessionWindow == null
@@ -396,6 +435,20 @@ class _QuotaHeaderStrip extends StatelessWidget {
   }
 }
 
+/// Lets a ring's provider label ellipsize inside a bounded row (the drawer's
+/// stacked strip, where large text would otherwise push the row past the drawer
+/// width) and keep its natural width in the header's unbounded scrolling one.
+class _LabelSlot extends StatelessWidget {
+  const _LabelSlot({required this.axis, required this.child});
+
+  final Axis axis;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) =>
+      axis == Axis.vertical ? Flexible(child: child) : child;
+}
+
 QuotaWindowDto? _findWindow(ProviderQuotaDto? provider, String windowId) {
   if (provider == null) return null;
   for (final w in provider.windows) {
@@ -412,11 +465,18 @@ class _ProviderQuotaRing extends StatelessWidget {
     required this.provider,
     required this.weeklyWindow,
     required this.sessionWindow,
+    this.axis = Axis.horizontal,
   });
 
   final ProviderQuotaDto provider;
   final QuotaWindowDto? weeklyWindow;
   final QuotaWindowDto? sessionWindow;
+
+  /// How the strip this ring belongs to is laid out. Stacked in the drawer the
+  /// row has a real width to fit inside, so the label gives way first; in the
+  /// header's scrolling row the width is unbounded and a flexible child there
+  /// would have nothing to flex against.
+  final Axis axis;
 
   @override
   Widget build(BuildContext context) {
@@ -479,14 +539,17 @@ class _ProviderQuotaRing extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 8),
-            Text(
-              _providerLabel(provider.provider),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                fontSize: 13,
-                color: MeshColors.textSecondary,
-                fontWeight: FontWeight.w500,
+            _LabelSlot(
+              axis: axis,
+              child: Text(
+                _providerLabel(provider.provider),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 13,
+                  color: MeshColors.textSecondary,
+                  fontWeight: FontWeight.w500,
+                ),
               ),
             ),
           ],
@@ -591,10 +654,7 @@ String? _resetLine(QuotaWindowDto window) {
 /// to match reset timestamps. Carries relative age when [now] is provided so
 /// stale readings are visibly distinct. Null when the state behind this window
 /// never reached a probe, or the stamp can't be parsed.
-String? _asOfLine(
-  String? scrapedAtIso, {
-  DateTime? now,
-}) {
+String? _asOfLine(String? scrapedAtIso, {DateTime? now}) {
   if (scrapedAtIso == null) return null;
   final scraped = DateTime.tryParse(scrapedAtIso);
   if (scraped == null) return null;
@@ -835,7 +895,9 @@ class _SchedulerWarningBadge extends StatelessWidget {
         decoration: BoxDecoration(
           color: MeshColors.statusIdle.withValues(alpha: 0.12),
           borderRadius: BorderRadius.circular(4),
-          border: Border.all(color: MeshColors.statusIdle.withValues(alpha: 0.5)),
+          border: Border.all(
+            color: MeshColors.statusIdle.withValues(alpha: 0.5),
+          ),
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
@@ -916,25 +978,15 @@ class _LivePulseState extends State<_LivePulse>
 /// chrome to the locked V1.4.0 layout.
 class _NavItem extends StatelessWidget {
   const _NavItem({
-    required this.label,
-    required this.view,
+    required this.destination,
     required this.selected,
     required this.onSelect,
-    this.alsoActiveFor = const [],
     this.compact = false,
   });
 
-  final String label;
-  final DashboardView view;
+  final DashboardDestination destination;
   final DashboardView selected;
   final ValueChanged<DashboardView> onSelect;
-
-  /// Extra views this one item also represents (ISSUE_NUM: `IU` covers both the
-  /// node and the report sub-view). Selecting any of them keeps the item lit,
-  /// and tapping it while already there is a no-op rather than a jump back to
-  /// [view] — otherwise a tap on the lit `IU` button would silently throw away
-  /// the sub-view the user is reading.
-  final List<DashboardView> alsoActiveFor;
 
   /// Tighter horizontal padding on phones  — the desktop padding left the
   /// nav items too wide to fit alongside the brand + status on a ~390px phone,
@@ -943,11 +995,11 @@ class _NavItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final active = view == selected || alsoActiveFor.contains(selected);
+    final active = destination.isActive(selected);
     return Padding(
       padding: EdgeInsets.symmetric(horizontal: compact ? 0 : 2),
       child: TextButton(
-        onPressed: () => onSelect(active ? selected : view),
+        onPressed: () => onSelect(destination.targetFrom(selected)),
         style: TextButton.styleFrom(
           foregroundColor: active
               ? MeshColors.accent
@@ -963,7 +1015,7 @@ class _NavItem extends StatelessWidget {
             fontWeight: active ? FontWeight.w700 : FontWeight.w500,
           ),
         ),
-        child: Text(label),
+        child: Text(destination.label),
       ),
     );
   }
