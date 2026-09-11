@@ -18,9 +18,11 @@
  *   only in whoever typed them.
  * - **Presence is the state.** A row means enrolled; no row means not enrolled.
  *   There is no per-experiment tombstone, unlike `capability_grants`, because a
- *   rollout has no audit obligation a capability has — who enrolled whom and
- *   when is already on the mesh event timeline
- *   (`experiment_enrolled`/`experiment_unenrolled`).
+ *   rollout has no audit obligation a capability has: the row is the only
+ *   durable state, and `enrolledBy`/`enrolledAt` describe the enrollment in
+ *   force so an active enrollment reads back deterministically. The mesh
+ *   events (`experiment_enrolled`/`experiment_unenrolled`) are best-effort
+ *   observability, not a record anything depends on.
  * - **Administration is root-only and ungrantable.** Enforced in
  *   {@link ActorMesh}, one layer up from this module, which is pure registry
  *   plus persistence.
@@ -95,6 +97,16 @@ export interface ExperimentEnrollment {
 }
 
 /**
+ * What an enroll/unenroll reported back: the canonical thread id the change was
+ * keyed on and whether anything actually changed. `changed: false` is the
+ * idempotent repeat — already enrolled, or nothing to remove.
+ */
+export interface ExperimentEnrollmentChange {
+  actorId: string;
+  changed: boolean;
+}
+
+/**
  * Persistence boundary for enrollments — mirrors `CapabilityGrantStore`: SQLite
  * in production ({@link DbExperimentEnrollmentStore}), in-memory for tests and
  * the e2e runner. Keyed on (actorId, experiment); at most one row per pair.
@@ -118,11 +130,22 @@ export interface ExperimentEnrollmentStore {
   unenroll(actorId: string, experiment: string): boolean;
   /** Whether `actorId` is currently enrolled in `experiment`. */
   isEnrolled(actorId: string, experiment: string): boolean;
-  /** Every current enrollment — the readback/inspection view. */
+  /**
+   * Every current enrollment, ordered by (actorId, experiment) with plain
+   * code-unit comparison — the readback/inspection view. Ordering is part of
+   * the contract so a readback is the same whichever store backs the mesh.
+   */
   list(): ExperimentEnrollment[];
 }
 
 const key = (actorId: string, experiment: string): string => `${actorId} ${experiment}`;
+
+/** (actorId, experiment) order, comparing code units like SQLite's BINARY collation. */
+const byKey = (a: ExperimentEnrollment, b: ExperimentEnrollment): number => {
+  if (a.actorId !== b.actorId) return a.actorId < b.actorId ? -1 : 1;
+  if (a.experiment !== b.experiment) return a.experiment < b.experiment ? -1 : 1;
+  return 0;
+};
 
 /** In-memory enrollment store — for tests and the e2e runner. */
 export class InMemoryExperimentEnrollmentStore implements ExperimentEnrollmentStore {
@@ -144,6 +167,6 @@ export class InMemoryExperimentEnrollmentStore implements ExperimentEnrollmentSt
   }
 
   list(): ExperimentEnrollment[] {
-    return [...this.enrollments.values()].map((enrollment) => ({ ...enrollment }));
+    return [...this.enrollments.values()].sort(byKey).map((enrollment) => ({ ...enrollment }));
   }
 }

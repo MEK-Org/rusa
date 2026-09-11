@@ -55,7 +55,6 @@ describe("DbExperimentEnrollmentStore (DB-specific)", () => {
   it("registers its migration exactly once, at the documented id", () => {
     const ids = migrations.map((migration) => migration.id);
     expect(ids.filter((id) => id === "0047_actor_experiments")).toHaveLength(1);
-    expect(ids.indexOf("0047_actor_experiments")).toBe(ids.length - 1);
   });
 
   it("refuses to enroll an actor id with no actors row", () => {

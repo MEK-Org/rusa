@@ -14,9 +14,12 @@ import type { Migration } from "./types.js";
  *
  * - **No `revoked_at` tombstone.** A grant keeps its revocation because the
  *   grant history *is* the audit trail for a capability someone once held. A
- *   rollout has no such obligation: who enrolled whom and when is on the mesh
- *   event timeline (`experiment_enrolled` / `experiment_unenrolled`), so the
- *   table holds only what is true now, and unenrolling leaves nothing behind.
+ *   rollout has no such obligation, so the table holds only what is true now
+ *   and unenrolling leaves nothing behind. Row presence is the durable state;
+ *   `enrolled_by` / `enrolled_at` describe the enrollment in force, so an
+ *   active enrollment reads back deterministically without consulting the
+ *   mesh events — those (`experiment_enrolled` / `experiment_unenrolled`) are
+ *   best-effort observability, not a record this table relies on.
  * - **No name constraint.** The registry of legal experiment names lives in
  *   code (`actor/experiments.ts`) and the mesh rejects anything outside it. A
  *   CHECK naming the experiments would make every registry edit a table

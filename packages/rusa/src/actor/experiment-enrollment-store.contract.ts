@@ -16,9 +16,6 @@ export const enrollment = (over: Partial<ExperimentEnrollment> = {}): Experiment
   ...over,
 });
 
-const byKey = (a: ExperimentEnrollment, b: ExperimentEnrollment): number =>
-  `${a.actorId}:${a.experiment}`.localeCompare(`${b.actorId}:${b.experiment}`);
-
 /**
  * Behavior every {@link ExperimentEnrollmentStore} implementation must satisfy,
  * independent of backing storage — run against both
@@ -92,12 +89,18 @@ export function testExperimentEnrollmentStoreContract(
       expect(store.isEnrolled(OTHER, EXPERIMENT)).toBe(true);
     });
 
-    it("list() returns every current enrollment", () => {
+    it("list() returns every current enrollment ordered by (actorId, experiment)", () => {
       const store = makeStore();
-      store.enroll(enrollment({ actorId: WORKER }));
-      store.enroll(enrollment({ actorId: OTHER }));
-      const expected = [enrollment({ actorId: WORKER }), enrollment({ actorId: OTHER })];
-      expect([...store.list()].sort(byKey)).toEqual([...expected].sort(byKey));
+      // Enrolled out of order on purpose: the contract is key order, not
+      // insertion order, so a readback is the same whichever store backs it.
+      store.enroll(enrollment({ actorId: OTHER, experiment: EXPERIMENT }));
+      store.enroll(enrollment({ actorId: WORKER, experiment: "other_experiment" }));
+      store.enroll(enrollment({ actorId: WORKER, experiment: EXPERIMENT }));
+      expect(store.list()).toEqual([
+        enrollment({ actorId: WORKER, experiment: EXPERIMENT }),
+        enrollment({ actorId: WORKER, experiment: "other_experiment" }),
+        enrollment({ actorId: OTHER, experiment: EXPERIMENT }),
+      ]);
     });
   });
 }

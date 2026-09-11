@@ -52,6 +52,7 @@ import {
 import {
   assertKnownExperiment,
   type ExperimentEnrollment,
+  type ExperimentEnrollmentChange,
   type ExperimentEnrollmentStore,
   InMemoryExperimentEnrollmentStore,
   isKnownExperiment,
@@ -1965,12 +1966,18 @@ export class ActorMesh {
    * {@link setActorModel}: enrolling a thread that is not going to run again
    * records an intent nothing will ever read.
    *
-   * Idempotent: returns true when this call actually enrolled the actor, false
-   * when it was already enrolled. Only a real change records an event.
-   * Throws if the experiment is not registered, the actor is unknown or
-   * retired, or the caller is not root.
+   * Idempotent: `changed` is true when this call actually enrolled the actor,
+   * false when it was already enrolled; `actorId` is the canonical thread id
+   * the enrollment is keyed on (a legacy `"root"` address resolves), so a
+   * caller can correlate the response with {@link listExperimentEnrollments}.
+   * Only a real change records an event. Throws if the experiment is not
+   * registered, the actor is unknown or retired, or the caller is not root.
    */
-  enrollActorInExperiment(actorId: string, experiment: string, enrolledBy: string): boolean {
+  enrollActorInExperiment(
+    actorId: string,
+    experiment: string,
+    enrolledBy: string
+  ): ExperimentEnrollmentChange {
     actorId = this.resolveThreadId(actorId);
     enrolledBy = this.resolveThreadId(enrolledBy);
     const name = assertKnownExperiment(experiment);
@@ -1984,19 +1991,19 @@ export class ActorMesh {
       enrolledBy,
       enrolledAt: this.now(),
     };
-    if (!this.experiments.enroll(enrollment)) return false;
+    if (!this.experiments.enroll(enrollment)) return { actorId, changed: false };
     this.recordEvent({
       kind: "experiment_enrolled",
       actorId,
       detail: name,
       payload: JSON.stringify({ enrolledBy }),
     });
-    return true;
+    return { actorId, changed: true };
   }
 
   /**
    * Remove an actor's enrollment, subject to the same root-only authority as
-   * {@link enrollActorInExperiment}. Idempotent: returns true when a real
+   * {@link enrollActorInExperiment}. Idempotent: `changed` is true when a real
    * enrollment was removed, false when there was nothing to remove, and only a
    * real change records an event.
    *
@@ -2008,20 +2015,25 @@ export class ActorMesh {
    * Similarly, unenrollment does not require the experiment to still be
    * registered in code: if an experiment was removed from the registry, any
    * lingering durable rows can still be cleanly unenrolled via this path
-   * without requiring manual SQL.
+   * without requiring manual SQL. The event's `detail` is then the stored
+   * name, which no consumer checks against the registry.
    */
-  unenrollActorFromExperiment(actorId: string, experiment: string, unenrolledBy: string): boolean {
+  unenrollActorFromExperiment(
+    actorId: string,
+    experiment: string,
+    unenrolledBy: string
+  ): ExperimentEnrollmentChange {
     actorId = this.resolveThreadId(actorId);
     unenrolledBy = this.resolveThreadId(unenrolledBy);
     this.assertExperimentAuthority(unenrolledBy, actorId, "unenroll");
-    if (!this.experiments.unenroll(actorId, experiment)) return false;
+    if (!this.experiments.unenroll(actorId, experiment)) return { actorId, changed: false };
     this.recordEvent({
       kind: "experiment_unenrolled",
       actorId,
       detail: experiment,
       payload: JSON.stringify({ unenrolledBy }),
     });
-    return true;
+    return { actorId, changed: true };
   }
 
   /**
@@ -2039,7 +2051,7 @@ export class ActorMesh {
     return this.experiments.isEnrolled(this.resolveThreadId(actorId), experiment);
   }
 
-  /** Every current enrollment — the root's readback view. */
+  /** Every current enrollment in (actorId, experiment) order — the root's readback view. */
   listExperimentEnrollments(actorId?: string): ExperimentEnrollment[] {
     const enrollments = this.experiments.list();
     if (!actorId) return enrollments;
@@ -2067,7 +2079,10 @@ export class ActorMesh {
     if (!record) {
       throw new Error(`unknown thread id: ${actorId}`);
     }
-    if (callerId !== actorId && !this.isAncestorOf(callerId, actorId)) {
+    // Not redundant with the root check above: `isRoot` is decoupled from
+    // top-level topology, so another root's subtree is a legal shape that this
+    // root must not reach into. `isAncestorOf` admits the root itself.
+    if (!this.isAncestorOf(callerId, actorId)) {
       throw new Error(
         `root ${callerId} may only ${verb} actors in its own subtree ${preposition} an experiment (cannot ${verb} ${actorId})`
       );

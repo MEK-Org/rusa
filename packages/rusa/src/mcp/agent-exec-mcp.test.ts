@@ -18,6 +18,10 @@ import {
   InMemoryEventSourceSubscriptionStore,
   parentOf,
 } from "../actor/event-subscriptions.js";
+import {
+  type ExperimentEnrollmentStore,
+  InMemoryExperimentEnrollmentStore,
+} from "../actor/experiments.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import type { RusaConfig } from "../config/types.js";
@@ -104,6 +108,7 @@ function setup(
     listVoiceSessionChat?: ActorMeshOptions["listVoiceSessionChat"];
     useInboxStore?: boolean;
     rootId?: string;
+    experimentEnrollments?: ExperimentEnrollmentStore;
   } = {}
 ) {
   const registry = new InMemoryActorRepository();
@@ -150,6 +155,7 @@ function setup(
     eventSourceSubscriptions,
     eventManager,
     inboxStore: opts.useInboxStore ? inboxStore : undefined,
+    experimentEnrollments: opts.experimentEnrollments,
     isVoiceSessionActive: opts.isVoiceSessionActive,
     voiceSessionTransfer: opts.voiceSessionTransfer,
     listVoiceSessionChat: opts.listVoiceSessionChat,
@@ -3186,6 +3192,9 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
       arguments: { actor_id: "root", experiment: "head_obligation_closure" },
     })) as CallToolResult;
     expect(enrolled.isError).toBeFalsy();
+    // The response names the thread the row was written under, not the
+    // legacy address the caller typed, so it correlates with the readback.
+    expect(changeOf(enrolled)).toMatchObject({ actor_id: configuredRootId, changed: true });
     expect(mesh.isEnrolledInExperiment(configuredRootId, "head_obligation_closure")).toBe(true);
 
     const listed = (await root.callTool({
@@ -3206,16 +3215,26 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
       arguments: { actor_id: "root", experiment: "head_obligation_closure" },
     })) as CallToolResult;
     expect(unenrolled.isError).toBeFalsy();
+    expect(changeOf(unenrolled)).toMatchObject({ actor_id: configuredRootId, changed: true });
     expect(mesh.isEnrolledInExperiment(configuredRootId, "head_obligation_closure")).toBe(false);
   });
 
-  it("allows unenrolling an unregistered or retired experiment to clean up stale rows", async () => {
-    const { mesh } = setup();
+  it("deletes a stale row for an experiment no longer in the registry via the tool", async () => {
+    const experimentEnrollments = new InMemoryExperimentEnrollmentStore();
+    const { mesh } = setup({ experimentEnrollments });
     const root = await connect(createAgentExecMcpServer(mesh, "root", "root"));
     const threadId = mesh.spawn({
       charter: "subject",
       parentId: "root",
       modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+    });
+    // A row left behind by an experiment since deleted from `EXPERIMENTS`:
+    // nothing at the mesh or tool layer can write this name any more.
+    experimentEnrollments.enroll({
+      actorId: threadId,
+      experiment: "retired_experiment",
+      enrolledBy: "root",
+      enrolledAt: "2026-01-01T00:00:00Z",
     });
 
     const unenrollStale = (await root.callTool({
@@ -3223,6 +3242,14 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
       arguments: { actor_id: threadId, experiment: "retired_experiment" },
     })) as CallToolResult;
     expect(unenrollStale.isError).toBeFalsy();
-    expect(changeOf(unenrollStale)).toMatchObject({ enrolled: false, changed: false });
+    expect(changeOf(unenrollStale)).toMatchObject({ enrolled: false, changed: true });
+    expect(experimentEnrollments.list()).toEqual([]);
+
+    // Enrolling under that name is still refused — cleanup is one-way.
+    const reEnroll = (await root.callTool({
+      name: "enroll_actor_experiment",
+      arguments: { actor_id: threadId, experiment: "retired_experiment" },
+    })) as CallToolResult;
+    expect(reEnroll.isError).toBe(true);
   });
 });

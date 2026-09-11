@@ -131,8 +131,10 @@ export type MeshEventKind =
   // Experiment enrollment (#394): the root enrolled an actor in a hard-coded
   // experiment, or removed that enrollment. `actorId` = the ENROLLED actor (not
   // the root), so an actor's timeline shows the rollouts it was moved into and
-  // out of; `detail` = the experiment name, so the (kind, detail) index answers
-  // "who is in this experiment, and since when?"; `payload` =
+  // out of; `detail` = the experiment name as stored, so the (kind, detail)
+  // index answers "who is in this experiment, and since when?" — an unenroll
+  // may name an experiment since deleted from the registry (stale-row cleanup),
+  // and no consumer validates `detail` against it; `payload` =
   // { enrolledBy } / { unenrolledBy }. Emitted only on a real change: a repeat
   // of an enrollment already in force records nothing.
   | "experiment_enrolled"

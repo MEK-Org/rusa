@@ -978,8 +978,10 @@ export function createAgentExecMcpServer(
         const denied = assertRoot();
         if (denied) return denied;
         try {
-          const changed = mesh.enrollActorInExperiment(actor_id, experiment, selfId);
-          return toolOk({ actor_id, experiment, enrolled: true, changed });
+          // Echo the canonical id the row is keyed on, not the address typed,
+          // so the response correlates with list_actor_experiments.
+          const { actorId, changed } = mesh.enrollActorInExperiment(actor_id, experiment, selfId);
+          return toolOk({ actor_id: actorId, experiment, enrolled: true, changed });
         } catch (err) {
           return toolError(err);
         }
@@ -1001,8 +1003,12 @@ export function createAgentExecMcpServer(
         const denied = assertRoot();
         if (denied) return denied;
         try {
-          const changed = mesh.unenrollActorFromExperiment(actor_id, experiment, selfId);
-          return toolOk({ actor_id, experiment, enrolled: false, changed });
+          const { actorId, changed } = mesh.unenrollActorFromExperiment(
+            actor_id,
+            experiment,
+            selfId
+          );
+          return toolOk({ actor_id: actorId, experiment, enrolled: false, changed });
         } catch (err) {
           return toolError(err);
         }

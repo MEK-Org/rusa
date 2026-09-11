@@ -20,11 +20,13 @@ function setup(
     events?: (event: MeshEventInput) => void;
     experimentEnrollments?: InMemoryExperimentEnrollmentStore;
     workerStatus?: "active" | "retired";
+    rootId?: string;
   } = {}
 ) {
+  const rootId = opts.rootId ?? "root";
   const registry = new InMemoryActorRepository();
   registry.upsert({
-    id: "root",
+    id: rootId,
     charter: "root",
     parentId: null,
     isRoot: true,
@@ -34,7 +36,7 @@ function setup(
   registry.upsert({
     id: "parent",
     charter: "parent",
-    parentId: "root",
+    parentId: rootId,
     status: "active",
     createdAt: "2026-09-10T00:00:00Z",
   });
@@ -55,7 +57,7 @@ function setup(
   const enrollments = opts.experimentEnrollments ?? new InMemoryExperimentEnrollmentStore();
   const mesh = new ActorMesh({
     actors: registry,
-    rootId: "root",
+    rootId,
     createActor: () => ({}) as unknown as Actor,
     experimentEnrollments: enrollments,
     events: opts.events,
@@ -69,7 +71,10 @@ describe("actor experiment enrollment", () => {
     const { mesh } = setup();
     expect(mesh.isEnrolledInExperiment("worker", EXPERIMENT)).toBe(false);
 
-    expect(mesh.enrollActorInExperiment("worker", EXPERIMENT, "root")).toBe(true);
+    expect(mesh.enrollActorInExperiment("worker", EXPERIMENT, "root")).toEqual({
+      actorId: "worker",
+      changed: true,
+    });
     expect(mesh.isEnrolledInExperiment("worker", EXPERIMENT)).toBe(true);
     expect(mesh.listExperimentEnrollments()).toEqual([
       {
@@ -82,22 +87,42 @@ describe("actor experiment enrollment", () => {
     // Enrollment is per actor: nobody else is swept in.
     expect(mesh.isEnrolledInExperiment("sibling", EXPERIMENT)).toBe(false);
 
-    expect(mesh.unenrollActorFromExperiment("worker", EXPERIMENT, "root")).toBe(true);
+    expect(mesh.unenrollActorFromExperiment("worker", EXPERIMENT, "root")).toEqual({
+      actorId: "worker",
+      changed: true,
+    });
     expect(mesh.isEnrolledInExperiment("worker", EXPERIMENT)).toBe(false);
     expect(mesh.listExperimentEnrollments()).toEqual([]);
   });
 
   it("is idempotent in both directions, with deterministic readback", () => {
     const { mesh } = setup();
-    expect(mesh.enrollActorInExperiment("worker", EXPERIMENT, "root")).toBe(true);
-    expect(mesh.enrollActorInExperiment("worker", EXPERIMENT, "root")).toBe(false);
+    expect(mesh.enrollActorInExperiment("worker", EXPERIMENT, "root").changed).toBe(true);
+    expect(mesh.enrollActorInExperiment("worker", EXPERIMENT, "root").changed).toBe(false);
     expect(mesh.isEnrolledInExperiment("worker", EXPERIMENT)).toBe(true);
     expect(mesh.listExperimentEnrollments()).toHaveLength(1);
 
-    expect(mesh.unenrollActorFromExperiment("worker", EXPERIMENT, "root")).toBe(true);
-    expect(mesh.unenrollActorFromExperiment("worker", EXPERIMENT, "root")).toBe(false);
+    expect(mesh.unenrollActorFromExperiment("worker", EXPERIMENT, "root").changed).toBe(true);
+    expect(mesh.unenrollActorFromExperiment("worker", EXPERIMENT, "root").changed).toBe(false);
     expect(mesh.isEnrolledInExperiment("worker", EXPERIMENT)).toBe(false);
     expect(mesh.listExperimentEnrollments()).toEqual([]);
+  });
+
+  it("reports the canonical thread id when the legacy root address is used", () => {
+    const { mesh } = setup({ rootId: "root-thread-configured" });
+    // "root" is the legacy address for the configured root thread; the mesh
+    // resolves it, so the response names the row it actually wrote.
+    expect(mesh.enrollActorInExperiment("root", EXPERIMENT, "root")).toEqual({
+      actorId: "root-thread-configured",
+      changed: true,
+    });
+    expect(mesh.listExperimentEnrollments("root").map((e) => e.actorId)).toEqual([
+      "root-thread-configured",
+    ]);
+    expect(mesh.unenrollActorFromExperiment("root", EXPERIMENT, "root")).toEqual({
+      actorId: "root-thread-configured",
+      changed: true,
+    });
   });
 
   it("records one mesh event per real change and none for a repeat", () => {
@@ -130,16 +155,19 @@ describe("actor experiment enrollment", () => {
     expect(() => mesh.enrollActorInExperiment("worker", "not_an_experiment", "root")).toThrow(
       "unknown experiment: not_an_experiment"
     );
-    expect(mesh.unenrollActorFromExperiment("worker", "not_an_experiment", "root")).toBe(false);
+    expect(mesh.unenrollActorFromExperiment("worker", "not_an_experiment", "root").changed).toBe(
+      false
+    );
     expect(enrollments.list()).toEqual([]);
     // An unregistered name can never have been enrolled, so evaluating one is
     // deterministically false rather than an error at the read site.
     expect(mesh.isEnrolledInExperiment("worker", "not_an_experiment")).toBe(false);
   });
 
-  it("allows root to unenroll a stale or unregistered experiment without throwing", () => {
-    const { mesh, enrollments } = setup();
-    // A stale row directly in store (e.g. experiment removed from registry)
+  it("lets root unenroll a stale row whose experiment left the registry, recording its name", () => {
+    const events: MeshEventInput[] = [];
+    const { mesh, enrollments } = setup({ events: (event) => events.push(event) });
+    // A row written before the experiment was deleted from `EXPERIMENTS`.
     enrollments.enroll({
       actorId: "worker",
       experiment: "retired_experiment",
@@ -147,8 +175,21 @@ describe("actor experiment enrollment", () => {
       enrolledAt: "2026-09-10T00:00:00Z",
     });
     expect(enrollments.list()).toHaveLength(1);
-    expect(mesh.unenrollActorFromExperiment("worker", "retired_experiment", "root")).toBe(true);
+    expect(mesh.unenrollActorFromExperiment("worker", "retired_experiment", "root")).toEqual({
+      actorId: "worker",
+      changed: true,
+    });
     expect(enrollments.list()).toHaveLength(0);
+    // `detail` is the name as stored, registry or not: the event records what
+    // was cleaned up, and no consumer validates it against the registry.
+    expect(events.filter((event) => event.kind.startsWith("experiment_"))).toEqual([
+      {
+        kind: "experiment_unenrolled",
+        actorId: "worker",
+        detail: "retired_experiment",
+        payload: JSON.stringify({ unenrolledBy: "root" }),
+      },
+    ]);
   });
 
   it("admits only root: the actor itself, its parent, and a sibling are all refused", () => {
@@ -168,6 +209,42 @@ describe("actor experiment enrollment", () => {
       );
     }
     expect(mesh.isEnrolledInExperiment("worker", EXPERIMENT)).toBe(true);
+  });
+
+  it("scopes root's authority to its own subtree, like capability grants", () => {
+    const { mesh, registry, enrollments } = setup();
+    // The root flag is decoupled from top-level topology, so a second root
+    // with its own subtree is a legal shape — and off-limits to this root.
+    registry.upsert({
+      id: "account-b-root",
+      charter: "another account root",
+      parentId: null,
+      isRoot: true,
+      status: "active",
+      createdAt: "2026-09-10T00:00:00Z",
+    });
+    registry.upsert({
+      id: "account-b-child",
+      charter: "another account child",
+      parentId: "account-b-root",
+      status: "active",
+      createdAt: "2026-09-10T00:00:00Z",
+    });
+    expect(() => mesh.enrollActorInExperiment("account-b-child", EXPERIMENT, "root")).toThrow(
+      /own subtree/
+    );
+    expect(enrollments.list()).toEqual([]);
+    // Its own root may, and a root may enroll itself.
+    expect(
+      mesh.enrollActorInExperiment("account-b-child", EXPERIMENT, "account-b-root").changed
+    ).toBe(true);
+    expect(
+      mesh.enrollActorInExperiment("account-b-root", EXPERIMENT, "account-b-root").changed
+    ).toBe(true);
+    expect(() => mesh.unenrollActorFromExperiment("account-b-child", EXPERIMENT, "root")).toThrow(
+      /own subtree/
+    );
+    expect(mesh.isEnrolledInExperiment("account-b-child", EXPERIMENT)).toBe(true);
   });
 
   it("refuses an unknown target actor", () => {
@@ -192,7 +269,9 @@ describe("actor experiment enrollment", () => {
     expect(() => retired.mesh.enrollActorInExperiment("worker", EXPERIMENT, "root")).toThrow(
       "Cannot enroll a retired thread: worker"
     );
-    expect(retired.mesh.unenrollActorFromExperiment("worker", EXPERIMENT, "root")).toBe(true);
+    expect(retired.mesh.unenrollActorFromExperiment("worker", EXPERIMENT, "root").changed).toBe(
+      true
+    );
     expect(retired.mesh.isEnrolledInExperiment("worker", EXPERIMENT)).toBe(false);
   });
 
@@ -225,7 +304,7 @@ describe("actor experiment enrollment", () => {
       rootId: "root",
       createActor: () => ({}) as unknown as Actor,
     });
-    expect(mesh.enrollActorInExperiment("root", EXPERIMENT, "root")).toBe(true);
+    expect(mesh.enrollActorInExperiment("root", EXPERIMENT, "root").changed).toBe(true);
     expect(mesh.isEnrolledInExperiment("root", EXPERIMENT)).toBe(true);
   });
 });
