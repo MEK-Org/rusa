@@ -518,15 +518,32 @@ int _compareQueuedActors(ActorViewState a, ActorViewState b) {
 }
 
 class ActorStateSnapshot {
-  const ActorStateSnapshot({
+  ActorStateSnapshot({
     this.revision = 0,
     this.actors = const {},
     this.orderedIds = const [],
-  });
+    Set<String>? activeObligationIds,
+  }) : activeObligationIds = activeObligationIds ??
+            {
+              for (final a in actors.values)
+                if (a.isActiveRun && a.selectedObligation?.id != null)
+                  a.selectedObligation!.id,
+            };
+
+  const ActorStateSnapshot.empty()
+      : revision = 0,
+        actors = const {},
+        orderedIds = const [],
+        activeObligationIds = const {};
 
   final int revision;
   final Map<String, ActorViewState> actors;
   final List<String> orderedIds;
+
+  /// Set of obligation IDs currently being worked by any actor with an active run.
+  /// Precomputed once upon snapshot creation so per-widget lookups are O(1) rather
+  /// than scanning all actors per obligation widget.
+  final Set<String> activeObligationIds;
 
   ActorViewState? operator [](String id) => actors[id];
   ActorViewState? actor(String id) => actors[id];
@@ -544,6 +561,16 @@ class ActorStateSnapshot {
   List<ActorViewState> get queuedActors =>
       all.where((a) => a.isQueued).toList()..sort(_compareQueuedActors);
 
+  /// Whether some actor is running right now with this obligation as its
+  /// current run's selected focus. This is what makes an obligation read as
+  /// [ObligationPresentationState.active]: the server never stores such a
+  /// status, so it is derived here from the same run state that drives the
+  /// actor dot. A selected obligation only survives on a thread while its run
+  /// is live (the store clears it at the idle/queued boundary), so a
+  /// just-finished run cannot leave its obligation looking worked-on.
+  bool isObligationActive(String obligationId) =>
+      activeObligationIds.contains(obligationId);
+
   DotState dotFor(String actorId) {
     return actors[actorId]?.dotState ?? DotState.idle;
   }
@@ -557,10 +584,13 @@ class ActorStateSnapshot {
     int? revision,
     Map<String, ActorViewState>? actors,
     List<String>? orderedIds,
+    Set<String>? activeObligationIds,
   }) => ActorStateSnapshot(
     revision: revision ?? this.revision,
     actors: actors ?? this.actors,
     orderedIds: orderedIds ?? this.orderedIds,
+    activeObligationIds: activeObligationIds ??
+        (actors != null ? null : this.activeObligationIds),
   );
 
   @override
@@ -1216,6 +1246,38 @@ class ObligationArtifactDto {
   }
 }
 
+/// How an obligation reads on the dashboard. This is aligned with the actor
+/// dot palette so the two vocabularies share one meaning per colour: waiting ↔
+/// idle (grey), ready ↔ queued (yellow), active ↔ running (green). Done (blue)
+/// and cancelled (red) have no actor counterpart.
+///
+/// Every value but [active] is a persisted obligation status. [active] is
+/// synthetic — it never appears on the wire and is derived per render from
+/// whether an actor's live run has selected the obligation, so it costs no
+/// schema and can never go stale in the database.
+enum ObligationPresentationState {
+  waiting,
+  ready,
+  active,
+  scheduled,
+  done,
+  cancelled,
+
+  /// A status this client does not know. Rendered neutrally with the raw
+  /// status text rather than guessed at, so API drift is visible.
+  unknown;
+
+  static ObligationPresentationState fromStatus(String status) =>
+      switch (status) {
+        'waiting' => waiting,
+        'ready' => ready,
+        'scheduled' => scheduled,
+        'done' => done,
+        'cancelled' => cancelled,
+        _ => unknown,
+      };
+}
+
 class ObligationDto {
   const ObligationDto({
     required this.id,
@@ -1337,6 +1399,23 @@ class ObligationDto {
   bool get isScheduled => status == 'scheduled';
   bool get isTerminal => status == 'done' || status == 'cancelled';
   bool get isRecurring => recurrencePolicy != null;
+
+  /// How this obligation should read on the dashboard, given whether an actor
+  /// is actively working on it (see [ActorStateSnapshot.isObligationActive]).
+  ///
+  /// `active` is a presentation-only overlay on the ready status: an
+  /// otherwise ready obligation that an actor has selected for its active
+  /// run is being worked right now. Terminal, scheduled, and waiting
+  /// statuses represent durable lifecycle states (completed, cancelled,
+  /// scheduled for future execution, or waiting on dependencies/blockers)
+  /// that are not overridden by a run focus.
+  ObligationPresentationState presentationState({required bool activelyWorked}) {
+    final base = ObligationPresentationState.fromStatus(status);
+    if (activelyWorked && base == ObligationPresentationState.ready) {
+      return ObligationPresentationState.active;
+    }
+    return base;
+  }
 
   /// The database coherence constraint makes a checkpoint and its stamp appear
   /// together, and rejects blank checkpoints. The client can trust that API

@@ -25,6 +25,13 @@ abstract final class MeshColors {
   static const statusIdle = Color(0xFFF59E0B);
   static const statusRetired = Color(0xFF64748B);
   static const statusHalted = Color(0xFFEF4444);
+
+  /// Semantic aliases aligning color constants with actor and obligation lifecycle:
+  /// In the original theme, [statusIdle] was assigned amber (0xFFF59E0B) and
+  /// [statusRetired] slate grey (0xFF64748B). In the UI, amber draws queued/ready
+  /// states and grey draws idle/waiting states.
+  static const statusQueued = statusIdle;
+  static const statusWaiting = statusRetired;
 }
 
 /// Per-kind chip colors, lifted verbatim from the mockup's `.inline-kind-chip`

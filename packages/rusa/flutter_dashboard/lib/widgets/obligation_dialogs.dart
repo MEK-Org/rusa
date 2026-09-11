@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
+import 'obligation_status.dart';
 import 'owner_selector.dart';
 
 Future<void> showCreateObligationDialog(
@@ -685,7 +686,9 @@ Future<void> confirmAndSetObligationStatus(
         ElevatedButton(
           onPressed: () => Navigator.of(dialogContext).pop(true),
           style: ElevatedButton.styleFrom(
-            backgroundColor: status == 'done' ? MeshColors.statusActive : MeshColors.statusHalted,
+            backgroundColor: status == 'done'
+                ? ObligationStatusColors.done.dot
+                : ObligationStatusColors.cancelled.dot,
             foregroundColor: MeshColors.textPrimary,
           ),
           child: Text(label),

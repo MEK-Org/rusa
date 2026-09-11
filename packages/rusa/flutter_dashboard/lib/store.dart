@@ -264,7 +264,7 @@ class DashboardStore {
   final _subs = <StreamSubscription<dynamic>>[];
 
   final _actorStates = BehaviorSubject<ActorStateSnapshot>.seeded(
-    const ActorStateSnapshot(),
+    const ActorStateSnapshot.empty(),
   );
   final _halted = BehaviorSubject<bool>.seeded(false);
   final _schedulerWarning = BehaviorSubject<List<String>?>.seeded(null);
