@@ -60,12 +60,28 @@ void main() {
       final stream = FakeStream();
       final store = await _booted(api, stream);
 
+      api
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 1)
+        ..threadsResult = [
+          makeThread(
+            'a',
+            runState: RunState.queued,
+          ),
+        ];
       stream.runtimeStatesCtrl.add(_runtime(1, 'a', RunState.queued));
       await pumpEventQueue();
       expect(store.actor('a')?.runState, RunState.queued);
       expect(store.actor('a')?.selectedObligation, isNull);
       expect(api.threadsCallCount, 2);
 
+      api
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 2)
+        ..threadsResult = [
+          makeThread(
+            'a',
+            runState: RunState.idle,
+          ),
+        ];
       stream.runtimeStatesCtrl.add(_runtime(2, 'a', RunState.idle));
       await pumpEventQueue();
       expect(store.actor('a')?.runState, RunState.idle);
@@ -141,6 +157,23 @@ void main() {
       expect(api.threadsCallCount, 2);
       expect(store.actor('a')?.thread.pacingIntervalMs, 12002);
       expect(store.actor('a')?.thread.estimatedStartAt, isNull);
+
+      // Once the queue drains, the periodic poll shuts down and generates
+      // no further background fetches.
+      api.threadsResult = [
+        makeThread(
+          'a',
+          runState: RunState.running,
+        ),
+      ];
+      async.elapse(const Duration(seconds: 10));
+      async.flushMicrotasks();
+      expect(api.threadsCallCount, 3);
+
+      // With no queued cards remaining, another 10s elapses without polling.
+      async.elapse(const Duration(seconds: 10));
+      async.flushMicrotasks();
+      expect(api.threadsCallCount, 3);
 
       unawaited(store.dispose());
       async.flushMicrotasks();
@@ -693,6 +726,18 @@ void main() {
       ); // seeded running → green
 
       // Only the authoritative runtime channel drives the dot.
+      api
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 1)
+        ..threadsResult = [
+          makeThread(
+            'a',
+            parent: 'root',
+            created: 't1',
+            runState: RunState.queued,
+          ),
+          api.threadsResult[1],
+          api.threadsResult[2],
+        ];
       stream.runtimeStatesCtrl.add(_runtime(1, 'a', RunState.queued));
       await pumpEventQueue();
       expect(store.dotFor(api.threadsResult[0]), DotState.queued);

@@ -533,39 +533,21 @@ class DashboardStore {
 
   /// Replace the normalized actor-state snapshot from one authoritative server
   /// capture. Buffered deltas are applied only after its runtime cursor.
-  void _updateActorStatesFromThreads(
-    List<ThreadDto> threads, {
-    bool preserveLiveRunStates = false,
-  }) {
+  void _updateActorStatesFromThreads(List<ThreadDto> threads) {
     final cur = _actorStates.value;
     final updatedActors = <String, ActorViewState>{};
     final orderedIds = <String>[];
 
     for (final t in threads) {
       orderedIds.add(t.id);
-      final existing = cur.actors[t.id];
-      final runState =
-          (preserveLiveRunStates && existing != null)
-              ? existing.runState
-              : t.runState;
-      final clearsSelectedObligation =
-          runState == RunState.idle || runState == RunState.queued;
-      final selectedObligation =
-          clearsSelectedObligation ? null : t.selectedObligation;
-      updatedActors[t.id] = ActorViewState(
-        thread: t.copyWith(
-          runState: runState,
-          selectedObligation: selectedObligation,
-        ),
-        runState: runState,
-      );
+      updatedActors[t.id] = ActorViewState(thread: t, runState: t.runState);
     }
 
     _actorStates.add(
-      ActorStateSnapshot(
+      cur.copyWith(
         revision: cur.revision + 1,
-        actors: updatedActors,
         orderedIds: orderedIds,
+        actors: updatedActors,
       ),
     );
     _updateQueuePacingPoll();
@@ -1352,10 +1334,10 @@ class DashboardStore {
     final existing = cur.actors[delta.actorId];
     if (existing == null) return false;
     final updatedActors = Map<String, ActorViewState>.of(cur.actors);
-    // A durable inbox focus only belongs to an active run. Clearing it at the
-    // idle/queued lifecycle boundary prevents a just-finished run's card from
-    // appearing beneath the next provider reservation, without a second
-    // thread-list request on every queue admission.
+    // A durable inbox focus only belongs to an active run. Clearing it
+    // immediately at the idle/queued lifecycle boundary ensures a just-finished
+    // run's card does not render beneath the newly queued actor while the
+    // authoritative pacing snapshot is requested.
     final clearsSelectedObligation =
         delta.runState == RunState.idle || delta.runState == RunState.queued;
     updatedActors[delta.actorId] = existing.copyWith(
@@ -1405,16 +1387,7 @@ class DashboardStore {
       _halted.add(snap.halted);
       _schedulerWarning.add(snap.schedulerWarning);
       _supportedVoices.add(snap.supportedVoices);
-      final cursor = _runtimeCursor;
-      final isStaleSnap =
-          cursor != null &&
-          snap.runtimeCursor != null &&
-          snap.runtimeCursor!.streamId == cursor.streamId &&
-          snap.runtimeCursor!.revision < cursor.revision;
-      _updateActorStatesFromThreads(
-        snap.threads,
-        preserveLiveRunStates: isStaleSnap,
-      );
+      _updateActorStatesFromThreads(snap.threads);
       // Server truth has landed: the snapshot above REPLACED the seeded rows
       // wholesale, so an actor the server no longer lists is gone from the tree
       // by construction. What replacement can't undo on its own is a selection
@@ -1423,9 +1396,7 @@ class DashboardStore {
       _pruneSelectionToKnownActors();
       _actorsStale.add(false);
       _persistActorHierarchy(snap.threads);
-      if (!isStaleSnap) {
-        _runtimeCursor = snap.runtimeCursor;
-      }
+      _runtimeCursor = snap.runtimeCursor;
       _error.add(null);
       if (!_drainRuntimeBuffer()) _runtimeSyncAgain = true;
     }
@@ -1433,8 +1404,9 @@ class DashboardStore {
   }
 
   /// Write the authoritative hierarchy back for the next cold load (#273).
-  /// Runs on every successful sync — syncs are reconnect/mutation-driven, not
-  /// a poll — and the capture itself bounds what is written.
+  /// Runs on every successful sync. While normally reconnect/mutation-driven,
+  /// this also runs during the bounded 10s queue-pacing poll while cards remain
+  /// queued; the capture itself bounds what is written to storage.
   void _persistActorHierarchy(List<ThreadDto> threads) {
     _actorHierarchyCache.save(
       PersistedActorHierarchy.capture(
