@@ -1401,8 +1401,8 @@ export class ActorMesh {
 
   /**
    * The experiment-specific discipline in force for this actor's current run,
-   * or null when none is — the text an enrolled actor is told at selection, so
-   * a rejected yield is never its first explanation of the rule.
+   * or undefined when none is — the text an enrolled actor is told at
+   * selection, so a rejected yield is never its first explanation of the rule.
    *
    * This reads the armed run state {@link assertCleanYieldAllowed} enforces
    * rather than re-evaluating enrollment. Instruction and enforcement are then
@@ -1410,14 +1410,18 @@ export class ActorMesh {
    * selection and on neither in between, and an actor that is told nothing is
    * an actor nothing will be enforced against.
    *
-   * States the obligation rule directly without experiment framing.
+   * States the obligation rule directly without experiment framing, and per
+   * head: enforcement walks every armed head, so a selection of several is
+   * told that each one must take a legal exit, not just the first.
    */
-  runDisciplineNotice(actorId: string): string | null {
+  runDisciplineNotice(actorId: string): string | undefined {
     actorId = this.resolveThreadId(actorId);
     const runState = this.headClosureRuns.get(actorId);
-    if (!runState || runState.headObligationIds.size === 0) return null;
-    const heads = [...runState.headObligationIds].join(", ");
-    return `This run selected head attention (${heads}), so it may not yield cleanly while that obligation is left as it was found. Before \`yield_run\`, ${STRICT_HEAD_CLOSURE_EXITS}. A clean yield that leaves it untouched is rejected.`;
+    if (!runState || runState.headObligationIds.size === 0) return undefined;
+    const heads = [...runState.headObligationIds];
+    const selected =
+      heads.length === 1 ? `head obligation ${heads[0]}` : `head obligations ${heads.join(", ")}`;
+    return `This run selected ${selected}. Before \`yield_run\`, every selected head must take one of these exits: ${STRICT_HEAD_CLOSURE_EXITS}. A clean yield that leaves any selected head as it was found is rejected.`;
   }
 
   selectedInboxEntries(actorId: string): readonly string[] {

@@ -19,7 +19,7 @@ export const INBOX_MCP_NAME = "inbox";
 export interface SelectedInboxRun {
   entries: InboxEntry[];
   focus: ResolvedInboxFocus;
-  discipline?: string | null;
+  discipline?: string;
 }
 
 export interface InboxMcpRunScope {
@@ -116,7 +116,7 @@ export function createInboxMcpServer(
         return toolOk({
           entries: attachInboxHints(selected.entries),
           focus: selected.focus,
-          ...(selected.discipline ? { discipline: selected.discipline } : {}),
+          ...(selected.discipline === undefined ? {} : { discipline: selected.discipline }),
         });
       } catch (err) {
         return toolError(err);

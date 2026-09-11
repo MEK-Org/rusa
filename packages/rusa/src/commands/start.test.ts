@@ -641,6 +641,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(String(strict.selection.discipline)).not.toContain("strict_obligation_handling");
     expect(String(strict.selection.discipline)).not.toMatch(/experiment/i);
     expect(String(strict.selection.discipline)).toContain(strictHeadId);
+    expect(String(strict.selection.discipline)).toMatch(/every selected head/);
     expect(String(strict.selection.discipline)).toContain(
       "complete it, cancel it, schedule it, add a new unmet prerequisite, or create a new live direct child"
     );
