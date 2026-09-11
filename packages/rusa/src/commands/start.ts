@@ -1821,6 +1821,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           throw new Error("voice session transfer is unavailable on this instance");
         return voiceService.transferActiveSession(fromActorId, targetActorId);
       },
+      revertActiveSessionTransfer: (sessionId, fromActorId, targetActorId) => {
+        if (!voiceService)
+          throw new Error("voice session transfer is unavailable on this instance");
+        voiceService.revertActiveSessionTransfer(sessionId, fromActorId, targetActorId);
+      },
       notifySessionTransferred: (sessionId, targetActorId) =>
         voiceService?.notifySessionTransferred(sessionId, targetActorId),
     },

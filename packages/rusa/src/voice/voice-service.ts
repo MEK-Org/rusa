@@ -152,12 +152,6 @@ export interface VoiceServiceOptions {
   sessionLeaseMs?: number;
   /** Called once when an explicit session ends or expires. */
   onSessionEnded?: (actorId: string) => void;
-  /**
-   * Called after a live session is rebound to another actor. The dashboard uses
-   * this to tell the browser that owns the session to select and reconnect to
-   * the receiving actor without closing the session.
-   */
-  onSessionTransferred?: (sessionId: string, targetActorId: string) => void;
 }
 
 interface VoiceSession {
@@ -215,7 +209,6 @@ export class VoiceService {
     }
     this.voiceNameFor = options.voiceNameFor;
     this.onSessionEnded = options.onSessionEnded;
-    this.onSessionTransferred = options.onSessionTransferred;
   }
 
   // ── Explicit leased walkie sessions ────────────────────────────────────
@@ -321,8 +314,9 @@ export class VoiceService {
   /**
    * Rebind this actor's one active leased session to a different active actor.
    * The session UUID, open connection count, and reconnect lease remain intact;
-   * only its authority changes. The old holder is notified after the rebind so
-   * its ordinary deferred work can resume against the new authority state.
+   * only its authority changes. The mesh releases the old holder only after it
+   * has durably accepted the recipient's handoff, allowing a failed write to
+   * be rolled back without prematurely admitting ordinary source work.
    */
   transferActiveSession(fromActorId: string, targetActorId: string): string {
     if (!fromActorId.trim()) throw new Error("source actor id is required");
@@ -338,11 +332,16 @@ export class VoiceService {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error("active voice session disappeared before transfer");
     session.actorId = targetActorId;
-    // The source's lease ended by transfer, so release its ordinary work only
-    // after authority is gone. The receiving actor remains held by this same
-    // session until it explicitly exits or its reconnect lease expires.
-    this.onSessionEnded?.(fromActorId);
     return sessionId;
+  }
+
+  /** Undo a rebind that could not be paired with a durable mesh handoff. */
+  revertActiveSessionTransfer(sessionId: string, fromActorId: string, targetActorId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.actorId !== targetActorId) {
+      throw new Error("voice session cannot be restored after transfer");
+    }
+    session.actorId = fromActorId;
   }
 
   /** Deliver a post-rebind dashboard control frame when a voice UI is bound. */

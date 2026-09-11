@@ -21,7 +21,7 @@ export interface MeshChatReceivedListOptions {
 
 export interface MeshChatSessionListOptions {
   /** The newest rows to retain before returning them in chronological order. */
-  limit?: number;
+  limit: number;
 }
 
 interface MeshChatRow {
@@ -120,8 +120,8 @@ export class MeshChatRepository {
    * second transcript store: voice handoff context is a mechanical rendering of
    * the same messages the mesh already recorded.
    */
-  listForSession(sessionId: string, opts: MeshChatSessionListOptions = {}): MeshChat[] {
-    const limit = opts.limit ?? 12;
+  listForSession(sessionId: string, opts: MeshChatSessionListOptions): MeshChat[] {
+    const { limit } = opts;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
       throw new Error("mesh chat session limit must be between 1 and 100");
     }

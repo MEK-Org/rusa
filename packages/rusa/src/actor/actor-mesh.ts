@@ -22,7 +22,10 @@ import {
 } from "../runtime/event-manager.js";
 import { randomSupportedVoiceName } from "../voice/tts-voices.js";
 import { googleVoiceConfig } from "../voice/voice-config.js";
-import { renderVoiceTransferContext } from "../voice/voice-transfer-context.js";
+import {
+  MAX_VOICE_TRANSFER_NOTE_CHARS,
+  renderVoiceTransferContext,
+} from "../voice/voice-transfer-context.js";
 import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./actor-record.js";
 import {
   type CapabilityGrantStore,
@@ -178,6 +181,8 @@ export interface VoiceSessionTransferPort {
   activeSessionIdFor(actorId: string): string;
   /** Atomically rebind the caller's active session and return its same UUID. */
   transferActiveSession(fromActorId: string, targetActorId: string): string;
+  /** Restore a just-rebound session before its durable handoff was accepted. */
+  revertActiveSessionTransfer(sessionId: string, fromActorId: string, targetActorId: string): void;
   /** Tell the dashboard browser that owns this session to reconnect to target. */
   notifySessionTransferred(sessionId: string, targetActorId: string): void;
 }
@@ -1482,8 +1487,8 @@ export class ActorMesh {
     if (!transfer) throw new Error("voice session transfer is unavailable on this instance");
     const inboxStore = this.inboxStore;
     if (!inboxStore) throw new Error("voice session transfer requires a durable inbox");
-    if (handoffNote !== undefined && handoffNote.trim().length > 2_000) {
-      throw new Error("handoff note must be at most 2000 characters");
+    if (handoffNote !== undefined && handoffNote.trim().length > MAX_VOICE_TRANSFER_NOTE_CHARS) {
+      throw new Error(`handoff note must be at most ${MAX_VOICE_TRANSFER_NOTE_CHARS} characters`);
     }
 
     // Read and render before rebinding. If the durable context projection is
@@ -1493,37 +1498,77 @@ export class ActorMesh {
       this.listVoiceSessionChat?.(sessionId) ?? [],
       handoffNote
     );
-    const reboundSessionId = transfer.transferActiveSession(fromActorId, target.id);
-    if (reboundSessionId !== sessionId) {
-      throw new Error("voice session changed during transfer");
-    }
-
-    // Let the recipient reply through the same human chat session; the context
-    // is still durable in mesh_chat rather than copied into a new authority.
-    this.actors.patch(target.id, {
-      humanUnlocked: true,
-      lastChatSessionId: sessionId,
-    });
-    const inserted = inboxStore.append([
-      {
-        actorId: target.id,
-        source: `voice:transfer:${fromActorId}`,
-        payload: {
-          type: "voice.transfer",
-          priority: "responsive",
-          fromId: fromActorId,
-          sessionId,
-          context,
+    transfer.transferActiveSession(fromActorId, target.id);
+    let inserted: InboxEntry[];
+    try {
+      inserted = inboxStore.append([
+        {
+          actorId: target.id,
+          source: `voice:transfer:${fromActorId}`,
+          payload: {
+            type: "voice.transfer",
+            priority: "responsive",
+            fromId: fromActorId,
+            sessionId,
+            context,
+          },
         },
-      },
-    ]);
+      ]);
+      if (inserted.length !== 1) {
+        throw new Error("voice session transfer handoff was not durably inserted");
+      }
+    } catch (error) {
+      // Authority moves only after durable context has been rendered, and it
+      // moves back if the durable handoff cannot be written. The source is not
+      // released until after this point, so a failed write leaves its ordinary
+      // work held exactly as it was before the request.
+      try {
+        transfer.revertActiveSessionTransfer(sessionId, fromActorId, target.id);
+      } catch (rollbackError) {
+        this.log(
+          `voice session transfer rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`
+        );
+      }
+      throw error;
+    }
+    // The responsive row is now durable; releasing the source through the
+    // existing session-end path preserves normal-work deferral semantics.
+    this.notifyVoiceSessionEnded(fromActorId);
     if (inserted.length > 0) {
-      this.notifyInboxChanged(target.id, { priority: "responsive" });
+      try {
+        this.notifyInboxChanged(target.id, { priority: "responsive" });
+      } catch (error) {
+        this.log(
+          `voice transfer recipient nudge failed after durable handoff: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
     }
     // The control is intentionally last: the recipient has durable work before
     // the browser changes selection/reconnects to it.
-    transfer.notifySessionTransferred(sessionId, target.id);
+    try {
+      transfer.notifySessionTransferred(sessionId, target.id);
+    } catch (error) {
+      this.log(
+        `voice transfer dashboard control failed after durable handoff: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
     return { sessionId, targetActorId: target.id };
+  }
+
+  /**
+   * The currently leased voice session for an actor, if this host has one.
+   * This is intentionally lease-scoped rather than an actor-row capability:
+   * a recipient of a transfer may reply during the live handoff without
+   * permanently gaining direct-human authority.
+   */
+  activeVoiceSessionIdFor(actorId: string): string | undefined {
+    const transfer = this.voiceSessionTransfer;
+    if (!transfer) return undefined;
+    try {
+      return transfer.activeSessionIdFor(this.resolveThreadId(actorId));
+    } catch {
+      return undefined;
+    }
   }
 
   /** Resolve an active live actor from the caller's own handle set. */

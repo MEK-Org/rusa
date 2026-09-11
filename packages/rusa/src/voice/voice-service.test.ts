@@ -160,7 +160,7 @@ describe("VoiceService leased sessions", () => {
     expect(ended).toEqual([ACTOR, ACTOR]);
   });
 
-  it("atomically rebinds the same active session and releases only the source", () => {
+  it("atomically rebinds the same active session and can restore it before mesh delivery", () => {
     const ended: string[] = [];
     const controls: Array<[string, string]> = [];
     const { service } = makeService({ onSessionEnded: (actorId) => ended.push(actorId) });
@@ -175,7 +175,13 @@ describe("VoiceService leased sessions", () => {
     expect(service.hasSession("session-a", TARGET)).toBe(true);
     expect(service.hasActiveSession(ACTOR)).toBe(false);
     expect(service.hasActiveSession(TARGET)).toBe(true);
-    expect(ended).toEqual([ACTOR]);
+    expect(ended).toEqual([]);
+
+    service.revertActiveSessionTransfer("session-a", ACTOR, TARGET);
+    expect(service.hasSession("session-a", ACTOR)).toBe(true);
+    expect(service.hasSession("session-a", TARGET)).toBe(false);
+
+    expect(service.transferActiveSession(ACTOR, TARGET)).toBe("session-a");
 
     service.notifySessionTransferred("session-a", TARGET);
     expect(controls).toEqual([["session-a", TARGET]]);

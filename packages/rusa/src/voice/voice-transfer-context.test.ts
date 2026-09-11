@@ -18,13 +18,12 @@ function message(index: number, body = `body ${index}`): MeshChat {
 }
 
 describe("renderVoiceTransferContext", () => {
-  it("keeps only the newest bounded rows in chronological order plus the optional note", () => {
+  it("renders the query-bounded chronological rows plus the optional note", () => {
     const context = renderVoiceTransferContext(
-      Array.from({ length: MAX_VOICE_TRANSFER_CONTEXT_MESSAGES + 3 }, (_, index) => message(index)),
+      Array.from({ length: MAX_VOICE_TRANSFER_CONTEXT_MESSAGES }, (_, index) => message(index + 3)),
       "continue with the deployment check"
     );
 
-    expect(context).not.toContain("body 0");
     expect(context).toContain("body 3");
     expect(context.indexOf("body 3")).toBeLessThan(context.indexOf("body 14"));
     expect(context).toContain("Actor handoff note:");

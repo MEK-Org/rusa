@@ -1586,7 +1586,6 @@ describe("ActorMesh", () => {
   it("transfers the same voice session to a held active actor with bounded context", async () => {
     const inboxStore = createMemoryInboxStore();
     let holder = "";
-    let releaseSource: (() => void) | undefined;
     const controls: Array<[string, string]> = [];
     const context = [
       {
@@ -1618,8 +1617,12 @@ describe("ActorMesh", () => {
           if (fromActorId !== holder)
             throw new Error("caller does not hold an active voice session");
           holder = targetActorId;
-          releaseSource?.();
           return "walkie-session";
+        },
+        revertActiveSessionTransfer: (sessionId, fromActorId, targetActorId) => {
+          expect(sessionId).toBe("walkie-session");
+          expect(holder).toBe(targetActorId);
+          holder = fromActorId;
         },
         notifySessionTransferred: (sessionId, targetActorId) =>
           controls.push([sessionId, targetActorId]),
@@ -1629,7 +1632,6 @@ describe("ActorMesh", () => {
     const source = mesh.spawn({ charter: "source", parentId: "root" });
     const target = mesh.spawn({ charter: "target", parentId: source });
     holder = source;
-    releaseSource = () => mesh.notifyVoiceSessionEnded(source);
 
     const [sourceNormal] = inboxStore.append([
       { actorId: source, source: "github:MEK-Org/rusa", payload: { type: "github.issue" } },
@@ -1639,8 +1641,8 @@ describe("ActorMesh", () => {
     const result = mesh.transferVoiceSession(source, target, "take over the review");
     expect(result).toEqual({ sessionId: "walkie-session", targetActorId: target });
     expect(controls).toEqual([["walkie-session", target]]);
-    expect(registry.get(target)?.lastChatSessionId).toBe("walkie-session");
-    expect(registry.get(target)?.humanUnlocked).toBe(true);
+    expect(registry.get(target)?.lastChatSessionId).toBeUndefined();
+    expect(registry.get(target)?.humanUnlocked).toBeUndefined();
 
     const handoff = inboxStore.entries.find(
       (entry) => entry.actorId === target && entry.payload.type === "voice.transfer"
@@ -1678,6 +1680,7 @@ describe("ActorMesh", () => {
           holder = targetActorId;
           return "walkie-session";
         },
+        revertActiveSessionTransfer: () => {},
         notifySessionTransferred: () => {},
       },
     });
@@ -1690,6 +1693,48 @@ describe("ActorMesh", () => {
     expect(() => mesh.transferVoiceSession(source, unheld)).toThrow("not a handle held");
     mesh.retire(heldTarget);
     expect(() => mesh.transferVoiceSession(source, heldTarget)).toThrow("retired");
+  });
+
+  it("rolls a transferred lease back when the durable handoff write fails", () => {
+    let holder = "";
+    const backingStore = createMemoryInboxStore();
+    const failingInbox: InboxStore = {
+      ...backingStore,
+      append: () => {
+        throw new Error("disk full");
+      },
+    };
+    const { mesh } = setup({
+      inboxStore: failingInbox,
+      isVoiceSessionActive: (actorId) => actorId === holder,
+      voiceSessionTransfer: {
+        activeSessionIdFor: (actorId) => {
+          if (actorId !== holder) throw new Error("caller does not hold an active voice session");
+          return "walkie-session";
+        },
+        transferActiveSession: (fromActorId, targetActorId) => {
+          if (fromActorId !== holder)
+            throw new Error("caller does not hold an active voice session");
+          holder = targetActorId;
+          return "walkie-session";
+        },
+        revertActiveSessionTransfer: (sessionId, fromActorId, targetActorId) => {
+          expect(sessionId).toBe("walkie-session");
+          expect(holder).toBe(targetActorId);
+          holder = fromActorId;
+        },
+        notifySessionTransferred: () => {
+          throw new Error("must not notify after a failed durable handoff");
+        },
+      },
+    });
+    const source = mesh.spawn({ charter: "source", parentId: "root" });
+    const target = mesh.spawn({ charter: "target", parentId: source });
+    holder = source;
+
+    expect(() => mesh.transferVoiceSession(source, target)).toThrow("disk full");
+    expect(holder).toBe(source);
+    expect(backingStore.entries).toEqual([]);
   });
 
   it("defers a normal run queued before voice authority opens at final admission", async () => {

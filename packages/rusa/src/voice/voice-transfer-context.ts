@@ -21,7 +21,7 @@ export function renderVoiceTransferContext(
   messages: readonly MeshChat[],
   handoffNote?: string
 ): string {
-  const rows = messages.slice(-MAX_VOICE_TRANSFER_CONTEXT_MESSAGES).map((message) => {
+  const rows = messages.map((message) => {
     const body = boundedText(message.body, MAX_VOICE_TRANSFER_MESSAGE_CHARS);
     return `${message.ts} ${message.senderId} → ${message.recipientId}: ${body}`;
   });

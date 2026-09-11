@@ -22,7 +22,9 @@ import type { RootControlService } from "../actor/root-control.js";
 import type { RusaConfig } from "../config/types.js";
 import { runMigrations } from "../db/migrations/runner.js";
 import { InboxRepository } from "../db/repositories/inbox-repository.js";
+import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { ModelClassRepository } from "../db/repositories/model-class-repository.js";
+import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import {
   fillModelConfigFromCurrent,
@@ -260,6 +262,11 @@ describe("agent-execution MCP server", () => {
           holder = targetActorId;
           return "session-a";
         },
+        revertActiveSessionTransfer: (sessionId, fromActorId, targetActorId) => {
+          expect(sessionId).toBe("session-a");
+          expect(holder).toBe(targetActorId);
+          holder = fromActorId;
+        },
         notifySessionTransferred: (sessionId, targetActorId) =>
           controls.push([sessionId, targetActorId]),
       },
@@ -292,6 +299,94 @@ describe("agent-execution MCP server", () => {
       priority: "responsive",
       sessionId: "session-a",
     });
+  });
+
+  it("gives a SQLite-backed transfer recipient a lease-scoped reply tool and session", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const actors = new SqliteActorRepository(db);
+    const inboxStore = new InboxRepository(db);
+    const chat = new MeshChatRepository(db);
+    let holder = "";
+    const mesh = new ActorMesh({
+      actors,
+      inboxStore,
+      recordChat: (entry) => chat.record(entry),
+      voiceSessionTransfer: {
+        activeSessionIdFor: (actorId) => {
+          if (actorId !== holder) throw new Error("caller does not hold an active voice session");
+          return "transferred-session";
+        },
+        transferActiveSession: (fromActorId, targetActorId) => {
+          if (fromActorId !== holder)
+            throw new Error("caller does not hold an active voice session");
+          holder = targetActorId;
+          return "transferred-session";
+        },
+        revertActiveSessionTransfer: (sessionId, fromActorId, targetActorId) => {
+          expect(sessionId).toBe("transferred-session");
+          expect(holder).toBe(targetActorId);
+          holder = fromActorId;
+        },
+        notifySessionTransferred: () => {},
+      },
+      createActor: () => ({}) as unknown as Actor,
+    });
+    const liveActor = (id: string) =>
+      ({
+        id,
+        requestRun: () => {},
+        declareYield: () => {},
+        markUnkillable: () => {},
+        close: () => {},
+        isRunning: false,
+        preemptForResponsive: () => ({ preempted: false as const }),
+      }) as unknown as Actor;
+    const root: ActorRecord = {
+      id: "root",
+      charter: "root",
+      parentId: null,
+      isRoot: true,
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    const source: ActorRecord = {
+      id: "source",
+      charter: "source",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-01-01T00:00:01.000Z",
+    };
+    const target: ActorRecord = {
+      id: "target",
+      charter: "target",
+      parentId: "source",
+      status: "active",
+      createdAt: "2026-01-01T00:00:02.000Z",
+    };
+    mesh.adopt(root, liveActor(root.id));
+    mesh.adopt(source, liveActor(source.id));
+    mesh.adopt(target, liveActor(target.id));
+    actors.patch(source.id, { handles: [{ id: target.id }] });
+    holder = source.id;
+
+    mesh.transferVoiceSession(source.id, target.id);
+    expect(actors.get(target.id)?.humanUnlocked).toBeUndefined();
+
+    const client = await connect(createAgentExecMcpServer(mesh, target.id, root.id));
+    const { tools } = await client.listTools();
+    expect(tools.map((tool) => tool.name)).toContain("reply");
+
+    const reply = (await client.callTool({
+      name: "reply",
+      arguments: { message: "I have the call." },
+    })) as CallToolResult;
+    expect(reply.isError).not.toBe(true);
+    expect(
+      chat
+        .listForSession("transferred-session", { limit: 10 })
+        .find((entry) => entry.senderId === target.id)
+    ).toMatchObject({ recipientId: "human:operator", sessionId: "transferred-session" });
   });
 
   it("describes live capability grants as effective on the next run", async () => {
