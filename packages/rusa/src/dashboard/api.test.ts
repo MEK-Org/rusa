@@ -1135,14 +1135,12 @@ describe("handleMeshApiRequest", () => {
           position: 0,
           estimatedStartAt: "2026-06-21T00:00:10.000Z",
           pacingIntervalMs: 36_000_000,
-          blocker: "provider-pacing" as const,
         },
         {
           threadId: UUID_B,
           position: 1,
           estimatedStartAt: "2026-06-21T00:00:20.000Z",
           pacingIntervalMs: 36_000_000,
-          blocker: "provider-pacing" as const,
         },
       ],
     };
@@ -1153,15 +1151,12 @@ describe("handleMeshApiRequest", () => {
     expect(byId(UUID_A).queuePosition).toBe(0);
     expect(byId(UUID_A).estimatedStartAt).toBe("2026-06-21T00:00:10.000Z");
     expect(byId(UUID_A).pacingIntervalMs).toBe(36_000_000);
-    expect(byId(UUID_A).queueBlocker).toBe("provider-pacing");
     expect(byId(UUID_B).queuePosition).toBe(1);
     expect(byId(UUID_B).estimatedStartAt).toBe("2026-06-21T00:00:20.000Z");
     expect(byId(UUID_B).pacingIntervalMs).toBe(36_000_000);
-    expect(byId(UUID_B).queueBlocker).toBe("provider-pacing");
     expect(byId("root").queuePosition).toBeNull();
     expect(byId("root").estimatedStartAt).toBeNull();
     expect(byId("root").pacingIntervalMs).toBeNull();
-    expect(byId("root").queueBlocker).toBeNull();
   });
 
   it("GET /api/mesh/threads keeps each provider lane's queue position independent", async () => {
@@ -1173,8 +1168,18 @@ describe("handleMeshApiRequest", () => {
     deps = {
       ...deps,
       providerQueueSnapshots: () => [
-        { threadId: UUID_A, position: 0, estimatedStartAt: "2026-06-21T00:00:05.000Z" },
-        { threadId: UUID_B, position: 0, estimatedStartAt: "2026-06-21T00:01:00.000Z" },
+        {
+          threadId: UUID_A,
+          position: 0,
+          estimatedStartAt: "2026-06-21T00:00:05.000Z",
+          pacingIntervalMs: 5_000,
+        },
+        {
+          threadId: UUID_B,
+          position: 0,
+          estimatedStartAt: "2026-06-21T00:01:00.000Z",
+          pacingIntervalMs: 60_000,
+        },
       ],
     };
 
@@ -1194,8 +1199,8 @@ describe("handleMeshApiRequest", () => {
     deps = {
       ...deps,
       providerQueueSnapshots: () => [
-        { threadId: UUID_A, position: 0, estimatedStartAt: null },
-        { threadId: UUID_B, position: 1, estimatedStartAt: null },
+        { threadId: UUID_A, position: 0, estimatedStartAt: null, pacingIntervalMs: 10_000 },
+        { threadId: UUID_B, position: 1, estimatedStartAt: null, pacingIntervalMs: 10_000 },
       ],
     };
 
@@ -1217,7 +1222,9 @@ describe("handleMeshApiRequest", () => {
     let estimatedStartAt = "2026-06-21T00:00:10.000Z";
     deps = {
       ...deps,
-      providerQueueSnapshots: () => [{ threadId: UUID_A, position: 0, estimatedStartAt }],
+      providerQueueSnapshots: () => [
+        { threadId: UUID_A, position: 0, estimatedStartAt, pacingIntervalMs: 10_000 },
+      ],
     };
 
     const first = await call(deps, "GET", "/api/mesh/threads");

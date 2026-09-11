@@ -1305,7 +1305,7 @@ class DashboardStore {
         // is only a sequenced request to replace the thread snapshot and pick
         // up (or clear) the active run's selected obligation. A new queued
         // card or another state change while cards remain queued also needs an
-        // immediate authoritative pacing/blocker refresh; the queued-only poll
+        // immediate authoritative pacing/estimate refresh; the queued-only poll
         // below covers pacer changes that have no runtime-state delta at all.
         // Keep this delta for the sync drain: an API snapshot that raced its
         // SSE frame must not briefly restore the older run state while we ask

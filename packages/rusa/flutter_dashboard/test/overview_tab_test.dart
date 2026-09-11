@@ -460,7 +460,6 @@ void main() {
               runState: RunState.queued,
               estimatedStartAt: '2026-01-01T00:00:30.000Z',
               pacingIntervalMs: 36000000,
-              queueBlocker: 'provider-pacing',
             ),
             makeThread(
               'early',
@@ -468,15 +467,31 @@ void main() {
               runState: RunState.queued,
               estimatedStartAt: '2026-01-01T00:00:10.000Z',
               pacingIntervalMs: 36000000,
-              queueBlocker: 'provider-pacing',
             ),
+            // A lane with no pacing gap whose clock was pushed out by an
+            // explicit deferral: quote the estimate, never "every 0s".
+            makeThread(
+              'deferred',
+              parent: 'root',
+              runState: RunState.queued,
+              estimatedStartAt: '2026-01-01T00:00:20.000Z',
+              pacingIntervalMs: 0,
+            ),
+            // No estimate at position 0 is the staged head holding for a
+            // mesh concurrency slot; position 1 is the request behind it.
             makeThread(
               'unknown',
               parent: 'root',
               runState: RunState.queued,
-              queuePosition: 2,
+              queuePosition: 0,
               pacingIntervalMs: 36000000,
-              queueBlocker: 'mesh-concurrency',
+            ),
+            makeThread(
+              'behind',
+              parent: 'root',
+              runState: RunState.queued,
+              queuePosition: 1,
+              pacingIntervalMs: 36000000,
             ),
           ];
         final store = DashboardStore(api: api, stream: FakeStream());
@@ -486,7 +501,7 @@ void main() {
         await tester.pump();
         await tester.pump();
 
-        expect(find.text('3 queued'), findsOneWidget);
+        expect(find.text('5 queued'), findsOneWidget);
         expect(
           find.text(
             'Provider pacing every 10.0h; '
@@ -502,18 +517,34 @@ void main() {
           findsOneWidget,
         );
         expect(
+          find.text('Estimated start ${formatTs('2026-01-01T00:00:20.000Z')}'),
+          findsOneWidget,
+        );
+        expect(
           find.text(
             'Waiting for mesh concurrency; provider pacing every 10.0h.',
           ),
           findsOneWidget,
         );
+        expect(
+          find.text(
+            'Lane position 2; behind a request waiting for mesh concurrency; '
+            'provider pacing every 10.0h.',
+          ),
+          findsOneWidget,
+        );
 
-        // Rendered in estimated run order: early, then late, then unknown.
+        // Rendered in estimated run order: early, deferred, late, then the
+        // unknown-ETA entries by lane position.
         final earlyY = tester.getTopLeft(find.text('early-handle')).dy;
+        final deferredY = tester.getTopLeft(find.text('deferred-handle')).dy;
         final lateY = tester.getTopLeft(find.text('late-handle')).dy;
         final unknownY = tester.getTopLeft(find.text('unknown-handle')).dy;
-        expect(earlyY, lessThan(lateY));
+        final behindY = tester.getTopLeft(find.text('behind-handle')).dy;
+        expect(earlyY, lessThan(deferredY));
+        expect(deferredY, lessThan(lateY));
         expect(lateY, lessThan(unknownY));
+        expect(unknownY, lessThan(behindY));
         await store.dispose();
       });
     },

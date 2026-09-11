@@ -114,7 +114,6 @@ class ThreadDto {
     this.queuePosition,
     this.estimatedStartAt,
     this.pacingIntervalMs,
-    this.queueBlocker,
     this.ownerExpectsRetirement,
     this.selectedObligation,
     this.voiceName,
@@ -192,11 +191,10 @@ class ThreadDto {
   /// scheduler can't honestly quote one yet (e.g. behind a staged run).
   final String? estimatedStartAt;
 
-  /// Current normal-start spacing for this actor's provider lane.
+  /// Whole-millisecond start spacing on this actor's provider lane, or null
+  /// when the actor is not in a pacer queue. Zero means the lane has no
+  /// pacing gap, so any future [estimatedStartAt] is an explicit deferral.
   final int? pacingIntervalMs;
-
-  /// The live gate this request is waiting behind, when the scheduler knows it.
-  final String? queueBlocker;
   final bool? ownerExpectsRetirement;
 
   /// The active run's durable inbox focus, if it resolved to an obligation.
@@ -237,7 +235,6 @@ class ThreadDto {
     int? queuePosition,
     String? estimatedStartAt,
     int? pacingIntervalMs,
-    String? queueBlocker,
     bool? ownerExpectsRetirement,
     Object? selectedObligation = _keepThreadField,
     Object? voiceName = _keepThreadField,
@@ -282,7 +279,6 @@ class ThreadDto {
     queuePosition: queuePosition ?? this.queuePosition,
     estimatedStartAt: estimatedStartAt ?? this.estimatedStartAt,
     pacingIntervalMs: pacingIntervalMs ?? this.pacingIntervalMs,
-    queueBlocker: queueBlocker ?? this.queueBlocker,
     ownerExpectsRetirement:
         ownerExpectsRetirement ?? this.ownerExpectsRetirement,
     selectedObligation: identical(selectedObligation, _keepThreadField)
@@ -330,12 +326,10 @@ class ThreadDto {
     waitingOn: j['waitingOn'] as String?,
     queuePosition: j['queuePosition'] as int?,
     estimatedStartAt: j['estimatedStartAt'] as String?,
-    // The controller's stored interval is a REAL, so JSON can carry a
-    // fractional millisecond. The dashboard only renders whole milliseconds;
-    // round to the nearest one at this wire boundary rather than rejecting an
-    // otherwise valid queued card.
+    // The server rounds this to a whole millisecond, but the value is derived
+    // from a REAL, so decode through num rather than let one fractional
+    // number reject the entire thread snapshot.
     pacingIntervalMs: (j['pacingIntervalMs'] as num?)?.round(),
-    queueBlocker: j['queueBlocker'] as String?,
     ownerExpectsRetirement: j['ownerExpectsRetirement'] as bool?,
     selectedObligation: j['selectedObligation'] is Map
         ? ObligationDto.fromJson(
@@ -464,7 +458,6 @@ class ActorViewState {
   int? get queuePosition => thread.queuePosition;
   String? get estimatedStartAt => thread.estimatedStartAt;
   int? get pacingIntervalMs => thread.pacingIntervalMs;
-  String? get queueBlocker => thread.queueBlocker;
   bool? get ownerExpectsRetirement => thread.ownerExpectsRetirement;
   ObligationDto? get selectedObligation => thread.selectedObligation;
 

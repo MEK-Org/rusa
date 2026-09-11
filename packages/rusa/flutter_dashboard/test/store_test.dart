@@ -88,8 +88,9 @@ void main() {
         makeThread(
           'a',
           runState: RunState.queued,
+          queuePosition: 0,
+          estimatedStartAt: '2026-01-01T00:00:10.000Z',
           pacingIntervalMs: 9001,
-          queueBlocker: 'provider-pacing',
         ),
       ];
       stream.runtimeStatesCtrl.add(_runtime(1, 'a', RunState.queued));
@@ -97,7 +98,10 @@ void main() {
 
       expect(api.threadsCallCount, 2);
       expect(store.actor('a')?.thread.pacingIntervalMs, 9001);
-      expect(store.actor('a')?.thread.queueBlocker, 'provider-pacing');
+      expect(
+        store.actor('a')?.thread.estimatedStartAt,
+        '2026-01-01T00:00:10.000Z',
+      );
       await store.dispose();
     },
   );
@@ -110,8 +114,9 @@ void main() {
           makeThread(
             'a',
             runState: RunState.queued,
+            queuePosition: 0,
+            estimatedStartAt: '2026-01-01T00:00:10.000Z',
             pacingIntervalMs: 9001,
-            queueBlocker: 'provider-pacing',
           ),
         ];
       final store = DashboardStore(api: api, stream: FakeStream());
@@ -119,12 +124,14 @@ void main() {
       async.flushMicrotasks();
 
       expect(api.threadsCallCount, 1);
+      // The pacer re-tuned its interval and staged the head for mesh
+      // concurrency (estimate withdrawn) with no run-state transition.
       api.threadsResult = [
         makeThread(
           'a',
           runState: RunState.queued,
+          queuePosition: 0,
           pacingIntervalMs: 12002,
-          queueBlocker: 'mesh-concurrency',
         ),
       ];
 
@@ -133,7 +140,7 @@ void main() {
 
       expect(api.threadsCallCount, 2);
       expect(store.actor('a')?.thread.pacingIntervalMs, 12002);
-      expect(store.actor('a')?.thread.queueBlocker, 'mesh-concurrency');
+      expect(store.actor('a')?.thread.estimatedStartAt, isNull);
 
       unawaited(store.dispose());
       async.flushMicrotasks();

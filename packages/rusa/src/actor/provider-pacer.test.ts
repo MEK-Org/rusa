@@ -99,6 +99,22 @@ describe("ProviderPacer", () => {
     expect(pacer.waiting).toBe(0);
   });
 
+  it("quotes the pacing interval as whole milliseconds even when the controller set a fraction", () => {
+    const mesh = new ConcurrencyLimiter(1);
+    // The adaptive controller persists a REAL interval, so `setInterval`
+    // legitimately receives fractional milliseconds; the snapshot must still
+    // put an integer on the wire.
+    const pacer = new ProviderPacer(2_159_335.7, () => Date.now());
+    pacer.submit(async () => "queued", {
+      threadId: "queued-thread",
+      enqueueNormal: (fn) => mesh.enqueue(fn),
+    });
+
+    const [entry] = pacer.getQueueSnapshot();
+    expect(entry?.pacingIntervalMs).toBe(2_159_336);
+    expect(Number.isInteger(entry?.pacingIntervalMs)).toBe(true);
+  });
+
   it("reports FIFO positions and compounding ETAs for the queued lane", async () => {
     const base = Date.now();
     const mesh = new ConcurrencyLimiter(1);
@@ -120,14 +136,12 @@ describe("ProviderPacer", () => {
         position: 0,
         estimatedStartAt: base + 10_000,
         pacingIntervalMs: 10_000,
-        blocker: "provider-pacing",
       },
       {
         threadId: "following-thread",
         position: 1,
         estimatedStartAt: base + 20_000,
         pacingIntervalMs: 10_000,
-        blocker: "provider-pacing",
       },
     ]);
   });
@@ -157,14 +171,12 @@ describe("ProviderPacer", () => {
         position: 0,
         estimatedStartAt: null,
         pacingIntervalMs: 10_000,
-        blocker: "mesh-concurrency",
       },
       {
         threadId: "following-thread",
         position: 1,
         estimatedStartAt: null,
         pacingIntervalMs: 10_000,
-        blocker: "provider-pacing",
       },
     ]);
 
@@ -176,7 +188,6 @@ describe("ProviderPacer", () => {
         position: 0,
         estimatedStartAt: base + 10_000,
         pacingIntervalMs: 10_000,
-        blocker: "provider-pacing",
       },
     ]);
 
@@ -201,7 +212,6 @@ describe("ProviderPacer", () => {
         position: 0,
         estimatedStartAt: base + 5_000,
         pacingIntervalMs: 0,
-        blocker: "provider-pacing",
       },
     ]);
     await vi.advanceTimersByTimeAsync(4_999);

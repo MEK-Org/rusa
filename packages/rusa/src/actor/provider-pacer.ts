@@ -84,11 +84,13 @@ export class ProviderPacer {
    *   recomputes `nextAvailableAt` — the current value could already be
    *   stale. Callers must render `null` as "unknown", never fabricate a
    *   time.
-   * - `pacingIntervalMs` is the lane's current normal-start spacing.
-   *   `blocker` distinguishes a request still waiting for that pacing gate
-   *   from the staged head that has passed pacing and is waiting for mesh
-   *   concurrency. A request behind a staged head remains `provider-pacing`:
-   *   it cannot receive a reliable ETA until that start sets the next clock.
+   * - `pacingIntervalMs` is the lane's current normal-start spacing, rounded
+   *   to a whole millisecond here so the wire value is always an integer
+   *   (the adaptive controller stores a REAL). `0` means no pacing gap: a
+   *   future `estimatedStartAt` on such a lane comes from `deferUntil`.
+   * - The gate is derivable, not a separate field: `estimatedStartAt` is
+   *   `null` only while a staged head (position 0) holds for mesh
+   *   concurrency, and every later entry is then behind that head.
    * - Requests submitted without a `threadId` are omitted from the
    *   returned entries (nothing to key them by) but still consume a
    *   `position`, so surviving entries keep their true FIFO position.
@@ -97,18 +99,16 @@ export class ProviderPacer {
     threadId: string;
     position: number;
     estimatedStartAt: number | null;
-    /** Current normal-start spacing for this lane. */
+    /** Current normal-start spacing for this lane, in whole milliseconds. */
     pacingIntervalMs: number;
-    /** The gate this request is currently waiting behind. */
-    blocker: "provider-pacing" | "mesh-concurrency";
   }> {
     const snapshot: Array<{
       threadId: string;
       position: number;
       estimatedStartAt: number | null;
       pacingIntervalMs: number;
-      blocker: "provider-pacing" | "mesh-concurrency";
     }> = [];
+    const pacingIntervalMs = Math.round(this.intervalMs);
     let position = 0;
     let eta: number | null = this.staged ? null : this.nextAvailableAt;
 
@@ -118,8 +118,7 @@ export class ProviderPacer {
           threadId: this.staged.opts.threadId,
           position,
           estimatedStartAt: null,
-          pacingIntervalMs: this.intervalMs,
-          blocker: "mesh-concurrency",
+          pacingIntervalMs,
         });
       }
       position++;
@@ -131,8 +130,7 @@ export class ProviderPacer {
           threadId: request.opts.threadId,
           position,
           estimatedStartAt: eta,
-          pacingIntervalMs: this.intervalMs,
-          blocker: "provider-pacing",
+          pacingIntervalMs,
         });
       }
       position++;

@@ -387,7 +387,7 @@ void main() {
   });
 
   group('ThreadDto queue pacing', () {
-    test('deserializes the current pacing interval and live blocking gate', () {
+    test('deserializes the current pacing interval', () {
       final thread = ThreadDto.fromJson({
         'id': 'synthetic-queued',
         'handle': 'synthetic-queued',
@@ -399,11 +399,9 @@ void main() {
         'createdAt': '2026-01-01T00:00:00.000Z',
         'runState': 'queued',
         'pacingIntervalMs': 36000000,
-        'queueBlocker': 'provider-pacing',
       });
 
       expect(thread.pacingIntervalMs, 36000000);
-      expect(thread.queueBlocker, 'provider-pacing');
     });
 
     test('rounds a fractional wire interval to the nearest millisecond', () {
