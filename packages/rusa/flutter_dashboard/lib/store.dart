@@ -533,14 +533,32 @@ class DashboardStore {
 
   /// Replace the normalized actor-state snapshot from one authoritative server
   /// capture. Buffered deltas are applied only after its runtime cursor.
-  void _updateActorStatesFromThreads(List<ThreadDto> threads) {
+  void _updateActorStatesFromThreads(
+    List<ThreadDto> threads, {
+    bool preserveLiveRunStates = false,
+  }) {
     final cur = _actorStates.value;
     final updatedActors = <String, ActorViewState>{};
     final orderedIds = <String>[];
 
     for (final t in threads) {
       orderedIds.add(t.id);
-      updatedActors[t.id] = ActorViewState(thread: t, runState: t.runState);
+      final existing = cur.actors[t.id];
+      final runState =
+          (preserveLiveRunStates && existing != null)
+              ? existing.runState
+              : t.runState;
+      final clearsSelectedObligation =
+          runState == RunState.idle || runState == RunState.queued;
+      final selectedObligation =
+          clearsSelectedObligation ? null : t.selectedObligation;
+      updatedActors[t.id] = ActorViewState(
+        thread: t.copyWith(
+          runState: runState,
+          selectedObligation: selectedObligation,
+        ),
+        runState: runState,
+      );
     }
 
     _actorStates.add(
@@ -1307,10 +1325,6 @@ class DashboardStore {
         // card or another state change while cards remain queued also needs an
         // immediate authoritative pacing/estimate refresh; the queued-only poll
         // below covers pacer changes that have no runtime-state delta at all.
-        // Keep this delta for the sync drain: an API snapshot that raced its
-        // SSE frame must not briefly restore the older run state while we ask
-        // it for the newer pacing fields.
-        if (refreshQueuePacing) _bufferRuntimeState(delta);
         unawaited(_requestRuntimeSync());
       }
       return;
@@ -1391,7 +1405,16 @@ class DashboardStore {
       _halted.add(snap.halted);
       _schedulerWarning.add(snap.schedulerWarning);
       _supportedVoices.add(snap.supportedVoices);
-      _updateActorStatesFromThreads(snap.threads);
+      final cursor = _runtimeCursor;
+      final isStaleSnap =
+          cursor != null &&
+          snap.runtimeCursor != null &&
+          snap.runtimeCursor!.streamId == cursor.streamId &&
+          snap.runtimeCursor!.revision < cursor.revision;
+      _updateActorStatesFromThreads(
+        snap.threads,
+        preserveLiveRunStates: isStaleSnap,
+      );
       // Server truth has landed: the snapshot above REPLACED the seeded rows
       // wholesale, so an actor the server no longer lists is gone from the tree
       // by construction. What replacement can't undo on its own is a selection
@@ -1400,7 +1423,9 @@ class DashboardStore {
       _pruneSelectionToKnownActors();
       _actorsStale.add(false);
       _persistActorHierarchy(snap.threads);
-      _runtimeCursor = snap.runtimeCursor;
+      if (!isStaleSnap) {
+        _runtimeCursor = snap.runtimeCursor;
+      }
       _error.add(null);
       if (!_drainRuntimeBuffer()) _runtimeSyncAgain = true;
     }
