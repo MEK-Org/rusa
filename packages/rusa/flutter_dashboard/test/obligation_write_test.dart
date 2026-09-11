@@ -844,7 +844,15 @@ void main() {
           ownerId: 'actor-a',
           intent: 'Third child',
         );
-        api.obligationsResult = [root, first, second, third];
+        // This is intentionally not a sibling of the rows being dragged.
+        // The reorder endpoint validates neighbors against the owner's whole
+        // ready queue, so a visual sibling insertion must use it as a bound.
+        final interleaved = makeObligation(
+          'interleaved',
+          ownerId: 'actor-a',
+          intent: 'Separate root',
+        );
+        api.obligationsResult = [root, first, interleaved, second, third];
         store.saveWorkExpanded({'root'});
 
         await tester.pumpWidget(
@@ -891,6 +899,24 @@ void main() {
           Draggable<ObligationDto>,
           'Third child',
         );
+        final afterFirst = await tester.startGesture(
+          tester.getCenter(thirdDraggable),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        await afterFirst.moveTo(
+          tester.getBottomLeft(firstTarget) + const Offset(20, -3),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        await afterFirst.up();
+        await tester.pumpAndSettle();
+
+        expect(api.reorderCalls.last, (
+          id: 'third',
+          previousId: 'first',
+          nextId: 'interleaved',
+          scope: 'subtree',
+        ));
+
         final reparent = await tester.startGesture(
           tester.getCenter(thirdDraggable),
         );
@@ -901,6 +927,77 @@ void main() {
         await tester.pumpAndSettle();
 
         expect(api.reparentCalls, [(id: 'third', parentId: 'first')]);
+      },
+    );
+
+    testWidgets(
+      'rejects dropping an ancestor onto its descendant but allows promotion',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 900);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.resetDevicePixelRatio);
+        addTearDown(tester.view.resetPhysicalSize);
+
+        final root = makeObligation('root', intent: 'Root');
+        final parent = makeObligation(
+          'parent',
+          parentId: 'root',
+          intent: 'Parent',
+        );
+        final child = makeObligation(
+          'child',
+          parentId: 'parent',
+          intent: 'Child',
+        );
+        api.obligationsResult = [root, parent, child];
+        store.saveWorkExpanded({'root', 'parent'});
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final parentDraggable = find.widgetWithText(
+          Draggable<ObligationDto>,
+          'Parent',
+        );
+        final childTarget = find.widgetWithText(
+          DragTarget<ObligationDto>,
+          'Child',
+        );
+        final rootTarget = find.widgetWithText(
+          DragTarget<ObligationDto>,
+          'Root',
+        );
+
+        final cycle = await tester.startGesture(
+          tester.getCenter(parentDraggable),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        await cycle.moveTo(tester.getCenter(childTarget));
+        await tester.pump(const Duration(milliseconds: 50));
+        await cycle.up();
+        await tester.pumpAndSettle();
+        expect(api.reparentCalls, isEmpty);
+
+        final childDraggable = find.widgetWithText(
+          Draggable<ObligationDto>,
+          'Child',
+        );
+        final promote = await tester.startGesture(
+          tester.getCenter(childDraggable),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        await promote.moveTo(tester.getCenter(rootTarget));
+        await tester.pump(const Duration(milliseconds: 50));
+        await promote.up();
+        await tester.pumpAndSettle();
+
+        expect(api.reparentCalls, [(id: 'child', parentId: 'root')]);
       },
     );
   });

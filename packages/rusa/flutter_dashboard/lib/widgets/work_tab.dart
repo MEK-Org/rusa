@@ -130,21 +130,28 @@ class _WorkTabState extends State<WorkTab> {
     return null;
   }
 
-  List<ObligationDto>? _siblingsFor(
-    String id, [
-    List<ObligationTreeDto>? nodes,
-  ]) {
-    final current = nodes ?? _rootTrees;
-    if (current.any((node) => node.obligation.id == id)) {
-      return current.map((node) => node.obligation).toList();
+  /// Reads the same complete, priority-sorted ready queue that the reorder
+  /// endpoint uses to validate adjacent neighbors. The visible tree is not a
+  /// queue: ready work owned by the same actor can be interleaved under other
+  /// parents, so deriving neighbors from siblings makes valid drops fail.
+  Future<List<ObligationDto>> _readyQueueForOwner(String ownerId) async {
+    const pageSize = 100;
+    final queue = <ObligationDto>[];
+    var offset = 0;
+    while (true) {
+      final page = await widget.store.api.fetchObligations(
+        ownerId: ownerId,
+        status: 'ready',
+        limit: pageSize,
+        offset: offset,
+      );
+      queue.addAll(page.obligations);
+      if (!page.hasMore || page.obligations.isEmpty) return queue;
+      offset += page.obligations.length;
     }
-    for (final node in current) {
-      final found = _siblingsFor(id, node.children);
-      if (found != null) return found;
-    }
-    return null;
   }
 
+  /// True when [candidateId] is in [ancestorId]'s loaded subtree.
   bool _isObligationDescendant(String candidateId, String ancestorId) {
     final candidate = _findTree(candidateId);
     if (candidate == null) return false;
@@ -164,7 +171,7 @@ class _WorkTabState extends State<WorkTab> {
     if (dragged.id == target.id ||
         dragged.isTerminal ||
         target.isTerminal ||
-        _isObligationDescendant(target.id, dragged.id)) {
+        _isObligationDescendant(dragged.id, target.id)) {
       return false;
     }
     if (zone == HierarchyDropZone.on) return true;
@@ -189,27 +196,17 @@ class _WorkTabState extends State<WorkTab> {
         _expandedIds.add(target.id);
         widget.store.saveWorkExpanded(_expandedIds);
       } else {
-        final siblings = _siblingsFor(target.id)
-            ?.where(
-              (o) =>
-                  o.status == 'ready' &&
-                  o.ownerId == dragged.ownerId &&
-                  !o.isTerminal,
-            )
-            .toList();
-        if (siblings == null) return;
-        siblings.removeWhere((o) => o.id == dragged.id);
-        final targetIndex = siblings.indexWhere((o) => o.id == target.id);
+        final queue = await _readyQueueForOwner(dragged.ownerId);
+        queue.removeWhere((o) => o.id == dragged.id);
+        final targetIndex = queue.indexWhere((o) => o.id == target.id);
         if (targetIndex < 0) return;
         final insertIndex = zone == HierarchyDropZone.before
             ? targetIndex
             : targetIndex + 1;
-        final previousId = insertIndex == 0
+        final previousId = insertIndex == 0 ? null : queue[insertIndex - 1].id;
+        final nextId = insertIndex == queue.length
             ? null
-            : siblings[insertIndex - 1].id;
-        final nextId = insertIndex == siblings.length
-            ? null
-            : siblings[insertIndex].id;
+            : queue[insertIndex].id;
         await widget.store.api.reorderObligation(
           dragged.id,
           previousId: previousId,

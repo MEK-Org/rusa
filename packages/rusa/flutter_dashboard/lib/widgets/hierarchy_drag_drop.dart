@@ -25,6 +25,9 @@ HierarchyDropZone classifyHierarchyDropZone({
 /// A generic Flutter drag target with common zone selection and feedback.
 /// Consumers own their acceptance rules and persistence callbacks; keeping
 /// those here would blur the very different actor and obligation invariants.
+/// [onDrop] is intentionally fire-and-forget so a successful drop can clear
+/// its feedback immediately; consumers must catch, surface, and recover from
+/// their own mutation errors in the callback.
 class HierarchyDropTarget<T extends Object> extends StatefulWidget {
   const HierarchyDropTarget({
     super.key,

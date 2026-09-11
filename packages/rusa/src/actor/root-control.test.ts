@@ -348,18 +348,17 @@ describe("RootControlService", () => {
     });
   });
 
-  it("refuses a root or foreign actor before asking the mesh to reparent it", () => {
-    const { mesh, service } = setup({
-      mesh: {
-        ...setup().mesh,
-        isAncestorOf: vi.fn((_, id) => id !== "foreign"),
-      },
-    });
+  it("refuses a root, foreign actor, or foreign destination before asking the mesh to reparent it", () => {
+    const { mesh, service } = setup();
+    vi.mocked(mesh.isAncestorOf).mockImplementation((_, id) => id !== "foreign");
 
     expect(() => service.reparentChild("root", "worker-2", "human:operator")).toThrow(
       /root descendants/
     );
     expect(() => service.reparentChild("foreign", "worker-2", "human:operator")).toThrow(
+      /root descendants/
+    );
+    expect(() => service.reparentChild("worker-1", "foreign", "human:operator")).toThrow(
       /root descendants/
     );
     expect(mesh.reparentThread).not.toHaveBeenCalled();
