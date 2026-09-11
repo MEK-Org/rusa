@@ -149,6 +149,10 @@ class _DashboardBodyState extends State<DashboardBody> {
           builder: (context, snap) {
             final inActorDetail =
                 _view == DashboardView.actors && snap.data != null;
+            // A nested Scaffold of our own: the drawer has to hang off a
+            // Scaffold, and this body is rendered directly — without main.dart's
+            // — by the screenshot harness and the widget tests, so owning one
+            // keeps the drawer (and this file) VM-safe.
             return Scaffold(
               key: _scaffoldKey,
               backgroundColor: MeshColors.bgPrimary,
@@ -380,7 +384,9 @@ class _ActorsBody extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             ActorTree(store: store),
-            Expanded(child: DetailPanel(store: store, onSelectView: onSelectView)),
+            Expanded(
+              child: DetailPanel(store: store, onSelectView: onSelectView),
+            ),
           ],
         );
       },
