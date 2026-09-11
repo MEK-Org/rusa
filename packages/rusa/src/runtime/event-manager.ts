@@ -121,6 +121,18 @@ export interface NormalizedIntegrationEvent {
   eventSummary?: string;
 }
 
+/**
+ * What one external event durably produced. `entries` is the append result in
+ * delivery order; `ownerIds` is the ladder's own answer to who the effective
+ * owners were, so the after-commit wake can tell an owner's copy from a
+ * subscriber's without re-routing. A non-owner recipient's copy is an ordinary
+ * responsive wake: it must not abort a run that event does not belong to.
+ */
+export interface DurableEventDelivery {
+  entries: readonly InboxEntry[];
+  ownerIds: readonly string[];
+}
+
 export interface EventSourceRecipients {
   /**
    * True only when a directive named a live actor and that actor became the
@@ -628,9 +640,9 @@ export class EventManager {
    * inbox rows. Actors are not invoked here; downstream components respond to
    * durable changes.
    */
-  handleExternalEvent(raw: RawIntegrationEvent): readonly InboxEntry[] {
+  handleExternalEvent(raw: RawIntegrationEvent): DurableEventDelivery {
     const normalized = this.normalizeEvent(raw);
-    if (!normalized) return [];
+    if (!normalized) return { entries: [], ownerIds: [] };
     return this.handleNormalizedEvent(normalized);
   }
 
@@ -639,7 +651,7 @@ export class EventManager {
    * legacy ActorMesh delivery contract without inventing a fourth ingress
    * normalizer branch.
    */
-  handleNormalizedEvent(normalized: NormalizedIntegrationEvent): readonly InboxEntry[] {
+  handleNormalizedEvent(normalized: NormalizedIntegrationEvent): DurableEventDelivery {
     // Normalize once at the durable boundary, before either side effect. The
     // resolver and InboxStore must observe the same canonical key: otherwise a
     // legacy-form ActorMesh delivery routes correctly but writes an inbox row
@@ -674,7 +686,7 @@ export class EventManager {
       // slice, events under it would hit this drop when the delegate dies —
       // still visible here, but the invariant is what keeps that from happening.
       this.log?.(`event not covered by any subscription — dropped (${summary})`);
-      return [];
+      return { entries: [], ownerIds: [] };
     }
 
     const deliverable = applyAuthorSuppression({
@@ -685,7 +697,7 @@ export class EventManager {
       eventSummary: summary,
       log: this.log,
     });
-    if (deliverable.length === 0) return [];
+    if (deliverable.length === 0) return { entries: [], ownerIds: [] };
 
     const newItems: InboxAppendInput[] = deliverable.map((actorId) => ({
       id: normalized.dedupeKey
@@ -708,6 +720,6 @@ export class EventManager {
         throw new Error(`Inbox append returned an unexpected actor: ${entry.actorId}`);
       }
     }
-    return entries;
+    return { entries, ownerIds: recipients.ownerIds };
   }
 }

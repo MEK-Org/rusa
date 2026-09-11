@@ -148,7 +148,7 @@ describe("EventManager", () => {
         commentId: 987654,
       });
 
-      const entries = await em.handleExternalEvent(rawWebhook);
+      const { entries } = await em.handleExternalEvent(rawWebhook);
       expect(entries.length).toBe(1);
       expect(entries[0].source).toBe("github:MEK-Org/rusa/issues/383");
       expect(entries[0].payload.type).toBe("issue_comment.created");
@@ -176,7 +176,7 @@ describe("EventManager", () => {
         },
       };
 
-      const entries = await em.handleExternalEvent(rawPrClosed);
+      const { entries } = await em.handleExternalEvent(rawPrClosed);
       expect(entries.length).toBe(1);
       expect(entries[0].source).toBe("github:MEK-Org/rusa/pulls/380");
       expect(entries[0].payload.type).toBe("pull_request.closed");
@@ -197,7 +197,7 @@ describe("EventManager", () => {
         },
       });
 
-      const entries = await em.handleExternalEvent({
+      const { entries } = await em.handleExternalEvent({
         sourceType: "github",
         rawPayload: {
           event: "check_suite",
@@ -233,7 +233,7 @@ describe("EventManager", () => {
         },
       };
 
-      const entries = await em.handleExternalEvent(rawChat);
+      const { entries } = await em.handleExternalEvent(rawChat);
       expect(entries.length).toBe(1);
       expect(entries[0].source).toBe("gchat:spaces/AAA");
       expect(entries[0].payload).toEqual({
@@ -266,7 +266,7 @@ describe("EventManager", () => {
         idempotencyKey: "timer-1",
       };
 
-      const entries = await em.handleExternalEvent(rawTimer);
+      const { entries } = await em.handleExternalEvent(rawTimer);
       expect(entries.length).toBe(1);
       expect(entries[0].source).toBe("system:events");
       expect(entries[0].payload.type).toBe("timer.wake");
@@ -292,7 +292,7 @@ describe("EventManager", () => {
         rawPayload: { type: "service.deploy", buildId: "b-999" },
       };
 
-      const entries = await em.handleExternalEvent(rawTimer);
+      const { entries } = await em.handleExternalEvent(rawTimer);
       expect(entries.length).toBe(1);
       expect(entries[0].source).toBe("system:events/deploys/b-999");
       expect(entries[0].payload.type).toBe("service.deploy");
@@ -356,7 +356,7 @@ describe("EventManager", () => {
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
 
-      const entries = await em.handleExternalEvent({
+      const { entries } = await em.handleExternalEvent({
         sourceType: "timer",
         rawResource: "system:events",
         rawPayload: { type: "test.event" },
@@ -365,6 +365,46 @@ describe("EventManager", () => {
       expect(entries.length).toBe(3);
       const recipientIds = entries.map((e) => e.actorId).sort();
       expect(recipientIds).toEqual(["owner-actor", "sub-1", "sub-2"]);
+    });
+
+    it("names the resolved owners beside the entries so the wake can preempt only them", async () => {
+      const inbox = new FakeInboxStore();
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
+        resolveRecipients: () => ({
+          directed: false,
+          ownerIds: ["owner-actor"],
+          subscriberIds: ["sub-1"],
+        }),
+      };
+      const em = new EventManager({ inboxStore: inbox, resolver });
+
+      const delivery = await em.handleExternalEvent({
+        sourceType: "timer",
+        rawResource: "system:events",
+        rawPayload: { type: "test.event" },
+      });
+
+      expect(delivery.entries.map((e) => e.actorId)).toEqual(["owner-actor", "sub-1"]);
+      expect(delivery.ownerIds).toEqual(["owner-actor"]);
+    });
+
+    it("reports no owner when routing found only subscribers", async () => {
+      const inbox = new FakeInboxStore();
+      const resolver: EventRoutingKernel = {
+        resolveOwner: unusedLadder,
+        resolveRecipients: () => ({ directed: false, ownerIds: [], subscriberIds: ["sub-1"] }),
+      };
+      const em = new EventManager({ inboxStore: inbox, resolver });
+
+      const delivery = await em.handleExternalEvent({
+        sourceType: "timer",
+        rawResource: "system:events",
+        rawPayload: { type: "test.event" },
+      });
+
+      expect(delivery.entries.map((e) => e.actorId)).toEqual(["sub-1"]);
+      expect(delivery.ownerIds).toEqual([]);
     });
 
     it("deduplicates recipients when an actor is both owner and subscriber", async () => {
@@ -379,7 +419,7 @@ describe("EventManager", () => {
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
 
-      const entries = await em.handleExternalEvent({
+      const { entries } = await em.handleExternalEvent({
         sourceType: "timer",
         rawResource: "system:events",
         rawPayload: { type: "test.event" },
@@ -399,7 +439,7 @@ describe("EventManager", () => {
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
 
-      const entries = await em.handleExternalEvent({
+      const { entries } = await em.handleExternalEvent({
         sourceType: "timer",
         rawResource: "system:events/uncovered/1",
         rawPayload: { type: "test.event" },
@@ -440,10 +480,10 @@ describe("EventManager", () => {
         idempotencyKey: "unique-guid-456",
       };
 
-      const firstPass = await em.handleExternalEvent(event);
+      const { entries: firstPass } = await em.handleExternalEvent(event);
       expect(firstPass.length).toBe(1);
 
-      const secondPass = await em.handleExternalEvent(event);
+      const { entries: secondPass } = await em.handleExternalEvent(event);
       expect(secondPass.length).toBe(0);
 
       expect(inbox.countUnhandled("actor-idemp")).toBe(1);
@@ -464,7 +504,7 @@ describe("EventManager", () => {
       const em = new EventManager({ inboxStore: inbox, resolver });
 
       // Verify no runtime, runner, or execution dispatcher is invoked
-      const entries = await em.handleExternalEvent({
+      const { entries } = await em.handleExternalEvent({
         sourceType: "timer",
         rawResource: "system:events/jobs/1",
         rawPayload: { type: "job.created" },
@@ -641,7 +681,7 @@ describe("EventManager", () => {
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
 
-      const entries = await em.handleExternalEvent({
+      const { entries } = await em.handleExternalEvent({
         sourceType: "timer",
         rawResource: "github:org/repo/issues/1",
         rawPayload: { type: "issue_comment.created" },
@@ -666,7 +706,7 @@ describe("EventManager", () => {
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
 
-      const entries = await em.handleExternalEvent({
+      const { entries } = await em.handleExternalEvent({
         sourceType: "timer",
         rawResource: "system:events",
         rawPayload: { type: "system.event" },
@@ -705,7 +745,7 @@ describe("EventManager", () => {
         resolver: directedResolver({ handle: "cloudy-porpoise", handleId: "uuid-cloudy" }),
       });
 
-      const entries = await em.handleExternalEvent({
+      const { entries } = await em.handleExternalEvent({
         sourceType: "timer",
         rawResource: "github:MEK-Org/rusa/issues/383",
         rawPayload: { type: "issue_comment.created" },
@@ -724,7 +764,7 @@ describe("EventManager", () => {
         resolver: directedResolver({ handle: "cloudy-porpoise", handleId: "uuid-cloudy" }),
       });
 
-      const entries = await em.handleExternalEvent({
+      const { entries } = await em.handleExternalEvent({
         sourceType: "timer",
         rawResource: "github:MEK-Org/rusa/issues/383",
         rawPayload: { type: "issue_comment.created" },
@@ -746,7 +786,7 @@ describe("EventManager", () => {
         resolver: directedResolver({ obligationOwner: "actor-governing" }),
       });
 
-      const entries = await em.handleExternalEvent({
+      const { entries } = await em.handleExternalEvent({
         sourceType: "timer",
         rawResource: "github:MEK-Org/rusa/issues/383",
         rawPayload: { type: "issue_comment.created" },
@@ -820,7 +860,7 @@ describe("EventManager", () => {
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
 
-      const entries = await em.handleExternalEvent({
+      const { entries } = await em.handleExternalEvent({
         sourceType: "timer",
         rawResource: "system:events",
         rawPayload: { type: "test.event" },
@@ -853,7 +893,7 @@ describe("EventManager", () => {
       };
       const em = new EventManager({ inboxStore: inbox, resolver });
 
-      const entries = await em.handleExternalEvent({
+      const { entries } = await em.handleExternalEvent({
         sourceType: "timer",
         rawResource: "system:events",
         rawPayload: { type: "test.event" },
