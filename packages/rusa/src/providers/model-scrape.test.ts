@@ -890,9 +890,27 @@ done
           leakShapeExercised = true;
           break;
         } finally {
+          // A failing run deliberately creates an unreapable server; never let one
+          // escape onto the shared box - and reap the descendant group too, since
+          // that is the residue #84 was actually about.
+          // Both paths go through the guarded helpers: inside a sandbox whose init
+          // is PID 1, a misread group id is not a stray signal, it is this run.
           for (const line of serversFor(sock)) {
             reapProcess(Number(line.trim().split(/\s+/)[0]));
           }
+          // Group ids are recycled, and this one was read tens of seconds ago, so
+          // only signal it while it still holds something this probe started. That
+          // shrinks the window to the gap between the check and the signal rather
+          // than closing it - `ps` is a snapshot, not a lock.
+          // `mockBin` is this run's own mkdtemp path, which is the uniqueness
+          // `groupStillHosts` asks its callers for: as a substring of argv it can
+          // name only processes this test started. It is matched here without the
+          // new-session exclusion paneGroupOf needs, and that asymmetry is
+          // deliberate rather than an oversight to tidy up. tmux setsids the pane
+          // leader, so the server never shares the pane group and the filter would
+          // exclude nothing; and a member of this group that did carry the
+          // server's argv would be probe residue to drain, not to spare. Adding
+          // the exclusion here could only shrink what cleanup reaps.
           if (paneGroup !== undefined && groupStillHosts(paneGroup, mockBin)) {
             reapProcessGroup(paneGroup);
           }
