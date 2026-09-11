@@ -14,16 +14,77 @@ export type CloseOnMergeDirective =
 
 type HtmlComment = { body: string; source: string; terminated: boolean };
 
-const DIRECTIVE_PREFIX = /^mesh:close-on-merge(?=$|[\s:])/i;
+const DIRECTIVE_PREFIX = /^mesh:close-on-merge/i;
 const DIRECTIVE_GRAMMAR = /^mesh:close-on-merge(?:[ \t]+#[1-9]\d*)+[ \t]*$/;
+
+function maskMarkdownCode(body: string): string {
+  const masked = body.split("");
+  const mask = (start: number, end: number) => {
+    for (let index = start; index < end; index++) {
+      if (masked[index] !== "\r" && masked[index] !== "\n") masked[index] = " ";
+    }
+  };
+
+  for (let index = 0; index < body.length; ) {
+    const fence =
+      (index === 0 || body[index - 1] === "\n") &&
+      body.slice(index).match(/^ {0,3}(`{3,}|~{3,})[^\r\n]*(?:\r?\n|$)/);
+    if (fence) {
+      const marker = fence[1];
+      const closing = new RegExp(`^ {0,3}${marker[0]}{${marker.length},}[ \\t]*\\r?$`);
+      let end = index + fence[0].length;
+      while (end < body.length) {
+        const nextLineEnd = body.indexOf("\n", end);
+        const lineEnd = nextLineEnd === -1 ? body.length : nextLineEnd;
+        if (closing.test(body.slice(end, lineEnd))) {
+          end = nextLineEnd === -1 ? lineEnd : nextLineEnd + 1;
+          break;
+        }
+        end = nextLineEnd === -1 ? body.length : nextLineEnd + 1;
+      }
+      mask(index, end);
+      index = end;
+      continue;
+    }
+
+    if (body[index] === "`") {
+      let markerEnd = index;
+      while (body[markerEnd] === "`") markerEnd++;
+      const markerLength = markerEnd - index;
+      let closingStart = markerEnd;
+      while (closingStart < body.length) {
+        if (body[closingStart] !== "`") {
+          closingStart++;
+          continue;
+        }
+        let closingEnd = closingStart;
+        while (body[closingEnd] === "`") closingEnd++;
+        if (closingEnd - closingStart === markerLength) {
+          mask(index, closingEnd);
+          index = closingEnd;
+          break;
+        }
+        closingStart = closingEnd;
+      }
+      if (closingStart >= body.length) index = markerEnd;
+      continue;
+    }
+
+    index++;
+  }
+
+  return masked.join("");
+}
 
 function htmlComments(body: string): HtmlComment[] {
   const comments: HtmlComment[] = [];
+  const executableBody = maskMarkdownCode(body);
   const commentRe = /<!--([\s\S]*?)(-->|$)/g;
-  for (const match of body.matchAll(commentRe)) {
+  for (const match of executableBody.matchAll(commentRe)) {
+    const start = match.index ?? 0;
     comments.push({
       body: match[1],
-      source: match[0],
+      source: body.slice(start, start + match[0].length),
       terminated: match[2] === "-->",
     });
   }

@@ -21,9 +21,11 @@ function recordingIssueClient(
     headSha: "head-sha",
     blocking: [],
   },
-  prDetails: Partial<PullRequestDetails> = {}
+  prDetails: Partial<PullRequestDetails> = {},
+  postMergePrDetails: Partial<PullRequestDetails> = prDetails
 ): { client: IssueClient; calls: Call[] } {
   const calls: Call[] = [];
+  let pullRequestReadCount = 0;
   const client: IssueClient = {
     createIssue: async () => ({ number: 1, htmlUrl: "" }),
     createPullRequest: async () => ({ number: 1, htmlUrl: "" }),
@@ -32,6 +34,7 @@ function recordingIssueClient(
     listIssues: async () => [],
     getPullRequestDetails: async (repo, prNumber) => {
       calls.push({ method: "getPullRequestDetails", args: [repo, prNumber] });
+      const details = pullRequestReadCount++ === 0 ? prDetails : postMergePrDetails;
       return {
         number: 1,
         title: "",
@@ -41,7 +44,7 @@ function recordingIssueClient(
         baseRef: "staging",
         headSha: "details-head-sha",
         state: "",
-        ...prDetails,
+        ...details,
       };
     },
     getPullRequestChecksStatus: async (repo, prNumber) => {
@@ -309,14 +312,15 @@ describe("repo MCP server", () => {
       "getPullRequestDetails",
       "getPullRequestChecksStatus",
       "mergePullRequest",
+      "getPullRequestDetails",
       "closeIssue",
       "postComment",
       "closeIssue",
       "postComment",
     ]);
-    expect(calls[3].args).toEqual(["owner/repo", 114, "completed"]);
-    expect(calls[5].args).toEqual(["owner/repo", 9, "completed"]);
-    const closeComment = calls[4].args[2] as string;
+    expect(calls[4].args).toEqual(["owner/repo", 114, "completed"]);
+    expect(calls[6].args).toEqual(["owner/repo", 9, "completed"]);
+    const closeComment = calls[5].args[2] as string;
     expect(closeComment).toContain("#42");
     expect(parseAuthor(closeComment)).toBe("test-actor-1");
   });
@@ -389,6 +393,52 @@ describe("repo MCP server", () => {
     expect(res.isError).toBeFalsy();
     expect(textOf(res)).toBe("abc123sha");
     expect(calls.map((c) => c.method)).not.toContain("closeIssue");
+  });
+
+  it("does not close from a directive removed while the pull request merges", async () => {
+    const { client: backend, calls } = recordingIssueClient(
+      undefined,
+      { body: "<!-- mesh:close-on-merge #114 -->" },
+      { body: "" }
+    );
+    const client = await connect(createRepoMcpServer("test-actor-1", backend));
+
+    const res = (await client.callTool({
+      name: "merge_pull_request",
+      arguments: { repo: "owner/repo", prNumber: 42 },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toContain("no longer matched the directive read before merge");
+    expect(calls.map((c) => c.method)).toEqual([
+      "getPullRequestDetails",
+      "getPullRequestChecksStatus",
+      "mergePullRequest",
+      "getPullRequestDetails",
+    ]);
+  });
+
+  it("does not close when the pull request is retargeted during the merge", async () => {
+    const { client: backend, calls } = recordingIssueClient(
+      undefined,
+      { body: "<!-- mesh:close-on-merge #114 -->", baseRef: "staging" },
+      { body: "<!-- mesh:close-on-merge #114 -->", baseRef: "master" }
+    );
+    const client = await connect(createRepoMcpServer("test-actor-1", backend));
+
+    const res = (await client.callTool({
+      name: "merge_pull_request",
+      arguments: { repo: "owner/repo", prNumber: 42 },
+    })) as CallToolResult;
+
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toContain("no longer matched the directive read before merge");
+    expect(calls.map((c) => c.method)).toEqual([
+      "getPullRequestDetails",
+      "getPullRequestChecksStatus",
+      "mergePullRequest",
+      "getPullRequestDetails",
+    ]);
   });
 
   it("reports a failed close without failing an already-merged pull request", async () => {

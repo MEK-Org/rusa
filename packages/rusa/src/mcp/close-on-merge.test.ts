@@ -78,10 +78,36 @@ describe("parseCloseOnMergeDirective", () => {
     expect(parsed.kind).toBe("malformed");
   });
 
+  it("fails closed for every HTML comment beginning with the reserved directive name", () => {
+    for (const body of [
+      "<!-- mesh:close-on-merge,#114 -->",
+      "<!-- mesh:close-on-merge-legacy #114 -->",
+      "<!-- mesh:close-on-merge #114 -->\n<!-- mesh:close-on-merge,#9 -->",
+    ]) {
+      expect(parseCloseOnMergeDirective(body).kind, body).toBe("malformed");
+    }
+  });
+
   it("ignores foreign HTML comments", () => {
     expect(parseCloseOnMergeDirective("<!-- other:close-on-merge #114 -->")).toEqual({
       kind: "absent",
     });
+  });
+
+  it("ignores literal directive examples in Markdown code", () => {
+    for (const body of [
+      "```html\n<!-- mesh:close-on-merge #114 -->\n```",
+      "~~~html\n<!-- mesh:close-on-merge #114 -->\n~~~",
+      "Use `<!-- mesh:close-on-merge #114 -->` in the PR body.",
+    ]) {
+      expect(parseCloseOnMergeDirective(body), body).toEqual({ kind: "absent" });
+    }
+
+    expect(
+      parseCloseOnMergeDirective(
+        "```html\n<!-- mesh:close-on-merge #114 -->\n```\n\n<!-- mesh:close-on-merge #9 -->"
+      )
+    ).toEqual({ kind: "close", issueNumbers: [9] });
   });
 
   it("rejects the whole body when a valid directive sits beside a malformed one", () => {
