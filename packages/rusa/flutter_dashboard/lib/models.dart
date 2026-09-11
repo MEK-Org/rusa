@@ -330,7 +330,11 @@ class ThreadDto {
     waitingOn: j['waitingOn'] as String?,
     queuePosition: j['queuePosition'] as int?,
     estimatedStartAt: j['estimatedStartAt'] as String?,
-    pacingIntervalMs: j['pacingIntervalMs'] as int?,
+    // The controller's stored interval is a REAL, so JSON can carry a
+    // fractional millisecond. The dashboard only renders whole milliseconds;
+    // round to the nearest one at this wire boundary rather than rejecting an
+    // otherwise valid queued card.
+    pacingIntervalMs: (j['pacingIntervalMs'] as num?)?.round(),
     queueBlocker: j['queueBlocker'] as String?,
     ownerExpectsRetirement: j['ownerExpectsRetirement'] as bool?,
     selectedObligation: j['selectedObligation'] is Map

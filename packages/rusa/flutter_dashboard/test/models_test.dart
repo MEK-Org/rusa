@@ -405,6 +405,23 @@ void main() {
       expect(thread.pacingIntervalMs, 36000000);
       expect(thread.queueBlocker, 'provider-pacing');
     });
+
+    test('rounds a fractional wire interval to the nearest millisecond', () {
+      final thread = ThreadDto.fromJson({
+        'id': 'synthetic-queued',
+        'handle': 'synthetic-queued',
+        'parentId': 'root',
+        'status': 'active',
+        'provider': 'synthetic-provider',
+        'model': 'synthetic-model',
+        'charterPreview': '',
+        'createdAt': '2026-01-01T00:00:00.000Z',
+        'runState': 'queued',
+        'pacingIntervalMs': 36000000.6,
+      });
+
+      expect(thread.pacingIntervalMs, 36000001);
+    });
   });
 
   group('ActorStateSnapshot.queuedActors ordering', () {

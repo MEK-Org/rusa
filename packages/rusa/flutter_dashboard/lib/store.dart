@@ -19,6 +19,10 @@ enum _RuntimePhase { uninitialized, syncing, live }
 const int _kRuntimeDeltaBufferCap = 100;
 const Duration _kRuntimeRetryInitial = Duration(milliseconds: 250);
 const Duration _kRuntimeRetryMax = Duration(seconds: 5);
+// A queue admission has an SSE state transition, but pacer-only interval and
+// staged-head changes do not. Poll only while cards are queued so their
+// explanation stays current without a permanent thread-list poll.
+const Duration _kQueuePacingPollInterval = Duration(seconds: 10);
 
 /// One line in the merged live-output console.
 class LiveLine {
@@ -324,6 +328,7 @@ class DashboardStore {
 
   Timer? _topologyDebounce;
   Timer? _quotaPoll;
+  Timer? _queuePacingPoll;
   Timer? _runtimeRetry;
   _RuntimePhase _runtimePhase = _RuntimePhase.uninitialized;
   RuntimeCursor? _runtimeCursor;
@@ -545,6 +550,27 @@ class DashboardStore {
         orderedIds: orderedIds,
       ),
     );
+    _updateQueuePacingPoll();
+  }
+
+  /// Pacer-only changes do not have a runtime-state delta to invalidate the
+  /// list. Keep one bounded revalidation active only while a queued card is
+  /// visible, and stop it as soon as the authoritative state has no queue.
+  void _updateQueuePacingPoll() {
+    if (_actorStates.value.queuedActors.isEmpty) {
+      _queuePacingPoll?.cancel();
+      _queuePacingPoll = null;
+      return;
+    }
+    if (_queuePacingPoll?.isActive ?? false) return;
+    _queuePacingPoll = Timer.periodic(_kQueuePacingPollInterval, (_) {
+      if (_actorStates.value.queuedActors.isEmpty) {
+        _queuePacingPoll?.cancel();
+        _queuePacingPoll = null;
+        return;
+      }
+      unawaited(_requestRuntimeSync());
+    });
   }
 
   // ── Tree flattening (visible order = the basis for shift-range) ──
@@ -1264,15 +1290,27 @@ class DashboardStore {
       return;
     }
     if (delta.revision <= cursor.revision) return;
+    final hadQueuedActors = _actorStates.value.queuedActors.isNotEmpty;
     if (delta.revision == cursor.revision + 1 && _applyRuntimeState(delta)) {
       _runtimeCursor = RuntimeCursor(
         streamId: cursor.streamId,
         revision: delta.revision,
       );
-      if (delta.refreshThreadSnapshot) {
+      final hasQueuedActors = _actorStates.value.queuedActors.isNotEmpty;
+      final refreshQueuePacing =
+          delta.runState == RunState.queued ||
+          (hadQueuedActors && hasQueuedActors);
+      if (delta.refreshThreadSnapshot || refreshQueuePacing) {
         // Inbox selection changes do not alter the run state, so their delta
         // is only a sequenced request to replace the thread snapshot and pick
-        // up (or clear) the active run's selected obligation.
+        // up (or clear) the active run's selected obligation. A new queued
+        // card or another state change while cards remain queued also needs an
+        // immediate authoritative pacing/blocker refresh; the queued-only poll
+        // below covers pacer changes that have no runtime-state delta at all.
+        // Keep this delta for the sync drain: an API snapshot that raced its
+        // SSE frame must not briefly restore the older run state while we ask
+        // it for the newer pacing fields.
+        if (refreshQueuePacing) _bufferRuntimeState(delta);
         unawaited(_requestRuntimeSync());
       }
       return;
@@ -1318,6 +1356,7 @@ class DashboardStore {
     _actorStates.add(
       cur.copyWith(revision: cur.revision + 1, actors: updatedActors),
     );
+    _updateQueuePacingPoll();
     return true;
   }
 
@@ -1525,6 +1564,7 @@ class DashboardStore {
   Future<void> dispose() async {
     _topologyDebounce?.cancel();
     _quotaPoll?.cancel();
+    _queuePacingPoll?.cancel();
     _runtimeRetry?.cancel();
     for (final s in _subs) {
       await s.cancel();

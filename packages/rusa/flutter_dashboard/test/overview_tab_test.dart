@@ -334,6 +334,25 @@ void main() {
       expect(find.text('0 queued'), findsOneWidget);
 
       // root becomes queued.
+      // Queue admission revalidates the pacing explanation, so model the
+      // authoritative snapshot the server has published for this revision.
+      api
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 3)
+        ..threadsResult = [
+          makeThread('root', created: 't0', runState: RunState.queued),
+          makeThread(
+            'w1',
+            parent: 'root',
+            created: 't1',
+            runState: RunState.running,
+          ),
+          makeThread(
+            'w2',
+            parent: 'root',
+            created: 't2',
+            runState: RunState.idle,
+          ),
+        ];
       stream.runtimeStatesCtrl.add(
         const ActorRuntimeStateDelta(
           streamId: 'stream-a',

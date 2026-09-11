@@ -42,7 +42,7 @@ void main() {
   });
 
   test(
-    'runtime queued and idle transitions clear an active-run focus locally',
+    'runtime queued and idle transitions clear an active-run focus',
     () async {
       final api = FakeApi()
         ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
@@ -64,16 +64,81 @@ void main() {
       await pumpEventQueue();
       expect(store.actor('a')?.runState, RunState.queued);
       expect(store.actor('a')?.selectedObligation, isNull);
-      expect(api.threadsCallCount, 1);
+      expect(api.threadsCallCount, 2);
 
       stream.runtimeStatesCtrl.add(_runtime(2, 'a', RunState.idle));
       await pumpEventQueue();
       expect(store.actor('a')?.runState, RunState.idle);
       expect(store.actor('a')?.selectedObligation, isNull);
-      expect(api.threadsCallCount, 1);
+      expect(api.threadsCallCount, 2);
       await store.dispose();
     },
   );
+
+  test(
+    'queue admission immediately refreshes the pacing explanation',
+    () async {
+      final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
+        ..threadsResult = [makeThread('a', runState: RunState.idle)];
+      final stream = FakeStream();
+      final store = await _booted(api, stream);
+
+      api.threadsResult = [
+        makeThread(
+          'a',
+          runState: RunState.queued,
+          pacingIntervalMs: 9001,
+          queueBlocker: 'provider-pacing',
+        ),
+      ];
+      stream.runtimeStatesCtrl.add(_runtime(1, 'a', RunState.queued));
+      await pumpEventQueue();
+
+      expect(api.threadsCallCount, 2);
+      expect(store.actor('a')?.thread.pacingIntervalMs, 9001);
+      expect(store.actor('a')?.thread.queueBlocker, 'provider-pacing');
+      await store.dispose();
+    },
+  );
+
+  test('queued cards revalidate pacer-only changes on a bounded poll', () {
+    fakeAsync((async) {
+      final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
+        ..threadsResult = [
+          makeThread(
+            'a',
+            runState: RunState.queued,
+            pacingIntervalMs: 9001,
+            queueBlocker: 'provider-pacing',
+          ),
+        ];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      unawaited(store.init());
+      async.flushMicrotasks();
+
+      expect(api.threadsCallCount, 1);
+      api.threadsResult = [
+        makeThread(
+          'a',
+          runState: RunState.queued,
+          pacingIntervalMs: 12002,
+          queueBlocker: 'mesh-concurrency',
+        ),
+      ];
+
+      async.elapse(const Duration(seconds: 10));
+      async.flushMicrotasks();
+
+      expect(api.threadsCallCount, 2);
+      expect(store.actor('a')?.thread.pacingIntervalMs, 12002);
+      expect(store.actor('a')?.thread.queueBlocker, 'mesh-concurrency');
+
+      unawaited(store.dispose());
+      async.flushMicrotasks();
+    });
+  });
 
   test('init loads dashboard quota provider config', () async {
     final api = FakeApi()
