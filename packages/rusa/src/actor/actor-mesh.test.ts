@@ -8779,6 +8779,65 @@ describe("strict obligation handling experiment (#382)", () => {
     expect(headEntries().map((entry) => entry.payload.obligationId)).toEqual(["head-1", "head-2"]);
   });
 
+  it("tells the enrolled run its discipline at the selection that arms enforcement, and says nothing to an unenrolled one", () => {
+    const { mesh } = strictMesh();
+    const optedIn = worker(mesh, "opted in");
+    const control = worker(mesh, "unenrolled control");
+    mesh.enrollActorInExperiment(optedIn, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "told-head", title: "Told head", ownerId: optedIn });
+    repo.create({ id: "untold-head", title: "Untold head", ownerId: control });
+
+    // Nothing is in force before the selection that arms it.
+    expect(mesh.runDisciplineNotice(optedIn)).toBeNull();
+
+    selectHead(mesh, optedIn, "told-head");
+    selectHead(mesh, control, "untold-head");
+
+    const notice = mesh.runDisciplineNotice(optedIn);
+    expect(notice).not.toContain(STRICT_OBLIGATION_HANDLING_EXPERIMENT);
+    expect(notice).not.toMatch(/experiment/i);
+    expect(notice).toContain("told-head");
+    // The exits it names are the exits enforcement accepts, worded once.
+    const exits =
+      "complete it, cancel it, schedule it, add a new unmet prerequisite, or create a new live direct child";
+    expect(notice).toContain(exits);
+    expect(() => mesh.declareYield(optedIn, "complete")).toThrow(exits);
+
+    // An unenrolled actor is told nothing, and keeps yielding cleanly.
+    expect(mesh.runDisciplineNotice(control)).toBeNull();
+    expect(() => mesh.declareYield(control, "complete")).not.toThrow();
+  });
+
+  it("moves instruction and enforcement together when root changes enrollment between runs", () => {
+    const { mesh } = strictMesh();
+    const subject = worker(mesh);
+    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "enrolled-run", title: "Enrolled run", ownerId: subject });
+    selectHead(mesh, subject, "enrolled-run");
+    expect(mesh.runDisciplineNotice(subject)).toContain("enrolled-run");
+    expect(() => mesh.declareYield(subject, "complete")).toThrow(
+      /selected head obligation enrolled-run/
+    );
+    mesh.finishInboxRun(subject);
+
+    // Unenrolled: the next selection neither instructs nor enforces.
+    mesh.unenrollActorFromExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "released-run", title: "Released run", ownerId: subject });
+    selectHead(mesh, subject, "released-run");
+    expect(mesh.runDisciplineNotice(subject)).toBeNull();
+    expect(() => mesh.declareYield(subject, "complete")).not.toThrow();
+    mesh.finishInboxRun(subject);
+
+    // Re-enrolled: both come back at the same boundary.
+    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "rearmed-run", title: "Rearmed run", ownerId: subject });
+    selectHead(mesh, subject, "rearmed-run");
+    expect(mesh.runDisciplineNotice(subject)).toContain("rearmed-run");
+    expect(() => mesh.declareYield(subject, "complete")).toThrow(
+      /selected head obligation rearmed-run/
+    );
+  });
+
   it("refuses head selection for an enrolled actor when the mesh has no closure reads", () => {
     // A partial port — every embedder built before #382 has one — must not
     // quietly turn enrollment into a no-op.

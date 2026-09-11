@@ -721,6 +721,15 @@ export interface ActorMeshOptions {
 }
 
 /**
+ * The exits a strict head-obligation run has, worded once. Both halves of the
+ * experiment read this string: the discipline an enrolled run is told when its
+ * selection arms enforcement, and the rejection raised if it yields cleanly
+ * anyway. One wording means the instruction cannot drift from the rule.
+ */
+const STRICT_HEAD_CLOSURE_EXITS =
+  "complete it, cancel it, schedule it, add a new unmet prerequisite, or create a new live direct child";
+
+/**
  * The actor scheduler (design Part D — the v2 pump repurposed). It owns the
  * {@link ActorRepository} (durable records) and the set of *live* actors,
  * and provides the mesh's primitives:
@@ -1388,6 +1397,27 @@ export class ActorMesh {
       });
     }
     return entries;
+  }
+
+  /**
+   * The experiment-specific discipline in force for this actor's current run,
+   * or null when none is — the text an enrolled actor is told at selection, so
+   * a rejected yield is never its first explanation of the rule.
+   *
+   * This reads the armed run state {@link assertCleanYieldAllowed} enforces
+   * rather than re-evaluating enrollment. Instruction and enforcement are then
+   * the same decision: a root enrollment change lands on both at the next
+   * selection and on neither in between, and an actor that is told nothing is
+   * an actor nothing will be enforced against.
+   *
+   * States the obligation rule directly without experiment framing.
+   */
+  runDisciplineNotice(actorId: string): string | null {
+    actorId = this.resolveThreadId(actorId);
+    const runState = this.headClosureRuns.get(actorId);
+    if (!runState || runState.headObligationIds.size === 0) return null;
+    const heads = [...runState.headObligationIds].join(", ");
+    return `This run selected head attention (${heads}), so it may not yield cleanly while that obligation is left as it was found. Before \`yield_run\`, ${STRICT_HEAD_CLOSURE_EXITS}. A clean yield that leaves it untouched is rejected.`;
   }
 
   selectedInboxEntries(actorId: string): readonly string[] {
@@ -3028,7 +3058,7 @@ export class ActorMesh {
       `clean yield from ${actorId} rejected: head obligation ${obligationId} not finished or decomposed (${reason})`
     );
     throw new Error(
-      `Cannot yield run: selected head obligation ${obligationId} ("${title ?? obligationId}") was not finished or decomposed. Reason: ${reason}. Complete the obligation, schedule it, add an unmet prerequisite, or create a new live direct child before yielding.`
+      `Cannot yield run: selected head obligation ${obligationId} ("${title ?? obligationId}") was not finished or decomposed. Reason: ${reason}. Before yielding cleanly, ${STRICT_HEAD_CLOSURE_EXITS}.`
     );
   }
 
