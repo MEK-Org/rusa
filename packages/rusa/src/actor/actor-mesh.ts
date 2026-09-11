@@ -49,6 +49,14 @@ import {
   isSubResourceOf,
   resourceKey,
 } from "./event-subscriptions.js";
+import {
+  assertKnownExperiment,
+  type ExperimentEnrollment,
+  type ExperimentEnrollmentChange,
+  type ExperimentEnrollmentStore,
+  InMemoryExperimentEnrollmentStore,
+  isKnownExperiment,
+} from "./experiments.js";
 import { generateHandle } from "./handle-generator.js";
 import type { InboxEntry, InboxPayload, InboxStore } from "./inbox-store.js";
 import {
@@ -615,6 +623,14 @@ export interface ActorMeshOptions {
    * granted (see {@link grantableCapabilities}).
    */
   capabilityGrants?: CapabilityGrantStore;
+  /**
+   * Durable store of per-actor experiment enrollments (#394). Defaults to an
+   * in-memory store; the wiring supplies the SQLite-backed one, which is what
+   * makes an enrollment survive a restart. Only the root administers
+   * enrollments and only registered experiment names are accepted — both
+   * enforced here in the mesh, never in the store.
+   */
+  experimentEnrollments?: ExperimentEnrollmentStore;
   eventSourceOwners?: EventSourceOwnerStore;
   eventSourceSubscriptions?: EventSourceSubscriptionStore;
   /**
@@ -737,6 +753,7 @@ export class ActorMesh {
   }) => string;
   readonly eventManager?: EventManager;
   private readonly grants: CapabilityGrantStore;
+  private readonly experiments: ExperimentEnrollmentStore;
   private readonly eventSourceOwners: EventSourceOwnerStore;
   private readonly eventSourceSubscriptions: EventSourceSubscriptionStore;
   private readonly configuredEventSources: readonly EventResource[] | undefined;
@@ -798,6 +815,7 @@ export class ActorMesh {
     this.supportsExecutionTarget = opts.supportsExecutionTarget;
     this.validateModel = opts.validateModel;
     this.grants = opts.capabilityGrants ?? new InMemoryCapabilityGrantStore();
+    this.experiments = opts.experimentEnrollments ?? new InMemoryExperimentEnrollmentStore();
     this.eventSourceOwners = opts.eventSourceOwners ?? new InMemoryEventSourceOwnerStore();
     this.eventSourceSubscriptions =
       opts.eventSourceSubscriptions ?? new InMemoryEventSourceSubscriptionStore();
@@ -1934,6 +1952,142 @@ export class ActorMesh {
         this.log(`onCapabilityRevoked failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+  }
+
+  /**
+   * Enroll an actor in a hard-coded experiment (#394) — the rollout primitive
+   * that keeps "try this on a few actors first" from becoming a permanent
+   * column on `actors`.
+   *
+   * Root-only and ungrantable: administering a rollout is not a capability the
+   * mesh can hand out, so the check is `isRootActor` here rather than an
+   * allow-list anywhere. Enrollment is strictly post-spawn — the actor must
+   * already exist — and a retired actor is refused, matching
+   * {@link setActorModel}: enrolling a thread that is not going to run again
+   * records an intent nothing will ever read.
+   *
+   * Idempotent: `changed` is true when this call actually enrolled the actor,
+   * false when it was already enrolled; `actorId` is the canonical thread id
+   * the enrollment is keyed on (a legacy `"root"` address resolves), so a
+   * caller can correlate the response with {@link listExperimentEnrollments}.
+   * Only a real change records an event. Throws if the experiment is not
+   * registered, the actor is unknown or retired, or the caller is not root.
+   */
+  enrollActorInExperiment(
+    actorId: string,
+    experiment: string,
+    enrolledBy: string
+  ): ExperimentEnrollmentChange {
+    actorId = this.resolveThreadId(actorId);
+    enrolledBy = this.resolveThreadId(enrolledBy);
+    const name = assertKnownExperiment(experiment);
+    const record = this.assertExperimentAuthority(enrolledBy, actorId, "enroll");
+    if (record.status === "retired") {
+      throw new Error(`Cannot enroll a retired thread: ${actorId}`);
+    }
+    const enrollment: ExperimentEnrollment = {
+      actorId,
+      experiment: name,
+      enrolledBy,
+      enrolledAt: this.now(),
+    };
+    if (!this.experiments.enroll(enrollment)) return { actorId, changed: false };
+    this.recordEvent({
+      kind: "experiment_enrolled",
+      actorId,
+      detail: name,
+      payload: JSON.stringify({ enrolledBy }),
+    });
+    return { actorId, changed: true };
+  }
+
+  /**
+   * Remove an actor's enrollment, subject to the same root-only authority as
+   * {@link enrollActorInExperiment}. Idempotent: `changed` is true when a real
+   * enrollment was removed, false when there was nothing to remove, and only a
+   * real change records an event.
+   *
+   * A retired actor may be unenrolled, deliberately unlike enrollment. An
+   * enrollment outlives retirement so a revived actor resumes the rollout it
+   * was in; withdrawing a rollout from a retired actor must therefore not
+   * require reviving it first.
+   *
+   * Similarly, unenrollment does not require the experiment to still be
+   * registered in code: if an experiment was removed from the registry, any
+   * lingering durable rows can still be cleanly unenrolled via this path
+   * without requiring manual SQL. The event's `detail` is then the stored
+   * name, which no consumer checks against the registry.
+   */
+  unenrollActorFromExperiment(
+    actorId: string,
+    experiment: string,
+    unenrolledBy: string
+  ): ExperimentEnrollmentChange {
+    actorId = this.resolveThreadId(actorId);
+    unenrolledBy = this.resolveThreadId(unenrolledBy);
+    this.assertExperimentAuthority(unenrolledBy, actorId, "unenroll");
+    if (!this.experiments.unenroll(actorId, experiment)) return { actorId, changed: false };
+    this.recordEvent({
+      kind: "experiment_unenrolled",
+      actorId,
+      detail: experiment,
+      payload: JSON.stringify({ unenrolledBy }),
+    });
+    return { actorId, changed: true };
+  }
+
+  /**
+   * The runtime evaluation API: is this actor in this experiment right now?
+   * Read straight through to the durable store, so an enrollment made by
+   * another connection takes effect without a restart.
+   *
+   * An unregistered name answers false rather than throwing. That is not
+   * leniency: a name outside the registry can never have been enrolled, so
+   * false is the only correct answer, and a call site deciding behavior should
+   * not have to guard against its own registry constant.
+   */
+  isEnrolledInExperiment(actorId: string, experiment: string): boolean {
+    if (!isKnownExperiment(experiment)) return false;
+    return this.experiments.isEnrolled(this.resolveThreadId(actorId), experiment);
+  }
+
+  /** Every current enrollment in (actorId, experiment) order — the root's readback view. */
+  listExperimentEnrollments(actorId?: string): ExperimentEnrollment[] {
+    const enrollments = this.experiments.list();
+    if (!actorId) return enrollments;
+    const targetId = this.resolveThreadId(actorId);
+    return enrollments.filter((enrollment) => enrollment.actorId === targetId);
+  }
+
+  /**
+   * Authority for experiment administration (#394): root only, over its own
+   * subtree (itself included), and only for an actor that exists. Fail-closed —
+   * an unknown caller is never root — and enforced HERE rather than only at the
+   * tool layer, so the "ungrantable, root-only" boundary holds for any future
+   * caller. Returns the target's record, which both callers need next.
+   */
+  private assertExperimentAuthority(
+    callerId: string,
+    actorId: string,
+    verb: "enroll" | "unenroll"
+  ): ActorRecord {
+    const preposition = verb === "enroll" ? "in" : "from";
+    if (!this.isRootActor(callerId)) {
+      throw new Error(`only the root may ${verb} an actor ${preposition} an experiment`);
+    }
+    const record = this.actors.get(actorId);
+    if (!record) {
+      throw new Error(`unknown thread id: ${actorId}`);
+    }
+    // Not redundant with the root check above: `isRoot` is decoupled from
+    // top-level topology, so another root's subtree is a legal shape that this
+    // root must not reach into. `isAncestorOf` admits the root itself.
+    if (!this.isAncestorOf(callerId, actorId)) {
+      throw new Error(
+        `root ${callerId} may only ${verb} actors in its own subtree ${preposition} an experiment (cannot ${verb} ${actorId})`
+      );
+    }
+    return record;
   }
 
   /** Every grant, active and revoked — for the root's `list_grants` tool + audit. */
