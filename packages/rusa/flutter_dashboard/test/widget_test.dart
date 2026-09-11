@@ -1867,6 +1867,51 @@ void main() {
     });
   });
 
+  testWidgets(
+    'ActorTree center drop persists actor reparenting and refreshes the tree',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [
+            makeThread('root', created: 't0'),
+            makeThread('parent-a', parent: 'root', created: 't1'),
+            makeThread('parent-b', parent: 'root', created: 't2'),
+            makeThread('worker', parent: 'parent-a', created: 't3'),
+          ];
+        final store = DashboardStore(
+          api: api,
+          stream: FakeStream(),
+          treePreferencesCache: FakeTreePreferencesCache(),
+        );
+        await store.init();
+        await tester.pumpWidget(_harness(store));
+        await tester.pump(const Duration(milliseconds: 50));
+
+        final worker = find.widgetWithText(
+          Draggable<ThreadDto>,
+          'worker-handle',
+        );
+        final newParent = find.widgetWithText(
+          DragTarget<ThreadDto>,
+          'parent-b-handle',
+        );
+        expect(worker, findsOneWidget);
+        expect(newParent, findsOneWidget);
+
+        final reparent = await tester.startGesture(tester.getCenter(worker));
+        await tester.pump(const Duration(milliseconds: 50));
+        await reparent.moveTo(tester.getCenter(newParent));
+        await tester.pump(const Duration(milliseconds: 50));
+        await reparent.up();
+        await tester.pump(const Duration(milliseconds: 100));
+
+        expect(api.actorReparentCalls, [(id: 'worker', parentId: 'parent-b')]);
+        expect(store.actor('worker')?.parentId, 'parent-b');
+        await store.dispose();
+      });
+    },
+  );
+
   testWidgets('ActorTree uses LongPressDraggable when touchTargets is true', (
     tester,
   ) async {

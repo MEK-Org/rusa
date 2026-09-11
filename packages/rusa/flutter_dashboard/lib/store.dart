@@ -745,6 +745,14 @@ class DashboardStore {
     _treePreferencesCache.saveActorOrder(nextMap);
   }
 
+  /// Persist an actor hierarchy move, then replace the local tree with the
+  /// server's authoritative snapshot. This preserves selection/expansion where
+  /// their ids remain valid and avoids treating a visual drag as a durable move.
+  Future<void> reparentActor(String actorId, String parentId) async {
+    await _api.reparentActor(actorId, parentId: parentId);
+    await refreshThreads();
+  }
+
   /// Sorts siblings respecting an optional custom ordering. Actors present in
   /// [customOrder] are sorted by their index; unindexed actors follow, sorted
   /// by [ThreadDto.createdAt] ascending with [ThreadDto.id] tiebreak.
@@ -1126,7 +1134,10 @@ class DashboardStore {
           thread: existing.thread.copyWith(voiceName: updatedVoiceName),
         );
         _actorStates.add(
-          current.copyWith(revision: current.revision + 1, actors: updatedActors),
+          current.copyWith(
+            revision: current.revision + 1,
+            actors: updatedActors,
+          ),
         );
       }
       _error.add(null);
