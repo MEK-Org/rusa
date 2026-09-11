@@ -7,14 +7,19 @@ import 'package:flutter_svg/flutter_svg.dart';
 /// gives the artwork visual breathing room at the existing header size, on
 /// both the desktop header and the phone drawer.
 class BrandMark extends StatelessWidget {
-  const BrandMark({super.key, this.artworkSize = 22});
+  const BrandMark({super.key});
 
-  /// Height of the artwork box itself. Padding is added around it on top of
-  /// this, so the widget's total footprint is `artworkSize + 2 * kPadding`.
-  final double artworkSize;
+  /// Fixed height constraint for the artwork box itself. Sized so the padded
+  /// widget sits comfortably centered in the 56px header row.
+  static const double _kArtworkHeight = 22;
 
-  /// Surrounding space compensating for the artwork's tight crop. Sized so the
-  /// padded widget still sits comfortably in the 56px header row.
+  /// Surrounding space compensating for the artwork's tight crop.
+  ///
+  /// With [kPadding] of 5 px on all sides and artwork height constrained to
+  /// 22 px, the widget's vertical footprint is 32 px (`22 + 2 * 5`). Because
+  /// the SVG has an intrinsic 687×596 aspect ratio (~1.1527:1) letterboxed by
+  /// [BoxFit.contain], the artwork renders at ~25.36 px wide, producing a total
+  /// horizontal footprint of ~35.36 px (`25.36 + 2 * 5`).
   static const double kPadding = 5;
 
   @override
@@ -23,7 +28,7 @@ class BrandMark extends StatelessWidget {
       padding: const EdgeInsets.all(kPadding),
       child: SvgPicture.asset(
         'assets/antler_tree_mark.svg',
-        height: artworkSize,
+        height: _kArtworkHeight,
         fit: BoxFit.contain,
         semanticsLabel: 'Rusa antler-tree mark',
       ),
