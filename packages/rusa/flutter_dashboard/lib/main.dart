@@ -3,6 +3,7 @@ import 'package:flutter_web_plugins/url_strategy.dart';
 import 'package:web/web.dart' as web;
 
 import 'api.dart';
+import 'breakpoints.dart';
 import 'avatar_upload_web.dart';
 import 'dashboard_title.dart';
 import 'iu/iu_reports_view.dart';

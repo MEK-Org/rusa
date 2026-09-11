@@ -12,7 +12,7 @@ import 'obligation_dialogs.dart';
 
 /// Below this available width, the inbox and obligations sections stack in a
 /// single column instead of sitting side by side. Kept local rather than
-/// shared with `dashboard_body.dart`'s `kNarrowBreakpoint` — that constant
+/// shared with `breakpoints.dart`'s `kNarrowBreakpoint` — that constant
 /// reflects the whole-window master-detail reflow, while this one reflects
 /// the width actually available to this tab's content, which can differ once
 /// the actor tree panel is factored in.
