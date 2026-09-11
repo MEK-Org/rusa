@@ -113,6 +113,7 @@ class ThreadDto {
     this.waitingOn,
     this.queuePosition,
     this.estimatedStartAt,
+    this.pacingIntervalMs,
     this.ownerExpectsRetirement,
     this.selectedObligation,
     this.voiceName,
@@ -189,6 +190,11 @@ class ThreadDto {
   /// ISO-8601 estimate of this actor's provider run start, or null when the
   /// scheduler can't honestly quote one yet (e.g. behind a staged run).
   final String? estimatedStartAt;
+
+  /// Whole-millisecond start spacing on this actor's provider lane, or null
+  /// when the actor is not in a pacer queue. Zero means the lane has no
+  /// pacing gap, so any future [estimatedStartAt] is an explicit deferral.
+  final int? pacingIntervalMs;
   final bool? ownerExpectsRetirement;
 
   /// The active run's durable inbox focus, if it resolved to an obligation.
@@ -228,6 +234,7 @@ class ThreadDto {
     String? waitingOn,
     int? queuePosition,
     String? estimatedStartAt,
+    int? pacingIntervalMs,
     bool? ownerExpectsRetirement,
     Object? selectedObligation = _keepThreadField,
     Object? voiceName = _keepThreadField,
@@ -271,6 +278,7 @@ class ThreadDto {
     waitingOn: waitingOn ?? this.waitingOn,
     queuePosition: queuePosition ?? this.queuePosition,
     estimatedStartAt: estimatedStartAt ?? this.estimatedStartAt,
+    pacingIntervalMs: pacingIntervalMs ?? this.pacingIntervalMs,
     ownerExpectsRetirement:
         ownerExpectsRetirement ?? this.ownerExpectsRetirement,
     selectedObligation: identical(selectedObligation, _keepThreadField)
@@ -318,6 +326,10 @@ class ThreadDto {
     waitingOn: j['waitingOn'] as String?,
     queuePosition: j['queuePosition'] as int?,
     estimatedStartAt: j['estimatedStartAt'] as String?,
+    // The server rounds this to a whole millisecond, but the value is derived
+    // from a REAL, so decode through num rather than let one fractional
+    // number reject the entire thread snapshot.
+    pacingIntervalMs: (j['pacingIntervalMs'] as num?)?.round(),
     ownerExpectsRetirement: j['ownerExpectsRetirement'] as bool?,
     selectedObligation: j['selectedObligation'] is Map
         ? ObligationDto.fromJson(
@@ -445,6 +457,7 @@ class ActorViewState {
   String? get waitingOn => thread.waitingOn;
   int? get queuePosition => thread.queuePosition;
   String? get estimatedStartAt => thread.estimatedStartAt;
+  int? get pacingIntervalMs => thread.pacingIntervalMs;
   bool? get ownerExpectsRetirement => thread.ownerExpectsRetirement;
   ObligationDto? get selectedObligation => thread.selectedObligation;
 

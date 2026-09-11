@@ -765,12 +765,7 @@ class _OverviewTabState extends State<OverviewTab> {
                     padding: const EdgeInsets.only(bottom: 8),
                     child: _buildActorContextCard(
                       actor,
-                      queueDetail: actor.estimatedStartAt != null
-                          ? 'Estimated start ${formatTs(actor.estimatedStartAt!)}'
-                          : actor.waitingOn ??
-                                (actor.queuePosition != null
-                                    ? 'Lane position ${actor.queuePosition! + 1}'
-                                    : 'Queued behind another provider request.'),
+                      queueDetail: _queueWaitDetail(actor),
                     ),
                   ),
             ],
@@ -1144,4 +1139,43 @@ class _OverviewTabState extends State<OverviewTab> {
       ),
     );
   }
+
+  /// Names the gate a queued card is waiting behind using only what the
+  /// pacer snapshot already carries: a null estimate at lane position 0 is
+  /// the staged head holding for a mesh concurrency slot, a null estimate
+  /// further back is a request behind that head, and any other estimate is
+  /// the lane's pacing clock. A zero interval has no pacing gap to quote.
+  String _queueWaitDetail(ActorViewState actor) {
+    final interval = actor.pacingIntervalMs ?? 0;
+    final pacing = interval > 0
+        ? 'Provider pacing every ${_formatPacingInterval(interval)}'
+        : null;
+    if (actor.estimatedStartAt != null) {
+      final estimate = 'Estimated start ${formatTs(actor.estimatedStartAt!)}';
+      return pacing == null ? estimate : '$pacing; $estimate';
+    }
+    final position = actor.queuePosition;
+    if (position == 0) {
+      return pacing == null
+          ? 'Waiting for mesh concurrency.'
+          : 'Waiting for mesh concurrency; ${pacing.toLowerCase()}.';
+    }
+    if (position != null) {
+      final behind =
+          'Lane position ${position + 1}; behind a request waiting for mesh '
+          'concurrency';
+      return pacing == null ? '$behind.' : '$behind; ${pacing.toLowerCase()}.';
+    }
+    return actor.waitingOn ?? 'Queued behind another provider request.';
+  }
+}
+
+String _formatPacingInterval(int milliseconds) {
+  if (milliseconds < 60 * 1000) {
+    return '${(milliseconds / 1000).toStringAsFixed(1)}s';
+  }
+  if (milliseconds < 60 * 60 * 1000) {
+    return '${(milliseconds / (60 * 1000)).toStringAsFixed(1)}m';
+  }
+  return '${(milliseconds / (60 * 60 * 1000)).toStringAsFixed(1)}h';
 }

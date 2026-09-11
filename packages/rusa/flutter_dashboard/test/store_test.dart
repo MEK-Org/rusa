@@ -42,7 +42,7 @@ void main() {
   });
 
   test(
-    'runtime queued and idle transitions clear an active-run focus locally',
+    'runtime queued and idle transitions clear an active-run focus',
     () async {
       final api = FakeApi()
         ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
@@ -60,20 +60,125 @@ void main() {
       final stream = FakeStream();
       final store = await _booted(api, stream);
 
+      api
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 1)
+        ..threadsResult = [
+          makeThread(
+            'a',
+            runState: RunState.queued,
+          ),
+        ];
       stream.runtimeStatesCtrl.add(_runtime(1, 'a', RunState.queued));
       await pumpEventQueue();
       expect(store.actor('a')?.runState, RunState.queued);
       expect(store.actor('a')?.selectedObligation, isNull);
-      expect(api.threadsCallCount, 1);
+      expect(api.threadsCallCount, 2);
 
+      api
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 2)
+        ..threadsResult = [
+          makeThread(
+            'a',
+            runState: RunState.idle,
+          ),
+        ];
       stream.runtimeStatesCtrl.add(_runtime(2, 'a', RunState.idle));
       await pumpEventQueue();
       expect(store.actor('a')?.runState, RunState.idle);
       expect(store.actor('a')?.selectedObligation, isNull);
-      expect(api.threadsCallCount, 1);
+      expect(api.threadsCallCount, 2);
       await store.dispose();
     },
   );
+
+  test(
+    'queue admission immediately refreshes the pacing explanation',
+    () async {
+      final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
+        ..threadsResult = [makeThread('a', runState: RunState.idle)];
+      final stream = FakeStream();
+      final store = await _booted(api, stream);
+
+      api.threadsResult = [
+        makeThread(
+          'a',
+          runState: RunState.queued,
+          queuePosition: 0,
+          estimatedStartAt: '2026-01-01T00:00:10.000Z',
+          pacingIntervalMs: 9001,
+        ),
+      ];
+      stream.runtimeStatesCtrl.add(_runtime(1, 'a', RunState.queued));
+      await pumpEventQueue();
+
+      expect(api.threadsCallCount, 2);
+      expect(store.actor('a')?.thread.pacingIntervalMs, 9001);
+      expect(
+        store.actor('a')?.thread.estimatedStartAt,
+        '2026-01-01T00:00:10.000Z',
+      );
+      await store.dispose();
+    },
+  );
+
+  test('queued cards revalidate pacer-only changes on a bounded poll', () {
+    fakeAsync((async) {
+      final api = FakeApi()
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 0)
+        ..threadsResult = [
+          makeThread(
+            'a',
+            runState: RunState.queued,
+            queuePosition: 0,
+            estimatedStartAt: '2026-01-01T00:00:10.000Z',
+            pacingIntervalMs: 9001,
+          ),
+        ];
+      final store = DashboardStore(api: api, stream: FakeStream());
+      unawaited(store.init());
+      async.flushMicrotasks();
+
+      expect(api.threadsCallCount, 1);
+      // The pacer re-tuned its interval and staged the head for mesh
+      // concurrency (estimate withdrawn) with no run-state transition.
+      api.threadsResult = [
+        makeThread(
+          'a',
+          runState: RunState.queued,
+          queuePosition: 0,
+          pacingIntervalMs: 12002,
+        ),
+      ];
+
+      async.elapse(const Duration(seconds: 10));
+      async.flushMicrotasks();
+
+      expect(api.threadsCallCount, 2);
+      expect(store.actor('a')?.thread.pacingIntervalMs, 12002);
+      expect(store.actor('a')?.thread.estimatedStartAt, isNull);
+
+      // Once the queue drains, the periodic poll shuts down and generates
+      // no further background fetches.
+      api.threadsResult = [
+        makeThread(
+          'a',
+          runState: RunState.running,
+        ),
+      ];
+      async.elapse(const Duration(seconds: 10));
+      async.flushMicrotasks();
+      expect(api.threadsCallCount, 3);
+
+      // With no queued cards remaining, another 10s elapses without polling.
+      async.elapse(const Duration(seconds: 10));
+      async.flushMicrotasks();
+      expect(api.threadsCallCount, 3);
+
+      unawaited(store.dispose());
+      async.flushMicrotasks();
+    });
+  });
 
   test('init loads dashboard quota provider config', () async {
     final api = FakeApi()
@@ -621,6 +726,18 @@ void main() {
       ); // seeded running → green
 
       // Only the authoritative runtime channel drives the dot.
+      api
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 1)
+        ..threadsResult = [
+          makeThread(
+            'a',
+            parent: 'root',
+            created: 't1',
+            runState: RunState.queued,
+          ),
+          api.threadsResult[1],
+          api.threadsResult[2],
+        ];
       stream.runtimeStatesCtrl.add(_runtime(1, 'a', RunState.queued));
       await pumpEventQueue();
       expect(store.dotFor(api.threadsResult[0]), DotState.queued);

@@ -35,6 +35,7 @@ ThreadDto makeThread(
   String? estimatedStartAt,
   ObligationDto? selectedObligation,
   String? voiceName,
+  int? pacingIntervalMs,
 }) => ThreadDto(
   id: id,
   handle: '$id-handle',
@@ -61,6 +62,7 @@ ThreadDto makeThread(
   estimatedStartAt: estimatedStartAt,
   selectedObligation: selectedObligation,
   voiceName: voiceName,
+  pacingIntervalMs: pacingIntervalMs,
 );
 
 MeshEvent makeEvent(

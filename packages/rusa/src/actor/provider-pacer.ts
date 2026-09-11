@@ -84,6 +84,13 @@ export class ProviderPacer {
    *   recomputes `nextAvailableAt` — the current value could already be
    *   stale. Callers must render `null` as "unknown", never fabricate a
    *   time.
+   * - `pacingIntervalMs` is the lane's current normal-start spacing, rounded
+   *   to a whole millisecond here so the wire value is always an integer
+   *   (the adaptive controller stores a REAL). `0` means no pacing gap: a
+   *   future `estimatedStartAt` on such a lane comes from `deferUntil`.
+   * - The gate is derivable, not a separate field: `estimatedStartAt` is
+   *   `null` only while a staged head (position 0) holds for mesh
+   *   concurrency, and every later entry is then behind that head.
    * - Requests submitted without a `threadId` are omitted from the
    *   returned entries (nothing to key them by) but still consume a
    *   `position`, so surviving entries keep their true FIFO position.
@@ -92,22 +99,39 @@ export class ProviderPacer {
     threadId: string;
     position: number;
     estimatedStartAt: number | null;
+    /** Current normal-start spacing for this lane, in whole milliseconds. */
+    pacingIntervalMs: number;
   }> {
-    const snapshot: Array<{ threadId: string; position: number; estimatedStartAt: number | null }> =
-      [];
+    const snapshot: Array<{
+      threadId: string;
+      position: number;
+      estimatedStartAt: number | null;
+      pacingIntervalMs: number;
+    }> = [];
+    const pacingIntervalMs = Math.round(this.intervalMs);
     let position = 0;
     let eta: number | null = this.staged ? null : this.nextAvailableAt;
 
     if (this.staged) {
       if (this.staged.opts.threadId) {
-        snapshot.push({ threadId: this.staged.opts.threadId, position, estimatedStartAt: null });
+        snapshot.push({
+          threadId: this.staged.opts.threadId,
+          position,
+          estimatedStartAt: null,
+          pacingIntervalMs,
+        });
       }
       position++;
     }
 
     for (const request of this.queue) {
       if (request.opts.threadId) {
-        snapshot.push({ threadId: request.opts.threadId, position, estimatedStartAt: eta });
+        snapshot.push({
+          threadId: request.opts.threadId,
+          position,
+          estimatedStartAt: eta,
+          pacingIntervalMs,
+        });
       }
       position++;
       if (eta !== null) eta += this.intervalMs;

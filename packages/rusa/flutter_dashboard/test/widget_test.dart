@@ -396,6 +396,22 @@ void main() {
         expect(find.byTooltip('Run now'), findsNothing);
 
         // 'a' transitions to queued.
+        // Queue admission immediately revalidates the pacing explanation, so
+        // model the authoritative snapshot published by the server.
+        api
+          ..runtimeCursor = const RuntimeCursor(
+            streamId: 'stream-a',
+            revision: 2,
+          )
+          ..threadsResult = [
+            makeThread('root', created: 't0', runState: RunState.idle),
+            makeThread(
+              'a',
+              parent: 'root',
+              created: 't1',
+              runState: RunState.queued,
+            ),
+          ];
         stream.runtimeStatesCtrl.add(
           const ActorRuntimeStateDelta(
             streamId: 'stream-a',
@@ -413,6 +429,20 @@ void main() {
         expect(find.byTooltip('Interrupt'), findsNothing);
 
         // 'a' transitions to idle.
+        api
+          ..runtimeCursor = const RuntimeCursor(
+            streamId: 'stream-a',
+            revision: 3,
+          )
+          ..threadsResult = [
+            makeThread('root', created: 't0', runState: RunState.idle),
+            makeThread(
+              'a',
+              parent: 'root',
+              created: 't1',
+              runState: RunState.idle,
+            ),
+          ];
         stream.runtimeStatesCtrl.add(
           const ActorRuntimeStateDelta(
             streamId: 'stream-a',

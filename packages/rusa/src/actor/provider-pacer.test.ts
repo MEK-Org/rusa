@@ -99,6 +99,22 @@ describe("ProviderPacer", () => {
     expect(pacer.waiting).toBe(0);
   });
 
+  it("quotes the pacing interval as whole milliseconds even when the controller set a fraction", () => {
+    const mesh = new ConcurrencyLimiter(1);
+    // The adaptive controller persists a REAL interval, so `setInterval`
+    // legitimately receives fractional milliseconds; the snapshot must still
+    // put an integer on the wire.
+    const pacer = new ProviderPacer(2_159_335.7, () => Date.now());
+    pacer.submit(async () => "queued", {
+      threadId: "queued-thread",
+      enqueueNormal: (fn) => mesh.enqueue(fn),
+    });
+
+    const [entry] = pacer.getQueueSnapshot();
+    expect(entry?.pacingIntervalMs).toBe(2_159_336);
+    expect(Number.isInteger(entry?.pacingIntervalMs)).toBe(true);
+  });
+
   it("reports FIFO positions and compounding ETAs for the queued lane", async () => {
     const base = Date.now();
     const mesh = new ConcurrencyLimiter(1);
@@ -115,8 +131,18 @@ describe("ProviderPacer", () => {
     });
 
     expect(pacer.getQueueSnapshot()).toEqual([
-      { threadId: "head-thread", position: 0, estimatedStartAt: base + 10_000 },
-      { threadId: "following-thread", position: 1, estimatedStartAt: base + 20_000 },
+      {
+        threadId: "head-thread",
+        position: 0,
+        estimatedStartAt: base + 10_000,
+        pacingIntervalMs: 10_000,
+      },
+      {
+        threadId: "following-thread",
+        position: 1,
+        estimatedStartAt: base + 20_000,
+        pacingIntervalMs: 10_000,
+      },
     ]);
   });
 
@@ -140,14 +166,29 @@ describe("ProviderPacer", () => {
     // The staged request can't become eligible until it actually starts and
     // recomputes nextAvailableAt, so every entry's ETA is unknown.
     expect(pacer.getQueueSnapshot()).toEqual([
-      { threadId: "staged-thread", position: 0, estimatedStartAt: null },
-      { threadId: "following-thread", position: 1, estimatedStartAt: null },
+      {
+        threadId: "staged-thread",
+        position: 0,
+        estimatedStartAt: null,
+        pacingIntervalMs: 10_000,
+      },
+      {
+        threadId: "following-thread",
+        position: 1,
+        estimatedStartAt: null,
+        pacingIntervalMs: 10_000,
+      },
     ]);
 
     release();
     await vi.advanceTimersByTimeAsync(0);
     expect(pacer.getQueueSnapshot()).toEqual([
-      { threadId: "following-thread", position: 0, estimatedStartAt: base + 10_000 },
+      {
+        threadId: "following-thread",
+        position: 0,
+        estimatedStartAt: base + 10_000,
+        pacingIntervalMs: 10_000,
+      },
     ]);
 
     await vi.advanceTimersByTimeAsync(10_000);
@@ -166,7 +207,12 @@ describe("ProviderPacer", () => {
     });
 
     expect(pacer.getQueueSnapshot()).toEqual([
-      { threadId: "delayed-thread", position: 0, estimatedStartAt: base + 5_000 },
+      {
+        threadId: "delayed-thread",
+        position: 0,
+        estimatedStartAt: base + 5_000,
+        pacingIntervalMs: 0,
+      },
     ]);
     await vi.advanceTimersByTimeAsync(4_999);
     expect(run.started).toBe(false);

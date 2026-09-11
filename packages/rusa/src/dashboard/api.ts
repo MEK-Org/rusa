@@ -81,13 +81,15 @@ export interface DashboardDataDeps {
    * Read-only, per-lane FIFO snapshots from every live `ProviderPacer`,
    * flattened across lanes. `position` is 0-based within its own provider
    * lane (not globally comparable across lanes); `estimatedStartAt` is an
-   * ISO-8601 projection or `null` when it can't be honestly quoted yet —
-   * see `ProviderPacer.getQueueSnapshot` for the full contract this mirrors.
+   * ISO-8601 projection or `null` when it can't be honestly quoted yet;
+   * `pacingIntervalMs` is the lane's whole-millisecond start spacing — see
+   * `ProviderPacer.getQueueSnapshot` for the full contract this mirrors.
    */
   providerQueueSnapshots?: () => Array<{
     threadId: string;
     position: number;
     estimatedStartAt: string | null;
+    pacingIntervalMs: number;
   }>;
   /**
    * Current selected obligation for an actor's active run. This is a
@@ -258,6 +260,12 @@ interface ThreadDto {
    * live pacer state — never persisted, and shifts as pacing changes.
    */
   estimatedStartAt?: string | null;
+  /**
+   * Whole-millisecond start spacing on this request's provider lane, or
+   * `null` when the actor is not in a pacer queue. Same live-pacer source and
+   * lifetime as `estimatedStartAt`.
+   */
+  pacingIntervalMs?: number | null;
 }
 
 /**
@@ -1408,6 +1416,7 @@ export async function handleMeshApiRequest(
         lastActiveAt: lastActiveByActor.get(r.id) ?? null,
         queuePosition: providerQueueSnapshots.get(r.id)?.position ?? null,
         estimatedStartAt: providerQueueSnapshots.get(r.id)?.estimatedStartAt ?? null,
+        pacingIntervalMs: providerQueueSnapshots.get(r.id)?.pacingIntervalMs ?? null,
         selectedProvider: selection?.provider ?? null,
         selectedLane: selection?.lane ?? null,
         selectedModel: selection?.model ?? null,
