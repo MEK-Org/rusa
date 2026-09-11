@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'dart:async';
 import 'package:rxdart/rxdart.dart';
 
+import '../breakpoints.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -81,7 +82,7 @@ class _DetailPanelState extends State<DetailPanel>
       builder: (_, _) {
         final walkieActive = widget.store.walkieActive.valueOrNull ?? false;
         final height = MediaQuery.of(context).size.height;
-        final isFullScreenWalkie = walkieActive && height < 500;
+        final isFullScreenWalkie = walkieActive && height < kShortViewportHeight;
 
         if (isFullScreenWalkie) {
           return ChatTab(

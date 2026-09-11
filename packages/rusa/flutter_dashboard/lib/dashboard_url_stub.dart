@@ -1,7 +1,8 @@
 import 'widgets/header.dart';
 
-/// VM/test fallback. The browser implementation reads and writes the URL.
-DashboardView dashboardViewFromUrl() => DashboardView.overview;
+/// VM/test fallback. The browser implementation reads and writes the URL; off
+/// the browser there is no address to read, so no view is named.
+DashboardView? dashboardViewFromUrl() => null;
 
 String? focusedObligationIdFromUrl() => null;
 

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
+import '../breakpoints.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -54,6 +55,13 @@ const Map<String, QuotaProviderConfig> kDefaultQuotaProviders = {
 /// [onSelect] is wired; header-only/standalone uses render brand + status
 /// exactly as before. IU reports are NOT a fourth destination : they are
 /// a sub-view of the IU route, switched inside the body.
+///
+/// On phones the header instead carries a single leading action in the slot the
+/// mesh icon occupies on the desktop — a hamburger that opens the navigation
+/// drawer ([onMenuTap]), or, once you are inside a detail view, a back arrow
+/// ([onBack]) that replaces it rather than costing the detail a second row of
+/// vertical space. Both the inline nav and the quota rings move into the drawer
+/// in that mode.
 class MeshHeader extends StatelessWidget {
   const MeshHeader({
     super.key,
@@ -61,6 +69,8 @@ class MeshHeader extends StatelessWidget {
     this.selected = DashboardView.actors,
     this.onSelect,
     this.quotaProviders = kDefaultQuotaProviders,
+    this.onMenuTap,
+    this.onBack,
   });
 
   final DashboardStore store;
@@ -74,31 +84,23 @@ class MeshHeader extends StatelessWidget {
   /// Per-provider quota window config. Defaults each provider to weekly.
   final Map<String, QuotaProviderConfig> quotaProviders;
 
+  /// Opens the phone navigation drawer. Wiring it switches the header into its
+  /// phone shape: a hamburger in the brand slot, nav and quota in the drawer.
+  final VoidCallback? onMenuTap;
+
+  /// Returns from a phone detail view to the list behind it. Takes the same
+  /// leading slot as [onMenuTap] and wins it while a detail is open.
+  final VoidCallback? onBack;
+
   @override
   Widget build(BuildContext context) {
-    Widget buildQuota() {
-      return StreamBuilder<QuotaSnapshotDto?>(
-        stream: store.quota,
-        initialData: store.quota.valueOrNull,
-        builder: (_, snap) => StreamBuilder<bool>(
-          stream: store.quotaRefreshing,
-          initialData: store.quotaRefreshing.valueOrNull ?? false,
-          builder: (_, refreshingSnap) => _QuotaHeaderStrip(
-            snapshot: snap.data,
-            quotaProviders: quotaProviders,
-            refreshing: refreshingSnap.data ?? false,
-          ),
-        ),
-      );
-    }
-
-    final height = MediaQuery.of(context).size.height;
+    final height = MediaQuery.sizeOf(context).height;
     return StreamBuilder<bool>(
       stream: store.walkieActive,
       initialData: store.walkieActive.valueOrNull ?? false,
       builder: (context, walkieActiveSnap) {
         final walkieActive = walkieActiveSnap.data ?? false;
-        if (walkieActive && height < 500) {
+        if (walkieActive && height < kShortViewportHeight) {
           return const SizedBox.shrink();
         }
         return Container(
@@ -110,7 +112,10 @@ class MeshHeader extends StatelessWidget {
           child: LayoutBuilder(
             builder: (context, constraints) {
               final compact = constraints.maxWidth < 520;
-              final twoTier = constraints.maxWidth < 850;
+              // Phone shape: navigation and quota both live in the drawer, so
+              // the header keeps to its single brand row.
+              final drawerNav = onMenuTap != null || onBack != null;
+              final twoTier = !drawerNav && constraints.maxWidth < 850;
               return Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -121,10 +126,9 @@ class MeshHeader extends StatelessWidget {
                         Expanded(
                           child: Row(
                             children: [
-                              const Icon(
-                                Icons.hub_outlined,
-                                color: MeshColors.accent,
-                                size: 22,
+                              _LeadingAction(
+                                onMenuTap: onMenuTap,
+                                onBack: onBack,
                               ),
                               const SizedBox(width: 10),
                               const Text(
@@ -163,7 +167,7 @@ class MeshHeader extends StatelessWidget {
                                 },
                               ),
                               if (!compact) ...[const SizedBox(width: 6)],
-                              if (onSelect != null)
+                              if (onSelect != null && !drawerNav)
                                 Expanded(
                                   child: SingleChildScrollView(
                                     scrollDirection: Axis.horizontal,
@@ -215,9 +219,12 @@ class MeshHeader extends StatelessWidget {
                             ],
                           ),
                         ),
-                        if (!twoTier) ...[
+                        if (!twoTier && !drawerNav) ...[
                           const SizedBox(width: 14),
-                          buildQuota(),
+                          QuotaIndicators(
+                            store: store,
+                            quotaProviders: quotaProviders,
+                          ),
                         ],
                       ],
                     ),
@@ -230,7 +237,10 @@ class MeshHeader extends StatelessWidget {
                           Expanded(
                             child: Align(
                               alignment: Alignment.centerRight,
-                              child: buildQuota(),
+                              child: QuotaIndicators(
+                                store: store,
+                                quotaProviders: quotaProviders,
+                              ),
                             ),
                           ),
                         ],
@@ -246,15 +256,86 @@ class MeshHeader extends StatelessWidget {
   }
 }
 
+/// The brand slot's leading widget: the mesh icon on the desktop, a hamburger
+/// once a drawer is wired, and a back arrow while a phone detail view is open.
+/// Only ever one of them — the phone header has exactly one leading action, and
+/// a detail view spends no separate row on its back affordance.
+class _LeadingAction extends StatelessWidget {
+  const _LeadingAction({required this.onMenuTap, required this.onBack});
+
+  final VoidCallback? onMenuTap;
+  final VoidCallback? onBack;
+
+  @override
+  Widget build(BuildContext context) {
+    final back = onBack;
+    final menu = onMenuTap;
+    if (back == null && menu == null) {
+      return const Icon(Icons.hub_outlined, color: MeshColors.accent, size: 22);
+    }
+    return IconButton(
+      onPressed: back ?? menu,
+      icon: Icon(
+        back != null ? Icons.arrow_back : Icons.menu,
+        color: MeshColors.accent,
+        size: 22,
+      ),
+      tooltip: back != null ? 'Back' : 'Navigation',
+      padding: EdgeInsets.zero,
+      visualDensity: VisualDensity.compact,
+      constraints: const BoxConstraints.tightFor(width: 40, height: 40),
+    );
+  }
+}
+
+/// The store-bound quota rings. The header renders them inline; the phone
+/// navigation drawer renders the same reading stacked at its bottom, so quota
+/// stays one tap away without spending header height on a phone.
+class QuotaIndicators extends StatelessWidget {
+  const QuotaIndicators({
+    super.key,
+    required this.store,
+    this.quotaProviders = kDefaultQuotaProviders,
+    this.axis = Axis.horizontal,
+  });
+
+  final DashboardStore store;
+  final Map<String, QuotaProviderConfig> quotaProviders;
+
+  /// Lay the per-provider rings out in a scrollable row (header) or a stacked
+  /// column (drawer).
+  final Axis axis;
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<QuotaSnapshotDto?>(
+      stream: store.quota,
+      initialData: store.quota.valueOrNull,
+      builder: (_, snap) => StreamBuilder<bool>(
+        stream: store.quotaRefreshing,
+        initialData: store.quotaRefreshing.valueOrNull ?? false,
+        builder: (_, refreshingSnap) => _QuotaHeaderStrip(
+          snapshot: snap.data,
+          quotaProviders: quotaProviders,
+          refreshing: refreshingSnap.data ?? false,
+          axis: axis,
+        ),
+      ),
+    );
+  }
+}
+
 class _QuotaHeaderStrip extends StatelessWidget {
   const _QuotaHeaderStrip({
     required this.snapshot,
     required this.quotaProviders,
     this.refreshing = false,
+    this.axis = Axis.horizontal,
   });
 
   final QuotaSnapshotDto? snapshot;
   final Map<String, QuotaProviderConfig> quotaProviders;
+  final Axis axis;
 
   /// True while a background SWR revalidation is in flight (ISSUE_NUM ask 4). The
   /// strip keeps rendering its last-known reading throughout — never a
@@ -272,36 +353,45 @@ class _QuotaHeaderStrip extends StatelessWidget {
         .where((entry) => entry.provider != null)
         .toList(growable: false);
     if (providers.isEmpty) return const SizedBox.shrink();
+    final rings = [
+      for (final entry in providers)
+        _ProviderQuotaRing(
+          provider: entry.provider!,
+          weeklyWindow: _findWindow(entry.provider, entry.config.primaryWindow),
+          sessionWindow: entry.config.sessionWindow == null
+              ? null
+              : _findWindow(entry.provider, entry.config.sessionWindow!),
+        ),
+    ];
     return AnimatedOpacity(
       opacity: refreshing ? 0.55 : 1.0,
       duration: const Duration(milliseconds: 200),
-      child: ClipRect(
-        child: SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          physics: const ClampingScrollPhysics(),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              for (final entry in providers) ...[
-                _ProviderQuotaRing(
-                  provider: entry.provider!,
-                  weeklyWindow: _findWindow(
-                    entry.provider,
-                    entry.config.primaryWindow,
-                  ),
-                  sessionWindow: entry.config.sessionWindow == null
-                      ? null
-                      : _findWindow(
-                          entry.provider,
-                          entry.config.sessionWindow!,
-                        ),
-                ),
-                if (entry != providers.last) const SizedBox(width: 18),
+      child: axis == Axis.vertical
+          ? Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                for (final ring in rings) ...[
+                  ring,
+                  if (ring != rings.last) const SizedBox(height: 14),
+                ],
               ],
-            ],
-          ),
-        ),
-      ),
+            )
+          : ClipRect(
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                physics: const ClampingScrollPhysics(),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (final ring in rings) ...[
+                      ring,
+                      if (ring != rings.last) const SizedBox(width: 18),
+                    ],
+                  ],
+                ),
+              ),
+            ),
     );
   }
 }

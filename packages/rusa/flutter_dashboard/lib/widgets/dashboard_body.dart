@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 
+import '../breakpoints.dart';
 import '../dashboard_url.dart';
 import '../models.dart';
 import '../store.dart';
@@ -8,21 +9,20 @@ import '../theme.dart';
 import 'actor_tree.dart';
 import 'detail_panel.dart';
 import 'header.dart';
+import 'mobile_nav_drawer.dart';
 import 'overview_tab.dart';
 import 'work_tab.dart';
-
-/// Below which width (logical px) the dashboard reflows from the desktop
-/// side-by-side master-detail to the mobile master-detail *navigation* layout
-/// (full-width list → tap → full-width detail with a back affordance).
-const double kNarrowBreakpoint = 700;
 
 /// The header + responsive master-detail body. Lives in its own (VM-safe) file
 /// — importing no web-only code — so the screenshot harness can render the real
 /// layout headlessly.
 ///
-///  • Wide  (≥ [kNarrowBreakpoint]): actor tree on the left, detail on the right.
+///  • Wide  (≥ [kNarrowBreakpoint]): actor tree on the left, detail on the right,
+///    with the nav and quota inline in the header.
 ///  • Narrow (< [kNarrowBreakpoint]): a full-width list; tapping an actor
-///    navigates to its full-width detail, and a back bar returns to the list.
+///    navigates to its full-width detail. The nav moves into a drawer opened
+///    from the header's hamburger, and inside a detail a back arrow takes that
+///    same slot rather than adding a row of its own.
 class DashboardBody extends StatefulWidget {
   const DashboardBody({
     super.key,
@@ -52,11 +52,16 @@ class _DashboardBodyState extends State<DashboardBody> {
   late DashboardView _view;
   StreamSubscription<String?>? _focusSub;
   StreamSubscription<String?>? _actorSub;
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
+
+  /// Whether the landing view has been settled against the viewport, which
+  /// takes a [MediaQuery] and so can only happen once dependencies are in.
+  bool _landingViewResolved = false;
 
   @override
   void initState() {
     super.initState();
-    _view = dashboardViewFromUrl();
+    _view = dashboardViewFromUrl() ?? DashboardView.overview;
     final initialObligation = focusedObligationIdFromUrl();
     if (initialObligation != null) {
       widget.store.setFocusedObligationId(initialObligation);
@@ -88,6 +93,21 @@ class _DashboardBodyState extends State<DashboardBody> {
     });
   }
 
+  /// Settles where an unaddressed load lands, once the body knows how much room
+  /// it has. On a truly short viewport — the geometry the walkie-talkie takes
+  /// over full screen — the overview's stacked cards have nowhere to go, so the
+  /// actor hierarchy is the useful landing. A URL that names a view still wins;
+  /// this only picks the default, and only for the first layout, so a later
+  /// rotation never yanks you off the view you are reading.
+  void _resolveLandingView(BoxConstraints constraints) {
+    if (_landingViewResolved || !constraints.hasBoundedHeight) return;
+    _landingViewResolved = true;
+    if (dashboardViewFromUrl() == null &&
+        constraints.maxHeight < kShortViewportHeight) {
+      _view = DashboardView.actors;
+    }
+  }
+
   @override
   void dispose() {
     _focusSub?.cancel();
@@ -107,9 +127,47 @@ class _DashboardBodyState extends State<DashboardBody> {
 
   @override
   Widget build(BuildContext context) {
-    // Paint the dark base color directly (not just via the Scaffold) so the
-    // detail pane — which draws no background of its own — stays on-theme
-    // everywhere, including the headless screenshot capture.
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        _resolveLandingView(constraints);
+        if (constraints.maxWidth >= kNarrowBreakpoint) {
+          return _chrome();
+        }
+        // On a phone the header's leading slot carries the navigation: the
+        // hamburger that opens the drawer, or — once an actor's detail is open
+        // — the back arrow out of it.
+        return StreamBuilder<String?>(
+          stream: widget.store.primary,
+          initialData: widget.store.primary.valueOrNull,
+          builder: (context, snap) {
+            final inActorDetail =
+                _view == DashboardView.actors && snap.data != null;
+            return Scaffold(
+              key: _scaffoldKey,
+              backgroundColor: MeshColors.bgPrimary,
+              drawer: MobileNavDrawer(
+                store: widget.store,
+                selected: _view,
+                onSelect: _selectView,
+                quotaProviders: _quotaProviders(
+                  widget.store.dashboardConfig.valueOrNull,
+                ),
+              ),
+              body: _chrome(
+                onMenuTap: () => _scaffoldKey.currentState?.openDrawer(),
+                onBack: inActorDetail ? widget.store.clearSelection : null,
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  /// The header + current view. Paints the dark base color directly (not just
+  /// via the Scaffold) so the detail pane — which draws no background of its
+  /// own — stays on-theme everywhere, including the headless screenshot capture.
+  Widget _chrome({VoidCallback? onMenuTap, VoidCallback? onBack}) {
     return ColoredBox(
       color: MeshColors.bgPrimary,
       child: Column(
@@ -121,6 +179,8 @@ class _DashboardBodyState extends State<DashboardBody> {
             quotaProviders: _quotaProviders(
               widget.store.dashboardConfig.valueOrNull,
             ),
+            onMenuTap: onMenuTap,
+            onBack: onBack,
           ),
           Expanded(
             child: _view == DashboardView.overview
@@ -320,8 +380,9 @@ class _UnavailableView extends StatelessWidget {
 }
 
 /// Mobile master-detail navigation: shows the full-width actor list until an
-/// actor is selected, then swaps to that actor's full-width detail view with a
-/// back bar. Driven by the store's `primary` (a back tap clears it).
+/// actor is selected, then gives that actor's detail the whole screen. The way
+/// back is the header's back arrow (wired by [DashboardBody] from the same
+/// `primary` stream), so the detail spends none of its own height on one.
 class _NarrowBody extends StatelessWidget {
   const _NarrowBody({required this.store, required this.onSelectView});
 
@@ -342,74 +403,10 @@ class _NarrowBody extends StatelessWidget {
             touchTargets: true,
           );
         }
-        final height = MediaQuery.of(context).size.height;
-        return StreamBuilder<bool>(
-          stream: store.walkieActive,
-          initialData: store.walkieActive.valueOrNull ?? false,
-          builder: (_, walkieActiveSnap) {
-            final walkieActive = walkieActiveSnap.data ?? false;
-            final isFullScreenWalkie = walkieActive && height < 500;
-            return Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                _BackBar(store: store),
-                if (!isFullScreenWalkie)
-                  const Divider(height: 1, color: MeshColors.border),
-                Expanded(child: DetailPanel(store: store, narrow: true, onSelectView: onSelectView)),
-              ],
-            );
-          },
-        );
-      },
-    );
-  }
-}
-
-/// The narrow-layout back affordance: a tap returns from an actor's detail view
-/// to the full-width list.
-class _BackBar extends StatelessWidget {
-  const _BackBar({required this.store});
-
-  final DashboardStore store;
-
-  @override
-  Widget build(BuildContext context) {
-    final height = MediaQuery.of(context).size.height;
-    return StreamBuilder<bool>(
-      stream: store.walkieActive,
-      initialData: store.walkieActive.valueOrNull ?? false,
-      builder: (context, walkieActiveSnap) {
-        final walkieActive = walkieActiveSnap.data ?? false;
-        if (walkieActive && height < 500) {
-          return const SizedBox.shrink();
-        }
-        return Material(
-          color: MeshColors.bgSecondary,
-          child: InkWell(
-            onTap: store.clearSelection,
-            child: Container(
-              height: 48,
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              child: Row(
-                children: const [
-                  Icon(
-                    Icons.arrow_back,
-                    size: 20,
-                    color: MeshColors.textSecondary,
-                  ),
-                  SizedBox(width: 8),
-                  Text(
-                    'Actors',
-                    style: TextStyle(
-                      color: MeshColors.textSecondary,
-                      fontSize: 14,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
+        return DetailPanel(
+          store: store,
+          narrow: true,
+          onSelectView: onSelectView,
         );
       },
     );

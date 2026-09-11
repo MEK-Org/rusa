@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:rxdart/rxdart.dart';
 
+import '../breakpoints.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -143,7 +144,7 @@ class _ChatTabState extends State<ChatTab> {
 
         final height = MediaQuery.of(context).size.height;
         final walkieActive = widget.store.walkieActive.valueOrNull ?? false;
-        final isFullScreenWalkie = walkieActive && height < 500;
+        final isFullScreenWalkie = walkieActive && height < kShortViewportHeight;
 
         if (isFullScreenWalkie) {
           return Column(
