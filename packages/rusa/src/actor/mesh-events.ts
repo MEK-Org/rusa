@@ -122,6 +122,10 @@ export type MeshEventKind =
   // that corrective budget (`continuation_capped`).
   | "run_continued"
   | "run_yielded"
+  // A strict-obligation experiment participant attempted a clean yield without
+  // closing the selected head obligation; payload identifies the obligation and
+  // actionable reason. The rejected yield itself is not recorded as yielded.
+  | "run_yield_rejected"
   | "continuation_capped"
   // Capability lifecycle (design ISSUE_NUM, phase 1a): the root granted/revoked an
   // extra MCP capability to an actor. `actorId` = the grantee actor, `payload` = { grantedBy },

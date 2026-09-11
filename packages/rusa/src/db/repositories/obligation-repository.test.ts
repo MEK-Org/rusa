@@ -2983,6 +2983,32 @@ describe("ObligationRepository", () => {
       repository.create({ title: "prereq", id: "prereq", ownerId: "actor-a" });
       expect(() => repository.removePrerequisite("dependent", "prereq")).not.toThrow();
     });
+
+    it("reads unbounded lightweight child and prerequisite edges for lifecycle checks", () => {
+      repository.create({ title: "parent", id: "parent-edge", ownerId: "actor-a" });
+      for (let index = 0; index <= 100; index++) {
+        repository.create({
+          title: `child ${index}`,
+          id: `child-edge-${index}`,
+          parentId: "parent-edge",
+          ownerId: "actor-a",
+          creatorId: index === 100 ? "creator-a" : null,
+        });
+      }
+      repository.create({ title: "prerequisite", id: "prereq-edge", ownerId: "actor-a" });
+      repository.addPrerequisite("parent-edge", "prereq-edge");
+      repository.setTerminalStatus("prereq-edge", "done");
+
+      expect(repository.listDirectChildEdges("parent-edge")).toContainEqual({
+        id: "child-edge-100",
+        status: "ready",
+        creatorId: "creator-a",
+      });
+      expect(repository.listDirectChildEdges("parent-edge")).toHaveLength(101);
+      expect(repository.listPrerequisiteEdges("parent-edge")).toEqual([
+        { prerequisiteId: "prereq-edge", status: "done" },
+      ]);
+    });
   });
 
   describe("checkpoint", () => {

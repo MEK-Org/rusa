@@ -38,6 +38,10 @@ import {
   InMemoryEventSourceSubscriptionStore,
   parentOf,
 } from "./event-subscriptions.js";
+import {
+  InMemoryExperimentEnrollmentStore,
+  STRICT_OBLIGATION_HANDLING_EXPERIMENT,
+} from "./experiments.js";
 import { ExternalRootDriver } from "./external-root-driver.js";
 import { routeRunFailure } from "./failure-sink.js";
 import type {
@@ -200,6 +204,7 @@ function setup(
     actors?: InMemoryActorRepository;
     withTransaction?: ActorMeshOptions["withTransaction"];
     handleForId?: (id: string) => string;
+    experimentEnrollments?: InMemoryExperimentEnrollmentStore;
   } = {}
 ) {
   const registry = opts.actors ?? new InMemoryActorRepository();
@@ -243,6 +248,7 @@ function setup(
     events: opts.events,
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
     inboxStore,
+    experimentEnrollments: opts.experimentEnrollments,
     eventSourceOwners,
     eventSourceSubscriptions,
     eventManager,
@@ -8489,5 +8495,313 @@ describe("ActorMesh", () => {
         mesh.setActorModel(child, { provider: "claude", model: "claude-opus-4-8" }, parent)
       ).toThrow(new RegExp(`Cannot set model on retired thread: ${child}`));
     });
+  });
+});
+
+describe("strict obligation handling experiment (#382)", () => {
+  let db: Database.Database;
+  let repo: ObligationRepository;
+  let inboxStore: ReturnType<typeof createMemoryInboxStore>;
+  let enrollments: InMemoryExperimentEnrollmentStore;
+
+  beforeEach(() => {
+    db = new Database(":memory:");
+    runMigrations(db);
+    repo = new ObligationRepository(db);
+    inboxStore = createMemoryInboxStore();
+    enrollments = new InMemoryExperimentEnrollmentStore();
+  });
+
+  afterEach(() => db.close());
+
+  function strictMesh(events?: MeshEventSink) {
+    return setup({
+      events,
+      inboxStore,
+      experimentEnrollments: enrollments,
+      obligations: {
+        findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref),
+        get: (id) => repo.get(id),
+        listDirectChildEdges: (parentId) => repo.listDirectChildEdges(parentId),
+        listPrerequisiteEdges: (dependentId) => repo.listPrerequisiteEdges(dependentId),
+      },
+    });
+  }
+
+  function selectHead(mesh: ActorMesh, actorId: string, obligationId: string): void {
+    mesh.deliverReadyHeadAttention(actorId, { id: obligationId, intent: "handle it" }, null);
+    mesh.actorQueued(actorId, { responsive: false, mode: "ordinary" });
+    const entry = inboxStore.entries.find(
+      (candidate) =>
+        candidate.actorId === actorId &&
+        candidate.payload.type === "obligation.ready_head" &&
+        candidate.payload.obligationId === obligationId
+    );
+    if (!entry) throw new Error("expected ready-head inbox entry");
+    mesh.selectInboxEntries(actorId, [entry.id]);
+  }
+
+  function worker(mesh: ActorMesh, charter = "worker"): string {
+    return mesh.spawn({
+      charter,
+      parentId: "root",
+      modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+    });
+  }
+
+  it("enforces only a root-enrolled worker and records an actionable rejection", () => {
+    const events: MeshEventInput[] = [];
+    const { mesh } = strictMesh((event) => events.push(event));
+    const optedIn = worker(mesh, "opted in");
+    const control = worker(mesh, "unenrolled control");
+    mesh.enrollActorInExperiment(optedIn, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "strict-head", title: "Strict head", ownerId: optedIn });
+    repo.create({ id: "control-head", title: "Control head", ownerId: control });
+
+    selectHead(mesh, optedIn, "strict-head");
+    selectHead(mesh, control, "control-head");
+
+    expect(() => mesh.declareYield(control, "complete")).not.toThrow();
+    expect(() => mesh.declareYield(optedIn, "complete")).toThrow(
+      /selected head obligation strict-head \("Strict head"\) was not finished or decomposed/
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "run_yield_rejected",
+        actorId: optedIn,
+        payload: expect.stringContaining('"obligationId":"strict-head"'),
+      })
+    );
+  });
+
+  it("captures experiment membership at selection, so a root unenrollment applies next run", () => {
+    const { mesh } = strictMesh();
+    const subject = worker(mesh);
+    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "captured", title: "Captured", ownerId: subject });
+    selectHead(mesh, subject, "captured");
+
+    mesh.unenrollActorFromExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    expect(() => mesh.declareYield(subject, "complete")).toThrow(
+      /selected head obligation captured/
+    );
+    mesh.abandonInboxRun(subject);
+
+    repo.create({ id: "next-control", title: "Next control", ownerId: subject });
+    selectHead(mesh, subject, "next-control");
+    expect(() => mesh.declareYield(subject, "complete")).not.toThrow();
+  });
+
+  it("accepts terminal exits and a worker-created live child", () => {
+    const { mesh } = strictMesh();
+    for (const [id, terminal] of [
+      ["done", "done"],
+      ["cancelled", "cancelled"],
+      ["scheduled", "scheduled"],
+    ] as const) {
+      const subject = worker(mesh, id);
+      mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+      repo.create({ id, title: id, ownerId: subject });
+      selectHead(mesh, subject, id);
+      if (terminal === "scheduled") {
+        repo.setRecurrence(id, { policy: "cron", cronExpr: "0 0 * * *" });
+        repo.setTerminalStatus(id, "done");
+      } else {
+        repo.setTerminalStatus(id, terminal);
+      }
+      expect(() => mesh.declareYield(subject, "complete")).not.toThrow();
+    }
+
+    const subject = worker(mesh, "decomposer");
+    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "parent", title: "Parent", ownerId: subject });
+    selectHead(mesh, subject, "parent");
+    repo.create({
+      id: "child",
+      parentId: "parent",
+      title: "Child",
+      ownerId: subject,
+      creatorId: subject,
+    });
+    expect(() => mesh.declareYield(subject, "blocked")).not.toThrow();
+  });
+
+  it("rejects pre-existing or other-authored children, but accepts a newly added unmet prerequisite", () => {
+    const { mesh } = strictMesh();
+    const subject = worker(mesh);
+    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "parent", title: "Parent", ownerId: subject });
+    repo.create({
+      id: "old-child",
+      parentId: "parent",
+      title: "Old child",
+      ownerId: subject,
+      creatorId: subject,
+    });
+    selectHead(mesh, subject, "parent");
+    repo.create({
+      id: "other-child",
+      parentId: "parent",
+      title: "Other child",
+      ownerId: subject,
+      creatorId: "another-actor",
+    });
+    expect(() => mesh.declareYield(subject, "complete")).toThrow(/pre-existing work/);
+
+    repo.create({ id: "review", title: "Review", ownerId: "human:reviewer" });
+    repo.addPrerequisite("parent", "review");
+    expect(() => mesh.declareYield(subject, "blocked")).not.toThrow();
+  });
+
+  it("does not accept a cancelled prerequisite and clears enforcement on an abandoned run", () => {
+    const { mesh } = strictMesh();
+    const subject = worker(mesh);
+    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "first", title: "First", ownerId: subject });
+    selectHead(mesh, subject, "first");
+    repo.create({ id: "cancelled-gate", title: "Cancelled gate", ownerId: subject });
+    repo.setTerminalStatus("cancelled-gate", "cancelled");
+    repo.addPrerequisite("first", "cancelled-gate");
+    expect(() => mesh.declareYield(subject, "blocked")).toThrow(/pre-existing work/);
+
+    mesh.abandonInboxRun(subject);
+    mesh.unenrollActorFromExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "after-failure", title: "After failure", ownerId: subject });
+    selectHead(mesh, subject, "after-failure");
+    expect(() => mesh.declareYield(subject, "complete")).not.toThrow();
+  });
+
+  it("does not constrain runs selected from regular messages rather than head attention", () => {
+    const { mesh } = strictMesh();
+    const subject = worker(mesh);
+    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+
+    repo.create({ id: "ob-unrelated", title: "Unrelated Task", ownerId: subject });
+    mesh.sendMessage(subject, "general message", "root");
+    mesh.actorQueued(subject, { responsive: false, mode: "ordinary" });
+    const msgEntry = inboxStore.entries.find(
+      (e) => e.actorId === subject && e.payload.type === "mesh.message"
+    );
+    if (!msgEntry) throw new Error("expected message inbox entry");
+    mesh.selectInboxEntries(subject, [msgEntry.id]);
+
+    expect(() => mesh.declareYield(subject, "complete")).not.toThrow();
+    mesh.finishInboxRun(subject);
+  });
+
+  it("evaluates standing/apex nodes when re-readied, and accepts question child for operator continuation", () => {
+    const { mesh } = strictMesh();
+    const subject = worker(mesh);
+    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+
+    repo.create({ id: "standing-effort", title: "Standing Maintenance", ownerId: subject });
+    repo.create({
+      id: "initial-child",
+      parentId: "standing-effort",
+      title: "Initial Task",
+      ownerId: subject,
+      creatorId: subject,
+    });
+
+    repo.setTerminalStatus("initial-child", "done");
+    expect(repo.get("standing-effort")?.status).toBe("ready");
+
+    selectHead(mesh, subject, "standing-effort");
+
+    expect(() => mesh.declareYield(subject, "complete")).toThrow(
+      /selected head obligation standing-effort \("Standing Maintenance"\) was not finished or decomposed/
+    );
+
+    repo.create({
+      id: "standing-question",
+      parentId: "standing-effort",
+      title: "More work needed under standing maintenance?",
+      ownerId: "human:operator",
+      creatorId: subject,
+    });
+    expect(repo.get("standing-effort")?.status).toBe("waiting");
+
+    expect(() => mesh.declareYield(subject, "complete")).not.toThrow();
+    mesh.finishInboxRun(subject);
+  });
+
+  it("preserves failed-run handling without clean-yield rejection", () => {
+    const { mesh } = strictMesh();
+    const subject = worker(mesh);
+    mesh.enrollActorInExperiment(subject, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+
+    repo.create({ id: "ob-crashed", title: "Crashing Task", ownerId: subject });
+    selectHead(mesh, subject, "ob-crashed");
+
+    expect(() => mesh.finishInboxRun(subject)).not.toThrow();
+    expect(repo.get("ob-crashed")?.status).toBe("ready");
+  });
+
+  it("preserves head-only notification ordering through the production ready-head listener", () => {
+    const { mesh } = strictMesh();
+    const subject = worker(mesh);
+    // Exactly what runStart wires: repository head transitions route into the
+    // mesh's attention delivery. Without this, no repository mutation could
+    // ever append an entry and the "no early notification" assertion below
+    // would hold even if head routing were broken.
+    repo.setReadyHeadListener(({ ownerId, head, previousHeadId, sequence }) =>
+      mesh.deliverReadyHeadAttention(
+        ownerId,
+        head === null ? null : { id: head.id, intent: head.intent },
+        previousHeadId,
+        sequence
+      )
+    );
+    const headEntries = () =>
+      inboxStore.entries.filter(
+        (entry) => entry.actorId === subject && entry.payload.type === "obligation.ready_head"
+      );
+
+    repo.create({ id: "head-1", title: "Head 1", ownerId: subject, priority: 10 });
+    // The listener — not a manual call — delivered the first head.
+    expect(headEntries().map((entry) => entry.payload.obligationId)).toEqual(["head-1"]);
+
+    repo.create({ id: "blocker", title: "Blocker", ownerId: subject, priority: 50 });
+    repo.create({ id: "head-2", title: "Head 2", ownerId: subject, priority: 100 });
+    repo.addPrerequisite("head-2", "blocker");
+    expect(repo.get("head-2")?.status).toBe("waiting");
+    const beforeUnblock = headEntries().length;
+
+    // head-2 goes waiting -> ready behind head-1, which stays the head: the
+    // owner's head never changes, so no attention is emitted early.
+    repo.setTerminalStatus("blocker", "done");
+    expect(repo.get("head-2")?.status).toBe("ready");
+    expect(headEntries().length).toBe(beforeUnblock);
+
+    // Ordinary later delivery: head-1 finishing makes head-2 the head, and the
+    // same production listener path appends it with no manual injection.
+    repo.setTerminalStatus("head-1", "done");
+    expect(headEntries().map((entry) => entry.payload.obligationId)).toEqual(["head-1", "head-2"]);
+  });
+
+  it("refuses head selection for an enrolled actor when the mesh has no closure reads", () => {
+    // A partial port — every embedder built before #382 has one — must not
+    // quietly turn enrollment into a no-op.
+    const { mesh } = setup({
+      inboxStore,
+      experimentEnrollments: enrollments,
+      obligations: { findLiveByExternalRef: (ref) => repo.findLiveByExternalRef(ref) },
+    });
+    const enrolled = worker(mesh, "enrolled");
+    const unenrolled = worker(mesh, "unenrolled");
+    mesh.enrollActorInExperiment(enrolled, STRICT_OBLIGATION_HANDLING_EXPERIMENT, "root");
+    repo.create({ id: "partial-head", title: "Partial head", ownerId: enrolled });
+    repo.create({ id: "partial-control-head", title: "Control head", ownerId: unenrolled });
+
+    expect(() => selectHead(mesh, enrolled, "partial-head")).toThrow(
+      /enrolled in strict_obligation_handling, but this mesh has no obligation closure reads/
+    );
+    // Nothing was armed and nothing was committed, so no clean yield can pass
+    // unenforced on a stale selection either.
+    expect(mesh.selectedInboxEntries(enrolled)).toEqual([]);
+
+    // An unenrolled actor on the same partial port is untouched.
+    expect(() => selectHead(mesh, unenrolled, "partial-control-head")).not.toThrow();
+    expect(() => mesh.declareYield(unenrolled, "complete")).not.toThrow();
   });
 });

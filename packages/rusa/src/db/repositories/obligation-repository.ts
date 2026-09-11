@@ -1234,6 +1234,33 @@ export class ObligationRepository {
     ).map(toObligation);
   }
 
+  /**
+   * Lightweight, unbounded edge read for run-local closure checks. This avoids
+   * pagination (a 101st child must be visible) and the projected row's priority
+   * work when the mesh only needs status and creator attribution.
+   */
+  listDirectChildEdges(
+    parentId: string
+  ): Array<{ id: string; status: ObligationStatus; creatorId: string | null }> {
+    return this.db
+      .prepare("SELECT id, status, creator_id AS creatorId FROM obligations WHERE parent_id = ?")
+      .all(parentId) as Array<{ id: string; status: ObligationStatus; creatorId: string | null }>;
+  }
+
+  /** Lightweight, unbounded prerequisite edge read for run-local closure checks. */
+  listPrerequisiteEdges(
+    dependentId: string
+  ): Array<{ prerequisiteId: string; status: ObligationStatus }> {
+    return this.db
+      .prepare(
+        `SELECT edge.prerequisite_id AS prerequisiteId, obligation.status AS status
+         FROM obligation_prerequisites edge
+         JOIN obligations obligation ON obligation.id = edge.prerequisite_id
+         WHERE edge.dependent_id = ?`
+      )
+      .all(dependentId) as Array<{ prerequisiteId: string; status: ObligationStatus }>;
+  }
+
   /** Bounded direct-child read for externally serialized projections. */
   listChildrenPage(parentId: string, options: ChildObligationPageOptions): ObligationPage {
     const { limit, offset } = validatePage(options);
