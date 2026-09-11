@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:rxdart/rxdart.dart';
 
+import '../breakpoints.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -93,9 +94,7 @@ class _OverviewTabState extends State<OverviewTab> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _buildQuotaPoolsCard(),
-          const SizedBox(height: 20),
-          _buildMyQueueSection(),
+          _buildQueueAndCharts(),
           const SizedBox(height: 20),
           _buildRunningWorkersSection(),
           const SizedBox(height: 20),
@@ -104,6 +103,32 @@ class _OverviewTabState extends State<OverviewTab> {
           _buildYieldEventsSection(),
         ],
       ),
+    );
+  }
+
+  /// The existing dashboard breakpoint keeps the operator's queue beside the
+  /// quota chart when there is room, while preserving a readable queue-first
+  /// flow on phone-sized displays.
+  Widget _buildQueueAndCharts() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final queue = _buildMyQueueSection();
+        final charts = _buildQuotaPoolsCard();
+        if (constraints.maxWidth < kNarrowBreakpoint) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [queue, const SizedBox(height: 20), charts],
+          );
+        }
+        return Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(child: queue),
+            const SizedBox(width: 20),
+            Expanded(child: charts),
+          ],
+        );
+      },
     );
   }
 
@@ -385,8 +410,10 @@ class _OverviewTabState extends State<OverviewTab> {
                                 ),
                               ],
                             )
-                          : Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          : Wrap(
+                              alignment: WrapAlignment.spaceBetween,
+                              crossAxisAlignment: WrapCrossAlignment.center,
+                              runSpacing: 10,
                               children: [
                                 const Text(
                                   'No obligations in your queue.',
@@ -424,7 +451,10 @@ class _OverviewTabState extends State<OverviewTab> {
                     )
                   else ...[
                     if (ready.isNotEmpty) ...[
-                      Row(
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 4,
+                        crossAxisAlignment: WrapCrossAlignment.center,
                         children: [
                           const Text(
                             'Ready Obligations',
@@ -434,7 +464,6 @@ class _OverviewTabState extends State<OverviewTab> {
                               fontWeight: FontWeight.w700,
                             ),
                           ),
-                          const SizedBox(width: 8),
                           Container(
                             padding: const EdgeInsets.symmetric(
                               horizontal: 6,
@@ -464,7 +493,10 @@ class _OverviewTabState extends State<OverviewTab> {
                       if (waiting.isNotEmpty) const SizedBox(height: 16),
                     ],
                     if (waiting.isNotEmpty) ...[
-                      Row(
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 4,
+                        crossAxisAlignment: WrapCrossAlignment.center,
                         children: [
                           const Text(
                             'Waiting Obligations',
@@ -474,7 +506,6 @@ class _OverviewTabState extends State<OverviewTab> {
                               fontWeight: FontWeight.w700,
                             ),
                           ),
-                          const SizedBox(width: 8),
                           Container(
                             padding: const EdgeInsets.symmetric(
                               horizontal: 6,
@@ -504,7 +535,10 @@ class _OverviewTabState extends State<OverviewTab> {
                       if (scheduled.isNotEmpty) const SizedBox(height: 16),
                     ],
                     if (scheduled.isNotEmpty) ...[
-                      Row(
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 4,
+                        crossAxisAlignment: WrapCrossAlignment.center,
                         children: [
                           const Text(
                             'Scheduled Obligations',
@@ -514,7 +548,6 @@ class _OverviewTabState extends State<OverviewTab> {
                               fontWeight: FontWeight.w700,
                             ),
                           ),
-                          const SizedBox(width: 8),
                           Container(
                             padding: const EdgeInsets.symmetric(
                               horizontal: 6,

@@ -236,10 +236,15 @@ class ObligationRow extends StatelessWidget {
                 children: [
                   const Icon(Icons.schedule, size: 13, color: MeshColors.textMuted),
                   const SizedBox(width: 4),
-                  Text(
-                    'Returns ${formatReturnsIn(obligation.nextReadyAt!)} '
-                    '(${formatTs(obligation.nextReadyAt!)})',
-                    style: const TextStyle(color: MeshColors.textMuted, fontSize: 11.5),
+                  Expanded(
+                    child: Text(
+                      'Returns ${formatReturnsIn(obligation.nextReadyAt!)} '
+                      '(${formatTs(obligation.nextReadyAt!)})',
+                      style: const TextStyle(
+                        color: MeshColors.textMuted,
+                        fontSize: 11.5,
+                      ),
+                    ),
                   ),
                 ],
               ),

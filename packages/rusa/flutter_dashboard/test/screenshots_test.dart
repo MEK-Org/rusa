@@ -45,6 +45,58 @@ void main() {
   });
 
   testWidgets(
+    'renders overview queue and quota columns wide and stacked narrow',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..obligationsResult = [
+            makeObligation(
+              'overview-ready',
+              ownerId: 'human:operator',
+              intent: 'Review deployment checklist',
+            ),
+          ]
+          ..quotaHistoryResult = _overviewQuotaHistory();
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        addTearDown(store.dispose);
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        final key = GlobalKey();
+        await tester.binding.setSurfaceSize(const Size(1200, 900));
+        await tester.pumpWidget(
+          _app(
+            store,
+            key,
+            dashboardKey: const ValueKey('wide-overview'),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.byType(OverviewTab), findsOneWidget);
+        await _capture(key, '$_outDir/overview_columns_wide.png');
+
+        await tester.binding.setSurfaceSize(const Size(390, 844));
+        await tester.pumpWidget(
+          _app(
+            store,
+            key,
+            dashboardKey: const ValueKey('narrow-overview'),
+          ),
+        );
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.byType(OverviewTab), findsOneWidget);
+        expect(find.text('Review deployment checklist'), findsOneWidget);
+        await _capture(key, '$_outDir/overview_columns_narrow.png');
+        expect(tester.takeException(), isNull);
+      });
+    },
+  );
+
+  testWidgets(
     'renders the dashboard overview (tree + detail + coalesced events)',
     (tester) async {
       await tester.runAsync(() async {
@@ -209,7 +261,11 @@ void main() {
 
 // ── App composition ──────────────────────────────────────────────────────────
 
-Widget _app(DashboardStore store, Key boundaryKey) => MaterialApp(
+Widget _app(
+  DashboardStore store,
+  Key boundaryKey, {
+  Key? dashboardKey,
+}) => MaterialApp(
   debugShowCheckedModeBanner: false,
   theme: buildMeshTheme(),
   home: Scaffold(
@@ -219,7 +275,7 @@ Widget _app(DashboardStore store, Key boundaryKey) => MaterialApp(
     // background that DashboardBody paints itself.
     body: RepaintBoundary(
       key: boundaryKey,
-      child: DashboardBody(store: store),
+      child: DashboardBody(key: dashboardKey, store: store),
     ),
   ),
 );
@@ -317,6 +373,35 @@ QuotaSnapshotDto _seedQuota() => const QuotaSnapshotDto(
           status: 'available',
           headline: false,
           windowMs: 18000000,
+        ),
+      ],
+    ),
+  ],
+);
+
+QuotaHistoryDto _overviewQuotaHistory() => const QuotaHistoryDto(
+  generatedAt: '2026-06-26T09:00:00Z',
+  historySince: '2026-06-23T09:00:00Z',
+  history: [
+    QuotaHistorySeriesDto(
+      provider: 'codex',
+      windowId: 'weekly',
+      label: 'Weekly',
+      points: [
+        QuotaHistoryPointDto(
+          observedAt: '2026-06-23T09:00:00Z',
+          remainingPercent: 80,
+          intervalSeconds: 30,
+        ),
+        QuotaHistoryPointDto(
+          observedAt: '2026-06-25T09:00:00Z',
+          remainingPercent: 60,
+          intervalSeconds: 45,
+        ),
+        QuotaHistoryPointDto(
+          observedAt: '2026-06-26T09:00:00Z',
+          remainingPercent: 52,
+          intervalSeconds: 60,
         ),
       ],
     ),
