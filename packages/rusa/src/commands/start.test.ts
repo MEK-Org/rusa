@@ -525,6 +525,87 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }
   });
 
+  it("enrolls an opted-in worker through the live root mesh MCP while an unenrolled control keeps its clean yield", async () => {
+    let mesh: ActorMesh | undefined;
+    let root: Actor | undefined;
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            root = handles.root as Actor;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh || !root) throw new Error("mesh not ready");
+
+    type WithMcpServers = { opts: { mcpServers: Array<{ name: string; url: string }> } };
+    const meshUrl = (actor: Actor) => {
+      const url = (actor as unknown as WithMcpServers).opts.mcpServers.find(
+        (server) => server.name === "mesh"
+      )?.url;
+      if (!url) throw new Error("mesh MCP server missing");
+      return url;
+    };
+    const call = async (url: string, name: string, args: Record<string, unknown>) => {
+      const client = new Client({ name: "strict-obligation-dogfood", version: "0.0.0" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+      try {
+        return await client.callTool({ name, arguments: args });
+      } finally {
+        await client.close();
+      }
+    };
+
+    const liveMesh = mesh;
+    const optedIn = liveMesh.spawn({
+      charter: "live opted-in worker",
+      parentId: "root",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+    });
+    const control = liveMesh.spawn({
+      charter: "live unenrolled control",
+      parentId: "root",
+      modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+    });
+    const enrolled = await call(meshUrl(root), "enroll_actor_experiment", {
+      actor_id: optedIn,
+      experiment: "strict_obligation_handling",
+    });
+    expect(enrolled.isError).toBeFalsy();
+
+    const obligations = getRepositories().obligations;
+    for (const [actorId, obligationId] of [
+      [optedIn, "live-strict-head"],
+      [control, "live-control-head"],
+    ]) {
+      obligations.create({ id: obligationId, title: obligationId, ownerId: actorId });
+      liveMesh.deliverReadyHeadAttention(actorId, { id: obligationId, intent: "handle it" }, null);
+      liveMesh.actorQueued(actorId, { responsive: false, mode: "ordinary" });
+      const entry = getRepositories()
+        .inbox.list(actorId, { status: "unhandled" })
+        .entries.find((candidate) => candidate.payload.type === "obligation.ready_head");
+      if (!entry) throw new Error("ready-head inbox entry missing");
+      liveMesh.selectInboxEntries(actorId, [entry.id]);
+    }
+
+    const optedInActor = liveMesh.get(optedIn);
+    const controlActor = liveMesh.get(control);
+    if (!optedInActor || !controlActor) throw new Error("worker MCP endpoints missing");
+    const rejected = await call(meshUrl(optedInActor as Actor), "yield_run", {
+      status: "complete",
+    });
+    expect(rejected.isError).toBe(true);
+    expect(JSON.stringify(rejected)).toContain("selected head obligation live-strict-head");
+    const accepted = await call(meshUrl(controlActor as Actor), "yield_run", {
+      status: "complete",
+    });
+    expect(accepted.isError).toBeFalsy();
+  });
+
   describe("worker fallback is root-only ", () => {
     it("never wires an actor-level fallback for a worker, even when root has one configured", async () => {
       const config = {

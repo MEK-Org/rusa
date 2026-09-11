@@ -1795,6 +1795,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // here rather than at routing time hangs boot.
     obligations: {
       findLiveByExternalRef: (ref) => getRepositories().obligations.findLiveByExternalRef(ref),
+      // Strict-obligation handling snapshots these unbounded edge reads at
+      // selection and compares them again on clean yield. Keep the production
+      // wiring on the same durable repository seam as the experiment registry.
+      get: (id) => getRepositories().obligations.get(id),
+      listDirectChildEdges: (parentId) =>
+        getRepositories().obligations.listDirectChildEdges(parentId),
+      listPrerequisiteEdges: (dependentId) =>
+        getRepositories().obligations.listPrerequisiteEdges(dependentId),
       // Retirement's fail-closed preflight (#191): every non-terminal obligation
       // owned in the subtree is a blocker, so `scheduled` counts alongside
       // `ready` and `waiting` — a recurrence that has not fired yet is still

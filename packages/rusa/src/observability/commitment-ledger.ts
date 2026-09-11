@@ -203,6 +203,8 @@ const LEDGER_READS: Readonly<Record<MeshEventKind, LedgerRead>> = {
   run_preempted: "ignored",
   portable_context_compacted: "ignored",
   run_coalesced: "ignored",
+  // Rejection is rollout observability; it records no commitment progress.
+  run_yield_rejected: "ignored",
   stamp_invalid: "ignored",
   // The decider's other events in the same run (`run_start`, `run_yielded`) are
   // what say it was working; withdrawing one scheduled delivery neither opens

@@ -29,6 +29,7 @@ import { runMigrations } from "../db/migrations/runner.js";
 import { InboxRepository } from "../db/repositories/inbox-repository.js";
 import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { ModelClassRepository } from "../db/repositories/model-class-repository.js";
+import { ObligationRepository } from "../db/repositories/obligation-repository.js";
 import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import {
@@ -256,6 +257,69 @@ describe("agent-execution MCP server", () => {
     const yieldTool = tools.find((t) => t.name === "yield_run");
     expect(yieldTool?.description).toMatch(/finish work your parent asked you to do/i);
     expect(yieldTool?.description).toMatch(/automatic parent notification won't fire/i);
+  });
+
+  it("uses root enrollment to gate the opted-in worker while an unenrolled MCP control keeps yielding", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    try {
+      const obligations = new ObligationRepository(db);
+      const { inboxStore, mesh } = setup({
+        useInboxStore: true,
+        obligations: {
+          findLiveByExternalRef: (ref) => obligations.findLiveByExternalRef(ref),
+          get: (id) => obligations.get(id),
+          listDirectChildEdges: (id) => obligations.listDirectChildEdges(id),
+          listPrerequisiteEdges: (id) => obligations.listPrerequisiteEdges(id),
+        },
+      });
+      const root = await connect(createAgentExecMcpServer(mesh, "root", "root"));
+      const optedIn = mesh.spawn({
+        charter: "opted in",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const control = mesh.spawn({
+        charter: "control",
+        parentId: "root",
+        modelConfig: { provider: "claude", model: "claude-sonnet-5" },
+      });
+      const enrollment = (await root.callTool({
+        name: "enroll_actor_experiment",
+        arguments: { actor_id: optedIn, experiment: "strict_obligation_handling" },
+      })) as CallToolResult;
+      expect(enrollment.isError).toBeFalsy();
+
+      for (const [actorId, obligationId] of [
+        [optedIn, "strict-mcp-head"],
+        [control, "control-mcp-head"],
+      ]) {
+        obligations.create({ id: obligationId, title: obligationId, ownerId: actorId });
+        mesh.deliverReadyHeadAttention(actorId, { id: obligationId, intent: "handle it" }, null);
+        mesh.actorQueued(actorId, { responsive: false, mode: "ordinary" });
+        const entry = inboxStore
+          .list(actorId, { status: "unhandled" })
+          .entries.find((candidate) => candidate.payload.type === "obligation.ready_head");
+        if (!entry) throw new Error("expected ready-head inbox entry");
+        mesh.selectInboxEntries(actorId, [entry.id]);
+      }
+
+      const optedInClient = await connect(createAgentExecMcpServer(mesh, optedIn, "root"));
+      const controlClient = await connect(createAgentExecMcpServer(mesh, control, "root"));
+      const rejected = (await optedInClient.callTool({
+        name: "yield_run",
+        arguments: { status: "complete" },
+      })) as CallToolResult;
+      expect(rejected.isError).toBe(true);
+      expect(String(dataOf(rejected))).toContain("selected head obligation strict-mcp-head");
+      const accepted = (await controlClient.callTool({
+        name: "yield_run",
+        arguments: { status: "complete" },
+      })) as CallToolResult;
+      expect(accepted.isError).toBeFalsy();
+    } finally {
+      db.close();
+    }
   });
 
   it("transfers only the caller's active voice session through a held target", async () => {
