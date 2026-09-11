@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/widgets/actor_tree.dart';
+import 'package:rusa_dashboard/widgets/brand_mark.dart';
 import 'package:rusa_dashboard/widgets/dashboard_body.dart';
 import 'package:rusa_dashboard/widgets/detail_panel.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
@@ -135,9 +136,9 @@ void main() {
       final store = await _store();
       await _pump(tester, store, size: const Size(390, 844));
 
-      // The mesh icon and the inline nav both give way to one leading action.
+      // The brand mark and the inline nav both give way to one leading action.
       expect(find.byIcon(Icons.menu), findsOneWidget);
-      expect(find.byIcon(Icons.hub_outlined), findsNothing);
+      expect(find.byType(BrandMark), findsNothing);
       expect(find.text('Overview'), findsNothing);
       expect(find.text('IU'), findsNothing);
       expect(find.byType(MobileNavDrawer), findsNothing);
@@ -148,8 +149,8 @@ void main() {
       for (final label in ['Overview', 'Actors', 'Work', 'IU']) {
         expect(find.text(label), findsOneWidget);
       }
-      // The mesh icon keeps its place in the drawer it made room for.
-      expect(find.byIcon(Icons.hub_outlined), findsOneWidget);
+      // The brand mark keeps its place in the drawer it made room for.
+      expect(find.byType(BrandMark), findsOneWidget);
 
       await store.dispose();
     });
@@ -325,14 +326,14 @@ void main() {
     });
   });
 
-  testWidgets('the desktop header keeps its mesh icon, inline nav and quota', (
+  testWidgets('the desktop header keeps its brand mark, inline nav and quota', (
     tester,
   ) async {
     await tester.runAsync(() async {
       final store = await _store(quota: _quotaSnapshot());
       await _pump(tester, store, size: const Size(1360, 840));
 
-      expect(find.byIcon(Icons.hub_outlined), findsOneWidget);
+      expect(find.byType(BrandMark), findsOneWidget);
       expect(find.byIcon(Icons.menu), findsNothing);
       expect(find.byType(Drawer), findsNothing);
       for (final label in ['Overview', 'Actors', 'Work', 'IU']) {
@@ -360,7 +361,7 @@ void main() {
       expect(find.byType(ActorTree), findsOneWidget);
       expect(find.byType(DetailPanel), findsOneWidget);
       expect(find.byIcon(Icons.arrow_back), findsNothing);
-      expect(find.byIcon(Icons.hub_outlined), findsOneWidget);
+      expect(find.byType(BrandMark), findsOneWidget);
 
       await store.dispose();
     });

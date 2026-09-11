@@ -4,6 +4,7 @@ import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
 import 'header.dart';
+import 'brand_mark.dart';
 
 /// The phone navigation drawer behind the header's hamburger: the same top-level
 /// destinations the desktop header carries inline, with the quota rings pinned
@@ -43,17 +44,13 @@ class MobileNavDrawer extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  // The mesh icon keeps its place here, where the hamburger took
-                  // its slot in the header.
+                  // The antler/tree brand mark keeps its place here, where the
+                  // hamburger took its slot in the header.
                   Padding(
-                    padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
-                    child: Row(
-                      children: const [
-                        Icon(
-                          Icons.hub_outlined,
-                          color: MeshColors.accent,
-                          size: 22,
-                        ),
+                    padding: const EdgeInsets.fromLTRB(15, 15, 20, 11),
+                    child: const Row(
+                      children: [
+                        BrandMark(),
                         SizedBox(width: 10),
                         Text(
                           'RUSA',
