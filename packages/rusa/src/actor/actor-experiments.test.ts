@@ -3,12 +3,12 @@ import { InMemoryActorRepository } from "../repositories/in-memory-actor-reposit
 import type { Actor } from "./actor.js";
 import { ActorMesh } from "./actor-mesh.js";
 import {
-  HEAD_OBLIGATION_CLOSURE_EXPERIMENT,
   InMemoryExperimentEnrollmentStore,
+  STRICT_OBLIGATION_HANDLING_EXPERIMENT,
 } from "./experiments.js";
 import type { MeshEventInput } from "./mesh-events.js";
 
-const EXPERIMENT = HEAD_OBLIGATION_CLOSURE_EXPERIMENT;
+const EXPERIMENT = STRICT_OBLIGATION_HANDLING_EXPERIMENT;
 
 /**
  * A mesh over a fixed topology: root, a worker, the worker's parent, and a

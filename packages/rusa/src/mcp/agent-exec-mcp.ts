@@ -971,7 +971,7 @@ export function createAgentExecMcpServer(
           actor_id: z.string().describe("The thread id of the actor to enroll."),
           experiment: z
             .string()
-            .describe("A registered experiment name, e.g. 'head_obligation_closure'."),
+            .describe("A registered experiment name, e.g. 'strict_obligation_handling'."),
         },
       },
       async ({ actor_id, experiment }) => {

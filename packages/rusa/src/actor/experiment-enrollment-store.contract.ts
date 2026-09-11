@@ -6,7 +6,7 @@ export const WORKER = "worker-thread-1";
 export const OTHER = "worker-thread-2";
 
 /** The one registered experiment; the store itself holds no registry opinion. */
-export const EXPERIMENT = "head_obligation_closure";
+export const EXPERIMENT = "strict_obligation_handling";
 
 export const enrollment = (over: Partial<ExperimentEnrollment> = {}): ExperimentEnrollment => ({
   actorId: WORKER,
@@ -91,15 +91,17 @@ export function testExperimentEnrollmentStoreContract(
 
     it("list() returns every current enrollment ordered by (actorId, experiment)", () => {
       const store = makeStore();
-      // Enrolled out of order on purpose: the contract is key order, not
-      // insertion order, so a readback is the same whichever store backs it.
-      store.enroll(enrollment({ actorId: OTHER, experiment: EXPERIMENT }));
-      store.enroll(enrollment({ actorId: WORKER, experiment: "other_experiment" }));
-      store.enroll(enrollment({ actorId: WORKER, experiment: EXPERIMENT }));
+      // Names spelled in known alphabetical order here rather than reusing the
+      // registered one, so renaming an experiment cannot quietly flip what this
+      // asserts. Enrolled out of order on purpose: the contract is key order,
+      // not insertion order, so a readback is the same whichever store backs it.
+      store.enroll(enrollment({ actorId: OTHER, experiment: "alpha_experiment" }));
+      store.enroll(enrollment({ actorId: WORKER, experiment: "beta_experiment" }));
+      store.enroll(enrollment({ actorId: WORKER, experiment: "alpha_experiment" }));
       expect(store.list()).toEqual([
-        enrollment({ actorId: WORKER, experiment: EXPERIMENT }),
-        enrollment({ actorId: WORKER, experiment: "other_experiment" }),
-        enrollment({ actorId: OTHER, experiment: EXPERIMENT }),
+        enrollment({ actorId: WORKER, experiment: "alpha_experiment" }),
+        enrollment({ actorId: WORKER, experiment: "beta_experiment" }),
+        enrollment({ actorId: OTHER, experiment: "alpha_experiment" }),
       ]);
     });
   });

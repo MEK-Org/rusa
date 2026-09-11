@@ -3030,31 +3030,31 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
     })) as CallToolResult;
     const threadId = (dataOf(spawned) as { thread_id: string }).thread_id;
     // Enrollment is strictly post-spawn: the actor exists first, unenrolled.
-    expect(mesh.isEnrolledInExperiment(threadId, "head_obligation_closure")).toBe(false);
+    expect(mesh.isEnrolledInExperiment(threadId, "strict_obligation_handling")).toBe(false);
 
     const enrolled = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "head_obligation_closure" },
+      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
     })) as CallToolResult;
     expect(enrolled.isError).toBeFalsy();
     expect(changeOf(enrolled)).toMatchObject({
       actor_id: threadId,
-      experiment: "head_obligation_closure",
+      experiment: "strict_obligation_handling",
       enrolled: true,
       changed: true,
     });
-    expect(mesh.isEnrolledInExperiment(threadId, "head_obligation_closure")).toBe(true);
+    expect(mesh.isEnrolledInExperiment(threadId, "strict_obligation_handling")).toBe(true);
 
     const listed = (await root.callTool({
       name: "list_actor_experiments",
       arguments: { actor_id: threadId },
     })) as CallToolResult;
     expect(dataOf(listed)).toMatchObject({
-      experiments: [{ name: "head_obligation_closure" }],
+      experiments: [{ name: "strict_obligation_handling" }],
       enrollments: [
         {
           actor_id: threadId,
-          experiment: "head_obligation_closure",
+          experiment: "strict_obligation_handling",
           enrolled_by: "root",
         },
       ],
@@ -3062,11 +3062,11 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
 
     const unenrolled = (await root.callTool({
       name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "head_obligation_closure" },
+      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
     })) as CallToolResult;
     expect(unenrolled.isError).toBeFalsy();
     expect(changeOf(unenrolled)).toMatchObject({ enrolled: false, changed: true });
-    expect(mesh.isEnrolledInExperiment(threadId, "head_obligation_closure")).toBe(false);
+    expect(mesh.isEnrolledInExperiment(threadId, "strict_obligation_handling")).toBe(false);
     const afterList = (await root.callTool({
       name: "list_actor_experiments",
       arguments: {},
@@ -3085,11 +3085,11 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
 
     const first = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "head_obligation_closure" },
+      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
     })) as CallToolResult;
     const second = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "head_obligation_closure" },
+      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
     })) as CallToolResult;
     expect(second.isError).toBeFalsy();
     expect(changeOf(first)).toMatchObject({ enrolled: true, changed: true });
@@ -3097,11 +3097,11 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
 
     await root.callTool({
       name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "head_obligation_closure" },
+      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
     });
     const repeatOff = (await root.callTool({
       name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "head_obligation_closure" },
+      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
     })) as CallToolResult;
     expect(repeatOff.isError).toBeFalsy();
     expect(changeOf(repeatOff)).toMatchObject({ enrolled: false, changed: false });
@@ -3125,7 +3125,7 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
 
     const unknownActor = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: "no-such-thread", experiment: "head_obligation_closure" },
+      arguments: { actor_id: "no-such-thread", experiment: "strict_obligation_handling" },
     })) as CallToolResult;
     expect(unknownActor.isError).toBe(true);
     expect(mesh.listExperimentEnrollments()).toEqual([]);
@@ -3141,24 +3141,24 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
     });
     await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "head_obligation_closure" },
+      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
     });
     mesh.retire(threadId);
 
-    expect(mesh.isEnrolledInExperiment(threadId, "head_obligation_closure")).toBe(true);
+    expect(mesh.isEnrolledInExperiment(threadId, "strict_obligation_handling")).toBe(true);
     const reEnroll = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "head_obligation_closure" },
+      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
     })) as CallToolResult;
     expect(reEnroll.isError).toBe(true);
     expect(String(dataOf(reEnroll))).toContain("retired");
 
     const withdraw = (await root.callTool({
       name: "unenroll_actor_experiment",
-      arguments: { actor_id: threadId, experiment: "head_obligation_closure" },
+      arguments: { actor_id: threadId, experiment: "strict_obligation_handling" },
     })) as CallToolResult;
     expect(withdraw.isError).toBeFalsy();
-    expect(mesh.isEnrolledInExperiment(threadId, "head_obligation_closure")).toBe(false);
+    expect(mesh.isEnrolledInExperiment(threadId, "strict_obligation_handling")).toBe(false);
   });
 
   it("is not a grantable capability, so no grant can hand it to a worker", async () => {
@@ -3189,13 +3189,13 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
 
     const enrolled = (await root.callTool({
       name: "enroll_actor_experiment",
-      arguments: { actor_id: "root", experiment: "head_obligation_closure" },
+      arguments: { actor_id: "root", experiment: "strict_obligation_handling" },
     })) as CallToolResult;
     expect(enrolled.isError).toBeFalsy();
     // The response names the thread the row was written under, not the
     // legacy address the caller typed, so it correlates with the readback.
     expect(changeOf(enrolled)).toMatchObject({ actor_id: configuredRootId, changed: true });
-    expect(mesh.isEnrolledInExperiment(configuredRootId, "head_obligation_closure")).toBe(true);
+    expect(mesh.isEnrolledInExperiment(configuredRootId, "strict_obligation_handling")).toBe(true);
 
     const listed = (await root.callTool({
       name: "list_actor_experiments",
@@ -3205,18 +3205,18 @@ describe("actor experiment enrollment (root-only, ungrantable)", () => {
       enrollments: [
         {
           actor_id: configuredRootId,
-          experiment: "head_obligation_closure",
+          experiment: "strict_obligation_handling",
         },
       ],
     });
 
     const unenrolled = (await root.callTool({
       name: "unenroll_actor_experiment",
-      arguments: { actor_id: "root", experiment: "head_obligation_closure" },
+      arguments: { actor_id: "root", experiment: "strict_obligation_handling" },
     })) as CallToolResult;
     expect(unenrolled.isError).toBeFalsy();
     expect(changeOf(unenrolled)).toMatchObject({ actor_id: configuredRootId, changed: true });
-    expect(mesh.isEnrolledInExperiment(configuredRootId, "head_obligation_closure")).toBe(false);
+    expect(mesh.isEnrolledInExperiment(configuredRootId, "strict_obligation_handling")).toBe(false);
   });
 
   it("deletes a stale row for an experiment no longer in the registry via the tool", async () => {

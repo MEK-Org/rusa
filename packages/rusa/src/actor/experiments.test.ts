@@ -8,23 +8,23 @@ import {
   assertKnownExperiment,
   EXPERIMENT_NAMES,
   EXPERIMENTS,
-  HEAD_OBLIGATION_CLOSURE_EXPERIMENT,
   InMemoryExperimentEnrollmentStore,
   isKnownExperiment,
+  STRICT_OBLIGATION_HANDLING_EXPERIMENT,
 } from "./experiments.js";
 
 describe("the experiment registry", () => {
   it("is exactly the hard-coded set, and every entry has an intent", () => {
-    expect(EXPERIMENT_NAMES).toEqual([HEAD_OBLIGATION_CLOSURE_EXPERIMENT]);
+    expect(EXPERIMENT_NAMES).toEqual([STRICT_OBLIGATION_HANDLING_EXPERIMENT]);
     for (const name of EXPERIMENT_NAMES) {
       expect(EXPERIMENTS[name].intent.trim().length).toBeGreaterThan(0);
     }
   });
 
   it("recognizes a registered name and rejects everything else", () => {
-    expect(isKnownExperiment(HEAD_OBLIGATION_CLOSURE_EXPERIMENT)).toBe(true);
-    expect(isKnownExperiment("head_obligation_closure ")).toBe(false);
-    expect(isKnownExperiment("Head_Obligation_Closure")).toBe(false);
+    expect(isKnownExperiment(STRICT_OBLIGATION_HANDLING_EXPERIMENT)).toBe(true);
+    expect(isKnownExperiment("strict_obligation_handling ")).toBe(false);
+    expect(isKnownExperiment("Strict_Obligation_Handling")).toBe(false);
     expect(isKnownExperiment("not_an_experiment")).toBe(false);
     expect(isKnownExperiment("")).toBe(false);
     // An inherited Object property is not an experiment, however much it looks
@@ -34,8 +34,8 @@ describe("the experiment registry", () => {
   });
 
   it("names the registry contents when it refuses an unknown experiment", () => {
-    expect(assertKnownExperiment(HEAD_OBLIGATION_CLOSURE_EXPERIMENT)).toBe(
-      HEAD_OBLIGATION_CLOSURE_EXPERIMENT
+    expect(assertKnownExperiment(STRICT_OBLIGATION_HANDLING_EXPERIMENT)).toBe(
+      STRICT_OBLIGATION_HANDLING_EXPERIMENT
     );
     expect(() => assertKnownExperiment("not_an_experiment")).toThrow(
       `unknown experiment: not_an_experiment (known: ${EXPERIMENT_NAMES.join(", ")})`
