@@ -2068,9 +2068,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                 });
               });
               if (!focus) throw new Error(`run focus was not resolved for actor: ${id}`);
+              // Read after the selection commits: the same armed decision the
+              // clean-yield check enforces is what states the rule here, so
+              // the two can never disagree about this run.
               return {
                 entries,
                 focus,
+                discipline: mesh.runDisciplineNotice(id),
               };
             },
             selected: () => mesh.selectedInboxEntries(id),
@@ -2603,6 +2607,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         return {
           entries,
           focus,
+          discipline: mesh.runDisciplineNotice(rootId),
         };
       },
       selected: () => mesh.selectedInboxEntries(rootId),

@@ -10,11 +10,20 @@ export type { SelectedInboxEntry };
 
 export const INBOX_MCP_NAME = "inbox";
 
+/**
+ * What one `select` committed: the entries, the run's resolved focus, and —
+ * only when the mesh armed an experiment-specific rule on this very selection
+ * — the discipline that rule holds the run to. Omitted, not empty, for every
+ * run nothing is armed for, so an unenrolled actor's selection is unchanged.
+ */
+export interface SelectedInboxRun {
+  entries: InboxEntry[];
+  focus: ResolvedInboxFocus;
+  discipline?: string;
+}
+
 export interface InboxMcpRunScope {
-  select: (
-    entryIds: string[],
-    obligationId?: string
-  ) => InboxEntry[] | { entries: InboxEntry[]; focus: ResolvedInboxFocus };
+  select: (entryIds: string[], obligationId?: string) => InboxEntry[] | SelectedInboxRun;
   selected: () => readonly string[];
   onHandled?: () => void;
   isFenced?: () => boolean;
@@ -107,6 +116,7 @@ export function createInboxMcpServer(
         return toolOk({
           entries: attachInboxHints(selected.entries),
           focus: selected.focus,
+          ...(selected.discipline === undefined ? {} : { discipline: selected.discipline }),
         });
       } catch (err) {
         return toolError(err);
