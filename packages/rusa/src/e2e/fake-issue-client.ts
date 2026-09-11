@@ -117,6 +117,7 @@ export class FakeIssueClient implements IssueClient {
       body: pr.body,
       htmlUrl: pr.htmlUrl,
       headRef: pr.headRef,
+      baseRef: pr.base ?? "",
       headSha: `fake-head-${prNumber}`,
       state: pr.state,
     };

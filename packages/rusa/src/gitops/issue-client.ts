@@ -156,6 +156,7 @@ export interface PullRequestDetails {
   body: string;
   htmlUrl: string;
   headRef: string;
+  baseRef: string;
   headSha: string;
   state: string;
 }
@@ -1056,6 +1057,7 @@ export class GitHubIssueClient implements IssueClient {
       body: string | null;
       html_url: string;
       head: { ref: string; sha: string };
+      base?: { ref?: string } | null;
       state: string;
     }>("GET", `/repos/${repo}/pulls/${prNumber}`);
 
@@ -1065,6 +1067,7 @@ export class GitHubIssueClient implements IssueClient {
       body: pr.body ?? "",
       htmlUrl: pr.html_url,
       headRef: pr.head.ref,
+      baseRef: pr.base?.ref ?? "",
       headSha: pr.head.sha,
       state: pr.state,
     };
