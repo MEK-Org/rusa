@@ -96,6 +96,34 @@ void main() {
       expect(walkie.streams[0].disposed, isTrue);
       expect(walkie.streams[1].disposed, isFalse);
     });
+
+    test(
+      'server handoff selects and reconnects to the recipient without closing the session',
+      () async {
+        await controller.dispose();
+        final selected = <String>[];
+        controller = WalkieController(
+          actorId: 'a',
+          deps: walkie.deps,
+          onTransfer: selected.add,
+        );
+        await controller.enable();
+        await pumpEventQueue();
+        final first = walkie.stream;
+        final sessionId = first.connectCalls.single.sessionId;
+
+        first.controlsCtrl.add(const VoiceSessionControl(targetActorId: 'b'));
+        await pumpEventQueue();
+
+        expect(controller.actorId, 'b');
+        expect(selected, ['b']);
+        expect(first.disposed, isTrue);
+        expect(walkie.streams, hasLength(2));
+        expect(walkie.stream.connectCalls.single.actors, ['b']);
+        expect(walkie.stream.connectCalls.single.sessionId, sessionId);
+        expect(api.disabledVoiceSessions, isEmpty);
+      },
+    );
   });
 
   group('playback queue', () {

@@ -33,6 +33,7 @@ import { stampAuthor } from "../mcp/stamp.js";
 import { clearProviderModelCatalog, setProviderModelCatalog } from "../providers/model-catalog.js";
 import type { ProviderModelConfig, RawProviderModelConfig } from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
+import { deduplicatedInboxEntryId } from "../runtime/event-manager.js";
 import { WebhookSilenceDetector } from "../webhook/silence-detector.js";
 
 const worktreeMock = vi.hoisted(() => ({
@@ -1516,6 +1517,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     expect(inbox.entries).toHaveLength(1);
     expect(inbox.entries[0]).toMatchObject({
       actorId: workerId,
+      id: deduplicatedInboxEntryId("github:delivery-903", workerId),
       source: "github:dummy-org/dummy-repo/issues/456",
       seenAt: null,
       handledAt: null,
@@ -3973,10 +3975,11 @@ describe("runStart webhook event routing (Phase 4)", () => {
     await readyPromise;
     if (!mesh) throw new Error("mesh not ready");
 
-    // Force deliverEvent to reject
-    const originalDeliver = mesh.deliverEvent.bind(mesh);
+    // The Chat ingress uses the source-specific external-event seam; rejection
+    // must still reach the source so it can redeliver.
+    const originalDeliver = mesh.deliverExternalEvent.bind(mesh);
     let rejected = false;
-    mesh.deliverEvent = async (..._args) => {
+    mesh.deliverExternalEvent = async (..._args) => {
       rejected = true;
       throw new Error("Simulated delivery failure");
     };
@@ -3995,7 +3998,7 @@ describe("runStart webhook event routing (Phase 4)", () => {
     ).rejects.toThrow("Simulated delivery failure");
     expect(rejected).toBe(true);
 
-    mesh.deliverEvent = originalDeliver;
+    mesh.deliverExternalEvent = originalDeliver;
   });
 
   it("rehydrates active workers on boot and retires unresolvable ones without blocking others", async () => {

@@ -34,6 +34,7 @@ ThreadDto makeThread(
   int? queuePosition,
   String? estimatedStartAt,
   ObligationDto? selectedObligation,
+  String? voiceName,
 }) => ThreadDto(
   id: id,
   handle: '$id-handle',
@@ -59,6 +60,7 @@ ThreadDto makeThread(
   queuePosition: queuePosition,
   estimatedStartAt: estimatedStartAt,
   selectedObligation: selectedObligation,
+  voiceName: voiceName,
 );
 
 MeshEvent makeEvent(
@@ -143,7 +145,9 @@ ObligationDto makeObligation(
   checkpoint: checkpoint,
   // A checkpoint's stamp is set with it server-side, so a fixture that names a
   // standing without one would exercise a state the store cannot produce.
-  checkpointAt: checkpoint == null ? null : (checkpointAt ?? '2026-09-07T11:00:00.000Z'),
+  checkpointAt: checkpoint == null
+      ? null
+      : (checkpointAt ?? '2026-09-07T11:00:00.000Z'),
   checkpointBy: checkpoint == null ? null : (checkpointBy ?? ownerId),
   hasCompletionHistory: hasCompletionHistory,
 );
@@ -153,6 +157,7 @@ ObligationDto makeObligation(
 class FakeApi extends DashboardApi {
   FakeApi() : super();
   List<ThreadDto> threadsResult = [];
+  List<String> supportedVoices = const [];
   QuotaSnapshotDto? quotaResult;
   QuotaHistoryDto? quotaHistoryResult;
   Object? quotaError;
@@ -201,7 +206,20 @@ class FakeApi extends DashboardApi {
       schedulerWarning: schedulerWarning,
       threads: threadsResult,
       runtimeCursor: runtimeCursor,
+      supportedVoices: supportedVoices,
     );
+  }
+
+  final actorVoiceUpdates = <({String actorId, String? voiceName})>[];
+
+  @override
+  Future<String?> updateActorVoice(String actorId, String? voiceName) async {
+    actorVoiceUpdates.add((actorId: actorId, voiceName: voiceName));
+    threadsResult = [
+      for (final thread in threadsResult)
+        thread.id == actorId ? thread.copyWith(voiceName: voiceName) : thread,
+    ];
+    return voiceName;
   }
 
   @override
@@ -1101,6 +1119,7 @@ class FakeWakeLock implements ScreenWakeLock {
 class FakeVoiceStream implements VoiceStreamSource {
   final framesCtrl = StreamController<VoiceAnnouncement>.broadcast();
   final statusCtrl = StreamController<VoiceStreamStatus>.broadcast();
+  final controlsCtrl = StreamController<VoiceSessionControl>.broadcast();
   final connectCalls = <({List<String> actors, String sessionId})>[];
   bool disposed = false;
 
@@ -1108,6 +1127,8 @@ class FakeVoiceStream implements VoiceStreamSource {
   Stream<VoiceAnnouncement> get frames => framesCtrl.stream;
   @override
   Stream<VoiceStreamStatus> get status => statusCtrl.stream;
+  @override
+  Stream<VoiceSessionControl> get controls => controlsCtrl.stream;
 
   @override
   void connect(List<String> actors, String sessionId) =>
@@ -1118,6 +1139,7 @@ class FakeVoiceStream implements VoiceStreamSource {
     disposed = true;
     framesCtrl.close();
     statusCtrl.close();
+    controlsCtrl.close();
   }
 }
 

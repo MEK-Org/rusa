@@ -27,6 +27,8 @@ import { type Logger, nullLogger } from "../observability/logger.js";
 import type { ProviderModelConfig } from "../providers/model-config.js";
 import { resolveReferenceSync } from "../references/resolve.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
+import { canonicalSupportedVoiceName, SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
+import { googleVoiceConfig, voiceConfigSchema } from "../voice/voice-config.js";
 import type { SseHub } from "./sse.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
@@ -220,6 +222,11 @@ interface ThreadDto {
   eligibleAt?: number | null;
   /** The active run's selected inbox-focus obligation, when one exists. */
   selectedObligation?: Obligation;
+  /**
+   * The actor's persisted walkie-talkie voice, or null when it follows the
+   * instance-wide default (every actor without a stored `voice_config`).
+   */
+  voiceName: string | null;
   /**
    * The leading `CHARTER_PREVIEW_CHARS` characters of the charter, ellipsised
    * when clipped. The full text is detail data: `GET
@@ -1197,6 +1204,78 @@ export async function handleMeshApiRequest(
     }
   }
 
+  if (req.method === "PATCH") {
+    // PATCH /api/mesh/actors/<id>/voice — set or clear the actor's persisted
+    // walkie-talkie voice. `{ "voiceConfig": { schemaVersion: 1,
+    // provider: "google", config: { voiceName: "Puck" } } }` stores the
+    // current provider branch; `{ "voiceConfig": null }` clears it back to
+    // the instance-wide default.
+    // The voice is presentation config, not run state: editing a retired
+    // actor is allowed and takes effect on that actor's next spoken reply.
+    const voicePatchMatch = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/voice$/);
+    if (voicePatchMatch) {
+      if (!deps?.actors) {
+        sendJson(res, 503, { error: "mesh data API unavailable (no live mesh bound)" });
+        return true;
+      }
+      const actors = deps.actors;
+      const actorId = decodeURIComponent(voicePatchMatch[1]);
+      if (!actors.get(actorId)) {
+        sendJson(res, 404, { error: "actor not found" });
+        return true;
+      }
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            sendJson(res, 400, { error: "Missing or invalid body" });
+            return;
+          }
+          const body = parsed as Record<string, unknown>;
+          if (!("voiceConfig" in body)) {
+            sendJson(res, 400, {
+              error: "voiceConfig is required (null restores the instance default)",
+            });
+            return;
+          }
+          const voiceConfigResult =
+            body.voiceConfig === null ? null : voiceConfigSchema.safeParse(body.voiceConfig);
+          if (voiceConfigResult !== null && !voiceConfigResult.success) {
+            sendJson(res, 400, {
+              error:
+                "voiceConfig must be { schemaVersion: 1, provider: 'google', config: { voiceName } }, or null for the default",
+            });
+            return;
+          }
+          const voiceName =
+            voiceConfigResult === null
+              ? undefined
+              : canonicalSupportedVoiceName(voiceConfigResult.data.config.voiceName);
+          if (voiceConfigResult !== null && !voiceName) {
+            sendJson(res, 400, {
+              error: "voiceConfig.config.voiceName must name a supported Google TTS voice",
+            });
+            return;
+          }
+          actors.patch(actorId, {
+            voiceConfig: voiceName === undefined ? undefined : googleVoiceConfig(voiceName),
+          });
+          // The initiating dashboard applies this acknowledgement directly.
+          // Other tabs follow their normal refresh lifecycle; one setting does
+          // not warrant a dedicated SSE event and cache path.
+          sendJson(res, 200, { voiceName: voiceName ?? null });
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+  }
+
   if (req.method !== "GET") {
     sendJson(res, 405, { error: "method not allowed" });
     return true;
@@ -1335,6 +1414,7 @@ export async function handleMeshApiRequest(
         selectedEffort: selection?.effort ?? null,
         eligibleAt: selection?.eligibleAt ?? null,
         ...(selectedObligation ? { selectedObligation } : {}),
+        voiceName: r.voiceConfig?.provider === "google" ? r.voiceConfig.config.voiceName : null,
       };
     });
     const schedulerHealth = deps.schedulerHealth?.();
@@ -1343,6 +1423,7 @@ export async function handleMeshApiRequest(
       schedulerWarning: schedulerHealth && !schedulerHealth.ok ? schedulerHealth.issues : null,
       runtimeCursor: runtime ? { streamId: runtime.streamId, revision: runtime.revision } : null,
       threads,
+      supportedVoices: SUPPORTED_TTS_VOICES,
     });
     return true;
   }

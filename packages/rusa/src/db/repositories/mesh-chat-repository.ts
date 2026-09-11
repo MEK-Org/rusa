@@ -19,6 +19,11 @@ export interface MeshChatReceivedListOptions {
   limit?: number;
 }
 
+export interface MeshChatSessionListOptions {
+  /** The newest rows to retain before returning them in chronological order. */
+  limit: number;
+}
+
 interface MeshChatRow {
   id: string;
   ts: string;
@@ -107,6 +112,28 @@ export class MeshChatRepository {
       )
       .all(actorId, limit) as MeshChatRow[];
     return rows.map(toMeshChat);
+  }
+
+  /**
+   * Return a bounded, chronological projection of existing durable chat rows
+   * for one walkie session. It is intentionally a read of `mesh_chat`, not a
+   * second transcript store: voice handoff context is a mechanical rendering of
+   * the same messages the mesh already recorded.
+   */
+  listForSession(sessionId: string, opts: MeshChatSessionListOptions): MeshChat[] {
+    const { limit } = opts;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error("mesh chat session limit must be between 1 and 100");
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM mesh_chat
+         WHERE session_id = ?
+         ORDER BY ts DESC, id DESC
+         LIMIT ?`
+      )
+      .all(sessionId, limit) as MeshChatRow[];
+    return rows.reverse().map(toMeshChat);
   }
 
   /**

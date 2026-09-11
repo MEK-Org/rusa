@@ -32,6 +32,7 @@ import 'package:rusa_dashboard/widgets/actor_tree.dart';
 import 'package:rusa_dashboard/widgets/avatar.dart';
 import 'package:rusa_dashboard/widgets/dashboard_body.dart';
 import 'package:rusa_dashboard/widgets/detail_panel.dart';
+import 'package:rusa_dashboard/widgets/mobile_nav_drawer.dart';
 import 'package:rusa_dashboard/widgets/overview_tab.dart';
 
 import 'fakes.dart';
@@ -101,9 +102,12 @@ void main() {
 
         final api = FakeApi()
           ..threadsResult = _seedThreads()
-          ..eventPages = [EventPage(events: _seedEvents(), nextCursor: null)];
+          ..eventPages = [EventPage(events: _seedEvents(), nextCursor: null)]
+          ..quotaResult = _seedQuota();
         final store = DashboardStore(api: api, stream: FakeStream());
         await store.init();
+        // Quota rides the bottom of the phone drawer, so seed a reading for it.
+        await store.refreshQuota();
 
         // A typical tall phone viewport (~390 logical px wide → narrow layout).
         await tester.binding.setSurfaceSize(const Size(390, 844));
@@ -111,19 +115,25 @@ void main() {
 
         final key = GlobalKey();
         await tester.pumpWidget(_mobileApp(store, key));
-        // Overview is the default landing view now; switch to Actors for the
-        // master-detail navigation captures below. At this width the header
-        // nav is horizontally scrollable and "Actors" starts off-screen
-        // (~x=389) — scroll it into view before tapping, else the tap
-        // silently misses and both shots below would capture Overview while
-        // still passing (ISSUE_NUM review).
-        await tester.ensureVisible(find.text('Actors'));
+        // Overview is the default landing view at this height; switch to
+        // Actors for the master-detail navigation captures below. On a phone
+        // the destinations live in the drawer behind the header's hamburger.
+        await tester.tap(find.byIcon(Icons.menu));
+        // Let the drawer animation finish so the shot is the settled panel.
         await tester.pump();
-        await tester.tap(find.text('Actors'));
+        await tester.pump(const Duration(milliseconds: 400));
+
+        // 1) The open navigation drawer: destinations up top, quota pinned to
+        // the bottom.
+        expect(find.byType(MobileNavDrawer), findsOneWidget);
+        await _capture(key, '$_outDir/mobile_drawer.png');
+
+        await tester.tap(find.byKey(const ValueKey('drawer-nav-actors')));
         await tester.pump();
+        await tester.pump(const Duration(milliseconds: 400));
         await _settleImages(tester, _portraitUrls(ids));
 
-        // 1) The full-width actor list (no actor selected → master view).
+        // 2) The full-width actor list (no actor selected → master view).
         // Assert the actor tree actually rendered — not still Overview — so
         // a missed nav tap fails loudly instead of silently capturing the
         // wrong screen.
@@ -131,7 +141,8 @@ void main() {
         expect(find.byType(ActorTree), findsOneWidget);
         await _capture(key, '$_outDir/mobile_list.png');
 
-        // 2) Tap an actor → full-width detail view with the back bar.
+        // 3) Tap an actor → full-width detail view, its way back the header's
+        // top-left arrow rather than a row of its own.
         store.clickActor('11111111-1111-4111-8111-111111111111');
         await _settleImages(tester, _portraitUrls(ids));
         // Assert the actor detail panel — identified by the selected actor's
@@ -252,6 +263,65 @@ class _LabeledAvatar extends StatelessWidget {
 }
 
 // ── Seed data ────────────────────────────────────────────────────────────────
+
+/// Two providers mid-week, so the drawer's bottom slot shows real rings.
+/// `resetAtIso` is left null so the ring colors come from the wall-clock-free
+/// quota-only fallback and the shot is reproducible.
+QuotaSnapshotDto _seedQuota() => const QuotaSnapshotDto(
+  generatedAt: '2026-06-26T09:00:00Z',
+  providers: [
+    ProviderQuotaDto(
+      provider: 'claude',
+      status: 'available',
+      usedPercent: 38,
+      tier: null,
+      message: null,
+      windows: [
+        QuotaWindowDto(
+          id: 'weekly',
+          label: 'Weekly',
+          usedPercent: 38,
+          status: 'available',
+          headline: true,
+          windowMs: 604800000,
+        ),
+        QuotaWindowDto(
+          id: 'session',
+          label: 'Session',
+          usedPercent: 12,
+          status: 'available',
+          headline: false,
+          windowMs: 18000000,
+        ),
+      ],
+    ),
+    ProviderQuotaDto(
+      provider: 'codex',
+      status: 'available',
+      usedPercent: 71,
+      tier: null,
+      message: null,
+      windows: [
+        QuotaWindowDto(
+          id: 'weekly',
+          label: 'Weekly',
+          usedPercent: 71,
+          status: 'available',
+          headline: true,
+          windowMs: 604800000,
+        ),
+        QuotaWindowDto(
+          id: 'five_hour',
+          label: '5h',
+          usedPercent: 44,
+          status: 'available',
+          headline: false,
+          windowMs: 18000000,
+        ),
+      ],
+    ),
+  ],
+);
 
 List<String> _seedIds() => const [
   'root',

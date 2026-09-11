@@ -1,12 +1,75 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
+import '../breakpoints.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
 
 /// The top-level dashboard views the header nav switches between.
 enum DashboardView { overview, actors, understanding, reports, work }
+
+/// One top-level destination the navigation offers. The desktop header renders
+/// these inline and the phone drawer renders them as rows, from this one list —
+/// a fifth destination, or a change to what `IU` covers, lands in both places
+/// at once.
+class DashboardDestination {
+  const DashboardDestination({
+    required this.label,
+    required this.view,
+    required this.icon,
+    this.alsoActiveFor = const [],
+  });
+
+  final String label;
+  final DashboardView view;
+
+  /// Shown by the drawer, which has room for one; the inline header nav is
+  /// labels only.
+  final IconData icon;
+
+  /// Extra views this one destination also represents (ISSUE_NUM: `IU` covers both
+  /// the node and the report sub-view). Selecting any of them keeps it lit, and
+  /// tapping it while already there is a no-op rather than a jump back to
+  /// [view] — otherwise a tap on the lit `IU` button would silently throw away
+  /// the sub-view the user is reading.
+  final List<DashboardView> alsoActiveFor;
+
+  bool isActive(DashboardView selected) =>
+      view == selected || alsoActiveFor.contains(selected);
+
+  /// What a tap should select: the view itself, or — when already here — the
+  /// sub-view you are on, left alone.
+  DashboardView targetFrom(DashboardView selected) =>
+      isActive(selected) ? selected : view;
+}
+
+const List<DashboardDestination> kDashboardDestinations = [
+  DashboardDestination(
+    label: 'Overview',
+    view: DashboardView.overview,
+    icon: Icons.dashboard_outlined,
+  ),
+  DashboardDestination(
+    label: 'Actors',
+    view: DashboardView.actors,
+    icon: Icons.account_tree_outlined,
+  ),
+  DashboardDestination(
+    label: 'Work',
+    view: DashboardView.work,
+    icon: Icons.checklist_outlined,
+  ),
+  // ISSUE_NUM: ONE top-level IU destination. The node/report choice lives inside
+  // the IU route (`_IuBody` in dashboard_body.dart), so it stays active for
+  // either sub-view.
+  DashboardDestination(
+    label: 'IU',
+    view: DashboardView.understanding,
+    icon: Icons.insights_outlined,
+    alsoActiveFor: [DashboardView.reports],
+  ),
+];
 
 /// Per-provider quota UI config. Each provider owns the windows that drive its
 /// header rings: `primaryWindow` (weekly, outer ring) and `sessionWindow`
@@ -54,6 +117,13 @@ const Map<String, QuotaProviderConfig> kDefaultQuotaProviders = {
 /// [onSelect] is wired; header-only/standalone uses render brand + status
 /// exactly as before. IU reports are NOT a fourth destination : they are
 /// a sub-view of the IU route, switched inside the body.
+///
+/// On phones the header instead carries a single leading action in the slot the
+/// mesh icon occupies on the desktop — a hamburger that opens the navigation
+/// drawer ([onMenuTap]), or, once you are inside a detail view, a back arrow
+/// ([onBack]) that replaces it rather than costing the detail a second row of
+/// vertical space. Both the inline nav and the quota rings move into the drawer
+/// in that mode.
 class MeshHeader extends StatelessWidget {
   const MeshHeader({
     super.key,
@@ -61,6 +131,8 @@ class MeshHeader extends StatelessWidget {
     this.selected = DashboardView.actors,
     this.onSelect,
     this.quotaProviders = kDefaultQuotaProviders,
+    this.onMenuTap,
+    this.onBack,
   });
 
   final DashboardStore store;
@@ -74,31 +146,23 @@ class MeshHeader extends StatelessWidget {
   /// Per-provider quota window config. Defaults each provider to weekly.
   final Map<String, QuotaProviderConfig> quotaProviders;
 
+  /// Opens the phone navigation drawer. Wiring it switches the header into its
+  /// phone shape: a hamburger in the brand slot, nav and quota in the drawer.
+  final VoidCallback? onMenuTap;
+
+  /// Returns from a phone detail view to the list behind it. Takes the same
+  /// leading slot as [onMenuTap] and wins it while a detail is open.
+  final VoidCallback? onBack;
+
   @override
   Widget build(BuildContext context) {
-    Widget buildQuota() {
-      return StreamBuilder<QuotaSnapshotDto?>(
-        stream: store.quota,
-        initialData: store.quota.valueOrNull,
-        builder: (_, snap) => StreamBuilder<bool>(
-          stream: store.quotaRefreshing,
-          initialData: store.quotaRefreshing.valueOrNull ?? false,
-          builder: (_, refreshingSnap) => _QuotaHeaderStrip(
-            snapshot: snap.data,
-            quotaProviders: quotaProviders,
-            refreshing: refreshingSnap.data ?? false,
-          ),
-        ),
-      );
-    }
-
-    final height = MediaQuery.of(context).size.height;
+    final height = MediaQuery.sizeOf(context).height;
     return StreamBuilder<bool>(
       stream: store.walkieActive,
       initialData: store.walkieActive.valueOrNull ?? false,
       builder: (context, walkieActiveSnap) {
         final walkieActive = walkieActiveSnap.data ?? false;
-        if (walkieActive && height < 500) {
+        if (walkieActive && height < kShortViewportHeight) {
           return const SizedBox.shrink();
         }
         return Container(
@@ -110,7 +174,10 @@ class MeshHeader extends StatelessWidget {
           child: LayoutBuilder(
             builder: (context, constraints) {
               final compact = constraints.maxWidth < 520;
-              final twoTier = constraints.maxWidth < 850;
+              // Phone shape: navigation and quota both live in the drawer, so
+              // the header keeps to its single brand row.
+              final drawerNav = onMenuTap != null || onBack != null;
+              final twoTier = !drawerNav && constraints.maxWidth < 850;
               return Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -121,10 +188,9 @@ class MeshHeader extends StatelessWidget {
                         Expanded(
                           child: Row(
                             children: [
-                              const Icon(
-                                Icons.hub_outlined,
-                                color: MeshColors.accent,
-                                size: 22,
+                              _LeadingAction(
+                                onMenuTap: onMenuTap,
+                                onBack: onBack,
                               ),
                               const SizedBox(width: 10),
                               const Text(
@@ -163,51 +229,21 @@ class MeshHeader extends StatelessWidget {
                                 },
                               ),
                               if (!compact) ...[const SizedBox(width: 6)],
-                              if (onSelect != null)
+                              if (onSelect != null && !drawerNav)
                                 Expanded(
                                   child: SingleChildScrollView(
                                     scrollDirection: Axis.horizontal,
                                     child: Row(
                                       children: [
                                         SizedBox(width: compact ? 8 : 16),
-                                        _NavItem(
-                                          label: 'Overview',
-                                          view: DashboardView.overview,
-                                          selected: selected,
-                                          onSelect: onSelect!,
-                                          compact: compact,
-                                        ),
-                                        _NavItem(
-                                          label: 'Actors',
-                                          view: DashboardView.actors,
-                                          selected: selected,
-                                          onSelect: onSelect!,
-                                          compact: compact,
-                                        ),
-                                        _NavItem(
-                                          label: 'Work',
-                                          view: DashboardView.work,
-                                          selected: selected,
-                                          onSelect: onSelect!,
-                                          compact: compact,
-                                        ),
-                                        // ISSUE_NUM: ONE top-level IU button. The
-                                        // node/report choice now lives inside
-                                        // the IU route (`_IuBody` in
-                                        // dashboard_body.dart), so this item
-                                        // stays active for either sub-view and
-                                        // a tap while already in IU keeps the
-                                        // sub-view you were on.
-                                        _NavItem(
-                                          label: 'IU',
-                                          view: DashboardView.understanding,
-                                          alsoActiveFor: const [
-                                            DashboardView.reports,
-                                          ],
-                                          selected: selected,
-                                          onSelect: onSelect!,
-                                          compact: compact,
-                                        ),
+                                        for (final destination
+                                            in kDashboardDestinations)
+                                          _NavItem(
+                                            destination: destination,
+                                            selected: selected,
+                                            onSelect: onSelect!,
+                                            compact: compact,
+                                          ),
                                       ],
                                     ),
                                   ),
@@ -215,9 +251,12 @@ class MeshHeader extends StatelessWidget {
                             ],
                           ),
                         ),
-                        if (!twoTier) ...[
+                        if (!twoTier && !drawerNav) ...[
                           const SizedBox(width: 14),
-                          buildQuota(),
+                          QuotaIndicators(
+                            store: store,
+                            quotaProviders: quotaProviders,
+                          ),
                         ],
                       ],
                     ),
@@ -230,7 +269,10 @@ class MeshHeader extends StatelessWidget {
                           Expanded(
                             child: Align(
                               alignment: Alignment.centerRight,
-                              child: buildQuota(),
+                              child: QuotaIndicators(
+                                store: store,
+                                quotaProviders: quotaProviders,
+                              ),
                             ),
                           ),
                         ],
@@ -246,15 +288,92 @@ class MeshHeader extends StatelessWidget {
   }
 }
 
+/// The brand slot's leading widget: the mesh icon on the desktop, a hamburger
+/// once a drawer is wired, and a back arrow while a phone detail view is open.
+/// Only ever one of them — the phone header has exactly one leading action, and
+/// a detail view spends no separate row on its back affordance.
+class _LeadingAction extends StatelessWidget {
+  const _LeadingAction({required this.onMenuTap, required this.onBack});
+
+  final VoidCallback? onMenuTap;
+  final VoidCallback? onBack;
+
+  @override
+  Widget build(BuildContext context) {
+    final back = onBack;
+    final menu = onMenuTap;
+    if (back == null && menu == null) {
+      return const Icon(Icons.hub_outlined, color: MeshColors.accent, size: 22);
+    }
+    return IconButton(
+      onPressed: back ?? menu,
+      icon: Icon(
+        back != null ? Icons.arrow_back : Icons.menu,
+        color: MeshColors.accent,
+        size: 22,
+      ),
+      tooltip: back != null ? 'Back' : 'Navigation',
+      padding: EdgeInsets.zero,
+      // The Material minimum touch target, which the 56px header row has room
+      // for — the same standard the phone actor list asks for with
+      // `touchTargets: true`. Left at the default (standard) visual density,
+      // since `VisualDensity.compact` would shave these constraints back to 40.
+      constraints: const BoxConstraints.tightFor(
+        width: kMinInteractiveDimension,
+        height: kMinInteractiveDimension,
+      ),
+    );
+  }
+}
+
+/// The store-bound quota rings. The header renders them inline; the phone
+/// navigation drawer renders the same reading stacked at its bottom, so quota
+/// stays one tap away without spending header height on a phone.
+class QuotaIndicators extends StatelessWidget {
+  const QuotaIndicators({
+    super.key,
+    required this.store,
+    this.quotaProviders = kDefaultQuotaProviders,
+    this.axis = Axis.horizontal,
+  });
+
+  final DashboardStore store;
+  final Map<String, QuotaProviderConfig> quotaProviders;
+
+  /// Lay the per-provider rings out in a scrollable row (header) or a stacked
+  /// column (drawer).
+  final Axis axis;
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<QuotaSnapshotDto?>(
+      stream: store.quota,
+      initialData: store.quota.valueOrNull,
+      builder: (_, snap) => StreamBuilder<bool>(
+        stream: store.quotaRefreshing,
+        initialData: store.quotaRefreshing.valueOrNull ?? false,
+        builder: (_, refreshingSnap) => _QuotaHeaderStrip(
+          snapshot: snap.data,
+          quotaProviders: quotaProviders,
+          refreshing: refreshingSnap.data ?? false,
+          axis: axis,
+        ),
+      ),
+    );
+  }
+}
+
 class _QuotaHeaderStrip extends StatelessWidget {
   const _QuotaHeaderStrip({
     required this.snapshot,
     required this.quotaProviders,
     this.refreshing = false,
+    this.axis = Axis.horizontal,
   });
 
   final QuotaSnapshotDto? snapshot;
   final Map<String, QuotaProviderConfig> quotaProviders;
+  final Axis axis;
 
   /// True while a background SWR revalidation is in flight (ISSUE_NUM ask 4). The
   /// strip keeps rendering its last-known reading throughout — never a
@@ -272,38 +391,62 @@ class _QuotaHeaderStrip extends StatelessWidget {
         .where((entry) => entry.provider != null)
         .toList(growable: false);
     if (providers.isEmpty) return const SizedBox.shrink();
+    final rings = [
+      for (final entry in providers)
+        _ProviderQuotaRing(
+          axis: axis,
+          provider: entry.provider!,
+          weeklyWindow: _findWindow(entry.provider, entry.config.primaryWindow),
+          sessionWindow: entry.config.sessionWindow == null
+              ? null
+              : _findWindow(entry.provider, entry.config.sessionWindow!),
+        ),
+    ];
     return AnimatedOpacity(
       opacity: refreshing ? 0.55 : 1.0,
       duration: const Duration(milliseconds: 200),
-      child: ClipRect(
-        child: SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          physics: const ClampingScrollPhysics(),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              for (final entry in providers) ...[
-                _ProviderQuotaRing(
-                  provider: entry.provider!,
-                  weeklyWindow: _findWindow(
-                    entry.provider,
-                    entry.config.primaryWindow,
-                  ),
-                  sessionWindow: entry.config.sessionWindow == null
-                      ? null
-                      : _findWindow(
-                          entry.provider,
-                          entry.config.sessionWindow!,
-                        ),
-                ),
-                if (entry != providers.last) const SizedBox(width: 18),
+      child: axis == Axis.vertical
+          ? Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                for (final ring in rings) ...[
+                  ring,
+                  if (ring != rings.last) const SizedBox(height: 14),
+                ],
               ],
-            ],
-          ),
-        ),
-      ),
+            )
+          : ClipRect(
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                physics: const ClampingScrollPhysics(),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (final ring in rings) ...[
+                      ring,
+                      if (ring != rings.last) const SizedBox(width: 18),
+                    ],
+                  ],
+                ),
+              ),
+            ),
     );
   }
+}
+
+/// Lets a ring's provider label ellipsize inside a bounded row (the drawer's
+/// stacked strip, where large text would otherwise push the row past the drawer
+/// width) and keep its natural width in the header's unbounded scrolling one.
+class _LabelSlot extends StatelessWidget {
+  const _LabelSlot({required this.axis, required this.child});
+
+  final Axis axis;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) =>
+      axis == Axis.vertical ? Flexible(child: child) : child;
 }
 
 QuotaWindowDto? _findWindow(ProviderQuotaDto? provider, String windowId) {
@@ -322,11 +465,18 @@ class _ProviderQuotaRing extends StatelessWidget {
     required this.provider,
     required this.weeklyWindow,
     required this.sessionWindow,
+    this.axis = Axis.horizontal,
   });
 
   final ProviderQuotaDto provider;
   final QuotaWindowDto? weeklyWindow;
   final QuotaWindowDto? sessionWindow;
+
+  /// How the strip this ring belongs to is laid out. Stacked in the drawer the
+  /// row has a real width to fit inside, so the label gives way first; in the
+  /// header's scrolling row the width is unbounded and a flexible child there
+  /// would have nothing to flex against.
+  final Axis axis;
 
   @override
   Widget build(BuildContext context) {
@@ -389,14 +539,17 @@ class _ProviderQuotaRing extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 8),
-            Text(
-              _providerLabel(provider.provider),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                fontSize: 13,
-                color: MeshColors.textSecondary,
-                fontWeight: FontWeight.w500,
+            _LabelSlot(
+              axis: axis,
+              child: Text(
+                _providerLabel(provider.provider),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 13,
+                  color: MeshColors.textSecondary,
+                  fontWeight: FontWeight.w500,
+                ),
               ),
             ),
           ],
@@ -501,10 +654,7 @@ String? _resetLine(QuotaWindowDto window) {
 /// to match reset timestamps. Carries relative age when [now] is provided so
 /// stale readings are visibly distinct. Null when the state behind this window
 /// never reached a probe, or the stamp can't be parsed.
-String? _asOfLine(
-  String? scrapedAtIso, {
-  DateTime? now,
-}) {
+String? _asOfLine(String? scrapedAtIso, {DateTime? now}) {
   if (scrapedAtIso == null) return null;
   final scraped = DateTime.tryParse(scrapedAtIso);
   if (scraped == null) return null;
@@ -745,7 +895,9 @@ class _SchedulerWarningBadge extends StatelessWidget {
         decoration: BoxDecoration(
           color: MeshColors.statusIdle.withValues(alpha: 0.12),
           borderRadius: BorderRadius.circular(4),
-          border: Border.all(color: MeshColors.statusIdle.withValues(alpha: 0.5)),
+          border: Border.all(
+            color: MeshColors.statusIdle.withValues(alpha: 0.5),
+          ),
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
@@ -826,25 +978,15 @@ class _LivePulseState extends State<_LivePulse>
 /// chrome to the locked V1.4.0 layout.
 class _NavItem extends StatelessWidget {
   const _NavItem({
-    required this.label,
-    required this.view,
+    required this.destination,
     required this.selected,
     required this.onSelect,
-    this.alsoActiveFor = const [],
     this.compact = false,
   });
 
-  final String label;
-  final DashboardView view;
+  final DashboardDestination destination;
   final DashboardView selected;
   final ValueChanged<DashboardView> onSelect;
-
-  /// Extra views this one item also represents (ISSUE_NUM: `IU` covers both the
-  /// node and the report sub-view). Selecting any of them keeps the item lit,
-  /// and tapping it while already there is a no-op rather than a jump back to
-  /// [view] — otherwise a tap on the lit `IU` button would silently throw away
-  /// the sub-view the user is reading.
-  final List<DashboardView> alsoActiveFor;
 
   /// Tighter horizontal padding on phones  — the desktop padding left the
   /// nav items too wide to fit alongside the brand + status on a ~390px phone,
@@ -853,11 +995,11 @@ class _NavItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final active = view == selected || alsoActiveFor.contains(selected);
+    final active = destination.isActive(selected);
     return Padding(
       padding: EdgeInsets.symmetric(horizontal: compact ? 0 : 2),
       child: TextButton(
-        onPressed: () => onSelect(active ? selected : view),
+        onPressed: () => onSelect(destination.targetFrom(selected)),
         style: TextButton.styleFrom(
           foregroundColor: active
               ? MeshColors.accent
@@ -873,7 +1015,7 @@ class _NavItem extends StatelessWidget {
             fontWeight: active ? FontWeight.w700 : FontWeight.w500,
           ),
         ),
-        child: Text(label),
+        child: Text(destination.label),
       ),
     );
   }

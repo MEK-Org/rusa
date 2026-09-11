@@ -66,6 +66,44 @@ function prettyLogger(options: Omit<CreateLoggerOptions, "destination" | "format
   return { logger, lines };
 }
 
+/**
+ * Top-level keys of a raw JSON record line, in emitted order, duplicates kept.
+ *
+ * `JSON.parse` cannot answer this: it resolves a repeated key to the last one
+ * seen, which is exactly the concealment these tests exist to defeat. So the
+ * line is scanned as text — a string at depth 1 followed by `:` is a key, and
+ * anything nested is deeper — and the duplicate survives to be asserted on.
+ */
+function topLevelKeys(line: string): string[] {
+  const keys: string[] = [];
+  let depth = 0;
+  let index = 0;
+  while (index < line.length) {
+    const char = line[index];
+    if (char === '"') {
+      const start = index;
+      index += 1;
+      while (index < line.length && line[index] !== '"') index += line[index] === "\\" ? 2 : 1;
+      index += 1;
+      let after = index;
+      while (after < line.length && /\s/.test(line[after])) after += 1;
+      if (depth === 1 && line[after] === ":")
+        keys.push(JSON.parse(line.slice(start, index)) as string);
+      continue;
+    }
+    if (char === "{" || char === "[") depth += 1;
+    else if (char === "}" || char === "]") depth -= 1;
+    index += 1;
+  }
+  return keys;
+}
+
+/** Assert raw top-level keys are unique without letting JSON.parse conceal a duplicate. */
+function expectUniqueTopLevelKeys(line: string): void {
+  const keys = topLevelKeys(line);
+  expect(new Set(keys)).toHaveLength(keys.length);
+}
+
 const originalLevelEnv = process.env[LOG_LEVEL_ENV_VAR];
 const originalFormatEnv = process.env[LOG_FORMAT_ENV_VAR];
 
@@ -183,6 +221,195 @@ describe("child context", () => {
     logger.info("service_stopped");
 
     expect(records()[1]).not.toHaveProperty("actorId");
+  });
+});
+
+describe("context key uniqueness", () => {
+  it("scans escaped keys while ignoring nested and string-embedded lookalikes", () => {
+    const line =
+      '{"level":"info","escaped\\"key":1,"nested":{"escaped\\"key":2},"array":[{"time":"nested"}],"text":"{\\"time\\":\\"string\\"}","escaped\\u0022key":3}';
+
+    const keys = topLevelKeys(line);
+    expect(keys).toEqual(["level", 'escaped"key', "nested", "array", "text", 'escaped"key']);
+    expect(new Set(keys)).toHaveLength(keys.length - 1);
+  });
+
+  /**
+   * The shape `rusa start` actually builds: a root bound to `component: start`
+   * whose `actor-run` child rebinds the same key. Before the merge, Pino
+   * appended the layers and the record carried `component` twice.
+   */
+  it("emits one component key when a child rebinds its parent's", () => {
+    const { logger, lines } = recordingLogger({ context: { component: "start" } });
+
+    logger.child({ component: "actor-run" }).info("run_start", { provider: "claude" });
+
+    const line = lines.join("").trim();
+    expectUniqueTopLevelKeys(line);
+    expect(line).toContain('"component":"actor-run"');
+    expect(line).not.toContain('"component":"start"');
+  });
+
+  it("lets the innermost layer win across a chain of rebinding children", () => {
+    const { logger, lines, records } = recordingLogger({ context: { component: "start" } });
+
+    logger.child({ component: "actor-run" }).child({ component: "provider" }).info("call_started");
+
+    expectUniqueTopLevelKeys(lines.join("").trim());
+    expect(records()[0].component).toBe("provider");
+  });
+
+  it("lets one call's field win over the context it collides with, once", () => {
+    const { logger, lines, records } = recordingLogger({ context: { component: "start" } });
+
+    logger.child({ component: "actor-run", actorId: "worker-7" }).info("run_start", {
+      component: "sub-step",
+    });
+
+    expectUniqueTopLevelKeys(lines.join("").trim());
+    expect(records()[0]).toMatchObject({ component: "sub-step", actorId: "worker-7" });
+  });
+
+  it("keeps inherited context the collision did not name", () => {
+    const { logger, lines, records } = recordingLogger({
+      context: { component: "start", service: "rusa", host: "mesh-1" },
+    });
+
+    logger
+      .child({ component: "actor-run" })
+      .child({ actorId: "worker-7", runId: "run-42" })
+      .info("run_start");
+
+    expectUniqueTopLevelKeys(lines.join("").trim());
+    expect(records()[0]).toMatchObject({
+      component: "actor-run",
+      service: "rusa",
+      host: "mesh-1",
+      actorId: "worker-7",
+      runId: "run-42",
+      msg: "run_start",
+    });
+  });
+
+  it("leaves the parent and a sibling untouched when one child rebinds a key", () => {
+    const { logger, lines, records } = recordingLogger({ context: { component: "start" } });
+    const parent = logger.child({ component: "actor-run" });
+
+    parent.child({ component: "provider" }).info("call_started");
+    parent.child({ actorId: "worker-7" }).info("run_start");
+    parent.info("runs_drained");
+    logger.info("service_stopped");
+
+    for (const line of lines.join("").split("\n").filter(Boolean)) {
+      expectUniqueTopLevelKeys(line);
+    }
+    expect(records().map((record) => record.component)).toEqual([
+      "provider",
+      "actor-run",
+      "actor-run",
+      "start",
+    ]);
+    expect(records()[1]).toMatchObject({ actorId: "worker-7" });
+    expect(records()[2]).not.toHaveProperty("actorId");
+  });
+
+  it("emits every key once on a record carrying an error and its cause chain", () => {
+    const cause = new Error("socket hang up");
+    const failure = new Error("run failed", { cause });
+    const { logger, lines, records } = recordingLogger({ context: { component: "start" } });
+
+    logger
+      .child({ component: "actor-run", actorId: "worker-7" })
+      .error("run_end", { success: false, err: failure });
+
+    const line = lines.join("").trim();
+    expectUniqueTopLevelKeys(line);
+    expect(records()[0]).toMatchObject({ component: "actor-run", actorId: "worker-7" });
+    const err = records()[0].err as SerializedError;
+    expect(err.message).toBe("run failed");
+    expect((err.cause as SerializedError).message).toBe("socket hang up");
+  });
+
+  it("still redacts an overriding context layer by name and by value", () => {
+    // Synthetic value only; nothing here is a real credential.
+    const token = "fixture-provider-token-9999";
+    const { logger, lines, records } = recordingLogger({
+      context: { component: "start" },
+      secrets: [token],
+    });
+
+    logger
+      .child({ component: "provider", apiKey: token, endpoint: `https://example.test/${token}` })
+      .info("call_started");
+
+    const line = lines.join("").trim();
+    expectUniqueTopLevelKeys(line);
+    expect(line).not.toContain(token);
+    expect(records()[0]).toMatchObject({
+      component: "provider",
+      apiKey: REDACTED,
+      endpoint: `https://example.test/${REDACTED}`,
+    });
+  });
+
+  it("shows the winning component once on the readable line too", () => {
+    const { logger, lines } = prettyLogger({ context: { component: "start" } });
+
+    logger.child({ component: "actor-run" }).info("run_start", { provider: "claude" });
+
+    expect(lines()).toHaveLength(1);
+    // `time LEVEL component event field=value` — the component slot holds the
+    // winner, and the loser is nowhere on the line under any spelling.
+    const tokens = lines()[0].split(/\s+/).filter(Boolean);
+    expect(tokens[2]).toBe("actor-run");
+    expect(tokens).not.toContain("start");
+    expect(lines()[0]).not.toContain("component=");
+  });
+
+  it("reserves Pino-owned keys across root, child and call context", () => {
+    const ignored = ["root", "child", "call"];
+    const { logger, lines, records } = recordingLogger({
+      context: { component: "start", level: ignored[0], time: ignored[0], msg: ignored[0] },
+    });
+
+    logger
+      .child({ component: "actor-run", level: ignored[1], time: ignored[1], msg: ignored[1] })
+      .info("run_start", { level: ignored[2], time: ignored[2], msg: ignored[2] });
+
+    const line = lines.join("").trim();
+    expectUniqueTopLevelKeys(line);
+    expect(records()[0]).toMatchObject({
+      level: "info",
+      time: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+      component: "actor-run",
+      msg: "run_start",
+    });
+    for (const value of ignored) expect(line).not.toContain(`"${value}"`);
+  });
+
+  it("redacts a secret registered after root and child context were bound", () => {
+    // Synthetic value only; it is registered only after both contexts exist.
+    const token = "fixture-late-token-9999";
+    let secrets: readonly string[] = [];
+    const { logger, lines, records } = recordingLogger({
+      context: { component: "start", rootEndpoint: `https://example.test/${token}` },
+      secrets: () => secrets,
+    });
+    const child = logger.child({
+      component: "provider",
+      childEndpoint: `https://example.test/${token}`,
+    });
+
+    secrets = [token];
+    child.info("call_started");
+
+    const line = lines.join("").trim();
+    expectUniqueTopLevelKeys(line);
+    expect(line).not.toContain(token);
+    expect(records()[0]).toMatchObject({
+      rootEndpoint: `https://example.test/${REDACTED}`,
+      childEndpoint: `https://example.test/${REDACTED}`,
+    });
   });
 });
 

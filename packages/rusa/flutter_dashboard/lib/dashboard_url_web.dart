@@ -4,7 +4,10 @@ import 'package:flutter/services.dart';
 
 import 'widgets/header.dart';
 
-DashboardView dashboardViewFromUrl() => _parse(Uri.base.path);
+/// The view the current address names, or null when the path names none —
+/// the bare `/` landing, where the caller picks the default that suits the
+/// viewport.
+DashboardView? dashboardViewFromUrl() => _parse(Uri.base.path);
 
 String? focusedObligationIdFromUrl() {
   final path = Uri.base.path.replaceFirst(RegExp(r'/+$'), '');
@@ -49,11 +52,12 @@ void writeDashboardViewToUrl(
   unawaited(SystemNavigator.routeInformationUpdated(uri: url, replace: true));
 }
 
-DashboardView _parse(String path) {
+DashboardView? _parse(String path) {
   final cleanPath = path.replaceFirst(RegExp(r'/+$'), '');
   if (cleanPath.startsWith('/actors')) return DashboardView.actors;
   if (cleanPath == '/understanding') return DashboardView.understanding;
   if (cleanPath == '/reports') return DashboardView.reports;
   if (cleanPath.startsWith('/work')) return DashboardView.work;
-  return DashboardView.overview;
+  if (cleanPath == '/overview') return DashboardView.overview;
+  return null;
 }

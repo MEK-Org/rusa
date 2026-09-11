@@ -18,6 +18,8 @@ import {
 import { normalizeModelEffortSelection } from "../providers/reasoning-effort.js";
 import type { CodingProvider, RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
+import { isSupportedVoiceName } from "../voice/tts-voices.js";
 import { Actor } from "./actor.js";
 import type {
   ActorFactoryContext,
@@ -30,7 +32,12 @@ import type {
 import { ActorMesh, RetirementBlockedError } from "./actor-mesh.js";
 import type { ActorRecord } from "./actor-record.js";
 import { RunStartCancelledError, type RunStartHandle } from "./concurrency-limiter.js";
-import type { EventResource } from "./event-subscriptions.js";
+import {
+  type EventResource,
+  InMemoryEventSourceOwnerStore,
+  InMemoryEventSourceSubscriptionStore,
+  parentOf,
+} from "./event-subscriptions.js";
 import { ExternalRootDriver } from "./external-root-driver.js";
 import { routeRunFailure } from "./failure-sink.js";
 import type {
@@ -176,6 +183,8 @@ function setup(
     recordRunYield?: ActorMeshOptions["recordRunYield"];
     inboxStore?: InboxStore;
     isVoiceSessionActive?: ActorMeshOptions["isVoiceSessionActive"];
+    voiceSessionTransfer?: ActorMeshOptions["voiceSessionTransfer"];
+    listVoiceSessionChat?: ActorMeshOptions["listVoiceSessionChat"];
     onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
     grantableCapabilities?: ReadonlySet<string>;
     validateSpawn?: ActorMeshOptions["validateSpawn"];
@@ -199,8 +208,28 @@ function setup(
   let seq = 0;
   let chatSeq = 0;
   const scheduledMessages = opts.scheduledMessages ?? new FakeScheduledMessageScheduler();
+  const inboxStore = opts.inboxStore ?? createMemoryInboxStore();
+  const eventSourceOwners = new InMemoryEventSourceOwnerStore();
+  const eventSourceSubscriptions = new InMemoryEventSourceSubscriptionStore();
 
-  const mesh = new ActorMesh({
+  let mesh!: ActorMesh;
+  const eventSourceResolver = new HierarchicalEventSourceResolver({
+    ports: {
+      parentOf,
+      isLive: (actorId) => mesh.isLiveActor(actorId),
+      activeDelegationsFor: (resource) => eventSourceOwners.activeForResource(resource),
+      directSubscribersFor: (resource) => eventSourceSubscriptions.subscribersOf(resource),
+      findLiveObligationByExternalRef: (ref) => opts.obligations?.findLiveByExternalRef(ref),
+      resolveActor: (handleOrId) => mesh.resolveLiveActorId(handleOrId),
+    },
+    log: (m) => logs.push(m),
+  });
+  const eventManager = new EventManager({
+    inboxStore,
+    resolver: eventSourceResolver,
+    log: (m) => logs.push(m),
+  });
+  mesh = new ActorMesh({
     actors: registry,
     rootId: opts.rootId ?? "root",
     handleForId: opts.handleForId,
@@ -213,8 +242,13 @@ function setup(
     isShuttingDown: opts.isShuttingDown,
     events: opts.events,
     recordChat: opts.recordChat ?? (() => `message-${++chatSeq}`),
-    inboxStore: opts.inboxStore ?? createMemoryInboxStore(),
+    inboxStore,
+    eventSourceOwners,
+    eventSourceSubscriptions,
+    eventManager,
     isVoiceSessionActive: opts.isVoiceSessionActive,
+    voiceSessionTransfer: opts.voiceSessionTransfer,
+    listVoiceSessionChat: opts.listVoiceSessionChat,
     obligations: opts.obligations,
     configuredEventSources: opts.configuredEventSources,
     scheduledMessages,
@@ -400,6 +434,23 @@ describe("ActorMesh", () => {
     expect(canWrite("root")).toBe(true);
     expect(canWrite(sibling)).toBe(false);
     expect(canWrite(descendant)).toBe(false);
+  });
+
+  it("randomizes a supported voice for every newly spawned actor", () => {
+    const { mesh, registry } = setup();
+    const voices = new Set<string>();
+    for (let i = 0; i < 25; i++) {
+      const id = mesh.spawn({ charter: `worker ${i}`, parentId: "root" });
+      const voiceConfig = registry.get(id)?.voiceConfig;
+      expect(voiceConfig?.schemaVersion).toBe(1);
+      expect(voiceConfig?.provider).toBe("google");
+      expect(voiceConfig?.config.voiceName).toBeDefined();
+      expect(isSupportedVoiceName(voiceConfig?.config.voiceName ?? "")).toBe(true);
+      voices.add(voiceConfig?.config.voiceName ?? "");
+    }
+    // 25 spawns over a 30-voice catalog must not collapse to one voice; the
+    // probability of a false failure is astronomically small.
+    expect(voices.size).toBeGreaterThan(1);
   });
 
   it("sequences real actor and external-root transitions on one contiguous revision", async () => {
@@ -1530,6 +1581,160 @@ describe("ActorMesh", () => {
     expect(
       inboxStore.entries.filter((entry) => entry.actorId === worker && !entry.handledAt)
     ).toHaveLength(3);
+  });
+
+  it("transfers the same voice session to a held active actor with bounded context", async () => {
+    const inboxStore = createMemoryInboxStore();
+    let holder = "";
+    const controls: Array<[string, string]> = [];
+    const context = [
+      {
+        id: "one",
+        ts: "2026-01-01T00:00:01.000Z",
+        senderId: "human:operator",
+        recipientId: "source",
+        body: "first durable memo",
+        sessionId: "walkie-session",
+      },
+      {
+        id: "two",
+        ts: "2026-01-01T00:00:02.000Z",
+        senderId: "source",
+        recipientId: "human:operator",
+        body: "second durable reply",
+        sessionId: "walkie-session",
+      },
+    ];
+    const { mesh, fake, tick, registry } = setup({
+      inboxStore,
+      isVoiceSessionActive: (actorId) => actorId === holder,
+      voiceSessionTransfer: {
+        activeSessionIdFor: (actorId) => {
+          if (actorId !== holder) throw new Error("caller does not hold an active voice session");
+          return "walkie-session";
+        },
+        transferActiveSession: (fromActorId, targetActorId) => {
+          if (fromActorId !== holder)
+            throw new Error("caller does not hold an active voice session");
+          holder = targetActorId;
+          return "walkie-session";
+        },
+        revertActiveSessionTransfer: (sessionId, fromActorId, targetActorId) => {
+          expect(sessionId).toBe("walkie-session");
+          expect(holder).toBe(targetActorId);
+          holder = fromActorId;
+        },
+        notifySessionTransferred: (sessionId, targetActorId) =>
+          controls.push([sessionId, targetActorId]),
+      },
+      listVoiceSessionChat: (sessionId) => (sessionId === "walkie-session" ? context : []),
+    });
+    const source = mesh.spawn({ charter: "source", parentId: "root" });
+    const target = mesh.spawn({ charter: "target", parentId: source });
+    holder = source;
+
+    const [sourceNormal] = inboxStore.append([
+      { actorId: source, source: "github:MEK-Org/rusa", payload: { type: "github.issue" } },
+    ]);
+    expect(mesh.notifyInboxChanged(source)).toBe(false);
+
+    const result = mesh.transferVoiceSession(source, target, "take over the review");
+    expect(result).toEqual({ sessionId: "walkie-session", targetActorId: target });
+    expect(controls).toEqual([["walkie-session", target]]);
+    expect(registry.get(target)?.lastChatSessionId).toBeUndefined();
+    expect(registry.get(target)?.humanUnlocked).toBeUndefined();
+
+    const handoff = inboxStore.entries.find(
+      (entry) => entry.actorId === target && entry.payload.type === "voice.transfer"
+    );
+    expect(handoff?.payload.priority).toBe("responsive");
+    expect(String(handoff?.payload.context)).toContain("first durable memo");
+    expect(String(handoff?.payload.context).indexOf("first durable memo")).toBeLessThan(
+      String(handoff?.payload.context).indexOf("second durable reply")
+    );
+    expect(String(handoff?.payload.context)).toContain("take over the review");
+    expect(sourceNormal?.handledAt).toBeNull();
+
+    // Rebinding releases the source's held ordinary work exactly through the
+    // existing session-end path, while the recipient's normal work stays held.
+    await tick();
+    expect(fake(source).calls.length).toBeGreaterThan(0);
+    const targetCallsBeforeRelease = fake(target).calls.length;
+    inboxStore.append([
+      { actorId: target, source: "github:MEK-Org/rusa", payload: { type: "github.issue" } },
+    ]);
+    expect(mesh.notifyInboxChanged(target)).toBe(false);
+    holder = "";
+    expect(mesh.notifyVoiceSessionEnded(target)).toBe(true);
+    await tick();
+    expect(fake(target).calls.length).toBeGreaterThan(targetCallsBeforeRelease);
+  });
+
+  it("refuses voice transfer to self, a retired target, or an unheld actor", () => {
+    let holder = "";
+    const { mesh } = setup({
+      isVoiceSessionActive: (actorId) => actorId === holder,
+      voiceSessionTransfer: {
+        activeSessionIdFor: () => "walkie-session",
+        transferActiveSession: (_fromActorId, targetActorId) => {
+          holder = targetActorId;
+          return "walkie-session";
+        },
+        revertActiveSessionTransfer: () => {},
+        notifySessionTransferred: () => {},
+      },
+    });
+    const source = mesh.spawn({ charter: "source", parentId: "root" });
+    const heldTarget = mesh.spawn({ charter: "target", parentId: source });
+    const unheld = mesh.spawn({ charter: "unheld", parentId: "root" });
+    holder = source;
+
+    expect(() => mesh.transferVoiceSession(source, source)).toThrow("itself");
+    expect(() => mesh.transferVoiceSession(source, unheld)).toThrow("not a handle held");
+    mesh.retire(heldTarget);
+    expect(() => mesh.transferVoiceSession(source, heldTarget)).toThrow("retired");
+  });
+
+  it("rolls a transferred lease back when the durable handoff write fails", () => {
+    let holder = "";
+    const backingStore = createMemoryInboxStore();
+    const failingInbox: InboxStore = {
+      ...backingStore,
+      append: () => {
+        throw new Error("disk full");
+      },
+    };
+    const { mesh } = setup({
+      inboxStore: failingInbox,
+      isVoiceSessionActive: (actorId) => actorId === holder,
+      voiceSessionTransfer: {
+        activeSessionIdFor: (actorId) => {
+          if (actorId !== holder) throw new Error("caller does not hold an active voice session");
+          return "walkie-session";
+        },
+        transferActiveSession: (fromActorId, targetActorId) => {
+          if (fromActorId !== holder)
+            throw new Error("caller does not hold an active voice session");
+          holder = targetActorId;
+          return "walkie-session";
+        },
+        revertActiveSessionTransfer: (sessionId, fromActorId, targetActorId) => {
+          expect(sessionId).toBe("walkie-session");
+          expect(holder).toBe(targetActorId);
+          holder = fromActorId;
+        },
+        notifySessionTransferred: () => {
+          throw new Error("must not notify after a failed durable handoff");
+        },
+      },
+    });
+    const source = mesh.spawn({ charter: "source", parentId: "root" });
+    const target = mesh.spawn({ charter: "target", parentId: source });
+    holder = source;
+
+    expect(() => mesh.transferVoiceSession(source, target)).toThrow("disk full");
+    expect(holder).toBe(source);
+    expect(backingStore.entries).toEqual([]);
   });
 
   it("defers a normal run queued before voice authority opens at final admission", async () => {
@@ -5191,6 +5396,64 @@ describe("ActorMesh", () => {
   });
 
   describe("Event Subscriptions (Phase 2)", () => {
+    it("offers no second routing seam to construct a mesh with", () => {
+      const { mesh } = setup();
+      // Authority and delivery are the same object by construction: the mesh
+      // reads its ladder off the manager it was given. A resolver passed
+      // beside that manager is what let an embedder hold two disagreeing
+      // policies, so the option no longer exists to pass.
+      const options: ActorMeshOptions = {
+        actors: new InMemoryActorRepository(),
+        // @ts-expect-error - there is one event seam: the EventManager itself.
+        eventSourceResolver: {},
+      };
+      expect(options).toBeDefined();
+      expect(mesh).toBeDefined();
+    });
+
+    it("delivers in one turn, so a queued retirement cannot orphan a durable entry", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh } = setup({ inboxStore });
+      const worker = mesh.spawn({ charter: "repo worker", parentId: "root" });
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo", worker, "root");
+
+      // Recipient liveness, the durable append, and the wake are one turn.
+      // Suspend anywhere between them and a retirement lands after a recipient
+      // was resolved as live: the row is still written (InboxRepository.append
+      // validates only non-empty actor ids, and the inbox table has no actor
+      // foreign key), leaving durable unhandled work nobody alive can take,
+      // and the wake then fails. A microtask queued before the call is the
+      // tightest interleaving available — it runs at the first suspension
+      // point inside deliverEvent, if the code has one at all.
+      const retirement = Promise.resolve().then(() => mesh.retire(worker));
+      const delivery = mesh.deliverEvent("github:dummy-org/dummy-repo", "repo event", {
+        inboxPayload: payload("push"),
+      });
+
+      await expect(delivery).resolves.toBeUndefined();
+      await retirement;
+
+      expect(inboxStore.entries.filter((entry) => entry.actorId === worker)).toHaveLength(1);
+    });
+
+    it("canonicalizes a legacy resource once for both routing and durable inbox source", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const { mesh } = setup({ inboxStore });
+      const worker = mesh.spawn({ charter: "issue worker", parentId: "root" });
+      mesh.subscribeEventSource("github:dummy-org/dummy-repo/issues/456", worker, "root");
+
+      await mesh.deliverEvent("github_issue:dummy-org/dummy-repo#456", "legacy issue event", {
+        inboxPayload: payload("issues.opened"),
+      });
+
+      expect(inboxStore.entries).toEqual([
+        expect.objectContaining({
+          actorId: worker,
+          source: "github:dummy-org/dummy-repo/issues/456",
+        }),
+      ]);
+    });
+
     it("subscribes and unsubscribes event sources and records audit events", () => {
       const events: MeshEventInput[] = [];
       const { mesh } = setup({ events: (e: MeshEventInput) => events.push(e) });
@@ -6276,6 +6539,172 @@ describe("ActorMesh", () => {
       expect(fake(watcherB).calls).toHaveLength(1);
     });
 
+    /**
+     * Two actors mid-run on a provider that never finishes on its own, so a
+     * delivery's effect on each in-flight run is observable through the abort
+     * signal the provider was handed.
+     */
+    function setupTwoRunningActors() {
+      const inboxStore = createMemoryInboxStore();
+      const events: MeshEventInput[] = [];
+      const signals = new Map<string, AbortSignal | undefined>();
+      const resolvers = new Map<string, (result: Partial<RunResult>) => void>();
+      // A shared provider's `calls` array is one object for every actor, so
+      // per-actor run counts are kept here, keyed by the actor's cwd.
+      const runs = new Map<string, number>();
+      // Each admission's responsive flag as the scheduler saw it, per actor, so
+      // a follow-up run can be shown to have kept the delivery's priority.
+      const admissions = new Map<string, boolean[]>();
+      const provider = new FakeProvider((opts) => {
+        const actorId = opts.cwd.slice("/tmp/".length);
+        runs.set(actorId, (runs.get(actorId) ?? 0) + 1);
+        if (signals.has(actorId)) {
+          return { success: true, exitCode: 0, output: "follow-up handled" };
+        }
+        signals.set(actorId, opts.signal);
+        return new Promise<Partial<RunResult>>((resolve) => {
+          resolvers.set(actorId, resolve);
+        });
+      });
+      const harness = setup({
+        inboxStore,
+        events: (event) => events.push(event),
+        sharedProvider: provider,
+        onQueued: (actorId, ctx) => {
+          admissions.set(actorId, [...(admissions.get(actorId) ?? []), ctx.responsive]);
+        },
+      });
+      const startRun = async (actorId: string) => {
+        inboxStore.append([{ actorId, source: "mesh:root", payload: payload("mesh.message") }]);
+        harness.mesh.notifyInboxChanged(actorId);
+        await harness.tick();
+        expect(runs.get(actorId)).toBe(1);
+        expect(signals.get(actorId)?.aborted).toBe(false);
+      };
+      const preemptions = () =>
+        events.filter((event) => event.kind === "run_preempted").map((event) => event.actorId);
+      const unhandledResponsive = (actorId: string) =>
+        inboxStore.entries.filter(
+          (entry) =>
+            entry.actorId === actorId &&
+            entry.handledAt === null &&
+            entry.payload.priority === "responsive"
+        );
+      return {
+        ...harness,
+        inboxStore,
+        signals,
+        resolvers,
+        runs,
+        admissions,
+        startRun,
+        preemptions,
+        unhandledResponsive,
+      };
+    }
+
+    const responsiveIssueEvent = {
+      sourceType: "timer",
+      rawResource: ISSUE,
+      rawPayload: payload("issues.opened"),
+      priority: "responsive",
+      eventSummary: "responsive issue event",
+    } as const;
+
+    const deliveryPaths = [
+      {
+        name: "deliverExternalEvent (production)",
+        deliver: (mesh: ActorMesh) => mesh.deliverExternalEvent(responsiveIssueEvent),
+      },
+      {
+        name: "deliverEvent (transitional characterization)",
+        deliver: (mesh: ActorMesh) =>
+          mesh.deliverEvent(ISSUE, "responsive issue event", {
+            inboxPayload: payload("issues.opened"),
+            inboxPriority: "responsive",
+          }),
+      },
+    ] as const;
+
+    describe.each(deliveryPaths)("responsive fan-out via $name", ({ deliver }) => {
+      it("preempts only the owner's active run; the subscriber gets a durable responsive wake", async () => {
+        const t = setupTwoRunningActors();
+        const owner = t.mesh.spawn({ charter: "owner", parentId: "root" });
+        const watcher = t.mesh.spawn({ charter: "watcher", parentId: "root" });
+        t.mesh.subscribeEventSource(ISSUE, owner, "root");
+        t.mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+        await t.startRun(owner);
+        await t.startRun(watcher);
+
+        await deliver(t.mesh);
+
+        // The owner's run is replaced exactly once; the subscriber's is not.
+        expect(t.signals.get(owner)?.aborted).toBe(true);
+        expect(t.signals.get(owner)?.reason).toBe("interrupt:responsive-notification");
+        expect(t.signals.get(watcher)?.aborted).toBe(false);
+        expect(t.preemptions()).toEqual([owner]);
+
+        // Append-before-notify held for both: each has its own durable copy.
+        expect(t.unhandledResponsive(owner)).toHaveLength(1);
+        expect(t.unhandledResponsive(watcher)).toHaveLength(1);
+
+        // The owner's replacement run sees its entry.
+        t.resolvers.get(owner)?.({
+          success: false,
+          exitCode: 143,
+          cancelled: true,
+          interrupted: true,
+          output: "[Task interrupted by responsive-notification]",
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(t.runs.get(owner)).toBe(2);
+
+        // The subscriber's run finishes on its own; the responsive entry then
+        // earns a follow-up run rather than having been lost with an abort.
+        expect(t.runs.get(watcher)).toBe(1);
+        t.resolvers.get(watcher)?.({ success: true, exitCode: 0, output: "finished normally" });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(t.runs.get(watcher)).toBe(2);
+        // The follow-up was admitted as responsive work: not preempting is a
+        // narrower change than downgrading the subscriber's copy to normal.
+        expect(t.admissions.get(watcher)).toEqual([false, true]);
+      });
+
+      it("preempts nobody when routing finds only subscribers", async () => {
+        const t = setupTwoRunningActors();
+        const watcherA = t.mesh.spawn({ charter: "watcher a", parentId: "root" });
+        const watcherB = t.mesh.spawn({ charter: "watcher b", parentId: "root" });
+        t.mesh.addEventSourceSubscriber(ISSUE, watcherA, watcherA);
+        t.mesh.addEventSourceSubscriber(ISSUE, watcherB, watcherB);
+        await t.startRun(watcherA);
+        await t.startRun(watcherB);
+
+        await deliver(t.mesh);
+
+        expect(t.signals.get(watcherA)?.aborted).toBe(false);
+        expect(t.signals.get(watcherB)?.aborted).toBe(false);
+        expect(t.preemptions()).toEqual([]);
+        expect(t.unhandledResponsive(watcherA)).toHaveLength(1);
+        expect(t.unhandledResponsive(watcherB)).toHaveLength(1);
+      });
+
+      it("still quick-starts an idle subscriber as responsive work", async () => {
+        const t = setupTwoRunningActors();
+        const owner = t.mesh.spawn({ charter: "owner", parentId: "root" });
+        const watcher = t.mesh.spawn({ charter: "watcher", parentId: "root" });
+        t.mesh.subscribeEventSource(ISSUE, owner, "root");
+        t.mesh.addEventSourceSubscriber(ISSUE, watcher, watcher);
+        await t.startRun(owner);
+
+        await deliver(t.mesh);
+        // Responsive admission bypasses the ordinary debounce window.
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(t.runs.get(watcher)).toBe(1);
+        expect(t.preemptions()).toEqual([owner]);
+      });
+    });
+
     it("does not double-deliver to an actor that both owns and subscribes", async () => {
       const { mesh, tick, fake } = setup();
       const owner = mesh.spawn({ charter: "owner", parentId: "root" });
@@ -7263,6 +7692,38 @@ describe("ActorMesh", () => {
         type: "operator.run_now",
         priority: "responsive",
       });
+    });
+
+    it("runNow still replaces an active run — explicit control is not event fan-out", async () => {
+      const inboxStore = createMemoryInboxStore();
+      const events: MeshEventInput[] = [];
+      let signal: AbortSignal | undefined;
+      let runIndex = 0;
+      const { mesh, tick, fake } = setup({
+        inboxStore,
+        events: (e) => events.push(e),
+        sharedProvider: new FakeProvider((opts) => {
+          if (runIndex++ === 0) {
+            signal = opts.signal;
+            return new Promise<RunResult>(() => {});
+          }
+          return { success: true, exitCode: 0, output: "" };
+        }),
+      });
+      const worker = mesh.spawn({ charter: "worker", parentId: "root" });
+      inboxStore.append([{ actorId: worker, source: "root", payload: payload("task") }]);
+      mesh.notifyInboxChanged(worker);
+      await tick();
+      expect(fake(worker).calls).toHaveLength(1);
+      expect(signal?.aborted).toBe(false);
+
+      expect(mesh.runNow(worker, "dashboard")).toEqual({ queued: true });
+
+      expect(signal?.aborted).toBe(true);
+      expect(signal?.reason).toBe("interrupt:responsive-notification");
+      expect(events.filter((e) => e.kind === "run_preempted").map((e) => e.actorId)).toEqual([
+        worker,
+      ]);
     });
 
     it("runNow throws when target actor is unknown ", () => {

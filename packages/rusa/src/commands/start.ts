@@ -33,6 +33,7 @@ import {
   isSubResourceOf,
   missingAuditedEventSourceOwnerships,
   normalizeEventResource,
+  parentOf,
   reconcileEventSourceSubscriptions,
   reconcileEventSources,
   resourceKey,
@@ -130,10 +131,6 @@ import { GoogleDriveClient } from "../drive/drive-client.js";
 import { GoogleGmailClient } from "../email/gmail-client.js";
 import { instanceWorkerFactory } from "../experimental/remote-instances/e2e-adapter.js";
 import { FollowerHub } from "../experimental/remote-instances/follower-hub.js";
-import {
-  checkSuiteWakesAnyone,
-  deriveGitHubInboxNotification,
-} from "../github/inbox-notification.js";
 import { startGitHubEventPoller } from "../github/poller.js";
 import { startGitHttpServer } from "../gitops/git-http-server.js";
 import {
@@ -214,6 +211,7 @@ import type { McpServerSpec, RunResult } from "../providers/types.js";
 import { resolveQuotaDatabasePath, SharedQuotaStore } from "../quota/shared-store.js";
 import { ReferenceCacheService } from "../references/cache-service.js";
 import { asGitHubIssue, parseReference } from "../references/reference.js";
+import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
 import { createCommitmentPolarityEvaluator } from "../understanding/commitment-polarity.js";
 import {
   DistillerCursorStore,
@@ -237,7 +235,9 @@ import { readBuildSentinel } from "../update/build-sentinel.js";
 import { MeshDrainer } from "../update/drain.js";
 import { recordRestartAndCheckFlap } from "../update/flap-detector.js";
 import { BuildRunner, GitRunner } from "../update/runner.js";
+import { canonicalSupportedVoiceName } from "../voice/tts-voices.js";
 import type { VoiceService } from "../voice/voice-service.js";
+import { MAX_VOICE_TRANSFER_CONTEXT_MESSAGES } from "../voice/voice-transfer-context.js";
 import { createVoiceService } from "../voice/wiring.js";
 import {
   directiveBodyForWebhookPayload,
@@ -1705,8 +1705,31 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // authority host-owned while letting the later service attach its registry.
   let voiceService: VoiceService | null = null;
 
+  // One ownership ladder, assembled at the host boundary. Both EventManager
+  // delivery and ActorMesh authority checks use these same narrow read ports;
+  // neither component may instantiate a competing resolver.
+  let mesh!: ActorMesh;
+  const emitMeshRoutingLog = (message: string) => console.log(`[mesh] ${message}`);
+  const eventSourceResolver = new HierarchicalEventSourceResolver({
+    ports: {
+      parentOf,
+      isLive: (actorId) => mesh.isLiveActor(actorId),
+      activeDelegationsFor: (resource) => eventSourceOwners.activeForResource(resource),
+      directSubscribersFor: (resource) => eventSourceSubscriptions.subscribersOf(resource),
+      findLiveObligationByExternalRef: (ref) =>
+        getRepositories().obligations.findLiveByExternalRef(ref),
+      resolveActor: (handleOrId) => mesh.resolveLiveActorId(handleOrId),
+    },
+    log: emitMeshRoutingLog,
+  });
+  const eventManager = new EventManager({
+    inboxStore,
+    resolver: eventSourceResolver,
+    log: emitMeshRoutingLog,
+  });
+
   // ── Actor mesh: the root plus any worker threads it spawns ──
-  const mesh: ActorMesh = new ActorMesh({
+  mesh = new ActorMesh({
     actors,
     rootId,
     // Placement exists when an experimental remote-instance seam or follower gateway
@@ -1753,6 +1776,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     capabilityGrants,
     eventSourceOwners,
     eventSourceSubscriptions,
+    // One seam: the manager carries the kernel built above, so mesh authority
+    // and event delivery cannot diverge.
+    eventManager,
     // The configured scope the mesh refuses new subscriptions outside of, so a
     // `subscribe_event_source` call cannot reopen what the config closed.
     configuredEventSources: configuredRoots,
@@ -1781,6 +1807,32 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     },
     inboxStore,
     isVoiceSessionActive: (actorId) => voiceService?.hasActiveSession(actorId) ?? false,
+    // The registry is constructed later with the configured Gemini client, so
+    // this host-owned port closes over it. ActorMesh keeps authorization and
+    // durable handoff delivery; VoiceService keeps the one live-session map.
+    voiceSessionTransfer: {
+      activeSessionIdFor: (actorId) => {
+        if (!voiceService)
+          throw new Error("voice session transfer is unavailable on this instance");
+        return voiceService.activeSessionIdFor(actorId);
+      },
+      transferActiveSession: (fromActorId, targetActorId) => {
+        if (!voiceService)
+          throw new Error("voice session transfer is unavailable on this instance");
+        return voiceService.transferActiveSession(fromActorId, targetActorId);
+      },
+      revertActiveSessionTransfer: (sessionId, fromActorId, targetActorId) => {
+        if (!voiceService)
+          throw new Error("voice session transfer is unavailable on this instance");
+        voiceService.revertActiveSessionTransfer(sessionId, fromActorId, targetActorId);
+      },
+      notifySessionTransferred: (sessionId, targetActorId) =>
+        voiceService?.notifySessionTransferred(sessionId, targetActorId),
+    },
+    listVoiceSessionChat: (sessionId) =>
+      getRepositories().meshChat.listForSession(sessionId, {
+        limit: MAX_VOICE_TRANSFER_CONTEXT_MESSAGES,
+      }),
     onInboxEntriesSeen: (_actorId, entries) =>
       reactToQueuedInboxEntries(issueClient, entries, console.warn, chatClient ?? undefined),
     // Grantable = every registered MCP-server capability PLUS the secret
@@ -1869,7 +1921,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       gitBridgeDeliverables.delete(actorId);
       return notifyingParent ? deliverable : undefined;
     },
-    log: (m) => console.log(`[mesh] ${m}`),
+    log: emitMeshRoutingLog,
     retireCleanups: createStartRetireCleanups(workersDir, osScheduler, e2eInstance, {
       dir: antigravityScratchDir(),
       listActors: actorLiveness,
@@ -3155,25 +3207,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       console.log(`[webhook] never-delivered event dropped: ${event}/${action} (${summary})`);
       return;
     }
-    // Not in the set above, because the set reads a type string and the
-    // deciding field is in the payload: a check suite wakes its owner when it
-    // is red and stays quiet when it is green.
-    if (event === "check_suite" && action === "completed" && !checkSuiteWakesAnyone(payload)) {
-      const summary = `sender=${sender ?? "<unknown>"} repo=${repo}${number != null ? `#${number}` : ""}`;
-      console.log(`[webhook] non-actionable check suite dropped: ${event}/${action} (${summary})`);
-      return;
-    }
-
     const eventSummary = `GitHub ${event}/${action} on ${repo}`;
     if (repoFullName) {
-      const notification = deriveGitHubInboxNotification(event, payload);
-      if (!notification) throw new Error("GitHub event repository could not be resolved");
-      await mesh.deliverEvent(notification.resource, eventSummary, {
+      await mesh.deliverExternalEvent({
+        sourceType: "github",
+        rawPayload: { event, payload },
         directedTarget,
         stampedAuthor,
         instanceId: rootHandle,
-        inboxPayload: notification.payload,
-        inboxDedupeKey: deliveryId ? `github:${deliveryId}` : undefined,
+        idempotencyKey: deliveryId ? `github:${deliveryId}` : undefined,
+        eventSummary,
       });
     } else {
       if (stampedAuthor !== null) {
@@ -3226,6 +3269,16 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         home: mcHome,
         apiKey: geminiApiKey,
         voice: config.voice,
+        // Per-actor voice for reply TTS: the actor's persisted voice_config,
+        // validated against the supported catalog, else the instance-wide
+        // default. Resolved fresh per reply so a dashboard edit takes effect
+        // on the actor's very next spoken reply.
+        voiceNameFor: (actorId) => {
+          const voiceConfig = actors.get(actorId)?.voiceConfig;
+          const voiceName =
+            voiceConfig?.provider === "google" ? voiceConfig.config.voiceName : undefined;
+          return voiceName === undefined ? undefined : canonicalSupportedVoiceName(voiceName);
+        },
         onSessionEnded: (actorId) => mesh.notifyVoiceSessionEnded(actorId),
       })
     : null;
@@ -3427,23 +3480,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
           .catch(() => {});
         return;
       }
-      await mesh.deliverEvent(
-        `gchat:${msg.spaceName.startsWith("spaces/") ? msg.spaceName : `spaces/${msg.spaceName}`}`,
-        `chat message from ${who}`,
-        {
-          inboxPayload: {
-            type: "gchat.message",
-            messageName: msg.name,
-            spaceName: msg.spaceName,
-            threadName: msg.threadName,
-            senderName: msg.senderName,
-            priority: "responsive",
-          },
-          inboxDedupeKey: msg.name,
-          inboxDeliveredAt: msg.createTime ? new Date(msg.createTime) : undefined,
-          inboxPriority: "responsive",
-        }
-      );
+      await mesh.deliverExternalEvent({
+        sourceType: "chat",
+        rawPayload: msg,
+        idempotencyKey: msg.name,
+        priority: "responsive",
+        eventSummary: `chat message from ${who}`,
+      });
     };
 
     if (opts?.e2e?.chatSource) {
@@ -3640,9 +3683,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   let diskAlert: DiskUsageAlert | null = null;
   if (diskAlertConfig?.enabled !== false) {
     const activeDiskAlert = new DiskUsageAlert(diskAlertConfig, async (event) => {
-      await mesh.deliverEvent("system:events", event.message, {
-        inboxPayload: event,
-        inboxPriority: "responsive",
+      await mesh.deliverExternalEvent({
+        sourceType: "timer",
+        rawResource: "system:events",
+        rawPayload: event,
+        priority: "responsive",
+        eventSummary: event.message,
       });
     });
     diskAlert = activeDiskAlert;

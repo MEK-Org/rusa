@@ -1,5 +1,9 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { ActorMesh } from "../../actor/actor-mesh.js";
+import {
+  InMemoryEventSourceOwnerStore,
+  InMemoryEventSourceSubscriptionStore,
+} from "../../actor/event-subscriptions.js";
 import { ExternalRootDriver } from "../../actor/external-root-driver.js";
 import { InMemoryActorRepository } from "../../repositories/in-memory-actor-repository.js";
 import { ActorHandle } from "./actor-handle.js";
@@ -40,9 +44,15 @@ export function createHarness(options: {
   const events: Array<{ actorId: string; event: ActorEvent }> = [];
   const failures: Error[] = [];
   let sequence = 0;
+  const eventSourceOwners = new InMemoryEventSourceOwnerStore();
+  const eventSourceSubscriptions = new InMemoryEventSourceSubscriptionStore();
+  // No event seam: these follower tests never route or deliver events, and a
+  // mesh without one simply refuses those paths rather than inventing a ladder.
   const mesh = new ActorMesh({
     actors,
     rootId: "root",
+    eventSourceOwners,
+    eventSourceSubscriptions,
     maxConcurrent: 1,
     idgen: () => `instance-worker-${++sequence}`,
     recordChat: (message) => {

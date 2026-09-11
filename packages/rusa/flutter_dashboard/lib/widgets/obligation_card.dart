@@ -7,6 +7,7 @@ import '../theme.dart';
 import '../util.dart';
 import 'header.dart';
 import 'obligation_dialogs.dart';
+import 'obligation_status.dart';
 
 class ObligationRow extends StatelessWidget {
   const ObligationRow({
@@ -127,13 +128,19 @@ class ObligationRow extends StatelessWidget {
             },
             itemBuilder: (context) => [
               if (obligation.isReady)
-                const PopupMenuItem(
+                PopupMenuItem(
                   value: 'done',
                   child: Row(
                     children: [
-                      Icon(Icons.check_circle_outline, size: 16, color: Color(0xFF34D399)),
-                      SizedBox(width: 8),
-                      Text('Mark Done', style: TextStyle(color: MeshColors.textPrimary, fontSize: 13)),
+                      // Blue for done, matching the chip: green is reserved for
+                      // an obligation an actor is working right now.
+                      Icon(
+                        Icons.check_circle_outline,
+                        size: 16,
+                        color: ObligationStatusColors.done.chipForeground,
+                      ),
+                      const SizedBox(width: 8),
+                      const Text('Mark Done', style: TextStyle(color: MeshColors.textPrimary, fontSize: 13)),
                     ],
                   ),
                 ),
@@ -187,7 +194,7 @@ class ObligationRow extends StatelessWidget {
             Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _StatusChip(status: obligation.status),
+                ObligationStatusChip(obligation: obligation, store: store),
                 const SizedBox(width: 12),
                 Expanded(child: titleAndOwner),
                 const SizedBox(width: 8),
@@ -246,7 +253,9 @@ class ObligationRow extends StatelessWidget {
                   color: MeshColors.bgTertiary,
                   border: Border(
                     left: BorderSide(
-                      color: obligation.isDone ? MeshColors.statusActive : MeshColors.statusRetired,
+                      color: obligation.isDone
+                          ? ObligationStatusColors.done.dot
+                          : ObligationStatusColors.cancelled.dot,
                       width: 3,
                     ),
                   ),
@@ -408,62 +417,6 @@ class ObligationCheckpointPanel extends StatelessWidget {
           else
             Text(text, maxLines: maxLines, overflow: TextOverflow.ellipsis, style: bodyStyle),
         ],
-      ),
-    );
-  }
-}
-
-class _StatusChip extends StatelessWidget {
-  const _StatusChip({required this.status});
-  final String status;
-
-  @override
-  Widget build(BuildContext context) {
-    Color bg, fg;
-    switch (status) {
-      case 'ready':
-        bg = const Color(0xFF064E3B);
-        fg = const Color(0xFF34D399);
-        break;
-      case 'waiting':
-        bg = const Color(0xFF78350F);
-        fg = const Color(0xFFFBBF24);
-        break;
-      case 'active':
-        bg = const Color(0xFF1E3A8A);
-        fg = const Color(0xFF60A5FA);
-        break;
-      case 'done':
-        bg = const Color(0xFF34D399).withValues(alpha: 0.1);
-        fg = const Color(0xFF34D399);
-        break;
-      case 'cancelled':
-        bg = const Color(0xFFF87171).withValues(alpha: 0.1);
-        fg = const Color(0xFFF87171);
-        break;
-      case 'scheduled':
-        bg = const Color(0xFF312E81);
-        fg = const Color(0xFFA5B4FC);
-        break;
-      default:
-        bg = MeshColors.bgTertiary;
-        fg = MeshColors.textSecondary;
-    }
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-      decoration: BoxDecoration(
-        color: bg,
-        borderRadius: BorderRadius.circular(4),
-      ),
-      child: Text(
-        status.toUpperCase(),
-        style: kMonoStyle.copyWith(
-          color: fg,
-          fontSize: 10,
-          fontWeight: FontWeight.w700,
-          letterSpacing: 0.5,
-        ),
       ),
     );
   }

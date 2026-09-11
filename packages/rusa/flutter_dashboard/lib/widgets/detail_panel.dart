@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'dart:async';
 import 'package:rxdart/rxdart.dart';
 
+import '../breakpoints.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
@@ -81,7 +82,7 @@ class _DetailPanelState extends State<DetailPanel>
       builder: (_, _) {
         final walkieActive = widget.store.walkieActive.valueOrNull ?? false;
         final height = MediaQuery.of(context).size.height;
-        final isFullScreenWalkie = walkieActive && height < 500;
+        final isFullScreenWalkie = walkieActive && height < kShortViewportHeight;
 
         if (isFullScreenWalkie) {
           return ChatTab(
@@ -808,6 +809,7 @@ class _InfoViewState extends State<_InfoView> {
                 _meta('Retire expected', actor.ownerExpectsRetirement!.toString()),
             ],
           ),
+          _VoicePicker(actor: actor, store: widget.store),
           if (showPool) ...[
             const SizedBox(height: 20),
             _pool(
@@ -849,6 +851,59 @@ class _InfoViewState extends State<_InfoView> {
                     height: 1.5,
                   ),
                 ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The actor's walkie-talkie voice picker on the Info tab: a dropdown of the
+/// supported Google TTS voices plus an "Instance default" entry that clears
+/// the persisted setting. The catalog comes from the threads snapshot the
+/// store already polls, so the picker populates without an extra fetch.
+class _VoicePicker extends StatelessWidget {
+  const _VoicePicker({required this.actor, required this.store});
+
+  final ThreadDto actor;
+  final DashboardStore store;
+
+  @override
+  Widget build(BuildContext context) {
+    final supported = store.supportedVoices.value;
+    if (supported.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    return Padding(
+      padding: const EdgeInsets.only(top: 16),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          const Text(
+            'Voice: ',
+            style: TextStyle(
+              color: MeshColors.textMuted,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          DropdownButton<String?>(
+            value: actor.voiceName,
+            underline: const SizedBox.shrink(),
+            style: kMonoStyle.copyWith(
+              color: MeshColors.textSecondary,
+              fontSize: 13,
+            ),
+            dropdownColor: MeshColors.bgTertiary,
+            items: [
+              const DropdownMenuItem<String?>(
+                value: null,
+                child: Text('Instance default'),
+              ),
+              for (final voice in supported)
+                DropdownMenuItem<String?>(value: voice, child: Text(voice)),
+            ],
+            onChanged: (voice) => store.updateActorVoice(actor.id, voice),
+          ),
         ],
       ),
     );

@@ -11,6 +11,7 @@ import { VOICE_PRESENCE_GRACE_MS, VoiceService } from "./voice-service.js";
 import { attachVoiceOutbound } from "./wiring.js";
 
 const ACTOR = "aaaaaaaa-0000-4000-8000-000000000001";
+const TARGET = "bbbbbbbb-0000-4000-8000-000000000002";
 
 function fakeSpeech(overrides: Partial<SpeechClient> = {}): SpeechClient {
   return {
@@ -33,6 +34,7 @@ function makeService(
     max?: number;
     sessionLeaseMs?: number;
     onSessionEnded?: (actorId: string) => void;
+    voiceNameFor?: (actorId: string) => string | undefined;
   } = {}
 ) {
   const home = mkdtempSync(join(tmpdir(), "voice-service-"));
@@ -43,6 +45,7 @@ function makeService(
     maxAnnouncements: opts.max,
     sessionLeaseMs: opts.sessionLeaseMs,
     onSessionEnded: opts.onSessionEnded,
+    voiceNameFor: opts.voiceNameFor,
     encode: async (pcm, _rate, basePath) => {
       const path = `${basePath}.mp3`;
       await writeFile(path, pcm);
@@ -156,6 +159,34 @@ describe("VoiceService leased sessions", () => {
     expect(sessions.closeSession("session-a")).toBe(false);
     expect(ended).toEqual([ACTOR, ACTOR]);
   });
+
+  it("atomically rebinds the same active session and can restore it before mesh delivery", () => {
+    const ended: string[] = [];
+    const controls: Array<[string, string]> = [];
+    const { service } = makeService({ onSessionEnded: (actorId) => ended.push(actorId) });
+    service.setSessionTransferNotifier((sessionId, targetActorId) =>
+      controls.push([sessionId, targetActorId])
+    );
+    service.openSession("session-a", ACTOR);
+
+    expect(service.activeSessionIdFor(ACTOR)).toBe("session-a");
+    expect(service.transferActiveSession(ACTOR, TARGET)).toBe("session-a");
+    expect(service.hasSession("session-a", ACTOR)).toBe(false);
+    expect(service.hasSession("session-a", TARGET)).toBe(true);
+    expect(service.hasActiveSession(ACTOR)).toBe(false);
+    expect(service.hasActiveSession(TARGET)).toBe(true);
+    expect(ended).toEqual([]);
+
+    service.revertActiveSessionTransfer("session-a", ACTOR, TARGET);
+    expect(service.hasSession("session-a", ACTOR)).toBe(true);
+    expect(service.hasSession("session-a", TARGET)).toBe(false);
+
+    expect(service.transferActiveSession(ACTOR, TARGET)).toBe("session-a");
+
+    service.notifySessionTransferred("session-a", TARGET);
+    expect(controls).toEqual([["session-a", TARGET]]);
+    expect(() => service.transferActiveSession(ACTOR, TARGET)).toThrow("does not hold");
+  });
 });
 
 describe("VoiceService outbound reply TTS", () => {
@@ -221,6 +252,68 @@ describe("VoiceService outbound reply TTS", () => {
     }
     const backlog = service.backlog(ACTOR);
     expect(backlog.map((a) => a.text)).toEqual(["reply 2", "reply 3", "reply 4"]);
+  });
+});
+
+describe("VoiceService per-actor voice selection", () => {
+  it("passes the actor's resolved voice to synthesis, looked up per reply", async () => {
+    const streamSynthesize = vi.fn(async () => ({
+      sampleRate: 24_000,
+      pcmStream: (async function* () {})(),
+    }));
+    const voiceNameFor = vi.fn((actorId: string): string | undefined =>
+      actorId === ACTOR ? "Charon" : undefined
+    );
+    const { service } = makeService({
+      speech: fakeSpeech({ streamSynthesize }),
+      voiceNameFor,
+    });
+    service.presenceConnect([ACTOR]);
+
+    await service.handleMeshEvent(replyEvent());
+    expect(streamSynthesize).toHaveBeenCalledWith("On it — ETA five minutes.", "Charon");
+    expect(voiceNameFor).toHaveBeenCalledWith(ACTOR);
+
+    // Resolved again for the next reply, so a mid-conversation voice change
+    // takes effect immediately.
+    voiceNameFor.mockReturnValue("Kore");
+    await service.handleMeshEvent(replyEvent({ body: "Second reply." }));
+    expect(streamSynthesize).toHaveBeenLastCalledWith("Second reply.", "Kore");
+  });
+
+  it("passes undefined for an actor with no voice setting — the instance default", async () => {
+    const streamSynthesize = vi.fn(async () => ({
+      sampleRate: 24_000,
+      pcmStream: (async function* () {})(),
+    }));
+    const { service } = makeService({
+      speech: fakeSpeech({ streamSynthesize }),
+      voiceNameFor: () => undefined,
+    });
+    service.presenceConnect([ACTOR]);
+
+    await service.handleMeshEvent(replyEvent());
+    expect(streamSynthesize).toHaveBeenCalledWith("On it — ETA five minutes.", undefined);
+  });
+
+  it("uses the instance default when no voice resolver is installed", async () => {
+    const streamSynthesize = vi.fn(async () => ({
+      sampleRate: 24_000,
+      pcmStream: (async function* () {})(),
+    }));
+    const { service } = makeService({ speech: fakeSpeech({ streamSynthesize }) });
+    service.presenceConnect([ACTOR]);
+
+    await service.handleMeshEvent(replyEvent());
+    expect(streamSynthesize).toHaveBeenCalledWith("On it — ETA five minutes.", undefined);
+  });
+
+  it("never consults the voice resolver for a non-reply event", async () => {
+    const voiceNameFor = vi.fn(() => "Charon");
+    const { service } = makeService({ voiceNameFor });
+    service.presenceConnect([ACTOR]);
+    expect(await service.handleMeshEvent(replyEvent({ kind: "run_start" }))).toBeNull();
+    expect(voiceNameFor).not.toHaveBeenCalled();
   });
 });
 

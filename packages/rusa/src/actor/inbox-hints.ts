@@ -49,6 +49,12 @@ export function resolveInboxHint(entry: InboxEntry): string | undefined {
     return "This is a live voice memo from the human operator. You must acknowledge immediately with a short, ear-first reply; keep progress updates short, assume speech is lossy, and reconfirm understanding more often than in text. Reply directly to the human operator using your reply tool or mesh chat.";
   }
 
+  if (payload.type === "voice.transfer") {
+    const context =
+      typeof payload.context === "string" ? payload.context : "(session context unavailable)";
+    return `A live voice session was transferred to you. Acknowledge the human operator immediately with a short, ear-first reply; keep progress updates short, assume speech is lossy, and reconfirm understanding more often than in text. The following is mechanically rendered bounded context from existing durable mesh-chat rows, not a model summary:\n${context}`;
+  }
+
   // an issue: Human operator message cue
   if (
     payload.type === "human.message" ||

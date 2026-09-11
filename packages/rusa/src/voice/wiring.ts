@@ -15,6 +15,12 @@ export function createVoiceService(options: {
   home: string;
   apiKey: string;
   voice?: VoiceConfig;
+  /**
+   * Per-actor voice lookup, consulted before each reply's synthesis. The
+   * caller resolves it against the actor repository; undefined keeps the
+   * instance-wide configured default.
+   */
+  voiceNameFor?: (actorId: string) => string | undefined;
   onSessionEnded?: (actorId: string) => void;
 }): VoiceService {
   return new VoiceService({
@@ -25,6 +31,7 @@ export function createVoiceService(options: {
       ttsModel: options.voice?.ttsModel,
       voiceName: options.voice?.voiceName,
     }),
+    voiceNameFor: options.voiceNameFor,
     onSessionEnded: options.onSessionEnded,
   });
 }

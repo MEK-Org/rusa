@@ -14,6 +14,7 @@ import type { ModelClassRepository } from "../db/repositories/model-class-reposi
 import type { FollowerInfo } from "../experimental/remote-instances/follower-hub.js";
 import type { ConcreteModelConfigInput, ProviderModelConfig } from "../providers/model-config.js";
 import { githubBranchReference } from "../references/reference.js";
+import { MAX_VOICE_TRANSFER_NOTE_CHARS } from "../voice/voice-transfer-context.js";
 import { toolError, toolOk } from "./result.js";
 import { HUMAN_OPERATOR, isHumanOperator } from "./stamp.js";
 import { createMcpServer } from "./strict-server.js";
@@ -208,7 +209,8 @@ export function createAgentExecMcpServer(
   };
 
   const rec = mesh.actors.get(selfId);
-  if (rec?.humanUnlocked) {
+  const voiceSessionId = mesh.activeVoiceSessionIdFor(selfId);
+  if (rec?.humanUnlocked || voiceSessionId) {
     server.registerTool(
       "reply",
       {
@@ -221,7 +223,8 @@ export function createAgentExecMcpServer(
       async ({ message }) => {
         try {
           const r = mesh.actors.get(selfId);
-          const sessionId = r?.lastChatSessionId ?? "default-session";
+          const sessionId = mesh.activeVoiceSessionIdFor(selfId) ?? r?.lastChatSessionId;
+          if (!sessionId) throw new Error("reply requires an active human conversation");
           mesh.recordMessageEmitted({
             fromId: selfId,
             toId: HUMAN_OPERATOR,
@@ -373,6 +376,41 @@ export function createAgentExecMcpServer(
         }
         options?.onWrite?.();
         return toolOk(deliver_at ? `scheduled for ${deliver_at}` : "sent");
+      } catch (err) {
+        return toolError(err);
+      }
+    }
+  );
+
+  server.registerTool(
+    "transfer_voice_session",
+    {
+      title: "Transfer the active voice session",
+      description:
+        "Transfer the caller's active leased voice session to an active actor whose handle the caller holds. The same session stays active; the recipient receives responsive handoff context and the dashboard reconnects to it. This tool is registered uniformly because the lease can begin after this server is constructed; it validates the live holder at invocation.",
+      inputSchema: {
+        target: z
+          .string()
+          .min(1)
+          .describe(
+            "Thread id or display handle from your held handles for the receiving actor; parent/root aliases are not transfer targets unless you hold that actor."
+          ),
+        handoff_note: z
+          .string()
+          .trim()
+          .min(1)
+          .max(MAX_VOICE_TRANSFER_NOTE_CHARS)
+          .optional()
+          .describe(
+            "Optional bounded note for the receiving actor, alongside durable session context."
+          ),
+      },
+    },
+    async ({ target, handoff_note }) => {
+      try {
+        const result = mesh.transferVoiceSession(selfId, target, handoff_note);
+        options?.onWrite?.();
+        return toolOk({ target_thread_id: result.targetActorId });
       } catch (err) {
         return toolError(err);
       }

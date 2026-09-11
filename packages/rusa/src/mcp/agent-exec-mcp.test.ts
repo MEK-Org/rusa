@@ -12,11 +12,19 @@ import {
   type SpawnRequest,
 } from "../actor/actor-mesh.js";
 import type { ActorRecord } from "../actor/actor-record.js";
+import {
+  InMemoryEventSourceOwnerStore,
+  InMemoryEventSourceSubscriptionStore,
+  parentOf,
+} from "../actor/event-subscriptions.js";
 import type { ScheduledMessage, ScheduledMessageScheduler } from "../actor/os-scheduler.js";
 import type { RootControlService } from "../actor/root-control.js";
 import type { RusaConfig } from "../config/types.js";
 import { runMigrations } from "../db/migrations/runner.js";
+import { InboxRepository } from "../db/repositories/inbox-repository.js";
+import { MeshChatRepository } from "../db/repositories/mesh-chat-repository.js";
 import { ModelClassRepository } from "../db/repositories/model-class-repository.js";
+import { SqliteActorRepository } from "../db/repositories/sqlite-actor-repository.js";
 import { FakeProvider } from "../providers/fake-provider.js";
 import {
   fillModelConfigFromCurrent,
@@ -26,6 +34,7 @@ import {
 } from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
 import { InMemoryActorRepository } from "../repositories/in-memory-actor-repository.js";
+import { EventManager, HierarchicalEventSourceResolver } from "../runtime/event-manager.js";
 import { createAgentExecMcpServer } from "./agent-exec-mcp.js";
 
 async function connect(server: McpServer): Promise<Client> {
@@ -89,6 +98,10 @@ function setup(
     validateModel?: ActorMeshOptions["validateModel"];
     configuredEventSources?: readonly string[];
     handleForId?: (id: string) => string;
+    isVoiceSessionActive?: ActorMeshOptions["isVoiceSessionActive"];
+    voiceSessionTransfer?: ActorMeshOptions["voiceSessionTransfer"];
+    listVoiceSessionChat?: ActorMeshOptions["listVoiceSessionChat"];
+    useInboxStore?: boolean;
   } = {}
 ) {
   const registry = new InMemoryActorRepository();
@@ -100,13 +113,43 @@ function setup(
     payload?: string;
   }[] = [];
   let seq = 0;
-  const mesh = new ActorMesh({
+  const eventSourceOwners = new InMemoryEventSourceOwnerStore();
+  const eventSourceSubscriptions = new InMemoryEventSourceSubscriptionStore();
+  let mesh!: ActorMesh;
+  const eventSourceResolver = new HierarchicalEventSourceResolver({
+    ports: {
+      parentOf,
+      isLive: (actorId) => mesh.isLiveActor(actorId),
+      activeDelegationsFor: (resource) => eventSourceOwners.activeForResource(resource),
+      directSubscribersFor: (resource) => eventSourceSubscriptions.subscribersOf(resource),
+      findLiveObligationByExternalRef: (ref) => opts.obligations?.findLiveByExternalRef(ref),
+      resolveActor: (handleOrId) => mesh.resolveLiveActorId(handleOrId),
+    },
+  });
+  // The delegation tools read the ownership ladder, and a mesh reaches that
+  // ladder only through its one event seam. A real InboxRepository backs the
+  // manager so this harness cannot drift from production append semantics.
+  const eventDb = new Database(":memory:");
+  runMigrations(eventDb);
+  const inboxStore = new InboxRepository(eventDb);
+  const eventManager = new EventManager({
+    inboxStore,
+    resolver: eventSourceResolver,
+  });
+  mesh = new ActorMesh({
     actors: registry,
     validateSpawn: opts.validateSpawn,
     validateModel: opts.validateModel,
     maxConcurrent: opts.maxConcurrent,
     scheduledMessages: opts.scheduledMessages,
     obligations: opts.obligations,
+    eventSourceOwners,
+    eventSourceSubscriptions,
+    eventManager,
+    inboxStore: opts.useInboxStore ? inboxStore : undefined,
+    isVoiceSessionActive: opts.isVoiceSessionActive,
+    voiceSessionTransfer: opts.voiceSessionTransfer,
+    listVoiceSessionChat: opts.listVoiceSessionChat,
     events: (e) => events.push(e),
     grantableCapabilities: new Set([
       "understanding-write",
@@ -156,7 +199,7 @@ function setup(
     },
     root
   );
-  return { registry, mesh, events };
+  return { registry, mesh, events, inboxStore };
 }
 
 describe("agent-execution MCP server", () => {
@@ -186,6 +229,7 @@ describe("agent-execution MCP server", () => {
         "set_thread_title",
         "spawn_thread",
         "subscribe_event_source",
+        "transfer_voice_session",
         "unsubscribe_event_source",
         "yield_run",
       ].sort()
@@ -199,6 +243,150 @@ describe("agent-execution MCP server", () => {
     const yieldTool = tools.find((t) => t.name === "yield_run");
     expect(yieldTool?.description).toMatch(/finish work your parent asked you to do/i);
     expect(yieldTool?.description).toMatch(/automatic parent notification won't fire/i);
+  });
+
+  it("transfers only the caller's active voice session through a held target", async () => {
+    let holder = "";
+    const controls: Array<[string, string]> = [];
+    const { inboxStore, mesh } = setup({
+      useInboxStore: true,
+      isVoiceSessionActive: (actorId) => actorId === holder,
+      voiceSessionTransfer: {
+        activeSessionIdFor: (actorId) => {
+          if (actorId !== holder) throw new Error("caller does not hold an active voice session");
+          return "session-a";
+        },
+        transferActiveSession: (fromActorId, targetActorId) => {
+          if (fromActorId !== holder)
+            throw new Error("caller does not hold an active voice session");
+          holder = targetActorId;
+          return "session-a";
+        },
+        revertActiveSessionTransfer: (sessionId, fromActorId, targetActorId) => {
+          expect(sessionId).toBe("session-a");
+          expect(holder).toBe(targetActorId);
+          holder = fromActorId;
+        },
+        notifySessionTransferred: (sessionId, targetActorId) =>
+          controls.push([sessionId, targetActorId]),
+      },
+      listVoiceSessionChat: () => [],
+    });
+    const source = mesh.spawn({
+      charter: "source",
+      parentId: "root",
+      modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+    });
+    const target = mesh.spawn({
+      charter: "target",
+      parentId: source,
+      modelConfig: { provider: "claude", model: "claude-sonnet-4-6" },
+    });
+    holder = source;
+    const client = await connect(createAgentExecMcpServer(mesh, source, "root"));
+
+    const result = (await client.callTool({
+      name: "transfer_voice_session",
+      arguments: { target, handoff_note: "continue the incident response" },
+    })) as CallToolResult;
+
+    expect(result.isError).not.toBe(true);
+    expect(dataOf(result)).toEqual({ target_thread_id: target });
+    expect(holder).toBe(target);
+    expect(controls).toEqual([["session-a", target]]);
+    expect(inboxStore.list(target).entries[0]?.payload).toMatchObject({
+      type: "voice.transfer",
+      priority: "responsive",
+      sessionId: "session-a",
+    });
+  });
+
+  it("gives a SQLite-backed transfer recipient a lease-scoped reply tool and session", async () => {
+    const db = new Database(":memory:");
+    runMigrations(db);
+    const actors = new SqliteActorRepository(db);
+    const inboxStore = new InboxRepository(db);
+    const chat = new MeshChatRepository(db);
+    let holder = "";
+    const mesh = new ActorMesh({
+      actors,
+      inboxStore,
+      recordChat: (entry) => chat.record(entry),
+      voiceSessionTransfer: {
+        activeSessionIdFor: (actorId) => {
+          if (actorId !== holder) throw new Error("caller does not hold an active voice session");
+          return "transferred-session";
+        },
+        transferActiveSession: (fromActorId, targetActorId) => {
+          if (fromActorId !== holder)
+            throw new Error("caller does not hold an active voice session");
+          holder = targetActorId;
+          return "transferred-session";
+        },
+        revertActiveSessionTransfer: (sessionId, fromActorId, targetActorId) => {
+          expect(sessionId).toBe("transferred-session");
+          expect(holder).toBe(targetActorId);
+          holder = fromActorId;
+        },
+        notifySessionTransferred: () => {},
+      },
+      createActor: () => ({}) as unknown as Actor,
+    });
+    const liveActor = (id: string) =>
+      ({
+        id,
+        requestRun: () => {},
+        declareYield: () => {},
+        markUnkillable: () => {},
+        close: () => {},
+        isRunning: false,
+        preemptForResponsive: () => ({ preempted: false as const }),
+      }) as unknown as Actor;
+    const root: ActorRecord = {
+      id: "root",
+      charter: "root",
+      parentId: null,
+      isRoot: true,
+      status: "active",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    const source: ActorRecord = {
+      id: "source",
+      charter: "source",
+      parentId: "root",
+      status: "active",
+      createdAt: "2026-01-01T00:00:01.000Z",
+    };
+    const target: ActorRecord = {
+      id: "target",
+      charter: "target",
+      parentId: "source",
+      status: "active",
+      createdAt: "2026-01-01T00:00:02.000Z",
+    };
+    mesh.adopt(root, liveActor(root.id));
+    mesh.adopt(source, liveActor(source.id));
+    mesh.adopt(target, liveActor(target.id));
+    actors.patch(source.id, { handles: [{ id: target.id }] });
+    holder = source.id;
+
+    mesh.transferVoiceSession(source.id, target.id);
+    expect(actors.get(target.id)?.humanUnlocked).toBeUndefined();
+
+    const client = await connect(createAgentExecMcpServer(mesh, target.id, root.id));
+    const { tools } = await client.listTools();
+    expect(tools.map((tool) => tool.name)).toContain("reply");
+
+    const reply = (await client.callTool({
+      name: "reply",
+      arguments: { message: "I have the call." },
+    })) as CallToolResult;
+    expect(reply.isError).not.toBe(true);
+    expect(
+      chat
+        .listForSession("transferred-session", { limit: 10 })
+        .find((entry) => entry.senderId === target.id)
+    ).toMatchObject({ recipientId: "human:operator", sessionId: "transferred-session" });
   });
 
   it("describes live capability grants as effective on the next run", async () => {
@@ -239,6 +427,7 @@ describe("agent-execution MCP server", () => {
         "set_actor_model",
         "spawn_thread",
         "subscribe_event_source",
+        "transfer_voice_session",
         "unsubscribe_event_source",
         "yield_run",
       ].sort()

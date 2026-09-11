@@ -1,6 +1,7 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
-import { HUMAN_OPERATOR, isHumanOperator, isSystemActor, MESH_SYSTEM } from "../mcp/stamp.js";
+import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
+import { HUMAN_OPERATOR, isHumanOperator, MESH_SYSTEM } from "../mcp/stamp.js";
 import { prerequisiteEdgeKey } from "../obligations/obligation.js";
 import {
   assertConcreteModelConfig,
@@ -10,8 +11,22 @@ import {
   type RawProviderModelConfig,
 } from "../providers/model-config.js";
 import type { RunResult } from "../providers/types.js";
-import { asGitHubIssue, parseReference } from "../references/reference.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
+import {
+  applyAuthorSuppression,
+  type DurableEventDelivery,
+  deduplicatedInboxEntryId,
+  type EventManager,
+  type EventRoutingKernel,
+  type EventSourceOwnershipDiagnostic,
+  type RawIntegrationEvent,
+} from "../runtime/event-manager.js";
+import { randomSupportedVoiceName } from "../voice/tts-voices.js";
+import { googleVoiceConfig } from "../voice/voice-config.js";
+import {
+  MAX_VOICE_TRANSFER_NOTE_CHARS,
+  renderVoiceTransferContext,
+} from "../voice/voice-transfer-context.js";
 import type { ActorHandle, ActorRecord, ActorStatus, ContextConfig } from "./actor-record.js";
 import {
   type CapabilityGrantStore,
@@ -32,9 +47,7 @@ import {
   InMemoryEventSourceOwnerStore,
   InMemoryEventSourceSubscriptionStore,
   isSubResourceOf,
-  parentOf,
   resourceKey,
-  sameResource,
 } from "./event-subscriptions.js";
 import { generateHandle } from "./handle-generator.js";
 import type { InboxEntry, InboxPayload, InboxStore } from "./inbox-store.js";
@@ -49,17 +62,6 @@ import { type ActorRunMode, isResponsiveNudge, type RunNudge } from "./trigger-r
 
 /** `from` attributed to a mechanical (cron-driven) wake delivery — not a peer actor. */
 export const SCHEDULER_SENDER_ID = "scheduler";
-
-/** Map only the issue-shaped event resources obligations may govern. */
-function eventResourceObligationKey(resource: EventResource): string | undefined {
-  try {
-    const key = resourceKey(resource);
-    return asGitHubIssue(parseReference(key)) ? key : undefined;
-  } catch {
-    // An invalid resource cannot name an obligation. Preserve subscription routing.
-    return undefined;
-  }
-}
 
 /** Runtime contract the mesh needs for routing; provider-backed Actor is one implementation. */
 export interface MeshActor {
@@ -174,6 +176,18 @@ export interface RetireOptions {
   forceQueued?: boolean;
 }
 
+/** Host-owned live-session operations used by the actor transfer primitive. */
+export interface VoiceSessionTransferPort {
+  /** Read the caller's unambiguous active session before any authority moves. */
+  activeSessionIdFor(actorId: string): string;
+  /** Atomically rebind the caller's active session and return its same UUID. */
+  transferActiveSession(fromActorId: string, targetActorId: string): string;
+  /** Restore a just-rebound session before its durable handoff was accepted. */
+  revertActiveSessionTransfer(sessionId: string, fromActorId: string, targetActorId: string): void;
+  /** Tell the dashboard browser that owns this session to reconnect to target. */
+  notifySessionTransferred(sessionId: string, targetActorId: string): void;
+}
+
 /** One live obligation, in the detail a retirement refusal needs to name it. */
 export interface LiveObligationSummary {
   id: string;
@@ -224,40 +238,12 @@ export interface RetirementBlockers {
  * Effective event routing authority diagnostic (#369).
  * Distinguishes the governing source, principal, resource level, and liveness for a canonical resource.
  */
-export interface EffectiveRouteDiagnostic {
-  /**
-   * The canonical resource queried, normalized to canonical scheme and
-   * path syntax (resolving legacy prefixes or alternate representations).
-   */
-  resource: EventResource;
-  /**
-   * Governing authority kind:
-   * - 'obligation': claimed by a live obligation in the hierarchy (takes precedence over subscriptions).
-   * - 'subscription': governed by an active live subscription in the hierarchy.
-   * - null: uncovered by any live obligation or live subscription.
-   */
-  governingSource: "obligation" | "subscription" | null;
-  /**
-   * The principal (actor id or entity id) holding effective authority,
-   * or null if uncovered. For subscriptions, the system invariant enforces
-   * at most one active subscriber per resource level.
-   */
-  principal: string | null;
-  /**
-   * The canonical resource level where the governing claim was found
-   * (exact resource or ancestor level), or null if uncovered.
-   */
-  resourceLevel: EventResource | null;
-  /**
-   * Whether the governing principal is currently a live, runnable actor.
-   * - On 'subscription' routes, this is always true because stored subscriptions only
-   *   confer effective authority when the subscriber is live (dead subscribers yield to live ancestors or uncovered).
-   * - On 'obligation' routes, this surfaces when a live obligation is held by a non-runnable
-   *   principal (e.g. human:operator or an absent actor), which claims authority but cannot receive delivery.
-   * - On uncovered routes, this is always false.
-   */
-  isLive: boolean;
-}
+/**
+ * Public diagnostic from the shared routing kernel (#369). Its field-level
+ * #369 semantics live with {@link EventSourceOwnershipDiagnostic}, where the
+ * ladder constructs the value.
+ */
+export type EffectiveRouteDiagnostic = EventSourceOwnershipDiagnostic;
 
 /**
  * Retirement refused because the subtree still holds work someone has to decide
@@ -466,34 +452,6 @@ export interface EventDeliveryOptions {
   inboxPriority?: "responsive" | "normal";
 }
 
-/**
- * Whether an event is important enough to climb from its exact resource to a
- * broader subscriber when no live exact subscriber exists .
- *
- * Exact subscriptions do not consult this policy. Keep the list closed: an
- * unknown event remains deliverable to an exact subscriber but is not allowed
- * to wake a repo/org (or chat-root) owner as a fallback.
- */
-function mayBubbleToParent(
-  eventType: string | undefined,
-  eventMerged: boolean | undefined
-): boolean {
-  switch (eventType) {
-    case "issues.opened":
-    case "issue_comment.created":
-    case "pull_request.opened":
-    case "pull_request_review.submitted":
-    case "pull_request_review_comment.created":
-    case "check_suite.completed":
-    case "gchat.message":
-      return true;
-    case "pull_request.closed":
-      return eventMerged === true;
-    default:
-      return false;
-  }
-}
-
 export interface RetireCleanup {
   name: string;
   /**
@@ -660,6 +618,17 @@ export interface ActorMeshOptions {
   eventSourceOwners?: EventSourceOwnerStore;
   eventSourceSubscriptions?: EventSourceSubscriptionStore;
   /**
+   * The single external-event seam: the host-assembled EventManager, which
+   * carries the one routing kernel as {@link EventManager.routing}. Mesh reads
+   * its authority ladder from that manager rather than accepting a resolver
+   * beside it, so a mesh with two competing routing policies cannot be
+   * constructed at all.
+   *
+   * Mesh retains the manager only to append through it before
+   * notifyInboxChanged; #384 will move after-commit notification out of Mesh.
+   */
+  eventManager?: EventManager;
+  /**
    * The event sources this instance is configured for. Direct subscriptions are
    * refused outside them, which is what keeps a subscription from reopening the
    * scope narrowing `config.yaml` closed. Omitted by meshes built without a
@@ -676,6 +645,14 @@ export interface ActorMeshOptions {
   inboxStore?: InboxStore;
   /** Host-owned leased walkie authority; absent preserves existing dispatch semantics. */
   isVoiceSessionActive?: (actorId: string) => boolean;
+  /**
+   * Host-owned in-memory session registry. The mesh owns target authorization,
+   * inbox delivery, and the durable handoff projection; this port owns only the
+   * atomic live-session rebind and dashboard transport notification.
+   */
+  voiceSessionTransfer?: VoiceSessionTransferPort;
+  /** Read existing durable rows for the session; never creates a transcript store. */
+  listVoiceSessionChat?: (sessionId: string) => MeshChat[];
   /** General lifecycle hook matching onYield. */
   onQueued?: (actorId: string, context: { responsive: boolean; mode: ActorRunMode }) => void;
   /** Best-effort receipts for entries first accepted into an execution opportunity. */
@@ -758,6 +735,7 @@ export class ActorMesh {
     body: string;
     sessionId?: string;
   }) => string;
+  readonly eventManager?: EventManager;
   private readonly grants: CapabilityGrantStore;
   private readonly eventSourceOwners: EventSourceOwnerStore;
   private readonly eventSourceSubscriptions: EventSourceSubscriptionStore;
@@ -765,6 +743,8 @@ export class ActorMesh {
   private readonly obligations?: MeshObligationPort;
   private readonly inboxStore?: InboxStore;
   private readonly isVoiceSessionActive: (actorId: string) => boolean;
+  private readonly voiceSessionTransfer?: VoiceSessionTransferPort;
+  private readonly listVoiceSessionChat?: (sessionId: string) => MeshChat[];
   private readonly onQueued?: ActorMeshOptions["onQueued"];
   private readonly onInboxEntriesSeen?: ActorMeshOptions["onInboxEntriesSeen"];
   private readonly grantable: ReadonlySet<string>;
@@ -825,6 +805,8 @@ export class ActorMesh {
     this.obligations = opts.obligations;
     this.inboxStore = opts.inboxStore;
     this.isVoiceSessionActive = opts.isVoiceSessionActive ?? (() => false);
+    this.voiceSessionTransfer = opts.voiceSessionTransfer;
+    this.listVoiceSessionChat = opts.listVoiceSessionChat;
     this.onQueued = opts.onQueued;
     this.onInboxEntriesSeen = opts.onInboxEntriesSeen;
     this.grantable = opts.grantableCapabilities ?? new Set();
@@ -867,6 +849,7 @@ export class ActorMesh {
     this.log = opts.log ?? (() => {});
     this.scheduledMessages = opts.scheduledMessages;
     this.withTransaction = opts.withTransaction ?? ((fn) => fn());
+    this.eventManager = opts.eventManager;
   }
 
   /**
@@ -1157,8 +1140,34 @@ export class ActorMesh {
    * entry joins it and becomes seen immediately; only deliveries during an
    * active run set the dirty follow-up. A held normal entry remains durable but
    * returns false because the session-end release, not this call, will nudge it.
+   *
+   * Responsive work replaces an in-flight run — operator control, human
+   * messages, and `runNow` all mean "now". The one wake that may not is an
+   * event copy for a recipient other than the effective owner; that decision
+   * lives in {@link notifyEventRecipient}, so no caller of this method can
+   * turn preemption off.
    */
   notifyInboxChanged(actorId: string, nudge: RunNudge = {}): boolean {
+    return this.wakeForInbox(actorId, nudge, { preempt: true });
+  }
+
+  /**
+   * Event fan-out's wake. Only the event's effective owner may have its active
+   * run replaced; every other recipient's copy keeps responsive scheduling and
+   * admission but joins that actor's run as a follow-up instead of aborting
+   * work the event does not belong to. Private and named for its one use so
+   * "responsive but not preempting" cannot leak into a control path.
+   */
+  private notifyEventRecipient(
+    dest: string,
+    priority: "responsive" | "normal" | undefined,
+    isOwner: boolean
+  ): boolean {
+    return this.wakeForInbox(dest, { priority }, { preempt: isOwner });
+  }
+
+  /** The shared body of both wakes; `preempt` is required so every caller states it. */
+  private wakeForInbox(actorId: string, nudge: RunNudge, opts: { preempt: boolean }): boolean {
     actorId = this.resolveThreadId(actorId);
     const rec = this.actors.get(actorId);
     if (rec && rec.status !== "active") {
@@ -1173,11 +1182,14 @@ export class ActorMesh {
     if (!isResponsiveNudge(nudge) && this.isVoiceSessionActive(actorId)) {
       // The entry is already durable. It must wait for the session-end nudge,
       // rather than adding an ordinary execution opportunity behind the voice
-      // conversation. Responsive work still preempts exactly as before.
+      // conversation. Responsive work passes the hold whether or not it may
+      // preempt — the same voice exemption `admitRun` and `selectInboxEntries`
+      // grant responsive entries — so a non-owner's event copy is admitted
+      // behind the voice session's own run rather than held with normal work.
       this.log(`inbox_changed for ${actorId} held — active voice session`);
       return false;
     }
-    if (isResponsiveNudge(nudge)) {
+    if (isResponsiveNudge(nudge) && opts.preempt) {
       const preemption = target.preemptForResponsive();
       if (preemption.preempted) {
         this.recordEvent({
@@ -1484,6 +1496,144 @@ export class ActorMesh {
   }
 
   /**
+   * Transfer the caller's one active leased voice session to a target the
+   * caller already holds as a messaging capability. The session remains
+   * process-local; the receiving actor gets a responsive, durable inbox entry
+   * whose context is mechanically rendered from existing `mesh_chat` rows.
+   */
+  transferVoiceSession(
+    fromActorId: string,
+    targetHandleOrId: string,
+    handoffNote?: string
+  ): { sessionId: string; targetActorId: string } {
+    fromActorId = this.resolveThreadId(fromActorId);
+    const source = this.actors.get(fromActorId);
+    if (!source || source.status !== "active" || !this.live.has(fromActorId)) {
+      throw new Error("source actor is not active");
+    }
+    const target = this.resolveHeldActiveActor(fromActorId, targetHandleOrId);
+    if (target.id === fromActorId) throw new Error("cannot transfer a voice session to itself");
+    const transfer = this.voiceSessionTransfer;
+    if (!transfer) throw new Error("voice session transfer is unavailable on this instance");
+    const inboxStore = this.inboxStore;
+    if (!inboxStore) throw new Error("voice session transfer requires a durable inbox");
+    if (handoffNote !== undefined && handoffNote.trim().length > MAX_VOICE_TRANSFER_NOTE_CHARS) {
+      throw new Error(`handoff note must be at most ${MAX_VOICE_TRANSFER_NOTE_CHARS} characters`);
+    }
+
+    // Read and render before rebinding. If the durable context projection is
+    // unavailable, no live authority moves and the caller can retry safely.
+    const sessionId = transfer.activeSessionIdFor(fromActorId);
+    const context = renderVoiceTransferContext(
+      this.listVoiceSessionChat?.(sessionId) ?? [],
+      handoffNote
+    );
+    transfer.transferActiveSession(fromActorId, target.id);
+    let inserted: InboxEntry[];
+    try {
+      inserted = inboxStore.append([
+        {
+          actorId: target.id,
+          source: `voice:transfer:${fromActorId}`,
+          payload: {
+            type: "voice.transfer",
+            priority: "responsive",
+            fromId: fromActorId,
+            sessionId,
+            context,
+          },
+        },
+      ]);
+      if (inserted.length !== 1) {
+        throw new Error("voice session transfer handoff was not durably inserted");
+      }
+    } catch (error) {
+      // Authority moves only after durable context has been rendered, and it
+      // moves back if the durable handoff cannot be written. The source is not
+      // released until after this point, so a failed write leaves its ordinary
+      // work held exactly as it was before the request.
+      try {
+        transfer.revertActiveSessionTransfer(sessionId, fromActorId, target.id);
+      } catch (rollbackError) {
+        this.log(
+          `voice session transfer rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`
+        );
+      }
+      throw error;
+    }
+    // The responsive row is now durable; releasing the source through the
+    // existing session-end path preserves normal-work deferral semantics.
+    this.notifyVoiceSessionEnded(fromActorId);
+    if (inserted.length > 0) {
+      try {
+        this.notifyInboxChanged(target.id, { priority: "responsive" });
+      } catch (error) {
+        this.log(
+          `voice transfer recipient nudge failed after durable handoff: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+    // The control is intentionally last: the recipient has durable work before
+    // the browser changes selection/reconnects to it.
+    try {
+      transfer.notifySessionTransferred(sessionId, target.id);
+    } catch (error) {
+      this.log(
+        `voice transfer dashboard control failed after durable handoff: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    return { sessionId, targetActorId: target.id };
+  }
+
+  /**
+   * The currently leased voice session for an actor, if this host has one.
+   * This is intentionally lease-scoped rather than an actor-row capability:
+   * a recipient of a transfer may reply during the live handoff without
+   * permanently gaining direct-human authority.
+   */
+  activeVoiceSessionIdFor(actorId: string): string | undefined {
+    const transfer = this.voiceSessionTransfer;
+    if (!transfer) return undefined;
+    try {
+      return transfer.activeSessionIdFor(this.resolveThreadId(actorId));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Resolve an active live actor from the caller's own handle set. */
+  private resolveHeldActiveActor(requesterId: string, targetHandleOrId: string): ActorRecord {
+    const requested = targetHandleOrId.trim();
+    if (!requested) throw new Error("target actor must not be blank");
+    const requester = this.actors.get(requesterId);
+    if (!requester) throw new Error("source actor not found");
+
+    const normalized = requested.toLowerCase();
+    if (requested === requesterId || this.handleForId(requesterId).toLowerCase() === normalized) {
+      throw new Error("cannot transfer a voice session to itself");
+    }
+    const held = requester.handles ?? [];
+    const matches = held
+      .map((handle) => this.actors.get(handle.id))
+      .filter((record): record is ActorRecord =>
+        Boolean(
+          record &&
+            (record.id === requested || this.handleForId(record.id).toLowerCase() === normalized)
+        )
+      );
+    if (matches.length === 0) {
+      throw new Error("target actor is not a handle held by the caller");
+    }
+    if (matches.length > 1) {
+      throw new Error(`target actor handle is ambiguous: ${requested}`);
+    }
+    const target = matches[0];
+    if (target.status === "retired") throw new Error("target actor is retired");
+    if (!this.live.has(target.id)) throw new Error("target actor is not live");
+    return target;
+  }
+
+  /**
    * Refuse an execution placement this runtime cannot honour.
    *
    * Called before the spawn id, the record, or the parent's handle exist, so a
@@ -1536,6 +1686,10 @@ export class ActorMesh {
       sessionId: req.conversationId,
       title: req.title,
       executionTarget: req.executionTarget,
+      // Every actor gets its own walkie-talkie voice at birth so a transfer or
+      // multi-actor chat is audible as different speakers; the operator can
+      // re-pick it from the actor info panel at any time.
+      voiceConfig: googleVoiceConfig(randomSupportedVoiceName()),
       status: "active",
       createdAt: this.now(),
     };
@@ -1803,15 +1957,24 @@ export class ActorMesh {
   }
 
   /**
+   * The one routing kernel, read off the single event seam. There is no setter
+   * and no fallback construction: if the host assembled a manager, its ladder
+   * is the mesh's ladder by identity.
+   */
+  private get routing(): EventRoutingKernel | undefined {
+    return this.eventManager?.routing;
+  }
+
+  /**
    * The live **owner** destinations for an event, walking the ownership ladder:
    * a live obligation claiming the source, then an explicit ownership row, then
    * (for bubble-eligible event classes) the same two questions of the parent
    * resource.
    *
-   * Ownership only. Direct subscribers are resolved by
-   * {@link liveDirectSubscribers} and merged by {@link deliverEvent}, never
-   * here — this function is also what {@link effectiveOwnerOf} answers with, so
-   * a subscriber appearing in its result would let anyone who subscribed to a
+   * Ownership only. Direct subscribers are resolved and merged by
+   * {@link HierarchicalEventSourceResolver.resolveRecipients}, never here —
+   * this function is also what {@link effectiveOwnerOf} answers with, so a
+   * subscriber appearing in its result would let anyone who subscribed to a
    * source delegate or reclaim it.
    */
   /**
@@ -1833,96 +1996,12 @@ export class ActorMesh {
       exactObligationOwner?: string | null;
     } = {}
   ): { diagnostic: EffectiveRouteDiagnostic; destinations: string[] } {
-    let current: EventResource | undefined = resource;
-    let exact = true;
-
-    // Atomicity Invariant: The check `this.live.has(sub.actorId)` and the delivery
-    // via `requestRun` happen in the same synchronous section with no await.
-    while (current) {
-      // The obligation store is the ownership authority for linked issue/PR
-      // work. Consulted before the subscription store at every rung of
-      // the climb, so a live obligation supersedes any manual delegation on the
-      // same source — and so a comment event resolves to the obligation on its
-      // issue one level up, which the path grammar makes free.
-      //
-      // Derived, never written: nothing here deactivates a subscription. The
-      // prior subscriber is superseded rather than destroyed, which keeps the
-      // audit history intact and makes replay and restart reconstruct the same
-      // answer with no chance of reviving a stale owner.
-      const governing =
-        exact && opts.exactObligationOwner !== undefined
-          ? (opts.exactObligationOwner ?? undefined)
-          : this.obligationOwnerFor(current);
-      exact = false;
-      if (governing) {
-        // The claim is authoritative even when its owner is not runnable. A
-        // human/system owner, or a temporarily absent actor, produces no
-        // destination; falling through would hand their work to whichever actor
-        // happened to be subscribed earlier.
-        const isLive = this.live.has(governing);
-        return {
-          diagnostic: {
-            resource: resourceKey(resource),
-            governingSource: "obligation",
-            principal: governing,
-            resourceLevel: resourceKey(current),
-            isLive,
-          },
-          destinations: isLive ? [governing] : [],
-        };
-      }
-
-      const activeSubs = this.eventSourceOwners.activeForResource(current);
-      const liveSubs: string[] = [];
-      for (const sub of activeSubs) {
-        if (
-          opts.ignoreExactResource &&
-          sameResource(sub.resource, opts.ignoreExactResource) &&
-          sameResource(current, opts.ignoreExactResource)
-        ) {
-          continue;
-        }
-        if (this.live.has(sub.actorId) && !liveSubs.includes(sub.actorId)) {
-          liveSubs.push(sub.actorId);
-        }
-      }
-      if (liveSubs.length > 0) {
-        return {
-          diagnostic: {
-            resource: resourceKey(resource),
-            governingSource: "subscription",
-            principal: liveSubs[0],
-            resourceLevel: resourceKey(current),
-            isLive: true,
-          },
-          destinations: liveSubs,
-        };
-      }
-      // Event-class policy gates only the first parent climb. Once an
-      // allowlisted event may bubble, the existing walk may continue past dead
-      // intermediate subscribers to the first live ancestor owner.
-      if (sameResource(current, resource) && opts.enforceBubblingPolicy) {
-        const allowParent = mayBubbleToParent(
-          opts.eventPayload?.type,
-          opts.eventPayload?.merged === true
-        );
-        if (!allowParent) {
-          break;
-        }
-      }
-      current = parentOf(current);
+    const routing = this.routing;
+    if (!routing) {
+      throw new Error("Event routing requires a host-assembled EventManager");
     }
-
-    return {
-      diagnostic: {
-        resource: resourceKey(resource),
-        governingSource: null,
-        principal: null,
-        resourceLevel: null,
-        isLive: false,
-      },
-      destinations: [],
-    };
+    const decision = routing.resolveOwner(resource, opts);
+    return { diagnostic: decision.diagnostic, destinations: decision.ownerIds };
   }
 
   /**
@@ -1931,10 +2010,10 @@ export class ActorMesh {
    * (for bubble-eligible event classes) the same two questions of the parent
    * resource.
    *
-   * Ownership only. Direct subscribers are resolved by
-   * {@link liveDirectSubscribers} and merged by {@link deliverEvent}, never
-   * here — this function is also what {@link effectiveOwnerOf} answers with, so
-   * a subscriber appearing in its result would let anyone who subscribed to a
+   * Ownership only. Direct subscribers are resolved and merged by
+   * {@link HierarchicalEventSourceResolver.resolveRecipients}, never here —
+   * this function is also what {@link effectiveOwnerOf} answers with, so a
+   * subscriber appearing in its result would let anyone who subscribed to a
    * source delegate or reclaim it.
    */
   private resolveLiveOwnerDestinations(
@@ -1948,44 +2027,6 @@ export class ActorMesh {
     } = {}
   ): string[] {
     return this.resolveRoutingDecision(resource, opts).destinations;
-  }
-
-  /**
-   * The live actors directly subscribed to this **exact** resource.
-   *
-   * Deliberately not part of the ownership walk. Subscribers never receive
-   * bubbled events — bubbling exists so an important event is not missed by
-   * whoever is responsible for it, and a subscriber is interested rather than
-   * responsible — so there is no ancestor loop here and no event-class gate to
-   * apply.
-   *
-   * Computing this outside {@link resolveLiveOwnerDestinations} is what makes
-   * it reliable rather than a convenience. That walk returns from inside its
-   * obligation rung: a live obligation owned by a human, or by an actor that is
-   * not currently live, terminates the climb with an empty destination list.
-   * Adding subscribers as another push inside the loop would mean a subscriber
-   * silently received nothing on exactly the sources busy enough to carry an
-   * obligation.
-   */
-  private liveDirectSubscribers(resource: EventResource): string[] {
-    return this.eventSourceSubscriptions
-      .subscribersOf(resource)
-      .map((subscription) => subscription.actorId)
-      .filter((actorId) => this.live.has(actorId));
-  }
-
-  /**
-   * The owner of the live obligation claiming this event source, if any.
-   *
-   * Returns an entity id, which may be a human — the caller decides what that
-   * means for routing. Absent an obligation repository (a mesh built without
-   * one, as in many tests) this is always undefined and routing is unchanged.
-   */
-  private obligationOwnerFor(resource: EventResource): string | undefined {
-    if (!this.obligations) return undefined;
-    const referenceKey = eventResourceObligationKey(resource);
-    if (!referenceKey) return undefined;
-    return this.obligations.findLiveByExternalRef(referenceKey)?.ownerId;
   }
 
   private effectiveOwnerOf(
@@ -2191,158 +2232,132 @@ export class ActorMesh {
    * instance back into an org-wide firehose . A covering org source is considered only
    * for the event classes explicitly allowed by {@link mayBubbleToParent} .
    * Follows the CRITICAL invariant of checking liveness and delivering synchronously.
+   * TRANSITIONAL: production ingress enters {@link deliverExternalEvent}. Since
+   * the GitHub, Chat, and timer callers moved there, this payload-bearing path
+   * has no in-repo caller outside tests; it remains only as the published
+   * embedder contract and as characterization coverage. #393 tracks collapsing
+   * it into the EventManager path so the most-tested entry point is again the
+   * production one.
    */
   async deliverEvent(
     resource: EventResource,
     eventSummary: string,
     opts: EventDeliveryOptions = {}
   ): Promise<void> {
-    let destinations: string[];
-    let directed = false;
-    // A live obligation is the ownership authority even when the event carries
-    // a bot-authored directed target. Directives remain useful for unclaimed
-    // work, but cannot route claimed work around its current owner.
-    if (opts.directedTarget) {
-      const governing = this.obligationOwnerFor(resource);
-      if (governing) {
-        destinations = this.live.has(governing) ? [governing] : [];
-      } else {
-        const directedTarget = this.resolveLiveActor(opts.directedTarget);
-        if (directedTarget) {
-          this.log(`mesh:deliver directed-delivered to ${opts.directedTarget} (${eventSummary})`);
-          destinations = [directedTarget.id];
-          directed = true;
-        } else {
-          this.log(`mesh:deliver target not live: ${opts.directedTarget} — directive ignored`);
-          destinations = this.resolveLiveOwnerDestinations(resource, {
-            enforceBubblingPolicy: true,
-            eventPayload: opts.inboxPayload,
-            exactObligationOwner: null,
-          });
-        }
+    // CRITICAL: no `await` may appear between recipient resolution and the
+    // notification below. EventManager's routing and append are synchronous for
+    // exactly this reason, and this method stays async only to preserve its
+    // public contract — as it did before the extraction. Yield anywhere in
+    // here and an actor can retire after being resolved as live, leaving a
+    // durable unhandled row with nobody alive to take it.
+    if (opts.inboxPayload) {
+      if (!this.eventManager) {
+        throw new Error("Inbox delivery requires a host-assembled EventManager");
       }
-    } else {
-      destinations = this.resolveLiveOwnerDestinations(resource, {
-        enforceBubblingPolicy: true,
-        eventPayload: opts.inboxPayload,
+      const rawResource = typeof resource === "string" ? resource : resourceKey(resource);
+      const delivery = this.eventManager.handleNormalizedEvent({
+        resource: rawResource,
+        payload: {
+          ...opts.inboxPayload,
+          ...(opts.inboxPriority === "responsive" ? { priority: "responsive" } : {}),
+        },
+        deliveredAt: opts.inboxDeliveredAt,
+        dedupeKey: opts.inboxDedupeKey,
+        directedTarget: opts.directedTarget,
+        stampedAuthor: opts.stampedAuthor,
+        instanceId: opts.instanceId,
+        eventSummary,
       });
+      this.notifyPersistedInboxEntries(delivery, opts.inboxPriority);
+      return;
     }
 
-    // Direct subscribers are added to whatever ownership resolved to — the two
-    // relationships compose rather than compete. A subscriber is added even when
-    // ownership resolved to nobody (an obligation held by a human, an absent
-    // owner, a source no live actor owns), and never displaces the owner when it
-    // did. The exact resource only: a subscription does not bubble.
-    //
-    // A *successfully targeted* delivery is the one case where this does not
-    // apply. A verified bot directive names the single actor an event is for;
-    // fanning it out to subscribers would make `mesh:deliver` mean something
-    // other than what it says.
-    //
-    // Read `directed` precisely: it is set only on that happy path. A directive
-    // overridden by a live obligation, or one naming a target that is no longer
-    // live, resolves ownership normally and still reaches subscribers. That is
-    // deliberate rather than incidental — a standing interest in a source's
-    // direct events is not defeated by a directive aimed at someone else, or by
-    // one that failed to land. Those paths also leave `directed` false for the
-    // author-suppression exemption below, which only a landed directive earns.
-    if (!directed) {
-      for (const subscriber of this.liveDirectSubscribers(resource)) {
-        if (!destinations.includes(subscriber)) destinations.push(subscriber);
-      }
+    const rawResource = typeof resource === "string" ? resource : resourceKey(resource);
+    const routing = this.routing;
+    if (!routing) {
+      throw new Error("Event routing requires a host-assembled EventManager");
+    }
+    const recipients = routing.resolveRecipients(rawResource, {
+      directedTarget: opts.directedTarget,
+      eventPayload: opts.inboxPayload,
+      eventSummary,
+    });
+    const destinations: string[] = [];
+    for (const id of recipients.ownerIds) {
+      if (!destinations.includes(id)) destinations.push(id);
+    }
+    for (const sub of recipients.subscriberIds) {
+      if (!destinations.includes(sub)) destinations.push(sub);
     }
 
     if (destinations.length === 0) {
-      // Invariant this drop relies on (ISSUE_NUM review): root retains a covering
-      // source for anything it delegates from (config-declared sources persist;
-      // delegation only adds child sub-slices). So a live event that's in-scope
-      // always matches an ancestor source before reaching here — an uncovered
-      // event is genuinely out-of-scope for this instance, and dropping it
-      // (journal-visible) is correct rather than a silent loss. If a future
-      // change ever lets root delegate away its only covering source for a
-      // slice, events under it would hit this drop when the delegate dies —
-      // still visible here, but the invariant is what keeps that from happening.
+      // See the drop rationale in EventManager.handleExternalEvent: an
+      // uncovered event is out-of-scope for this instance by definition,
+      // because root retains a covering source for anything it delegates from.
       this.log(`event not covered by any subscription — dropped (${eventSummary})`);
       return;
     }
 
-    // A verified `system:*` stamp marks a persistence-only write performed by
-    // mesh infrastructure rather than a peer actor — it
-    // withholds delivery to EVERY destination, not just an author-match. Only a
-    // verified stamp may trigger this (opts.stampedAuthor only exists when
-    // resolveStampedAuthor's HMAC + freshness checks passed in start.ts); an
-    // unverified or stale system-looking stamp resolves to null upstream and
-    // falls through to the ordinary per-destination checks below, so it still
-    // fails open and delivers .
-    const systemSuppressed =
-      !directed &&
-      opts.stampedAuthor != null &&
-      opts.instanceId !== undefined &&
-      isSystemActor(opts.stampedAuthor.actorId) &&
-      opts.stampedAuthor.instanceId === opts.instanceId;
-    if (systemSuppressed && opts.stampedAuthor) {
-      this.log(
-        `system-event suppressed by author stamp: actor=${opts.stampedAuthor.actorId} instance=${opts.stampedAuthor.instanceId} (${eventSummary})`
-      );
-    }
-
-    const deliverable: string[] = [];
-    for (const dest of destinations) {
-      let suppressed = false;
-      if (directed) {
-        // A valid bot-authored mesh:deliver directive intentionally targets the
-        // actor even though the underlying bot event would otherwise self-suppress.
-      } else if (systemSuppressed) {
-        suppressed = true;
-      } else if (
-        opts.stampedAuthor != null &&
-        opts.instanceId !== undefined &&
-        opts.stampedAuthor.actorId === dest &&
-        opts.stampedAuthor.instanceId === opts.instanceId
-      ) {
-        this.log(
-          `self-event suppressed by author stamp: actor=${opts.stampedAuthor.actorId} instance=${opts.stampedAuthor.instanceId} (${eventSummary})`
-        );
-        suppressed = true;
-      }
-
-      if (!suppressed) deliverable.push(dest);
-    }
-
+    const deliverable = applyAuthorSuppression({
+      directed: recipients.directed,
+      destinations,
+      stampedAuthor: opts.stampedAuthor,
+      instanceId: opts.instanceId,
+      eventSummary,
+      log: this.log,
+    });
     if (deliverable.length === 0) return;
 
-    if (opts.inboxPayload) {
-      if (!this.inboxStore) throw new Error("GitHub inbox delivery requires an inbox store");
-      const source = resourceKey(resource);
-      const inboxPayload = opts.inboxPayload;
-      const entries = this.inboxStore.append(
-        deliverable.map((actorId) => ({
-          id: opts.inboxDedupeKey
-            ? deduplicatedInboxEntryId(opts.inboxDedupeKey, actorId)
-            : undefined,
-          actorId,
-          source,
-          deliveredAt: opts.inboxDeliveredAt,
-          payload: inboxPayload,
-        }))
-      );
-      for (const entry of entries) {
-        const dest = entry.actorId;
-        if (!deliverable.includes(dest)) {
-          throw new Error(`Inbox append returned an unexpected actor: ${dest}`);
-        }
-        if (!this.notifyInboxChanged(dest, { priority: opts.inboxPriority })) {
-          throw new Error(`Delivery target ${dest} is not live after inbox persistence`);
-        }
-      }
-      return;
-    }
-
     for (const dest of deliverable) {
-      if (!this.notifyInboxChanged(dest, { priority: opts.inboxPriority })) {
+      const isOwner = recipients.ownerIds.includes(dest);
+      if (!this.notifyEventRecipient(dest, opts.inboxPriority, isOwner)) {
         this.log(`Delivery target ${dest} is not live; cannot deliver event`);
       }
     }
+  }
+
+  /**
+   * The host's three external ingress paths enter here with an explicit raw
+   * source shape. EventManager owns normalize → route → append; Mesh owns the
+   * after-commit wake until #384 extracts that notification seam.
+   *
+   * Like {@link deliverEvent}, the body runs to completion in one turn: the
+   * manager's normalize/route/append is synchronous, so nothing can retire
+   * between resolution, persistence, and the wake.
+   */
+  async deliverExternalEvent(raw: RawIntegrationEvent): Promise<void> {
+    if (!this.eventManager) {
+      throw new Error("External event delivery requires a host-assembled EventManager");
+    }
+    this.notifyPersistedInboxEntries(this.eventManager.handleExternalEvent(raw), raw.priority);
+  }
+
+  /**
+   * Every persisted copy is just as durable and just as responsive for
+   * scheduling; which recipient's run may be replaced is decided by
+   * {@link notifyEventRecipient}. A subscriber-only route preempts nobody.
+   */
+  private notifyPersistedInboxEntries(
+    delivery: DurableEventDelivery,
+    priority: "responsive" | "normal" | undefined
+  ): void {
+    for (const entry of delivery.entries) {
+      const dest = entry.actorId;
+      const isOwner = delivery.ownerIds.includes(dest);
+      if (!this.notifyEventRecipient(dest, priority, isOwner)) {
+        throw new Error(`Delivery target ${dest} is not live after inbox persistence`);
+      }
+    }
+  }
+
+  /** A narrow live-actor read port for the host-assembled routing kernel. */
+  isLiveActor(actorId: string): boolean {
+    return this.live.has(actorId);
+  }
+
+  /** A narrow handle/id resolution port for directed delivery. */
+  resolveLiveActorId(handleOrId: string): { id: string } | undefined {
+    return this.resolveLiveActor(handleOrId);
   }
 
   private resolveLiveActor(handleOrId: string): MeshActor | undefined {
@@ -3969,14 +3984,4 @@ function immediateStart<T>(fn: () => Promise<T>): RunStartHandle<T> {
       return true;
     },
   };
-}
-
-function deduplicatedInboxEntryId(dedupeKey: string, actorId: string): string {
-  const digest = createHash("sha256")
-    .update(dedupeKey)
-    .update("\0")
-    .update(actorId)
-    .digest("hex")
-    .slice(0, 32);
-  return `dedupe:${digest}`;
 }

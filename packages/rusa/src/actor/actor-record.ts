@@ -1,4 +1,5 @@
 import type { ProviderModelConfig } from "../providers/model-config.js";
+import type { VoiceConfigDocument } from "../voice/voice-config.js";
 
 export type ActorStatus = "active" | "retired";
 
@@ -54,4 +55,6 @@ export interface ActorRecord {
   createdAt: string;
   /** Registered follower ID where this actor is placed remotely; unset for leader-local execution. */
   executionTarget?: string;
+  /** Per-actor walkie-talkie voice; absent follows the instance-wide default. */
+  voiceConfig?: VoiceConfigDocument;
 }

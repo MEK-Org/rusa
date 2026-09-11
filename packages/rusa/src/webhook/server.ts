@@ -531,6 +531,15 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
     options.voice && options.mesh && sseHub
       ? attachVoiceOutbound(options.mesh.emitter, options.voice.service, sseHub)
       : null;
+  // The session registry lives in VoiceService while the targeted wire channel
+  // lives in this hub. Join them only after both are constructed so a transfer
+  // can preserve its session while telling the owning browser to reconnect to
+  // the recipient actor.
+  if (options.voice && sseHub) {
+    options.voice.service.setSessionTransferNotifier((sessionId, targetActorId) =>
+      sseHub.pushVoiceControl(sessionId, targetActorId)
+    );
+  }
   const server = createServer(createDashboardRequestHandler(options, dataDeps, voiceDeps));
 
   await new Promise<void>((resolve, reject) => {
@@ -554,6 +563,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
     close: () =>
       new Promise<void>((resolve, reject) => {
         detachVoiceOutbound?.();
+        options.voice?.service.setSessionTransferNotifier(undefined);
         sseHub?.close();
         server.closeAllConnections();
         server.close((err) => (err ? reject(err) : resolve()));
