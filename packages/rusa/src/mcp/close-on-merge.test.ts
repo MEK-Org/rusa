@@ -110,26 +110,61 @@ describe("parseCloseOnMergeDirective", () => {
     ).toEqual({ kind: "close", issueNumbers: [9] });
   });
 
-  it("ignores literal directive examples in four-space-indented Markdown code", () => {
+  it("executes only a directive that occupies its own top-level line", () => {
     for (const body of [
-      "Documentation:\n\n    <!-- mesh:close-on-merge #114 -->",
-      "Documentation:\n\n\t<!-- mesh:close-on-merge #114 -->",
-      "Example:\n\n    step one\n    <!-- mesh:close-on-merge #114 -->\n    step three",
+      "<!-- mesh:close-on-merge #114 -->",
+      "<!-- mesh:close-on-merge #114 -->   ",
+      "Ships it.\r\n\r\n<!-- mesh:close-on-merge #114 -->\r\n",
+      "> quoted context\n<!-- mesh:close-on-merge #114 -->",
+      "```html\n<!-- mesh:close-on-merge #9 -->\n```\n<!-- mesh:close-on-merge #114 -->\nTrailing prose.",
+      "<!-- mesh:close-on-merge #114 -->\n<!-- mesh:author:v2 actor instance 1 abcd -->",
+    ]) {
+      expect(parseCloseOnMergeDirective(body), body).toEqual({
+        kind: "close",
+        issueNumbers: [114],
+      });
+    }
+  });
+
+  it("rejects a reserved-name comment that shares its line with anything else", () => {
+    for (const body of [
+      " <!-- mesh:close-on-merge #114 -->",
+      "    <!-- mesh:close-on-merge #114 -->",
+      "\t<!-- mesh:close-on-merge #114 -->",
+      "See the note\n    <!-- mesh:close-on-merge #114 -->",
+      "<!-- mesh:close-on-merge #114 --> ships it",
+      "Ships it <!-- mesh:close-on-merge #114 -->",
+      "<!-- mesh:close-on-merge #114 --><!-- mesh:author:v2 actor instance 1 abcd -->",
+    ]) {
+      expect(parseCloseOnMergeDirective(body), body).toEqual({
+        kind: "malformed",
+        reason: expect.stringContaining("own line"),
+      });
+    }
+  });
+
+  it("never executes a directive nested in a Markdown container", () => {
+    const tildeInBlockquote = "> ~~~html\n> <!-- mesh:close-on-merge #114 -->\n> ~~~";
+    expect(parseCloseOnMergeDirective(tildeInBlockquote)).toEqual({
+      kind: "malformed",
+      reason: expect.stringContaining("own line"),
+    });
+    for (const body of [
+      "> ```html\n> <!-- mesh:close-on-merge #114 -->\n> ```",
+      "- item\n\n  ~~~\n  <!-- mesh:close-on-merge #114 -->\n  ~~~",
     ]) {
       expect(parseCloseOnMergeDirective(body), body).toEqual({ kind: "absent" });
     }
-
+    for (const body of [
+      "> <!-- mesh:close-on-merge #114 -->",
+      "- <!-- mesh:close-on-merge #114 -->",
+      "1. <!-- mesh:close-on-merge #114 -->",
+    ]) {
+      expect(parseCloseOnMergeDirective(body).kind, body).toBe("malformed");
+    }
     expect(
-      parseCloseOnMergeDirective(
-        "    <!-- mesh:close-on-merge #114 -->\n\n<!-- mesh:close-on-merge #9 -->"
-      )
-    ).toEqual({ kind: "close", issueNumbers: [9] });
-  });
-
-  it("treats an indented directive after a paragraph line as live HTML, not code", () => {
-    expect(
-      parseCloseOnMergeDirective("See the note\n    <!-- mesh:close-on-merge #114 -->")
-    ).toEqual({ kind: "close", issueNumbers: [114] });
+      parseCloseOnMergeDirective(`${tildeInBlockquote}\n\n<!-- mesh:close-on-merge #9 -->`).kind
+    ).toBe("malformed");
   });
 
   it("rejects the whole body when a valid directive sits beside a malformed one", () => {
