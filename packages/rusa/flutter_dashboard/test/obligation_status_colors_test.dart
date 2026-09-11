@@ -69,16 +69,18 @@ void main() {
       );
     });
 
-    test('a worked live obligation reads active, ready or waiting alike', () {
+    test('a worked ready obligation reads active; waiting stays waiting', () {
       expect(
         makeObligation('o', status: 'ready')
             .presentationState(activelyWorked: true),
         ObligationPresentationState.active,
       );
+      // Waiting is blocked or waiting on children/decisions; it does not read
+      // as active even if selected by an actor run.
       expect(
         makeObligation('o', status: 'waiting')
             .presentationState(activelyWorked: true),
-        ObligationPresentationState.active,
+        ObligationPresentationState.waiting,
       );
     });
 
@@ -160,21 +162,49 @@ void main() {
       ]);
       expect(snap.isObligationActive('arc'), isTrue);
     });
+
+    test('activeObligationIds memoises the active set across actors', () {
+      final snap = snapshotOf([
+        makeThread(
+          't1',
+          runState: RunState.running,
+          selectedObligation: makeObligation('ob-1'),
+        ),
+        makeThread(
+          't2',
+          runState: RunState.windingDown,
+          selectedObligation: makeObligation('ob-2'),
+        ),
+        makeThread(
+          't3',
+          runState: RunState.idle,
+          selectedObligation: makeObligation('ob-3'),
+        ),
+      ]);
+      expect(snap.activeObligationIds, {'ob-1', 'ob-2'});
+      expect(snap.isObligationActive('ob-1'), isTrue);
+      expect(snap.isObligationActive('ob-2'), isTrue);
+      expect(snap.isObligationActive('ob-3'), isFalse);
+    });
   });
 
   group('colour mapping', () {
-    test('follows the actor palette, with blue done and red cancelled', () {
+    test('follows the actor palette, with blue done, indigo scheduled, and red cancelled', () {
       expect(
         ObligationStatusColors.of(ObligationPresentationState.waiting).dot,
-        MeshColors.statusRetired,
+        MeshColors.statusWaiting,
       );
       expect(
         ObligationStatusColors.of(ObligationPresentationState.ready).dot,
-        MeshColors.statusIdle,
+        MeshColors.statusQueued,
       );
       expect(
         ObligationStatusColors.of(ObligationPresentationState.active).dot,
         MeshColors.statusActive,
+      );
+      expect(
+        ObligationStatusColors.of(ObligationPresentationState.scheduled).dot,
+        const Color(0xFF818CF8),
       );
       expect(
         ObligationStatusColors.of(ObligationPresentationState.done).dot,
@@ -302,25 +332,36 @@ void main() {
     });
   });
 
-  testWidgets('the work tree dot reads the same state as the chip', (
+  testWidgets('the work tree dot turns green for ready work, and stays grey for waiting', (
     tester,
   ) async {
     await tester.runAsync(() async {
-      final focus = makeObligation(
-        'arc',
+      final readyFocus = makeObligation(
+        'ready-arc',
         ownerId: 'worker',
+        status: 'ready',
+        intent: 'The ready arc',
+      );
+      final waitingFocus = makeObligation(
+        'waiting-arc',
+        ownerId: 'helper',
         status: 'waiting',
-        intent: 'The arc',
+        intent: 'The waiting arc',
       );
       final api = FakeApi()
         ..threadsResult = [
           makeThread(
             'worker',
             runState: RunState.running,
-            selectedObligation: focus,
+            selectedObligation: readyFocus,
+          ),
+          makeThread(
+            'helper',
+            runState: RunState.running,
+            selectedObligation: waitingFocus,
           ),
         ]
-        ..obligationsResult = [focus];
+        ..obligationsResult = [readyFocus, waitingFocus];
 
       final store = DashboardStore(api: api, stream: FakeStream());
       await store.init();
@@ -333,8 +374,18 @@ void main() {
       await tester.pump();
       await tester.pump();
 
-      // Waiting, but its owner is mid-run on it: green, like the actor dot.
-      expect(dotColor(tester), MeshColors.statusActive);
+      // Find all dots in the work tree:
+      final dots = tester
+          .widgetList<Container>(
+            find.descendant(
+              of: find.byType(ObligationStatusDot),
+              matching: find.byType(Container),
+            ),
+          )
+          .map((c) => (c.decoration! as BoxDecoration).color!)
+          .toList();
+
+      expect(dots, [MeshColors.statusActive, MeshColors.statusWaiting]);
 
       await store.dispose();
     });

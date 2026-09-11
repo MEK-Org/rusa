@@ -518,15 +518,32 @@ int _compareQueuedActors(ActorViewState a, ActorViewState b) {
 }
 
 class ActorStateSnapshot {
-  const ActorStateSnapshot({
+  ActorStateSnapshot({
     this.revision = 0,
     this.actors = const {},
     this.orderedIds = const [],
-  });
+    Set<String>? activeObligationIds,
+  }) : activeObligationIds = activeObligationIds ??
+            {
+              for (final a in actors.values)
+                if (a.isActiveRun && a.selectedObligation?.id != null)
+                  a.selectedObligation!.id,
+            };
+
+  const ActorStateSnapshot.empty()
+      : revision = 0,
+        actors = const {},
+        orderedIds = const [],
+        activeObligationIds = const {};
 
   final int revision;
   final Map<String, ActorViewState> actors;
   final List<String> orderedIds;
+
+  /// Set of obligation IDs currently being worked by any actor with an active run.
+  /// Precomputed once upon snapshot creation so per-widget lookups are O(1) rather
+  /// than scanning all actors per obligation widget.
+  final Set<String> activeObligationIds;
 
   ActorViewState? operator [](String id) => actors[id];
   ActorViewState? actor(String id) => actors[id];
@@ -551,9 +568,8 @@ class ActorStateSnapshot {
   /// actor dot. A selected obligation only survives on a thread while its run
   /// is live (the store clears it at the idle/queued boundary), so a
   /// just-finished run cannot leave its obligation looking worked-on.
-  bool isObligationActive(String obligationId) => actors.values.any(
-    (a) => a.isActiveRun && a.selectedObligation?.id == obligationId,
-  );
+  bool isObligationActive(String obligationId) =>
+      activeObligationIds.contains(obligationId);
 
   DotState dotFor(String actorId) {
     return actors[actorId]?.dotState ?? DotState.idle;
@@ -568,10 +584,13 @@ class ActorStateSnapshot {
     int? revision,
     Map<String, ActorViewState>? actors,
     List<String>? orderedIds,
+    Set<String>? activeObligationIds,
   }) => ActorStateSnapshot(
     revision: revision ?? this.revision,
     actors: actors ?? this.actors,
     orderedIds: orderedIds ?? this.orderedIds,
+    activeObligationIds: activeObligationIds ??
+        (actors != null ? null : this.activeObligationIds),
   );
 
   @override
@@ -1384,17 +1403,15 @@ class ObligationDto {
   /// How this obligation should read on the dashboard, given whether an actor
   /// is actively working on it (see [ActorStateSnapshot.isObligationActive]).
   ///
-  /// `active` is a presentation-only overlay on the two live statuses: a
-  /// ready obligation that an actor has picked up is being worked, and so is a
-  /// waiting one whose owner is mid-run (it may have gone waiting because that
-  /// very run spawned children). Terminal and scheduled statuses are durable
-  /// facts recorded by the run itself, so they outrank a run focus that is
-  /// simply still pointing at the obligation until the run ends.
+  /// `active` is a presentation-only overlay on the ready status: an
+  /// otherwise ready obligation that an actor has selected for its active
+  /// run is being worked right now. Terminal, scheduled, and waiting
+  /// statuses represent durable lifecycle states (completed, cancelled,
+  /// scheduled for future execution, or waiting on dependencies/blockers)
+  /// that are not overridden by a run focus.
   ObligationPresentationState presentationState({required bool activelyWorked}) {
     final base = ObligationPresentationState.fromStatus(status);
-    if (activelyWorked &&
-        (base == ObligationPresentationState.ready ||
-            base == ObligationPresentationState.waiting)) {
+    if (activelyWorked && base == ObligationPresentationState.ready) {
       return ObligationPresentationState.active;
     }
     return base;

@@ -29,13 +29,13 @@ class ObligationStatusColors {
     chipBackground: Color(0xFF1E293B),
     chipForeground: Color(0xFF94A3B8),
     chipBorder: Color(0xFF334155),
-    dot: MeshColors.statusRetired,
+    dot: MeshColors.statusWaiting,
   );
   static const ready = ObligationStatusColors(
     chipBackground: Color(0xFF78350F),
     chipForeground: Color(0xFFFBBF24),
     chipBorder: Color(0xFFB45309),
-    dot: MeshColors.statusIdle,
+    dot: MeshColors.statusQueued,
   );
   static const active = ObligationStatusColors(
     chipBackground: Color(0xFF064E3B),
@@ -47,7 +47,8 @@ class ObligationStatusColors {
     chipBackground: Color(0xFF312E81),
     chipForeground: Color(0xFFA5B4FC),
     chipBorder: Color(0xFF4338CA),
-    dot: MeshColors.accent,
+    // Indigo, matching the chip and visually distinct from done's royal blue.
+    dot: Color(0xFF818CF8),
   );
   static const done = ObligationStatusColors(
     chipBackground: Color(0xFF1E3A8A),
