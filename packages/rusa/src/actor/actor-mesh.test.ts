@@ -6394,6 +6394,9 @@ describe("ActorMesh", () => {
       // A shared provider's `calls` array is one object for every actor, so
       // per-actor run counts are kept here, keyed by the actor's cwd.
       const runs = new Map<string, number>();
+      // Each admission's responsive flag as the scheduler saw it, per actor, so
+      // a follow-up run can be shown to have kept the delivery's priority.
+      const admissions = new Map<string, boolean[]>();
       const provider = new FakeProvider((opts) => {
         const actorId = opts.cwd.slice("/tmp/".length);
         runs.set(actorId, (runs.get(actorId) ?? 0) + 1);
@@ -6409,6 +6412,9 @@ describe("ActorMesh", () => {
         inboxStore,
         events: (event) => events.push(event),
         sharedProvider: provider,
+        onQueued: (actorId, ctx) => {
+          admissions.set(actorId, [...(admissions.get(actorId) ?? []), ctx.responsive]);
+        },
       });
       const startRun = async (actorId: string) => {
         inboxStore.append([{ actorId, source: "mesh:root", payload: payload("mesh.message") }]);
@@ -6432,6 +6438,7 @@ describe("ActorMesh", () => {
         signals,
         resolvers,
         runs,
+        admissions,
         startRun,
         preemptions,
         unhandledResponsive,
@@ -6500,6 +6507,9 @@ describe("ActorMesh", () => {
         t.resolvers.get(watcher)?.({ success: true, exitCode: 0, output: "finished normally" });
         await vi.advanceTimersByTimeAsync(0);
         expect(t.runs.get(watcher)).toBe(2);
+        // The follow-up was admitted as responsive work: not preempting is a
+        // narrower change than downgrading the subscriber's copy to normal.
+        expect(t.admissions.get(watcher)).toEqual([false, true]);
       });
 
       it("preempts nobody when routing finds only subscribers", async () => {

@@ -1112,17 +1112,33 @@ export class ActorMesh {
    * active run set the dirty follow-up. A held normal entry remains durable but
    * returns false because the session-end release, not this call, will nudge it.
    *
-   * Responsive work replaces an in-flight run by default — operator control,
-   * human messages, and `runNow` all mean "now". Event fan-out passes
-   * `preempt: false` for a recipient that is not the event's effective owner:
-   * that copy keeps responsive scheduling and admission but joins the run as
-   * a follow-up instead of aborting work the event does not belong to.
+   * Responsive work replaces an in-flight run — operator control, human
+   * messages, and `runNow` all mean "now". The one wake that may not is an
+   * event copy for a recipient other than the effective owner; that decision
+   * lives in {@link notifyEventRecipient}, so no caller of this method can
+   * turn preemption off.
    */
-  notifyInboxChanged(
-    actorId: string,
-    nudge: RunNudge = {},
-    opts: { preempt?: boolean } = {}
+  notifyInboxChanged(actorId: string, nudge: RunNudge = {}): boolean {
+    return this.wakeForInbox(actorId, nudge, { preempt: true });
+  }
+
+  /**
+   * Event fan-out's wake. Only the event's effective owner may have its active
+   * run replaced; every other recipient's copy keeps responsive scheduling and
+   * admission but joins that actor's run as a follow-up instead of aborting
+   * work the event does not belong to. Private and named for its one use so
+   * "responsive but not preempting" cannot leak into a control path.
+   */
+  private notifyEventRecipient(
+    dest: string,
+    priority: "responsive" | "normal" | undefined,
+    isOwner: boolean
   ): boolean {
+    return this.wakeForInbox(dest, { priority }, { preempt: isOwner });
+  }
+
+  /** The shared body of both wakes; `preempt` is required so every caller states it. */
+  private wakeForInbox(actorId: string, nudge: RunNudge, opts: { preempt: boolean }): boolean {
     actorId = this.resolveThreadId(actorId);
     const rec = this.actors.get(actorId);
     if (rec && rec.status !== "active") {
@@ -1137,11 +1153,14 @@ export class ActorMesh {
     if (!isResponsiveNudge(nudge) && this.isVoiceSessionActive(actorId)) {
       // The entry is already durable. It must wait for the session-end nudge,
       // rather than adding an ordinary execution opportunity behind the voice
-      // conversation. Responsive work still preempts exactly as before.
+      // conversation. Responsive work passes the hold whether or not it may
+      // preempt — the same voice exemption `admitRun` and `selectInboxEntries`
+      // grant responsive entries — so a non-owner's event copy is admitted
+      // behind the voice session's own run rather than held with normal work.
       this.log(`inbox_changed for ${actorId} held — active voice session`);
       return false;
     }
-    if (isResponsiveNudge(nudge) && opts.preempt !== false) {
+    if (isResponsiveNudge(nudge) && opts.preempt) {
       const preemption = target.preemptForResponsive();
       if (preemption.preempted) {
         this.recordEvent({
@@ -2123,8 +2142,8 @@ export class ActorMesh {
     if (deliverable.length === 0) return;
 
     for (const dest of deliverable) {
-      const preempt = recipients.ownerIds.includes(dest);
-      if (!this.notifyInboxChanged(dest, { priority: opts.inboxPriority }, { preempt })) {
+      const isOwner = recipients.ownerIds.includes(dest);
+      if (!this.notifyEventRecipient(dest, opts.inboxPriority, isOwner)) {
         this.log(`Delivery target ${dest} is not live; cannot deliver event`);
       }
     }
@@ -2147,10 +2166,9 @@ export class ActorMesh {
   }
 
   /**
-   * Only the event's effective owner may have its active run replaced. Every
-   * other recipient's copy is just as durable and just as responsive for
-   * scheduling, but a subscriber's run is not aborted by an event it merely
-   * observes; a subscriber-only route therefore preempts nobody.
+   * Every persisted copy is just as durable and just as responsive for
+   * scheduling; which recipient's run may be replaced is decided by
+   * {@link notifyEventRecipient}. A subscriber-only route preempts nobody.
    */
   private notifyPersistedInboxEntries(
     delivery: DurableEventDelivery,
@@ -2158,8 +2176,8 @@ export class ActorMesh {
   ): void {
     for (const entry of delivery.entries) {
       const dest = entry.actorId;
-      const preempt = delivery.ownerIds.includes(dest);
-      if (!this.notifyInboxChanged(dest, { priority }, { preempt })) {
+      const isOwner = delivery.ownerIds.includes(dest);
+      if (!this.notifyEventRecipient(dest, priority, isOwner)) {
         throw new Error(`Delivery target ${dest} is not live after inbox persistence`);
       }
     }
