@@ -1,7 +1,15 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 /**
  * Host-side PTY scrape of codex's interactive `/status` panel .
@@ -19,11 +27,14 @@ import { join } from "node:path";
  *  - We drive codex's ALREADY-authenticated session and only READ what it prints.
  *  - We send `/status` (read-only), NEVER `/usage` — on codex `/usage` CONSUMES
  *    one of the account's limited "usage limit resets", a mutating action.
- *  - We point codex at an ISOLATED, throwaway `CODEX_HOME` seeded with a COPY of
- *    the host's `auth.json` — never the real `~/.codex`. codex builds its own
- *    fresh state DB there; the real auth/state is never opened, refreshed,
- *    rotated, or written. Auth-safe AND host-state-safe by construction. The
- *    copied-auth home is deleted after each scrape.
+ *  - While `/status` is read-only and does not consume resets, CLI startup and
+ *    authenticated requests are not exempt from standard credential/OAuth token refresh.
+ *    Like the worker sandbox (#128), we link the shared persistent `auth.json` into
+ *    the isolated `CODEX_HOME`. Refresh tokens rotate globally, so persisting refreshed
+ *    credentials in the shared auth file prevents the host from retaining a consumed token
+ *    when the throwaway probe directory is swept.
+ *  - Probe config and session state remain isolated: `config.toml` and tmux/session state
+ *    live in the throwaway `CODEX_HOME`, deleted after each scrape.
  *
  * `/status` itself is free; the caller (quota MCP) still gates this behind the
  * interactive_scrape TTL so we never probe-on-read.
@@ -173,16 +184,21 @@ export function buildTmuxScript(
 }
 
 /**
- * Seed an isolated throwaway `CODEX_HOME`: a copy of the host `auth.json` plus a
- * `config.toml` (host config, best effort) with the probe dir pre-trusted so the
- * interactive TUI never blocks on its "Do you trust this directory?" prompt.
+ * Seed an isolated throwaway `CODEX_HOME`: symlink the shared persistent `auth.json`
+ * (so credential refreshes persist across cleanup, matching #128's shared-auth discipline)
+ * plus a probe-specific `config.toml` (host config, best effort) with the probe dir
+ * pre-trusted so the interactive TUI never blocks on its "Do you trust this directory?" prompt.
  * Returns the new home dir (caller deletes it).
  */
 function seedIsolatedCodexHome(actorDir: string, hostCodexDir: string): string {
   const codexHome = mkdtempSync(join(tmpdir(), "rusa-codex-status-"));
   const hostAuth = join(hostCodexDir, "auth.json");
   if (existsSync(hostAuth)) {
-    writeFileSync(join(codexHome, "auth.json"), readFileSync(hostAuth), { mode: 0o600 });
+    try {
+      symlinkSync(resolve(hostAuth), join(codexHome, "auth.json"));
+    } catch {
+      writeFileSync(join(codexHome, "auth.json"), readFileSync(hostAuth), { mode: 0o600 });
+    }
   }
   let baseConfig = "";
   const hostConfig = join(hostCodexDir, "config.toml");
