@@ -335,7 +335,7 @@ describe("InboxFocusResolver", () => {
   });
 
   it("rejects an explicit focus that is terminal or missing", () => {
-    obligations.setTerminalStatus("sibling-work", "done");
+    obligations.setTerminalStatus("sibling-work", "done", null, null, "system:mesh");
     const [entry] = append([
       { id: "general", source: "mesh:root", payload: { type: "mesh.message" } },
     ]);

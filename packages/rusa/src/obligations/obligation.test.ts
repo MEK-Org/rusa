@@ -5,6 +5,7 @@ import {
   isTerminalObligationStatus,
   ObligationValidationError,
   parseExternalRef,
+  parseHistoryPayload,
   validateEntityId,
 } from "./obligation.js";
 
@@ -119,5 +120,111 @@ describe("obligation entity and status helpers", () => {
 
     expect(() => assertObligationStatus("ready")).not.toThrow();
     expect(() => assertObligationStatus("invalid")).toThrow(ObligationValidationError);
+  });
+});
+
+describe("obligation history payload validation", () => {
+  it("accepts valid sparse deltas with entity IDs and external references", () => {
+    const payload = parseHistoryPayload(
+      JSON.stringify({
+        schemaVersion: 1,
+        before: {
+          ownerId: "actor-a",
+          parentId: "parent-1",
+          externalRef: "github:MEK-Org/rusa/issues/185",
+          status: "ready",
+          priority: 10,
+        },
+        after: {
+          ownerId: "human:operator",
+          parentId: null,
+          externalRef: null,
+          status: "done",
+          priority: null,
+        },
+      })
+    );
+
+    expect(payload.schemaVersion).toBe(1);
+    expect(payload.before.ownerId).toBe("actor-a");
+    expect(payload.before.parentId).toBe("parent-1");
+    expect(payload.before.externalRef).toBe("github:MEK-Org/rusa/issues/185");
+    expect(payload.after.ownerId).toBe("human:operator");
+    expect(payload.after.parentId).toBeNull();
+    expect(payload.after.externalRef).toBeNull();
+  });
+
+  it("rejects blank or whitespace-only ownerId", () => {
+    expect(() =>
+      parseHistoryPayload('{"schemaVersion":1,"before":{},"after":{"ownerId":""}}')
+    ).toThrow(ObligationValidationError);
+
+    expect(() =>
+      parseHistoryPayload('{"schemaVersion":1,"before":{},"after":{"ownerId":"   "}}')
+    ).toThrow(ObligationValidationError);
+
+    expect(() =>
+      parseHistoryPayload('{"schemaVersion":1,"before":{"ownerId":"   "},"after":{}}')
+    ).toThrow(ObligationValidationError);
+  });
+
+  it("rejects blank or whitespace-only parentId", () => {
+    expect(() =>
+      parseHistoryPayload('{"schemaVersion":1,"before":{},"after":{"parentId":""}}')
+    ).toThrow(ObligationValidationError);
+
+    expect(() =>
+      parseHistoryPayload('{"schemaVersion":1,"before":{},"after":{"parentId":"   "}}')
+    ).toThrow(ObligationValidationError);
+
+    expect(() =>
+      parseHistoryPayload('{"schemaVersion":1,"before":{"parentId":"   "},"after":{}}')
+    ).toThrow(ObligationValidationError);
+  });
+
+  it("accepts externalRef values the reference grammar admits but the live identity policy refuses", () => {
+    // History records what the claim *was*; a ref the policy later narrows out
+    // of live rows still has to read back from `before`.
+    expect(
+      parseHistoryPayload(
+        '{"schemaVersion":1,"before":{"externalRef":"github:MEK-Org/rusa/issues/1/comments/2"},"after":{"externalRef":null}}'
+      ).before.externalRef
+    ).toBe("github:MEK-Org/rusa/issues/1/comments/2");
+
+    expect(
+      parseHistoryPayload(
+        '{"schemaVersion":1,"before":{},"after":{"externalRef":"gchat:spaces/AAAA/messages/BBBB"}}'
+      ).after.externalRef
+    ).toBe("gchat:spaces/AAAA/messages/BBBB");
+  });
+
+  it("rejects externalRef strings that violate the canonical reference grammar", () => {
+    expect(() =>
+      parseHistoryPayload('{"schemaVersion":1,"before":{},"after":{"externalRef":""}}')
+    ).toThrow(ObligationValidationError);
+
+    expect(() =>
+      parseHistoryPayload('{"schemaVersion":1,"before":{},"after":{"externalRef":"   "}}')
+    ).toThrow(ObligationValidationError);
+
+    expect(() =>
+      parseHistoryPayload('{"schemaVersion":1,"before":{},"after":{"externalRef":"not-a-ref"}}')
+    ).toThrow(ObligationValidationError);
+
+    expect(() =>
+      parseHistoryPayload(
+        '{"schemaVersion":1,"before":{},"after":{"externalRef":"https://github.com/MEK-Org/rusa"}}'
+      )
+    ).toThrow(ObligationValidationError);
+
+    expect(() =>
+      parseHistoryPayload(
+        '{"schemaVersion":1,"before":{},"after":{"externalRef":"github:MEK-Org//rusa"}}'
+      )
+    ).toThrow(ObligationValidationError);
+
+    expect(() =>
+      parseHistoryPayload('{"schemaVersion":1,"before":{"externalRef":"not-a-ref"},"after":{}}')
+    ).toThrow(ObligationValidationError);
   });
 });

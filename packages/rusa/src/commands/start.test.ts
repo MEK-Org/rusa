@@ -525,6 +525,271 @@ describe("runStart webhook event routing (Phase 4)", () => {
     }
   });
 
+  it("tells and gates a root-enrolled worker across the live MCP boundary while an unenrolled control is untouched", async () => {
+    let mesh: ActorMesh | undefined;
+    let root: Actor | undefined;
+    await new Promise<void>((resolve) => {
+      void runStart({
+        e2e: {
+          onReady: (handles) => {
+            mesh = handles.mesh;
+            root = handles.root as Actor;
+            shutdownFn = handles.shutdown;
+            resolve();
+          },
+        },
+      });
+    });
+    if (!mesh || !root) throw new Error("mesh not ready");
+
+    type LiveActorOptions = {
+      mcpServers: Array<{ name: string; url: string }>;
+      onRunStart?: (
+        responsive: boolean,
+        injectRecord: undefined,
+        selected: { provider: string; model: string; effort: string }
+      ) => void;
+      onRunEnd?: (result: {
+        success: boolean;
+        output: string;
+        exitCode: number;
+      }) => void | Promise<void>;
+    };
+    const optionsOf = (actor: Actor) => (actor as unknown as { opts: LiveActorOptions }).opts;
+    const urlOf = (actor: Actor, server: string) => {
+      const url = optionsOf(actor).mcpServers.find((entry) => entry.name === server)?.url;
+      if (!url) throw new Error(`${server} MCP server missing`);
+      return url;
+    };
+    const call = async (url: string, name: string, args: Record<string, unknown>) => {
+      const client = new Client({ name: "strict-obligation-dogfood", version: "0.0.0" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+      try {
+        return await client.callTool({ name, arguments: args });
+      } finally {
+        await client.close();
+      }
+    };
+    const payloadOf = (result: Awaited<ReturnType<typeof call>>): Record<string, unknown> => {
+      const [first] = result.content as Array<{ type: string; text?: string }>;
+      return JSON.parse(first?.text ?? "{}") as Record<string, unknown>;
+    };
+
+    const liveMesh = mesh;
+    const spawnWorker = (charter: string) =>
+      liveMesh.spawn({
+        charter,
+        parentId: "root",
+        modelConfig: { provider: "antigravity", model: "Gemini 3.7 Flash", effort: "high" },
+      });
+    const optedIn = spawnWorker("live opted-in worker");
+    const control = spawnWorker("live unenrolled control");
+    const actorOf = (id: string) => {
+      const actor = liveMesh.get(id) as Actor | undefined;
+      if (!actor) throw new Error(`worker MCP endpoints missing: ${id}`);
+      return actor;
+    };
+
+    // Root-only enrollment, through root's own live mesh endpoint.
+    const enrolled = await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
+      actor_id: optedIn,
+      experiment: "strict_obligation_handling",
+    });
+    expect(enrolled.isError).toBeFalsy();
+
+    // Attention arrives the way production delivers it: creating the obligation
+    // moves each worker's ready head, and runStart's ready-head listener routes
+    // that transition into the worker's durable inbox. Nothing is injected.
+    for (const [actorId, title] of [
+      [optedIn, "live strict head"],
+      [control, "live control head"],
+    ]) {
+      getRepositories().obligations.create({ title, ownerId: actorId });
+    }
+
+    // Each worker selects its own head through its real inbox MCP endpoint —
+    // the same `select` the model calls — which needs a durable run open, so
+    // start one through the production run hook.
+    const selectHeadOverMcp = async (
+      actorId: string
+    ): Promise<{ obligationId: string; selection: Record<string, unknown> }> => {
+      optionsOf(actorOf(actorId)).onRunStart?.(false, undefined, {
+        provider: "antigravity",
+        model: "Gemini 3.7 Flash",
+        effort: "high",
+      });
+      const inboxUrl = urlOf(actorOf(actorId), "inbox");
+      const listed = payloadOf(await call(inboxUrl, "list", { status: "unhandled" })) as {
+        entries: Array<{ id: string; payload: { type: string; obligationId?: string } }>;
+      };
+      const entry = listed.entries.find(
+        (candidate) => candidate.payload.type === "obligation.ready_head"
+      );
+      if (!entry?.payload.obligationId)
+        throw new Error(`ready-head inbox entry missing: ${actorId}`);
+      const selected = await call(inboxUrl, "select", { entry_ids: [entry.id] });
+      expect(selected.isError).toBeFalsy();
+      return { obligationId: entry.payload.obligationId, selection: payloadOf(selected) };
+    };
+    const strict = await selectHeadOverMcp(optedIn);
+    const strictHeadId = strict.obligationId;
+    const controlSelection = await selectHeadOverMcp(control);
+
+    // The selection that arms enforcement is also what states the rule, so the
+    // worker learns it before its first yield rather than from a rejection.
+    // The rule is stated directly without mentioning the experiment itself.
+    expect(String(strict.selection.discipline)).not.toContain("strict_obligation_handling");
+    expect(String(strict.selection.discipline)).not.toMatch(/experiment/i);
+    expect(String(strict.selection.discipline)).toContain(strictHeadId);
+    expect(String(strict.selection.discipline)).toMatch(/every selected head/);
+    expect(String(strict.selection.discipline)).toContain(
+      "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor"
+    );
+    // The unenrolled control's selection carries no trace of the experiment.
+    expect(controlSelection.selection).not.toHaveProperty("discipline");
+    expect(JSON.stringify(controlSelection.selection)).not.toContain("strict_obligation_handling");
+
+    // The enrolled worker cannot yield cleanly on an untouched head.
+    const rejected = await call(urlOf(actorOf(optedIn), "mesh"), "yield_run", {
+      status: "complete",
+    });
+    expect(rejected.isError).toBe(true);
+    expect(JSON.stringify(rejected)).toContain(`selected head obligation ${strictHeadId}`);
+    expect(
+      getRepositories()
+        .meshEvents.listEventsByActors([optedIn], { limit: 20, kinds: ["run_yield_rejected"] })
+        .events.some((event) => (event.payload ?? "").includes(strictHeadId))
+    ).toBe(true);
+
+    // Decomposing it through the worker's own obligations MCP is a legal exit.
+    const child = await call(urlOf(actorOf(optedIn), "obligations"), "create_obligation", {
+      owner_id: optedIn,
+      parent_id: strictHeadId,
+      title: "Review the strict head",
+    });
+    expect(child.isError).toBeFalsy();
+    const accepted = await call(urlOf(actorOf(optedIn), "mesh"), "yield_run", {
+      status: "complete",
+    });
+    expect(accepted.isError).toBeFalsy();
+
+    // Handing the head to a sibling is a legal exit too (#420), through the
+    // worker's own obligations MCP under the production owner-or-ancestor
+    // policy: checkpoint first, reassign second. The committed transition
+    // reaches the recipient's durable inbox through runStart's ready-head
+    // sink in this process — no restart, no injection. A fresh enrolled
+    // worker, because a clean yield fences every tool of the one above.
+    const handoffSource = spawnWorker("live handoff source");
+    const recipient = spawnWorker("live handoff recipient");
+    expect(
+      (
+        await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
+          actor_id: handoffSource,
+          experiment: "strict_obligation_handling",
+        })
+      ).isError
+    ).toBeFalsy();
+    const handoffHeadId = getRepositories().obligations.create({
+      title: "live handoff head",
+      ownerId: handoffSource,
+    }).id;
+    const handoffRun = await selectHeadOverMcp(handoffSource);
+    expect(handoffRun.obligationId).toBe(handoffHeadId);
+    const obligationsUrl = urlOf(actorOf(handoffSource), "obligations");
+    expect(
+      (
+        await call(obligationsUrl, "set_checkpoint", {
+          id: handoffHeadId,
+          checkpoint: "Findings recorded; recipient should take the next action.",
+        })
+      ).isError
+    ).toBeFalsy();
+    expect(
+      (
+        await call(obligationsUrl, "reassign_obligation", {
+          id: handoffHeadId,
+          owner_id: recipient,
+        })
+      ).isError
+    ).toBeFalsy();
+    // Ownership has left the worker's subtree, so its checkpoint write is now
+    // refused: the order above is the only one that works.
+    expect(
+      (await call(obligationsUrl, "set_checkpoint", { id: handoffHeadId, checkpoint: "late" }))
+        .isError
+    ).toBe(true);
+    const recipientInbox = payloadOf(
+      await call(urlOf(actorOf(recipient), "inbox"), "list", { status: "unhandled" })
+    ) as { entries: Array<{ payload: { type: string; obligationId?: string } }> };
+    expect(
+      recipientInbox.entries.some(
+        (entry) =>
+          entry.payload.type === "obligation.ready_head" &&
+          entry.payload.obligationId === handoffHeadId
+      )
+    ).toBe(true);
+    const handedOff = await call(urlOf(actorOf(handoffSource), "mesh"), "yield_run", {
+      status: "complete",
+    });
+    expect(handedOff.isError).toBeFalsy();
+    expect(getRepositories().obligations.require(handoffHeadId)).toMatchObject({
+      ownerId: recipient,
+      status: "ready",
+      checkpointBy: handoffSource,
+    });
+
+    // The unenrolled control keeps the existing behavior on the same wiring.
+    const controlYield = await call(urlOf(actorOf(control), "mesh"), "yield_run", {
+      status: "complete",
+    });
+    expect(controlYield.isError).toBeFalsy();
+
+    // A root enrollment change lands on instruction and enforcement together,
+    // at the next selection across the same live boundary.
+    const switched = spawnWorker("live enrollment-change worker");
+    expect(
+      (
+        await call(urlOf(root, "mesh"), "enroll_actor_experiment", {
+          actor_id: switched,
+          experiment: "strict_obligation_handling",
+        })
+      ).isError
+    ).toBeFalsy();
+    getRepositories().obligations.create({ title: "live enrolled head", ownerId: switched });
+    const enrolledRun = await selectHeadOverMcp(switched);
+    expect(String(enrolledRun.selection.discipline)).toContain(enrolledRun.obligationId);
+    expect(String(enrolledRun.selection.discipline)).not.toContain("strict_obligation_handling");
+    expect(String(enrolledRun.selection.discipline)).not.toMatch(/experiment/i);
+    const enrolledYield = await call(urlOf(actorOf(switched), "mesh"), "yield_run", {
+      status: "complete",
+    });
+    expect(enrolledYield.isError).toBe(true);
+
+    expect(
+      (
+        await call(urlOf(root, "mesh"), "unenroll_actor_experiment", {
+          actor_id: switched,
+          experiment: "strict_obligation_handling",
+        })
+      ).isError
+    ).toBeFalsy();
+    // End the run the way production ends it, then move this worker's head
+    // with a higher-priority obligation so the next run selects fresh.
+    await optionsOf(actorOf(switched)).onRunEnd?.({ success: true, output: "", exitCode: 0 });
+    getRepositories().obligations.create({
+      title: "live released head",
+      ownerId: switched,
+      priority: 100,
+    });
+    const releasedRun = await selectHeadOverMcp(switched);
+    expect(releasedRun.obligationId).not.toBe(enrolledRun.obligationId);
+    expect(releasedRun.selection).not.toHaveProperty("discipline");
+    const releasedYield = await call(urlOf(actorOf(switched), "mesh"), "yield_run", {
+      status: "complete",
+    });
+    expect(releasedYield.isError).toBeFalsy();
+  });
+
   describe("worker fallback is root-only ", () => {
     it("never wires an actor-level fallback for a worker, even when root has one configured", async () => {
       const config = {

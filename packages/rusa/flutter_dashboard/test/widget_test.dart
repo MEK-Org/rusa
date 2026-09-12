@@ -8,6 +8,7 @@ import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/theme.dart';
 import 'package:rusa_dashboard/widgets/actor_tree.dart';
 import 'package:rusa_dashboard/widgets/avatar.dart';
+import 'package:rusa_dashboard/widgets/brand_mark.dart';
 import 'package:rusa_dashboard/widgets/detail_panel.dart';
 import 'package:rusa_dashboard/widgets/header.dart';
 import 'package:rusa_dashboard/widgets/live_output_tab.dart';
@@ -15,7 +16,7 @@ import 'package:rusa_dashboard/widgets/live_output_tab.dart';
 import 'fakes.dart';
 
 // The store does real async I/O (Futures + broadcast streams) and the dashboard
-// has always-running animations (status pulse, cursor). So we drive each test
+// has always-running animations (blinking cursor). So we drive each test
 // inside tester.runAsync (real async zone) and pump fixed durations rather than
 // pumpAndSettle (which would never settle against the repeating animations).
 
@@ -396,6 +397,22 @@ void main() {
         expect(find.byTooltip('Run now'), findsNothing);
 
         // 'a' transitions to queued.
+        // Queue admission immediately revalidates the pacing explanation, so
+        // model the authoritative snapshot published by the server.
+        api
+          ..runtimeCursor = const RuntimeCursor(
+            streamId: 'stream-a',
+            revision: 2,
+          )
+          ..threadsResult = [
+            makeThread('root', created: 't0', runState: RunState.idle),
+            makeThread(
+              'a',
+              parent: 'root',
+              created: 't1',
+              runState: RunState.queued,
+            ),
+          ];
         stream.runtimeStatesCtrl.add(
           const ActorRuntimeStateDelta(
             streamId: 'stream-a',
@@ -413,6 +430,20 @@ void main() {
         expect(find.byTooltip('Interrupt'), findsNothing);
 
         // 'a' transitions to idle.
+        api
+          ..runtimeCursor = const RuntimeCursor(
+            streamId: 'stream-a',
+            revision: 3,
+          )
+          ..threadsResult = [
+            makeThread('root', created: 't0', runState: RunState.idle),
+            makeThread(
+              'a',
+              parent: 'root',
+              created: 't1',
+              runState: RunState.idle,
+            ),
+          ];
         stream.runtimeStatesCtrl.add(
           const ActorRuntimeStateDelta(
             streamId: 'stream-a',
@@ -1001,7 +1032,7 @@ void main() {
     });
   });
 
-  testWidgets('header shows the active pulse in the brand cluster', (
+  testWidgets('header shows the brand mark and no routine status when active', (
     tester,
   ) async {
     await tester.runAsync(() async {
@@ -1028,12 +1059,13 @@ void main() {
       );
       await tester.pump(const Duration(milliseconds: 50));
 
-      expect(find.text('Active'), findsOneWidget);
-      expect(find.text('Mesh System Active'), findsNothing);
-      expect(find.text('SYSTEM HALTED'), findsNothing);
-      expect(find.text('V1.4.0'), findsNothing);
+      // Issue #412: the antler/tree mark is the upper-left brand and no
+      // routine status indicator renders during normal operation.
+      expect(find.byType(BrandMark), findsOneWidget);
+      expect(find.text('Active'), findsNothing);
+      expect(find.text('Halted'), findsNothing);
       expect(
-        tester.getTopLeft(find.text('Active')).dx,
+        tester.getTopLeft(find.byType(BrandMark)).dx,
         lessThan(tester.getTopLeft(find.text('Actors')).dx),
       );
       await store.dispose();
@@ -1836,6 +1868,51 @@ void main() {
       await store.dispose();
     });
   });
+
+  testWidgets(
+    'ActorTree center drop persists actor reparenting and refreshes the tree',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi()
+          ..threadsResult = [
+            makeThread('root', created: 't0'),
+            makeThread('parent-a', parent: 'root', created: 't1'),
+            makeThread('parent-b', parent: 'root', created: 't2'),
+            makeThread('worker', parent: 'parent-a', created: 't3'),
+          ];
+        final store = DashboardStore(
+          api: api,
+          stream: FakeStream(),
+          treePreferencesCache: FakeTreePreferencesCache(),
+        );
+        await store.init();
+        await tester.pumpWidget(_harness(store));
+        await tester.pump(const Duration(milliseconds: 50));
+
+        final worker = find.widgetWithText(
+          Draggable<ThreadDto>,
+          'worker-handle',
+        );
+        final newParent = find.widgetWithText(
+          DragTarget<ThreadDto>,
+          'parent-b-handle',
+        );
+        expect(worker, findsOneWidget);
+        expect(newParent, findsOneWidget);
+
+        final reparent = await tester.startGesture(tester.getCenter(worker));
+        await tester.pump(const Duration(milliseconds: 50));
+        await reparent.moveTo(tester.getCenter(newParent));
+        await tester.pump(const Duration(milliseconds: 50));
+        await reparent.up();
+        await tester.pump(const Duration(milliseconds: 100));
+
+        expect(api.actorReparentCalls, [(id: 'worker', parentId: 'parent-b')]);
+        expect(store.actor('worker')?.parentId, 'parent-b');
+        await store.dispose();
+      });
+    },
+  );
 
   testWidgets('ActorTree uses LongPressDraggable when touchTargets is true', (
     tester,

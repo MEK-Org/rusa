@@ -33,6 +33,7 @@ function fakeIssueClient(): { client: IssueClient; labels: string[] } {
       body: "b",
       htmlUrl: "u",
       headRef: "h",
+      baseRef: "staging",
       headSha: "head-sha",
       state: "open",
     }),

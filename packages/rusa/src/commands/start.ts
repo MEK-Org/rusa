@@ -17,6 +17,7 @@ import {
   type ActorFactoryContext,
   ActorMesh,
   type MeshActor,
+  type MeshObligationClosurePort,
   type RetireCleanup,
 } from "../actor/actor-mesh.js";
 import type { ActorRecord, PortableContextConfig } from "../actor/actor-record.js";
@@ -1774,6 +1775,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
       return runId;
     },
     capabilityGrants,
+    // Experiment enrollments (#394): the durable, actor-id-keyed rollout state
+    // behind `enroll_actor_experiment`. SQLite-backed so an enrollment survives
+    // a restart; the registry of legal experiment names stays in code.
+    experimentEnrollments: getRepositories().experimentEnrollments,
     eventSourceOwners,
     eventSourceSubscriptions,
     // One seam: the manager carries the kernel built above, so mesh authority
@@ -1791,6 +1796,14 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     // here rather than at routing time hangs boot.
     obligations: {
       findLiveByExternalRef: (ref) => getRepositories().obligations.findLiveByExternalRef(ref),
+      // Strict-obligation handling snapshots these unbounded edge reads at
+      // selection and compares them again on clean yield. Keep the production
+      // wiring on the same durable repository seam as the experiment registry.
+      get: (id) => getRepositories().obligations.get(id),
+      listDirectChildEdges: (parentId) =>
+        getRepositories().obligations.listDirectChildEdges(parentId),
+      listPrerequisiteEdges: (dependentId) =>
+        getRepositories().obligations.listPrerequisiteEdges(dependentId),
       // Retirement's fail-closed preflight (#191): every non-terminal obligation
       // owned in the subtree is a blocker, so `scheduled` counts alongside
       // `ready` and `waiting` — a recurrence that has not fired yet is still
@@ -1804,7 +1817,10 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
             status: obligation.status,
             title: obligation.title,
           })),
-    },
+      // The production mesh always satisfies the strict-closure contract: this
+      // assertion is what makes "the closure reads are wired here" a compile
+      // error to break rather than a runtime warning to miss.
+    } satisfies MeshObligationClosurePort,
     inboxStore,
     isVoiceSessionActive: (actorId) => voiceService?.hasActiveSession(actorId) ?? false,
     // The registry is constructed later with the configured Gemini client, so
@@ -2052,9 +2068,13 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                 });
               });
               if (!focus) throw new Error(`run focus was not resolved for actor: ${id}`);
+              // Read after the selection commits: the same armed decision the
+              // clean-yield check enforces is what states the rule here, so
+              // the two can never disagree about this run.
               return {
                 entries,
                 focus,
+                discipline: mesh.runDisciplineNotice(id),
               };
             },
             selected: () => mesh.selectedInboxEntries(id),
@@ -2520,7 +2540,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   mcpHttp.setWakeObligationHandler({
     token: wakeToken,
     deliver: (id: string) => {
-      getRepositories().obligations.activateScheduled(id);
+      getRepositories().obligations.activateScheduled(id, "system:mesh");
     },
   });
 
@@ -2587,6 +2607,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         return {
           entries,
           focus,
+          discipline: mesh.runDisciplineNotice(rootId),
         };
       },
       selected: () => mesh.selectedInboxEntries(rootId),
@@ -3330,6 +3351,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
                   entry.estimatedStartAt === null
                     ? null
                     : new Date(entry.estimatedStartAt).toISOString(),
+                pacingIntervalMs: entry.pacingIntervalMs,
               }))
             ),
           // Current work is the durable inbox focus for this actor's active

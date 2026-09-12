@@ -203,6 +203,8 @@ const LEDGER_READS: Readonly<Record<MeshEventKind, LedgerRead>> = {
   run_preempted: "ignored",
   portable_context_compacted: "ignored",
   run_coalesced: "ignored",
+  // Rejection is rollout observability; it records no commitment progress.
+  run_yield_rejected: "ignored",
   stamp_invalid: "ignored",
   // The decider's other events in the same run (`run_start`, `run_yielded`) are
   // what say it was working; withdrawing one scheduled delivery neither opens
@@ -212,6 +214,12 @@ const LEDGER_READS: Readonly<Record<MeshEventKind, LedgerRead>> = {
   // closing: the obligation tree already holds that standing, and the run that
   // wrote it is bracketed by events this projection does read.
   obligation_checkpoint_set: "ignored",
+  // Root moving an actor into or out of a rollout is administration of the
+  // mesh's own experiment state, not the actor opening or closing a commitment
+  // to anybody. The run that enrolls somebody is bracketed by events this
+  // projection already reads.
+  experiment_enrolled: "ignored",
+  experiment_unenrolled: "ignored",
   host_job_submitted: "ignored",
   host_job_stopped: "ignored",
   host_job_exited: "ignored",

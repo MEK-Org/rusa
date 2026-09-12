@@ -7,6 +7,7 @@ import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
 import 'avatar.dart';
+import 'hierarchy_drag_drop.dart';
 import 'status_dot.dart';
 
 /// Left sidebar: "Active Hierarchy" header + Show-Retired toggle + the alive
@@ -74,9 +75,16 @@ class ActorTree extends StatelessWidget {
                   itemCount: visible.length,
                   itemBuilder: (_, i) {
                     final t = visible[i];
-                    final hasVisibleChildren = store.actorStates.value.actors.values.any(
-                      (c) => c.thread.parentId == t.id && store.isThreadVisible(c.thread),
-                    );
+                    final hasVisibleChildren = store
+                        .actorStates
+                        .value
+                        .actors
+                        .values
+                        .any(
+                          (c) =>
+                              c.thread.parentId == t.id &&
+                              store.isThreadVisible(c.thread),
+                        );
                     final isCollapsed = store.collapsed.value.contains(t.id);
                     return _ActorRow(
                       thread: t,
@@ -90,6 +98,7 @@ class ActorTree extends StatelessWidget {
                       isCollapsed: isCollapsed,
                       onToggleCollapse: () => store.toggleCollapsed(t.id),
                       store: store,
+                      canAcceptDrop: _canAcceptActorDrop,
                     );
                   },
                 );
@@ -99,6 +108,38 @@ class ActorTree extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  bool _canAcceptActorDrop(
+    ThreadDto dragged,
+    ThreadDto target,
+    HierarchyDropZone zone,
+  ) {
+    if (dragged.id == target.id ||
+        dragged.isRetired ||
+        target.isRetired ||
+        dragged.parentId == null ||
+        _isActorDescendant(target.id, dragged.id)) {
+      return false;
+    }
+    return zone == HierarchyDropZone.on || dragged.parentId == target.parentId;
+  }
+
+  /// True when [candidateId] is in [ancestorId]'s loaded ancestry chain.
+  /// The server remains authoritative, but this makes impossible loaded-tree
+  /// drops unavailable before a request is made.
+  bool _isActorDescendant(String candidateId, String ancestorId) {
+    final byId = {
+      for (final state in store.actorStates.value.actors.values)
+        state.thread.id: state.thread,
+    };
+    final visited = <String>{};
+    var cursor = byId[candidateId]?.parentId;
+    while (cursor != null && visited.add(cursor)) {
+      if (cursor == ancestorId) return true;
+      cursor = byId[cursor]?.parentId;
+    }
+    return false;
   }
 
   Widget _header(BuildContext context) => Padding(
@@ -362,6 +403,7 @@ class _ActorRow extends StatefulWidget {
     required this.isCollapsed,
     required this.onToggleCollapse,
     required this.store,
+    required this.canAcceptDrop,
   });
 
   final ThreadDto thread;
@@ -375,14 +417,13 @@ class _ActorRow extends StatefulWidget {
   final bool isCollapsed;
   final VoidCallback onToggleCollapse;
   final DashboardStore store;
+  final bool Function(ThreadDto, ThreadDto, HierarchyDropZone) canAcceptDrop;
 
   @override
   State<_ActorRow> createState() => _ActorRowState();
 }
 
 class _ActorRowState extends State<_ActorRow> {
-  bool _dropBefore = true;
-
   Widget _buildChevron() {
     if (!widget.hasChildren) {
       return const SizedBox(width: 24);
@@ -420,10 +461,7 @@ class _ActorRowState extends State<_ActorRow> {
       text,
       maxLines: 1,
       overflow: TextOverflow.ellipsis,
-      style: kMonoStyle.copyWith(
-        fontSize: 11,
-        color: MeshColors.textSecondary,
-      ),
+      style: kMonoStyle.copyWith(fontSize: 11, color: MeshColors.textSecondary),
     );
     if (pool == null && modelClass == null && desiredModelClass == null) {
       return label;
@@ -449,7 +487,7 @@ class _ActorRowState extends State<_ActorRow> {
 
   Widget _buildContent(
     BuildContext context, {
-    bool isHoveredTarget = false,
+    HierarchyDropZone? activeDropZone,
   }) {
     final thread = widget.thread;
     final dot = widget.dot;
@@ -475,7 +513,8 @@ class _ActorRowState extends State<_ActorRow> {
     final staging = staged != null
         ? !listEquals(staged, pool) || desiredModelClass != modelClass
         : desiredModelClass != null ||
-              (thread.desiredModel != null && thread.desiredModel != thread.model);
+              (thread.desiredModel != null &&
+                  thread.desiredModel != thread.model);
     final showModel =
         thread.model != null ||
         thread.desiredModel != null ||
@@ -486,245 +525,213 @@ class _ActorRowState extends State<_ActorRow> {
     final currentModel = thread.model ?? (staging ? 'default' : '');
     final currentText = modelClass != null
         ? 'class $modelClass'
-        : (isPool
-              ? '$currentModel${_poolSuffix(pool.length)}'
-              : currentModel);
+        : (isPool ? '$currentModel${_poolSuffix(pool.length)}' : currentModel);
     final desiredModel = thread.desiredModel ?? 'default';
     final desiredText = desiredModelClass != null
         ? 'class $desiredModelClass'
         : (isPool
               ? '$desiredModel${_poolSuffix(staged?.length ?? 0)}'
               : desiredModel);
-    final displayedModel = staging ? '$currentText → $desiredText' : currentText;
+    final displayedModel = staging
+        ? '$currentText → $desiredText'
+        : currentText;
     final tooltipPool =
         modelClass != null || desiredModelClass != null || isPool ? pool : null;
 
-    return Container(
-      decoration: BoxDecoration(
-        color: isHoveredTarget
-            ? MeshColors.accent.withValues(alpha: 0.08)
-            : (widget.selected ? MeshColors.bgSelected : Colors.transparent),
-        border: Border(
-          top: isHoveredTarget && _dropBefore
-              ? const BorderSide(color: MeshColors.accent, width: 2)
-              : BorderSide.none,
-          bottom: isHoveredTarget && !_dropBefore
-              ? const BorderSide(color: MeshColors.accent, width: 2)
-              : BorderSide.none,
-        ),
-      ),
-      padding: EdgeInsets.fromLTRB(
-        12.0 + widget.depth * 16,
-        widget.touchTargets ? 12 : 6,
-        12,
-        widget.touchTargets ? 12 : 6,
-      ),
-      child: Row(
-        children: [
-          _buildChevron(),
-          const SizedBox(width: 4),
-          // Shared with overview rows so avatar status remains identical in
-          // the hierarchy and its active-work summary.
-          ActorAvatarWithStatus(
-            id: thread.id,
-            state: dot,
-            retired: thread.isRetired,
-            store: widget.store,
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  thread.handle,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: kMonoStyle.copyWith(
-                    fontSize: 16,
-                    color: thread.isRetired
-                        ? MeshColors.textMuted
-                        : MeshColors.textPrimary,
-                    fontWeight: widget.selected
-                        ? FontWeight.w700
-                        : FontWeight.w500,
-                  ),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  thread.title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 12,
-                    color: MeshColors.textMuted,
-                  ),
-                ),
-                if (showModel ||
-                    showEffort ||
-                    thread.commitmentKind != null) ...[
-                  const SizedBox(height: 4),
-                  Row(
-                    children: [
-                      if (showModel)
-                        Flexible(
-                          child: _modelLabel(
-                            displayedModel,
-                            pool: tooltipPool,
-                            staged: staged,
-                            modelClass: modelClass,
-                            desiredModelClass: desiredModelClass,
-                          ),
-                        ),
-                      if (showEffort) ...[
-                        if (showModel)
-                          const SizedBox(width: 6),
-                        Flexible(
-                          child: Text(
-                            thread.effortChangePending &&
-                                    thread.desiredEffort != thread.effort
-                                ? 'effort ${thread.effort ?? "default"} → ${thread.desiredEffort ?? "default"}'
-                                : 'effort ${thread.effort ?? "default"}',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: kMonoStyle.copyWith(
-                              fontSize: 11,
-                              color: MeshColors.textSecondary,
-                            ),
-                          ),
-                        ),
-                      ],
-                      if (thread.commitmentKind != null) ...[
-                        if (showModel || showEffort)
-                          const SizedBox(width: 6),
-                        _WorkStateBadge(
-                          kind: thread.commitmentKind!,
-                          compact: true,
-                        ),
-                      ],
-                    ],
-                  ),
-                ],
-              ],
-            ),
-          ),
-          if (isQueued) ...[
-            IconButton(
-              icon: const Icon(Icons.fast_forward_rounded, size: 18),
-              color: MeshColors.textSecondary,
-              hoverColor: MeshColors.accent.withValues(alpha: 0.15),
-              splashRadius: 14,
-              tooltip: 'Run now',
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-              onPressed: () => widget.store.runNowActor(thread.id),
-            ),
-            const SizedBox(width: 2),
-            IconButton(
-              icon: const Icon(Icons.stop_rounded, size: 20),
-              color: MeshColors.textSecondary,
-              hoverColor: MeshColors.statusHalted.withValues(alpha: 0.15),
-              splashRadius: 14,
-              tooltip: 'Cancel queued run',
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-              onPressed: () => widget.store.interruptActor(thread.id),
-            ),
-          ] else if (isRunning)
-            IconButton(
-              icon: const Icon(Icons.stop_rounded, size: 20),
-              color: MeshColors.textSecondary,
-              hoverColor: MeshColors.statusHalted.withValues(alpha: 0.15),
-              splashRadius: 14,
-              tooltip: 'Interrupt',
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-              onPressed: () => widget.store.interruptActor(thread.id),
-            )
-          else if (widget.touchTargets)
-            const Padding(
-              padding: EdgeInsets.only(left: 6),
-              child: Icon(
-                Icons.chevron_right,
-                size: 18,
-                color: MeshColors.textMuted,
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildFeedback(BuildContext context) {
-    return Material(
-      color: Colors.transparent,
-      elevation: 6,
-      borderRadius: BorderRadius.circular(8),
+    return HierarchyDropHighlight(
+      zone: activeDropZone,
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          color: MeshColors.bgSecondary,
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: MeshColors.accent),
+        color: widget.selected ? MeshColors.bgSelected : Colors.transparent,
+        padding: EdgeInsets.fromLTRB(
+          12.0 + widget.depth * 16,
+          widget.touchTargets ? 12 : 6,
+          12,
+          widget.touchTargets ? 12 : 6,
         ),
         child: Row(
-          mainAxisSize: MainAxisSize.min,
           children: [
-            StatusDot(state: widget.dot, size: 8),
-            const SizedBox(width: 8),
-            Text(
-              widget.thread.handle,
-              style: kMonoStyle.copyWith(
-                fontSize: 14,
-                color: MeshColors.textPrimary,
-                fontWeight: FontWeight.w600,
+            _buildChevron(),
+            const SizedBox(width: 4),
+            // Shared with overview rows so avatar status remains identical in
+            // the hierarchy and its active-work summary.
+            ActorAvatarWithStatus(
+              id: thread.id,
+              state: dot,
+              retired: thread.isRetired,
+              store: widget.store,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    thread.handle,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: kMonoStyle.copyWith(
+                      fontSize: 16,
+                      color: thread.isRetired
+                          ? MeshColors.textMuted
+                          : MeshColors.textPrimary,
+                      fontWeight: widget.selected
+                          ? FontWeight.w700
+                          : FontWeight.w500,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    thread.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: MeshColors.textMuted,
+                    ),
+                  ),
+                  if (showModel ||
+                      showEffort ||
+                      thread.commitmentKind != null) ...[
+                    const SizedBox(height: 4),
+                    Row(
+                      children: [
+                        if (showModel)
+                          Flexible(
+                            child: _modelLabel(
+                              displayedModel,
+                              pool: tooltipPool,
+                              staged: staged,
+                              modelClass: modelClass,
+                              desiredModelClass: desiredModelClass,
+                            ),
+                          ),
+                        if (showEffort) ...[
+                          if (showModel) const SizedBox(width: 6),
+                          Flexible(
+                            child: Text(
+                              thread.effortChangePending &&
+                                      thread.desiredEffort != thread.effort
+                                  ? 'effort ${thread.effort ?? "default"} → ${thread.desiredEffort ?? "default"}'
+                                  : 'effort ${thread.effort ?? "default"}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: kMonoStyle.copyWith(
+                                fontSize: 11,
+                                color: MeshColors.textSecondary,
+                              ),
+                            ),
+                          ),
+                        ],
+                        if (thread.commitmentKind != null) ...[
+                          if (showModel || showEffort) const SizedBox(width: 6),
+                          _WorkStateBadge(
+                            kind: thread.commitmentKind!,
+                            compact: true,
+                          ),
+                        ],
+                      ],
+                    ),
+                  ],
+                ],
               ),
             ),
+            if (isQueued) ...[
+              IconButton(
+                icon: const Icon(Icons.fast_forward_rounded, size: 18),
+                color: MeshColors.textSecondary,
+                hoverColor: MeshColors.accent.withValues(alpha: 0.15),
+                splashRadius: 14,
+                tooltip: 'Run now',
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                onPressed: () => widget.store.runNowActor(thread.id),
+              ),
+              const SizedBox(width: 2),
+              IconButton(
+                icon: const Icon(Icons.stop_rounded, size: 20),
+                color: MeshColors.textSecondary,
+                hoverColor: MeshColors.statusHalted.withValues(alpha: 0.15),
+                splashRadius: 14,
+                tooltip: 'Cancel queued run',
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                onPressed: () => widget.store.interruptActor(thread.id),
+              ),
+            ] else if (isRunning)
+              IconButton(
+                icon: const Icon(Icons.stop_rounded, size: 20),
+                color: MeshColors.textSecondary,
+                hoverColor: MeshColors.statusHalted.withValues(alpha: 0.15),
+                splashRadius: 14,
+                tooltip: 'Interrupt',
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                onPressed: () => widget.store.interruptActor(thread.id),
+              )
+            else if (widget.touchTargets)
+              const Padding(
+                padding: EdgeInsets.only(left: 6),
+                child: Icon(
+                  Icons.chevron_right,
+                  size: 18,
+                  color: MeshColors.textMuted,
+                ),
+              ),
           ],
         ),
       ),
     );
   }
 
+  Widget _buildFeedback(BuildContext context) {
+    return HierarchyDragFeedback(
+      leading: StatusDot(state: widget.dot, size: 8),
+      label: widget.thread.handle,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    return DragTarget<ThreadDto>(
-      onWillAcceptWithDetails: (details) {
-        return details.data.parentId == widget.thread.parentId &&
-            details.data.id != widget.thread.id;
-      },
-      onMove: (details) {
-        final renderBox = context.findRenderObject() as RenderBox?;
-        if (renderBox != null) {
-          final local = renderBox.globalToLocal(details.offset);
-          final dropBefore = local.dy < (renderBox.size.height / 2);
-          if (dropBefore != _dropBefore) {
-            setState(() => _dropBefore = dropBefore);
+    return HierarchyDropTarget<ThreadDto>(
+      canAccept: (dragged, zone) =>
+          widget.canAcceptDrop(dragged, widget.thread, zone),
+      onDrop: (dragged, zone) async {
+        try {
+          if (zone == HierarchyDropZone.on) {
+            await widget.store.reparentActor(dragged.id, widget.thread.id);
+          } else {
+            widget.store.reorderActor(
+              dragged.id,
+              widget.thread.id,
+              before: zone == HierarchyDropZone.before,
+            );
+          }
+        } catch (err) {
+          if (context.mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Failed to move actor: $err'),
+                backgroundColor: MeshColors.statusHalted,
+              ),
+            );
           }
         }
       },
-      onAcceptWithDetails: (details) {
-        widget.store.reorderActor(
-          details.data.id,
-          widget.thread.id,
-          before: _dropBefore,
-        );
-      },
-      builder: (context, candidateData, rejectedData) {
-        final isHoveredTarget = candidateData.isNotEmpty;
+      builder: (context, activeDropZone) {
         final childWhenDragging = Opacity(
           opacity: 0.35,
           child: _buildContent(context),
         );
         final child = InkWell(
           onTap: widget.onSelect,
-          child: _buildContent(context, isHoveredTarget: isHoveredTarget),
+          child: _buildContent(context, activeDropZone: activeDropZone),
         );
 
         if (widget.touchTargets) {
           return LongPressDraggable<ThreadDto>(
             data: widget.thread,
+            dragAnchorStrategy: pointerDragAnchorStrategy,
             hitTestBehavior: HitTestBehavior.opaque,
             feedback: _buildFeedback(context),
             childWhenDragging: childWhenDragging,
@@ -734,6 +741,7 @@ class _ActorRowState extends State<_ActorRow> {
 
         return Draggable<ThreadDto>(
           data: widget.thread,
+          dragAnchorStrategy: pointerDragAnchorStrategy,
           hitTestBehavior: HitTestBehavior.opaque,
           feedback: _buildFeedback(context),
           childWhenDragging: childWhenDragging,
@@ -760,9 +768,7 @@ class _WorkStateBadge extends StatelessWidget {
       decoration: BoxDecoration(
         color: MeshColors.accent.withValues(alpha: 0.14),
         borderRadius: BorderRadius.circular(4),
-        border: Border.all(
-          color: MeshColors.accent.withValues(alpha: 0.65),
-        ),
+        border: Border.all(color: MeshColors.accent.withValues(alpha: 0.65)),
       ),
       child: Text(
         kind.toUpperCase(),

@@ -152,6 +152,7 @@ describe("handleMeshApiRequest", () => {
   let actors: InMemoryActorRepository;
   let deps: DashboardDataDeps;
   let rootSpawns: Array<{ request: unknown; principal: string }>;
+  let rootReparents: Array<{ id: string; parentId: string; principal: string }>;
 
   beforeEach(() => {
     db = new Database(":memory:");
@@ -162,6 +163,7 @@ describe("handleMeshApiRequest", () => {
     obligations = new ObligationRepository(db);
     actors = new InMemoryActorRepository();
     rootSpawns = [];
+    rootReparents = [];
     const mockMesh = {
       sendHumanMessage: (toId: string, body: string, sessionId: string) => {
         meshEvents.record({
@@ -188,6 +190,9 @@ describe("handleMeshApiRequest", () => {
         spawnChild: (request: unknown, principal: string) => {
           rootSpawns.push({ request, principal });
           return UUID_A;
+        },
+        reparentChild: (id: string, parentId: string, principal: string) => {
+          rootReparents.push({ id, parentId, principal });
         },
       } as unknown as RootControlService,
     };
@@ -375,6 +380,29 @@ describe("handleMeshApiRequest", () => {
         },
       },
     ]);
+  });
+
+  it("POST /api/mesh/actors/:id/reparent delegates an operator-root move", async () => {
+    const { res } = await call(
+      deps,
+      "POST",
+      `/api/mesh/actors/${UUID_B}/reparent`,
+      JSON.stringify({ parentId: UUID_A })
+    );
+    await settled(res);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ok: true });
+    expect(rootReparents).toEqual([{ id: UUID_B, parentId: UUID_A, principal: "human:operator" }]);
+  });
+
+  it("POST /api/mesh/actors/:id/reparent rejects a missing parent before root control", async () => {
+    const { res } = await call(deps, "POST", `/api/mesh/actors/${UUID_B}/reparent`, "{}");
+    await settled(res);
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("parentId is required");
+    expect(rootReparents).toEqual([]);
   });
 
   it("POST /api/mesh/actors forwards a portable context selection ", async () => {
@@ -1130,8 +1158,18 @@ describe("handleMeshApiRequest", () => {
     deps = {
       ...deps,
       providerQueueSnapshots: () => [
-        { threadId: UUID_A, position: 0, estimatedStartAt: "2026-06-21T00:00:10.000Z" },
-        { threadId: UUID_B, position: 1, estimatedStartAt: "2026-06-21T00:00:20.000Z" },
+        {
+          threadId: UUID_A,
+          position: 0,
+          estimatedStartAt: "2026-06-21T00:00:10.000Z",
+          pacingIntervalMs: 36_000_000,
+        },
+        {
+          threadId: UUID_B,
+          position: 1,
+          estimatedStartAt: "2026-06-21T00:00:20.000Z",
+          pacingIntervalMs: 36_000_000,
+        },
       ],
     };
 
@@ -1140,10 +1178,13 @@ describe("handleMeshApiRequest", () => {
     const byId = (id: string) => body.threads.find((t: { id: string }) => t.id === id);
     expect(byId(UUID_A).queuePosition).toBe(0);
     expect(byId(UUID_A).estimatedStartAt).toBe("2026-06-21T00:00:10.000Z");
+    expect(byId(UUID_A).pacingIntervalMs).toBe(36_000_000);
     expect(byId(UUID_B).queuePosition).toBe(1);
     expect(byId(UUID_B).estimatedStartAt).toBe("2026-06-21T00:00:20.000Z");
+    expect(byId(UUID_B).pacingIntervalMs).toBe(36_000_000);
     expect(byId("root").queuePosition).toBeNull();
     expect(byId("root").estimatedStartAt).toBeNull();
+    expect(byId("root").pacingIntervalMs).toBeNull();
   });
 
   it("GET /api/mesh/threads keeps each provider lane's queue position independent", async () => {
@@ -1155,8 +1196,18 @@ describe("handleMeshApiRequest", () => {
     deps = {
       ...deps,
       providerQueueSnapshots: () => [
-        { threadId: UUID_A, position: 0, estimatedStartAt: "2026-06-21T00:00:05.000Z" },
-        { threadId: UUID_B, position: 0, estimatedStartAt: "2026-06-21T00:01:00.000Z" },
+        {
+          threadId: UUID_A,
+          position: 0,
+          estimatedStartAt: "2026-06-21T00:00:05.000Z",
+          pacingIntervalMs: 5_000,
+        },
+        {
+          threadId: UUID_B,
+          position: 0,
+          estimatedStartAt: "2026-06-21T00:01:00.000Z",
+          pacingIntervalMs: 60_000,
+        },
       ],
     };
 
@@ -1176,8 +1227,8 @@ describe("handleMeshApiRequest", () => {
     deps = {
       ...deps,
       providerQueueSnapshots: () => [
-        { threadId: UUID_A, position: 0, estimatedStartAt: null },
-        { threadId: UUID_B, position: 1, estimatedStartAt: null },
+        { threadId: UUID_A, position: 0, estimatedStartAt: null, pacingIntervalMs: 10_000 },
+        { threadId: UUID_B, position: 1, estimatedStartAt: null, pacingIntervalMs: 10_000 },
       ],
     };
 
@@ -1199,7 +1250,9 @@ describe("handleMeshApiRequest", () => {
     let estimatedStartAt = "2026-06-21T00:00:10.000Z";
     deps = {
       ...deps,
-      providerQueueSnapshots: () => [{ threadId: UUID_A, position: 0, estimatedStartAt }],
+      providerQueueSnapshots: () => [
+        { threadId: UUID_A, position: 0, estimatedStartAt, pacingIntervalMs: 10_000 },
+      ],
     };
 
     const first = await call(deps, "GET", "/api/mesh/threads");
@@ -2235,7 +2288,7 @@ describe("handleMeshApiRequest", () => {
       it("excludes quiet terminal roots by default, includes them with includeTerminalRoots=true (#241)", async () => {
         obligations.create({ title: "live-root", id: "live-root", ownerId: "actor-1" });
         obligations.create({ title: "quiet-done", id: "quiet-done", ownerId: "actor-1" });
-        obligations.setTerminalStatus("quiet-done", "done");
+        obligations.setTerminalStatus("quiet-done", "done", null, null, "system:mesh");
 
         const { res: defaultRes } = await call(deps, "GET", "/api/mesh/obligations/forest");
         const defaultData = JSON.parse(defaultRes.body);
@@ -2276,7 +2329,7 @@ describe("handleMeshApiRequest", () => {
           parentId: "root-task",
           ownerId: "actor-2",
         });
-        obligations.setTerminalStatus("sub-1", "done");
+        obligations.setTerminalStatus("sub-1", "done", null, null, "system:mesh");
 
         const { res } = await call(deps, "GET", "/api/mesh/obligations/root-task");
         expect(res.statusCode).toBe(200);
@@ -2287,6 +2340,96 @@ describe("handleMeshApiRequest", () => {
           ["sub-1", "sub-2"].sort()
         );
         expect(data.blockingChildren.map((c: { id: string }) => c.id)).toEqual(["sub-2"]);
+        expect(data.blockedBy).toEqual([]);
+        expect(data.blockedByTotal).toBe(0);
+        expect(data.blockedByHasMore).toBe(false);
+        expect(data.blocks).toEqual([]);
+        expect(data.blocksTotal).toBe(0);
+        expect(data.blocksHasMore).toBe(false);
+      });
+
+      it("returns both blockedBy and blocks dependency directions with titles and externalRefs", async () => {
+        obligations.create({
+          title: "Prerequisite Non-GitHub",
+          id: "prereq-non-gh",
+          ownerId: "actor-1",
+        });
+        obligations.create({
+          title: "Prerequisite GitHub",
+          id: "prereq-gh",
+          ownerId: "actor-1",
+          externalRef: "github:MEK-Org/rusa/issues/101",
+        });
+        obligations.create({
+          title: "Target Obligation",
+          id: "target-ob",
+          ownerId: "actor-2",
+          blockedBy: ["prereq-non-gh", "prereq-gh"],
+        });
+        obligations.create({
+          title: "Dependent GitHub",
+          id: "dep-gh",
+          ownerId: "actor-3",
+          externalRef: "github:MEK-Org/rusa/issues/102",
+          blockedBy: ["target-ob"],
+        });
+        obligations.create({
+          title: "Dependent Non-GitHub",
+          id: "dep-non-gh",
+          ownerId: "actor-3",
+          blockedBy: ["target-ob"],
+        });
+
+        // Test target-ob: blocked by prereq-non-gh and prereq-gh; blocks dep-gh and dep-non-gh
+        const { res } = await call(deps, "GET", "/api/mesh/obligations/target-ob");
+        expect(res.statusCode).toBe(200);
+        const data = JSON.parse(res.body);
+
+        expect(data.blockedByTotal).toBe(2);
+        expect(data.blockedByHasMore).toBe(false);
+        expect(data.blockedBy).toHaveLength(2);
+        const nonGhPrereq = data.blockedBy.find((b: { id: string }) => b.id === "prereq-non-gh");
+        expect(nonGhPrereq.title).toBe("Prerequisite Non-GitHub");
+        expect(nonGhPrereq.externalRef).toBeNull();
+        const ghPrereq = data.blockedBy.find((b: { id: string }) => b.id === "prereq-gh");
+        expect(ghPrereq.title).toBe("Prerequisite GitHub");
+        expect(ghPrereq.externalRef.key).toBe("github:MEK-Org/rusa/issues/101");
+
+        expect(data.blocksTotal).toBe(2);
+        expect(data.blocksHasMore).toBe(false);
+        expect(data.blocks).toHaveLength(2);
+        const ghDep = data.blocks.find((b: { id: string }) => b.id === "dep-gh");
+        expect(ghDep.title).toBe("Dependent GitHub");
+        expect(ghDep.externalRef.key).toBe("github:MEK-Org/rusa/issues/102");
+        const nonGhDep = data.blocks.find((b: { id: string }) => b.id === "dep-non-gh");
+        expect(nonGhDep.title).toBe("Dependent Non-GitHub");
+        expect(nonGhDep.externalRef).toBeNull();
+
+        // Test pagination on blockedBy and blocks
+        const { res: pagedRes } = await call(
+          deps,
+          "GET",
+          "/api/mesh/obligations/target-ob?limit=1&blocked_by_offset=1&blocks_offset=1"
+        );
+        expect(pagedRes.statusCode).toBe(200);
+        const pagedData = JSON.parse(pagedRes.body);
+        expect(pagedData.blockedByTotal).toBe(2);
+        expect(pagedData.blockedBy).toHaveLength(1);
+        expect(pagedData.blockedByHasMore).toBe(false);
+        expect(pagedData.blocksTotal).toBe(2);
+        expect(pagedData.blocks).toHaveLength(1);
+        expect(pagedData.blocksHasMore).toBe(false);
+
+        // Test offset 0 hasMore
+        const { res: limitRes } = await call(
+          deps,
+          "GET",
+          "/api/mesh/obligations/target-ob?limit=1&blocked_by_offset=0&blocks_offset=0"
+        );
+        expect(limitRes.statusCode).toBe(200);
+        const limitData = JSON.parse(limitRes.body);
+        expect(limitData.blockedByHasMore).toBe(true);
+        expect(limitData.blocksHasMore).toBe(true);
       });
 
       it("returns obligation with referenceCache embeddings and isolates faults", async () => {
@@ -2502,10 +2645,14 @@ describe("handleMeshApiRequest", () => {
           id: "recurring-task",
           ownerId: "actor-1",
         });
-        obligations.setRecurrence("recurring-task", { policy: "cron", cronExpr: "0 * * * *" });
-        obligations.setTerminalStatus("recurring-task", "done", "cycle one");
-        obligations.activateScheduled("recurring-task");
-        obligations.setTerminalStatus("recurring-task", "done", "cycle two");
+        obligations.setRecurrence(
+          "recurring-task",
+          { policy: "cron", cronExpr: "0 * * * *" },
+          "system:mesh"
+        );
+        obligations.setTerminalStatus("recurring-task", "done", "cycle one", null, "system:mesh");
+        obligations.activateScheduled("recurring-task", "system:mesh");
+        obligations.setTerminalStatus("recurring-task", "done", "cycle two", null, "system:mesh");
 
         const { res } = await call(deps, "GET", "/api/mesh/obligations/recurring-task?limit=1");
         expect(res.statusCode).toBe(200);

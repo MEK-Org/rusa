@@ -2,7 +2,13 @@ import { randomUUID } from "node:crypto";
 import { getDb } from "../db/index.js";
 import type { MeshChat } from "../db/repositories/mesh-chat-repository.js";
 import { HUMAN_OPERATOR, isHumanOperator, MESH_SYSTEM } from "../mcp/stamp.js";
-import { prerequisiteEdgeKey } from "../obligations/obligation.js";
+import {
+  isBlockingObligationStatus,
+  isTerminalObligationStatus,
+  type Obligation,
+  type ObligationStatus,
+  prerequisiteEdgeKey,
+} from "../obligations/obligation.js";
 import {
   assertConcreteModelConfig,
   isModelClassReference,
@@ -49,6 +55,15 @@ import {
   isSubResourceOf,
   resourceKey,
 } from "./event-subscriptions.js";
+import {
+  assertKnownExperiment,
+  type ExperimentEnrollment,
+  type ExperimentEnrollmentChange,
+  type ExperimentEnrollmentStore,
+  InMemoryExperimentEnrollmentStore,
+  isKnownExperiment,
+  STRICT_OBLIGATION_HANDLING_EXPERIMENT,
+} from "./experiments.js";
 import { generateHandle } from "./handle-generator.js";
 import type { InboxEntry, InboxPayload, InboxStore } from "./inbox-store.js";
 import {
@@ -205,6 +220,33 @@ export interface LiveObligationSummary {
 export interface MeshObligationPort {
   findLiveByExternalRef(ref: string): { ownerId: string } | null;
   listLiveOwnedBy?(ownerId: string): readonly LiveObligationSummary[];
+  /** Point read and unbounded edge reads used only for strict run-local closure. */
+  get?(id: string): Obligation | null;
+  listDirectChildEdges?(
+    parentId: string
+  ): Array<{ id: string; status: ObligationStatus; creatorId: string | null }>;
+  listPrerequisiteEdges?(
+    dependentId: string
+  ): Array<{ prerequisiteId: string; status: ObligationStatus }>;
+}
+
+/**
+ * The narrower contract strict obligation handling (#382) actually requires.
+ *
+ * These reads stay optional on {@link MeshObligationPort} so an embedder built
+ * before #382 keeps working, but they are not optional for an *enrolled* actor:
+ * enrollment without this contract is a misconfiguration, not a soft mode.
+ * {@link ActorMesh.selectInboxEntries} refuses head attention in that state
+ * rather than letting an enrolled run yield cleanly on an untouched head.
+ */
+export type MeshObligationClosurePort = MeshObligationPort &
+  Required<Pick<MeshObligationPort, "get" | "listDirectChildEdges" | "listPrerequisiteEdges">>;
+
+/** Whether a wired port can answer every read strict closure needs. */
+export function supportsObligationClosureReads(
+  port: MeshObligationPort | undefined
+): port is MeshObligationClosurePort {
+  return Boolean(port?.get && port.listDirectChildEdges && port.listPrerequisiteEdges);
 }
 
 /** One live obligation owned inside a retiring subtree (#191). */
@@ -615,6 +657,14 @@ export interface ActorMeshOptions {
    * granted (see {@link grantableCapabilities}).
    */
   capabilityGrants?: CapabilityGrantStore;
+  /**
+   * Durable store of per-actor experiment enrollments (#394). Defaults to an
+   * in-memory store; the wiring supplies the SQLite-backed one, which is what
+   * makes an enrollment survive a restart. Only the root administers
+   * enrollments and only registered experiment names are accepted — both
+   * enforced here in the mesh, never in the store.
+   */
+  experimentEnrollments?: ExperimentEnrollmentStore;
   eventSourceOwners?: EventSourceOwnerStore;
   eventSourceSubscriptions?: EventSourceSubscriptionStore;
   /**
@@ -671,6 +721,15 @@ export interface ActorMeshOptions {
 }
 
 /**
+ * The exits a strict head-obligation run has, worded once. Both halves of the
+ * experiment read this string: the discipline an enrolled run is told when its
+ * selection arms enforcement, and the rejection raised if it yields cleanly
+ * anyway. One wording means the instruction cannot drift from the rule.
+ */
+const STRICT_HEAD_CLOSURE_EXITS =
+  "complete it, cancel it, schedule it, add a new unmet prerequisite, create a new live direct child, or write your own current checkpoint and then reassign the still-ready obligation to a distinct active actor";
+
+/**
  * The actor scheduler (design Part D — the v2 pump repurposed). It owns the
  * {@link ActorRepository} (durable records) and the set of *live* actors,
  * and provides the mesh's primitives:
@@ -689,6 +748,35 @@ export interface ActorMeshOptions {
  * Per-actor serialization comes from each actor's TriggerRunner; cross-actor
  * concurrency is bounded by a shared {@link ConcurrencyLimiter}.
  */
+interface HeadClosureRunState {
+  headObligationIds: Set<string>;
+  /**
+   * Each strict head as it stood when this actor first selected it in this
+   * run, or null when the closure could not read it then. Handoff evidence is
+   * scoped to the run against this snapshot, exactly as the child and
+   * prerequisite exits are scoped against the pre-existing id sets below: the
+   * run must have started with this actor owning the head, and the checkpoint
+   * it hands off with must be a rewrite made during the run rather than a
+   * standing left over from an earlier one.
+   *
+   * The first observation is the one kept. Re-selecting the same head later in
+   * the run must not refresh the baseline, or a mid-run rewrite followed by a
+   * re-selection would read as "unchanged" and a mid-run transfer as "never
+   * owned".
+   */
+  selectedHeads: Map<string, SelectedHeadSnapshot | null>;
+  preExistingChildIds: Map<string, Set<string>>;
+  preExistingPrerequisiteIds: Map<string, Set<string>>;
+}
+
+/** The fields of a selected strict head that a handoff is judged against. */
+interface SelectedHeadSnapshot {
+  ownerId: string;
+  checkpoint: string | null;
+  checkpointAt: string | null;
+  checkpointBy: string | null;
+}
+
 export class ActorMesh {
   readonly actors: ActorRepository;
   private readonly createActor: ActorFactory;
@@ -737,10 +825,13 @@ export class ActorMesh {
   }) => string;
   readonly eventManager?: EventManager;
   private readonly grants: CapabilityGrantStore;
+  private readonly experiments: ExperimentEnrollmentStore;
   private readonly eventSourceOwners: EventSourceOwnerStore;
   private readonly eventSourceSubscriptions: EventSourceSubscriptionStore;
   private readonly configuredEventSources: readonly EventResource[] | undefined;
   private readonly obligations?: MeshObligationPort;
+  /** Captured at selection so root enrollment changes never alter an active run. */
+  private readonly headClosureRuns = new Map<string, HeadClosureRunState>();
   private readonly inboxStore?: InboxStore;
   private readonly isVoiceSessionActive: (actorId: string) => boolean;
   private readonly voiceSessionTransfer?: VoiceSessionTransferPort;
@@ -798,6 +889,7 @@ export class ActorMesh {
     this.supportsExecutionTarget = opts.supportsExecutionTarget;
     this.validateModel = opts.validateModel;
     this.grants = opts.capabilityGrants ?? new InMemoryCapabilityGrantStore();
+    this.experiments = opts.experimentEnrollments ?? new InMemoryExperimentEnrollmentStore();
     this.eventSourceOwners = opts.eventSourceOwners ?? new InMemoryEventSourceOwnerStore();
     this.eventSourceSubscriptions =
       opts.eventSourceSubscriptions ?? new InMemoryEventSourceSubscriptionStore();
@@ -1213,6 +1305,7 @@ export class ActorMesh {
   actorQueued(actorId: string, context: { responsive: boolean; mode: ActorRunMode }): InboxEntry[] {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
+    this.headClosureRuns.delete(actorId);
     // Open the run-scoped head window. An actor absent from this set delivers
     // head attention immediately, which is what every non-run producer wants.
     this.actorsInRun.add(actorId);
@@ -1267,8 +1360,78 @@ export class ActorMesh {
       }
       return entry;
     });
+    // Capture experiment membership now. Root can revise enrollment later, but
+    // that governs a future selection rather than retroactively releasing or
+    // constraining this already-running actor.
+    const headObligationIds = this.isEnrolledInExperiment(
+      actorId,
+      STRICT_OBLIGATION_HANDLING_EXPERIMENT
+    )
+      ? entries.flatMap((entry) =>
+          entry.payload.type === "obligation.ready_head" &&
+          typeof entry.payload.obligationId === "string"
+            ? [entry.payload.obligationId]
+            : []
+        )
+      : [];
+    // Fail closed, and fail here — before the selection commits, so nothing has
+    // run yet and no clean yield can slip past unenforced. An enrolled actor in
+    // a mesh without closure reads is a misconfiguration the root must fix by
+    // wiring the port or unenrolling, not a run that silently opts out.
+    const closure = this.obligations;
+    if (headObligationIds.length > 0 && !supportsObligationClosureReads(closure)) {
+      throw new Error(
+        `Cannot select head attention: ${actorId} is enrolled in ${STRICT_OBLIGATION_HANDLING_EXPERIMENT}, but this mesh has no obligation closure reads (get, listDirectChildEdges, listPrerequisiteEdges) wired. Wire the closure port or unenroll the actor.`
+      );
+    }
     beforeCommit?.(entries);
     this.selectedInboxEntryIds.set(actorId, unique);
+    if (headObligationIds.length > 0 && supportsObligationClosureReads(closure)) {
+      const run: HeadClosureRunState = this.headClosureRuns.get(actorId) ?? {
+        headObligationIds: new Set<string>(),
+        selectedHeads: new Map<string, SelectedHeadSnapshot | null>(),
+        preExistingChildIds: new Map<string, Set<string>>(),
+        preExistingPrerequisiteIds: new Map<string, Set<string>>(),
+      };
+      this.headClosureRuns.set(actorId, run);
+      for (const obligationId of headObligationIds) {
+        run.headObligationIds.add(obligationId);
+        if (!run.selectedHeads.has(obligationId)) {
+          // An unreadable head is recorded as such rather than left absent, so
+          // a later re-selection cannot quietly supply a baseline the run did
+          // not start with. Enforcement then fails closed on a handoff of it;
+          // every other exit is judged from the live row as before.
+          const selected = closure.get(obligationId);
+          run.selectedHeads.set(
+            obligationId,
+            selected
+              ? {
+                  ownerId: selected.ownerId,
+                  checkpoint: selected.checkpoint,
+                  checkpointAt: selected.checkpointAt,
+                  checkpointBy: selected.checkpointBy,
+                }
+              : null
+          );
+        }
+        if (!run.preExistingChildIds.has(obligationId)) {
+          run.preExistingChildIds.set(
+            obligationId,
+            new Set(closure.listDirectChildEdges(obligationId).map((child) => child.id))
+          );
+        }
+        if (!run.preExistingPrerequisiteIds.has(obligationId)) {
+          run.preExistingPrerequisiteIds.set(
+            obligationId,
+            new Set(
+              closure
+                .listPrerequisiteEdges(obligationId)
+                .map((prerequisite) => prerequisite.prerequisiteId)
+            )
+          );
+        }
+      }
+    }
     const actor = this.live.get(actorId);
     if (actor) {
       this.actorRuntimeStateChanged(actorId, this.runtimeStateOf(actor), {
@@ -1276,6 +1439,31 @@ export class ActorMesh {
       });
     }
     return entries;
+  }
+
+  /**
+   * The experiment-specific discipline in force for this actor's current run,
+   * or undefined when none is — the text an enrolled actor is told at
+   * selection, so a rejected yield is never its first explanation of the rule.
+   *
+   * This reads the armed run state {@link assertCleanYieldAllowed} enforces
+   * rather than re-evaluating enrollment. Instruction and enforcement are then
+   * the same decision: a root enrollment change lands on both at the next
+   * selection and on neither in between, and an actor that is told nothing is
+   * an actor nothing will be enforced against.
+   *
+   * States the obligation rule directly without experiment framing, and per
+   * head: enforcement walks every armed head, so a selection of several is
+   * told that each one must take a legal exit, not just the first.
+   */
+  runDisciplineNotice(actorId: string): string | undefined {
+    actorId = this.resolveThreadId(actorId);
+    const runState = this.headClosureRuns.get(actorId);
+    if (!runState || runState.headObligationIds.size === 0) return undefined;
+    const heads = [...runState.headObligationIds];
+    const selected =
+      heads.length === 1 ? `head obligation ${heads[0]}` : `head obligations ${heads.join(", ")}`;
+    return `This run selected ${selected}. Before \`yield_run\`, every selected head must take one of these exits: ${STRICT_HEAD_CLOSURE_EXITS}. A clean yield that leaves any selected head as it was found is rejected.`;
   }
 
   selectedInboxEntries(actorId: string): readonly string[] {
@@ -1286,6 +1474,7 @@ export class ActorMesh {
   finishInboxRun(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
+    this.headClosureRuns.delete(actorId);
     this.flushRunHeadAttention(actorId);
     // Both factory-created workers and the externally-created root finish runs
     // through this boundary. Applying here covers a tuple staged mid-run: it
@@ -1304,6 +1493,7 @@ export class ActorMesh {
   abandonInboxRun(actorId: string): void {
     actorId = this.resolveThreadId(actorId);
     this.selectedInboxEntryIds.delete(actorId);
+    this.headClosureRuns.delete(actorId);
     this.flushRunHeadAttention(actorId);
   }
 
@@ -1934,6 +2124,142 @@ export class ActorMesh {
         this.log(`onCapabilityRevoked failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+  }
+
+  /**
+   * Enroll an actor in a hard-coded experiment (#394) — the rollout primitive
+   * that keeps "try this on a few actors first" from becoming a permanent
+   * column on `actors`.
+   *
+   * Root-only and ungrantable: administering a rollout is not a capability the
+   * mesh can hand out, so the check is `isRootActor` here rather than an
+   * allow-list anywhere. Enrollment is strictly post-spawn — the actor must
+   * already exist — and a retired actor is refused, matching
+   * {@link setActorModel}: enrolling a thread that is not going to run again
+   * records an intent nothing will ever read.
+   *
+   * Idempotent: `changed` is true when this call actually enrolled the actor,
+   * false when it was already enrolled; `actorId` is the canonical thread id
+   * the enrollment is keyed on (a legacy `"root"` address resolves), so a
+   * caller can correlate the response with {@link listExperimentEnrollments}.
+   * Only a real change records an event. Throws if the experiment is not
+   * registered, the actor is unknown or retired, or the caller is not root.
+   */
+  enrollActorInExperiment(
+    actorId: string,
+    experiment: string,
+    enrolledBy: string
+  ): ExperimentEnrollmentChange {
+    actorId = this.resolveThreadId(actorId);
+    enrolledBy = this.resolveThreadId(enrolledBy);
+    const name = assertKnownExperiment(experiment);
+    const record = this.assertExperimentAuthority(enrolledBy, actorId, "enroll");
+    if (record.status === "retired") {
+      throw new Error(`Cannot enroll a retired thread: ${actorId}`);
+    }
+    const enrollment: ExperimentEnrollment = {
+      actorId,
+      experiment: name,
+      enrolledBy,
+      enrolledAt: this.now(),
+    };
+    if (!this.experiments.enroll(enrollment)) return { actorId, changed: false };
+    this.recordEvent({
+      kind: "experiment_enrolled",
+      actorId,
+      detail: name,
+      payload: JSON.stringify({ enrolledBy }),
+    });
+    return { actorId, changed: true };
+  }
+
+  /**
+   * Remove an actor's enrollment, subject to the same root-only authority as
+   * {@link enrollActorInExperiment}. Idempotent: `changed` is true when a real
+   * enrollment was removed, false when there was nothing to remove, and only a
+   * real change records an event.
+   *
+   * A retired actor may be unenrolled, deliberately unlike enrollment. An
+   * enrollment outlives retirement so a revived actor resumes the rollout it
+   * was in; withdrawing a rollout from a retired actor must therefore not
+   * require reviving it first.
+   *
+   * Similarly, unenrollment does not require the experiment to still be
+   * registered in code: if an experiment was removed from the registry, any
+   * lingering durable rows can still be cleanly unenrolled via this path
+   * without requiring manual SQL. The event's `detail` is then the stored
+   * name, which no consumer checks against the registry.
+   */
+  unenrollActorFromExperiment(
+    actorId: string,
+    experiment: string,
+    unenrolledBy: string
+  ): ExperimentEnrollmentChange {
+    actorId = this.resolveThreadId(actorId);
+    unenrolledBy = this.resolveThreadId(unenrolledBy);
+    this.assertExperimentAuthority(unenrolledBy, actorId, "unenroll");
+    if (!this.experiments.unenroll(actorId, experiment)) return { actorId, changed: false };
+    this.recordEvent({
+      kind: "experiment_unenrolled",
+      actorId,
+      detail: experiment,
+      payload: JSON.stringify({ unenrolledBy }),
+    });
+    return { actorId, changed: true };
+  }
+
+  /**
+   * The runtime evaluation API: is this actor in this experiment right now?
+   * Read straight through to the durable store, so an enrollment made by
+   * another connection takes effect without a restart.
+   *
+   * An unregistered name answers false rather than throwing. That is not
+   * leniency: a name outside the registry can never have been enrolled, so
+   * false is the only correct answer, and a call site deciding behavior should
+   * not have to guard against its own registry constant.
+   */
+  isEnrolledInExperiment(actorId: string, experiment: string): boolean {
+    if (!isKnownExperiment(experiment)) return false;
+    return this.experiments.isEnrolled(this.resolveThreadId(actorId), experiment);
+  }
+
+  /** Every current enrollment in (actorId, experiment) order — the root's readback view. */
+  listExperimentEnrollments(actorId?: string): ExperimentEnrollment[] {
+    const enrollments = this.experiments.list();
+    if (!actorId) return enrollments;
+    const targetId = this.resolveThreadId(actorId);
+    return enrollments.filter((enrollment) => enrollment.actorId === targetId);
+  }
+
+  /**
+   * Authority for experiment administration (#394): root only, over its own
+   * subtree (itself included), and only for an actor that exists. Fail-closed —
+   * an unknown caller is never root — and enforced HERE rather than only at the
+   * tool layer, so the "ungrantable, root-only" boundary holds for any future
+   * caller. Returns the target's record, which both callers need next.
+   */
+  private assertExperimentAuthority(
+    callerId: string,
+    actorId: string,
+    verb: "enroll" | "unenroll"
+  ): ActorRecord {
+    const preposition = verb === "enroll" ? "in" : "from";
+    if (!this.isRootActor(callerId)) {
+      throw new Error(`only the root may ${verb} an actor ${preposition} an experiment`);
+    }
+    const record = this.actors.get(actorId);
+    if (!record) {
+      throw new Error(`unknown thread id: ${actorId}`);
+    }
+    // Not redundant with the root check above: `isRoot` is decoupled from
+    // top-level topology, so another root's subtree is a legal shape that this
+    // root must not reach into. `isAncestorOf` admits the root itself.
+    if (!this.isAncestorOf(callerId, actorId)) {
+      throw new Error(
+        `root ${callerId} may only ${verb} actors in its own subtree ${preposition} an experiment (cannot ${verb} ${actorId})`
+      );
+    }
+    return record;
   }
 
   /** Every grant, active and revoked — for the root's `list_grants` tool + audit. */
@@ -2662,17 +2988,26 @@ export class ActorMesh {
   declareYield(id: string, status: string, note?: string): void {
     id = this.resolveThreadId(id);
     const actor = this.live.get(id);
-    const runId = actor ? (this.recordRunYield?.(id, status, note) ?? null) : null;
-    this.recordEvent({
-      kind: "run_yielded",
-      actorId: id,
-      detail: actor ? status : "dropped — no live actor",
-      body: note,
-    });
     if (!actor) {
+      this.recordEvent({
+        kind: "run_yielded",
+        actorId: id,
+        detail: "dropped — no live actor",
+        body: note,
+      });
       this.log(`yield from ${id} dropped — no live actor`);
       return;
     }
+    if (status === "complete" || status === "blocked") {
+      this.assertCleanYieldAllowed(id);
+    }
+    const runId = this.recordRunYield?.(id, status, note) ?? null;
+    this.recordEvent({
+      kind: "run_yielded",
+      actorId: id,
+      detail: status,
+      body: note,
+    });
     actor.declareYield(status, note);
     const parentId = this.actors.get(id)?.parentId;
     const inboxStore = this.inboxStore;
@@ -2696,6 +3031,161 @@ export class ActorMesh {
         status,
       });
     }
+  }
+
+  private assertCleanYieldAllowed(actorId: string): void {
+    const runState = this.headClosureRuns.get(actorId);
+    if (!runState || runState.headObligationIds.size === 0) return;
+    const closure = this.obligations;
+    // Selection already refused to arm a run without these reads, so this is
+    // the second half of the same fail-closed rule rather than a soft skip: an
+    // enforced run never yields cleanly on evidence the mesh cannot read.
+    if (!supportsObligationClosureReads(closure)) {
+      const [obligationId] = runState.headObligationIds;
+      this.rejectCleanYield(
+        actorId,
+        obligationId ?? "unknown",
+        null,
+        "the mesh obligation closure port is unavailable, so closure cannot be verified"
+      );
+    }
+
+    for (const obligationId of runState.headObligationIds) {
+      const obligation = closure.get(obligationId);
+      if (!obligation || !isBlockingObligationStatus(obligation.status)) continue;
+
+      if (obligation.status === "ready") {
+        const shortfall = this.strictHandoffShortfall(
+          actorId,
+          obligation,
+          runState.selectedHeads.get(obligationId) ?? null
+        );
+        if (shortfall === null) continue;
+        this.rejectCleanYield(actorId, obligationId, obligation.title, shortfall);
+      }
+
+      const preExistingChildren =
+        runState.preExistingChildIds.get(obligationId) ?? new Set<string>();
+      const hasNewlyCreatedLiveChild = closure
+        .listDirectChildEdges(obligationId)
+        .some(
+          (child) =>
+            child.creatorId === actorId &&
+            !isTerminalObligationStatus(child.status) &&
+            !preExistingChildren.has(child.id)
+        );
+      const preExistingPrerequisites =
+        runState.preExistingPrerequisiteIds.get(obligationId) ?? new Set<string>();
+      const hasNewlyAddedUnmetPrerequisite = closure
+        .listPrerequisiteEdges(obligationId)
+        .some(
+          (prerequisite) =>
+            !preExistingPrerequisites.has(prerequisite.prerequisiteId) &&
+            !isTerminalObligationStatus(prerequisite.status)
+        );
+      if (!hasNewlyCreatedLiveChild && !hasNewlyAddedUnmetPrerequisite) {
+        this.rejectCleanYield(
+          actorId,
+          obligationId,
+          obligation.title,
+          "obligation is waiting on pre-existing work but gained neither a newly created live direct child nor a newly added unmet prerequisite during this run"
+        );
+      }
+    }
+  }
+
+  /**
+   * Why a still-ready strict head does not count as handed off by this run, or
+   * null when it does (#420).
+   *
+   * A handoff is the outgoing owner's own act: the run started with this actor
+   * owning the head, the head now belongs to a distinct actor that can be
+   * woken, and the checkpoint it carries was written by this actor during the
+   * run. The selection-time owner is load-bearing rather than a restatement of
+   * `actorId`: head attention is delivered to the owner, but ownership can move
+   * between delivery and selection (an ancestor reassigns it elsewhere), and
+   * without the snapshot such a run could yield cleanly on a transfer it never
+   * performed. The checkpoint is compared against the same snapshot so a
+   * standing left from an earlier run cannot stand in for this one.
+   *
+   * The obligation row and the ready-head transition are already committed by
+   * the repository before this runs, which is what makes the disposition
+   * durable: the live listener delivers the recipient's attention in-process,
+   * and boot reconciliation restores it if the process is interrupted between
+   * that commit and the wake.
+   */
+  private strictHandoffShortfall(
+    outgoingActorId: string,
+    obligation: Obligation,
+    selected: SelectedHeadSnapshot | null
+  ): string | null {
+    const recipientId = this.resolveThreadId(obligation.ownerId);
+    if (recipientId === outgoingActorId) return "obligation is still ready";
+    const moved = `obligation is still ready and moved to ${obligation.ownerId}`;
+    if (!selected) {
+      return `${moved}, but it could not be read when selected, so the transfer cannot be attributed to this run`;
+    }
+    if (this.resolveThreadId(selected.ownerId) !== outgoingActorId) {
+      return `${moved}, but this actor did not own it when selected, so the transfer is not this run's handoff`;
+    }
+    if (!obligation.checkpoint || obligation.checkpointBy !== outgoingActorId) {
+      return `${moved} without a checkpoint written by this actor`;
+    }
+    if (
+      obligation.checkpoint === selected.checkpoint &&
+      obligation.checkpointAt === selected.checkpointAt &&
+      obligation.checkpointBy === selected.checkpointBy
+    ) {
+      return `${moved} with a checkpoint left over from before this run rather than rewritten during it`;
+    }
+    if (!this.isWakeableRecipient(obligation.ownerId)) {
+      return `${moved}, which is not an active actor that can be woken`;
+    }
+    return null;
+  }
+
+  /**
+   * Whether a handoff recipient will ever be woken for the work: an actor in
+   * the tree — not a human or system principal, which no inbox serves — whose
+   * durable record is active and which is not mid-retirement. The durable
+   * record is used rather than `live` on purpose: an active recipient may be
+   * between process restart and rehydration, when the committed ready-head
+   * transition is exactly what restores its queue. Retirement is the one
+   * non-restart state that record cannot show (see {@link isActiveActor}).
+   */
+  private isWakeableRecipient(ownerId: string): boolean {
+    if (ownerId.startsWith("human:") || ownerId.startsWith("system:")) return false;
+    return this.isActiveActor(this.resolveThreadId(ownerId));
+  }
+
+  /**
+   * Active by durable record and not currently being torn down. Retiring a
+   * subtree recurses into children first and only marks each actor retired on
+   * the way back out, so an ancestor unwinding its own retire still reads as
+   * active right up until it's torn down.
+   */
+  private isActiveActor(id: string): boolean {
+    return this.actors.get(id)?.status === "active" && !this.retiring.has(id);
+  }
+
+  private rejectCleanYield(
+    actorId: string,
+    obligationId: string,
+    title: string | null,
+    reason: string
+  ): never {
+    this.recordEvent({
+      kind: "run_yield_rejected",
+      actorId,
+      detail: `Clean yield rejected for head obligation ${obligationId}: ${reason}`,
+      payload: JSON.stringify({ obligationId, title, reason }),
+    });
+    this.log(
+      `clean yield from ${actorId} rejected: head obligation ${obligationId} not finished or decomposed (${reason})`
+    );
+    throw new Error(
+      `Cannot yield run: selected head obligation ${obligationId} ("${title ?? obligationId}") was not finished or decomposed. Reason: ${reason}. Before yielding cleanly, ${STRICT_HEAD_CLOSURE_EXITS}.`
+    );
   }
 
   markUnkillable(actorId: string): void {
@@ -3851,25 +4341,21 @@ export class ActorMesh {
    * Who should hear that a scheduled message will never arrive: the sender if
    * it's genuinely live, else its nearest live ancestor.
    *
-   * "Live" is narrower than `status === "active"`. Retiring a subtree recurses
-   * into children first and only marks each actor retired on the way back out,
-   * so an ancestor unwinding its own retire still reads as active right up until
-   * it's torn down. Notifying it would post into an actor that is about to be
-   * closed — the notification is accepted
-   * and then destroyed, which looks identical to delivering it.
+   * "Live" here is {@link isActiveActor}, narrower than `status === "active"`:
+   * notifying an ancestor unwinding its own retire would post into an actor
+   * that is about to be closed — the notification is accepted and then
+   * destroyed, which looks identical to delivering it.
    *
    * The walk can't stop at the first parent for the same reason: when a whole
    * subtree goes down, that parent is usually mid-retire too.
    */
   private resolveDropNotifyTarget(fromId: string): string | null {
-    const isLive = (id: string): boolean =>
-      this.actors.get(id)?.status === "active" && !this.retiring.has(id);
-    if (isLive(fromId)) return fromId;
+    if (this.isActiveActor(fromId)) return fromId;
 
     const seen = new Set<string>([fromId]);
     let next = this.actors.get(fromId)?.parentId;
     while (next && !seen.has(next)) {
-      if (isLive(next)) return next;
+      if (this.isActiveActor(next)) return next;
       seen.add(next);
       next = this.actors.get(next)?.parentId;
     }

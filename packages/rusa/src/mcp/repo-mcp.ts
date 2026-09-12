@@ -5,6 +5,7 @@ import {
   type PullRequestChecksStatus,
   PullRequestChecksUnreadableError,
 } from "../gitops/issue-client.js";
+import { parseCloseOnMergeDirective } from "./close-on-merge.js";
 import { toolError, toolOk } from "./result.js";
 import { stampAuthor } from "./stamp.js";
 import { createMcpServer } from "./strict-server.js";
@@ -45,6 +46,19 @@ export function createRepoMcpServer(
       ? checks.blocking.map((check) => `${check.name} (${check.conclusion})`).join(", ")
       : `overall checks state: ${checks.state}`;
 
+  const errorMessage = (err: unknown) => (err instanceof Error ? err.message : String(err));
+
+  const matchingCloseDirective = (
+    beforeMerge: ReturnType<typeof parseCloseOnMergeDirective>,
+    afterMerge: ReturnType<typeof parseCloseOnMergeDirective>
+  ) =>
+    beforeMerge.kind === "close" &&
+    afterMerge.kind === "close" &&
+    beforeMerge.issueNumbers.length === afterMerge.issueNumbers.length &&
+    beforeMerge.issueNumbers.every(
+      (issueNumber, index) => issueNumber === afterMerge.issueNumbers[index]
+    );
+
   server.registerTool(
     "merge_pull_request",
     {
@@ -79,6 +93,15 @@ export function createRepoMcpServer(
         const trimmedOverrideReason = overrideReason?.trim();
         if (overrideFailingChecks && !trimmedOverrideReason) {
           return toolError(new Error("overrideReason is required to merge over non-green checks"));
+        }
+
+        const pr = await issueClient.getPullRequestDetails(repo, prNumber);
+        const closeDirective =
+          pr.baseRef === "staging"
+            ? parseCloseOnMergeDirective(pr.body)
+            : { kind: "absent" as const };
+        if (closeDirective.kind === "malformed") {
+          return toolError(new Error(closeDirective.reason));
         }
 
         let checkedHeadSha: string | undefined;
@@ -138,8 +161,51 @@ export function createRepoMcpServer(
             // successfully merged PR because the follow-up comment failed.
           }
         }
+        const closeResults: string[] = [];
+        if (closeDirective.kind === "close") {
+          try {
+            const mergedPr = await issueClient.getPullRequestDetails(repo, prNumber);
+            const mergedDirective =
+              mergedPr.baseRef === "staging"
+                ? parseCloseOnMergeDirective(mergedPr.body)
+                : { kind: "absent" as const };
+            if (!matchingCloseDirective(closeDirective, mergedDirective)) {
+              closeResults.push(
+                "Did not close requested issues: the merged pull request no longer matched the directive read before merge."
+              );
+            } else {
+              for (const issueNumber of closeDirective.issueNumbers) {
+                try {
+                  await issueClient.closeIssue(repo, issueNumber, "completed");
+                  closeResults.push(`Closed #${issueNumber}.`);
+                  try {
+                    await issueClient.postComment(
+                      repo,
+                      issueNumber,
+                      appendAuthorStamp(
+                        `Closed automatically after pull request #${prNumber} merged to staging.`,
+                        repo,
+                        issueNumber
+                      )
+                    );
+                  } catch (err) {
+                    closeResults.push(
+                      `Closed #${issueNumber}, but could not post its merge record: ${errorMessage(err)}`
+                    );
+                  }
+                } catch (err) {
+                  closeResults.push(`Could not close #${issueNumber}: ${errorMessage(err)}`);
+                }
+              }
+            }
+          } catch (err) {
+            closeResults.push(
+              `Did not close requested issues because the merged pull request could not be re-read: ${errorMessage(err)}`
+            );
+          }
+        }
         options.onWrite?.();
-        return toolOk(sha);
+        return toolOk([sha, ...closeResults].join("\n"));
       } catch (err) {
         return toolError(err);
       }

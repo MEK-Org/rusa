@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:rusa_dashboard/breakpoints.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/util.dart';
@@ -20,6 +21,73 @@ Widget _app(
 );
 
 void main() {
+  testWidgets(
+    'Overview uses columns wide and stacks My Queue above quota pacing narrow',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi();
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        addTearDown(store.dispose);
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        await tester.binding.setSurfaceSize(const Size(1200, 900));
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        final wideQueue = tester.getRect(find.text('My Queue'));
+        final wideQuota = tester.getRect(
+          find.text('Quota Pacing — Prior 3 Days'),
+        );
+        expect(wideQueue.left, lessThan(wideQuota.left));
+        expect(wideQueue.bottom, greaterThan(wideQuota.top));
+        expect(wideQuota.bottom, greaterThan(wideQueue.top));
+        expect(find.text('New Obligation'), findsOneWidget);
+
+        await tester.binding.setSurfaceSize(const Size(390, 844));
+        await tester.pump();
+
+        final narrowQueue = tester.getRect(find.text('My Queue'));
+        final narrowQuota = tester.getRect(
+          find.text('Quota Pacing — Prior 3 Days'),
+        );
+        expect(narrowQueue.left, closeTo(narrowQuota.left, 1));
+        expect(narrowQueue.top, lessThan(narrowQuota.top));
+        expect(find.text('New Obligation'), findsNothing);
+        expect(find.byIcon(Icons.add), findsOneWidget);
+
+        // Just below kNarrowBreakpoint (700): 20px tab padding on each side (40 total).
+        // Surface width 739 gives maxWidth 699 < 700 -> stacked vertically.
+        await tester.binding.setSurfaceSize(
+          const Size(kNarrowBreakpoint + 40 - 1, 900),
+        );
+        await tester.pump();
+
+        final justBelowQueue = tester.getRect(find.text('My Queue'));
+        final justBelowQuota = tester.getRect(
+          find.text('Quota Pacing — Prior 3 Days'),
+        );
+        expect(justBelowQueue.left, closeTo(justBelowQuota.left, 1));
+        expect(justBelowQueue.top, lessThan(justBelowQuota.top));
+
+        // At kNarrowBreakpoint (700): surface width 740 gives maxWidth 700 -> two columns.
+        await tester.binding.setSurfaceSize(
+          const Size(kNarrowBreakpoint + 40, 900),
+        );
+        await tester.pump();
+
+        final atBoundaryQueue = tester.getRect(find.text('My Queue'));
+        final atBoundaryQuota = tester.getRect(
+          find.text('Quota Pacing — Prior 3 Days'),
+        );
+        expect(atBoundaryQueue.left, lessThan(atBoundaryQuota.left));
+        expect(atBoundaryQueue.bottom, greaterThan(atBoundaryQuota.top));
+        expect(atBoundaryQuota.bottom, greaterThan(atBoundaryQueue.top));
+      });
+    },
+  );
+
   testWidgets('yield rows do not overflow at mobile (~390px) width ', (
     tester,
   ) async {
@@ -334,6 +402,25 @@ void main() {
       expect(find.text('0 queued'), findsOneWidget);
 
       // root becomes queued.
+      // Queue admission revalidates the pacing explanation, so model the
+      // authoritative snapshot the server has published for this revision.
+      api
+        ..runtimeCursor = const RuntimeCursor(streamId: 'stream-a', revision: 3)
+        ..threadsResult = [
+          makeThread('root', created: 't0', runState: RunState.queued),
+          makeThread(
+            'w1',
+            parent: 'root',
+            created: 't1',
+            runState: RunState.running,
+          ),
+          makeThread(
+            'w2',
+            parent: 'root',
+            created: 't2',
+            runState: RunState.idle,
+          ),
+        ];
       stream.runtimeStatesCtrl.add(
         const ActorRuntimeStateDelta(
           streamId: 'stream-a',
@@ -440,18 +527,39 @@ void main() {
               parent: 'root',
               runState: RunState.queued,
               estimatedStartAt: '2026-01-01T00:00:30.000Z',
+              pacingIntervalMs: 36000000,
             ),
             makeThread(
               'early',
               parent: 'root',
               runState: RunState.queued,
               estimatedStartAt: '2026-01-01T00:00:10.000Z',
+              pacingIntervalMs: 36000000,
             ),
+            // A lane with no pacing gap whose clock was pushed out by an
+            // explicit deferral: quote the estimate, never "every 0s".
+            makeThread(
+              'deferred',
+              parent: 'root',
+              runState: RunState.queued,
+              estimatedStartAt: '2026-01-01T00:00:20.000Z',
+              pacingIntervalMs: 0,
+            ),
+            // No estimate at position 0 is the staged head holding for a
+            // mesh concurrency slot; position 1 is the request behind it.
             makeThread(
               'unknown',
               parent: 'root',
               runState: RunState.queued,
-              queuePosition: 2,
+              queuePosition: 0,
+              pacingIntervalMs: 36000000,
+            ),
+            makeThread(
+              'behind',
+              parent: 'root',
+              runState: RunState.queued,
+              queuePosition: 1,
+              pacingIntervalMs: 36000000,
             ),
           ];
         final store = DashboardStore(api: api, stream: FakeStream());
@@ -461,23 +569,50 @@ void main() {
         await tester.pump();
         await tester.pump();
 
-        expect(find.text('3 queued'), findsOneWidget);
+        expect(find.text('5 queued'), findsOneWidget);
         expect(
-          find.text('Estimated start ${formatTs('2026-01-01T00:00:10.000Z')}'),
+          find.text(
+            'Provider pacing every 10.0h; '
+            'Estimated start ${formatTs('2026-01-01T00:00:10.000Z')}',
+          ),
           findsOneWidget,
         );
         expect(
-          find.text('Estimated start ${formatTs('2026-01-01T00:00:30.000Z')}'),
+          find.text(
+            'Provider pacing every 10.0h; '
+            'Estimated start ${formatTs('2026-01-01T00:00:30.000Z')}',
+          ),
           findsOneWidget,
         );
-        expect(find.text('Lane position 3'), findsOneWidget);
+        expect(
+          find.text('Estimated start ${formatTs('2026-01-01T00:00:20.000Z')}'),
+          findsOneWidget,
+        );
+        expect(
+          find.text(
+            'Waiting for mesh concurrency; provider pacing every 10.0h.',
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.text(
+            'Lane position 2; behind a request waiting for mesh concurrency; '
+            'provider pacing every 10.0h.',
+          ),
+          findsOneWidget,
+        );
 
-        // Rendered in estimated run order: early, then late, then unknown.
+        // Rendered in estimated run order: early, deferred, late, then the
+        // unknown-ETA entries by lane position.
         final earlyY = tester.getTopLeft(find.text('early-handle')).dy;
+        final deferredY = tester.getTopLeft(find.text('deferred-handle')).dy;
         final lateY = tester.getTopLeft(find.text('late-handle')).dy;
         final unknownY = tester.getTopLeft(find.text('unknown-handle')).dy;
-        expect(earlyY, lessThan(lateY));
+        final behindY = tester.getTopLeft(find.text('behind-handle')).dy;
+        expect(earlyY, lessThan(deferredY));
+        expect(deferredY, lessThan(lateY));
         expect(lateY, lessThan(unknownY));
+        expect(unknownY, lessThan(behindY));
         await store.dispose();
       });
     },

@@ -81,13 +81,15 @@ export interface DashboardDataDeps {
    * Read-only, per-lane FIFO snapshots from every live `ProviderPacer`,
    * flattened across lanes. `position` is 0-based within its own provider
    * lane (not globally comparable across lanes); `estimatedStartAt` is an
-   * ISO-8601 projection or `null` when it can't be honestly quoted yet —
-   * see `ProviderPacer.getQueueSnapshot` for the full contract this mirrors.
+   * ISO-8601 projection or `null` when it can't be honestly quoted yet;
+   * `pacingIntervalMs` is the lane's whole-millisecond start spacing — see
+   * `ProviderPacer.getQueueSnapshot` for the full contract this mirrors.
    */
   providerQueueSnapshots?: () => Array<{
     threadId: string;
     position: number;
     estimatedStartAt: string | null;
+    pacingIntervalMs: number;
   }>;
   /**
    * Current selected obligation for an actor's active run. This is a
@@ -258,6 +260,12 @@ interface ThreadDto {
    * live pacer state — never persisted, and shifts as pacing changes.
    */
   estimatedStartAt?: string | null;
+  /**
+   * Whole-millisecond start spacing on this request's provider lane, or
+   * `null` when the actor is not in a pacer queue. Same live-pacer source and
+   * lifetime as `estimatedStartAt`.
+   */
+  pacingIntervalMs?: number | null;
 }
 
 /**
@@ -558,6 +566,44 @@ export async function handleMeshApiRequest(
               "human:operator"
             );
             sendJson(res, 201, { id });
+          } catch (err) {
+            sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+          }
+        })
+        .catch((err) => sendJson(res, 500, { error: String(err) }));
+      return true;
+    }
+
+    // POST /api/mesh/actors/:id/reparent — operator-root reorganization.
+    const reparentActorMatch = pathname.match(/^\/api\/mesh\/actors\/([^/]+)\/reparent$/);
+    if (reparentActorMatch) {
+      const rootControl = deps?.rootControl;
+      if (!rootControl) {
+        sendJson(res, 503, { error: "root control unavailable" });
+        return true;
+      }
+      const actorId = decodeURIComponent(reparentActorMatch[1]);
+      readBody(req)
+        .then((bodyStr) => {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(bodyStr);
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON body" });
+            return;
+          }
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            sendJson(res, 400, { error: "Missing or invalid parentId" });
+            return;
+          }
+          const parentId = (parsed as Record<string, unknown>).parentId;
+          if (typeof parentId !== "string" || !parentId.trim()) {
+            sendJson(res, 400, { error: "parentId is required" });
+            return;
+          }
+          try {
+            rootControl.reparentChild(actorId, parentId.trim(), "human:operator");
+            sendJson(res, 200, { ok: true });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
           }
@@ -1004,7 +1050,13 @@ export async function handleMeshApiRequest(
             return;
           }
           try {
-            const obligation = obligations.setTerminalStatus(id, status, note, resolutionRef);
+            const obligation = obligations.setTerminalStatus(
+              id,
+              status,
+              note,
+              resolutionRef,
+              HUMAN_OPERATOR
+            );
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1057,7 +1109,7 @@ export async function handleMeshApiRequest(
           try {
             sendJson(res, 200, {
               ok: true,
-              obligation: obligations.setExternalRef(id, externalRef),
+              obligation: obligations.setExternalRef(id, externalRef, HUMAN_OPERATOR),
             });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1103,7 +1155,13 @@ export async function handleMeshApiRequest(
             return;
           }
           try {
-            const obligation = obligations.movePriorityInternal(id, previousId, nextId, scope);
+            const obligation = obligations.movePriorityInternal(
+              id,
+              previousId,
+              nextId,
+              HUMAN_OPERATOR,
+              scope
+            );
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1145,7 +1203,7 @@ export async function handleMeshApiRequest(
             return;
           }
           try {
-            const obligation = obligations.reparent(id, parentId);
+            const obligation = obligations.reparent(id, parentId, HUMAN_OPERATOR);
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1193,7 +1251,7 @@ export async function handleMeshApiRequest(
             return;
           }
           try {
-            const obligation = obligations.reassign(id, owner.ownerId);
+            const obligation = obligations.reassign(id, owner.ownerId, HUMAN_OPERATOR);
             sendJson(res, 200, { ok: true, obligation });
           } catch (err) {
             sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
@@ -1408,6 +1466,7 @@ export async function handleMeshApiRequest(
         lastActiveAt: lastActiveByActor.get(r.id) ?? null,
         queuePosition: providerQueueSnapshots.get(r.id)?.position ?? null,
         estimatedStartAt: providerQueueSnapshots.get(r.id)?.estimatedStartAt ?? null,
+        pacingIntervalMs: providerQueueSnapshots.get(r.id)?.pacingIntervalMs ?? null,
         selectedProvider: selection?.provider ?? null,
         selectedLane: selection?.lane ?? null,
         selectedModel: selection?.model ?? null,
@@ -1585,7 +1644,7 @@ export async function handleMeshApiRequest(
     return true;
   }
 
-  // GET /api/mesh/obligations/:id — single obligation with parent + children + blockingChildren
+  // GET /api/mesh/obligations/:id — single obligation with parent + children + blockingChildren + dependencies
   const obligationMatch = pathname.match(/^\/api\/mesh\/obligations\/([^/]+)$/);
   if (obligationMatch) {
     if (!deps.obligations) {
@@ -1601,6 +1660,8 @@ export async function handleMeshApiRequest(
     const limit = clampLimit(url, MAX_OBLIGATION_PAGE_LIMIT);
     const offset = parsePositiveInt(url, "offset") ?? 0;
     const completionsOffset = parsePositiveInt(url, "completions_offset") ?? 0;
+    const blockedByOffset = parsePositiveInt(url, "blocked_by_offset") ?? 0;
+    const blocksOffset = parsePositiveInt(url, "blocks_offset") ?? 0;
     const children = deps.obligations.listChildrenPage(id, { limit, offset });
     const blockingChildren = deps.obligations.listChildrenPage(id, {
       limit,
@@ -1610,6 +1671,14 @@ export async function handleMeshApiRequest(
     const completions = deps.obligations.listCompletionsPage(id, {
       limit,
       offset: completionsOffset,
+    });
+    const blockedBy = deps.obligations.listBlockedByPage(id, {
+      limit,
+      offset: blockedByOffset,
+    });
+    const blocks = deps.obligations.listUnblocksPage(id, {
+      limit,
+      offset: blocksOffset,
     });
     const parent = obligation.parentId ? deps.obligations.get(obligation.parentId) : null;
     const artifacts = await Promise.all(
@@ -1642,6 +1711,12 @@ export async function handleMeshApiRequest(
       completions: completions.completions,
       completionsTotal: completions.total,
       completionsHasMore: completions.hasMore,
+      blockedBy: blockedBy.obligations,
+      blockedByTotal: blockedBy.total,
+      blockedByHasMore: blockedBy.hasMore,
+      blocks: blocks.obligations,
+      blocksTotal: blocks.total,
+      blocksHasMore: blocks.hasMore,
       artifacts,
       externalReference,
     });

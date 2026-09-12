@@ -5,6 +5,7 @@ import '../breakpoints.dart';
 import '../models.dart';
 import '../store.dart';
 import '../theme.dart';
+import 'brand_mark.dart';
 
 /// The top-level dashboard views the header nav switches between.
 enum DashboardView { overview, actors, understanding, reports, work }
@@ -108,8 +109,10 @@ const Map<String, QuotaProviderConfig> kDefaultQuotaProviders = {
   ),
 };
 
-/// Top bar matching the locked V1.4.0 header: brand on the left, a compact live
-/// status indicator in the brand cluster, and quota rings on the right.
+/// Top bar matching the locked V1.4.0 header: brand on the left (the
+/// antler/tree mark, issue #412), a halted badge only while an active halt
+/// exists — no routine status indicator during normal operation — and quota
+/// rings on the right.
 /// Deliberately NO summary stats (alive/events/messages) — Operator cut them.
 ///
 /// Carries a minimal nav ("Overview" / "Actors" / "IU") that slots into the
@@ -209,7 +212,7 @@ class MeshHeader extends StatelessWidget {
                                 initialData: store.halted.valueOrNull ?? false,
                                 builder: (_, snap) => (snap.data ?? false)
                                     ? _HaltedBadge(compact: compact)
-                                    : _LivePulse(compact: compact),
+                                    : const SizedBox.shrink(),
                               ),
                               StreamBuilder<List<String>?>(
                                 stream: store.schedulerWarning,
@@ -288,10 +291,11 @@ class MeshHeader extends StatelessWidget {
   }
 }
 
-/// The brand slot's leading widget: the mesh icon on the desktop, a hamburger
-/// once a drawer is wired, and a back arrow while a phone detail view is open.
-/// Only ever one of them — the phone header has exactly one leading action, and
-/// a detail view spends no separate row on its back affordance.
+/// The brand slot's leading widget: the antler/tree mark on the desktop, a
+/// hamburger once a drawer is wired, and a back arrow while a phone detail
+/// view is open. Only ever one of them — the phone header has exactly one
+/// leading action, and a detail view spends no separate row on its back
+/// affordance.
 class _LeadingAction extends StatelessWidget {
   const _LeadingAction({required this.onMenuTap, required this.onBack});
 
@@ -303,7 +307,7 @@ class _LeadingAction extends StatelessWidget {
     final back = onBack;
     final menu = onMenuTap;
     if (back == null && menu == null) {
-      return const Icon(Icons.hub_outlined, color: MeshColors.accent, size: 22);
+      return const BrandMark();
     }
     return IconButton(
       onPressed: back ?? menu,
@@ -833,8 +837,9 @@ Color _legacyColorForRemaining(double remainingPercent) {
   return MeshColors.statusActive;
 }
 
-/// The engaged-emergency-brake indicator: a solid (non-pulsing) red pause icon
-/// and a bold "Halted" label — visually distinct from the active green pulse.
+/// The engaged-emergency-brake indicator: a solid red pause icon and a bold
+/// "Halted" label — the only status the header surfaces (issue #412), shown
+/// solely while an active halt exists.
 class _HaltedBadge extends StatelessWidget {
   const _HaltedBadge({this.compact = false});
 
@@ -921,54 +926,6 @@ class _SchedulerWarningBadge extends StatelessWidget {
           ],
         ),
       ),
-    );
-  }
-}
-
-class _LivePulse extends StatefulWidget {
-  const _LivePulse({this.compact = false});
-  final bool compact;
-  @override
-  State<_LivePulse> createState() => _LivePulseState();
-}
-
-class _LivePulseState extends State<_LivePulse>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _c = AnimationController(
-    vsync: this,
-    duration: const Duration(milliseconds: 1600),
-  )..repeat(reverse: true);
-
-  @override
-  void dispose() {
-    _c.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        FadeTransition(
-          opacity: Tween(begin: 0.4, end: 1.0).animate(_c),
-          child: Container(
-            width: 8,
-            height: 8,
-            decoration: const BoxDecoration(
-              color: MeshColors.statusActive,
-              shape: BoxShape.circle,
-            ),
-          ),
-        ),
-        if (!widget.compact) ...[
-          const SizedBox(width: 8),
-          const Text(
-            'Active',
-            style: TextStyle(color: MeshColors.textSecondary, fontSize: 13),
-          ),
-        ],
-      ],
     );
   }
 }

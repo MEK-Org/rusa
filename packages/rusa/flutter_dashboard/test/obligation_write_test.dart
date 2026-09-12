@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 import 'package:rusa_dashboard/api.dart';
+import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/widgets/inbox_tab.dart';
 import 'package:rusa_dashboard/widgets/obligation_card.dart';
@@ -15,49 +16,70 @@ import 'fakes.dart';
 
 void main() {
   group('DashboardApi Obligation Write Methods', () {
-    test('createObligation sends POST with correct payload and returns ObligationDto', () async {
+    test('reparentActor sends the root-control request', () async {
       final mockClient = MockClient((req) async {
-        expect(req.url.path, '/api/mesh/obligations');
+        expect(req.url.path, '/api/mesh/actors/worker/reparent');
         expect(req.method, 'POST');
-        final parsed = jsonDecode(req.body) as Map<String, dynamic>;
-        expect(parsed['ownerId'], 'cloudy-porpoise');
-        expect(parsed['title'], 'Test create');
-        expect(parsed['intent'], 'Test create body');
-        expect(parsed['priority'], 50.0);
-
-        return http.Response(
-          jsonEncode({
-            'obligation': {
-              'id': 'ob-new-1',
-              'parentId': null,
-              'ownerId': 'cloudy-porpoise',
-              'title': 'Test create',
-              'intent': 'Test create body',
-              'externalRef': null,
-              'status': 'ready',
-              'priority': 50.0,
-              'effectivePriority': 50.0,
-              'prioritySourceId': 'ob-new-1',
-            }
-          }),
-          201,
-        );
+        expect(jsonDecode(req.body), {'parentId': 'steward'});
+        return http.Response(jsonEncode({'ok': true}), 200);
       });
-
-      final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
-      final result = await api.createObligation(
-        ownerId: 'cloudy-porpoise',
-        title: 'Test create',
-        intent: 'Test create body',
-        priority: 50.0,
+      final api = DashboardApi(
+        client: mockClient,
+        base: Uri.parse('http://localhost:3000'),
       );
 
-      expect(result.id, 'ob-new-1');
-      expect(result.ownerId, 'cloudy-porpoise');
-      expect(result.title, 'Test create');
-      expect(result.heading, 'Test create');
-      expect(result.effectivePriority, 50.0);
+      await api.reparentActor('worker', parentId: 'steward');
     });
+
+    test(
+      'createObligation sends POST with correct payload and returns ObligationDto',
+      () async {
+        final mockClient = MockClient((req) async {
+          expect(req.url.path, '/api/mesh/obligations');
+          expect(req.method, 'POST');
+          final parsed = jsonDecode(req.body) as Map<String, dynamic>;
+          expect(parsed['ownerId'], 'cloudy-porpoise');
+          expect(parsed['title'], 'Test create');
+          expect(parsed['intent'], 'Test create body');
+          expect(parsed['priority'], 50.0);
+
+          return http.Response(
+            jsonEncode({
+              'obligation': {
+                'id': 'ob-new-1',
+                'parentId': null,
+                'ownerId': 'cloudy-porpoise',
+                'title': 'Test create',
+                'intent': 'Test create body',
+                'externalRef': null,
+                'status': 'ready',
+                'priority': 50.0,
+                'effectivePriority': 50.0,
+                'prioritySourceId': 'ob-new-1',
+              },
+            }),
+            201,
+          );
+        });
+
+        final api = DashboardApi(
+          client: mockClient,
+          base: Uri.parse('http://localhost:3000'),
+        );
+        final result = await api.createObligation(
+          ownerId: 'cloudy-porpoise',
+          title: 'Test create',
+          intent: 'Test create body',
+          priority: 50.0,
+        );
+
+        expect(result.id, 'ob-new-1');
+        expect(result.ownerId, 'cloudy-porpoise');
+        expect(result.title, 'Test create');
+        expect(result.heading, 'Test create');
+        expect(result.effectivePriority, 50.0);
+      },
+    );
 
     test('setObligationStatus sends POST and transitions status', () async {
       final mockClient = MockClient((req) async {
@@ -79,13 +101,16 @@ void main() {
               'priority': 100.0,
               'effectivePriority': 100.0,
               'prioritySourceId': 'ob-123',
-            }
+            },
           }),
           200,
         );
       });
 
-      final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
+      final api = DashboardApi(
+        client: mockClient,
+        base: Uri.parse('http://localhost:3000'),
+      );
       final result = await api.setObligationStatus('ob-123', 'done');
 
       expect(result.id, 'ob-123');
@@ -93,98 +118,127 @@ void main() {
       expect(result.isDone, true);
     });
 
-    test('setObligationStatus sends the note and parses terminalNote back', () async {
-      final mockClient = MockClient((req) async {
-        final parsed = jsonDecode(req.body) as Map<String, dynamic>;
-        expect(parsed['status'], 'cancelled');
-        expect(parsed['note'], 'Superseded by #61.');
+    test(
+      'setObligationStatus sends the note and parses terminalNote back',
+      () async {
+        final mockClient = MockClient((req) async {
+          final parsed = jsonDecode(req.body) as Map<String, dynamic>;
+          expect(parsed['status'], 'cancelled');
+          expect(parsed['note'], 'Superseded by #61.');
 
-        return http.Response(
-          jsonEncode({
-            'ok': true,
-            'obligation': {
-              'id': 'ob-123',
-              'parentId': null,
-              'ownerId': 'root',
-              'intent': 'Dropped task',
-              'externalRef': null,
-              'status': 'cancelled',
-              'priority': 100.0,
-              'effectivePriority': 100.0,
-              'prioritySourceId': 'ob-123',
-              'terminalNote': 'Superseded by #61.',
-            }
-          }),
-          200,
+          return http.Response(
+            jsonEncode({
+              'ok': true,
+              'obligation': {
+                'id': 'ob-123',
+                'parentId': null,
+                'ownerId': 'root',
+                'intent': 'Dropped task',
+                'externalRef': null,
+                'status': 'cancelled',
+                'priority': 100.0,
+                'effectivePriority': 100.0,
+                'prioritySourceId': 'ob-123',
+                'terminalNote': 'Superseded by #61.',
+              },
+            }),
+            200,
+          );
+        });
+
+        final api = DashboardApi(
+          client: mockClient,
+          base: Uri.parse('http://localhost:3000'),
         );
-      });
-
-      final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
-      final result = await api.setObligationStatus('ob-123', 'cancelled', note: 'Superseded by #61.');
-
-      expect(result.terminalNote, 'Superseded by #61.');
-    });
-
-    test('setObligationStatus omits a blank note rather than sending an empty reason', () async {
-      final mockClient = MockClient((req) async {
-        final parsed = jsonDecode(req.body) as Map<String, dynamic>;
-        // Absent, not ''. The server records "no reason given" as null, and an
-        // empty string would trip the column's own CHECK.
-        expect(parsed.containsKey('note'), false);
-
-        return http.Response(
-          jsonEncode({
-            'ok': true,
-            'obligation': {
-              'id': 'ob-123',
-              'parentId': null,
-              'ownerId': 'root',
-              'intent': 'Quiet task',
-              'externalRef': null,
-              'status': 'done',
-              'priority': 100.0,
-              'effectivePriority': 100.0,
-              'prioritySourceId': 'ob-123',
-              'terminalNote': null,
-            }
-          }),
-          200,
+        final result = await api.setObligationStatus(
+          'ob-123',
+          'cancelled',
+          note: 'Superseded by #61.',
         );
-      });
 
-      final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
-      final result = await api.setObligationStatus('ob-123', 'done', note: '   ');
+        expect(result.terminalNote, 'Superseded by #61.');
+      },
+    );
 
-      expect(result.terminalNote, isNull);
-    });
+    test(
+      'setObligationStatus omits a blank note rather than sending an empty reason',
+      () async {
+        final mockClient = MockClient((req) async {
+          final parsed = jsonDecode(req.body) as Map<String, dynamic>;
+          // Absent, not ''. The server records "no reason given" as null, and an
+          // empty string would trip the column's own CHECK.
+          expect(parsed.containsKey('note'), false);
 
-    test('setObligationExternalRef sends the raw ref and parses the result', () async {
-      final mockClient = MockClient((req) async {
-        expect(req.url.path, '/api/mesh/obligations/ob-1/external-ref');
-        final parsed = jsonDecode(req.body) as Map<String, dynamic>;
-        // Sent verbatim: the grammar is the server's to define, and validating
-        // it twice gives two places to disagree.
-        expect(parsed['externalRef'], 'github:MEK-Org/rusa');
-        return http.Response(
-          jsonEncode({
-            'ok': true,
-            'obligation': {
-              'id': 'ob-1',
-              'ownerId': 'root',
-              'title': 'Keep rusa releasable',
-              'externalRef': {'key': 'github:MEK-Org/rusa'},
-              'status': 'ready',
-              'effectivePriority': 1.0,
-            }
-          }),
-          200,
+          return http.Response(
+            jsonEncode({
+              'ok': true,
+              'obligation': {
+                'id': 'ob-123',
+                'parentId': null,
+                'ownerId': 'root',
+                'intent': 'Quiet task',
+                'externalRef': null,
+                'status': 'done',
+                'priority': 100.0,
+                'effectivePriority': 100.0,
+                'prioritySourceId': 'ob-123',
+                'terminalNote': null,
+              },
+            }),
+            200,
+          );
+        });
+
+        final api = DashboardApi(
+          client: mockClient,
+          base: Uri.parse('http://localhost:3000'),
         );
-      });
+        final result = await api.setObligationStatus(
+          'ob-123',
+          'done',
+          note: '   ',
+        );
 
-      final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
-      final result = await api.setObligationExternalRef('ob-1', '  github:MEK-Org/rusa  ');
-      expect(result.externalRef, 'github:MEK-Org/rusa');
-    });
+        expect(result.terminalNote, isNull);
+      },
+    );
+
+    test(
+      'setObligationExternalRef sends the raw ref and parses the result',
+      () async {
+        final mockClient = MockClient((req) async {
+          expect(req.url.path, '/api/mesh/obligations/ob-1/external-ref');
+          final parsed = jsonDecode(req.body) as Map<String, dynamic>;
+          // Sent verbatim: the grammar is the server's to define, and validating
+          // it twice gives two places to disagree.
+          expect(parsed['externalRef'], 'github:MEK-Org/rusa');
+          return http.Response(
+            jsonEncode({
+              'ok': true,
+              'obligation': {
+                'id': 'ob-1',
+                'ownerId': 'root',
+                'title': 'Keep rusa releasable',
+                'externalRef': {'key': 'github:MEK-Org/rusa'},
+                'status': 'ready',
+                'effectivePriority': 1.0,
+              },
+            }),
+            200,
+          );
+        });
+
+        final api = DashboardApi(
+          client: mockClient,
+          base: Uri.parse('http://localhost:3000'),
+        );
+        final result = await api.setObligationExternalRef(
+          'ob-1',
+          '  github:MEK-Org/rusa  ',
+        );
+        expect(result.externalRef, 'github:MEK-Org/rusa');
+      },
+    );
 
     test('a blank ref is sent as null, meaning unlink', () async {
       final mockClient = MockClient((req) async {
@@ -200,55 +254,67 @@ void main() {
               'externalRef': null,
               'status': 'ready',
               'effectivePriority': 1.0,
-            }
+            },
           }),
           200,
         );
       });
 
-      final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
-      expect((await api.setObligationExternalRef('ob-1', '   ')).externalRef, isNull);
-    });
-
-    test('reorderObligation sends POST with previousId, nextId, and scope', () async {
-      final mockClient = MockClient((req) async {
-        expect(req.url.path, '/api/mesh/obligations/ob-target/reorder');
-        expect(req.method, 'POST');
-        final parsed = jsonDecode(req.body) as Map<String, dynamic>;
-        expect(parsed['previousId'], 'ob-prev');
-        expect(parsed['nextId'], 'ob-next');
-        expect(parsed['scope'], 'subtree');
-
-        return http.Response(
-          jsonEncode({
-            'ok': true,
-            'obligation': {
-              'id': 'ob-target',
-              'parentId': null,
-              'ownerId': 'root',
-              'intent': 'Reordered',
-              'externalRef': null,
-              'status': 'ready',
-              'priority': 150.0,
-              'effectivePriority': 150.0,
-              'prioritySourceId': 'ob-target',
-            }
-          }),
-          200,
-        );
-      });
-
-      final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
-      final result = await api.reorderObligation(
-        'ob-target',
-        previousId: 'ob-prev',
-        nextId: 'ob-next',
-        scope: 'subtree',
+      final api = DashboardApi(
+        client: mockClient,
+        base: Uri.parse('http://localhost:3000'),
       );
-
-      expect(result.id, 'ob-target');
-      expect(result.effectivePriority, 150.0);
+      expect(
+        (await api.setObligationExternalRef('ob-1', '   ')).externalRef,
+        isNull,
+      );
     });
+
+    test(
+      'reorderObligation sends POST with previousId, nextId, and scope',
+      () async {
+        final mockClient = MockClient((req) async {
+          expect(req.url.path, '/api/mesh/obligations/ob-target/reorder');
+          expect(req.method, 'POST');
+          final parsed = jsonDecode(req.body) as Map<String, dynamic>;
+          expect(parsed['previousId'], 'ob-prev');
+          expect(parsed['nextId'], 'ob-next');
+          expect(parsed['scope'], 'subtree');
+
+          return http.Response(
+            jsonEncode({
+              'ok': true,
+              'obligation': {
+                'id': 'ob-target',
+                'parentId': null,
+                'ownerId': 'root',
+                'intent': 'Reordered',
+                'externalRef': null,
+                'status': 'ready',
+                'priority': 150.0,
+                'effectivePriority': 150.0,
+                'prioritySourceId': 'ob-target',
+              },
+            }),
+            200,
+          );
+        });
+
+        final api = DashboardApi(
+          client: mockClient,
+          base: Uri.parse('http://localhost:3000'),
+        );
+        final result = await api.reorderObligation(
+          'ob-target',
+          previousId: 'ob-prev',
+          nextId: 'ob-next',
+          scope: 'subtree',
+        );
+
+        expect(result.id, 'ob-target');
+        expect(result.effectivePriority, 150.0);
+      },
+    );
 
     test('reparentObligation sends POST with parentId', () async {
       final mockClient = MockClient((req) async {
@@ -270,14 +336,20 @@ void main() {
               'priority': null,
               'effectivePriority': 200.0,
               'prioritySourceId': 'ob-new-parent',
-            }
+            },
           }),
           200,
         );
       });
 
-      final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
-      final result = await api.reparentObligation('ob-child', parentId: 'ob-new-parent');
+      final api = DashboardApi(
+        client: mockClient,
+        base: Uri.parse('http://localhost:3000'),
+      );
+      final result = await api.reparentObligation(
+        'ob-child',
+        parentId: 'ob-new-parent',
+      );
 
       expect(result.id, 'ob-child');
       expect(result.parentId, 'ob-new-parent');
@@ -301,12 +373,15 @@ void main() {
               'priority': 100.0,
               'effectivePriority': 100.0,
               'prioritySourceId': 'ob-owner',
-            }
+            },
           }),
           200,
         );
       });
-      final api = DashboardApi(client: mockClient, base: Uri.parse('http://localhost:3000'));
+      final api = DashboardApi(
+        client: mockClient,
+        base: Uri.parse('http://localhost:3000'),
+      );
       final result = await api.reassignObligation(
         'ob-owner',
         ownerId: 'human:operator',
@@ -330,63 +405,80 @@ void main() {
       );
     });
 
-    testWidgets('renders work tab with obligation tree and interactive action buttons', (tester) async {
-      tester.view.physicalSize = const Size(1280, 900);
-      tester.view.devicePixelRatio = 1.0;
-      addTearDown(tester.view.resetDevicePixelRatio);
-      addTearDown(tester.view.resetPhysicalSize);
+    testWidgets(
+      'renders work tab with obligation tree and interactive action buttons',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 900);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.resetDevicePixelRatio);
+        addTearDown(tester.view.resetPhysicalSize);
 
-      final ob1 = makeObligation('ob-root-1', intent: 'Root Feature', status: 'ready');
-      final ob2 = makeObligation('ob-child-1', parentId: 'ob-root-1', intent: 'Child Task', status: 'ready');
-      api.obligationsResult = [ob1, ob2];
+        final ob1 = makeObligation(
+          'ob-root-1',
+          intent: 'Root Feature',
+          status: 'ready',
+        );
+        final ob2 = makeObligation(
+          'ob-child-1',
+          parentId: 'ob-root-1',
+          intent: 'Child Task',
+          status: 'ready',
+        );
+        api.obligationsResult = [ob1, ob2];
 
-      await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(
-            body: WorkTab(
-              store: store,
-              onSelectView: (_) {},
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
             ),
           ),
-        ),
-      );
+        );
 
-      await tester.pumpAndSettle();
+        await tester.pumpAndSettle();
 
-      expect(find.text('WORK QUEUE'), findsOneWidget);
-      expect(find.text('Root Feature'), findsOneWidget);
-      expect(find.byTooltip('New Root Obligation'), findsOneWidget);
+        expect(find.text('WORK QUEUE'), findsOneWidget);
+        expect(find.text('Root Feature'), findsOneWidget);
+        expect(find.byTooltip('New Root Obligation'), findsOneWidget);
 
-      // Tap on the root obligation in the tree
-      await tester.tap(find.text('Root Feature'));
-      await tester.pumpAndSettle();
+        // Tap on the root obligation in the tree
+        await tester.tap(find.text('Root Feature'));
+        await tester.pumpAndSettle();
 
-      // Check detail view sections
-      expect(find.text('OBLIGATION ACTIONS'), findsOneWidget);
-      expect(find.text('Mark Done'), findsOneWidget);
-      expect(find.text('Cancel Obligation'), findsOneWidget);
-      expect(find.text('Reassign...'), findsOneWidget);
-      expect(find.text('Reparent...'), findsOneWidget);
-      expect(find.text('Add Child...'), findsOneWidget);
+        // Check detail view sections
+        expect(find.text('OBLIGATION ACTIONS'), findsNothing);
+        expect(find.text('ob-root-1'), findsNothing);
+        expect(find.text('Reparent...'), findsNothing);
+        expect(find.byTooltip('Mark Done'), findsOneWidget);
+        expect(find.byTooltip('Cancel Obligation'), findsOneWidget);
+        expect(find.byTooltip('Reassign obligation'), findsOneWidget);
+        expect(find.byTooltip('Add child obligation'), findsOneWidget);
 
-      // Tap Mark Done and confirm dialog
-      await tester.tap(find.text('Mark Done'));
-      await tester.pumpAndSettle();
+        // Tap Mark Done and confirm dialog
+        await tester.tap(find.byTooltip('Mark Done'));
+        await tester.pumpAndSettle();
 
-      expect(find.text('Mark Done Obligation?'), findsOneWidget);
-      // Confirm the action
-      await tester.tap(find.descendant(of: find.byType(AlertDialog), matching: find.widgetWithText(ElevatedButton, 'Mark Done')));
-      await tester.pumpAndSettle();
+        expect(find.text('Mark Done Obligation?'), findsOneWidget);
+        // Confirm the action
+        await tester.tap(
+          find.descendant(
+            of: find.byType(AlertDialog),
+            matching: find.widgetWithText(ElevatedButton, 'Mark Done'),
+          ),
+        );
+        await tester.pumpAndSettle();
 
-      // Verify the status transition was recorded in the api
-      expect(api.statusCalls.length, 1);
-      expect(api.statusCalls.first.id, 'ob-root-1');
-      expect(api.statusCalls.first.status, 'done');
-      // No reason typed is no reason recorded, not an empty one.
-      expect(api.statusCalls.first.note, isNull);
-    });
+        // Verify the status transition was recorded in the api
+        expect(api.statusCalls.length, 1);
+        expect(api.statusCalls.first.id, 'ob-root-1');
+        expect(api.statusCalls.first.status, 'done');
+        // No reason typed is no reason recorded, not an empty one.
+        expect(api.statusCalls.first.note, isNull);
+      },
+    );
 
-    testWidgets('carries the operator\'s typed reason through to the API', (tester) async {
+    testWidgets('carries the operator\'s typed reason through to the API', (
+      tester,
+    ) async {
       tester.view.physicalSize = const Size(1280, 900);
       tester.view.devicePixelRatio = 1.0;
       addTearDown(tester.view.resetDevicePixelRatio);
@@ -407,11 +499,14 @@ void main() {
 
       await tester.tap(find.text('Root Feature'));
       await tester.pumpAndSettle();
-      await tester.tap(find.text('Cancel Obligation'));
+      await tester.tap(find.byTooltip('Cancel Obligation'));
       await tester.pumpAndSettle();
 
       await tester.enterText(
-        find.descendant(of: find.byType(AlertDialog), matching: find.byType(TextField)),
+        find.descendant(
+          of: find.byType(AlertDialog),
+          matching: find.byType(TextField),
+        ),
         'Superseded by the ancestry projection.',
       );
       await tester.tap(
@@ -423,7 +518,10 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(api.statusCalls.single.status, 'cancelled');
-      expect(api.statusCalls.single.note, 'Superseded by the ancestry projection.');
+      expect(
+        api.statusCalls.single.note,
+        'Superseded by the ancestry projection.',
+      );
     });
 
     testWidgets('shows why a terminal obligation ended', (tester) async {
@@ -445,11 +543,20 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('Completed because:'), findsOneWidget);
-      expect(find.text('Flutter — the tooling is already wired here.'), findsOneWidget);
+      expect(
+        find.text('Flutter — the tooling is already wired here.'),
+        findsOneWidget,
+      );
     });
 
-    testWidgets('says nothing about a reason when none was recorded', (tester) async {
-      final cancelled = makeObligation('ob-quiet', intent: 'Dropped', status: 'cancelled');
+    testWidgets('says nothing about a reason when none was recorded', (
+      tester,
+    ) async {
+      final cancelled = makeObligation(
+        'ob-quiet',
+        intent: 'Dropped',
+        status: 'cancelled',
+      );
 
       await tester.pumpWidget(
         MaterialApp(
@@ -463,7 +570,9 @@ void main() {
       expect(find.text('Cancelled because:'), findsNothing);
     });
 
-    testWidgets('owner panel labels the category instead of repeating the id', (tester) async {
+    testWidgets('owner panel labels the category instead of repeating the id', (
+      tester,
+    ) async {
       tester.view.physicalSize = const Size(1280, 900);
       tester.view.devicePixelRatio = 1.0;
       addTearDown(tester.view.resetDevicePixelRatio);
@@ -472,19 +581,22 @@ void main() {
       // Neither owner is a live actor this dashboard knows, so the panel's
       // primary line falls back to the raw id. Printing the id again beneath it
       // says nothing and drops the cue the old `Kind: ACTOR` line carried.
-      final operatorOwned =
-          makeObligation('ob-op', ownerId: 'human:operator', intent: 'Operator Work');
-      final ghostOwned =
-          makeObligation('ob-ghost', ownerId: 'actor-ghost', intent: 'Ghost Work');
+      final operatorOwned = makeObligation(
+        'ob-op',
+        ownerId: 'human:operator',
+        intent: 'Operator Work',
+      );
+      final ghostOwned = makeObligation(
+        'ob-ghost',
+        ownerId: 'actor-ghost',
+        intent: 'Ghost Work',
+      );
       api.obligationsResult = [operatorOwned, ghostOwned];
 
       await tester.pumpWidget(
         MaterialApp(
           home: Scaffold(
-            body: WorkTab(
-              store: store,
-              onSelectView: (_) {},
-            ),
+            body: WorkTab(store: store, onSelectView: (_) {}),
           ),
         ),
       );
@@ -501,7 +613,9 @@ void main() {
       expect(find.text('Actor — not in this mesh view'), findsOneWidget);
     });
 
-    testWidgets('opens the external-ref dialog and unlinks through the API', (tester) async {
+    testWidgets('opens the external-ref dialog and unlinks through the API', (
+      tester,
+    ) async {
       tester.view.physicalSize = const Size(1280, 900);
       tester.view.devicePixelRatio = 1.0;
       addTearDown(tester.view.resetDevicePixelRatio);
@@ -538,69 +652,87 @@ void main() {
       expect(find.text('External Reference'), findsNothing);
     });
 
-    testWidgets('keeps the external-ref dialog open and shows the server error', (tester) async {
-      tester.view.physicalSize = const Size(1280, 900);
-      tester.view.devicePixelRatio = 1.0;
-      addTearDown(tester.view.resetDevicePixelRatio);
-      addTearDown(tester.view.resetPhysicalSize);
+    testWidgets(
+      'keeps the external-ref dialog open and shows the server error',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 900);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.resetDevicePixelRatio);
+        addTearDown(tester.view.resetPhysicalSize);
 
-      api.externalRefError = StateError('external ref must name a GitHub target');
-      api.obligationsResult = [makeObligation('ob-linkable', intent: 'Linkable work')];
-      await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(
-            body: WorkTab(store: store, onSelectView: (_) {}),
+        api.externalRefError = StateError(
+          'external ref must name a GitHub target',
+        );
+        api.obligationsResult = [
+          makeObligation('ob-linkable', intent: 'Linkable work'),
+        ];
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
           ),
-        ),
-      );
-      await tester.pumpAndSettle();
+        );
+        await tester.pumpAndSettle();
 
-      await tester.tap(find.text('Linkable work'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.byTooltip('Link an issue, PR or repo'));
-      await tester.pumpAndSettle();
-      await tester.enterText(find.byType(TextField), 'github:MEK-Org/rusa/comments/9');
-      await tester.tap(find.widgetWithText(ElevatedButton, 'Save'));
-      await tester.pumpAndSettle();
+        await tester.tap(find.text('Linkable work'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.byTooltip('Link an issue, PR or repo'));
+        await tester.pumpAndSettle();
+        await tester.enterText(
+          find.byType(TextField),
+          'github:MEK-Org/rusa/comments/9',
+        );
+        await tester.tap(find.widgetWithText(ElevatedButton, 'Save'));
+        await tester.pumpAndSettle();
 
-      expect(find.text('External Reference'), findsOneWidget);
-      expect(find.text('Bad state: external ref must name a GitHub target'), findsOneWidget);
-    });
+        expect(find.text('External Reference'), findsOneWidget);
+        expect(
+          find.text('Bad state: external ref must name a GitHub target'),
+          findsOneWidget,
+        );
+      },
+    );
 
-    testWidgets('does not offer external-ref editing for a terminal obligation', (tester) async {
-      tester.view.physicalSize = const Size(1280, 900);
-      tester.view.devicePixelRatio = 1.0;
-      addTearDown(tester.view.resetDevicePixelRatio);
-      addTearDown(tester.view.resetPhysicalSize);
+    testWidgets(
+      'does not offer external-ref editing for a terminal obligation',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 900);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.resetDevicePixelRatio);
+        addTearDown(tester.view.resetPhysicalSize);
 
-      api.obligationsResult = [
-        makeObligation(
-          'ob-done',
-          intent: 'Finished work',
-          externalRef: 'github:MEK-Org/rusa',
-          status: 'done',
-        ),
-      ];
-      await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(
-            body: WorkTab(store: store, onSelectView: (_) {}),
+        api.obligationsResult = [
+          makeObligation(
+            'ob-done',
+            intent: 'Finished work',
+            externalRef: 'github:MEK-Org/rusa',
+            status: 'done',
           ),
-        ),
-      );
-      await tester.pumpAndSettle();
+        ];
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
 
-      await tester.tap(find.byTooltip('Show Done'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Finished work'));
-      await tester.pumpAndSettle();
+        await tester.tap(find.byTooltip('Show Done'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Finished work'));
+        await tester.pumpAndSettle();
 
-      expect(find.byType(ReferencePreview), findsOneWidget);
-      expect(find.byTooltip('Change or unlink'), findsNothing);
-      expect(find.byTooltip('Link an issue, PR or repo'), findsNothing);
-    });
+        expect(find.byType(ReferencePreview), findsOneWidget);
+        expect(find.byTooltip('Change or unlink'), findsNothing);
+        expect(find.byTooltip('Link an issue, PR or repo'), findsNothing);
+      },
+    );
 
-    testWidgets('allows creating a new root obligation from sidebar', (tester) async {
+    testWidgets('allows creating a new root obligation from sidebar', (
+      tester,
+    ) async {
       tester.view.physicalSize = const Size(1280, 900);
       tester.view.devicePixelRatio = 1.0;
       addTearDown(tester.view.resetDevicePixelRatio);
@@ -611,10 +743,7 @@ void main() {
       await tester.pumpWidget(
         MaterialApp(
           home: Scaffold(
-            body: WorkTab(
-              store: store,
-              onSelectView: (_) {},
-            ),
+            body: WorkTab(store: store, onSelectView: (_) {}),
           ),
         ),
       );
@@ -628,7 +757,10 @@ void main() {
       expect(find.text('Create Root Obligation'), findsOneWidget);
 
       // Fields in order: title, intent (body), owner.
-      await tester.enterText(find.byType(TextFormField).at(0), 'Brand New Root Task');
+      await tester.enterText(
+        find.byType(TextFormField).at(0),
+        'Brand New Root Task',
+      );
       await tester.pumpAndSettle();
       await tester.enterText(
         find.byType(TextFormField).at(1),
@@ -651,7 +783,9 @@ void main() {
       expect(api.createObligationCalls.first.parentId, null);
     });
 
-    testWidgets('an empty body is sent as no body, not as an empty string', (tester) async {
+    testWidgets('an empty body is sent as no body, not as an empty string', (
+      tester,
+    ) async {
       tester.view.physicalSize = const Size(1280, 900);
       tester.view.devicePixelRatio = 1.0;
       addTearDown(tester.view.resetDevicePixelRatio);
@@ -659,7 +793,9 @@ void main() {
 
       await tester.pumpWidget(
         MaterialApp(
-          home: Scaffold(body: WorkTab(store: store, onSelectView: (_) {})),
+          home: Scaffold(
+            body: WorkTab(store: store, onSelectView: (_) {}),
+          ),
         ),
       );
       await tester.pumpAndSettle();
@@ -681,57 +817,189 @@ void main() {
       expect(api.createObligationCalls.single.intent, isNull);
     });
 
-    testWidgets('allows reparenting an obligation', (tester) async {
-      tester.view.physicalSize = const Size(1280, 900);
-      tester.view.devicePixelRatio = 1.0;
-      addTearDown(tester.view.resetDevicePixelRatio);
-      addTearDown(tester.view.resetPhysicalSize);
+    testWidgets(
+      'uses edge drops to persist sibling neighbors and center drops to reparent',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 900);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.resetDevicePixelRatio);
+        addTearDown(tester.view.resetPhysicalSize);
 
-      final ob1 = makeObligation('ob-1', intent: 'Task to Reparent', status: 'ready');
-      api.obligationsResult = [ob1];
+        final root = makeObligation('root', intent: 'Root', status: 'ready');
+        final first = makeObligation(
+          'first',
+          parentId: 'root',
+          ownerId: 'actor-a',
+          intent: 'First child',
+        );
+        final second = makeObligation(
+          'second',
+          parentId: 'root',
+          ownerId: 'actor-a',
+          intent: 'Second child',
+        );
+        final third = makeObligation(
+          'third',
+          parentId: 'root',
+          ownerId: 'actor-a',
+          intent: 'Third child',
+        );
+        // This is intentionally not a sibling of the rows being dragged.
+        // The reorder endpoint validates neighbors against the owner's whole
+        // ready queue, so a visual sibling insertion must use it as a bound.
+        final interleaved = makeObligation(
+          'interleaved',
+          ownerId: 'actor-a',
+          intent: 'Separate root',
+        );
+        api.obligationsResult = [root, first, interleaved, second, third];
+        store.saveWorkExpanded({'root'});
 
-      await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(
-            body: WorkTab(
-              store: store,
-              onSelectView: (_) {},
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
             ),
           ),
-        ),
-      );
+        );
 
-      await tester.pumpAndSettle();
+        await tester.pumpAndSettle();
 
-      // Select obligation
-      await tester.tap(find.text('Task to Reparent'));
-      await tester.pumpAndSettle();
+        final secondDraggable = find.widgetWithText(
+          Draggable<ObligationDto>,
+          'Second child',
+        );
+        final firstTarget = find.widgetWithText(
+          DragTarget<ObligationDto>,
+          'First child',
+        );
+        expect(secondDraggable, findsOneWidget);
+        expect(firstTarget, findsOneWidget);
 
-      // Tap Reparent...
-      await tester.tap(find.text('Reparent...'));
-      await tester.pumpAndSettle();
+        final reorder = await tester.startGesture(
+          tester.getCenter(secondDraggable),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        await reorder.moveTo(
+          tester.getTopLeft(firstTarget) + const Offset(20, 3),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        await reorder.up();
+        await tester.pumpAndSettle();
 
-      expect(find.text('Reparent Obligation'), findsOneWidget);
+        expect(api.reorderCalls, hasLength(1));
+        expect(api.reorderCalls.single, (
+          id: 'second',
+          previousId: null,
+          nextId: 'first',
+          scope: 'subtree',
+        ));
 
-      // Tap Attach to Parent button
-      await tester.tap(find.text('Attach to Parent'));
-      await tester.pumpAndSettle();
+        final thirdDraggable = find.widgetWithText(
+          Draggable<ObligationDto>,
+          'Third child',
+        );
+        final afterFirst = await tester.startGesture(
+          tester.getCenter(thirdDraggable),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        await afterFirst.moveTo(
+          tester.getBottomLeft(firstTarget) + const Offset(20, -3),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        await afterFirst.up();
+        await tester.pumpAndSettle();
 
-      // Enter new parent ID
-      await tester.enterText(
-        find.widgetWithText(TextFormField, '').first,
-        'ob-new-target-parent',
-      );
-      await tester.pumpAndSettle();
+        expect(api.reorderCalls.last, (
+          id: 'third',
+          previousId: 'first',
+          nextId: 'interleaved',
+          scope: 'subtree',
+        ));
 
-      // Tap Reparent submit
-      await tester.tap(find.widgetWithText(ElevatedButton, 'Reparent'));
-      await tester.pumpAndSettle();
+        final reparent = await tester.startGesture(
+          tester.getCenter(thirdDraggable),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        await reparent.moveTo(tester.getCenter(firstTarget));
+        await tester.pump(const Duration(milliseconds: 50));
+        await reparent.up();
+        await tester.pumpAndSettle();
 
-      expect(api.reparentCalls.length, 1);
-      expect(api.reparentCalls.first.id, 'ob-1');
-      expect(api.reparentCalls.first.parentId, 'ob-new-target-parent');
-    });
+        expect(api.reparentCalls, [(id: 'third', parentId: 'first')]);
+      },
+    );
+
+    testWidgets(
+      'rejects dropping an ancestor onto its descendant but allows promotion',
+      (tester) async {
+        tester.view.physicalSize = const Size(1280, 900);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.resetDevicePixelRatio);
+        addTearDown(tester.view.resetPhysicalSize);
+
+        final root = makeObligation('root', intent: 'Root');
+        final parent = makeObligation(
+          'parent',
+          parentId: 'root',
+          intent: 'Parent',
+        );
+        final child = makeObligation(
+          'child',
+          parentId: 'parent',
+          intent: 'Child',
+        );
+        api.obligationsResult = [root, parent, child];
+        store.saveWorkExpanded({'root', 'parent'});
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: WorkTab(store: store, onSelectView: (_) {}),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final parentDraggable = find.widgetWithText(
+          Draggable<ObligationDto>,
+          'Parent',
+        );
+        final childTarget = find.widgetWithText(
+          DragTarget<ObligationDto>,
+          'Child',
+        );
+        final rootTarget = find.widgetWithText(
+          DragTarget<ObligationDto>,
+          'Root',
+        );
+
+        final cycle = await tester.startGesture(
+          tester.getCenter(parentDraggable),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        await cycle.moveTo(tester.getCenter(childTarget));
+        await tester.pump(const Duration(milliseconds: 50));
+        await cycle.up();
+        await tester.pumpAndSettle();
+        expect(api.reparentCalls, isEmpty);
+
+        final childDraggable = find.widgetWithText(
+          Draggable<ObligationDto>,
+          'Child',
+        );
+        final promote = await tester.startGesture(
+          tester.getCenter(childDraggable),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        await promote.moveTo(tester.getCenter(rootTarget));
+        await tester.pump(const Duration(milliseconds: 50));
+        await promote.up();
+        await tester.pumpAndSettle();
+
+        expect(api.reparentCalls, [(id: 'child', parentId: 'root')]);
+      },
+    );
   });
 
   group('InboxTab Interactive Write UI', () {
@@ -749,14 +1017,26 @@ void main() {
       );
     });
 
-    testWidgets('renders ready obligations with reorder controls and actions', (tester) async {
+    testWidgets('renders ready obligations with reorder controls and actions', (
+      tester,
+    ) async {
       tester.view.physicalSize = const Size(1280, 900);
       tester.view.devicePixelRatio = 1.0;
       addTearDown(tester.view.resetDevicePixelRatio);
       addTearDown(tester.view.resetPhysicalSize);
 
-      final ob1 = makeObligation('ob-1', ownerId: 'actor-a', intent: 'First Ready', effectivePriority: 10.0);
-      final ob2 = makeObligation('ob-2', ownerId: 'actor-a', intent: 'Second Ready', effectivePriority: 20.0);
+      final ob1 = makeObligation(
+        'ob-1',
+        ownerId: 'actor-a',
+        intent: 'First Ready',
+        effectivePriority: 10.0,
+      );
+      final ob2 = makeObligation(
+        'ob-2',
+        ownerId: 'actor-a',
+        intent: 'Second Ready',
+        effectivePriority: 20.0,
+      );
       api.obligationsResult = [ob1, ob2];
 
       await tester.pumpWidget(

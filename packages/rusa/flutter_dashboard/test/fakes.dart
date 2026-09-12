@@ -35,6 +35,7 @@ ThreadDto makeThread(
   String? estimatedStartAt,
   ObligationDto? selectedObligation,
   String? voiceName,
+  int? pacingIntervalMs,
 }) => ThreadDto(
   id: id,
   handle: '$id-handle',
@@ -61,6 +62,7 @@ ThreadDto makeThread(
   estimatedStartAt: estimatedStartAt,
   selectedObligation: selectedObligation,
   voiceName: voiceName,
+  pacingIntervalMs: pacingIntervalMs,
 );
 
 MeshEvent makeEvent(
@@ -183,6 +185,8 @@ class FakeApi extends DashboardApi {
   final rootSpawnCalls =
       <({String charter, String? title, String? provider, String? model})>[];
   String spawnedRootChildId = 'spawned-child';
+  final actorReparentCalls = <({String id, String parentId})>[];
+  Object? actorReparentError;
 
   /// When set, the NEXT fetchQuota awaits this instead of returning
   /// [quotaResult] immediately — lets a test observe the SWR "refreshing"
@@ -274,6 +278,17 @@ class FakeApi extends DashboardApi {
       makeThread(spawnedRootChildId, parent: 'root', title: title),
     ];
     return spawnedRootChildId;
+  }
+
+  @override
+  Future<void> reparentActor(String id, {required String parentId}) async {
+    actorReparentCalls.add((id: id, parentId: parentId));
+    final error = actorReparentError;
+    if (error != null) throw error;
+    threadsResult = [
+      for (final thread in threadsResult)
+        thread.id == id ? thread.copyWith(parentId: parentId) : thread,
+    ];
   }
 
   @override
@@ -518,6 +533,12 @@ class FakeApi extends DashboardApi {
   List<ObligationDto> obligationsResult = [];
   Map<String, ObligationDetailSnapshot> obligationDetails = {};
   Map<String, ReferenceDto?> obExternalReferences = {};
+  Map<String, List<ObligationDto>> obBlockedBy = {};
+  Map<String, int> obBlockedByTotal = {};
+  Map<String, bool> obBlockedByHasMore = {};
+  Map<String, List<ObligationDto>> obBlocks = {};
+  Map<String, int> obBlocksTotal = {};
+  Map<String, bool> obBlocksHasMore = {};
 
   /// When set, computes the detail snapshot per call instead of the static
   /// [obligationDetails] map — needed to fake a paginated completions field
@@ -594,6 +615,8 @@ class FakeApi extends DashboardApi {
       (o) => o.id == id,
       orElse: () => makeObligation(id),
     );
+    final blockedBy = obBlockedBy[id] ?? const <ObligationDto>[];
+    final blocks = obBlocks[id] ?? const <ObligationDto>[];
     return ObligationDetailSnapshot(
       obligation: ob,
       parent: ob.parentId == null
@@ -611,6 +634,12 @@ class FakeApi extends DashboardApi {
                 o.status != 'cancelled',
           )
           .toList(),
+      blockedBy: blockedBy,
+      blockedByTotal: obBlockedByTotal[id] ?? blockedBy.length,
+      blockedByHasMore: obBlockedByHasMore[id] ?? false,
+      blocks: blocks,
+      blocksTotal: obBlocksTotal[id] ?? blocks.length,
+      blocksHasMore: obBlocksHasMore[id] ?? false,
       externalReference: obExternalReferences[id],
     );
   }
