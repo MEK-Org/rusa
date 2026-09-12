@@ -247,6 +247,89 @@ void main() {
       expect(snapshot.externalReference!.url, 'https://github.com/MEK-Org/rusa/issues/345');
       expect(snapshot.externalReference!.author, 'AlabasterAxe');
     });
+
+    test('deserializes blockedBy and blocks from server list format with counts', () {
+      final json = {
+        'obligation': {
+          'id': 'ob-target',
+          'ownerId': 'test-actor',
+          'status': 'waiting',
+          'effectivePriority': 50.0,
+        },
+        'parent': null,
+        'children': [],
+        'blockingChildren': [],
+        'blockedBy': [
+          {
+            'id': 'prereq-non-gh',
+            'ownerId': 'actor-1',
+            'title': 'Prerequisite Title',
+            'status': 'ready',
+            'effectivePriority': 20.0,
+          },
+          {
+            'id': 'prereq-gh',
+            'ownerId': 'actor-2',
+            'title': 'Prerequisite with GitHub Ref',
+            'status': 'waiting',
+            'effectivePriority': 30.0,
+            'externalRef': 'github:MEK-Org/rusa/issues/100',
+          },
+        ],
+        'blockedByTotal': 5,
+        'blockedByHasMore': true,
+        'blocks': [
+          {
+            'id': 'dep-1',
+            'ownerId': 'actor-3',
+            'title': 'Dependent Title',
+            'status': 'waiting',
+            'effectivePriority': 40.0,
+          },
+        ],
+        'blocksTotal': 1,
+        'blocksHasMore': false,
+      };
+
+      final snapshot = ObligationDetailSnapshot.fromJson(json);
+      expect(snapshot.blockedBy, hasLength(2));
+      expect(snapshot.blockedBy[0].id, 'prereq-non-gh');
+      expect(snapshot.blockedBy[0].heading, 'Prerequisite Title');
+      expect(snapshot.blockedBy[0].externalRef, isNull);
+      expect(snapshot.blockedBy[1].id, 'prereq-gh');
+      expect(snapshot.blockedBy[1].heading, 'Prerequisite with GitHub Ref');
+      expect(snapshot.blockedBy[1].externalRef, 'github:MEK-Org/rusa/issues/100');
+      expect(snapshot.blockedByTotal, 5);
+      expect(snapshot.blockedByHasMore, true);
+
+      expect(snapshot.blocks, hasLength(1));
+      expect(snapshot.blocks[0].id, 'dep-1');
+      expect(snapshot.blocks[0].heading, 'Dependent Title');
+      expect(snapshot.blocksTotal, 1);
+      expect(snapshot.blocksHasMore, false);
+    });
+
+    test('handles empty and absent blockedBy and blocks fields gracefully', () {
+      final json = {
+        'obligation': {
+          'id': 'ob-target',
+          'ownerId': 'test-actor',
+          'status': 'ready',
+          'effectivePriority': 50.0,
+        },
+        'parent': null,
+        'children': [],
+        'blockingChildren': [],
+      };
+
+      final snapshot = ObligationDetailSnapshot.fromJson(json);
+      expect(snapshot.blockedBy, isEmpty);
+      expect(snapshot.blockedByTotal, 0);
+      expect(snapshot.blockedByHasMore, false);
+      expect(snapshot.blocks, isEmpty);
+      expect(snapshot.blocksTotal, 0);
+      expect(snapshot.blocksHasMore, false);
+    });
   });
 
   group('ActorViewState', () {

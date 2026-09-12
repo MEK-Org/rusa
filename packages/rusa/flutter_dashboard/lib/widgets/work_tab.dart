@@ -856,6 +856,22 @@ class _DetailViewState extends State<_DetailView> {
             ],
             _SectionHeader('CHILDREN'),
             _childrenPanel(context, data),
+            const SizedBox(height: 24),
+            _SectionHeader('BLOCKED BY'),
+            _dependencyPanel(
+              data.blockedBy,
+              total: data.blockedByTotal,
+              hasMore: data.blockedByHasMore,
+              emptyText: 'Not blocked by any obligations or issues.',
+            ),
+            const SizedBox(height: 24),
+            _SectionHeader('BLOCKS'),
+            _dependencyPanel(
+              data.blocks,
+              total: data.blocksTotal,
+              hasMore: data.blocksHasMore,
+              emptyText: 'Does not block any obligations or issues.',
+            ),
           ],
         );
       },
@@ -1379,6 +1395,60 @@ class _DetailViewState extends State<_DetailView> {
                       ? 'Hide done children'
                       : 'Show $hiddenCount done '
                             '${hiddenCount == 1 ? 'child' : 'children'}',
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _dependencyPanel(
+    List<ObligationDto> dependencies, {
+    required int total,
+    required bool hasMore,
+    required String emptyText,
+  }) {
+    if (dependencies.isEmpty) {
+      return Text(
+        emptyText,
+        style: const TextStyle(color: MeshColors.textMuted, fontSize: 13),
+      );
+    }
+
+    final remaining = total - dependencies.length;
+    return Container(
+      decoration: BoxDecoration(
+        color: MeshColors.bgSecondary,
+        border: Border.all(color: MeshColors.border),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          for (var i = 0; i < dependencies.length; i++) ...[
+            ObligationRow(
+              obligation: dependencies[i],
+              store: store,
+              showOwner: true,
+              showActions: false,
+              onSelectView: onSelectView,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 16,
+                vertical: 12,
+              ),
+            ),
+            if (i < dependencies.length - 1 || hasMore)
+              const Divider(height: 1, color: MeshColors.border),
+          ],
+          if (hasMore)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              child: Text(
+                'and $remaining more',
+                style: const TextStyle(
+                  color: MeshColors.textMuted,
+                  fontSize: 13,
                 ),
               ),
             ),

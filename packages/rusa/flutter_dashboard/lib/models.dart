@@ -1597,6 +1597,12 @@ class ObligationDetailSnapshot {
     this.parent,
     required this.children,
     required this.blockingChildren,
+    this.blockedBy = const [],
+    this.blockedByTotal = 0,
+    this.blockedByHasMore = false,
+    this.blocks = const [],
+    this.blocksTotal = 0,
+    this.blocksHasMore = false,
     this.artifacts = const [],
     this.completions = const [],
     this.completionsTotal = 0,
@@ -1608,6 +1614,12 @@ class ObligationDetailSnapshot {
   final ObligationDto? parent;
   final List<ObligationDto> children;
   final List<ObligationDto> blockingChildren;
+  final List<ObligationDto> blockedBy;
+  final int blockedByTotal;
+  final bool blockedByHasMore;
+  final List<ObligationDto> blocks;
+  final int blocksTotal;
+  final bool blocksHasMore;
   final List<ObligationArtifactDto> artifacts;
   final List<ObligationCompletionDto> completions;
   final int completionsTotal;
@@ -1641,6 +1653,16 @@ class ObligationDetailSnapshot {
               .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
               .toList()
         : const <ObligationDto>[],
+    blockedBy: (j['blockedBy'] as List<dynamic>? ?? const [])
+        .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    blockedByTotal: j['blockedByTotal'] as int? ?? 0,
+    blockedByHasMore: j['blockedByHasMore'] as bool? ?? false,
+    blocks: (j['blocks'] as List<dynamic>? ?? const [])
+        .map((e) => ObligationDto.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    blocksTotal: j['blocksTotal'] as int? ?? 0,
+    blocksHasMore: j['blocksHasMore'] as bool? ?? false,
     artifacts: (j['artifacts'] is List)
         ? (j['artifacts'] as List<dynamic>)
               .map(
