@@ -450,6 +450,139 @@ describe("EventManager", () => {
     });
   });
 
+  describe("Uncovered-drop ownership diagnostics (#428)", () => {
+    // The production path end to end: raw GitHub ingress, the real ladder,
+    // and the durable-boundary drop. Each case seeds the ownership rows the
+    // #428 incident had (an exact PR owner and a repository owner) and varies
+    // only the condition the drop line cannot distinguish on its own.
+    const repository = "github:MEK-Org/glass_goals_devkit";
+    const pullRequest = `${repository}/pulls/5`;
+
+    function seedOwners(): InMemoryEventSourceOwnerStore {
+      const owners = new InMemoryEventSourceOwnerStore();
+      owners.subscribe({
+        resource: pullRequest,
+        actorId: "pr-owner",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-12T12:00:00Z",
+      });
+      owners.subscribe({
+        resource: repository,
+        actorId: "repo-owner",
+        subscribedBy: "root",
+        subscribedAt: "2026-09-12T12:00:00Z",
+      });
+      return owners;
+    }
+
+    function mergedClosure(): RawIntegrationEvent {
+      return {
+        sourceType: "github",
+        rawPayload: {
+          event: "pull_request",
+          payload: {
+            action: "closed",
+            repository: { full_name: "MEK-Org/glass_goals_devkit" },
+            pull_request: { number: 5, merged: true },
+          },
+        },
+        eventSummary: "GitHub pull_request/closed",
+      };
+    }
+
+    function manager(opts: {
+      owners: InMemoryEventSourceOwnerStore;
+      obligations?: { findLiveByExternalRef(ref: string): { ownerId: string } | null | undefined };
+      isLive: (actorId: string) => boolean;
+    }) {
+      const inbox = new FakeInboxStore();
+      const logs: string[] = [];
+      const em = new EventManager({
+        inboxStore: inbox,
+        log: (message) => logs.push(message),
+        resolver: createRoutingKernel({
+          owners: opts.owners,
+          subscriptions: new InMemoryEventSourceSubscriptionStore(),
+          obligations: opts.obligations,
+          isLive: opts.isLive,
+        }),
+      });
+      return { em, inbox, logs };
+    }
+
+    it("routes a merged closure to its live exact owner without a drop line", () => {
+      const { em, inbox, logs } = manager({ owners: seedOwners(), isLive: () => true });
+
+      const delivery = em.handleExternalEvent(mergedClosure());
+
+      expect(delivery.ownerIds).toEqual(["pr-owner"]);
+      expect(inbox.entries.map((entry) => entry.actorId)).toEqual(["pr-owner"]);
+      expect(logs).toEqual([]);
+    });
+
+    it("reports no governing rung when every delegated owner is not live", () => {
+      const { em, inbox, logs } = manager({ owners: seedOwners(), isLive: () => false });
+
+      const delivery = em.handleExternalEvent(mergedClosure());
+
+      expect(delivery.entries).toEqual([]);
+      expect(inbox.entries).toEqual([]);
+      // The incident's line stays byte-identical; the discriminator is its own
+      // adjacent line so existing journal greps keep matching.
+      expect(logs).toEqual([
+        "event not covered by any subscription — dropped (GitHub pull_request/closed)",
+        "uncovered drop ownership: governingSource=none resourceLevel=none isLive=false",
+      ]);
+    });
+
+    it("reports the authoritative obligation rung when its holder cannot run", () => {
+      const { em, inbox, logs } = manager({
+        owners: seedOwners(),
+        obligations: {
+          findLiveByExternalRef: (ref) =>
+            ref === pullRequest ? { ownerId: "human:operator" } : null,
+        },
+        isLive: (id) => id !== "human:operator",
+      });
+
+      const delivery = em.handleExternalEvent(mergedClosure());
+
+      // Both delegated owners are live, yet the claim stops the walk: this is
+      // the path the drop line alone could not tell apart from dead owners.
+      expect(delivery.entries).toEqual([]);
+      expect(inbox.entries).toEqual([]);
+      expect(logs).toEqual([
+        "event not covered by any subscription — dropped (GitHub pull_request/closed)",
+        `uncovered drop ownership: governingSource=obligation resourceLevel=${pullRequest} isLive=false`,
+      ]);
+      for (const line of logs) expect(line).not.toContain("human:operator");
+    });
+
+    it("keeps a branch push exact-only and says no rung answered", () => {
+      const { em, inbox, logs } = manager({ owners: seedOwners(), isLive: () => true });
+
+      const delivery = em.handleExternalEvent({
+        sourceType: "github",
+        rawPayload: {
+          event: "push",
+          payload: {
+            ref: "refs/heads/worker",
+            repository: { full_name: "MEK-Org/glass_goals_devkit" },
+          },
+        },
+        eventSummary: "GitHub push",
+      });
+
+      // The live repository owner is one rung up and must not receive it.
+      expect(delivery.entries).toEqual([]);
+      expect(inbox.entries).toEqual([]);
+      expect(logs).toEqual([
+        "event not covered by any subscription — dropped (GitHub push)",
+        "uncovered drop ownership: governingSource=none resourceLevel=none isLive=false",
+      ]);
+    });
+  });
+
   describe("Stable dedupe IDs and durable idempotency", () => {
     it("generates deterministic 32-hex dedupe IDs via deduplicatedInboxEntryId", () => {
       const id1 = deduplicatedInboxEntryId("key-123", "actor-a");
@@ -535,14 +668,16 @@ describe("EventManager", () => {
         },
       });
 
-      expect(resolver.resolveRecipients("system:events")).toEqual({
+      // toMatchObject: the ladder also reports its `ownership` diagnostic,
+      // which these delivery-shape assertions do not care about.
+      expect(resolver.resolveRecipients("system:events")).toMatchObject({
         directed: false,
         ownerIds: [],
         subscriberIds: [],
       });
       expect(lookups).toEqual([]);
 
-      expect(resolver.resolveRecipients("github_issue:MEK-Org/rusa#383")).toEqual({
+      expect(resolver.resolveRecipients("github_issue:MEK-Org/rusa#383")).toMatchObject({
         directed: false,
         ownerIds: ["issue-owner"],
         subscriberIds: [],
@@ -813,7 +948,7 @@ describe("EventManager", () => {
           "github:MEK-Org/rusa/issues/383",
           { directedTarget: "actor-governing" }
         )
-      ).toEqual({ directed: false, ownerIds: ["actor-governing"], subscriberIds: [] });
+      ).toMatchObject({ directed: false, ownerIds: ["actor-governing"], subscriberIds: [] });
     });
 
     it("does not fan a landed directive out to subscribers", () => {
@@ -839,7 +974,7 @@ describe("EventManager", () => {
       const missed = resolver.resolveRecipients("github:MEK-Org/rusa/issues/383", {
         directedTarget: "nobody-here",
       });
-      expect(missed).toEqual({
+      expect(missed).toMatchObject({
         directed: false,
         ownerIds: [],
         subscriberIds: ["actor-watcher"],
