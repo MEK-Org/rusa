@@ -89,6 +89,11 @@ import { type PoolLaneCandidate, ProviderPacer, submitPoolGate } from "../actor/
 import type { QuotaThrottleStatus, QuotaThrottleTick } from "../actor/quota-throttle-status.js";
 import { resolveRootActorId } from "../actor/root-actor-id.js";
 import { RootControlService } from "../actor/root-control.js";
+import {
+  describePool,
+  RootModelConfigStartupError,
+  resolveRootBootModelConfig,
+} from "../actor/root-model-config.js";
 import { buildRootPrompt } from "../actor/root-prompt.js";
 import { createRunAccounting, projectActorRunLaunchConfig } from "../actor/run-accounting.js";
 import {
@@ -1063,6 +1068,39 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // and without this line every owner check in the repository is inert.
   getRepositories().setActorExists((actorId) => actors.get(actorId)?.status === "active");
   const rootId = resolveRootActorId(actors);
+  // The root's durable pool lives on its actor record, where `set_actor_model`
+  // writes it, and wins over the scalar `rootActor` file tuple once it exists.
+  // The file seeds only a record with no pool. Resolved before any server is
+  // bound so an unrunnable persisted pool stops boot with nothing to unwind.
+  let rootBootModelConfig: ReturnType<typeof resolveRootBootModelConfig>;
+  try {
+    rootBootModelConfig = resolveRootBootModelConfig({
+      config,
+      actors,
+      rootId,
+      bootstrap: {
+        provider: rootActor.provider,
+        model: rootActor.model,
+        ...(rootActor.effort === undefined ? {} : { effort: rootActor.effort }),
+      },
+      portable: rootActor.context?.type === "portable",
+    });
+  } catch (err) {
+    if (!(err instanceof RootModelConfigStartupError)) throw err;
+    log.error("root_model_config_invalid", {
+      error: err.name,
+      rootId,
+      reason: err.message,
+      action: err.action,
+    });
+    process.exit(1);
+    return;
+  }
+  log.info("root_model_config_resolved", {
+    rootId,
+    source: rootBootModelConfig.source,
+    modelConfig: describePool(rootBootModelConfig.modelConfig),
+  });
   const inboxStore = getRepositories().inbox;
   const modelScrapesStore = getRepositories().modelScrapes;
   const workersDir = join(mcHome, "workers");
@@ -1154,9 +1192,11 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   log.info("shared_mcp_serving", { servers: sharedMcp.map((u) => u.name) });
 
   // ── Provider + actor repository ──
-  let provider: ReturnType<typeof resolveRootProvider>;
+  // The scalar `rootActor` tuple must still resolve even when the persisted
+  // pool won above: it seeds a fresh record and remains the launch policy of
+  // the root-only `fallback` degrade path.
   try {
-    provider = resolveRootProvider(config);
+    resolveRootProvider(config);
   } catch (err) {
     console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
@@ -2797,26 +2837,20 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
   // Which entry actually ran, for the failure-notice label — set on each
   // onRunStart, read back on that same run's onRunEnd (mirrors the worker
   // `lastSelected` pattern, since root's one entry can move too).
-  let rootLastSelected: RawProviderModelConfig = {
-    provider: provider.providerName,
-    model: provider.model,
-    effort: provider.effort,
-  };
+  let rootLastSelected: RawProviderModelConfig = rootBootModelConfig.modelConfig[0];
   let root: MeshActor;
   root =
     externalRoot ??
     new Actor({
       id: rootId,
       cwd: rootAgentDir,
-      // Root's declared pool always has exactly one entry (it never draws
-      // from a multi-candidate pool at launch-time selection — that's a
-      // worker-only concept; `fallback` below is its own, separate degrade
-      // path), but that one entry can still be moved via `set_actor_model`
-      // (#199 amend gaps 1-2), so resolution must read the live entry rather
-      // than freeze the boot-time `resolveRootProvider` result.
-      modelConfig: [
-        { provider: provider.providerName, model: provider.model, effort: provider.effort },
-      ],
+      // Root's declared pool is whatever its record carries: the persisted
+      // ordered pool after a restart, or the configured tuple on first boot
+      // (#333). `set_actor_model` can still move it (#199 amend gaps 1-2),
+      // so resolution reads the live entry rather than freezing the
+      // boot-time `resolveRootProvider` result. `fallback` below is its own,
+      // separate degrade path.
+      modelConfig: [...rootBootModelConfig.modelConfig],
       resolveProvider: (selected) =>
         resolveProvider(config, selected.provider, selected.model, selected.effort),
       mcpServers: rootMcp,
@@ -2861,8 +2895,9 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         // Same dispatch-time apply as the worker beforeRun (#199, extended to
         // pools): a pool staged while root was queued/idle must land before
         // this run's own gate()/admission and run_start, not at the end of
-        // the run after. Root's declared pool is always fixed at one entry
-        // (see the `modelConfig` comment on root's Actor construction above).
+        // the run after. Root's declared pool may hold several ordered
+        // entries (see the `modelConfig` comment on root's Actor construction
+        // above); the halt gate reads the first, the entry that launches first.
         mesh.applyPendingModel(rootId);
         const rootRecord = actors.get(rootId);
         const launchProviderName = rootRecord?.modelConfig?.[0]?.provider ?? rootProviderName;
@@ -3009,13 +3044,12 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
     charter: rootActor.charter ?? DEFAULT_ROOT_CHARTER,
     parentId: null,
     isRoot: true,
-    modelConfig: [
-      {
-        provider: rootActor.provider,
-        model: rootActor.model,
-        ...(rootActor.effort === undefined ? {} : { effort: rootActor.effort }),
-      },
-    ],
+    // Persisted pool preserved verbatim (validated, same order), or the
+    // configured tuple seeding a record that had none. Adoption merges onto
+    // the existing row, so `modelClass` is written explicitly: retained with a
+    // persisted pool, cleared when the file seeds a fresh one.
+    modelConfig: rootBootModelConfig.modelConfig,
+    modelClass: rootBootModelConfig.modelClass,
     context: rootActor.context,
     sessionId:
       rootActor.context?.type === "portable"
@@ -3065,7 +3099,7 @@ export async function runStart(opts?: RunStartOptions): Promise<void> {
         ? `portable/${rootContext.mode} (stateless)`
         : (actors.get(rootId)?.sessionId ?? "(new)");
     console.log(
-      `[root] provider=${provider.name} session=${sessionDescription} tools=${rootMcp.map((u) => u.name).join(",")}`
+      `[root] model_config=${describePool(rootBootModelConfig.modelConfig)} (${rootBootModelConfig.source}) session=${sessionDescription} tools=${rootMcp.map((u) => u.name).join(",")}`
     );
   }
 
