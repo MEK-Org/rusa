@@ -33,6 +33,8 @@ program
   .option("--resume", "Resume an existing instance root without reprovisioning")
   .option("--base-config-home <path>", "Home to seed providers and the Gemini key from")
   .option("--root-driver <driver>", "Root driver: provider or external", "provider")
+  .option("--auth-emulator <host:port>", "Use a loopback Firebase Auth emulator (demo-rusa-auth)")
+  .option("--auth-email <email>", "Sole emulator operator", "operator@example.com")
   .option("--port-offset <n>", "Offset the disposable instance's default ports", Number, 0)
   .option("--follower-bind <ip>", "Enable follower gateway on this Tailscale IPv4 address")
   .option("--follower-port <port>", "Follower gateway port", Number, 8190)
@@ -45,6 +47,8 @@ program
       root?: string;
       baseConfigHome?: string;
       rootDriver: string;
+      authEmulator?: string;
+      authEmail: string;
       portOffset: number;
       followerBind?: string;
       followerPort: number;
@@ -62,6 +66,8 @@ program
         root: opts.root,
         baseConfigHome: opts.baseConfigHome,
         rootDriver: opts.rootDriver,
+        authEmulator: opts.authEmulator,
+        authEmail: opts.authEmail,
         portOffset: opts.portOffset,
         followerGateway:
           opts.followerBind && opts.followerTokenFile

@@ -6,6 +6,7 @@ import 'package:web/web.dart' as web;
 
 import 'mesh_stream.dart';
 import 'models.dart';
+import 'session_events_web.dart';
 
 /// Browser `EventSource` implementation of [MeshStreamSource].
 ///
@@ -21,7 +22,7 @@ class WebEventSourceStream implements MeshStreamSource {
   final _elided = StreamController<void>.broadcast();
   final _runtimeHello = StreamController<RuntimeHello>.broadcast();
   final _runtimeStates = StreamController<ActorRuntimeStateDelta>.broadcast();
-  web.EventSource? _es;
+  SessionEventSource? _es;
 
   @override
   Stream<MeshEvent> get meshEvents => _mesh.stream;
@@ -40,7 +41,7 @@ class WebEventSourceStream implements MeshStreamSource {
     final qs = actors.isEmpty
         ? ''
         : '?actors=${Uri.encodeQueryComponent(actors.join(','))}';
-    final es = web.EventSource('/api/mesh/stream$qs');
+    final es = SessionEventSource('/api/mesh/stream$qs');
     es.addEventListener(
       'mesh_event',
       _listener((data) {

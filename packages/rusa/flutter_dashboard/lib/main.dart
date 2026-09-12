@@ -3,6 +3,7 @@ import 'package:flutter_web_plugins/url_strategy.dart';
 import 'package:web/web.dart' as web;
 
 import 'api.dart';
+import 'session_events_web.dart';
 import 'breakpoints.dart';
 import 'avatar_upload_web.dart';
 import 'dashboard_title.dart';
@@ -99,6 +100,8 @@ class _DashboardPageState extends State<DashboardPage> {
           // screenshot harness.
           Expanded(
             child: DashboardBody(
+              onLogout: authenticationEnabled ? logout : null,
+              profilePhotoUrl: profilePhotoUrl,
               store: _store,
               understandingBuilder: (_) => const IuTreeBody(),
               reportsBuilder: (_) => IuReportsBody(store: _store),

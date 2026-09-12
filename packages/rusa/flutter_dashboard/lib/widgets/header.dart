@@ -136,9 +136,13 @@ class MeshHeader extends StatelessWidget {
     this.quotaProviders = kDefaultQuotaProviders,
     this.onMenuTap,
     this.onBack,
+    this.onLogout,
+    this.profilePhotoUrl,
   });
 
   final DashboardStore store;
+  final VoidCallback? onLogout;
+  final String? profilePhotoUrl;
 
   /// Which top-level view is active (drives the nav highlight).
   final DashboardView selected;
@@ -261,6 +265,13 @@ class MeshHeader extends StatelessWidget {
                             quotaProviders: quotaProviders,
                           ),
                         ],
+                        if (onLogout != null) ...[
+                          const SizedBox(width: 10),
+                          ProfileMenu(
+                            photoUrl: profilePhotoUrl,
+                            onLogout: onLogout!,
+                          ),
+                        ],
                       ],
                     ),
                   ),
@@ -287,6 +298,53 @@ class MeshHeader extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+/// Authenticated operator menu; omitted entirely in auth-disabled mode.
+class ProfileMenu extends StatelessWidget {
+  const ProfileMenu({super.key, this.photoUrl, required this.onLogout});
+
+  final String? photoUrl;
+  final VoidCallback onLogout;
+
+  @override
+  Widget build(BuildContext context) {
+    const fallback = Icon(Icons.person_outline, size: 22);
+    return PopupMenuButton<String>(
+      tooltip: 'Profile menu',
+      position: PopupMenuPosition.under,
+      onSelected: (_) => onLogout(),
+      itemBuilder: (_) => const [
+        PopupMenuItem(
+          value: 'logout',
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.logout, size: 18),
+              SizedBox(width: 10),
+              Text('Log out'),
+            ],
+          ),
+        ),
+      ],
+      icon: CircleAvatar(
+        radius: 16,
+        backgroundColor: MeshColors.border,
+        foregroundColor: MeshColors.textPrimary,
+        child: photoUrl == null || photoUrl!.isEmpty
+            ? fallback
+            : ClipOval(
+                child: Image.network(
+                  photoUrl!,
+                  width: 32,
+                  height: 32,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, _, _) => fallback,
+                ),
+              ),
+      ),
     );
   }
 }

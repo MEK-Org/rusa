@@ -34,6 +34,7 @@ import { resolveReferenceSync } from "../references/resolve.js";
 import type { ActorRepository } from "../repositories/actor-repository.js";
 import { canonicalSupportedVoiceName, SUPPORTED_TTS_VOICES } from "../voice/tts-voices.js";
 import { googleVoiceConfig, voiceConfigSchema } from "../voice/voice-config.js";
+import { isAuthenticatedOperatorRequest } from "./auth.js";
 import type { SseHub } from "./sse.js";
 
 /** Everything the mesh Data API needs, injected by the server wiring. */
@@ -702,7 +703,12 @@ export async function handleMeshApiRequest(
           if (bodyStr.trim()) {
             try {
               const parsed = JSON.parse(bodyStr);
-              if (parsed && typeof parsed.by === "string" && parsed.by.trim()) {
+              if (
+                !isAuthenticatedOperatorRequest(req) &&
+                parsed &&
+                typeof parsed.by === "string" &&
+                parsed.by.trim()
+              ) {
                 by = parsed.by.trim();
               }
             } catch {

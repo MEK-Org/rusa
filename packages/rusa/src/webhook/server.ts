@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import type { ActorMesh } from "../actor/actor-mesh.js";
 import type { InboxStore } from "../actor/inbox-store.js";
 import type { RootControlService } from "../actor/root-control.js";
-import type { DashboardConfig } from "../config/types.js";
+import type { DashboardAuthConfig, DashboardConfig } from "../config/types.js";
 import { type DashboardDataDeps, handleMeshApiRequest } from "../dashboard/api.js";
 import {
   getDashboardAsset,
@@ -15,6 +15,7 @@ import {
   getDashboardHtml,
   hasDashboardAsset,
 } from "../dashboard/assets.js";
+import { createDashboardAuth, type DashboardAuth } from "../dashboard/auth.js";
 import {
   applyBrandingToHtml,
   applyBrandingToManifest,
@@ -155,6 +156,7 @@ export interface DashboardMeshRefs {
 }
 
 export interface DashboardServerOptions {
+  auth?: DashboardAuthConfig;
   port: number;
   bindHost?: string;
   serveUi?: boolean;
@@ -247,8 +249,11 @@ export function parseJsonObjectBody(body: string): JsonObjectParseResult {
 export function createDashboardRequestHandler(
   options: DashboardServerOptions,
   dataDeps: DashboardDataDeps | null = null,
-  voiceDeps: VoiceApiDeps | null = null
+  voiceDeps: VoiceApiDeps | null = null,
+  auth: DashboardAuth | null = null
 ) {
+  if (options.auth && !auth)
+    throw new Error("Dashboard auth configuration requires an initialized authentication boundary");
   const { serveUi = true } = options;
   const log = (options.logger ?? nullLogger).child({ component: "dashboard" });
   return async (req: IncomingMessage, res: ServerResponse) => {
@@ -268,6 +273,48 @@ export function createDashboardRequestHandler(
           })
         );
         return;
+      }
+
+      if (req.method === "GET" && pathname === "/dashboard-auth.js") {
+        const asset = getDashboardAsset(pathname);
+        if (!asset) {
+          res.writeHead(503, { "Content-Type": "text/plain" });
+          res.end("Dashboard assets are missing; rebuild Rusa");
+          return;
+        }
+        res.writeHead(200, {
+          "Content-Type": "application/javascript",
+          "Cache-Control": "no-cache",
+        });
+        res.end(asset.body);
+        return;
+      }
+      if (auth && (await auth.handle(req, res, pathname))) return;
+      if (!auth && req.method === "GET" && pathname === "/api/auth/config") {
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify({ enabled: false }));
+        return;
+      }
+      // The public shell contains no instance name, avatar, or dashboard data.
+      if (
+        auth &&
+        serveUi &&
+        req.method === "GET" &&
+        !pathname.startsWith("/api/") &&
+        (pathname === "/index.html" || !getDashboardAsset(pathname))
+      ) {
+        res.writeHead(200, {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-store",
+        });
+        res.end(
+          '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Rusa</title><base href="/"></head><body><script src="/dashboard-auth.js" defer></script></body></html>'
+        );
+        return;
+      }
+      if (auth && !(await auth.authorize(req, res))) return;
+      if (auth && (pathname === "/api/mesh/stream" || pathname === "/api/mesh/voice/stream")) {
+        auth.guardStream(req, res);
       }
 
       if (req.method === "GET" && pathname === "/api/dashboard/config") {
@@ -488,10 +535,14 @@ export function createWebhookRequestHandler(options: WebhookServerOptions) {
 /**
  * Start the dashboard HTTP server on the given port.
  */
-export async function startDashboardServer(options: DashboardServerOptions): Promise<{
+export async function startDashboardServer(
+  options: DashboardServerOptions,
+  authForE2E?: DashboardAuth
+): Promise<{
   close: () => Promise<void>;
 }> {
   const { port } = options;
+  const auth = authForE2E ?? (options.auth ? createDashboardAuth(options.auth) : null);
   const bindHost = options.bindHost ?? "127.0.0.1";
   const log = (options.logger ?? nullLogger).child({ component: "dashboard" });
   // When a live mesh is bound, stand up the SSE fan-out hub and the Data API
@@ -554,7 +605,7 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
       sseHub.pushVoiceControl(sessionId, targetActorId)
     );
   }
-  const server = createServer(createDashboardRequestHandler(options, dataDeps, voiceDeps));
+  const server = createServer(createDashboardRequestHandler(options, dataDeps, voiceDeps, auth));
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -571,17 +622,25 @@ export async function startDashboardServer(options: DashboardServerOptions): Pro
       }
       resolve();
     });
+  }).catch(async (error) => {
+    detachVoiceOutbound?.();
+    options.voice?.service.setSessionTransferNotifier(undefined);
+    sseHub?.close();
+    await auth?.close();
+    throw error;
   });
 
   return {
-    close: () =>
-      new Promise<void>((resolve, reject) => {
+    close: async () => {
+      await auth?.close();
+      await new Promise<void>((resolve, reject) => {
         detachVoiceOutbound?.();
         options.voice?.service.setSessionTransferNotifier(undefined);
         sseHub?.close();
         server.closeAllConnections();
         server.close((err) => (err ? reject(err) : resolve()));
-      }),
+      });
+    },
   };
 }
 

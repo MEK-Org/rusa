@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'session_events_web.dart';
 import 'dart:convert';
 import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
@@ -243,7 +244,7 @@ class WebVoiceStream implements VoiceStreamSource {
   final _frames = StreamController<VoiceAnnouncement>.broadcast();
   final _status = StreamController<VoiceStreamStatus>.broadcast();
   final _controls = StreamController<VoiceSessionControl>.broadcast();
-  web.EventSource? _es;
+  SessionEventSource? _es;
 
   @override
   Stream<VoiceAnnouncement> get frames => _frames.stream;
@@ -258,7 +259,7 @@ class WebVoiceStream implements VoiceStreamSource {
     _es?.close();
     final qs = Uri.encodeQueryComponent(actors.join(','));
     final session = Uri.encodeQueryComponent(sessionId);
-    final es = web.EventSource(
+    final es = SessionEventSource(
       '/api/mesh/voice/stream?actors=$qs&sessionId=$session',
     );
     es.addEventListener(
