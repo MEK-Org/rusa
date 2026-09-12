@@ -135,6 +135,15 @@ export function extractCodexTokenUsage(jsonl: string, runStartedAt: string): Tot
   return found ? totals : null;
 }
 
+/**
+ * Kimi Code (`@moonshot-ai/kimi-code` 0.42.0) appends one durable `usage.record` row per LLM
+ * response to `sessions/<workspace>/<session>/agents/<agent>/wire.jsonl`: `{type, agentId,
+ * model, usage: {inputOther, output, inputCacheRead, inputCacheCreation}, usageScope?, time}`
+ * with `time` as epoch milliseconds. Every row is an increment, whether `usageScope` is `turn`
+ * (a turn step) or `session` (an operation such as compaction), so all rows are summed.
+ * The older nested `message.payload.token_usage` rows are still accepted for stores that
+ * predate that format.
+ */
 export function extractKimiTokenUsage(jsonl: string, runStartedAt: string): Totals | null {
   const start = Date.parse(runStartedAt);
   const totals: Totals = {
@@ -151,14 +160,15 @@ export function extractKimiTokenUsage(jsonl: string, runStartedAt: string): Tota
       const row = JSON.parse(line) as Record<string, unknown>;
       const timestamp = rowTimestamp(row);
       if (timestamp === null || timestamp < start) continue;
-      const message = asRecord(row.message);
-      const payload = asRecord(message?.payload) ?? asRecord(row.payload);
+      const payload = asRecord(asRecord(row.message)?.payload);
       const usage =
         row.type === "usage.record" ? asRecord(row.usage) : asRecord(payload?.token_usage);
       if (!usage) continue;
       const other = kimiUsageNumber(usage, "inputOther", "input_other");
       const creation = kimiUsageNumber(usage, "inputCacheCreation", "input_cache_creation");
-      const uncached = other === null && creation === null ? null : (other ?? 0) + (creation ?? 0);
+      // Uncached input is a composite of two reported fields; if either is missing the
+      // composite is unknown rather than the other half.
+      const uncached = other === null || creation === null ? null : other + creation;
       const cacheRead = kimiUsageNumber(usage, "inputCacheRead", "input_cache_read");
       const output = nonNegativeInteger(usage.output);
       found = addPartial(totals, uncached, cacheRead, output) || found;
@@ -175,7 +185,7 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-/** Return the value emitted by this Kimi wire format without inventing a zero for an omission. */
+/** Read one usage field under its current (camelCase) or legacy (snake_case) name; absent stays null. */
 function kimiUsageNumber(
   usage: Record<string, unknown>,
   camelCase: string,

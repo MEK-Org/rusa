@@ -341,13 +341,16 @@ describe("KimiProvider", () => {
         "wire.jsonl"
       );
       mkdirSync(dirname(wirePath), { recursive: true });
-      const futureTimestamp = new Date(Date.now() + 60_000).toISOString();
+      // Path mirrors kimi-code 0.42.0's `sessions/<workspace>/<session>/agents/<agent>/wire.jsonl`
+      // (agent-core-v2 sessionLifecycle/internal/addressing.ts), which the sandbox binds from
+      // `kimiSessionStoreDir(...)/sessions` (see sandbox.ts).
+      const futureTime = Date.now() + 60_000;
       writeFileSync(
         wirePath,
         readFileSync(
           join(import.meta.dirname, "fixtures", "token-kimi-code-success.jsonl"),
           "utf8"
-        ).replace(/"time":"[^"]+"/g, `"time":"${futureTimestamp}"`)
+        ).replace(/"time":\d+/g, `"time":${futureTime}`)
       );
       vi.mocked(spawn).mockReturnValue(
         makeMockChild({
@@ -370,9 +373,9 @@ describe("KimiProvider", () => {
         expect(result.tokenUsage).toMatchObject({
           provider: "kimi",
           model: "kimi-for-coding",
-          uncachedInput: 25,
-          cacheRead: 12,
-          output: 11,
+          uncachedInput: 22810,
+          cacheRead: 10993,
+          output: 966,
         });
       } finally {
         rmSync(worktreePath, { recursive: true, force: true });

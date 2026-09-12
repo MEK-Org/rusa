@@ -1,3 +1,5 @@
-{"type":"usage.record","time":"2026-09-12T10:00:01.000Z","agentId":"main","usage":{"inputOther":"12","output":-1,"inputCacheRead":1.5}}
-{"type":"usage.record","time":"2026-09-12T10:00:02.000Z","agentId":"main","usage":"not-an-object"}
-{"type":"usage.record","time":"2026-09-12T10:00:03.000Z","agentId":"main","usage":{"inputOther":1.5}}
+{"type":"usage.record","agentId":"main","model":"kimi-code/kimi-for-coding","usage":{"inputOther":"1873","output":-1,"inputCacheRead":1.5,"inputCacheCreation":9120},"usageScope":"turn","time":1789207201000}
+{"type":"usage.record","agentId":"main","model":"kimi-code/kimi-for-coding","usage":"not-an-object","usageScope":"turn","time":1789207202000}
+{"type":"usage.record","agentId":"main","model":"kimi-code/kimi-for-coding","usage":{"inputOther":1.5,"inputCacheCreation":2},"usageScope":"turn","time":1789207203000}
+{"type":"usage.record","agentId":"main","model":"kimi-code/kimi-for-coding","usage":{"inputOther":5,"inputCacheCreation":2,"output":3},"usageScope":"turn","time":"not-a-time"}
+{"type":"usage.record","agentId":"main","model":"kimi-code/kimi-for-coding","usage":{"inputOther":5,"inputCacheCreation":2,"output":3},"usageScope":"turn","time":1789207204000
