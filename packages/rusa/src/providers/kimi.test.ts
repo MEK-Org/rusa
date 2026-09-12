@@ -2,6 +2,7 @@ import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import EventEmitter from "node:events";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -14,7 +15,7 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProviderConfig } from "../config/types.js";
 import { buildKimiMcpConfig, KimiProvider, kimiMcpConfigPath, mergeKimiMcpConfig } from "./kimi.js";
-import { SANDBOX_KIMI_MCP_CONFIG_PATH } from "./sandbox.js";
+import { kimiSessionStoreDir, SANDBOX_KIMI_MCP_CONFIG_PATH } from "./sandbox.js";
 
 const { spawnFn, execSyncFn, execFileSyncFn } = vi.hoisted(() => {
   const spawnFn = vi.fn();
@@ -322,6 +323,64 @@ describe("KimiProvider", () => {
       const callArgs = vi.mocked(spawn).mock.calls[0][1];
       expect(callArgs).toContain("-m");
       expect(callArgs).toContain("kimi-k2-5p");
+    });
+  });
+
+  describe("token accounting", () => {
+    it("attaches current Kimi Code usage.record fields to a completed sandbox result", async () => {
+      const worktreePath = mkdtempSync(join(tmpdir(), "kimi-token-usage-"));
+      const sessionId = "session_6c2ad3ad-abcd-1234-ef56-000000000001";
+      const storeDir = kimiSessionStoreDir(worktreePath);
+      const wirePath = join(
+        storeDir,
+        "sessions",
+        "fixture",
+        sessionId,
+        "agents",
+        "main",
+        "wire.jsonl"
+      );
+      mkdirSync(dirname(wirePath), { recursive: true });
+      // Path mirrors kimi-code 0.42.0's `sessions/<workspace>/<session>/agents/<agent>/wire.jsonl`
+      // (agent-core-v2 sessionLifecycle/internal/addressing.ts), which the sandbox binds from
+      // `kimiSessionStoreDir(...)/sessions` (see sandbox.ts).
+      const futureTime = Date.now() + 60_000;
+      writeFileSync(
+        wirePath,
+        readFileSync(
+          join(import.meta.dirname, "fixtures", "token-kimi-code-success.jsonl"),
+          "utf8"
+        ).replace(/"time":\d+/g, `"time":${futureTime}`)
+      );
+      vi.mocked(spawn).mockReturnValue(
+        makeMockChild({
+          stdout: STREAM_JSON_WITH_META,
+        }) as unknown as ChildProcessWithoutNullStreams
+      );
+
+      try {
+        const result = await new KimiProvider(
+          "kimi",
+          { cliCommand: "kimi" },
+          "kimi-for-coding"
+        ).run({
+          prompt: "test",
+          cwd: worktreePath,
+          sandbox: { worktreePath },
+        });
+
+        expect(result.success).toBe(true);
+        expect(result.tokenUsage).toMatchObject({
+          provider: "kimi",
+          model: "kimi-for-coding",
+          uncachedInput: 22810,
+          cacheRead: 10993,
+          output: 966,
+        });
+      } finally {
+        rmSync(worktreePath, { recursive: true, force: true });
+        rmSync(storeDir, { recursive: true, force: true });
+      }
     });
   });
 

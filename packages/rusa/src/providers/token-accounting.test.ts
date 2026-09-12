@@ -50,6 +50,41 @@ describe("provider token normalizers", () => {
     });
   });
 
+  // Fixture rows follow the durable `usage.record` event serialized by @moonshot-ai/kimi-code
+  // 0.42.0 (packages/agent-core-v2/src/agent/usage/usageOps.ts, app/event/event2.ts): the
+  // payload keys, an optional `usageScope`, and a trailing epoch-millisecond `time`. Every row
+  // is an increment, so the `session`-scope (compaction) row counts alongside the turn rows.
+  it("attributes Kimi Code usage.record entries for kimi-for-coding", () => {
+    expect(
+      extractKimiTokenUsage(fixture("token-kimi-code-success.jsonl"), "2026-09-12T10:00:00Z")
+    ).toEqual({
+      uncachedInput: 22810,
+      cacheRead: 10993,
+      output: 966,
+      reasoning: null,
+      response: null,
+    });
+  });
+
+  it("preserves absent Kimi Code usage fields instead of making them zero", () => {
+    expect(
+      extractKimiTokenUsage(fixture("token-kimi-code-partial.jsonl"), "2026-09-12T10:00:00Z")
+    ).toEqual({
+      // Neither row reports both halves of uncached input, so the composite stays unknown.
+      uncachedInput: null,
+      cacheRead: 10993,
+      output: 311,
+      reasoning: null,
+      response: null,
+    });
+  });
+
+  it("ignores malformed Kimi Code usage records", () => {
+    expect(
+      extractKimiTokenUsage(fixture("token-kimi-code-malformed.jsonl"), "2026-09-12T10:00:00Z")
+    ).toBeNull();
+  });
+
   it("decodes agy fields and checks output = reasoning + response", () => {
     const rows = JSON.parse(fixture("token-agy.json")) as Array<{
       uncachedInput: number;
