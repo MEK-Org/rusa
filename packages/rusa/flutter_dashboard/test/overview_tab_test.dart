@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:rusa_dashboard/breakpoints.dart';
 import 'package:rusa_dashboard/models.dart';
 import 'package:rusa_dashboard/store.dart';
 import 'package:rusa_dashboard/util.dart';
@@ -20,6 +21,73 @@ Widget _app(
 );
 
 void main() {
+  testWidgets(
+    'Overview uses columns wide and stacks My Queue above quota pacing narrow',
+    (tester) async {
+      await tester.runAsync(() async {
+        final api = FakeApi();
+        final store = DashboardStore(api: api, stream: FakeStream());
+        await store.init();
+        addTearDown(store.dispose);
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+
+        await tester.binding.setSurfaceSize(const Size(1200, 900));
+        await tester.pumpWidget(_app(store));
+        await tester.pump();
+        await tester.pump();
+
+        final wideQueue = tester.getRect(find.text('My Queue'));
+        final wideQuota = tester.getRect(
+          find.text('Quota Pacing — Prior 3 Days'),
+        );
+        expect(wideQueue.left, lessThan(wideQuota.left));
+        expect(wideQueue.bottom, greaterThan(wideQuota.top));
+        expect(wideQuota.bottom, greaterThan(wideQueue.top));
+        expect(find.text('New Obligation'), findsOneWidget);
+
+        await tester.binding.setSurfaceSize(const Size(390, 844));
+        await tester.pump();
+
+        final narrowQueue = tester.getRect(find.text('My Queue'));
+        final narrowQuota = tester.getRect(
+          find.text('Quota Pacing — Prior 3 Days'),
+        );
+        expect(narrowQueue.left, closeTo(narrowQuota.left, 1));
+        expect(narrowQueue.top, lessThan(narrowQuota.top));
+        expect(find.text('New Obligation'), findsNothing);
+        expect(find.byIcon(Icons.add), findsOneWidget);
+
+        // Just below kNarrowBreakpoint (700): 20px tab padding on each side (40 total).
+        // Surface width 739 gives maxWidth 699 < 700 -> stacked vertically.
+        await tester.binding.setSurfaceSize(
+          const Size(kNarrowBreakpoint + 40 - 1, 900),
+        );
+        await tester.pump();
+
+        final justBelowQueue = tester.getRect(find.text('My Queue'));
+        final justBelowQuota = tester.getRect(
+          find.text('Quota Pacing — Prior 3 Days'),
+        );
+        expect(justBelowQueue.left, closeTo(justBelowQuota.left, 1));
+        expect(justBelowQueue.top, lessThan(justBelowQuota.top));
+
+        // At kNarrowBreakpoint (700): surface width 740 gives maxWidth 700 -> two columns.
+        await tester.binding.setSurfaceSize(
+          const Size(kNarrowBreakpoint + 40, 900),
+        );
+        await tester.pump();
+
+        final atBoundaryQueue = tester.getRect(find.text('My Queue'));
+        final atBoundaryQuota = tester.getRect(
+          find.text('Quota Pacing — Prior 3 Days'),
+        );
+        expect(atBoundaryQueue.left, lessThan(atBoundaryQuota.left));
+        expect(atBoundaryQueue.bottom, greaterThan(atBoundaryQuota.top));
+        expect(atBoundaryQuota.bottom, greaterThan(atBoundaryQueue.top));
+      });
+    },
+  );
+
   testWidgets('yield rows do not overflow at mobile (~390px) width ', (
     tester,
   ) async {
